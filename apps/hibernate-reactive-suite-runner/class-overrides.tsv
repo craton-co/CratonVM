@@ -1,0 +1,50 @@
+# =============================================================================
+# class-overrides.tsv — per-class runner accommodations for
+# run-hibernate-reactive-suite.sh
+#
+# Same schema/semantics as apps/hib-suite-runner/class-overrides.tsv — see that
+# file's header for the full rationale on why this table exists and is force-
+# added to git despite apps/ being gitignored wholesale.
+#
+# FORMAT — tab-separated, three columns. `#` comments and blank lines ignored.
+#
+#   <fully.qualified.TestClass>   <timeout-seconds | ->   <extra VM flags | ->
+#
+#   timeout   a FLOOR, not an absolute: the class runs with
+#             max(this, the run's --timeout/$TIMEOUT). `-` = no override.
+#   flags     extra CratonVM flags appended for this class only, before the
+#             @common.args argfile. Space-separated. Already-present flags are
+#             not duplicated. `-` = none.
+#
+# Verify the table is actually live before trusting a suite run:
+#     ./run-hibernate-reactive-suite.sh overrides
+#
+# EMPTY as of the initial harness validation (2026-08-03): no full `categorize`
+# run has happened yet (needs a live reactive DB — see README.md / DB-
+# REQUIRED.md). Populate this once a categorize run against a real DB surfaces
+# classes that need more than the flat --timeout, the same way hib-suite-runner
+# accumulated its table from real runs.
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# 2026-08-17 — the two accommodatable classes from the residual seven. See
+# known-issues/hibernate-reactive/residual-seven-after-the-afc-fix-20260817.md.
+#
+# Both produce CORRECT results and simply need longer than the suite's flat
+# 120s: 219s and 286s measured, against HotSpot's 18.5s and 13.5s. The cause is
+# one measured defect (functional-interface dispatch at 8-10x HotSpot's
+# INTERPRETER) and it is filed; reporting it as a FAIL every run costs the next
+# reader the same investigation without adding information.
+#
+# The flags column is what does the work here, not the timeout column: the
+# deadline that fires first is JUnit's, set for the whole suite by common.args.
+# 540s keeps a margin under each fixture's OWN 10-minute Vert.x @Timeout, which
+# no flag can reach.
+#
+# The other three (MultithreadedInsertionWithLazyConnectionTest,
+# it.LocalContextTest, techempower.TechEmpowerTest) are deliberately NOT here:
+# they exceed that hardcoded Vert.x budget, so no override can rescue them and
+# they stay reported as FAIL.
+# -----------------------------------------------------------------------------
+org.hibernate.reactive.MultithreadedInsertionTest	600	-Djunit.jupiter.execution.timeout.default=540s
+org.hibernate.reactive.MultithreadedIdentityGenerationTest	600	-Djunit.jupiter.execution.timeout.default=540s

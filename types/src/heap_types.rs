@@ -532,17 +532,60 @@ const KIND_BITS: u64 = 0x3;
 const ELEM_SHIFT: u32 = MARK_QUARTET_SHIFT + 2; // 50: word bits 50..53, byte 6 bits 2..5
 const ELEM_BITS: u64 = 0xF;
 // Word bits 54..55 (byte 6, bits 6..7) are RESERVED: inside MARK_QUARTET_MASK,
-// claimed by no field. They are preserved by every quartet rebuild.
+// claimed by no field. They are preserved by every quartet rebuild. See
+// `MARK_RESERVED_MASK` — they are not merely spare, they are now the header
+// screen's only always-zero field.
 const FLAGS_SHIFT: u32 = MARK_QUARTET_SHIFT + 8; // 56: word bits 56..59, byte 7 bits 0..3
-                                                 // FOUR bits for three defined flags. The spare one is not slack -- it is what
-                                                 // keeps `header_reserved_fields_plausible` able to fail. That screen rejects a
-                                                 // header carrying an undefined flag bit, and if the field were exactly three
-                                                 // bits wide the bit could not be represented, so the screen would always pass:
-                                                 // a guard that cannot fail, on the path that decides whether a candidate
-                                                 // address is a real object.
+                                                 // FOUR bits, and as of 2026-09-08 all four are defined. The fourth used to be
+                                                 // held spare so `header_reserved_fields_plausible` could fail — that screen
+                                                 // rejects a header carrying an undefined flag bit, and with a three-bit field
+                                                 // the bit could not be represented, so the screen would always pass.
+                                                 //
+                                                 // `GC_FLAG_HEADER` claimed it, and what it buys is worth more than what the
+                                                 // screen lost: the screen could only ever reject a candidate whose bytes were
+                                                 // already wrong, whereas an all-zero header made the commonest object in Java
+                                                 // unparseable by the collector's own linear walk.
+                                                 //
+                                                 // The screen did not lose its ability to fail, though — it moved. It now
+                                                 // tests `MARK_RESERVED_MASK` (bits 54..55), which is two always-zero bits
+                                                 // rather than one, so it rejects 3 of 4 random words on that field where it
+                                                 // used to reject 1 of 2. The `gc_flags` clause is kept beside it so a FIFTH
+                                                 // flag added without revisiting the site is still rejected.
 const FLAGS_BITS: u64 = 0xF;
 const AGE_SHIFT: u32 = MARK_QUARTET_SHIFT + 12; // 60: word bits 60..63, byte 7 bits 4..7
 const AGE_BITS: u64 = 0xF;
+
+/// The quartet's two RESERVED bits (word bits 54..55; byte 6, bits 6..7),
+/// claimed by no field and **zero in every header any allocator publishes**.
+///
+/// This is now the one always-zero field a header screen can test. It took over
+/// that job on 2026-09-08 from the `gc_flags` nibble's spare bit, which
+/// [`GC_FLAG_HEADER`] claimed. Two bits rather than one, so it rejects 3 of 4
+/// random words on this field instead of 1 of 2.
+///
+/// Its zero-ness is not a convention this constant invents — the JIT already
+/// depends on it. `kind` and `element_type` share byte 6 with these bits, and
+/// several emitted guards separate a plain object from an array with a single
+/// `CMP BYTE [recv + KIND_TAGS_BYTE_OFFSET], 0`. A header that set bit 54 or 55
+/// would break those guards long before it reached a collector, which is what
+/// makes "non-zero here means corrupt" a safe thing for a GC screen to assume.
+/// Keep the two facts together: whichever of them is weakened, both fail.
+pub const MARK_RESERVED_MASK: u64 = 0b11 << (MARK_QUARTET_SHIFT + 6);
+
+const _: () = assert!(
+    MARK_RESERVED_MASK & !MARK_QUARTET_MASK == 0,
+    "the reserved bits must lie inside MARK_QUARTET_MASK, or a lock/inflate/forward \
+     transition would drop them and the screen would read garbage"
+);
+const _: () = assert!(
+    MARK_RESERVED_MASK
+        & ((KIND_BITS << KIND_SHIFT)
+            | (ELEM_BITS << ELEM_SHIFT)
+            | (FLAGS_BITS << FLAGS_SHIFT)
+            | (AGE_BITS << AGE_SHIFT))
+        == 0,
+    "the reserved bits must be claimed by no quartet field"
+);
 
 // The regression guard for the 2026-08-07 mask fix, at COMPILE time: every one
 // of the four fields must lie wholly inside MARK_QUARTET_MASK. The old
@@ -948,6 +991,45 @@ pub const GC_FLAG_MARKED: u8 = 0x02;
 /// uniform 16-byte-cell layout (no flag) within the same process.
 pub const GC_FLAG_COMPACT: u8 = 0x04;
 
+/// GC flag: **these 16 bytes are a published object header.** Set by every
+/// allocator at allocation time, never cleared, and preserved by every
+/// mark-word transition (it lives inside [`MARK_QUARTET_MASK`], which
+/// [`ObjectHeader::quartet_of`] carries through thin-locking, inflation,
+/// forwarding and hash installation alike).
+///
+/// # Why a collector cannot do without it
+///
+/// Every other bit of a minimal object's header is legitimately zero.
+/// `java/lang/Object` is `ClassId(0)`, a field-less object's `shape` is `0`,
+/// and `MARK_NEUTRAL`, `ObjectKind::Object` and `ArrayElementType::Reference`
+/// all encode as `0` — so before this flag existed, `new Object()` published a
+/// header of **sixteen zero bytes**, byte-for-byte identical to reclaimed,
+/// zeroed, unlisted arena space. A linear heap walk cannot parse an arena in
+/// which the commonest object in Java is indistinguishable from a hole, and the
+/// young non-moving sweep did not: it classified runs of them as walk desyncs,
+/// discarded every reclaim decision taken since the last anchor, and stepped
+/// over the rest without freeing them. That is the whole of
+/// `h2-testvaluememory-system-gc-retained-every-empty-object-FIXED-20260908`
+/// — 100% of an allocation-only workload's garbage surviving every
+/// `System.gc()`, ~2.1 MB a round, monotonic, until the collector thrashed.
+///
+/// HotSpot has never had the problem for the same reason it does not need this
+/// bit: its unlocked mark word is `0b01`, not `0b00`, so no live header is ever
+/// all-zero. This flag is that property, bought in the one place this VM had
+/// spare — see the `gc_flags` nibble's fourth bit at [`MARK_QUARTET_MASK`].
+///
+/// # What must NOT be built on it
+///
+/// It is an allocator invariant, so it is only as strong as the weakest
+/// allocation path. Its ABSENCE must therefore never be read as "not a live
+/// object" anywhere a wrong answer frees memory: a candidate-validation
+/// predicate that demanded it would drop a conservative root the day some path
+/// forgot to set it, and drop the live object with it. Use it only where the
+/// current behaviour on absence is retention. `SWEEP_NO_HEADER_FLAG` in
+/// `gc/src/gen_heap.rs` counts walked objects that lack it, so the invariant
+/// can be measured before anything is allowed to depend on it.
+pub const GC_FLAG_HEADER: u8 = 0x08;
+
 impl ObjectHeader {
     /// Construct a fresh, unlocked object header. The mark word is initialized
     /// to `MARK_NEUTRAL` (no lock held, no identity hash installed).
@@ -968,11 +1050,15 @@ impl ObjectHeader {
         } else {
             num_slots
         };
-        // The quartet is born inside the mark word. `gc_age` and `gc_flags`
-        // start at 0, which `MARK_NEUTRAL` already gives us.
+        // The quartet is born inside the mark word. `gc_age` starts at 0, which
+        // `MARK_NEUTRAL` already gives us; `gc_flags` starts at
+        // [`GC_FLAG_HEADER`] and not at 0, because a wholly zero header is not
+        // parseable as an object — see that constant for the collector defect
+        // this exists to close.
         let mark = MARK_NEUTRAL
             | ((kind as u64) & KIND_BITS) << KIND_SHIFT
-            | ((element_type as u64) & ELEM_BITS) << ELEM_SHIFT;
+            | ((element_type as u64) & ELEM_BITS) << ELEM_SHIFT
+            | ((GC_FLAG_HEADER as u64) & FLAGS_BITS) << FLAGS_SHIFT;
         Self {
             class_id,
             shape,
@@ -1179,7 +1265,12 @@ impl ObjectHeader {
     }
 
     /// The GC flag bits ([`GC_FLAG_OLD_GEN`] / [`GC_FLAG_MARKED`] /
-    /// [`GC_FLAG_COMPACT`]).
+    /// [`GC_FLAG_COMPACT`] / [`GC_FLAG_HEADER`]).
+    ///
+    /// The nibble is now fully allocated. [`GC_FLAG_HEADER`] is set on every
+    /// header this constructor builds, so `gc_flags() == 0` no longer means
+    /// "an ordinary young object" — it means the bytes were never published as
+    /// a header at all.
     #[inline(always)]
     pub fn gc_flags(&self) -> u8 {
         ((self.mark_word.load(std::sync::atomic::Ordering::Relaxed) >> FLAGS_SHIFT) & FLAGS_BITS)
@@ -1451,6 +1542,17 @@ impl ObjectHeader {
     #[inline(always)]
     pub fn quartet_of(mark: u64) -> u64 {
         mark & MARK_QUARTET_MASK
+    }
+
+    /// True when this header's [`MARK_RESERVED_MASK`] bits are clear, i.e. the
+    /// bytes carry the one field every real header always leaves at zero.
+    ///
+    /// A GC header screen may use this to REJECT a candidate. It must never use
+    /// it to accept one, and nothing may be built on the converse of
+    /// [`GC_FLAG_HEADER`]: over-rejection at a mark site is a premature free.
+    #[inline]
+    pub fn reserved_mark_bits_clear(&self) -> bool {
+        self.mark_word.load(std::sync::atomic::Ordering::Relaxed) & MARK_RESERVED_MASK == 0
     }
 
     /// Returns true if this object is in the old generation.
@@ -1775,6 +1877,49 @@ mod tests {
             0,
             0,
         )
+    }
+
+    /// **No header this constructor builds may be all-zero bytes.**
+    ///
+    /// The minimum a Java heap can hold is a field-less `ClassId(0)` object —
+    /// `java/lang/Object` is exactly that — and every one of its fields
+    /// encodes as `0`: `class_id`, `shape`, `MARK_NEUTRAL`,
+    /// `ObjectKind::Object`, `ArrayElementType::Reference`. Until 2026-09-08
+    /// it therefore published sixteen zero bytes, byte-for-byte identical to
+    /// reclaimed, zeroed arena space, and the young non-moving sweep could not
+    /// parse its own arena: every `System.gc()` under `-XX:+UseGenerationalGC`
+    /// retained ~100% of an allocation-only workload's garbage. See
+    /// [`GC_FLAG_HEADER`].
+    ///
+    /// Asserted on the BYTES rather than on the flag, because the flag is the
+    /// current means and the bytes are the requirement. A future layout change
+    /// that reintroduces an all-zero header is the defect, however it spells
+    /// its flags.
+    #[test]
+    fn a_published_header_is_never_sixteen_zero_bytes() {
+        let minimal = ObjectHeader::new(
+            ClassId::new(0),
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            0,
+            0,
+        );
+        let words = [
+            (minimal.class_id.as_u32() as u64) | ((minimal.shape as u64) << 32),
+            minimal.mark_word.load(Ordering::Relaxed),
+        ];
+        assert_ne!(
+            words,
+            [0, 0],
+            "a field-less ClassId(0) object published an all-zero header: the \
+             collector's linear walk cannot tell it from a hole",
+        );
+        assert_eq!(
+            words[0], 0,
+            "precondition: the FIRST word really is all-zero for this shape, \
+             so the second word is what carries the distinction",
+        );
+        assert_eq!(minimal.gc_flags(), GC_FLAG_HEADER);
     }
 
     // -- Constants --
@@ -2187,8 +2332,12 @@ mod tests {
     #[test]
     fn an_empty_claim_set_wins_nothing() {
         let header = make_header();
+        let before = header.gc_flags();
         assert!(!header.try_add_gc_flags(0));
-        assert_eq!(header.gc_flags(), 0);
+        // Unchanged, not zero: `ObjectHeader::new` sets `GC_FLAG_HEADER`, so
+        // "the claim wrote nothing" is a comparison against what was there.
+        assert_eq!(header.gc_flags(), before);
+        assert_eq!(before, GC_FLAG_HEADER);
     }
 
     /// A claim must not disturb one other bit of the word. The quartet shares

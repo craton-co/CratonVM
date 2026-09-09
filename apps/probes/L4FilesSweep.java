@@ -116,7 +116,26 @@ public class L4FilesSweep {
             "a//b", "a/./b", "a/../b", "/..", "trailing/", ".hidden", "a.b.c",
         };
         for (String s : specs) {
-            Path q = Paths.get(s);
+            // A spec can be a legal path on one platform and not on another:
+            // "//" is a hostname-less UNC path, so `Paths.get("//")` throws
+            // InvalidPathException on Windows where it returns the root on
+            // Linux. Unguarded, that killed the WHOLE probe at the fifth spec
+            // -- on the HOTSPOT arm, so the strict-corpus gate scored it as an
+            // arm that did not complete rather than as a comparison, and
+            // `existence`, `readWrite`, `directories`, `copyMove`,
+            // `attributes` and every section after this one never ran on
+            // Windows at all.
+            //
+            // Reported as a row instead: all three arms print the same row on
+            // the same platform, which is what makes it a comparison, and the
+            // several hundred rows after it exist again.
+            Path q;
+            try {
+                q = Paths.get(s);
+            } catch (InvalidPathException e) {
+                p("path[" + s + "] toString", "THREW " + e.getClass().getName());
+                continue;
+            }
             p("path[" + s + "] toString", q.toString());
             p("path[" + s + "] fileName", q.getFileName());
             p("path[" + s + "] parent", q.getParent());

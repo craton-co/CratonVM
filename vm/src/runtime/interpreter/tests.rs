@@ -5032,6 +5032,11 @@ fn t18_k2_getfield_int_still_works() {
 ///      produces an all-zero header.
 ///   3. The resulting header's first 16 bytes are not all-zero
 ///      even for a zero-field java.lang.Object instance.
+///
+/// (3) is now carried by `GC_FLAG_HEADER` rather than by the hash, which went
+/// lazy in 2026-08-07's header shrink. The property is the same one; only its
+/// source moved. See the comment at the assertion for the month this test spent
+/// asserting the opposite, and for why the fix is not to mint a hash again.
 #[test]
 fn h1_tlab_object_header_has_nonzero_hash_at_allocation() {
     use cratonvm_gc::heap::ObjectHeader;
@@ -5061,17 +5066,33 @@ fn h1_tlab_object_header_has_nonzero_hash_at_allocation() {
     assert_eq!(header.class_id, ClassId::new(0));
     assert_eq!(header.num_slots(), 0);
 
-    // First 16 bytes: must NOT be all-zero, since identity_hash_code
-    // A bare `new Object()` (class_id 0, no fields, unhashed, unlocked) DOES
-    // now read as all-zero. That is a real regression in the stale-pointer
-    // detector's discriminator, recorded here rather than hidden: the hash it
-    // used to key on left the header, and minting one eagerly to restore it
-    // would make every `synchronized` block inflate.
+    // First 16 bytes: must NOT be all-zero.
+    //
+    // This assertion has been both ways round, and the round trip is the point.
+    // It was written as `assert_ne!` because an all-zero header made the
+    // stale-pointer detector in `execute_invoke` mis-flag every legitimate
+    // `Object` key in a `HashMap`. When the identity hash moved into the mark
+    // word and became lazy (2026-08-07), a bare `new Object()` went back to
+    // all-zero and this test was INVERTED to `assert_eq!`, with a comment
+    // calling it "a real regression in the stale-pointer detector's
+    // discriminator, recorded here rather than hidden".
+    //
+    // Recorded, and then it cost far more than the detector. An all-zero header
+    // is also unparseable by the young non-moving sweep's linear walk, so every
+    // `System.gc()` under `-XX:+UseGenerationalGC` retained ~100% of an
+    // allocation-only workload's garbage — see
+    // `docs/internal/fixed-bugs/h2-testvaluememory-system-gc-retained-every-empty-object-FIXED-20260908.md`.
+    //
+    // `GC_FLAG_HEADER` restores the property WITHOUT reviving the eager hash the
+    // comment correctly refused: a minted-at-allocation hash would lose every
+    // `try_thin_lock` CAS and inflate a monitor for every `synchronized` block.
     // SAFETY: we just wrote a valid ObjectHeader into `ptr`, so its first 16 bytes are initialized and readable.
     let first_16: [u8; 16] = unsafe { std::ptr::read(ptr as *const [u8; 16]) };
-    assert_eq!(
+    assert_ne!(
         first_16, [0u8; 16],
-        "a bare fresh Object header is all-zero now that the hash is lazy"
+        "a published header must never be sixteen zero bytes: it is then \
+         indistinguishable from reclaimed, zeroed arena space, both to the \
+         stale-pointer detector and to the collector's own heap walk"
     );
 
     // Path 2: verify VmHeap::next_identity_hash never returns 0

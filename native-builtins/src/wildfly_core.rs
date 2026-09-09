@@ -1611,7 +1611,9 @@ fn async_future_await_payload_result(
     mut this: ObjectRef,
     waiting: &Value,
 ) -> MethodCallResult {
+    let this_pin = ctx.pin_native_root(this);
     loop {
+        let mut this = ctx.read_native_pin(this_pin, this);
         let status = ctx.get_field_by_name(this, "status");
         if !async_future_status_is_named(ctx, &status, waiting, "WAITING") {
             return Ok(Some(status));

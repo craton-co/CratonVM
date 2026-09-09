@@ -307,7 +307,23 @@ fn jython_new_module(
     name: &str,
     dict: Value,
 ) -> Result<ObjectRef, MethodCallFailed> {
+    // GC: a reference held in a Rust local across an allocating or Java-re-entering
+    // call goes stale under a moving collector, and under the Generational
+    // non-moving young sweep an unrooted object is ZEROED in place. Pin and
+    // re-read. `safe_native_call_impl` truncates `native_pin_roots` when the native
+    // returns, so an unmatched pin costs nothing on an error path. See
+    // `internal/audits/wide-tranche-triage-20260907.md`.
+    // `create_string` allocates, so `dict` — held since entry — is a pre-call
+    // address by the time it is handed to the constructor.
+    let dict_pin = match dict {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
     let name_obj = ctx.create_string(name);
+    let dict = match dict_pin {
+        Some((p, o)) => Value::Object(Some(ctx.read_native_pin(p, o))),
+        None => dict,
+    };
     let module = match ctx.new_object_initialized(
         "org/python/core/PyModule",
         "(Ljava/lang/String;Lorg/python/core/PyObject;)V",
@@ -1088,7 +1104,9 @@ fn java_list_get(ctx: &mut dyn NativeContext, list: ObjectRef, index: i32) -> Op
 fn java_string_list_contains(ctx: &mut dyn NativeContext, list: ObjectRef, key: ObjectRef) -> bool {
     let key_text = ctx.read_string(key);
     if let Some(size) = java_list_size(ctx, list) {
+        let list_pin = ctx.pin_native_root(list);
         for index in 0..size {
+            let list = ctx.read_native_pin(list_pin, list);
             let Some(item) = java_list_get(ctx, list, index) else {
                 continue;
             };

@@ -220,6 +220,10 @@ mod inlining;
 /// Engagement count for the splice cursor clamp, for `jit-method-stats`.
 /// A number beside a result is what says whether the guard ran at all.
 pub(crate) use inlining::inline_live_slot_clamps;
+/// Engagement count for the open-inline-locals floor, for `jit-method-stats`.
+/// Separate from the clamp above for the reason the counter itself is: one
+/// number cannot say which of the two guards a result should be credited to.
+pub(crate) use inlining::inline_locals_floor_bumps;
 /// The PC -> inline-chain map, and the per-compile session that records it.
 ///
 /// NAMED rather than glob re-exported, unlike the ~15 `pub use foo::*;`
@@ -242,7 +246,7 @@ pub use inlining::{
     begin_inline_frame_recording, begin_npe_trap_recording, finish_inline_frame_recording,
     finish_npe_trap_recording, inline_call_map_at_return_counts, inline_frame_map_enabled,
     inline_miss_edge_poison_counts, npe_trap_lines_enabled, InlineFrameLevel, InlineFrameMap,
-    NpeTrapMap, NpeTrapSite,
+    InlineFrameRow, NpeTrapMap, NpeTrapSite,
 };
 mod arith;
 mod arrays;
@@ -415,6 +419,16 @@ struct Compiler {
     /// Number of locals mapped to callee-saved registers.
     num_reg_locals: usize,
     /// Per-local register assignment from graph-coloring allocator.
+    /// DIAGNOSTIC (`CRATONVM_DBG_JIT_SLOT_OVERLAP=1`): frame offsets this
+    /// compile has emitted a STORE to, and the offsets it has emitted a LOAD
+    /// from together with the emitting Rust backtrace.
+    ///
+    /// A load from an offset nothing ever stores to is a read of uninitialised
+    /// stack. `Select.processGroupResult` reloaded its `long offset` local from
+    /// exactly such a slot on the loop back edge, which is how a window query's
+    /// rows came to be dropped as if they were an OFFSET clause.
+    pub(super) dbg_stored_slots: Vec<(i32, usize)>,
+    pub(super) dbg_loaded_slots: Vec<(i32, usize)>,
     /// `local_assignments[i] = Some(reg)` means local i is in that register.
     local_assignments: Vec<Option<u8>>,
     /// Which register-homed locals a GC-capable safepoint actually has to
@@ -1597,6 +1611,19 @@ struct Compiler {
     /// point resumes at its bci, an exceptional one is *thrown* at its bci and
     /// is only ever used to pick a handler. Sharing one map let a reason-2/6
     /// box be handed to a reason-9 stub (and vice versa).
+    /// Per-bci JEP-358 NPE action for a bci routed to the PRECISE null-check
+    /// stub (reason 10).
+    ///
+    /// Reason 10 was written for `putfield`, whose action is always
+    /// `npe_action::NONE`, so it baked that constant in. An array access does
+    /// NOT have a constant action -- `array_opcode_npe_action` derives it per
+    /// element type so the helpful message can say which access was null -- and
+    /// routing array null checks through the precise stub without carrying it
+    /// would silently downgrade every array NPE message inside a try block.
+    ///
+    /// Absent means `NONE`, which is exactly the `putfield` behaviour this
+    /// preserves.
+    precise_npe_action_by_bci: FxHashMap<usize, u8>,
     exc_frame_box_ptr_by_bci:
         rustc_hash::FxHashMap<usize, *const crate::deopt::DeoptimizationPoint>,
     /// deopt-osr Step 7: bcis (loop-boundary PCs vetted by OSR-entry) that carry
@@ -2723,6 +2750,8 @@ impl Compiler {
             num_locals,
             num_params,
             num_reg_locals,
+            dbg_stored_slots: Vec::new(),
+            dbg_loaded_slots: Vec::new(),
             local_assignments,
             // Built by `compile_with_param_slots` (it has `code`/`param_oop_mask`,
             // which this constructor does not). `None` = conservative fallback.
@@ -2923,6 +2952,7 @@ impl Compiler {
             deopt_regs_base,
             deopt_box_ptr_by_bci: FxHashMap::default(),
             exc_frame_box_ptr_by_bci: FxHashMap::default(),
+            precise_npe_action_by_bci: FxHashMap::default(),
             osr_exit_points: Vec::new(),
             osr_exit_box_ptr_by_bci: FxHashMap::default(),
             osr_exit_test_trigger_bci: None,

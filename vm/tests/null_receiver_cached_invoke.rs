@@ -28,6 +28,22 @@
 //!
 //! The probe deliberately checks the WARM answers — a cold-only test passed
 //! throughout the entire lifetime of the bug.
+//!
+//! # And it checks TWO invokespecial callees, one of them large
+//!
+//! The guard above landed in the single-pass backend's direct-call arm. The
+//! optimizing (C2/IR) tier has an inliner of its own, with a budget four times
+//! larger, and it splices the callee's bytecode in place of the invoke —
+//! deleting the very instruction JVMS §6.5 hangs the NPE on. It never got the
+//! guard, so this file went red again on 2026-09-08 with
+//! `warm-invokespecial=NO-THROW(3)`.
+//!
+//! A small callee cannot tell those two inliners apart: both claim it, and a
+//! fix in either makes the site green. `privateCallBig` is past the single-pass
+//! budget (`Refuse(CalleeTooLarge)`) and inside the IR tier's, so a green
+//! `warm-invokespecial-big` is a statement about the tier that actually
+//! compiles hot code. See
+//! `docs/internal/retired/warm-invokespecial-on-a-null-receiver-runs-the-callee-again-FIXED-20260908.md`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -41,9 +57,29 @@ public class NullReceiverCachedProbe {
     public int ifaceCall() { return 1; }
     public int virtualCall() { return 2; }
     private int privateCall() { return 3; }
+    // A private callee too LARGE for the single-pass backend's inline budget
+    // (`Refuse(CalleeTooLarge)`) and comfortably inside the optimizing tier's,
+    // which is four times bigger. It is the arm that isolated the 2026-09-08
+    // regression: `privateCall` alone cannot tell the two inliners apart, and
+    // the guard the single-pass one has carried since `cd451facc` made the
+    // small arm look like the whole story. Both reported NO-THROW; only this
+    // one rules the single-pass inliner out.
+    private int privateCallBig() {
+      int a = 0;
+      a+=1;a+=2;a+=3;a+=4;a+=5;a+=6;a+=7;a+=8;a+=9;a+=10;
+      a+=1;a+=2;a+=3;a+=4;a+=5;a+=6;a+=7;a+=8;a+=9;a+=10;
+      a+=1;a+=2;a+=3;a+=4;a+=5;a+=6;a+=7;a+=8;a+=9;a+=10;
+      a+=1;a+=2;a+=3;a+=4;a+=5;a+=6;a+=7;a+=8;a+=9;a+=10;
+      a+=1;a+=2;a+=3;a+=4;a+=5;a+=6;a+=7;a+=8;a+=9;a+=10;
+      a+=1;a+=2;a+=3;a+=4;a+=5;a+=6;a+=7;a+=8;a+=9;a+=10;
+      a+=1;a+=2;a+=3;a+=4;a+=5;a+=6;a+=7;a+=8;a+=9;a+=10;
+      a+=1;a+=2;a+=3;a+=4;a+=5;a+=6;a+=7;a+=8;a+=9;a+=10;
+      return a;
+    }
     // javac emits `invokespecial Impl.privateCall()` here — the same opcode
     // JDK's Class.isDirectSubType uses for `c.getInterfaces(boolean)`.
     static int callPrivateOn(Impl t) { return t.privateCall(); }
+    static int callPrivateBigOn(Impl t) { return t.privateCallBig(); }
     static int callVirtualOn(Impl t) { return t.virtualCall(); }
     static int callIfaceOn(Iface t) { return t.ifaceCall(); }
   }
@@ -66,11 +102,13 @@ public class NullReceiverCachedProbe {
     int sink = 0;
     for (int i = 0; i < 50000; i++) {
       sink += Impl.callPrivateOn(real);
+      sink += Impl.callPrivateBigOn(real);
       sink += Impl.callVirtualOn(real);
       sink += Impl.callIfaceOn(real);
     }
     if (sink == 0) System.out.println("unreachable");
     check("warm-invokespecial", () -> Impl.callPrivateOn(null));
+    check("warm-invokespecial-big", () -> Impl.callPrivateBigOn(null));
     check("warm-invokevirtual", () -> Impl.callVirtualOn(null));
     check("warm-invokeinterface", () -> Impl.callIfaceOn(null));
     System.out.println("OK");
@@ -242,6 +280,7 @@ fn assert_all_npe(stdout: &str, jit: bool) {
     );
     for site in [
         "warm-invokespecial",
+        "warm-invokespecial-big",
         "warm-invokevirtual",
         "warm-invokeinterface",
     ] {

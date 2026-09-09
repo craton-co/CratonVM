@@ -2225,10 +2225,19 @@ fn ks_throw(ctx: &mut dyn NativeContext, class_name: &str, msg: &str) -> MethodC
 /// `initialized` field, and any receiver that already has a store bound in
 /// `keystore.rs`'s registry was loaded through `engineLoad` by definition.
 /// Only a receiver that satisfies none of the three is genuinely uninitialized.
-fn ks_require_loaded(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<(), MethodCallFailed> {
-    if matches!(ctx.get_field(this, 1), Value::Int(1))
-        || matches!(ctx.get_field_by_name(this, "initialized"), Value::Int(1))
-        || crate::keystore::keystore_id_from_object(ctx, this) != 0
+fn ks_require_loaded(
+    ctx: &mut dyn NativeContext,
+    this: &mut ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    // Receiver by `&mut` per the gate's own remedy (`WORKER-5-NOTE-10` §7.3).
+    // TODAY every allocation in this function is on the path that THROWS, and
+    // every caller propagates with `?` — so no caller currently reaches a use
+    // of a stale receiver. That is a property of the callers, not of this
+    // function, and it is not one a reader can check at the call site. The
+    // `&mut` makes the shape impossible instead of making this instance safe.
+    if matches!(ctx.get_field(*this, 1), Value::Int(1))
+        || matches!(ctx.get_field_by_name(*this, "initialized"), Value::Int(1))
+        || crate::keystore::keystore_id_from_object(ctx, *this) != 0
     {
         return Ok(());
     }
@@ -2363,8 +2372,8 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
         "getCertificate",
         "(Ljava/lang/String;)Ljava/security/cert/Certificate;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ks_require_loaded(ctx, this)?;
+            let mut this = obj_arg(args, 0)?;
+            ks_require_loaded(ctx, &mut this)?;
             crate::keystore::keystore_get_certificate(ctx, args)
         },
     );
@@ -2379,8 +2388,8 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
         "getCertificateChain",
         "(Ljava/lang/String;)[Ljava/security/cert/Certificate;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ks_require_loaded(ctx, this)?;
+            let mut this = obj_arg(args, 0)?;
+            ks_require_loaded(ctx, &mut this)?;
             crate::keystore::keystore_get_certificate_chain(ctx, args)
         },
     );
@@ -2391,8 +2400,8 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
         "getKey",
         "(Ljava/lang/String;[C)Ljava/security/Key;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ks_require_loaded(ctx, this)?;
+            let mut this = obj_arg(args, 0)?;
+            ks_require_loaded(ctx, &mut this)?;
             let key = crate::keystore::keystore_get_key(ctx, args)?;
             // `engine_get_key` decrypts JKS-shrouded key material with the
             // password it was just handed. If the stored DER is STILL an
@@ -2425,8 +2434,8 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
         "containsAlias",
         "(Ljava/lang/String;)Z",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ks_require_loaded(ctx, this)?;
+            let mut this = obj_arg(args, 0)?;
+            ks_require_loaded(ctx, &mut this)?;
             crate::keystore::keystore_contains_alias(ctx, args)
         },
     );
@@ -2440,15 +2449,15 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
     // registered in both modes (phases_early phase53 for synthetic-JDK,
     // `keystore::register_keystore_real` for real-JDK).
     r.register(cls, "aliases", "()Ljava/util/Enumeration;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ks_require_loaded(ctx, this)?;
+        let mut this = obj_arg(args, 0)?;
+        ks_require_loaded(ctx, &mut this)?;
         crate::keystore::keystore_aliases(ctx, args)
     });
 
     // size() -> int  (a readout of the real entry count, not a counter)
     r.register(cls, "size", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ks_require_loaded(ctx, this)?;
+        let mut this = obj_arg(args, 0)?;
+        ks_require_loaded(ctx, &mut this)?;
         crate::keystore::keystore_size(ctx, args)
     });
 
@@ -2465,8 +2474,8 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
         "setCertificateEntry",
         "(Ljava/lang/String;Ljava/security/cert/Certificate;)V",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ks_require_loaded(ctx, this)?;
+            let mut this = obj_arg(args, 0)?;
+            ks_require_loaded(ctx, &mut this)?;
             let id = crate::keystore::keystore_ensure_store_id(ctx, this);
             let alias = ks_alias(ctx, args);
             crate::keystore::keystore_set_certificate_entry_native(ctx, args)?;
@@ -2495,8 +2504,8 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
         "setKeyEntry",
         "(Ljava/lang/String;Ljava/security/Key;[C[Ljava/security/cert/Certificate;)V",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ks_require_loaded(ctx, this)?;
+            let mut this = obj_arg(args, 0)?;
+            ks_require_loaded(ctx, &mut this)?;
             let id = crate::keystore::keystore_ensure_store_id(ctx, this);
             let alias = ks_alias(ctx, args);
             crate::keystore::keystore_set_key_entry_native(ctx, args)?;
@@ -2514,8 +2523,8 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
 
     // deleteEntry(String alias) -> void
     r.register(cls, "deleteEntry", "(Ljava/lang/String;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ks_require_loaded(ctx, this)?;
+        let mut this = obj_arg(args, 0)?;
+        ks_require_loaded(ctx, &mut this)?;
         let id = crate::keystore::keystore_ensure_store_id(ctx, this);
         crate::keystore::keystore_delete_entry_native(ctx, args)?;
         ks_sync_count(ctx, this, id);
@@ -2543,7 +2552,7 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
     //      a JKS body round-trips through `load()` whatever type string the
     //      caller asked `getInstance` for.
     r.register(cls, "store", "(Ljava/io/OutputStream;[C)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
+        let mut this = obj_arg(args, 0)?;
         let out = match args.get(1) {
             Some(Value::Object(Some(o))) => *o,
             _ => {
@@ -2563,7 +2572,7 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
             )?;
             return Ok(None);
         }
-        ks_require_loaded(ctx, this)?;
+        ks_require_loaded(ctx, &mut this)?;
         let id = crate::keystore::keystore_id_from_object(ctx, this);
         if id == 0 {
             // `loaded` is set, yet no store is bound: the only way to reach
@@ -2587,8 +2596,8 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
         "isCertificateEntry",
         "(Ljava/lang/String;)Z",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ks_require_loaded(ctx, this)?;
+            let mut this = obj_arg(args, 0)?;
+            ks_require_loaded(ctx, &mut this)?;
             crate::keystore::keystore_is_certificate_entry(ctx, args)
         },
     );
@@ -2596,8 +2605,8 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
     // isKeyEntry(String alias) -> boolean  (true for private AND secret keys,
     // matching both the JDK contract and what `getKey` above will hand back)
     r.register(cls, "isKeyEntry", "(Ljava/lang/String;)Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ks_require_loaded(ctx, this)?;
+        let mut this = obj_arg(args, 0)?;
+        ks_require_loaded(ctx, &mut this)?;
         crate::keystore::keystore_is_key_entry(ctx, args)
     });
     r.set_category(__prev_cat);

@@ -3273,7 +3273,11 @@ pub(super) fn compile_osr_artifact(
     }
     if !osr_reused {
         crate::jit::disasm::maybe_dump(
-            "osr",
+            // The DOOR and the BACKEND are different questions and only the
+            // first was ever printed. `used_ir_backend` has recorded the
+            // second all along; a reader chasing a miscompiled body needs both
+            // to know which emitter to go and read.
+            if compiled.used_ir_backend { "osr/ir" } else { "osr/sp" },
             &class_name_arc,
             &method_name_arc,
             &descriptor_arc,
@@ -3663,7 +3667,7 @@ pub(super) fn try_osr(
             // and the disassembly said it had not; the disassembly was of
             // another artifact.
             crate::jit::disasm::maybe_dump(
-                "osr-optimizing",
+                if c.used_ir_backend { "osr-optimizing/ir" } else { "osr-optimizing/sp" },
                 &class_name_arc,
                 &method_name_arc,
                 &descriptor_arc,
@@ -6496,7 +6500,7 @@ pub(super) fn compile_optimizing_artifact(
             );
         }
         crate::jit::disasm::maybe_dump_annotated(
-            "callee",
+            if compiled.used_ir_backend { "callee/ir" } else { "callee/sp" },
             &callee_cached.class_name,
             &callee_cached.method_name,
             &callee_cached.method_descriptor,
@@ -6965,7 +6969,7 @@ pub(super) fn try_jit_upgrade_with_gate(
         );
     }
     crate::jit::disasm::maybe_dump(
-        "upgrade",
+        if compiled_arc.used_ir_backend { "upgrade/ir" } else { "upgrade/sp" },
         &cached.class_name,
         &cached.method_name,
         &cached.method_descriptor,
@@ -8500,7 +8504,7 @@ pub(super) fn try_jit_compile_callee_slow(
         );
     }
     crate::jit::disasm::maybe_dump(
-        "full",
+        if compiled.used_ir_backend { "full/ir" } else { "full/sp" },
         &cached.class_name,
         &cached.method_name,
         &cached.method_descriptor,
@@ -11643,7 +11647,14 @@ pub(super) fn execute_jit_call(
             // — e.g. one that scalar-replaced an object, whose snapshot records
             // machine provenance the mapper can't re-materialize — falls straight
             // through to the safe re-run instead of relying on the mapper bail.
-            if cratonvm_jit::deopt_real_enabled() && compiled.can_deopt_resume {
+            // ADDITIVE second arm: `can_deopt_resume` is false on every
+            // optimizing-tier artifact in a production build, so without it
+            // this sink fell through to the whole-method re-run below and ran
+            // any side effect the compiled body had ALREADY committed a second
+            // time, silently. See `sink_precise_resume_allowed`.
+            if (cratonvm_jit::deopt_real_enabled() && compiled.can_deopt_resume)
+                || sink_precise_resume_allowed_for(cached, &rframe)
+            {
                 // deopt-osr Step 9: epoch staleness guard + de-speculation
                 // wiring (record the deopt, evict, escalate to not-entrant /
                 // not-compilable, advance the live epoch). Resumes the trapping
@@ -12110,7 +12121,14 @@ pub(super) fn execute_jit_call_decoded(
             // checks and de-speculation live inside
             // `real_frame_deopt_resume_and_despeculate`; any refusal falls
             // through to the safe re-run below.
-            if cratonvm_jit::deopt_real_enabled() && compiled.can_deopt_resume {
+            // ADDITIVE second arm: `can_deopt_resume` is false on every
+            // optimizing-tier artifact in a production build, so without it
+            // this sink fell through to the whole-method re-run below and ran
+            // any side effect the compiled body had ALREADY committed a second
+            // time, silently. See `sink_precise_resume_allowed`.
+            if (cratonvm_jit::deopt_real_enabled() && compiled.can_deopt_resume)
+                || sink_precise_resume_allowed_for(cached, &rframe)
+            {
                 if let Some(r) = real_frame_deopt_resume_and_despeculate(
                     shared, thread, compiled, cached, &rframe,
                 ) {
@@ -12578,7 +12596,13 @@ pub(crate) fn resume_deopted_body(
     if ir_deopt_resume_enabled() && resume_from_ir_deopt(shared, thread, cached, rframe).is_some() {
         return run_pushed_frame_to_completion(shared, thread, frames_depth_on_entry).map(Some);
     }
-    if cratonvm_jit::deopt_real_enabled() && compiled.can_deopt_resume {
+    // ADDITIVE second arm — see `sink_precise_resume_allowed`. Without it this
+    // function's own doc ("the only correct answer for a body that has already
+    // committed a side effect") described something it could not do on an
+    // optimizing-tier artifact, which is the tier the defect it cites needs.
+    if (cratonvm_jit::deopt_real_enabled() && compiled.can_deopt_resume)
+        || sink_precise_resume_allowed_for(cached, rframe)
+    {
         if real_frame_deopt_resume_and_despeculate(shared, thread, compiled, cached, rframe)
             .is_some()
         {

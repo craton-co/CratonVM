@@ -2819,6 +2819,121 @@ not an address\n",
             }
         }
 
+        // WHICH REGISTER HOLDS A VACATED ADDRESS.
+        //
+        // The reports this exists for all have the same shape -- compiled code
+        // reading an address inside a span the collector just decommitted --
+        // and all of them leave the same question open: the fault ADDRESS is in
+        // the dead span, but which of the sixteen values the frame is carrying
+        // was the stale one, and what was it? Reading it off `rax`/`rsi`/`r13`
+        // by eye works only when they happen to be equal.
+        //
+        // `gc_quiescence`'s vacated ledger answers it exactly: it holds the
+        // key set of the last collection's pointer map minus that cycle's
+        // destinations, so a register whose value is in it named an object the
+        // collector moved AWAY and did not move anything back into. That is the
+        // read that faults, attributed to a named register.
+        //
+        // `was_vacated_try` never blocks: the faulting thread may hold the
+        // ledger's lock, and a hang here costs the whole report.
+        // No-op unless `CRATONVM_DBG_VACATED_FRAMES` is armed.
+        {
+            let mut rbuf = [0u8; 16];
+            let mut any = false;
+            let mut locked = false;
+            for (label, which) in [
+                (b"rax".as_slice(), GREG_RAX),
+                (b"rbx".as_slice(), GREG_RBX),
+                (b"rcx".as_slice(), GREG_RCX),
+                (b"rdx".as_slice(), GREG_RDX),
+                (b"rsi".as_slice(), GREG_RSI),
+                (b"rdi".as_slice(), GREG_RDI),
+                (b"rbp".as_slice(), GREG_RBP),
+                (b"r8".as_slice(), GREG_R8),
+                (b"r9".as_slice(), GREG_R9),
+                (b"r10".as_slice(), GREG_R10),
+                (b"r11".as_slice(), GREG_R11),
+                (b"r12".as_slice(), GREG_R12),
+                (b"r13".as_slice(), GREG_R13),
+                (b"r14".as_slice(), GREG_R14),
+                (b"r15".as_slice(), GREG_R15),
+            ] {
+                let v = greg_from_ucontext(ucontext, which) as usize;
+                match cratonvm_gc::gc_quiescence::was_vacated_try(v) {
+                    Err(()) => {
+                        locked = true;
+                        break;
+                    }
+                    Ok(None) => {}
+                    Ok(Some(moved_to)) => {
+                        any = true;
+                        async_signal_safe::write_all(
+                            async_signal_safe::STDERR_FD,
+                            b"#  VACATED REGISTER: ",
+                        );
+                        async_signal_safe::write_all(async_signal_safe::STDERR_FD, label);
+                        async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"=0x");
+                        let n = hex_into_buf(&mut rbuf, v as u64);
+                        async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+                        async_signal_safe::write_all(
+                            async_signal_safe::STDERR_FD,
+                            b" named an object a completed collection moved to 0x",
+                        );
+                        let n = hex_into_buf(&mut rbuf, moved_to as u64);
+                        async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+                        async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"
+");
+                    }
+                }
+            }
+            if locked {
+                async_signal_safe::write_all(
+                    async_signal_safe::STDERR_FD,
+                    b"#  vacated ledger locked - no verdict on the registers
+",
+                );
+            } else if !any && cratonvm_gc::gc_quiescence::vacated_frames_enabled() {
+                async_signal_safe::write_all(
+                    async_signal_safe::STDERR_FD,
+                    b"#  no register names an address a completed collection vacated
+",
+                );
+            }
+            // WAS THIS THREAD EVER HANDED THE MAP IT IS MISSING?
+            //
+            // A stale register on a thread whose last applied cycle EQUALS the
+            // relocating-cycle count was rewritten and is stale anyway -- a hole
+            // in the rewrite itself. A smaller number is a thread that never got
+            // the map, which is a different defect with a different fix, and
+            // without this line the two are indistinguishable in the report.
+            // `path` names which of the three remap entry points ran: 1 =
+            // stop-the-world resume, 2 = ordinary blocked-region wake, 3 =
+            // leaked-region fallback, 0 = never.
+            {
+                let (cycle, path) = cratonvm_gc::gc_quiescence::last_pointer_map_applied();
+                let total = cratonvm_gc::gc_quiescence::RELOCATING_CYCLES
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                async_signal_safe::write_all(
+                    async_signal_safe::STDERR_FD,
+                    b"#  this thread last applied a relocation map at cycle=",
+                );
+                let n = hex_into_buf(&mut rbuf, cycle);
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"0x");
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, b" path=");
+                let n = hex_into_buf(&mut rbuf, u64::from(path));
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+                async_signal_safe::write_all(
+                    async_signal_safe::STDERR_FD,
+                    b" of relocating_cycles=0x",
+                );
+                let n = hex_into_buf(&mut rbuf, total);
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"
+");
+            }
+        }
+
         // Is the faulting PC inside a code buffer this process still HOLDS? The
         // name registry knows only bodies `JitCache::put` published; every
         // `ExecutableBuffer` registers here, including OSR trampolines and

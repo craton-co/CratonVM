@@ -133,6 +133,65 @@ fn current_os_tid() -> u32 {
     0
 }
 
+/// `CRATONVM_MONITOR_FASTPATH=0` — restore the pre-2026-09-08 uncontended
+/// `monitorenter` / `monitorexit` path, so one binary can measure both arms.
+///
+/// Off, the JMX bookkeeping goes back through the registry map on every
+/// acquire and release and always visits the contended slots, and the two
+/// opcode handlers go back to pre-building their JEP 358 message context. The
+/// two arms are behaviourally identical — this exists because
+/// `probes/SyncCost.java` has to be run on a shared host where a sequential
+/// pair of builds is not a measurement.
+pub(crate) fn monitor_fastpath_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_MONITOR_FASTPATH").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
+/// The per-thread JMX monitor slots, in one allocation.
+///
+/// # Why these three moved out of [`ThreadEntry`]
+///
+/// `complete_jmx_monitor_enter` runs on EVERY uncontended `monitorenter` and
+/// `remove_jmx_locked_monitor` on every `monitorexit`, and both reached their
+/// slots through `ThreadRegistry::threads` — an `RwLock` read plus an
+/// `FxHashMap` lookup — before touching three `parking_lot` mutexes. `perf` on
+/// `probes/SyncCost.java`'s `synchronized`-block loop put the pair at 15.0% of
+/// the whole loop, against 3.8% for `MonitorTable::{enter_or_contend,exit}`:
+/// the bookkeeping cost four times the locking it describes.
+///
+/// Behind an `Arc`, the owning thread caches a handle once and never consults
+/// the map again — the same idiom, for the same reason, as
+/// [`ThreadRegistry::self_async_slot`]. Cross-thread readers (the JMX snapshot,
+/// the GC root walk and its post-move remap) still go through the map and see
+/// the very same allocation.
+#[derive(Default)]
+pub(crate) struct JmxMonitorBook {
+    /// The monitor this thread is currently BLOCKED_ON_MONITOR_ENTER for.
+    contended_monitor: Mutex<Option<ObjectRef>>,
+    /// When that block began, for `getBlockedTime()`.
+    contended_started: Mutex<Option<Instant>>,
+    /// Monitors this thread currently owns: `getLockedMonitors()`, and a GC
+    /// root set that is remapped across a moving collection.
+    locked: Mutex<Vec<ObjectRef>>,
+    /// `true` from `set_jmx_contended_monitor` until the matching
+    /// `complete_jmx_monitor_enter`, i.e. exactly while the two slots above may
+    /// hold `Some`.
+    ///
+    /// It exists so the UNCONTENDED arm — which publishes ownership through the
+    /// same `complete_jmx_monitor_enter` and therefore ran the clear-and-drain
+    /// unconditionally — can skip both mutexes on a relaxed load. It is a hint
+    /// in one direction only: a stale `true` costs one extra pass over two
+    /// slots that are already `None` (which is what `reset_jmx_contention_stats`
+    /// can leave behind), and a `false` is only ever written by the thread that
+    /// wrote the `true`, after it has cleared both slots.
+    contending: AtomicBool,
+}
+
 /// An entry in the thread registry for one JVM thread.
 struct ThreadEntry {
     /// Human-readable name.
@@ -194,14 +253,15 @@ struct ThreadEntry {
     /// JMX diagnostic roots. These are deliberately separate from a blocked
     /// thread's frame snapshot: a lock relationship must remain observable
     /// while the owner is running, and must be remapped across a moving GC.
-    jmx_contended_monitor: Mutex<Option<ObjectRef>>,
+    /// The three slots every `monitorenter` / `monitorexit` touches, in one
+    /// allocation behind an `Arc` so the owning thread can reach them without
+    /// the registry map — see [`ThreadRegistry::with_self_jmx_monitors`].
+    jmx_monitors: Arc<JmxMonitorBook>,
     jmx_waiting_monitor: Mutex<Option<ObjectRef>>,
-    jmx_locked_monitors: Mutex<Vec<ObjectRef>>,
     /// Shared, so the owning thread can reach its own list without going
     /// through [`ThreadRegistry::threads`] — see
     /// [`ThreadRegistry::jmx_locked_synchronizers_of`].
     jmx_locked_synchronizers: Arc<Mutex<Vec<ObjectRef>>>,
-    jmx_contended_started: Mutex<Option<Instant>>,
     jmx_wait_started: Mutex<Option<Instant>>,
     jmx_blocked_count: AtomicU64,
     jmx_blocked_nanos: AtomicU64,
@@ -488,11 +548,9 @@ impl ThreadRegistry {
             frame_trace: Arc::new(Mutex::new(Vec::new())),
             vm_state: Arc::new(Mutex::new(String::new())),
             gc_block_state: Arc::new(GcBlockState::new()),
-            jmx_contended_monitor: Mutex::new(None),
+            jmx_monitors: Arc::new(JmxMonitorBook::default()),
             jmx_waiting_monitor: Mutex::new(None),
-            jmx_locked_monitors: Mutex::new(Vec::new()),
             jmx_locked_synchronizers: Arc::new(Mutex::new(Vec::new())),
-            jmx_contended_started: Mutex::new(None),
             jmx_wait_started: Mutex::new(None),
             jmx_blocked_count: AtomicU64::new(0),
             jmx_blocked_nanos: AtomicU64::new(0),
@@ -1521,8 +1579,11 @@ impl ThreadRegistry {
     /// is rooted by this registry entry until the acquire completes.
     pub fn set_jmx_contended_monitor(&self, thread_id: ThreadId, monitor: ObjectRef) {
         if let Some(entry) = self.threads.read().get(&thread_id) {
-            *entry.jmx_contended_monitor.lock() = Some(monitor);
-            *entry.jmx_contended_started.lock() = Some(Instant::now());
+            *entry.jmx_monitors.contended_monitor.lock() = Some(monitor);
+            *entry.jmx_monitors.contended_started.lock() = Some(Instant::now());
+            // Arms the two slots above for `complete_jmx_monitor_enter`, whose
+            // uncontended callers skip them entirely — see `JmxMonitorBook`.
+            entry.jmx_monitors.contending.store(true, Ordering::Release);
             // Count the block HERE, not on release. The JMM counts a thread as
             // having blocked the moment it starts waiting, and a JMX consumer
             // diagnosing a hang reads `getBlockedCount()` while the thread is
@@ -1537,32 +1598,94 @@ impl ThreadRegistry {
     /// Finish an acquisition attempt. Successful acquisitions become owned
     /// monitor roots; failed/aborted attempts simply lose the contention root.
     pub fn complete_jmx_monitor_enter(&self, thread_id: ThreadId, monitor: ObjectRef) {
-        if let Some(entry) = self.threads.read().get(&thread_id) {
-            *entry.jmx_contended_monitor.lock() = None;
-            // Only the DURATION is added here — the count was taken when the
-            // block began. `jmx_contended_started` is `None` on the uncontended
-            // arm (which calls this to publish ownership), so nothing accrues
-            // for an acquisition that never waited.
-            if let Some(start) = entry.jmx_contended_started.lock().take() {
-                entry.jmx_blocked_nanos.fetch_add(
-                    start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-                    Ordering::Relaxed,
-                );
+        let blocked_nanos = self.with_self_jmx_monitors(thread_id, |book| {
+            // THE CONTENDED SLOTS, ONLY WHEN THERE WAS CONTENTION. This method
+            // is the ownership publish for the uncontended arm too, and that arm
+            // never called `set_jmx_contended_monitor`, so both slots are
+            // already `None` and locking them twice to write `None` over `None`
+            // was pure cost on every `monitorenter` in the process.
+            let mut blocked_nanos = 0u64;
+            if book.contending.load(Ordering::Acquire) || !monitor_fastpath_enabled() {
+                *book.contended_monitor.lock() = None;
+                // Only the DURATION is added here — the count was taken when
+                // the block began.
+                if let Some(start) = book.contended_started.lock().take() {
+                    blocked_nanos = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                }
+                book.contending.store(false, Ordering::Release);
             }
-            let mut owned = entry.jmx_locked_monitors.lock();
+            let mut owned = book.locked.lock();
             if !owned.iter().any(|o| o.as_ptr() == monitor.as_ptr()) {
                 owned.push(monitor);
+            }
+            blocked_nanos
+        });
+        // `jmx_blocked_nanos` lives on the entry, not the book, and is only ever
+        // written on the contended arm — so the map lookup it needs is paid
+        // exactly when a thread actually blocked, never on the fast path.
+        if let Some(nanos) = blocked_nanos {
+            if nanos != 0 {
+                if let Some(entry) = self.threads.read().get(&thread_id) {
+                    entry.jmx_blocked_nanos.fetch_add(nanos, Ordering::Relaxed);
+                }
             }
         }
     }
 
     pub fn remove_jmx_locked_monitor(&self, thread_id: ThreadId, monitor: ObjectRef) {
-        if let Some(entry) = self.threads.read().get(&thread_id) {
-            entry
-                .jmx_locked_monitors
-                .lock()
-                .retain(|o| o.as_ptr() != monitor.as_ptr());
+        self.with_self_jmx_monitors(thread_id, |book| {
+            book.locked.lock().retain(|o| o.as_ptr() != monitor.as_ptr());
+        });
+    }
+
+    /// Run `f` against `thread_id`'s [`JmxMonitorBook`], reaching it through a
+    /// per-thread cached handle rather than the registry map.
+    ///
+    /// Sound for the same reason [`Self::self_async_slot`] is: the `Arc` is
+    /// created once in `register_with_daemon_stw_ready` and never replaced, so
+    /// the cached handle is the same allocation the map holds, forever. The
+    /// cache is keyed by `(registry_id, thread_id)` — a monotonic registry id,
+    /// not an address, because `ThreadId`s restart per registry and the test
+    /// suite builds many registries on one OS thread. Reaping a terminated
+    /// entry does not invalidate it: the `Arc` keeps the book alive, and a
+    /// thread whose entry is gone is dead.
+    ///
+    /// Every caller is a SELF-lookup (`monitorenter` / `monitorexit` on the
+    /// calling thread), which is what makes the cache hit; a cross-thread call
+    /// still gets the right book, just by re-populating the cache.
+    ///
+    /// `f` runs while the thread-local cache is borrowed, so it must not call
+    /// back into this method. Both callers are in this file and only touch the
+    /// book's own mutexes.
+    fn with_self_jmx_monitors<R>(
+        &self,
+        thread_id: ThreadId,
+        f: impl FnOnce(&JmxMonitorBook) -> R,
+    ) -> Option<R> {
+        thread_local! {
+            static CACHED: std::cell::RefCell<Option<(u64, ThreadId, Arc<JmxMonitorBook>)>> =
+                const { std::cell::RefCell::new(None) };
         }
+        CACHED.with(|c| {
+            if monitor_fastpath_enabled() {
+                let cached = c.borrow();
+                if let Some((rid, tid, book)) = cached.as_ref() {
+                    if *rid == self.registry_id && *tid == thread_id {
+                        return Some(f(book));
+                    }
+                }
+            }
+            let book = self
+                .threads
+                .read()
+                .get(&thread_id)
+                .map(|e| Arc::clone(&e.jmx_monitors))?;
+            let r = f(&book);
+            if monitor_fastpath_enabled() {
+                *c.borrow_mut() = Some((self.registry_id, thread_id, book));
+            }
+            Some(r)
+        })
     }
 
     pub fn set_jmx_waiting_monitor(&self, thread_id: ThreadId, monitor: ObjectRef) {
@@ -1816,9 +1939,9 @@ impl ThreadRegistry {
         let threads = self.threads.read();
         let entry = threads.get(&thread_id)?;
         let snapshot = (
-            *entry.jmx_contended_monitor.lock(),
+            *entry.jmx_monitors.contended_monitor.lock(),
             *entry.jmx_waiting_monitor.lock(),
-            entry.jmx_locked_monitors.lock().clone(),
+            entry.jmx_monitors.locked.lock().clone(),
             entry.jmx_locked_synchronizers.lock().clone(),
             (entry.jmx_blocked_nanos.load(Ordering::Relaxed) / 1_000_000) as i64,
             entry.jmx_blocked_count.load(Ordering::Relaxed) as i64,
@@ -1834,7 +1957,7 @@ impl ThreadRegistry {
             entry.jmx_blocked_nanos.store(0, Ordering::Relaxed);
             entry.jmx_waited_count.store(0, Ordering::Relaxed);
             entry.jmx_waited_nanos.store(0, Ordering::Relaxed);
-            *entry.jmx_contended_started.lock() = None;
+            *entry.jmx_monitors.contended_started.lock() = None;
             *entry.jmx_wait_started.lock() = None;
         }
     }
@@ -2345,13 +2468,13 @@ impl ThreadRegistry {
                 if let Some(obj) = entry.java_thread_obj {
                     all_roots.push(obj);
                 }
-                if let Some(obj) = *entry.jmx_contended_monitor.lock() {
+                if let Some(obj) = *entry.jmx_monitors.contended_monitor.lock() {
                     all_roots.push(obj);
                 }
                 if let Some(obj) = *entry.jmx_waiting_monitor.lock() {
                     all_roots.push(obj);
                 }
-                all_roots.extend(entry.jmx_locked_monitors.lock().iter().copied());
+                all_roots.extend(entry.jmx_monitors.locked.lock().iter().copied());
                 all_roots.extend(entry.jmx_locked_synchronizers.lock().iter().copied());
             }
             // A posted async exception must survive even if the target
@@ -2417,13 +2540,13 @@ impl ThreadRegistry {
                     *obj = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
                 }
             };
-            if let Some(obj) = entry.jmx_contended_monitor.lock().as_mut() {
+            if let Some(obj) = entry.jmx_monitors.contended_monitor.lock().as_mut() {
                 remap_jmx(obj);
             }
             if let Some(obj) = entry.jmx_waiting_monitor.lock().as_mut() {
                 remap_jmx(obj);
             }
-            for obj in entry.jmx_locked_monitors.lock().iter_mut() {
+            for obj in entry.jmx_monitors.locked.lock().iter_mut() {
                 remap_jmx(obj);
             }
             // `synchronizer_owner` is keyed by these very addresses, so the
@@ -2582,6 +2705,23 @@ impl ThreadRegistry {
         // integer compares, so the audit is affordable unconditionally and does
         // not need a flag to have been set before the run that reproduces.
         let vacated = heap.and_then(|h| h.young_inactive_semispace_range());
+        // This cycle's cross-thread conservative scan of BLOCKED peers' native
+        // stacks, as `(os_tid, addr, value)`. Drained once here and bucketed by
+        // owner below: these words live in a peer's machine stack, are named by
+        // no oop map, and are the population §12 of
+        // `internal/fixed-suite-bugs/netty/bytebuf-multiplethreads-npe-generational-blocked-wake-jit-remap-FIXED-20260908.md`
+        // measured stale on essentially every relocating cycle. Draining
+        // unconditionally matters as much as using it -- a capture left behind
+        // by a cycle that did not fold would be applied against the WRONG
+        // pointer map later.
+        let scanned_stack_slots = cratonvm_gc::gc_quiescence::take_peer_stack_slots();
+        // Adopted by SOME blocked thread below. The complement is the reading
+        // that matters: a capture nobody claimed is a word in a peer that is
+        // NOT in a blocked region -- a take-over freeze, whose thread has no
+        // wake hook to apply a fixup at -- naming an object this cycle just
+        // relocated, with nothing left to rewrite it. Counted rather than
+        // assumed absent; see `PEER_STACK_SLOTS_UNROUTED`.
+        let mut adopted_here = 0usize;
         let threads = self.threads.read();
         for (tid, entry) in threads.iter() {
             if !entry.alive.load(Ordering::Acquire) {
@@ -2643,6 +2783,37 @@ impl ThreadRegistry {
                     // SAFETY: `new` comes from the GC pointer map and points
                     // at the relocated object's header.
                     *r = unsafe { ObjectRef::from_raw(new as *mut u8) };
+                }
+            }
+            // THE BLOCKED-PEER NATIVE-STACK REPAIR (2026-09-07).
+            //
+            // Adopt this cycle's captures for this thread, then advance every
+            // entry -- new and inherited -- through this collection's pointer
+            // map. Same shape as `slot_origins` below, and for the same reason:
+            // an exact per-map lookup cannot strand an entry on a missed chain
+            // seed. The difference is only that these are keyed by a RAW
+            // ADDRESS in the peer's stack rather than by `(frame, idx)`.
+            if cratonvm_gc::gc_quiescence::blocked_peer_stack_remap_enabled() {
+                let os_tid = self.os_tid_of(*tid);
+                let mut ns = entry.gc_block_state.native_slots.lock();
+                if let Some(mine) = os_tid {
+                    for &(t, addr, value) in &scanned_stack_slots {
+                        if t == mine {
+                            ns.push(crate::threading::jvm_thread::NativeSlotFixup {
+                                addr,
+                                orig: value,
+                                cur: value,
+                            });
+                            cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_ADOPTED
+                                .fetch_add(1, Ordering::Relaxed);
+                            adopted_here += 1;
+                        }
+                    }
+                }
+                for e in ns.iter_mut() {
+                    if let Some(&new) = pointer_map.get(&e.cur) {
+                        e.cur = new;
+                    }
                 }
             }
             // cceres3 FIX: advance the exact per-slot tracker through THIS
@@ -2716,6 +2887,14 @@ impl ThreadRegistry {
                     snapshot.len()
                 );
             }
+        }
+        // The complement of the adoption, taken after the walk so every blocked
+        // thread has had its chance to claim a capture.
+        if scanned_stack_slots.len() > adopted_here {
+            cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_UNROUTED.fetch_add(
+                (scanned_stack_slots.len() - adopted_here) as u64,
+                Ordering::Relaxed,
+            );
         }
     }
 

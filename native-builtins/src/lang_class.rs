@@ -17809,7 +17809,9 @@ pub(crate) fn native_class_get_type_parameters(
     // the `build_mirror_array` contract.
     let mut arr = ctx.new_ref_array(ClassId::new(0), class_sig.type_params.len());
     let arr_pin = ctx.pin_native_root(arr);
+    let this_pin = ctx.pin_native_root(this);
     for (i, tp) in class_sig.type_params.iter().enumerate() {
+        let this = ctx.read_native_pin(this_pin, this);
         // `Class.getTypeParameters()` must return the SAME TypeVariable
         // objects across repeated calls, exactly like HotSpot's
         // `Class.getGenericInfo()` soft-reference cache. Building a fresh
@@ -18342,7 +18344,9 @@ pub(crate) fn native_method_get_type_parameters(
                 // allocating-fill pattern as `native_class_get_type_parameters`.
                 let mut arr = ctx.new_ref_array(ClassId::new(0), method_sig.type_params.len());
                 let arr_pin = ctx.pin_native_root(arr);
+                let this_pin = ctx.pin_native_root(this);
                 for (i, tp) in method_sig.type_params.iter().enumerate() {
+                    let this = ctx.read_native_pin(this_pin, this);
                     // genericDeclaration = the declaring Method/Constructor (`this`).
                     let tv =
                         crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this)));
@@ -23105,11 +23109,24 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
         .class_id_by_name("java/lang/reflect/AnnotatedType")
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let out = ctx.new_ref_array(comp, n);
+    // GC-safety: `make_annotated_type_with_anns` allocates, once per turn. The
+    // array being filled and every mirror in `generic_type_mirrors` are bare
+    // Rust locals -- a `Vec<ObjectRef>` is not a GC root and nothing rewrites
+    // its elements -- so from the second turn on both the store target and the
+    // mirror handed to the builder are pre-GC addresses. Pin the array for the
+    // loop and each mirror for the call that consumes it. (The earlier sweep
+    // skipped this row because `pin_native_root` does not take a `Vec`; the
+    // fix is to pin the ELEMENT.)
+    let out_pin = ctx.pin_native_root(out);
+    let mirror_pins: Vec<usize> = generic_type_mirrors
+        .iter()
+        .map(|m| ctx.pin_native_root(*m))
+        .collect();
     for i in 0..n {
-        let tm = generic_type_mirrors
-            .get(i)
-            .copied()
-            .unwrap_or_else(|| ctx.get_class_mirror(cratonvm_types::ClassId::new(0)));
+        let tm = match (generic_type_mirrors.get(i), mirror_pins.get(i)) {
+            (Some(m), Some(pin)) => ctx.read_native_pin(*pin, *m),
+            _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
+        };
         let empty = Vec::new();
         let anns = per_param.get(i).unwrap_or(&empty);
         let at = make_annotated_type_with_anns(ctx, tm, anns, declaring_class_id)?;
@@ -23122,8 +23139,11 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
         if let Some(type_arg_anns) = per_param_type_args.get(i) {
             stash_annotated_type_argument_anns(at, type_arg_anns.clone());
         }
+        let out = ctx.read_native_pin(out_pin, out);
         ctx.set_array_element(out, i, Value::Object(Some(at)));
     }
+    let out = ctx.read_native_pin(out_pin, out);
+    ctx.unpin_native_roots(out_pin);
     Ok(Some(Value::Object(Some(out))))
 }
 

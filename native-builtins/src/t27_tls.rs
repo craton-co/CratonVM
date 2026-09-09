@@ -1338,12 +1338,12 @@ pub(crate) fn capture_huc_key_managers_ctx_key_body(
 /// stable ClientConfig to retain TLS 1.3 tickets across URL requests.
 pub(crate) fn capture_huc_ssl_context(
     ctx: &mut dyn NativeContext,
-    mut ctx_obj: ObjectRef,
+    ctx_obj: &mut ObjectRef,
 ) -> Result<(), MethodCallFailed> {
-    let ident = ctx_identity(ctx, ctx_obj)?;
+    let ident = ctx_identity(ctx, *ctx_obj)?;
     set_huc_default_client_identity(ident);
-    capture_huc_key_managers_ctx_key(ctx, &mut ctx_obj)?;
-    capture_huc_trust_managers_ctx_key(ctx, ctx_obj)?;
+    capture_huc_key_managers_ctx_key(ctx, ctx_obj)?;
+    capture_huc_trust_managers_ctx_key(ctx, *ctx_obj)?;
 
     let ident = huc_default_client_identity();
     let km_ctx_key = huc_default_key_managers_ctx_key();
@@ -1367,7 +1367,7 @@ pub(crate) fn capture_huc_ssl_context(
 pub(crate) fn capture_huc_ssl_context_for_connection(
     ctx: &mut dyn NativeContext,
     connection: ObjectRef,
-    ctx_obj: ObjectRef,
+    ctx_obj: &mut ObjectRef,
 ) -> Result<(), MethodCallFailed> {
     let default_identity = huc_default_identity_slot().lock().clone();
     let default_roots = huc_default_trust_roots_slot().lock().clone();
@@ -7530,11 +7530,11 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         factory: ObjectRef,
         connection: Option<ObjectRef>,
     ) -> Result<(), MethodCallFailed> {
-        if let Some(sslctx) = resolve_sslcontext_from_factory(ctx, factory) {
+        if let Some(mut sslctx) = resolve_sslcontext_from_factory(ctx, factory) {
             if let Some(connection) = connection {
-                capture_huc_ssl_context_for_connection(ctx, connection, sslctx)?;
+                capture_huc_ssl_context_for_connection(ctx, connection, &mut sslctx)?;
             } else {
-                capture_huc_ssl_context(ctx, sslctx)?;
+                capture_huc_ssl_context(ctx, &mut sslctx)?;
             }
         }
         Ok(())

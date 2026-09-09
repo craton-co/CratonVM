@@ -2417,7 +2417,14 @@ fn walk_imports_recursive(
         single => vec![single],
     };
 
+    // GC-safety: `register_root_bean_definition` allocates a
+    // `RootBeanDefinition` and dispatches `registerBeanDefinition`, and the
+    // recursive call below does the same at every depth. `registry` is a bare
+    // Rust parameter carried into all of them, so from the second `@Import`
+    // target on it is a pre-GC address.
+    let registry_pin = ctx.pin_native_root(registry);
     for entry in entries {
+        let registry = ctx.read_native_pin(registry_pin, registry);
         let desc = match entry {
             cratonvm_native_api::AnnotationElementValue::Class(d) => d,
             _ => continue,
@@ -2449,8 +2456,10 @@ fn walk_imports_recursive(
             *registered += 1;
         }
         // Recurse into the import's own @Import tree.
+        let registry = ctx.read_native_pin(registry_pin, registry);
         walk_imports_recursive(ctx, &imp_class, registry, seen, registered, depth + 1)?;
     }
+    ctx.unpin_native_roots(registry_pin);
     Ok(())
 }
 

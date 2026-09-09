@@ -806,6 +806,15 @@ pub struct GcFlags {
     /// HALF A/B — the abort it exists to reproduce would not come back, and the
     /// arm would read as evidence that the screens were not the fix.
     pub g1_parallel_evac_screen: bool,
+    /// `CRATONVM_G1_SERIAL_EVAC_HOLDER_SCREEN` (default ON) -- the same
+    /// word0-is-an-arena-pointer holder refusal on the SERIAL evacuator's
+    /// ref scan. Its walk rewrites the cells it visits and is bounded by the
+    /// REGION, not by the holder, so a bad header rewrites the objects that
+    /// follow it. Set to 0 to ablate.
+    pub g1_serial_evac_holder_screen: bool,
+    /// `CRATONVM_G1_VERIFY_FORWARDS_RETIRED` -- count objects still FORWARDED
+    /// after `retire_forwards`. Diagnostic, opt-in, counts only.
+    pub g1_verify_forwards_retired: bool,
     /// `CRATONVM_G1_EVAC_COPY_WATCH` — record every to-space copy's first
     /// header word as it is made, and re-read them at two checkpoints inside
     /// the pause. **OPT-IN** ([`parse::non_empty_non_zero`]): a push per copy
@@ -818,6 +827,68 @@ pub struct GcFlags {
     /// the pause. Checkpoint 1 closes the parallel closure, checkpoint 2 the
     /// serial self-forward drain.
     pub g1_evac_copy_watch: bool,
+    /// `CRATONVM_G1_REF_WRITE_WATCH` — record every REFERENCE-SLOT WRITE the
+    /// collector makes during a pause, keyed by slot address, and name the
+    /// writer when a later walk finds that slot corrupt. **OPT-IN**
+    /// ([`parse::non_empty_non_zero`]): a hash-map insert per rewritten slot
+    /// under one lock, so it is a debug instrument and not a production guard.
+    ///
+    /// It answers the question
+    /// `g1-eight-byte-write-at-a-live-objects-base-20260906` names as its next
+    /// step and could not answer from the READ side: the corrupt cells it
+    /// measured are an EIGHT-byte quantity sitting where a SIXTEEN-byte cell's
+    /// first word belongs, and the two candidate producers (an 8-byte
+    /// reference write into a legacy cell, versus a read misaligned by 8 into
+    /// a forwarded object's mark word) are distinguished only by whether a
+    /// collector write actually landed on that slot. [`CopyWatch`] cannot see
+    /// it: it records COPIES, and a write into a resident object's body is not
+    /// one.
+    pub g1_ref_write_watch: bool,
+    /// `CRATONVM_G1_EVAC_SUPPLY_SCREEN` (default **ON**) -- refuse an
+    /// evacuation supply address that is not the start of an object, on the
+    /// three routes that had no screen of their own: the marking keep-alive
+    /// set, the evacuation-failure drain's seeds, and Phase 3.5's finalizer
+    /// resurrection.
+    ///
+    /// See `G1Collector::evacuation_supply_is_an_object` for what an
+    /// unscreened route costs: `evacuate_object` sizes, copies and installs a
+    /// forwarding mark word against whatever bytes it is handed, so an
+    /// INTERIOR address produces both families
+    /// `g1-eight-byte-write-at-a-live-objects-base-20260906` measured -- a
+    /// to-space copy whose first word is an arena pointer, and an eight-byte
+    /// `target | MARK_FORWARDED` written inside a live object's body.
+    ///
+    /// `=0` restores the unscreened behaviour, which is the same-binary A/B.
+    pub g1_evac_supply_screen: bool,
+    /// `CRATONVM_G1_EVAC_CANDIDATE_ARENA_SCREEN` (default **ON**) -- refuse a
+    /// reference-slot evacuation candidate whose `class_id`/`shape` dword pair
+    /// recombines to a pointer into the collector's own arena.
+    ///
+    /// Split out of `g1_evac_ref_implausible_refuse`, which stays opt-in. That
+    /// flag's opt-in status was decided against the CLASS-ID BAND test -- an
+    /// assumption about which ids a loader mints, which had already gone stale
+    /// once -- and the arena test was folded into the same flag afterwards.
+    /// They are not the same kind of claim: `class_id`(4) + `shape`(4) IS the
+    /// header's first eight bytes, so a pair landing inside this arena is a
+    /// BODY word read at an address that is not an object start, and no future
+    /// class-id space can make it a header. The same test already refuses by
+    /// default on the serial evacuator's holders and on the Phase-4 fixup's
+    /// (`CRATONVM_G1_SERIAL_EVAC_HOLDER_SCREEN`).
+    pub g1_evac_candidate_arena_screen: bool,
+    /// `CRATONVM_G1_EVAC_EMPTY_HEADER_GRID_PROOF` (default **ON**) -- when a
+    /// candidate's header reads `class_id = 0, num_slots = 0, kind = Object`,
+    /// prove it against the region's object grid before following it.
+    ///
+    /// That sixteen-byte shape is what the PAYLOAD WORD of a null `Value` cell
+    /// reads as, and it is a valid zero-field object, so no header screen can
+    /// reject it. See `G1Collector::empty_header_is_a_real_object`: following
+    /// one installs a forwarding mark word at `addr + 8`, which is the next
+    /// cell's discriminant word inside a live object -- the corrupt-cell family
+    /// of `g1-eight-byte-write-at-a-live-objects-base-20260906`, bit for bit.
+    ///
+    /// The proof is an O(region) walk, paid only on that shape. `=0` stands it
+    /// down, which is the same-binary A/B.
+    pub g1_evac_empty_header_grid_proof: bool,
     /// `CRATONVM_G1_PARALLEL_EVAC_SHARED_DEST` — when the parallel evacuator's
     /// reserved Free pool runs out, place the object in an EXISTING non-CSet
     /// region of the destination type instead of failing the evacuation.
@@ -1853,7 +1924,22 @@ impl GcFlags {
             old_sweep_jit: on_unless_zero(src, "CRATONVM_OLD_SWEEP_JIT"),
             g1_parallel_evac: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC"),
             g1_parallel_evac_screen: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC_SCREEN"),
+            g1_serial_evac_holder_screen: on_unless_zero(
+                src,
+                "CRATONVM_G1_SERIAL_EVAC_HOLDER_SCREEN",
+            ),
+            g1_verify_forwards_retired: present(src, "CRATONVM_G1_VERIFY_FORWARDS_RETIRED"),
             g1_evac_copy_watch: non_empty_non_zero(src, "CRATONVM_G1_EVAC_COPY_WATCH"),
+            g1_ref_write_watch: non_empty_non_zero(src, "CRATONVM_G1_REF_WRITE_WATCH"),
+            g1_evac_supply_screen: on_unless_zero(src, "CRATONVM_G1_EVAC_SUPPLY_SCREEN"),
+            g1_evac_candidate_arena_screen: on_unless_zero(
+                src,
+                "CRATONVM_G1_EVAC_CANDIDATE_ARENA_SCREEN",
+            ),
+            g1_evac_empty_header_grid_proof: on_unless_zero(
+                src,
+                "CRATONVM_G1_EVAC_EMPTY_HEADER_GRID_PROOF",
+            ),
             g1_parallel_evac_shared_dest: on_unless_zero(
                 src,
                 "CRATONVM_G1_PARALLEL_EVAC_SHARED_DEST",

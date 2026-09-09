@@ -687,7 +687,9 @@ fn drain_via_invoke(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     // Loop over `int read()` calls until -1 is returned. This is O(n)
     // interpreter re-entries but matches the spec for arbitrary streams.
+    let stream_pin = ctx.pin_native_root(stream);
     loop {
+        let stream = ctx.read_native_pin(stream_pin, stream);
         let res = ctx.invoke(
             "java/io/InputStream",
             "read",
@@ -962,7 +964,9 @@ fn native_create_reader_from_reader(
         }
     };
     let mut text = String::new();
+    let reader_in_pin = ctx.pin_native_root(reader_in);
     loop {
+        let reader_in = ctx.read_native_pin(reader_in_pin, reader_in);
         let res = ctx.invoke(
             "java/io/Reader",
             "read",
@@ -1012,7 +1016,9 @@ fn make_cursor_reader(
 /// Drain a `java.io.Reader` into a String, char-at-a-time (small XML payloads).
 fn drain_reader_to_string(ctx: &mut dyn NativeContext, reader_in: ObjectRef) -> String {
     let mut text = String::new();
+    let reader_in_pin = ctx.pin_native_root(reader_in);
     loop {
+        let reader_in = ctx.read_native_pin(reader_in_pin, reader_in);
         let res = ctx.invoke(
             "java/io/Reader",
             "read",

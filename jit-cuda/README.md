@@ -43,7 +43,7 @@ remains empty; fixture-dependent tests then fail loudly with
 files.
 
 Some optional fixtures import `craton.gpu.*` runtime or annotation classes. If
-the dependent `craton-gpu` crate does not export a Java classpath for those
+the dependent `craton-gpu4j` crate does not export a Java classpath for those
 classes, `build.rs` skips only those API-dependent fixtures and still compiles
 the core analyzer/lowering fixtures used by default tests.
 

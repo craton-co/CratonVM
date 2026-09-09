@@ -30,6 +30,7 @@ es_segalloc_arena_dispatch
 fjp_recursive
 getclass_concrete_class
 hib_dev_05_private_abstract_dispatch
+inet_address_hostname_contract
 inet_socket_address_port_only
 inputstream_super_read_probe
 instant_real_jdk_factory_tostring
@@ -37,6 +38,7 @@ intrinsic_diff
 jit_cold_new_cp
 jit_collection_ctor_identity
 jit_cov06_array_allocation
+jit_final_devirt_native_shadow
 jit_interp_differential
 jit_ir_athrow_dispatch
 jit_ir_exception_stub_throw_bci
@@ -48,6 +50,8 @@ native_alloc_oom_catchable
 native_io_dis_read_fully_pin
 native_io_dis_shared_stream
 nio_selector_build_set_gc
+null_receiver_cached_invoke
+osr_unbox_intrinsic_handler_frame
 plain_server_socket_contract
 private_invokevirtual_shadow
 probe_compile_guard
@@ -62,10 +66,12 @@ rslf4j1_get_resources
 runtime_halt
 sb_count_slot_guard_regression
 scheduled_executor_cancel_shutdown_regression
+sealed_bootstrap_permitted_subclasses
 server_socket_adaptor_accept
 socket_input_stream_timeout
 spring_io_enumset_regression
 sslserversocket_accept_echo
+stack_trace_across_tiers
 stackwalker_reflect_gc
 sublist_view_regression
 synchronized_wrapper_mutex
@@ -126,3 +132,108 @@ writer_flush_real
 #                              it is a timeout being hit, not an assertion
 #                              disagreeing. Diagnose the 60s wait before
 #                              ratcheting it.
+
+# ---------------------------------------------------------------------------
+# NOT ratcheted: RED. These RUN against a real binary and FAIL -- a defect,
+# not a prerequisite question -- so ratcheting one turns this step red for
+# every lane until it is fixed.
+#
+# NAMED HERE FOR THE REASON THE VACUOUS BLOCK GIVES: "the alternative is that
+# they stay invisible -- which is how they got here." Until 2026-09-08 the
+# header counted the REDs ("3 RED out of 95") and the file named none of them,
+# so a target that RUNS AND FAILS was less visible than one that merely skips.
+# Both categories now get a name and a reason.
+#
+# Re-surveyed 2026-09-08 against a release binary and Temurin 25.0.3+9 on
+# Windows: 79 RUNS, 14 VACUOUS, 2 RED out of 95 (was 73/19/3 on 2026-08-30).
+# LATER THE SAME DAY one of those two REDs was fixed and ratcheted; the other
+# (`stack_trace_across_tiers`) was fixed 18 minutes after this line was
+# written, and ratcheted on 2026-09-09 -- see the bottom of this block. The
+# "2 RED" above is the count ON 2026-09-08 and has not been re-surveyed.
+#
+# PROMOTED 2026-09-08 (second sitting), after `936536100` fixed the RED this
+# block used to carry (`null_receiver_cached_invoke`): five of the
+# nine candidates this block used to list are now in the ratcheted list above.
+# Each was observed RUNning twice -- the morning survey, then again against a
+# debug binary built from dev @ ebc5e46c4 -- which is the bar this file asks
+# for. `null_receiver_cached_invoke` was run 10 times, not 2, because its row
+# is JIT-timing dependent and a single green on such a row is a coin flip:
+# 10/10 ok at ~10s each, against FAILED at 4.15s before the fix.
+#
+#   inet_address_hostname_contract  13s      null_receiver_cached_invoke  10s
+#   jit_final_devirt_native_shadow  25s      osr_unbox_intrinsic_...      14s
+#   sealed_bootstrap_permitted_subclasses    10s
+#
+# FOUR of the nine passed the same bar and are still NOT promoted, on cost
+# alone. Ratcheting them would add ~5 minutes to a step whose whole list took
+# 34m55s here (Windows, debug, idle host) against ci.yml's `timeout-minutes:
+# 15`. That gap is not itself an alarm -- the step runs on ubuntu-latest only
+# and is green there -- but it is not headroom to spend blind either. Someone
+# with the Linux number should take these; the measurement is done:
+#
+#   jit_guarded_inline_native_shadow          97s
+#   jit_ir_phi_copy_register_alias            77s
+#   jit_site_trap_never_duplicates_a_side_effect  61s
+#   stack_trace_compiled_callee               57s
+#
+# The ninth, `vthread_probe_regression`, FAILED again on 2026-09-08 at 120s --
+# the FLAKY block above is right and its one green that morning was luck.
+#
+# ---------------------------------------------------------------------------
+# TWO TARGETS IN THE RATCHETED LIST ABOVE ARE FLAKY ON WINDOWS. Found by
+# running the whole list on 2026-09-08; both then re-run ALONE on an idle host,
+# because load manufactures exactly this shape:
+#
+#   socket_input_stream_timeout   1 of 3 alone. Failing run 86.9s, passing runs
+#                                 far under. The fixture is killed by the
+#                                 harness clock, not by its assertion.
+#   wave1_c_executor              1 of 3 alone, and 1 of 4 again with
+#                                 `--test-threads=1`. SERIALISING DOES NOT FIX
+#                                 IT, which refutes the obvious reading (five
+#                                 #[test] fns each spawning a VM, contending).
+#                                 A serialised pass runs all five in ~30s
+#                                 total; on a bad run ONE of them alone blows
+#                                 the fixture's hardcoded 30s wall. That is a
+#                                 5x stall in the VM, not a marginal timeout.
+#
+# THEY ARE LEFT RATCHETED ON PURPOSE. The FLAKY rule above would remove them,
+# but this step runs on `ubuntu-latest` only and every observation here is
+# Windows; unratcheting on that evidence would cut real Linux coverage to fix a
+# red nobody has seen. What is needed is the same rate measured on Linux. Until
+# then they are named here rather than left as a surprise.
+#
+#   stack_trace_across_tiers   FIXED AND PROMOTED 2026-09-09. It is in the
+#                              ratcheted list above; this entry is kept only so
+#                              that a reader who remembers it as RED finds out
+#                              why it is not.
+#
+# The RED above was written at 16:19 on 2026-09-08. `c798aae82` fixed it at
+# 16:37 the same day -- eighteen minutes later -- so this block was stale
+# before the day was out and nobody re-read it. The cause was not the inline
+# frame map: the IR tier spliced callee bodies and recorded no frame rows at
+# all, so `CRATONVM_JIT_NO_INLINE_FRAME_MAP=1` did not remove `mid`/`outer`
+# (they were already gone) and the test's own anti-vacuity switch had stopped
+# measuring anything. That commit added the missing producer.
+#
+# Verified here on 2026-09-09, Windows, DEBUG binary built from a pristine
+# `origin/dev` @ ccf731dd3 (`git diff origin/dev` empty), Temurin 25.0.3+9:
+#
+#   * three arms on ONE class file -- HotSpot, `CRATONVM_DISABLE_JIT=1`, and
+#     the JIT arm -- agree byte-for-byte on all THREE rows, including
+#     `after_main_osr   len=5 [leaf:25 mid:26 outer:27 probe:42 main:66]`.
+#     `main:66` is the OSR-refreshed pc; the pre-fix witness was `main:62`.
+#   * 10 runs of the target under `CRATONVM_REQUIRE_E2E=1`: 10 PASS, 0 FAIL,
+#     39.5-48.4s each. Ten and not two because this row only exists if `main`
+#     really OSR-compiles, which is the same reason
+#     `null_receiver_cached_invoke` was run ten times above.
+#
+# COST: +~42s on Windows/debug. The Linux number is unmeasured, and the step's
+# budget there is the thing that matters (`timeout-minutes: 15`), so if that
+# step starts running close to its wall this is a fair row to reconsider --
+# unlike the four cost-deferred candidates above, though, this one is a gate
+# against a defect that has already regressed once.
+#
+# NO RED TARGET IS NAMED IN THIS FILE ANY MORE. That is not the same claim as
+# "there are none": the last full survey is the dated one in the header, and
+# nobody has re-run all 95 since. It means only that both targets this block
+# named have been fixed and ratcheted.

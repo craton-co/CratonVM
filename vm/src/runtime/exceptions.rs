@@ -1315,10 +1315,54 @@ fn klass_origin(shared: &SharedVm, thread: &JvmThread, display_name: &str) -> Op
         }
     };
 
-    let class_id = cm.find_unique_class_by_name(lookup_name).or_else(|| {
+    let Some(class_id) = cm.find_unique_class_by_name(lookup_name).or_else(|| {
         let frame_class = thread.frames.last()?.class_id;
         cm.find_class_by_name_for_class(lookup_name, frame_class)
-    })?;
+    }) else {
+        // NOT LOADED — and for a `java.base` name that is still answerable
+        // without loading anything, because `java.base` has exactly one
+        // defining loader in every JVM (JVMS §5.3.1: the bootstrap loader
+        // defines it, and the module system's own bootstrap depends on that
+        // being true before any other loader exists).
+        //
+        // The gap this closes is not hypothetical and not rare. CratonVM's
+        // immutable collections are internal STAMPS, and `cce_display_class_name`
+        // deliberately renders them as the JDK class they stand in for
+        // (`java.util.ImmutableCollections$MapN`) — a name with no loaded class
+        // behind it unless something else happened to load it. So the same cast
+        // failure printed two different messages in one run, decided by nothing
+        // the program did:
+        //
+        //   empty: [java.util.ImmutableCollections$MapN cannot be cast to java.lang.String]
+        //   many:  [class java.util.ImmutableCollections$MapN cannot be cast to
+        //           class java.lang.String (… are in module java.base of loader 'bootstrap')]
+        //
+        // measured 2026-09-08 on `LambdaSafeUnmodifiableMapClassCastProbe`,
+        // where `Map.of(k,v,k,v)` loads the real `MapN` and `Map.of()` does not.
+        // HotSpot prints the second form for both. A message that changes with
+        // the class-load history is a message no consumer can parse — Spring's
+        // `LambdaSafe` and mockk's `JvmAutoHinter` both parse this text — so the
+        // answer has to be the same either way.
+        //
+        // Deliberately `java.base` ALONE. Every other module's loader is a real
+        // question (`java.sql` is the platform loader, an application module's
+        // is the app loader), and answering it from the name would be a guess in
+        // a string log-scrapers read. `None` keeps today's bare wording for
+        // those, which is what this function has always done when it cannot
+        // name an operand.
+        let pkg = lookup_name
+            .rsplit_once('.')
+            .map(|(p, _)| p)?
+            .replace('.', "/");
+        if cm.module_registry.module_for_package(&pkg)? != "java.base" {
+            return None;
+        }
+        return Some(KlassOrigin {
+            module: Some("java.base".to_string()),
+            loader: "'bootstrap'",
+            loader_id: cratonvm_types::ClassLoaderId::Bootstrap,
+        });
+    };
     let class = cm.get_class(class_id)?;
     let loader_id = class.loader_id;
     let loader = loader_name_and_id(loader_id)?;

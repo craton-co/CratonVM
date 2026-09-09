@@ -265,15 +265,31 @@ fn report_reclaimed_receiver_inner(
     // be read again — so a hit here names the method and slot where the
     // analysis is wrong, which is the only thing that turns "disable the
     // filter and the corruption stops" into a fix.
-    if let Some(where_) = cratonvm_gc::gc_quiescence::liveness_filtered_at(addr) {
+    //
+    // THE AGE IS PART OF THE CLAIM. The ledger is keyed by address and the
+    // allocator re-serves addresses, so an entry from many collections ago
+    // describes whatever object held this address THEN. Reported without it,
+    // this line named a 1200-cycles-stale frame as the cause of a failure that
+    // `CRATONVM_NO_LOCAL_LIVENESS=1` went on to reproduce
+    // (`bindabletests-moving-young-leaves-a-frame-slot-unremapped-20260908.md`).
+    // `filtered_on` == `heap_collection` is the reading worth acting on.
+    if let Some((where_, on)) = cratonvm_gc::gc_quiescence::liveness_filtered_at(addr) {
         static L: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if L.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MAX_REPORTS {
+            let now = shared.mem.heap.collection_count();
             tracing::error!(
                 target: "cratonvm::gc::guard",
                 obj = format!("{addr:#x}"),
                 site = site,
                 filtered_at = %where_,
-                "…and the per-bci local-liveness filter DROPPED this address from a root                  snapshot at the frame named here. The filter guarantees such a slot is never                  read again; it was.",
+                filtered_on = on,
+                heap_collection = now,
+                collections_since = now.saturating_sub(on),
+                "…and the per-bci local-liveness filter DROPPED this address from a root \
+                 snapshot at the frame named here. The filter guarantees such a slot is never \
+                 read again. `collections_since` is how stale the attribution is: the ledger \
+                 is keyed by ADDRESS, so a non-zero value means the allocator may have \
+                 re-served it and the frame named is about a different object.",
             );
         }
     }
@@ -559,6 +575,17 @@ pub(crate) fn audit_thread_frames(shared: &SharedVm, thread: &JvmThread, site: &
     // in frame slots must not pay for it forever.
     static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     const PROBE_BUDGET: u64 = 200_000;
+    // THE COMPILED HALF. Everything below walks `thread.frames`, which holds
+    // only INTERPRETER frames -- a JIT frame's oops live in the machine stack
+    // band and in register images, so on a workload whose stale holder is
+    // compiled this function was silent by construction and the first symptom
+    // was a SIGSEGV at a JIT pc. Same ledger, same verdict, other storage.
+    // No-op unless `CRATONVM_DBG_VACATED_FRAMES` is armed.
+    crate::jit::conservative_roots::audit_jit_frames_for_vacated(
+        Some(shared),
+        thread.thread_id.0,
+        site,
+    );
     let heap = &shared.mem.heap;
     for (fi, fr) in thread.frames.iter().enumerate() {
         let live_mask = fr.live_locals_mask_here();
@@ -575,7 +602,7 @@ pub(crate) fn audit_thread_frames(shared: &SharedVm, thread: &JvmThread, site: &
             // old address reads back a perfectly valid object of an unrelated
             // class, and every test in this function stays silent. Asked FIRST,
             // and only when armed.
-            if let Some(moved_to) = cratonvm_gc::gc_quiescence::was_vacated(a) {
+            if let Some((moved_to, vacated_on)) = cratonvm_gc::gc_quiescence::was_vacated_on(a) {
                 static V: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 if V.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MAX_REPORTS {
                     tracing::error!(
@@ -590,8 +617,15 @@ pub(crate) fn audit_thread_frames(shared: &SharedVm, thread: &JvmThread, site: &
                         slot = format!("{what}[{idx}]"),
                         slot_class = %class_name_of(shared, heap.class_id_of(o).as_u32()),
                         moved_to = format!("{moved_to:#x}"),
+                        // The ledger accumulates across cycles, so the cycle
+                        // that vacated `a` is the only one worth comparing
+                        // `thread_last_heal` against - `heap_collection` is the
+                        // count at the safepoint, which at a safepoint is
+                        // always equal to it and proves nothing.
+                        vacated_on,
                         heap_collection = heap.collection_count(),
                         thread_last_heal = thread.last_heal_collection,
+                        remap_reached_this_thread = vacated_on <= thread.last_heal_collection,
                         class_at_target = %class_name_of(
                             shared,
                             // SAFETY: `moved_to` is a post-move object base the
@@ -601,9 +635,49 @@ pub(crate) fn audit_thread_frames(shared: &SharedVm, thread: &JvmThread, site: &
                             })
                             .as_u32(),
                         ),
-                        "a LIVE frame slot still names an address the LAST collection moved an \
-                         object away from — the frame remap did not reach this slot. \
-                         `slot_class` is whatever the slide has since put at that address.",
+                        "a LIVE frame slot still names an address a collection moved an object \
+                         away from and the allocator has not re-issued since. Read \
+                         `remap_reached_this_thread` first: TRUE means the frame remap ran for \
+                         this thread on cycle `vacated_on` and did not reach this slot; FALSE \
+                         means the slot was written AFTER that remap, so its producer, not the \
+                         remap, is holding the stale reference. `slot_class` is whatever the \
+                         slide has since put at that address.",
+                    );
+                }
+            }
+            // The RE-SERVED face, which the exact ledger above cannot see.
+            // `was_vacated` drops an address the moment the allocator hands it
+            // out again -- and that is exactly when a stale holder stops being
+            // harmless (until re-issue it reads a zeroed corpse). The history
+            // ledger keeps the pair for the whole run and uses the CLASS at the
+            // address as the discriminator, so a hit here says: this slot names
+            // an address whose object was moved away and something of a
+            // DIFFERENT class now lives there.
+            if let Some((moved_to, class_at_moved_to, class_here)) =
+                cratonvm_gc::gc_quiescence::stale_use_verdict(a)
+            {
+                static W: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if W.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MAX_REPORTS {
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        obj = format!("{a:#x}"),
+                        site = site,
+                        tid = thread.thread_id.0,
+                        frame = fi,
+                        class = %fr.class_name(),
+                        method = %fr.method_name(),
+                        pc = fr.pc,
+                        slot = format!("{what}[{idx}]"),
+                        moved_to = format!("{moved_to:#x}"),
+                        class_at_moved_to = %class_name_of(shared, class_at_moved_to),
+                        class_here_now = %class_name_of(shared, class_here),
+                        heap_collection = heap.collection_count(),
+                        thread_last_heal = thread.last_heal_collection,
+                        "a LIVE frame slot names an address the collector moved an object away \
+                         from and the allocator has since RE-SERVED to an object of a different \
+                         class. Every read through this slot returns the wrong object. This is \
+                         the face the exact vacated ledger cannot see, and the first safepoint \
+                         at which the owning frame, method, pc and slot are all still in hand.",
                     );
                 }
             }
