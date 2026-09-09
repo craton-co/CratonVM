@@ -6884,6 +6884,15 @@ fn append_ir_inline_site(
             // The receiver the deleted invoke used to null-check. See
             // `ir::IrInlineSite::receiver_is_arg0`.
             receiver_is_arg0: !site.callee_is_static,
+            // Whose bytecode this body is. The single-pass inliner has recorded
+            // the same pair since 2026-09-01 (`x64::inlining`'s
+            // `inline_site_label` / `InlineSite::class_id`); this tier spliced
+            // the body and dropped the identity, so every callee it inlined
+            // contributed no frame to a stack trace. Same string shape, built
+            // from the same three fields, so the two tiers' chains are
+            // indistinguishable to the consumer.
+            method_key: format!("{}.{}:{}", site.class_name, site.method_name, site.descriptor),
+            class_id: site.class_id,
         },
     );
     for &(cpc, field_index, type_tag) in &site.field_info {
@@ -22007,6 +22016,11 @@ fn precise_frame_publishing_opcode(op: u8) -> bool {
     if op == 0xba {
         return precise_indy_enabled();
     }
+    // Array LOADS and PRIMITIVE array stores. `aastore` (0x53) is deliberately
+    // NOT here -- see `precise_array_access_enabled`.
+    if matches!(op, 0x2e..=0x35 | 0x4f..=0x52 | 0x54..=0x56) {
+        return precise_array_access_enabled();
+    }
     matches!(op, 0xb7 | 0xb8 | 0xc2 | 0xc3)
 }
 
@@ -22041,6 +22055,50 @@ fn precise_frame_publishing_opcode(op: u8) -> bool {
 /// This is the case `first_unsupported_precise_frame_site`'s doc anticipated
 /// when it said the pc/opcode is what makes a refusal actionable: the reason
 /// alone named a policy, and the opcode named the lowering.
+/// Whether a protected array LOAD (0x2e..=0x35) or PRIMITIVE array STORE
+/// (0x4f..=0x52, 0x54..=0x56) may be treated as publishing a precise
+/// exceptional frame.
+///
+/// **This one IS a lowering change**, unlike `precise_indy_enabled`. Both of
+/// these opcodes' throwing edges published nothing before:
+///
+/// * the AIOOBE pad returned the sentinel through the epilogue, so the handler
+///   was entered from the INTERPRETER's frame. `emit_bounds_check` now routes a
+///   protected site to deopt-stub reason 11, which publishes the exception via
+///   `jit_throw_aioobe` and then materialises the frame -- the shape reason 10
+///   uses for a locally-detected NPE.
+/// * the array null check went to the shared stub. `emit_null_check_array_
+///   store_at` now routes a protected site to reason 10, carrying its JEP-358
+///   action per bci (`precise_npe_action_by_bci`) so an array NPE inside a try
+///   block keeps the message naming which access was null.
+///
+/// # Why `aastore` (0x53) is excluded even though it motivated the work
+///
+/// It has a THIRD edge the others do not: the JVMS covariance check. The inline
+/// arm publishes it correctly (`jit_aastore_type_check` +
+/// `emit_post_invoke_exception_check`), but the ZGC-barrier fallback arm calls
+/// the void `jit_aastore` helper and, in that call site's own words, takes
+/// "deliberately NO `emit_post_invoke_exception_check`" -- its exceptions travel
+/// the pending-signal channel for the interpreter to drain.
+///
+/// RBC.6 decides before codegen and cannot know which arm the emitter will pick,
+/// so admitting `aastore` would be admitting the unpublished arm too. That the
+/// arm is unreachable today (nothing arms the barrier;
+/// `AASTORE_ZGC_GATE_FALLBACKS` is expected to be zero for the life of every
+/// shipping process) is exactly the kind of "provably unreachable" argument that
+/// stops being true quietly. Admitting it needs that arm to publish first.
+///
+/// So this change does NOT free `MVMap.flushAppendBuffer`, which is refused at
+/// `0x53`. It frees every method refused for an array LOAD or a primitive store,
+/// which is the larger population and shares all of the work.
+fn precise_array_access_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_PRECISE_ARRAY_ACCESS").is_none()
+    })
+}
+
 fn precise_indy_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -25252,6 +25310,11 @@ fn try_compile_inner(
         // See `CompiledMethod::spliced_bodies_side_effect_free`. Vacuously true
         // until a body is actually spliced.
         let mut ir_spliced_bodies_pure = true;
+        // Combined-buffer pc → the spliced callees enclosing it. Built from the
+        // same site table the builder gets, and for a different consumer: this
+        // one is read at CALL RETURN sites by `ir_lower` so a stack trace can
+        // name the callees this tier inlined. Empty when nothing is spliced.
+        let mut ir_inline_frame_sites = ir::IrInlineFrameSites::default();
         if ir_inline_enabled() {
             if let (Some(ir_resolver), Some(invoke_resolver)) =
                 (ir_inline_resolver, cp_invoke_resolver)
@@ -25374,6 +25437,9 @@ fn try_compile_inner(
                     // land on zeroes rather than on whatever follows the Vec.
                     combined.push(0);
                     combined.push(0);
+                    // BEFORE the move: `apply_inline_tables` consumes
+                    // `tables`, and the resolver needs the same `sites` map.
+                    ir_inline_frame_sites = ir::IrInlineFrameSites::from_sites(&tables.sites);
                     builder.apply_inline_tables(tables);
                     ir_combined = Some(combined);
                 }
@@ -26022,6 +26088,7 @@ fn try_compile_inner(
                         &ir_direct_calls,
                         &ir_ic_slots,
                         &ir_compact_fields,
+                        &ir_inline_frame_sites,
                     );
                     drop(metrics_lower);
                     // The C1->C2 acceptance gate. A body that lowered but
@@ -39301,21 +39368,29 @@ mod tests {
 
         // One un-admitted throwing opcode anywhere in the same protected
         // range is still enough to withhold coverage for the whole method —
-        // this list is a conjunction, not a majority vote. `aaload` (0x32) is
-        // the witness: its inline bounds/null check bails to the shared
-        // sentinel stub, which records no frame.
-        let mut with_aaload = code.clone();
-        with_aaload.splice(1..1, [0x32]);
-        let aaload_table = vec![ExceptionTableEntry {
+        // this list is a conjunction, not a majority vote.
+        //
+        // The witness was `aaload` (0x32), "its inline bounds/null check bails
+        // to the shared sentinel stub, which records no frame". That stopped
+        // being true when the bounds check and the array null check grew
+        // publishing exits (deopt-stub reasons 11 and 10) and array loads were
+        // admitted, so the witness moved to `aastore` (0x53) — which is
+        // deliberately still un-admitted for a reason of its own: its
+        // ZGC-barrier fallback arm calls the void `jit_aastore` helper and takes
+        // "deliberately NO `emit_post_invoke_exception_check`". See
+        // `precise_array_access_enabled`.
+        let mut with_aastore = code.clone();
+        with_aastore.splice(1..1, [0x53]);
+        let aastore_table = vec![ExceptionTableEntry {
             start_pc: 0,
             end_pc: 14,
             handler_pc: 14,
             catch_type: 0,
         }];
         assert!(!precise_exception_frame_sites_supported(
-            &with_aaload,
-            with_aaload.len(),
-            &aaload_table,
+            &with_aastore,
+            with_aastore.len(),
+            &aastore_table,
         ));
     }
 

@@ -145,6 +145,7 @@ pub(super) fn push_frame_verbatim(
     cached: Arc<CachedBytecodeMethod>,
     slots: &ArgSlots,
     total_args: usize,
+    monitor: Option<ObjectRef>,
 ) -> CachedCallResult {
     thread.frames[frame_idx].stack.discard_top(total_args);
     // The frame this call returns into was retired in place, not destroyed, so
@@ -168,6 +169,7 @@ pub(super) fn push_frame_verbatim(
             .frames
             .push_cached_compact_reusing(Arc::clone(&cached), &slots[..total_args])
     {
+        install_door_monitor(thread, monitor);
         fire_method_entry_after_push(shared.vm_identity, thread);
         return CachedCallResult::FramePushed;
     }
@@ -190,6 +192,7 @@ pub(super) fn push_frame_verbatim(
             &mut thread.stacks_pool,
         );
         push_frame_and_fire_entry(shared.vm_identity, thread, frame);
+        install_door_monitor(thread, monitor);
         return CachedCallResult::FramePushed;
     }
     let parts = crate::runtime::frame::take_cached_compact_parts(
@@ -205,8 +208,122 @@ pub(super) fn push_frame_verbatim(
         parts.2,
         parts.3,
     );
+    install_door_monitor(thread, monitor);
     fire_method_entry_after_push(shared.vm_identity, thread);
     CachedCallResult::FramePushed
+}
+
+/// Record on the just-pushed frame the monitor its door acquired, so
+/// `pop_and_recycle_frame_with_reason` releases it however the frame leaves.
+///
+/// Written by index from the frame stack's top rather than folded into the
+/// push, because the three push shapes install the frame differently and one of
+/// them fires `MethodEntry` on the way; doing it after the push is the one
+/// ordering that is identical on all three.
+#[inline]
+fn install_door_monitor(thread: &mut JvmThread, monitor: Option<ObjectRef>) {
+    if let Some(obj) = monitor {
+        if let Some(top) = thread.frames.last_mut() {
+            debug_assert!(
+                top.monitor_on_exit.is_none(),
+                "a freshly pushed frame already owns a monitor"
+            );
+            top.monitor_on_exit = Some(obj);
+        }
+    }
+}
+
+/// `CRATONVM_JIT_NO_DOOR_SYNC=1` — restore the pre-2026-09-08 refusal, where
+/// every fast door declined a `synchronized` callee outright.
+///
+/// # Why the doors take them now
+///
+/// The refusal was the single largest reason any door declined anything.
+/// `CRATONVM_DBG_FIELD_SITE=1` on `probes/CollatorSplit.java` (H2's BNF
+/// autocompletion reaches `RuleBasedCollator.compare` through
+/// `StringUtils.startsWithIgnoringCase`, and ICU's normaliser drives
+/// `StringBuffer` — a final class whose accessors are all `synchronized` — one
+/// character at a time):
+///
+/// ```text
+/// [invoke-door] declines by reason (total 3092393):
+/// [invoke-door]  888279  28.7%  special: cached target is VirtualBytecode on a non-special call
+/// [invoke-door]  888105  28.7%  virtual: callee is SYNCHRONIZED
+/// ```
+///
+/// The two rows are one population: the virtual door is tried first, and the
+/// non-virtual door that runs after it declines the same call again. 888 105
+/// of the run's 2.47 M interpreted calls — **36%** — were pushed off the
+/// ~150 ns door onto the ~430 ns general path for that one reason.
+///
+/// # What it costs to take them
+///
+/// Only an UNCONTENDED acquire. A contended one declines to the general path,
+/// which owns the GC-blocked wait protocol (`monitor_enter_synchronized_method`
+/// pins and remaps the arguments across a moving collection); none of that
+/// belongs in a door. The release rides on `Frame::monitor_on_exit`, a field
+/// that has existed — with the GC's remap and root-scan support already wired —
+/// since the stackless-dispatch design that never shipped it, and every frame
+/// removal in the interpreter funnels through
+/// `pop_and_recycle_frame_with_reason`: normal return, exception unwind, and
+/// the orphan sweeps `execute`/`resume_continuation` run after an early
+/// `return Err`.
+#[inline]
+pub(crate) fn door_sync_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_NO_DOOR_SYNC").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
+    })
+}
+
+/// Acquire an `ACC_SYNCHRONIZED` callee's monitor for a door, or refuse.
+///
+/// `Some(Some(obj))` — acquired uncontended; the caller MUST store `obj` in the
+/// pushed frame's `monitor_on_exit`. `Some(None)` — nothing to acquire.
+/// `None` — the door must decline, and the general path re-does the call.
+///
+/// Declining on contention is not a fallback, it is the design: the blocking
+/// acquire has to pin and remap the arguments across a moving GC, and a door
+/// that tried would be a second, unaudited copy of
+/// `monitor_enter_synchronized_method`.
+#[inline]
+pub(crate) fn door_monitor_acquire(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    cached: &CachedBytecodeMethod,
+    receiver: Option<ObjectRef>,
+) -> Option<Option<ObjectRef>> {
+    if !cached.is_synchronized {
+        return Some(None);
+    }
+    if !door_sync_enabled() {
+        return None;
+    }
+    // A static synchronized method locks the class mirror, and getting one can
+    // allocate. The door has no safepoint between `read_args_verbatim` and the
+    // push, so it must not. Static synchronized keeps the general path.
+    let obj = receiver?;
+    if shared
+        .threads
+        .monitors
+        .enter_or_contend(obj, thread.thread_id)
+        .is_some()
+    {
+        // Contended: `enter_or_contend` did NOT acquire, so there is nothing to
+        // release and nothing to retract. The general path blocks properly.
+        return None;
+    }
+    // Same ownership publish the uncontended arm of `monitor_enter_blocking`
+    // makes. Skipping it would leave `getLockedMonitors()` blind to exactly the
+    // monitors the doors now serve.
+    shared
+        .threads
+        .thread_registry
+        .complete_jmx_monitor_enter(thread.thread_id, obj);
+    Some(Some(obj))
 }
 
 /// The questions that are constants of the callee, asked once here for every
@@ -221,7 +338,10 @@ pub(super) fn callee_is_plain_bytecode(
     cached: &CachedBytecodeMethod,
     num_params: usize,
 ) -> Option<&cratonvm_jit_api::DescriptorFacts> {
-    if cached.is_synchronized {
+    // `is_synchronized` is NOT refused here any more; `door_monitor_acquire`
+    // owns that decision, because it is the only place that can also take the
+    // monitor. See `door_sync_enabled`.
+    if cached.is_synchronized && !door_sync_enabled() {
         return None;
     }
     if cached.force_native_cache.get() != Some(&false) {
@@ -333,10 +453,60 @@ pub(super) fn callee_has_compiled_body(shared: &SharedVm, cached: &CachedBytecod
 fn report_decline(kind: &'static str, why: &'static str) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static REPORTED: AtomicU32 = AtomicU32::new(0);
-    if !site_stats::on() || REPORTED.fetch_add(1, Ordering::Relaxed) >= 12 {
+    if !site_stats::on() {
+        return;
+    }
+    // COUNT EVERY DECLINE, not just the first twelve. `door: special
+    // hit=390521 miss=2075102` on a collator workload says the door is
+    // declining 84% of the calls and the twelve printed lines cannot say which
+    // of the ten reasons that is -- and the ten want different repairs. The
+    // table has one row per (kind, reason) pair, so it is bounded by the number
+    // of `decline!` sites; a linear scan under a mutex is free at a call site
+    // that only runs when the census is armed.
+    {
+        let mut table = DECLINE_REASONS.lock();
+        match table.iter_mut().find(|(k, w, _)| *k == kind && *w == why) {
+            Some(row) => row.2 += 1,
+            None => table.push((kind, why, 1)),
+        }
+    }
+    if REPORTED.fetch_add(1, Ordering::Relaxed) >= 12 {
         return;
     }
     eprintln!("[invoke-door] {kind} declined: {why}");
+}
+
+/// One row per `(door, reason)` pair the run declined on. See [`report_decline`].
+static DECLINE_REASONS: parking_lot::Mutex<Vec<(&'static str, &'static str, u64)>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Print the decline tally, highest first. Called from the final site-cache
+/// dump so a short run still reports.
+pub(crate) fn dump_decline_reasons() {
+    let table = DECLINE_REASONS.lock();
+    if table.is_empty() {
+        return;
+    }
+    let mut rows: Vec<_> = table.clone();
+    rows.sort_by(|a, b| b.2.cmp(&a.2));
+    let total: u64 = rows.iter().map(|r| r.2).sum();
+    eprintln!("[invoke-door] declines by reason (total {total}):");
+    for (kind, why, n) in rows {
+        let pct = if total == 0 { 0.0 } else { n as f64 * 100.0 / total as f64 };
+        eprintln!("[invoke-door]   {n:>10}  {pct:5.1}%  {kind}: {why}");
+    }
+}
+
+/// Record a decline by the VIRTUAL door, which has no `hit/miss` counters of
+/// its own but is the door tried FIRST for `invokevirtual`.
+///
+/// Without this the census attributed its declines to the non-virtual door
+/// that runs after it: "special: cached target is VirtualBytecode on a
+/// non-special call" was 40% of every decline on a collator workload and meant
+/// only "the virtual door already said no", naming nothing.
+#[inline]
+pub(crate) fn note_virtual_decline(why: &'static str) {
+    report_decline("virtual", why);
 }
 
 /// Note a decline and return `None`, in one expression.
@@ -371,6 +541,12 @@ pub(super) fn execute_invokestatic_fast_door(
                 decline!("static", MISS, "the target class has been redefined");
             }
             Arc::clone(cached)
+        }
+        Some(CachedInvokeTarget::Native { .. }) => {
+            decline!("static", MISS, "cached target is a registered native")
+        }
+        Some(CachedInvokeTarget::Jit { .. }) => {
+            decline!("static", MISS, "cached target is a compiled body")
         }
         Some(_) => decline!("static", MISS, "cached target is not plain bytecode"),
         None => decline!("static", MISS, "inline cache miss"),
@@ -412,10 +588,16 @@ pub(super) fn execute_invokestatic_fast_door(
     ) {
         decline!("static", MISS, "an argument slot needs coercion");
     }
+    // Static synchronized locks the class mirror, and fetching one can
+    // allocate. The door has no safepoint between `read_args_verbatim` and the
+    // push, so it must not; static synchronized keeps the general path.
+    let Some(monitor) = door_monitor_acquire(shared, thread, &cached, None) else {
+        decline!("static", MISS, "callee is static synchronized");
+    };
     site_stats::bump(site_stats::DOOR_STATIC_HIT);
     dbg_invoke_stats_record(0);
     Some(Ok(push_frame_verbatim(
-        shared, thread, frame_idx, cached, &slots, num_params,
+        shared, thread, frame_idx, cached, &slots, num_params, monitor,
     )))
 }
 
@@ -482,6 +664,24 @@ pub(super) fn execute_nonvirtual_fast_door(
             }
             (Arc::clone(cached), Some(*receiver_class_id))
         }
+        // SPLIT BY VARIANT. A single "not plain bytecode" reason covered 77% of
+        // every door decline on a collator workload and named nothing: a
+        // `Native` target is a door that can never serve it, a `VirtualBytecode`
+        // on a NON-special call is a door that declines what the virtual door
+        // should have taken, and a `Jit` target is a callee the general path has
+        // to enter anyway. The three want completely different repairs.
+        Some(CachedInvokeTarget::Native { .. }) => {
+            decline!("special", MISS, "cached target is a registered native")
+        }
+        Some(CachedInvokeTarget::VirtualNative { .. }) => {
+            decline!("special", MISS, "cached target is a virtual registered native")
+        }
+        Some(CachedInvokeTarget::VirtualBytecode { .. }) => {
+            decline!("special", MISS, "cached target is VirtualBytecode on a non-special call")
+        }
+        Some(CachedInvokeTarget::Jit { .. }) => {
+            decline!("special", MISS, "cached target is a compiled body")
+        }
         Some(_) => decline!("special", MISS, "cached target is not plain bytecode"),
         None => decline!("special", MISS, "inline cache miss"),
     };
@@ -544,10 +744,20 @@ pub(super) fn execute_nonvirtual_fast_door(
             decline!("special", MISS, "receiver class differs from the entry");
         }
     }
+    // The receiver is `slots[0]`: `read_args_verbatim` ran with the
+    // has-receiver flag, and there is no safepoint between it and the push.
+    let recv = slots[0].0.as_object_ptr().map(|ptr| {
+        // SAFETY: the slot came off the caller operand stack as an object
+        // reference, so the address is a live object start on this heap.
+        unsafe { ObjectRef::from_raw(ptr as *mut u8) }
+    });
+    let Some(monitor) = door_monitor_acquire(shared, thread, &cached, recv) else {
+        decline!("special", MISS, "synchronized callee: contended or static");
+    };
     site_stats::bump(site_stats::DOOR_SPECIAL_HIT);
     dbg_invoke_stats_record(0);
     Some(Ok(push_frame_verbatim(
-        shared, thread, frame_idx, cached, &slots, total_args,
+        shared, thread, frame_idx, cached, &slots, total_args, monitor,
     )))
 }
 

@@ -1803,9 +1803,6 @@ fn dbg_no_prune() -> bool {
     *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_NO_PRUNE").is_some())
 }
 
-/// Cached `CRATONVM_DBG_FULLSTACK_SCAN` gate (Windows-only diagnostic), same
-/// per-native-call hot-path rationale as [`dbg_no_prune`].
-#[cfg(any(target_os = "windows", target_os = "linux"))]
 /// H2-CID0 (2026-08-05) — times the unregistered-JIT-frame memo said "clean"
 /// while a real scan of the same range found a frame.
 ///
@@ -2025,6 +2022,153 @@ fn unreg_memo_hiwater_enabled() -> bool {
     })
 }
 
+thread_local! {
+    /// Is the running `scan_active_jit_frames` the COLLECTION's own root pass,
+    /// rather than one of the per-native-call snapshot publishers?
+    ///
+    /// The above-chain conservative band is affordable once per collection and
+    /// not once per native call, and only the collection's pass is what the
+    /// collector marks from — so the two need telling apart. Set by
+    /// [`scan_active_jit_frames_for_collection`], which is the entry point
+    /// `memory::roots::collect_roots` uses.
+    static GC_ROOT_PASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// True while the collection's own root pass is running on this thread.
+#[inline]
+pub fn gc_root_pass_active() -> bool {
+    GC_ROOT_PASS.with(|c| c.get())
+}
+
+/// [`scan_active_jit_frames`] as the COLLECTION's root pass — the entry point
+/// `memory::roots::collect_roots` calls, and the only one that scans the band
+/// above the JIT entry chain. Restores the previous value rather than clearing,
+/// so a nested call (there is none today) cannot silently downgrade the outer
+/// pass.
+pub fn scan_active_jit_frames_for_collection(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
+    let prev = GC_ROOT_PASS.with(|c| c.replace(true));
+    scan_active_jit_frames(heap, out);
+    GC_ROOT_PASS.with(|c| c.set(prev));
+}
+
+/// Engagement census for the above-chain conservative band.
+///
+/// A band that is never scanned and a band that is scanned and finds nothing
+/// read the same way in a passing run, and this repair exists because a page
+/// spent a day on an instrument that could not tell those apart. `passes` is
+/// the denominator, `roots` what the band contributed, `bytes` how much stack
+/// it had to read to get them.
+pub mod above_chain {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static PASSES: AtomicU64 = AtomicU64::new(0);
+    pub static ROOTS: AtomicU64 = AtomicU64::new(0);
+    pub static BYTES: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn note(roots: usize, bytes: usize) {
+        PASSES.fetch_add(1, Ordering::Relaxed);
+        ROOTS.fetch_add(roots as u64, Ordering::Relaxed);
+        BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// `(passes, roots, bytes)` — for the shutdown census.
+    pub fn census() -> (u64, u64, u64) {
+        (
+            PASSES.load(Ordering::Relaxed),
+            ROOTS.load(Ordering::Relaxed),
+            BYTES.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// OPT-IN gate for the above-chain conservative band
+/// (`CRATONVM_JIT_ABOVE_CHAIN_SCAN=1`), and it is opt-in because it was
+/// MEASURED not to be the fix it was written as.
+///
+/// The hypothesis was that the BindableTests ByteBuddy reclaim's missed root
+/// lives in `[max(entry_sp), stack_high)` — the VM's own Rust frames between
+/// the outermost interpreter entry and the compiled call — because
+/// `CRATONVM_DBG_FULLSTACK_SCAN=1` cures that failure and its only difference
+/// from the normal path is scanning the whole stack. It is not, or not only:
+/// with this band walked on every collection (4978 passes, 3 056 492 roots,
+/// 1.0 GB of stack read) the failure is unchanged, and so is it with the
+/// widest possible CHAIN band (`CRATONVM_NO_PRECISE_JIT_MAPS=1`) and with the
+/// A5 filter's veto removed (`CRATONVM_JIT_UNREG_ACCEPT_RESIDUE=1`). What is
+/// left of the fullstack diagnostic's difference is that it also scans on the
+/// per-native-call snapshot publishers — see [`above_chain_all_paths`].
+///
+/// Kept, default off, as the lever that reading measures rather than a fix:
+/// a default-on gigabyte of stack reads per run buys nothing demonstrated.
+/// See
+/// `docs/known-issues/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn above_chain_scan_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ABOVE_CHAIN_SCAN").is_some()
+    })
+}
+
+/// `CRATONVM_JIT_ABOVE_CHAIN_ALL_PATHS=1` — also walk the band on the
+/// per-native-call snapshot publishers, not only on the collection's own root
+/// pass.
+///
+/// This is the difference between the band repair and
+/// `CRATONVM_DBG_FULLSTACK_SCAN`, and it is a flag rather than a default
+/// because it is the expensive half: `update_root_snapshot` runs on every
+/// object-returning native call, and paying a live-stack walk there is what
+/// makes the fullstack diagnostic 2-3x slower than the run it is diagnosing.
+/// Kept so the two can be told apart by measurement instead of argument.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn above_chain_all_paths() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ABOVE_CHAIN_ALL_PATHS").is_some()
+    })
+}
+
+/// `CRATONVM_JIT_ABOVE_CHAIN_FROM_SP=1` — start the band at the SCANNER's SP
+/// rather than at the top of the JIT entry chain.
+///
+/// The chain scan is supposed to cover `[scanner_sp, max(entry_sp))` already,
+/// but only for entries with no precise oop map: a PRECISE entry contributes
+/// its map's slots and no band at all. This makes the two hypotheses
+/// separable without also changing which paths scan.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn above_chain_from_sp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ABOVE_CHAIN_FROM_SP").is_some()
+    })
+}
+
+/// `CRATONVM_DBG_ABOVE_CHAIN_KB=<n>` — cap the above-chain band at `n` KiB.
+///
+/// Diagnostic only, and the reason it exists: the band's upper bound is the
+/// thread's stack top, so "the fix works" says nothing about WHERE the missed
+/// root was. Bisecting `n` until the failure returns names the depth, which is
+/// the first step in replacing this conservative band with a precise root.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn above_chain_scan_cap_bytes() -> Option<usize> {
+    static CAP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_ABOVE_CHAIN_KB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&kb| kb > 0)
+            .map(|kb| kb * 1024)
+    })
+}
+
+/// Cached `CRATONVM_DBG_FULLSTACK_SCAN` gate, same per-native-call hot-path
+/// rationale as [`dbg_no_prune`].
+///
+/// Its doc comment and a `#[cfg(any(windows, linux))]` used to sit ~200 lines
+/// above, orphaned where the function had been before it moved — so the
+/// attribute landed on [`UNREG_MEMO_SUPPRESSED`] instead, cfg-gating a counter
+/// that `vm-cli` reads unconditionally. Both are reunited with the function
+/// here; the gate itself needs no cfg (the flag is read on every target, only
+/// its CONSUMER in `scan_active_jit_frames` is windows/linux).
 fn dbg_fullstack_scan() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -5281,16 +5425,31 @@ fn activation_bci(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> Option<i32> 
 ///
 /// Key 2 is the safepoint-id slot read back as a bci, and since 2026-09-02
 /// [`activation_bci`] can answer that for an `used_ir_backend` artifact too
-/// (through `CompiledMethod::safepoint_bci_table`). It still reaches no chain:
-/// an IR artifact's `inline_frame_map` is EMPTY, because
-/// `record_inline_frame_row` is called only from the single-pass splicer and
-/// one compile produces one artifact, so `compiled_frame_inline_chain` returns
-/// on the `is_empty()` guard before either key is consulted. Key 1 is a CODE
-/// LAYOUT fact -- the byte offset of a return address in this artifact's own
-/// buffer -- and carries no assumption about which backend emitted it, so it
-/// needs no refusal either. IR-tier inlining therefore still contributes no
-/// frames; it needs its own producer, keyed off `InlineScopeTable`, and that is
-/// a separate change from giving the tier a line.
+/// (through `CompiledMethod::safepoint_bci_table`). Key 1 is a CODE LAYOUT
+/// fact -- the byte offset of a return address in this artifact's own buffer
+/// -- and carries no assumption about which backend emitted it. Neither needs
+/// a backend refusal, and since 2026-09-08 neither gets one: an IR artifact
+/// that spliced a body now arrives here with a POPULATED `inline_frame_map`
+/// and its inlined callees are reported like any other.
+///
+/// Until then they were not. `record_inline_frame_row` is called only from the
+/// single-pass splicer, so an IR artifact's map was empty and this function
+/// returned on the `is_empty()` guard before either key was consulted -- and
+/// IR-tier inlining contributed no frames at all. That was invisible while the
+/// optimizing tier claimed few methods and became a live trace defect when it
+/// claimed more: measured 2026-09-08 on `probes/StackTraceAfterOsr.java`,
+/// `after_main_osr` printed `len=3 [leaf mid* outer* probe main]` against the
+/// interpreter's `len=5`, the two starred frames being bodies the IR splicer
+/// had inlined into `probe`.
+///
+/// The producer is `ir_lower`'s `note_inline_frame_return_site`, and it is
+/// keyed off `ir::IrInlineFrameSites` -- the COMBINED-BUFFER pc -- not off
+/// `InlineScopeTable` as this note used to predict. The reason is key 2's own
+/// ambiguity: a spliced region is covered by the caller's snapshot at the
+/// `invoke` pc, so every level of a NESTED splice reports one bci and
+/// `from_rows` (correctly) poisons rows that disagree under it. Combined-pc
+/// ranges are disjoint by construction, so they name one body and one nesting
+/// exactly -- which is what key 1, the exact return address, then carries.
 ///
 /// # The fail-closed rule
 ///
@@ -6262,6 +6421,62 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
         }
         // No live JIT frames on THIS thread — nothing to scan.
         return;
+    }
+    // ABOVE-CHAIN CONSERVATIVE BAND — an OPT-IN LEVER, not a fix. Read
+    // `above_chain_scan_enabled` before reaching for it.
+    //
+    // The chain scan below covers `[scanner_sp, max(entry_sp))` — every frame
+    // BELOW the JIT entry. Nothing covers `[max(entry_sp), stack_high)`, the
+    // VM's own Rust frames between the outermost interpreter entry and the
+    // compiled call, except the A5 probe — and the A5 probe only marks that
+    // band when it first finds a JIT RETURN ADDRESS in it. That is a real hole
+    // in the root set, and closing it was the obvious reading of the
+    // BindableTests ByteBuddy reclaim, because `CRATONVM_DBG_FULLSTACK_SCAN=1`
+    // cures that failure and scanning this band is most of what it does.
+    //
+    // It is not the hole that failure falls through. Walking the band on every
+    // collection (4978 passes, 3 056 492 roots, 1.0 GB of stack read) leaves
+    // 26/27 exactly as it was, and so do the two other levers that widen the
+    // same neighbourhood: `CRATONVM_NO_PRECISE_JIT_MAPS=1` (every chain entry
+    // conservative, so the chain band is at its widest) and
+    // `CRATONVM_JIT_UNREG_ACCEPT_RESIDUE=1` (the A5 filter's veto removed).
+    // What remains of the fullstack diagnostic's difference is the PATH, not
+    // the range: it also scans from `update_root_snapshot`, on every
+    // object-returning native call. See `above_chain_all_paths`, and
+    // `docs/known-issues/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`.
+    //
+    // Sound on the same terms as the chain band beside it, which has always
+    // pushed conservative roots on cycles that could still relocate: a live
+    // chain entry makes `gc_quiescence::is_active()` true, and
+    // `collect_garbage_inner` then diverts to the non-moving sweep through
+    // either `has_conservative_roots && !moving_young` or
+    // `unrewritable_conservative_jit_roots` (which additionally requires that
+    // a conservative scan ran this cycle — this one). Nothing is relocated, so
+    // a pointer-shaped `i64` picked up here can only over-retain.
+    //
+    // `CRATONVM_DBG_ABOVE_CHAIN_KB=<n>` caps the band at `n` KiB above the
+    // chain, which is how a holder's depth would be bisected once one is found
+    // up there.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    if above_chain_scan_enabled() && (gc_root_pass_active() || above_chain_all_paths()) {
+        let cover_hi = if above_chain_from_sp() {
+            scanner_sp
+        } else {
+            JIT_ENTRY_CHAIN
+                .with(|c| c.borrow().iter().map(|e| e.entry_sp).max())
+                .unwrap_or(scanner_sp)
+                .max(scanner_sp)
+        };
+        let high = current_thread_stack_high();
+        let hi = match above_chain_scan_cap_bytes() {
+            Some(cap) => high.min(cover_hi.saturating_add(cap)),
+            None => high,
+        };
+        if hi > cover_hi {
+            let before = out.len();
+            scan_one_frame(cover_hi, hi, heap, out);
+            above_chain::note(out.len() - before, hi - cover_hi);
+        }
     }
     // WS1 JIT-scan cache (see the module-level comment at `JIT_SCAN_CACHE`):
     // reuse the previous scan's roots verbatim unless a Rust↔JIT boundary

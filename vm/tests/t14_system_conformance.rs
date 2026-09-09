@@ -388,6 +388,11 @@ fn t14_gated_registrations_are_declared() {
             target: "cds::register_cds_natives(registry);",
             reason: "Experimental CDS surface, opt-in by design.",
         },
+        Allowed {
+            cfg: "#[cfg(windows)]",
+            target: "attach_provider::register_attach_provider(registry);",
+            reason: "A TARGET gate, not a feature gate, so it does not fork                      `-p cratonvm-cli` from `--workspace` -- both resolve it                      the same way on the same host. It forks Windows from                      Linux, and that fork is the JDK's:                      `sun/tools/attach/AttachProviderImpl` is a different                      class on each platform, and only the Windows one                      declares `tempPath()Ljava/lang/String;` and                      `volumeFlags(Ljava/lang/String;)J`. Registering them on                      Linux would bind natives to methods that do not exist                      there; the Linux `listVirtualMachines()` is ordinary                      bytecode and needs no native at all. The module itself                      is `#![cfg(windows)]` (native-builtins/src/                     attach_provider.rs), so the gate is also what makes the                      call site compile off-Windows.",
+        },
     ];
 
     let src = read_ws("native-builtins/src/lib.rs");

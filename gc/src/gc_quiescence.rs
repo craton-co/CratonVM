@@ -1440,13 +1440,17 @@ pub fn take_major_gc_request() -> bool {
 /// re-opening `TestDefaultInstanceManager.testClassUnloading` for the third
 /// time — a fix still present in the tree, and inert. Compare
 /// `vm::memory::roots::conditional_loader_metadata`, which asks the same
-/// question and correctly never had the term.
+/// question and does not carry the term. (It did carry it for a month; the
+/// disjunct was inert for the reason the next paragraph gives, and was removed
+/// on 2026-09-08 so this comparison is true again. Do not re-add it.)
 ///
 /// Note also that `unregistered_jit_frame_on_stack()` is always `false` at the
 /// mirror call site: `collect_roots` clears it (and
 /// `force_non_moving_jit_roots`) before step 6 and only re-sets it at step 14's
 /// JIT scan. It is kept for callers that ask later in the pass; a `false` there
-/// is a false negative, which is the safe direction.
+/// is a false negative, which is the safe direction. `collect_roots`' own A5
+/// repair (step 14a5) is the model for anything that needs the TRUE answer:
+/// ask after the JIT scan, not before it.
 pub fn young_marker_follows_side_tables() -> bool {
     // The one switch that can push a cycle past `divert_non_moving` entirely.
     if crate::gc_flags().dbg_force_moving {
@@ -2803,13 +2807,28 @@ pub fn check_stale_use(addr: usize, site: &'static str) {
 /// address it dropped later turns up as a failing receiver, the analysis was
 /// wrong about that slot, and this names the method and the slot to look at.
 /// Bounded; oldest entries are simply overwritten.
-static LIVENESS_FILTERED: parking_lot::RwLock<Option<rustc_hash::FxHashMap<usize, String>>> =
+///
+/// # Why the collection number is part of the value
+///
+/// The map is keyed by ADDRESS, and the allocator re-serves addresses. On a
+/// workload that recycles the front of a semispace thousands of times — any
+/// `CRATONVM_DBG_GC_STRESS` run — a hit says "SOME object at this address was
+/// filtered here", which is not the claim `vm::memory::reclaim_guard` prints
+/// off it ("The filter guarantees such a slot is never read again; it was").
+/// It printed exactly that about a 1200-cycles-stale entry on 2026-09-08,
+/// while `CRATONVM_NO_LOCAL_LIVENESS=1` reproduced the failure the entry was
+/// being blamed for — see
+/// `docs/known-issues/springboot/bindabletests-moving-young-leaves-a-frame-slot-unremapped-20260908.md`.
+/// Carrying the collection index lets the reporter print the entry's age beside
+/// the claim, so a stale attribution can be discounted instead of acted on.
+static LIVENESS_FILTERED: parking_lot::RwLock<Option<rustc_hash::FxHashMap<usize, (String, u64)>>> =
     parking_lot::RwLock::new(None);
 
 const LIVENESS_FILTERED_MAX: usize = 8192;
 
-/// Record that `addr` was in `where_` and the liveness filter dropped it.
-pub fn note_liveness_filtered(addr: usize, where_: impl FnOnce() -> String) {
+/// Record that `addr` was in `where_` and the liveness filter dropped it, on
+/// heap collection `collection`.
+pub fn note_liveness_filtered(addr: usize, collection: u64, where_: impl FnOnce() -> String) {
     if !vacated_frames_enabled() {
         return;
     }
@@ -2818,11 +2837,13 @@ pub fn note_liveness_filtered(addr: usize, where_: impl FnOnce() -> String) {
     if map.len() >= LIVENESS_FILTERED_MAX {
         map.clear();
     }
-    map.insert(addr, where_());
+    map.insert(addr, (where_(), collection));
 }
 
-/// Was `addr` dropped from a root snapshot by the liveness filter, and where?
-pub fn liveness_filtered_at(addr: usize) -> Option<String> {
+/// Was `addr` dropped from a root snapshot by the liveness filter, where, and
+/// on which collection? Print the collection beside the current one — a bare
+/// hit is a lead, not a verdict (see the type's doc).
+pub fn liveness_filtered_at(addr: usize) -> Option<(String, u64)> {
     if !vacated_frames_enabled() {
         return None;
     }
@@ -3011,8 +3032,17 @@ pub fn register_self_jit_depth_slot(os_tid: u32) -> std::sync::Arc<std::sync::at
 /// scans registers plus `[rsp, stack_base)`, cannot see them. For the initiator
 /// and for a cooperatively parked peer that is fine (`collect_roots` scans its
 /// own; a parked peer publishes its own and remaps on resume). A BLOCKED peer
-/// does neither, and `apply_pending_blocked_fixups` never remaps a shadow
-/// stack, so its shadow-stack oops are unpinned and unremapped.
+/// does neither, so without this its shadow-stack oops are unpinned during the
+/// collection -- which is what this map exists to fix, by letting the initiator
+/// find and pin them.
+///
+/// The REMAP half is a separate repair and has since landed beside it:
+/// `apply_blocked_wake_jit_remap` (both wake paths, `check_post_block_gc_refs`
+/// and the leaked-region fallback `apply_pending_blocked_fixups`) now remaps the
+/// waking peer's shadow stack, active JIT frames and register image. The two are
+/// complementary and neither subsumes the other -- a pin keeps the objects still
+/// for the cycle, a remap fixes up a peer whose objects moved on a cycle that
+/// did not pin it.
 ///
 /// The initiator cannot recover the window from the peer's frames the way
 /// `shadow_window_from_frame` does: that helper only trusts a frame whose

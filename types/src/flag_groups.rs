@@ -978,6 +978,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "sweep-census", on_key: Some("CRATONVM_DBG_SWEEP_CENSUS"), off_key: None, off_word: None, since: "2026-07-07" },
     E { group: Group::DBG, token: "sweep-edges", on_key: Some("CRATONVM_DBG_SWEEP_EDGES"), off_key: None, off_word: None, since: "2026-06-03" },
     E { group: Group::DBG, token: "unreg-declined", on_key: Some("CRATONVM_DBG_UNREG_DECLINED"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::DBG, token: "above-chain-kb", on_key: Some("CRATONVM_DBG_ABOVE_CHAIN_KB"), off_key: None, off_word: None, since: "2026-09-08" },
     E { group: Group::DBG, token: "sweep-referrers", on_key: Some("CRATONVM_DBG_SWEEP_REFERRERS"), off_key: None, off_word: None, since: "2026-08-03" },
     E { group: Group::DBG, token: "sweep-zero", on_key: Some("CRATONVM_DBG_SWEEP_ZERO"), off_key: None, off_word: None, since: "2026-06-16" },
     E { group: Group::DBG, token: "sweep-trace-class", on_key: Some("CRATONVM_DBG_SWEEP_TRACE_CLASS"), off_key: None, off_word: None, since: "2026-09-06" },
@@ -1085,6 +1086,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "moving-young-band-liveness-screen", on_key: None, off_key: Some("CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN"), off_word: None, since: "2026-09-03" },
     E { group: Group::GC, token: "moving-young-band-thread-window", on_key: None, off_key: Some("CRATONVM_MOVING_YOUNG_NO_BAND_THREAD_WINDOW"), off_word: None, since: "2026-09-04" },
     E { group: Group::JIT, token: "unreg-accept-residue", on_key: Some("CRATONVM_JIT_UNREG_ACCEPT_RESIDUE"), off_key: None, off_word: None, since: "2026-08-07" },
+    // 2026-09-08. OPT-IN: the collection's own root pass also scans the
+    // native-stack band ABOVE the JIT entry chain conservatively. Written as a
+    // fix for the BindableTests ByteBuddy reclaim and measured NOT to be one —
+    // kept as the lever that says so. See `above_chain_scan_enabled`.
+    E { group: Group::JIT, token: "above-chain-scan", on_key: Some("CRATONVM_JIT_ABOVE_CHAIN_SCAN"), off_key: None, off_word: None, since: "2026-09-08" },
+    E { group: Group::JIT, token: "above-chain-all-paths", on_key: Some("CRATONVM_JIT_ABOVE_CHAIN_ALL_PATHS"), off_key: None, off_word: None, since: "2026-09-08" },
+    E { group: Group::JIT, token: "above-chain-from-sp", on_key: Some("CRATONVM_JIT_ABOVE_CHAIN_FROM_SP"), off_key: None, off_word: None, since: "2026-09-08" },
     E { group: Group::JIT, token: "a5-residue-filter", on_key: Some("CRATONVM_JIT_A5_RESIDUE_FILTER"), off_key: None, off_word: Some("0"), since: "2026-09-06" },
     E { group: Group::JIT, token: "a5-shape-filter", on_key: Some("CRATONVM_JIT_A5_SHAPE_FILTER"), off_key: None, off_word: None, since: "2026-09-06" },
     // 2026-09-08. Default-ON kill switch over the RELOCATION LICENCE half of the
@@ -1295,6 +1303,11 @@ pub const INVENTORY: &[E] = &[
     // `MVMap.flushAppendBuffer` -- 15.2% of CPU on a contended H2 workload --
     // permanently interpreted.
     E { group: Group::JIT, token: "precise-indy", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_INDY"), off_word: None, since: "2026-09-06" },
+    // Array loads and PRIMITIVE array stores. A real lowering change, not
+    // bookkeeping: the AIOOBE pad and the array null-check stub both published
+    // nothing, and now route to deopt-stub reasons 11 and 10. `aastore` is
+    // excluded -- its ZGC-barrier fallback arm still does not publish.
+    E { group: Group::JIT, token: "precise-array-access", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_ARRAY_ACCESS"), off_word: None, since: "2026-09-06" },
     // Opt-in. The GP register file landed beside the FP one on 2026-09-02, but
     // the flip still wants a wall-clock measurement -- see
     // `ir_lower::linear_scan_enabled`. `since` stays 2026-08-01: the flag is the
@@ -1746,6 +1759,13 @@ pub const INVENTORY: &[E] = &[
     // `frame-slot-reuse` — off routes every frame's buffers back through
     // the thread pools on return instead of retiring the frame in place.
     E { group: Group::JIT, token: "frame-slot-reuse", on_key: None, off_key: Some("CRATONVM_JIT_NO_FRAME_SLOT_REUSE"), off_word: None, since: "2026-09-02" },
+    // 2026-09-08. Opt-in restore of the pre-door refusal of `synchronized`
+    // callees. That refusal was the single largest reason any fast door
+    // declined anything -- 888,105 of 2.47 M interpreted calls on a
+    // `java.text` collator workload, 36% of them -- because ICU's normaliser
+    // drives `StringBuffer` one character at a time. See
+    // `invoke_fast::door_sync_enabled`.
+    E { group: Group::JIT, token: "door-sync", on_key: None, off_key: Some("CRATONVM_JIT_NO_DOOR_SYNC"), off_word: None, since: "2026-09-08" },
     // `frame-emplace` — off builds the frame on the Rust stack and moves it
     // into the slot instead of constructing it there.
     E { group: Group::JIT, token: "frame-emplace", on_key: None, off_key: Some("CRATONVM_JIT_NO_FRAME_EMPLACE"), off_word: None, since: "2026-09-03" },
@@ -1962,10 +1982,20 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "blocked-peer-stack-remap", on_key: None, off_key: Some("CRATONVM_GC_NO_BLOCKED_PEER_STACK_REMAP"), off_word: None, since: "2026-09-07" },
     E { group: Group::JIT, token: "xt-keep-unrewritable-on-discharge", on_key: Some("CRATONVM_XT_KEEP_UNREWRITABLE_ON_DISCHARGE"), off_key: None, off_word: None, since: "2026-09-04" },
     E { group: Group::GC, token: "zgc-unrewritable-peer-refuses", on_key: Some("CRATONVM_ZGC_UNREWRITABLE_PEER_REFUSES"), off_key: None, off_word: None, since: "2026-09-04" },
-    E { group: Group::JIT, token: "xt-helper-window-pin-resolve", on_key: Some("CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE"), off_key: None, off_word: None, since: "2026-09-04" },
+    // Default-ON since 2026-09-08. It shipped opt-in, and the helper-window
+    // DISCHARGE (default-on, same family) then made the pin load-bearing: a
+    // discharged cycle relocates on the strength of "every window pinned", and
+    // `is_heap_addr` -- the predicate it used to pin with -- drops a misaligned
+    // interior pointer and a one-past-the-end cursor, which are the two shapes a
+    // compiled loop leaves in a frozen peer's registers. `0` is the kill switch.
+    E { group: Group::JIT, token: "xt-helper-window-pin-resolve", on_key: Some("CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "xt-helper-window-interior", on_key: Some("CRATONVM_XT_HELPER_WINDOW_INTERIOR"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "xt-helper-window-pin", on_key: Some("CRATONVM_XT_HELPER_WINDOW_PIN"), off_key: None, off_word: None, since: "2026-09-01" },
     E { group: Group::JIT, token: "xt-helper-window-scan", on_key: Some("CRATONVM_XT_HELPER_WINDOW_SCAN"), off_key: None, off_word: None, since: "2026-07-02" },
+    // Kill switch for the `process_vm_readv` peer-stack reader, so the reader
+    // and the historical direct load are A/B-able inside one binary. Opt-in:
+    // setting it restores the pre-fix behaviour exactly, SIGSEGV included.
+    E { group: Group::JIT, token: "xt-no-safe-peer-read", on_key: Some("CRATONVM_XT_NO_SAFE_PEER_READ"), off_key: None, off_word: None, since: "2026-09-08" },
     E { group: Group::JIT, token: "xt-jit-root-scan", on_key: Some("CRATONVM_XT_JIT_ROOT_SCAN"), off_key: None, off_word: None, since: "2026-06-23" },
     // Value token, milliseconds: `CRATONVM_JIT=xt-peer-deadline-ms=50`. Unset
     // means the built-in 20 ms, and `0` is rejected by the parser's own filter,
@@ -3456,6 +3486,11 @@ mod tests {
                 "CRATONVM_JIT",
                 "xt-peer-shadow-scan",
                 "CRATONVM_XT_PEER_SHADOW_SCAN",
+            ),
+            (
+                "CRATONVM_JIT",
+                "xt-helper-window-pin-resolve",
+                "CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE",
             ),
         ] {
             let off = case(&[(group, &format!("-{token}"))]);
