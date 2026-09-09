@@ -19545,14 +19545,36 @@ impl G1Collector {
         let honour_movable = g1_movable_pins_enabled()
             && !crate::gc_quiescence::moving_young_coverage_incomplete();
         let mut set: RegionSet = if crate::gc_quiescence::is_active() {
-            crate::gc_quiescence::pinned_jit_roots_snapshot()
-                .into_iter()
+            let snap = crate::gc_quiescence::pinned_jit_roots_snapshot();
+            let (mut n_mov, mut n_unrew) = (0usize, 0usize);
+            let kept: Vec<usize> = snap
+                .iter()
+                .copied()
                 .filter(|&addr| {
-                    let movable = honour_movable
-                        && crate::gc_quiescence::is_movable_jit_root(addr)
-                        && !crate::gc_quiescence::is_unrewritable_jit_root(addr);
-                    !movable
+                    let claimed = crate::gc_quiescence::is_movable_jit_root(addr);
+                    let vetoed = crate::gc_quiescence::is_unrewritable_jit_root(addr);
+                    if claimed {
+                        n_mov += 1;
+                    }
+                    if vetoed {
+                        n_unrew += 1;
+                    }
+                    !(honour_movable && claimed && !vetoed)
                 })
+                .collect();
+            if gc_flags().g1_dbg_pins {
+                tracing::warn!(
+                    "[g1][MOVPIN] snapshot={} kept={} movable_claimed={} unrew_veto={}                      honour_movable={} coverage_incomplete={} movable_set={}",
+                    snap.len(),
+                    kept.len(),
+                    n_mov,
+                    n_unrew,
+                    honour_movable,
+                    crate::gc_quiescence::moving_young_coverage_incomplete(),
+                    crate::gc_quiescence::movable_jit_root_count(),
+                );
+            }
+            kept.into_iter()
                 .filter_map(|addr| self.lookup_region_for_addr(addr))
                 .collect()
         } else {
