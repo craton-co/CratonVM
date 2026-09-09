@@ -6528,7 +6528,6 @@ impl IrBuilder {
         // expansion's two loads need. See `string_access_site_pcs`.
         reset_string_access_sites();
         reset_site_traps_this_build();
-        SPLICED_MERGE_SEEN.with(|c| c.set(false));
         // Consume the verifier's canonical decode/CFG contract instead of
         // maintaining a second opcode-length scanner in the compiler.
         let verified = cratonvm_reader::verified_code(code.get(..code_len)?).ok()?;
@@ -6683,11 +6682,6 @@ impl IrBuilder {
             // so the locals and operand stack this snapshots are the callee's
             // throughout — the same invariant the caller's own merges rely on.
             if self.merges.contains_key(&pc) {
-                // A merge inside a relocated body disqualifies this artifact
-                // from the optimizing OSR door. See `SPLICED_MERGE_SEEN`.
-                if !self.splice.is_empty() {
-                    note_spliced_merge();
-                }
                 // Add current state as predecessor (fall-through). On a loop
                 // header this is the forward-entry predecessor; the back-edge
                 // arrives later and is back-patched (see add_merge_predecessor).
@@ -10377,50 +10371,6 @@ pub fn ir_scalar_intrinsics_enabled() -> bool {
 /// Scalar-intrinsic sites lowered as arithmetic, this process.
 static SCALAR_INTRINSICS_LOWERED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-
-thread_local! {
-    /// Did the build just finished activate a merge INSIDE a spliced body?
-    ///
-    /// Set by [`IrBuilder::build`]'s walk, reset at its entry, and read by
-    /// `try_compile_inner` the moment it returns — the same one-shot
-    /// thread-local shape `reset_string_access_sites` /
-    /// `string_access_site_pcs` already use, and for the same reason: the
-    /// builder is consumed by `build`, so there is nothing left to ask
-    /// afterwards.
-    ///
-    /// # What it gates, and why
-    ///
-    /// A body with a merge inside a relocated callee MUST NOT be entered
-    /// through the optimizing OSR door. Measured on `Min1.clamp` (an
-    /// `if/else if/else` funnelling to one return, spliced into a counted
-    /// loop): entering the optimizing artifact at the loop header produces a
-    /// WRONG and RUN-TO-RUN VARYING checksum, while the identical body reached
-    /// through the method-entry compile is correct on the same workload
-    /// (`Min2`, 400 000 invocations, exact parity with HotSpot). Turning off
-    /// only `CRATONVM_JIT_IR_OSR_ENTRY` restores correctness with the splice
-    /// still enabled, which is what localises the defect to the OSR entry stub
-    /// rather than to the splice or to the graph — the graph was read node by
-    /// node and its phis are right.
-    ///
-    /// So the refusal is placed at the door that is broken, not at the feature
-    /// that exposed it: such an artifact publishes NO `ir_osr_entries`, the OSR
-    /// door finds no stub for its pc and falls back to the single-pass OSR
-    /// body, and the method-entry population keeps the inlining.
-    ///
-    /// Lifting this needs `emit_osr_entry_stubs` understood and fixed; it is
-    /// not a property of splicing that cannot be supported.
-    static SPLICED_MERGE_SEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-fn note_spliced_merge() {
-    SPLICED_MERGE_SEEN.with(|c| c.set(true));
-}
-
-/// Did the most recent [`IrBuilder::build`] on this thread activate a merge
-/// inside a spliced body? See [`SPLICED_MERGE_SEEN`].
-pub fn spliced_merge_was_built() -> bool {
-    SPLICED_MERGE_SEEN.with(|c| c.get())
-}
 
 /// Conditional branches replaced by a guard plus an unconditional jump, this
 /// process. See [`IrBuilder::prune_always_taken_branch`].
