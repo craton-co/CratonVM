@@ -1358,6 +1358,14 @@ pub const INVENTORY: &[E] = &[
     // put it where the lowerer looks.
     E { group: Group::JIT, token: "ir-splice-direct-call", on_key: Some("CRATONVM_JIT_IR_SPLICE_DIRECT_CALL"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
     E { group: Group::JIT, token: "ir-splice-getstatic", on_key: Some("CRATONVM_JIT_IR_SPLICE_GETSTATIC"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // Splice a callee whose body contains a `checkcast` or an `instanceof`.
+    // The same rebase as the two above, and the refusal that page named as
+    // the next one to take: every typed read out of an untyped container is a
+    // `checkcast`. Opt-IN and default OFF -- the plumbing is here, the soak is
+    // not, and a spliced type check is the first spliced site that can THROW
+    // on a caller-produced value. Read site accepts `1`/`true`/`on`/`yes` and
+    // nothing else, so there is no off-word: removing the key is the way back.
+    E { group: Group::JIT, token: "ir-splice-typecheck", on_key: Some("CRATONVM_JIT_IR_SPLICE_TYPECHECK"), off_key: None, off_word: None, since: "2026-09-09" },
     // R1. Memoize the ACCEPTED optimizing OSR artifact, not only the refusals.
     // Without it one run recompiled the same method 502 times.
     E { group: Group::JIT, token: "osr-optimizing-cache", on_key: Some("CRATONVM_JIT_OSR_OPTIMIZING_CACHE"), off_key: None, off_word: Some("0"), since: "2026-09-09" },

@@ -10151,6 +10151,11 @@ fn resolve_inline_site_from(
     // straight through with no merge bookkeeping, so exactly one return, at the
     // end, is the shape the splice can honour.
     let mut ir_return_pcs: Vec<usize> = Vec::new();
+    // IR-tier only: the body's type-check sites,
+    // `(callee_pc, cp_idx, is_checkcast)`, resolved to
+    // `(class_id, class_name)` below once the callee's constant pool is in
+    // hand. See the `0xc0 | 0xc1` arm.
+    let mut ir_typecheck_sites: Vec<(usize, u16, bool)> = Vec::new();
     while scan_pc < code_len {
         match code[scan_pc] {
             0xaa | 0xab => no!("tableswitch/lookupswitch"),
@@ -10168,6 +10173,26 @@ fn resolve_inline_site_from(
             }
             0xbb | 0xbd | 0xc5 => no!("new/anewarray/multianewarray"),
             0xbf => no!("athrow"),
+            // checkcast / instanceof. Admitted for the IR builder, which has
+            // had both arms since cov-05 (`Op::CheckCast`, `Op::InstanceOf`),
+            // once `IrInlineTables` rebases their target rows; still refused
+            // outright for the single-pass mini-emitter, which has neither.
+            //
+            // Resolved BELOW, against the CALLEE's constant pool, exactly like
+            // `ir_new_sites`: the CP index here indexes the callee's pool, and
+            // this scan runs before the callee's class info is in hand.
+            0xc0 | 0xc1 if ir_mode => {
+                if !cratonvm_jit::ir::ir_splice_typecheck_enabled() {
+                    no!("checkcast/instanceof");
+                }
+                if scan_pc + 2 >= code_len {
+                    return None;
+                }
+                let cp_idx = ((code[scan_pc + 1] as u16) << 8) | code[scan_pc + 2] as u16; // Cast: bytecode operand decoding
+                ir_typecheck_sites.push((scan_pc, cp_idx, code[scan_pc] == 0xc0));
+                scan_pc += 3;
+                continue;
+            }
             0xc0 | 0xc1 => no!("checkcast/instanceof"),
             0xc2 | 0xc3 => no!("monitorenter/monitorexit"),
             // A relocated body's control flow would need the merge/loop-header
@@ -10413,6 +10438,41 @@ fn resolve_inline_site_from(
                 }) => ir_new_info.push((npc, class_id, num_fields)),
                 _ => no!("ir-splice-new-site-unresolved"),
             }
+        }
+    }
+
+    // Resolve the body's type-check sites against the CALLEE's constant pool.
+    // `resolve_jit_new_site` answers exactly the question these need -- is the
+    // CONSTANT_Class target LOADED from this holder's loader -- and a
+    // `checkcast` / `instanceof` CP entry is the identical CONSTANT_Class
+    // shape, which is why the caller-side lane in `try_compile_inner` reuses
+    // the same resolver rather than adding one.
+    //
+    // A `Deferred` site refuses the whole splice rather than being dropped,
+    // for the same reason `new`'s does: with `ir-unresolved-class-trap` off
+    // (its default) the builder's `0xc0` / `0xc1` arm bails the METHOD on a
+    // missing row, so admitting the body without the row would cost the caller
+    // its IR compile entirely -- after the splice was committed to. The callee
+    // is still compiled and still called; it is just not spliced.
+    let mut ir_typecheck_info: Vec<(usize, u32, String, bool)> = Vec::new();
+    if ir_mode && !ir_typecheck_sites.is_empty() {
+        for &(tpc, cp_idx, is_checkcast) in &ir_typecheck_sites {
+            let Some(cratonvm_jit::JitNewSite::Resolved { class_id, .. }) =
+                resolve_jit_new_site(&cm, declaring_id, cp_idx)
+            else {
+                no!("ir-splice-typecheck-unresolved");
+            };
+            // The NAME as well as the id: the type-check helpers are by-name
+            // and memoize on the interned `(ptr, len)`, with the id carried
+            // alongside so they can skip the `(ClassLoaderId, name)` dictionary
+            // lookup. Interning itself is jit-side and happens at rebase time.
+            let Some(name) = cm
+                .get_class(declaring_id)
+                .and_then(|c| c.constant_pool.get_class_name(cp_idx))
+            else {
+                no!("ir-splice-typecheck-unresolved");
+            };
+            ir_typecheck_info.push((tpc, class_id, name.to_string(), is_checkcast));
         }
     }
 
@@ -11145,6 +11205,7 @@ fn resolve_inline_site_from(
         field_info,
         compact_field_info,
         static_field_info,
+        typecheck_info: ir_typecheck_info,
         ldc_info,
         ldc2w_info,
         ldc_fp_pcs,

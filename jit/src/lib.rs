@@ -6624,6 +6624,24 @@ pub struct InlineSite {
     pub compact_field_info: Vec<(usize, u32, bool)>,
     /// Resolved static field access: (callee_pc, class_id_raw, field_index, type_tag, is_volatile).
     pub static_field_info: Vec<(usize, u32, usize, u8, bool)>,
+    /// Resolved `checkcast` / `instanceof` targets in the callee body:
+    /// `(callee_pc, target_class_id, target_class_name, is_checkcast)`.
+    ///
+    /// Populated for the IR tier only. A site enters this list only when its
+    /// CONSTANT_Class target is already LOADED from the callee holder's
+    /// loader -- the same "resolved or not" question `new` / `anewarray` ask,
+    /// and the same answer the caller's own `checkcast_info` is built from.
+    /// An unresolvable site refuses the whole BODY rather than being dropped:
+    /// the builder's `0xc0` / `0xc1` arms bail the METHOD on a missing row
+    /// under the default flags (`ir-unresolved-class-trap` is opt-in and off),
+    /// so admitting the body without the row would cost the caller its IR
+    /// compile after the splice was committed to. Same trade and same sentence
+    /// as `ir-splice-static-field-unresolved`.
+    ///
+    /// The NAME is carried rather than an interned pointer because interning
+    /// is `jit`-side (`intern_typecheck_target`) and this struct is built by
+    /// the VM-side resolver, which holds the class manager lock.
+    pub typecheck_info: Vec<(usize, u32, String, bool)>,
     /// Resolved ldc constants: (callee_pc, i64_value).
     pub ldc_info: Vec<(usize, i64)>,
     /// Resolved ldc2_w constants: (callee_pc, i64_value).
@@ -7042,6 +7060,50 @@ fn append_ir_inline_site(
         // disagree. See `ir::ir_splice_getstatic_enabled`.
         return false;
     }
+    // Type checks, rebased. Same cause and same shape as the static reads
+    // above -- `InlineSite::typecheck_info` carries rows the VM-side resolver
+    // proved LOADED, and until now nothing put them where the builder's
+    // `0xc0` / `0xc1` arms look, so the scanner refused the callee outright.
+    //
+    // The OPCODE is re-read from the relocated bytes for the same reason the
+    // `getstatic` rebase re-reads its own: `is_checkcast` decides which of two
+    // maps a row lands in, and a row in the wrong one is an `Op::InstanceOf`
+    // planted at a `checkcast` -- a site that pushes an `Int` where the
+    // verifier proved a `Ref`, which the next merge would join against a real
+    // reference. The resolver cannot produce that, so this can only fire on a
+    // defect, which is the case worth having a check for.
+    //
+    // Unlike the static rows there is no value-tier gate: a type check yields
+    // `Ref` (0xc0) or `Int` (0xc1) and neither is wide or floating-point, so
+    // it cannot smuggle a `Long`/`Double` node into a graph admitted through
+    // the int clause.
+    if ir::ir_splice_typecheck_enabled() {
+        for (cpc, class_id, name, is_checkcast) in &site.typecheck_info {
+            let want = if *is_checkcast { 0xc0 } else { 0xc1 };
+            if site.callee_code.get(*cpc).copied() != Some(want) {
+                return false;
+            }
+            // Interned process-wide, NOT owned by this compilation -- the
+            // type-check helpers memoize on the `(ptr, len)` pair, so it must
+            // outlive every artifact that bakes it. Same call, and the same
+            // `class_id` argument, as the caller's own sites in
+            // `try_compile_inner`: the id is what this holder's loader
+            // resolves, which saves the helper a dictionary lookup keyed by
+            // `(ClassLoaderId, name)`.
+            let (ptr, len) = intern_typecheck_target(name, Some(*class_id));
+            let entry = (ptr as usize, len);
+            if *is_checkcast {
+                tables.checkcast_info.insert(base + cpc, entry);
+            } else {
+                tables.instanceof_info.insert(base + cpc, entry);
+            }
+        }
+    } else if !site.typecheck_info.is_empty() {
+        // Kill switch set; the VM-side scanner mirror should already have
+        // refused this body. Refuse here too -- the two halves must not be
+        // able to disagree. See `ir::ir_splice_typecheck_enabled`.
+        return false;
+    }
     // The resolver PROVED these bodies are no-ops, which is what
     // `object_init_pcs` means — elidable on any receiver, not only on a fresh
     // `Op::New`. `trivial_init_pcs` is the narrower set and would refuse the
@@ -7212,6 +7274,8 @@ fn merge_ir_inline_tables(into: &mut ir::IrInlineTables, from: ir::IrInlineTable
         ldc_info,
         ldc2w_info,
         static_field_info,
+        checkcast_info,
+        instanceof_info,
     } = from;
     into.sites.extend(sites);
     into.field_info.extend(field_info);
@@ -7221,6 +7285,8 @@ fn merge_ir_inline_tables(into: &mut ir::IrInlineTables, from: ir::IrInlineTable
     into.ldc_info.extend(ldc_info);
     into.ldc2w_info.extend(ldc2w_info);
     into.static_field_info.extend(static_field_info);
+    into.checkcast_info.extend(checkcast_info);
+    into.instanceof_info.extend(instanceof_info);
 }
 
 /// Turn a spliced body's resolver-side [`InlineInvokeTarget`]s into the
@@ -8347,6 +8413,7 @@ mod profile_guided_inlining_tests {
             field_info: Vec::new(),
             compact_field_info: Vec::new(),
             static_field_info: Vec::new(),
+            typecheck_info: Vec::new(),
             ldc_info: Vec::new(),
             ldc2w_info: Vec::new(),
             ldc_fp_pcs: Vec::new(),
@@ -9134,6 +9201,7 @@ mod inline_selection_tests {
             static_field_info: (0..static_fields)
                 .map(|pc| (pc, 1, 0, b'I', false))
                 .collect(),
+            typecheck_info: Vec::new(),
             ldc_info: Vec::new(),
             ldc2w_info: Vec::new(),
             ldc_fp_pcs: Vec::new(),
@@ -25682,6 +25750,18 @@ fn try_compile_inner(
                     // BEFORE the move: `apply_inline_tables` consumes
                     // `tables`, and the resolver needs the same `sites` map.
                     ir_inline_frame_sites = ir::IrInlineFrameSites::from_sites(&tables.sites);
+                    // Also before the move, and for the same reason the
+                    // caller's own type checks set this flag: a spliced
+                    // `checkcast` lowers to the same helper, which resolves
+                    // `&mut JvmThread` through `jit_thread_mut()` -- and the
+                    // `!has_dispatch` fast entry never sets that TLS. A row
+                    // rebased here without the flag is the `jit-clinit-gap`
+                    // defect wearing a different opcode.
+                    if !tables.checkcast_info.is_empty()
+                        || !tables.instanceof_info.is_empty()
+                    {
+                        ir_needs_dispatch_for_checkcast = true;
+                    }
                     builder.apply_inline_tables(tables);
                     ir_combined = Some(combined);
                 }

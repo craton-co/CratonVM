@@ -189,19 +189,13 @@ throughput-neutral.
 
 ## 5. What a spliced callee is still refused for
 
-`putstatic`, `anewarray` / `multianewarray`, `checkcast` / `instanceof`,
-`athrow`, `monitorenter` / `monitorexit`, `tableswitch` / `lookupswitch`,
+`putstatic`, `anewarray` / `multianewarray`, `athrow`,
+`monitorenter` / `monitorexit`, `tableswitch` / `lookupswitch`,
 `invokedynamic`, `jsr`/`ret`, integer division, and any body with more than one
 `return` or a `return` that is not last.
 
-**`checkcast` / `instanceof` is the next one to take, and it is the same shape
-as this one.** `IrBuilder` has both arms already (`Op::CheckCast`,
-`Op::InstanceOf`, keyed by pc through `set_checkcast_info` /
-`set_instanceof_info`), so what is missing is again a rebase — plus, unlike
-`getstatic`, a resolution step, because `InlineSite` carries no checkcast rows
-today and the arms want `(name_ptr, name_len)` into an arena this compile owns.
-Every typed read out of an untyped container is a `checkcast`, so on framework
-code it is likely worth more than `getstatic` was.
+`checkcast` / `instanceof` **came off this list on 2026-09-09** — see §8, which
+is this section's prediction carried out and one of its claims corrected.
 
 `putstatic` is the one that should stay refused until somebody does the barrier
 work, not until somebody does the plumbing.
@@ -257,3 +251,104 @@ The fast regression suite is 92 of 92 against HotSpot, and the crate suites are
   Azure bench host `BENCHMARK.md`'s table comes from, so the absolutes are not
   comparable to it. The A/B is: same binary, same window, alternated and
   order-flipped.
+
+## 8. `checkcast` / `instanceof`, taken
+
+§5 predicted this was the next refusal to take and that it was the same shape
+as `getstatic`. It was, and it is done, behind
+`CRATONVM_JIT_IR_SPLICE_TYPECHECK=1` — **opt-in, default OFF**, for a reason
+§8.3 gives.
+
+**One claim in §5 was wrong.** It said the arms want `(name_ptr, name_len)`
+"into an arena this compile owns", and predicted a resolution step on top of
+the rebase. They do not: `intern_typecheck_target` interns the name
+PROCESS-WIDE and deliberately, because the type-check helpers memoize on the
+`(ptr, len)` pair and it must not be recycled for another class when an
+artifact is freed. So there was no arena lifetime to solve, and this is purely
+a rebase — strictly less work than §5 budgeted for, not more.
+
+### 8.1 What it is
+
+`bench/SpliceCastProbe.java`. `unwrap` is `aload_0; checkcast #Box;
+getfield #v; ireturn` — what `List<Box>.get(i).v` is after erasure — and
+`tagOf` is the `instanceof` half. Both were refused whole at resolution.
+
+The scanner's `0xc0 | 0xc1` arm now defers the site instead of refusing it,
+resolving it against the CALLEE's constant pool exactly as `ir_new_sites` are
+resolved, and `append_ir_inline_site` rebases the rows into
+`IrInlineTables::checkcast_info` / `instanceof_info`. An UNRESOLVABLE site
+refuses the whole body (`ir-splice-typecheck-unresolved`) rather than being
+dropped: with `ir-unresolved-class-trap` off — its default — the builder's
+`0xc0` arm bails the METHOD on a missing row, so admitting the body without it
+would cost the caller its IR compile after the splice was committed to. Same
+trade and same sentence as `ir-splice-static-field-unresolved`.
+
+A spliced type check owes `has_dispatch`, for the same reason the caller's own
+sites do: the helper resolves `&mut JvmThread` through `jit_thread_mut()`, and
+the `!has_dispatch` fast entry never sets that TLS.
+
+### 8.2 That it engages, and what it costs
+
+Not inferred from a stopwatch — the refusal census says it directly:
+
+```
+TYPECHECK=0   [ir] inline-plan SpliceCastProbe.step(II)I:  (no spliced bodies)
+TYPECHECK=1   [ir] inline-plan SpliceCastProbe.step(II)I: 2 site(s), 2 spliced
+                                                          bodies, 21 bytes appended
+              [ir] spliced 2 callee bodies into SpliceCastProbe.step(II)I
+```
+
+Both callees, and the `checkcast/instanceof` refusal for them disappears from
+the IR-mode resolver while remaining for the single-pass one, which still has
+no arm for either opcode.
+
+Interleaved, order-flipped, 14 paired rounds, `CRATONVM_C2_ACCEPT=always`,
+4 000 000 reps, Windows dev box, checksum `164255232` on every sample and
+matching Temurin JDK 25:
+
+| | median | |
+|---|---|---|
+| off | 209 ms | one mode |
+| on | 184.5 ms | **−11.7 %, faster in 11 of 14 paired rounds** |
+
+The ON arm has two modes and §7's tier race is why: 8 runs at ~180 ms (the
+optimizing body with the splice installed) and 6 at ~207 ms (the single-pass
+body, indistinguishable from the OFF arm). Against the OFF median the fast
+mode alone is **−14.1 %**. Nothing here is a claim about the race, which §7
+already flagged as untouched and which this work does not touch either.
+
+### 8.3 Why it is off anyway
+
+Soak-clean: `tools/jit-flag-soak.sh` over the 39 deterministic workloads in
+`vm/tests/resources/cratonvm`, under Generational, G1 and ZGC —
+`divergent=0 nondeterministic=0` in all three.
+
+What is missing is the one thing `getstatic` never had to answer. **A spliced
+type check is the first spliced site that can THROW on a value the caller
+produced.** `bench/SpliceCastThrow.java` drives the failing cast, the null
+that must pass the cast and then fail the deref, and the `instanceof` that
+must answer false, all from inside a relocated body; both arms agree with each
+other exactly (`-1589077594` on 300 000 reps, TYPECHECK=0 and =1), so the
+splice is semantics-preserving on this shape.
+
+It does NOT agree with Temurin (`-1521462424`), and that gap is **not this
+feature's**: it is there with the switch off, on the single-pass body, and it
+survives folding the exception message out of the checksum. Something about
+this VM's behaviour on that probe differs from HotSpot's independently of
+splicing. Until that is chased down there is no clean end-to-end
+exception-path parity to point at, and a switch whose novel risk is exactly
+the exception path does not get flipped on without one.
+
+So: the plumbing is here, the soak is clean, the measurement is real, and the
+default stays OFF until the probe above can be checksum-compared against
+HotSpot rather than only against itself.
+
+### 8.4 What is next, on the same evidence
+
+`bench/CratonBenchC2.java`'s refusal census was §6's basis for naming
+`checkcast`/`instanceof` next. Of the three reasons it listed —
+`native-shadow`, `ir-splice-target-not-provably-monomorphic`, and
+`checkcast/instanceof` — one is now gone. The other two are what a re-run of
+that census should be read for; **`ir-splice-target-not-provably-monomorphic`
+is the interesting one**, because unlike the three plumbing refusals taken so
+far it is a real modelling question and not a rebase.

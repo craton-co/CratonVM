@@ -1518,6 +1518,22 @@ pub struct IrInlineTables {
     /// SATB pre-barrier that lives on the single-pass `jit_putstatic_*` path.
     /// The resolver refuses it separately so the two sides cannot disagree.
     pub static_field_info: HashMap<usize, (u32, usize, u8, bool)>,
+    /// `pc -> (name_ptr, name_len)` for the `checkcast` (`0xc0`) sites inside
+    /// spliced bodies, rebased into combined-buffer coordinates and merged
+    /// into the builder's own `checkcast_info`.
+    ///
+    /// Same shape and same cause as [`Self::static_field_info`]: the rows were
+    /// resolvable all along and nothing rebased them, so the scanner refused
+    /// every callee containing a type check. The pointee is interned
+    /// PROCESS-WIDE by `intern_typecheck_target`, not owned by this compile --
+    /// the type-check helpers memoize on the `(ptr, len)` pair, so it must not
+    /// be recycled for another class when this artifact is freed.
+    pub checkcast_info: HashMap<usize, (usize, usize)>,
+    /// `pc -> (name_ptr, name_len)` for the `instanceof` (`0xc1`) sites inside
+    /// spliced bodies. Same shape and same reason as [`Self::checkcast_info`];
+    /// separate because the builder keys the two arms separately and a method
+    /// may contain both.
+    pub instanceof_info: HashMap<usize, (usize, usize)>,
 }
 
 /// The builder's state for one splice in progress.
@@ -5599,6 +5615,8 @@ impl IrBuilder {
             ldc_info,
             ldc2w_info,
             static_field_info,
+            checkcast_info,
+            instanceof_info,
         } = tables;
         self.inline_sites.extend(sites);
         self.field_info.extend(field_info);
@@ -5616,6 +5634,12 @@ impl IrBuilder {
         // `getstatic` sites, keyed by its own pcs, and a spliced body's pcs are
         // combined-buffer pcs at or past `code_len`.
         self.static_field_info.extend(static_field_info);
+        // Same merge and same disjointness argument again: `set_checkcast_info`
+        // / `set_instanceof_info` have already installed the caller's own type
+        // checks under the caller's own pcs, and a spliced body's pcs are
+        // combined-buffer pcs at or past `code_len`.
+        self.checkcast_info.extend(checkcast_info);
+        self.instanceof_info.extend(instanceof_info);
     }
 
     /// How many splices [`Self::build`] performed. Diagnostic only.
@@ -10661,6 +10685,43 @@ pub fn ir_splice_getstatic_enabled() -> bool {
     })
 }
 
+/// May a spliced callee body contain a `checkcast` or an `instanceof`?
+/// **Default OFF**; `CRATONVM_JIT_IR_SPLICE_TYPECHECK=1` lifts the
+/// `checkcast/instanceof` refusal.
+///
+/// The same shape as [`ir_splice_getstatic_enabled`], and named as the next
+/// one to take by
+/// `docs/internal/performance/c2-splice-getstatic-and-the-calls-it-left-behind-20260909.md`
+/// §5: every typed read out of an untyped container is a `checkcast`, so on
+/// framework code the refusal falls on more callees than `getstatic` did.
+/// `IrBuilder` has had both arms (`Op::CheckCast`, `Op::InstanceOf`) since
+/// cov-05; what was missing is again a rebase.
+///
+/// Read by BOTH halves, with the same hazard as its two siblings: the splice
+/// scanner in `jit_bridge` decides whether to admit such a callee, and
+/// [`IrInlineTables::checkcast_info`] / [`IrInlineTables::instanceof_info`]
+/// carry the rows the builder's `0xc0` / `0xc1` arms then look up. Neither
+/// half may be flipped alone.
+///
+/// # Why it is off
+///
+/// `getstatic` landed on because it had a measurement. This has the plumbing
+/// and not yet the soak, and it is the more invasive of the two: a spliced
+/// type check is the first spliced site that can THROW on a value the caller
+/// produced (`ClassCastException`), so the deopt and pending-exception paths
+/// out of a relocated body are exercised by it in a way `getstatic` never
+/// exercised them. Off until that has been soaked on its own.
+pub fn ir_splice_typecheck_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPLICE_TYPECHECK").as_deref(),
+            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+        )
+    })
+}
+
 pub fn ir_scalar_intrinsics_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -11576,6 +11637,75 @@ mod tests {
         assert!(
             without_rows.build(&code, 4).is_none(),
             "with no row the builder must bail the METHOD -- that is the failure              mode the resolver's admission has to stay in step with",
+        );
+    }
+
+    /// A spliced `checkcast` resolves through `IrInlineTables::checkcast_info`,
+    /// and a MISSING row bails the whole method.
+    ///
+    /// The negative half is the load-bearing one, for the same reason it is in
+    /// the `getstatic` test above: with `ir-unresolved-class-trap` off (its
+    /// default) the builder's `0xc0` arm bails the METHOD on a missing row, so
+    /// a resolver that admitted such a callee without rebasing its rows would
+    /// cost the caller its whole IR compile -- and from outside that is
+    /// indistinguishable from a workload with no type check in it.
+    #[test]
+    fn a_spliced_checkcast_resolves_through_the_rebased_rows() {
+        // Caller: `static Object f(Object o) { return g(o); }`
+        //   pc 0  aload_0
+        //   pc 1  invokestatic #1   (spliced)
+        //   pc 4  areturn
+        // Callee `static Object g(Object o) { return (Box) o; }`, relocated to
+        // combined pc 6:
+        //   pc 6  aload_0
+        //   pc 7  checkcast #2
+        //   pc 10 areturn
+        let code = [
+            0x2a, 0xb8, 0x00, 0x01, 0xb0, 0x00, // caller, code_len 5
+            0x2a, 0xc0, 0x00, 0x02, 0xb0, // relocated callee at [6, 11)
+            0, 0,
+        ];
+        let site = IrInlineSite {
+            base: 6,
+            code_len: 5,
+            num_args: 1,
+            max_locals: 1,
+            arg_local_slots: vec![0],
+            returns_value: true,
+            receiver_is_arg0: false,
+            method_key: "P.g:(Ljava/lang/Object;)Ljava/lang/Object;".to_string(),
+            class_id: 7,
+        };
+        // A stable, non-dangling `(ptr, len)` -- the shape
+        // `intern_typecheck_target` hands the rebase.
+        static TARGET: &str = "P$Box";
+        let entry = (TARGET.as_ptr() as usize, TARGET.len());
+
+        let mut with_rows = IrBuilder::new(1, 2);
+        let mut tables = IrInlineTables::default();
+        tables.sites.insert(1, site.clone());
+        // The row `append_ir_inline_site` rebases: CALLEE pc 1 + base 6.
+        tables.checkcast_info.insert(7, entry);
+        with_rows.apply_inline_tables(tables);
+        let graph = with_rows
+            .build(&code, 5)
+            .expect("a spliced checkcast with its row must build");
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::CheckCast { name_ptr, .. } if name_ptr == entry.0)),
+            "the spliced `checkcast` must lower to an Op::CheckCast naming the rebased target, not bail the method",
+        );
+
+        // Same site, same bytes, no row.
+        let mut without_rows = IrBuilder::new(1, 2);
+        let mut bare = IrInlineTables::default();
+        bare.sites.insert(1, site);
+        without_rows.apply_inline_tables(bare);
+        assert!(
+            without_rows.build(&code, 5).is_none(),
+            "with no row the builder must bail the METHOD -- that is the failure mode the resolver's admission has to stay in step with",
         );
     }
 
