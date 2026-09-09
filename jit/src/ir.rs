@@ -1508,6 +1508,27 @@ struct SpliceFrame {
     saved_locals: Vec<NodeId>,
     saved_stack: Vec<NodeId>,
     returns_value: bool,
+    /// This body has more than one reachable `return`, so a `return` is NOT a
+    /// splice exit: it is an edge into the continuation built at [`Self::end`].
+    /// Decided once, by the pre-scan in [`IrBuilder::build`], from the same
+    /// verified decode the merge targets come from — never from the walk,
+    /// which meets the returns one at a time and cannot know it is at the last.
+    multi_return: bool,
+    /// One `(ctrl, mem, value)` per `return` the walk has reached, in walk
+    /// order. `value` is [`NO_NODE`] for a `void` callee.
+    ///
+    /// The caller's locals and operand stack need no entry here: they are
+    /// saved above and are the same on every path out of the callee, because
+    /// the callee cannot reach them.
+    exits: Vec<(NodeId, NodeId, NodeId)>,
+    /// Combined-buffer pc of the last `return` recorded in [`Self::exits`].
+    ///
+    /// The continuation's `Merge` and `Phi`s are stamped with this rather than
+    /// with `end`: `end` is one PAST the body, so `spliced_ranges` would
+    /// resolve it to the caller and `resume_bci` would stop rewriting these
+    /// nodes to the enclosing `invoke`. See [`IrInlineSite`] on the two
+    /// meanings of `bytecode_pc`.
+    exit_bci: usize,
 }
 
 /// Hard cap on inline-scope chain length.
@@ -4593,6 +4614,11 @@ pub struct IrBuilder {
     /// walk is inside a relocated callee body, which is what suppresses merge
     /// activation, the reachability skip and safepoint recording.
     splice: Vec<SpliceFrame>,
+    /// `IrInlineSite::base` of every admitted body with more than one reachable
+    /// `return`. Filled by the pre-scan in [`Self::build`] and read once, by
+    /// [`Self::begin_splice`]. Empty unless `CRATONVM_JIT_IR_SPLICE_MULTI_RETURN=1`
+    /// — and without it the scanner has admitted no such body either.
+    splice_multi_return: HashSet<usize>,
     /// Diagnostic-only: how many splices this build performed, for the
     /// `[ir] spliced` line. Never read by lowering.
     splices_done: usize,
@@ -4922,6 +4948,7 @@ impl IrBuilder {
             indy_trap_sites: HashMap::new(),
             inline_sites: HashMap::new(),
             splice: Vec::new(),
+            splice_multi_return: HashSet::new(),
             splices_done: 0,
             splice_local: HashSet::new(),
             splice_tainted: HashSet::new(),
@@ -5694,12 +5721,16 @@ impl IrBuilder {
 
         let saved_locals = std::mem::replace(&mut self.locals, callee_locals);
         let saved_stack = std::mem::take(&mut self.stack);
+        let multi_return = self.splice_multi_return.contains(&base);
         self.splice.push(SpliceFrame {
             return_pc: pc + instr_len,
             end,
             saved_locals,
             saved_stack,
             returns_value,
+            multi_return,
+            exits: Vec::new(),
+            exit_bci: pc,
         });
         self.splices_done += 1;
         // A callee body in the graph is the transform that makes every other
@@ -5788,6 +5819,120 @@ impl IrBuilder {
             // The sets are scoped to one outermost splice: node ids from a
             // closed region can never be a later region's store target, and
             // keeping them would only grow.
+            self.splice_local.clear();
+            self.splice_tainted.clear();
+        }
+        Some(frame.return_pc)
+    }
+
+    /// A `return` inside an open splice.
+    ///
+    /// For a body with one `return` this IS the splice exit and the v1 fast
+    /// path stands: restore the caller's frame, push the value, resume after
+    /// the `invoke`.
+    ///
+    /// For a body with several, a `return` is an *edge* rather than an exit —
+    /// the walk has to keep going, because the other returns and the code that
+    /// reaches them are still ahead of it in the relocated buffer. The edge's
+    /// `(ctrl, mem, value)` is parked on the frame, `ctrl` goes dead, and the
+    /// walk steps to the next instruction exactly as it does after any
+    /// unconditional transfer. Whatever follows is either a branch target —
+    /// whose merge the branch itself created, and whose activation restores
+    /// `ctrl` — or genuinely unreachable, and the walk's own "reachable code
+    /// must have a control token" net refuses the method.
+    ///
+    /// Returns the pc to continue at, or `None` to refuse the method.
+    fn splice_return(&mut self, value: Option<NodeId>, pc: usize) -> Option<usize> {
+        if !self.splice.last()?.multi_return {
+            return self.end_splice(value);
+        }
+        let ctrl = self.ctrl_opt()?;
+        let mem = self.mem;
+        // `NO_NODE` for a `void` callee: `returns_value` decides whether the
+        // continuation reads this column at all, so a placeholder here is
+        // never a value anything can name.
+        let val = if self.splice.last()?.returns_value {
+            value?
+        } else {
+            NO_NODE
+        };
+        let frame = self.splice.last_mut()?;
+        frame.exits.push((ctrl, mem, val));
+        frame.exit_bci = pc;
+        self.ctrl = NO_NODE;
+        Some(pc + 1)
+    }
+
+    /// Close a multi-return splice: join its recorded exit edges and hand the
+    /// result back to the caller.
+    ///
+    /// Called when the walk reaches `end` — one past the callee's last
+    /// bytecode, which is a `return` by the scanner's own admission rule, so
+    /// every edge is already in.
+    ///
+    /// The join is built by hand rather than through [`Self::ensure_merge`] /
+    /// [`Self::activate_merge`] for two reasons. The `merges` map is keyed by
+    /// pc, and `end` is the `base` of whatever body `lib.rs` appended next —
+    /// so a continuation keyed there would collide with that body's own
+    /// merge at its pc 0 (a `while` starting at the top of a method makes one).
+    /// And the merge machinery phis the locals and operand stack, which here
+    /// are the *callee's*, about to be thrown away: every phi it built would be
+    /// dead on arrival.
+    ///
+    /// What does need a phi is the memory token and the returned value, and
+    /// only where the edges disagree.
+    fn finish_multi_return_splice(&mut self) -> Option<usize> {
+        let frame = self.splice.pop()?;
+        if frame.exits.is_empty() {
+            return None;
+        }
+        let bci = frame.exit_bci;
+
+        let ctrls: Vec<NodeId> = frame.exits.iter().map(|&(c, _, _)| c).collect();
+        let ctrl = if ctrls.len() == 1 {
+            ctrls[0]
+        } else {
+            // A merge inside a relocated body disqualifies this artifact from
+            // the optimizing OSR door, for the same unfixed reason an ordinary
+            // spliced merge does. See `SPLICED_MERGE_SEEN`.
+            note_spliced_merge();
+            MULTI_RETURN_SPLICES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            MULTI_RETURN_EDGES.fetch_add(ctrls.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            self.graph
+                .add(Op::Merge, IrType::Control, ctrls, Some(bci))
+        };
+        self.ctrl = ctrl;
+
+        let mems: Vec<NodeId> = frame.exits.iter().map(|&(_, m, _)| m).collect();
+        if mems.iter().any(|&m| m != mems[0]) {
+            let mut inputs = vec![ctrl];
+            inputs.extend_from_slice(&mems);
+            self.mem = self
+                .graph
+                .add(Op::Phi, IrType::Memory, inputs, Some(bci));
+        } else {
+            self.mem = mems[0];
+        }
+
+        self.locals = frame.saved_locals;
+        self.stack = frame.saved_stack;
+        if frame.returns_value {
+            let vals: Vec<NodeId> = frame.exits.iter().map(|&(_, _, v)| v).collect();
+            if vals.iter().any(|&v| v == NO_NODE) {
+                return None;
+            }
+            let joined = if vals.iter().any(|&v| v != vals[0]) {
+                let mut inputs = vec![ctrl];
+                inputs.extend_from_slice(&vals);
+                let ty = self.phi_data_type(&inputs);
+                self.graph.add(Op::Phi, ty, inputs, Some(bci))
+            } else {
+                vals[0]
+            };
+            self.push(joined);
+        }
+
+        if self.splice.is_empty() {
             self.splice_local.clear();
             self.splice_tainted.clear();
         }
@@ -6602,10 +6747,11 @@ impl IrBuilder {
         // target only handler code can reach, which would leave an input-less
         // control node in the graph.
         //
-        // Bodies with more than one `return`, or a `return` anywhere but the
-        // last instruction, are still refused — by the scanner, independently
-        // of this (`ir-splice-not-single-trailing-return`). Merging several
-        // returns into one continuation is the next increment, not this one.
+        // A `return` anywhere but the last instruction is still refused by the
+        // scanner (`ir-splice-not-single-trailing-return`); several returns
+        // that all funnel to a trailing one are admitted under
+        // `ir_splice_multi_return_enabled`, and the loop below is where the
+        // walk learns which bodies those are.
         if ir_splice_branch_enabled() {
             let bodies: Vec<(usize, usize)> = self
                 .inline_sites
@@ -6636,6 +6782,35 @@ impl IrBuilder {
                         self.loop_headers.insert(base + header);
                     }
                 }
+
+                // A body with several `return`s: the walk must NOT leave the
+                // splice at the first one. Decide it here, from the same
+                // verified decode, because the walk meets the returns one at a
+                // time and cannot tell the first from the last.
+                //
+                // Only reachable returns count. An unreachable one is code the
+                // walk never enters, and counting it would put the body on the
+                // continuation path with one exit edge that never arrives —
+                // which `finish_multi_return_splice` would refuse, losing a
+                // body the straight-through path handles fine.
+                if ir_splice_multi_return_enabled() {
+                    let mut reachable_returns = 0usize;
+                    let mut p = 0usize;
+                    while p < body_len {
+                        let Some(decoded) = body_verified.instruction_at(p) else {
+                            return ir_build_bail(line!(), base + p);
+                        };
+                        if body_reachable.contains(&p)
+                            && matches!(body.get(p), Some(0xac..=0xb1))
+                        {
+                            reachable_returns += 1;
+                        }
+                        p = decoded.next_pc as usize;
+                    }
+                    if reachable_returns > 1 {
+                        self.splice_multi_return.insert(base);
+                    }
+                }
             }
         }
 
@@ -6651,6 +6826,20 @@ impl IrBuilder {
             // into whatever `lib.rs` appended next.
             if let Some(frame) = self.splice.last() {
                 if pc >= frame.end {
+                    // A multi-return body ENDS here rather than falling off:
+                    // its last instruction is a `return` (the scanner admits no
+                    // other shape) and that return recorded an edge instead of
+                    // exiting, so `pc` lands exactly on `end` with every edge
+                    // in and `ctrl` dead. Join them and resume the caller.
+                    if frame.multi_return && pc == frame.end && !frame.exits.is_empty() {
+                        match self.finish_multi_return_splice() {
+                            Some(next) => {
+                                pc = next;
+                                continue;
+                            }
+                            None => return ir_build_bail(line!(), pc),
+                        }
+                    }
                     return ir_build_bail(line!(), pc);
                 }
             }
@@ -8640,7 +8829,7 @@ impl IrBuilder {
                     // resumes after the `invoke`. No `Op::Return`, and `ctrl`
                     // stays live.
                     if !self.splice.is_empty() {
-                        match self.end_splice(Some(val)) {
+                        match self.splice_return(Some(val), pc) {
                             Some(next) => {
                                 pc = next;
                                 continue;
@@ -8660,7 +8849,7 @@ impl IrBuilder {
                 0xad => {
                     let val = self.pop();
                     if !self.splice.is_empty() {
-                        match self.end_splice(Some(val)) {
+                        match self.splice_return(Some(val), pc) {
                             Some(next) => {
                                 pc = next;
                                 continue;
@@ -8698,7 +8887,7 @@ impl IrBuilder {
                 0xae | 0xaf => {
                     let val = self.pop();
                     if !self.splice.is_empty() {
-                        match self.end_splice(Some(val)) {
+                        match self.splice_return(Some(val), pc) {
                             Some(next) => {
                                 pc = next;
                                 continue;
@@ -8717,7 +8906,7 @@ impl IrBuilder {
                 // return (void)
                 0xb1 => {
                     if !self.splice.is_empty() {
-                        match self.end_splice(None) {
+                        match self.splice_return(None, pc) {
                             Some(next) => {
                                 pc = next;
                                 continue;
@@ -10361,6 +10550,64 @@ pub fn ir_splice_branch_enabled() -> bool {
             Ok("0") | Ok("false") | Ok("off") | Ok("no")
         )
     })
+}
+
+/// May a spliced callee body have more than one `return`? **Default OFF**;
+/// `CRATONVM_JIT_IR_SPLICE_MULTI_RETURN=1` lifts the
+/// `ir-splice-not-single-trailing-return` refusal.
+///
+/// # Why it is off, given that it works
+///
+/// It works, and it is soak-clean: 39 deterministic workloads under three
+/// collectors with 0 divergence, checksum parity against Temurin JDK 25 on 14
+/// workloads, and a probe built for it (`MultiRet`) where the census reads
+/// `bodies=3 return_edges=8` on and `bodies=0` off.
+///
+/// What it does not do is go faster. Interleaved, order-flipped, 14 rounds on
+/// that probe: **+0.0 % median, faster in 5 of 14 paired rounds.** Splicing
+/// removes a call and adds a merge and a phi, and on this shape those cancel.
+///
+/// Against a neutral measurement there is a real cost on the other side. A
+/// merge built inside a spliced body sets `SPLICED_MERGE_SEEN`, which withholds
+/// the artifact's `ir_osr_entries` — the containment for
+/// `docs/known-issues/ir-osr-entry-miscompiles-a-spliced-merge-20260909.md`.
+/// So turning this on forfeits the optimizing OSR door for every method that
+/// benefits from it, in exchange for nothing measured. It is off until that
+/// entry stub is fixed, at which point the trade is coverage against nothing
+/// and it should be flipped.
+///
+/// Implies [`ir_splice_branch_enabled`] in practice — a second `return` is
+/// only reachable through a branch — and, like it, is read by BOTH halves:
+/// the splice scanner in `jit_bridge`, which decides whether to admit such a
+/// callee, and [`IrBuilder::splice_return`] / [`IrBuilder::finish_multi_return_splice`],
+/// which build the continuation. Admitting a body one half does not understand
+/// is the orphan-node failure STUB-S8 was, so neither may be flipped alone.
+pub fn ir_splice_multi_return_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        ir_splice_branch_enabled()
+            && matches!(
+                cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPLICE_MULTI_RETURN").as_deref(),
+                Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+            )
+    })
+}
+
+/// Spliced callee bodies whose several `return`s were funnelled into one
+/// continuation merge, and how many return edges that took in total. Both are
+/// process-wide and diagnostic only; `interp_census` prints them so "no
+/// multi-return body was ever admitted" is distinguishable from "the feature
+/// is not wired".
+static MULTI_RETURN_SPLICES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MULTI_RETURN_EDGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(bodies, return edges)` — see [`MULTI_RETURN_SPLICES`].
+pub fn multi_return_splice_census() -> (u64, u64) {
+    (
+        MULTI_RETURN_SPLICES.load(std::sync::atomic::Ordering::Relaxed),
+        MULTI_RETURN_EDGES.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 pub fn ir_scalar_intrinsics_enabled() -> bool {

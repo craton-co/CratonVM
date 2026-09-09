@@ -2118,6 +2118,48 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Drop every cached REFERENCE copy, because a collector may have run.
+    ///
+    /// The register file here is a write-through read cache over a frame slot.
+    /// For an `int` that cache never goes stale — nothing but this body writes
+    /// the slot. For a reference it does: a moving collector rewrites the slot
+    /// under a frame it did not stop, and it cannot rewrite a copy in a
+    /// register no oop map names. Reading that copy afterwards dereferences the
+    /// object's OLD address, which is the failure class
+    /// `fix/netty-close-ordering-20260905` was.
+    ///
+    /// So every point at which control can leave this body and come back drops
+    /// the copies, and the next read reloads the word the collector updated.
+    /// `except` is the node the site itself just defined — an `Op::Call`'s
+    /// result is produced AFTER the collection, so it is fresh, and dropping it
+    /// would take back the one promotion a call site can offer.
+    ///
+    /// Cheap enough to be unconditional in shape: the loop runs over the nodes
+    /// that actually hold a register (`gp_reg_owner` is five wide), not over
+    /// the graph.
+    fn invalidate_ref_residency(&mut self, except: Option<NodeId>) {
+        if !ir_ref_residency_enabled() {
+            return;
+        }
+        for slot in 0..self.gp_reg_owner.len() {
+            let Some(owner) = self.gp_reg_owner[slot] else {
+                continue;
+            };
+            if Some(owner) == except {
+                continue;
+            }
+            if self.graph.nodes.get(owner as usize).map(|n| n.ty) != Some(IrType::Ref) {
+                continue;
+            }
+            if let Some(cell) = self.gp_reg_live.get_mut(owner as usize) {
+                if *cell {
+                    *cell = false;
+                    REF_RESIDENCY_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
     /// The `imm32` this operand denotes, if it is an integer constant that
     /// fits one.
     ///
@@ -4737,6 +4779,15 @@ impl<'a> Lowerer<'a> {
         // IR safepoint poll -- tolerated on an overflowed buffer; see
         // `Self::patch_or_bail` / `patch_rel32_to_here`.
         Self::patch_or_bail(&mut self.buf, clear_patch, rel);
+        // The poll is the one GC point that is not a node, so the node loop's
+        // invalidation cannot see it. It is also the one that MATTERS most for
+        // a loop-carried reference: a back edge polls every iteration, and a
+        // collection there rewrites the home word under a register copy made
+        // before it. Invalidating unconditionally -- on the merge of the taken
+        // and not-taken paths, not inside the taken branch -- is correct
+        // because the two paths must agree about what is readable from a
+        // register afterwards, and the fast path pays only a bookkeeping bit.
+        self.invalidate_ref_residency(None);
     }
 
     /// `emit_safepoint_map` at the current spill watermark, reporting whether
@@ -5286,8 +5337,24 @@ impl<'a> Lowerer<'a> {
         // The level-2 detour is a no-op unless a machine-level flag is on; see
         // `lower_data_node_through_mir`, which falls through to the per-opcode
         // arm for every node no tile covers.
+        // Hoisted out of the loop deliberately. `ir_ref_residency_enabled` is an
+        // uncached `runtime_var` read, and asking it once per NODE is how
+        // `CRATONVM_DBG_COMPACT_INLINE` came to be 99.1% of all flag reads on a
+        // BigDecimal run -- a cost paid in the DEFAULT configuration, where the
+        // answer is always `false`, for a feature that is off.
+        let ref_residency = ir_ref_residency_enabled();
         for &node_id in &block.nodes {
             self.lower_data_node_through_mir(block_idx, node_id);
+            // Did lowering that node let a collector run? `op_cannot_deopt` is
+            // the allowlist that answers it — every op on it is pure
+            // arithmetic, control, a constant or a parameter, and none of them
+            // emits a call. An op NOT on it invalidates, which is the safe
+            // direction and the reason the question is asked through an
+            // allowlist rather than through `ir_op_is_safepoint` (which is a
+            // model of oop-map publication sites, not of calls).
+            if ref_residency && !op_cannot_deopt(&self.graph.nodes[node_id as usize].op) {
+                self.invalidate_ref_residency(Some(node_id));
+            }
         }
 
         // Emit terminator
@@ -13065,8 +13132,9 @@ fn ir_alu_imm_enabled() -> bool {
 /// Measured with it on, against off, on the same binary: see
 /// `[c2] deopt points` in the exit census.
 /// Let the register file be AUTHORITATIVE for a promoted `Int`/`Long`, instead
-/// of a write-through read cache over the frame — **default OFF**, opt in with
-/// `CRATONVM_JIT_IR_REG_AUTHORITATIVE=1`.
+/// of a write-through read cache over the frame — **default ON** since
+/// 2026-09-09; `CRATONVM_JIT_IR_REG_AUTHORITATIVE=0` restores the write-through
+/// shape, so both arms stay timeable from one binary.
 ///
 /// This is the switch on [`Lowerer::compute_deopt_named_reachable`]. Off, a
 /// value keeps its home store unless it owns its register for the whole method
@@ -13074,20 +13142,33 @@ fn ir_alu_imm_enabled() -> bool {
 /// that can actually happen names it — which is the difference between "a
 /// handful of values in a trap-free kernel" and "ordinary methods".
 ///
-/// Default OFF because the prediction it rests on is the same one
-/// `CRATONVM_JIT_IR_DROP_UNREACHABLE_HOMES` rests on, and that has been off
-/// since it landed for the same reason: the net under a wrong prediction is a
-/// refused compile, which is safe, but the population it newly applies to has
-/// not been soaked. **It does not touch reference values or the GC**: `Ref` is
-/// refused by both droppability predicates exactly as before, so no oop becomes
-/// register-resident and `OopMapEntry` still needs no register bank.
+/// # Why it is on
+///
+/// It landed off, because the prediction it rests on is the same one
+/// `CRATONVM_JIT_IR_DROP_UNREACHABLE_HOMES` rests on and that had been off
+/// since it landed: the net under a wrong prediction is a refused compile,
+/// which is safe, but the population it newly applies to had not been soaked.
+/// It has been now, and the soak is what flipped it rather than the argument:
+///
+/// * `tools/jit-flag-soak.sh` over the 39 deterministic workloads in
+///   `vm/tests/resources/cratonvm`, under Generational, G1 and ZGC —
+///   0 divergent in all three.
+/// * checksum parity against Temurin JDK 25 on 14 workloads across 7 feature
+///   arms — all matching.
+/// * `C2Probe loop 20000`, interleaved and order-flipped, 12 rounds: **−3.7 %
+///   median, faster in 12 of 12 paired rounds**.
+///
+/// **It does not touch reference values or the GC**: `Ref` is refused by both
+/// droppability predicates exactly as before. Reference residency is a separate
+/// switch and a separate answer — see [`ir_ref_residency_enabled`], which is
+/// off because it does not pay, not because it is unsafe.
 pub fn ir_register_authoritative_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
+        !matches!(
             cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_REG_AUTHORITATIVE").as_deref(),
-            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
         )
     })
 }
@@ -13223,6 +13304,92 @@ pub fn ir_aastore_enabled() -> bool {
             Ok("0") | Ok("false") | Ok("off") | Ok("no")
         )
     })
+}
+
+/// References admitted to the GP register file, and cached copies dropped
+/// because a collector could have run since the copy was made.
+///
+/// Read as a pair, and read `dropped == 0` with suspicion: a workload that
+/// promoted references but never invalidated one either has no calls at all or
+/// has an invalidation that is not wired, and only the counter distinguishes
+/// them.
+static REF_RESIDENCY_ADMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REF_RESIDENCY_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(references given a register, cached copies invalidated)`, process-wide.
+pub fn ir_ref_residency_census() -> (u64, u64) {
+    (
+        REF_RESIDENCY_ADMITTED.load(std::sync::atomic::Ordering::Relaxed),
+        REF_RESIDENCY_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// May a REFERENCE be register-resident in this backend? **Default OFF**;
+/// `CRATONVM_JIT_IR_REF_RESIDENCY=1` turns it on.
+///
+/// # What was actually blocking this
+///
+/// The tree's standing answer — `docs/feature-designs/two-backends-decision.md`
+/// step 1, and this file's own bank match — was "`OopMapEntry` has no register
+/// bank, so a collector could neither see nor relocate a reference in a
+/// register". That is a correct statement about a backend whose register file
+/// is AUTHORITATIVE. This one's is not: it is a write-through read cache over a
+/// frame slot, the slot is written at every definition, and `emit_safepoint_map`
+/// publishes that slot. The collector's view was never incomplete. What was
+/// wrong was only the *cached copy*, and only after a collection — a moving
+/// collector rewrites the slot and cannot rewrite the copy.
+///
+/// So the obligation is not "tell the collector about the register". It is
+/// "never read a copy the collector may have invalidated", and
+/// [`Lowerer::invalidate_ref_residency`] discharges it directly. This is the
+/// same shape as the R4 lesson: the blocker was a whole-mechanism proxy
+/// standing in for a per-point question.
+///
+/// # Why the allocator's own rule is not the safety net
+///
+/// `allocate_linear_scan` refuses a reference whose live range covers a
+/// `MachineModel::safepoint`, and this flag lifts that refusal
+/// (`refs_may_cross_safepoints`). It has to: that model is built from
+/// `ir_op_is_safepoint`, a model of *oop-map publication* sites, and this
+/// backend also emits plain helper calls at ops that are not on that list —
+/// `Op::Load` reaching `jit_getfield` is one, `Op::Store` reaching
+/// `jit_putfield_object` another. Leaning on it would have been leaning on an
+/// under-approximation. The invalidation instead asks an ALLOWLIST
+/// (`op_cannot_deopt`): an op nobody has classified invalidates, so an op added
+/// to `Op` later is safe by default. A false invalidation costs a reference its
+/// register between two instructions; a false omission is a stale oop, which is
+/// heap corruption, so the polarity is the whole design.
+///
+/// Default OFF until the GC soak suites have run against it — the failure it
+/// risks is silent and the flag is how both arms are timed from one binary.
+fn ir_ref_residency_enabled() -> bool {
+    matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_REF_RESIDENCY").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
+}
+
+/// May a promoted reference's live range CROSS a safepoint? **Default ON**
+/// (within `ir-ref-residency`, which is itself off); `-ir-ref-residency-cross-safepoint`
+/// restricts promotion to ranges with no safepoint in them at all.
+///
+/// The two are worth separating because they cost different things, and the
+/// difference is not a detail — it is the whole result. Crossing admits the
+/// shapes that matter (a loop-carried node pointer, an array base held over a
+/// call) but the allocator then RESERVES a register for the whole range while
+/// `invalidate_ref_residency` makes the copy unreadable for most of it, so the
+/// promotion can cost a register without buying a single avoided reload.
+/// Restricting to safepoint-free ranges gives the register back wherever the
+/// copy would have been dead anyway.
+///
+/// Which one wins is a question about the workload's shape and is answered by
+/// measurement; see `docs/feature-designs/two-backends-decision.md`.
+fn ir_ref_residency_cross_safepoint_enabled() -> bool {
+    !matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_REF_RESIDENCY_CROSS_SAFEPOINT")
+            .as_deref(),
+        Ok("0") | Ok("false") | Ok("off") | Ok("no")
+    )
 }
 
 /// Block-exit edges that became a real fall-through because the layout already
@@ -14363,6 +14530,15 @@ fn ir_lower_machine_model(
         .map(|s| s.reg)
         .collect();
     let mut model = crate::regalloc::MachineModel::for_graph(graph, schedule, live, regs);
+    // Reference residency. The allocator's own rule — no reference may hold a
+    // register across a safepoint — is the right default for a backend whose
+    // register file is authoritative. This one's is a write-through read cache
+    // over a frame slot the oop map DOES name, so the collector's view is
+    // complete without it and the obligation this lifts is discharged instead
+    // by `invalidate_ref_residency`, which drops the cached copy at every point
+    // a collector could have run. See `ir_ref_residency_enabled`.
+    model.refs_may_cross_safepoints =
+        ir_ref_residency_enabled() && ir_ref_residency_cross_safepoint_enabled();
 
     // `MachineModel::clobbered_at` binary-searches by position, so the list
     // must stay sorted AND hold one entry per position. Merge through a map
@@ -14722,6 +14898,23 @@ fn plan_register_residency(
             (RegClass::Gp, Some(IrType::Int) | Some(IrType::Long))
                 if IR_LOWER_LS_GPRS.contains(&reg.num) =>
             {
+                true
+            }
+            // A REFERENCE, under `CRATONVM_JIT_IR_REF_RESIDENCY`. Read the
+            // paragraph above and then this one: what that paragraph states is
+            // the obligation, and the obligation is discharged rather than
+            // waived. The home word is still written at the definition (a
+            // `Ref` is refused by `value_home_droppable` and
+            // `phi_home_droppable` exactly as before), so `emit_safepoint_map`
+            // publishes a slot the collector can read AND update; the register
+            // is a copy, and `invalidate_ref_residency` drops it at every point
+            // a collector could have run, so the next read reloads the word the
+            // collector just rewrote. No reference is ever a root the map does
+            // not name, and `OopMapEntry` needs no register bank.
+            (RegClass::Gp, Some(IrType::Ref))
+                if ir_ref_residency_enabled() && IR_LOWER_LS_GPRS.contains(&reg.num) =>
+            {
+                REF_RESIDENCY_ADMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 true
             }
             _ => {
@@ -22693,6 +22886,58 @@ mod tests {").next().unwrap_or(src);
              vacuous"
         );
         let _ = doubled;
+    }
+
+    /// The GP half of the same invariant, at its DEFAULT.
+    ///
+    /// The bank match in `plan_register_residency` names
+    /// `a_reference_is_never_promoted_into_the_gp_file` as what pins it, and
+    /// until 2026-09-09 the name pointed at nothing. It does now, and it pins
+    /// the DEFAULT rather than an absolute: `CRATONVM_JIT_IR_REF_RESIDENCY=1`
+    /// admits a reference deliberately, and `invalidate_ref_residency` is what
+    /// it owes for that. With the flag at its default the answer must be the
+    /// old one, whatever else has changed around it.
+    #[test]
+    fn a_reference_is_never_promoted_into_the_gp_file() {
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+            receiver_param: None,
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let obj = graph.add(Op::Param(0), IrType::Ref, vec![start], Some(0));
+        // Two reads of `obj`, so `ir_residency_pays_enabled` cannot decline it
+        // for the unrelated reason that a once-read value never repays the
+        // prologue save. Both are `Op::Cmp`, which reaches no helper — so
+        // nothing but the type is keeping this value out of the file.
+        let a = graph.add(Op::Cmp(crate::ir::CmpOp::Ne), IrType::Int, vec![obj, obj], Some(1));
+        let b = graph.add(Op::Cmp(crate::ir::CmpOp::Eq), IrType::Int, vec![obj, obj], Some(2));
+        let sum = graph.add(Op::Add, IrType::Int, vec![a, b], Some(3));
+        let sum2 = graph.add(Op::Add, IrType::Int, vec![sum, sum], Some(4));
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, sum2], Some(5));
+        let _ = mem;
+        let schedule = ir_schedule::schedule(&graph);
+
+        let plan = plan_slots(&graph, &schedule, None);
+        let Some(residency) = plan_register_residency(&graph, &schedule, &plan)
+            .expect("the allocation verifies")
+        else {
+            return;
+        };
+        assert_eq!(
+            residency.gp_reg_of[obj as usize], None,
+            "a reference took a GP register at the DEFAULT setting; the oop map              names frame slots only, so a collector could neither see nor              relocate it, and nothing invalidates the copy"
+        );
+        assert!(
+            residency.gp_reg_of[sum as usize].is_some(),
+            "the int must be promoted, or the assertion above is vacuous"
+        );
     }
 
     /// A value live across a helper call must not keep a caller-saved register.
