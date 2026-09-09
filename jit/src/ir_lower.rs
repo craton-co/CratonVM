@@ -10462,6 +10462,25 @@ impl<'a> Lowerer<'a> {
     /// can reconstruct it. `live.range` gives that check exactly: a value whose
     /// range STARTS before the entry position and extends past it is live-in,
     /// and every such value must be named by the snapshot.
+    /// May a value of this shape be excused from an OSR entry's seeding
+    /// obligation, on the grounds that **the stub can produce it itself**?
+    ///
+    /// One function because there are two duties and they must agree. The
+    /// eligibility test below excuses such a value from "every value live
+    /// across this block start must be named by a local"; the emission loop
+    /// then has to WRITE it. Excusing without emitting is exactly what
+    /// `ir-osr-entry-miscompiles-a-spliced-merge-FIXED-20260909.md` was: the
+    /// two halves were written in different places and agreed only by
+    /// accident, and when the accident ran out a literal loop arm read a frame
+    /// word nothing had written.
+    ///
+    /// Anything added here needs an arm in that emission loop too, and
+    /// `an_osr_entry_emits_every_shape_its_eligibility_test_excuses` fails
+    /// until it has one.
+    fn osr_entry_can_produce(op: &Op) -> bool {
+        matches!(op, Op::Const(_) | Op::ConstF(_))
+    }
+
     fn emit_osr_entry_stubs(&mut self, live: &crate::regalloc::LiveModel) {
         if !ir_osr_entry_enabled() {
             return;
@@ -10554,10 +10573,12 @@ impl<'a> Lowerer<'a> {
             // signature of exactly that. Excusing a constant is right; excusing
             // it without emitting it was the defect.
             let unseedable = (0..live.range.len()).any(|id| {
-                if matches!(
-                    self.graph.nodes.get(id).map(|n| &n.op),
-                    Some(Op::Const(_)) | Some(Op::ConstF(_))
-                ) {
+                if self
+                    .graph
+                    .nodes
+                    .get(id)
+                    .is_some_and(|n| Self::osr_entry_can_produce(&n.op))
+                {
                     return false;
                 }
                 // Cast: an index into the node arena is a `NodeId`.
@@ -10566,10 +10587,12 @@ impl<'a> Lowerer<'a> {
             if unseedable {
                 if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
                     for (id, r) in live.range.iter().enumerate() {
-                        if matches!(
-                            self.graph.nodes.get(id).map(|n| &n.op),
-                            Some(Op::Const(_)) | Some(Op::ConstF(_))
-                        ) {
+                        if self
+                            .graph
+                            .nodes
+                            .get(id)
+                            .is_some_and(|n| Self::osr_entry_can_produce(&n.op))
+                        {
                             continue;
                         }
                         if r.is_some_and(|r| {
@@ -10596,10 +10619,11 @@ impl<'a> Lowerer<'a> {
             // at this point.
             let const_seeds: Vec<NodeId> = (0..live.range.len())
                 .filter(|&id| {
-                    matches!(
-                        self.graph.nodes.get(id).map(|n| &n.op),
-                        Some(Op::Const(_)) | Some(Op::ConstF(_))
-                    ) && live_across(id)
+                    self.graph
+                        .nodes
+                        .get(id)
+                        .is_some_and(|n| Self::osr_entry_can_produce(&n.op))
+                        && live_across(id)
                 })
                 // Cast: an index into the node arena is a `NodeId`.
                 .map(|id| id as NodeId)
@@ -10709,10 +10733,12 @@ impl<'a> Lowerer<'a> {
                 };
                 self.emit_mov_rax_imm64(bits);
                 self.store_abi_reg(RAX, off);
+                // `publish_fp_from_slot`, not an open-coded load, because that
+                // is the function `Op::ConstF`'s own definition calls -- and
+                // because `assigned_xmm`'s contract is that only the publishing
+                // sites read it.
                 if is_fp {
-                    if let Some(dst) = self.assigned_xmm(id) {
-                        self.fp_load(dst, off, is_double);
-                    }
+                    self.publish_fp_from_slot(id, off, is_double);
                 }
             }
 
@@ -10723,7 +10749,43 @@ impl<'a> Lowerer<'a> {
                 self.emit_mov_rax_from_r11_disp((i as i32) * 8);
                 if !self.home_dropped.get(v as usize).copied().unwrap_or(false) {
                     if let Some(off) = self.node_slot.get(v as usize).copied().flatten() {
-                        self.store_abi_reg(RAX, off.get() as i32);
+                        // Cast: a frame offset inside this method's own frame.
+                        let off = off.get() as i32;
+                        self.store_abi_reg(RAX, off);
+                        // -- ...and into its XMM register, when it has one --
+                        //
+                        // The home word is not the whole truth for an FP value.
+                        // `fp_load_value` -- which every FP operand read in the
+                        // body goes through -- takes a value from its RESIDENT
+                        // XMM and never looks at the frame when one exists, and
+                        // an FP definition publishes one: `Op::Param` through
+                        // `publish_fp_from_slot`, every FP arithmetic node
+                        // through `fp_store_value`. Those definitions sit in
+                        // the blocks this stub jumps past.
+                        //
+                        // So this is the constants defect above, in the other
+                        // register file, and it needs neither a splice nor a
+                        // merge to reach: `double f(int n, double k) { double
+                        // a = k*3.0+1.5; ... for (..) s += x*k + a; }` names
+                        // `k` and `a` at the header, both live across it, both
+                        // read from XMMs the entry stub had never written.
+                        // Seeding only the home word left the PREVIOUS frame's
+                        // floating-point registers standing in for them.
+                        //
+                        // A GPR-resident local was already handled below; that
+                        // half was written and this one was not, which is the
+                        // same asymmetry `osr_entry_can_produce` now exists to
+                        // stop repeating.
+                        //
+                        // Reading the word back is safe under this `if`: an FP
+                        // home is never dropped (`value_home_droppable` admits
+                        // `Int` and `Long` alone), so the branch that skips the
+                        // store is not one an FP value can take.
+                        if let Some(ty) = self.graph.nodes.get(v as usize).map(|n| n.ty) {
+                            if matches!(ty, IrType::Float | IrType::Double) {
+                                self.publish_fp_from_slot(v, off, ty == IrType::Double);
+                            }
+                        }
                     }
                 }
                 if let Some(dst) = self.assigned_gpr(v) {
@@ -20907,6 +20969,228 @@ mod tests {").next().unwrap_or(src);
             entered(&[6, 7, 1]),
             Some(7 + 2 * 100 + 3 * 900),
             "i=1,2 take the 100 arm and i=3,4,5 take the 900 arm",
+        );
+    }
+
+    /// **The entered body may not read an XMM register nobody wrote.**
+    ///
+    /// The constants defect above, in the other register file, and reached
+    /// without a merge, a literal arm or a splice:
+    ///
+    /// ```java
+    /// int f(int n) { double a = (double) n; int s = 0;
+    ///                for (int i = 0; i < n; i++) {
+    ///                    s += (int) (a + i);
+    ///                    s += (int) (a + s);
+    ///                }
+    ///                return s; }
+    /// ```
+    ///
+    /// `a` is an ordinary JVM local. It is not a phi -- nothing reassigns it
+    /// in the loop -- so at the header the snapshot names the `Op::I2D` that
+    /// computed it, the eligibility test is satisfied, and the stub seeds it.
+    /// Seeded into its HOME WORD, which was the whole of the seeding: and an
+    /// FP definition does not stop at the home word. `fp_store_value` copies
+    /// the result into the value's assigned XMM and marks it resident, after
+    /// which every reader in the body takes the REGISTER (`fp_load_value` ->
+    /// `resident_xmm`) and never looks at the frame again. The stub jumps past
+    /// that definition, so the body read whatever floating-point register the
+    /// previous frame happened to leave behind.
+    ///
+    /// **Observable on Windows only, and that is a property of the defect
+    /// rather than of the test.** A value is register-resident across a
+    /// safepoint only if its register survives one, and `IR_PROLOGUE_SAVED` --
+    /// the XMMs this prologue saves -- is `[6, 7]` on Win64 and EMPTY on
+    /// System V, where the ABI makes every XMM volatile. So on Linux every
+    /// register in `IR_LINEAR_SCAN` is caller-saved, an FP value live across
+    /// the safepoint at a loop header is split rather than promoted, and there
+    /// is no stale register for the entry to leave behind. The byte scan below
+    /// is what establishes which of the two a given run is, instead of letting
+    /// System V report a pass it did not earn.
+    ///
+    /// Three details of the fixture are load-bearing, and every one of them
+    /// was found by watching an earlier fixture fail to reproduce:
+    ///
+    /// * `a` read TWICE, because residency is `static_uses >= 2`
+    ///   (`ir_residency_pays_here`, whose loop weighting is default-off). A
+    ///   value read once per trip gets no register, stays in its frame word,
+    ///   and is seeded correctly by the unfixed emitter.
+    /// * the two reads adding `i` and `s`, not `i` twice: GVN merges two
+    ///   `(double) i` conversions into ONE node with two uses of its own, and
+    ///   that one -- defined in the loop, with the shorter range -- takes the
+    ///   register instead of `a`.
+    /// * neither read loop-invariant, because LICM hoists an invariant
+    ///   `(int) a` out of the loop and the hoisted `Op::D2I` is then an
+    ///   unnamed integer live across the header, which the eligibility test
+    ///   refuses outright -- a test that never enters, passing for the wrong
+    ///   reason.
+    ///
+    /// The byte scan below is what turned each of those from a false pass into
+    /// a failure, and it is why this test is worth more than its assertion.
+    #[test]
+    fn an_osr_entry_seeds_the_fp_registers_its_body_reads() {
+        let _osr = OsrEntryForce::on();
+        //  0: iload_0  1: i2d  2: dstore_1        (a = (double) n)
+        //  3: iconst_0 4: istore_3                (s = 0)
+        //  5: iconst_0 6: istore 4                (i = 0)
+        //  8: iload 4 10: iload_0 11: if_icmpge 37   <- header, bci 8
+        // 14: iload_3 15: dload_1 16: iload 4 18: i2d 19: dadd 20: d2i
+        // 21: iadd    22: istore_3
+        // 23: iload_3 24: dload_1 25: iload_3 26: i2d 27: dadd 28: d2i
+        // 29: iadd    30: istore_3
+        // 31: iinc 4,1 34: goto 8  37: iload_3  38: ireturn
+        let code = [
+            0x1a, 0x87, 0x48, 0x03, 0x3e, 0x03, 0x36, 0x04, 0x15, 0x04, 0x1a, 0xa2, 0x00, 0x1a,
+            0x1d, 0x27, 0x15, 0x04, 0x87, 0x63, 0x8e, 0x60, 0x3e, 0x1d, 0x27, 0x1d, 0x87, 0x63,
+            0x8e, 0x60, 0x3e, 0x84, 0x04, 0x01, 0xa7, 0xff, 0xe6, 0x1d, 0xac, 0, 0,
+        ];
+        // The bytecode's own arithmetic, in Rust, so the expected answers are
+        // derived rather than hand-computed: `d2i` truncates toward zero and
+        // `iadd` is 32-bit, which `as i32` and `wrapping_add` reproduce.
+        let expect = |n: i32, a: f64, s0: i32, i0: i32| -> i32 {
+            let (mut s, mut i) = (s0, i0);
+            while i < n {
+                s = s.wrapping_add((a + f64::from(i)) as i32);
+                s = s.wrapping_add((a + f64::from(s)) as i32);
+                i += 1;
+            }
+            s
+        };
+
+        let cm = compile_via_ir(&code, 39, 1, 5).expect("the FP-invariant loop compiles via IR");
+        // The ordinary entry, which never skipped the definition and was always
+        // right. `a` is `(double) n` here, because that is what the method's
+        // own prologue computes.
+        // Cast: both doors hand back RAX, whose low 32 bits are this method's
+        // `int` result; the upper half is not sign-extended, so the comparison
+        // is made on the 32 bits the body actually wrote.
+        assert_eq!(
+            unsafe { cm.try_call(&[5]).expect("test JIT call") } as i32,
+            expect(5, 5.0, 0, 0),
+            "the method-entry door",
+        );
+
+        let Some((_addr, _needed)) = cm.ir_osr_entry_addr(8) else {
+            assert!(
+                cm.ir_osr_entries.is_empty(),
+                "an entry for some other bci while the loop header was refused \
+                 means the eligibility test and the emitter disagree",
+            );
+            return;
+        };
+        // Cast: as above.
+        let entered = |l: &[i64]| unsafe { cm.ir_osr_enter(8, 0, l) }.map(|v| v as i32);
+        // Enter at the header in a state the method could not have reached
+        // from its own entry -- `a` is 2.5, which `(double) n` never produces,
+        // so a stub that leaves the register alone cannot accidentally hold
+        // the right bits. The fraction also makes `d2i`'s truncation part of
+        // the answer, so a register holding SOME double is not enough either.
+        //
+        // SAFETY: the stub builds and tears down its own frame, reads exactly
+        // `locals[0..5]`, and returns the method's `int` result in RAX.
+        // Cast: an IEEE-754 bit pattern into the locals array's word.
+        let locals: [i64; 5] = [6, 2.5f64.to_bits() as i64, 0, 3, 2];
+        assert_eq!(
+            entered(&locals),
+            Some(expect(6, 2.5, 3, 2)),
+            "`a` must come from the XMM this stub seeded, not from whatever              floating-point register the previous frame left behind",
+        );
+        // A second entry, with a DIFFERENT `a`, from a frame the first entry
+        // has just used: a stub that seeds the register once, or that passes
+        // because the right value happened to still be there, fails here.
+        // Cast: as above.
+        let again: [i64; 5] = [4, (-1.75f64).to_bits() as i64, 0, 0, 0];
+        assert_eq!(
+            entered(&again),
+            Some(expect(4, -1.75, 0, 0)),
+            "a second entry must re-seed the register rather than inherit it",
+        );
+
+        // The vacuity guard, LAST: the two entries above are the claim, and
+        // this is the evidence that they were asked anything at all. If the
+        // allocator gave `a` no register there is no stale register to read,
+        // the body loads it from its frame word, and both entries pass on the
+        // unfixed emitter too. This graph builds no `Op::ConstF` and the
+        // stub's other work is integer stores, so a MOVSD inside the stub can
+        // only be the FP publish this test exists to check.
+        let bytes = cm.code_bytes();
+        let (_, stub_off, _) = *cm
+            .ir_osr_entries
+            .first()
+            .expect("the header entry was found above");
+        assert_eq!(cm.ir_osr_entries.len(), 1, "one entry, so one stub to scan");
+        let movsd = |b: &[u8]| b.windows(3).filter(|w| *w == [0xF2, 0x0F, 0x10]).count();
+        let (in_body, in_stub) = (
+            movsd(&bytes[..stub_off as usize]),
+            movsd(&bytes[stub_off as usize..]),
+        );
+        if IR_LOWER_SAVED_XMMS.is_empty() {
+            // System V, where this defect is unreachable. Stated as an
+            // assertion rather than an early `return` with a comment, because
+            // the interesting failure is the day it stops being true: an FP
+            // value that IS resident here, on a platform whose prologue saves
+            // no XMM, is a register the epilogue does not restore -- a
+            // different and worse bug than this one.
+            assert_eq!(
+                in_stub, 0,
+                "an FP value is register-resident across a safepoint on a                  platform whose prologue saves no XMM ({in_body} MOVSD in the                  body): `IR_PROLOGUE_SAVED` and `IR_LINEAR_SCAN` have come                  apart",
+            );
+            return;
+        }
+        assert!(
+            in_stub > 0,
+            "the stub publishes no XMM register ({in_body} MOVSD in the body,              {in_stub} in the stub): the allocator gave `a` none, so this              fixture no longer reproduces the defect it was written for and              must be repaired rather than believed",
+        );
+    }
+
+    /// **Every shape the eligibility test excuses must have an emission arm.**
+    ///
+    /// The mechanical half of `osr_entry_can_produce`'s doc comment. The
+    /// defect it was extracted from was not a wrong predicate -- excusing a
+    /// constant is right -- but two lists in two places that had to agree and
+    /// were only checked by hand. This checks them.
+    ///
+    /// Textual, in the idiom of
+    /// `every_droppable_op_writes_its_home_once_through_store_rax` above: the
+    /// alternative is a runtime scan, and there is nothing to scan at runtime
+    /// -- the failure is a shape that never gets emitted, which is precisely
+    /// the case that produces no node to look at.
+    #[test]
+    fn an_osr_entry_emits_every_shape_its_eligibility_test_excuses() {
+        let src = include_str!("ir_lower.rs");
+        // The FIRST occurrence of each needle is the code; the second is this
+        // test quoting it.
+        let excused_src = src
+            .split("fn osr_entry_can_produce(op: &Op) -> bool {")
+            .nth(1)
+            .expect("`osr_entry_can_produce` is in this file")
+            .split("\n    }")
+            .next()
+            .expect("the function ends");
+        let mut excused = std::collections::BTreeSet::new();
+        collect_op_names(excused_src, &mut excused);
+        assert!(
+            !excused.is_empty(),
+            "the predicate scan found nothing -- `osr_entry_can_produce` \
+             changed shape and this test would now pass vacuously",
+        );
+
+        let emitted_src = src
+            .split("let (bits, is_fp, is_double) = match self.graph.nodes.get(id as usize) {")
+            .nth(1)
+            .expect("the seed emission is in this file")
+            .split("None => continue,")
+            .next()
+            .expect("the match ends");
+        let mut emitted = std::collections::BTreeSet::new();
+        collect_op_names(emitted_src, &mut emitted);
+
+        assert_eq!(
+            excused, emitted,
+            "the OSR entry excuses {excused:?} from being seeded but emits \
+             {emitted:?}. A shape excused and not emitted is a value the \
+             entered body reads out of a frame word nothing wrote -- see \
+             `an_osr_entry_seeds_the_constants_its_merge_arms_read`.",
         );
     }
 

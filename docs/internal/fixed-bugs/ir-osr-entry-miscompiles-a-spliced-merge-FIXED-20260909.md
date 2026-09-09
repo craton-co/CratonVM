@@ -8,6 +8,11 @@ fix. **Retired from** `docs/known-issues/`.
 `an_osr_entry_seeds_the_constants_its_merge_arms_read` and
 `a_spliced_branchy_body_runs_from_both_doors`.
 
+**A sibling was found the same day**, by asking what else the stub jumps past,
+and fixed with it: the seeding wrote home words and left the FP REGISTERS
+stale. See "The same defect in the other register file" below — it is Win64-only
+and it is why this page is worth more than its own bug.
+
 The page's own localisation was **right about where and wrong about what**. It
 is kept below, unedited, because being wrong in a specific enough way to be
 checked is what made the next step cheap — and because the correction is the
@@ -104,6 +109,76 @@ now consistent.
 
 `ir::SPLICED_MERGE_SEEN` and the `cm.ir_osr_entries` withholding it drove are
 gone.
+
+## The same defect in the other register file
+
+The fix above answers "which locations does the entered body read that this
+stub does not write?" with *the home word of a constant*. Asked once, the
+question is worth asking to exhaustion, and the stub's own seeding loop gives a
+second answer.
+
+A named local is seeded by writing the interpreter's word into the value's home
+word — and, when the allocator gave it one, into its GPR. That second clause
+exists because a GPR-resident value is read from its register. **There was no
+third clause for the XMM file**, and an FP definition publishes exactly the same
+way: `Op::Param` through `publish_fp_from_slot`, every FP arithmetic node
+through `fp_store_value`, both marking the register resident, after which
+`fp_load_value` — every FP operand read in the body — takes the register and
+never looks at the frame again. Those definitions are in the blocks the stub
+jumps past.
+
+```java
+int f(int n) { double a = (double) n; int s = 0;
+               for (int i = 0; i < n; i++) { s += (int)(a + i); s += (int)(a + s); }
+               return s; }
+```
+
+`a` is an ordinary local, not a phi — nothing reassigns it in the loop — so the
+snapshot names it, the eligibility test is satisfied, and the stub accepted the
+block and seeded half of it. Entered at the header with `a = 2.5`, the body read
+whatever the previous frame had left in that XMM: **130 where 220 is the answer**
+(`an_osr_entry_seeds_the_fp_registers_its_body_reads`, with the fix removed).
+
+The seeding now publishes an FP local through `publish_fp_from_slot` — the
+function the definition itself calls — and the constant seeding above was moved
+onto the same function rather than open-coding half of it, which also restores
+`assigned_xmm`'s stated contract that only the publishing sites read it.
+
+### Win64 only, and worth stating why
+
+A value is register-resident across a safepoint only if its register survives
+one. `xmm_roles::IR_PROLOGUE_SAVED` — the XMMs `emit_prologue` saves — is
+`[6, 7]` on Win64 and **empty on System V**, where the ABI makes every XMM
+volatile. So on Linux every register in `IR_LINEAR_SCAN` is caller-saved, an FP
+value live across the safepoint at a loop header is split rather than promoted,
+and there is no stale register for an entry to leave behind.
+
+That is not a footnote, it is the reason this took a Windows machine to see.
+Five Java-level and bytecode-level fixtures were built and run on the Linux box
+and every one of them returned the right answer; the residency census said
+`resident=5 (fp=0 gp=5)` each time, and a `SEED local 1 = n7 I2D ty=Double
+xmm=None` dump is what finally named the reason. The same fixture on Windows
+reproduces immediately. **A Linux-only test run cannot see this class of defect
+at all**, which is worth knowing before the next FP register question is
+answered by "the suite is green".
+
+The test says which of the two it is rather than passing quietly: on System V it
+asserts the stub emits NO XMM publish — because an FP value that *were* resident
+there would be a register the epilogue does not restore, a different and worse
+bug — and on Win64 it asserts one is emitted, so the fixture cannot rot into a
+vacuous pass.
+
+### And the check that lets a shape through is now one function
+
+`osr_entry_can_produce` is the single predicate naming the shapes the
+eligibility test excuses from being named by a local. It had been spelled out
+three times. The defect at the top of this page was precisely two such lists
+agreeing by accident, so
+`an_osr_entry_emits_every_shape_its_eligibility_test_excuses` now checks that
+every excused shape has an emission arm — textually, in the idiom of
+`every_droppable_op_writes_its_home_once_through_store_rax`, because the failure
+mode is a shape that never gets emitted and so leaves no node to inspect at
+runtime.
 
 ## Why the containment could come off rather than stay as belt-and-braces
 
