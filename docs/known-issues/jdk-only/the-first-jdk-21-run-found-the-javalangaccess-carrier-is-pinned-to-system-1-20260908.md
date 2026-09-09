@@ -199,7 +199,12 @@ was silently absent.
   a stack trace. Full measurement, and an UNRESOLVED conflict with the
   `--real-jdk` cell recorded above (Linux shows the fallback in BOTH modes,
   Windows recorded `--real-jdk` correct):
-  the-cldr-adapter-sees-5-locales-instead-of-1063-because-jdk-localedata-never-loads-20260909.md
+  ../serviceloader-loadinstalled-finds-nothing-so-every-platform-loader-service-is-empty-20260909.md
+  **CORRECTED the same day:** the cause is NOT `jdk.localedata` failing to
+  load — that module is present and its data is intact. It is
+  `ServiceLoader.loadInstalled` returning NOTHING for every service (the
+  platform-loader lookup), which is what the CLDR adapter uses to find its
+  supplementary metadata. Not a locale defect at all.
 * **The 87-method claim is about the class, not about CratonVM.** Only
   `parkVirtualThread(long)` and `encodeASCII` were observed failing; that the
   other 85 would fail the same way is a prediction from the mechanism, not a
