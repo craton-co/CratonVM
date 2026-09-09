@@ -553,6 +553,32 @@ pub(crate) fn altrace_enabled_vm() -> bool {
     *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ALTRACE").is_some())
 }
 
+/// The address set `collect_roots` produced for the collection now running.
+///
+/// `CRATONVM_DBG_ROOT_REMAP_AUDIT` only. The post-GC verifiers can say a frame
+/// slot named an object the cycle did not copy; they cannot say whether the
+/// scan had handed that slot to the collector, and the two verdicts have
+/// nothing in common. "The scan would root it" (re-running the frame's own scan
+/// afterwards) is a proxy that answers about the frame as it is NOW; this
+/// answers about the list the collector was actually given.
+static ROOT_SET_SNAPSHOT: parking_lot::Mutex<Option<rustc_hash::FxHashSet<usize>>> =
+    parking_lot::Mutex::new(None);
+
+/// Record the root set a collection is about to mark from.
+pub fn note_root_set(roots: &[ObjectRef]) {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOT_REMAP_AUDIT").is_none() {
+        return;
+    }
+    let set: rustc_hash::FxHashSet<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
+    *ROOT_SET_SNAPSHOT.lock() = Some(set);
+}
+
+/// `Some(true|false)` when the snapshot is armed and populated, `None` when it
+/// is not -- so a report can say "not measured" rather than "absent".
+pub fn root_set_contains(addr: usize) -> Option<bool> {
+    ROOT_SET_SNAPSHOT.lock().as_ref().map(|s| s.contains(&addr))
+}
+
 pub(crate) fn watch_addr() -> Option<usize> {
     use std::sync::OnceLock;
     static W: OnceLock<Option<usize>> = OnceLock::new();
@@ -2181,6 +2207,13 @@ fn verify_no_stale_refs(
                             frame.local_kind_at(li),
                             heap.map(|h| h.is_heap_addr(addr).is_some()).unwrap_or(false),
                             heap.map(|h| h.collection_count()).unwrap_or(0),
+                        );
+                        // AND WHETHER THE COLLECTOR WAS GIVEN IT. Armed by
+                        // `CRATONVM_DBG_ROOT_REMAP_AUDIT`; `None` prints as
+                        // "not measured" rather than as an absence.
+                        eprintln!(
+                            "POST-GC RECLAIMED-WHILE-HELD LOCAL ^ in_root_set={:?}",
+                            root_set_contains(addr),
                         );
                         // AND WHETHER THE SCAN WOULD PRODUCE IT AT ALL. Re-run
                         // the frame's own root scan -- the very call `roots.rs`
