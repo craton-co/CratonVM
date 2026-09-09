@@ -5140,6 +5140,24 @@ impl GenerationalHeap {
                     }
                 }
                 let is_true_undersized = real_fields.is_some_and(|n| n > num_slots);
+                // A class that declares NO fields at all, probed at any index.
+                //
+                // Split out of the general arm below because that arm's triage
+                // clause -- "a REAL JDK class whose `num_slots` equals
+                // `real_field_count` is NOT benign" -- is VACUOUSLY true here
+                // and reads as an accusation. The clause names an ALIASING
+                // layout: two natives writing and reading different shapes into
+                // one object. A zero-field class has no room for a second
+                // layout, so there is no other writer to disagree with, and the
+                // read can only be a caller-side speculative probe.
+                //
+                // MEASURED: `java/nio/Bits$1` (`real_field_count=Some(0)`,
+                // `num_slots=0`) fired this once per boot from
+                // `buffer_pool_get_name`, on runs that then passed 12/12, and
+                // it was filed as the lead on an unrelated SIGSEGV minutes
+                // later. That probe is fixed at its caller; this arm is so the
+                // NEXT one is not read the same way.
+                let declares_no_fields = num_slots == 0 && real_fields == Some(0);
                 if is_true_undersized {
                     tracing::error!(
                         target: "cratonvm::gc::guard",
@@ -5152,6 +5170,28 @@ impl GenerationalHeap {
                         "gen_heap::get_field: out-of-bounds field read dropped \
                          (undersized object layout — class declares more fields \
                          than the object was allocated with)",
+                    );
+                } else if declares_no_fields {
+                    tracing::warn!(
+                        target: "cratonvm::gc::guard",
+                        obj = ?obj_ref.as_ptr(),
+                        index,
+                        num_slots,
+                        class_id = ?header.class_id,
+                        class_name = %class_name,
+                        real_field_count = ?real_fields,
+                        "gen_heap::get_field: out-of-bounds field read dropped \
+                         (caller used slot index past receiver's layout). This \
+                         class declares NO fields at all, so it cannot be \
+                         carrying a second, aliasing layout, and the \
+                         `num_slots` == `real_field_count` clause of the \
+                         general warning does NOT apply to it: the read is a \
+                         caller-side speculative probe against a receiver that \
+                         does not match, and the null it gets back is the \
+                         answer the caller's own fallback already expects. Fix \
+                         it at the CALLER, by asking the receiver's class \
+                         before reading a slot -- it is not evidence of data \
+                         loss.",
                     );
                 } else {
                     tracing::warn!(
