@@ -1010,7 +1010,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-169 tokens.
+173 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1069,6 +1069,10 @@ export inherited from a parent shell.
 | `g1-verify-forwards-retired` | `CRATONVM_G1_VERIFY_FORWARDS_RETIRED` |
 | `g1-evac-copy-watch` | `CRATONVM_G1_EVAC_COPY_WATCH` |
 | `g1-parallel-evac-shared-dest` | `CRATONVM_G1_PARALLEL_EVAC_SHARED_DEST` |
+| `g1-evac-supply-screen` | `CRATONVM_G1_EVAC_SUPPLY_SCREEN` |
+| `g1-evac-candidate-arena-screen` | `CRATONVM_G1_EVAC_CANDIDATE_ARENA_SCREEN` |
+| `g1-evac-empty-header-grid-proof` | `CRATONVM_G1_EVAC_EMPTY_HEADER_GRID_PROOF` |
+| `g1-ref-write-watch` | `CRATONVM_G1_REF_WRITE_WATCH` |
 | `g1-parallel-evac-resume-dest` | `CRATONVM_G1_PARALLEL_EVAC_RESUME_DEST` |
 | `g1-evac-ref-implausible-refuse` | `CRATONVM_G1_EVAC_REF_IMPLAUSIBLE_REFUSE` |
 | `g1-cleanup-walk` | `CRATONVM_G1_CLEANUP_WALK` |

@@ -104,6 +104,30 @@ reclaimed rather than moved, and `was_vacated` is recording something else), or
 the frame was not in the set the remap walked. Both are testable and neither
 has been tested.
 
+## A sibling with the same shape, in the other tier (added 2026-09-09)
+
+`docs/internal/fixed-suite-bugs/netty/bytebuf-multiplethreads-npe-generational-blocked-wake-jit-remap-FIXED-20260908.md`
+§16 reports the same three-part signature from the COMPILED side: an
+operand-stack entry naming an address a moving young cycle vacated, on a thread
+that had applied that cycle's pointer map, deterministic, moving-only. There it
+is root-caused — the JIT's per-slot oop tracker marks the entry NOT a reference,
+so `collect_live_oop_homes` publishes it on no rewritable channel — with the
+method, the slot and the faulting instruction named.
+
+**That is not this bug**: this workload reports
+`moving-no-jit-frames-live=1203`, so no compiled frame is live and the JIT
+marking gap cannot apply here; these slots are `Value::Object(Some(_))` in
+interpreter frames and are already tagged.
+
+What transfers is where to look. Both are **the most recently pushed operand**
+across a GC-capable call — `stack[0]` eight times out of eight here — and both
+survive a remap that demonstrably ran. If one mechanism explains both, that is
+the shape it has. Its instruments may also be worth borrowing: that page added a
+signal-safe `VACATED REGISTER` scan to the fatal handler and a per-thread record
+of which remap path last ran (`gc_quiescence::note_pointer_map_applied`), which
+is what turned "the remap did not reach this slot" from an inference into a
+printed fact.
+
 ## What is ruled out
 
 * **Not the non-moving sweep.** `[GC] decision histogram: moving=1203

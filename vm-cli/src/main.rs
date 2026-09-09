@@ -6309,6 +6309,29 @@ discarded={bs_d} dropped={bs_x} unrouted={bs_u} enabled={bs_on}"
             // scalar replacement or LICM hoisting no slots has no such region,
             // so a zero word-count against one of those names is a statement
             // about the optimisation rather than about the region.
+            // `[jit-vacated-frame]` census (`CRATONVM_DBG_VACATED_FRAMES`).
+            // `verifiable` is the number that matters: a slot the coverage
+            // machinery claims to describe, still naming an address the last
+            // collection vacated.
+            {
+                let (jv_n, jv_v, jv_per) =
+                    cratonvm_vm::jit::conservative_roots::jit_vacated_frame_census();
+                if jv_n > 0 {
+                    let mut per = String::new();
+                    for (i, name) in
+                        cratonvm_vm::jit::conservative_roots::JIT_VACATED_REGION_NAMES
+                            .iter()
+                            .enumerate()
+                    {
+                        if jv_per[i] > 0 {
+                            per.push_str(&format!(" {name}={}", jv_per[i]));
+                        }
+                    }
+                    eprintln!(
+                        "[GC] jit_vacated_frames: total={jv_n} verifiable={jv_v} by_region:{per}"
+                    );
+                }
+            }
             let (fl_n, fl_sc, fl_rh, fl_ar) = cratonvm_jit::region_extent_census();
             eprintln!(
                 "[GC] jit_frame_region_extents: frames={fl_n} with_scalar_span={fl_sc} \

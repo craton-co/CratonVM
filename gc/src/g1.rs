@@ -223,9 +223,6 @@ fn for_each_flat_object_reference_capped(
         // `max_slots` is the caller's region-derived bound; `usize::MAX` from
         // the uncapped entry point leaves the old behaviour exactly as it was.
         let end = (header.num_slots() as usize).min(max_slots);
-        // Snapshot for the holder report below: the census moving across one
-        // cell read is what identifies THAT read as the corrupt one.
-        let mut census_before = cratonvm_types::cell_census::decoded();
         for index in first_index..end {
             let slot = unsafe { obj_ptr.add(HEADER_SIZE + index * SLOT_SIZE) } as *mut u8;
             // Discriminant-screened: see `heap::read_value_cell_checked`. An
@@ -251,11 +248,29 @@ fn for_each_flat_object_reference_capped(
             // 16-byte-cell arm for it -- and "always exactly 32" is that cap,
             // not a property of the defect.
             //
-            // Keyed on the census counter rather than on the returned `Value`:
-            // a corrupt cell decodes to `Value::Object(None)`, which is also
-            // what a genuine null decodes to, so the value alone cannot tell
-            // them apart. `cell_census::decoded()` moving across this one read
-            // can.
+            // Keyed on THIS CELL'S OWN DISCRIMINANT, not on a counter.
+            //
+            // It used to be keyed on `cell_census::decoded()` moving across the
+            // read, with the reasoning that a corrupt cell decodes to
+            // `Value::Object(None)` and so cannot be told from a genuine null
+            // by its value alone. That reasoning is right and the mechanism was
+            // wrong: `cell_census` is a PROCESS-GLOBAL counter and this walk
+            // runs on every evacuation worker at once, so under
+            // `CRATONVM_G1_WORKERS=16` one worker's corrupt cell moved the
+            // counter that a different worker then attributed to whatever cell
+            // it had just read.
+            //
+            // MEASURED 2026-09-08 (`TestHostConfigAutomaticDeploymentXmlExternalWarXml`,
+            // Linux, -Xmx1g, 16 workers): of 20 grid verdicts in one run, two of
+            // the first three named cells holding `raw0=0x4 raw1=<a heap
+            // pointer>` -- an ordinary, VALID `Value::Object`, one of which the
+            // reference-write watch showed this same pause had just written
+            // itself. The population this family has been counted from is
+            // therefore mixed, and the mixing rate rises with worker count.
+            //
+            // `read_value_checked_atomic`'s own test is `w0 as u32 >
+            // VALUE_MAX_DISCRIMINANT`, over the sixteen bytes already read
+            // here. Applying it directly is exact, thread-local and free.
             //
             // Measured 2026-09-06 on `org.h2.test.store.TestMVStoreTool`
             // (-Xmx256m, G1, `CRATONVM_G1_JIT_MARK_DRIVER=1`): >=32 corrupt
@@ -325,8 +340,9 @@ fn for_each_flat_object_reference_capped(
             // that did not) rather than corrupt cells. If this fires again it
             // means a second producer, and the fields above are what separate
             // it from the one already fixed.
-            if cratonvm_types::cell_census::decoded() != census_before {
-                census_before = cratonvm_types::cell_census::decoded();
+            // SAFETY: the walk read sixteen bytes at `slot` above.
+            let cell_w0 = unsafe { std::ptr::read(slot as *const u64) };
+            if (cell_w0 as u32) > cratonvm_types::VALUE_MAX_DISCRIMINANT {
                 let n = FLAT_WALK_CORRUPT_CELL_HOLDER.fetch_add(1, Ordering::Relaxed) + 1;
                 // Same rate limit as the report below, NOT `n <= 8` alone: `n` is a
                 // RUN-GLOBAL counter, so `n <= 8` samples only the first eight
@@ -338,15 +354,22 @@ fn for_each_flat_object_reference_capped(
                 // the power-of-two samples keeps the instrument alive for the
                 // rest of the run at the same bounded cost.
                 if n <= 8 || n.is_power_of_two() {
-                    let mut pend = PENDING_CORRUPT_HOLDERS.lock();
-                    if pend.len() < 8 {
-                        pend.push((
-                            obj_ptr as usize,
-                            header.class_id.as_u32(),
-                            header.num_slots(),
-                            header.mark_word.load(Ordering::Relaxed),
-                        ));
-                    }
+                    // SAFETY: the walk just read sixteen bytes here.
+                    let (raw0, raw1) = unsafe {
+                        (
+                            std::ptr::read(slot as *const u64),
+                            std::ptr::read((slot as *const u64).add(1)),
+                        )
+                    };
+                    queue_pending_corrupt_holder(
+                        obj_ptr as *mut u8,
+                        header,
+                        slot as usize,
+                        index,
+                        raw0,
+                        raw1,
+                        "corrupt-cell",
+                    );
                 }
                 if n <= 8 || n.is_power_of_two() {
                     // WHICH WALK, and WHAT the header's first word actually is.
@@ -372,18 +395,53 @@ fn for_each_flat_object_reference_capped(
                     // parallel evacuator that produced the 2026-09-05 family.
                     let word0 = (header.class_id.as_u32() as u64)
                         | ((header.num_slots() as u64) << 32);
+                    // SAFETY: the walk read sixteen bytes at `slot` above.
+                    let (raw0, raw1) = unsafe {
+                        (
+                            std::ptr::read(slot as *const u64),
+                            std::ptr::read((slot as *const u64).add(1)),
+                        )
+                    };
                     tracing::warn!(
-                        "[g1] legacy 16-byte-cell walk hit a CORRUPT CELL (#{n}):                          caller={} holder=0x{:x} class_id={} num_slots={} kind={:?}                          header_word0=0x{word0:016x} word0_plausible_ptr={}                          mark=0x{:016x} gc_flags=0x{:x} gc_age={} is_compact={}                          slot_index={index} end={end} -- the cell screen rejected                          this word, so either the holder IS compact and this walk                          chose the wrong arm, or the holder is not an object at all.",
+                        "[g1] legacy 16-byte-cell walk hit a CORRUPT CELL (#{n}):                          caller={} holder=0x{:x} class_id={} num_slots={} kind={:?}                          header_word0=0x{word0:016x} word0_arena_ptr={}                          word0_plausible_ptr_LOOSE={}                          mark=0x{:016x} gc_flags=0x{:x} gc_age={} is_compact={}                          slot=0x{:x} slot_index={index} end={end}                          raw0=0x{raw0:016x} raw1=0x{raw1:016x} raw0_tag={}                          raw0_untagged_is_arena_ptr={} {} -- the cell screen                          rejected this word.",
                         std::panic::Location::caller(),
                         obj_ptr as usize,
                         header.class_id.as_u32(),
                         header.num_slots(),
                         header.kind(),
+                        // THE FIELD THIS REPORT USED TO CARRY WAS THE WRONG TEST.
+                        //
+                        // `word0_plausible_ptr` was
+                        // `cratonvm_types::plausible_heap_pointer(word0)`, which
+                        // asks only non-null / 8-aligned / under 2^47. It answers
+                        // TRUE for `0x0000001200000040` -- an ordinary
+                        // `class_id=64 / num_slots=18` header pair -- and that
+                        // value sits 2157 GiB below any measured arena base.
+                        // `g1-eight-byte-write-at-a-live-objects-base-20260906`
+                        // rests its "19 of 19 holders had word0_plausible_ptr=true"
+                        // on this field; re-taken against the arena bounds the
+                        // refusing screens use, the same population scored 0 of 25.
+                        // The arena test is now first and the loose one is kept
+                        // beside it, renamed so the two can never again be quoted
+                        // as one number.
+                        word_is_arena_pointer(word0),
                         cratonvm_types::plausible_heap_pointer(word0),
                         header.mark_word.load(Ordering::Relaxed),
                         header.gc_flags(),
                         header.gc_age(),
                         cratonvm_types::is_compact_object(header),
+                        slot as usize,
+                        // `raw0 & 3 == 3` is `MARK_FORWARDED`. A corrupt cell
+                        // whose first word is a TAGGED heap pointer and whose
+                        // second word is zero is bit-for-bit the first sixteen
+                        // bytes of a FORWARDED object -- mark word, then a zero
+                        // body word. That is the "read misaligned by 8" horn, and
+                        // it is distinguished from the "8-byte write into a legacy
+                        // cell" horn by `ref_write_watch` below, which says
+                        // whether a collector write actually landed here.
+                        raw0 & 0b11,
+                        word_is_arena_pointer(raw0 & !0b11u64),
+                        ref_write_provenance(slot as usize),
                     );
                 }
             }
@@ -432,7 +490,77 @@ static FLAT_WALK_CORRUPT_CELL_HOLDER: AtomicUsize = AtomicUsize::new(0);
 /// `grid=INTERIOR` says the address was never an object start, the words read
 /// as a header are a neighbour's slots, and there is no header writer at all.
 /// Bounded, because the answer does not get truer after the eighth sample.
-static PENDING_CORRUPT_HOLDERS: Mutex<Vec<(usize, u32, u32, u64)>> = Mutex::new(Vec::new());
+/// One corrupt-cell report, held until a pause body can answer the questions a
+/// free function cannot: is the HOLDER at a real object start, and -- the
+/// question added here -- does the region's own object grid place the CORRUPT
+/// SLOT inside that holder, or inside the object that follows it?
+///
+/// The second question is the discriminator this family has been missing. A
+/// slot the grid places in a NEIGHBOUR means the holder's declared body is
+/// longer than the bytes the allocator gave it, so the walk over-strode and the
+/// "corrupt cell" is the neighbour's header and mark word read as a `Value`
+/// (`raw0 = target | MARK_FORWARDED`, `raw1 = 0` is exactly a forwarded
+/// object's first sixteen bytes). A slot the grid places INSIDE the holder is a
+/// genuine foreign write into a live object's body, which is the defect this
+/// page has been hunting.
+#[derive(Clone, Copy)]
+struct PendingCorruptHolder {
+    holder: usize,
+    class_id: u32,
+    num_slots: u32,
+    mark: u64,
+    /// The cell the screen rejected, and its two raw words as the walk read
+    /// them.
+    slot: usize,
+    slot_index: usize,
+    raw0: u64,
+    raw1: u64,
+    /// `#[track_caller]` location of the WALK that read it.
+    caller: &'static std::panic::Location<'static>,
+    /// Which screen queued this holder. `"corrupt-cell"` is the legacy-cell
+    /// walk's own report; the others are the three holder REFUSALS, which
+    /// until 2026-09-08 produced no grid verdict at all -- so the population
+    /// `g1-eight-byte-write-at-a-live-objects-base-20260906` calls "the genuine
+    /// shape" was the one population never asked whether it was at an object
+    /// start.
+    reason: &'static str,
+}
+
+/// Queue a holder for the end-of-pause grid verdict. Bounded at eight per
+/// drain, like the corrupt-cell path it was factored out of.
+///
+/// `slot`/`raw0`/`raw1` describe the CELL for the corrupt-cell route; for a
+/// holder refusal there is no single cell, so the holder's own first sixteen
+/// bytes are recorded instead -- which is exactly what the refusal is about.
+#[track_caller]
+fn queue_pending_corrupt_holder(
+    holder: *mut u8,
+    header: &ObjectHeader,
+    slot: usize,
+    slot_index: usize,
+    raw0: u64,
+    raw1: u64,
+    reason: &'static str,
+) {
+    let mut pend = PENDING_CORRUPT_HOLDERS.lock();
+    if pend.len() >= 8 {
+        return;
+    }
+    pend.push(PendingCorruptHolder {
+        holder: holder as usize,
+        class_id: header.class_id.as_u32(),
+        num_slots: header.num_slots(),
+        mark: header.mark_word.load(Ordering::Relaxed),
+        slot,
+        slot_index,
+        raw0,
+        raw1,
+        caller: std::panic::Location::caller(),
+        reason,
+    });
+}
+
+static PENDING_CORRUPT_HOLDERS: Mutex<Vec<PendingCorruptHolder>> = Mutex::new(Vec::new());
 
 /// How many holders the parallel reference scan refused because their first
 /// header word is a pointer into the collector's own arena.
@@ -469,6 +597,76 @@ pub static PHASE4_HOLDER_REFUSED: AtomicUsize = AtomicUsize::new(0);
 /// Expected ZERO. `CRATONVM_G1_VERIFY_FORWARDS_RETIRED=1` only.
 pub static UNRETIRED_FORWARDS: AtomicUsize = AtomicUsize::new(0);
 
+/// How many evacuation candidates carried the EMPTY-HEADER shape and were
+/// therefore proved against the region's object grid.
+///
+/// This is the cost side of [`G1Collector::empty_header_is_a_real_object`]: one
+/// linear region walk each. Read it against
+/// [`EVAC_EMPTY_HEADER_REFUSED`] -- a large count here with a zero
+/// there means the shape is common and genuine, and the screen is paying for
+/// nothing.
+pub static EVAC_EMPTY_HEADER_PROVED: AtomicUsize = AtomicUsize::new(0);
+
+/// How many empty-header candidates were WAIVED because this pause had already
+/// spent its grid-proof budget.
+///
+/// Expected to be ZERO on any workload that is not pathological. A non-zero
+/// count means the empty-header shape arrives more than
+/// [`EMPTY_HEADER_PROOF_BUDGET_PER_PAUSE`] times in one pause, so the screen is
+/// no longer covering all of them and the budget is what to raise -- or the
+/// shape is genuine and common, which the ratio to
+/// [`EVAC_EMPTY_HEADER_REFUSED`] says.
+pub static EVAC_EMPTY_HEADER_WAIVED: AtomicUsize = AtomicUsize::new(0);
+
+/// Grid proofs this pause has already paid for; reset at the pause funnel.
+static EMPTY_HEADER_PROOFS_THIS_PAUSE: AtomicUsize = AtomicUsize::new(0);
+
+/// How many O(region) grid walks one pause will pay to prove empty-header
+/// candidates.
+///
+/// The proof is exact and the shape is rare -- 9 to 17 refusals per WHOLE RUN
+/// on the class this was measured against -- but "rare" is a property of a
+/// workload and this is a per-candidate cost on the evacuation path, so it is
+/// bounded rather than trusted. Above the budget the candidate is accepted, as
+/// it was before 2026-09-08: a refusal that is WRONG drops a live reference,
+/// and an unproved candidate is not a proved-bad one.
+const EMPTY_HEADER_PROOF_BUDGET_PER_PAUSE: usize = 64;
+
+/// How many of those the grid said were not object starts.
+///
+/// Expected to be ZERO. Non-zero means a reference slot (or a conservative
+/// root) named the PAYLOAD WORD of a null `Value` cell, whose sixteen bytes
+/// read as a zero-field class-0 object and pass every header screen there is.
+pub static EVAC_EMPTY_HEADER_REFUSED: AtomicUsize = AtomicUsize::new(0);
+
+/// How many evacuation CANDIDATES were refused because their first header
+/// word recombines to a pointer into this collector's arena.
+///
+/// Expected to be ZERO. Non-zero means a reference slot named an address that
+/// is not an object start -- and every one of them, before 2026-09-08, was
+/// followed into `evacuate`, which installed a forwarding mark word eight bytes
+/// into whatever live object actually owned those bytes.
+pub static EVAC_REF_REJECTED_ARENA: AtomicUsize = AtomicUsize::new(0);
+
+/// How many `MARK_FORWARDED` mark words decoded to a target that
+/// [`cratonvm_types::ObjectHeader::make_forwarded`] could never have installed.
+///
+/// Expected to be ZERO, and non-zero is not a degradation to tolerate: the
+/// decoded value is returned to the evacuator as "where this object went", is
+/// STORED into the reference slot being scanned, and is pushed onto the gray
+/// worklist as a holder. See
+/// [`G1Collector::decode_forwarding_target`].
+pub static FORWARD_TARGET_IMPLAUSIBLE: AtomicUsize = AtomicUsize::new(0);
+
+/// How many addresses the three unscreened evacuation SUPPLY routes offered
+/// that are not object starts. See
+/// [`G1Collector::evacuation_supply_is_an_object`].
+///
+/// Expected to be ZERO. A non-zero count is the producer
+/// `g1-eight-byte-write-at-a-live-objects-base-20260906` spent its whole census
+/// looking for on the READ side.
+pub static EVAC_SUPPLY_NON_OBJECT: AtomicUsize = AtomicUsize::new(0);
+
 /// How many compact reference-field offsets were skipped because the resolved
 /// layout places them past the body that same layout declares.
 ///
@@ -484,6 +682,51 @@ fn write_flat_object_reference(slot: *mut u8, raw: usize, compact: bool) {
         let value = Value::Object(Some(unsafe { ObjectRef::from_raw(raw as *mut u8) }));
         unsafe { cratonvm_types::write_value_atomic(slot as *mut Value, value) };
     }
+}
+
+/// [`write_flat_object_reference`], recorded by [`RefWriteWatch`] when the
+/// watch is armed.
+///
+/// Every reference-slot rewrite in this file goes through this or
+/// [`note_ref_write`], so "did a collector write land on this slot" is a
+/// lookup. `#[track_caller]` so the location the watch stores is the WALK's,
+/// which is the only part of the stack that distinguishes the six flat-walk
+/// sites from each other.
+///
+/// `holder_end` is the extent the CALLER believes the holder has. It is
+/// derived from the holder's own header, so it is a circular bound and cannot
+/// by itself prove a write stayed inside a real object -- that is what the
+/// drain's `grid_object_containing` is for. What it does catch, for free, is a
+/// walk whose stride and whose bound disagree.
+#[track_caller]
+#[inline]
+fn write_flat_object_reference_watched(
+    slot: *mut u8,
+    raw: usize,
+    compact: bool,
+    holder: *mut u8,
+    holder_end: usize,
+) {
+    note_ref_write(
+        slot as usize,
+        raw as u64,
+        holder as usize,
+        holder_end,
+        if compact { 8 } else { 16 },
+    );
+    write_flat_object_reference(slot, raw, compact);
+}
+
+/// The extent a walk believes its holder has: `holder + object_total_size`,
+/// saturating, and `0` when the header does not size (which
+/// [`note_ref_write`] reads as "no bound to check").
+#[inline]
+fn holder_extent(obj_ptr: *mut u8, header: &ObjectHeader) -> usize {
+    let size = object_total_size(header);
+    if size < HEADER_SIZE {
+        return 0;
+    }
+    (obj_ptr as usize).saturating_add(size)
 }
 
 #[inline]
@@ -1028,6 +1271,38 @@ struct RegionsBase(*mut G1Region);
 unsafe impl Send for RegionsBase {}
 unsafe impl Sync for RegionsBase {}
 
+/// Whether a followability test may pay for an O(region) grid walk to settle
+/// the EMPTY-HEADER shape.
+///
+/// # Why this is a parameter and not a policy
+///
+/// `empty_header_is_a_real_object` is exact and it is the only thing that can
+/// separate a real zero-field object from the payload word of a null `Value`
+/// cell. It is also a linear region walk, and the two kinds of caller are three
+/// orders of magnitude apart:
+///
+///  * the ROOT routes (`note_root_object_plausibility`, the root-pin scan) and
+///    the three evacuation SUPPLY routes ask once per root / keep-alive entry /
+///    seed -- tens to hundreds per pause, and **every empty-header refusal
+///    measured on 2026-09-08 came from `root-pin-scan`**;
+///  * the two evacuator ENTRY screens ask once per object evacuated. Measured
+///    on the same class: 21 000 - 43 000 empty-header candidates in one run,
+///    against 27 - 46 refusals. Proving those is a per-copy region walk for a
+///    population that is overwhelmingly genuine.
+///
+/// So the entry screens keep the cheap half of the test -- tag bytes, cursor
+/// containment, the class-id band and the arena test -- and leave the grid to
+/// the routes that supply them. That is not a coverage hole: an address only
+/// reaches `evacuate` through a root, a supply route or a reference slot, and
+/// the first two now prove it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GridProof {
+    /// Walk the region's object grid for an empty-header candidate.
+    Yes,
+    /// Do not; this caller is on the per-object path.
+    No,
+}
+
 /// Which end of a holder's region bounds a reference walk.
 ///
 /// See [`G1Collector::holder_walkable_slots_view`] for why the two evacuators
@@ -1079,6 +1354,210 @@ struct CopyWatch {
 /// reproduces it and nothing 'changes'), and an object never copied at all
 /// (never in the ledger, so no checkpoint ever looks at it).
 static COPY_WATCH: std::sync::OnceLock<CopyWatch> = std::sync::OnceLock::new();
+
+/// One reference-slot write the collector made, as [`RefWriteWatch`] records it.
+#[derive(Clone, Copy)]
+struct RefWrite {
+    /// The bytes stored. For `width = 8` this is the raw pointer; for
+    /// `width = 16` it is the `Value` cell's DISCRIMINANT word, which is what a
+    /// later corrupt-cell report reads back and rejects.
+    value: u64,
+    /// The object the walk was walking when it made this write.
+    holder: usize,
+    /// `holder + object_total_size(holder_header)` at write time -- the extent
+    /// the writing walk believed the holder had.
+    holder_end: usize,
+    /// 8 for the compact/array arm's raw pointer store, 16 for a legacy
+    /// `Value` cell. THE WHOLE POINT: the measured corruption is an eight-byte
+    /// quantity where a sixteen-byte cell's first word belongs, so which of the
+    /// two wrote a given slot is the question.
+    width: u8,
+    /// `#[track_caller]` location of the write site.
+    site: &'static std::panic::Location<'static>,
+}
+
+/// `CRATONVM_G1_REF_WRITE_WATCH=1`: every reference-slot write the collector
+/// makes during a pause, keyed by SLOT ADDRESS.
+///
+/// # Why the read side could not answer this
+///
+/// `g1-eight-byte-write-at-a-live-objects-base-20260906` measured 58 corrupt
+/// cells whose first word is a tagged heap pointer and whose second word is
+/// zero, and named two producers it could not distinguish:
+///
+///  1. an 8-byte reference write into a 16-byte legacy cell -- a walk striding
+///     8 bytes over its neighbours stamps word0 of each cell and leaves word1;
+///  2. a READ misaligned by 8 into a forwarded object's mark word, where
+///     `target | MARK_FORWARDED` is followed by a zero body word.
+///
+/// They differ in exactly one observable: whether a collector write actually
+/// landed on that slot. This records the write side so the question is a
+/// lookup rather than an inference. [`CopyWatch`] cannot answer it -- it
+/// records COPIES, and a write into a resident object's body is not one, which
+/// is why it read clean at every checkpoint while holders kept appearing.
+///
+/// A `HashMap` rather than [`CopyWatch`]'s `Vec`: the interesting query is
+/// "who wrote THIS slot", asked once per corrupt cell against a ledger with
+/// hundreds of thousands of entries, and a linear scan of that is minutes.
+/// Last writer wins, which is the one a corrupt read is complaining about.
+struct RefWriteWatch {
+    writes: Mutex<std::collections::HashMap<usize, RefWrite>>,
+    /// Writes whose slot lay outside the holder's own declared body. This is
+    /// the CIRCULAR half of the test (the extent comes from the same header the
+    /// walk took its count from) and so it is expected to be zero even when the
+    /// defect is present; it is here because a non-zero count would name a
+    /// walk whose bound and whose stride disagree, which is free to check.
+    out_of_body: AtomicUsize,
+}
+
+/// The one [`RefWriteWatch`] a run has. `None` unless
+/// `CRATONVM_G1_REF_WRITE_WATCH=1`.
+static REF_WRITE_WATCH: std::sync::OnceLock<RefWriteWatch> = std::sync::OnceLock::new();
+
+/// How many reference-slot writes carried a value whose low three bits are not
+/// clear -- i.e. NOT an object address.
+///
+/// Expected to be ZERO, and it is the counter to read first. See
+/// [`note_ref_write`]'s tripwire.
+pub static REF_WRITE_TAGGED_VALUE: AtomicUsize = AtomicUsize::new(0);
+
+/// Record one reference-slot write, and TRIPWIRE any write whose value is not
+/// an object address.
+///
+/// # The tripwire runs whether or not the watch is armed
+///
+/// It is a mask and a branch on a path that is already storing to memory, and
+/// it is the check that names the defect
+/// `g1-eight-byte-write-at-a-live-objects-base-20260906` measured from the read
+/// side only. Measured 2026-09-08 on
+/// `TestHostConfigAutomaticDeploymentXmlExternalWarXml` (Linux, `-Xmx1g`,
+/// `CRATONVM_G1_WORKERS=16`, `RESUME_DEST=0`): live class-6 objects carrying a
+/// reference slot whose value is `0x78695c60002b` -- an address with
+/// `MARK_FORWARDED` still on it, which is a mark WORD where an object ADDRESS
+/// belongs. Every consumer of such a slot is wrong in a different way: the
+/// evacuation candidate screen refuses it (`verdict=NullOrUnaligned`) and so
+/// leaves a live referent unevacuated, the interpreter degrades it to `null`,
+/// and the JIT dereferences it.
+///
+/// The read side cannot say who produced it, because the value is COPIED along
+/// with its holder by every subsequent evacuation -- the three reports in that
+/// run are one corrupted object and two later copies of it. Only a check at
+/// the write catches the first one.
+///
+/// The ledger below is separate and opt-in
+/// (`CRATONVM_G1_REF_WRITE_WATCH=1`): the arming is a single `OnceLock::get`,
+/// so an unarmed run pays one predictable load per rewritten slot.
+///
+/// `#[track_caller]` all the way down: the caller of interest is the WALK, not
+/// this function and not [`write_flat_object_reference`], so every wrapper
+/// between the two carries the attribute.
+#[track_caller]
+#[inline]
+fn note_ref_write(slot: usize, value: u64, holder: usize, holder_end: usize, width: u8) {
+    // THE TRIPWIRE. An object address is 8-aligned by construction
+    // (`plausible_heap_pointer` is asserted in `make_forwarded` and
+    // `make_inflated`, and every allocator aligns to 8), so a non-zero value
+    // with any low bit set is not one. `| MARK_FORWARDED` (0b11) is the shape
+    // measured; `| MARK_INFLATED` (0b10) would be a monitor pointer and is the
+    // same class of mistake.
+    if value & 0b111 != 0 {
+        let n = REF_WRITE_TAGGED_VALUE.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 16 || n.is_power_of_two() {
+            tracing::warn!(
+                "[g1] a REFERENCE-SLOT WRITE carried a TAGGED value (#{n}): \
+                 slot=0x{slot:x} value=0x{value:016x} low3={} untagged=0x{:x} \
+                 holder=0x{holder:x} holder_end=0x{holder_end:x} width={width} site={} -- \
+                 an object address is 8-aligned, so this is a MARK WORD (or an \
+                 interior/tagged word) being stored where an object reference \
+                 belongs. Whoever reads this slot next reads it as a reference.",
+                value & 0b111,
+                value & !0b111,
+                std::panic::Location::caller(),
+            );
+        }
+    }
+    let Some(w) = REF_WRITE_WATCH.get() else {
+        return;
+    };
+    let rec = RefWrite {
+        value,
+        holder,
+        holder_end,
+        width,
+        site: std::panic::Location::caller(),
+    };
+    if holder != 0
+        && holder_end > holder + HEADER_SIZE
+        && (slot < holder + HEADER_SIZE || slot + width as usize > holder_end)
+    {
+        let n = w.out_of_body.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            tracing::warn!(
+                "[g1][ref-write-watch] a reference write landed OUTSIDE its own holder's \
+                 body (#{n}): slot=0x{slot:x} width={width} value=0x{value:016x} \
+                 holder=0x{holder:x} holder_end=0x{holder_end:x} site={} -- the walk's \
+                 bound and its stride disagree, so this write reached the object that \
+                 follows the holder.",
+                rec.site,
+            );
+        }
+    }
+    w.writes.lock().insert(slot, rec);
+}
+
+/// What wrote `slot` this pause, if anything, rendered for a corrupt-cell
+/// report. Also asks about `slot + 8` and `slot - 8`: an eight-byte write into
+/// a sixteen-byte cell lands on ONE of the cell's two words, and which one it
+/// is decides whether the reader saw a stamped discriminant or a stamped
+/// payload.
+fn ref_write_provenance(slot: usize) -> String {
+    let Some(w) = REF_WRITE_WATCH.get() else {
+        return "ref_write_watch=off".to_string();
+    };
+    let map = w.writes.lock();
+    let one = |a: usize| -> String {
+        match map.get(&a) {
+            Some(r) => format!(
+                "0x{a:x}<-width={} value=0x{:016x} holder=0x{:x} holder_end=0x{:x} site={}",
+                r.width, r.value, r.holder, r.holder_end, r.site
+            ),
+            None => format!("0x{a:x}<-none"),
+        }
+    };
+    format!(
+        "ref_write_watch=[{} | {} | {}]",
+        one(slot.wrapping_sub(8)),
+        one(slot),
+        one(slot.wrapping_add(8)),
+    )
+}
+
+/// The collector's arena bounds, published for the free functions that have no
+/// `&self` and must nonetheless ask the ONE question this family turns on.
+///
+/// `word0_plausible_ptr` -- the field
+/// `g1-eight-byte-write-at-a-live-objects-base-20260906` rests its "19 of 19"
+/// on -- is `cratonvm_types::plausible_heap_pointer`, which asks only
+/// non-null / 8-aligned / under 2^47. It answers TRUE for
+/// `0x0000001200000040`, an ordinary `class_id=64 num_slots=18` header pair
+/// sitting 2157 GiB below any arena. The screens that REFUSE a holder ask a
+/// different and much narrower question -- is the recombined pair inside
+/// `[arena_base, arena_end)` -- and the two disagree on exactly that input.
+/// Publishing the bounds is what lets the free-function report ask the
+/// refusing screens' question instead of the loose one.
+static G1_ARENA_BASE: AtomicUsize = AtomicUsize::new(0);
+static G1_ARENA_END: AtomicUsize = AtomicUsize::new(0);
+
+/// Is `word` a pointer into the collector's arena, by the SAME test
+/// `G1Collector::holder_word0_arena_pointer` applies? `false` when no
+/// collector has published bounds yet.
+fn word_is_arena_pointer(word: u64) -> bool {
+    let (base, end) = (
+        G1_ARENA_BASE.load(Ordering::Relaxed),
+        G1_ARENA_END.load(Ordering::Relaxed),
+    );
+    end > base && (word as usize) >= base && (word as usize) < end
+}
 
 impl CopyWatch {
     #[inline]
@@ -1959,6 +2438,7 @@ impl<'a> SharedEvac<'a> {
     /// slot; on a CAS loss the speculatively-copied destination is abandoned
     /// (becomes unreferenced to-space garbage reclaimed next cycle) and the
     /// winner's pointer is returned so all references converge.
+    #[track_caller]
     unsafe fn evacuate(
         &self,
         tlab: &mut TlabSet,
@@ -1991,6 +2471,43 @@ impl<'a> SharedEvac<'a> {
         // under the off word would make the switch a HALF A/B: the crash it is
         // meant to reproduce would not come back, and the arm would look like
         // evidence that the screens were not what fixed it.
+        // IS THE CANDIDATE THE START OF AN OBJECT? Asked HERE, one frame above
+        // every supply route, because that is the only place the answer covers
+        // all of them -- and `#[track_caller]` on this function makes the
+        // report name the route that offered it.
+        //
+        // `evacuate` sizes an object from the header at this address, copies
+        // that many bytes, and installs a forwarding mark word at `addr + 8`.
+        // For an INTERIOR address the third of those writes eight bytes inside
+        // a LIVE object's body and leaves the word beside it untouched, which
+        // is `g1-eight-byte-write-at-a-live-objects-base-20260906`'s
+        // corrupt-cell family exactly. The alignment guard below is the only
+        // thing this entry point used to ask, and an interior address is
+        // 8-aligned.
+        if gc_flags().g1_evac_supply_screen
+            && !self
+                .collector
+                .addr_is_followable_object_view(
+                    self.view(),
+                    old_ptr as usize,
+                    "parallel-evacuate",
+                    GridProof::No,
+                )
+        {
+            let n = EVAC_SUPPLY_NON_OBJECT.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                tracing::warn!(
+                    "[g1] parallel evacuation REFUSED a candidate that is not an OBJECT \
+                     START (#{n}): addr=0x{:x} caller={} -- sizing an object from these \
+                     bytes and installing a forwarding mark word at addr+8 is how an \
+                     eight-byte `target | MARK_FORWARDED` lands inside a live object's \
+                     body. The reference is left unchanged and the pause continues.",
+                    old_ptr as usize,
+                    std::panic::Location::caller(),
+                );
+            }
+            return None;
+        }
         if self.screens_armed() && (old_ptr.is_null() || (old_ptr as usize) & 0x7 != 0) {
             let n = PARALLEL_EVAC_UNALIGNED_CANDIDATE.fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 8 || n.is_power_of_two() {
@@ -2013,7 +2530,16 @@ impl<'a> SharedEvac<'a> {
         // Fast path: already forwarded this cycle.
         let observed = mark_atomic.load(Ordering::Acquire);
         if ObjectHeader::is_forwarded_mark(observed) {
-            let existing = ObjectHeader::forwarding_target(observed) as usize;
+            // VALIDATE THE DECODE. See `G1Collector::decode_forwarding_target`:
+            // a word whose low two bits are `0b11` by coincidence passes
+            // `is_forwarded_mark`, and its decoded "target" was being returned
+            // here, stored into the caller's reference slot and pushed onto the
+            // gray worklist.
+            let existing = match self.collector.decode_forwarding_target(observed, old_ptr as usize)
+            {
+                Some(t) => t as usize,
+                None => return None,
+            };
             // DEFECT-2 FIX (part 1 of 2): record the forward in THIS cycle's
             // forward set even though we didn't perform the copy, so it reaches
             // `pointer_map`. The serial path dedups via the per-cycle
@@ -2105,7 +2631,13 @@ impl<'a> SharedEvac<'a> {
                     // value would mean an unmodelled writer, and adopting its
                     // payload as an address is exactly the INFLATED/FORWARDED
                     // aliasing this encoding was audited against.
-                    Err(actual) if ObjectHeader::is_forwarded_mark(actual) => {
+                    Err(actual)
+                        if ObjectHeader::is_forwarded_mark(actual)
+                            && self
+                                .collector
+                                .decode_forwarding_target(actual, old_ptr as usize)
+                                .is_some() =>
+                    {
                         // THE THIRD ARM OF THE SAME SHAPE. `evacuate`'s
                         // already-forwarded fast path records the adopted
                         // forward (DEFECT-2 part 1) and its copy-path CAS-loser
@@ -2124,6 +2656,8 @@ impl<'a> SharedEvac<'a> {
                         // from every arm is what makes "every forward this
                         // pause installed is a key of `pointer_map`" a property
                         // of the code rather than of which arm happened to run.
+                        // Validated by the guard on this arm; see
+                        // `decode_forwarding_target`.
                         let target = ObjectHeader::forwarding_target(actual);
                         EVACUATE_CAS_LOSER_FORWARDS.fetch_add(1, Ordering::Relaxed);
                         forwards.push((old, target as usize));
@@ -2220,7 +2754,13 @@ impl<'a> SharedEvac<'a> {
             // value means an unmodelled writer, and adopting its payload as an
             // address is the INFLATED/FORWARDED aliasing this encoding was
             // audited against.
-            Err(winner) if ObjectHeader::is_forwarded_mark(winner) => {
+            Err(winner)
+                if ObjectHeader::is_forwarded_mark(winner)
+                    && self
+                        .collector
+                        .decode_forwarding_target(winner, old_ptr as usize)
+                        .is_some() =>
+            {
                 // DEFECT-2 FIX, SECOND SITE (2026-08-26). This arm returned the
                 // winner's target WITHOUT recording `old_ptr -> target` in
                 // `forwards`, so the forward never reached this cycle's
@@ -2239,6 +2779,8 @@ impl<'a> SharedEvac<'a> {
                 // Part 2's invariant is unaffected: it clears `forwarding_ptr`
                 // for every key in `pointer_map` at cycle end, so this key is
                 // cleared too — which is what part 2 wants, not a hazard to it.
+                // Validated by the guard on this arm; see
+                // `decode_forwarding_target`.
                 let target = ObjectHeader::forwarding_target(winner);
                 EVACUATE_CAS_LOSER_FORWARDS.fetch_add(1, Ordering::Relaxed);
                 forwards.push((old_ptr as usize, target as usize));
@@ -2301,6 +2843,39 @@ impl<'a> SharedEvac<'a> {
                         header.num_slots(),
                     );
                 }
+            // QUEUE IT FOR THE END-OF-PAUSE GRID VERDICT.
+            //
+            // This refusal population is the one
+            // `g1-eight-byte-write-at-a-live-objects-base-20260906` calls "the
+            // genuine shape", and it is the one population that never got the
+            // question asked of it: `grid_closes_on_cursor` and
+            // `locate_in_object_grid` are only reachable with the region table
+            // held, and a refusal returns immediately. So "is this address an
+            // object start at all" -- the question that decides whether there
+            // is a WRITER to find or a walk that arrived somewhere it should
+            // not have -- was answered for the corrupt-CELL family and never
+            // for this one.
+            //
+            // The holder's own first sixteen bytes stand in for the cell: they
+            // ARE what the refusal is about.
+            {
+                // SAFETY: the screen above already read this header.
+                let (w0, w1) = unsafe {
+                    (
+                        std::ptr::read(obj_ptr as *const u64),
+                        std::ptr::read((obj_ptr as *const u64).add(1)),
+                    )
+                };
+                queue_pending_corrupt_holder(
+                    obj_ptr as *mut u8,
+                    header,
+                    obj_ptr as usize,
+                    0,
+                    w0,
+                    w1,
+                    "parallel-ref-scan-holder-word0-arena-pointer",
+                );
+            }
                 return;
             }
         }
@@ -2342,6 +2917,13 @@ impl<'a> SharedEvac<'a> {
                             if let Some((new_ptr, fresh)) =
                                 self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
                             {
+                                note_ref_write(
+                                    slot_ptr as usize,
+                                    new_ptr as u64,
+                                    obj_ptr as usize,
+                                    holder_extent(obj_ptr, header),
+                                    8,
+                                );
                                 std::ptr::write(slot_ptr as *mut u64, new_ptr as u64);
                                 if fresh {
                                     Self::record_fresh_child(
@@ -2414,7 +2996,13 @@ impl<'a> SharedEvac<'a> {
                             if let Some((new_ptr, fresh)) =
                                 self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
                             {
-                                write_flat_object_reference(slot_ptr, new_ptr as usize, compact);
+                                write_flat_object_reference_watched(
+                                    slot_ptr,
+                                    new_ptr as usize,
+                                    compact,
+                                    obj_ptr,
+                                    holder_extent(obj_ptr, header),
+                                );
                                 if fresh {
                                     Self::record_fresh_child(
                                         ref_ptr,
@@ -2580,6 +3168,13 @@ impl<'a> SharedEvac<'a> {
                                 if let Some((new_ptr, fresh)) =
                                     self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
                                 {
+                                    note_ref_write(
+                                        slot_ptr as usize,
+                                        new_ptr as u64,
+                                        obj_ptr as usize,
+                                        (obj_ptr as usize).saturating_add(obj_size),
+                                        8,
+                                    );
                                     std::ptr::write(slot_ptr as *mut u64, new_ptr as u64);
                                     if fresh {
                                         Self::record_fresh_child(
@@ -2627,10 +3222,12 @@ impl<'a> SharedEvac<'a> {
                                 if let Some((new_ptr, fresh)) =
                                     self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
                                 {
-                                    write_flat_object_reference(
+                                    write_flat_object_reference_watched(
                                         slot_ptr,
                                         new_ptr as usize,
                                         compact,
+                                        obj_ptr,
+                                        holder_extent(obj_ptr, header),
                                     );
                                     if fresh {
                                         Self::record_fresh_child(
@@ -5283,6 +5880,20 @@ impl G1Collector {
         // republishes it as the prefix grows.
         crate::gen_heap::publish_jit_read_bounds(0, arena_base, arena_base + arena.committed_len());
 
+        // The arena bounds, for the free functions that have no `&self`. See
+        // [`G1_ARENA_BASE`]: the corrupt-cell report used
+        // `plausible_heap_pointer`, which is a much looser question than the
+        // one the REFUSING screens ask, and the two disagree on exactly the
+        // input this family's central statistic was taken over.
+        G1_ARENA_BASE.store(arena_base, Ordering::Relaxed);
+        G1_ARENA_END.store(arena_end, Ordering::Relaxed);
+        if gc_flags().g1_ref_write_watch {
+            let _ = REF_WRITE_WATCH.set(RefWriteWatch {
+                writes: Mutex::new(std::collections::HashMap::new()),
+                out_of_body: AtomicUsize::new(0),
+            });
+        }
+
         // Precise root coverage — publish what this collector's relocating
         // phase MAY MOVE, which is the question the frame-band verifier asks
         // and which G1 was the only relocating collector not answering.
@@ -6879,6 +7490,9 @@ impl G1Collector {
         let mut work_list: Vec<*mut u8> = Vec::new();
 
         for &seed in seeds {
+            if !self.evacuation_supply_is_an_object(&regions, "evac-failure-drain-seed", seed) {
+                continue;
+            }
             if let Some((new_ptr, _fresh)) = self.evacuate_object(
                 &mut regions,
                 seed as *mut u8,
@@ -7281,6 +7895,9 @@ impl G1Collector {
         // dropping it (a drop = the object's unscanned subtree is silently
         // unmarked = cleanup frees live Old/humongous objects).
         for addr in self.marking_keepalive_roots(&regions, &cset_set) {
+            if !self.evacuation_supply_is_an_object(&regions, "marking-keepalive", addr) {
+                continue;
+            }
             if let Some((new_ptr, fresh)) = self.evacuate_object(
                 &mut regions,
                 addr as *mut u8,
@@ -7901,6 +8518,9 @@ impl G1Collector {
         // regions, exactly where the gray set concentrates. Same protocol as
         // the young paths.
         for addr in self.marking_keepalive_roots(&regions, &cset_set) {
+            if !self.evacuation_supply_is_an_object(&regions, "marking-keepalive", addr) {
+                continue;
+            }
             if let Some((new_ptr, fresh)) = self.evacuate_object(
                 &mut regions,
                 addr as *mut u8,
@@ -9393,6 +10013,9 @@ impl G1Collector {
             }
             // Dead in the CSet: evacuate it like a root and let the scan
             // below pull its subtree out too.
+            if !self.evacuation_supply_is_an_object(regions, "finalizer-resurrect", old_addr) {
+                continue;
+            }
             if let Some((new_ptr, fresh)) = self.evacuate_object(
                 regions,
                 old_addr as *mut u8,
@@ -9540,6 +10163,7 @@ impl G1Collector {
         }
     }
 
+    #[track_caller]
     fn evacuate_object(
         &self,
         regions: &mut Vec<G1Region>,
@@ -9575,10 +10199,36 @@ impl G1Collector {
         // plausible object header inside a live CSet region (roots go through
         // `note_root_object_plausibility`, slots through
         // `evacuation_candidate_is_an_object`), and the regions guard is held.
+        // The serial twin of the screen in `SharedEvac::evacuate`; see it for
+        // what an interior address costs here.
+        if gc_flags().g1_evac_supply_screen
+            && !self.addr_is_followable_object_view(
+                RegionView::Slice(regions),
+                old_addr,
+                "serial-evacuate",
+                GridProof::No,
+            )
+        {
+            let n = EVAC_SUPPLY_NON_OBJECT.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                tracing::warn!(
+                    "[g1] serial evacuation REFUSED a candidate that is not an OBJECT \
+                     START (#{n}): addr=0x{old_addr:x} caller={} {}",
+                    std::panic::Location::caller(),
+                    self.describe_rejected_address(regions, old_addr),
+                );
+            }
+            return None;
+        }
         let mark_atomic = unsafe { &(*(old_ptr as *const ObjectHeader)).mark_word };
         let observed = mark_atomic.load(Ordering::Acquire);
         if ObjectHeader::is_forwarded_mark(observed) {
-            return Some((ObjectHeader::forwarding_target(observed), false));
+            // Same validation as the parallel twin's fast path; see
+            // `Self::decode_forwarding_target`. A word that is not a forward
+            // this collector installed must not be answered with as if it were.
+            return self
+                .decode_forwarding_target(observed, old_addr)
+                .map(|t| (t, false));
         }
 
         // PREDICT-THEN-VERIFY BACKSTOP. The tag compare above is the whole
@@ -10126,6 +10776,66 @@ impl G1Collector {
             // SAFETY: the verdict above validated the tag bytes and the
             // address's containment below its region's cursor.
             let cand = unsafe { &*(raw as *const ObjectHeader) };
+            // THE ARENA TEST REFUSES BY DEFAULT; THE CLASS-ID BAND STILL DOES
+            // NOT. They are two different questions and one flag used to answer
+            // both.
+            //
+            // `g1-eight-byte-write-at-a-live-objects-base-20260906` left
+            // `CRATONVM_G1_EVAC_REF_IMPLAUSIBLE_REFUSE` opt-in on the reasoning
+            // that "a refusal that is WRONG drops a live reference, which
+            // manufactures exactly the premature-free corruption this page is
+            // about". That reasoning is sound and it was taken against the
+            // CLASS-ID BAND test -- an assumption about which ids a loader
+            // mints, which had already gone stale once (autobox and
+            // lambda-proxy ids). It was NOT taken against the arena test, which
+            // was added to `note_implausible_legacy_header` afterwards and
+            // folded into the same flag.
+            //
+            // The arena test is a different kind of statement. `class_id`(4) +
+            // `shape`(4) IS the header's first eight bytes, so a pair that
+            // recombines to an address inside THIS collector's own arena is not
+            // a header -- it is the first body word of something else, read at
+            // an address that is not an object start. No loader, no id space
+            // and no future class count can make it one. The same test already
+            // refuses by default on the SERIAL evacuator's holders and on the
+            // Phase-4 fixup's (`CRATONVM_G1_SERIAL_EVAC_HOLDER_SCREEN`); the
+            // reference-slot CANDIDATE route was the one place it only warned.
+            //
+            // What that cost, measured 2026-09-08 on
+            // `TestHostConfigAutomaticDeploymentXmlExternalWarXml` (Linux,
+            // -Xmx1g, `CRATONVM_G1_WORKERS=16`): a candidate at
+            // `holder + 0x38` -- the PAYLOAD word of a legacy cell, i.e. an
+            // interior address -- was followed into `evacuate`, which installed
+            // a forwarding mark word at `candidate + 8`. That address is
+            // `holder + 0x40`, the DISCRIMINANT word of the next cell, so a
+            // live 16-slot object came out of the pause with
+            // `raw0 = 0x727ff9d00003` (a target tagged `MARK_FORWARDED`) and
+            // `raw1 = 0` at slot 3. That is this page's corrupt-cell family,
+            // bit for bit: "an EIGHT-byte quantity sitting where a SIXTEEN-byte
+            // cell's first word belongs, with the second word untouched".
+            //
+            // `CRATONVM_G1_EVAC_CANDIDATE_ARENA_SCREEN=0` stands it down.
+            if gc_flags().g1_evac_candidate_arena_screen {
+                if let Some(paired) = self.holder_word0_arena_pointer(cand) {
+                    let n = EVAC_REF_REJECTED_ARENA.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n <= 8 || n.is_power_of_two() {
+                        tracing::warn!(
+                            "[g1] {site}: REFUSED a candidate whose first header word is an \
+                             ARENA POINTER (#{n}): holder=0x{:x} slot={slot} \
+                             candidate=0x{raw:x} paired=0x{paired:016x} \
+                             mark=0x{:016x} -- `class_id`+`shape` IS the first eight bytes \
+                             of a header, so a pair that recombines to an address in this \
+                             collector's own arena is a BODY word read at an address that \
+                             is not an object start. Following it would have installed a \
+                             forwarding mark word eight bytes inside a live object. The \
+                             slot is left unchanged and the pause continues.",
+                            holder as usize,
+                            cand.mark_word.load(Ordering::Relaxed),
+                        );
+                    }
+                    return false;
+                }
+            }
             let implausible = self.note_implausible_legacy_header_view(
                 regions,
                 raw as *mut u8,
@@ -10200,8 +10910,16 @@ impl G1Collector {
                 let n = EVAC_REF_REJECTED_IMPLAUSIBLE.fetch_add(1, Ordering::Relaxed) + 1;
                 if n <= 8 || n.is_power_of_two() {
                     tracing::warn!(
-                        "[g1] {site}: REFUSED a candidate whose legacy header is                          IMPLAUSIBLE (#{n}): holder=0x{:x} slot={slot} candidate=0x{raw:x}                          — the tag screen passed it, the class-id band screen did not.                          The slot is left unchanged and the pause continues; the report                          one line above names the shape. This is the refusal the ROOT                          route has made since 2026-09-02.",
+                        "[g1] {site}: REFUSED a candidate whose legacy header is \
+                         IMPLAUSIBLE (#{n}): holder=0x{:x} slot={slot} candidate=0x{raw:x} \
+                         candidate_low3={} {} \
+                         — the tag screen passed it, the class-id band screen did not. \
+                         The slot is left unchanged and the pause continues; the report \
+                         one line above names the shape. This is the refusal the ROOT \
+                         route has made since 2026-09-02.",
                         holder as usize,
+                        raw & 0b111,
+                        ref_write_provenance(holder as usize + slot),
                     );
                 }
                 return false;
@@ -10598,7 +11316,7 @@ impl G1Collector {
         addr: usize,
         site: &'static str,
     ) -> bool {
-        self.addr_is_followable_object_view(RegionView::Slice(regions), addr, site)
+        self.addr_is_followable_object_view(RegionView::Slice(regions), addr, site, GridProof::Yes)
     }
 
     /// [`Self::addr_is_followable_object`] against a [`RegionView`].
@@ -10607,6 +11325,7 @@ impl G1Collector {
         regions: RegionView<'_>,
         addr: usize,
         site: &'static str,
+        prove: GridProof,
     ) -> bool {
         if !self.candidate_header_is_plausible_view(regions, addr) {
             return false;
@@ -10614,7 +11333,304 @@ impl G1Collector {
         // SAFETY: the screen above validated the tag bytes and placed `addr`
         // inside a live region's committed span.
         let header = unsafe { &*(addr as *const ObjectHeader) };
+        // THE EMPTY-HEADER SHAPE, which no header screen can reject; see
+        // `empty_header_is_a_real_object`. Tested before the band screen
+        // because it is the cheaper predicate to FAIL: three field reads, and
+        // only a match pays for the grid walk.
+        if prove == GridProof::Yes
+            && gc_flags().g1_evac_empty_header_grid_proof
+            && header.class_id.as_u32() == 0
+            && header.num_slots() == 0
+            && header.kind() == ObjectKind::Object
+            && !cratonvm_types::is_compact_object(header)
+            && !self.empty_header_is_a_real_object(regions, addr)
+        {
+            let n = EVAC_EMPTY_HEADER_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                tracing::warn!(
+                    "[g1] {site}: REFUSED an EMPTY-HEADER candidate the object grid places \
+                     INSIDE another object (#{n}): addr=0x{addr:x} mark={:#018x} {} -- \
+                     `class_id=0 num_slots=0 kind=Object` is what the PAYLOAD WORD of a \
+                     null `Value` cell reads as, and every header screen accepts it. \
+                     Following it would have installed a forwarding mark word at addr+8, \
+                     which is the next cell's discriminant word inside a live object.",
+                    header.mark_word.load(Ordering::Relaxed),
+                    self.describe_rejected_address_view(regions, addr),
+                );
+            }
+            return false;
+        }
         !self.note_implausible_legacy_header_view(regions, addr as *mut u8, header, site)
+    }
+
+    /// Decode a `MARK_FORWARDED` mark word into the address it names, refusing
+    /// a word this collector could not have written.
+    ///
+    /// # `forwarding_target` strips two bits; `make_forwarded` asserts three
+    ///
+    /// `ObjectHeader::make_forwarded` asserts
+    /// `plausible_heap_pointer(target)` -- non-null, **8-byte aligned**, under
+    /// 2^47 -- so every forwarding target this or any other collector installs
+    /// has its low THREE bits clear. `ObjectHeader::forwarding_target` masks
+    /// off `MARK_STATE_MASK` (the low **two**) and the quartet, so **bit 2
+    /// survives the decode**. A word that is not a forwarding pointer at all
+    /// but whose low two bits happen to be `0b11` therefore passes
+    /// `is_forwarded_mark` and decodes to an address with bit 2 set -- which is
+    /// impossible for a real one.
+    ///
+    /// MEASURED 2026-09-08 on `TestHostConfigAutomaticDeploymentXmlExternalWarXml`
+    /// (Linux, `-Xmx1g`, `CRATONVM_G1_WORKERS=16`), by a tripwire on every
+    /// reference-slot write:
+    ///
+    /// ```text
+    /// slot=0x7a24de7ce638 value=0x00006e6547246e6c low3=4 width=8
+    /// slot=0x7a24deafd098 value=0x0000636a61636a2c low3=4 width=8
+    /// slot=0x7a24deafd0c8 value=0x0000636a61636a2c low3=4 width=8
+    /// slot=0x7a24deafd758 value=0x00000000f5ecdec4 low3=4 width=8
+    /// ```
+    ///
+    /// **`low3 = 4` on every one**, and the values are ASCII (`0x636a61636a2c`
+    /// is `"(jacj"`, `0x6e6547246e6c` is `"ln$Ge"`) -- Java string payload read
+    /// as a mark word. Bit 2 set on 4 of 4 is the signature of this decode and
+    /// of nothing else.
+    ///
+    /// # Why this is the producer the page was looking for
+    ///
+    /// `g1-eight-byte-write-at-a-live-objects-base-20260906` searched the READ
+    /// side for six months of pages and concluded "the origin is upstream of
+    /// every walk on this page and is still unfound". It is here, one frame
+    /// above every walk:
+    ///
+    ///  1. a candidate reference passes the header screens (they validate the
+    ///     mark word's TAG BYTES at bits 48..53, which say nothing about bits
+    ///     0..2);
+    ///  2. `evacuate`'s already-forwarded fast path reads its mark word, sees
+    ///     `0b11`, and returns a decoded target that is not an address;
+    ///  3. the caller **stores that value into the live reference slot it was
+    ///     scanning** -- eight bytes for an array element or a compact field,
+    ///     sixteen for a legacy `Value` cell -- and **pushes it onto the gray
+    ///     worklist as a holder**;
+    ///  4. the walk that next picks that holder up reads a "header" out of
+    ///     whatever those bytes are: an arena pointer where `class_id`/`shape`
+    ///     belong, a `num_slots` of 30825, a body extent of twelve gigabytes.
+    ///     Those are this page's two measured families, in order.
+    ///
+    /// The copy watch was clean at every checkpoint because nothing rewrote a
+    /// COPY; the six flat walks all read the damage because the damage is in
+    /// the slot they read; and screening one walk moved the reports to the next
+    /// because the producer is none of them.
+    ///
+    /// # The refusal cannot drop a live reference
+    ///
+    /// `None` means "this word is not a forward this collector installed", and
+    /// the callers already handle it: the reference slot is left holding the
+    /// address it had, which still names the object it named. That is strictly
+    /// better than storing a value no allocator ever returned.
+    fn decode_forwarding_target(&self, mark: u64, holder: usize) -> Option<*mut u8> {
+        let target = ObjectHeader::forwarding_target(mark) as usize;
+        // The install-time assertion, restated as a test. Alignment alone
+        // catches the measured population (bit 2, 4 of 4); the arena bound
+        // catches the half of a random word that happens to be 8-aligned.
+        let aligned = cratonvm_types::plausible_heap_pointer(target as u64);
+        let in_arena = self.arena_end > self.arena_base
+            && target >= self.arena_base
+            && target < self.arena_end;
+        if aligned && in_arena {
+            return Some(target as *mut u8);
+        }
+        let n = FORWARD_TARGET_IMPLAUSIBLE.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            tracing::warn!(
+                "[g1] a FORWARDED mark word decoded to a target `make_forwarded` could \
+                 not have installed (#{n}): holder=0x{holder:x} mark={mark:#018x} \
+                 target=0x{target:x} low3={} aligned={aligned} in_arena={in_arena} \
+                 arena=[{:#x},{:#x}) -- `make_forwarded` asserts \
+                 `plausible_heap_pointer`, so a real target has its low THREE bits \
+                 clear, while `forwarding_target` strips only the low TWO. This word's \
+                 low two bits are `0b11` by coincidence, not by installation. Refused: \
+                 the slot keeps the address it has.",
+                target & 0b111,
+                self.arena_base,
+                self.arena_end,
+            );
+        }
+        None
+    }
+
+    /// A candidate whose header reads `class_id = 0`, `num_slots = 0`,
+    /// `kind = Object` -- an EMPTY HEADER -- proved against the region's own
+    /// object grid.
+    ///
+    /// # The one shape no header screen can reject
+    ///
+    /// A legacy `Value` cell is sixteen bytes: a discriminant word then a
+    /// payload word. A NULL reference cell is therefore
+    /// `[4, 0]` -- `Value::Object(None)` -- and the address of its PAYLOAD word
+    /// has, as its own next sixteen bytes, `[0, <the next cell's
+    /// discriminant>]`. Read as a header that is:
+    ///
+    ///   class_id = 0, num_slots = 0, kind = Object (tag 0), element_type =
+    ///   Reference (tag 0), gc_flags = 0, gc_age = 0, state = NEUTRAL
+    ///
+    /// -- which is a *valid, sixteen-byte, zero-field object*. It satisfies
+    /// [`Self::classify_candidate_header_view`] (both tag bytes decode, the
+    /// address is 8-aligned and below its region's cursor), it satisfies
+    /// [`Self::note_implausible_legacy_header_view`] (class 0 with a handful of
+    /// slots is legitimate in this tree, and `0` is not a pointer into the
+    /// arena), and it satisfies `object_total_size` (sixteen bytes, fits
+    /// anywhere). **Every screen this file has passes it.**
+    ///
+    /// So it reaches `evacuate`, which installs a forwarding mark word at
+    /// `addr + 8` -- the DISCRIMINANT word of the next cell of a live object --
+    /// and the result is this page's corrupt-cell family exactly:
+    ///
+    /// ```text
+    /// slot=0x7a4356f031f8 slot_index=10 raw0=0x00007a4354900013 raw1=0x0
+    /// raw0_tag=3  raw0_untagged_arena=true  slot_in=HOLDER
+    /// slot_minus_8(class_id=0 slots=0 kind=Object mark=0x00007a4354900013)
+    /// ```
+    ///
+    /// `slot - 8` is the null cell's payload word, `slot` is the next cell's
+    /// discriminant word, and what sits in it is `target | MARK_FORWARDED`
+    /// with the sixteen-byte cell's second word untouched. That is "an EIGHT
+    /// byte quantity sitting where a SIXTEEN-byte cell's first word belongs",
+    /// measured 58 times by
+    /// `g1-eight-byte-write-at-a-live-objects-base-20260906` and never
+    /// attributed.
+    ///
+    /// # Why the grid, and why only here
+    ///
+    /// The region's object grid is the ONLY oracle that can separate the two:
+    /// it walks from the region base by each object's own declared size, so it
+    /// knows where objects actually begin. It is O(region) and cannot be run
+    /// per candidate -- but it does not have to be. The empty-header shape is
+    /// what a null cell's payload looks like and is essentially never a real
+    /// allocation: `ClassId(0)` with `kind == Object` is the MIC/PIC empty-slot
+    /// sentinel and the primitive-array id, not an instance of anything. The
+    /// counters say how often the assumption holds.
+    ///
+    /// Returns `true` (follow it) when the grid confirms an object start, or
+    /// when the grid cannot answer -- an unanswerable grid must not become a
+    /// refusal, because a refusal that is WRONG drops a live reference, which
+    /// is the corruption this page is about.
+    fn empty_header_is_a_real_object(&self, regions: RegionView<'_>, addr: usize) -> bool {
+        let Some(idx) = self.lookup_region_for_addr(addr) else {
+            return true;
+        };
+        let Some(r) = regions.get(idx) else {
+            return true;
+        };
+        let base = r.data.as_ptr() as usize;
+        let cursor = r.cursor();
+        if addr < base || addr >= base + cursor {
+            return true;
+        }
+        // THE BUDGET. See `EMPTY_HEADER_PROOF_BUDGET_PER_PAUSE`: the proof is
+        // O(region) and this is the evacuation path, so a workload that
+        // produces the shape in bulk must not turn a correctness screen into a
+        // pause-time regression. Above it, answer as the collector did before
+        // this screen existed and count the waiver.
+        if EMPTY_HEADER_PROOFS_THIS_PAUSE.fetch_add(1, Ordering::Relaxed)
+            >= EMPTY_HEADER_PROOF_BUDGET_PER_PAUSE
+        {
+            EVAC_EMPTY_HEADER_WAIVED.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        EVAC_EMPTY_HEADER_PROVED.fetch_add(1, Ordering::Relaxed);
+        let jit_skips = self.jit_tlab_skip_spans();
+        let mut offset = 0usize;
+        while base + offset < addr {
+            let obj_ptr = (base + offset) as *mut u8;
+            if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_ptr as usize) {
+                offset += skip;
+                continue;
+            }
+            // SAFETY: below the region's published cursor, inside its own span.
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            let obj_size = object_total_size(header);
+            if obj_size == 0 || obj_size > cursor.saturating_sub(offset) {
+                // The grid desynced before reaching the address, so it cannot
+                // answer. Not a refusal -- see the doc.
+                return true;
+            }
+            offset += obj_size;
+        }
+        base + offset == addr
+    }
+
+    /// Is `addr` the START of an object, at a supply route that has no screen
+    /// of its own?
+    ///
+    /// # The routes, and what an unscreened one costs
+    ///
+    /// `evacuate_object` sizes an object from the header at the address it is
+    /// given and `copy_nonoverlapping`s that many bytes, then installs a
+    /// forwarding mark word at `addr + 8`. Handed an INTERIOR address it does
+    /// all three against bytes that are not a header:
+    ///
+    ///  * the copy reproduces a live object's BODY words as the destination's
+    ///    header, so the destination's first eight bytes are whatever the
+    ///    victim had at that offset -- typically a reference payload, i.e. **a
+    ///    pointer into this arena sitting where `class_id`/`shape` belong**,
+    ///    with a plausible-looking mark word beside it. That is the
+    ///    arena-pointer holder family of
+    ///    `g1-eight-byte-write-at-a-live-objects-base-20260906`, and it is why
+    ///    those holders keep turning up as the FIRST object of a fresh
+    ///    to-space region;
+    ///  * the forwarding install writes eight bytes at `addr + 8`, which for an
+    ///    interior `addr` is **inside a live object's body**, leaving the word
+    ///    beside it untouched. That is the corrupt-cell family from the same
+    ///    page: `raw0 = target | MARK_FORWARDED`, `raw1 = 0`, at a cell the
+    ///    grid places inside a sound holder. MEASURED 2026-09-08, one such cell
+    ///    at `slot_off_in_obj=0x60` of a live 16-slot object, `raw0` tagged 3
+    ///    and its untagged value an arena address, with the reference-write
+    ///    watch showing NO collector write on that slot -- because the writer
+    ///    was a mark-word store, not a reference write.
+    ///
+    /// Three routes reach `evacuate_object` without asking: the marking
+    /// KEEP-ALIVE set (`marking_keepalive_roots` filters on CSet residency
+    /// only), the evacuation-failure DRAIN's seeds
+    /// (`drain_kept_self_forwards`, whose seeds are the identity keys of a
+    /// FAILED pause's forwarding map -- the least trustworthy addresses the
+    /// collector holds), and Phase 3.5's finalizer RESURRECTION. The root loops
+    /// have screened since 2026-09-02 and the two worker walks since
+    /// 2026-09-05; these three were left, and `SharedEvac::evacuate`'s
+    /// last-ditch guard checks only ALIGNMENT, which an interior address passes
+    /// trivially.
+    ///
+    /// Refusing cannot drop a live reference: an address that is not an object
+    /// start has no object to evacuate. What the caller loses is a keep-alive /
+    /// seed / resurrection it could not have serviced correctly anyway -- and
+    /// on every one of these routes the address is a DERIVED one (a gray-set
+    /// entry, a forwarding-map key, a finalizer registration), never the only
+    /// path to a live object.
+    ///
+    /// `CRATONVM_G1_EVAC_SUPPLY_SCREEN=0` stands it down, which is the
+    /// same-binary A/B.
+    fn evacuation_supply_is_an_object(
+        &self,
+        regions: &[G1Region],
+        site: &'static str,
+        addr: usize,
+    ) -> bool {
+        if !gc_flags().g1_evac_supply_screen {
+            return true;
+        }
+        if self.addr_is_followable_object(regions, addr, site) {
+            return true;
+        }
+        let n = EVAC_SUPPLY_NON_OBJECT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            tracing::warn!(
+                "[g1] {site}: an evacuation SUPPLY address is not an object start (#{n}): \
+                 addr=0x{addr:x} {} -- `evacuate_object` would have sized an object from \
+                 bytes that are not a header, copied them, and installed a forwarding mark \
+                 word at addr+8, which for an interior address is inside a LIVE object's \
+                 body. Skipped; the pause continues.",
+                self.describe_rejected_address(regions, addr),
+            );
+        }
+        false
     }
 
     /// Is this CSet-resident root the start of a live object? Counts and, for
@@ -10644,7 +11660,7 @@ impl G1Collector {
     /// `mixed_collection` only, and parallel evacuation is the DEFAULT arm
     /// (`CRATONVM_G1_PARALLEL_EVAC`, on unless `0`).
     fn note_root_object_plausibility_view(&self, regions: RegionView<'_>, addr: usize) -> bool {
-        if self.addr_is_followable_object_view(regions, addr, "cset-root") {
+        if self.addr_is_followable_object_view(regions, addr, "cset-root", GridProof::Yes) {
             return true;
         }
         let n = NON_OBJECT_ROOT_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
@@ -10812,10 +11828,83 @@ impl G1Collector {
     ///    address on a walk, which is the family
     ///    `g1-parallel-evacuator-had-none-of-the-serial-arms-header-screens`
     ///    already names.
+    /// Which object does `slot`'s region place it in, walked from the region
+    /// base by each object's own declared size, and is that `holder`?
+    ///
+    /// This is the per-address companion to [`Self::grid_closes_on_cursor`].
+    /// The closure test is a property of the whole region -- it says the sizes
+    /// the walk strode summed to the cursor -- and a holder that over-declares
+    /// while a later object under-declares by the same amount still closes. The
+    /// question a corrupt-cell report needs answered is narrower and local: the
+    /// walk read sixteen bytes at `slot` while claiming to be inside `holder`,
+    /// so is `slot` inside `holder`'s allocated extent or inside the object
+    /// after it?
+    ///
+    /// Returns a rendered verdict rather than a bool because the three outcomes
+    /// need different follow-ups and a bool cannot carry which one happened.
+    fn grid_object_containing(&self, regions: &[G1Region], slot: usize, holder: usize) -> String {
+        let Some(r) = self.lookup_region_for_addr(slot).and_then(|i| regions.get(i)) else {
+            return "slot_in=NO-REGION".to_string();
+        };
+        let base = r.data.as_ptr() as usize;
+        let cursor = r.cursor();
+        if slot < base || slot >= base + cursor {
+            return format!("slot_in=ABOVE-CURSOR cursor={cursor:#x}");
+        }
+        let jit_skips = self.jit_tlab_skip_spans();
+        let mut offset = 0usize;
+        while offset < cursor {
+            let obj_ptr = (base + offset) as *mut u8;
+            if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_ptr as usize) {
+                if slot < base + offset + skip {
+                    return format!("slot_in=JIT-TLAB-SKIP span={offset:#x}+{skip:#x}");
+                }
+                offset += skip;
+                continue;
+            }
+            // SAFETY: `base + offset` is inside the region's own committed span,
+            // below the published cursor.
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            let obj_size = object_total_size(header);
+            if obj_size == 0 || obj_size > cursor.saturating_sub(offset) {
+                return format!("slot_in=GRID-DESYNC at={offset:#x} size={obj_size:#x}");
+            }
+            if slot < base + offset + obj_size {
+                let start = base + offset;
+                let verdict = if start == holder { "HOLDER" } else { "NEIGHBOUR" };
+                return format!(
+                    "slot_in={verdict} obj={start:#x} obj_size={obj_size:#x} \
+                     obj_class_id={} obj_slots={} obj_kind={:?} obj_is_compact={} \
+                     slot_off_in_obj={:#x} slot_is_that_objs_mark_word={}",
+                    header.class_id.as_u32(),
+                    header.num_slots(),
+                    header.kind(),
+                    cratonvm_types::is_compact_object(header),
+                    slot - start,
+                    slot == start + cratonvm_types::MARK_WORD_OFFSET,
+                );
+            }
+            offset += obj_size;
+        }
+        "slot_in=PAST-CURSOR".to_string()
+    }
+
     fn report_pending_corrupt_holders(&self, regions: &[G1Region]) {
-        let drained: Vec<(usize, u32, u32, u64)> =
+        let drained: Vec<PendingCorruptHolder> =
             std::mem::take(&mut *PENDING_CORRUPT_HOLDERS.lock());
-        for (addr, cid, slots, mark) in drained {
+        for rec in drained {
+            let PendingCorruptHolder {
+                holder: addr,
+                class_id: cid,
+                num_slots: slots,
+                mark,
+                slot,
+                slot_index,
+                raw0,
+                raw1,
+                caller,
+                reason,
+            } = rec;
             // RE-TAKE OF THIS FAMILY'S `word0_plausible_ptr` STATISTIC.
             // The page cites that field TRUE on 19 of 19 holders as its evidence
             // that the header's first word is a pointer. It reports TRUE for
@@ -10859,12 +11948,94 @@ impl G1Collector {
                     )
                 })
                 .unwrap_or_else(|| "r?".to_string());
+            // WHICH OBJECT DOES THE GRID PUT THE CORRUPT SLOT IN?
+            //
+            // `grid_closes_on_cursor` says the region's boundaries are the
+            // allocator's; it does not say the HOLDER's declared body is the
+            // bytes the allocator gave IT. This does, for the one address that
+            // matters. The two answers have opposite fixes and nothing else on
+            // this page separates them:
+            //
+            //  * `slot_in=HOLDER` -- the walk stayed inside the object it was
+            //    walking, so a foreign write really did land in a live object's
+            //    body and there is a WRITER upstream of every walk.
+            //  * `slot_in=NEIGHBOUR` -- the holder over-declared, the walk
+            //    strode past its end, and the "corrupt cell" is the next
+            //    object's header and mark word read as a `Value`. The defect is
+            //    then the holder's own count, not a writer, and every
+            //    corrupt-cell verdict on that population is a misparse.
+            let slot_in = self.grid_object_containing(regions, slot, addr);
+            // WHAT DOES `raw0` NAME, AND WHAT IS EIGHT BYTES BEFORE THE SLOT?
+            //
+            // The measured corrupt cell is `raw0 = <arena address> | 3`,
+            // `raw1 = 0`. Three producers fit that and they are told apart by
+            // these two fields alone:
+            //
+            //  * `target_mark == raw0` -- the value IS the mark word of the
+            //    object it names, so something COPIED a mark word into this
+            //    cell rather than storing a reference. The search is then for a
+            //    16-byte copy whose source was an object header.
+            //  * `slot_minus_8_is_object_start` -- an object begins at
+            //    `slot - 8`, so `slot` IS that object's mark word and the cell
+            //    the walk read straddles an object boundary. The producer is
+            //    then whatever made the walk believe `slot` was a cell.
+            //  * neither -- an eight-byte store of a forwarding mark word at an
+            //    address that is not a mark word, i.e. `make_forwarded`
+            //    installed against an INTERIOR address (`slot - 8` being the
+            //    interior one).
+            let raw0_target = (raw0 & !0b11u64) as usize;
+            let target_desc = if self.arena_end > self.arena_base
+                && raw0_target >= self.arena_base
+                && raw0_target < self.arena_end
+            {
+                // SAFETY: inside the arena, which is mapped for the collector's
+                // lifetime; sixteen bytes at an 8-aligned address in it.
+                let h = unsafe { &*(raw0_target as *const ObjectHeader) };
+                let m = h.mark_word.load(Ordering::Relaxed);
+                format!(
+                    "target=0x{raw0_target:x} target_class_id={} target_slots={} \
+                     target_mark={m:#018x} target_mark_is_raw0={} \
+                     target_is_region_base={}",
+                    h.class_id.as_u32(),
+                    h.num_slots(),
+                    m == raw0,
+                    self.lookup_region_for_addr(raw0_target)
+                        .and_then(|i| regions.get(i))
+                        .is_some_and(|r| r.data.as_ptr() as usize == raw0_target),
+                )
+            } else {
+                "target=not-in-arena".to_string()
+            };
+            let before_desc = if slot >= self.arena_base + 8 && slot < self.arena_end {
+                // SAFETY: as above, eight bytes below an in-arena address.
+                let h = unsafe { &*((slot - 8) as *const ObjectHeader) };
+                format!(
+                    "slot_minus_8(class_id={} slots={} kind={:?} mark={:#018x})",
+                    h.class_id.as_u32(),
+                    h.num_slots(),
+                    h.kind(),
+                    h.mark_word.load(Ordering::Relaxed),
+                )
+            } else {
+                "slot_minus_8=?".to_string()
+            };
             tracing::warn!(
                 "[g1] CORRUPT-CELL HOLDER GRID VERDICT: holder={addr:#x} class_id={cid} \
-                 num_slots={slots} mark={mark:#018x} gc_flags={:#x} paired={paired:#018x} \n                 word0_arena_test={arena_says} arena=[{:#x},{:#x}) \n                 source={where_from} {provenance}",
+                 num_slots={slots} mark={mark:#018x} gc_flags={:#x} paired={paired:#018x} \
+                 word0_arena_test={arena_says} arena=[{:#x},{:#x}) reason={reason} \
+                 caller={caller} \
+                 slot={slot:#x} slot_index={slot_index} raw0={raw0:#018x} raw1={raw1:#018x} \
+                 raw0_tag={} raw0_untagged_arena={} {target_desc} {before_desc} \
+                 {slot_in} {} \
+                 source={where_from} {provenance}",
                 (mark >> 56) & 0xF,
                 self.arena_base,
                 self.arena_end,
+                raw0 & 0b11,
+                self.arena_end > self.arena_base
+                    && ((raw0 & !0b11u64) as usize) >= self.arena_base
+                    && ((raw0 & !0b11u64) as usize) < self.arena_end,
+                ref_write_provenance(slot),
             );
         }
     }
@@ -11035,7 +12206,7 @@ impl G1Collector {
                     if !self.evacuation_candidate_is_an_object(
                         regions,
                         "worklist-scan[array]",
-                        obj_ptr,
+                        obj_ptr as *mut u8,
                         i,
                         raw as usize,
                     ) {
@@ -11054,6 +12225,13 @@ impl G1Collector {
                         bytes_copied,
                         cset,
                     ) {
+                        note_ref_write(
+                            slot_ptr as usize,
+                            new_ptr as u64,
+                            obj_ptr as usize,
+                            holder_extent(obj_ptr, header),
+                            8,
+                        );
                         unsafe {
                             std::ptr::write(slot_ptr as *mut u64, new_ptr as u64);
                         }
@@ -11101,7 +12279,7 @@ impl G1Collector {
                     if !self.evacuation_candidate_is_an_object(
                         regions,
                         "worklist-scan[object]",
-                        obj_ptr,
+                        obj_ptr as *mut u8,
                         // The SLOT, not the candidate. Both were `raw` here,
                         // so every rejection this site has ever reported
                         // printed a heap address where the offset belongs --
@@ -11124,7 +12302,13 @@ impl G1Collector {
                         bytes_copied,
                         cset,
                     ) {
-                        write_flat_object_reference(slot_ptr, new_ptr as usize, compact);
+                        write_flat_object_reference_watched(
+                            slot_ptr,
+                            new_ptr as usize,
+                            compact,
+                            obj_ptr,
+                            holder_extent(obj_ptr, header),
+                        );
                         if fresh {
                             work_list.push(new_ptr);
                         }
@@ -11452,6 +12636,13 @@ impl G1Collector {
                             bytes_copied,
                             cset,
                         ) {
+                            note_ref_write(
+                                slot_ptr as usize,
+                                new_ptr as u64,
+                                obj_ptr as usize,
+                                holder_extent(obj_ptr, header),
+                                8,
+                            );
                             unsafe {
                                 std::ptr::write(slot_ptr as *mut u64, new_ptr as u64);
                             }
@@ -11518,7 +12709,13 @@ impl G1Collector {
                             bytes_copied,
                             cset,
                         ) {
-                            write_flat_object_reference(slot_ptr, new_ptr as usize, compact);
+                            write_flat_object_reference_watched(
+                                slot_ptr,
+                                new_ptr as usize,
+                                compact,
+                                obj_ptr,
+                                holder_extent(obj_ptr, header),
+                            );
                             work_list.push(new_ptr);
                         }
                     },
@@ -11716,10 +12913,18 @@ impl G1Collector {
         // `add_reference` dedups.)
         // F-02 — the CSet-screened forwarding lookup this walk resolves slots
         // through. See `ForwardLookup`.
+        // `RegionView::Raw`, not `Slice`: the walk below takes `&mut regions[i]`
+        // for the card table, so a shared slice borrow cannot live across it.
+        // This is the identical access the parallel arm's screens already take
+        // (see `RegionView`) -- base pointer plus length, one region at a time,
+        // through shared references only, over a table that is not reallocated
+        // during a pause.
+        let regions_len = regions.len();
         let forwards = ForwardLookup {
             collector: self,
             cset,
             map: pointer_map,
+            regions: RegionView::Raw(RegionsBase(regions.as_mut_ptr()), regions_len),
         };
         let mut new_rset_edges: Vec<(usize, usize)> = Vec::new();
         // G1AUD-9 — the `(target, holder)` pairs already emitted for the region
@@ -11870,6 +13075,39 @@ impl G1Collector {
                             header.mark_word.load(Ordering::Relaxed),
                         );
                     }
+            // QUEUE IT FOR THE END-OF-PAUSE GRID VERDICT.
+            //
+            // This refusal population is the one
+            // `g1-eight-byte-write-at-a-live-objects-base-20260906` calls "the
+            // genuine shape", and it is the one population that never got the
+            // question asked of it: `grid_closes_on_cursor` and
+            // `locate_in_object_grid` are only reachable with the region table
+            // held, and a refusal returns immediately. So "is this address an
+            // object start at all" -- the question that decides whether there
+            // is a WRITER to find or a walk that arrived somewhere it should
+            // not have -- was answered for the corrupt-CELL family and never
+            // for this one.
+            //
+            // The holder's own first sixteen bytes stand in for the cell: they
+            // ARE what the refusal is about.
+            {
+                // SAFETY: the screen above already read this header.
+                let (w0, w1) = unsafe {
+                    (
+                        std::ptr::read(obj_ptr as *const u64),
+                        std::ptr::read((obj_ptr as *const u64).add(1)),
+                    )
+                };
+                queue_pending_corrupt_holder(
+                    obj_ptr as *mut u8,
+                    header,
+                    obj_ptr as usize,
+                    0,
+                    w0,
+                    w1,
+                    "phase4-fixup-holder",
+                );
+            }
                 }
                 if !refuse {
                     if rewrite {
@@ -11878,7 +13116,7 @@ impl G1Collector {
                     self.collect_outgoing_cross_region_edges(
                         regions,
                         i,
-                        obj_ptr,
+                        obj_ptr as *mut u8,
                         header,
                         &mut new_rset_edges,
                         &mut seen_targets,
@@ -12129,7 +13367,7 @@ impl G1Collector {
                     }
                 } else {
                     for_each_flat_object_reference_trusting_header(
-                        obj_ptr,
+                        obj_ptr as *mut u8,
                         header,
                         0,
                         |_, raw, _| check(raw),
@@ -12303,7 +13541,7 @@ impl G1Collector {
                 } else {
                     let mut found = 0u64;
                     for_each_flat_object_reference_trusting_header(
-                        obj_ptr,
+                        obj_ptr as *mut u8,
                         header,
                         0,
                         |_, raw, _| {
@@ -12567,7 +13805,7 @@ impl G1Collector {
                     }
                 } else {
                     for_each_flat_object_reference_trusting_header(
-                        obj_ptr,
+                        obj_ptr as *mut u8,
                         header,
                         0,
                         |_, raw, _| {
@@ -12670,7 +13908,7 @@ impl G1Collector {
                     }
                 } else {
                     for_each_flat_object_reference_trusting_header(
-                        obj_ptr,
+                        obj_ptr as *mut u8,
                         header,
                         0,
                         |_, raw, _| {
@@ -15890,7 +17128,7 @@ impl G1Collector {
                     }
                 } else {
                     for_each_flat_object_reference_trusting_header(
-                        obj_ptr,
+                        obj_ptr as *mut u8,
                         header,
                         0,
                         |_, raw, _| {
@@ -19756,6 +20994,37 @@ impl GarbageCollector for G1Collector {
             self.young_collection(roots, monitors)
         };
         let result = self.retry_after_evacuation_failure(result, roots, monitors);
+        // THE DRAIN THAT COVERS EVERY PAUSE PATH.
+        //
+        // `report_pending_corrupt_holders` is also called from five pause
+        // bodies, which is where it can run with the regions lock already held
+        // and answer soonest. That is not the same as covering every path:
+        // `g1-eight-byte-write-at-a-live-objects-base-20260906` measured
+        // **0 grid verdicts against 14 corrupt cells** on
+        // `TestHostConfigAutomaticDeploymentXmlExternalWarXml` at `-Xmx2g`,
+        // because that class's reports arrive from five walks on a pause path
+        // that reaches none of them -- so the ONE question the page most needed
+        // answered went unanswered for an instrument reason rather than a
+        // defect one, and the same drain emits eight verdicts a run on H2.
+        //
+        // This site is the pause's single funnel: every young, mixed and
+        // retry path returns through it. Draining here costs a lock acquire on
+        // an empty vector per pause and makes "a corrupt cell was reported and
+        // no verdict followed" mean the crash beat the drain, which is a fact
+        // about the run rather than about the wiring.
+        {
+            let regions = self.regions.read();
+            self.report_pending_corrupt_holders(&regions);
+        }
+        // The empty-header grid-proof budget is per PAUSE; this is the funnel
+        // every pause returns through. See
+        // `EMPTY_HEADER_PROOF_BUDGET_PER_PAUSE`.
+        EMPTY_HEADER_PROOFS_THIS_PAUSE.store(0, Ordering::Relaxed);
+        // One pause's worth of writes; the ledger answers questions about the
+        // pause that made them and a run-long map would be gigabytes.
+        if let Some(w) = REF_WRITE_WATCH.get() {
+            w.writes.lock().clear();
+        }
         let pause_ms = pause_start.elapsed().as_millis() as u64;
         if gc_flags().g1_dbg_diag {
             eprintln!(
@@ -20952,6 +22221,11 @@ struct ForwardLookup<'a> {
     collector: &'a G1Collector,
     cset: &'a RegionSet,
     map: &'a cratonvm_types::PointerMap,
+    /// The region table, so [`update_object_refs`] can clamp its two walks to
+    /// the holder's own region. Phase 4 already holds it; passing it here is
+    /// what lets the bound be a property of the WALK rather than of its one
+    /// caller's loop condition.
+    regions: RegionView<'a>,
 }
 
 impl ForwardLookup<'_> {
@@ -20966,16 +22240,50 @@ impl ForwardLookup<'_> {
 }
 
 /// Update reference fields in an object using the forwarding map.
+///
+/// # Both arms are bounded by the holder's own region
+///
+/// This walk WRITES every slot it resolves, and until 2026-09-08 neither arm
+/// had a bound of any kind: the array arm iterated `array_length` raw `u64`
+/// slots and the object arm went through
+/// [`for_each_flat_object_reference_trusting_header`], whose own doc says it
+/// "bounds it by nothing". `g1-eight-byte-write-at-a-live-objects-base-20260906`
+/// names this as the AMPLIFIER of the corrupt-header family: one refusal in its
+/// census named a holder declaring 102736 legacy slots -- a 1.6 MB body in a
+/// 1 MiB region, rewritten cell by cell with forwarding addresses.
+///
+/// Its single caller (Phase 4's linear region walk) does break on
+/// `offset + obj_size > cursor`, so in practice the count it hands over already
+/// fits the region -- but that is a property of ONE caller, restated nowhere,
+/// and the counts here come from the same `shape` dword the family corrupts.
+/// The clamp makes it a property of the walk. It cannot drop a live reference:
+/// a reference field of an object is inside that object, and a slot past the
+/// holder's own region is not one.
 fn update_object_refs(obj_ptr: *mut u8, header: &ObjectHeader, forwards: &ForwardLookup<'_>) {
     let data_start = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET) };
+    let extent = holder_extent(obj_ptr, header);
 
     if header.kind() == ObjectKind::Array {
         if header.element_type() == ArrayElementType::Reference {
-            for i in 0..header.array_length() as usize {
+            let walkable = forwards.collector.holder_walkable_slots_view(
+                forwards.regions,
+                obj_ptr,
+                header.array_length() as usize,
+                8,
+                HolderBound::Cursor,
+            );
+            for i in 0..walkable {
                 let slot_ptr = unsafe { data_start.add(i * 8) };
                 let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
                 if raw != 0 {
                     if let Some(new_addr) = forwards.resolve(raw as usize) {
+                        note_ref_write(
+                            slot_ptr as usize,
+                            new_addr as u64,
+                            obj_ptr as usize,
+                            extent,
+                            8,
+                        );
                         unsafe {
                             std::ptr::write(slot_ptr as *mut u64, new_addr as u64);
                         }
@@ -20984,9 +22292,16 @@ fn update_object_refs(obj_ptr: *mut u8, header: &ObjectHeader, forwards: &Forwar
             }
         }
     } else {
-        for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |slot, raw, compact| {
+        let walkable = forwards.collector.holder_walkable_slots_view(
+            forwards.regions,
+            obj_ptr,
+            header.num_slots() as usize,
+            SLOT_SIZE,
+            HolderBound::Cursor,
+        );
+        for_each_flat_object_reference_capped(obj_ptr, header, 0, walkable, |slot, raw, compact| {
             if let Some(new_addr) = forwards.resolve(raw) {
-                write_flat_object_reference(slot, new_addr, compact);
+                write_flat_object_reference_watched(slot, new_addr, compact, obj_ptr, extent);
             }
         });
     }
@@ -22096,20 +23411,32 @@ mod tests {
                 .contains(&idx),
             "a real object root must leave its region collectable"
         );
-        // The limitation, pinned so it cannot be forgotten: the screen reads the
-        // BYTES at the address, so an interior pointer whose bytes happen to
-        // decode is indistinguishable from an object start. A zeroed field cell
-        // is the standard example — `class_id=0, num_slots=0, kind=Object`
-        // yields exactly `HEADER_SIZE`, which is why the rset-source walk
-        // documents the same hole.
+        // THE LIMITATION THIS TEST USED TO PIN IS CLOSED (2026-09-08), and the
+        // assertion is inverted rather than deleted so the reason survives.
+        //
+        // It read: "a zeroed cell decodes as a plausible header -- this screen
+        // cannot see it, and a test claiming otherwise would be describing a
+        // collector we do not have". That was true of every screen this file
+        // had, and it is the door
+        // `g1-eight-byte-write-at-a-live-objects-base-20260906` came through:
+        // a null `Value` cell is `[4, 0]`, so the address of its PAYLOAD word
+        // has `[0, <the next cell's discriminant>]` as its own sixteen bytes
+        // and reads as a valid zero-field class-0 object. Following one
+        // installs a forwarding mark word at `addr + 8` -- the next cell's
+        // discriminant word, inside a live object -- which is that page's
+        // corrupt-cell family bit for bit.
+        //
+        // `empty_header_is_a_real_object` closes it with the only oracle that
+        // can: the region's own object grid, walked once, and only for this
+        // shape. `CRATONVM_G1_EVAC_EMPTY_HEADER_GRID_PROOF=0` restores the
+        // behaviour this assertion used to describe.
         let zeroed_cell =
             unsafe { ObjectRef::from_raw((obj.as_ptr() as usize + HEADER_SIZE) as *mut u8) };
         assert!(
-            !gc.pinned_region_set_including_non_object_roots(&regions, &[zeroed_cell])
+            gc.pinned_region_set_including_non_object_roots(&regions, &[zeroed_cell])
                 .contains(&idx),
-            "a zeroed cell decodes as a plausible header — this screen cannot \
-             see it, and a test claiming otherwise would be describing a \
-             collector we do not have"
+            "a zeroed field cell is not an object start, and the region's own \
+             object grid is what says so"
         );
 
         // What it DOES catch is the measured shape: bytes that do not decode.
@@ -22953,10 +24280,12 @@ mod tests {
         // one here is how the screen's behaviour becomes observable.
         map.insert(b_addr, 0xbeef_0000);
 
+        let regions_for_lookup = gc.regions.read();
         let lookup = ForwardLookup {
             collector: &gc,
             cset: &cset,
             map: &map,
+            regions: RegionView::Slice(&regions_for_lookup),
         };
         assert_eq!(
             lookup.resolve(a_addr),
@@ -23127,6 +24456,61 @@ mod tests {
     }
 
     // -- Collector creation --
+
+    /// `forwarding_target` strips the low TWO bits; `make_forwarded` asserts
+    /// the low THREE are clear. A word that is not a forward at all but whose
+    /// low two bits are `0b11` therefore decodes to an address that no
+    /// installation could have produced -- and that value used to be returned
+    /// to the evacuator, stored into the reference slot being scanned, and
+    /// pushed onto the gray worklist as a holder.
+    ///
+    /// See `G1Collector::decode_forwarding_target` for the measurement: four
+    /// of four reference-slot writes carrying a tagged value had `low3 = 4`,
+    /// and their payloads were ASCII.
+    #[test]
+    fn a_word_that_is_forwarded_only_by_coincidence_does_not_decode_to_a_target() {
+        let gc = make_collector();
+
+        // A real install round-trips.
+        let real = gc.arena_base + 0x1000;
+        let installed = ObjectHeader::make_forwarded(0, real);
+        assert!(ObjectHeader::is_forwarded_mark(installed));
+        assert_eq!(
+            gc.decode_forwarding_target(installed, 0),
+            Some(real as *mut u8),
+            "a target this collector installed must decode back to itself"
+        );
+
+        // The ASCII payload of a Java string, whose low two bits are `0b11` by
+        // coincidence. `is_forwarded_mark` accepts it and `forwarding_target`
+        // hands back an address with bit 2 still set.
+        let coincidence = 0x0000_636a_6163_6a2f_u64;
+        assert!(
+            ObjectHeader::is_forwarded_mark(coincidence),
+            "the low two bits are the whole of `is_forwarded_mark`"
+        );
+        assert_eq!(
+            ObjectHeader::forwarding_target(coincidence) as usize & 0b111,
+            0b100,
+            "bit 2 survives the decode, which is what makes the value detectable"
+        );
+        assert_eq!(
+            gc.decode_forwarding_target(coincidence, 0),
+            None,
+            "a word `make_forwarded` could not have written must not decode"
+        );
+
+        // ...and an 8-ALIGNED coincidence, which alignment alone cannot catch,
+        // is refused by the arena bound.
+        let aligned_coincidence = 0x0000_636a_6163_6a2b_u64;
+        assert!(ObjectHeader::is_forwarded_mark(aligned_coincidence));
+        assert_eq!(
+            ObjectHeader::forwarding_target(aligned_coincidence) as usize & 0b111,
+            0,
+            "this one IS 8-aligned; only the arena bound rejects it"
+        );
+        assert_eq!(gc.decode_forwarding_target(aligned_coincidence, 0), None);
+    }
 
     #[test]
     fn collector_creation() {
@@ -26824,7 +28208,7 @@ mod tests {
                     }
                 } else {
                     for_each_flat_object_reference_trusting_header(
-                        obj_ptr,
+                        obj_ptr as *mut u8,
                         header,
                         0,
                         |_, raw, _| check(raw),
