@@ -1330,52 +1330,75 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-skip-republish", on_key: Some("CRATONVM_JIT_IR_SKIP_REPUBLISH"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "ir-deopt-regs", on_key: Some("CRATONVM_JIT_IR_DEOPT_REGS"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "ir-osr-entry", on_key: Some("CRATONVM_JIT_IR_OSR_ENTRY"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
+    // ── The nine C2-cost changes of 2026-09-09 (`d21ae9e3f`) ──────────
+    //
+    // Landed on `dev` with no INVENTORY rows, which held the pre-push
+    // flag-surface gate red for every branch cut from it. Declared here from
+    // their read sites; the defaults below are what those sites actually do,
+    // not what the commit message summarised.
+    //
+    // R2a. Splice a callee whose body carries `ldc`/`ldc2_w`: `IrInlineTables`
+    // carries the constants now, so the builder no longer needs to invent the
+    // float/double discriminator `InlineSite`'s raw `i64` dropped.
+    E { group: Group::JIT, token: "ir-splice-ldc", on_key: Some("CRATONVM_JIT_IR_SPLICE_LDC"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // R2b. Splice a callee whose body BRANCHES. The builder re-verifies each
+    // relocated body on its own and rebases the merge targets and loop headers
+    // that come out, which is the analysis the caller's `verified_code` cannot
+    // supply for a region past its `code_len`.
+    E { group: Group::JIT, token: "ir-splice-branch", on_key: Some("CRATONVM_JIT_IR_SPLICE_BRANCH"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // Splice a callee whose body reads a STATIC. `InlineSite::static_field_info`
+    // has carried the resolved rows all along; `IrInlineTables` now rebases
+    // them, so the builder's `0xb2` arm finds a spliced site exactly as it
+    // finds one of the caller's own. `putstatic` is refused separately and
+    // unconditionally -- the builder has no arm for it.
+    // Bind a surviving statically-bound call inside a spliced body to the
+    // callee's entry with a raw CALL, instead of letting it fall through to
+    // `jit_invoke_dispatch` and resolve the callee by name on every call. The
+    // resolver had bound and keep-alive-registered the entry all along; nothing
+    // put it where the lowerer looks.
+    E { group: Group::JIT, token: "ir-splice-direct-call", on_key: Some("CRATONVM_JIT_IR_SPLICE_DIRECT_CALL"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    E { group: Group::JIT, token: "ir-splice-getstatic", on_key: Some("CRATONVM_JIT_IR_SPLICE_GETSTATIC"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // R1. Memoize the ACCEPTED optimizing OSR artifact, not only the refusals.
+    // Without it one run recompiled the same method 502 times.
+    E { group: Group::JIT, token: "osr-optimizing-cache", on_key: Some("CRATONVM_JIT_OSR_OPTIMIZING_CACHE"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // R7. Elide the `JMP` to a block that is physically next.
+    E { group: Group::JIT, token: "ir-fallthrough", on_key: Some("CRATONVM_JIT_IR_FALLTHROUGH"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // R3, R4 and R6: opt-IN, default OFF pending their soaks. Each read site
+    // accepts `1`/`true`/`on`/`yes` and nothing else, so there is no off-word
+    // to state -- removing the key is the way back.
+    E { group: Group::JIT, token: "ir-deopt-points-at-traps", on_key: Some("CRATONVM_JIT_IR_DEOPT_POINTS_AT_TRAPS"), off_key: None, off_word: None, since: "2026-09-09" },
+    E { group: Group::JIT, token: "ir-reg-authoritative", on_key: Some("CRATONVM_JIT_IR_REG_AUTHORITATIVE"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    E { group: Group::JIT, token: "ir-speculate", on_key: Some("CRATONVM_JIT_IR_SPECULATE"), off_key: None, off_word: None, since: "2026-09-09" },
+    // Diagnosis lever, value-taking: a comma-separated list of conservative
+    // root-band CLASSES to skip (`operand-spill`,
+    // `outgoing-args-or-deopt-regs`, `safepoint-gpr-spill-image`). Absent
+    // means skip nothing, which is the only setting that is safe -- dropping a
+    // root frees what it named, and the lever exists to MEASURE the ceiling a
+    // real fix would reach, not to be run. Landed 2026-09-09 with the G1
+    // pinned-regions work and undeclared; see `band_skip_classes`.
+    E { group: Group::JIT, token: "band-skip", on_key: Some("CRATONVM_JIT_BAND_SKIP"), off_key: None, off_word: None, since: "2026-09-09" },
     E { group: Group::JIT, token: "ls-carry-relief", on_key: Some("CRATONVM_JIT_LS_CARRY_RELIEF"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "ir-reserve-carried", on_key: Some("CRATONVM_JIT_IR_RESERVE_CARRIED"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "osr-optimizing", on_key: Some("CRATONVM_JIT_OSR_OPTIMIZING"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "osr-optimizing-memo", on_key: Some("CRATONVM_JIT_OSR_OPTIMIZING_MEMO"), off_key: None, off_word: Some("0"), since: "2026-09-06" },
-    // 2026-09-09, the C2-tier cost work. The optimizing OSR path memoized only
-    // its REFUSALS, so an accepted artifact was rebuilt at every entry -- 502
-    // compiles of one method on one run, 24% of wall clock. This is the
-    // acceptance memo; `-osr-optimizing-cache` restores the recompile so the
-    // two arms are timeable from one binary.
-    E { group: Group::JIT, token: "osr-optimizing-cache", on_key: Some("CRATONVM_JIT_OSR_OPTIMIZING_CACHE"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
-    // IR-tier inlining, the three shapes the splice scanner used to refuse.
-    // Each is read by BOTH halves of its feature -- the scanner in
-    // `jit_bridge`, which admits the callee, and `IrBuilder`, which walks it --
-    // and neither half may be flipped alone: a body admitted without the
-    // builder's half is the orphan-node failure STUB-S8 was.
-    E { group: Group::JIT, token: "ir-splice-ldc", on_key: Some("CRATONVM_JIT_IR_SPLICE_LDC"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
-    E { group: Group::JIT, token: "ir-splice-branch", on_key: Some("CRATONVM_JIT_IR_SPLICE_BRANCH"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
-    E { group: Group::JIT, token: "ir-splice-multi-return", on_key: Some("CRATONVM_JIT_IR_SPLICE_MULTI_RETURN"), off_key: None, off_word: None, since: "2026-09-09" },
-    // Block layout: elide the `JMP rel32` to a successor the layout already
-    // placed physically next. Default ON; `-ir-fallthrough` restores the shape
-    // in which every CFG edge ended in an explicit jump, which is the arm that
-    // says whether `ir_schedule`'s frequency-driven layout buys anything.
-    E { group: Group::JIT, token: "ir-fallthrough", on_key: Some("CRATONVM_JIT_IR_FALLTHROUGH"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
-    // The three default-OFF experiments from the same work. Each changes what
-    // the optimizing tier emits and each is off until its own soak has run:
+    // The remaining three of the 2026-09-09 C2-cost switches. The rest of that
+    // work is declared in the block above; these are the ones whose read sites
+    // arrived on a different branch.
     //
-    //   ir-deopt-points-at-traps  a `DeoptimizationPoint` only at a bci a
-    //                             transfer can arrive at, instead of at every
-    //                             bytecode index (points 90 -> 20).
-    //   ir-reg-authoritative      drop the home store of a value no deopt that
-    //                             can happen could name (stores 67 -> 60).
-    //   ir-ref-residency          let a REFERENCE be register-resident, with
-    //                             the cached copy invalidated at every point a
-    //                             collector could have run.
-    E { group: Group::JIT, token: "ir-deopt-points-at-traps", on_key: Some("CRATONVM_JIT_IR_DEOPT_POINTS_AT_TRAPS"), off_key: None, off_word: None, since: "2026-09-09" },
-    E { group: Group::JIT, token: "ir-reg-authoritative", on_key: Some("CRATONVM_JIT_IR_REG_AUTHORITATIVE"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // A spliced body with more than one `return`. Read by BOTH halves -- the
+    // scanner in `jit_bridge` and `IrBuilder::splice_return` -- and off
+    // because it measures neutral while forfeiting the optimizing OSR door
+    // for every method it applies to; see `ir_splice_multi_return_enabled`.
+    E { group: Group::JIT, token: "ir-splice-multi-return", on_key: Some("CRATONVM_JIT_IR_SPLICE_MULTI_RETURN"), off_key: None, off_word: None, since: "2026-09-09" },
+    // Let a REFERENCE be register-resident, with the cached copy invalidated
+    // at every point a collector could have run. Off because it does not pay,
+    // not because it is unsafe.
     E { group: Group::JIT, token: "ir-ref-residency", on_key: Some("CRATONVM_JIT_IR_REF_RESIDENCY"), off_key: None, off_word: None, since: "2026-09-09" },
     // The two halves of `ir-ref-residency` cost different things: crossing a
     // safepoint admits the shapes that matter but RESERVES a register the
     // invalidation then makes unreadable for most of the range. Separated so
     // both are timeable from one binary. Only meaningful with the above on.
     E { group: Group::JIT, token: "ir-ref-residency-cross-safepoint", on_key: Some("CRATONVM_JIT_IR_REF_RESIDENCY_CROSS_SAFEPOINT"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
-    // Speculation: fold an arm never taken in >= 2000 observations into an
-    // `Op::Guard`, so the cold half stops being emitted and stops being
-    // scheduled around. Needs the branch profile, i.e. `tier-pgo-always`.
-    E { group: Group::JIT, token: "ir-speculate", on_key: Some("CRATONVM_JIT_IR_SPECULATE"), off_key: None, off_word: None, since: "2026-09-09" },
     E { group: Group::JIT, token: "ir-drop-phi-home", on_key: Some("CRATONVM_JIT_IR_DROP_PHI_HOME"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "ir-publish-at-def", on_key: Some("CRATONVM_JIT_IR_PUBLISH_AT_DEF"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "ir-drop-home", on_key: Some("CRATONVM_JIT_IR_DROP_HOME"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
@@ -1964,6 +1987,7 @@ pub const INVENTORY: &[E] = &[
     // the moment a method tiers up. Affordable since the counters went
     // lock-free (measured 0.6% on an always-on run), and default OFF only
     // until that measurement has been repeated on a soak.
+    // Presence-tested (`runtime_var_os(..).is_some()`), so any value turns it on.
     E { group: Group::JIT, token: "tier-pgo-always", on_key: Some("CRATONVM_TIER_PGO_ALWAYS"), off_key: None, off_word: None, since: "2026-09-09" },
     E { group: Group::JIT, token: "tiered", on_key: Some("CRATONVM_TIER_ENABLED"), off_key: None, off_word: Some("0"), since: "2026-06-22" },
     E { group: Group::JIT, token: "tlab-zero-elision", on_key: None, off_key: Some("CRATONVM_NO_JIT_TLAB_ZERO_ELISION"), off_word: None, since: "2026-07-30" },

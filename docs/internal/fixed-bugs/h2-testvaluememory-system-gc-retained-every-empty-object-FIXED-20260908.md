@@ -205,6 +205,21 @@ layout is the obvious candidate. That is a hypothesis and nothing on this page
 measured it. What the page does establish is that it is not the leak, not the
 metric, and not enough to threaten a 3x threshold.
 
+> **CORRECTED 2026-09-09.** The hypothesis in the paragraph above is wrong, and
+> so is the sentence that calls 977 a residual at all. `testType` nulls `list`
+> and `map` and **does not null `array`**, and it reads `array.length` AFTER the
+> measurement — so the 125 000-slot `Object[]` is a LIVE local across both
+> `System.gc()` calls, on every JVM. 125 000 x 8 + 16 = 1 000 016 B = 977 KB is
+> that array, and HotSpot's 488 is the same array with 4-byte compressed
+> references. There is no over-retention in the `--nojit` rows: **977 is the
+> floor, reached exactly**, and only compressed references could go below it.
+> The value cells are `ValueNull.INSTANCE` — one singleton, which is what
+> `size: 1` in the assertion message reports — so their layout cannot be the
+> cause. Measured in
+> `docs/known-issues/h2/testvaluememory-fails-under-g1-on-conservative-jit-roots-20260908.md`,
+> which also prices what the JIT-on rows would cost with precise compiled-frame
+> roots.
+
 The first version of this section drew the conclusion from the `retained`
 column alone — "`--nojit` retained 0, JIT on retained 2930" — which is the
 identical number for "reclaimed early" and "never counted", and would have read

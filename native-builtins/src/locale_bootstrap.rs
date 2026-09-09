@@ -1086,6 +1086,70 @@ fn get_available_locales(ctx: &mut dyn NativeContext, _args: &[Value]) -> Method
     Ok(Some(Value::Object(Some(arr))))
 }
 
+/// `JRELocaleProviderAdapter.getLocaleServiceProvider(Class)`.
+///
+/// A named function rather than a closure so the delegation arm can be tested
+/// directly; the registration and the reasoning for it are at the call site.
+fn jre_adapter_get_locale_service_provider(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // `args[0]` is the receiver; `args[1]` is the first PARAMETER.
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // Compare the fully qualified name with separators normalised, so this does
+    // not depend on whether the registry hands back the internal or the dotted
+    // spelling. A suffix match would do today, but an exact one cannot be
+    // surprised by a later SPI whose name happens to end the same way.
+    let spi = match args.get(1) {
+        Some(Value::Object(Some(mirror))) => {
+            crate::lang_class::mirror_class_name(ctx, *mirror).map(|n| n.replace('/', "."))
+        }
+        _ => None,
+    };
+    if spi.as_deref() == Some("java.text.spi.DecimalFormatSymbolsProvider") {
+        // Not shadowed by any native, so this runs the adapter's own bytecode;
+        // it does not re-enter this method.
+        match ctx.invoke_virtual(
+            this,
+            "getDecimalFormatSymbolsProvider",
+            "()Ljava/text/spi/DecimalFormatSymbolsProvider;",
+            &[],
+        ) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                // DEGRADE rather than propagate. `getDecimalFormatSymbolsProvider`
+                // instantiates the adapter's inner provider off
+                // `LocaleDataMetaInfo`/`LocaleResources` -- the resource-bundle
+                // chain this whole override exists to bypass. Before this arm
+                // existed the answer was an unconditional `null`, which
+                // `findAdapter` is written to skip; propagating instead would
+                // turn a wrong-but-working format call into a throw out of
+                // `DecimalFormatSymbols.getInstance` on any image that cannot
+                // walk that chain. Falling back to the old `null` means this arm
+                // can only improve on the previous behaviour and can never
+                // introduce a failure that was not there before.
+                //
+                // Logged rather than swallowed: a locale that quietly formats as
+                // English is exactly the defect that hides for months when
+                // nothing says anything.
+                tracing::warn!(
+                    error = ?e,
+                    "getDecimalFormatSymbolsProvider threw; falling back to the \
+                     legacy null. Number symbols then resolve against ROOT -- every \
+                     locale formats as English -- on any JDK whose \
+                     FallbackLocaleProviderAdapter is root-only, which JDK 21's is \
+                     and JDK 25's is not."
+                );
+                return Ok(Some(Value::Object(None)));
+            }
+        }
+    }
+    Ok(Some(Value::Object(None)))
+}
+
 pub fn register(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -1212,19 +1276,50 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // `throw new InternalError("should not come down here")`, and which
     // `LocaleServiceProviderPool.findAdapter` is written to skip.
     //
-    // It is not landed here because it cannot be landed blind: each
+    // Wave-5, 2026-09-09: the FIRST arm of that faithful fix is now landed —
+    // `DecimalFormatSymbolsProvider` only. Every other SPI still answers null.
+    //
+    // Why this arm first. It is the one a `--jdk-only` corpus row was waiting
+    // on. `DecimalFormatSymbols.initialize` calls
+    // `LocaleProviderAdapter.getAdapter(DecimalFormatSymbolsProvider.class,
+    // loc)`, whose `findAdapter` accepts an adapter only if
+    // `adapter.getLocaleServiceProvider(spi)` is non-null. The blanket null
+    // made that test fail for CLDR *and* for JRE, so `getAdapter` fell through
+    // to `fallbackLocaleProviderAdapter` — and on JDK 21 (only)
+    // `FallbackLocaleProviderAdapter` overrides `getLocaleResources` to hand
+    // back its `rootLocaleResources` field for ANY locale. JDK 25 deletes that
+    // override and inherits the per-locale one, which is the whole reason the
+    // same VM is correct there. Measured, all four cells:
+    //
+    //   image / mode        STEP2 provider   chosen adapter  its LocaleResources
+    //   HotSpot 21          DFSProviderImpl  CLDR            de_DE      correct
+    //   CratonVM 21 real    null             Fallback        ROOT       correct*
+    //   CratonVM 21 strict  null             Fallback        ROOT       WRONG
+    //   CratonVM 25 strict  null             Fallback        de_DE      correct
+    //
+    //   (*) correct only because `--real-jdk` runs a synthetic
+    //       `DecimalFormatSymbols.initialize` stub that never walks providers.
+    //       Strict mode refuses that stub, so strict mode is the only arm that
+    //       consults this native at all — the defect was present in the default
+    //       mode too, and invisible there.
+    //
+    // Note what this does NOT do: it does not retire the native, and the other
+    // ~11 SPI classes still get the blanket null, so the divergence recorded
+    // above is narrowed and not closed. The remaining arms need the same
+    // treatment ONE AT A TIME with the formatting suites re-run for each, and a
+    // blanket delegation on the strength of reading the switch is still the
+    // wrong move.
+    //
+    // The wave-4 caution, still true of every arm except this one: each
     // `get*Provider()` calls `getLanguageTagSet(...)` and instantiates the
     // adapter's inner provider off `LocaleDataMetaInfo`/`LocaleResources` —
     // precisely the JDK resource-bundle chain this C20 override exists to
-    // bypass for Jackson/H2/`Locale.getDefault()` formatting. Landing it needs
-    // a build plus those suites. Whoever picks it up: delegate ONE SPI at a
-    // time, re-run the formatting suites for each, and do not "simplify" it to
-    // a blanket delegation on the strength of reading the switch.
+    // bypass for Jackson/H2/`Locale.getDefault()` formatting.
     registry.register(
         "sun/util/locale/provider/JRELocaleProviderAdapter",
         "getLocaleServiceProvider",
         "(Ljava/lang/Class;)Ljava/util/spi/LocaleServiceProvider;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        jre_adapter_get_locale_service_provider,
     );
 
     // Getter overrides for synthetic Locales created by get_or_create_default.
@@ -1867,5 +1962,182 @@ mod tests {
         );
         // `en_` — a country that is present but empty.
         assert_eq!(parse_posix_locale("en_"), ("en".to_string(), String::new()));
+    }
+}
+
+#[cfg(test)]
+mod locale_service_provider_delegation_tests {
+    use super::*;
+    use crate::test_utils::MockNativeContext;
+    use cratonvm_native_api::{NativeClassAccess, NativeHeapAccess};
+    use cratonvm_types::error::MethodCallResult;
+
+    /// `LocaleProviderAdapter.findAdapter` accepts an adapter only when
+    /// `adapter.getLocaleServiceProvider(spi)` is non-null. This native used to
+    /// answer `null` for EVERY spi, so no adapter was ever accepted and
+    /// `getAdapter` fell through to `fallbackLocaleProviderAdapter` -- which on
+    /// JDK 21 (and not on 25) returns its root `LocaleResources` for any
+    /// locale. That is the whole JDK 21 strict-mode locale defect: every locale
+    /// formatted as English, with nothing missing and nothing thrown.
+    ///
+    /// These are mock tests because the defect is invisible on a JDK 25 image,
+    /// and a JDK 25 image is what CI has.
+    fn adapter_and_spi_mirror(ctx: &mut MockNativeContext, spi_class: &str) -> (ObjectRef, ObjectRef) {
+        let adapter_cid = ctx
+            .ensure_class_initialized("sun/util/locale/provider/CLDRLocaleProviderAdapter")
+            .expect("declare adapter");
+        let adapter = ctx.alloc_object(adapter_cid, 0);
+        let spi_cid = ctx.ensure_class_initialized(spi_class).expect("declare spi");
+        let mirror = ctx.get_class_mirror(spi_cid);
+        (adapter, mirror)
+    }
+
+    /// The delegation must be a call to the receiver's own
+    /// `getDecimalFormatSymbolsProvider`, with the JDK signature. Asserting
+    /// only "non-null was returned" would also pass for a stub that invented
+    /// some other object.
+    fn record_call(
+        _ctx: &mut MockNativeContext,
+        _receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        _args: &[Value],
+    ) -> Option<MethodCallResult> {
+        if method_name == "getDecimalFormatSymbolsProvider"
+            && descriptor == "()Ljava/text/spi/DecimalFormatSymbolsProvider;"
+        {
+            // A sentinel Int is not a legal return here; it is used BECAUSE it
+            // cannot be confused with anything the blanket-null path produces.
+            Some(Ok(Some(Value::Int(0x0DF5))))
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn the_decimal_format_symbols_provider_is_delegated_to_the_real_getter() {
+        let mut ctx = MockNativeContext::new();
+        let (adapter, mirror) =
+            adapter_and_spi_mirror(&mut ctx, "java/text/spi/DecimalFormatSymbolsProvider");
+        ctx.set_invoke_virtual_hook(record_call);
+
+        let got = jre_adapter_get_locale_service_provider(
+            &mut ctx,
+            &[Value::Object(Some(adapter)), Value::Object(Some(mirror))],
+        );
+
+        assert_eq!(
+            got.ok().flatten(),
+            Some(Value::Int(0x0DF5)),
+            "the DecimalFormatSymbolsProvider arm did not delegate; a null here \
+             makes findAdapter skip every adapter and fall through to the \
+             fallback one, whose LocaleResources is ROOT on JDK 21"
+        );
+    }
+
+    /// The control that makes the test above mean something. Without it, an arm
+    /// that delegated for EVERY spi class would pass, and every one of the
+    /// remaining SPIs would silently start walking the resource-bundle chain
+    /// this override exists to bypass.
+    #[test]
+    fn an_spi_that_has_no_arm_yet_still_answers_null() {
+        let mut ctx = MockNativeContext::new();
+        let (adapter, mirror) =
+            adapter_and_spi_mirror(&mut ctx, "java/util/spi/CalendarDataProvider");
+        ctx.set_invoke_virtual_hook(record_call);
+
+        let got = jre_adapter_get_locale_service_provider(
+            &mut ctx,
+            &[Value::Object(Some(adapter)), Value::Object(Some(mirror))],
+        );
+
+        assert_eq!(
+            got.ok().flatten(),
+            Some(Value::Object(None)),
+            "an SPI with no arm must still answer null -- delegating for all of \
+             them at once is exactly what the wave-4 note forbids"
+        );
+    }
+
+    /// A near miss: same simple name, different package. The match is on the
+    /// fully qualified name, so a class that merely ENDS the same way must not
+    /// be claimed.
+    #[test]
+    fn a_same_named_class_in_another_package_is_not_claimed() {
+        let mut ctx = MockNativeContext::new();
+        let (adapter, mirror) =
+            adapter_and_spi_mirror(&mut ctx, "com/example/spi/DecimalFormatSymbolsProvider");
+        ctx.set_invoke_virtual_hook(record_call);
+
+        let got = jre_adapter_get_locale_service_provider(
+            &mut ctx,
+            &[Value::Object(Some(adapter)), Value::Object(Some(mirror))],
+        );
+
+        assert_eq!(
+            got.ok().flatten(),
+            Some(Value::Object(None)),
+            "the match must be on the fully qualified name, not a suffix"
+        );
+    }
+
+    /// The degrade path. If the real getter throws, the arm must fall back to
+    /// the legacy `null` rather than propagate -- otherwise this change could
+    /// turn a wrong-but-working format call into a throw out of
+    /// `DecimalFormatSymbols.getInstance` on an image that cannot walk the
+    /// resource-bundle chain. Without this test the fallback is one `return`
+    /// away from being deleted as dead code by someone tidying the match.
+    #[test]
+    fn a_throwing_getter_degrades_to_the_legacy_null_instead_of_propagating() {
+        fn throwing_call(
+            _ctx: &mut MockNativeContext,
+            _receiver: ObjectRef,
+            method_name: &str,
+            _descriptor: &str,
+            _args: &[Value],
+        ) -> Option<MethodCallResult> {
+            if method_name == "getDecimalFormatSymbolsProvider" {
+                Some(Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
+                    message: "the resource-bundle chain is unavailable".to_string(),
+                }
+                .into()))
+            } else {
+                None
+            }
+        }
+
+        let mut ctx = MockNativeContext::new();
+        let (adapter, mirror) =
+            adapter_and_spi_mirror(&mut ctx, "java/text/spi/DecimalFormatSymbolsProvider");
+        ctx.set_invoke_virtual_hook(throwing_call);
+
+        let got = jre_adapter_get_locale_service_provider(
+            &mut ctx,
+            &[Value::Object(Some(adapter)), Value::Object(Some(mirror))],
+        );
+
+        assert_eq!(
+            got.ok().flatten(),
+            Some(Value::Object(None)),
+            "a throwing getter must degrade to null; propagating would make this              arm capable of breaking a call that merely formatted wrongly before"
+        );
+    }
+
+    /// A missing or null Class argument must not panic and must not delegate:
+    /// the JDK contract for an unrecognised spi is the null that
+    /// `findAdapter` is written to skip.
+    #[test]
+    fn a_null_spi_argument_answers_null_rather_than_delegating() {
+        let mut ctx = MockNativeContext::new();
+        let (adapter, _mirror) =
+            adapter_and_spi_mirror(&mut ctx, "java/text/spi/DecimalFormatSymbolsProvider");
+        ctx.set_invoke_virtual_hook(record_call);
+
+        let got = jre_adapter_get_locale_service_provider(
+            &mut ctx,
+            &[Value::Object(Some(adapter)), Value::Object(None)],
+        );
+
+        assert_eq!(got.ok().flatten(), Some(Value::Object(None)));
     }
 }
