@@ -1,134 +1,166 @@
-# `Calendar` reports root week rules for every locale
+# `Calendar` reports the same week rules for every locale, because CratonVM synthesises the `CalendarData` bundle with a plain `"1"` where CLDR has a region table
 
-**Title correction, 2026-09-09:** this page was first filed as "...because the
-provider lookup still answers `null` for `CalendarDataProvider`". That is the
-proximate cause but not the whole one: making the lookup answer non-null
-produces CLDR ROOT week data instead, which is worse. The `null` is real, and
-behind it sits a root-resource fault in the calendar path.
-
-**Status:** open, cause known, fix known and prescribed. Not a strict-mode row.
+**Status:** open. Cause MEASURED and located to one function; fix deliberately
+not attempted this session (see "Scope").
 **Applies to:** every mode and both JDK images — `--real-jdk` and `--jdk-only`,
-JDK 21 and JDK 25. It is **mode-independent**, which is what distinguishes it
-from the locale row retired the same day.
-**Found:** 2026-09-09, by `probes/LocaleSelect.java` — as a side effect of
-fixing the `DecimalFormatSymbolsProvider` arm, not as the thing being looked
-for. The probe prints it because section A asks five locale-sensitive services
-through public API, not just the one under investigation.
+JDK 21 and JDK 25. **Mode-independent**, which is what distinguishes it from the
+locale row retired the same day.
+**Found:** 2026-09-09 by `probes/LocaleSelect.java`, as a side effect of the
+`DecimalFormatSymbols` fix. Diagnosed the same day by `probes/CalWeek.java`.
 
-## The one wrong answer
+> **This page has been wrong twice, and both wrong versions are recorded rather
+> than deleted.** It was first filed as "the provider lookup answers `null`",
+> then revised to "the provider resolves against ROOT resources". Neither is the
+> cause. The measurement that settles it is section 2.
 
-```
-Calendar.getInstance(loc)          getFirstDayOfWeek()   getMinimalDaysInFirstWeek()
-  HotSpot 21          en-US                 1                        1
-  HotSpot 21          de-DE                 2                        4
-  HotSpot 21          fr-FR                 2                        4
-  CratonVM (any mode, either image)  de-DE  1                        1     WRONG
-  CratonVM (any mode, either image)  fr-FR  1                        1     WRONG
-```
-
-`en-US` is the control and it agrees everywhere — which it must, because `1/1`
-is also what the defect produces. An arm where the control disagrees is a broken
-probe, not a finding.
-
-## The cause
-
-The same one that produced the retired locale row, one switch arm over.
-`native-builtins/src/locale_bootstrap.rs` registers a native over
-`sun/util/locale/provider/JRELocaleProviderAdapter.getLocaleServiceProvider`.
-It used to answer `null` for every SPI class; it now delegates for
-`java.text.spi.DecimalFormatSymbolsProvider` and still answers `null` for the
-rest, `java.util.spi.CalendarDataProvider` among them.
-
-`LocaleProviderAdapter.findAdapter` accepts an adapter only when that lookup is
-non-null, so for `CalendarDataProvider` no adapter is ever accepted,
-`getAdapter` falls through to `fallbackLocaleProviderAdapter`, and the week
-rules come from root data. Nothing throws and nothing is missing — the CLDR
-adapter, asked directly, has the right data in every cell.
-
-Why this one is mode-independent while the retired locale row was not: there is
-no synthetic `Calendar` stub bypassing the walk in `--real-jdk` the way
-`DecimalFormatSymbols.initialize` bypasses it. Both modes take the real path,
-so both are wrong.
-
-## The obvious fix was TRIED and REFUTED, 2026-09-09
-
-**Do not simply add the `CalendarDataProvider` arm.** It was written, built and
-measured, and it is a net REGRESSION. Recorded here so nobody spends the same
-build on it twice.
-
-Delegating `getLocaleServiceProvider(CalendarDataProvider.class)` to the
-receiver's real `getCalendarDataProvider()` gives:
+## 1. The one wrong answer
 
 ```
-                  HotSpot 21    before the arm    with the arm
-  en-US (control)   1 / 1         1 / 1  correct   2 / 1   WRONG (regressed)
-  de-DE             2 / 4         1 / 1  wrong     2 / 1   still wrong
-  fr-FR             2 / 4         1 / 1  wrong     2 / 1   still wrong
+Calendar.getInstance(loc)      getFirstDayOfWeek()   getMinimalDaysInFirstWeek()
+  HotSpot 21    en-US                  1                        1
+  HotSpot 21    de-DE                  2                        4
+  HotSpot 21    fr-FR                  2                        4
+  CratonVM (any mode, either image)
+                en-US                  1                        1     correct*
+                de-DE                  1                        1     WRONG
+                fr-FR                  1                        1     WRONG
 ```
 
-Every locale answers `2 / 1`, which is **CLDR root** (`firstDay=mon`,
-`minDays=1`). So the delegation does reach the provider -- and the provider
-then resolves against ROOT resources, the same root-resource fault as the
-`DecimalFormatSymbols` row, in a different service.
+\* `en-US` is correct **by luck**, and that matters — see section 3.
 
-The blanket `null` was hiding that behind a piece of luck.
-`CalendarDataUtility.retrieveFirstDayOfWeek` falls back to `1` (Sunday) when the
-pool yields nothing, and `retrieveMinimalDaysInFirstWeek` falls back to `1`.
-For `en-US` those defaults are the CORRECT answer, so the control looked healthy
-for the wrong reason. Delegating replaces a lucky default with wrong data, and
-breaks the one cell that was right.
+## 2. The cause, measured layer by layer
 
-**This is why the wave-4 note says one SPI at a time with the suites re-run for
-each.** The `DecimalFormatSymbolsProvider` arm was uneventful; this one is not,
-and a blanket delegation of all ~11 would have shipped this regression silently
-alongside it.
+`probes/CalWeek.java` goes straight at the CLDR adapter, bypassing both
+`LocaleServiceProviderPool` and the shadowed `getLocaleServiceProvider`, and
+asks each layer separately. For `de-DE`:
 
-## What the real fix has to do
+```
+                                   HotSpot 21                      CratonVM 21
+L2 resources.locale                de_DE                           de_DE     <- SAME
+L2 getCalendarData(firstDayOfWeek) "1: AG AS BD BR ... US ...;     "1"       <- DIFFERENT
+                                     2: 001 AD ... DE ...;
+                                     6: MV;7: AE AF ..."
+L1 provider.getFirstDayOfWeek      2                               0
+```
 
-Make the calendar resource lookup resolve for the REQUESTED locale rather than
-root -- i.e. the same question the retired `DecimalFormatSymbols` row answered,
-asked of `LocaleResources.getCalendarData` instead. Until that holds, the arm
-must stay undelegated: the `null` is wrong, but it is wrong in a way that is
-correct for `en-US` and no worse elsewhere.
+Three things follow immediately.
 
-A useful next measurement: whether
-`CLDRLocaleProviderAdapter.getLocaleResources(de_DE)` (which the retired row
-proved returns a genuine `de_DE` resources object) yields the right week data
-when asked directly. If it does, the fault is again SELECTION -- which pool /
-adapter the calendar path ends on -- and not the data.
+**It is not a selection fault.** The `LocaleResources` handed out carries the
+REQUESTED locale (`de_DE`) on both VMs. The previous revision of this page
+blamed root resources; that was wrong, and it was wrong because it reasoned by
+analogy with the `DecimalFormatSymbols` row instead of asking this question.
 
-## The fix that was proposed here first -- SUPERSEDED by the section above
+**The week rules are not per-locale data at all.** HotSpot returns the SAME
+string for `en-US` and `de-DE` — a region-keyed table.
+`CLDRCalendarDataProviderImpl` parses it and selects by the locale's COUNTRY. So
+correct `LocaleResources` is necessary but nowhere near sufficient.
 
-The original text of this page said, and it is left here because it is the
-obvious move and the next person will think of it too:
+**CratonVM's value is a plain `"1"`**, which is not a region table. The real
+provider finds no region in it, returns `0`, and `CalendarDataUtility`'s
+"not in 1..7" guard falls back to its default of `1` — for every locale.
 
-> Add the `CalendarDataProvider` arm to the switch in `locale_bootstrap.rs`,
-> delegating to the receiver's `getCalendarDataProvider()`, exactly as the
-> `DecimalFormatSymbolsProvider` arm now does.
+## 3. Why `en-US` looked healthy, and why that is dangerous
 
-That was tried on 2026-09-09 and it regresses `en-US`. See "TRIED and REFUTED"
-above before writing it again.
+`CalendarDataUtility.retrieveFirstDayOfWeek` defaults to `1` (Sunday) and
+`retrieveMinimalDaysInFirstWeek` defaults to `1`. For `en-US` those defaults are
+the CORRECT answer. The control therefore passed for the wrong reason, and any
+change that makes the lookup "work" without supplying a real region table will
+BREAK it — which is exactly what happened in section 5.
 
-The wave-4 caution above that registration still governs and should be obeyed
-rather than skipped because the first arm was uneventful: `get*Provider()`
-instantiates the adapter's inner provider off `LocaleDataMetaInfo` /
-`LocaleResources`, which is the resource-bundle chain this whole C20 override
-exists to bypass for Jackson / H2 / `Locale.getDefault()` formatting. Delegate
-ONE SPI at a time and re-run the formatting suites for each. Do not blanket-
-delegate the remaining ~11 on the strength of reading the switch.
+## 4. The site
+
+`native-builtins/src/locale_resources.rs`. The synthesis arm
+
+```rust
+} else if bundle_name.starts_with("sun.util.resources.CalendarData")
+    || bundle_name.starts_with("sun.util.resources.cldr.CalendarData")
+{
+    populate_calendar_data_en(ctx, &mut map_now);
+}
+```
+
+serves a hand-built bundle whose body is
+
+```rust
+put_str(ctx, map_pin, map, "firstDayOfWeek", "1"); // Sunday
+put_str(ctx, map_pin, map, "minimalDaysInFirstWeek", "1");
+```
+
+**The file already knows this is wrong.** The overlay whitelist ~700 lines later
+excludes `CalendarData` for precisely this reason:
+
+> `CalendarData` is the reason: its CLDR `firstDayOfWeek` is not the plain `"1"`
+> this file's curated table writes, it is a country-list string — `"1: AG AS BD
+> BR …;2: 001 AD AE …;6: MV;7: AE AF BH …"` — which the real
+> `CLDRCalendarDataProviderImpl` parses per region. Overlaying it would replace
+> a value a consumer reads as an integer with one it cannot parse.
+
+That caution guards the OVERLAY path. It does not guard the SYNTHESIS path
+above, which serves the same `"1"` to the same parser. The comment describes the
+defect and sits in the same file as it.
+
+## 5. Two fixes that were tried or proposed and do NOT work
+
+**Delegating the `CalendarDataProvider` arm** — written, built, measured
+2026-09-09, reverted. Making `getLocaleServiceProvider(CalendarDataProvider.class)`
+return the real provider gives `2/1` for EVERY locale and regresses the `en-US`
+control:
+
+```
+                    HotSpot 21   before      with the arm
+  en-US (control)     1 / 1      1 / 1  ok   2 / 1  WRONG (regressed)
+  de-DE               2 / 4      1 / 1  bad  2 / 1  still wrong
+  fr-FR               2 / 4      1 / 1  bad  2 / 1  still wrong
+```
+
+`2` is what CLDR's table gives region `001`, the world default. Section 2
+measures the CLDR provider answering `0` when asked DIRECTLY, so the `2` arrives
+by some other route through `LocaleServiceProviderPool` — **not explained here,
+and not needed**: either way the arm cannot be right while the bundle says `"1"`.
+Recorded so nobody re-spends the build.
+
+**The `null` framing.** The blanket `null` from
+`JRELocaleProviderAdapter.getLocaleServiceProvider` is real, and is described in
+`../internal/retired/jdk-21-strict-mode-answers-a-non-root-locale-with-root-resources-FIXED-20260909.md`.
+It is not what makes the week rules wrong: acting on it alone produces the
+regression above.
+
+## 6. What a real fix has to do
+
+Supply the CLDR region table for `firstDayOfWeek` / `minimalDaysInFirstWeek`, or
+stop synthesising the `CalendarData` bundle at all when the real JDK image can
+supply it. The second is the honest repair and is the larger change: the
+synthesis exists so locale-sensitive formatting works when the resource chain
+cannot be walked, and removing it is a behaviour change for every consumer of
+that bundle, not only `Calendar`.
+
+Whichever is chosen, the acceptance test is fixed in advance by section 1:
+`en-US` must STAY `1/1` while `de-DE` and `fr-FR` become `2/4`. A change that
+moves `en-US` off `1/1` is a regression regardless of what it does to the rest.
+
+## Scope
+
+Not attempted on 2026-09-09: narrowing or retiring a synthetic resource that
+shadows real JDK data is the same family as the synthetic-bridge retirement that
+was out of scope for that session. This page exists so the next person starts
+from the measurement instead of from the two wrong theories above.
 
 ## Reproducing
 
 ```
-JAVA_HOME=<jdk21> cratonvm -cp . LocaleSelect
+JAVA_HOME=<jdk21> cratonvm --add-exports java.base/sun.util.locale.provider=ALL-UNNAMED \
+                           --add-opens java.base/sun.util.locale.provider=ALL-UNNAMED \
+                           -cp . CalWeek
 ```
 
-Read the `Calendar firstDay` lines under `[de-DE]` and `[fr-FR]` in section A,
-against the same lines from `<jdk21>/bin/java -cp . LocaleSelect`. Section A
-needs no `--add-exports`: it is public API only, so no step of it can be mute.
+`probes/CalWeek.java` prints the public answer and then both layers, with
+`en-US` as the control. Compare against `<jdk21>/bin/java` with the same flags.
+The single line that decides it is `L2 getCalendarData(firstDayOfWeek)`: a region
+table means the bundle is real, a bare `"1"` means it is the synthesised one.
 
 ## Related
 
-- `docs/internal/retired/jdk-21-strict-mode-answers-a-non-root-locale-with-root-resources-FIXED-20260909.md`
-  — the same registration, the `DecimalFormatSymbolsProvider` arm, and the
-  measured four-cell table showing the blanket `null` is present everywhere.
+- `../internal/retired/jdk-21-strict-mode-answers-a-non-root-locale-with-root-resources-FIXED-20260909.md`
+  — the same registration's blanket `null`, and the `DecimalFormatSymbolsProvider`
+  arm that WAS landed. That row really was a selection fault; this one is not,
+  and the analogy is what made this page wrong twice.
