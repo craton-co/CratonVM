@@ -119,10 +119,35 @@ and a third was abandoned when another tenant started a 13-process build. Both
 are "no measurement" under this page's own rule, not results, and neither is
 counted above.)*
 
+### Re-verified again after merging dev, on the tree that ships
+
+dev moved 15 commits under this branch while it was being measured, and one of
+them (`6c9933883`) touches `xt_root_scan.rs` -- the same file -- so the merged
+tree was rebuilt and re-run rather than assumed. (That commit is the Linux
+`/proc/self/maps` arm and does not interact with this flag or with the Windows
+helper-window pass.)
+
+| run | wall | `actual` | ref-array OOM | any OOM | arena | SIGSEGV | NPE | `skipped_jit` | `on_proven_jit` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 918 s | 99800 | **0** | **0** | **0** | **0** | **0** | **0** | 255 |
+| 2 | 930 s | 99966 | **0** | **0** | **0** | **0** | **0** | **0** | 31 |
+| 3 | 929 s | 99948 | **0** | **0** | **0** | **0** | **0** | **0** | 27 |
+
+Exact accounting again in all three (200, 34, 52 `COUNTER` timeouts against
+200, 34, 52 missing). **11 runs in total on this page, 0 ref-array
+`OutOfMemoryError` and 0 SIGSEGV in every one.**
+
+Run 1 is a worked example of this page's own load warning rather than a
+counter-example: the regression suite was running on the same box, and it took
+200 timeouts and 255 compaction cycles where the quiet runs beside it took 34
+and 52. `actual` is a property of the machine, exactly as the 2026-09-05 (b)
+addendum says -- and the two numbers that are NOT are 0 and 0 in all three.
+
 ### Regression suite
 
-92 passed, 0 failed on the same binary (`regression-suite/run.sh`), so the
-wider pin costs nothing elsewhere either.
+92 passed, 0 failed on both binaries (`regression-suite/run.sh`) -- the
+pre-merge one and the merged tree that ships -- so the wider pin costs nothing
+elsewhere either.
 
 ### What retires this page
 
