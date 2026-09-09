@@ -888,12 +888,16 @@ fn header_offset_emission_site_inventory_matches_the_doc() {
     // the raw row went DOWN while a site was added. The checked row is counted
     // for the same reason the sibling test counts ir_lower's: deleting it would
     // silently restore an unchecked site.
+    // The fifth row went 2 -> 3 on 2026-09-06: the precise-AIOOBE deopt stub
+    // (reason 11) re-loads the array length for `jit_throw_aioobe`, exactly as
+    // the shared cold pad above it does, and spells the constant through the
+    // same checked `disp8_const` narrowing. A third site, still build-checked.
     let cases: [(&str, &str, usize); 7] = [
         ("HEADER_SIZE", " as u8", 22),
         ("HEADER_SIZE", " as i32", 13),
         ("ARRAY_LENGTH_OFFSET", " as u8", 22),
         ("ARRAY_LENGTH_OFFSET", " as i32", 5),
-        ("ARRAY_LENGTH_OFFSET", " as i64", 2),
+        ("ARRAY_LENGTH_OFFSET", " as i64", 3),
         ("ARRAY_DATA_OFFSET", " as u8", 13),
         ("ARRAY_DATA_OFFSET", " as i32", 0),
     ];

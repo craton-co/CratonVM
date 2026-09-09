@@ -575,6 +575,17 @@ pub(crate) fn audit_thread_frames(shared: &SharedVm, thread: &JvmThread, site: &
     // in frame slots must not pay for it forever.
     static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     const PROBE_BUDGET: u64 = 200_000;
+    // THE COMPILED HALF. Everything below walks `thread.frames`, which holds
+    // only INTERPRETER frames -- a JIT frame's oops live in the machine stack
+    // band and in register images, so on a workload whose stale holder is
+    // compiled this function was silent by construction and the first symptom
+    // was a SIGSEGV at a JIT pc. Same ledger, same verdict, other storage.
+    // No-op unless `CRATONVM_DBG_VACATED_FRAMES` is armed.
+    crate::jit::conservative_roots::audit_jit_frames_for_vacated(
+        Some(shared),
+        thread.thread_id.0,
+        site,
+    );
     let heap = &shared.mem.heap;
     for (fi, fr) in thread.frames.iter().enumerate() {
         let live_mask = fr.live_locals_mask_here();

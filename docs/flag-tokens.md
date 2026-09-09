@@ -603,7 +603,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-399 tokens.
+400 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -713,6 +713,7 @@ export inherited from a parent shell.
 | `precise-getstatic-checkcast` | `CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST` |
 | `precise-alloc-athrow` | `CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW` |
 | `precise-indy` | `CRATONVM_JIT_NO_PRECISE_INDY` |
+| `precise-array-access` | `CRATONVM_JIT_NO_PRECISE_ARRAY_ACCESS` |
 | `ir-linear-scan` | `CRATONVM_JIT_IR_LINEAR_SCAN` |
 | `ir-inline-tlab` | `CRATONVM_JIT_IR_INLINE_TLAB` |
 | `tls-thread-fetch` | `CRATONVM_JIT_TLS_THREAD_FETCH` |
@@ -974,7 +975,6 @@ export inherited from a parent shell.
 | `xt-pinned-peer-depth` | `CRATONVM_XT_PINNED_PEER_DEPTH` |
 | `xt-pinned-peer-publish-only` | `CRATONVM_XT_PINNED_PEER_PUBLISH_ONLY` |
 | `xt-pinned-peer-unpinnable` | `CRATONVM_XT_PINNED_PEER_UNPINNABLE` |
-| `xt-no-safe-peer-read` | `CRATONVM_XT_NO_SAFE_PEER_READ` |
 | `xt-peer-shadow-scan` | `CRATONVM_XT_PEER_SHADOW_SCAN` |
 | `dbg-stale-frame-words` | `CRATONVM_DBG_STALE_FRAME_WORDS` |
 | `pin-unnamed-frame-refs` | `CRATONVM_JIT_PIN_UNNAMED_FRAME_REFS` |
@@ -985,6 +985,7 @@ export inherited from a parent shell.
 | `xt-helper-window-interior` | `CRATONVM_XT_HELPER_WINDOW_INTERIOR` |
 | `xt-helper-window-pin` | `CRATONVM_XT_HELPER_WINDOW_PIN` |
 | `xt-helper-window-scan` | `CRATONVM_XT_HELPER_WINDOW_SCAN` |
+| `xt-no-safe-peer-read` | `CRATONVM_XT_NO_SAFE_PEER_READ` |
 | `xt-jit-root-scan` | `CRATONVM_XT_JIT_ROOT_SCAN` |
 | `xt-peer-deadline-ms` | `CRATONVM_XT_PEER_DEADLINE_MS` |
 | `xt-peer-total-ms` | `CRATONVM_XT_PEER_TOTAL_MS` |

@@ -691,8 +691,10 @@ pub(super) fn stw_take_over_and_wait(
         // re-scanning it only widens the conservative-candidate volume that
         // feeds the mark-phase writer, with zero coverage benefit.
         let blocked_os_tids = shared.threads.thread_registry.blocked_os_tids();
-        // WHICH PREDICATE, and it is the open question on
-        // `bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829`.
+        // WHICH PREDICATE. This was the open question on
+        // `bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829` (retired to
+        // `fixed-suite-bugs/h2-suite-bugs/` 2026-09-08); it is answered, and the
+        // answer is the widest of the three arms below.
         //
         // `is_object_address` is `registry.contains(addr)` -- EXACT BASES ONLY.
         // A frozen peer holding a DERIVED pointer (a compiled loop's pointer
@@ -738,6 +740,13 @@ pub(super) fn stw_take_over_and_wait(
         // SAFE direction here and the asymmetry is stark: a false positive
         // costs one page of compaction, a false negative costs a
         // use-after-free.
+        //
+        // DEFAULT since 2026-09-08, and the reason is that the DISCHARGE is
+        // default-on: a cycle whose helper windows are all pinned no longer
+        // refuses, so `is_heap_addr`'s two rejections stopped being lost
+        // compaction and became an unpinned array under a relocating cycle.
+        // The predicate that claims completeness has to be the one that can
+        // deliver it. See `xt::helper_window_pin_resolve_enabled`.
         let pin_resolve = xt::helper_window_pin_resolve_enabled();
         let (windows, _roots) = if pin_resolve {
             xt::helper_window_pass(
