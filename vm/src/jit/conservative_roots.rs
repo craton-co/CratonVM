@@ -10733,6 +10733,14 @@ mod tests {
     /// thread would be a claim about frames that do not exist.
     #[test]
     fn a_thread_with_no_jit_frames_deposits_nothing() {
+        // `peer_proven_jit_depth` is a PROCESS global, and
+        // `beginning_a_coverage_cycle_clears_the_peer_ledger` deposits 7 into
+        // it under this latch. Without taking the latch here too, that 7 is
+        // read as this test's own deposit: `left: 7, right: 0`, only ever in
+        // parallel -- alone and under `--test-threads=1` it passes.
+        let _serialised = super::coverage_oracle_gate_tests::COVERAGE_ORACLE_TEST_LATCH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert_eq!(current_thread_jit_depth(), 0, "test precondition");
         cratonvm_gc::gc_quiescence::reset_peer_proven_jit_depth();
         publish_peer_jit_coverage_for_stw();
