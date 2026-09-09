@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | **OPEN.** `CRATONVM_JIT_UNREG_RESIDUE_LICENCE` shipped **default-ON** in `115f9f00b` and corrupts the heap: `8/10` against a `10/10` control on one binary. This page flips it to **opt-in** and keeps the ZGC OOM it was built to fix, because a loud OOM beats silent corruption. The licence's *mechanism* is right and its OOM fix is real — only the default is wrong. |
-| **Scope** | ZGC (the default collector), any workload that keeps live references in the shallow band above `cover_hi`. Reproduced on `probes/MvsCreate.java` at `-Xmx2g`. |
+| **Scope** | ZGC (the default collector), any workload that keeps live references in the shallow band above `cover_hi`. Reproduced on `probes/MvsCreate.java` at `-Xmx2g`, and still present after `12b8a05aa`. |
 | **Control** | the same binary with `CRATONVM_JIT_UNREG_RESIDUE_LICENCE=0`: 43 of 43 clean. |
 | **Supersedes the "FIXED" claim in** | `../../internal/fixed-suite-bugs/gc/zgc-oom-on-mvstore-was-returned-frame-residue-FIXED-20260908.md` — its cause analysis stands, its §5 verification has one gap, named in §3 below. |
 
@@ -49,12 +49,24 @@ author found `115f9f00b` on `dev`, and agrees:
 | variant, `500k` @ `2g` | granted | withheld |
 |---|---:|---:|
 | dev@d7768380b, 10 pairs | 8/10 | 10/10 |
-| this branch's binary, 8 pairs | 7/8 | 8/8 |
+| this branch pre-merge, 8 pairs | 7/8 | 8/8 |
+| **this branch merged onto dev, 25 pairs** | **20/25** | **25/25** |
 | mark **and** pin both dropped, 33 runs/arm | 27/33 | 33/33 |
-| **pooled** | **42/51** | **51/51** |
+| **pooled** | **62/76** | **76/76** |
 
-Fisher's exact on the pooled table: **p ≈ 0.002**. Fifty-one clean control runs
-is what turns "a known MVStore flake" into a signal.
+Seventy-six clean control runs against fourteen failures is what turns "a known
+MVStore flake" into a signal.
+
+**The merged-tree row nearly went the other way, and how it did is the point.**
+`12b8a05aa gc,vm: the blocked-region wake never remapped compiled state` landed
+on `dev` between the first measurement and this one — a stale-compiled-state fix,
+exactly the family this failure belongs to — so the merged tree was re-measured
+rather than assumed. Its **first ten pairs were 10/10 clean**, which at the
+observed ~20% rate happens about one time in nine and reads exactly like "the
+sibling fixed it". The next fifteen pairs were **10/15**, with `Chunk 6`,
+`Chunk 6`, `Chunk 15`, `Chunk 6`, `Chunk 15`. Ten clean runs is not an absence
+proof for a one-in-five defect; budget the sample from the rate before reading
+a clean batch as a fix.
 
 ### The ratchet, both directions, on the shipped binary
 
