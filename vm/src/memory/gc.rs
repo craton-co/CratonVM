@@ -2160,12 +2160,27 @@ fn verify_no_stale_refs(
                     {
                         reclaimed_reports += 1;
                         genuine_reports += 1;
+                        // WHY the scan skipped it, since `scan_local_objects`
+                        // has exactly two ways to drop a LIVE object local:
+                        // the `local_kinds` LONG/DOUBLE gate, and the
+                        // `is_heap_addr` screen. They have completely
+                        // different fixes, and neither is the liveness
+                        // filter this arm has already excluded.
                         eprintln!(
                             "POST-GC RECLAIMED-WHILE-HELD LOCAL: frame[{}] {}.{} local[{}] pc={} \
                              holds 0x{:x}, inside the semispace this cycle emptied, and the \
                              pointer map has no entry for it -- the object was NOT copied, so \
-                             this slot was not in the root set",
-                            fi, cname, mname, li, frame.pc, addr,
+                             this slot was not in the root set. local_kind={} in_heap={} \
+                             collection={}",
+                            fi,
+                            cname,
+                            mname,
+                            li,
+                            frame.pc,
+                            addr,
+                            frame.local_kind_at(li),
+                            heap.map(|h| h.is_heap_addr(addr).is_some()).unwrap_or(false),
+                            heap.map(|h| h.collection_count()).unwrap_or(0),
                         );
                     }
                 }
@@ -2246,8 +2261,15 @@ fn verify_no_stale_refs(
                             "POST-GC RECLAIMED-WHILE-HELD STACK: frame[{}] {}.{} stack[{}] pc={} \
                              holds 0x{:x}, inside the semispace this cycle emptied, and the \
                              pointer map has no entry for it -- the object was NOT copied, so \
-                             this slot was not in the root set",
-                            fi, cname, mname, si, frame.pc, addr,
+                             this slot was not in the root set. in_heap={} collection={}",
+                            fi,
+                            cname,
+                            mname,
+                            si,
+                            frame.pc,
+                            addr,
+                            heap.map(|h| h.is_heap_addr(addr).is_some()).unwrap_or(false),
+                            heap.map(|h| h.collection_count()).unwrap_or(0),
                         );
                     }
                 }
