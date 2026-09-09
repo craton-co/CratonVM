@@ -2780,6 +2780,212 @@ fn moving_young_frame_live_hi(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> 
     (hi > 0).then_some(hi)
 }
 
+/// Consume-side register-oop-mask census: `(frames_with_mask, frames_no_mask,
+/// words_excluded)`. The emit side has its own
+/// (`cratonvm_jit::reg_oop_mask_cause`); this one says whether the map that was
+/// published actually reached a frame walk.
+static REGOOP_FRAMES_MASKED: AtomicUsize = AtomicUsize::new(0);
+static REGOOP_FRAMES_UNMASKED: AtomicUsize = AtomicUsize::new(0);
+static REGOOP_WORDS_EXCLUDED: AtomicUsize = AtomicUsize::new(0);
+static DEADSPILL_WORDS_EXCLUDED: AtomicUsize = AtomicUsize::new(0);
+static OUTGOING_WORDS_EXCLUDED: AtomicUsize = AtomicUsize::new(0);
+
+/// `(frames_with_mask, frames_without, blind-spill words excluded,
+/// dead-operand-spill words excluded, outgoing-reserve words excluded)`.
+pub fn reg_oop_mask_census() -> (usize, usize, usize, usize, usize) {
+    (
+        REGOOP_FRAMES_MASKED.load(Ordering::Relaxed),
+        REGOOP_FRAMES_UNMASKED.load(Ordering::Relaxed),
+        REGOOP_WORDS_EXCLUDED.load(Ordering::Relaxed),
+        DEADSPILL_WORDS_EXCLUDED.load(Ordering::Relaxed),
+        OUTGOING_WORDS_EXCLUDED.load(Ordering::Relaxed),
+    )
+}
+
+/// The register-oop mask of the ACTIVE safepoint in this frame
+/// ([`cratonvm_jit::OopMapEntry::reg_oop_mask`]), or `None` for "no claim".
+///
+/// Same resolution as [`moving_young_frame_live_hi`], and the same
+/// most-conservative merge when several maps share the safepoint id: the UNION
+/// of their masks, and `None` the moment any one of them abstains. A mask is a
+/// licence to STOP scanning slots, so the merge has to widen, not narrow -- an
+/// intersection would let one map's silence delete another's live register.
+fn active_reg_oop_mask(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> Option<u16> {
+    if !gc_reg_oop_maps_enabled() {
+        return None;
+    }
+    let sp_id = active_safepoint_id(rbp, cm)?;
+    let mut any = false;
+    let mut mask = 0u16;
+    for map in cm.oop_maps.iter().filter(|m| m.bytecode_pc == sp_id) {
+        mask |= map.reg_oop_mask?;
+        any = true;
+    }
+    any.then_some(mask)
+}
+
+/// `CRATONVM_GC_REG_OOP_MAPS=0` -- ignore every published
+/// [`cratonvm_jit::OopMapEntry::reg_oop_mask`] and scan the whole blind-spill
+/// image again. **Default ON.**
+///
+/// The consume-side half of the bisect pair; `CRATONVM_JIT_REG_OOP_MAPS=0` is
+/// the emit-side one. This one takes effect at the next collection, which is
+/// what an investigation on a warm VM wants.
+fn gc_reg_oop_maps_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_GC_REG_OOP_MAPS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        },
+    )
+}
+
+/// Is `off` in the OUTGOING-argument reserve of a frame whose active safepoint
+/// proved it staged no reference there?
+///
+/// The reserve is the deepest part of the frame: the ABI shadow space and the
+/// room `SUB RSP, frame_size` set aside for stack arguments. The prologue never
+/// initialises it, so before this frame writes anything it holds whatever a
+/// previous, deeper frame left below the old stack pointer -- dead values from
+/// a call that already returned, which the conservative scan then marks and
+/// (under G1) pins a region for. On H2 `TestValueMemory` Type 3 that class is
+/// 314 of the 380 unrewritable band words.
+///
+/// # What licenses skipping it
+///
+/// A reference the frame ITSELF stages there is a different matter, and the
+/// compiler already reports it: `pending_staged_args_unmapped` is set when a
+/// reference is staged into "the native-ABI outgoing-argument area
+/// (`emit_stack_arg_setup`), the direct-call service slots, or an inlined
+/// callee's parameter locals", and its own doc calls that fail-closed. That bit
+/// is exactly what makes [`crate::jit::conservative_roots::active_reg_oop_mask`]
+/// abstain, so **a `Some` mask already carries the proof** and this predicate
+/// needs no second channel: no reference of this frame's is in the reserve, and
+/// what predates the frame is not this frame's to keep alive.
+///
+/// The deopt `SavedRegisters` block is NOT covered by that argument -- it is a
+/// register image the deopt stub reads back -- and it shares `region_name`'s
+/// bucket with the reserve. `FrameLayout::outgoing_lo` is published so the two
+/// can be told apart; when it is `0` the producer made no claim and this
+/// returns `false`.
+#[inline]
+fn is_dead_outgoing_reserve(
+    layout: &cratonvm_jit::FrameLayout,
+    off: i32,
+    reg_mask: Option<u16>,
+) -> bool {
+    if !gc_outgoing_arg_roots_enabled() || reg_mask.is_none() {
+        return false;
+    }
+    layout.outgoing_lo > 0 && off >= layout.outgoing_lo
+}
+
+/// `CRATONVM_GC_OUTGOING_ARG_ROOTS=0` -- keep marking the outgoing-argument
+/// reserve. **Default ON**, i.e. it is skipped on frames whose safepoint proved
+/// it staged no reference there.
+///
+/// The third bisect lever, beside `CRATONVM_GC_REG_OOP_MAPS` and
+/// `CRATONVM_GC_DEAD_SPILL_ROOTS`. Separate because it rests on a third claim.
+fn gc_outgoing_arg_roots_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_GC_OUTGOING_ARG_ROOTS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        },
+    )
+}
+
+/// Is `off` an operand-spill slot the active safepoint has already RECLAIMED?
+///
+/// `OopMapEntry::live_frame_hi` is the operand-spill cursor at the moment the
+/// safepoint was emitted, and its own doc states the consequence: slots at a
+/// larger offset are "inside the `max_stack`-sized spill reserve but above the
+/// live operand stack and the staged invoke-argument buffer, so their contents
+/// are dead -- the spill cursor reclaims by moving, it does not clear." What is
+/// in them is whatever the deepest earlier operand stack left there, and in
+/// allocation-heavy code that is a stale object pointer.
+///
+/// The tree already spends this claim: [`band_slot_is_verifiable`] returns
+/// `false` here, which is how the moving-young coverage proof excuses these
+/// words from shadow-stack publication. Relocation is already unsound if the
+/// claim is wrong, because nothing rewrites them.
+///
+/// This is a STRONGER use of the same claim, and the difference is worth
+/// stating plainly: excusing a word from publication over-retains when the
+/// claim is wrong, whereas dropping it from the root set FREES. That is why it
+/// carries its own switch and why the oracle
+/// (`CRATONVM_DBG_VERIFY_REG_OOP_MAPS=1`) checks these words alongside the
+/// register-mask ones rather than trusting the argument.
+///
+/// The class test is `region_name`'s, not a bare `[spill_lo, spill_hi)` range:
+/// that ladder puts LICM hoist slots, scalar-replacement fields and the
+/// reserved-locals tail AHEAD of `operand-spill`, and those are not reclaimed
+/// by the cursor.
+#[inline]
+fn spill_slot_is_dead_above_cursor(
+    layout: &cratonvm_jit::FrameLayout,
+    off: i32,
+    live_hi: Option<i32>,
+) -> bool {
+    if !gc_dead_spill_roots_enabled() {
+        return false;
+    }
+    let Some(hi) = live_hi else {
+        return false;
+    };
+    off >= hi && layout.region_name(off) == "operand-spill"
+}
+
+/// `CRATONVM_GC_DEAD_SPILL_ROOTS=0` -- keep marking operand-spill slots above
+/// the safepoint's live cursor. **Default ON**, i.e. they are dropped.
+///
+/// The bisect lever for [`spill_slot_is_dead_above_cursor`], and the companion
+/// of `CRATONVM_GC_REG_OOP_MAPS`. The two narrowings are independent switches
+/// because they rest on DIFFERENT claims -- one on the compiler's register
+/// model, one on the spill cursor -- and a regression has to be attributable to
+/// one of them.
+fn gc_dead_spill_roots_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_GC_DEAD_SPILL_ROOTS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        },
+    )
+}
+
+/// Does the mask permit a live reference in the blind-spill slot at `off`?
+///
+/// `true` for every offset OUTSIDE the spill image -- this decides one region
+/// and must not answer for the rest of the band.
+#[inline]
+fn spill_slot_may_hold_oop(
+    layout: &cratonvm_jit::FrameLayout,
+    off: i32,
+    reg_mask: Option<u16>,
+) -> bool {
+    let Some(mask) = reg_mask else {
+        return true;
+    };
+    let Some(idx) = layout.spill_image_index(off) else {
+        return true;
+    };
+    // A slot index the mask cannot represent is one this build does not model.
+    // Scan it: the mask is a licence, and it does not extend past its width.
+    idx >= 16 || mask & (1u16 << idx) != 0
+}
+
 /// Whether `exact_rbp` recorded for a chain entry actually belongs to a
 /// DEEPER, unguarded compiled frame rather than to the entry's own method.
 ///
@@ -8867,8 +9073,18 @@ fn scan_compiled_frame_bands(
             if frame_size > MAX_COMPILED_FRAME_BYTES || frame_size > rbp {
                 return false;
             }
-            if let Some(skip) = band_skip_classes() {
-                scan_one_frame_skipping(rbp, frame_size, cm, skip, heap, out);
+            // The register-file half of this frame's active oop map. `None`
+            // keeps the whole blind image in the scan, which is what every
+            // frame did before 2026-09-09.
+            let reg_mask = active_reg_oop_mask(rbp, cm);
+            if reg_mask.is_some() {
+                REGOOP_FRAMES_MASKED.fetch_add(1, Ordering::Relaxed);
+            } else {
+                REGOOP_FRAMES_UNMASKED.fetch_add(1, Ordering::Relaxed);
+            }
+            let skip = band_skip_classes();
+            if skip.is_some() || reg_mask.is_some() || gc_dead_spill_roots_enabled() {
+                scan_one_frame_filtered(rbp, frame_size, cm, skip, reg_mask, heap, out);
             } else {
                 scan_one_frame(rbp - frame_size, rbp, heap, out);
             }
@@ -8880,7 +9096,7 @@ fn scan_compiled_frame_bands(
             // innermost frame above has none, and it already forces the
             // non-moving sweep through `FOREIGN_INNERMOST_RBP`, so there is no
             // move to veto there.
-            publish_unrewritable_band_roots(rbp, frame_size, cm, heap);
+            publish_unrewritable_band_roots(rbp, frame_size, cm, reg_mask, heap);
         }
 
         // `[rbp]` and `[rbp + 8]` hold the saved caller RBP and return PC.
@@ -9199,13 +9415,20 @@ fn band_skip_classes() -> Option<&'static [String]> {
     .as_deref()
 }
 
-/// [`scan_one_frame`] over `[rbp - frame_size, rbp)`, minus the storage classes
-/// [`band_skip_classes`] names. Only reachable with that flag set.
-fn scan_one_frame_skipping(
+/// [`scan_one_frame`] over `[rbp - frame_size, rbp)`, minus two filters:
+///
+/// * the blind-spill slots this safepoint's [`active_reg_oop_mask`] excludes --
+///   the production narrowing, on by default;
+/// * the storage classes [`band_skip_classes`] names -- the unsafe measurement
+///   lever, off by default.
+///
+/// Only reachable when at least one of them has something to say.
+fn scan_one_frame_filtered(
     rbp: usize,
     frame_size: usize,
     cm: &cratonvm_jit::CompiledMethod,
-    skip: &[String],
+    skip: Option<&[String]>,
+    reg_mask: Option<u16>,
     heap: &VmHeap,
     out: &mut Vec<ObjectRef>,
 ) {
@@ -9219,16 +9442,36 @@ fn scan_one_frame_skipping(
     while addr + 8 <= rbp {
         // Cast: a compiled frame is far smaller than i32::MAX bytes.
         let off = (rbp - addr) as i32;
-        let class = layout.region_name(off);
-        // `operand-spill` is skipped only ABOVE the live cursor. Below it the
-        // slots hold the CURRENT operand stack, which is as live as a root
-        // gets — skipping those would not be measuring a ceiling, it would be
-        // measuring a crash.
-        let skipped = skip.iter().any(|c| c == class)
-            && (class != "operand-spill" || live_hi.is_some_and(|hi| off >= hi));
-        if skipped {
+        if !spill_slot_may_hold_oop(layout, off, reg_mask) {
+            REGOOP_WORDS_EXCLUDED.fetch_add(1, Ordering::Relaxed);
+            note_excluded_band_word(addr, off, layout, heap, "reg-mask");
             addr += 8;
             continue;
+        }
+        if spill_slot_is_dead_above_cursor(layout, off, live_hi) {
+            DEADSPILL_WORDS_EXCLUDED.fetch_add(1, Ordering::Relaxed);
+            note_excluded_band_word(addr, off, layout, heap, "dead-spill");
+            addr += 8;
+            continue;
+        }
+        if is_dead_outgoing_reserve(layout, off, reg_mask) {
+            OUTGOING_WORDS_EXCLUDED.fetch_add(1, Ordering::Relaxed);
+            note_excluded_band_word(addr, off, layout, heap, "outgoing");
+            addr += 8;
+            continue;
+        }
+        if let Some(skip) = skip {
+            let class = layout.region_name(off);
+            // `operand-spill` is skipped only ABOVE the live cursor. Below it
+            // the slots hold the CURRENT operand stack, which is as live as a
+            // root gets -- skipping those would not be measuring a ceiling, it
+            // would be measuring a crash.
+            let skipped = skip.iter().any(|c| c == class)
+                && (class != "operand-spill" || live_hi.is_some_and(|hi| off >= hi));
+            if skipped {
+                addr += 8;
+                continue;
+            }
         }
         // SAFETY: aligned read inside this thread's own live compiled frame,
         // over the same interval `scan_one_frame` reads.
@@ -9241,6 +9484,220 @@ fn scan_one_frame_skipping(
         }
         if let Some(obj) = heap.is_object_address(qword) {
             out.push(obj);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The register-oop mask's falsification oracle
+// ---------------------------------------------------------------------------
+//
+// `active_reg_oop_mask` is a licence to DROP roots, so the only question that
+// matters about it is whether it ever drops one that mattered. A count of
+// dropped words cannot answer that -- a blind spill image is full of dead
+// register leftovers, and dropping those is the entire point.
+//
+// The discriminating question is narrower: of the words this mask excluded, how
+// many named an object that NO OTHER ROOT names? Those, and only those, are the
+// ones the collector would now free on the mask's word alone. Everything else
+// is a duplicate the rest of the root set already covers, and its removal
+// cannot change what survives.
+//
+// So the oracle records every excluded word that resolved to an object, and
+// `verify_excluded_spill_words` re-checks them against the FINISHED root set --
+// which is why it cannot run inside the band scan, where the root set is still
+// half-built. A non-zero `only-root` count is a refutation of the mask and
+// should stop the change; a large `duplicate` count beside a zero `only-root`
+// count is what a correct narrowing looks like.
+//
+// `CRATONVM_DBG_VERIFY_REG_OOP_MAPS=1`. Off by default and free when off: the
+// recording site is one already-resolved `OnceLock` load per excluded word.
+
+/// `CRATONVM_DBG_VERIFY_REG_OOP_MAPS=1` -- see the module comment above.
+fn verify_reg_oop_maps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VERIFY_REG_OOP_MAPS").is_some()
+    })
+}
+
+thread_local! {
+    /// `(object address, frame offset, register name)` for each blind-spill
+    /// word this pass excluded that nevertheless resolved to an object.
+    static EXCLUDED_SPILL_WORDS: std::cell::RefCell<Vec<(usize, i32, &'static str, &'static str)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Running totals for the oracle. See [`verify_excluded_band_words`].
+static ORACLE_WORDS: AtomicUsize = AtomicUsize::new(0);
+static ORACLE_REACHABLE: AtomicUsize = AtomicUsize::new(0);
+static ORACLE_UNREACHABLE: AtomicUsize = AtomicUsize::new(0);
+static ORACLE_INCOMPLETE: AtomicUsize = AtomicUsize::new(0);
+
+/// `(words, reachable, unreachable, walk_incomplete)`.
+///
+/// **`unreachable` is the number that decides whether the narrowings are
+/// sound**, and `walk_incomplete` is the number that decides whether
+/// `unreachable` may be read at all.
+pub fn reg_oop_mask_oracle() -> (usize, usize, usize, usize) {
+    (
+        ORACLE_WORDS.load(Ordering::Relaxed),
+        ORACLE_REACHABLE.load(Ordering::Relaxed),
+        ORACLE_UNREACHABLE.load(Ordering::Relaxed),
+        ORACLE_INCOMPLETE.load(Ordering::Relaxed),
+    )
+}
+
+/// Record a band word the narrowings excluded, for
+/// [`verify_excluded_band_words`]. Inert unless the oracle is armed.
+#[inline]
+fn note_excluded_band_word(
+    addr: usize,
+    off: i32,
+    layout: &cratonvm_jit::FrameLayout,
+    heap: &VmHeap,
+    why: &'static str,
+) {
+    if !verify_reg_oop_maps() {
+        return;
+    }
+    // SAFETY: the same aligned in-frame read the scan itself would have made at
+    // this address had the narrowing not excluded it.
+    let qword = unsafe { (addr as *const usize).read() };
+    if heap.is_object_address(qword).is_none() {
+        return;
+    }
+    let reg = layout
+        .spill_image_register(off)
+        .unwrap_or_else(|| layout.region_name(off));
+    EXCLUDED_SPILL_WORDS.with(|v| v.borrow_mut().push((qword, off, reg, why)));
+}
+
+/// Clear the oracle's per-pass record. Called by the root gatherer beside the
+/// other per-collection resets.
+pub fn clear_excluded_spill_words() {
+    if !verify_reg_oop_maps() {
+        return;
+    }
+    EXCLUDED_SPILL_WORDS.with(|v| v.borrow_mut().clear());
+}
+
+/// Decide, for each band word the narrowings dropped, whether dropping it can
+/// have changed what survives.
+///
+/// # Why the first version of this was worthless
+///
+/// It asked whether any OTHER ROOT named the same address, and reported the
+/// ones where none did. That is not the question. A genuinely dead object --
+/// exactly what these narrowings exist to release -- is by construction named
+/// only by dead words, so it always "refuted" the change. The instrument fired
+/// 20 times on `TestValueMemory` and could not say whether even one of them
+/// mattered, which is the same as not having an instrument.
+///
+/// # The question that does decide it
+///
+/// **Is the object still TRANSITIVELY REACHABLE from the narrowed root set?**
+///
+/// * reachable -- dropping the word changed nothing. The object survives on
+///   another path and the narrowing is provably free here.
+/// * unreachable -- the object's survival depended on the dropped word. It is
+///   either garbage (the intended win) or a live object the narrowing lost, and
+///   nothing short of the program's own behaviour separates those. Every one of
+///   these is a case that needs a human.
+///
+/// So `unreachable == 0` over a corpus is the licence to ship, and any non-zero
+/// count is a finding to explain rather than a number to watch.
+///
+/// # Reading the walk-incomplete count first
+///
+/// [`cratonvm_gc::gc::for_each_object_reference`] DECLINES on an object it
+/// cannot walk flatly (a G1 humongous object is region-fragmented) and on a
+/// header it cannot decode. Those objects contribute no edges, so the closure
+/// is an UNDER-approximation and "unreachable" is over-reported. A run with a
+/// non-zero `walk_incomplete` cannot have its `unreachable` count read as a
+/// refutation -- that is the trap the previous version fell into from the other
+/// direction, and it is stated here so the next reader does not have to
+/// rediscover it.
+pub fn verify_excluded_band_words(roots: &[ObjectRef], heap: &VmHeap) {
+    if !verify_reg_oop_maps() {
+        return;
+    }
+    let pending: Vec<(usize, i32, &'static str, &'static str)> =
+        EXCLUDED_SPILL_WORDS.with(|v| std::mem::take(&mut *v.borrow_mut()));
+    if pending.is_empty() {
+        return;
+    }
+    // Closure from the NARROWED root set -- the set the collector is about to
+    // use. Capped so a pathological heap cannot turn a debug flag into a hang;
+    // hitting the cap is itself an incomplete walk.
+    const MAX_VISITED: usize = 4_000_000;
+    // UNIFORM, and NOT raiseable per collector. A flat payload read past a
+    // certain size is unsafe on EVERY backend here, because they all place a
+    // large object across spans that are not contiguous in the address space --
+    // G1 as `HumongousStart` plus continuations with their own buffers, ZGC
+    // across pages. This was tried as `if heap.is_g1() { 512K } else { 64M }`
+    // on the reasoning that only G1 fragments, and the 64 MiB arm SEGFAULTED
+    // 3 runs in 6 on `TestValueMemory` under ZGC (0 in 6 with the oracle off,
+    // narrowings on or off, so it was the walk and not the change under test).
+    // The cost of the low cap is real and is reported rather than hidden:
+    // declining H2's 1 000 016-byte `Object[]` leaves its 125 000 elements
+    // looking unreachable, which is why `walk_incomplete` has to be read before
+    // `UNREACHABLE` means anything.
+    const MAX_OBJECT_BYTES: usize = 512 * 1024;
+    let mut seen: std::collections::HashSet<usize> =
+        std::collections::HashSet::with_capacity(roots.len() * 2);
+    let mut stack: Vec<usize> = Vec::with_capacity(roots.len());
+    let mut incomplete = 0usize;
+    for r in roots {
+        let a = r.as_ptr() as usize;
+        if seen.insert(a) {
+            stack.push(a);
+        }
+    }
+    while let Some(obj) = stack.pop() {
+        if seen.len() >= MAX_VISITED {
+            incomplete += 1;
+            break;
+        }
+        let mut children: Vec<usize> = Vec::new();
+        // SAFETY: the world is stopped for this collection, and every address
+        // reaching here was validated by `is_object_address` -- the roots by
+        // their producers, the children just below.
+        let walked = unsafe {
+            cratonvm_gc::gc::for_each_object_reference(obj, MAX_OBJECT_BYTES, &mut |c| {
+                children.push(c)
+            })
+        };
+        if !walked {
+            incomplete += 1;
+        }
+        for c in children {
+            if heap.is_object_address(c).is_none() {
+                continue;
+            }
+            if seen.insert(c) {
+                stack.push(c);
+            }
+        }
+    }
+    if incomplete > 0 {
+        ORACLE_INCOMPLETE.fetch_add(incomplete, Ordering::Relaxed);
+    }
+    for (addr, off, reg, why) in pending {
+        ORACLE_WORDS.fetch_add(1, Ordering::Relaxed);
+        if seen.contains(&addr) {
+            ORACLE_REACHABLE.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let n = ORACLE_UNREACHABLE.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 16 || n.is_power_of_two() {
+            eprintln!(
+                "[regoop] UNREACHABLE (#{n}, {why}): band slot off={off} ({reg}) named \
+                 0x{addr:x}, which is NOT reachable from the narrowed root set — this \
+                 narrowing decided its fate. Garbage, or a live object just lost; only \
+                 behaviour tells them apart. walk_incomplete={} so far.",
+                ORACLE_INCOMPLETE.load(Ordering::Relaxed),
+            );
         }
     }
 }
@@ -9301,6 +9758,7 @@ fn publish_unrewritable_band_roots(
     rbp: usize,
     frame_size: usize,
     cm: &cratonvm_jit::CompiledMethod,
+    reg_mask: Option<u16>,
     heap: &VmHeap,
 ) {
     if frame_size == 0 || frame_size > rbp {
@@ -9319,6 +9777,18 @@ fn publish_unrewritable_band_roots(
     while addr + 8 <= hi {
         // Cast: a compiled frame is far smaller than i32::MAX bytes.
         let off = (rbp - addr) as i32;
+        // A blind-spill slot the map excludes is not a root, so it is not a
+        // pin either. Skipping it here as well as in the scan is what keeps the
+        // two halves the same partition -- pinning a word nothing marks would
+        // hold a region out of a G1 collection set for an object that is no
+        // longer in the root set at all.
+        if !spill_slot_may_hold_oop(&cm.frame_layout, off, reg_mask)
+            || spill_slot_is_dead_above_cursor(&cm.frame_layout, off, live_hi)
+            || is_dead_outgoing_reserve(&cm.frame_layout, off, reg_mask)
+        {
+            addr += 8;
+            continue;
+        }
         if band_slot_is_verifiable(off, &cm.frame_layout, live_hi) {
             // Verified storage. An unpublished movable oop here already forces
             // the non-moving sweep, and a published one is rewritten by
@@ -11959,6 +12429,7 @@ mod tests {
             bytecode_pc: 0,
             frame_slot_offsets: vec![-16],
             moving_young_coverage_complete: true,
+            reg_oop_mask: None,
             live_frame_hi: 0,
             local_oop_mask: None,
             num_locals: 0,
@@ -11997,6 +12468,7 @@ mod tests {
             bytecode_pc: 0,
             frame_slot_offsets: vec![-16],
             moving_young_coverage_complete: true,
+            reg_oop_mask: None,
             live_frame_hi: 0,
             local_oop_mask: None,
             num_locals: 0,
@@ -12038,6 +12510,7 @@ mod tests {
             bytecode_pc: 0,
             frame_slot_offsets: vec![-16],
             moving_young_coverage_complete: false,
+            reg_oop_mask: None,
             live_frame_hi: 0,
             local_oop_mask: None,
             num_locals: 0,
@@ -12155,6 +12628,7 @@ mod tests {
             bytecode_pc: 0,
             frame_slot_offsets: vec![-8],
             moving_young_coverage_complete: false,
+            reg_oop_mask: None,
             live_frame_hi: 0,
             local_oop_mask: None,
             num_locals: 0,
@@ -12168,6 +12642,7 @@ mod tests {
             bytecode_pc: 0,
             frame_slot_offsets: vec![-16, -24],
             moving_young_coverage_complete: false,
+            reg_oop_mask: None,
             live_frame_hi: 0,
             local_oop_mask: None,
             num_locals: 0,
@@ -12181,6 +12656,7 @@ mod tests {
             bytecode_pc: 0,
             frame_slot_offsets: vec![],
             moving_young_coverage_complete: false,
+            reg_oop_mask: None,
             live_frame_hi: 0,
             local_oop_mask: None,
             num_locals: 0,
@@ -12241,6 +12717,7 @@ mod tests {
             bytecode_pc: 0,
             frame_slot_offsets: vec![-16],
             moving_young_coverage_complete: false,
+            reg_oop_mask: None,
             live_frame_hi: 0,
             local_oop_mask: None,
             num_locals: 0,

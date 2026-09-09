@@ -984,6 +984,128 @@ impl Compiler {
         true
     }
 
+    /// Which GPRs may hold a LIVE object reference at the current safepoint, as
+    /// a bitmask over [`ALL_SPILL_GPRS`] positions — [`crate::OopMapEntry::reg_oop_mask`].
+    ///
+    /// `emit_pre_safepoint_spill` writes the register file into the frame so a
+    /// conservative scan can see it, and that image is BLIND: every register's
+    /// last value is retained, live or not. This is the narrowing, and it is the
+    /// register-file counterpart of the `frame_slot_offsets` the same map
+    /// already carries.
+    ///
+    /// # What licenses excluding a register
+    ///
+    /// Exactly one claim: **a live reference is either on the simulated operand
+    /// stack, or in a live oop local, or staged for the pending call.** The
+    /// first two are modelled here register-by-register; the third is
+    /// frame-resident by the time this runs (`pending_staged_arg_oops` holds
+    /// FRAME offsets), and the case where it is not is precisely what
+    /// `pending_staged_args_unmapped` reports — so that one refuses outright.
+    ///
+    /// This is the same model `collect_live_oop_homes` publishes to the shadow
+    /// stack, read for a different question. That function asks "what must I
+    /// make rewritable"; this asks "what may hold a reference at all", which is
+    /// a superset — it keeps `Scratch` and XMM-adjacent cases the shadow push
+    /// refuses, because for a mask they are answers rather than refusals.
+    ///
+    /// # Fail-open, in one direction only
+    ///
+    /// Every uncertainty returns `None`, which means "no claim" and leaves the
+    /// consumer scanning the whole image — the behaviour from before this
+    /// existed. A `Some` that is too NARROW frees a live object, so each
+    /// refusal below is load-bearing rather than tidy:
+    ///
+    /// * marks out of sync with the stack, or not exact — the marks are then not
+    ///   a type map and an unmarked entry may still be a reference;
+    /// * the local oop dataflow did not reach this pc — no per-bci statement
+    ///   about which locals hold references;
+    /// * an inline scope whose mask is unavailable — a spliced callee's locals
+    ///   are references this frame's mask does not describe;
+    /// * `local_oop_window_count` refusing the method outright;
+    /// * `pending_staged_args_unmapped` — a reference argument was staged into
+    ///   the native outgoing-argument area, the direct-call service slots, or an
+    ///   inlined callee's parameter locals, none of which this compiler can
+    ///   name. Its own doc calls that fail-closed, and this is the same close.
+    ///
+    /// `RAX` is kept unconditionally. It is where the emitter materialises every
+    /// loaded, allocated and returned reference before it is pushed or stored,
+    /// so it can hold one in flight at a point the simulated stack does not yet
+    /// describe. One slot is not worth the argument.
+    fn live_oop_register_mask(&self) -> Option<u16> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !reg_oop_maps_enabled() || self.failed {
+            reg_oop_mask_cause::DISABLED.fetch_add(1, Relaxed);
+            return None;
+        }
+        // A reference staged where no map can name it. Fail closed.
+        if self.pending_staged_args_unmapped {
+            reg_oop_mask_cause::STAGED_ARGS_UNMAPPED.fetch_add(1, Relaxed);
+            return None;
+        }
+        if self.stack.len() != self.stack_oop_marks.len() {
+            reg_oop_mask_cause::MARK_DESYNC.fetch_add(1, Relaxed);
+            return None;
+        }
+        if !self.stack.is_empty() && !self.stack_oop_marks_exact {
+            reg_oop_mask_cause::MARKS_INEXACT.fetch_add(1, Relaxed);
+            return None;
+        }
+        if crate::x64::licm::local_oop_window_count(self.num_locals).is_none() {
+            reg_oop_mask_cause::LOCAL_WINDOWS.fetch_add(1, Relaxed);
+            return None;
+        }
+        for scope in &self.inline_oop_scopes {
+            if scope.mask_at_cur().is_none() {
+                reg_oop_mask_cause::INLINE_SCOPE.fetch_add(1, Relaxed);
+                return None;
+            }
+        }
+        let bit = |reg: u8| -> u16 {
+            match ALL_SPILL_GPRS.iter().position(|&r| r == reg) {
+                // Cast: position < 14 < 16, so the shift is in range.
+                Some(i) => 1u16 << i,
+                None => 0,
+            }
+        };
+        // RAX — see the doc above.
+        let mut mask = bit(RAX);
+        // Operand-stack entries the marks call references, in whichever
+        // register holds them. `Scratch` is included rather than refused: it is
+        // flushed before every call, so it is normally empty here, and when it
+        // is not the honest answer is a set bit.
+        let n = self.stack.len().min(self.stack_oop_marks.len());
+        for i in 0..n {
+            if !self.stack_oop_marks[i] {
+                continue;
+            }
+            match self.stack[i] {
+                StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg, ..) => mask |= bit(reg),
+                StackSlot::Frame(_) | StackSlot::Xmm(_) => {}
+            }
+        }
+        // Reference locals live at THIS pc, in their register homes. The
+        // frame-homed ones need no bit: they are not in the spill image.
+        let mut reached = true;
+        let mut regs: Vec<u8> = Vec::new();
+        let ok = self.for_each_oop_local_at_current_pc(|k| {
+            if let Some(r) = self.reg_for_local(k) {
+                regs.push(r);
+            }
+        });
+        if !ok {
+            reached = false;
+        }
+        if !reached {
+            reg_oop_mask_cause::LOCAL_DATAFLOW.fetch_add(1, Relaxed);
+            return None;
+        }
+        for r in regs {
+            mask |= bit(r);
+        }
+        reg_oop_mask_cause::PUBLISHED.fetch_add(1, Relaxed);
+        Some(mask)
+    }
+
     /// Return whether the shadow-stack push can prove it will publish every
     /// live oop for the current safepoint. Any `false` result is a correctness
     /// signal to the GC: if this frame is live here, moving-young must divert to
@@ -1966,6 +2088,12 @@ impl Compiler {
                     map_incomplete,
                 ),
                 live_frame_hi,
+                // The register-file half of this map. Computed here rather than
+                // in `emit_shadow_push` for the same reason
+                // `moving_young_coverage_complete` is fixed up here: this is
+                // where the map is actually built, and the staged-argument
+                // state it refuses on is still un-taken at this point.
+                reg_oop_mask: self.live_oop_register_mask(),
                 // The oracle a stale-word report needs to say "live". Taken
                 // through the shared accessor so the method-entry poll records
                 // its parameter mask rather than a `None` (see

@@ -2698,6 +2698,9 @@ impl<'a> Lowerer<'a> {
             // `scan_oop_slots` yields `ObjectRef` values, which mark but cannot
             // be written back through.
             moving_young_coverage_complete: complete,
+            // The IR tier stages its oops in frame slots rather than in a
+            // blind register image, so it has no register claim to make.
+            reg_oop_mask: None,
             live_frame_hi: live_hi,
             // The IR tier allocates frame slots; it does not home local `k` at
             // `[rbp - 8*(k+1)]`, so the locals-band oracle does not apply to
@@ -16550,6 +16553,9 @@ pub(crate) fn lower_inner_with_scopes(
         },
         reg_spill_lo: 0,
         reg_spill_hi: 0,
+        // No outgoing reserve this backend can name; see
+        // `FrameLayout::outgoing_lo`, where 0 means "no claim".
+        outgoing_lo: 0,
         frame_size,
     };
     if needs_context {

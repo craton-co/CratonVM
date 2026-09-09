@@ -2565,6 +2565,64 @@ pub(super) fn call_spill_elision_mode() -> u8 {
 /// position in `ALL_SPILL_GPRS` — so a skipped store leaves a stale slot, which
 /// the scanner re-validates through `heap.is_object_address` and which can
 /// therefore only over-retain, never under-report.
+/// Why [`crate::x64::Compiler::live_oop_register_mask`] abstained, by cause.
+///
+/// A mask that is always `None` and a mask that is always full look identical
+/// from the collector -- both leave the whole blind-spill image in the scan --
+/// so the emit side has to say which it is, per cause, or the narrowing cannot
+/// be debugged at all.
+pub mod reg_oop_mask_cause {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    pub static DISABLED: AtomicUsize = AtomicUsize::new(0);
+    pub static STAGED_ARGS_UNMAPPED: AtomicUsize = AtomicUsize::new(0);
+    pub static MARK_DESYNC: AtomicUsize = AtomicUsize::new(0);
+    pub static MARKS_INEXACT: AtomicUsize = AtomicUsize::new(0);
+    pub static LOCAL_WINDOWS: AtomicUsize = AtomicUsize::new(0);
+    pub static INLINE_SCOPE: AtomicUsize = AtomicUsize::new(0);
+    pub static LOCAL_DATAFLOW: AtomicUsize = AtomicUsize::new(0);
+    pub static PUBLISHED: AtomicUsize = AtomicUsize::new(0);
+
+    /// `(disabled, staged_args, mark_desync, marks_inexact, local_windows,
+    /// inline_scope, local_dataflow, published)`.
+    pub fn snapshot() -> (usize, usize, usize, usize, usize, usize, usize, usize) {
+        let g = |c: &AtomicUsize| c.load(Ordering::Relaxed);
+        (
+            g(&DISABLED),
+            g(&STAGED_ARGS_UNMAPPED),
+            g(&MARK_DESYNC),
+            g(&MARKS_INEXACT),
+            g(&LOCAL_WINDOWS),
+            g(&INLINE_SCOPE),
+            g(&LOCAL_DATAFLOW),
+            g(&PUBLISHED),
+        )
+    }
+}
+
+/// `CRATONVM_JIT_REG_OOP_MAPS=0` — stop publishing
+/// [`crate::OopMapEntry::reg_oop_mask`], so every consumer falls back to
+/// scanning the whole blind-spill image. **Default ON.**
+///
+/// The bisect lever for the register half of the oop maps. It is the emit-side
+/// switch; `CRATONVM_GC_REG_OOP_MAPS=0` is the consume-side one, and either
+/// alone restores the pre-2026-09-09 root set. Two switches because the map is
+/// baked into a `CompiledMethod` at compile time: flipping the emitter needs a
+/// fresh compile to take effect, flipping the consumer takes effect at the next
+/// collection, and an investigation wants both.
+pub(super) fn reg_oop_maps_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_REG_OOP_MAPS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        },
+    )
+}
+
 pub(super) fn narrow_safepoint_spill_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
