@@ -1,9 +1,9 @@
 # RETIRED — the Hazelcast autoconfiguration "crash or hang on every GC"
 
 **Status: RETIRED 2026-09-09**, superseded by measurement. Filed 2026-09-08 as
-`docs/known-issues/springboot/hazelcast-autoconfiguration-crash-hang-cluster-decommitted-span-20260908.md`
--- a page that never reached `origin/dev`, so this file is where its content
-now lives. Everything it claimed is quoted below.
+`docs/known-issues/springboot/hazelcast-autoconfiguration-crash-hang-cluster-decommitted-span-20260908.md`,
+deleted by the same change that added this file. Everything it claimed is
+quoted below.
 
 Of the six cells in the page's result matrix, **five were wrong by the time it
 was filed or wrong when it was filed**, and the one that survives is a
