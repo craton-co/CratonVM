@@ -1330,6 +1330,45 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-skip-republish", on_key: Some("CRATONVM_JIT_IR_SKIP_REPUBLISH"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "ir-deopt-regs", on_key: Some("CRATONVM_JIT_IR_DEOPT_REGS"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "ir-osr-entry", on_key: Some("CRATONVM_JIT_IR_OSR_ENTRY"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
+    // ── The nine C2-cost changes of 2026-09-09 (`d21ae9e3f`) ──────────
+    //
+    // Landed on `dev` with no INVENTORY rows, which held the pre-push
+    // flag-surface gate red for every branch cut from it. Declared here from
+    // their read sites; the defaults below are what those sites actually do,
+    // not what the commit message summarised.
+    //
+    // R2a. Splice a callee whose body carries `ldc`/`ldc2_w`: `IrInlineTables`
+    // carries the constants now, so the builder no longer needs to invent the
+    // float/double discriminator `InlineSite`'s raw `i64` dropped.
+    E { group: Group::JIT, token: "ir-splice-ldc", on_key: Some("CRATONVM_JIT_IR_SPLICE_LDC"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // R2b. Splice a callee whose body BRANCHES. The builder re-verifies each
+    // relocated body on its own and rebases the merge targets and loop headers
+    // that come out, which is the analysis the caller's `verified_code` cannot
+    // supply for a region past its `code_len`.
+    E { group: Group::JIT, token: "ir-splice-branch", on_key: Some("CRATONVM_JIT_IR_SPLICE_BRANCH"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // R1. Memoize the ACCEPTED optimizing OSR artifact, not only the refusals.
+    // Without it one run recompiled the same method 502 times.
+    E { group: Group::JIT, token: "osr-optimizing-cache", on_key: Some("CRATONVM_JIT_OSR_OPTIMIZING_CACHE"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // R7. Elide the `JMP` to a block that is physically next.
+    E { group: Group::JIT, token: "ir-fallthrough", on_key: Some("CRATONVM_JIT_IR_FALLTHROUGH"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // R3, R4 and R6: opt-IN, default OFF pending their soaks. Each read site
+    // accepts `1`/`true`/`on`/`yes` and nothing else, so there is no off-word
+    // to state -- removing the key is the way back.
+    E { group: Group::JIT, token: "ir-deopt-points-at-traps", on_key: Some("CRATONVM_JIT_IR_DEOPT_POINTS_AT_TRAPS"), off_key: None, off_word: None, since: "2026-09-09" },
+    E { group: Group::JIT, token: "ir-reg-authoritative", on_key: Some("CRATONVM_JIT_IR_REG_AUTHORITATIVE"), off_key: None, off_word: None, since: "2026-09-09" },
+    E { group: Group::JIT, token: "ir-speculate", on_key: Some("CRATONVM_JIT_IR_SPECULATE"), off_key: None, off_word: None, since: "2026-09-09" },
+    // Presence-tested (`runtime_var_os(..).is_some()`), so any value turns it
+    // on: keep the profiler armed for every tier rather than only where the
+    // tiering policy asks for it.
+    E { group: Group::JIT, token: "tier-pgo-always", on_key: Some("CRATONVM_TIER_PGO_ALWAYS"), off_key: None, off_word: None, since: "2026-09-09" },
+    // Diagnosis lever, value-taking: a comma-separated list of conservative
+    // root-band CLASSES to skip (`operand-spill`,
+    // `outgoing-args-or-deopt-regs`, `safepoint-gpr-spill-image`). Absent
+    // means skip nothing, which is the only setting that is safe -- dropping a
+    // root frees what it named, and the lever exists to MEASURE the ceiling a
+    // real fix would reach, not to be run. Landed 2026-09-09 with the G1
+    // pinned-regions work and undeclared; see `band_skip_classes`.
+    E { group: Group::JIT, token: "band-skip", on_key: Some("CRATONVM_JIT_BAND_SKIP"), off_key: None, off_word: None, since: "2026-09-09" },
     E { group: Group::JIT, token: "ls-carry-relief", on_key: Some("CRATONVM_JIT_LS_CARRY_RELIEF"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "ir-reserve-carried", on_key: Some("CRATONVM_JIT_IR_RESERVE_CARRIED"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "osr-optimizing", on_key: Some("CRATONVM_JIT_OSR_OPTIMIZING"), off_key: None, off_word: Some("0"), since: "2026-09-04" },

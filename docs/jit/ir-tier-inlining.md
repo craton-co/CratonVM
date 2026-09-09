@@ -116,12 +116,37 @@ the entire point.
 
 | refused | why |
 |---|---|
-| any branch | a relocated body's merges and loop headers would have to be computed over the caller's code; there is no second walker |
+| more than one `return`, or a `return` that is not last | the walk goes straight through from the body's first byte to its return; merging several returns into one continuation is a later increment |
 | `idiv`/`irem`/`ldiv`/`lrem` | the div-zero guard is the only guard the builder emits, and a spliced region should carry none of its own |
 | `ldc` / `ldc2_w` | `InlineSite` records a raw `i64` where the builder needs the value **and** its float/double discriminator; inventing that bit is how a `long` constant becomes a `double` |
 | `getstatic` / `putstatic` | no static-field rows are rebased, and `putstatic` is a side effect re-execution cannot undo |
-| more than one return, or a return that is not last | the walk goes straight through from the body's first byte to its return |
 | a target that is not provably monomorphic | the IR tier has no class-id guard node, so a speculative splice has nothing to fall back to |
+
+### Branches — `ir-splice-branch`
+
+Default ON since 2026-09-09; `CRATONVM_JIT_IR_SPLICE_BRANCH=0` restores the
+straight-line-only admission v1 shipped with.
+
+The obstacle was never the branch. It was that `verified_code` above analysed
+`code[..code_len]` — the CALLER alone — so a relocated body's merge targets and
+loop headers were in nobody's decode. Closing that needs no new analysis,
+because a callee body IS a valid method body: `IrBuilder::build` runs the same
+verifier over each spliced body and rebases what comes out by the body's
+`base`. Branch offsets need no rebasing at all — they are relative, the body is
+copied contiguously, so a branch inside it lands inside it in combined
+coordinates by construction.
+
+The merge-activation gate in the walk is therefore no longer
+`self.splice.is_empty()`. A join inside a spliced region is activated exactly
+as one in the caller is, and the φ it builds carries a combined-buffer pc,
+which is what every other node in a relocated region already carries.
+
+Pairing that with the OSR door surfaced
+`ir-osr-entry-miscompiles-a-spliced-merge-FIXED-20260909`. The page is worth
+reading for what it corrected rather than for what it found: an entry stub
+jumps past the block that writes a CONSTANT's home word, and a merge store
+reads its arms from their home words — a defect with no splice in it at all,
+which a spliced clamp is merely how anyone first saw.
 
 "Provably monomorphic" is `static`, `private`, `final`, `<init>`, or a `final`
 declaring class. Deliberately **not** a CHA-style "no loaded subclass overrides
