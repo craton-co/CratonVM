@@ -1646,10 +1646,25 @@ jobs:
       # baseline's own note names the page that diagnoses them.
       #
       # `21-linux` was minted 2026-09-09 against Temurin 21.0.12+8, so ALL FOUR
-      # legs now adjudicate and none refuses. It carries 16 sections -- the same
-      # count as `21-windows`, but NOT the same set: Linux does not diverge on
-      # `textformat` (that row is locale data and this is a different host), and
-      # it carries a vthreads row Windows does not.
+      # legs now adjudicate and none refuses. It was minted at 16 sections --
+      # the same count as `21-windows`, though NOT the same set: Linux does not
+      # diverge on `textformat` (that row is locale data and this is a different
+      # host), and it carries a vthreads row Windows does not.
+      #
+      # It was RE-FROZEN at 10 sections later the same day, when the JDK 21
+      # serialization defect was fixed and its six `JdkOnlyBreadthProbe` rows
+      # stopped diverging (that probe is now byte-identical to HotSpot in both
+      # modes). GONE rows pass, so leaving them would not have gone red -- it
+      # would just have left six rows of slack in the ratchet, which is exactly
+      # the state a re-freeze exists to remove.
+      #
+      # `21-windows` STILL CARRIES THOSE SIX ROWS, and that asymmetry is
+      # deliberate rather than an oversight: the fix is platform-independent, so
+      # they will read as GONE there too and the leg passes, but re-minting a
+      # key requires running the gate against a real JDK 21 image on that OS and
+      # the Windows host no longer has one. The Windows 21 leg is therefore six
+      # rows looser than the Linux one until someone with a Windows JDK 21
+      # re-freezes it. Anyone who does: expect exactly those six rows to drop.
       #
       # It was not accepted from one mint. The vthreads section is an
       # intermittent race, so a baseline minted from a run that saw the smaller
