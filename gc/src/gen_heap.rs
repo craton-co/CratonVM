@@ -16276,6 +16276,27 @@ impl GenerationalHeap {
                 young_from.used(),
                 off >= bm_span,
             );
+            // The header is still intact here: from-space is not reset until
+            // after the copy phase. A plausible header at `old_ptr` says the
+            // walk missed a real object; an implausible one says the reference
+            // was already wrong before this cycle, and the refusal is right.
+            let near = starts.nearest_start_at_or_below(old_ptr as usize);
+            // SAFETY: `old_ptr` is inside from-space (checked by the caller),
+            // which is mapped and not yet reset; two byte reads and a u32 read
+            // at the fixed header offsets are in bounds.
+            let (kind_tag, elem_tag, cid) = unsafe {
+                (
+                    cratonvm_types::kind_tag_at(old_ptr),
+                    cratonvm_types::element_type_tag_at(old_ptr),
+                    std::ptr::read_unaligned(old_ptr as *const u32),
+                )
+            };
+            eprintln!(
+                "[forward-refused] ^ header_at_old_ptr: class_id={cid} kind_tag={kind_tag} \
+                 elem_tag={elem_tag} nearest_recorded_start={} delta={}",
+                near.map(|a| format!("0x{a:x}")).unwrap_or_else(|| "none".into()),
+                near.map(|a| (old_ptr as usize).saturating_sub(a) as i64).unwrap_or(-1),
+            );
         }
     }
 
