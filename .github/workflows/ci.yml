@@ -1632,9 +1632,18 @@ jobs:
       # this matrix leg's `<feature>-<os>`. That is deliberate: a baseline from
       # another key cannot adjudicate this one, and "no baseline" must never
       # read as "nothing diverged". `25-linux` and `25-windows` are committed,
-      # so those two legs adjudicate; the two JDK 21 legs refuse and say so —
-      # same posture, and the same reason, as the bridge ratchet being
-      # `ubuntu-latest` only. A 21 key can only be minted by a run on 21.
+      # so those two legs adjudicate. `21-windows` was minted 2026-09-08 against
+      # a real Temurin 21.0.12.1+1, so the Windows 21 leg adjudicates too. It
+      # carries 16 sections where the 25 keys carry 2, because the first run
+      # ever made against a 21 image found FOUR defects -- the JavaLangAccess
+      # carrier is pinned by name to `java.lang.System$1`, which on JDK 21 is a
+      # PrivilegedAction and not the JLA at all. Those rows are frozen so the
+      # gate can say "no worse"; they are NOT accepted behaviour, and the
+      # baseline's own note names the page that diagnoses them.
+      #
+      # The LINUX 21 leg still refuses, same posture and same reason as the
+      # bridge ratchet being `ubuntu-latest` only: a `21-linux` key can only be
+      # minted by a run on 21 on Linux.
       #
       # The script self-tests its own ratchet hermetically before touching a VM
       # — it asserts that an injected new section IS flagged and a baselined one

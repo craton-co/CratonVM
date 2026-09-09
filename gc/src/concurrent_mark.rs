@@ -27,7 +27,8 @@ use parking_lot::Mutex;
 
 use crate::heap::{
     array_data_size, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET,
-    GC_FLAG_COMPACT, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE,
+    GC_FLAG_COMPACT, GC_FLAG_HEADER, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE,
+    REF_ELEMENT_SIZE, SLOT_SIZE,
 };
 use crate::mark_bitmap::MarkBitmap;
 use crate::old_gen::OldGen;
@@ -1082,7 +1083,16 @@ pub(crate) fn concurrent_mark_object_size(header: *const ObjectHeader) -> Option
             ARRAY_DATA_OFFSET.checked_add(data_size)
         }
         tag if tag == ObjectKind::Object as u8 => {
-            let known_flags = GC_FLAG_OLD_GEN | GC_FLAG_MARKED | GC_FLAG_COMPACT;
+            // Every DEFINED flag, and `GC_FLAG_HEADER` is one of them as of
+            // 2026-09-08. Omitting it here does not merely weaken the screen —
+            // it inverts it: the flag is set on every object every allocator
+            // publishes, so an incomplete `known_flags` rejects the sizing of
+            // EVERY plain object, the concurrent marker skips them all and
+            // falls back to "mark all old-gen objects for this cycle", and G1
+            // stops unloading classes (caught by `RClassUnloadSweep` in the
+            // regression suite, and by this file's own
+            // `concurrent_mark_object_size_rejects_inconsistent_object_header`).
+            let known_flags = GC_FLAG_OLD_GEN | GC_FLAG_MARKED | GC_FLAG_COMPACT | GC_FLAG_HEADER;
             if snapshot.gc_flags & !known_flags != 0 {
                 return None;
             }

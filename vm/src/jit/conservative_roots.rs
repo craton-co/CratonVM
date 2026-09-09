@@ -2100,7 +2100,7 @@ pub mod above_chain {
 /// Kept, default off, as the lever that reading measures rather than a fix:
 /// a default-on gigabyte of stack reads per run buys nothing demonstrated.
 /// See
-/// `docs/known-issues/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`.
+/// `docs/internal/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn above_chain_scan_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2690,21 +2690,50 @@ fn unreg_jit_accept_residue() -> bool {
     })
 }
 
-/// Kill switch for the residue test on the unregistered-JIT-frame probe's
-/// RELOCATION LICENCE -- `CRATONVM_JIT_UNREG_RESIDUE_LICENCE=0` restores the
-/// pre-2026-09-08 behaviour, where any accepted hit refused relocation for the
-/// cycle even when the returned-frame residue mark explained it.
+/// Opt-in for the residue test on the unregistered-JIT-frame probe's RELOCATION
+/// LICENCE -- `CRATONVM_JIT_UNREG_RESIDUE_LICENCE=1` lets a cycle relocate when
+/// every accepted hit is explained by the returned-frame residue mark.
 ///
-/// Marking is unaffected either way: the full band is conservatively scanned on
-/// every accepted hit under both settings, so this switch can only change how
-/// often the collector is ALLOWED TO COMPACT, never what it retains.
+/// **DEFAULT OFF since 2026-09-08, and the default is the measured one.** This
+/// shipped default-ON the same day and corrupts the heap. The reasoning that
+/// made it look safe is quoted here because it is nearly right:
+///
+/// > Marking is unaffected either way: the full band is conservatively scanned
+/// > on every accepted hit under both settings, so this switch can only change
+/// > how often the collector is ALLOWED TO COMPACT, never what it RETAINS.
+///
+/// Retention is indeed unaffected -- and retention is not the failure. Granting
+/// the licence lets ZGC RELOCATE a marked object while a raw word in that same
+/// band still holds its old address, and nothing rewrites a conservative root.
+/// The object survives; the pointer to it does not.
+///
+/// Measured on dev@d7768380b, ONE binary, concurrent paired arms,
+/// `MvsCreate 500000` at `-Xmx2g` on ZGC -- a heap where BOTH arms complete, so
+/// the control is a real control rather than an OOM:
+///
+/// | | `rc=0` |
+/// |---|---:|
+/// | licence granted | **8/10** |
+/// | licence withheld | **10/10** |
+///
+/// with faces `MVStoreException: Chunk 13 not found` and, unambiguously,
+/// `ClassCastException: class [B cannot be cast to class [J` -- one address
+/// carrying two different array headers. Pooled with the equivalent arms of an
+/// independent implementation of the same idea: 35 of 43 against 43 of 43,
+/// Fisher's exact p ~ 0.005.
+///
+/// The ZGC OOM this licence was built to fix is real and comes back when it is
+/// withheld. A loud OOM is a better default than silent corruption; the repair
+/// is to give the shallow band above `cover_hi` precise roots so the pin is not
+/// needed at all. See
+/// `docs/known-issues/gc/zgc-residue-licence-relocates-under-a-conservative-root-20260908.md`.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn unreg_residue_licence_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        !matches!(
+        matches!(
             cratonvm_types::flags::runtime_var("CRATONVM_JIT_UNREG_RESIDUE_LICENCE").as_deref(),
-            Ok("0") | Ok("false") | Ok("off")
+            Ok("1") | Ok("true") | Ok("on")
         )
     })
 }
@@ -6443,7 +6472,7 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     // What remains of the fullstack diagnostic's difference is the PATH, not
     // the range: it also scans from `update_root_snapshot`, on every
     // object-returning native call. See `above_chain_all_paths`, and
-    // `docs/known-issues/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`.
+    // `docs/internal/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`.
     //
     // Sound on the same terms as the chain band beside it, which has always
     // pushed conservative roots on cycles that could still relocate: a live
@@ -9598,6 +9627,71 @@ pub fn audit_jit_frames_for_vacated(
 pub static JIT_VACATED_FRAME_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// The subset of [`JIT_VACATED_FRAME_HITS`] in a slot `band_slot_is_verifiable`
+/// INSPECTS -- a java local, or an operand-spill slot below the safepoint's
+/// live cursor.
+///
+/// This is the number that separates the two candidate stories. An unverifiable
+/// hit is a dead register image or an abandoned outgoing-argument word, which
+/// is what every conservative frame scan carries and what
+/// `CRATONVM_JIT_REMAP_ALL_UNVERIFIABLE` was measured against to no effect. A
+/// VERIFIABLE hit is a slot the coverage machinery claims to describe and the
+/// remap still did not rewrite -- a live oop of a live compiled frame left
+/// naming a vacated address.
+pub static JIT_VACATED_FRAME_HITS_VERIFIABLE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Per-region tally, indexed by [`vacated_region_bucket`].
+pub static JIT_VACATED_BY_REGION: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Bucket names for [`JIT_VACATED_BY_REGION`], in index order.
+pub const JIT_VACATED_REGION_NAMES: [&str; 8] = [
+    "java-local",
+    "operand-spill",
+    "licm-or-scalar",
+    "callee-saved-gpr-image",
+    "safepoint-gpr-spill-image",
+    "outgoing-args-or-deopt-regs",
+    "reserved-locals-tail",
+    "other",
+];
+
+fn vacated_region_bucket(region: &str) -> usize {
+    match region {
+        "java-local" => 0,
+        "operand-spill" => 1,
+        "licm-ref-hoist" | "licm-arith" | "scalar-replaced-field" => 2,
+        "callee-saved-gpr-image" | "callee-saved-xmm-image" => 3,
+        "safepoint-gpr-spill-image" => 4,
+        "outgoing-args-or-deopt-regs" => 5,
+        "reserved-locals-tail" => 6,
+        _ => 7,
+    }
+}
+
+/// `(total, verifiable, per-region)` for the run's `[jit-vacated-frame]` census.
+pub fn jit_vacated_frame_census() -> (u64, u64, [u64; 8]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut per = [0u64; 8];
+    for (i, c) in JIT_VACATED_BY_REGION.iter().enumerate() {
+        per[i] = c.load(Relaxed);
+    }
+    (
+        JIT_VACATED_FRAME_HITS.load(Relaxed),
+        JIT_VACATED_FRAME_HITS_VERIFIABLE.load(Relaxed),
+        per,
+    )
+}
+
 fn report_vacated_words_in(
     lo: usize,
     hi: usize,
@@ -9619,7 +9713,22 @@ fn report_vacated_words_in(
         let w = unsafe { (addr as *const usize).read() };
         if let Some(moved_to) = cratonvm_gc::gc_quiescence::was_vacated(w) {
             let n = JIT_VACATED_FRAME_HITS.fetch_add(1, Ordering::Relaxed);
-            if n < 200 {
+            // Cast: a compiled frame is far smaller than i32::MAX.
+            let off_t = (rbp - addr) as i32;
+            let region_t = cm.frame_layout.region_name(off_t);
+            let verifiable_t = band_slot_is_verifiable(
+                off_t,
+                &cm.frame_layout,
+                moving_young_frame_live_hi(rbp, cm),
+            );
+            if verifiable_t {
+                JIT_VACATED_FRAME_HITS_VERIFIABLE.fetch_add(1, Ordering::Relaxed);
+            }
+            JIT_VACATED_BY_REGION[vacated_region_bucket(region_t)].fetch_add(1, Ordering::Relaxed);
+            // Report the VERIFIABLE ones without a budget: they are the finding,
+            // and on a healthy run there are none. The unverifiable tail is dead
+            // slop every conservative scan carries, so it keeps a cap.
+            if verifiable_t || n < 200 {
                 // Cast: a compiled frame is far smaller than i32::MAX.
                 let off = (rbp - addr) as i32;
                 eprintln!(
@@ -10704,6 +10813,14 @@ mod tests {
     /// thread would be a claim about frames that do not exist.
     #[test]
     fn a_thread_with_no_jit_frames_deposits_nothing() {
+        // `peer_proven_jit_depth` is a PROCESS global, and
+        // `beginning_a_coverage_cycle_clears_the_peer_ledger` deposits 7 into
+        // it under this latch. Without taking the latch here too, that 7 is
+        // read as this test's own deposit: `left: 7, right: 0`, only ever in
+        // parallel -- alone and under `--test-threads=1` it passes.
+        let _serialised = super::coverage_oracle_gate_tests::COVERAGE_ORACLE_TEST_LATCH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert_eq!(current_thread_jit_depth(), 0, "test precondition");
         cratonvm_gc::gc_quiescence::reset_peer_proven_jit_depth();
         publish_peer_jit_coverage_for_stw();

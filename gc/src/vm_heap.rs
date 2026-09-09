@@ -589,8 +589,43 @@ impl VmHeap {
         dispatch!(self, set_layout_domain(domain))
     }
 
+    /// `CRATONVM_DBG_VACATED_FRAMES` bookkeeping: an address the allocator has
+    /// just issued is no longer evidence that anything was moved away from it.
+    ///
+    /// Every non-TLAB allocation door on this type funnels its result through
+    /// here. The TLAB door is [`Self::refill_tlab`], which purges the whole
+    /// chunk at once — see `gc_quiescence::note_allocated_range` for why the
+    /// per-object door alone left the instrument reporting every fresh young
+    /// object as a stale reference on the non-ZGC backends.
+    #[inline]
+    fn note_alloc(o: ObjectRef) -> ObjectRef {
+        if !crate::gc_quiescence::vacated_frames_enabled() {
+            return o;
+        }
+        // The whole EXTENT, not just the base. An address the ledger holds
+        // because a small object was moved away from it stops being evidence
+        // the moment a LARGER object is allocated over it -- and only the base
+        // of that larger object would be purged by an address-keyed door, so
+        // every interior word stayed in the ledger for the rest of the run.
+        // On BindableTests that is a quarter-megabyte of stale entries per
+        // large array, which is the exact false-positive class this ledger was
+        // repaired to stop producing.
+        //
+        // SAFETY: `o` is an object the allocator has just finished laying out;
+        // its header is initialised and mapped.
+        let base = o.as_ptr() as usize;
+        let size = unsafe { crate::gen_heap::gen_object_total_size(&*(base as *const ObjectHeader)) };
+        crate::gc_quiescence::note_allocated_range(base, base.saturating_add(size.max(8)));
+        o
+    }
+
+    #[inline]
+    fn note_alloc_opt(o: Option<ObjectRef>) -> Option<ObjectRef> {
+        o.map(Self::note_alloc)
+    }
+
     pub fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
-        dispatch!(self, alloc_object(class_id, num_fields))
+        Self::note_alloc(dispatch!(self, alloc_object(class_id, num_fields)))
     }
 
     pub fn alloc_array(
@@ -599,29 +634,29 @@ impl VmHeap {
         element_type: ArrayElementType,
         length: usize,
     ) -> ObjectRef {
-        dispatch!(self, alloc_array(class_id, element_type, length))
+        Self::note_alloc(dispatch!(self, alloc_array(class_id, element_type, length)))
     }
 
     /// Try to allocate an object. Returns `None` on OOM (caller should trigger GC and retry).
     pub fn try_alloc_object(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
-        match self {
+        Self::note_alloc_opt(match self {
             VmHeap::Generational(h) => h.try_alloc_object(class_id, num_fields),
             VmHeap::G1(h) => h.try_alloc_object(class_id, num_fields),
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(h) => h.try_alloc_object(class_id, num_fields),
-        }
+        })
     }
 
     /// Try to allocate directly in the old generation. This is only available
     /// for the generational heap; other heap implementations return `None` so
     /// callers can fall back to their normal allocation path.
     pub fn try_alloc_object_old(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
-        match self {
+        Self::note_alloc_opt(match self {
             VmHeap::Generational(h) => h.try_alloc_object_old(class_id, num_fields),
             VmHeap::G1(_) => None,
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(_) => None,
-        }
+        })
     }
 
     /// Allocate a same-layout old-generation batch under one allocator lock.
@@ -634,12 +669,17 @@ impl VmHeap {
         num_fields: usize,
         count: usize,
     ) -> Vec<ObjectRef> {
-        match self {
+        let batch = match self {
             VmHeap::Generational(h) => h.try_alloc_objects_old_batch(class_id, num_fields, count),
             VmHeap::G1(_) => Vec::new(),
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(_) => Vec::new(),
+        };
+        if crate::gc_quiescence::vacated_frames_enabled() {
+            let addrs: Vec<usize> = batch.iter().map(|o| o.as_ptr() as usize).collect();
+            crate::gc_quiescence::note_allocated(&addrs);
         }
+        batch
     }
 
     /// Fallible twin of [`alloc_object`](Self::alloc_object): same (no-GC)
@@ -647,12 +687,12 @@ impl VmHeap {
     /// on true heap exhaustion instead of aborting the VM. Lets the JIT
     /// object-alloc helper raise a catchable `OutOfMemoryError`.
     pub fn try_alloc_object_full(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
-        match self {
+        Self::note_alloc_opt(match self {
             VmHeap::Generational(h) => h.try_alloc_object_full(class_id, num_fields),
             VmHeap::G1(h) => h.try_alloc_object(class_id, num_fields),
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(h) => h.try_alloc_object(class_id, num_fields),
-        }
+        })
     }
 
     /// Fallible twin of [`alloc_array`](Self::alloc_array): same (no-GC)
@@ -665,12 +705,12 @@ impl VmHeap {
         element_type: ArrayElementType,
         length: usize,
     ) -> Option<ObjectRef> {
-        match self {
+        Self::note_alloc_opt(match self {
             VmHeap::Generational(h) => h.try_alloc_array_full(class_id, element_type, length),
             VmHeap::G1(h) => h.try_alloc_array(class_id, element_type, length),
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(h) => h.try_alloc_array(class_id, element_type, length),
-        }
+        })
     }
 
     /// DBG (bc math-ec `0x4`): scan young from-space for the first `0x4` seed
@@ -719,7 +759,7 @@ impl VmHeap {
         num_fields: usize,
         descriptor_bytes: &[u8],
     ) -> Option<ObjectRef> {
-        match self {
+        Self::note_alloc_opt(match self {
             VmHeap::Generational(h) => {
                 h.try_alloc_object_with_descriptors(class_id, num_fields, descriptor_bytes)
             }
@@ -730,7 +770,7 @@ impl VmHeap {
             VmHeap::Zgc(h) => {
                 h.try_alloc_object_with_descriptors(class_id, num_fields, descriptor_bytes)
             }
-        }
+        })
     }
 
     pub fn try_alloc_array(
@@ -739,12 +779,12 @@ impl VmHeap {
         element_type: ArrayElementType,
         length: usize,
     ) -> Option<ObjectRef> {
-        match self {
+        Self::note_alloc_opt(match self {
             VmHeap::Generational(h) => h.try_alloc_array(class_id, element_type, length),
             VmHeap::G1(h) => h.try_alloc_array(class_id, element_type, length),
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(h) => h.try_alloc_array(class_id, element_type, length),
-        }
+        })
     }
 
     // =====================================================================
@@ -1127,6 +1167,34 @@ impl VmHeap {
     /// UNvalidated even though the relocation table only holds live bases,
     /// because that keeps the flag's meaning to one sentence a caller can
     /// check rather than a chain of invariants it has to trust.
+    /// Rate limiter for the stale-barrier census in
+    /// [`Self::load_and_forward_inner`], keyed by CALL SITE.
+    ///
+    /// Returns true at most once per distinct Rust backtrace, and at most
+    /// `MAX_SITES` times overall. `CRATONVM_DBG_VACATED_FRAMES` only -- the
+    /// capture alone is far too expensive for any other run.
+    #[cold]
+    #[inline(never)]
+    fn stale_barrier_site_is_new() -> bool {
+        use std::collections::HashSet;
+        use std::hash::{Hash, Hasher};
+        const MAX_SITES: usize = 40;
+        static SEEN: std::sync::Mutex<Option<HashSet<u64>>> = std::sync::Mutex::new(None);
+        let bt = std::backtrace::Backtrace::force_capture().to_string();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bt.hash(&mut h);
+        let key = h.finish();
+        let mut g = match SEEN.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let set = g.get_or_insert_with(HashSet::new);
+        if set.len() >= MAX_SITES {
+            return false;
+        }
+        set.insert(key)
+    }
+
     #[inline]
     fn load_and_forward_inner(&self, obj: ObjectRef, pre_validated: bool) -> (ObjectRef, bool) {
         // KINDOF-SENTINEL: `obj` itself has been observed already invalid
@@ -1156,8 +1224,18 @@ impl VmHeap {
         // suspicion.
         if crate::gc_quiescence::vacated_frames_enabled() {
             if let Some(moved_to) = crate::gc_quiescence::was_vacated(obj.as_ptr() as usize) {
-                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+                // ONE REPORT PER CALL SITE, not per occurrence.
+                //
+                // This barrier is the choke point every raw `ObjectRef` a
+                // native still holds passes through -- `forward_boundary_value`
+                // for `set_field` / `set_array_element`, `forward_boundary_args`
+                // for the `invoke_*` family -- so a hit names a native that
+                // captured a reference before an allocation and used it after.
+                // The population is a handful of distinct sites hit thousands
+                // of times each, and a flat count of 12 reported the first site
+                // twelve times and every other one never. Keyed by the
+                // backtrace so the census is of SITES.
+                if Self::stale_barrier_site_is_new() {
                     tracing::error!(
                         target: "cratonvm::gc::guard",
                         obj = format!("{:#x}", obj.as_ptr() as usize),
@@ -3724,9 +3802,10 @@ impl VmHeap {
                 crate::gen_heap::SWEEP_ANCHOR_NOT_A_BASE.load(O::Relaxed),
             );
             eprintln!(
-                "[GC] young_sweep_empty_runs: last_cycle_bytes={} young_used={}",
+                "[GC] young_sweep_empty_runs: last_cycle_bytes={} young_used={} no_header_flag={}",
                 crate::gen_heap::EMPTY_RUN_BYTES_LAST.load(O::Relaxed),
                 crate::gen_heap::EMPTY_RUN_YOUNG_USED_LAST.load(O::Relaxed),
+                crate::gen_heap::SWEEP_NO_HEADER_FLAG.load(O::Relaxed),
             );
             let l = &crate::gen_heap::LATE_WALK_ZERO_RUNS;
             eprintln!(
@@ -3991,12 +4070,20 @@ impl VmHeap {
     /// that is how the object enters the start registry the sweep, the SATB
     /// barrier and the conservative scans all consult.
     pub fn refill_tlab(&self, requested_size: usize) -> Option<(*mut u8, usize)> {
-        match self {
+        let chunk = match self {
             VmHeap::Generational(h) => h.refill_tlab(requested_size),
             VmHeap::G1(h) => h.refill_tlab(requested_size),
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(h) => h.refill_tlab(requested_size),
+        };
+        // `CRATONVM_DBG_VACATED_FRAMES`: the chunk is bump-allocated from
+        // without any further call into the heap, so this is the only door that
+        // can tell the vacated ledger those addresses are being re-issued.
+        if let Some((ptr, size)) = chunk {
+            let lo = ptr as usize;
+            crate::gc_quiescence::note_allocated_range(lo, lo.saturating_add(size));
         }
+        chunk
     }
 
     /// An object the VM just finished laying out at `ptr` inside a chunk from

@@ -395,8 +395,10 @@ out here — but it is the predicate, on a platform where it had never been read
 
 * **Not a stage advance.** `docs/jdk-only-migration.md` §"Rollout stages" is
   untouched. Stage 3 wants "Windows filesystem/process/networking vectors
-  stable" across JDK 21 and 25; this is three probes on JDK 25, and the JDK 21
-  legs still refuse for want of a `21-*` key.
+  stable" across JDK 21 and 25; this is three probes on JDK 25. (Those JDK 21
+  legs refused then for want of a `21-*` key. `21-windows` was minted
+  2026-09-08 and that leg adjudicates now, but nothing on THIS page has been
+  re-measured on 21, so the stage-3 gap stands.)
 * **Not a statement about `--synthetic-jdk`.** All measurement here is on the
   two shipping arms.
 * **Two of the three fixes are mode-independent.** They were found by a

@@ -1311,6 +1311,10 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             // Single-threaded fast path: no barrier needed
             let gc_start = std::time::Instant::now();
             let mut roots = collect_roots(shared, thread);
+            // `CRATONVM_DBG_ROOT_REMAP_AUDIT`: the list the collector is about to
+            // mark from, so a post-GC verifier can say whether a slot it found
+            // naming a reclaimed object was ever in it.
+            crate::memory::gc::note_root_set(&roots);
             // STW invariant: single-threaded path means this thread is
             // the only mutator — every other thread is implicitly
             // "parked" (it doesn't exist). Construct the token directly.
@@ -1530,6 +1534,10 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
 
                 // Collect roots: current thread + all snapshots + shared state
                 let mut roots = collect_roots(shared, thread);
+                // `CRATONVM_DBG_ROOT_REMAP_AUDIT`: the list the collector is about to
+                // mark from, so a post-GC verifier can say whether a slot it found
+                // naming a reclaimed object was ever in it.
+                crate::memory::gc::note_root_set(&roots);
                 let snapshot_roots = shared.threads.thread_registry.collect_all_root_snapshots();
                 roots.extend(snapshot_roots);
                 // INT-3 (G1) — everything a frozen peer can address must not
@@ -1814,6 +1822,10 @@ pub(super) fn maybe_gc_forced_at(
     let alive_count = shared.threads.thread_registry.alive_count() as u32; // Widening: thread count to u32
     if alive_count <= 1 {
         let mut roots = collect_roots(shared, thread);
+        // `CRATONVM_DBG_ROOT_REMAP_AUDIT`: the list the collector is about to
+        // mark from, so a post-GC verifier can say whether a slot it found
+        // naming a reclaimed object was ever in it.
+        crate::memory::gc::note_root_set(&roots);
         // STW invariant: single-threaded fast path — see `maybe_gc`.
         // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
         weakref_null_referents_pre_gc(shared);
@@ -1864,6 +1876,10 @@ pub(super) fn maybe_gc_forced_at(
             let mut xt_roots: Vec<ObjectRef> = Vec::new();
             let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
             let mut roots = collect_roots(shared, thread);
+            // `CRATONVM_DBG_ROOT_REMAP_AUDIT`: the list the collector is about to
+            // mark from, so a post-GC verifier can say whether a slot it found
+            // naming a reclaimed object was ever in it.
+            crate::memory::gc::note_root_set(&roots);
             let snapshot_roots = shared.threads.thread_registry.collect_all_root_snapshots();
             roots.extend(snapshot_roots);
             // INT-3 (G1) — everything a frozen peer can address must not
@@ -2101,6 +2117,10 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
     let alive_count = shared.threads.thread_registry.alive_count() as u32; // Widening: thread count to u32
     if alive_count <= 1 {
         let mut roots = collect_roots(shared, thread);
+        // `CRATONVM_DBG_ROOT_REMAP_AUDIT`: the list the collector is about to
+        // mark from, so a post-GC verifier can say whether a slot it found
+        // naming a reclaimed object was ever in it.
+        crate::memory::gc::note_root_set(&roots);
         // STW invariant: single-threaded fast path — see `maybe_gc`.
         // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
         weakref_null_referents_pre_gc(shared);
@@ -2162,6 +2182,10 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             let mut xt_roots: Vec<ObjectRef> = Vec::new();
             let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
             let mut roots = collect_roots(shared, thread);
+            // `CRATONVM_DBG_ROOT_REMAP_AUDIT`: the list the collector is about to
+            // mark from, so a post-GC verifier can say whether a slot it found
+            // naming a reclaimed object was ever in it.
+            crate::memory::gc::note_root_set(&roots);
             let snapshot_roots = shared.threads.thread_registry.collect_all_root_snapshots();
             roots.extend(snapshot_roots);
             // INT-3 (G1) — everything a frozen peer can address must not
@@ -4746,17 +4770,24 @@ fn note_tlab_legacy_object(class_id: ClassId, num_fields: usize) {
 
 /// Initialize an object header at the given pointer.
 ///
-/// H1: `identity_hash_code` is now eagerly assigned at allocation time
-/// (caller passes `shared.mem.heap.next_identity_hash()`). The previous
-/// behavior of storing 0 and "lazily" filling on first `hashCode()` call
-/// was not actually wired up anywhere — every fresh TLAB-allocated
-/// `new Object()` (cid=0, fields=0) produced an all-zero first 16 bytes
-/// of header that the stale-pointer detector in `execute_invoke`
-/// mis-flagged as stale memory, causing CGLIB's HashMap operations to
-/// emit spurious "Stale pointer detected" warnings on every legitimate
-/// `Object` key. The non-TLAB allocators in `gc::heap`/`gc::gen_heap`/
-/// `gc::g1` have always assigned a fresh hash here; this brings the
-/// fast path into agreement with them.
+/// **This doc claimed an eager identity hash until 2026-09-08 and had been
+/// wrong for a month.** `ObjectHeader::new` has had no hash parameter since the
+/// 2026-08-06/07 header shrink folded the hash into the mark word and made it
+/// lazy, so nothing here has minted one since; `grep next_identity_hash` finds
+/// no caller on this path. The text is kept, corrected, because the property it
+/// was defending is real and is now defended by something else.
+///
+/// H1, as it actually stands: a fresh TLAB-allocated `new Object()`
+/// (`cid=0`, `fields=0`) must not publish an all-zero first 16 bytes. It would
+/// otherwise be indistinguishable from stale, zeroed memory — which cost the
+/// stale-pointer detector in `execute_invoke` a 100% false-positive rate on
+/// legitimate `Object` keys (CGLIB's HashMap operations), and cost the young
+/// non-moving sweep the ability to parse its own arena
+/// (`h2-testvaluememory-system-gc-retained-every-empty-object-FIXED-20260908`).
+///
+/// `ObjectHeader::new` now sets `GC_FLAG_HEADER`, so the property holds for
+/// every allocator without anything having to be minted — and, unlike an eager
+/// hash, without making every `synchronized` block lose its thin-lock CAS.
 #[inline(always)]
 pub(super) fn init_object_header(
     ptr: *mut u8,
@@ -6039,6 +6070,12 @@ pub(crate) fn apply_pointer_map_to_thread(
     pointer_map: &cratonvm_types::PointerMap,
     heap: &crate::memory::VmHeap,
 ) {
+    // Attribution for a later stale-reference report: this thread applied a
+    // relocation map through the STOP-THE-WORLD RESUME path. See
+    // `gc_quiescence::note_pointer_map_applied`.
+    if !pointer_map.is_empty() {
+        cratonvm_gc::gc_quiescence::note_pointer_map_applied(1);
+    }
     // JNI local references (INT-2, safepoint-resume half): rewrite THIS
     // thread's `JNI_LOCAL_FRAMES` handles through the pointer map — a JNI
     // native that re-entered Java and parked at the safepoint poll must not

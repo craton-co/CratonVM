@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 2026-09-08 `new Object()` published sixteen zero bytes, so `System.gc()` kept every one of them
+
+`java/lang/Object` is `ClassId(0)`, a field-less object's `shape` is `0`, and
+`MARK_NEUTRAL` / `ObjectKind::Object` / `ArrayElementType::Reference` all encode
+as `0` — so the commonest object in Java reached the heap as sixteen zero bytes,
+byte-for-byte identical to reclaimed, zeroed, unlisted arena space. The young
+non-moving sweep, which every `System.gc()` diverts to, cannot parse that: runs
+of such objects were either stepped over without being freed or treated as a
+walk desync that unwound every reclaim decision since the last anchor. An
+allocation-only workload retained ~100% of its garbage under
+`-XX:+UseGenerationalGC`, ~2.1 MB a round, monotonic, until the collector
+thrashed — `ChurnLoop 40 125000` did not finish inside 300 s.
+
+`GC_FLAG_HEADER` (mark-word bit 59) now says *these bytes are a published object
+header*. It is set by `ObjectHeader::new` and by both JIT inline-allocation
+emitters, never cleared, and preserved by every mark-word transition. HotSpot has
+never had the problem for the same reason it needs no such bit: its unlocked mark
+word is `0b01`. `ChurnLoop` is flat and finishes 40 rounds in 1.4 s;
+`zero_spans`, `zero_empty_runs` and the sweep's `live_inside` refusals all go to
+zero, and `SWEEP_NO_HEADER_FLAG` — new, printed unconditionally in the
+young-sweep census — measures the allocator invariant rather than assuming it.
+
+Second, separable defect on the same page: `Runtime.freeMemory()` answered from
+the young arena's raw bump cursor, which the in-place sweep never retreats, so
+the reported heap filled once and never emptied. `heap_allocated_bytes` now
+answers from `live_bytes_estimate` (`young.used − young.free_list + old.used`),
+which is what its own doc always described.
+
+`org.h2.test.unit.TestValueMemory` under `-XX:+UseGenerationalGC` goes from FAIL
+at Type 0 (`Used memory: 7018`, 7.2x a 3x threshold) to PASS on all 40 types with
+a worst row of 2.30x. The remaining distance to HotSpot's 0.5x is measured and
+attributed: it is conservative JIT-frame root retention, and `--nojit` reads
+976-977 on every arm. That also turned up a failure nobody had run for — the same class
+fails under `-XX:+UseG1GC`, identically on the binary before this work, because
+G1's conservative roots retain at region granularity; split out as
+`docs/known-issues/h2/testvaluememory-fails-under-g1-on-conservative-jit-roots-20260908.md`
+rather than folded in here. Full write-up:
+[`docs/internal/fixed-bugs/h2-testvaluememory-system-gc-retained-every-empty-object-FIXED-20260908.md`](docs/internal/fixed-bugs/h2-testvaluememory-system-gc-retained-every-empty-object-FIXED-20260908.md).
+
+The VM had already met these sixteen bytes three times and written each one down
+as a cost rather than a defect, none of them naming the collector: `invoke.rs`
+demoted its "Stale pointer detected" WARN to `debug!` for `java/lang/Object`
+call sites because "a bare `new Object()` IS all-zero, legitimately";
+`h1_tlab_object_header_has_nonzero_hash_at_allocation` was *inverted* from
+`assert_ne!` to `assert_eq!` on exactly that array; and `init_object_header`'s
+doc claimed an eager identity hash that had not existed since the 24 → 16
+shrink. All three are corrected, and the WARN is restored for `Object`
+(`ClassLoader` keeps its separately-justified demotion) — measured at zero
+"Stale pointer detected" lines across the suite, the H2 corpus and the probes on
+all three collectors. The eager hash all three reach for is the wrong repair:
+minting one at allocation makes every `synchronized` block lose its thin-lock
+CAS and inflate a monitor.
+
+Adding the flag also inverted two "list of every defined flag" screens that had
+to grow it in the same commit: `concurrent_mark_object_size`'s `known_flags` —
+without which G1's concurrent mark refused every gray entry as a torn header,
+took `cleanup`'s retain-everything fail-safe and stopped unloading classes — and
+`header_reserved_fields_plausible`, whose `gc_flags` clause became a tautology
+and which now screens the mark word's two reserved bits instead.
+
 ### 2026-09-02 `String` is `final`, and that is what killed its own intrinsic — 170x on `charAt`
 
 `String.charAt` in a compiled counted loop cost ~400 ns/char while a

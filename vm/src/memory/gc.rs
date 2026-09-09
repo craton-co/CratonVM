@@ -553,6 +553,32 @@ pub(crate) fn altrace_enabled_vm() -> bool {
     *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ALTRACE").is_some())
 }
 
+/// The address set `collect_roots` produced for the collection now running.
+///
+/// `CRATONVM_DBG_ROOT_REMAP_AUDIT` only. The post-GC verifiers can say a frame
+/// slot named an object the cycle did not copy; they cannot say whether the
+/// scan had handed that slot to the collector, and the two verdicts have
+/// nothing in common. "The scan would root it" (re-running the frame's own scan
+/// afterwards) is a proxy that answers about the frame as it is NOW; this
+/// answers about the list the collector was actually given.
+static ROOT_SET_SNAPSHOT: parking_lot::Mutex<Option<rustc_hash::FxHashSet<usize>>> =
+    parking_lot::Mutex::new(None);
+
+/// Record the root set a collection is about to mark from.
+pub fn note_root_set(roots: &[ObjectRef]) {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOT_REMAP_AUDIT").is_none() {
+        return;
+    }
+    let set: rustc_hash::FxHashSet<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
+    *ROOT_SET_SNAPSHOT.lock() = Some(set);
+}
+
+/// `Some(true|false)` when the snapshot is armed and populated, `None` when it
+/// is not -- so a report can say "not measured" rather than "absent".
+pub fn root_set_contains(addr: usize) -> Option<bool> {
+    ROOT_SET_SNAPSHOT.lock().as_ref().map(|s| s.contains(&addr))
+}
+
 pub(crate) fn watch_addr() -> Option<usize> {
     use std::sync::OnceLock;
     static W: OnceLock<Option<usize>> = OnceLock::new();
@@ -858,10 +884,40 @@ pub fn update_all_roots(
         return;
     }
     gcpart_record(shared.mem.heap.collection_count(), pointer_map);
+    // Every relocating cycle, counted unconditionally: it is the denominator
+    // for `gc_quiescence::last_pointer_map_applied`, which says whether a
+    // thread holding a stale reference had ever been handed the map it is
+    // missing. See `RELOCATING_CYCLES`.
+    cratonvm_gc::gc_quiescence::RELOCATING_CYCLES
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // `CRATONVM_DBG_VACATED_FRAMES` — remember what this collection moved
     // objects away FROM, so the next safepoint's frame audit can name any slot
     // still holding one. No-op unless the flag is set.
-    cratonvm_gc::gc_quiescence::record_vacated(pointer_map);
+    cratonvm_gc::gc_quiescence::record_vacated(pointer_map, shared.mem.heap.collection_count());
+    // The class-discriminated HISTORY ledger, whose only producer was ZGC's
+    // `relocate_stw` until 2026-09-08. The exact ledger above forgets an
+    // address the instant the allocator re-issues it -- and that is precisely
+    // when a stale holder becomes visible, because until re-issue it reads a
+    // zeroed corpse and nothing looks wrong. The two windows do not overlap,
+    // which is why `stale_use_verdict` reported zero on every failing
+    // generational run: it had no history to read.
+    //
+    // The BindableTests moving-young failure is exactly the shape this ledger
+    // discriminates -- `ServiceLoader$LazyClassPathLookupIterator.parse`
+    // invoking `openStream()` on a receiver that reads back as a
+    // `java.util.Hashtable` because the address was re-served.
+    if cratonvm_gc::gc_quiescence::vacated_frames_enabled() {
+        let classed: Vec<(usize, usize, u32)> = pointer_map
+            .iter()
+            .map(|(from, to)| {
+                // SAFETY: `to` is a post-copy object base this collection just
+                // wrote; its header is mapped.
+                let at = unsafe { ObjectRef::from_raw(*to as *mut u8) };
+                (*from, *to, shared.mem.heap.class_id_of(at).as_u32())
+            })
+            .collect();
+        cratonvm_gc::gc_quiescence::record_moved_history(&classed);
+    }
     crate::runtime::interpreter::remap_trace_push(
         shared,
         thread,
@@ -1657,7 +1713,7 @@ pub fn update_all_roots(
     //     fixup cannot rewrite another VM's entries.
 
     // Post-GC verification: check that no frame refs still point to relocated addresses.
-    verify_no_stale_refs(thread, pointer_map);
+    verify_no_stale_refs(thread, pointer_map, Some(&shared.mem.heap));
     // Opt-in (CRATONVM_DBG_HEAP_STALE=1) deep heap-walk: catch un-forwarded /
     // reclaimed reference fields in OTHER objects (not just this thread's
     // frames) — where the residual ClassLoader/Locale stale-ref actually lives.
@@ -1828,7 +1884,14 @@ pub fn verify_heap_object_fields(
             .unwrap_or_else(|| format!("cid#{}", cid.as_u32()))
     };
     let mut reported = 0usize;
-    const CAP: usize = 40;
+    // Distinct (referrer class, slot, reason) triples already reported THIS
+    // collection. Without it one repeated pair burns the whole cap and hides
+    // every other referrer: on BindableTests under GC stress a single
+    // `java/lang/Module field[0]` accounted for 2272 of 2280 lines, and nothing
+    // else in the heap was ever reachable by this pass.
+    let mut seen: std::collections::HashSet<(u32, usize, &'static str)> =
+        std::collections::HashSet::new();
+    const CAP: usize = 200;
     // Recycled-destination filter — the same ambiguity `verify_no_stale_refs`
     // documents at length, which this pass was missing.
     //
@@ -1880,16 +1943,19 @@ pub fn verify_heap_object_fields(
             for i in 0..nf {
                 if let Value::Object(Some(target)) = heap.get_field(referrer, i) {
                     if let Some(reason) = classify(target.as_ptr() as usize) {
-                        eprintln!(
-                            "[heap-stale] {} OBJ {} field[{}] -> 0x{:x}",
-                            reason,
-                            class_name(r_cid),
-                            i,
-                            target.as_ptr() as usize,
-                        );
-                        reported += 1;
-                        if reported >= CAP {
-                            break;
+                        if seen.insert((r_cid.as_u32(), i, reason)) {
+                            eprintln!(
+                                "[heap-stale] {} OBJ {} field[{}] -> 0x{:x} (referrer 0x{:x})",
+                                reason,
+                                class_name(r_cid),
+                                i,
+                                target.as_ptr() as usize,
+                                ptr as usize,
+                            );
+                            reported += 1;
+                            if reported >= CAP {
+                                break;
+                            }
                         }
                     }
                 }
@@ -1904,16 +1970,22 @@ pub fn verify_heap_object_fields(
                     unsafe { (ptr as *const u8).add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
                 let raw = unsafe { read_ref_slot(s_ptr) } as usize;
                 if let Some(reason) = classify(raw) {
-                    eprintln!(
-                        "[heap-stale] {} ARR {}[{}] -> 0x{:x}",
-                        reason,
-                        class_name(r_cid),
-                        i,
-                        raw,
-                    );
-                    reported += 1;
-                    if reported >= CAP {
-                        break;
+                    // Arrays dedupe on the CLASS and the reason only: the index
+                    // is data, and a 4096-element array with one dangling slot
+                    // must not read as 4096 distinct findings.
+                    if seen.insert((r_cid.as_u32(), usize::MAX, reason)) {
+                        eprintln!(
+                            "[heap-stale] {} ARR {}[{}] -> 0x{:x} (referrer 0x{:x})",
+                            reason,
+                            class_name(r_cid),
+                            i,
+                            raw,
+                            ptr as usize,
+                        );
+                        reported += 1;
+                        if reported >= CAP {
+                            break;
+                        }
                     }
                 }
             }
@@ -1921,8 +1993,9 @@ pub fn verify_heap_object_fields(
     }
     if reported > 0 {
         eprintln!(
-            "[heap-stale] ^ {} stale field(s) this GC (pointer_map size={})",
+            "[heap-stale] ^ {} distinct stale (class, slot, reason) triple(s) at collection {}              (pointer_map size={})",
             reported,
+            heap.collection_count(),
             pointer_map.len(),
         );
     }
@@ -2006,11 +2079,34 @@ pub fn audit_overlay_refs(shared: &crate::vm::SharedVm) {
 fn verify_no_stale_refs(
     thread: &crate::threading::jvm_thread::JvmThread,
     pointer_map: &cratonvm_types::PointerMap,
+    heap: Option<&crate::memory::VmHeap>,
 ) -> usize {
     use crate::types::Value;
     use cratonvm_types::ObjectHeader;
 
     let mut genuine_reports = 0usize;
+    // THE OTHER HALF OF THE INVARIANT: a slot naming a from-space address the
+    // pointer map does NOT contain.
+    //
+    // Everything else in this function asks "did the remap rewrite every slot
+    // whose object MOVED". That question cannot see the opposite failure: an
+    // object that was never copied at all because the root scan missed the slot
+    // holding it. After a Cheney cycle the inactive semispace holds nothing
+    // live, so a live frame slot naming an address inside it is proof that the
+    // collection reclaimed an object a frame still held -- and this is the last
+    // moment at which the frame, method, pc and slot are all in hand. Every
+    // reader-side reporter downstream sees only an address and a failed
+    // dispatch, an unbounded number of collections later.
+    //
+    // Live-filtered, because a DEAD local naming a reclaimed object is the
+    // collector working as designed -- that is precisely what the per-bci
+    // liveness filter is for. Operand-stack slots are always live.
+    //
+    // Found the BindableTests residual this way: a `java.util.function.Supplier`
+    // in `DisplayNameUtils.determineDisplayNameForMethod` local[0].
+    let inactive_young: Option<(usize, usize)> =
+        heap.and_then(|h| h.young_inactive_semispace_range());
+    let mut reclaimed_reports = 0usize;
     // Lazily-built set of this pause's destination addresses (map VALUES),
     // used to recognise recycled destinations. Built only when a candidate
     // stale slot is actually found, so the common (clean) path pays nothing.
@@ -2048,6 +2144,9 @@ fn verify_no_stale_refs(
     for (fi, frame) in thread.frames.iter().enumerate() {
         let cname = frame.class_name();
         let mname = frame.method_name();
+        // The frame's own per-bci liveness mask, for the RECLAIMED-WHILE-HELD
+        // arm: a DEAD local naming a reclaimed object is the filter working.
+        let live_mask = frame.live_locals_mask_here();
         // Check locals
         for li in 0..frame.locals_len() {
             let val = frame.get_local(li as u16);
@@ -2079,6 +2178,65 @@ fn verify_no_stale_refs(
                                 "POST-GC STALE LOCAL: frame[{}] {}.{} local[{}] still points to \
                                  relocated addr 0x{:x} (should be 0x{:x})",
                                 fi, cname, mname, li, addr, new_addr,
+                            );
+                        }
+                    }
+                }
+                if let Some((lo, hi)) = inactive_young {
+                    let live = li >= 64 || live_mask & (1u64 << li) != 0;
+                    if live
+                        && addr >= lo
+                        && addr < hi
+                        && !pointer_map.contains_key(&addr)
+                        && reclaimed_reports < 8
+                    {
+                        reclaimed_reports += 1;
+                        genuine_reports += 1;
+                        // WHY the scan skipped it, since `scan_local_objects`
+                        // has exactly two ways to drop a LIVE object local:
+                        // the `local_kinds` LONG/DOUBLE gate, and the
+                        // `is_heap_addr` screen. They have completely
+                        // different fixes, and neither is the liveness
+                        // filter this arm has already excluded.
+                        eprintln!(
+                            "POST-GC RECLAIMED-WHILE-HELD LOCAL: frame[{}] {}.{} local[{}] pc={} \
+                             holds 0x{:x}, inside the semispace this cycle emptied, and the \
+                             pointer map has no entry for it -- the object was NOT copied, so \
+                             this slot was not in the root set. local_kind={} in_heap={} \
+                             collection={}",
+                            fi,
+                            cname,
+                            mname,
+                            li,
+                            frame.pc,
+                            addr,
+                            frame.local_kind_at(li),
+                            heap.map(|h| h.is_heap_addr(addr).is_some()).unwrap_or(false),
+                            heap.map(|h| h.collection_count()).unwrap_or(0),
+                        );
+                        // AND WHETHER THE COLLECTOR WAS GIVEN IT. Armed by
+                        // `CRATONVM_DBG_ROOT_REMAP_AUDIT`; `None` prints as
+                        // "not measured" rather than as an absence.
+                        eprintln!(
+                            "POST-GC RECLAIMED-WHILE-HELD LOCAL ^ in_root_set={:?}",
+                            root_set_contains(addr),
+                        );
+                        // AND WHETHER THE SCAN WOULD PRODUCE IT AT ALL. Re-run
+                        // the frame's own root scan -- the very call `roots.rs`
+                        // step 1 makes -- and look for the address. TRUE means
+                        // the root set contained this slot and the collection
+                        // dropped the object anyway, which is a marking or
+                        // copying fault, not a scanning one. FALSE means the
+                        // scan is the place to look, and `local_kind` /
+                        // `in_heap` above say which of its two filters did it.
+                        if let Some(h) = heap {
+                            let mut probe: Vec<ObjectRef> = Vec::new();
+                            frame.scan_local_objects(&mut probe, h);
+                            eprintln!(
+                                "POST-GC RECLAIMED-WHILE-HELD LOCAL ^ scan_would_root={} \
+                                 (frame's own scan yields {} roots)",
+                                probe.iter().any(|r| r.as_ptr() as usize == addr),
+                                probe.len(),
                             );
                         }
                     }
@@ -2146,6 +2304,30 @@ fn verify_no_stale_refs(
                                 fi, cname, mname, si, addr, new_addr,
                             );
                         }
+                    }
+                }
+                if let Some((lo, hi)) = inactive_young {
+                    if addr >= lo
+                        && addr < hi
+                        && !pointer_map.contains_key(&addr)
+                        && reclaimed_reports < 8
+                    {
+                        reclaimed_reports += 1;
+                        genuine_reports += 1;
+                        eprintln!(
+                            "POST-GC RECLAIMED-WHILE-HELD STACK: frame[{}] {}.{} stack[{}] pc={} \
+                             holds 0x{:x}, inside the semispace this cycle emptied, and the \
+                             pointer map has no entry for it -- the object was NOT copied, so \
+                             this slot was not in the root set. in_heap={} collection={}",
+                            fi,
+                            cname,
+                            mname,
+                            si,
+                            frame.pc,
+                            addr,
+                            heap.map(|h| h.is_heap_addr(addr).is_some()).unwrap_or(false),
+                            heap.map(|h| h.collection_count()).unwrap_or(0),
+                        );
                     }
                 }
                 if heavy && addr != 0 {
@@ -2546,7 +2728,7 @@ mod tests {
         thread.frames.push(frame);
 
         assert_eq!(
-            verify_no_stale_refs(&thread, &map),
+            verify_no_stale_refs(&thread, &map, None),
             1,
             "recycled destination must be benign; unrewritten key must report"
         );

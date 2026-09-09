@@ -164,21 +164,20 @@ cycles, `ok=412 failed=0`; `PooledBigEndianHeapByteBufTest` 663 moving cycles,
 `NioEventLoopTest` reports `ok=13 failed=0` and then does not exit — the
 fixture's non-daemon event loop, which HotSpot does identically (§10.6).
 
-### 4.1 What is NOT fixed, stated precisely
+### 4.1 What is NOT fixed — **superseded by §16, which root-causes it**
 
 `AdvancedLeakAwareByteBufTest` and `AdvancedLeakAwareCompositeByteBufTest` still
-crash **when `CRATONVM_XT_JIT_COVERAGE_ASSUME=1` is set**. That flag's own doc
-calls it "A MEASUREMENT INSTRUMENT, and unsafe to run with… A peer that
-deposited nothing has NOT proved its frames rewritable, and relocating under it
-strands its oops." Its stated purpose was to price this very repair; with the
-repair in place it takes the family from 18/19 to 2/19, and what remains is the
-residue it is designed to ignore — cycles relocating under frames whose oop maps
-are genuinely incomplete. `compiled-frame-oop-not-published`,
-`innermost-rbp-belongs-to-unguarded-callee` and
-`xt-helper-window-conservative-scan` all appear in those runs' fallback
-histograms. **No wake-time rewrite can repair an oop that no map names**, and
-that population is refused by default: at the shipped default these two classes
-are 0/4, and with the trigger alone (no divert removal) 0/4.
+crash **when `CRATONVM_XT_JIT_COVERAGE_ASSUME=1` is set**.
+
+> **§16 supersedes this section's reading.** This section attributed the
+> residual to "the residue ASSUME is designed to ignore" — cycles relocating
+> under frames whose oop maps are genuinely incomplete, i.e. to an operator
+> overriding a correct refusal. **That is wrong.** §16 root-causes it to a
+> specific JIT operand-stack oop-marking gap in two named netty methods, on a
+> thread that HAD applied the collection's pointer map. ASSUME does not cause
+> the defect; it removes a coincidental refusal that was hiding it. The
+> fallback-reason histograms this section quoted are real, and are not evidence
+> for the claim they were used to support.
 
 Two further honest limits:
 
@@ -337,3 +336,234 @@ CRATONVM_NO_BLOCKED_WAKE_JIT_REMAP=1 \
 the derived-pointer population that no conservative write-back can repair
 (15 230 of them in one clean `DuplicatedByteBufTest` run), and the standing
 reason `unrewritable_conservative_jit_roots` remains the shipped default.
+
+## 16. The `AdvancedLeakAware*` residual, root-caused — an operand-stack oop the JIT never marked
+
+§4.1 filed the last two crashing classes as "the residue `ASSUME` is designed to
+ignore". That is wrong, and this section replaces it. The residual is a JIT
+codegen defect with a named method, a named slot and a named instruction; the
+only thing `ASSUME` contributes is removing an unrelated refusal that was
+hiding it.
+
+### 16.1 A reproducer that is not intermittent
+
+`io.netty.buffer.AdvancedLeakAwareByteBufTest`, `--Xmx 1g
+-XX:+UseGenerationalGC`, `CRATONVM_GC_NO_PEER_PIN_DIVERT=1
+CRATONVM_GC_YOUNG_TRIGGER_PERCENT=1 CRATONVM_XT_JIT_COVERAGE_ASSUME=1`:
+**SIGSEGV 8/8**, and 5/5, 4/4, 3/3 on every later batch. §4.1's "1/5 and 2/5,
+then 0/10" was the same defect measured at 2 reps a class on a loaded host, not
+a rare event.
+
+`ASSUME` is REQUIRED and is the only flag that is: **5/5 with it, 0/5 without**,
+both at the same trigger and the same divert removal.
+
+### 16.2 One method, one instruction, every time
+
+`CRATONVM_DBG_JIT_NAMES=1` names the faulting body in every crash:
+
+```
+#  jit pc  : io/netty/buffer/SimpleLeakAwareByteBuf.newSharedLeakAwareByteBuf(…)
+```
+
+and the fault pc is at the **same code offset, 0x216, in every run**.
+`CRATONVM_DBG_JIT_DISASM` gives the instruction and the two before it:
+
+```
+ 213: 498bc5             mov  rax,r13          ; rax = this
+ 216: 8b880f000000       mov  ecx,[rax+0Fh]    ; <-- FAULTS
+ 21c: 4883e104           and  rcx,4
+```
+
+`[rax + 15]` is the object header's `GC_FLAGS` byte and `4` is
+`GC_FLAG_COMPACT`: this is the compact-`getfield` arm's receiver dereference,
+the method's FIRST touch of `this`. The prologue disassembly shows `mov r13,rsi`
+— `r13` is `this`, arriving in the argument register.
+
+**The receiver is already stale when the method is entered.** That is why
+`CRATONVM_JIT_DENY` on this one method is **0/4 against 4/4** (the interpreter
+reads the receiver from a remapped frame slot instead), and why denying either
+callee changes nothing (4/4).
+
+### 16.3 The stale value, proved by the collector's own ledger
+
+`CRATONVM_DBG_VACATED_FRAMES=1` plus the signal-safe register scan added with
+this section (`crash_handler`, "VACATED REGISTER") reports, on every crash:
+
+```
+#  VACATED REGISTER: rax=0x740ab02cb370 named an object a completed collection moved to 0x740ac0200018
+#  VACATED REGISTER: rsi=0x740ab02cb370 …
+#  VACATED REGISTER: r13=0x740ab02cb370 …
+#  this thread last applied a relocation map at cycle=0x12 path=1 of relocating_cycles=0x12
+```
+
+Two facts, and the second is the one that matters:
+
+* the value is not "an address that looks moved" — it is a key of the
+  collector's vacated ledger, which subtracts that cycle's destinations;
+* **`cycle == relocating_cycles` and `path=1`**: this thread applied the pointer
+  map for the most recent relocating cycle, through the STOP-THE-WORLD RESUME
+  (`apply_pointer_map_to_thread`, which runs `remap_active_jit_frames`,
+  `remap_register_image_words` and the shadow-stack remap). This is **not** a
+  thread that never got the map. The rewrite ran and the reference is stale
+  anyway.
+
+### 16.4 The unpublished slot
+
+`CRATONVM_DBG_SHADOW2=1 CRATONVM_DBG_SHADOW2_FILTER=LeakAwareByteBuf` prints,
+per safepoint, the simulated operand stack, its oop marks, and the homes
+`collect_live_oop_homes` publishes on the shadow stack. Across the whole
+leak-aware family there are exactly **two** operand entries marked `false`, and
+they are in exactly the two callers of the faulting method:
+
+```
+AdvancedLeakAwareByteBuf.duplicate:  pc=8  stack=[Frame(104)] marks=[false]  homes=[Reg(12), Frame(64)]
+AdvancedLeakAwareByteBuf.slice:(II)  pc=10 stack=[Frame(136)] marks=[false]  homes=[Reg(14), Frame(80)]
+```
+
+`Frame(104)` and `Frame(136)` are **absent from `homes`** —
+`collect_live_oop_homes` skips any entry whose mark is `false`. Contrast the
+sibling that behaves:
+
+```
+SimpleLeakAwareByteBuf.<init>: pc=20 stack=[Frame(80), Frame(88)] marks=[true, true]
+                               homes=[Frame(80), Frame(88), Reg(15), …]
+```
+
+So the chain, end to end:
+
+1. the caller pushes the receiver for the pending
+   `newSharedLeakAwareByteBuf(...)` call and then makes a GC-capable call
+   (`super.duplicate()` / `super.slice()`);
+2. that operand entry lives in a frame slot and the JIT's per-slot oop tracker
+   has it marked **not a reference**, so it is published on **no rewritable
+   channel** — not the shadow stack, and not the map the shadow stack's
+   coverage bit is derived from;
+3. a moving young collection during the inner call relocates the receiver; the
+   frame slot keeps the pre-move address;
+4. the slot is popped and passed in `rsi` to `newSharedLeakAwareByteBuf`;
+5. its first receiver dereference — `mov ecx,[rax+0Fh]` — reads decommitted
+   from-space → SIGSEGV.
+
+**The structural hazard behind it**: `Compiler::push_stack` pushes
+`stack_oop_marks.push(false)` and relies on the opcode handler calling
+`mark_top_as_oop()` afterwards. The default is the UNSAFE direction — a missed
+call does not produce a conservative over-approximation, it silently drops a
+live oop off every rewritable channel. `stack_push(slot, is_oop)` takes the bit
+explicitly and is the safe shape; the `push_from_rax()` + `mark_top_as_oop()`
+pair is the one that can be broken by omission. Which emitter path drops the
+mark for these two shapes is the remaining unknown — the `aload_0..3`,
+wide-`aload`, `canonicalize_stack` and `flush_scratch_registers` paths were all
+read and all preserve the mark correctly.
+
+### 16.5 The SIGSEGV and this page's original NPE are the same defect
+
+`CRATONVM_GC_RESERVE=0` keeps the vacated granules mapped instead of
+decommitting them. On the same repro:
+
+| arm | crashes | result |
+|---|---:|---|
+| baseline | **5 / 5** | — |
+| `CRATONVM_GC_RESERVE=0` | **0 / 5** | `ok=424 failed=2`, 49 moving cycles |
+
+The crash disappears and **two tests fail instead**. That is the same stale
+receiver, read rather than faulted on — and it closes the loop with §2 of the
+predecessor page, whose symptom was never a crash but a
+`NullPointerException` on a live object inside JUnit's `ValidatingInvocation`.
+The faulting instruction is additionally a registered **implicit-null-check**
+site (the compact-`getfield` arm's `GC_FLAGS` read is what
+`bind_implicit_null_recovery` binds), so a stale receiver whose address the
+recovery accepts is reported as an NPE rather than as a fatal signal. One
+defect, three faces, selected by whether the vacated span is mapped and by where
+the stale address lands.
+
+### 16.6 Arms that proved nothing, recorded so they are not re-run
+
+Several of these were run and read before they were checked. They are listed
+because this page's whole history is made of exactly that mistake.
+
+* **`CRATONVM_NO_SHADOW_STACK=1` — the variable does not exist.** The real
+  token is `CRATONVM_SHADOW_STACK` (opt-in). The 3/3 that arm reported is a
+  measurement of nothing.
+* **`CRATONVM_SHADOW_PIN=1` (4/4)** publishes shadow oops as PINNED roots — and
+  `VmHeap::Generational::honours_conservative_pins()` is `false`, so a Cheney
+  copy moves them anyway. Vacuous on this collector by construction.
+* **`CRATONVM_SHADOW_NOPUSH=1` (0/4)** looks like a fix and is not: it also sets
+  `pending_shadow_coverage_complete = false`, which makes every safepoint of the
+  method report incomplete coverage and DIVERTS the cycles this frame is live
+  for. It suppresses the relocation rather than surviving it.
+  **`CRATONVM_SHADOW_NORELOAD=1` is the arm that isolates the reload** — it
+  keeps the push, so coverage and engagement are unchanged — and it reads
+  **5/5**. The shadow reload is innocent.
+* **The JIT-frame vacated auditor added with this section over-reports.** It
+  walks the frame band conservatively with no per-bci liveness filter, so a DEAD
+  java-local slot holding a vacated address counts as a hit: the non-crashing
+  no-`ASSUME` control read 5136 "verifiable" hits against the crashing arm's
+  320. Its per-region tally is usable; its totals are not a signal.
+* **Refuted hypotheses**, each with an arm: nested inlining
+  (`CRATONVM_JIT_INLINE_NEST=0` → 4/4), the callees
+  (`CRATONVM_JIT_DENY` on either `newLeakAwareByteBuf` → 4/4), the existing
+  remap widenings (`CRATONVM_JIT_REMAP_ALL_UNVERIFIABLE`,
+  `CRATONVM_GC_NO_BLOCKED_PEER_STACK_REMAP`,
+  `CRATONVM_NO_BLOCKED_WAKE_JIT_REMAP` → all 3/3 or 4/4), the entry poll's
+  sign-extended sp-id (`active_safepoint_id` truncates with `as u32`, which
+  recovers `ENTRY_POLL_BC_PC` exactly), and **publishing the flushed frame slot
+  alongside the register home** for every register-resident oop local — built,
+  measured **3/3**, and reverted.
+* `CRATONVM_JIT_SAFEPOINT_POLLS=0` reads **1/4 with MORE relocation** (64 moving
+  cycles). Suggestive that the parking point matters, not conclusive, and not
+  built on here.
+
+### 16.7 What a fix has to do, and what it must not
+
+The repair is to mark that operand entry as a reference so
+`collect_live_oop_homes` publishes it — not to widen a remap. Every remap-side
+lever above is null because the value is on no channel to remap.
+
+Two guards for whoever takes it:
+
+* **do not "fix" it by defaulting `push_stack`'s mark to `true`.** A false
+  `true` pins a non-reference word and, worse, hands a non-address to the shadow
+  reload to store into a live home. The bit has to be right, not conservative.
+* **`CRATONVM_SHADOW_NOPUSH`, and any arm that changes
+  `pending_shadow_coverage_complete`, is not a control** — it changes whether
+  the cycle relocates at all. Use `CRATONVM_SHADOW_NORELOAD`,
+  `CRATONVM_JIT_DENY`, or `CRATONVM_GC_RESERVE=0`, all of which leave engagement
+  intact.
+
+### 16.8 Scope
+
+Unchanged from §4.1's surviving half: this is reachable only with
+`CRATONVM_GC_NO_PEER_PIN_DIVERT=1` **and** `CRATONVM_XT_JIT_COVERAGE_ASSUME=1`.
+At the shipped default these two classes are 0/4, and with the trigger alone
+0/4, because `unrewritable_conservative_jit_roots` refuses the cycles. It is a
+blocker for restoring moving-young engagement, not for the shipped
+configuration.
+
+### 16.9 A sibling with the same shape and a different mechanism
+
+`docs/known-issues/springboot/bindabletests-moving-young-leaves-a-frame-slot-unremapped-20260908.md`
+was filed the same day by another session and reports the same three-part
+signature from the other side of the tier boundary:
+
+* an **operand-stack** entry naming an address a moving young cycle vacated;
+* on a thread that was healed for that very collection
+  (`heap_collection == thread_last_heal`, the interpreter-side spelling of
+  §16.3's `cycle == relocating_cycles`);
+* deterministic, and only under the moving Cheney cycle.
+
+**They are not the same bug and should not be merged.** That page reports
+`moving-no-jit-frames-live=1203` — *no compiled frame is live at any collection
+in that workload* — so the JIT oop-marking gap §16.4 names cannot be its cause;
+its slots are `Value::Object(Some(_))` in interpreter frames, already tagged,
+and its open question is whether the address was in that cycle's `pointer_map`
+at all.
+
+What is worth carrying across is the shape. Both are **the most recently pushed
+operand** (theirs `stack[0]` eight times out of eight; mine the receiver staged
+for a pending call), both survive a remap that ran, and neither is a
+lost-tag/liveness-filter problem — that page ruled the liveness filter out with
+`CRATONVM_NO_LOCAL_LIVENESS=1`, and this one rules out lost tags because the
+JIT's own mark vector says `false` for a slot the bytecode proves is a
+reference. If one mechanism turns out to explain both, the top-of-operand-stack
+entry across a GC-capable call is where to look; until then they are two
+findings that agree about where to point.

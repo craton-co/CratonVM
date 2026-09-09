@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | **FIXED** (`CRATONVM_G1_PARALLEL_EVAC_RESUME_DEST`, default ON). The instrument that hid it — the per-pause region census, filled by the serial driver only — is fixed on the other three drivers too. |
 | **Symptom** | `OutOfMemoryError: Java heap space` at `-Xmx2g` on `org.apache.catalina.startup.TestHostConfigAutomaticDeploymentXmlExternalWarXml`, a workload **HotSpot runs to completion in 18 s at `-Xmx512m` with an 18-24 MB live set**. |
-| **Left behind by** | `g1-eight-byte-write-at-a-live-objects-base-20260906`, whose closing line — "the remaining failures are genuine heap exhaustion at `-Xmx2g`" — was an assumption, not a measurement, and is wrong. |
+| **Left behind by** | `g1-eight-byte-write-at-a-live-objects-base-FIXED-20260908`, whose closing line — "the remaining failures are genuine heap exhaustion at `-Xmx2g`" — was an assumption, not a measurement, and is wrong. |
 
 ## The baseline that makes this a defect rather than a workload
 
