@@ -11787,6 +11787,194 @@ fn p87_xmm_local_allocation_verified() {
     );
 }
 
+/// **The XMM-homed-local emitter, exercised on a System V host.**
+///
+/// The test above proves the ALLOCATOR hands a float/double local an XMM
+/// register. Nothing proved the EMITTER then does anything with it, on the
+/// platform that runs the suite: `Compiler::new` gates the allocation behind
+/// `xmm_local_homes_enabled`, which is Win64-only for the ABI reason stated
+/// there, so on Linux `xmm_for_local` answered `None` for every local and the
+/// fifteen sites that read it never ran.
+///
+/// This is the prologue's three of those, forced on and off over one fixture:
+///
+///   * a register-passed float/double parameter is moved GPR -> XMM, rather
+///     than stored to its frame home;
+///   * an XMM-mapped local past the parameter span is zeroed with `PXOR`,
+///     rather than by storing a zeroed GPR to its frame slot;
+///   * neither instruction is emitted when the homes are off.
+///
+/// **Bytes only, never executed.** Forcing the homes on does not change the
+/// ABI: code compiled this way would lose a local across any call on System V,
+/// which is the whole reason the default is what it is. This test inspects the
+/// buffer and calls nothing in it.
+#[test]
+fn an_xmm_homed_local_is_loaded_and_zeroed_by_the_prologue() {
+    // MOVQ xmm8, rax — 66 REX.W+R 0F 6E /r, ModRM 11 000 000.
+    const MOVQ_XMM8_RAX: [u8; 5] = [0x66, 0x4C, 0x0F, 0x6E, 0xC0];
+    // PXOR xmm9, xmm9 — 66 REX.R+B 0F EF /r, ModRM 11 001 001.
+    const PXOR_XMM9: [u8; 5] = [0x66, 0x45, 0x0F, 0xEF, 0xC9];
+
+    // Local 0 is the incoming parameter and is XMM-homed; local 2 is an
+    // XMM-homed local past the parameter span, so the prologue must zero it.
+    // XMM8/XMM9 rather than XMM2..7 because `regalloc` allocates single-pass
+    // local homes out of the high half — the same range the test above asserts.
+    let prologue_bytes = |homes: bool| -> Vec<u8> {
+        let _force = if homes {
+            XmmLocalHomesForce::on()
+        } else {
+            XmmLocalHomesForce::off()
+        };
+        let alloc_result = crate::regalloc::RegAllocResult {
+            assignments: vec![None; 4],
+            xmm_assignments: vec![Some(8), None, Some(9), None],
+            used_callee_saved: Vec::new(),
+            used_xmm_regs: vec![8, 9],
+            block_live_in: Vec::new(),
+        };
+        let mut compiler = Compiler::new(
+            "xmm-home-prologue-test".to_string(),
+            ExecutableBuffer::new(4096).expect("test executable buffer"),
+            4,
+            1,
+            8,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            alloc_result,
+            false,
+            test_helpers(),
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Vec::new(),
+        );
+        compiler.emit_prologue();
+        assert!(
+            !compiler.buf.overflowed(),
+            "the test buffer must hold the prologue",
+        );
+        compiler.buf.as_slice().to_vec()
+    };
+
+    let win = prologue_bytes(true);
+    let sysv = prologue_bytes(false);
+    let has = |b: &[u8], pat: &[u8; 5]| b.windows(5).any(|w| w == pat);
+
+    assert!(
+        has(&win, &MOVQ_XMM8_RAX),
+        "with XMM homes on, the parameter must be moved into XMM8 — this is \
+         `frames::emit_prologue`'s register-argument arm, and it is the arm \
+         that never runs on System V",
+    );
+    assert!(
+        has(&win, &PXOR_XMM9),
+        "with XMM homes on, an XMM-mapped local past the parameter span must \
+         be zeroed in its REGISTER; zeroing only its frame word would leave \
+         the register holding the previous frame's value",
+    );
+    assert!(
+        !has(&sysv, &MOVQ_XMM8_RAX) && !has(&sysv, &PXOR_XMM9),
+        "with XMM homes off, every float/double local uses its frame home and \
+         no XMM instruction belongs in the prologue at all",
+    );
+    assert_ne!(
+        win, sysv,
+        "the two arms emitted identical bytes, so the gate is being ignored \
+         and both assertions above are about the same compile",
+    );
+}
+
+/// **The ten bytecode arms, exercised on a System V host.**
+///
+/// The prologue test above covers `frames`' three sites. These are the other
+/// ten: every `dload`/`dstore`/`fload`/`fstore` and accumulator arm in
+/// `bytecode_walk` that reads `xmm_for_local`, reached the way production
+/// reaches them -- a whole compile through `driver::compile`, with the
+/// allocator choosing the homes rather than a fixture asserting them.
+///
+/// The assertion is an A/B rather than a byte pattern on purpose. Which
+/// instruction each arm picks is the emitter's business and changes with it;
+/// that the two arms of the gate produce DIFFERENT code, and that the forced-on
+/// one keeps the allocator's XMM registers out of the frame, is the property
+/// this is here to hold.
+///
+/// **Bytes only, never executed** -- see `XmmLocalHomesForce`.
+#[test]
+fn the_bytecode_arms_honour_an_xmm_home_the_allocator_gave() {
+    // static double f(int n) { double a = n; return a + a; }
+    //   0: iload_0  1: i2d  2: dstore_1  3: dload_1  4: dload_1  5: dadd
+    //   6: dreturn
+    // One store and two loads of local 1, which is what earns it a register.
+    let code = [0x1a, 0x87, 0x48, 0x27, 0x27, 0x63, 0xaf, 0, 0];
+    let code_len = 7;
+
+    // Precondition: the ALLOCATOR gives local 1 an XMM home on this fixture.
+    // Without it the two arms below are the same compile and the A/B proves
+    // nothing -- the failure mode this fixture is one edit away from.
+    let loops = detect_loops(&code, code_len);
+    let alloc = crate::regalloc::allocate_registers(&code, code_len, 3, 1, &loops);
+    assert!(
+        alloc.xmm_assignments.iter().any(|a| a.is_some()),
+        "the allocator gave this fixture no XMM home, so the gate below has \
+         nothing to gate: repair the fixture rather than believe the A/B",
+    );
+
+    let compiled = |homes: bool| -> Vec<u8> {
+        let _force = if homes {
+            XmmLocalHomesForce::on()
+        } else {
+            XmmLocalHomesForce::off()
+        };
+        let cm = crate::x64::driver::compile(
+            &code,
+            code_len,
+            1,
+            3,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            std::collections::HashMap::new(),
+            None,
+        )
+        .expect("the fixture compiles through the single-pass backend");
+        cm.code_bytes().to_vec()
+    };
+
+    let win = compiled(true);
+    let sysv = compiled(false);
+
+    assert_ne!(
+        win, sysv,
+        "the two arms of `xmm_local_homes_enabled` emitted identical code for \
+         a method whose double local the allocator put in an XMM register — \
+         the gate is being ignored, and every `xmm_for_local` arm in \
+         `bytecode_walk` is unreachable on this host",
+    );
+}
+
 // --- 87.2: FP Loop Optimization ---
 
 #[test]
