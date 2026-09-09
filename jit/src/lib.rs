@@ -2673,6 +2673,28 @@ impl FrameLayout {
         }
     }
 
+    /// Name the x86-64 GPR whose image `off` is, when `off` lands in the
+    /// per-safepoint blind spill (`safepoint-gpr-spill-image`).
+    ///
+    /// The spill is emitted as one store per entry of `x64::ALL_SPILL_GPRS`, in
+    /// table order, at `reg_spill_lo + 8 * index` (`emit_blind_reg_spill`), so
+    /// the index inverts exactly. Diagnostics only, and the table below must
+    /// stay in step with that constant -- a wrong name here misattributes a
+    /// retained object to the wrong register, which is worse than no name.
+    pub fn spill_image_register(&self, off: i32) -> Option<&'static str> {
+        const NAMES: [&str; 14] = [
+            "rax", "rcx", "rdx", "rbx", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13",
+            "r14", "r15",
+        ];
+        if self.reg_spill_hi <= self.reg_spill_lo || off < self.reg_spill_lo
+            || off >= self.reg_spill_hi
+        {
+            return None;
+        }
+        // Cast: the span is 14 slots, so the index is in range by construction.
+        NAMES.get(((off - self.reg_spill_lo) / 8) as usize).copied()
+    }
+
     /// Name the region `off` falls in. Diagnostics only.
     pub fn region_name(&self, off: i32) -> &'static str {
         let hit = |lo: i32, hi: i32| hi > lo && off >= lo && off < hi;
