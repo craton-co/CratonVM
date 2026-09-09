@@ -51,9 +51,19 @@ fn cratonvm_binary_lookup() -> Option<PathBuf> {
         }
     }
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    // vm/Cargo.toml lives at <repo>/vm; binary lands at
+    // <repo>/target/release/cratonvm{.exe}. Probing ONLY `cratonvm.exe` made
+    // this fallback unsatisfiable off-Windows, so on Linux the test skipped
+    // (and still printed `ok`) unless `CRATONVM_BIN` was set -- which is what
+    // kept the hard-coded `;` above invisible for as long as it was.
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     let candidate = PathBuf::from(manifest_dir)
         .parent()
-        .map(|p| p.join("target").join("release").join("cratonvm.exe"))?;
+        .map(|p| p.join("target").join("release").join(exe))?;
     if candidate.exists() {
         Some(candidate)
     } else {
@@ -146,12 +156,17 @@ public class SingleLookup {{
     Some((fixture_dir, jar_path))
 }
 
+/// Join classpath entries with the HOST's path separator — `;` on Windows, `:`
+/// everywhere else. See the note on the same function in
+/// `rslf4j1_get_resources.rs`: a hard-coded `;` collapses the whole classpath
+/// into one entry on Linux and the fixture class is then never found.
 fn format_classpath(parts: &[&Path]) -> String {
+    let sep = if cfg!(windows) { ";" } else { ":" };
     parts
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect::<Vec<_>>()
-        .join(";")
+        .join(sep)
 }
 
 /// Wave-1 Task B acceptance: spawn cratonvm in real-JDK mode against a
@@ -165,7 +180,7 @@ fn singular_get_resource_matches_bulk_get_resources_for_jar_entry() {
         None => {
             eprintln!(
                 "Skipping: cratonvm release binary not available at \
-                 target/release/cratonvm.exe"
+                 target/release/cratonvm[.exe]"
             );
             return;
         }
@@ -188,7 +203,7 @@ fn singular_get_resource_matches_bulk_get_resources_for_jar_entry() {
     let output = Command::new(&bin)
         .args(["--java-home", &java_home, "-c", &cp, "SingleLookup"])
         .output()
-        .expect("must spawn cratonvm.exe");
+        .expect("must spawn cratonvm");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

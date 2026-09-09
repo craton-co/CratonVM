@@ -6,7 +6,7 @@
 #
 # Optional feature-gated benches (off by default so this suite keeps passing
 # before the underlying CratonVM features land — see
-# docs/known-issues/gpu-offload-followups-20260711.md):
+# gpu-offload-followups-20260711.md):
 #   BENCH_DOT=1  — also run GpuDotBench.dotReduce (bench-gpu/GpuDotBench.java)
 #                  vs its TornadoVM @Reduce twin (bench-tornado/TornadoDotBench.java).
 #                  Exercises the reduction-dispatch feature (item 1 in the doc
@@ -182,7 +182,7 @@ done
 # ── GpuDotBench.dotReduce (optional, BENCH_DOT=1) ───────────────────────────────
 # Reduction-dispatch bench: dotReduce is analyzer-eligible (is_reduction:true)
 # but --gpu transparent dispatch currently falls through to CPU for non-void
-# kernels (docs/known-issues/gpu-offload-followups-20260711.md item 1), so
+# kernels (gpu-offload-followups-20260711.md item 1), so
 # gated off by default — running it before that lands just re-measures the CPU
 # fallback, which is harmless but not informative for a default suite run.
 bench_dot() {

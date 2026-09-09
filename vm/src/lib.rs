@@ -80,13 +80,16 @@ pub use cratonvm_native_collections::report_map_view_cache_at_exit;
 /// reason `evacuate_cas_loser_forwards` above is. `written == 0` means the
 /// repair never engaged on the run and nothing may be concluded from its
 /// result -- see `gc_quiescence::PEER_STACK_SLOTS_CAPTURED`.
-pub fn blocked_peer_stack_remap_census() -> (u64, u64, u64, u64, bool) {
+pub fn blocked_peer_stack_remap_census() -> (u64, u64, u64, u64, u64, u64, u64, bool) {
     use std::sync::atomic::Ordering;
     (
         cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_CAPTURED.load(Ordering::Relaxed),
         cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_ADOPTED.load(Ordering::Relaxed),
         cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_WRITTEN.load(Ordering::Relaxed),
         cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_SKIPPED.load(Ordering::Relaxed),
+        cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_DISCARDED.load(Ordering::Relaxed),
+        cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_DROPPED.load(Ordering::Relaxed),
+        cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_UNROUTED.load(Ordering::Relaxed),
         cratonvm_gc::gc_quiescence::blocked_peer_stack_remap_enabled(),
     )
 }

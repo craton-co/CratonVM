@@ -4421,17 +4421,63 @@ pub fn native_return_pushed_to_stack(_shared: &SharedVm, thread: &mut JvmThread)
 /// object graph it touches. Calling this from the safepoint publish bounds
 /// that damage to one safepoint interval. Returns the number of chain
 /// entries + write-backs applied.
-/// `CRATONVM_BLOCKED_WAKE_JIT_REMAP=1` -- remap a waking blocked thread's
-/// COMPILED state (JIT frames, register image, shadow stack), not just its
-/// interpreter frames.
+/// The JIT half of the blocked-region wake: remap this thread's active
+/// compiled frames, register images and shadow stack through the fixup chain
+/// composed while it slept.
 ///
-/// Default OFF only until it is measured; the omission it closes is a
-/// use-after-free. See the block in [`apply_pending_blocked_fixups`].
+/// **Default-ON as of 2026-09-08; `CRATONVM_NO_BLOCKED_WAKE_JIT_REMAP=1` is the
+/// kill switch.** It shipped opt-in and wired into
+/// `apply_pending_blocked_fixups` only -- the LEAKED-region fallback -- so the
+/// path that actually runs, `check_post_block_gc_refs`, remapped interpreter
+/// frames and thread-local refs and nothing compiled. A thread that blocked in
+/// a native with compiled frames below it therefore resumed with every
+/// JIT-frame oop, register-image word and shadow-stack entry still at its
+/// pre-move address, which is a use-after-free whatever else is true.
+///
+/// That omission is the one `xt_jit_coverage_assume`'s doc names as the price
+/// of crediting blocked peers -- *"giving them a deposit means teaching the
+/// blocked-region WAKE to remap JIT frames (it currently remaps only
+/// interpreter frames)"* -- and it is what
+/// `internal/fixed-suite-bugs/netty/bytebuf-multiplethreads-npe-generational-blocked-wake-jit-remap-FIXED-20260908.md`
+/// spent §6-§12 narrowing to "the stale reference is outside the heap, in a
+/// peer". Measured on that page's own repro at
+/// `CRATONVM_GC_YOUNG_TRIGGER_PERCENT=1 CRATONVM_XT_JIT_COVERAGE_ASSUME=1
+/// CRATONVM_GC_NO_PEER_PIN_DIVERT=1`: SIGSEGV in compiled code reading a
+/// decommitted heap span, **6/6 with this disabled and 0/10 with it enabled on
+/// one binary** (10/10 on the dev tip that predates it). Across the whole
+/// 19-class family at that engagement, 18 of 19 classes crashed before and
+/// none after.
 fn blocked_wake_jit_remap_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_BLOCKED_WAKE_JIT_REMAP").is_some()
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_BLOCKED_WAKE_JIT_REMAP").is_none()
     })
+}
+
+/// The JIT half of a blocked-region wake, shared by the ordinary path
+/// (`check_post_block_gc_refs`) and the leaked-region fallback
+/// (`apply_pending_blocked_fixups`).
+///
+/// Sound on both because each runs ON the waking thread, after
+/// `leave_blocked_region_flagged` and before it can re-enter Java or compiled
+/// code: `JIT_ENTRY_CHAIN`, the cached top RBP and the shadow stack are all
+/// thread-local, so nothing here reads another thread's state, and no pause can
+/// complete concurrently (this thread now counts in `expected`). Re-remapping an
+/// already-rewritten slot is harmless -- a second lookup of a to-space address
+/// misses.
+fn apply_blocked_wake_jit_remap(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    fixup: &cratonvm_types::PointerMap,
+) {
+    if !blocked_wake_jit_remap_enabled() || fixup.is_empty() {
+        return;
+    }
+    crate::jit::conservative_roots::remap_active_jit_frames(fixup);
+    crate::jit::conservative_roots::remap_register_image_words(fixup, Some(shared));
+    if crate::jit::conservative_roots::shadow_stack_enabled() {
+        thread.shadow_stack.remap(fixup);
+    }
 }
 
 /// Write back the native-stack words a peer collection scanned out of this
@@ -4553,13 +4599,10 @@ pub(crate) fn apply_pending_blocked_fixups(shared: &SharedVm, thread: &mut JvmTh
         // function runs ON the waking thread, before it can re-enter compiled
         // code. Re-remapping an already-rewritten slot is harmless -- a second
         // lookup of a to-space address misses.
-        if blocked_wake_jit_remap_enabled() {
-            crate::jit::conservative_roots::remap_active_jit_frames(&fixup);
-            crate::jit::conservative_roots::remap_register_image_words(&fixup, Some(shared));
-            if crate::jit::conservative_roots::shadow_stack_enabled() {
-                thread.shadow_stack.remap(&fixup);
-            }
-        }
+        // Attribution: this thread applied a relocation map through the
+        // LEAKED-REGION FALLBACK.
+        cratonvm_gc::gc_quiescence::note_pointer_map_applied(3);
+        apply_blocked_wake_jit_remap(shared, thread, &fixup);
         for frame in &mut thread.frames {
             frame.update_local_refs(&fixup, &shared.mem.heap);
             frame.stack.update_object_refs(&fixup, &shared.mem.heap);
@@ -7287,6 +7330,25 @@ impl<'a> NativeContextImpl<'a> {
                     self.thread.frames.len()
                 );
             }
+            // THE JIT HALF OF THIS WAKE (2026-09-08), and until now it ran
+            // only in the leaked-region FALLBACK. Everything below this line
+            // rewrites interpreter frames and thread-local `ObjectRef`s; a
+            // thread that blocked in a native with COMPILED frames below it
+            // has its live oops in JIT frame slots, register images and the
+            // shadow stack instead, and nothing on this path touched them.
+            //
+            // `apply_pointer_map_to_thread` -- the STW-resume path -- has
+            // carried exactly these three calls for the thread that parked at
+            // the barrier, and its comment already describes this defect for
+            // that population: "this stranded a non-initiator's JIT-frame oops
+            // at their old addresses after a relocation -- a use-after-free".
+            // A blocked peer is the same bug one path over, and it is the
+            // population a moving young cycle relocates under whenever the
+            // cross-thread coverage handshake credits it.
+            // Attribution: this thread applied a relocation map through the
+            // ORDINARY BLOCKED-REGION WAKE.
+            cratonvm_gc::gc_quiescence::note_pointer_map_applied(2);
+            apply_blocked_wake_jit_remap(self.shared, self.thread, &fixup);
             for frame in &mut self.thread.frames {
                 frame.update_local_refs(&fixup, &self.shared.mem.heap);
                 frame

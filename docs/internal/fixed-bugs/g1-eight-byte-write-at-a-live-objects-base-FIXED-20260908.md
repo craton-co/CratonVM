@@ -316,9 +316,10 @@ records for the previous ten.
   above are TIMEOUTs. That is
   `docs/internal/performance/h2-mvstoretool-create-phase-is-mutator-side-address-validation-20260907.md`
   — mutator-side address validation, not this.
-* **The ZGC `OutOfMemoryError` on MVStore**, which is a refused compactor with
-  88% of the heap free —
-  `docs/known-issues/h2/zgc-oom-on-mvstore-is-the-unregistered-entry-frame-blocking-compaction-20260907.md`.
+* **The ZGC `OutOfMemoryError` on MVStore** — a refused compactor with 88% of
+  the heap free, and a RETURNED frame's residue rather than an entry frame.
+  Fixed separately on the same day:
+  `docs/internal/fixed-suite-bugs/gc/zgc-oom-on-mvstore-was-returned-frame-residue-FIXED-20260908.md`.
 * **The conservative JIT root scan itself.** Door 2's addresses arrive from
   `root-pin-scan`, i.e. a compiled frame holding a pointer into an object's
   field cell. The fix makes the collector refuse to treat that as an object

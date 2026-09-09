@@ -6,7 +6,7 @@
 # kernel. That gap let a real regression land undetected on 2026-07-11 (an
 # invoke-cache promotion bug made GPU offload silently stop dispatching to
 # the GPU after the first call at a call site — see
-# docs/known-issues/gpu-offload-followups-20260711.md item 7). This workflow
+# gpu-offload-followups-20260711.md item 7). This workflow
 # is the fix: build the real `gpu-driver` binary and run it against actual
 # CUDA hardware, checksum- and timing-gated, on a schedule so a regression
 # can't sit unnoticed between releases.

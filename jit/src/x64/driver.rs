@@ -2657,6 +2657,11 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
     // Snapshot the frame partition and the label BEFORE `compiler.buf` is moved
     // into the artifact (which partially moves `compiler`).
     let frame_layout = compiler.frame_layout();
+    // The denominator for any later per-region stale-word census: whether this
+    // compile gave the scalar-replacement and LICM-hoist regions an extent at
+    // all. A region with no extent cannot receive a word, so a zero count
+    // against it is a statement about the optimisation, not about the region.
+    frame_layout.record_region_extent_census();
     // DIAGNOSTIC (`CRATONVM_DBG_JIT_SLOT_OVERLAP=1`), here because this is the
     // last point at which the whole compile is still in one piece: every frame
     // slot this body READS and never WRITES. A no-op unless the flag is set.

@@ -1130,6 +1130,13 @@ impl<'a> ParEvac<'a> {
                 // recorded HERE too; the equivalent G1 arm not doing so was a
                 // live root-remap hole.
                 EVAC_CAS_LOSSES.fetch_add(1, Ordering::Relaxed);
+                // Tell the moving-young verifier that the complete object we
+                // just wrote at `new_addr`'s PREDECESSOR -- our own speculative
+                // copy -- is being abandoned unscanned, so it does not read the
+                // pre-move addresses still in its slots as missed heap
+                // rewrites. Recorded before `new_addr` is overwritten with the
+                // winner's address; no-op unless the verifier is armed.
+                crate::gen_heap::record_abandoned_evac_copy(new_addr);
                 new_addr = ObjectHeader::forwarding_target(winner) as usize;
                 shard.forwards.push((old_addr, new_addr));
                 shard.tally[4] += 1;

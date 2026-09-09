@@ -1803,9 +1803,6 @@ fn dbg_no_prune() -> bool {
     *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_NO_PRUNE").is_some())
 }
 
-/// Cached `CRATONVM_DBG_FULLSTACK_SCAN` gate (Windows-only diagnostic), same
-/// per-native-call hot-path rationale as [`dbg_no_prune`].
-#[cfg(any(target_os = "windows", target_os = "linux"))]
 /// H2-CID0 (2026-08-05) — times the unregistered-JIT-frame memo said "clean"
 /// while a real scan of the same range found a frame.
 ///
@@ -2025,6 +2022,153 @@ fn unreg_memo_hiwater_enabled() -> bool {
     })
 }
 
+thread_local! {
+    /// Is the running `scan_active_jit_frames` the COLLECTION's own root pass,
+    /// rather than one of the per-native-call snapshot publishers?
+    ///
+    /// The above-chain conservative band is affordable once per collection and
+    /// not once per native call, and only the collection's pass is what the
+    /// collector marks from — so the two need telling apart. Set by
+    /// [`scan_active_jit_frames_for_collection`], which is the entry point
+    /// `memory::roots::collect_roots` uses.
+    static GC_ROOT_PASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// True while the collection's own root pass is running on this thread.
+#[inline]
+pub fn gc_root_pass_active() -> bool {
+    GC_ROOT_PASS.with(|c| c.get())
+}
+
+/// [`scan_active_jit_frames`] as the COLLECTION's root pass — the entry point
+/// `memory::roots::collect_roots` calls, and the only one that scans the band
+/// above the JIT entry chain. Restores the previous value rather than clearing,
+/// so a nested call (there is none today) cannot silently downgrade the outer
+/// pass.
+pub fn scan_active_jit_frames_for_collection(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
+    let prev = GC_ROOT_PASS.with(|c| c.replace(true));
+    scan_active_jit_frames(heap, out);
+    GC_ROOT_PASS.with(|c| c.set(prev));
+}
+
+/// Engagement census for the above-chain conservative band.
+///
+/// A band that is never scanned and a band that is scanned and finds nothing
+/// read the same way in a passing run, and this repair exists because a page
+/// spent a day on an instrument that could not tell those apart. `passes` is
+/// the denominator, `roots` what the band contributed, `bytes` how much stack
+/// it had to read to get them.
+pub mod above_chain {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static PASSES: AtomicU64 = AtomicU64::new(0);
+    pub static ROOTS: AtomicU64 = AtomicU64::new(0);
+    pub static BYTES: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn note(roots: usize, bytes: usize) {
+        PASSES.fetch_add(1, Ordering::Relaxed);
+        ROOTS.fetch_add(roots as u64, Ordering::Relaxed);
+        BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// `(passes, roots, bytes)` — for the shutdown census.
+    pub fn census() -> (u64, u64, u64) {
+        (
+            PASSES.load(Ordering::Relaxed),
+            ROOTS.load(Ordering::Relaxed),
+            BYTES.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// OPT-IN gate for the above-chain conservative band
+/// (`CRATONVM_JIT_ABOVE_CHAIN_SCAN=1`), and it is opt-in because it was
+/// MEASURED not to be the fix it was written as.
+///
+/// The hypothesis was that the BindableTests ByteBuddy reclaim's missed root
+/// lives in `[max(entry_sp), stack_high)` — the VM's own Rust frames between
+/// the outermost interpreter entry and the compiled call — because
+/// `CRATONVM_DBG_FULLSTACK_SCAN=1` cures that failure and its only difference
+/// from the normal path is scanning the whole stack. It is not, or not only:
+/// with this band walked on every collection (4978 passes, 3 056 492 roots,
+/// 1.0 GB of stack read) the failure is unchanged, and so is it with the
+/// widest possible CHAIN band (`CRATONVM_NO_PRECISE_JIT_MAPS=1`) and with the
+/// A5 filter's veto removed (`CRATONVM_JIT_UNREG_ACCEPT_RESIDUE=1`). What is
+/// left of the fullstack diagnostic's difference is that it also scans on the
+/// per-native-call snapshot publishers — see [`above_chain_all_paths`].
+///
+/// Kept, default off, as the lever that reading measures rather than a fix:
+/// a default-on gigabyte of stack reads per run buys nothing demonstrated.
+/// See
+/// `docs/known-issues/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn above_chain_scan_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ABOVE_CHAIN_SCAN").is_some()
+    })
+}
+
+/// `CRATONVM_JIT_ABOVE_CHAIN_ALL_PATHS=1` — also walk the band on the
+/// per-native-call snapshot publishers, not only on the collection's own root
+/// pass.
+///
+/// This is the difference between the band repair and
+/// `CRATONVM_DBG_FULLSTACK_SCAN`, and it is a flag rather than a default
+/// because it is the expensive half: `update_root_snapshot` runs on every
+/// object-returning native call, and paying a live-stack walk there is what
+/// makes the fullstack diagnostic 2-3x slower than the run it is diagnosing.
+/// Kept so the two can be told apart by measurement instead of argument.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn above_chain_all_paths() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ABOVE_CHAIN_ALL_PATHS").is_some()
+    })
+}
+
+/// `CRATONVM_JIT_ABOVE_CHAIN_FROM_SP=1` — start the band at the SCANNER's SP
+/// rather than at the top of the JIT entry chain.
+///
+/// The chain scan is supposed to cover `[scanner_sp, max(entry_sp))` already,
+/// but only for entries with no precise oop map: a PRECISE entry contributes
+/// its map's slots and no band at all. This makes the two hypotheses
+/// separable without also changing which paths scan.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn above_chain_from_sp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ABOVE_CHAIN_FROM_SP").is_some()
+    })
+}
+
+/// `CRATONVM_DBG_ABOVE_CHAIN_KB=<n>` — cap the above-chain band at `n` KiB.
+///
+/// Diagnostic only, and the reason it exists: the band's upper bound is the
+/// thread's stack top, so "the fix works" says nothing about WHERE the missed
+/// root was. Bisecting `n` until the failure returns names the depth, which is
+/// the first step in replacing this conservative band with a precise root.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn above_chain_scan_cap_bytes() -> Option<usize> {
+    static CAP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_ABOVE_CHAIN_KB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&kb| kb > 0)
+            .map(|kb| kb * 1024)
+    })
+}
+
+/// Cached `CRATONVM_DBG_FULLSTACK_SCAN` gate, same per-native-call hot-path
+/// rationale as [`dbg_no_prune`].
+///
+/// Its doc comment and a `#[cfg(any(windows, linux))]` used to sit ~200 lines
+/// above, orphaned where the function had been before it moved — so the
+/// attribute landed on [`UNREG_MEMO_SUPPRESSED`] instead, cfg-gating a counter
+/// that `vm-cli` reads unconditionally. Both are reunited with the function
+/// here; the gate itself needs no cfg (the flag is read on every target, only
+/// its CONSUMER in `scan_active_jit_frames` is windows/linux).
 fn dbg_fullstack_scan() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -2543,6 +2687,54 @@ fn unreg_jit_accept_residue() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_UNREG_ACCEPT_RESIDUE").is_some()
+    })
+}
+
+/// Opt-in for the residue test on the unregistered-JIT-frame probe's RELOCATION
+/// LICENCE -- `CRATONVM_JIT_UNREG_RESIDUE_LICENCE=1` lets a cycle relocate when
+/// every accepted hit is explained by the returned-frame residue mark.
+///
+/// **DEFAULT OFF since 2026-09-08, and the default is the measured one.** This
+/// shipped default-ON the same day and corrupts the heap. The reasoning that
+/// made it look safe is quoted here because it is nearly right:
+///
+/// > Marking is unaffected either way: the full band is conservatively scanned
+/// > on every accepted hit under both settings, so this switch can only change
+/// > how often the collector is ALLOWED TO COMPACT, never what it RETAINS.
+///
+/// Retention is indeed unaffected -- and retention is not the failure. Granting
+/// the licence lets ZGC RELOCATE a marked object while a raw word in that same
+/// band still holds its old address, and nothing rewrites a conservative root.
+/// The object survives; the pointer to it does not.
+///
+/// Measured on dev@d7768380b, ONE binary, concurrent paired arms,
+/// `MvsCreate 500000` at `-Xmx2g` on ZGC -- a heap where BOTH arms complete, so
+/// the control is a real control rather than an OOM:
+///
+/// | | `rc=0` |
+/// |---|---:|
+/// | licence granted | **8/10** |
+/// | licence withheld | **10/10** |
+///
+/// with faces `MVStoreException: Chunk 13 not found` and, unambiguously,
+/// `ClassCastException: class [B cannot be cast to class [J` -- one address
+/// carrying two different array headers. Pooled with the equivalent arms of an
+/// independent implementation of the same idea: 35 of 43 against 43 of 43,
+/// Fisher's exact p ~ 0.005.
+///
+/// The ZGC OOM this licence was built to fix is real and comes back when it is
+/// withheld. A loud OOM is a better default than silent corruption; the repair
+/// is to give the shallow band above `cover_hi` precise roots so the pin is not
+/// needed at all. See
+/// `docs/known-issues/gc/zgc-residue-licence-relocates-under-a-conservative-root-20260908.md`.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn unreg_residue_licence_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_UNREG_RESIDUE_LICENCE").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
     })
 }
 
@@ -5262,16 +5454,31 @@ fn activation_bci(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> Option<i32> 
 ///
 /// Key 2 is the safepoint-id slot read back as a bci, and since 2026-09-02
 /// [`activation_bci`] can answer that for an `used_ir_backend` artifact too
-/// (through `CompiledMethod::safepoint_bci_table`). It still reaches no chain:
-/// an IR artifact's `inline_frame_map` is EMPTY, because
-/// `record_inline_frame_row` is called only from the single-pass splicer and
-/// one compile produces one artifact, so `compiled_frame_inline_chain` returns
-/// on the `is_empty()` guard before either key is consulted. Key 1 is a CODE
-/// LAYOUT fact -- the byte offset of a return address in this artifact's own
-/// buffer -- and carries no assumption about which backend emitted it, so it
-/// needs no refusal either. IR-tier inlining therefore still contributes no
-/// frames; it needs its own producer, keyed off `InlineScopeTable`, and that is
-/// a separate change from giving the tier a line.
+/// (through `CompiledMethod::safepoint_bci_table`). Key 1 is a CODE LAYOUT
+/// fact -- the byte offset of a return address in this artifact's own buffer
+/// -- and carries no assumption about which backend emitted it. Neither needs
+/// a backend refusal, and since 2026-09-08 neither gets one: an IR artifact
+/// that spliced a body now arrives here with a POPULATED `inline_frame_map`
+/// and its inlined callees are reported like any other.
+///
+/// Until then they were not. `record_inline_frame_row` is called only from the
+/// single-pass splicer, so an IR artifact's map was empty and this function
+/// returned on the `is_empty()` guard before either key was consulted -- and
+/// IR-tier inlining contributed no frames at all. That was invisible while the
+/// optimizing tier claimed few methods and became a live trace defect when it
+/// claimed more: measured 2026-09-08 on `probes/StackTraceAfterOsr.java`,
+/// `after_main_osr` printed `len=3 [leaf mid* outer* probe main]` against the
+/// interpreter's `len=5`, the two starred frames being bodies the IR splicer
+/// had inlined into `probe`.
+///
+/// The producer is `ir_lower`'s `note_inline_frame_return_site`, and it is
+/// keyed off `ir::IrInlineFrameSites` -- the COMBINED-BUFFER pc -- not off
+/// `InlineScopeTable` as this note used to predict. The reason is key 2's own
+/// ambiguity: a spliced region is covered by the caller's snapshot at the
+/// `invoke` pc, so every level of a NESTED splice reports one bci and
+/// `from_rows` (correctly) poisons rows that disagree under it. Combined-pc
+/// ranges are disjoint by construction, so they name one body and one nesting
+/// exactly -- which is what key 1, the exact return address, then carries.
 ///
 /// # The fail-closed rule
 ///
@@ -6140,12 +6347,81 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
                         // scan itself is narrowed above, never the marking scope
                         // once something is actually found.
                         scan_one_frame(search_lo, high, heap, out);
-                        cratonvm_gc::gc_quiescence::set_unregistered_jit_frame_on_stack();
-                        // The frame's oops are now MARKED but still not
-                        // rewritable, so the cycle cannot be a moving one.
-                        cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
-                            cratonvm_gc::gc_quiescence::incomplete_reason::UNREGISTERED_JIT_FRAME,
-                        );
+                        // MARKING AND THE RELOCATION LICENCE ARE TWO QUESTIONS,
+                        // and until 2026-09-08 this site answered both with the
+                        // one `accept` above.
+                        //
+                        // `accept`'s residue test is short-circuited by
+                        // `chain_len > 0`, on the argument quoted above it:
+                        // "with entries on the chain, `search_lo` is already
+                        // `cover_hi`, so anything found above it is a frame the
+                        // chain does not cover and must be marked". That is
+                        // right about MARKING and wrong about LIVENESS.
+                        // `JIT_RESIDUE_HI` is MONOTONIC over the thread's whole
+                        // life (its own doc says why), so a shallower JIT call
+                        // that returned long ago leaves residue ABOVE the
+                        // current chain's `cover_hi` — and the band
+                        // `[cover_hi, residue_hi)` is then scanned and its
+                        // leftovers read as a live guardless frame. Every hit
+                        // on the H2 `MvsCreate` ZGC OOM was of exactly that
+                        // shape (`is_residue=true`, `chain_len=1..3`), and the
+                        // refusal it raised cost the collector its only
+                        // defragmentation for the life of the process.
+                        //
+                        // So: keep marking the full band unconditionally (a
+                        // conservative mark is over-retention, never a
+                        // correctness risk, and `roots.rs` republishes these
+                        // addresses as `publish_pinned_jit_roots`, which ZGC
+                        // withholds the PAGE of), and raise the refusal only for
+                        // a hit the residue mark cannot explain.
+                        //
+                        // The re-probe is NOT "believe the first hit was
+                        // residue and stop". `native_stack_has_jit_frame`
+                        // returns the LOWEST hit in the band, so a residue hit
+                        // can hide a genuine one above it; the band
+                        // `[residue_hi, scan_hi)` is one no returned frame on
+                        // this thread can have written, and the one live
+                        // guardless frame this probe exists for — the process
+                        // entry point — sits above every JIT entry the run ever
+                        // makes and therefore inside it.
+                        //
+                        // CLASSIFY FIRST, THEN DECIDE. The census describes what
+                        // the probe SAW and is therefore identical under either
+                        // setting of the kill switch below; only the refusal
+                        // consults the switch. A census that changed with the
+                        // switch could not be used to judge the switch.
+                        let live_hit = match probe {
+                            None => None,
+                            Some((hit_slot, w)) => {
+                                let residue_hi = jit_residue_hi();
+                                if residue_hi == 0 || hit_slot >= residue_hi {
+                                    Some((hit_slot, w))
+                                } else {
+                                    let live_lo = residue_hi.max(search_lo);
+                                    if scan_hi > live_lo {
+                                        native_stack_has_jit_frame(live_lo, scan_hi)
+                                    } else {
+                                        None
+                                    }
+                                }
+                            }
+                        };
+                        if live_hit.is_some() {
+                            cratonvm_gc::gc_quiescence::note_unregistered_jit_frame_live();
+                        } else {
+                            cratonvm_gc::gc_quiescence::note_unregistered_jit_frame_residue();
+                        }
+                        if live_hit.is_some()
+                            || !unreg_residue_licence_enabled()
+                            || unreg_jit_accept_residue()
+                        {
+                            cratonvm_gc::gc_quiescence::set_unregistered_jit_frame_on_stack();
+                            // The frame's oops are now MARKED but still not
+                            // rewritable, so the cycle cannot be a moving one.
+                            cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+                                cratonvm_gc::gc_quiescence::incomplete_reason::UNREGISTERED_JIT_FRAME,
+                            );
+                        }
                     } else if probe.is_none() {
                         UNREG_JIT_MEMO.with(|c| {
                             let mut m = c.get();
@@ -6174,6 +6450,62 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
         }
         // No live JIT frames on THIS thread — nothing to scan.
         return;
+    }
+    // ABOVE-CHAIN CONSERVATIVE BAND — an OPT-IN LEVER, not a fix. Read
+    // `above_chain_scan_enabled` before reaching for it.
+    //
+    // The chain scan below covers `[scanner_sp, max(entry_sp))` — every frame
+    // BELOW the JIT entry. Nothing covers `[max(entry_sp), stack_high)`, the
+    // VM's own Rust frames between the outermost interpreter entry and the
+    // compiled call, except the A5 probe — and the A5 probe only marks that
+    // band when it first finds a JIT RETURN ADDRESS in it. That is a real hole
+    // in the root set, and closing it was the obvious reading of the
+    // BindableTests ByteBuddy reclaim, because `CRATONVM_DBG_FULLSTACK_SCAN=1`
+    // cures that failure and scanning this band is most of what it does.
+    //
+    // It is not the hole that failure falls through. Walking the band on every
+    // collection (4978 passes, 3 056 492 roots, 1.0 GB of stack read) leaves
+    // 26/27 exactly as it was, and so do the two other levers that widen the
+    // same neighbourhood: `CRATONVM_NO_PRECISE_JIT_MAPS=1` (every chain entry
+    // conservative, so the chain band is at its widest) and
+    // `CRATONVM_JIT_UNREG_ACCEPT_RESIDUE=1` (the A5 filter's veto removed).
+    // What remains of the fullstack diagnostic's difference is the PATH, not
+    // the range: it also scans from `update_root_snapshot`, on every
+    // object-returning native call. See `above_chain_all_paths`, and
+    // `docs/known-issues/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`.
+    //
+    // Sound on the same terms as the chain band beside it, which has always
+    // pushed conservative roots on cycles that could still relocate: a live
+    // chain entry makes `gc_quiescence::is_active()` true, and
+    // `collect_garbage_inner` then diverts to the non-moving sweep through
+    // either `has_conservative_roots && !moving_young` or
+    // `unrewritable_conservative_jit_roots` (which additionally requires that
+    // a conservative scan ran this cycle — this one). Nothing is relocated, so
+    // a pointer-shaped `i64` picked up here can only over-retain.
+    //
+    // `CRATONVM_DBG_ABOVE_CHAIN_KB=<n>` caps the band at `n` KiB above the
+    // chain, which is how a holder's depth would be bisected once one is found
+    // up there.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    if above_chain_scan_enabled() && (gc_root_pass_active() || above_chain_all_paths()) {
+        let cover_hi = if above_chain_from_sp() {
+            scanner_sp
+        } else {
+            JIT_ENTRY_CHAIN
+                .with(|c| c.borrow().iter().map(|e| e.entry_sp).max())
+                .unwrap_or(scanner_sp)
+                .max(scanner_sp)
+        };
+        let high = current_thread_stack_high();
+        let hi = match above_chain_scan_cap_bytes() {
+            Some(cap) => high.min(cover_hi.saturating_add(cap)),
+            None => high,
+        };
+        if hi > cover_hi {
+            let before = out.len();
+            scan_one_frame(cover_hi, hi, heap, out);
+            above_chain::note(out.len() - before, hi - cover_hi);
+        }
     }
     // WS1 JIT-scan cache (see the module-level comment at `JIT_SCAN_CACHE`):
     // reuse the previous scan's roots verbatim unless a Rust↔JIT boundary
@@ -9198,6 +9530,225 @@ fn report_stale_words_in(
     }
 }
 
+/// Walk this thread's live compiled frame bands and report any word naming an
+/// address the LAST collection vacated.
+///
+/// # Why this exists next to `reclaim_guard::audit_thread_frames`
+///
+/// That auditor tests `thread.frames` -- the INTERPRETER frames -- against the
+/// same ledger, and its report ("a LIVE frame slot still names an address the
+/// LAST collection moved an object away from") is the exact verdict wanted
+/// here. It simply cannot see a compiled frame: a JIT frame's oops live in the
+/// machine stack band, not in a `Frame`. So on a workload whose stale holder is
+/// compiled, the interpreter auditor is silent and the first symptom is the
+/// SIGSEGV.
+///
+/// The ledger is what makes this sharper than
+/// [`report_stale_after_remap`]. That one flags any word equal to a pointer-map
+/// KEY, which on a real stack is mostly dead slop that happens to look like a
+/// moved address (thousands per run). `gc_quiescence::was_vacated` subtracts the
+/// destination set, so a hit is a word naming an address the collector moved an
+/// object AWAY from and did not move anything back INTO -- which is precisely
+/// the read that faults.
+///
+/// No-op unless `CRATONVM_DBG_VACATED_FRAMES` is armed.
+pub fn audit_jit_frames_for_vacated(
+    shared: Option<&crate::vm::SharedVm>,
+    tid: u64,
+    site: &'static str,
+) {
+    if !cratonvm_gc::gc_quiescence::vacated_frames_enabled() {
+        return;
+    }
+    let scanner_sp = current_stack_pointer();
+    JIT_ENTRY_CHAIN.with(|c| {
+        {
+            let mut v = c.borrow_mut();
+            flush_top_rbp_cache_to_chain(v.as_mut_slice());
+        }
+        let chain = c.borrow();
+        for entry in chain.iter() {
+            let Some(info) = entry.precise else { continue };
+            let entry_sp = entry.entry_sp;
+            let mut rbp = info.exact_rbp;
+            if rbp == 0 || rbp & 0x7 != 0 || rbp < scanner_sp || rbp >= entry_sp {
+                continue;
+            }
+            let Some(innermost_cm) = innermost_frame_method(
+                rbp,
+                info.exact_cm_id,
+                entry_sp,
+                scanner_sp,
+                info.compiled_method,
+            ) else {
+                continue;
+            };
+            // SAFETY: same contract as `report_stale_after_remap` -- the chain
+            // entry's CompiledMethod is Arc-owned by the JIT cache while any of
+            // its frames is live.
+            let mut cm: &cratonvm_jit::CompiledMethod = unsafe { &*innermost_cm };
+            let mut frames = 0usize;
+            while frames < 4096 {
+                frames += 1;
+                let frame_size = cm.osr_frame_size;
+                if frame_size <= 0 {
+                    break;
+                }
+                let frame_size = frame_size as usize;
+                const MAX_COMPILED_FRAME_BYTES: usize = 1024 * 1024;
+                if frame_size > MAX_COMPILED_FRAME_BYTES || frame_size > rbp {
+                    break;
+                }
+                report_vacated_words_in(rbp - frame_size, rbp, cm, rbp, shared, tid, site);
+                // SAFETY: `rbp` is a validated frame base in this thread's live
+                // JIT stack interval.
+                let parent_rbp = unsafe { (rbp as *const usize).read() };
+                let ret_addr = unsafe { ((rbp + 8) as *const usize).read() };
+                let Some(parent_cm_ptr) = cratonvm_jit::lookup_jit_code_range(ret_addr) else {
+                    break;
+                };
+                if parent_rbp <= rbp
+                    || parent_rbp & 0x7 != 0
+                    || parent_rbp >= entry_sp
+                    || parent_rbp < scanner_sp
+                {
+                    break;
+                }
+                // SAFETY: code ranges retain their CompiledMethod metadata for
+                // the lifetime of an active frame.
+                cm = unsafe { &*(parent_cm_ptr as *const cratonvm_jit::CompiledMethod) };
+                rbp = parent_rbp;
+            }
+        }
+    });
+}
+
+/// Hits reported by [`audit_jit_frames_for_vacated`] this process.
+pub static JIT_VACATED_FRAME_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The subset of [`JIT_VACATED_FRAME_HITS`] in a slot `band_slot_is_verifiable`
+/// INSPECTS -- a java local, or an operand-spill slot below the safepoint's
+/// live cursor.
+///
+/// This is the number that separates the two candidate stories. An unverifiable
+/// hit is a dead register image or an abandoned outgoing-argument word, which
+/// is what every conservative frame scan carries and what
+/// `CRATONVM_JIT_REMAP_ALL_UNVERIFIABLE` was measured against to no effect. A
+/// VERIFIABLE hit is a slot the coverage machinery claims to describe and the
+/// remap still did not rewrite -- a live oop of a live compiled frame left
+/// naming a vacated address.
+pub static JIT_VACATED_FRAME_HITS_VERIFIABLE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Per-region tally, indexed by [`vacated_region_bucket`].
+pub static JIT_VACATED_BY_REGION: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Bucket names for [`JIT_VACATED_BY_REGION`], in index order.
+pub const JIT_VACATED_REGION_NAMES: [&str; 8] = [
+    "java-local",
+    "operand-spill",
+    "licm-or-scalar",
+    "callee-saved-gpr-image",
+    "safepoint-gpr-spill-image",
+    "outgoing-args-or-deopt-regs",
+    "reserved-locals-tail",
+    "other",
+];
+
+fn vacated_region_bucket(region: &str) -> usize {
+    match region {
+        "java-local" => 0,
+        "operand-spill" => 1,
+        "licm-ref-hoist" | "licm-arith" | "scalar-replaced-field" => 2,
+        "callee-saved-gpr-image" | "callee-saved-xmm-image" => 3,
+        "safepoint-gpr-spill-image" => 4,
+        "outgoing-args-or-deopt-regs" => 5,
+        "reserved-locals-tail" => 6,
+        _ => 7,
+    }
+}
+
+/// `(total, verifiable, per-region)` for the run's `[jit-vacated-frame]` census.
+pub fn jit_vacated_frame_census() -> (u64, u64, [u64; 8]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut per = [0u64; 8];
+    for (i, c) in JIT_VACATED_BY_REGION.iter().enumerate() {
+        per[i] = c.load(Relaxed);
+    }
+    (
+        JIT_VACATED_FRAME_HITS.load(Relaxed),
+        JIT_VACATED_FRAME_HITS_VERIFIABLE.load(Relaxed),
+        per,
+    )
+}
+
+fn report_vacated_words_in(
+    lo: usize,
+    hi: usize,
+    cm: &cratonvm_jit::CompiledMethod,
+    rbp: usize,
+    shared: Option<&crate::vm::SharedVm>,
+    tid: u64,
+    site: &'static str,
+) {
+    if hi <= lo {
+        return;
+    }
+    let mut addr = (lo + 7) & !7usize;
+    const MAX_SCAN_BYTES: usize = 1024 * 1024;
+    let hi = hi.min(addr.saturating_add(MAX_SCAN_BYTES));
+    while addr + 8 <= hi {
+        // SAFETY: aligned read inside this thread's own live stack interval,
+        // bounded by the caller's frame bounds.
+        let w = unsafe { (addr as *const usize).read() };
+        if let Some(moved_to) = cratonvm_gc::gc_quiescence::was_vacated(w) {
+            let n = JIT_VACATED_FRAME_HITS.fetch_add(1, Ordering::Relaxed);
+            // Cast: a compiled frame is far smaller than i32::MAX.
+            let off_t = (rbp - addr) as i32;
+            let region_t = cm.frame_layout.region_name(off_t);
+            let verifiable_t = band_slot_is_verifiable(
+                off_t,
+                &cm.frame_layout,
+                moving_young_frame_live_hi(rbp, cm),
+            );
+            if verifiable_t {
+                JIT_VACATED_FRAME_HITS_VERIFIABLE.fetch_add(1, Ordering::Relaxed);
+            }
+            JIT_VACATED_BY_REGION[vacated_region_bucket(region_t)].fetch_add(1, Ordering::Relaxed);
+            // Report the VERIFIABLE ones without a budget: they are the finding,
+            // and on a healthy run there are none. The unverifiable tail is dead
+            // slop every conservative scan carries, so it keeps a cap.
+            if verifiable_t || n < 200 {
+                // Cast: a compiled frame is far smaller than i32::MAX.
+                let off = (rbp - addr) as i32;
+                eprintln!(
+                    "[jit-vacated-frame] site={site} tid={tid} method={} off={off} region={}                      verifiable={} resumed_from={} value=0x{w:x} moved_to=0x{moved_to:x}                      class_at_target={}",
+                    cm.method_label,
+                    cm.frame_layout.region_name(off),
+                    band_slot_is_verifiable(
+                        off,
+                        &cm.frame_layout,
+                        moving_young_frame_live_hi(rbp, cm),
+                    ),
+                    is_callee_saved_gpr_image(off, &cm.frame_layout),
+                    class_name_at(shared, moved_to),
+                );
+            }
+        }
+        addr += 8;
+    }
+}
+
 /// Walk every live compiled frame band after a moving collection has remapped
 /// the oop-map slots and report words that still name a moved-from address.
 ///
@@ -9417,7 +9968,7 @@ fn is_callee_saved_gpr_image(off: i32, layout: &cratonvm_jit::FrameLayout) -> bo
 /// by construction, and its zero is not an all-clear for them.
 ///
 /// The experiment this enables is a single A/B on the reproducer in
-/// `known-issues/netty/bytebuf-multiplethreads-npe-generational-moving-young-20260906.md`
+/// `internal/fixed-suite-bugs/netty/bytebuf-multiplethreads-npe-generational-blocked-wake-jit-remap-FIXED-20260908.md`
 /// §10.4 -- `CRATONVM_GC_NO_PEER_PIN_DIVERT=1` on
 /// `io.netty.handler.ipfilter.UniqueIpFilterTest`, which SIGSEGVs 3 runs in 13
 /// with compiled code reading a decommitted span. If widening the write removes
@@ -10262,6 +10813,14 @@ mod tests {
     /// thread would be a claim about frames that do not exist.
     #[test]
     fn a_thread_with_no_jit_frames_deposits_nothing() {
+        // `peer_proven_jit_depth` is a PROCESS global, and
+        // `beginning_a_coverage_cycle_clears_the_peer_ledger` deposits 7 into
+        // it under this latch. Without taking the latch here too, that 7 is
+        // read as this test's own deposit: `left: 7, right: 0`, only ever in
+        // parallel -- alone and under `--test-threads=1` it passes.
+        let _serialised = super::coverage_oracle_gate_tests::COVERAGE_ORACLE_TEST_LATCH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert_eq!(current_thread_jit_depth(), 0, "test precondition");
         cratonvm_gc::gc_quiescence::reset_peer_proven_jit_depth();
         publish_peer_jit_coverage_for_stw();

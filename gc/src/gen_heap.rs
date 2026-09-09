@@ -8914,6 +8914,43 @@ impl GenerationalHeap {
             let captured = crate::gc_quiescence::take_peer_reg_capture();
             let mut hits = 0usize;
             let mut reported = 0usize;
+            // THE INTERIOR CENSUS, and it is the one class of stale peer word
+            // no conservative write-back can repair.
+            //
+            // `record_peer_stack_slot`'s capture and the blocked-wake
+            // write-back both key on an OBJECT BASE, because `is_object_address`
+            // is the only predicate a conservative scan is allowed to trust. A
+            // word naming the INTERIOR of a live object -- a byte-array data
+            // pointer, a `DirectByteBuffer` address, any derived pointer -- is
+            // therefore neither marked, nor captured, nor rewritten, while the
+            // object it points into is kept alive by some other root and
+            // RELOCATED. The peer resumes and dereferences a vacated interior
+            // address, which is why the observed faults read at UNALIGNED
+            // addresses inside a decommitted span.
+            //
+            // That population is exactly what `unrewritable_conservative_jit_roots`
+            // exists to refuse -- its own comment says the registry "drops
+            // interior/derived pointers that name no base at all" -- so this
+            // counter is the measurement behind that refusal rather than an
+            // argument for it. It is only reachable with
+            // `CRATONVM_GC_NO_PEER_PIN_DIVERT=1`.
+            let from_lo = young_from.base_ptr() as usize;
+            let from_hi = from_lo + young_from.used();
+            let mut interior = 0usize;
+            let mut dead_base = 0usize;
+            for (_tid, _reg, val) in captured.iter().copied() {
+                if val < from_lo || val >= from_hi || pointer_map.contains_key(&val) {
+                    continue;
+                }
+                if young_object_starts.contains(val) {
+                    // A base that nothing relocated: the object died this
+                    // cycle. Harmless — the peer's word names garbage, and
+                    // garbage is what it named before the collection too.
+                    dead_base += 1;
+                } else {
+                    interior += 1;
+                }
+            }
             for (tid, reg, val) in captured.iter().copied() {
                 let Some(&new_addr) = pointer_map.get(&val) else {
                     continue;
@@ -8939,9 +8976,11 @@ impl GenerationalHeap {
                 crate::gc_quiescence::PEER_REG_STALE.fetch_add(hits as u64, Ordering::Relaxed);
             }
             eprintln!(
-                "[peer-reg-stale] cycle summary: captured_words={} stale={} pointer_map={}",
+                "[peer-reg-stale] cycle summary: captured_words={} stale={} interior={}                  dead_base={} pointer_map={}",
                 captured.len(),
                 hits,
+                interior,
+                dead_base,
                 pointer_map.len(),
             );
         }
@@ -9019,6 +9058,16 @@ impl GenerationalHeap {
                 n
             };
 
+            // Speculative copies the parallel evacuator abandoned after
+            // losing a forwarding CAS. They are complete objects that nothing
+            // references and nothing scanned, so every slot still names
+            // from-space -- a WHOLE-OBJECT miss, which is the shape that
+            // produced (and then sank) this instrument's only two historical
+            // non-zero readings. Excluded here so a non-zero count means what
+            // the instrument's contract says it means.
+            let abandoned = take_abandoned_evac_copies();
+            let mut skipped_abandoned = 0usize;
+
             let mut cursor = 0usize;
             let young_used = young_to.used();
             while cursor < young_used {
@@ -9029,19 +9078,28 @@ impl GenerationalHeap {
                 if size < HEADER_SIZE || cursor + size > young_used {
                     break;
                 }
-                missed_young += scan_obj("YOUNG", obj, header);
+                if abandoned.contains(&(obj as usize)) {
+                    skipped_abandoned += 1;
+                } else {
+                    missed_young += scan_obj("YOUNG", obj, header);
+                }
                 cursor += size;
             }
             for (obj, _size) in old_gen.walk_objects() {
                 // SAFETY: walk_objects yields live old-gen object starts.
                 let header = unsafe { &*(obj as *const ObjectHeader) };
-                missed_old += scan_obj("OLD", obj, header);
+                if abandoned.contains(&(obj as usize)) {
+                    skipped_abandoned += 1;
+                } else {
+                    missed_old += scan_obj("OLD", obj, header);
+                }
             }
             eprintln!(
-                "[moving-young-verify] forwarded_heap_refs_remaining young={} old={} pointer_map={}",
+                "[moving-young-verify] forwarded_heap_refs_remaining young={} old={} pointer_map={}                  abandoned_cas_loser_copies_skipped={}",
                 missed_young,
                 missed_old,
                 pointer_map.len(),
+                skipped_abandoned,
             );
             eprintln!(
                 "[moving-young-verify] scan frontier: scan_cursor=0x{:x} to_used=0x{:x} \
@@ -12235,8 +12293,7 @@ impl GenerationalHeap {
         // Only meaningful when this walk covers the whole arena, i.e. the
         // parallel prefix did not already consume the front of it.
         let seq_walk_covers_all = cursor == 0;
-        let mut anchor_probe = sweep_anchors.iter().peekable();
-        let mut anchors_off_grid = 0usize;
+        let mut anchor_probe = AnchorGridProbe::new(&sweep_anchors, seq_walk_covers_all);
 
         while cursor < used {
             // Skip known free blocks ROBUSTLY. The free list (`existing_free`) is
@@ -12252,6 +12309,10 @@ impl GenerationalHeap {
             // Now: drop free blocks the cursor has wholly passed, and if the cursor
             // lands AT or INSIDE a free block, resync to that block's end.
             {
+                // Where the walk stood BEFORE the free-block resync — the
+                // anchor probe below needs it to tell "crossed a known free
+                // block" (benign) from "strode past by an object" (the finding).
+                let pre_skip = cursor;
                 let (resynced, overshot) = skip_free_blocks(&mut cursor, &mut free_iter);
                 if overshot {
                     // The previous stride ran INTO a known free block: the
@@ -12272,6 +12333,11 @@ impl GenerationalHeap {
                     dead_watermark = dead_regions.len();
                     last_anchor_off = cursor;
                     objects_since_anchor = 0;
+                    // Anchor-validity probe: this `continue` skips the
+                    // walk-position probe below, so tell it about the span the
+                    // resync just crossed or the next iteration reports every
+                    // anchor inside it as off-grid.
+                    anchor_probe.crossed_free_block(pre_skip, cursor);
                     continue;
                 }
             }
@@ -12280,16 +12346,7 @@ impl GenerationalHeap {
             // start or a GAP-filler sentinel, both of which `sweep_chunk`
             // handles. Anything the anchor list holds strictly below it was
             // never reachable.
-            if seq_walk_covers_all {
-                while anchor_probe.peek().is_some_and(|&&a| a < cursor) {
-                    anchors_off_grid += 1;
-                    SWEEP_ANCHOR_NOT_A_BASE.fetch_add(1, Ordering::Relaxed);
-                    anchor_probe.next();
-                }
-                if anchor_probe.peek().is_some_and(|&&a| a == cursor) {
-                    anchor_probe.next();
-                }
-            }
+            anchor_probe.at_walk_position(cursor);
             // `cursor` is within `used`; the from-space region
             // `[base, base+used)` is backed by mapped, allocated memory. The
             // integer-to-pointer cast itself is safe; only the header deref
@@ -13133,7 +13190,10 @@ impl GenerationalHeap {
         // chunk started off the object grid parses phantom objects, and an
         // unmarked phantom reclaims and ZEROES every live object it subsumes.
         // Bounded, and normally never emitted at all — on a sound anchor list
-        // this counter is exactly zero.
+        // this counter is exactly zero. See [`AnchorGridProbe`] for the two
+        // benign crossings it used to count as findings, which is why "exactly
+        // zero" had not been true.
+        let anchors_off_grid = anchor_probe.off_grid();
         if anchors_off_grid > 0 {
             let n = ANCHOR_OFF_GRID_REPORTS.fetch_add(1, Ordering::Relaxed);
             if n < 8 {
@@ -17623,6 +17683,46 @@ fn moving_young_dangling_verify_enabled() -> bool {
     gc_flags().moving_young_verify
 }
 
+/// Speculative to-space (or old-gen) copies the parallel evacuator ABANDONED
+/// after losing the forwarding CAS, for the cycle currently being verified.
+///
+/// # Why the verifier above is unreadable without this
+///
+/// `ParEvac::evacuate` copies first and claims second, so a worker that loses
+/// the race has already written a complete object at `new_addr` and simply
+/// walks away from it: "to-space garbage reclaimed next cycle". Nothing
+/// references it, so nothing scans it, so **every one of its reference slots
+/// keeps the pre-move address** — and the verifier, which walks all of to-space
+/// and old-gen, reports each of them as a missed heap rewrite.
+///
+/// That is exactly the shape
+/// `internal/fixed-suite-bugs/netty/bytebuf-multiplethreads-npe-generational-blocked-wake-jit-remap-FIXED-20260908.md`
+/// §6 published a root cause off and then withdrew: *"an object whose every
+/// slot was missed"*, twice, never reproducible, and refuted by a scan-cursor
+/// instrument that could not explain it either. An abandoned loser explains
+/// both halves — whole-object, because the object was never scanned; and
+/// harmless, because it is unreachable garbage and no mutator can dereference
+/// it.
+///
+/// Populated only while the verifier is armed, so the ordinary evacuation path
+/// pays nothing.
+static ABANDONED_EVAC_COPIES: parking_lot::Mutex<Vec<usize>> = parking_lot::Mutex::new(Vec::new());
+
+/// Record one abandoned CAS-loser copy. No-op unless the verifier is armed.
+pub(crate) fn record_abandoned_evac_copy(addr: usize) {
+    if !moving_young_dangling_verify_enabled() {
+        return;
+    }
+    ABANDONED_EVAC_COPIES.lock().push(addr);
+}
+
+/// Take (and clear) this cycle's abandoned copies, as a set the verifier can
+/// test membership against.
+fn take_abandoned_evac_copies() -> rustc_hash::FxHashSet<usize> {
+    let mut g = ABANDONED_EVAC_COPIES.lock();
+    std::mem::take(&mut *g).into_iter().collect()
+}
+
 /// Scan a single object's reference slots for the `0x4` seed signature
 /// (`Object(Some(0 < p < 0x1000))` in a field, or a raw `0 < x < 0x1000` in a
 /// ref-array element). Returns the number of bad slots found; prints up to
@@ -19886,6 +19986,104 @@ fn skip_free_blocks(
     (resynced, overshot)
 }
 
+/// The sequential sweep walk's ANCHOR-VALIDITY probe, as a type.
+///
+/// The parallel sweep prefix splits from-space at `sweep_anchors` and starts an
+/// independent object chain at each one; its soundness rests entirely on those
+/// offsets being real walk positions. The sequential walk visits every walk
+/// position in ascending order, so an anchor it strides past without landing on
+/// is an anchor that is NOT on the object grid — a chunk started there parses
+/// phantom objects, and a phantom that reads as unmarked reclaims and zeroes
+/// every live object it subsumes. That is what [`SWEEP_ANCHOR_NOT_A_BASE`]
+/// counts, and its report calls the counter "exactly zero on a sound anchor
+/// list".
+///
+/// # The two crossings that are NOT findings
+///
+/// The probe was inline, ran after `skip_free_blocks`, and counted every
+/// unconsumed anchor below the cursor. Both of the walk's legitimate jumps
+/// therefore registered as findings:
+///
+/// * **offset 0.** The anchor builder deliberately exempts it from the "drop
+///   anchors that land inside a free block" filter — "it is the walk's start,
+///   not a split point, and every walker already skip-resyncs from it". When
+///   from-space opens with a free block, the first iteration resyncs the cursor
+///   past it and `continue`s (skipping the probe), and the next iteration finds
+///   anchor 0 below the cursor and counts it. This is the `off_grid=1
+///   anchors=2` reading two passing classes produced in the 2026-09-08
+///   BindableTests sweep: a two-entry list is `[0, used]`, and `used` cannot be
+///   reached from inside a `cursor < used` loop, so the exempt anchor is the
+///   only one it can have counted.
+/// * **a free block the walk resyncs over.** Anchors inside one are filtered
+///   out at construction against `exact_skips`, but the walk resyncs off
+///   `existing_free`, and a parallel chunk beginning at such an offset resyncs
+///   off exactly the same list — it parses no phantom, so it is not this
+///   failure.
+///
+/// An anchor the walk passed by an OBJECT stride still counts: that is the
+/// grid disagreement the probe exists for.
+struct AnchorGridProbe<'a> {
+    it: std::iter::Peekable<std::slice::Iter<'a, usize>>,
+    off_grid: usize,
+    /// Only meaningful when the sequential walk covers the whole arena; when
+    /// the parallel prefix already consumed the front, anchors below the
+    /// prefix end were proven by the prefix, not skipped.
+    armed: bool,
+}
+
+impl<'a> AnchorGridProbe<'a> {
+    fn new(anchors: &'a [usize], armed: bool) -> Self {
+        let mut p = Self {
+            it: anchors.iter().peekable(),
+            off_grid: 0,
+            armed,
+        };
+        if armed {
+            // Consume the exempt walk start before the walk can jump over it.
+            while p.it.peek().is_some_and(|&&a| a == 0) {
+                p.it.next();
+            }
+        }
+        p
+    }
+
+    /// The walk is standing on `cursor`, a position the object grid reaches.
+    fn at_walk_position(&mut self, cursor: usize) {
+        if !self.armed {
+            return;
+        }
+        while self.it.peek().is_some_and(|&&a| a < cursor) {
+            self.off_grid += 1;
+            SWEEP_ANCHOR_NOT_A_BASE.fetch_add(1, Ordering::Relaxed);
+            self.it.next();
+        }
+        if self.it.peek().is_some_and(|&&a| a == cursor) {
+            self.it.next();
+        }
+    }
+
+    /// The walk jumped from `from` to `to` over a KNOWN free block. Anchors in
+    /// `[from, to]` are accounted for, not skipped; anything still below `from`
+    /// was passed by an object stride and is a finding.
+    fn crossed_free_block(&mut self, from: usize, to: usize) {
+        if !self.armed {
+            return;
+        }
+        while self.it.peek().is_some_and(|&&a| a < from) {
+            self.off_grid += 1;
+            SWEEP_ANCHOR_NOT_A_BASE.fetch_add(1, Ordering::Relaxed);
+            self.it.next();
+        }
+        while self.it.peek().is_some_and(|&&a| a <= to) {
+            self.it.next();
+        }
+    }
+
+    fn off_grid(&self) -> usize {
+        self.off_grid
+    }
+}
+
 /// DoHead walk-desync hardening: measure the all-zero run starting at
 /// `start` (an 8-aligned walk-grid offset), in 8-byte words, capped at
 /// `limit`. Returns the run's END offset (always 8-aligned unless the run
@@ -20511,6 +20709,82 @@ impl GarbageCollector for GenerationalHeap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **THE OFF-GRID ANCHOR COUNTER MUST NOT COUNT THE WALK'S OWN START.**
+    ///
+    /// `[0, used]` with a free block at the front of from-space is the shape
+    /// the 2026-09-08 BindableTests sweep reported as `off_grid=1 anchors=2`
+    /// while the classes it came from PASSED. `used` is unreachable from inside
+    /// a `cursor < used` loop, so the reading could only have been the exempt
+    /// walk start — and a report whose own text says it is "exactly zero on a
+    /// sound anchor list" cannot be used as evidence about a sweep while it
+    /// fires on a sound one.
+    #[test]
+    fn the_walk_start_is_not_an_off_grid_anchor_when_from_space_opens_with_a_free_block() {
+        let anchors = [0usize, 4096];
+        let mut p = AnchorGridProbe::new(&anchors, true);
+        // The walk's first act: resync from 0 over a free block ending at 512.
+        p.crossed_free_block(0, 512);
+        p.at_walk_position(512);
+        p.at_walk_position(600);
+        assert_eq!(
+            p.off_grid(),
+            0,
+            "offset 0 is the walk's start, not a split point — the anchor \
+             builder exempts it from its own free-block filter for exactly \
+             this reason"
+        );
+    }
+
+    /// And an anchor inside a free block the walk resyncs over is not one
+    /// either: a parallel chunk beginning there resyncs off the same list, so
+    /// it parses no phantom.
+    #[test]
+    fn an_anchor_inside_a_resynced_free_block_is_not_off_grid() {
+        let anchors = [0usize, 256, 4096];
+        let mut p = AnchorGridProbe::new(&anchors, true);
+        p.at_walk_position(0);
+        p.crossed_free_block(128, 512);
+        p.at_walk_position(512);
+        assert_eq!(p.off_grid(), 0);
+    }
+
+    /// **BUT AN ANCHOR THE WALK PASSED BY AN OBJECT STRIDE STILL COUNTS.**
+    ///
+    /// Without this the fix above would be indistinguishable from deleting the
+    /// probe.
+    #[test]
+    fn an_anchor_strode_past_by_an_object_is_still_reported_off_grid() {
+        let anchors = [0usize, 300, 4096];
+        let mut p = AnchorGridProbe::new(&anchors, true);
+        p.at_walk_position(0);
+        // A 512-byte object took the walk from 0 to 512, straight over 300.
+        p.at_walk_position(512);
+        assert_eq!(
+            p.off_grid(),
+            1,
+            "300 is not a walk position: a chunk started there parses a phantom"
+        );
+
+        // And the same anchor is still a finding when the jump that passed it
+        // was an object stride ENDING at a free block the walk then crossed.
+        let mut q = AnchorGridProbe::new(&anchors, true);
+        q.at_walk_position(0);
+        q.crossed_free_block(512, 1024);
+        assert_eq!(q.off_grid(), 1);
+    }
+
+    /// Disarmed (the parallel prefix already consumed the front of from-space)
+    /// the probe reports nothing: anchors below the prefix end were PROVEN by
+    /// the prefix, not skipped.
+    #[test]
+    fn the_probe_is_silent_when_the_parallel_prefix_covered_the_front() {
+        let anchors = [0usize, 300, 4096];
+        let mut p = AnchorGridProbe::new(&anchors, false);
+        p.at_walk_position(512);
+        p.crossed_free_block(512, 1024);
+        assert_eq!(p.off_grid(), 0);
+    }
 
     /// Write `h` into `buf` at `off` bytes and return the buffer's base
     /// address. `Vec<u64>` gives the 8-byte alignment `ObjectHeader` needs.

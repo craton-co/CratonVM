@@ -608,7 +608,7 @@ First systematic validation of the GPU offload stack on real hardware (RTX
 day: a morning validation run that found and fixed two dispatch-correctness
 bugs, and an evening feature wave that closed most of the follow-ups the
 morning pass turned up. See
-`docs/known-issues/gpu-offload-followups-20260711.md` for full detail and
+`gpu-offload-followups-20260711.md` for full detail and
 remaining open items.
 
 #### Fixed (morning validation pass)
@@ -631,7 +631,7 @@ remaining open items.
 #### Known follow-ups
 - `GpuFuture` completion is now poll-driven but still not push-driven: `isDone()`/`getNow()` do a real non-blocking device check and finalize inline, but nothing drives that check without an application thread calling it — no background thread or driver callback completes a future on its own yet.
 - 2-D/nested loops and general (non-loop-guard) branches are still rejected by the analyzer; `)F`/`)D` reductions remain CPU-only by design.
-- Full open-items list in `docs/known-issues/gpu-offload-followups-20260711.md`.
+- Full open-items list in `gpu-offload-followups-20260711.md`.
 
 ---
 

@@ -656,5 +656,8 @@ pub mod site_stats {
             return;
         }
         report("FINAL");
+        // The door counters above say HOW OFTEN a door declined; this says WHY,
+        // which is the half that names a repair.
+        crate::runtime::interpreter::invoke_fast::dump_decline_reasons();
     }
 }

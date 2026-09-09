@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-536 tokens.
+537 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -535,6 +535,7 @@ export inherited from a parent shell.
 | `sweep-census` | `CRATONVM_DBG_SWEEP_CENSUS` |
 | `sweep-edges` | `CRATONVM_DBG_SWEEP_EDGES` |
 | `unreg-declined` | `CRATONVM_DBG_UNREG_DECLINED` |
+| `above-chain-kb` | `CRATONVM_DBG_ABOVE_CHAIN_KB` |
 | `sweep-referrers` | `CRATONVM_DBG_SWEEP_REFERRERS` |
 | `sweep-zero` | `CRATONVM_DBG_SWEEP_ZERO` |
 | `sweep-trace-class` | `CRATONVM_DBG_SWEEP_TRACE_CLASS` |
@@ -602,7 +603,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-393 tokens.
+400 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -623,8 +624,12 @@ export inherited from a parent shell.
 | `frame-bands` | `CRATONVM_JIT_NO_FRAME_BANDS` |
 | `oopmap-coverage-presence-only` | `CRATONVM_JIT_OOPMAP_COVERAGE_PRESENCE_ONLY` |
 | `unreg-accept-residue` | `CRATONVM_JIT_UNREG_ACCEPT_RESIDUE` |
+| `above-chain-scan` | `CRATONVM_JIT_ABOVE_CHAIN_SCAN` |
+| `above-chain-all-paths` | `CRATONVM_JIT_ABOVE_CHAIN_ALL_PATHS` |
+| `above-chain-from-sp` | `CRATONVM_JIT_ABOVE_CHAIN_FROM_SP` |
 | `a5-residue-filter` | `CRATONVM_JIT_A5_RESIDUE_FILTER` |
 | `a5-shape-filter` | `CRATONVM_JIT_A5_SHAPE_FILTER` |
+| `unreg-residue-licence` | `CRATONVM_JIT_UNREG_RESIDUE_LICENCE` |
 | `activation-global-mutex` | `CRATONVM_JIT_ACTIVATION_GLOBAL_MUTEX` |
 | `alloc-class-cache` | `CRATONVM_NO_JIT_ALLOC_CLASS_CACHE` |
 | `alloc-spill-sink` | `CRATONVM_JIT_NO_ALLOC_SPILL_SINK` |
@@ -708,6 +713,7 @@ export inherited from a parent shell.
 | `precise-getstatic-checkcast` | `CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST` |
 | `precise-alloc-athrow` | `CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW` |
 | `precise-indy` | `CRATONVM_JIT_NO_PRECISE_INDY` |
+| `precise-array-access` | `CRATONVM_JIT_NO_PRECISE_ARRAY_ACCESS` |
 | `ir-linear-scan` | `CRATONVM_JIT_IR_LINEAR_SCAN` |
 | `ir-inline-tlab` | `CRATONVM_JIT_IR_INLINE_TLAB` |
 | `tls-thread-fetch` | `CRATONVM_JIT_TLS_THREAD_FETCH` |
@@ -884,6 +890,7 @@ export inherited from a parent shell.
 | `door-recv-memo` | `CRATONVM_JIT_NO_DOOR_RECV_MEMO` |
 | `nonvirtual-fast-door` | `CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR` |
 | `frame-slot-reuse` | `CRATONVM_JIT_NO_FRAME_SLOT_REUSE` |
+| `door-sync` | `CRATONVM_JIT_NO_DOOR_SYNC` |
 | `frame-emplace` | `CRATONVM_JIT_NO_FRAME_EMPLACE` |
 | `iface-select-memo` | `CRATONVM_JIT_NO_IFACE_SELECT_MEMO` |
 | `ldc-const-cache` | `CRATONVM_JIT_NO_LDC_CONST_CACHE` |
@@ -978,6 +985,7 @@ export inherited from a parent shell.
 | `xt-helper-window-interior` | `CRATONVM_XT_HELPER_WINDOW_INTERIOR` |
 | `xt-helper-window-pin` | `CRATONVM_XT_HELPER_WINDOW_PIN` |
 | `xt-helper-window-scan` | `CRATONVM_XT_HELPER_WINDOW_SCAN` |
+| `xt-no-safe-peer-read` | `CRATONVM_XT_NO_SAFE_PEER_READ` |
 | `xt-jit-root-scan` | `CRATONVM_XT_JIT_ROOT_SCAN` |
 | `xt-peer-deadline-ms` | `CRATONVM_XT_PEER_DEADLINE_MS` |
 | `xt-peer-total-ms` | `CRATONVM_XT_PEER_TOTAL_MS` |
@@ -1022,7 +1030,7 @@ export inherited from a parent shell.
 | `moving-young-band-liveness-screen` | `CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN` |
 | `moving-young-band-thread-window` | `CRATONVM_MOVING_YOUNG_NO_BAND_THREAD_WINDOW` |
 | `zgc-jit-blanket-refusal` | `CRATONVM_ZGC_JIT_BLANKET_REFUSAL` |
-| `blocked-wake-jit-remap` | `CRATONVM_BLOCKED_WAKE_JIT_REMAP` |
+| `blocked-wake-jit-remap` | `CRATONVM_NO_BLOCKED_WAKE_JIT_REMAP` |
 | `blocked-peer-stack-remap` | `CRATONVM_GC_NO_BLOCKED_PEER_STACK_REMAP` |
 | `zgc-unrewritable-peer-refuses` | `CRATONVM_ZGC_UNREWRITABLE_PEER_REFUSES` |
 | `card-metrics` | `CRATONVM_GC_CARD_METRICS` |
@@ -1255,11 +1263,12 @@ export inherited from a parent shell.
 
 ## `CRATONVM_THREADS`
 
-22 tokens.
+23 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `jmx-owned-synchronizers` | `CRATONVM_JMX_OWNED_SYNCHRONIZERS` |
+| `monitor-fastpath` | `CRATONVM_MONITOR_FASTPATH` |
 | `assert-single-os-thread` | `CRATONVM_ASSERT_SINGLE_OS_THREAD` |
 | `async-handoff-sleep-floor-ms` | `CRATONVM_ASYNC_HANDOFF_SLEEP_FLOOR_MS` |
 | `async-submit-grace-ms` | `CRATONVM_ASYNC_SUBMIT_GRACE_MS` |
