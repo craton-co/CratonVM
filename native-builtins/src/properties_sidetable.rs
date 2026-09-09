@@ -1297,6 +1297,243 @@ pub fn replace_real_map(
     written
 }
 
+// ---------------------------------------------------------------------------
+// The other direction: real `map` -> the VM's system-property store
+// ---------------------------------------------------------------------------
+//
+// [`replace_real_map`] makes the receiver's real `map` readable by real
+// `Properties` bytecode. It does NOT make a WRITE through that bytecode
+// visible anywhere else, and once the `Properties` natives are retired
+// (`RETIRED_SHADOW_PHASE3_TRIPLES`) that write is the only one there is:
+// `System.getProperties().setProperty(k, v)` runs JDK bytecode straight into
+// the `map`, and the VM's own store -- which `System.getProperty` answers from
+// -- never hears about it.
+//
+// MEASURED: `probes/SystemRuntimeObjectSweep` rows 39 and 40 are what caught
+// it, and they are the ONLY two rows across 115 probes that the Phase 3
+// retirement moved.
+//
+//   a write through getProperties is visible to getProperty  four -> null
+//   setProperties round trip                    yes/null/true -> null/null/true
+//
+// The second is the same defect one level up: `System.setProperties(p)` read
+// its argument's entries out of the SIDE TABLE, and a `Properties` built by
+// real `<init>` has no side table -- its entries are in the real map.
+//
+// The functions below are the write half of the same bridge, and they are
+// deliberately shaped like their side-table twins
+// (`store_property_in_sidetable` / `remove_property_from_sidetable` /
+// `snapshot_sidetable`) so a future edit that adds a fourth mirror to
+// `System.setProperty` has an obvious place to put it.
+
+/// The receiver's real `map` field, or `None` if it has not been filled.
+///
+/// `None` is a real answer and not an error: [`replace_real_map`]'s stated
+/// invariant is that the field holds the whole snapshot or is ABSENT, so every
+/// caller here treats absence as "the side table is still the store" and does
+/// nothing. That is also what keeps these functions inert under `--real-jdk`,
+/// where the field is never filled at all.
+fn real_map_of(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(this, "map") {
+        Value::Object(Some(m)) => Some(m),
+        _ => None,
+    }
+}
+
+/// Ask the receiver's own bytecode for a property.
+///
+/// `Properties.getProperty` rather than `map.get`, because the JDK method is
+/// the definition: it walks the `defaults` chain and answers `null` for a
+/// non-`String` value, and re-implementing either here would be a second
+/// opinion that drifts from the first.
+///
+/// Callers must treat `None` as "ask the VM store next", never as "absent".
+/// The real map can legitimately lag the store -- a property the VM set after
+/// the last `System.getProperties()` call is only in the store -- so this is a
+/// first opinion, not an authority.
+pub fn lookup_in_real_map(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key: &str,
+) -> Option<String> {
+    real_map_of(ctx, this)?;
+    let this_pin = ctx.pin_native_root(this);
+    let k = ctx.create_string(key);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let got = ctx.invoke_virtual(
+        this_cur,
+        "getProperty",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        &[Value::Object(Some(k))],
+    );
+    ctx.unpin_native_roots(this_pin);
+    match got {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+        _ => None,
+    }
+}
+
+/// Mirror one `System.setProperty` into the real map.
+///
+/// The twin of [`store_property_in_sidetable`], and it exists for the reason
+/// that one does: a caller holding the singleton (Spring's `systemProperties`
+/// bean is the recorded case) never calls `System.getProperties()` again, so
+/// the refill on that path never re-fires and the held reference goes stale.
+pub fn store_property_in_real_map(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key: &str,
+    value: &str,
+) {
+    if key.len() > MAX_KV_LEN || value.len() > MAX_KV_LEN {
+        return;
+    }
+    if real_map_of(ctx, this).is_none() {
+        return;
+    }
+    let this_pin = ctx.pin_native_root(this);
+    let k = ctx.create_string(key);
+    let k_pin = ctx.pin_native_root(k);
+    let v = ctx.create_string(value);
+    let k_cur = ctx.read_native_pin(k_pin, k);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let r = ctx.invoke_virtual(
+        this_cur,
+        "setProperty",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;",
+        &[Value::Object(Some(k_cur)), Value::Object(Some(v))],
+    );
+    ctx.unpin_native_roots(k_pin);
+    ctx.unpin_native_roots(this_pin);
+    if props_stderr_diag() {
+        if let Err(e) = r {
+            eprintln!("[PROPS-REAL-MAP] setProperty {key:?} into the real map: {e:?}");
+        }
+    }
+}
+
+/// Mirror one `System.clearProperty` into the real map.
+pub fn remove_property_from_real_map(ctx: &mut dyn NativeContext, this: ObjectRef, key: &str) {
+    if real_map_of(ctx, this).is_none() {
+        return;
+    }
+    let this_pin = ctx.pin_native_root(this);
+    let k = ctx.create_string(key);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let r = ctx.invoke_virtual(
+        this_cur,
+        "remove",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        &[Value::Object(Some(k))],
+    );
+    ctx.unpin_native_roots(this_pin);
+    if props_stderr_diag() {
+        if let Err(e) = r {
+            eprintln!("[PROPS-REAL-MAP] remove {key:?} from the real map: {e:?}");
+        }
+    }
+}
+
+/// Every entry in the receiver's real `map`, as `System.setProperties` needs
+/// it.
+///
+/// `keySet().toArray()` and then one `getProperty` per key. Not
+/// `stringPropertyNames()`, whose `Set` would have to be walked through an
+/// `Iterator` from native code for no gain, and not a direct read of the
+/// `ConcurrentHashMap` internals, which is the thing this whole change exists
+/// to stop doing.
+///
+/// Non-`String` keys are skipped rather than stringified: `Properties`
+/// tolerates them through its `Hashtable` inheritance, `stringPropertyNames`
+/// drops them, and the VM's property store is `String`-keyed -- so dropping is
+/// both the JDK's answer and the only representable one.
+///
+/// # GC
+///
+/// The array and the receiver are pinned and re-read across the loop, because
+/// every `getProperty` re-enters Java and is a collection point. See
+/// [`replace_real_map`]'s note on the same hazard.
+pub fn snapshot_real_map(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<(String, String)> {
+    if real_map_of(ctx, this).is_none() {
+        return Vec::new();
+    }
+    let this_pin = ctx.pin_native_root(this);
+    let mut this_cur = ctx.read_native_pin(this_pin, this);
+    let keys = match ctx.invoke_virtual(this_cur, "keySet", "()Ljava/util/Set;", &[]) {
+        Ok(Some(Value::Object(Some(set)))) => {
+            let set_pin = ctx.pin_native_root(set);
+            let set_cur = ctx.read_native_pin(set_pin, set);
+            let arr = ctx.invoke_virtual(set_cur, "toArray", "()[Ljava/lang/Object;", &[]);
+            ctx.unpin_native_roots(set_pin);
+            match arr {
+                Ok(Some(Value::Object(Some(a)))) => Some(a),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let Some(keys) = keys else {
+        ctx.unpin_native_roots(this_pin);
+        return Vec::new();
+    };
+    let keys_pin = ctx.pin_native_root(keys);
+    let mut keys_cur = ctx.read_native_pin(keys_pin, keys);
+    let n = ctx.array_length(keys_cur);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        keys_cur = ctx.read_native_pin(keys_pin, keys_cur);
+        let Value::Object(Some(k_obj)) = ctx.get_array_element(keys_cur, i) else {
+            continue;
+        };
+        let Some(key) = ctx.read_string(k_obj) else {
+            continue;
+        };
+        this_cur = ctx.read_native_pin(this_pin, this_cur);
+        if let Some(value) = lookup_in_real_map(ctx, this_cur, &key) {
+            out.push((key, value));
+        }
+    }
+    ctx.unpin_native_roots(keys_pin);
+    ctx.unpin_native_roots(this_pin);
+    out
+}
+
+/// Fold anything written straight into the real map back into the VM's store.
+///
+/// The one write path with no mirror: real `Properties` bytecode, reached
+/// through a reference the caller already holds. `System.setProperty` and
+/// `System.clearProperty` write both stores themselves; this is for
+/// `System.getProperties().setProperty(..)`, which writes only the map.
+///
+/// Called at the TOP of the `--jdk-only` `System.getProperties` body, before
+/// the snapshot [`replace_real_map`] refills from -- the order is the point.
+/// Refilling first would `clear()` the map and drop exactly the writes this
+/// exists to harvest.
+///
+/// # What it cannot do
+///
+/// A `remove` performed directly on the receiver is invisible here: this is a
+/// union, not a reconciliation, and there is no record of what the map used to
+/// hold. `System.clearProperty` is mirrored, so the reachable gap is a direct
+/// `props.remove(k)` on the system singleton, whose key then survives in the VM
+/// store until something overwrites it. Recorded rather than papered over:
+/// closing it needs a generation counter on the map, which is a larger change
+/// than the defect justifies.
+pub fn harvest_real_map(ctx: &mut dyn NativeContext, this: ObjectRef) -> usize {
+    let mut harvested = 0usize;
+    for (key, value) in snapshot_real_map(ctx, this) {
+        if ctx.get_system_property(&key).as_deref() == Some(value.as_str()) {
+            continue;
+        }
+        let _ = ctx.set_system_property(&key, &value);
+        harvested += 1;
+    }
+    if harvested > 0 && props_stderr_diag() {
+        eprintln!("[PROPS-REAL-MAP] harvested {harvested} entries written through the receiver");
+    }
+    harvested
+}
+
 /// Public snapshot of side-table entries for a given object, used by
 /// surefire `setAsSystemProperties` etc. to iterate entries without
 /// going through the inner Map field.

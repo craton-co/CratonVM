@@ -372,3 +372,48 @@ dispatched was retired — and nothing moved, because the probe exercises
 Convert a dial result into a table entry only via a registry dump **from a run
 of the very probe whose improvement you are citing**, then rebuild and
 re-measure on two binaries.
+
+### After the build: prove the retirement is not INERT before reading a probe
+
+The four preconditions above decide whether to retire. This is the first thing
+to check once you have, and it is not any of them: **a refusal is a retirement
+only when nothing already owns the triple.**
+
+`NativeMethodRegistry::register_inner` refuses a `SyntheticStub` under
+`--jdk-only` without inserting it, which is what lets the real bytecode run. But
+`JdkOnlyViolation::SyntheticNativeRegistered` carries a `survivor`, and when it
+is non-null an EARLIER registration of the same triple is still in the slot and
+still serving — so strict mode runs that older native instead of the bytecode
+the policy asked for, every probe reads exactly as it did before, and the wave
+is a no-op that looks like a clean result. Re-registration is common: 53 of the
+185 triples in the 2026-09-09 CHM/`Properties` wave are registered more than
+once.
+
+```text
+python - <<'PY' report.json      # --jdk-only-report from any run of your probe
+import json, sys
+pre = ("java/util/concurrent/ConcurrentHashMap", "java/util/Properties")
+v = json.load(open(sys.argv[1], encoding="utf-8"))["violations"]
+ours = [r for r in v if r["kind"] == "synthetic-native-registered"
+        and r["class"].startswith(pre)]
+print(len(ours), "refusals,", sum(1 for r in ours if r["survivor"]), "with a survivor")
+PY
+```
+
+Zero survivors is the answer you need. Anything else means the table entry is
+inert for that triple and the registration that supersedes it has to be found
+and dealt with first.
+
+### A probe whose noise floor exceeds the effect cannot score a retirement
+
+The 2026-09-09 wave moved two probes of 115. One was
+`SystemRuntimeObjectSweep`, +4, and it was a real defect. The other was
+`VtHandoffProbe`, −4, and it was NOTHING: its rows are thread counts (`polls
+that received a value |96|` against `|76|`, `threads joined |510|` against
+`|512|`) and both arms are wrong against HotSpot in the same way on every run.
+
+A negative delta is the shape of the result you want, which is exactly why it is
+the one to distrust. Before recording an improvement, read the ROWS that moved
+and ask whether the probe could have produced that delta with no change at all —
+`measure a flaky vector's noise floor before explaining it` applies to the good
+news too.

@@ -5,6 +5,7 @@
 
 use cratonvm_native_api::{NativeKind, NativeMethodRegistry};
 use cratonvm_native_builtins::register_essential_natives;
+use cratonvm_types::compat::CompatibilityMode;
 
 fn production_registry() -> NativeMethodRegistry {
     let mut registry = NativeMethodRegistry::new();
@@ -787,4 +788,84 @@ fn p61_does_not_displace_phase57_path_natives() {
              instead of keeping a copy in sync."
         );
     }
+}
+
+/// The `--jdk-only` `System.getProperties` arm fills the REAL `map` field, and
+/// `native-api`'s Phase 3 retirement table is why this is a test.
+///
+/// `RETIRED_SHADOW_PHASE3_TRIPLES` retires `java/util/Properties.getProperty`
+/// and 32 of its siblings. JDK 9 moved `Properties`' storage into a
+/// `ConcurrentHashMap` field named `map`, so every one of those real bodies
+/// reads that field, and the object `System.getProperties()` returns is built
+/// by this VM. Between G60-1 and 2026-09-09 the field was PERMANENTLY NULL and
+/// `retired_shadow.rs` held both `getProperty` overloads back for exactly that
+/// reason, in these words: *retire them in the same change that makes that
+/// receiver real, or not at all.*
+///
+/// `native-api` cannot check the other half of that bargain — `native-builtins`
+/// depends on it and not the reverse — so a comment there is all it has, and a
+/// comment is not a compile-time link. This is the link. Delete the
+/// `replace_real_map` call and this fails, rather than
+/// `StaticProperty.<clinit>` failing with `InternalError: null property:
+/// java.home` in a `--jdk-only` run nothing in `cargo test` reaches.
+///
+/// Two halves, because either alone is a false green:
+///
+///  1. the two compatibility modes bind DIFFERENT bodies for the triple — a
+///     runtime check, so a branch collapsed to one arm cannot pass it;
+///  2. the `--jdk-only` body calls `replace_real_map` — a source check, because
+///     nothing else here can execute a native without a live `NativeContext`.
+#[test]
+fn the_jdk_only_get_properties_arm_fills_the_real_map() {
+    const TRIPLE: (&str, &str, &str) = (
+        "java/lang/System",
+        "getProperties",
+        "()Ljava/util/Properties;",
+    );
+    const BODY: &str = "native_system_get_properties_jdk_only";
+    const FILL: &str = "replace_real_map";
+
+    let (class, method, descriptor) = TRIPLE;
+
+    let production = production_registry();
+    let mut jdk_only = NativeMethodRegistry::new();
+    jdk_only.set_compatibility_mode(CompatibilityMode::JdkOnly);
+    register_essential_natives(&mut jdk_only);
+    assert!(
+        jdk_only.compatibility_mode().is_jdk_only(),
+        "the mode did not stick, so the branch under test was never taken"
+    );
+
+    let prod_body = production
+        .find(class, method, descriptor)
+        .expect("production mode must register System.getProperties");
+    let jdk_body = jdk_only
+        .find(class, method, descriptor)
+        .expect("--jdk-only must register System.getProperties");
+    assert!(
+        !std::ptr::fn_addr_eq(prod_body, jdk_body),
+        "both modes bound the same body for {class}.{method}{descriptor}; the \
+         registration-time branch has collapsed, so --jdk-only is running the \
+         --real-jdk body and the real Properties.map is null again"
+    );
+
+    // The source half. Located by the function's own name rather than by a
+    // literal call expression: `cargo fmt` rewraps an argument list and a test
+    // that reads the call TEXT goes red for a formatting change.
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+    let text = std::fs::read_to_string(&src).expect("lib.rs must be readable");
+    let body = strip_test_modules(&text);
+    let at = body
+        .find(&format!("fn {BODY}("))
+        .unwrap_or_else(|| panic!("{BODY} is gone from lib.rs; it is what fills Properties.map"));
+    let end = body[at..]
+        .find("\n}\n")
+        .map(|rel| at + rel)
+        .unwrap_or(body.len());
+    assert!(
+        body[at..end].contains(FILL),
+        "{BODY} no longer calls {FILL}. The 185 triples in \
+         RETIRED_SHADOW_PHASE3_TRIPLES read the real Properties.map, and \
+         nothing else fills it."
+    );
 }

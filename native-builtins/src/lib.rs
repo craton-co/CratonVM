@@ -145,6 +145,60 @@ fn system_property_check_key(
     Ok(key)
 }
 
+/// What `System.getProperty` answers, in precedence order.
+///
+/// Three sources, and the order is the whole content of this function:
+///
+///  1. the system `Properties` object's own real `map`, when it has one;
+///  2. the VM's system-property store;
+///  3. [`system_property_fallback`], the bootstrap defaults.
+///
+/// (1) is new with the Phase 3 `java/util/Properties` retirement and is the
+/// half a mirror cannot do. `System.setProperty` and `System.clearProperty`
+/// write BOTH stores, so those two never disagree. What has no mirror is real
+/// JDK bytecode reached through a reference the caller already holds --
+/// `System.getProperties().setProperty(k, v)` -- which writes the map and
+/// nothing else. Asking the map first is what makes that write visible here.
+///
+/// It cannot be the ONLY source: the map is refilled from the store by
+/// `System.getProperties()`, so between two such calls it legitimately lags a
+/// property the VM has set, and every miss has to fall through. The two orders
+/// are not interchangeable -- store-first would answer the STALE value for a
+/// key written through the receiver, which is the update half of the same
+/// defect and would have left `SystemRuntimeObjectSweep` row 39 green for the
+/// wrong reason (it adds a key rather than changing one).
+///
+/// # The residual, and why this order and not the other
+///
+/// A property written into the VM store by RUST -- `set_system_property` from
+/// somewhere in the VM, with no `System.setProperty` involved -- is masked here
+/// by an older value in the map, until the next `System.getProperties()` call
+/// refills it. The reverse order has a residual too, and a worse one: it masks
+/// every write through a held `Properties` reference, which is Java-visible.
+///
+/// The tie-break is not a guess about which is rarer. On a real JDK there is
+/// exactly one store and it IS the `Properties` object -- `System.getProperty`
+/// is literally `props.getProperty(key)`. This VM's own store is the shim, so
+/// when the two disagree the object is the one telling the truth about what
+/// Java did, and the store is the one that has to catch up. That is the same
+/// direction the whole §1.4 retirement campaign moves in.
+///
+/// Cost: one `invoke_virtual` per call, and only once a system `Properties`
+/// singleton exists with a filled `map`. MEASURED as affordable rather than
+/// assumed -- `System.getProperty`'s native carries `invocations: 0` in the
+/// probe-tree census, because the VM's own reads go through
+/// `NativeContext::get_system_property` in Rust and JDK callers go through
+/// `StaticProperty`'s cached statics. This is not a hot path.
+pub(crate) fn system_property_read(ctx: &mut dyn NativeContext, key: &str) -> Option<String> {
+    if let Some(props) = crate::lang_system::system_props_singleton(ctx.vm_identity()) {
+        if let Some(v) = crate::properties_sidetable::lookup_in_real_map(ctx, props, key) {
+            return Some(v);
+        }
+    }
+    ctx.get_system_property(key)
+        .or_else(|| system_property_fallback(ctx, key))
+}
+
 pub(crate) fn system_property_fallback(ctx: &dyn NativeContext, key: &str) -> Option<String> {
     // An explicit `System.setProperties(p)` REPLACES the property map, and a
     // key absent from the replacement is absent -- not a cue to fall back to a
@@ -7450,6 +7504,12 @@ fn native_system_get_properties_jdk_only(
     _args: &[Value],
 ) -> MethodCallResult {
     let props = system_properties_object(ctx)?;
+    // HARVEST BEFORE REFILL. `replace_real_map` clears the map and refills it
+    // from the VM store, so anything written straight through the receiver --
+    // `System.getProperties().setProperty(k, v)`, which is real JDK bytecode
+    // once `java/util/Properties` is retired -- has to be folded back into the
+    // store first or this call is what erases it.
+    crate::properties_sidetable::harvest_real_map(ctx, props);
     let snapshot = ctx.list_system_properties();
     crate::properties_sidetable::replace_sidetable(ctx, props, &snapshot);
     crate::properties_sidetable::replace_real_map(ctx, props, &snapshot);
@@ -10883,10 +10943,7 @@ pub fn register_essential_natives_with_shims(
             // 2026-08-29 -- see [`system_property_check_key`], which all four
             // entry points now share so they cannot drift apart again.
             let key = system_property_check_key(ctx, args)?;
-            match ctx
-                .get_system_property(&key)
-                .or_else(|| system_property_fallback(ctx, &key))
-            {
+            match system_property_read(ctx, &key) {
                 Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
                 None => Ok(Some(Value::Object(None))),
             }
@@ -10902,10 +10959,7 @@ pub fn register_essential_natives_with_shims(
             // default was the more misleading of the two, because it looks
             // exactly like a correctly-handled missing property.
             let key = system_property_check_key(ctx, args)?;
-            match ctx
-                .get_system_property(&key)
-                .or_else(|| system_property_fallback(ctx, &key))
-            {
+            match system_property_read(ctx, &key) {
                 Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
                 None => Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None)))),
             }
@@ -10941,6 +10995,10 @@ pub fn register_essential_natives_with_shims(
             // property as absent even though `System.getProperty("foo")` sees it.
             if let Some(props) = crate::lang_system::system_props_singleton(ctx.vm_identity()) {
                 crate::properties_sidetable::store_property_in_sidetable(ctx, props, &key, &val);
+                // And the REAL map, which is the store once the `Properties`
+                // natives are retired. Inert while the field is null, so
+                // `--real-jdk` is untouched.
+                crate::properties_sidetable::store_property_in_real_map(ctx, props, &key, &val);
             }
             match old {
                 Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
@@ -10964,6 +11022,7 @@ pub fn register_essential_natives_with_shims(
             // the matching comment in `setProperty` above (SC-web-method-spel RC-A).
             if let Some(props) = crate::lang_system::system_props_singleton(ctx.vm_identity()) {
                 crate::properties_sidetable::remove_property_from_sidetable(ctx, props, &key);
+                crate::properties_sidetable::remove_property_from_real_map(ctx, props, &key);
             }
             match result {
                 Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
@@ -10982,9 +11041,22 @@ pub fn register_essential_natives_with_shims(
         "setProperties",
         "(Ljava/util/Properties;)V",
         |ctx, args| {
+            // The side table FIRST, and the real map only when it is empty.
+            // Order matters both ways round: a VM-built `Properties` has a side
+            // table and may have no real map, and a `new Properties()` built by
+            // real `<init>` has a real map and no side table. Reading the
+            // wrong one silently installs an EMPTY property set, which is how
+            // `SystemRuntimeObjectSweep`'s `setProperties round trip` row read
+            // `null/null/true` under the Phase 3 retirement.
             let entries = match args.first() {
                 Some(Value::Object(Some(props))) => {
-                    crate::properties_sidetable::snapshot_sidetable(ctx, *props)
+                    let from_sidetable =
+                        crate::properties_sidetable::snapshot_sidetable(ctx, *props);
+                    if from_sidetable.is_empty() {
+                        crate::properties_sidetable::snapshot_real_map(ctx, *props)
+                    } else {
+                        from_sidetable
+                    }
                 }
                 _ => Vec::new(),
             };
