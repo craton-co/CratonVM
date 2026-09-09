@@ -279,6 +279,46 @@ impl ObjectStartBits {
         }
     }
 
+    /// `(base, span)` — the arena extent this bitmap can represent at all.
+    ///
+    /// Exposed for the evacuator's refusal census: an address the bitmap says
+    /// is not an object start because it lies OUTSIDE the covered span is a
+    /// completely different finding from one the walk simply did not visit,
+    /// and the report has to be able to tell them apart.
+    #[inline]
+    pub(crate) fn extent(&self) -> (usize, usize) {
+        (self.base, self.span)
+    }
+
+    /// The highest recorded object start at or below `addr`, if any.
+    ///
+    /// For the evacuator's refusal census: an address the walk did not record
+    /// is either an INTERIOR word of an object it did record -- in which case
+    /// the reference itself is wrong and the refusal is correct -- or a base
+    /// the walk never reached. The distance to the nearest start below is what
+    /// separates them.
+    pub(crate) fn nearest_start_at_or_below(&self, addr: usize) -> Option<usize> {
+        let off = addr.checked_sub(self.base)?;
+        if off >= self.span {
+            return None;
+        }
+        let mut bit = off >> 3;
+        loop {
+            let w = bit >> 6;
+            let b = bit & 63;
+            let word = self.words[w].load(Ordering::Relaxed);
+            let masked = word & (u64::MAX >> (63 - b));
+            if masked != 0 {
+                let hi = 63 - masked.leading_zeros() as usize;
+                return Some(self.base + (((w << 6) | hi) << 3));
+            }
+            if w == 0 {
+                return None;
+            }
+            bit = (w << 6) - 1;
+        }
+    }
+
     /// Membership. An address outside the span, or not 8-byte aligned, is not
     /// an object start — the same answer the `FxHashSet` gave.
     #[inline]

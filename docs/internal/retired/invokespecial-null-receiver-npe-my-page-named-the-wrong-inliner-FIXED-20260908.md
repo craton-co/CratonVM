@@ -196,6 +196,18 @@ categories.
   inlining dropping a JVMS-visible property that the un-inlined path keeps.
   Both are now named in `tools/e2e-ratchet.txt`; neither is ratcheted, so no
   job changes colour.
+
+> **SUPERSEDED 2026-09-09 — the sentence above ("neither is ratcheted, so no
+> job changes colour") is no longer true, and neither is "the second RED".**
+> `stack_trace_across_tiers` was fixed by `c798aae82` at 16:37 on 2026-09-08,
+> eighteen minutes after the survey line above was written, and is ratcheted
+> in `tools/e2e-ratchet.txt` as of 2026-09-09 (10/10 runs, three arms
+> byte-identical on all three rows). The cause named above is also wrong for
+> that target: it was not the inline frame map dropping frames but the IR tier
+> splicing callee bodies and recording no frame rows at all, which is why
+> `CRATONVM_JIT_NO_INLINE_FRAME_MAP=1` did not revert it. The family claim
+> ("inlining dropping a JVMS-visible property") still holds; the mechanism
+> does not. Body left unedited.
 * **The 2026-08-30 fix is not accused of being wrong.** Its code is present and
   its comment still describes its own emitter correctly. What changed is which
   emitter gets the site.

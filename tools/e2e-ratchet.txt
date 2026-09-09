@@ -71,6 +71,7 @@ server_socket_adaptor_accept
 socket_input_stream_timeout
 spring_io_enumset_regression
 sslserversocket_accept_echo
+stack_trace_across_tiers
 stackwalker_reflect_gc
 sublist_view_regression
 synchronized_wrapper_mutex
@@ -145,8 +146,10 @@ writer_flush_real
 #
 # Re-surveyed 2026-09-08 against a release binary and Temurin 25.0.3+9 on
 # Windows: 79 RUNS, 14 VACUOUS, 2 RED out of 95 (was 73/19/3 on 2026-08-30).
-# LATER THE SAME DAY one of those two REDs was fixed and ratcheted, leaving
-# ONE: `stack_trace_across_tiers`, at the bottom of this block.
+# LATER THE SAME DAY one of those two REDs was fixed and ratcheted; the other
+# (`stack_trace_across_tiers`) was fixed 18 minutes after this line was
+# written, and ratcheted on 2026-09-09 -- see the bottom of this block. The
+# "2 RED" above is the count ON 2026-09-08 and has not been re-surveyed.
 #
 # PROMOTED 2026-09-08 (second sitting), after `936536100` fixed the RED this
 # block used to carry (`null_receiver_cached_invoke`): five of the
@@ -199,14 +202,38 @@ writer_flush_real
 # red nobody has seen. What is needed is the same rate measured on Linux. Until
 # then they are named here rather than left as a surprise.
 #
-#   stack_trace_across_tiers   `after_main_osr` loses the `mid`/`outer`
-#                              frames: "the callees the JIT inlined into their
-#                              caller's artifact contributing no frame at
-#                              all". Same family as the null-receiver RED this
-#                              block used to carry beside it -- inlining
-#                              dropping a JVMS-visible property that the
-#                              un-inlined path preserves. That one is now fixed
-#                              (`936536100`, an `Op::Guard` ahead of the IR
-#                              tier's splice) and ratcheted; this one is not,
-#                              and the fix there is not obviously the fix here:
-#                              an absent FRAME is not an absent CHECK.
+#   stack_trace_across_tiers   FIXED AND PROMOTED 2026-09-09. It is in the
+#                              ratcheted list above; this entry is kept only so
+#                              that a reader who remembers it as RED finds out
+#                              why it is not.
+#
+# The RED above was written at 16:19 on 2026-09-08. `c798aae82` fixed it at
+# 16:37 the same day -- eighteen minutes later -- so this block was stale
+# before the day was out and nobody re-read it. The cause was not the inline
+# frame map: the IR tier spliced callee bodies and recorded no frame rows at
+# all, so `CRATONVM_JIT_NO_INLINE_FRAME_MAP=1` did not remove `mid`/`outer`
+# (they were already gone) and the test's own anti-vacuity switch had stopped
+# measuring anything. That commit added the missing producer.
+#
+# Verified here on 2026-09-09, Windows, DEBUG binary built from a pristine
+# `origin/dev` @ ccf731dd3 (`git diff origin/dev` empty), Temurin 25.0.3+9:
+#
+#   * three arms on ONE class file -- HotSpot, `CRATONVM_DISABLE_JIT=1`, and
+#     the JIT arm -- agree byte-for-byte on all THREE rows, including
+#     `after_main_osr   len=5 [leaf:25 mid:26 outer:27 probe:42 main:66]`.
+#     `main:66` is the OSR-refreshed pc; the pre-fix witness was `main:62`.
+#   * 10 runs of the target under `CRATONVM_REQUIRE_E2E=1`: 10 PASS, 0 FAIL,
+#     39.5-48.4s each. Ten and not two because this row only exists if `main`
+#     really OSR-compiles, which is the same reason
+#     `null_receiver_cached_invoke` was run ten times above.
+#
+# COST: +~42s on Windows/debug. The Linux number is unmeasured, and the step's
+# budget there is the thing that matters (`timeout-minutes: 15`), so if that
+# step starts running close to its wall this is a fair row to reconsider --
+# unlike the four cost-deferred candidates above, though, this one is a gate
+# against a defect that has already regressed once.
+#
+# NO RED TARGET IS NAMED IN THIS FILE ANY MORE. That is not the same claim as
+# "there are none": the last full survey is the dated one in the header, and
+# nobody has re-run all 95 since. It means only that both targets this block
+# named have been fixed and ratcheted.

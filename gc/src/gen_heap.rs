@@ -2937,6 +2937,9 @@ fn fwd_walk_enabled() -> bool {
     })
 }
 
+/// See `GenerationalHeap::note_objstart_walk`.
+static LAST_OBJSTART_WALK: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
+
 impl GenerationalHeap {
     /// Bind this heap to its VM's compact-layout domain.
     pub fn set_layout_domain(&self, domain: u32) {
@@ -5137,6 +5140,24 @@ impl GenerationalHeap {
                     }
                 }
                 let is_true_undersized = real_fields.is_some_and(|n| n > num_slots);
+                // A class that declares NO fields at all, probed at any index.
+                //
+                // Split out of the general arm below because that arm's triage
+                // clause -- "a REAL JDK class whose `num_slots` equals
+                // `real_field_count` is NOT benign" -- is VACUOUSLY true here
+                // and reads as an accusation. The clause names an ALIASING
+                // layout: two natives writing and reading different shapes into
+                // one object. A zero-field class has no room for a second
+                // layout, so there is no other writer to disagree with, and the
+                // read can only be a caller-side speculative probe.
+                //
+                // MEASURED: `java/nio/Bits$1` (`real_field_count=Some(0)`,
+                // `num_slots=0`) fired this once per boot from
+                // `buffer_pool_get_name`, on runs that then passed 12/12, and
+                // it was filed as the lead on an unrelated SIGSEGV minutes
+                // later. That probe is fixed at its caller; this arm is so the
+                // NEXT one is not read the same way.
+                let declares_no_fields = num_slots == 0 && real_fields == Some(0);
                 if is_true_undersized {
                     tracing::error!(
                         target: "cratonvm::gc::guard",
@@ -5149,6 +5170,28 @@ impl GenerationalHeap {
                         "gen_heap::get_field: out-of-bounds field read dropped \
                          (undersized object layout — class declares more fields \
                          than the object was allocated with)",
+                    );
+                } else if declares_no_fields {
+                    tracing::warn!(
+                        target: "cratonvm::gc::guard",
+                        obj = ?obj_ref.as_ptr(),
+                        index,
+                        num_slots,
+                        class_id = ?header.class_id,
+                        class_name = %class_name,
+                        real_field_count = ?real_fields,
+                        "gen_heap::get_field: out-of-bounds field read dropped \
+                         (caller used slot index past receiver's layout). This \
+                         class declares NO fields at all, so it cannot be \
+                         carrying a second, aliasing layout, and the \
+                         `num_slots` == `real_field_count` clause of the \
+                         general warning does NOT apply to it: the read is a \
+                         caller-side speculative probe against a receiver that \
+                         does not match, and the null it gets back is the \
+                         answer the caller's own fallback already expects. Fix \
+                         it at the CALLER, by asking the receiver's class \
+                         before reading a slot -- it is not evidence of data \
+                         loss.",
                     );
                 } else {
                     tracing::warn!(
@@ -8259,6 +8302,23 @@ impl GenerationalHeap {
         mv_phase!("objstart_walk");
         if mv_phase_on {
             moving_phase_count_push("objstart_walk_bytes", young_used as u128);
+        }
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOT_REMAP_AUDIT").is_some() {
+            let skip_bytes: usize = start_skips.iter().map(|&(_, sz)| sz).sum();
+            let head: Vec<String> = start_skips
+                .iter()
+                .take(4)
+                .map(|&(off, sz)| format!("0x{off:x}+0x{sz:x}"))
+                .collect();
+            Self::note_objstart_walk(format!(
+                "used=0x{young_used:x} starts_recorded={} parallel={walked_in_parallel} \
+                 chunks={objstart_chunk_count} complete={start_walk_complete} \
+                 skips={} skip_bytes=0x{skip_bytes:x} first_skips=[{}] \
+                 reserved_tails={moving_with_reserved_tails}",
+                young_object_starts.len(),
+                start_skips.len(),
+                head.join(" "),
+            ));
         }
         if moving_with_reserved_tails {
             // T-3 refusal. The walk above completed fine — the tails were
@@ -16265,6 +16325,115 @@ impl GenerationalHeap {
     /// every survivor is promoted regardless of age. This breaks the
     /// long-lived-tree semispace death spiral.
     #[allow(clippy::too_many_arguments)]
+    /// `CRATONVM_DBG_ROOT_REMAP_AUDIT`: what the object-start walk that built
+    /// THIS cycle's bitmap actually did.
+    ///
+    /// A refusal names an address the bitmap does not hold; whether that is the
+    /// walk's fault needs the walk's own numbers, and by the time
+    /// `forward_object` runs they are three hundred lines out of scope. Stored
+    /// rather than printed: it would otherwise be one line per collection on a
+    /// run that does seven thousand of them.
+    fn note_objstart_walk(summary: String) {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOT_REMAP_AUDIT").is_none() {
+            return;
+        }
+        *LAST_OBJSTART_WALK.lock() = Some(summary);
+    }
+
+    /// `CRATONVM_DBG_ROOT_REMAP_AUDIT`: the evacuator REFUSED to move a root.
+    ///
+    /// `forward_object_impl` has three refusal paths and every one of them
+    /// returns `old_ptr` unchanged, which `seed_roots` writes straight back
+    /// into the root slot. On the moving path that is indistinguishable from a
+    /// successful no-op: the object is left in from-space, gets no pointer-map
+    /// entry, and from-space is then reset -- so the slot dangles and nothing
+    /// downstream can say the evacuator declined it rather than the scan
+    /// missing it.
+    ///
+    /// The BindableTests residual is exactly that shape: `in_root_set=true`,
+    /// `scan_would_root=true`, and no pointer-map entry.
+    #[cold]
+    fn note_forward_refusal(
+        old_ptr: *mut u8,
+        reason: &'static str,
+        young_from: &Arena,
+        starts: &crate::young_mark::ObjectStartBits,
+    ) {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOT_REMAP_AUDIT").is_none() {
+            return;
+        }
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 24 {
+            let base = young_from.base_ptr() as usize;
+            let (bm_base, bm_span) = starts.extent();
+            let off = (old_ptr as usize).wrapping_sub(base);
+            let in_free_block = young_from
+                .free_blocks_sorted()
+                .iter()
+                .any(|(o, sz)| off >= *o && off < *o + *sz);
+            eprintln!(
+                "[forward-refused] {reason} old_ptr=0x{:x} (#{n}) off=0x{off:x} \
+                 arena=[0x{base:x} cap=0x{:x} used=0x{:x}] bitmap=[0x{bm_base:x} span=0x{bm_span:x}] \
+                 off_beyond_bitmap={} in_free_block={in_free_block} -- the root stays in \
+                 from-space with no pointer-map entry, and from-space is about to be reset",
+                old_ptr as usize,
+                young_from.capacity(),
+                young_from.used(),
+                off >= bm_span,
+            );
+            // The header is still intact here: from-space is not reset until
+            // after the copy phase. A plausible header at `old_ptr` says the
+            // walk missed a real object; an implausible one says the reference
+            // was already wrong before this cycle, and the refusal is right.
+            let near = starts.nearest_start_at_or_below(old_ptr as usize);
+            // SAFETY: `old_ptr` is inside from-space (checked by the caller),
+            // which is mapped and not yet reset; two byte reads and a u32 read
+            // at the fixed header offsets are in bounds.
+            let (kind_tag, elem_tag, cid) = unsafe {
+                (
+                    cratonvm_types::kind_tag_at(old_ptr),
+                    cratonvm_types::element_type_tag_at(old_ptr),
+                    std::ptr::read_unaligned(old_ptr as *const u32),
+                )
+            };
+            eprintln!(
+                "[forward-refused] ^ header_at_old_ptr: class_id={cid} kind_tag={kind_tag} \
+                 elem_tag={elem_tag} nearest_recorded_start={} delta={}",
+                near.map(|a| format!("0x{a:x}")).unwrap_or_else(|| "none".into()),
+                near.map(|a| (old_ptr as usize).saturating_sub(a) as i64).unwrap_or(-1),
+            );
+            if let Some(w) = LAST_OBJSTART_WALK.lock().as_ref() {
+                eprintln!("[forward-refused] ^ objstart_walk: {w}");
+            }
+            // THE OBJECT THE WALK STRODE OVER THIS ADDRESS WITH.
+            //
+            // The refused address is either an INTERIOR word of the object at
+            // `nearest_recorded_start` -- in which case the reference itself is
+            // wrong and this refusal is correct -- or the walk mis-sized that
+            // object and strode over live ones. Its class, kind and computed
+            // stride say which, and it is the one fact the census could not
+            // supply.
+            if let Some(near) = near {
+                if near != old_ptr as usize {
+                    // SAFETY: `near` is an object start this cycle's own walk
+                    // recorded, inside from-space, which is mapped and not yet
+                    // reset.
+                    let h = unsafe { &*(near as *const ObjectHeader) };
+                    eprintln!(
+                        "[forward-refused] ^ object_at_nearest_start: addr=0x{near:x}                          class_id={} kind={:?} num_slots={} array_length={} stride=0x{:x}                          covers_refused={}",
+                        h.class_id.as_u32(),
+                        h.kind(),
+                        h.num_slots(),
+                        h.array_length(),
+                        gen_object_total_size(h),
+                        near + gen_object_total_size(h) > old_ptr as usize,
+                    );
+                }
+            }
+        }
+    }
+
     fn forward_object(
         young_from: &Arena,
         young_object_starts: &crate::young_mark::ObjectStartBits,
@@ -16315,6 +16484,18 @@ impl GenerationalHeap {
         if !young_object_starts.contains(old_ptr as usize) {
             // Exact pre-GC membership rejects aligned interior words from
             // conservative roots before forwarding writes through them.
+            if young_from.contains(old_ptr) {
+                // ... but an address INSIDE from-space that the start bitmap
+                // does not know is not an interior word from a conservative
+                // root: it is an object the pre-GC walk that built the bitmap
+                // never saw.
+                Self::note_forward_refusal(
+                    old_ptr,
+                    "not-an-object-start",
+                    young_from,
+                    young_object_starts,
+                );
+            }
             return old_ptr;
         }
         // HIB-DCAST-LATEPHASE.1: `young_object_starts.contains(old_ptr)` above
@@ -16354,6 +16535,12 @@ impl GenerationalHeap {
                 backtrace = ?std::backtrace::Backtrace::capture(),
                 "gen_heap::forward_object: invalid kind/element_type tag — false root or \
                  corrupted header, not decoded as ObjectHeader",
+            );
+            Self::note_forward_refusal(
+                old_ptr,
+                "invalid-kind-or-element-tag",
+                young_from,
+                young_object_starts,
             );
             return old_ptr;
         }
@@ -16437,6 +16624,7 @@ impl GenerationalHeap {
             // Leave the object unmoved; this is a suspected false root or
             // corrupted slot. Returning old_ptr preserves progress while the
             // eprintln above gives us the evidence needed to diagnose.
+            Self::note_forward_refusal(old_ptr, "suspect-header", young_from, young_object_starts);
             return old_ptr;
         }
 
@@ -26332,6 +26520,37 @@ mod tests {
         let (ptr, size) = result.unwrap();
         assert!(!ptr.is_null());
         assert!(size > 0);
+    }
+
+    /// Regression: `Tlab::new` requires `ptr + size` to be 8-aligned
+    /// (gc/src/tlab.rs — "end pointer must be 8-aligned for tail-filler
+    /// safety"). `refill_tlab` used to hand back `requested_size.min(available)`
+    /// verbatim; when a refill request is truncated because the young
+    /// from-space is nearly full, `available` need only be a multiple of 8
+    /// (not 16+), so the truncated grant could itself be a non-8-aligned
+    /// byte count even though the returned `ptr` is always 8-byte aligned.
+    /// A deliberately non-8-aligned arena capacity (real capacities are
+    /// always multiples of 8, but nothing enforced that at this boundary)
+    /// reproduces the truncation deterministically without needing a JIT
+    /// allocation storm.
+    #[test]
+    fn tlab_refill_truncated_grant_is_always_8_aligned() {
+        // 4101 is deliberately NOT a multiple of 8.
+        let heap = GenerationalHeap::with_sizes(4101, 4096);
+        let (ptr, size) = heap
+            .refill_tlab(1_000_000)
+            .expect("refill_tlab should still succeed with a truncated grant");
+        assert_eq!(
+            size % 8,
+            0,
+            "truncated TLAB size must be 8-aligned, got {size}"
+        );
+        assert_eq!(
+            (ptr as usize + size) % 8,
+            0,
+            "ptr + size must be 8-aligned so Tlab::new's contract holds"
+        );
+        assert!(size <= 4101);
     }
 
     #[test]

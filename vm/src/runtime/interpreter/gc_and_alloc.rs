@@ -1311,6 +1311,10 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             // Single-threaded fast path: no barrier needed
             let gc_start = std::time::Instant::now();
             let mut roots = collect_roots(shared, thread);
+            // `CRATONVM_DBG_ROOT_REMAP_AUDIT`: the list the collector is about to
+            // mark from, so a post-GC verifier can say whether a slot it found
+            // naming a reclaimed object was ever in it.
+            crate::memory::gc::note_root_set(&roots);
             // STW invariant: single-threaded path means this thread is
             // the only mutator — every other thread is implicitly
             // "parked" (it doesn't exist). Construct the token directly.
@@ -1530,6 +1534,10 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
 
                 // Collect roots: current thread + all snapshots + shared state
                 let mut roots = collect_roots(shared, thread);
+                // `CRATONVM_DBG_ROOT_REMAP_AUDIT`: the list the collector is about to
+                // mark from, so a post-GC verifier can say whether a slot it found
+                // naming a reclaimed object was ever in it.
+                crate::memory::gc::note_root_set(&roots);
                 let snapshot_roots = shared.threads.thread_registry.collect_all_root_snapshots();
                 roots.extend(snapshot_roots);
                 // INT-3 (G1) — everything a frozen peer can address must not
@@ -1814,6 +1822,10 @@ pub(super) fn maybe_gc_forced_at(
     let alive_count = shared.threads.thread_registry.alive_count() as u32; // Widening: thread count to u32
     if alive_count <= 1 {
         let mut roots = collect_roots(shared, thread);
+        // `CRATONVM_DBG_ROOT_REMAP_AUDIT`: the list the collector is about to
+        // mark from, so a post-GC verifier can say whether a slot it found
+        // naming a reclaimed object was ever in it.
+        crate::memory::gc::note_root_set(&roots);
         // STW invariant: single-threaded fast path — see `maybe_gc`.
         // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
         weakref_null_referents_pre_gc(shared);
@@ -1864,6 +1876,10 @@ pub(super) fn maybe_gc_forced_at(
             let mut xt_roots: Vec<ObjectRef> = Vec::new();
             let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
             let mut roots = collect_roots(shared, thread);
+            // `CRATONVM_DBG_ROOT_REMAP_AUDIT`: the list the collector is about to
+            // mark from, so a post-GC verifier can say whether a slot it found
+            // naming a reclaimed object was ever in it.
+            crate::memory::gc::note_root_set(&roots);
             let snapshot_roots = shared.threads.thread_registry.collect_all_root_snapshots();
             roots.extend(snapshot_roots);
             // INT-3 (G1) — everything a frozen peer can address must not
@@ -2101,6 +2117,10 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
     let alive_count = shared.threads.thread_registry.alive_count() as u32; // Widening: thread count to u32
     if alive_count <= 1 {
         let mut roots = collect_roots(shared, thread);
+        // `CRATONVM_DBG_ROOT_REMAP_AUDIT`: the list the collector is about to
+        // mark from, so a post-GC verifier can say whether a slot it found
+        // naming a reclaimed object was ever in it.
+        crate::memory::gc::note_root_set(&roots);
         // STW invariant: single-threaded fast path — see `maybe_gc`.
         // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
         weakref_null_referents_pre_gc(shared);
@@ -2162,6 +2182,10 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             let mut xt_roots: Vec<ObjectRef> = Vec::new();
             let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
             let mut roots = collect_roots(shared, thread);
+            // `CRATONVM_DBG_ROOT_REMAP_AUDIT`: the list the collector is about to
+            // mark from, so a post-GC verifier can say whether a slot it found
+            // naming a reclaimed object was ever in it.
+            crate::memory::gc::note_root_set(&roots);
             let snapshot_roots = shared.threads.thread_registry.collect_all_root_snapshots();
             roots.extend(snapshot_roots);
             // INT-3 (G1) — everything a frozen peer can address must not
