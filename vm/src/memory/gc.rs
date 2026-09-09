@@ -1681,7 +1681,7 @@ pub fn update_all_roots(
     //     fixup cannot rewrite another VM's entries.
 
     // Post-GC verification: check that no frame refs still point to relocated addresses.
-    verify_no_stale_refs(thread, pointer_map);
+    verify_no_stale_refs(thread, pointer_map, Some(&shared.mem.heap));
     // Opt-in (CRATONVM_DBG_HEAP_STALE=1) deep heap-walk: catch un-forwarded /
     // reclaimed reference fields in OTHER objects (not just this thread's
     // frames) — where the residual ClassLoader/Locale stale-ref actually lives.
@@ -2047,11 +2047,34 @@ pub fn audit_overlay_refs(shared: &crate::vm::SharedVm) {
 fn verify_no_stale_refs(
     thread: &crate::threading::jvm_thread::JvmThread,
     pointer_map: &cratonvm_types::PointerMap,
+    heap: Option<&crate::memory::VmHeap>,
 ) -> usize {
     use crate::types::Value;
     use cratonvm_types::ObjectHeader;
 
     let mut genuine_reports = 0usize;
+    // THE OTHER HALF OF THE INVARIANT: a slot naming a from-space address the
+    // pointer map does NOT contain.
+    //
+    // Everything else in this function asks "did the remap rewrite every slot
+    // whose object MOVED". That question cannot see the opposite failure: an
+    // object that was never copied at all because the root scan missed the slot
+    // holding it. After a Cheney cycle the inactive semispace holds nothing
+    // live, so a live frame slot naming an address inside it is proof that the
+    // collection reclaimed an object a frame still held -- and this is the last
+    // moment at which the frame, method, pc and slot are all in hand. Every
+    // reader-side reporter downstream sees only an address and a failed
+    // dispatch, an unbounded number of collections later.
+    //
+    // Live-filtered, because a DEAD local naming a reclaimed object is the
+    // collector working as designed -- that is precisely what the per-bci
+    // liveness filter is for. Operand-stack slots are always live.
+    //
+    // Found the BindableTests residual this way: a `java.util.function.Supplier`
+    // in `DisplayNameUtils.determineDisplayNameForMethod` local[0].
+    let inactive_young: Option<(usize, usize)> =
+        heap.and_then(|h| h.young_inactive_semispace_range());
+    let mut reclaimed_reports = 0usize;
     // Lazily-built set of this pause's destination addresses (map VALUES),
     // used to recognise recycled destinations. Built only when a candidate
     // stale slot is actually found, so the common (clean) path pays nothing.
@@ -2089,6 +2112,9 @@ fn verify_no_stale_refs(
     for (fi, frame) in thread.frames.iter().enumerate() {
         let cname = frame.class_name();
         let mname = frame.method_name();
+        // The frame's own per-bci liveness mask, for the RECLAIMED-WHILE-HELD
+        // arm: a DEAD local naming a reclaimed object is the filter working.
+        let live_mask = frame.live_locals_mask_here();
         // Check locals
         for li in 0..frame.locals_len() {
             let val = frame.get_local(li as u16);
@@ -2122,6 +2148,25 @@ fn verify_no_stale_refs(
                                 fi, cname, mname, li, addr, new_addr,
                             );
                         }
+                    }
+                }
+                if let Some((lo, hi)) = inactive_young {
+                    let live = li >= 64 || live_mask & (1u64 << li) != 0;
+                    if live
+                        && addr >= lo
+                        && addr < hi
+                        && !pointer_map.contains_key(&addr)
+                        && reclaimed_reports < 8
+                    {
+                        reclaimed_reports += 1;
+                        genuine_reports += 1;
+                        eprintln!(
+                            "POST-GC RECLAIMED-WHILE-HELD LOCAL: frame[{}] {}.{} local[{}] pc={} \
+                             holds 0x{:x}, inside the semispace this cycle emptied, and the \
+                             pointer map has no entry for it -- the object was NOT copied, so \
+                             this slot was not in the root set",
+                            fi, cname, mname, li, frame.pc, addr,
+                        );
                     }
                 }
                 if heavy && addr != 0 {
@@ -2187,6 +2232,23 @@ fn verify_no_stale_refs(
                                 fi, cname, mname, si, addr, new_addr,
                             );
                         }
+                    }
+                }
+                if let Some((lo, hi)) = inactive_young {
+                    if addr >= lo
+                        && addr < hi
+                        && !pointer_map.contains_key(&addr)
+                        && reclaimed_reports < 8
+                    {
+                        reclaimed_reports += 1;
+                        genuine_reports += 1;
+                        eprintln!(
+                            "POST-GC RECLAIMED-WHILE-HELD STACK: frame[{}] {}.{} stack[{}] pc={} \
+                             holds 0x{:x}, inside the semispace this cycle emptied, and the \
+                             pointer map has no entry for it -- the object was NOT copied, so \
+                             this slot was not in the root set",
+                            fi, cname, mname, si, frame.pc, addr,
+                        );
                     }
                 }
                 if heavy && addr != 0 {
@@ -2587,7 +2649,7 @@ mod tests {
         thread.frames.push(frame);
 
         assert_eq!(
-            verify_no_stale_refs(&thread, &map),
+            verify_no_stale_refs(&thread, &map, None),
             1,
             "recycled destination must be benign; unrewritten key must report"
         );
