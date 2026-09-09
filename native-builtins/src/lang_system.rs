@@ -3139,6 +3139,13 @@ pub(crate) fn native_runtime_total_memory(
 /// separately and without a lock, so a concurrent allocation can make used
 /// exceed the committed figure read a moment earlier. HotSpot never reports a
 /// negative free heap; report 0 rather than a wrapped `Long`.
+///
+/// `used` is heap OCCUPANCY and must stay occupancy. It answered with the
+/// generational young arena's raw bump cursor until 2026-09-08, and that cursor
+/// never retreats under the in-place non-moving sweep — so `freeMemory()`
+/// reported a heap that filled once and never emptied, however much the
+/// collector reclaimed. See `NativeContext::heap_allocated_bytes`, whose doc
+/// carries the H2 measurement.
 pub(crate) fn native_runtime_free_memory(
     ctx: &mut dyn NativeContext,
     _args: &[Value],

@@ -1372,18 +1372,24 @@ pub(super) fn execute_invoke_kind(
                     // zeroed-out GC from-space memory. Fall back to the constant
                     // pool method_ref class so dispatch has a chance to succeed.
                     if cid == ClassId::new(0) {
-                        // H1: Stale-pointer detection. Pre-fix, fresh
-                        // TLAB-allocated `new Object()` instances had
-                        // `identity_hash_code: 0` (the lazy-assignment
-                        // comment was aspirational and never wired up),
-                        // and a class with `cid=0`+`fields=0` produces
-                        // an all-zero first 16 bytes that this detector
-                        // could not distinguish from genuine stale
-                        // memory. The fix landed in `init_object_header`
-                        // (TLAB fast path) which now mints a non-zero
-                        // hash at allocation time, matching the
-                        // non-TLAB allocators in `gc::heap`/
-                        // `gc::gen_heap`/`gc::g1`.
+                        // H1: Stale-pointer detection. A `cid=0`+`fields=0`
+                        // object — `new Object()` — used to produce an
+                        // all-zero first 16 bytes that this detector could
+                        // not distinguish from genuine stale memory. That
+                        // has been fixed twice: first by minting an eager
+                        // identity hash in `init_object_header`, which the
+                        // 2026-08-06/07 header shrink undid when the hash
+                        // moved into the mark word and went lazy; then by
+                        // `GC_FLAG_HEADER` (2026-09-08), which puts the
+                        // distinction in the header itself rather than in a
+                        // value that has to be minted.
+                        //
+                        // The second fix is the durable one, and not only for
+                        // this detector: an all-zero header is also
+                        // unparseable by the young non-moving sweep's linear
+                        // walk, which is what
+                        // `h2-testvaluememory-system-gc-retained-every-empty-object-FIXED-20260908`
+                        // is about.
                         //
                         // The detector still fires the warn! when the
                         // header is genuinely all-zero — a true
@@ -1531,53 +1537,47 @@ pub(super) fn execute_invoke_kind(
                                     }
                                 }
                             }
-                            // A bare `new Object()` IS all-zero, legitimately.
+                            // A bare `new Object()` is no longer all-zero, so
+                            // the `java/lang/Object` demotion this block used to
+                            // carry is GONE.
                             //
-                            // `ObjectHeader::new` documents the mark word as
-                            // "no identity hash installed", `MARK_NEUTRAL`,
-                            // `ObjectKind::Object` and `ArrayElementType::
-                            // Reference` are all `0`, and a no-field `Object`
-                            // has `class_id = 0` and `shape = 0` — so every one
-                            // of the 16 bytes this detector reads is zero for a
-                            // healthy, freshly allocated `java.lang.Object`.
-                            // The comment on `init_object_header` still claims
-                            // a fix that made this impossible ("identity_hash_
-                            // code is now eagerly assigned at allocation time,
-                            // caller passes next_identity_hash()"), but the
-                            // 2026-08-06/07 header shrink folded the hash into
-                            // the mark word and left `ObjectHeader::new` with no
-                            // hash parameter at all, so the fast path cannot
-                            // assign one and the false positive is back.
+                            // The history is worth keeping, because it is the
+                            // same defect twice. `ObjectHeader::new` leaves
+                            // `MARK_NEUTRAL`, `ObjectKind::Object` and
+                            // `ArrayElementType::Reference` at `0`, and a
+                            // no-field `Object` has `class_id = 0` and
+                            // `shape = 0` — so every one of the 16 bytes this
+                            // detector reads was zero for a healthy, freshly
+                            // allocated `java.lang.Object`. An eager identity
+                            // hash used to hide that; the 2026-08-06/07 header
+                            // shrink folded the hash into the mark word and made
+                            // it lazy, and the false positive came back at a
+                            // 100% rate — six lines of Java, all four
+                            // collectors. This site's answer was to demote the
+                            // warn to debug for `Object`-declared call sites,
+                            // with the trade stated explicitly: a genuinely
+                            // stale receiver there logs at debug instead.
                             //
-                            // It fires on `new Object()` used as a lock or
-                            // sentinel — six lines of Java reproduce it, on all
-                            // four collectors — and the cost is not the log
-                            // line: this warning is the tripwire for the
-                            // reclaimed-live-receiver family (CRATONVM_DBG_BUG03
-                            // / _SWEEP_ZERO / _STALE_RECV all hang off it), and
-                            // a tripwire that fires on healthy code is one
-                            // nobody reads.
+                            // `GC_FLAG_HEADER` (2026-09-08) removed the premise
+                            // instead. A published header is never sixteen zero
+                            // bytes now, so `header_bytes == [0u8; 16]` means
+                            // what this detector always wanted it to mean, and
+                            // the trade is no longer worth making: by the old
+                            // comment's own reasoning it was only worth it
+                            // "against a 100% false-positive rate here". Zero
+                            // "Stale pointer detected" lines across the 92-vector
+                            // regression suite on all three collectors and the
+                            // H2 corpus after the change.
                             //
-                            // Demoted, not deleted, and only when the CP class
-                            // is `java/lang/Object` itself — i.e. an
-                            // `Object`-declared call site (hashCode/equals/
-                            // toString/...), where the fallback the detector
-                            // takes is the CORRECT dispatch for a real bare
-                            // `Object` anyway. The trade is explicit: a
-                            // genuinely stale receiver at an `Object`-declared
-                            // site now logs at debug instead of warn. That is
-                            // worth it against a 100% false-positive rate here,
-                            // and it is exactly the call already made two lines
-                            // below for `java/lang/ClassLoader`.
-                            //
-                            // WildFly / JBoss Modules often hits this path on
+                            // `java/lang/ClassLoader` KEEPS its demotion — it
+                            // was never about the all-zero-by-design shape.
+                            // WildFly / JBoss Modules hits this path on
                             // `ClassLoader`-typed invokevirtual sites when a
-                            // receiver lost its header but CP resolution is
-                            // already `java/lang/ClassLoader`; the CP fallback
-                            // succeeds and a WARN was mostly noise.
-                            if method_class_name.as_ref() == "java/lang/Object"
-                                || method_class_name.as_ref() == "java/lang/ClassLoader"
-                            {
+                            // receiver has genuinely lost its header but CP
+                            // resolution already says `java/lang/ClassLoader`;
+                            // the CP fallback succeeds and the WARN was mostly
+                            // noise.
+                            if method_class_name.as_ref() == "java/lang/ClassLoader" {
                                 tracing::debug!(
                                     "Stale pointer detected in invokevirtual receiver \
                                      (ptr={:p}, all-zero header) — falling back to CP class {}",
