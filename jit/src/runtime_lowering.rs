@@ -460,18 +460,30 @@ pub(crate) fn emit_inline_tlab_new_ir(
         cratonvm_types::MARK_WORD_OFFSET as u8,
     ]);
     buf.emit(&0i32.to_le_bytes());
-    // GC_FLAG_COMPACT, as a BYTE and AFTER the mark word that would erase it.
+    // The gc_flags byte, as a BYTE and AFTER the mark word that would erase it.
     // `gc_age` shares this byte and is 0 at allocation, so writing the whole
     // byte is safe; a dword store here would run past a 16-byte header.
-    if compact.is_some() {
-        buf.emit(&[
-            0x41,
-            0xC6,
-            0x43,
-            cratonvm_types::GC_FLAGS_BYTE_OFFSET as u8,
-            cratonvm_types::GC_FLAG_COMPACT,
-        ]);
-    }
+    //
+    // UNCONDITIONAL, unlike the compact bit it used to carry alone.
+    // `GC_FLAG_HEADER` is what separates a published object header from zeroed
+    // arena space, and a JIT-inline `new Object()` — `ClassId(0)`, `shape = 0`,
+    // mark word zeroed by the store above — is otherwise sixteen zero bytes
+    // that the young non-moving sweep cannot parse and never reclaims. See
+    // `cratonvm_types::GC_FLAG_HEADER`. It cannot ride in the mark-word store
+    // above the way it does in the single-pass backend's paired dword stores:
+    // that store is `MOV QWORD [R11+disp8], imm32`, sign-extended, and bit 59
+    // is not encodable as an imm32.
+    buf.emit(&[
+        0x41,
+        0xC6,
+        0x43,
+        cratonvm_types::GC_FLAGS_BYTE_OFFSET as u8,
+        if compact.is_some() {
+            cratonvm_types::GC_FLAG_COMPACT | cratonvm_types::GC_FLAG_HEADER
+        } else {
+            cratonvm_types::GC_FLAG_HEADER
+        },
+    ]);
 
     // Step 5 — commit, now that the header is walker-coherent.
     buf.emit(&[0x49, 0x89, 0x82]); // MOV [R10 + disp32], RAX

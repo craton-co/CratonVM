@@ -3724,9 +3724,10 @@ impl VmHeap {
                 crate::gen_heap::SWEEP_ANCHOR_NOT_A_BASE.load(O::Relaxed),
             );
             eprintln!(
-                "[GC] young_sweep_empty_runs: last_cycle_bytes={} young_used={}",
+                "[GC] young_sweep_empty_runs: last_cycle_bytes={} young_used={} no_header_flag={}",
                 crate::gen_heap::EMPTY_RUN_BYTES_LAST.load(O::Relaxed),
                 crate::gen_heap::EMPTY_RUN_YOUNG_USED_LAST.load(O::Relaxed),
+                crate::gen_heap::SWEEP_NO_HEADER_FLAG.load(O::Relaxed),
             );
             let l = &crate::gen_heap::LATE_WALK_ZERO_RUNS;
             eprintln!(

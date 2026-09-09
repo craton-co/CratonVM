@@ -14345,7 +14345,12 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     }
 
     fn heap_allocated_bytes(&self) -> usize {
-        self.shared.mem.heap.allocated_bytes()
+        // `live_bytes_estimate`, NOT `allocated_bytes`. The two differ by the
+        // young free list, which is reusable space the arena hands straight
+        // back out — see the trait doc for what reporting the cursor instead
+        // cost. The other collectors' `live_bytes_estimate` falls through to
+        // `allocated_bytes`, so this is a no-op for them.
+        self.shared.mem.heap.live_bytes_estimate()
     }
 
     fn current_thread_allocated_bytes(&self) -> Option<u64> {

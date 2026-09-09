@@ -4746,17 +4746,24 @@ fn note_tlab_legacy_object(class_id: ClassId, num_fields: usize) {
 
 /// Initialize an object header at the given pointer.
 ///
-/// H1: `identity_hash_code` is now eagerly assigned at allocation time
-/// (caller passes `shared.mem.heap.next_identity_hash()`). The previous
-/// behavior of storing 0 and "lazily" filling on first `hashCode()` call
-/// was not actually wired up anywhere — every fresh TLAB-allocated
-/// `new Object()` (cid=0, fields=0) produced an all-zero first 16 bytes
-/// of header that the stale-pointer detector in `execute_invoke`
-/// mis-flagged as stale memory, causing CGLIB's HashMap operations to
-/// emit spurious "Stale pointer detected" warnings on every legitimate
-/// `Object` key. The non-TLAB allocators in `gc::heap`/`gc::gen_heap`/
-/// `gc::g1` have always assigned a fresh hash here; this brings the
-/// fast path into agreement with them.
+/// **This doc claimed an eager identity hash until 2026-09-08 and had been
+/// wrong for a month.** `ObjectHeader::new` has had no hash parameter since the
+/// 2026-08-06/07 header shrink folded the hash into the mark word and made it
+/// lazy, so nothing here has minted one since; `grep next_identity_hash` finds
+/// no caller on this path. The text is kept, corrected, because the property it
+/// was defending is real and is now defended by something else.
+///
+/// H1, as it actually stands: a fresh TLAB-allocated `new Object()`
+/// (`cid=0`, `fields=0`) must not publish an all-zero first 16 bytes. It would
+/// otherwise be indistinguishable from stale, zeroed memory — which cost the
+/// stale-pointer detector in `execute_invoke` a 100% false-positive rate on
+/// legitimate `Object` keys (CGLIB's HashMap operations), and cost the young
+/// non-moving sweep the ability to parse its own arena
+/// (`h2-testvaluememory-system-gc-retained-every-empty-object-FIXED-20260908`).
+///
+/// `ObjectHeader::new` now sets `GC_FLAG_HEADER`, so the property holds for
+/// every allocator without anything having to be minted — and, unlike an eager
+/// hash, without making every `synchronized` block lose its thin-lock CAS.
 #[inline(always)]
 pub(super) fn init_object_header(
     ptr: *mut u8,

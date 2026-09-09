@@ -41,7 +41,8 @@ use crate::gc::GcResult;
 use crate::heap::{
     array_data_size, array_element_type_from_tag, object_kind_from_tag, read_prim_element,
     write_prim_element, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET,
-    AUTOBOX_CLASS_ID, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE,
+    AUTOBOX_CLASS_ID, GC_FLAG_HEADER, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE,
+    REF_ELEMENT_SIZE, SLOT_SIZE,
 };
 use crate::old_gen::OldGen;
 
@@ -574,6 +575,22 @@ pub static SWEEP_ZERO_SPAN_HITS: AtomicU64 = AtomicU64::new(0);
 /// arrival into apparent corruption. Like its siblings above it has no printer
 /// — it is read from a debugger or an instrumented repro build.
 pub static SWEEP_ZERO_SPAN_EMPTY_RUNS: AtomicU64 = AtomicU64::new(0);
+
+/// Objects the young sequential walk sized whose header does NOT carry
+/// [`cratonvm_types::GC_FLAG_HEADER`].
+///
+/// The flag is set by `ObjectHeader::new` and by both JIT inline-allocation
+/// emitters, and is never cleared, so on a sound VM this is exactly zero. A
+/// non-zero value names an allocation path that publishes a header without it
+/// — which is not itself a defect today (nothing reads the flag on a path
+/// where absence costs anything), but IS the thing that must be zero before
+/// anything is allowed to. See `GC_FLAG_HEADER`'s "what must NOT be built on
+/// it" and `header_reserved_fields_plausible`.
+///
+/// Printed unconditionally in the young-sweep exit census, for the H2-CID0
+/// reason: a counter printed only when non-zero cannot distinguish "clean"
+/// from "the walk never ran", and here that is the whole question.
+pub static SWEEP_NO_HEADER_FLAG: AtomicU64 = AtomicU64::new(0);
 
 /// Bytes in the runs [`SWEEP_ZERO_SPAN_EMPTY_RUNS`] counts, accumulated for the
 /// CURRENT cycle by whichever walkers covered the arena (the sequential walk
@@ -12896,6 +12913,20 @@ impl GenerationalHeap {
             );
             objects_since_anchor += 1;
             walked_count += 1;
+            // The allocator invariant, measured rather than assumed. Every
+            // object the walk sizes reached the heap through some allocation
+            // path, so every one of them should carry `GC_FLAG_HEADER`; a
+            // non-zero count here names a path that publishes a header without
+            // it. Nothing DEPENDS on the flag today (see
+            // `header_reserved_fields_plausible`), which is precisely why the
+            // count has to exist: an invariant nothing checks is an invariant
+            // that decays silently, and the next change in this area — turning
+            // the plausibility screen into `gc_flags & GC_FLAG_HEADER != 0` —
+            // must not be made until this has been read clean on real
+            // workloads.
+            if header.gc_flags() & GC_FLAG_HEADER == 0 {
+                SWEEP_NO_HEADER_FLAG.fetch_add(1, Ordering::Relaxed);
+            }
             if retain_full_walk {
                 walked.push_back((
                     cursor,
@@ -17812,24 +17843,27 @@ fn seedhunt_scan_young(
     count
 }
 
-/// xt-hardening follow-up (2026-07-03): reject a conservative candidate
-/// whose header's ALWAYS-ZERO fields are non-zero. `ObjectHeader::new`
-/// (types/src/heap_types.rs) unconditionally zero-initializes `_padding`
-/// (offset 6-7) and `_gc_reserved` (offset 22-23), and every relocation copy
-/// site (region.rs) and the JIT inline-alloc fast path (x64.rs
-/// `emit_inline_tlab_new`, which explicitly zeroes offset 4-7 as a single
-/// dword even on its fast path — see the "Defensively zero offset 4" comment
-/// there) preserve that invariant; nothing in the codebase ever writes a
-/// non-zero byte into either field. `gc_flags` similarly has only 3 defined
-/// bits (`GC_FLAG_OLD_GEN`/`MARKED`/`COMPACT`); any other bit set is
-/// definitionally corrupt. This closes the residual (rarer, non-zero-word0)
-/// slice of the `mark_young` conservative-candidate false-positive family
-/// that the zero-word0 side-mark-set fix (2026-07-03, same session) does not
-/// cover — a candidate whose garbage predecessor bytes happen to satisfy the
-/// kind/num_slots/array_length/extent bounds but fail this near-free check.
-/// Four bytes of near-uniform-random garbage failing this check is a ~1/2^29
-/// false-negative-on-garbage rate (2 padding bytes + 2 reserved bytes + 5
-/// undefined gc_flags bits); real objects always pass.
+/// xt-hardening follow-up (2026-07-03): reject a conservative candidate whose
+/// header's ALWAYS-ZERO field is non-zero. It closes the residual (rarer,
+/// non-zero-word0) slice of the `mark_young` conservative-candidate
+/// false-positive family that the zero-word0 side-mark-set fix (2026-07-03,
+/// same session) does not cover — a candidate whose garbage predecessor bytes
+/// happen to satisfy the kind/num_slots/array_length/extent bounds but fail
+/// this near-free check. Real objects always pass.
+///
+/// WHICH field, and how much it buys, have BOTH changed twice and the text here
+/// tracked neither until 2026-09-08. It said `_padding` (offset 6-7) and
+/// `_gc_reserved` (offset 22-23) — fields the 32 -> 24 -> 16 header shrink
+/// deleted in 2026-08 — and quoted "~1/2^29" from summing their bytes with "5
+/// undefined gc_flags bits", when `gc_flags` is a FOUR-bit field. The real
+/// figure was 1 undefined bit, i.e. 1/2, off by 28 orders of magnitude; and
+/// `GC_FLAG_HEADER` then took that bit too, leaving 0.
+///
+/// What the screen actually rests on now is `MARK_RESERVED_MASK`, the mark
+/// word's two reserved bits, giving 3/4 — see
+/// [`header_reserved_fields_plausible`]. Keep the arithmetic in one place and
+/// state it as a rate, not as a folklore constant: a screen quoted at 1/2^29
+/// while delivering 1/2 is a guard everyone believes is doing work it is not.
 /// The screen every old-gen mark-worklist push must pass.
 ///
 /// [`OldGen::contains`] is a bare bounds check — no alignment, no header
@@ -18396,9 +18430,38 @@ fn note_rejected_old_mark_candidate(ptr: *mut u8, site: &'static str) {
     }
 }
 
+/// Rejects a header whose ALWAYS-ZERO field is not zero.
+///
+/// That field is now the mark word's two reserved bits
+/// ([`cratonvm_types::MARK_RESERVED_MASK`], word bits 54..55), not the
+/// `gc_flags` nibble. `GC_FLAG_HEADER` claimed the nibble's last undefined bit
+/// on 2026-09-08, so `gc_flags & !defined == 0` became a tautology — a screen
+/// that cannot fail. Reading it as still-load-bearing would have left this
+/// predicate quietly weaker than its own doc claims, which is the failure this
+/// file has been bitten by before.
+///
+/// The reserved bits are a strictly better field for the job: two bits instead
+/// of one, so 3 of 4 random words are rejected on it rather than 1 of 2, and
+/// their zero-ness is independently enforced — several JIT guards separate a
+/// plain object from an array with `CMP BYTE [recv + KIND_TAGS_BYTE_OFFSET], 0`,
+/// which is the same byte. The `gc_flags` clause is kept alongside so a FIFTH
+/// flag added without revisiting this site is still rejected rather than
+/// silently admitted.
+///
+/// **Do not make this test `gc_flags & GC_FLAG_HEADER != 0`.** It would be a far
+/// stronger screen and it is exactly the change that must not be made on
+/// reasoning alone: this predicate gates conservative-root candidates, where a
+/// false negative does not over-retain — it drops a root and frees a live
+/// object. `SWEEP_NO_HEADER_FLAG` exists to measure whether every allocation
+/// path really does set the flag; it would have to be read clean across real
+/// workloads first, and even then `mark_and_push_old_gen`'s walked-base oracle
+/// is what makes a rejection survivable at a precise site.
 #[inline]
 fn header_reserved_fields_plausible(header: &ObjectHeader) -> bool {
-    header.gc_flags() & !(GC_FLAG_OLD_GEN | GC_FLAG_MARKED | GC_FLAG_COMPACT) == 0
+    header.reserved_mark_bits_clear()
+        && header.gc_flags()
+            & !(GC_FLAG_OLD_GEN | GC_FLAG_MARKED | GC_FLAG_COMPACT | GC_FLAG_HEADER)
+            == 0
 }
 
 /// xt-hardening follow-up (2026-07-03): targeted defense against the
@@ -20837,9 +20900,13 @@ mod tests {
             0,
         );
         // `MARK_NEUTRAL`, `ObjectKind::Object` and `ArrayElementType::Reference`
-        // are ALL zero, so the constructor alone yields a wholly zero header —
-        // the JIT-allocated shape. A collector-visible bit is what separates the
-        // two; a bumped `gc_age` stands in for the mark/hash/lock family.
+        // are ALL zero. Until 2026-09-08 the constructor alone therefore yielded
+        // a WHOLLY zero header — that is the defect `GC_FLAG_HEADER` closes, and
+        // the constructor now sets it, so a real header's second word is
+        // non-zero by construction. The bumped `gc_age` is kept because this
+        // fixture must go on producing a ragged run whatever the flag does:
+        // it stands in for the mark/hash/lock family, and the assertion below
+        // is what proves the fixture still has the shape the test needs.
         h.set_gc_age(1);
         h
     }
@@ -20876,6 +20943,56 @@ mod tests {
             zero_run_empty_object_resume(base, 0, HEADER_SIZE + 8, 64, &[], None),
             Some(HEADER_SIZE),
             "must resume at the empty object's end, not at the ragged run's end"
+        );
+    }
+
+    /// **The arena must be parseable, and that starts at the allocator.**
+    ///
+    /// A field-less `ClassId(0)` object is the minimum a Java heap can hold —
+    /// `java/lang/Object` is exactly this shape — and until 2026-09-08 it
+    /// reached the heap as sixteen zero bytes, because `class_id`, `shape`,
+    /// `MARK_NEUTRAL`, `ObjectKind::Object` and `ArrayElementType::Reference`
+    /// are all `0`. The young non-moving sweep's zero-run arm then could not
+    /// tell a run of them from reclaimed, zeroed, unlisted space, and every
+    /// `System.gc()` under `-XX:+UseGenerationalGC` retained the lot
+    /// (`h2-testvaluememory-system-gc-retained-every-empty-object-FIXED-20260908`).
+    ///
+    /// This asserts the property the fix bought, at the only place it can be
+    /// asserted cheaply: the bytes a real allocation publishes. `zero_run_end`
+    /// is the sweep's own scanner, so a regression here is a regression there.
+    ///
+    /// **The bar is a run SHORTER THAN ONE SLOT, not a run of length zero**, and
+    /// the first version of this test got that wrong and was corrected by its
+    /// own failure. `class_id` and `shape` are still both zero for this shape,
+    /// so the header's FIRST word is still zero and the run is still 8 bytes
+    /// long; what `GC_FLAG_HEADER` changes is the SECOND word. Eight is enough,
+    /// and it is enough for a specific reason: every arm of the sweep's
+    /// zero-word0 branch — the empty-object-run recovery and the unwind alike —
+    /// is gated on `run_end - cursor >= HEADER_SIZE`, so a run that cannot
+    /// cover one whole slot falls through to the ordinary header parse. A test
+    /// demanding zero would be asserting something the layout does not provide
+    /// and the collector does not need.
+    #[test]
+    fn a_freshly_allocated_field_less_object_is_not_a_run_of_zeros() {
+        let heap = small_gen_heap();
+        let obj = heap.alloc_object(ClassId::new(0), 0);
+        let base = obj.as_ptr() as usize;
+        let run = zero_run_end(base, 0, HEADER_SIZE);
+        assert!(
+            run < HEADER_SIZE,
+            "a published header must not scan as a whole slot of zero words \
+             (run = {run}): the sweep's zero-run arms all trigger at \
+             `>= HEADER_SIZE`, and an arena whose commonest object reaches that \
+             bar is one the sweep cannot tell from a hole",
+        );
+        // SAFETY: `base` is a live allocation of this heap; its second header
+        // word is in bounds.
+        let word1 = unsafe { *((base + 8) as *const u64) };
+        assert_ne!(
+            word1, 0,
+            "and the word that stops the run is the mark word — the first is \
+             still all-zero for a ClassId(0) zero-field object, which is the \
+             whole reason the flag had to go in the second",
         );
     }
 
@@ -22871,7 +22988,11 @@ mod tests {
         assert_eq!(heap.class_id_of(obj), ClassId::new(1));
         assert_eq!(heap.get_header(obj).num_slots(), 2);
         assert_eq!(heap.get_header(obj).gc_age(), 0);
-        assert_eq!(heap.get_header(obj).gc_flags(), 0);
+        // `GC_FLAG_HEADER` and nothing else: a fresh young object is neither
+        // old-gen, nor marked, nor compact — but it IS a published header, and
+        // the whole point of that flag is that the bytes say so. A zero here
+        // would mean the sixteen bytes are indistinguishable from a hole.
+        assert_eq!(heap.get_header(obj).gc_flags(), GC_FLAG_HEADER);
     }
 
     #[test]
@@ -25209,10 +25330,13 @@ mod tests {
     /// header's bytes, written for conservative register/stack guesses. Its own
     /// doc records what a false reject costs at a precise site — "a false
     /// reject IS a premature free" — and then leaves that risk covered by a
-    /// convention (`_padding`/`_gc_reserved` stay zero, `gc_flags` never grows
-    /// a fourth bit) that nothing checks. `walk_objects` *derives* the object
-    /// grid instead of guessing at it, so when the two disagree about an
-    /// address the walk produced, the walk wins.
+    /// convention about which header field is always zero, which nothing
+    /// checks. That convention has now been broken twice (the 16-byte header
+    /// deleted `_padding`/`_gc_reserved`; `GC_FLAG_HEADER` claimed the
+    /// `gc_flags` nibble's fourth bit), which is the argument for this test
+    /// rather than against it: `walk_objects` *derives* the object grid instead
+    /// of guessing at it, so when the two disagree about an address the walk
+    /// produced, the walk wins — whatever the screen is currently keying on.
     ///
     /// Three cases, because the override must be exactly as wide as the proof:
     /// the screen alone drops the object; the screen plus the oracle keeps it;
@@ -25225,11 +25349,20 @@ mod tests {
         unsafe {
             let h = &mut *(obj as *mut ObjectHeader);
             h.set_num_slots(2);
-            // An undefined `gc_flags` bit: the exact shape
+            // A set RESERVED mark bit: the exact shape
             // `header_reserved_fields_plausible` rejects, and one that leaves
             // every SIZING path (`kind`, `shape`, `GC_FLAG_COMPACT`) untouched,
             // so the object walk still yields this address as a base.
-            h.add_gc_flags(0x08);
+            //
+            // This was `add_gc_flags(0x08)` until 2026-09-08, when that bit
+            // became `GC_FLAG_HEADER` and stopped being a rejection at all.
+            // A test whose PRECONDITION quietly turns true is a test that
+            // asserts nothing, so both `assert!`s below are written as
+            // preconditions on purpose.
+            h.mark_word.fetch_or(
+                cratonvm_types::MARK_RESERVED_MASK,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
 
         let bases: Vec<usize> = og.walk_objects().iter().map(|&(p, _)| p as usize).collect();
