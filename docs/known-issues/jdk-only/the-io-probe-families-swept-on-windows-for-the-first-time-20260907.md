@@ -175,7 +175,13 @@ and promote whatever is clean on both.
 
 * **Six probes, not 117.** The other 111 remain compiled by nothing and run by
   nothing on either platform.
-* **JDK 25 only.** Both JDK 21 legs of the CI matrix still refuse for want of a
-  `21-*` key, and this host carries no JDK 21 image to mint one with.
+* **JDK 25 only, when this was written.** ~~Both JDK 21 legs of the CI matrix
+  still refuse for want of a `21-*` key, and this host carries no JDK 21 image
+  to mint one with.~~ **Half-resolved 2026-09-08**: a Temurin 21.0.12.1+1 was
+  fetched and `21-windows` minted, so that leg adjudicates — and the first run
+  ever made against a 21 image found four defects, in
+  `the-first-jdk-21-run-found-the-javalangaccess-carrier-is-pinned-to-system-1-20260908.md`.
+  The 21 **Linux** leg still refuses. Nothing else on this page has been
+  re-measured on 21: the six probes here remain a JDK 25 result.
 * **§5's four are recorded, not diagnosed.** Only #2/#4's shared root cause is
   identified, and even that is a reading of the code rather than a measured fix.
