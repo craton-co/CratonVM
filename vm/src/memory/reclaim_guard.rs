@@ -602,7 +602,7 @@ pub(crate) fn audit_thread_frames(shared: &SharedVm, thread: &JvmThread, site: &
             // old address reads back a perfectly valid object of an unrelated
             // class, and every test in this function stays silent. Asked FIRST,
             // and only when armed.
-            if let Some(moved_to) = cratonvm_gc::gc_quiescence::was_vacated(a) {
+            if let Some((moved_to, vacated_on)) = cratonvm_gc::gc_quiescence::was_vacated_on(a) {
                 static V: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 if V.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MAX_REPORTS {
                     tracing::error!(
@@ -617,8 +617,15 @@ pub(crate) fn audit_thread_frames(shared: &SharedVm, thread: &JvmThread, site: &
                         slot = format!("{what}[{idx}]"),
                         slot_class = %class_name_of(shared, heap.class_id_of(o).as_u32()),
                         moved_to = format!("{moved_to:#x}"),
+                        // The ledger accumulates across cycles, so the cycle
+                        // that vacated `a` is the only one worth comparing
+                        // `thread_last_heal` against - `heap_collection` is the
+                        // count at the safepoint, which at a safepoint is
+                        // always equal to it and proves nothing.
+                        vacated_on,
                         heap_collection = heap.collection_count(),
                         thread_last_heal = thread.last_heal_collection,
+                        remap_reached_this_thread = vacated_on <= thread.last_heal_collection,
                         class_at_target = %class_name_of(
                             shared,
                             // SAFETY: `moved_to` is a post-move object base the
@@ -628,9 +635,13 @@ pub(crate) fn audit_thread_frames(shared: &SharedVm, thread: &JvmThread, site: &
                             })
                             .as_u32(),
                         ),
-                        "a LIVE frame slot still names an address the LAST collection moved an \
-                         object away from — the frame remap did not reach this slot. \
-                         `slot_class` is whatever the slide has since put at that address.",
+                        "a LIVE frame slot still names an address a collection moved an object \
+                         away from and the allocator has not re-issued since. Read \
+                         `remap_reached_this_thread` first: TRUE means the frame remap ran for \
+                         this thread on cycle `vacated_on` and did not reach this slot; FALSE \
+                         means the slot was written AFTER that remap, so its producer, not the \
+                         remap, is holding the stale reference. `slot_class` is whatever the \
+                         slide has since put at that address.",
                     );
                 }
             }

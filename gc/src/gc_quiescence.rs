@@ -2265,6 +2265,103 @@ pub fn native_rvas() -> Vec<usize> {
 mod tests {
     use super::*;
 
+    /// The vacated ledger is process-global and its gate is a process-global
+    /// byte, so the tests that arm it must not run beside each other.
+    static VACATED_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    fn pointer_map_of(pairs: &[(usize, usize)]) -> cratonvm_types::PointerMap {
+        let mut m = cratonvm_types::PointerMap::default();
+        for (k, v) in pairs {
+            m.insert(*k, *v);
+        }
+        m
+    }
+
+    /// The claim the whole instrument rests on: an address the allocator has
+    /// re-issued is not evidence of anything.
+    ///
+    /// Until 2026-09-08 the only callers of `note_allocated` were ZGC's, so on
+    /// `--XX:UseGc Generational` nothing ever removed an entry and the mutator
+    /// bump-allocated straight back into the semispace the previous cycle had
+    /// vacated. Every detector then reported freshly allocated young objects as
+    /// stale references -- the eight `stack[0]` "the frame remap did not reach
+    /// this slot" reports the BindableTests moving-collector page was written
+    /// around, whose producer backtrace is `Anewarray` pushing the array
+    /// `gc_alloc_array` had returned two statements earlier.
+    #[test]
+    fn vacated_ledger_forgets_a_re_issued_address() {
+        let _g = VACATED_TEST_LOCK.lock();
+        set_vacated_frames_enabled_for_test(true);
+        reset_vacated_ledger_for_test();
+
+        record_vacated(&pointer_map_of(&[(0x1000, 0x9000)]), 7);
+        assert_eq!(
+            was_vacated_on(0x1000),
+            Some((0x9000, 7)),
+            "a moved-from address must be in the ledger with the cycle that moved it"
+        );
+
+        note_allocated(&[0x1000]);
+        assert_eq!(
+            was_vacated(0x1000),
+            None,
+            "an address the allocator re-issued is no longer evidence of a stale reference"
+        );
+
+        reset_vacated_ledger_for_test();
+        set_vacated_frames_enabled_for_test(false);
+    }
+
+    /// A TLAB chunk is bump-allocated from without any further call into the
+    /// heap, so the per-object door cannot see the objects inside it. The
+    /// range door is the only one that can, and `VmHeap::refill_tlab` is the
+    /// single chokepoint every backend's TLAB comes through.
+    #[test]
+    fn vacated_ledger_forgets_a_whole_re_issued_tlab_chunk() {
+        let _g = VACATED_TEST_LOCK.lock();
+        set_vacated_frames_enabled_for_test(true);
+        reset_vacated_ledger_for_test();
+
+        record_vacated(
+            &pointer_map_of(&[(0x2000, 0xa000), (0x2100, 0xa100), (0x3000, 0xb000)]),
+            11,
+        );
+        note_allocated_range(0x2000, 0x2800);
+
+        assert_eq!(was_vacated(0x2000), None, "chunk start must be forgotten");
+        assert_eq!(was_vacated(0x2100), None, "chunk interior must be forgotten");
+        assert_eq!(
+            was_vacated_on(0x3000),
+            Some((0xb000, 11)),
+            "an address OUTSIDE the chunk must survive -- the purge is a range, not a clear"
+        );
+
+        reset_vacated_ledger_for_test();
+        set_vacated_frames_enabled_for_test(false);
+    }
+
+    /// The ledger accumulates across cycles on purpose (a stale reference is
+    /// not necessarily consumed before the next collection), so "vacated" alone
+    /// carries no date. `was_vacated_on` is what lets a report compare the
+    /// vacating cycle against the thread's `last_heal_collection` instead of
+    /// against the current collection count, which at a safepoint is always
+    /// equal to it and therefore proves nothing.
+    #[test]
+    fn vacated_ledger_dates_each_entry_by_its_own_cycle() {
+        let _g = VACATED_TEST_LOCK.lock();
+        set_vacated_frames_enabled_for_test(true);
+        reset_vacated_ledger_for_test();
+
+        record_vacated(&pointer_map_of(&[(0x4000, 0xc000)]), 3);
+        record_vacated(&pointer_map_of(&[(0x5000, 0xd000)]), 900);
+
+        assert_eq!(was_vacated_on(0x4000), Some((0xc000, 3)));
+        assert_eq!(was_vacated_on(0x5000), Some((0xd000, 900)));
+
+        reset_vacated_ledger_for_test();
+        set_vacated_frames_enabled_for_test(false);
+    }
+
     #[test]
     fn enter_leave_round_trip() {
         let d0 = depth();
@@ -2589,26 +2686,52 @@ mod tests {
 /// holding a perfectly valid `Thread` that happens to live at an address this
 /// cycle also moved something away from is not a defect — and reporting it as
 /// one is how an over-approximate instrument manufactures its own finding.
+///
+/// The map's value carries the COLLECTION the address was vacated on as well as
+/// the destination. The ledger accumulates across cycles (see
+/// [`record_vacated`]), so "vacated" alone says nothing about WHEN — and the
+/// report `reclaim_guard::audit_thread_frames` prints off it used to compare
+/// the thread's `last_heal_collection` against the CURRENT collection count,
+/// which is always equal at a safepoint and therefore proved nothing. With the
+/// vacating cycle in hand the comparison is the real one: `vacated_on <=
+/// thread_last_heal` means the remap ran for that thread on that cycle and
+/// missed the slot; `vacated_on > thread_last_heal` means the thread was never
+/// healed for it.
 type VacatedLedger = (
-    rustc_hash::FxHashMap<usize, usize>,
+    rustc_hash::FxHashMap<usize, (usize, u64)>,
     rustc_hash::FxHashSet<usize>,
 );
 
 static VACATED_ADDRS: parking_lot::RwLock<Option<VacatedLedger>> = parking_lot::RwLock::new(None);
 
 /// `CRATONVM_DBG_VACATED_FRAMES=1` — arm the vacated-address ledger.
+///
+/// Interpreter hot paths read this on every operand-stack push and every heap
+/// accessor (`load_and_forward`, `get_field`, ...). A `OnceLock` is an acquire
+/// load plus an out-of-line init check; this is one relaxed byte load with the
+/// init on a cold path. 0 = unset, 1 = off, 2 = on.
+static VACATED_FRAMES_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 #[inline]
 pub fn vacated_frames_enabled() -> bool {
-    // Interpreter hot paths read this on every operand-stack push and every
-    // heap accessor (`load_and_forward`, `get_field`, ...). A `OnceLock` is
-    // an acquire load plus an out-of-line init check; this is one relaxed
-    // byte load with the init on a cold path. 0 = unset, 1 = off, 2 = on.
-    static STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-    let s = STATE.load(std::sync::atomic::Ordering::Relaxed);
+    let s = VACATED_FRAMES_STATE.load(std::sync::atomic::Ordering::Relaxed);
     if s != 0 {
         return s == 2;
     }
-    vacated_frames_enabled_init(&STATE)
+    vacated_frames_enabled_init(&VACATED_FRAMES_STATE)
+}
+
+/// Test-only arming door, so the ledger's re-issue accounting can be exercised
+/// without an environment variable set before the process started.
+#[cfg(test)]
+pub(crate) fn set_vacated_frames_enabled_for_test(on: bool) {
+    VACATED_FRAMES_STATE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Test-only: drop the ledger so a test starts from a known state.
+#[cfg(test)]
+pub(crate) fn reset_vacated_ledger_for_test() {
+    *VACATED_ADDRS.write() = None;
 }
 
 #[cold]
@@ -2633,7 +2756,7 @@ fn vacated_frames_enabled_init(state: &std::sync::atomic::AtomicU8) -> bool {
 /// exactly the `SessionLocal$Savepoint` its `astore 4` had put there). With
 /// re-issued addresses removed, a hit is unambiguous: nothing has been
 /// allocated at that address since the collector moved its occupant away.
-pub fn record_vacated(pointer_map: &cratonvm_types::PointerMap) {
+pub fn record_vacated(pointer_map: &cratonvm_types::PointerMap, collection: u64) {
     if !vacated_frames_enabled() {
         return;
     }
@@ -2653,7 +2776,7 @@ pub fn record_vacated(pointer_map: &cratonvm_types::PointerMap) {
             from.remove(k);
             continue;
         }
-        from.insert(*k, *v);
+        from.insert(*k, (*v, collection));
     }
     // A destination is a live object's base now, so anything the ledger still
     // held for it is stale bookkeeping, not a stale reference.
@@ -2868,6 +2991,47 @@ pub fn note_allocated(addrs: &[usize]) {
     }
 }
 
+/// Forget every ledger entry inside `[lo, hi)` — the allocator has just handed
+/// that whole span out as a TLAB chunk, so every address in it is about to be
+/// re-issued.
+///
+/// # Why a RANGE, and why this is what made the instrument honest
+///
+/// [`note_allocated`] is the per-object door, and until 2026-09-08 the ONLY
+/// callers of it were ZGC's (`zgc/arena_tlab.rs`, `zgc/vm_tlab.rs`, `zgc.rs`).
+/// Under `--XX:UseGc Generational` — the configuration both BindableTests pages
+/// were written against — nothing ever removed an entry, and the mutator
+/// bump-allocates straight back into the semispace the previous cycle vacated.
+/// The ledger therefore answered "vacated" for every FRESHLY ALLOCATED object
+/// in the young generation, and every detector built on it
+/// (`ValueStack::check_vacated_push`, `reclaim_guard::audit_thread_frames`,
+/// `VmHeap::note_dead_base_deref`, `load_and_forward`) reported the allocation
+/// itself as a stale reference. That is the whole content of the "eight
+/// `stack[0]` reports in one run" table in
+/// `docs/internal/springboot/bindabletests-moving-young-leaves-a-frame-slot-unremapped-20260908.md`:
+/// the producer backtrace on every one of them is `Anewarray`'s
+/// `push(Value::Object(Some(arr)))`, two statements after `gc_alloc_array`
+/// returned `arr`, with no collection in between.
+///
+/// A TLAB chunk is handed out as one span and then bump-allocated from without
+/// any further call into the heap, so the per-object door cannot see those
+/// objects at all — the range door is the only one that can. Purging the whole
+/// chunk at refill is also strictly conservative in the safe direction: it can
+/// only ever DROP a claim, never manufacture one.
+pub fn note_allocated_range(lo: usize, hi: usize) {
+    if !vacated_frames_enabled() || hi <= lo {
+        return;
+    }
+    let mut g = VACATED_ADDRS.write();
+    let Some((from, _to)) = g.as_mut() else {
+        return;
+    };
+    if from.is_empty() {
+        return;
+    }
+    from.retain(|k, _| *k < lo || *k >= hi);
+}
+
 /// Did the last recorded collection move an object away from `addr`, and if so
 /// where to?
 ///
@@ -2875,6 +3039,15 @@ pub fn note_allocated(addrs: &[usize]) {
 /// was a source but is ALSO a destination this cycle wrote a survivor to: a
 /// slot naming that address may legitimately hold the survivor.
 pub fn was_vacated(addr: usize) -> Option<usize> {
+    was_vacated_on(addr).map(|(to, _)| to)
+}
+
+/// [`was_vacated`] plus the COLLECTION the address was vacated on.
+///
+/// The ledger accumulates, so an entry can be arbitrarily many cycles old; a
+/// report that does not print this cannot tell "the remap missed this slot"
+/// from "the thread was never healed for that cycle". See [`VacatedLedger`].
+pub fn was_vacated_on(addr: usize) -> Option<(usize, u64)> {
     if !vacated_frames_enabled() {
         return None;
     }

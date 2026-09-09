@@ -861,7 +861,7 @@ pub fn update_all_roots(
     // `CRATONVM_DBG_VACATED_FRAMES` — remember what this collection moved
     // objects away FROM, so the next safepoint's frame audit can name any slot
     // still holding one. No-op unless the flag is set.
-    cratonvm_gc::gc_quiescence::record_vacated(pointer_map);
+    cratonvm_gc::gc_quiescence::record_vacated(pointer_map, shared.mem.heap.collection_count());
     crate::runtime::interpreter::remap_trace_push(
         shared,
         thread,

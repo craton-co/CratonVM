@@ -589,8 +589,27 @@ impl VmHeap {
         dispatch!(self, set_layout_domain(domain))
     }
 
+    /// `CRATONVM_DBG_VACATED_FRAMES` bookkeeping: an address the allocator has
+    /// just issued is no longer evidence that anything was moved away from it.
+    ///
+    /// Every non-TLAB allocation door on this type funnels its result through
+    /// here. The TLAB door is [`Self::refill_tlab`], which purges the whole
+    /// chunk at once — see `gc_quiescence::note_allocated_range` for why the
+    /// per-object door alone left the instrument reporting every fresh young
+    /// object as a stale reference on the non-ZGC backends.
+    #[inline]
+    fn note_alloc(o: ObjectRef) -> ObjectRef {
+        crate::gc_quiescence::note_allocated(&[o.as_ptr() as usize]);
+        o
+    }
+
+    #[inline]
+    fn note_alloc_opt(o: Option<ObjectRef>) -> Option<ObjectRef> {
+        o.map(Self::note_alloc)
+    }
+
     pub fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
-        dispatch!(self, alloc_object(class_id, num_fields))
+        Self::note_alloc(dispatch!(self, alloc_object(class_id, num_fields)))
     }
 
     pub fn alloc_array(
@@ -599,29 +618,29 @@ impl VmHeap {
         element_type: ArrayElementType,
         length: usize,
     ) -> ObjectRef {
-        dispatch!(self, alloc_array(class_id, element_type, length))
+        Self::note_alloc(dispatch!(self, alloc_array(class_id, element_type, length)))
     }
 
     /// Try to allocate an object. Returns `None` on OOM (caller should trigger GC and retry).
     pub fn try_alloc_object(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
-        match self {
+        Self::note_alloc_opt(match self {
             VmHeap::Generational(h) => h.try_alloc_object(class_id, num_fields),
             VmHeap::G1(h) => h.try_alloc_object(class_id, num_fields),
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(h) => h.try_alloc_object(class_id, num_fields),
-        }
+        })
     }
 
     /// Try to allocate directly in the old generation. This is only available
     /// for the generational heap; other heap implementations return `None` so
     /// callers can fall back to their normal allocation path.
     pub fn try_alloc_object_old(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
-        match self {
+        Self::note_alloc_opt(match self {
             VmHeap::Generational(h) => h.try_alloc_object_old(class_id, num_fields),
             VmHeap::G1(_) => None,
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(_) => None,
-        }
+        })
     }
 
     /// Allocate a same-layout old-generation batch under one allocator lock.
@@ -634,12 +653,17 @@ impl VmHeap {
         num_fields: usize,
         count: usize,
     ) -> Vec<ObjectRef> {
-        match self {
+        let batch = match self {
             VmHeap::Generational(h) => h.try_alloc_objects_old_batch(class_id, num_fields, count),
             VmHeap::G1(_) => Vec::new(),
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(_) => Vec::new(),
+        };
+        if crate::gc_quiescence::vacated_frames_enabled() {
+            let addrs: Vec<usize> = batch.iter().map(|o| o.as_ptr() as usize).collect();
+            crate::gc_quiescence::note_allocated(&addrs);
         }
+        batch
     }
 
     /// Fallible twin of [`alloc_object`](Self::alloc_object): same (no-GC)
@@ -647,12 +671,12 @@ impl VmHeap {
     /// on true heap exhaustion instead of aborting the VM. Lets the JIT
     /// object-alloc helper raise a catchable `OutOfMemoryError`.
     pub fn try_alloc_object_full(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
-        match self {
+        Self::note_alloc_opt(match self {
             VmHeap::Generational(h) => h.try_alloc_object_full(class_id, num_fields),
             VmHeap::G1(h) => h.try_alloc_object(class_id, num_fields),
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(h) => h.try_alloc_object(class_id, num_fields),
-        }
+        })
     }
 
     /// Fallible twin of [`alloc_array`](Self::alloc_array): same (no-GC)
@@ -665,12 +689,12 @@ impl VmHeap {
         element_type: ArrayElementType,
         length: usize,
     ) -> Option<ObjectRef> {
-        match self {
+        Self::note_alloc_opt(match self {
             VmHeap::Generational(h) => h.try_alloc_array_full(class_id, element_type, length),
             VmHeap::G1(h) => h.try_alloc_array(class_id, element_type, length),
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(h) => h.try_alloc_array(class_id, element_type, length),
-        }
+        })
     }
 
     /// DBG (bc math-ec `0x4`): scan young from-space for the first `0x4` seed
@@ -719,7 +743,7 @@ impl VmHeap {
         num_fields: usize,
         descriptor_bytes: &[u8],
     ) -> Option<ObjectRef> {
-        match self {
+        Self::note_alloc_opt(match self {
             VmHeap::Generational(h) => {
                 h.try_alloc_object_with_descriptors(class_id, num_fields, descriptor_bytes)
             }
@@ -730,7 +754,7 @@ impl VmHeap {
             VmHeap::Zgc(h) => {
                 h.try_alloc_object_with_descriptors(class_id, num_fields, descriptor_bytes)
             }
-        }
+        })
     }
 
     pub fn try_alloc_array(
@@ -739,12 +763,12 @@ impl VmHeap {
         element_type: ArrayElementType,
         length: usize,
     ) -> Option<ObjectRef> {
-        match self {
+        Self::note_alloc_opt(match self {
             VmHeap::Generational(h) => h.try_alloc_array(class_id, element_type, length),
             VmHeap::G1(h) => h.try_alloc_array(class_id, element_type, length),
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(h) => h.try_alloc_array(class_id, element_type, length),
-        }
+        })
     }
 
     // =====================================================================
@@ -3991,12 +4015,20 @@ impl VmHeap {
     /// that is how the object enters the start registry the sweep, the SATB
     /// barrier and the conservative scans all consult.
     pub fn refill_tlab(&self, requested_size: usize) -> Option<(*mut u8, usize)> {
-        match self {
+        let chunk = match self {
             VmHeap::Generational(h) => h.refill_tlab(requested_size),
             VmHeap::G1(h) => h.refill_tlab(requested_size),
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(h) => h.refill_tlab(requested_size),
+        };
+        // `CRATONVM_DBG_VACATED_FRAMES`: the chunk is bump-allocated from
+        // without any further call into the heap, so this is the only door that
+        // can tell the vacated ledger those addresses are being re-issued.
+        if let Some((ptr, size)) = chunk {
+            let lo = ptr as usize;
+            crate::gc_quiescence::note_allocated_range(lo, lo.saturating_add(size));
         }
+        chunk
     }
 
     /// An object the VM just finished laying out at `ptr` inside a chunk from
