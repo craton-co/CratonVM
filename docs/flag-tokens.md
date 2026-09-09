@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-536 tokens.
+537 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -535,6 +535,7 @@ export inherited from a parent shell.
 | `sweep-census` | `CRATONVM_DBG_SWEEP_CENSUS` |
 | `sweep-edges` | `CRATONVM_DBG_SWEEP_EDGES` |
 | `unreg-declined` | `CRATONVM_DBG_UNREG_DECLINED` |
+| `above-chain-kb` | `CRATONVM_DBG_ABOVE_CHAIN_KB` |
 | `sweep-referrers` | `CRATONVM_DBG_SWEEP_REFERRERS` |
 | `sweep-zero` | `CRATONVM_DBG_SWEEP_ZERO` |
 | `sweep-trace-class` | `CRATONVM_DBG_SWEEP_TRACE_CLASS` |
@@ -602,7 +603,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-396 tokens.
+399 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -623,6 +624,9 @@ export inherited from a parent shell.
 | `frame-bands` | `CRATONVM_JIT_NO_FRAME_BANDS` |
 | `oopmap-coverage-presence-only` | `CRATONVM_JIT_OOPMAP_COVERAGE_PRESENCE_ONLY` |
 | `unreg-accept-residue` | `CRATONVM_JIT_UNREG_ACCEPT_RESIDUE` |
+| `above-chain-scan` | `CRATONVM_JIT_ABOVE_CHAIN_SCAN` |
+| `above-chain-all-paths` | `CRATONVM_JIT_ABOVE_CHAIN_ALL_PATHS` |
+| `above-chain-from-sp` | `CRATONVM_JIT_ABOVE_CHAIN_FROM_SP` |
 | `a5-residue-filter` | `CRATONVM_JIT_A5_RESIDUE_FILTER` |
 | `a5-shape-filter` | `CRATONVM_JIT_A5_SHAPE_FILTER` |
 | `unreg-residue-licence` | `CRATONVM_JIT_UNREG_RESIDUE_LICENCE` |
