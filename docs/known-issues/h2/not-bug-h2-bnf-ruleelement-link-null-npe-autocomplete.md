@@ -481,3 +481,86 @@ all land inside the run-to-run spread, confirming 2026-08-10. New: `-Xverify:non
 makes the collator bootstrap **twice as slow** (252-291 ms against 113-141 ms) —
 not a lever, but a separate anomaly worth its own look, since it says the
 interpreter depends on `verified_code` for speed.
+
+## Follow-up (2026-09-08, second pass): the cold head is call-bound, and the largest single refusal is now fixed — the gap is not
+
+Went back at this with the explicit goal of closing it. It is not closed. What
+follows is what the attempt established, because the shape of the answer is
+different from what this page assumed for two years of passes.
+
+### The head is not slow interpretation, it is slow CALLS — and the JIT does not help
+
+`probes/CollatorSplit.java` isolates what the walk actually does: ~200 calls to
+`collator.equals`, i.e. `RuleBasedCollator.compare`, per head. Interleaved,
+N=5, 4000 compares:
+
+| arm | ms | what it says |
+|---|---:|---|
+| HotSpot, JIT | 22 | |
+| HotSpot, `-Xint` | 155 | HotSpot's JIT is worth **7x** here |
+| CratonVM, JIT | 1638 | |
+| CratonVM, `--nojit` | 1920 | CratonVM's JIT is worth **1.17x** here |
+
+**CratonVM's interpreter is 12x HotSpot's interpreter; CratonVM's compiled path
+is 74x HotSpot's compiled path.** The gap on this workload is not the
+interpreter, it is that compilation buys almost nothing — and the reason is
+that the path is call-dense and a call keeps leaving compiled code. The ICU and
+collator methods ARE compiled (219 of them on this run, `RuleBasedCollator.compare`
+included); a `CRATONVM_DBG_JIT_METHOD_STATS=1` run counts **1.02 M** compiled-code
+→ Rust-native dispatches for 4000 compares, 255 per compare.
+
+So this page's target belongs to
+`docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md`, and the work
+below is recorded there in full.
+
+### One refusal was 36% of every call, and it is fixed
+
+The fast invoke doors had no per-reason census, and the virtual door — the one
+tried FIRST for `invokevirtual` — had no counters at all. Adding both named the
+largest single item immediately:
+
+```text
+[invoke-door] declines by reason (total 3092393):
+[invoke-door]   888279  28.7%  special: cached target is VirtualBytecode on a non-special call
+[invoke-door]   888105  28.7%  virtual: callee is SYNCHRONIZED
+```
+
+Those two rows are one population: the virtual door declined, and the
+non-virtual door behind it declined the same call again. Every door refused a
+`synchronized` callee outright, and `java.lang.StringBuffer` is `final` with
+`synchronized` accessors — which ICU's normaliser, reached from
+`StringUtils.startsWithIgnoringCase`, drives one call per character. **888 105
+of the run's 2.47 M interpreted calls, 36%, were pushed off the ~150 ns door
+onto the ~430 ns general path for that one reason.**
+
+The doors now take such a callee when its monitor is free, releasing through
+`Frame::monitor_on_exit` at the interpreter's single frame-removal choke point.
+Measured on `CollatorSplit`, N=9 interleaved medians: **1765 → 1607 ms, −9%,
+7 of 9 pairwise** (`CRATONVM_JIT_NO_DOOR_SYNC=1` restores the refusal).
+
+### And it does not move this page
+
+`TestBnf` fails at `TestBnf.java:138` with the change on, exactly as before, and
+the cold `SELECT` head did not resolvably move. Two reasons, both worth writing
+down so the next attempt starts here:
+
+1. **The head is bootstrap-dominated.** 53% of it is one `java.text.Collator`
+   construction, and the synchronized traffic is in the other half. A 9% win on
+   the walk is ~4% of the head.
+2. **The distance is 1.6-2x** (this page's own bisection: FAIL at 150 ms,
+   PASS at 200, against H2's 100 ms budget), and the profile that has to supply
+   it is flat. `perf` on the compiled arm puts no symbol above 10.3%
+   (`invoke_on_class_shared_inner`), and the next fourteen are all dispatch
+   machinery at 1-3% each. There is no 2x lever visible; there are a dozen 5%
+   ones.
+
+### What the next attempt should take, in order
+
+From the same census, after the synchronized rows are gone, **69% of what is
+left is a registered native** (`special: cached target is a virtual registered
+native` 40.3%, `static: ... registered native` 9.2%, plus most of the residual
+`not plain bytecode` 19.0%). A leaf-native door is the next structural item —
+the compiled side already has one — and it is a different project from the
+bytecode doors, because a native callee has no frame to push and the whole cost
+is the argument decode plus a `NativeMethodRegistry` probe that is keyed by
+name (`__memcmp` is 3.3% of the compiled arm's profile).
