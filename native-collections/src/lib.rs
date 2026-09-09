@@ -6643,23 +6643,52 @@ fn collect_via_real_iterator(
     };
     let mut out = Vec::new();
     let it_pin = ctx.pin_native_root(it);
-    loop {
-        let it = ctx.read_native_pin(it_pin, it);
-        match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
-            Ok(Some(Value::Int(n))) if n != 0 => {}
-            Err(e) => return Err(e),
-            _ => break,
+    // GC-safety for the ELEMENTS, not just the iterator.
+    //
+    // Every `hasNext`/`next` here runs arbitrary Java and can complete a moving
+    // young collection, and `out` is a plain Rust `Vec` — no GC root, no remap.
+    // So each turn of this loop can relocate every element collected so far,
+    // and the caller receives a vector whose earlier entries name pre-move
+    // addresses. It is the generic form of the defect: this one function backs
+    // `toArray`, `addAll`, `forEach` and `stream` for every foreign collection.
+    //
+    // MEASURED on BindableTests under `CRATONVM_DBG_GC_STRESS=262144`:
+    // `[deadref-pin]` fired inside `native_al_to_array`'s `pin_value_slice`,
+    // pinning an element this loop had already let go stale.
+    //
+    // `it_pin` is the group base, so one `unpin_native_roots(it_pin)` releases
+    // the iterator and every element pin together.
+    let mut handles: Vec<usize> = Vec::new();
+    let result = (|| -> Result<(), MethodCallFailed> {
+        loop {
+            let it = ctx.read_native_pin(it_pin, it);
+            match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
+                Ok(Some(Value::Int(n))) if n != 0 => {}
+                Err(e) => return Err(e),
+                _ => break,
+            }
+            match ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[]) {
+                Ok(Some(v)) => {
+                    handles.push(pin_value(ctx, v));
+                    out.push(v);
+                }
+                Err(e) => return Err(e),
+                _ => break,
+            }
+            // Safety bound against a misbehaving iterator that never reports done.
+            if out.len() > 16_777_216 {
+                break;
+            }
         }
-        match ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[]) {
-            Ok(Some(v)) => out.push(v),
-            Err(e) => return Err(e),
-            _ => break,
-        }
-        // Safety bound against a misbehaving iterator that never reports done.
-        if out.len() > 16_777_216 {
-            break;
-        }
+        Ok(())
+    })();
+    // Read every element back through its pin before the group is released —
+    // the point of taking them.
+    for (i, h) in handles.iter().enumerate() {
+        out[i] = read_pinned_elem(ctx, *h, out[i]);
     }
+    ctx.unpin_native_roots(it_pin);
+    result?;
     Ok(out)
 }
 
@@ -7549,16 +7578,33 @@ fn native_al_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // `_or_real` adds the real-`toArray()` fallback so a real-bytecode source
     // (ConcurrentLinkedQueue, LinkedList, …) the layout heuristics can't read
     // still contributes its elements.
-    let elems = collect_collection_elements_or_real(ctx, other)?;
+    // GC-SAFETY, and the pin has to be taken BEFORE this call rather than after
+    // it: `collect_collection_elements_or_real` sees through every wrapper and,
+    // for a real-bytecode source, calls the collection's own `toArray()` — so it
+    // allocates and can run arbitrary Java. `this` is live across it and was
+    // being read afterwards unprotected.
+    //
+    // MEASURED on BindableTests under `CRATONVM_DBG_GC_STRESS=262144`:
+    // `[deadref-pin]` caught the `pin_native_root(this)` that used to sit below
+    // this call being handed an address naming no live object — the pin
+    // faithfully preserving a dead value instead of protecting a live one.
+    let this_pin = ctx.pin_native_root(this);
+    let elems = match collect_collection_elements_or_real(ctx, other) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
+    let this = ctx.read_native_pin(this_pin, this);
     if elems.is_empty() {
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Int(0)));
     }
     let (_, my_size) = al_state(ctx, this);
     let my_size = my_size as usize;
-    // GC-SAFETY: same `al_ensure_capacity` allocation hazard -- `this` (used
-    // again in `al_set_size`) and every object-typed element of `elems`
-    // (written into `buf` below) are live across it.
-    let this_pin = ctx.pin_native_root(this);
+    // Same `al_ensure_capacity` allocation hazard as `native_al_add`: every
+    // object-typed element of `elems` is written into `buf` after it.
     let (_, elems_handles) = pin_value_slice(ctx, &elems);
     let this = ctx.read_native_pin(this_pin, this);
     let buf = al_ensure_capacity(ctx, this, my_size + elems.len())?;
@@ -49392,12 +49438,25 @@ fn native_hs_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let elems = collect_collection_elements_or_real(ctx, coll)?;
+    // GC-safety: `collect_collection_elements_or_real` drives the source's real
+    // `iterator()` for a foreign collection, so it allocates and runs Java.
+    // `this` is live across it and the pin below was being taken AFTERWARDS —
+    // `[deadref-pin]` caught it receiving an address that named no live object
+    // on BindableTests under `CRATONVM_DBG_GC_STRESS=262144`. Same shape, same
+    // fix, as `native_al_add_all`.
+    let this_pin = ctx.pin_native_root(this);
+    let elems = match collect_collection_elements_or_real(ctx, coll) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
+    let this = ctx.read_native_pin(this_pin, this);
     // Family-1 fix (cce0079): each `native_hs_add` is GC-capable — an
     // earlier iteration's GC left `this` and every later `elems` slot stale
     // (the callee pins its own args, but was being handed already-dead
     // addresses). Pin and refresh per iteration.
-    let this_pin = ctx.pin_native_root(this);
     let (_, handles) = pin_value_slice(ctx, &elems);
     let mut this = this;
     let mut modified = false;

@@ -4291,6 +4291,51 @@ fn safe_native_call_impl(
                     );
                 }
                 *o = healed;
+                // `CRATONVM_DBG_DEADREF_STORE`: did the heal actually heal it?
+                //
+                // `load_and_forward` reads the forwarding marker at the old
+                // address, and the comment above is careful to say that marker
+                // "stays readable until the memory is actually reused". Once the
+                // allocator has re-served the span there is nothing left to
+                // read, and the heal silently returns the dead address it was
+                // given. That is not a rare corner under GC stress: it is the
+                // normal case, because a stale reference is only USED some
+                // cycles after it goes stale.
+                //
+                // So this is the boundary at which a native's stale return
+                // becomes the interpreter's problem, and it is the only place
+                // that can name the native. Everything downstream sees an
+                // ordinary operand-stack value.
+                {
+                    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    if *ON.get_or_init(|| cratonvm_types::flags().gc.dbg_deadref_store) {
+                        if let Some(reason) = cratonvm_gc::gen_heap::dead_young_ref_reason_global(
+                            o.as_ptr() as usize,
+                        ) {
+                            static N: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                                let callee = native_callee_name(callback);
+                                let java_site = thread
+                                    .frames
+                                    .last()
+                                    .map(|f| {
+                                        format!(
+                                            "{}.{}{}",
+                                            f.class_name(),
+                                            f.method_name(),
+                                            f.method_descriptor()
+                                        )
+                                    })
+                                    .unwrap_or_default();
+                                eprintln!(
+                                    "[deadref-nret] {reason} native {callee} (invoked from                                      {java_site}) returned 0x{:x}, which names no live object,                                      and `load_and_forward` could not heal it — the forwarding                                      marker is gone because the span was re-served. The defect                                      is in the native: it held a reference across an allocation.",
+                                    o.as_ptr() as usize,
+                                );
+                            }
+                        }
+                    }
+                }
             }
             if let Some(o) = value_as_validated_object_ref(shared, *v) {
                 thread.native_pending_return = Some(o);

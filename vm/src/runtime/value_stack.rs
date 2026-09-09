@@ -469,6 +469,15 @@ impl ValueStack {
 
     #[inline(always)]
     fn check_vacated_compact(cv: &CompactValue) {
+        // See `check_dead_push` — this is the compact half, and it is the path
+        // `dup`, a local reload and the cached field/return producers take, so
+        // leaving it out would blind the probe to exactly the values that reach
+        // an invoke without ever touching a `Value`.
+        if cv.is_object() {
+            if let Some(ptr) = cv.as_object_ptr() {
+                Self::check_dead_push(ptr as usize, "push_compact");
+            }
+        }
         if !cratonvm_gc::gc_quiescence::vacated_frames_enabled() {
             return;
         }
@@ -483,7 +492,47 @@ impl ValueStack {
     }
 
     #[inline(always)]
+    /// `CRATONVM_DBG_DEADREF_STORE`: a reference PUSHED onto the operand stack
+    /// that names no live object.
+    ///
+    /// The arm `check_vacated_push` below cannot see this. That one reads the
+    /// vacated ledger, which forgets an address the moment the allocator
+    /// re-issues it, and a stale reference on this workload is pushed after
+    /// re-issue — so it reported zero on every run while the operand stack was
+    /// demonstrably carrying a dead value into an invoke.
+    ///
+    /// An operand-stack slot is already a GC root, so a hit here is one of two
+    /// things and the backtrace says which: something produced a dead value (a
+    /// native return, a field read), or the frame-root remap missed the slot
+    /// this value was copied from. Both are defects; they have different fixes.
+    #[cold]
+    fn report_dead_push(addr: usize, reason: &'static str, site: &'static str) {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 8 {
+            return;
+        }
+        eprintln!(
+            "[deadref-push] {reason} {site}: 0x{addr:x} pushed onto the operand stack names no              live object. caller:
+{:?}",
+            std::backtrace::Backtrace::force_capture(),
+        );
+    }
+
+    #[inline]
+    fn check_dead_push(addr: usize, site: &'static str) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| cratonvm_types::flags().gc.dbg_deadref_store) {
+            return;
+        }
+        if let Some(reason) = cratonvm_gc::gen_heap::dead_young_ref_reason_global(addr) {
+            Self::report_dead_push(addr, reason, site);
+        }
+    }
+
     fn check_vacated_push(value: &Value) {
+        if let Value::Object(Some(o)) = value {
+            Self::check_dead_push(o.as_ptr() as usize, "push");
+        }
         if !cratonvm_gc::gc_quiescence::vacated_frames_enabled() {
             return;
         }
