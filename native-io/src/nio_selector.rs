@@ -4025,18 +4025,24 @@ fn selector_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         return Err(closed_selector_typed(ctx));
     }
     let id = selector_id_from_obj(ctx, obj);
+    // Unlike `selector_selected_keys`, do NOT filter out cancelled-but-unpruned
+    // keys here: real `Selector.keys()` keeps a cancelled key in its key set
+    // until the selector's own cancelled-key processing runs at the next
+    // `select()` (matches this file's `cancelled: ... pruned at the start of
+    // the next select cycle` — see `KeyState::cancelled`). Netty's own
+    // `NioIoHandler.numRegistered()` depends on that laziness: it computes
+    // `selector().keys().size() - cancelledKeys`, where `cancelledKeys` is a
+    // counter Netty itself increments on every `cancel()`. Filtering here
+    // means Netty subtracts its own cancellation bookkeeping AGAIN from a set
+    // that had already excluded it — `NioEventLoopTest.testChannelsRegistered`
+    // deregisters one of two channels and reads `registeredChannels()` (this
+    // formula) drop straight to 0 instead of 1.
     let key_objs: Vec<ObjectRef> = if id == 0 {
         Vec::new()
     } else {
         let regs = selectors_read();
         match regs.get(&id) {
-            Some(s) => s
-                .lock()
-                .keys
-                .values()
-                .filter(|k| !k.cancelled)
-                .filter_map(|k| k.key_obj)
-                .collect(),
+            Some(s) => s.lock().keys.values().filter_map(|k| k.key_obj).collect(),
             None => Vec::new(),
         }
     };

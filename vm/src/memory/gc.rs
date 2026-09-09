@@ -861,6 +861,12 @@ pub fn update_all_roots(
     // `CRATONVM_DBG_VACATED_FRAMES` — remember what this collection moved
     // objects away FROM, so the next safepoint's frame audit can name any slot
     // still holding one. No-op unless the flag is set.
+    // Every relocating cycle, counted unconditionally: it is the denominator
+    // for `gc_quiescence::last_pointer_map_applied`, which says whether a
+    // thread holding a stale reference had ever been handed the map it is
+    // missing. See `RELOCATING_CYCLES`.
+    cratonvm_gc::gc_quiescence::RELOCATING_CYCLES
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     cratonvm_gc::gc_quiescence::record_vacated(pointer_map);
     crate::runtime::interpreter::remap_trace_push(
         shared,

@@ -8931,6 +8931,43 @@ impl GenerationalHeap {
             let captured = crate::gc_quiescence::take_peer_reg_capture();
             let mut hits = 0usize;
             let mut reported = 0usize;
+            // THE INTERIOR CENSUS, and it is the one class of stale peer word
+            // no conservative write-back can repair.
+            //
+            // `record_peer_stack_slot`'s capture and the blocked-wake
+            // write-back both key on an OBJECT BASE, because `is_object_address`
+            // is the only predicate a conservative scan is allowed to trust. A
+            // word naming the INTERIOR of a live object -- a byte-array data
+            // pointer, a `DirectByteBuffer` address, any derived pointer -- is
+            // therefore neither marked, nor captured, nor rewritten, while the
+            // object it points into is kept alive by some other root and
+            // RELOCATED. The peer resumes and dereferences a vacated interior
+            // address, which is why the observed faults read at UNALIGNED
+            // addresses inside a decommitted span.
+            //
+            // That population is exactly what `unrewritable_conservative_jit_roots`
+            // exists to refuse -- its own comment says the registry "drops
+            // interior/derived pointers that name no base at all" -- so this
+            // counter is the measurement behind that refusal rather than an
+            // argument for it. It is only reachable with
+            // `CRATONVM_GC_NO_PEER_PIN_DIVERT=1`.
+            let from_lo = young_from.base_ptr() as usize;
+            let from_hi = from_lo + young_from.used();
+            let mut interior = 0usize;
+            let mut dead_base = 0usize;
+            for (_tid, _reg, val) in captured.iter().copied() {
+                if val < from_lo || val >= from_hi || pointer_map.contains_key(&val) {
+                    continue;
+                }
+                if young_object_starts.contains(val) {
+                    // A base that nothing relocated: the object died this
+                    // cycle. Harmless — the peer's word names garbage, and
+                    // garbage is what it named before the collection too.
+                    dead_base += 1;
+                } else {
+                    interior += 1;
+                }
+            }
             for (tid, reg, val) in captured.iter().copied() {
                 let Some(&new_addr) = pointer_map.get(&val) else {
                     continue;
@@ -8956,9 +8993,11 @@ impl GenerationalHeap {
                 crate::gc_quiescence::PEER_REG_STALE.fetch_add(hits as u64, Ordering::Relaxed);
             }
             eprintln!(
-                "[peer-reg-stale] cycle summary: captured_words={} stale={} pointer_map={}",
+                "[peer-reg-stale] cycle summary: captured_words={} stale={} interior={}                  dead_base={} pointer_map={}",
                 captured.len(),
                 hits,
+                interior,
+                dead_base,
                 pointer_map.len(),
             );
         }
@@ -9036,6 +9075,16 @@ impl GenerationalHeap {
                 n
             };
 
+            // Speculative copies the parallel evacuator abandoned after
+            // losing a forwarding CAS. They are complete objects that nothing
+            // references and nothing scanned, so every slot still names
+            // from-space -- a WHOLE-OBJECT miss, which is the shape that
+            // produced (and then sank) this instrument's only two historical
+            // non-zero readings. Excluded here so a non-zero count means what
+            // the instrument's contract says it means.
+            let abandoned = take_abandoned_evac_copies();
+            let mut skipped_abandoned = 0usize;
+
             let mut cursor = 0usize;
             let young_used = young_to.used();
             while cursor < young_used {
@@ -9046,19 +9095,28 @@ impl GenerationalHeap {
                 if size < HEADER_SIZE || cursor + size > young_used {
                     break;
                 }
-                missed_young += scan_obj("YOUNG", obj, header);
+                if abandoned.contains(&(obj as usize)) {
+                    skipped_abandoned += 1;
+                } else {
+                    missed_young += scan_obj("YOUNG", obj, header);
+                }
                 cursor += size;
             }
             for (obj, _size) in old_gen.walk_objects() {
                 // SAFETY: walk_objects yields live old-gen object starts.
                 let header = unsafe { &*(obj as *const ObjectHeader) };
-                missed_old += scan_obj("OLD", obj, header);
+                if abandoned.contains(&(obj as usize)) {
+                    skipped_abandoned += 1;
+                } else {
+                    missed_old += scan_obj("OLD", obj, header);
+                }
             }
             eprintln!(
-                "[moving-young-verify] forwarded_heap_refs_remaining young={} old={} pointer_map={}",
+                "[moving-young-verify] forwarded_heap_refs_remaining young={} old={} pointer_map={}                  abandoned_cas_loser_copies_skipped={}",
                 missed_young,
                 missed_old,
                 pointer_map.len(),
+                skipped_abandoned,
             );
             eprintln!(
                 "[moving-young-verify] scan frontier: scan_cursor=0x{:x} to_used=0x{:x} \
@@ -11143,12 +11201,18 @@ impl GenerationalHeap {
                             // measured run at `--Xmx 320m` — and under a
                             // permanent non-moving sweep promotion is the young
                             // generation's ONLY exit for live data.
+                            // `None`: this is the PARALLEL chunk path. The
+                            // proved-base resume is enabled only on the
+                            // sequential walk, the one measured for it; a chunk
+                            // that meets a live mark inside a zero run keeps
+                            // bailing, which is what it did before.
                             if let Some(resume) = zero_run_empty_object_resume(
                                 from_base,
                                 cursor,
                                 run_end,
                                 used,
                                 &side_sorted,
+                                None,
                             ) {
                                 SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
                                 EMPTY_RUN_BYTES_CYCLE
@@ -11507,12 +11571,14 @@ impl GenerationalHeap {
                                 // holds nothing for this pass to rewrite. The
                                 // anomaly arm instead hands the whole stretch
                                 // to `rewrite_stretch`'s conservative rewrite.
+                                // `None` — parallel chunk path, see above.
                                 if let Some(resume) = zero_run_empty_object_resume(
                                     from_base,
                                     cursor,
                                     run_end,
                                     used,
                                     &side_sorted,
+                                    None,
                                 ) {
                                     SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
                                     EMPTY_RUN_BYTES_CYCLE
@@ -12244,8 +12310,7 @@ impl GenerationalHeap {
         // Only meaningful when this walk covers the whole arena, i.e. the
         // parallel prefix did not already consume the front of it.
         let seq_walk_covers_all = cursor == 0;
-        let mut anchor_probe = sweep_anchors.iter().peekable();
-        let mut anchors_off_grid = 0usize;
+        let mut anchor_probe = AnchorGridProbe::new(&sweep_anchors, seq_walk_covers_all);
 
         while cursor < used {
             // Skip known free blocks ROBUSTLY. The free list (`existing_free`) is
@@ -12261,6 +12326,10 @@ impl GenerationalHeap {
             // Now: drop free blocks the cursor has wholly passed, and if the cursor
             // lands AT or INSIDE a free block, resync to that block's end.
             {
+                // Where the walk stood BEFORE the free-block resync — the
+                // anchor probe below needs it to tell "crossed a known free
+                // block" (benign) from "strode past by an object" (the finding).
+                let pre_skip = cursor;
                 let (resynced, overshot) = skip_free_blocks(&mut cursor, &mut free_iter);
                 if overshot {
                     // The previous stride ran INTO a known free block: the
@@ -12281,6 +12350,11 @@ impl GenerationalHeap {
                     dead_watermark = dead_regions.len();
                     last_anchor_off = cursor;
                     objects_since_anchor = 0;
+                    // Anchor-validity probe: this `continue` skips the
+                    // walk-position probe below, so tell it about the span the
+                    // resync just crossed or the next iteration reports every
+                    // anchor inside it as off-grid.
+                    anchor_probe.crossed_free_block(pre_skip, cursor);
                     continue;
                 }
             }
@@ -12289,16 +12363,7 @@ impl GenerationalHeap {
             // start or a GAP-filler sentinel, both of which `sweep_chunk`
             // handles. Anything the anchor list holds strictly below it was
             // never reachable.
-            if seq_walk_covers_all {
-                while anchor_probe.peek().is_some_and(|&&a| a < cursor) {
-                    anchors_off_grid += 1;
-                    SWEEP_ANCHOR_NOT_A_BASE.fetch_add(1, Ordering::Relaxed);
-                    anchor_probe.next();
-                }
-                if anchor_probe.peek().is_some_and(|&&a| a == cursor) {
-                    anchor_probe.next();
-                }
-            }
+            anchor_probe.at_walk_position(cursor);
             // `cursor` is within `used`; the from-space region
             // `[base, base+used)` is backed by mapped, allocated memory. The
             // integer-to-pointer cast itself is safe; only the header deref
@@ -12372,7 +12437,14 @@ impl GenerationalHeap {
                 // exists for. Still never parsed and never freed: over-retention
                 // is always safe here.
                 let empty_resume = if run_end - cursor >= HEADER_SIZE && !vouched_live {
-                    zero_run_empty_object_resume(from_base, cursor, run_end, used, &side_sorted)
+                    zero_run_empty_object_resume(
+                        from_base,
+                        cursor,
+                        run_end,
+                        used,
+                        &side_sorted,
+                        Some(&unresolved_snapshot),
+                    )
                 } else {
                     None
                 };
@@ -13149,7 +13221,10 @@ impl GenerationalHeap {
         // chunk started off the object grid parses phantom objects, and an
         // unmarked phantom reclaims and ZEROES every live object it subsumes.
         // Bounded, and normally never emitted at all — on a sound anchor list
-        // this counter is exactly zero.
+        // this counter is exactly zero. See [`AnchorGridProbe`] for the two
+        // benign crossings it used to count as findings, which is why "exactly
+        // zero" had not been true.
+        let anchors_off_grid = anchor_probe.off_grid();
         if anchors_off_grid > 0 {
             let n = ANCHOR_OFF_GRID_REPORTS.fetch_add(1, Ordering::Relaxed);
             if n < 8 {
@@ -15448,7 +15523,7 @@ impl GenerationalHeap {
                     // fired on 4 of 4 entries — i.e. every major cycle seeded
                     // young->old from a conservative scan rather than a parse.
                     if let Some(resume) =
-                        zero_run_empty_object_resume(base, cursor, run_end, used, &[])
+                        zero_run_empty_object_resume(base, cursor, run_end, used, &[], None)
                     {
                         SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
                         EMPTY_RUN_BYTES_CYCLE
@@ -15758,7 +15833,7 @@ impl GenerationalHeap {
                     // primitive included — and gives up the precise parse of
                     // every real object in the stretch.
                     if let Some(resume) =
-                        zero_run_empty_object_resume(base, cursor, run_end, used, &[])
+                        zero_run_empty_object_resume(base, cursor, run_end, used, &[], None)
                     {
                         SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
                         EMPTY_RUN_BYTES_CYCLE
@@ -17248,7 +17323,7 @@ impl GenerationalHeap {
                         // consumer relies on. Today's arm omits them too, along
                         // with everything after them.
                         if let Some(resume) =
-                            zero_run_empty_object_resume(base, offset, run_end, used, &[])
+                            zero_run_empty_object_resume(base, offset, run_end, used, &[], None)
                         {
                             SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
                             EMPTY_RUN_BYTES_CYCLE
@@ -17637,6 +17712,46 @@ fn seedhunt_enabled() -> bool {
 #[inline]
 fn moving_young_dangling_verify_enabled() -> bool {
     gc_flags().moving_young_verify
+}
+
+/// Speculative to-space (or old-gen) copies the parallel evacuator ABANDONED
+/// after losing the forwarding CAS, for the cycle currently being verified.
+///
+/// # Why the verifier above is unreadable without this
+///
+/// `ParEvac::evacuate` copies first and claims second, so a worker that loses
+/// the race has already written a complete object at `new_addr` and simply
+/// walks away from it: "to-space garbage reclaimed next cycle". Nothing
+/// references it, so nothing scans it, so **every one of its reference slots
+/// keeps the pre-move address** — and the verifier, which walks all of to-space
+/// and old-gen, reports each of them as a missed heap rewrite.
+///
+/// That is exactly the shape
+/// `internal/fixed-suite-bugs/netty/bytebuf-multiplethreads-npe-generational-blocked-wake-jit-remap-FIXED-20260908.md`
+/// §6 published a root cause off and then withdrew: *"an object whose every
+/// slot was missed"*, twice, never reproducible, and refuted by a scan-cursor
+/// instrument that could not explain it either. An abandoned loser explains
+/// both halves — whole-object, because the object was never scanned; and
+/// harmless, because it is unreachable garbage and no mutator can dereference
+/// it.
+///
+/// Populated only while the verifier is armed, so the ordinary evacuation path
+/// pays nothing.
+static ABANDONED_EVAC_COPIES: parking_lot::Mutex<Vec<usize>> = parking_lot::Mutex::new(Vec::new());
+
+/// Record one abandoned CAS-loser copy. No-op unless the verifier is armed.
+pub(crate) fn record_abandoned_evac_copy(addr: usize) {
+    if !moving_young_dangling_verify_enabled() {
+        return;
+    }
+    ABANDONED_EVAC_COPIES.lock().push(addr);
+}
+
+/// Take (and clear) this cycle's abandoned copies, as a set the verifier can
+/// test membership against.
+fn take_abandoned_evac_copies() -> rustc_hash::FxHashSet<usize> {
+    let mut g = ABANDONED_EVAC_COPIES.lock();
+    std::mem::take(&mut *g).into_iter().collect()
 }
 
 /// Scan a single object's reference slots for the `0x4` seed signature
@@ -18912,12 +19027,16 @@ fn sweep_chunk(ctx: &SweepCtx<'_>, lo: usize, hi: usize) -> Option<SweepChunkRes
             let run_end = zero_run_end(from_base, cursor, limit);
             let vouched_live = ctx.side_sorted.binary_search(&(from_base + cursor)).is_ok();
             if run_end - cursor >= HEADER_SIZE && !vouched_live {
+                // `None`: this walk's `ctx` carries no unresolved-mark set,
+                // so it cannot tell a proved base from a conservative interior
+                // mark and must keep refusing.
                 if let Some(resume) = zero_run_empty_object_resume(
                     from_base,
                     cursor,
                     run_end,
                     ctx.used,
                     ctx.side_sorted,
+                    None,
                 ) {
                     SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
                     EMPTY_RUN_BYTES_CYCLE.fetch_add((resume - cursor) as u64, Ordering::Relaxed);
@@ -19930,6 +20049,104 @@ fn skip_free_blocks(
     (resynced, overshot)
 }
 
+/// The sequential sweep walk's ANCHOR-VALIDITY probe, as a type.
+///
+/// The parallel sweep prefix splits from-space at `sweep_anchors` and starts an
+/// independent object chain at each one; its soundness rests entirely on those
+/// offsets being real walk positions. The sequential walk visits every walk
+/// position in ascending order, so an anchor it strides past without landing on
+/// is an anchor that is NOT on the object grid — a chunk started there parses
+/// phantom objects, and a phantom that reads as unmarked reclaims and zeroes
+/// every live object it subsumes. That is what [`SWEEP_ANCHOR_NOT_A_BASE`]
+/// counts, and its report calls the counter "exactly zero on a sound anchor
+/// list".
+///
+/// # The two crossings that are NOT findings
+///
+/// The probe was inline, ran after `skip_free_blocks`, and counted every
+/// unconsumed anchor below the cursor. Both of the walk's legitimate jumps
+/// therefore registered as findings:
+///
+/// * **offset 0.** The anchor builder deliberately exempts it from the "drop
+///   anchors that land inside a free block" filter — "it is the walk's start,
+///   not a split point, and every walker already skip-resyncs from it". When
+///   from-space opens with a free block, the first iteration resyncs the cursor
+///   past it and `continue`s (skipping the probe), and the next iteration finds
+///   anchor 0 below the cursor and counts it. This is the `off_grid=1
+///   anchors=2` reading two passing classes produced in the 2026-09-08
+///   BindableTests sweep: a two-entry list is `[0, used]`, and `used` cannot be
+///   reached from inside a `cursor < used` loop, so the exempt anchor is the
+///   only one it can have counted.
+/// * **a free block the walk resyncs over.** Anchors inside one are filtered
+///   out at construction against `exact_skips`, but the walk resyncs off
+///   `existing_free`, and a parallel chunk beginning at such an offset resyncs
+///   off exactly the same list — it parses no phantom, so it is not this
+///   failure.
+///
+/// An anchor the walk passed by an OBJECT stride still counts: that is the
+/// grid disagreement the probe exists for.
+struct AnchorGridProbe<'a> {
+    it: std::iter::Peekable<std::slice::Iter<'a, usize>>,
+    off_grid: usize,
+    /// Only meaningful when the sequential walk covers the whole arena; when
+    /// the parallel prefix already consumed the front, anchors below the
+    /// prefix end were proven by the prefix, not skipped.
+    armed: bool,
+}
+
+impl<'a> AnchorGridProbe<'a> {
+    fn new(anchors: &'a [usize], armed: bool) -> Self {
+        let mut p = Self {
+            it: anchors.iter().peekable(),
+            off_grid: 0,
+            armed,
+        };
+        if armed {
+            // Consume the exempt walk start before the walk can jump over it.
+            while p.it.peek().is_some_and(|&&a| a == 0) {
+                p.it.next();
+            }
+        }
+        p
+    }
+
+    /// The walk is standing on `cursor`, a position the object grid reaches.
+    fn at_walk_position(&mut self, cursor: usize) {
+        if !self.armed {
+            return;
+        }
+        while self.it.peek().is_some_and(|&&a| a < cursor) {
+            self.off_grid += 1;
+            SWEEP_ANCHOR_NOT_A_BASE.fetch_add(1, Ordering::Relaxed);
+            self.it.next();
+        }
+        if self.it.peek().is_some_and(|&&a| a == cursor) {
+            self.it.next();
+        }
+    }
+
+    /// The walk jumped from `from` to `to` over a KNOWN free block. Anchors in
+    /// `[from, to]` are accounted for, not skipped; anything still below `from`
+    /// was passed by an object stride and is a finding.
+    fn crossed_free_block(&mut self, from: usize, to: usize) {
+        if !self.armed {
+            return;
+        }
+        while self.it.peek().is_some_and(|&&a| a < from) {
+            self.off_grid += 1;
+            SWEEP_ANCHOR_NOT_A_BASE.fetch_add(1, Ordering::Relaxed);
+            self.it.next();
+        }
+        while self.it.peek().is_some_and(|&&a| a <= to) {
+            self.it.next();
+        }
+    }
+
+    fn off_grid(&self) -> usize {
+        self.off_grid
+    }
+}
+
 /// DoHead walk-desync hardening: measure the all-zero run starting at
 /// `start` (an 8-aligned walk-grid offset), in 8-byte words, capped at
 /// `limit`. Returns the run's END offset (always 8-aligned unless the run
@@ -20079,12 +20296,24 @@ pub static YOUNG_WALK_ENTRIES: [AtomicU64; 5] = [
 pub static ZERO_RUN_REFUSALS: [AtomicU64; 3] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
+/// Zero runs stepped over by resuming at a PROVED live base inside them,
+/// instead of refusing and unwinding the cycle's reclaim decisions. See the
+/// long note in `zero_run_verdict`.
+///
+/// This is an ACCEPTANCE and deliberately not an entry in
+/// [`ZERO_RUN_REFUSALS`]: that array prints under a `refusals=` label, and
+/// filing an acceptance there would make the fix read as the defect it removes.
+/// `live_inside` stays the count of runs that were genuinely refused — an
+/// interior mark, or a caller with no `unresolved` set to judge against.
+pub static ZERO_RUN_LIVE_RESUMES: AtomicU64 = AtomicU64::new(0);
+
 fn zero_run_verdict(
     base: usize,
     cursor: usize,
     run_end: usize,
     used: usize,
     side_sorted: &[usize],
+    unresolved: Option<&[usize]>,
 ) -> ZeroRunVerdict {
     // Truncate to the last whole slot, and judge THAT boundary.
     //
@@ -20121,11 +20350,56 @@ fn zero_run_verdict(
         ZERO_RUN_REFUSALS[0].fetch_add(1, Ordering::Relaxed);
         return ZeroRunVerdict::Misaligned;
     }
-    // No marked base strictly inside `(cursor, run_end)`. `side_sorted` is
+    // A marked address strictly inside `(cursor, run_end)`. `side_sorted` is
     // ascending, so the only candidate is the last entry below `run_end`.
     let hi = base + run_end;
     let i = side_sorted.partition_point(|&a| a < hi);
     if i > 0 && side_sorted[i - 1] > base + cursor {
+        // RESUME AT A PROVED BASE, REFUSE OTHERWISE.
+        //
+        // The refusal below is right about its subject and must stay: a zero
+        // run casts doubt on every STRIDE since the last anchor, and the
+        // caller's unwind is what makes a mis-sized stride cost retention
+        // instead of a freed live object.
+        //
+        // But it is too strong for one shape. A field-less object is WHOLLY
+        // zero (`MARK_NEUTRAL`, `ObjectKind::Object` and
+        // `ArrayElementType::Reference` all encode as 0 — see the note above),
+        // so a run of them containing a LIVE empty object is the ordinary case,
+        // not a desync. On `ChurnLoop` (125k `new Object()` a round under
+        // `System.gc()`) every refusal was this one — `live_inside=17` against
+        // `zero_empty_runs=144` — and each discarded the cycle's whole
+        // reclamation: `dead_pushed=294 unwound_entries=295 bytes_swept=0`.
+        //
+        // What separates the two readings is whether the marked address is an
+        // object BASE. It need not be: `SWEEP_PHANTOM_INTERIOR_MARKS` records
+        // that conservative candidates can mark an object-INTERIOR word (a
+        // field address, a derived pointer, a spilled register mid-object) and
+        // the late-resolution pass cannot unmark the raw address, "so
+        // `side_sorted` can carry both". Resuming at an interior mark would
+        // land the cursor MID-OBJECT — the very desync this guard exists for,
+        // and the reason an earlier attempt at this (which argued `side_sorted`
+        // entries are "bases by construction") was reverted.
+        //
+        // `unresolved` is the set that may not be bases; everything else came
+        // from a precise ref-slot value or from `resolve_candidate_bases`, and
+        // is a base by construction. `None` means the caller cannot answer, and
+        // then this stays a refusal — which is what keeps every walk that has
+        // no live set, and `a_live_base_inside_the_run_is_still_a_desync`,
+        // behaving exactly as before.
+        //
+        // The FIRST base above `cursor` is the resume point, not the last below
+        // `run_end`: resuming at the last would step over the live objects
+        // between them, which are precisely the ones the walk must visit.
+        if let Some(unresolved) = unresolved {
+            let j = side_sorted.partition_point(|&a| a <= base + cursor);
+            if j < i && unresolved.binary_search(&side_sorted[j]).is_err() {
+                ZERO_RUN_LIVE_RESUMES.fetch_add(1, Ordering::Relaxed);
+                return ZeroRunVerdict::EmptyObjects {
+                    resume: side_sorted[j] - base,
+                };
+            }
+        }
         ZERO_RUN_REFUSALS[1].fetch_add(1, Ordering::Relaxed);
         return ZeroRunVerdict::LiveInside;
     }
@@ -20173,11 +20447,12 @@ fn zero_run_empty_object_resume(
     run_end: usize,
     used: usize,
     side_sorted: &[usize],
+    unresolved: Option<&[usize]>,
 ) -> Option<usize> {
     if empty_object_run_recovery_disabled() {
         return None;
     }
-    match zero_run_verdict(base, cursor, run_end, used, side_sorted) {
+    match zero_run_verdict(base, cursor, run_end, used, side_sorted, unresolved) {
         ZeroRunVerdict::EmptyObjects { resume } => Some(resume),
         _ => None,
     }
@@ -20308,7 +20583,7 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena, side_sorted: &[usize]) {
             let vouched_live = side_sorted.binary_search(&(base + cursor)).is_ok();
             if run_end - cursor >= HEADER_SIZE && !vouched_live {
                 if let Some(resume) =
-                    zero_run_empty_object_resume(base, cursor, run_end, used, side_sorted)
+                    zero_run_empty_object_resume(base, cursor, run_end, used, side_sorted, None)
                 {
                     SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
                     EMPTY_RUN_BYTES_CYCLE.fetch_add((resume - cursor) as u64, Ordering::Relaxed);
@@ -20498,6 +20773,82 @@ impl GarbageCollector for GenerationalHeap {
 mod tests {
     use super::*;
 
+    /// **THE OFF-GRID ANCHOR COUNTER MUST NOT COUNT THE WALK'S OWN START.**
+    ///
+    /// `[0, used]` with a free block at the front of from-space is the shape
+    /// the 2026-09-08 BindableTests sweep reported as `off_grid=1 anchors=2`
+    /// while the classes it came from PASSED. `used` is unreachable from inside
+    /// a `cursor < used` loop, so the reading could only have been the exempt
+    /// walk start — and a report whose own text says it is "exactly zero on a
+    /// sound anchor list" cannot be used as evidence about a sweep while it
+    /// fires on a sound one.
+    #[test]
+    fn the_walk_start_is_not_an_off_grid_anchor_when_from_space_opens_with_a_free_block() {
+        let anchors = [0usize, 4096];
+        let mut p = AnchorGridProbe::new(&anchors, true);
+        // The walk's first act: resync from 0 over a free block ending at 512.
+        p.crossed_free_block(0, 512);
+        p.at_walk_position(512);
+        p.at_walk_position(600);
+        assert_eq!(
+            p.off_grid(),
+            0,
+            "offset 0 is the walk's start, not a split point — the anchor \
+             builder exempts it from its own free-block filter for exactly \
+             this reason"
+        );
+    }
+
+    /// And an anchor inside a free block the walk resyncs over is not one
+    /// either: a parallel chunk beginning there resyncs off the same list, so
+    /// it parses no phantom.
+    #[test]
+    fn an_anchor_inside_a_resynced_free_block_is_not_off_grid() {
+        let anchors = [0usize, 256, 4096];
+        let mut p = AnchorGridProbe::new(&anchors, true);
+        p.at_walk_position(0);
+        p.crossed_free_block(128, 512);
+        p.at_walk_position(512);
+        assert_eq!(p.off_grid(), 0);
+    }
+
+    /// **BUT AN ANCHOR THE WALK PASSED BY AN OBJECT STRIDE STILL COUNTS.**
+    ///
+    /// Without this the fix above would be indistinguishable from deleting the
+    /// probe.
+    #[test]
+    fn an_anchor_strode_past_by_an_object_is_still_reported_off_grid() {
+        let anchors = [0usize, 300, 4096];
+        let mut p = AnchorGridProbe::new(&anchors, true);
+        p.at_walk_position(0);
+        // A 512-byte object took the walk from 0 to 512, straight over 300.
+        p.at_walk_position(512);
+        assert_eq!(
+            p.off_grid(),
+            1,
+            "300 is not a walk position: a chunk started there parses a phantom"
+        );
+
+        // And the same anchor is still a finding when the jump that passed it
+        // was an object stride ENDING at a free block the walk then crossed.
+        let mut q = AnchorGridProbe::new(&anchors, true);
+        q.at_walk_position(0);
+        q.crossed_free_block(512, 1024);
+        assert_eq!(q.off_grid(), 1);
+    }
+
+    /// Disarmed (the parallel prefix already consumed the front of from-space)
+    /// the probe reports nothing: anchors below the prefix end were PROVEN by
+    /// the prefix, not skipped.
+    #[test]
+    fn the_probe_is_silent_when_the_parallel_prefix_covered_the_front() {
+        let anchors = [0usize, 300, 4096];
+        let mut p = AnchorGridProbe::new(&anchors, false);
+        p.at_walk_position(512);
+        p.crossed_free_block(512, 1024);
+        assert_eq!(p.off_grid(), 0);
+    }
+
     /// Write `h` into `buf` at `off` bytes and return the buffer's base
     /// address. `Vec<u64>` gives the 8-byte alignment `ObjectHeader` needs.
     fn put_header(buf: &mut [u64], off: usize, h: ObjectHeader) -> usize {
@@ -20531,7 +20882,7 @@ mod tests {
         let mut buf = vec![0u64; 8]; // 64 bytes
         let base = put_header(&mut buf, HEADER_SIZE, plain_object(2));
         assert_eq!(
-            zero_run_empty_object_resume(base, 0, HEADER_SIZE, 64, &[]),
+            zero_run_empty_object_resume(base, 0, HEADER_SIZE, 64, &[], None),
             Some(HEADER_SIZE)
         );
     }
@@ -20589,7 +20940,7 @@ mod tests {
         // first word.
         assert_eq!(zero_run_end(base, 0, 64), HEADER_SIZE + 8);
         assert_eq!(
-            zero_run_empty_object_resume(base, 0, HEADER_SIZE + 8, 64, &[]),
+            zero_run_empty_object_resume(base, 0, HEADER_SIZE + 8, 64, &[], None),
             Some(HEADER_SIZE),
             "must resume at the empty object's end, not at the ragged run's end"
         );
@@ -20650,7 +21001,7 @@ mod tests {
     fn a_zero_run_shorter_than_one_slot_is_still_a_desync() {
         let mut buf = vec![0u64; 8];
         let base = put_header(&mut buf, 8, plain_object(1));
-        assert_eq!(zero_run_empty_object_resume(base, 0, 8, 64, &[]), None);
+        assert_eq!(zero_run_empty_object_resume(base, 0, 8, 64, &[], None), None);
     }
 
     /// Several empty objects in a row are still empty objects.
@@ -20659,7 +21010,7 @@ mod tests {
         let mut buf = vec![0u64; 16]; // 128 bytes
         let base = put_header(&mut buf, 3 * HEADER_SIZE, plain_object(1));
         assert_eq!(
-            zero_run_empty_object_resume(base, 0, 3 * HEADER_SIZE, 128, &[]),
+            zero_run_empty_object_resume(base, 0, 3 * HEADER_SIZE, 128, &[], None),
             Some(3 * HEADER_SIZE)
         );
     }
@@ -20672,7 +21023,43 @@ mod tests {
         let base = put_header(&mut buf, 2 * HEADER_SIZE, plain_object(0));
         let live = base + HEADER_SIZE;
         assert_eq!(
-            zero_run_empty_object_resume(base, 0, 2 * HEADER_SIZE, 64, &[live]),
+            zero_run_empty_object_resume(base, 0, 2 * HEADER_SIZE, 64, &[live], None),
+            None
+        );
+    }
+
+    /// A live mark inside the run is refused when it cannot be PROVED a base,
+    /// and resumed at when it can.
+    ///
+    /// The two arms are the whole of the 2026-09-07 change. `side_sorted`
+    /// carries conservative interior marks as well as bases
+    /// (`SWEEP_PHANTOM_INTERIOR_MARKS`), and resuming at an interior mark lands
+    /// the cursor mid-object — the desync
+    /// `a_live_base_inside_the_run_is_still_a_desync` exists to prevent. Only a
+    /// mark absent from `unresolved` is a base by construction.
+    #[test]
+    fn a_proved_live_base_inside_the_run_is_resumed_at_not_refused() {
+        let mut buf = vec![0u64; 8];
+        let base = put_header(&mut buf, 2 * HEADER_SIZE, plain_object(0));
+        let live = base + HEADER_SIZE;
+        // UNPROVED: `live` is in the unresolved set, so it may be an interior
+        // word. Refuse, exactly as with no set at all.
+        assert_eq!(
+            zero_run_empty_object_resume(base, 0, 2 * HEADER_SIZE, 64, &[live], Some(&[live])),
+            None,
+            "an unresolved mark may not be a base and must not be resumed at"
+        );
+        // PROVED: not in the unresolved set, so it came from a precise ref slot
+        // or `resolve_candidate_bases`. Resume AT it.
+        assert_eq!(
+            zero_run_empty_object_resume(base, 0, 2 * HEADER_SIZE, 64, &[live], Some(&[])),
+            Some(HEADER_SIZE),
+            "a proved base is on-grid and is where the walk should continue"
+        );
+        // And with no information at all the answer is still refusal — this is
+        // what keeps every walk that cannot answer behaving as before.
+        assert_eq!(
+            zero_run_empty_object_resume(base, 0, 2 * HEADER_SIZE, 64, &[live], None),
             None
         );
     }
@@ -20684,7 +21071,7 @@ mod tests {
         let mut buf = vec![0u64; 8];
         let base = put_header(&mut buf, 2 * HEADER_SIZE, plain_object(0));
         assert_eq!(
-            zero_run_empty_object_resume(base, HEADER_SIZE, 2 * HEADER_SIZE, 64, &[base]),
+            zero_run_empty_object_resume(base, HEADER_SIZE, 2 * HEADER_SIZE, 64, &[base], None),
             Some(2 * HEADER_SIZE)
         );
     }
@@ -20695,7 +21082,7 @@ mod tests {
     fn a_zero_run_to_the_end_of_used_is_not_a_desync() {
         let mut buf = vec![0u64; 4];
         let base = buf.as_mut_ptr() as usize;
-        assert_eq!(zero_run_empty_object_resume(base, 0, 32, 32, &[]), Some(32));
+        assert_eq!(zero_run_empty_object_resume(base, 0, 32, 32, &[], None), Some(32));
     }
 
     /// If the header the run lands on does not size plausibly, `run_end` is not
@@ -20706,7 +21093,7 @@ mod tests {
         // 4096 slots = 32 KiB, far past the 64-byte `used` bound.
         let base = put_header(&mut buf, HEADER_SIZE, plain_object(4096));
         assert_eq!(
-            zero_run_empty_object_resume(base, 0, HEADER_SIZE, 64, &[]),
+            zero_run_empty_object_resume(base, 0, HEADER_SIZE, 64, &[], None),
             None
         );
     }
@@ -21214,6 +21601,62 @@ mod tests {
         assert!(heap
             .is_object_address(invalid_element.as_ptr() as usize)
             .is_none());
+    }
+
+    /// A header the non-moving sweep ZEROED still decodes as a valid object.
+    ///
+    /// This is the hole under any screen of the form
+    /// `if is_object_address(addr).is_some() { not a victim }`:
+    /// `ObjectKind::Object` is discriminant **0**, `ArrayElementType`'s first
+    /// variant is 0, `header_reserved_fields_plausible` passes on all-zero
+    /// `gc_flags`, and a zeroed `num_slots` makes the extent check trivially
+    /// fit. So the one shape a reclaim guard exists to catch — a live reference
+    /// to a span the sweep zeroed IN PLACE, which is the mapped
+    /// (`CRATONVM_GEN_UNCOMMIT=0`) silent-data-loss face rather than the
+    /// SIGSEGV one — reads back as "a live object" here.
+    ///
+    /// `is_object_address` is not wrong: it answers "do these bytes decode as
+    /// an object header", which is what conservative stack-spill validation
+    /// needs. It is the wrong question for "is this object DEAD".
+    ///
+    /// THE OBVIOUS REPAIR DOES NOT WORK, and was measured rather than reasoned
+    /// about. Requiring a non-zero class id alongside it looks like the
+    /// discriminator and is not one: `java.lang.Object` is ITSELF `ClassId(0)`
+    /// (see `vm/src/memory/reclaim_guard.rs`'s header), so that test condemns
+    /// every live `new Object()`. Added to `deadrecv_check`'s re-allocation
+    /// screen it put `GpuResidencyGc` back to 8 reports a run, and — because
+    /// that guard also substitutes a benign value on a hit — back to answers
+    /// that DIFFER from HotSpot. Reverted.
+    ///
+    /// The unambiguous test is free-list membership
+    /// (`GenerationalHeap::reclaimed_hole_at`): a live object is never inside a
+    /// free block, never past the allocation frontier, never in the inactive
+    /// semispace. It takes the heap locks, so it belongs on the rare
+    /// `class_id == 0` fall-through rather than in front of every receiver.
+    #[test]
+    fn a_sweep_zeroed_header_still_decodes_as_an_object_of_class_zero() {
+        let heap = GenerationalHeap::new();
+        let obj = heap.alloc_object(ClassId::new(7), 2);
+        let addr = obj.as_ptr() as usize;
+        assert!(
+            heap.is_object_address(addr).is_some(),
+            "the live object must validate before the header is zeroed, or this              test proves nothing about the zeroing"
+        );
+        // Exactly what the sweep leaves behind.
+        // SAFETY: `obj` was just allocated by this heap and is `HEADER_SIZE`
+        // bytes wide at minimum; the test is single-threaded.
+        unsafe {
+            std::ptr::write_bytes(obj.as_ptr(), 0, cratonvm_types::HEADER_SIZE);
+        }
+        assert!(
+            heap.is_object_address(addr).is_some(),
+            "if this now answers None, `is_object_address` rejects a zeroed              header on its own and a re-allocation screen built on it is safe —              delete the class-id requirement in `deadrecv_check` that this test              justifies"
+        );
+        assert_eq!(
+            heap.class_id_of(obj).as_u32(),
+            0,
+            "and the class id is what separates it from a real object"
+        );
     }
 
     #[test]

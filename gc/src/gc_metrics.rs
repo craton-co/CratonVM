@@ -1177,6 +1177,46 @@ pub fn collector_decision_report() -> String {
             ));
         }
     }
+    // THE 2026-09-08 EVACUATION SCREENS, printed UNCONDITIONALLY so a zero is
+    // citable evidence rather than a silence.
+    //
+    // Every one of these is expected to be ZERO on a healthy run, and each
+    // names a distinct door into
+    // `g1-eight-byte-write-at-a-live-objects-base-20260906`'s two families:
+    //
+    //  * `fwd_target_implausible` -- a `MARK_FORWARDED` word decoded to a
+    //    target `make_forwarded` could not have installed (`forwarding_target`
+    //    strips the low TWO bits, the install asserts the low THREE), so a
+    //    non-address was about to be stored into a live reference slot and
+    //    pushed onto the gray worklist;
+    //  * `supply_non_object` -- an evacuation supply address that is not an
+    //    object start;
+    //  * `candidate_arena_ptr` -- a candidate whose `class_id`/`shape` pair
+    //    recombines to a pointer into this arena, i.e. a body word read at an
+    //    address that is not an object start;
+    //  * `empty_header_refused` / `empty_header_proved` -- the shape no header
+    //    screen can reject (a null `Value` cell's payload word reads as a
+    //    zero-field class-0 object), and how often the grid had to be walked to
+    //    say so. A large `proved` beside a zero `refused` means the shape is
+    //    common and genuine and the proof is paying for nothing;
+    //  * `tagged_ref_writes` -- a reference-slot write whose value is not
+    //    8-aligned, i.e. a mark word stored where an object address belongs.
+    {
+        use std::sync::atomic::Ordering as O;
+        s.push('\n');
+        s.push_str(&format!(
+            "[GC] g1 evac-screens: fwd_target_implausible={} supply_non_object={} \
+             candidate_arena_ptr={} empty_header_refused={} empty_header_proved={} \
+             empty_header_waived={} tagged_ref_writes={}",
+            crate::g1::FORWARD_TARGET_IMPLAUSIBLE.load(O::Relaxed),
+            crate::g1::EVAC_SUPPLY_NON_OBJECT.load(O::Relaxed),
+            crate::g1::EVAC_REF_REJECTED_ARENA.load(O::Relaxed),
+            crate::g1::EVAC_EMPTY_HEADER_REFUSED.load(O::Relaxed),
+            crate::g1::EVAC_EMPTY_HEADER_PROVED.load(O::Relaxed),
+            crate::g1::EVAC_EMPTY_HEADER_WAIVED.load(O::Relaxed),
+            crate::g1::REF_WRITE_TAGGED_VALUE.load(O::Relaxed),
+        ));
+    }
     // I-6 coverage. Printed whenever the verifier ran at all, including the
     // budgeted release pass, because the interesting reading is `objects`: a
     // zero `dangling` means nothing without the number of objects it is a

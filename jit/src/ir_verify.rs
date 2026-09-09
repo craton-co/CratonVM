@@ -695,6 +695,16 @@ fn expected_arity(op: &Op) -> (usize, usize) {
         Op::MonitorEnter | Op::MonitorExit => (3, 3),
         // cov-05 — [ctrl, mem, obj], same shape as `MonitorEnter` above.
         Op::InstanceOf { .. } | Op::CheckCast { .. } => (3, 3),
+        // [ctrl, mem, obj] — same shape again. It takes `ctrl` because it can
+        // DEOPT (null receiver, or a subclass that overrode the accessor) and
+        // `mem` because it reads the instance.
+        // [ctrl, mem, receiver] plus a delta for the one family that takes
+        // one. `UnboxOp::arity` is the single source of truth, so a family
+        // added there cannot fall out of step with this.
+        Op::Unbox { op, .. } => {
+            let n = 3 + op.arity();
+            (n, n)
+        }
         // cov-07 — [ctrl, mem, exc], a terminator like `Op::Return` above but
         // with a fixed arity: unlike a return, a throw always carries a value.
         Op::Throw => (3, 3),

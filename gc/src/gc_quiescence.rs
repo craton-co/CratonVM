@@ -857,6 +857,21 @@ pub fn begin_moving_young_coverage_cycle() {
     // through it and a pause that reaches only one of the two is still cleared.
     clear_xt_cycle_pinned_jit_roots();
     clear_xt_cycle_pinned_jit_depth();
+    // Same scope, and this one is load-bearing rather than belt-and-braces.
+    // The blocked-peer native-stack captures are produced by exactly the
+    // conservative scans `CONSERVATIVE_JIT_SCANS` counts above, and their only
+    // drain (`fold_pointer_map_into_blocked_audited`) sits behind
+    // `update_all_roots`'s empty-pointer-map early return — i.e. it never runs
+    // on a NON-moving cycle. Without a clear here the buffer accumulates every
+    // non-moving cycle's captures until it reaches its cap and the repair goes
+    // silent on the one cycle whose captures matter. See
+    // `clear_peer_stack_slots` for the ABA half of the argument.
+    clear_peer_stack_slots();
+    // The pairing diagnostic's capture has the same shape and the same drain:
+    // `take_peer_reg_capture` runs on the moving path only, so "words captured
+    // this cycle" silently included every non-moving cycle since the last
+    // relocation.
+    clear_peer_reg_capture();
 }
 
 /// Whether this cycle's root scan touched state belonging to a peer thread that
@@ -1183,6 +1198,49 @@ pub fn unregistered_jit_frame_on_stack() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Residue census for the unregistered-JIT-frame probe
+// ---------------------------------------------------------------------------
+//
+// The probe reads raw stack words and calls any word that lands inside a
+// registered JIT code range a frame. A compiled method that has ALREADY
+// RETURNED left exactly such a word at every depth below its own `entry_sp`,
+// so "there is a JIT return address up there" and "a compiled frame is live up
+// there" are not the same statement. `conservative_roots::jit_residue_hi` is
+// the discriminator the VM side already maintains for it.
+//
+// These two counters say which of the two a run actually saw, because
+// `relocation-coverage-reason: unregistered-jit-frame-on-stack=N` cannot: it
+// reads identically for a run held back by a live entry-point frame and for one
+// held back by the leftovers of a frame that returned minutes ago. On the H2
+// `MvsCreate` ZGC OOM every hit was the second kind.
+
+static UNREG_RESIDUE_EXPLAINED: AtomicUsize = AtomicUsize::new(0);
+static UNREG_RESIDUE_LIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// A probe hit that the returned-frame residue mark fully explains: the band it
+/// was found in is one a returned compiled frame may have written, and no hit
+/// remains above the mark. The frame's oops are still conservatively MARKED (and
+/// therefore page-pinned); only the relocation refusal is withheld.
+pub fn note_unregistered_jit_frame_residue() {
+    UNREG_RESIDUE_EXPLAINED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A probe hit at or above the residue mark — a band no returned frame on this
+/// thread can have written, so it is treated as a genuinely live guardless
+/// compiled frame and the relocation refusal stands.
+pub fn note_unregistered_jit_frame_live() {
+    UNREG_RESIDUE_LIVE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `(explained_by_residue, above_the_mark)` for the run so far.
+pub fn unregistered_jit_frame_residue_census() -> (usize, usize) {
+    (
+        UNREG_RESIDUE_EXPLAINED.load(Ordering::Relaxed),
+        UNREG_RESIDUE_LIVE.load(Ordering::Relaxed),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Per-cycle fallback for incomplete rewritable JIT coverage
 // ---------------------------------------------------------------------------
 //
@@ -1382,13 +1440,17 @@ pub fn take_major_gc_request() -> bool {
 /// re-opening `TestDefaultInstanceManager.testClassUnloading` for the third
 /// time — a fix still present in the tree, and inert. Compare
 /// `vm::memory::roots::conditional_loader_metadata`, which asks the same
-/// question and correctly never had the term.
+/// question and does not carry the term. (It did carry it for a month; the
+/// disjunct was inert for the reason the next paragraph gives, and was removed
+/// on 2026-09-08 so this comparison is true again. Do not re-add it.)
 ///
 /// Note also that `unregistered_jit_frame_on_stack()` is always `false` at the
 /// mirror call site: `collect_roots` clears it (and
 /// `force_non_moving_jit_roots`) before step 6 and only re-sets it at step 14's
 /// JIT scan. It is kept for callers that ask later in the pass; a `false` there
-/// is a false negative, which is the safe direction.
+/// is a false negative, which is the safe direction. `collect_roots`' own A5
+/// repair (step 14a5) is the model for anything that needs the TRUE answer:
+/// ask after the JIT scan, not before it.
 pub fn young_marker_follows_side_tables() -> bool {
     // The one switch that can push a cycle past `divert_non_moving` entirely.
     if crate::gc_flags().dbg_force_moving {
@@ -1868,6 +1930,117 @@ pub static PEER_REG_CAPTURE: parking_lot::Mutex<Vec<(u32, u8, usize)>> =
 pub static PEER_REG_STALE: AtomicU64 = AtomicU64::new(0);
 
 /// Record one frozen peer's register word. No-op unless the pairing is armed.
+/// Default-ON. `CRATONVM_GC_NO_BLOCKED_PEER_STACK_REMAP=1` restores the
+/// pre-2026-09-07 behaviour, where a blocked peer resumed with its
+/// conservatively-scanned stack words still at their pre-move addresses.
+pub fn blocked_peer_stack_remap_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GC_NO_BLOCKED_PEER_STACK_REMAP").is_none()
+    })
+}
+
+/// `(os_tid, addr, value)` for every native-stack word this cycle's
+/// cross-thread scan resolved to a heap object. Drained by
+/// `ThreadRegistry::fold_pointer_map_into_blocked_audited`, which moves each
+/// entry onto its owning blocked thread.
+static PEER_STACK_SLOTS: parking_lot::Mutex<Vec<(u32, usize, usize)>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Engagement census for the blocked-peer native-stack remap. `CAPTURED` is the
+/// denominator; `WRITTEN` is the repair actually storing a new address; and
+/// `SKIPPED` is the wake guard declining because the word no longer reads its
+/// captured value (the native call reused it). A run with `written=0` did not
+/// exercise the repair at all, and no conclusion may be drawn from its result.
+pub static PEER_STACK_SLOTS_CAPTURED: AtomicU64 = AtomicU64::new(0);
+pub static PEER_STACK_SLOTS_ADOPTED: AtomicU64 = AtomicU64::new(0);
+pub static PEER_STACK_SLOTS_WRITTEN: AtomicU64 = AtomicU64::new(0);
+pub static PEER_STACK_SLOTS_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Captures the buffer refused because it was already at its cap.
+///
+/// Non-zero is a REPAIR OUTAGE, not a tuning note: the words this pass exists
+/// to rewrite were the ones it declined to record. It reads zero only while the
+/// buffer's lifetime is genuinely per-cycle — see
+/// [`clear_peer_stack_slots`]'s caller.
+pub static PEER_STACK_SLOTS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Captures discarded at the next cycle's open because the cycle that took them
+/// never relocated.
+///
+/// These are correct discards — nothing moved, so nothing needs rewriting — and
+/// they are counted separately so they can never be mistaken for [`
+/// PEER_STACK_SLOTS_UNROUTED`], which is the population that DID need a channel
+/// and got none.
+pub static PEER_STACK_SLOTS_DISCARDED: AtomicU64 = AtomicU64::new(0);
+
+/// Captures a RELOCATING cycle's fold could not hand to any thread.
+///
+/// The fold adopts a capture onto its owning thread only while that thread is
+/// inside a blocked region; a peer frozen by the take-over path is in
+/// `CompiledUninterruptible` instead and has no wake hook to apply a fixup at.
+/// A non-zero reading is therefore a word in a live peer's stack that named an
+/// object this cycle moved and that nothing will ever rewrite — the defect
+/// `bytebuf-multiplethreads-npe-generational-moving-young` is about, counted
+/// instead of assumed absent.
+pub static PEER_STACK_SLOTS_UNROUTED: AtomicU64 = AtomicU64::new(0);
+
+/// Record one scanned native-stack word and the address it lives at.
+pub fn record_peer_stack_slot(os_tid: u32, addr: usize, value: usize) {
+    if !blocked_peer_stack_remap_enabled() {
+        return;
+    }
+    let mut g = PEER_STACK_SLOTS.lock();
+    // Bounded. A runaway capture would cost the pause it is trying to make
+    // correct; the observed population is 19-91 words per cycle.
+    if g.len() < 65536 {
+        g.push((os_tid, addr, value));
+        PEER_STACK_SLOTS_CAPTURED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PEER_STACK_SLOTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Drain the cycle's captures. Called once per collection by the fold.
+pub fn take_peer_stack_slots() -> Vec<(u32, usize, usize)> {
+    let mut g = PEER_STACK_SLOTS.lock();
+    std::mem::take(&mut *g)
+}
+
+/// Discard the cycle's captures without applying them -- for the paths that
+/// scan but then do not relocate, so nothing carries into the next cycle.
+///
+/// # Why this has to be called, and what happened while it was not
+///
+/// This function shipped with the 2026-09-07 repair and **had no caller**, and
+/// the drain on the other side is reached only through `update_all_roots`,
+/// which returns early on an empty pointer map — that is, on every NON-moving
+/// cycle. Since the non-moving cycles outnumber the moving ones by roughly
+/// forty to one on the workload the repair was written for, the buffer was in
+/// practice a process-lifetime accumulator of captures belonging to cycles that
+/// never relocated. Two consequences, and both are correctness ones:
+///
+/// * **the cap silences the repair.** `record_peer_stack_slot` drops a capture
+///   once the buffer holds 65536, so once the accumulation saturates, the
+///   moving cycle — the only cycle whose captures matter — records nothing.
+/// * **ABA.** A capture taken at cycle N carries `orig` = the word's value
+///   *then*. Folded at a later cycle M, it is advanced through M's pointer map.
+///   If the address was vacated at N, recycled, and moved again at M, the fold
+///   computes `cur` for the *new* occupant and the wake write-back stores it
+///   into a word that meant the old one — the repair manufacturing exactly the
+///   wrong-address read it exists to prevent.
+///
+/// Clearing at the point that OPENS a pause gives the buffer the per-cycle
+/// lifetime the fold already assumes, so a capture is only ever folded against
+/// the pointer map of the very cycle that took it.
+pub fn clear_peer_stack_slots() {
+    let mut g = PEER_STACK_SLOTS.lock();
+    if !g.is_empty() {
+        PEER_STACK_SLOTS_DISCARDED.fetch_add(g.len() as u64, Ordering::Relaxed);
+    }
+    g.clear();
+}
+
 pub fn record_peer_reg(os_tid: u32, reg: u8, value: usize) {
     if !peer_reg_pairing_enabled() {
         return;
@@ -2460,6 +2633,41 @@ fn vacated_frames_enabled_init(state: &std::sync::atomic::AtomicU8) -> bool {
 /// exactly the `SessionLocal$Savepoint` its `astore 4` had put there). With
 /// re-issued addresses removed, a hit is unambiguous: nothing has been
 /// allocated at that address since the collector moved its occupant away.
+/// Relocating collections this process has completed (every cycle that
+/// produced a non-empty pointer map).
+///
+/// Paired with [`note_pointer_map_applied`] it answers the question a stale
+/// register otherwise leaves open: was this thread ever handed the map it is
+/// missing? A thread whose last applied cycle EQUALS this counter was rewritten
+/// and is stale anyway -- a hole in the rewrite. One whose number is smaller
+/// never got the map at all, which is a different defect with a different fix.
+pub static RELOCATING_CYCLES: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// `(relocating-cycle number, path)` of the last pointer map THIS thread
+    /// applied to itself. Path: 1 = the stop-the-world resume
+    /// (`apply_pointer_map_to_thread`), 2 = the ordinary blocked-region wake
+    /// (`check_post_block_gc_refs`), 3 = the leaked-region fallback
+    /// (`apply_pending_blocked_fixups`).
+    ///
+    /// Read from the fatal-signal handler, which runs on the faulting thread,
+    /// so a plain thread-local `Cell` is the one storage class that is both
+    /// correct and reachable there.
+    static LAST_MAP_APPLIED: std::cell::Cell<(u64, u8)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Record that this thread has just applied a relocation pointer map. See
+/// [`LAST_MAP_APPLIED`].
+pub fn note_pointer_map_applied(path: u8) {
+    let n = RELOCATING_CYCLES.load(Ordering::Relaxed);
+    let _ = LAST_MAP_APPLIED.try_with(|c| c.set((n, path)));
+}
+
+/// `(cycle, path)` for this thread; `(0, 0)` if it never applied one.
+pub fn last_pointer_map_applied() -> (u64, u8) {
+    LAST_MAP_APPLIED.try_with(|c| c.get()).unwrap_or((0, 0))
+}
+
 pub fn record_vacated(pointer_map: &cratonvm_types::PointerMap) {
     if !vacated_frames_enabled() {
         return;
@@ -2599,13 +2807,28 @@ pub fn check_stale_use(addr: usize, site: &'static str) {
 /// address it dropped later turns up as a failing receiver, the analysis was
 /// wrong about that slot, and this names the method and the slot to look at.
 /// Bounded; oldest entries are simply overwritten.
-static LIVENESS_FILTERED: parking_lot::RwLock<Option<rustc_hash::FxHashMap<usize, String>>> =
+///
+/// # Why the collection number is part of the value
+///
+/// The map is keyed by ADDRESS, and the allocator re-serves addresses. On a
+/// workload that recycles the front of a semispace thousands of times — any
+/// `CRATONVM_DBG_GC_STRESS` run — a hit says "SOME object at this address was
+/// filtered here", which is not the claim `vm::memory::reclaim_guard` prints
+/// off it ("The filter guarantees such a slot is never read again; it was").
+/// It printed exactly that about a 1200-cycles-stale entry on 2026-09-08,
+/// while `CRATONVM_NO_LOCAL_LIVENESS=1` reproduced the failure the entry was
+/// being blamed for — see
+/// `docs/known-issues/springboot/bindabletests-moving-young-leaves-a-frame-slot-unremapped-20260908.md`.
+/// Carrying the collection index lets the reporter print the entry's age beside
+/// the claim, so a stale attribution can be discounted instead of acted on.
+static LIVENESS_FILTERED: parking_lot::RwLock<Option<rustc_hash::FxHashMap<usize, (String, u64)>>> =
     parking_lot::RwLock::new(None);
 
 const LIVENESS_FILTERED_MAX: usize = 8192;
 
-/// Record that `addr` was in `where_` and the liveness filter dropped it.
-pub fn note_liveness_filtered(addr: usize, where_: impl FnOnce() -> String) {
+/// Record that `addr` was in `where_` and the liveness filter dropped it, on
+/// heap collection `collection`.
+pub fn note_liveness_filtered(addr: usize, collection: u64, where_: impl FnOnce() -> String) {
     if !vacated_frames_enabled() {
         return;
     }
@@ -2614,11 +2837,13 @@ pub fn note_liveness_filtered(addr: usize, where_: impl FnOnce() -> String) {
     if map.len() >= LIVENESS_FILTERED_MAX {
         map.clear();
     }
-    map.insert(addr, where_());
+    map.insert(addr, (where_(), collection));
 }
 
-/// Was `addr` dropped from a root snapshot by the liveness filter, and where?
-pub fn liveness_filtered_at(addr: usize) -> Option<String> {
+/// Was `addr` dropped from a root snapshot by the liveness filter, where, and
+/// on which collection? Print the collection beside the current one — a bare
+/// hit is a lead, not a verdict (see the type's doc).
+pub fn liveness_filtered_at(addr: usize) -> Option<(String, u64)> {
     if !vacated_frames_enabled() {
         return None;
     }
@@ -2694,6 +2919,29 @@ pub fn was_vacated(addr: usize) -> Option<usize> {
         return None;
     }
     from.get(&addr).copied()
+}
+
+/// [`was_vacated`] for a SIGNAL HANDLER: never blocks.
+///
+/// The fatal-signal reporter runs on the faulting thread, which may itself hold
+/// the ledger's lock -- a blocking `read()` there turns a diagnosable crash into
+/// a hang, and a hang produces no report at all. `try_read` answers "cannot
+/// tell" instead, and the caller prints that rather than pretending the register
+/// was clean.
+pub fn was_vacated_try(addr: usize) -> Result<Option<usize>, ()> {
+    if !vacated_frames_enabled() {
+        return Ok(None);
+    }
+    let Some(g) = VACATED_ADDRS.try_read() else {
+        return Err(());
+    };
+    let Some((from, dests)) = g.as_ref() else {
+        return Ok(None);
+    };
+    if dests.contains(&addr) {
+        return Ok(None);
+    }
+    Ok(from.get(&addr).copied())
 }
 
 // ---------------------------------------------------------------------------
@@ -2784,8 +3032,17 @@ pub fn register_self_jit_depth_slot(os_tid: u32) -> std::sync::Arc<std::sync::at
 /// scans registers plus `[rsp, stack_base)`, cannot see them. For the initiator
 /// and for a cooperatively parked peer that is fine (`collect_roots` scans its
 /// own; a parked peer publishes its own and remaps on resume). A BLOCKED peer
-/// does neither, and `apply_pending_blocked_fixups` never remaps a shadow
-/// stack, so its shadow-stack oops are unpinned and unremapped.
+/// does neither, so without this its shadow-stack oops are unpinned during the
+/// collection -- which is what this map exists to fix, by letting the initiator
+/// find and pin them.
+///
+/// The REMAP half is a separate repair and has since landed beside it:
+/// `apply_blocked_wake_jit_remap` (both wake paths, `check_post_block_gc_refs`
+/// and the leaked-region fallback `apply_pending_blocked_fixups`) now remaps the
+/// waking peer's shadow stack, active JIT frames and register image. The two are
+/// complementary and neither subsumes the other -- a pin keeps the objects still
+/// for the cycle, a remap fixes up a peer whose objects moved on a cycle that
+/// did not pin it.
 ///
 /// The initiator cannot recover the window from the peer's frames the way
 /// `shadow_window_from_frame` does: that helper only trusts a frame whose

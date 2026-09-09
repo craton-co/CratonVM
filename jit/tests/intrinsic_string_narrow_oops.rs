@@ -93,21 +93,73 @@ fn helpers() -> JitRuntimeHelpers {
 }
 
 /// A heap object backed by a `Vec<u64>`, so the base address is 8-byte aligned.
+/// Bump-allocate `bytes` from the ONE fixture arena, 8-aligned and zeroed.
+///
+/// # Why an arena and not a `Vec` per object
+///
+/// Each `FakeObj` used to own a separate `Vec<u64>`, which made the addresses
+/// of the four fixtures four independent malloc results — and glibc is free to
+/// serve those from DIFFERENT arenas. Measured 2026-09-08 on Linux/glibc, in a
+/// plain `cargo test -p cratonvm-jit`:
+///
+/// ```text
+/// latin1    = 0x73af1c000b80   <- thread arena (mmap)
+/// empty_arr = 0x5adff817b1b0   <- main heap (brk), and the minimum
+/// s         = 0x73af1c000d00
+/// empty     = 0x73af1c000d30
+/// ```
+///
+/// `heap_base` is derived from the minimum, so the window started at the main
+/// heap and the other three sat ~33 TB above it — against a narrow window that
+/// is 32 GiB wide (`(u32::MAX << 3)`). `is_encodable` correctly said no, and
+/// the test failed 100% of the time on Linux while passing on Windows, whose
+/// allocator happened to keep all four together.
+///
+/// The 2026-08-13 fix addressed the allocation ORDER (allocate everything,
+/// then derive the base from the minimum) and that reasoning still holds. It
+/// could not fix the SPAN, because no ordering makes independent mallocs land
+/// near each other. One arena does: every fixture is now carved from a single
+/// 64 KiB block, so the four are a few hundred bytes apart by construction and
+/// the geometry stops depending on the allocator at all.
+///
+/// Leaked on purpose. These fixtures are handed to compiled code as raw
+/// pointers and must outlive every call in the test; a leak in a test binary
+/// that exits immediately afterwards costs nothing and removes any question of
+/// a fixture being freed while a JIT artifact still names it.
+fn arena_alloc(bytes: usize) -> *mut u8 {
+    const ARENA_BYTES: usize = 64 * 1024;
+    static ARENA: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static USED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    // `Vec<u64>` so the block is 8-aligned; every offset handed out is a
+    // multiple of 8, so every object is too.
+    let base = *ARENA.get_or_init(|| {
+        let words = vec![0u64; ARENA_BYTES / 8];
+        Box::leak(words.into_boxed_slice()).as_mut_ptr() as usize
+    });
+    let want = bytes.div_ceil(8).max(1) * 8;
+    let off = USED.fetch_add(want, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        off + want <= ARENA_BYTES,
+        "fixture arena exhausted ({off} + {want} > {ARENA_BYTES}); raise ARENA_BYTES"
+    );
+    (base + off) as *mut u8
+}
+
 struct FakeObj {
-    storage: Vec<u64>,
+    base: *mut u8,
 }
 
 impl FakeObj {
     fn with_bytes(total: usize) -> Self {
         FakeObj {
-            storage: vec![0u64; total.div_ceil(8).max(1)],
+            base: arena_alloc(total),
         }
     }
     fn base(&mut self) -> *mut u8 {
-        self.storage.as_mut_ptr() as *mut u8
+        self.base
     }
     fn ptr(&self) -> i64 {
-        self.storage.as_ptr() as i64
+        self.base as i64
     }
 }
 
@@ -253,8 +305,8 @@ fn java_hash(s: &str) -> i32 {
 fn string_intrinsics_decode_a_narrow_value_slot() {
     // ALLOCATE, THEN ENABLE — in that order, and not the other way round.
     //
-    // Every `FakeObj` is a separate `Vec<u64>`, so the allocator is free to
-    // hand them back in ANY address order. This test used to allocate the
+    // Every `FakeObj` is carved from one arena (see `arena_alloc`), but the
+    // allocator is still free to hand them out in ANY address order. This test used to allocate the
     // first backing array, derive `heap_base` from THAT one alone, enable
     // narrow oops, and only then allocate the rest — so any later allocation
     // landing at a lower address was below the base and
@@ -287,7 +339,7 @@ fn string_intrinsics_decode_a_narrow_value_slot() {
         ("s", s.ptr()),
         ("empty", empty.ptr()),
     ] {
-        assert_eq!(p % 8, 0, "{what}: FakeObj is Vec<u64>-backed, so 8-aligned");
+        assert_eq!(p % 8, 0, "{what}: arena offsets are multiples of 8");
     }
     // Only the two backing ARRAYS are ever encoded (they are what a `value`
     // slot points at); the String objects themselves are passed to compiled

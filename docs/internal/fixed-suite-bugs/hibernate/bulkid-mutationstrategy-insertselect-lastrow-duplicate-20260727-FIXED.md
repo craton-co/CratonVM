@@ -19,7 +19,7 @@
 > this fix — the assertion is a row-count mismatch (`expected: 1100 but was: 20`),
 > not the PK-violation/duplicated-last-row this doc describes, and it only
 > reproduces after other tests warm up the JIT in the same process. See
-> `docs/known-issues/hibernate/jit-warm-groupdata-window-row-collapse-20260906.md`.
+> `docs/internal/fixed-bugs/jit-warm-groupdata-window-row-collapse-20260906-FIXED.md`.
 
 **Status: OPEN, genuine CratonVM bug.** Confirmed via HotSpot diff (fails on CratonVM,
 100% clean on real HotSpot JDK 25 with the exact same class/list/order), confirmed NOT a

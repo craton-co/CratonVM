@@ -179,7 +179,13 @@ fn encode_isa(ctx: &mut dyn NativeContext, addr: SocketAddr) -> Option<ObjectRef
         Value::Object(Some(o)) => o,
         _ => return None,
     };
+    // GC: `create_string` allocates and `isa_obj` is read afterwards and
+    // returned. Released before every exit — this helper runs once per
+    // datagram receive.
+    let isa_pin = ctx.pin_native_root(isa_obj);
     let host = ctx.create_string(&addr.ip().to_string());
+    let isa_obj = ctx.read_native_pin(isa_pin, isa_obj);
+    ctx.unpin_native_roots(isa_pin);
     if ctx.object_num_fields(isa_obj) >= 2 {
         ctx.set_field(isa_obj, 0, Value::Object(Some(host)));
         ctx.set_field(isa_obj, 1, Value::Int(addr.port() as i32));
@@ -255,15 +261,23 @@ fn parse_inet_address(ctx: &mut dyn NativeContext, addr: ObjectRef) -> Option<Ip
     // A non-InetAddress argument (`join`'s `NetworkInterface`) has no such
     // method; the call fails and we fall through, which is exactly what the
     // caller's "default to the wildcard interface" path expects.
+    // GC: `getHostAddress()` runs Java, which allocates — it builds the very
+    // String it returns — and the slot-probing fallback below reads `addr`
+    // again afterwards. The caller's `args` slot is a root and is remapped;
+    // this copy is not.
+    let pin = ctx.pin_native_root(addr);
     if let Ok(Some(Value::Object(Some(s)))) =
         ctx.invoke_virtual(addr, "getHostAddress", "()Ljava/lang/String;", &[])
     {
         if let Some(text) = ctx.read_string(s) {
             if let Ok(ip) = text.parse::<IpAddr>() {
+                ctx.unpin_native_roots(pin);
                 return Some(ip);
             }
         }
     }
+    let addr = ctx.read_native_pin(pin, addr);
+    ctx.unpin_native_roots(pin);
     // Fallback: IP text at slot 1 (what net.rs encodes), then slot 0.
     let text = match ctx.get_field(addr, 1) {
         Value::Object(Some(s)) => ctx.read_string(s),
@@ -317,6 +331,9 @@ fn dgram_join_group(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let fd = dc_fd_of(ctx, this).ok_or_else(|| io_error("join: channel has no UDP socket"))?;
     let group_obj = arg_obj(args, 1).ok_or_else(|| io_error("join: null group"))?;
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let group_obj_pin = ctx.pin_native_root(group_obj);
     let group = parse_inet_address(ctx, group_obj)
         .ok_or_else(|| io_error("join: cannot parse group address"))?;
     // Optional NetworkInterface — try to extract an IP from it; default
@@ -368,6 +385,7 @@ fn dgram_join_group(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         MK_PRIVATE_SLOTS,
     );
     let (mk, base) = (minted.obj, minted.base);
+    let group_obj = ctx.read_native_pin(group_obj_pin, group_obj);
     ctx.set_field(mk, base + MK_FIELD_GROUP, Value::Object(Some(group_obj)));
     ctx.set_field(
         mk,

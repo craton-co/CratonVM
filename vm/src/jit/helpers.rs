@@ -3548,7 +3548,7 @@ unsafe fn route_implicit_exc_through_callee(
     // keeps the common exception path free of the thread-guard acquire.
     if cratonvm_jit::deopt::has_last_deopt() {
         if let Some((thread, _guard)) = jit_thread_mut() {
-            if let Some(v) = try_resume_trapped_callee(vm, thread, info) {
+            if let Some(v) = try_resume_trapped_callee(vm, thread, info, receiver_class_id) {
                 return v;
             }
         }
@@ -4034,7 +4034,7 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
     // Precise resume of a frame-stashing deopt in the dispatched callee (see
     // `try_resume_trapped_callee`). Must run before consuming the exception
     // signals below: a pure deopt sets no exception flags.
-    if let Some(v) = try_resume_trapped_callee(vm, thread, info) {
+    if let Some(v) = try_resume_trapped_callee(vm, thread, info, receiver_class_id) {
         return Some(v);
     }
 
@@ -4139,6 +4139,172 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
     None
 }
 
+/// De-speculate a method whose compiled body just trapped — TAKING THE
+/// SITE-TRAP DECISION ONCE.
+///
+/// `fallback_reason` is what to record when this is NOT an IR site trap; the
+/// two callers pass different ones because they know different things.
+///
+/// # Why the two consumers of a stashed deopt frame must ask the same function
+///
+/// A trapped compiled body's frame reaches one of two sinks, depending on how
+/// the callee was entered: `try_resume_trapped_callee` (the compiled caller's
+/// dispatch helper, for a callee that already has an artifact) or `execute`'s
+/// first-call tier-up sink (`interpreter.rs`, `execute-first-call-tierup`, for
+/// the invocation that installs one). They disagreed. The helper applied the
+/// policy below; the tier-up sink passed the DEOPT POINT'S OWN reason straight
+/// to `deoptimize`, and for a body whose trapping bci carries a safepoint that
+/// reason is `TransferToInterpreter`, whose `recommend_action` is `Reinterpret`
+/// — the artifact stays live, the next call re-enters it, and it traps again,
+/// forever.
+///
+/// # The policy
+///
+/// `UnreachedCode` (the usual fallback) is the one-shot "give up immediately"
+/// reason: the trapping method is made not-compilable on the first resolution
+/// and the tiered manager stops re-queuing recompiles that would just trap.
+///
+/// EXCEPT for an IR SITE TRAP. `probes/UnresolvedTrapProbe.java` measures why:
+/// the trapped method deopts on EVERY call (200,000 of 200,000) and
+/// `MakeNotCompilable` is consulted by `compile_gate` itself, so the method
+/// loses its body on EVERY tier — including the single-pass backend, which
+/// lowers `invokedynamic` and unresolved typechecks perfectly well. Before site
+/// traps existed the IR tier simply refused such a method and C1 compiled it;
+/// blacklisting is a strict regression on that.
+///
+/// A site trap means one thing only: the OPTIMIZING tier could not lower one
+/// call site. So ban the optimizing tier for this method — the memo
+/// `try_compile_inner` already consults — and pick a reason that RECOMPILES
+/// instead of blacklisting. The recompile then goes single-pass and does not
+/// trap. `SpeculationFailed` is that reason: `RecompileAndReinterpret` until the
+/// per-method deopt count crosses `max_deopts_per_method`, which keeps a
+/// backstop if the assumption above is ever wrong.
+///
+/// # Why the decision is taken ONCE, and in its OWN set
+///
+/// Everything after the first is a REPEAT of a decision already taken, and
+/// repeating it is not harmless: `SpeculationFailed` escalates on the
+/// per-method deopt COUNT, so a trapped site inside a long-running caller drives
+/// the method to `MakeNotCompilable` — the exact outcome this arm exists to
+/// avoid — purely by being reached often.
+///
+/// Why "often" is unavoidable: eviction and the epoch bump both fire on the
+/// first deopt, and `invalidate_matching` even evicts the direct CALLER
+/// transitively. But the caller may be a single in-flight invocation running a
+/// loop — measured on `probes/UnresolvedTrapProbe.java`, where one `main` frame
+/// calls the trapped callee 200,000 times through a `CALL` baked into code that
+/// is already executing. Re-binding happens (the tracer shows `main` recompiled
+/// and baking a second callee entry) but the RUNNING frame keeps the old
+/// address, and nothing short of deoptimizing the caller's frame can change
+/// that. `MakeNotEntrant` is an enum variant here with no entry-patching behind
+/// it, so there is no cheap displacement to reach for.
+///
+/// What IS in reach is not compounding the damage: take the policy decision
+/// once, and let the remaining calls resume in the interpreter — correct, and
+/// self-correcting the moment that caller frame returns and re-enters its
+/// recompiled self.
+///
+/// "Once" is `ir::claim_site_trap_decision`, a set of its own, and not
+/// `ir_evidence`'s refusal memo — see 81c9c9fd7 and the comment at the call.
+pub(crate) fn despeculate_trapped_method(
+    vm: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    fallback_reason: cratonvm_jit::deopt::DeoptReason,
+    bci: u32,
+) {
+    // Cheap negative first: both sinks call this on EVERY trapped-frame
+    // despeculation, and a VM that planted no site trap at all must not pay a
+    // hash and a lock read for it. Doubly so now that site traps are opt-in.
+    let (ir_site_trap, h) = if cratonvm_jit::ir::any_site_trap_registered() {
+        let h = cratonvm_jit::ir_method_memo_hash(class_name, method_name, descriptor);
+        (cratonvm_jit::ir::method_has_site_trap(h), h)
+    } else {
+        (false, 0)
+    };
+    let mut decided = true;
+    if ir_site_trap {
+        cratonvm_jit::ir::note_site_trap_taken();
+        // A DEDICATED set, not `ir_evidence`'s refusal memo (81c9c9fd7): that
+        // memo has a second writer -- the acceptance gate marks a method
+        // refused whenever it discards an optimizing body -- so reading it here
+        // would let a gate-refused method look "already decided" on its FIRST
+        // trap, and the policy, including the eviction, would never be applied.
+        decided = cratonvm_jit::ir::claim_site_trap_decision(h);
+        cratonvm_jit::ir_evidence::note_method_refused(h);
+        if !decided {
+            cratonvm_jit::ir::note_site_trap_repeat();
+        }
+    }
+    if decided {
+        DeoptimizationController::deoptimize(
+            vm,
+            class_name,
+            method_name,
+            descriptor,
+            if ir_site_trap {
+                cratonvm_jit::deopt::DeoptReason::SpeculationFailed
+            } else {
+                fallback_reason
+            },
+            bci,
+        );
+    }
+}
+
+/// Does the receiver at this call site resolve `info`'s SAM to the method the
+/// stashed frame names?
+///
+/// This is the identity `try_resume_trapped_callee` could not supply from
+/// `info` alone, and the one `try_lambda_site_direct_call` already spends on
+/// the other door (`site.cached_impl()`). It is read from the metafactory's own
+/// record — `LambdaCallSite::impl_handle`, the handle the `invokedynamic`
+/// bootstrap bound — rather than from `lambda_jit_site`, whose eligibility
+/// gates (static impl, identity coercion, no exception table, the
+/// `CRATONVM_JIT_LAMBDA_SITE` switch) decide whether a FAST PATH may serve the
+/// call and have nothing to say about which method a trapped frame belongs to.
+/// Measured on `DeoptLambdaRerunCount`: that door's `calls` counter is 0 for
+/// the shape this arm has to answer for, so keying on it would have been a fix
+/// that never fires.
+///
+/// Every clause is an equality, and all four must hold. `false` for a receiver
+/// that is not a lambda proxy, which is the overwhelmingly common case and
+/// costs one `FxHashMap` probe under a read lock.
+fn lambda_site_resolves_to(
+    vm: &SharedVm,
+    receiver_class_id: ClassId,
+    info: &JitInvokeInfo,
+    key_class: &str,
+    key_method: &str,
+    key_desc: &str,
+) -> bool {
+    // `ClassId::new(0)` is the "no receiver" value the dispatch helpers pass for
+    // a statically bound site. A lambda SAM call always has one.
+    if receiver_class_id.as_u32() == 0 {
+        return false;
+    }
+    let Some(call_site) = vm
+        .classes
+        .lambda_proxies
+        .read()
+        .get(&receiver_class_id)
+        .cloned()
+    else {
+        return false;
+    };
+    // The proxy must answer THIS call — name and descriptor both, the same pair
+    // `LambdaJitSite::serves` asks. A default method on the functional
+    // interface reaches the same receiver and is not the SAM.
+    if &*call_site.sam_method_name != info.method_name
+        || !descriptors_match_modulo_return(&call_site.sam_descriptor, info.descriptor)
+    {
+        return false;
+    }
+    let h = &call_site.impl_handle;
+    &*h.class_name == key_class && &*h.member_name == key_method && &*h.descriptor == key_desc
+}
+
 /// SAFETY: same contract as the surrounding dispatch helpers — `vm` live,
 /// `info` a live `JitInvokeInfo`, `thread` the current thread's exclusive
 /// borrow (passed in, NOT re-acquired via `jit_thread_mut`, because some call
@@ -4148,6 +4314,7 @@ unsafe fn try_resume_trapped_callee(
     vm: &SharedVm,
     thread: &mut JvmThread,
     info: &JitInvokeInfo,
+    receiver_class_id: ClassId,
 ) -> Option<i64> {
     let trc = |why: &str, detail: &dyn std::fmt::Display| {
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
@@ -4178,7 +4345,27 @@ unsafe fn try_resume_trapped_callee(
         trc("the stashed callee was redefined", &key);
         return None;
     }
-    if key_method != info.method_name || !descriptors_match_modulo_return(key_desc, info.descriptor)
+    // The identity check, asked of the method the site RESOLVED to rather than
+    // only of the name it was written with.
+    //
+    // For an ordinary call those are the same method, and `info` answers. For a
+    // SAM call on a lambda they are NEVER the same: `info.method_name` is the
+    // interface method (`apply`, `accept`, `test`) while the frame the compiled
+    // body stashed names the synthetic impl (`lambda$static$0`). Comparing the
+    // two therefore refused EVERY lambda callee's deopt, unconditionally and by
+    // construction — the frame was dropped as an orphan and the impl was
+    // re-entered from bci 0, re-running whatever it had already committed. See
+    // `docs/internal/retired/lambda-callee-deopt-is-orphaned-by-the-sam-name-check-FIXED-20260908.md`.
+    //
+    // The widening is exactly one alternative and it is not a relaxation: the
+    // receiver must be a lambda proxy, its SAM must be the method this call
+    // site names, and the impl the metafactory bound must be the stashed method
+    // NAME FOR NAME. A foreign frame — the Groovy "duplicate `main`" shape that
+    // forced the `5ceb880f` revert, and the reason this refusal is load-bearing
+    // — satisfies none of those.
+    if !(key_method == info.method_name
+        && descriptors_match_modulo_return(key_desc, info.descriptor))
+        && !lambda_site_resolves_to(vm, receiver_class_id, info, key_class, key_method, key_desc)
     {
         trc(
             "stash is not this call site's callee",
@@ -4186,6 +4373,12 @@ unsafe fn try_resume_trapped_callee(
         );
         return None;
     }
+    // A resume claimed through the lambda arm above is a lambda body's deopt
+    // that did NOT re-run from entry, which is what the SAM door's own outcome
+    // split counts. Record it there — the counter's question is "was a lambda
+    // body's trapped frame spent or dropped", and the answer is the same
+    // whichever door spent it. See `lambda_site_deopt_outcomes`.
+    let via_lambda_identity = key_method != info.method_name;
 
     // Resolve the trapping method from ITS OWN declaring class (baked in the
     // key) — mirrors the `callee_compiler` resolution recipe.
@@ -4306,16 +4499,16 @@ unsafe fn try_resume_trapped_callee(
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
         eprintln!("[cratonvm-deopt] helper precise-resume of trapped callee {key} at bci={bci}");
     }
+    if via_lambda_identity {
+        crate::runtime::interpreter::lambda_site_bump_resumed();
+    }
 
     // De-speculate the trapping method FIRST (record + evict + escalate), so
-    // repeated traps blacklist it and future calls interpret it outright.
-    // Reason: `UnreachedCode` — the one-shot "give up immediately" policy
-    // (`recommend_action`), so the trapping method is made not-compilable on
-    // the FIRST resolution and the tiered manager stops re-queuing recompiles
-    // that would just trap again. (A guard-bail stash reaching this arm is
-    // over-blacklisted by this — acceptable: it reverts to the interpreter,
-    // which is always correct.)
-    DeoptimizationController::deoptimize(
+    // repeated traps stop re-entering the artifact. The policy — and the
+    // reason it is not a plain `deoptimize` call — lives in
+    // `despeculate_trapped_method`, which the tier-up sink in
+    // `interpreter.rs` asks too so the two cannot answer differently.
+    despeculate_trapped_method(
         vm,
         key_class,
         key_method,
@@ -21046,13 +21239,17 @@ unsafe fn try_lambda_site_direct_call(
         // apart. Draining them is safe here BECAUSE this arm called exactly one
         // method: whatever they say happened, happened inside this site's impl.
         //
-        // The shared sentinel handler cannot be used for this: it identifies
-        // the trapped callee by the CALL SITE's name (`try_resume_trapped_callee`
-        // compares `info.method_name`), which for a SAM call is `apply` — never
-        // the `lambda$...` body that actually trapped. It would refuse the
-        // resume, re-stash the deopt flag, and the compiled CALLER would then
-        // read the callee's deopt as its own, de-speculating an innocent method
-        // and leaving a reconstructed frame nobody can claim.
+        // The shared sentinel handler is not used for this, and the reason is
+        // no longer that it CANNOT be: `try_resume_trapped_callee` used to
+        // identify the trapped callee by the CALL SITE's name alone, which for
+        // a SAM call is `apply` and never the `lambda$...` body that actually
+        // trapped, so it refused the resume and minted an orphan
+        // (`lambda-callee-deopt-is-orphaned-by-the-sam-name-check-20260908`).
+        // It now asks the metafactory's `impl_handle` as a second identity and
+        // would answer correctly. This arm still owns the case, because it owns
+        // something that helper does not: `site.disable_direct()`, the latch
+        // that keeps every LATER call to this site off the direct arm. Draining
+        // the signals here is what makes that decision possible.
         let sig = take_all_jit_signals(thread);
         let stashed = cratonvm_jit::deopt::take_last_deopt();
         if sig.exception.is_some() || (stashed.is_none() && !sig.deopt) {

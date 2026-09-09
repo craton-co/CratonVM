@@ -1335,15 +1335,23 @@ pub(crate) fn decode_socket_address(
     // Preferred path: use the public InetSocketAddress accessors so we
     // observe whatever state the JDK constructor populated, regardless
     // of internal field-layout details.
+    // GC: `getPort()` and `getHostString()` run Java, which allocates and can
+    // collect — and every path below reads `sa` again, either through the
+    // second accessor or through the two field-probing fallbacks. Pin it for
+    // the body and read it back after each call that re-entered the VM.
+    let sa_pin = ctx.pin_native_root(sa);
+    let mut sa = sa;
     let port_via_method = match ctx.invoke_virtual(sa, "getPort", "()I", &[]) {
         Ok(Some(Value::Int(v))) if (0..=u16::MAX as i32).contains(&v) => Some(v as u16),
         _ => None,
     };
+    sa = ctx.read_native_pin(sa_pin, sa);
     let host_via_method = match ctx.invoke_virtual(sa, "getHostString", "()Ljava/lang/String;", &[])
     {
         Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
         _ => None,
     };
+    sa = ctx.read_native_pin(sa_pin, sa);
     if let Some(p) = port_via_method {
         let h = host_via_method.unwrap_or_else(|| "0.0.0.0".to_string());
         let h = if h.is_empty() {
@@ -1351,6 +1359,7 @@ pub(crate) fn decode_socket_address(
         } else {
             h
         };
+        ctx.unpin_native_roots(sa_pin);
         return Ok((h, p));
     }
 
@@ -1400,6 +1409,7 @@ pub(crate) fn decode_socket_address(
             .map(|s| s.as_str())
             .unwrap_or("0.0.0.0");
         let h = if h.is_empty() { "0.0.0.0" } else { h };
+        ctx.unpin_native_roots(sa_pin);
         return Ok((h.to_string(), p));
     }
 
@@ -1415,10 +1425,12 @@ pub(crate) fn decode_socket_address(
             _ => 0,
         };
         if !host.is_empty() {
+            ctx.unpin_native_roots(sa_pin);
             return Ok((host, port));
         }
     }
 
+    ctx.unpin_native_roots(sa_pin);
     Err(ioex("SocketAddress: cannot decode host/port"))
 }
 
@@ -2481,14 +2493,22 @@ fn sc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         .ok_or_else(|| ioex("socket: could not allocate Socket"))?;
     // Safety net: the bare Socket skipped <init>, so seed `socketLock` with a
     // live monitor object so any `synchronized (socketLock)` method doesn't NPE.
+    //
+    // GC: the monitor's own allocation can move `sock`, which is then both
+    // stored through and returned.
+    let sock_pin = ctx.pin_native_root(sock);
+    let mut sock = sock;
     if !matches!(
         ctx.get_field_by_name(sock, "socketLock"),
         Value::Object(Some(_))
     ) {
         if let Ok(Some(Value::Object(Some(lock)))) = ctx.new_object("java/lang/Object") {
+            sock = ctx.read_native_pin(sock_pin, sock);
             ctx.set_field_by_name(sock, "socketLock", Value::Object(Some(lock)));
         }
     }
+    sock = ctx.read_native_pin(sock_pin, sock);
+    ctx.unpin_native_roots(sock_pin);
     Ok(Some(Value::Object(Some(sock))))
 }
 
@@ -2646,6 +2666,9 @@ fn sc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// later connect honour a configured outbound-port range.
 fn sc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_or_none(args, 0).ok_or_else(|| ioex("bind: null channel"))?;
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let this_pin = ctx.pin_native_root(this);
     if read_reg_id(ctx, this).is_some() {
         return Err(ioex("bind: channel is already bound or connected"));
     }
@@ -2688,6 +2711,7 @@ fn sc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         .local_addr()
         .map(|a| a.port() as i32)
         .unwrap_or(bind_addr.port() as i32);
+    let this = ctx.read_native_pin(this_pin, this);
     let blocking = read_blocking_flag(ctx, this);
     let id = tcp_register(TcpHandle::Bound(stream));
     tcp_blocking_state().write().insert(id, blocking);
@@ -2719,6 +2743,11 @@ fn sc_connect_bound(
                 "connect: {target} has no address compatible with bound {local}"
             ))
         })?;
+    // GC: this function blocks (`begin_blocking_region` around a poll loop
+    // that runs to the connect timeout) and allocates a String, and stores
+    // through `this` after both. A peer collection inside the blocking region
+    // is the widest window in this file.
+    let pin = ctx.pin_native_root(this);
     let blocking = read_blocking_flag(ctx, this);
     let started =
         crate::nb_connect::start_bound(stream, &remote).map_err(|e| map_err(&target, e))?;
@@ -2741,10 +2770,13 @@ fn sc_connect_bound(
                 .write()
                 .insert(id, TcpHandle::ConnectFailed(stream, error));
             tcp_blocking_state().write().insert(id, false);
+            let this = ctx.read_native_pin(pin, this);
             cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local.port() as i32));
             let host_str = ctx.create_string(host);
+            let this = ctx.read_native_pin(pin, this);
             cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
             cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
+            ctx.unpin_native_roots(pin);
             return Ok(false);
         }
         crate::nb_connect::StartConnect::DeferredFailure(_stream, error) => {
@@ -2788,6 +2820,7 @@ fn sc_connect_bound(
     }
     let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
     tcp_replace_connect_state(id, stream, connected, blocking);
+    let this = ctx.read_native_pin(pin, this);
     cf_set(
         ctx,
         this,
@@ -2796,8 +2829,10 @@ fn sc_connect_bound(
     );
     cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local_port));
     let host_str = ctx.create_string(host);
+    let this = ctx.read_native_pin(pin, this);
     cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
     cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
+    ctx.unpin_native_roots(pin);
     Ok(connected)
 }
 
@@ -2839,17 +2874,25 @@ fn decode_resolved_literal(ctx: &mut dyn NativeContext, sa: ObjectRef) -> Option
     }
     // An unresolved address has no InetAddress to reuse, and resolving it at
     // dial time is its defined behaviour — not something to optimise away.
+    // GC: `isUnresolved()` runs Java before `sa` is read again for
+    // `getAddress()`.
+    let sa_pin = ctx.pin_native_root(sa);
     if let Ok(Some(Value::Int(1))) = ctx.invoke_virtual(sa, "isUnresolved", "()Z", &[]) {
+        ctx.unpin_native_roots(sa_pin);
         return None;
     }
-    let ia = match ctx.invoke_virtual(sa, "getAddress", "()Ljava/net/InetAddress;", &[]) {
-        Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return None,
-    };
-    match ctx.invoke_virtual(ia, "getHostAddress", "()Ljava/lang/String;", &[]) {
-        Ok(Some(Value::Object(Some(str_obj)))) => ctx.read_string(str_obj),
+    let sa = ctx.read_native_pin(sa_pin, sa);
+    let out = match ctx.invoke_virtual(sa, "getAddress", "()Ljava/net/InetAddress;", &[]) {
+        Ok(Some(Value::Object(Some(ia)))) => {
+            match ctx.invoke_virtual(ia, "getHostAddress", "()Ljava/lang/String;", &[]) {
+                Ok(Some(Value::Object(Some(str_obj)))) => ctx.read_string(str_obj),
+                _ => None,
+            }
+        }
         _ => None,
-    }
+    };
+    ctx.unpin_native_roots(sa_pin);
+    out
 }
 
 /// Build the `SocketAddr` to dial from a resolved literal, or `None`.
@@ -2976,9 +3019,16 @@ fn sc_connect_unix(
     // The connect() syscall itself can block briefly on a busy listen backlog,
     // and touches no Java heap — bracket it like the INET blocking path so a
     // concurrent stop-the-world pause never waits on this thread.
+    // GC: `begin_blocking_region` tells the VM this thread will not cooperate
+    // with a stop-the-world pause, which is exactly the window in which a PEER
+    // thread's collection runs to completion. `end_blocking_region` does NOT
+    // rewrite native locals — `end_blocking_region_refs` exists because the
+    // plain form does not — so `this` is a pre-pause address from here on.
+    let pin = ctx.pin_native_root(this);
     ctx.begin_blocking_region();
     let connected = crate::uds::connect(path);
     ctx.end_blocking_region();
+    let this = ctx.read_native_pin(pin, this);
     let stream = connected.map_err(|e| map_err(path, e))?;
 
     let blocking = read_blocking_flag(ctx, this);
@@ -2991,7 +3041,9 @@ fn sc_connect_unix(
     cf_set(ctx, this, F_CONNECTED, Value::Int(1));
     cf_set(ctx, this, F_FAMILY, Value::Int(FAMILY_UNIX));
     let path_str = ctx.create_string(path);
+    let this = ctx.read_native_pin(pin, this);
     cf_set(ctx, this, F_UDS_PATH, Value::Object(Some(path_str)));
+    ctx.unpin_native_roots(pin);
     Ok(true)
 }
 
@@ -3007,9 +3059,25 @@ fn sc_connect_inner(
     // after-the-dial re-ask are one pair per entry point and an interrupted
     // connect raises exactly one exception. Any new caller of this function
     // must add the same pair; `allow_block` is the flag to gate it on.
+    // GC: this function is the crate's widest collection window. It calls
+    // three helpers that re-enter Java (`decode_unix_socket_address`,
+    // `decode_socket_address`, `decode_resolved_literal`), brackets a blocking
+    // OS `connect()` in `begin_blocking_region` — where a PEER thread's
+    // collection runs to completion while this one is explicitly not
+    // cooperating — and then allocates a String and stores it through `this`.
+    // The phase-trace comment below already says `create_string` "ALLOCATES
+    // and can therefore reach a collection"; the `cf_set` on the next line
+    // still went through a pre-allocation copy of `this`.
+    let base = ctx.pin_native_root(this);
+    let sa_pin = ctx.pin_native_root(sa);
+    let mut this = this;
+    let mut sa = sa;
     if let Some(path) = decode_unix_socket_address(ctx, sa)? {
+        this = ctx.read_native_pin(base, this);
+        ctx.unpin_native_roots(base);
         return sc_connect_unix(ctx, this, &path);
     }
+    sa = ctx.read_native_pin(sa_pin, sa);
     let (host, port) = decode_socket_address(ctx, sa)?;
     let host = connect_target_host(host);
     let target = format!("{host}:{port}");
@@ -3018,12 +3086,15 @@ fn sc_connect_inner(
     // `getaddrinfo` on a name the JDK had already turned into an address —
     // a lookup HotSpot never performs, and on Windows one that wedges the
     // resolver after a few dozen rapid calls.
+    sa = ctx.read_native_pin(sa_pin, sa);
     let preresolved = preresolved_socket_addr(decode_resolved_literal(ctx, sa), port);
     ipc_dbg(format!("connect target={target} allow_block={allow_block}"));
 
+    this = ctx.read_native_pin(base, this);
     if let Some(id) = read_reg_id(ctx, this) {
         let bound = tcp_take_bound(id)
             .ok_or_else(|| ioex("connect: channel is already connected or connecting"))?;
+        ctx.unpin_native_roots(base);
         return sc_connect_bound(ctx, this, id, bound, &host, port, allow_block);
     }
 
@@ -3094,6 +3165,9 @@ fn sc_connect_inner(
         ctx.begin_blocking_region();
         let connect_result = crate::outbound_policy::policy_connect_with(&target, preresolved);
         ctx.end_blocking_region();
+        // `end_blocking_region` does not rewrite native locals; the `_refs`
+        // variant exists precisely because the plain one does not.
+        this = ctx.read_native_pin(base, this);
         connect_dbg(format!(
             "dial-return target={target} ok={}",
             connect_result.is_ok()
@@ -3123,11 +3197,13 @@ fn sc_connect_inner(
         cf_set(ctx, this, F_CONNECTED, Value::Int(1));
         cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local_port));
         let host_str = ctx.create_string(&host);
+        this = ctx.read_native_pin(base, this);
         cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
         cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
         ipc_dbg(format!(
             "connect success(blocking) id={id} local_port={local_port}"
         ));
+        ctx.unpin_native_roots(base);
         return Ok(true);
     }
 
@@ -3186,11 +3262,13 @@ fn sc_connect_inner(
                 cf_set(ctx, this, F_CONNECTED, Value::Int(1));
                 cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local_port));
                 let host_str = ctx.create_string(&host);
+                this = ctx.read_native_pin(base, this);
                 cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
                 cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
                 ipc_dbg(format!(
                     "connect success(nonblocking-immediate) id={id} local_port={local_port}"
                 ));
+                ctx.unpin_native_roots(base);
                 return Ok(true);
             }
             Ok(crate::nb_connect::StartConnect::InProgress(stream)) => {
@@ -3236,9 +3314,11 @@ fn sc_connect_inner(
         // already correctly reports the saved failure (`Verdict::Failed`
         // below) as a typed exception.
         let host_str = ctx.create_string(&host);
+        this = ctx.read_native_pin(base, this);
         cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
         cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
         ipc_dbg(format!("connect deferred failure(nonblocking) id={id}"));
+        ctx.unpin_native_roots(base);
         return Ok(false);
     }
 
@@ -3247,9 +3327,11 @@ fn sc_connect_inner(
         tcp_blocking_state().write().insert(id, false);
         cf_set(ctx, this, F_REG_ID, Value::Int(id));
         let host_str = ctx.create_string(&host);
+        this = ctx.read_native_pin(base, this);
         cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
         cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
         ipc_dbg(format!("connect pending(nonblocking) id={id}"));
+        ctx.unpin_native_roots(base);
         return Ok(false);
     }
 
@@ -3808,6 +3890,9 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         Some(o) => o,
         None => return Err(ioex("read: null channel")),
     };
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let this_pin = ctx.pin_native_root(this);
     let bb = match obj_or_none(args, 1) {
         Some(o) => o,
         None => return Err(ioex("read: null ByteBuffer")),
@@ -3827,6 +3912,7 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             Err(ioex("read: channel not connected"))
         };
     };
+    let this = ctx.read_native_pin(this_pin, this);
 
     // RACE DIRECTION 1 — the interrupt landed BEFORE the read parked (or even
     // before it was called). `SocketChannelImpl.beginRead` runs `begin()`
@@ -4060,7 +4146,9 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 }
             }
         }
-        let written = buffer_write_bytes(ctx, bb, scratch.prefix(n as usize));
+        // GC: `capture_stack_trace` above allocates the trace it captures.
+    let bb = ctx.read_native_pin(bb_pin, bb);
+    let written = buffer_write_bytes(ctx, bb, scratch.prefix(n as usize));
         buffer_advance(ctx, bb, written);
     }
     ctx.unpin_native_roots(bb_pin);
@@ -4072,10 +4160,16 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         Some(o) => o,
         None => return Err(ioex("write: null channel")),
     };
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let this_pin = ctx.pin_native_root(this);
     let bb = match obj_or_none(args, 1) {
         Some(o) => o,
         None => return Err(ioex("write: null ByteBuffer")),
     };
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let bb_pin = ctx.pin_native_root(bb);
     // A channel closed BEFORE the call is a plain `ClosedChannelException`,
     // exactly as in `sc_read` — and it OUTRANKS a pending interrupt (measured:
     // `begin()`'s interruptor returns early on `if (!open)` without recording
@@ -4090,6 +4184,7 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             Err(ioex("write: channel not connected"))
         };
     };
+    let bb = ctx.read_native_pin(bb_pin, bb);
     // Copy the source region into the thread's reusable transfer buffer rather
     // than into a fresh `Vec` sized to `limit - position`. The buffer is
     // decoded ONCE here and the decoded access is reused for the census and the
@@ -4121,6 +4216,7 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if data.is_empty() {
         return Ok(Some(Value::Int(0)));
     }
+    let this = ctx.read_native_pin(this_pin, this);
 
     // RACE DIRECTION 1 — the interrupt landed BEFORE the write started.
     // `SocketChannelImpl.beginWrite` runs `begin()` ahead of the transfer, and
@@ -4271,10 +4367,16 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(o) => o,
         None => return Err(ioex("write(gathering): null channel")),
     };
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let this_pin = ctx.pin_native_root(this);
     let srcs = match obj_or_none(args, 1) {
         Some(o) => o,
         None => return Err(ioex("write(gathering): null buffer array")),
     };
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let srcs_pin = ctx.pin_native_root(srcs);
     // Closed-before-the-call outranks a pending interrupt — see `sc_write`.
     let reg_id = read_reg_id(ctx, this);
     let Some(id) = reg_id else {
@@ -4284,6 +4386,7 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             Err(ioex("write(gathering): channel not connected"))
         };
     };
+    let this = ctx.read_native_pin(this_pin, this);
 
     // Race direction 1, same as `sc_write`: an interrupt already pending when a
     // BLOCKING vectored write is entered closes the channel before any
@@ -4294,6 +4397,7 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     if blocking && ctx.is_interrupted(false) {
         return Err(close_by_interrupt(ctx, this));
     }
+    let srcs = ctx.read_native_pin(srcs_pin, srcs);
 
     // Collect each buffer's readable region (in order), keeping the buffer ref
     // so we can advance its position by the bytes actually consumed.
@@ -4472,10 +4576,16 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(o) => o,
         None => return Err(ioex("read(scattering): null channel")),
     };
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let this_pin = ctx.pin_native_root(this);
     let dsts = match obj_or_none(args, 1) {
         Some(o) => o,
         None => return Err(ioex("read(scattering): null buffer array")),
     };
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let dsts_pin = ctx.pin_native_root(dsts);
     let reg_id = read_reg_id(ctx, this);
     let Some(id) = reg_id else {
         // See `sc_read`: no registry id + `F_OPEN == 0` is a closed channel.
@@ -4485,6 +4595,7 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             Err(ioex("read(scattering): channel not connected"))
         };
     };
+    let this = ctx.read_native_pin(this_pin, this);
 
     // Race direction 1, same as `sc_read`: an interrupt already pending when a
     // BLOCKING vectored read is entered closes the channel before any transfer.
@@ -4492,6 +4603,7 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     if blocking && ctx.is_interrupted(false) {
         return Err(close_by_interrupt(ctx, this));
     }
+    let dsts = ctx.read_native_pin(dsts_pin, dsts);
 
     // Sum the writable capacity across the buffer slice; remember each target
     // so we can scatter the bytes back afterward (in array order).
@@ -4763,6 +4875,9 @@ fn sc_set_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(o) => o,
         None => return Ok(Some(Value::Object(None))),
     };
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let this_pin = ctx.pin_native_root(this);
     let opt_name = socket_option_name(ctx, obj_or_none(args, 1));
     // Accept either Int or Boolean payloads — both arrive as Value::Int here.
     let val = socket_option_value(ctx, args.get(2).copied().unwrap_or(Value::Int(0)));
@@ -4772,6 +4887,7 @@ fn sc_set_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // run. Record it against the channel itself first; `ssc_finish_bind` reads
     // it back and applies it to the listener it just created.
     if opt_name == "SO_REUSEADDR" {
+        let this = ctx.read_native_pin(this_pin, this);
         cf_set(ctx, this, F_REUSEADDR, Value::Int(val));
     }
     // …and every OTHER option has the same problem, with no `ssc_finish_bind`
@@ -5131,8 +5247,15 @@ fn ssc_bind_unix(
     // A Unix-domain listener has no port; `ssc_is_bound` special-cases the
     // family so leaving F_LOCAL_PORT at 0 is correct, and it keeps
     // `NioEndpoint.getLocalPort()` reporting -1 as it does on HotSpot.
+    //
+    // GC: `create_string` allocates, and `this` is both stored through AND
+    // RETURNED to Java afterwards — a stale return value is handed straight
+    // back to the caller's operand stack, where nothing will ever correct it.
+    let pin = ctx.pin_native_root(this);
     let path_str = ctx.create_string(path);
+    let this = ctx.read_native_pin(pin, this);
     cf_set(ctx, this, F_UDS_PATH, Value::Object(Some(path_str)));
+    ctx.unpin_native_roots(pin);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -5375,6 +5498,9 @@ fn ssc_accept_impl(
         Some(o) => o,
         None => return Err(ioex("accept: null channel")),
     };
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let this_pin = ctx.pin_native_root(this);
     // Closed-before-the-call outranks a pending interrupt, and it is a plain
     // `ClosedChannelException` — measured: the SECOND accept after a
     // `ClosedByInterruptException` reports exactly that, because `begin()`'s
@@ -5391,6 +5517,7 @@ fn ssc_accept_impl(
             Err(ioex("accept: server channel not bound"))
         };
     };
+    let this = ctx.read_native_pin(this_pin, this);
     let blocking = read_blocking_flag(ctx, this);
 
     // RACE DIRECTION 1 — the interrupt landed BEFORE the accept parked (or
@@ -5571,7 +5698,12 @@ fn ssc_accept_impl(
     cf_set(ctx, child, F_REG_ID, Value::Int(new_id));
     cf_set(ctx, child, F_CONNECTED, Value::Int(1));
     cf_set(ctx, child, F_LOCAL_PORT, Value::Int(local_port));
+    // GC: `create_string` allocates, and `child` is stored through and then
+    // returned to the acceptor.
+    let child_pin = ctx.pin_native_root(child);
     let host_str = ctx.create_string(&peer.ip().to_string());
+    let child = ctx.read_native_pin(child_pin, child);
+    ctx.unpin_native_roots(child_pin);
     cf_set(ctx, child, F_REMOTE, Value::Object(Some(host_str)));
     cf_set(ctx, child, F_REMOTE_PORT, Value::Int(peer.port() as i32));
 
@@ -5716,7 +5848,12 @@ fn ssc_accept_unix(
     cf_set(ctx, child, F_CONNECTED, Value::Int(1));
     cf_set(ctx, child, F_LOCAL_PORT, Value::Int(0));
     cf_set(ctx, child, F_FAMILY, Value::Int(FAMILY_UNIX));
+    // GC: as in the TCP twin — `create_string` allocates and `child` is stored
+    // through and returned afterwards.
+    let child_pin = ctx.pin_native_root(child);
     let path_str = ctx.create_string(&path);
+    let child = ctx.read_native_pin(child_pin, child);
+    ctx.unpin_native_roots(child_pin);
     cf_set(ctx, child, F_UDS_PATH, Value::Object(Some(path_str)));
 
     Ok(Some(Value::Object(Some(child))))

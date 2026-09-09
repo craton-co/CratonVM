@@ -3474,7 +3474,7 @@ pub fn execute(
                             );
                         }
                         crate::jit::disasm::maybe_dump_annotated(
-                            "first",
+                            if c.used_ir_backend { "first/ir" } else { "first/sp" },
                             &class_name_arc,
                             &method_name_arc,
                             &descriptor_arc,
@@ -4038,8 +4038,24 @@ pub fn execute(
                                     // them for no reason: on `TestScript` that
                                     // is `StringFunction1.getValue`, a
                                     // per-row expression evaluator.
+                                    //
+                                    // Through `despeculate_trapped_method` and
+                                    // not `deoptimize` directly, because the
+                                    // reason a bare `deoptimize` records here is
+                                    // the DEOPT POINT'S: for a trapping bci that
+                                    // carries a safepoint that reason is
+                                    // `TransferToInterpreter`, whose
+                                    // `recommend_action` is `Reinterpret` - the
+                                    // artifact stays live, the next call
+                                    // re-enters it, and it traps again, forever.
+                                    // The sibling sink
+                                    // (`try_resume_trapped_callee`) has always
+                                    // known that and asked for the site-trap
+                                    // policy instead; both now ask the same
+                                    // function, so they cannot answer
+                                    // differently again.
                                     if key_matches {
-                                        let _ = crate::jit::helpers::DeoptimizationController::deoptimize(
+                                        crate::jit::helpers::despeculate_trapped_method(
                                             shared,
                                             &class_name_str,
                                             method_name,
@@ -4088,37 +4104,105 @@ pub fn execute(
                                     // fatal error killed at ~212 s with
                                     // `stashed key "org/h2/util/StringUtils.cache:..."`
                                     // while running `StringFunction1.getValue`.
-                                    let mut materialize_failed = false;
-                                    if resume_gate_ok && key_matches {
-                                        let cached = Arc::new(CachedBytecodeMethod {
-                                            declaring_class_id: class_id,
-                                            class_name: Arc::from(class_name_str.as_str()),
-                                            method_name: Arc::from(method_name),
-                                            method_descriptor: Arc::from(method_descriptor),
-                                            source_file: source_file.as_deref().map(Arc::from),
-                                            code: crate::runtime::frame::padded_bytecode(
+                                    //
+                                    // Three refusals the RECONSTRUCTED FRAME
+                                    // genuinely cannot answer, and they are the
+                                    // ones the sibling sink makes or the
+                                    // emission side names:
+                                    //
+                                    //  * an `ACC_SYNCHRONIZED` method - the
+                                    //    method monitor is not in the frame
+                                    //    (`try_resume_trapped_callee` refuses
+                                    //    the same shape, for the same reason);
+                                    //  * a body that takes a monitor at all.
+                                    //    Every `FrameState` `ir_lower` builds
+                                    //    hard-codes `monitors: Vec::new()`, so
+                                    //    a resumed frame for such a body
+                                    //    believes it holds no lock and its
+                                    //    `monitorexit` unbalances. `ir_lower`'s
+                                    //    own comment says the sink "cannot fire
+                                    //    on information that was never
+                                    //    recorded" - `bytecode_holds_monitor`
+                                    //    is that information, read off the
+                                    //    bytecode instead;
+                                    //  * a resume bci past this method's code.
+                                    // The predicate's own terms, kept apart
+                                    // here only so the refusal message can name
+                                    // WHICH of them declined. The decision
+                                    // itself is `sink_precise_resume_allowed`,
+                                    // which all four deopt sinks ask.
+                                    let body_holds_monitor = cratonvm_jit::bytecode_holds_monitor(
+                                        &code_attr.code,
+                                        code_attr.code.len(),
+                                    );
+                                    let bci_in_code =
+                                        (rframe_for_despec.bci as usize) < code_attr.code.len();
+                                    // `can_deopt_resume` is very nearly not
+                                    // the question this sink has to ask, and
+                                    // asking it is what turned an ordinary
+                                    // trap into a hard process abort. "Nearly"
+                                    // because its elided-monitor conjunct DOES
+                                    // carry weight on the single-pass side --
+                                    // which is why `body_holds_monitor` above
+                                    // replaces it rather than dropping it. See
+                                    // `cratonvm_jit::deopt_sink_resume_enabled`
+                                    // for the whole argument and the measured
+                                    // population. The frame is already
+                                    // reconstructed and stashed; the sibling
+                                    // sink resumes exactly this stash, with
+                                    // exactly this builder, and has never
+                                    // consulted that flag.
+                                    //
+                                    // STRICTLY ADDITIVE. The `resume_gate_ok` arm is
+                                    // the pre-2026-09-07 condition, unchanged: when the
+                                    // backend set `can_deopt_resume` it has ALREADY
+                                    // vouched that no monitor was elided, so hanging the
+                                    // new guards on that arm too would turn a resume
+                                    // that works today - a single-pass body with a real
+                                    // `synchronized` block, trapping where no lock is
+                                    // held - into the very abort this change exists to
+                                    // remove. The guards belong to the NEW arm, the one
+                                    // running without the backend's word for it.
+                                    let resume_allowed = key_matches
+                                        && (resume_gate_ok
+                                            || sink_precise_resume_allowed(
                                                 &code_attr.code,
-                                            ),
-                                            exception_table: Arc::from(
-                                                code_attr.exception_table.as_slice(),
-                                            ),
-                                            max_stack: code_attr.max_stack,
-                                            max_locals: code_attr.max_locals,
-                                            num_params: count_method_params(method_descriptor)
-                                                as u16,
-                                            is_synchronized,
-                                            is_static,
-                                            force_native_cache: std::sync::OnceLock::new(),
-                                            descriptor_facts_cache: std::sync::OnceLock::new(),
-                                            intercept_shape_cache: std::sync::OnceLock::new(),
-                                            interp_invocations: std::sync::atomic::AtomicU32::new(0),
-                                            native_callback_cache: std::sync::OnceLock::new(),
-                                            invoc_key: std::sync::OnceLock::new(),
-                                            jit_probe_generation: std::sync::atomic::AtomicU64::new(
-                                                0,
-                                            ),
-                                            quickened: std::sync::OnceLock::new(),
-                                        });
+                                                code_attr.code.len(),
+                                                is_synchronized,
+                                                rframe_for_despec.bci,
+                                            ));
+                                    let mut materialize_failed = false;
+                                    if resume_allowed {
+                                        let cached =
+                                            Arc::new(CachedBytecodeMethod {
+                                                declaring_class_id: class_id,
+                                                class_name: Arc::from(class_name_str.as_str()),
+                                                method_name: Arc::from(method_name),
+                                                method_descriptor: Arc::from(method_descriptor),
+                                                source_file: source_file.as_deref().map(Arc::from),
+                                                code: crate::runtime::frame::padded_bytecode(
+                                                    &code_attr.code,
+                                                ),
+                                                exception_table: Arc::from(
+                                                    code_attr.exception_table.as_slice(),
+                                                ),
+                                                max_stack: code_attr.max_stack,
+                                                max_locals: code_attr.max_locals,
+                                                num_params: count_method_params(method_descriptor)
+                                                    as u16,
+                                                is_synchronized,
+                                                is_static,
+                                                force_native_cache: std::sync::OnceLock::new(),
+                                                descriptor_facts_cache: std::sync::OnceLock::new(),
+                                                intercept_shape_cache: std::sync::OnceLock::new(),
+                                                interp_invocations:
+                                                    std::sync::atomic::AtomicU32::new(0),
+                                                native_callback_cache: std::sync::OnceLock::new(),
+                                                invoc_key: std::sync::OnceLock::new(),
+                                                jit_probe_generation:
+                                                    std::sync::atomic::AtomicU64::new(0),
+                                                quickened: std::sync::OnceLock::new(),
+                                            });
                                         let pin_base = thread.native_pin_roots.len();
                                         let built = build_deopt_frame_inner(
                                             shared,
@@ -4254,11 +4338,35 @@ pub fn execute(
                                         // past bci 0. Refuse a whole-method replay:
                                         // it is observably wrong for methods with
                                         // stores, I/O, monitor actions, or callbacks.
-                                        let why = if !resume_gate_ok {
-                                            "can_deopt_resume=false (no deopt points, \
-                                         or an elided monitor)"
+                                        // WHICH gate declined is the whole
+                                        // diagnosis, and they need completely
+                                        // different fixes. `can_deopt_resume`
+                                        // is no longer one of them unless the
+                                        // resume was switched off, so naming it
+                                        // bare would send the next reader after
+                                        // a flag that is not the cause.
+                                        // The monitor and bci refusals belong to the NEW arm
+                                        // only, so ask them only when that arm was in play:
+                                        // with `resume_gate_ok` set the resume was attempted
+                                        // regardless, and naming one of them would describe a
+                                        // decision that never happened.
+                                        let why = if !resume_gate_ok && is_synchronized {
+                                            "the method is ACC_SYNCHRONIZED, so a resumed frame \
+                                         would not hold the method monitor"
+                                        } else if !resume_gate_ok && body_holds_monitor {
+                                            "the body enters a monitor and the IR frame states \
+                                         record none"
+                                        } else if !resume_gate_ok && !bci_in_code {
+                                            "the resume bci is past this method's code"
                                         } else if materialize_failed {
+                                            // Asked BEFORE the switch: a resume that was
+                                            // attempted and FAILED is the real reason; the
+                                            // switch is only the reason when no attempt was
+                                            // made at all.
                                             "the frame could not be materialised from its map"
+                                        } else if !cratonvm_jit::deopt_sink_resume_enabled() {
+                                            "can_deopt_resume=false (no deopt points, or an \
+                                         elided monitor) and CRATONVM_JIT_DEOPT_SINK_RESUME=0"
                                         } else {
                                             "unknown"
                                         };
@@ -4847,6 +4955,37 @@ pub fn pop_and_recycle_frame_with_reason(
             );
         }
     }
+    // AN `ACC_SYNCHRONIZED` FRAME A FAST DOOR PUSHED RELEASES ITS MONITOR HERE.
+    //
+    // The general path scopes that release to an RAII guard around the nested
+    // Rust invoke (`SynchronizedMethodGuard`). A door pushes the callee into
+    // THIS loop and returns, so there is no Rust scope to hang it on -- the
+    // frame owns it instead, in the `monitor_on_exit` slot the stackless
+    // design added and never filled.
+    //
+    // This is the only place it can go, and that is checkable rather than
+    // hopeful: every removal of an interpreter frame reaches this function --
+    // the return opcodes, the exception unwind (`was_popped_by_exception`),
+    // and the orphan sweeps `execute` and `resume_continuation` run after
+    // `execute_frame_from_index` returns early through `return Err`.
+    //
+    // Before the JVMTI hooks below, because a `FramePop` callback can run
+    // arbitrary Java -- including code that wants this very monitor.
+    //
+    // The address is read from the frame rather than remembered by the door: a
+    // moving collection between the acquire and the return relocates the
+    // object, and `memory/gc.rs` already remaps `monitor_on_exit` for exactly
+    // this reason.
+    if thread.frames.last().is_some_and(|f| f.monitor_on_exit.is_some()) {
+        let tid = thread.thread_id;
+        let monitor = thread
+            .frames
+            .last_mut()
+            .and_then(|f| f.monitor_on_exit.take());
+        if let Some(monitor) = monitor {
+            let _ = crate::vm::vm_exec::monitor_exit_and_retract_jmx(shared, monitor, tid);
+        }
+    }
     // T17.Δ.5 — JVMTI FramePop before the frame vanishes.
     fire_jvmti_frame_pop_if_requested(shared.vm_identity, thread, was_popped_by_exception);
     // The dying frame is read THROUGH THE STACK, not moved out of it.
@@ -5410,6 +5549,20 @@ fn execute_frame_from_index(
     // state observed at frame entry — the next `execute_frame` invocation
     // re-reads the global gate, so newly-enabled profiling picks up on the
     // next call rather than mid-loop.
+    // CORRECTION (2026-09-07): "the next call" understates the window, for
+    // every gate hoisted here. `execute_frame_from_index` runs an ENTIRE
+    // NESTED CALL TREE in one invocation — an interpreted call pushes a frame
+    // and `continue`s this same loop — so these locals are not observed per
+    // METHOD, they are observed per OUTERMOST interpreter entry. A gate armed
+    // while a deep call tree is running is not seen until that whole tree
+    // unwinds.
+    //
+    // That is defensible for a profiler and for a diagnostic trace, which is
+    // what every gate hoisted here is. It would NOT be defensible for a
+    // debugger's field watchpoints or for `any_class_redefined`, which is
+    // exactly why `field_fast`'s per-access checks are NOT hoisted alongside
+    // these — see the retired `heap-touching-bytecodes-are-the-outlier`
+    // write-up, which asked whether they could be and answered no.
     let pgo_enabled = crate::jit::profile::is_profiling_enabled();
     // T17.Δ.3 — hoist the JVMTI single-step listener gate out of the per-bytecode
     // loop (same contract as `pgo_enabled` above). `any_single_step_listener_active()`
@@ -5849,6 +6002,24 @@ fn execute_frame_from_index(
         // or backward-branch poll before another thread requests STW. Keep the
         // hot path to one atomic load; call the full safepoint machinery only
         // while a pause is actually active.
+        //
+        // # Why this stays `Acquire`, and where that stops being free
+        //
+        // The obvious optimisation — hoist this into a `poll_pending` local
+        // set at frame entry, the way `pgo_enabled` above is hoisted — was
+        // weighed and REFUSED on x86-64: an `Acquire` load there is a plain
+        // `mov`, so there is no fence to delete. The only thing hoisting buys
+        // is that the compiler may keep the flag in a register, and the only
+        // other lever is poll FREQUENCY, which is time-to-safepoint. The
+        // failure mode of getting that wrong is a GC that waits forever for a
+        // thread that never polls — the wrong trade for roughly one L1 hit,
+        // especially now that the flag has its own cache line
+        // (`threading::gc_barrier::CacheLineFlag`) and that hit is clean.
+        //
+        // **This must be revisited on aarch64.** There `Acquire` lowers to
+        // `ldar`, a real ordering instruction, and one per bytecode is not
+        // free. Whoever brings up that port owns this line; the x86-64
+        // reasoning above does not carry over.
         if shared
             .mem
             .gc_barrier
@@ -5916,6 +6087,38 @@ fn execute_frame_from_index(
         // — see the note at its binding for what it selects and why the
         // per-class `skip_verification` case still relies on the per-site
         // checks below as a second line of defence.
+        //
+        // # The two structural proposals for this match, both REFUTED (2026-09-05)
+        //
+        // Neither is a lever, and both are cheap to re-refute if the idea comes
+        // back. Straight-line arithmetic on this path costs ~7.5 ns per
+        // bytecode against HotSpot's ~0.95 — the whole remaining floor.
+        //
+        // * **"Dispatch on the pre-decoded `QuickenedCode` stream instead."**
+        //   `--noverify` flips `use_fast_path`, and the decoded path it selects
+        //   ALREADY runs on that stream — so the two engines price directly, in
+        //   one binary, on one program. `probes/FieldBurn.java`, N = 30 M,
+        //   min-of-5, wall ms: arithmetic loop **2312 fast against 5078
+        //   decoded**. The stream is 2.2x SLOWER. The cost is
+        //   `execute_instruction`'s out-of-line call, its ~200-variant match on
+        //   a 16-byte `Instruction`, the `thread.frames[frame_idx]` re-index
+        //   per operand and the `Result` round trip; an index-threaded loop
+        //   over the same handlers inherits all of it.
+        // * **"Give the eight opcodes with no fast arm one."** The ratio above
+        //   is per BYTECODE, and a switch executes once per iteration while
+        //   doing the work of a whole comparison chain.
+        //   `probes/SwitchBurn.java`, N = 20 M: `tableswitch` measures **4.7x**
+        //   HotSpot against straight-line arithmetic's 7.9x — BETTER than the
+        //   band, on the decoded path — and beats its own `ifchain` equivalent
+        //   outright (1752 ms against 2989).
+        //
+        // The one thing never tested is the INDIRECT BRANCH itself: a single
+        // dispatch site gives the predictor one history slot for every opcode
+        // transition in every program. That needs a branch-misprediction
+        // counter, i.e. a hardware profiler. **Do not build replicated dispatch
+        // sites before that number exists** — this note is two refutations long
+        // precisely because structural proposals here have not survived contact
+        // with a probe.
         // SAFETY (every `hot_fp` deref below): see the hoist note above —
         // reads only, no push, no `&mut` reborrow of the stack in between.
         // Explicit `&` on the place expression: calling `.len()` directly on

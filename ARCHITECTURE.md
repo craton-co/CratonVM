@@ -27,7 +27,7 @@ cratonvm/
   jit/                 cratonvm-jit                 x86-64 / AArch64 JIT compiler
   jit-cuda/            cratonvm-jit-cuda            Java bytecode -> PTX lowering for GPU offload
   cuda-bridge/         cuda-bridge                  Thin CUDA Driver API bridge for GPU offload
-  craton-gpu/          craton-gpu                   Build-time-only: packages the @GpuKernel/@Parallel Java annotation sources into a jar for jit-cuda's build script; no runtime code
+  craton-gpu4j/        cratonvm-gpu                 Build-time-only: packages the @GpuKernel/@Parallel Java annotation sources (from the gpu4j repo) into a jar for jit-cuda's build script; no runtime code
   classloading/        cratonvm-classloading        Class loading & bytecode verification
   gc/                  cratonvm-gc                  Garbage collectors (ZGC is the DEFAULT since 2026-08-10: concurrent-marking, compacting, optionally generational, behind the default-ON `zgc` feature; generational semi-space and G1 remain selectable)
   jfr/                 cratonvm-jfr                 Java Flight Recorder
@@ -54,7 +54,7 @@ libcratonvm  -> vm   (C-ABI / JNI Invocation API embedding shim)
 cratonvm-embed -> vm (curated, semver-stable Rust embedding facade)
 ```
 
-`craton-gpu` does not appear above: it is a *build-dependency* of
+`craton-gpu4j` does not appear above: it is a *build-dependency* of
 `jit-cuda` only (its `build.rs` compiles the GPU annotation sources and
 exposes their jar path via Cargo's `links` metadata), never a runtime
 dependency of anything.

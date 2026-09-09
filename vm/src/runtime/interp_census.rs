@@ -147,7 +147,45 @@ fn dump(label: &str, c: &Census, top: usize) {
 
 /// Print both censuses. Called from `vm-cli`'s exit report block; a census
 /// that was never armed prints nothing.
+/// A trapped compiled frame the sinks could not rebuild re-ran its method FROM
+/// ENTRY — side effects included. Say so, always.
+///
+/// # Why this one is not behind a debug flag
+///
+/// Everything else in this file is a diagnostic: you turn it on because you are
+/// already looking. This is not that. It is a silent WRONG ANSWER — a store, a
+/// call or a monitor action that happened twice because a deopt could not be
+/// resumed and the sink re-entered the method at bci 0
+/// (`jit-bridge-sinks-re-ran-a-side-effecting-body-FIXED-20260907.md`). The
+/// 2026-09-07 fix resumes wherever the frame CAN be rebuilt, which is the
+/// common case; what is left is this, and leaving it behind
+/// `CRATONVM_DBG_JITC` would keep the residual exactly as invisible as the
+/// defect was.
+///
+/// One line, only when the count is non-zero, naming the reasons. A clean run
+/// prints nothing.
+fn report_unrebuildable_frames() {
+    let bails = crate::runtime::interpreter::deopt_frame_bail_counts();
+    let total: u64 = bails.iter().map(|(_, n)| *n).sum();
+    if total == 0 {
+        return;
+    }
+    let detail = bails
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(why, n)| format!("{why}={n}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!(
+        "[cratonvm] WARNING: {total} trapped compiled frame(s) could not be rebuilt and their \
+         methods RE-RAN FROM ENTRY, repeating any side effect committed before the trap: \
+         {detail}. See internal/fixed-bugs/\
+         jit-bridge-sinks-re-ran-a-side-effecting-body-FIXED-20260907.md."
+    );
+}
+
 pub fn report_at_exit() {
+    report_unrebuildable_frames();
     dump("interp-frames", interp_census(), 60);
     dump("tierup-decline", decline_census(), 60);
     // C1→C2 supersede engagement. `unchanged`/`first-publish` are the two
@@ -193,10 +231,67 @@ pub fn report_at_exit() {
             .map(|(cause, n)| format!("{cause}={n}"))
             .collect::<Vec<_>>()
             .join(" ");
-        eprintln!("[c2-supersede] ir site traps planted: {trap_line}");
+        // REFUSED, beside PLANTED, for the same reason PLANTED is printed as
+        // all three rows including zeros: a planted count on its own cannot
+        // tell "this workload has no such site" from "every such site was
+        // declined", and those want opposite next steps.
+        //
+        // It is also the price tag of `CRATONVM_JIT_IR_TRAP_REPLAY_GUARD`.
+        // Every refusal is one optimizing body handed back to the single-pass
+        // tier, and the guard's own doc claims that cost is "countable rather
+        // than argued about" — which was not true while nothing read the
+        // counter. `ir_trap_refusal_census` landed with no reader in
+        // 7ade4a87c; this is that reader.
+        let refused_line = cratonvm_jit::ir::ir_trap_refusal_census()
+            .iter()
+            .map(|(cause, n)| format!("{cause}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        // TAKEN, beside PLANTED. The planting doc promised this half and did
+        // not have it: "a cause whose taken count is not ~0 has had its
+        // coldness argument refuted". A non-zero number means a trap sat on a
+        // LIVE path, which is the falsifiable form of that claim.
+        eprintln!(
+            "[c2-supersede] ir site traps planted: {trap_line} | REFUSED as unresumable: \
+             {refused_line} | TAKEN at runtime: {}",
+            cratonvm_jit::ir::site_traps_taken(),
+        );
+        let repeats = cratonvm_jit::ir::site_trap_repeats();
+        if repeats > 0 {
+            eprintln!(
+                "[c2-supersede] ir site traps re-fired after the decision: {repeats} (a caller frame still holds a baked CALL to the trapping body)"
+            );
+        }
+        // Trapped frames the sinks could NOT rebuild, confirmed at zero.
+        //
+        // The non-zero case is reported unconditionally by
+        // `report_unrebuildable_frames` above and is NOT repeated here; this
+        // line exists so a diagnostic run can tell "the residual is empty"
+        // apart from "the census is not wired up", which are the same silence.
+        if crate::runtime::interpreter::deopt_frame_bail_total() == 0 {
+            eprintln!(
+                "[c2-supersede] trapped frames that could not be rebuilt: 0 (every trap this \
+                 run resumed precisely)"
+            );
+        }
         let (lowered, refused) = cratonvm_jit::ir::scalar_intrinsic_census();
         eprintln!(
             "[c2-supersede] call-site intrinsics: lowered_as_arithmetic={lowered} refused_method={refused}"
+        );
+        // The guarded slot-0 accessors (`Op::Unbox`): the unboxing pair and the
+        // four `Atomic*` families. Counted on their own line rather than folded
+        // into `lowered_as_arithmetic`, because they are not arithmetic -- they
+        // are guarded memory ops, and three of them WRITE. They came off the
+        // `refused_method` work list, so the two numbers have to be readable
+        // against each other.
+        //
+        // `note_unbox_lowered` existed from the day the op landed and nothing
+        // printed it, which is the "instrument armed where nobody reads it"
+        // shape this census exists to avoid: a zero here now means the emitter
+        // found no sites, and that is a different statement from silence.
+        eprintln!(
+            "[c2-supersede] unbox accessors: lowered_inline={}",
+            cratonvm_jit::ir::unbox_lowered()
         );
         // The branch-profile window. `still_open` at exit should be ~0: a
         // nomination that opens the window and never closes it pins branch
@@ -239,6 +334,20 @@ pub fn report_at_exit() {
             "[c2-supersede] ir bounds elisions by range proof: {} (rest are dominating-redundancy)",
             cratonvm_jit::ir_check_elim::range_census(),
         );
+        // WHY the rest were not provable. "Extend the range pass" is four
+        // separate decisions with very different costs, and this says which
+        // one is actually holding the checks.
+        let refusals = cratonvm_jit::ir_check_elim::refusal_census();
+        if !refusals.is_empty() {
+            let body: Vec<String> = refusals
+                .iter()
+                .map(|(name, n)| format!("{name}={n}"))
+                .collect();
+            eprintln!(
+                "[c2-supersede] ir bounds range refusals: {}",
+                body.join(" ")
+            );
+        }
         eprintln!(
             "[c2-supersede] ir aastore sites lowered: {}",
             cratonvm_jit::ir_lower::ir_aastore_census(),

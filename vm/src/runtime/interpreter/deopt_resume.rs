@@ -32,8 +32,30 @@ use super::*;
 /// real-frame-deopt: `true` (default OFF) when an IR-path deopt should resume
 /// the interpreter at the trapping bci from the reconstructed frame, instead of
 /// re-running the method from entry. Gated by `CRATONVM_IR_DEOPT_RESUME` while
-/// it soaks — the precise resume is unvalidated against the full VM suite, and
-/// no production IR method emits a deopt guard yet, so default OFF is inert.
+/// it soaks — the precise resume is unvalidated against the full VM suite.
+///
+/// # "default OFF is inert" was true once, and stopped being true
+///
+/// This doc used to finish "…and no production IR method emits a deopt guard
+/// yet, so default OFF is inert." That clause is FALSE and was load-bearing for
+/// a real defect: it is why three `jit_bridge` sinks could gate their precise
+/// resume behind this flag and read as harmless, while in fact they fell
+/// through to re-running the method from entry and repeating any side effect
+/// the compiled body had already committed
+/// (`jit-bridge-sinks-re-ran-a-side-effecting-body-FIXED-20260907.md`).
+///
+/// Production IR methods emit deopt guards routinely — array access, field
+/// access and division all lower to one, and every `invokedynamic` the tier
+/// cannot lower gets an unconditional planted trap. Measured 2026-09-07 on a
+/// single `ASTParserLoadingTest` run: **27 547 traps taken at runtime.**
+///
+/// What makes default OFF tolerable now is NOT inertness. It is that the sinks
+/// no longer depend on this flag to resume: they ask
+/// [`sink_precise_resume_allowed`], which is default ON. This flag now governs
+/// only the `resume_from_ir_deopt` path, whose distinguishing capability is
+/// inlined-caller chains (`materialise_inlined_chain`) — a case
+/// `build_deopt_frame_inner` declines and counts as
+/// `DeoptFrameBail::InlinedChain`, and which has not been observed to occur.
 pub(super) fn ir_deopt_resume_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
@@ -784,6 +806,137 @@ pub(super) fn verify_reconstructed_oops(
 /// Rust-side only), so no GC can stale the built frame. `stress` forces a GC
 /// immediately before refill — the ONLY sanctioned injection point — to
 /// exercise the forward-in-place path (tests / `CRATONVM_GC_STRESS`).
+/// Why [`build_deopt_frame_inner`] declined to rebuild a trapped frame.
+///
+/// # Why this is counted at all
+///
+/// Before 2026-09-07 the deopt sinks answered a trap they could not resume by
+/// re-running the method from entry, which for a body that had already
+/// committed a store runs it twice
+/// (`jit-bridge-sinks-re-ran-a-side-effecting-body-FIXED-20260907.md`). The fix
+/// resumes instead — but only when the frame can be rebuilt, and "when it
+/// cannot" was a single phrase covering NINE distinct causes, none of them
+/// counted. So the residual could be described and not sized, and nobody could
+/// say whether a given workload hits it at all, or which cause to attack first.
+///
+/// `try_resume_trapped_callee` learned the same lesson in its own comments: *"a
+/// refusal that cannot be named cannot be counted, which is why the orphan in
+/// `jit-direct-call-mints-an-orphaned-deopt-frame` was attributed to inlining
+/// on no evidence."* These are that naming, for the rebuild side.
+///
+/// Ungated: one relaxed increment on a path that is already doing frame
+/// reconstruction, and a census that is off by default is a census nobody reads
+/// when the number finally matters.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DeoptFrameBail {
+    /// The stash names an inlined caller chain. `materialise_inlined_chain`
+    /// handles those for `resume_from_ir_deopt`; this builder does not.
+    InlinedChain,
+    /// The frame belongs to a DIFFERENT method than the one being rebuilt — a
+    /// nested callee's trap whose sentinel travelled outward.
+    IdentityMismatch,
+    /// `bci == u32::MAX`, the superseded-guard sentinel, which exists precisely
+    /// so this check fails.
+    SupersededSentinel,
+    /// `CRATONVM_DEOPT_VERIFY` found a structural invariant violated.
+    VerifyFailed,
+    /// An `ACC_SYNCHRONIZED` method carrying scalar-replaced objects: the
+    /// method monitor may have been elided under that replacement.
+    SynchronizedWithVirtuals,
+    /// Re-materialising the scalar-replaced object graph failed.
+    VirtualMaterialise,
+    /// A local slot the mapper has no representation for.
+    UnmappableLocal,
+    /// An operand-stack slot the mapper has no representation for.
+    UnmappableStack,
+    /// A held monitor that is not a resolved object reference.
+    BadMonitor,
+    /// The reconstructed operand stack did not fit the frame's padded stack.
+    StackPush,
+}
+
+impl DeoptFrameBail {
+    const ALL: [DeoptFrameBail; 10] = [
+        DeoptFrameBail::InlinedChain,
+        DeoptFrameBail::IdentityMismatch,
+        DeoptFrameBail::SupersededSentinel,
+        DeoptFrameBail::VerifyFailed,
+        DeoptFrameBail::SynchronizedWithVirtuals,
+        DeoptFrameBail::VirtualMaterialise,
+        DeoptFrameBail::UnmappableLocal,
+        DeoptFrameBail::UnmappableStack,
+        DeoptFrameBail::BadMonitor,
+        DeoptFrameBail::StackPush,
+    ];
+
+    /// The census name. Hyphenated and stable: these are grepped out of suite
+    /// logs, so renaming one silently breaks whoever is tracking it.
+    pub fn name(self) -> &'static str {
+        match self {
+            DeoptFrameBail::InlinedChain => "inlined-caller-chain",
+            DeoptFrameBail::IdentityMismatch => "identity-mismatch",
+            DeoptFrameBail::SupersededSentinel => "superseded-guard-sentinel",
+            DeoptFrameBail::VerifyFailed => "deopt-verify-failed",
+            DeoptFrameBail::SynchronizedWithVirtuals => "synchronized-with-virtual-objects",
+            DeoptFrameBail::VirtualMaterialise => "virtual-object-materialise-failed",
+            DeoptFrameBail::UnmappableLocal => "unmappable-local-slot",
+            DeoptFrameBail::UnmappableStack => "unmappable-stack-slot",
+            DeoptFrameBail::BadMonitor => "held-monitor-not-an-object",
+            DeoptFrameBail::StackPush => "operand-stack-did-not-fit",
+        }
+    }
+}
+
+static DEOPT_FRAME_BAILS: [std::sync::atomic::AtomicU64; 10] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+/// Count one decline, and trace it under `CRATONVM_DBG_DEOPT`.
+fn note_deopt_frame_bail(why: DeoptFrameBail, rframe: &cratonvm_jit::deopt::ReconstructedFrame) {
+    DEOPT_FRAME_BAILS[why as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+        eprintln!(
+            "[cratonvm-deopt] frame rebuild refused ({}): stash={} bci={}",
+            why.name(),
+            rframe.method_key,
+            rframe.bci,
+        );
+    }
+}
+
+/// `(reason, count)` for every way a trapped frame could not be rebuilt.
+///
+/// A non-zero total is the size of the residual the sink fix left behind: those
+/// traps still fall back to re-running the method from entry, side effects and
+/// all. Zero means every trap this run took was resumed precisely.
+pub fn deopt_frame_bail_counts() -> Vec<(&'static str, u64)> {
+    DeoptFrameBail::ALL
+        .iter()
+        .map(|w| {
+            (
+                w.name(),
+                DEOPT_FRAME_BAILS[*w as usize].load(std::sync::atomic::Ordering::Relaxed),
+            )
+        })
+        .collect()
+}
+
+/// Total declines, across every reason — the one number a regression test
+/// asserts is zero.
+pub fn deopt_frame_bail_total() -> u64 {
+    DEOPT_FRAME_BAILS
+        .iter()
+        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        .sum()
+}
+
+/// Reset the census. **Tests only** — a test that warms a VM and then measures
+/// one trapping call needs the warm-up's declines out of the way.
+pub fn reset_deopt_frame_bail_counts() {
+    for c in DEOPT_FRAME_BAILS.iter() {
+        c.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn build_deopt_frame_inner(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -798,6 +951,7 @@ pub(crate) fn build_deopt_frame_inner(
     // (a non-scalar elision sets `has_elided_monitor` → `can_deopt_resume=false`),
     // so every monitor here is materializable + relockable.
     if !rframe.caller_frames.is_empty() {
+        note_deopt_frame_bail(DeoptFrameBail::InlinedChain, rframe);
         return None;
     }
 
@@ -814,9 +968,11 @@ pub(crate) fn build_deopt_frame_inner(
         &cached.method_name,
         &cached.method_descriptor,
     ) {
+        note_deopt_frame_bail(DeoptFrameBail::IdentityMismatch, rframe);
         return None;
     }
     if rframe.bci == u32::MAX {
+        note_deopt_frame_bail(DeoptFrameBail::SupersededSentinel, rframe);
         return None;
     }
 
@@ -834,6 +990,7 @@ pub(crate) fn build_deopt_frame_inner(
                  — forcing safe re-run",
                 rframe.method_key, rframe.bci
             );
+            note_deopt_frame_bail(DeoptFrameBail::VerifyFailed, rframe);
             return None;
         }
     }
@@ -889,13 +1046,18 @@ pub(crate) fn build_deopt_frame_inner(
         // this sink to bail on. This whole path is `CRATONVM_DEOPT_REAL`-gated
         // (default-off).
         if cached.is_synchronized {
+            note_deopt_frame_bail(DeoptFrameBail::SynchronizedWithVirtuals, rframe);
             return None;
         }
         let mut copy = rframe.clone();
-        crate::runtime::deopt_materialize::materialize_virtual_objects(
+        if crate::runtime::deopt_materialize::materialize_virtual_objects(
             shared, thread, &mut copy, /* stress_gc */ false, /* keep_pins */ true,
         )
-        .ok()?;
+        .is_err()
+        {
+            note_deopt_frame_bail(DeoptFrameBail::VirtualMaterialise, rframe);
+            return None;
+        }
         materialized_frame = copy;
         &materialized_frame
     } else {
@@ -918,8 +1080,20 @@ pub(crate) fn build_deopt_frame_inner(
             rframe.method_key, rframe.bci, rframe.locals, rframe.stack
         );
     }
-    let locals = ir_deopt_locals(&rframe.locals)?;
-    let stack_vals = ir_deopt_frame_values(&rframe.stack)?;
+    let locals = match ir_deopt_locals(&rframe.locals) {
+        Some(l) => l,
+        None => {
+            note_deopt_frame_bail(DeoptFrameBail::UnmappableLocal, rframe);
+            return None;
+        }
+    };
+    let stack_vals = match ir_deopt_frame_values(&rframe.stack) {
+        Some(v) => v,
+        None => {
+            note_deopt_frame_bail(DeoptFrameBail::UnmappableStack, rframe);
+            return None;
+        }
+    };
 
     // ROOT the reconstructed oops BEFORE the GC-capable refill (locals then
     // stack — the order the re-read below relies on).
@@ -947,7 +1121,10 @@ pub(crate) fn build_deopt_frame_inner(
             // Null monitor or an unresolved form — refuse rather than relock a
             // bogus object (would corrupt the monitor table). Release nothing
             // extra; the caller truncates `native_pin_roots` to its watermark.
-            _ => return None,
+            _ => {
+                note_deopt_frame_bail(DeoptFrameBail::BadMonitor, rframe);
+                return None;
+            }
         }
     }
 
@@ -1024,6 +1201,7 @@ pub(crate) fn build_deopt_frame_inner(
         // them. The caller then releases the pins and re-runs.
         if frame.stack.push(*v).is_err() {
             frame.recycle(&mut thread.locals_pool, &mut thread.stacks_pool);
+            note_deopt_frame_bail(DeoptFrameBail::StackPush, rframe);
             return None;
         }
     }
@@ -1041,6 +1219,84 @@ pub(crate) fn build_deopt_frame_inner(
         }
     }
     Some(frame)
+}
+
+/// May a deopt sink resume this trapped body from its reconstructed frame
+/// WITHOUT the backend's `can_deopt_resume` vouching for it?
+///
+/// # One predicate, asked at every sink
+///
+/// Four sinks consume a stashed IR deopt frame, and which one a trap reaches
+/// depends only on how the callee was entered. Until 2026-09-07 they gave three
+/// different answers to the same event:
+///
+/// * `try_resume_trapped_callee` (`jit/helpers.rs`) resumed it precisely;
+/// * `execute`'s tier-up sink (`interpreter.rs`) raised a hard `InternalError`
+///   — fixed 2026-09-07;
+/// * `execute_jit_call` (`jit-callsite-a`), `execute_jit_call_decoded`
+///   (`jit-callsite-b`) and [`resume_deopted_body`] re-ran the whole method from
+///   entry, with no side-effect check — so a body that had already committed a
+///   store committed it a second time, silently.
+///
+/// A deopt sentinel does NOT mean "nothing happened": the compiled body ran up
+/// to `bci` and stopped. Re-entering at bci 0 re-executes everything before it.
+/// [`resume_deopted_body`]'s own doc says exactly that, and names what it cost —
+/// the hibernate-reactive `reactiveRemove`-fires-twice defect, one
+/// `ArrayLoop.next()` dispatch and two deletes. The fix for THAT added the
+/// resume call this predicate now makes reachable: it was gated on
+/// `can_deopt_resume`, which an optimizing-tier artifact never has, so it could
+/// not fire on the tier the defect actually needs.
+///
+/// # The three refusals
+///
+/// They are what the reconstructed frame genuinely cannot describe, and they
+/// are the same three `try_resume_trapped_callee` makes or the emission side
+/// names:
+///
+/// * an **`ACC_SYNCHRONIZED`** method — the method monitor is not in the frame;
+/// * a body that **takes a monitor at all**. Every `FrameState` `ir_lower`
+///   builds hard-codes `monitors: Vec::new()`, so a resumed frame for such a
+///   body believes it holds no lock. That is also what covers the one thing
+///   `can_deopt_resume` really protected: an elided monitor FORCES the flag
+///   false, so such a body reaches this predicate — and eliding is a codegen
+///   decision, not a bytecode rewrite, so the ops are still there to see;
+/// * a **resume bci past the method's code**.
+///
+/// # Additive by construction
+///
+/// Every caller ORs this beside its existing `can_deopt_resume` arm rather than
+/// replacing it. A backend that SET that flag has already vouched no monitor
+/// was elided, so applying these guards there too would refuse a single-pass
+/// body with an ordinary `synchronized` block that resumes correctly today.
+pub(crate) fn sink_precise_resume_allowed(
+    code: &[u8],
+    code_len: usize,
+    is_synchronized: bool,
+    bci: u32,
+) -> bool {
+    cratonvm_jit::deopt_sink_resume_enabled()
+        && !is_synchronized
+        && !cratonvm_jit::bytecode_holds_monitor(code, code_len)
+        && (bci as usize) < code_len
+}
+
+/// [`sink_precise_resume_allowed`] for a sink holding a `CachedBytecodeMethod`
+/// rather than a raw `Code` attribute.
+///
+/// `cached.code` is `padded_bytecode`, i.e. the real body followed by zero
+/// bytes. That is safe for both readers: `0x00` is `nop`, so the monitor walk
+/// runs off the end finding nothing, and the bci bound is the one
+/// `try_resume_trapped_callee` already applies against the same padded length.
+pub(crate) fn sink_precise_resume_allowed_for(
+    cached: &Arc<CachedBytecodeMethod>,
+    rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+) -> bool {
+    sink_precise_resume_allowed(
+        &cached.code,
+        cached.code.len(),
+        cached.is_synchronized,
+        rframe.bci,
+    )
 }
 
 /// real-frame-deopt Step 4 — RESUME a real (Object-bearing) deopt at the trapping
@@ -2038,7 +2294,14 @@ pub(super) fn real_frame_deopt_resume_and_despeculate(
     // de-spec'd there and never reaches whole-method give-up. The limit mirrors
     // HotSpot's `PerBytecodeTrapLimit`. Skipped for the superseded-artifact
     // sentinel (`bci == u32::MAX`), whose failing site was already counted on the
-    // pre-supersession deopts. Inert in production (this sink is deopt-real-only).
+    // pre-supersession deopts.
+    //
+    // NO LONGER inert in production. This sink was `deopt-real`-only when that
+    // sentence was written; since 2026-09-07 the three `jit_bridge` sinks reach
+    // it through `sink_precise_resume_allowed` too, so per-bci de-spec now fires
+    // on ordinary runs. That is the intended direction — one pathological
+    // speculation site gets suppressed on the next compile and the method stays
+    // compiled, instead of the whole method being given up.
     const PER_BCI_DESPEC_LIMIT: usize = 4;
     if rframe.bci != u32::MAX {
         let bci_deopts = shared

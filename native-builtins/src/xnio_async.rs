@@ -1771,7 +1771,9 @@ fn native_iof_cancel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         ctx.set_field(this, IOF_STATUS, Value::Int(STATUS_CANCELLED as i32));
         let notifiers = inner.drain_notifiers();
         inner.cv.notify_all();
+        let this_pin = ctx.pin_native_root(this);
         for e in &notifiers {
+            let this = ctx.read_native_pin(this_pin, this);
             IoFutureInner::fire_notifier(ctx, this, e);
         }
     }

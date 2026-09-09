@@ -73,6 +73,27 @@ pub use cratonvm_native_collections::report_map_view_cache_at_exit;
 /// The `CRATONVM_DBG_WATCH_PUN` census, re-exported for the same reason. Its
 /// two DENOMINATORS are why it exists: a watch that reports no punned cell has
 /// said nothing until it also says how many times it looked.
+/// Engagement census for the blocked-peer native-stack remap, as
+/// `(captured, adopted, written, skipped, enabled)`.
+///
+/// Re-exported because `vm-cli` does not link `cratonvm-gc` directly, the same
+/// reason `evacuate_cas_loser_forwards` above is. `written == 0` means the
+/// repair never engaged on the run and nothing may be concluded from its
+/// result -- see `gc_quiescence::PEER_STACK_SLOTS_CAPTURED`.
+pub fn blocked_peer_stack_remap_census() -> (u64, u64, u64, u64, u64, u64, u64, bool) {
+    use std::sync::atomic::Ordering;
+    (
+        cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_CAPTURED.load(Ordering::Relaxed),
+        cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_ADOPTED.load(Ordering::Relaxed),
+        cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_WRITTEN.load(Ordering::Relaxed),
+        cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_SKIPPED.load(Ordering::Relaxed),
+        cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_DISCARDED.load(Ordering::Relaxed),
+        cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_DROPPED.load(Ordering::Relaxed),
+        cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_UNROUTED.load(Ordering::Relaxed),
+        cratonvm_gc::gc_quiescence::blocked_peer_stack_remap_enabled(),
+    )
+}
+
 pub use cratonvm_gc::zgc::report_punned_watch_at_exit;
 /// The collector's own account of the last cycle and the decision histogram
 /// behind it. Re-exported because `vm-cli` prints it at shutdown under

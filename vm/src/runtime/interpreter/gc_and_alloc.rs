@@ -691,8 +691,10 @@ pub(super) fn stw_take_over_and_wait(
         // re-scanning it only widens the conservative-candidate volume that
         // feeds the mark-phase writer, with zero coverage benefit.
         let blocked_os_tids = shared.threads.thread_registry.blocked_os_tids();
-        // WHICH PREDICATE, and it is the open question on
-        // `bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829`.
+        // WHICH PREDICATE. This was the open question on
+        // `bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829` (retired to
+        // `fixed-suite-bugs/h2-suite-bugs/` 2026-09-08); it is answered, and the
+        // answer is the widest of the three arms below.
         //
         // `is_object_address` is `registry.contains(addr)` -- EXACT BASES ONLY.
         // A frozen peer holding a DERIVED pointer (a compiled loop's pointer
@@ -738,6 +740,13 @@ pub(super) fn stw_take_over_and_wait(
         // SAFE direction here and the asymmetry is stark: a false positive
         // costs one page of compaction, a false negative costs a
         // use-after-free.
+        //
+        // DEFAULT since 2026-09-08, and the reason is that the DISCHARGE is
+        // default-on: a cycle whose helper windows are all pinned no longer
+        // refuses, so `is_heap_addr`'s two rejections stopped being lost
+        // compaction and became an unpinned array under a relocating cycle.
+        // The predicate that claims completeness has to be the one that can
+        // deliver it. See `xt::helper_window_pin_resolve_enabled`.
         let pin_resolve = xt::helper_window_pin_resolve_enabled();
         let (windows, _roots) = if pin_resolve {
             xt::helper_window_pass(
@@ -5294,7 +5303,17 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
                 .slot_origins
                 .lock()
                 .iter()
-                .any(|so| so.cur != so.orig);
+                .any(|so| so.cur != so.orig)
+            // The native-stack write-back is a third channel with the same
+            // leaked-exit exposure, and testing only the first two let a
+            // thread whose ONLY pending repair was a raw stack word run on
+            // with it. See `apply_native_slot_fixups`.
+            || thread
+                .gc_block_state
+                .native_slots
+                .lock()
+                .iter()
+                .any(|ns| ns.cur != ns.orig);
         if pending {
             let n = crate::vm::vm_exec::apply_pending_blocked_fixups(shared, thread);
             if n > 0 && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some() {
@@ -6027,6 +6046,12 @@ pub(crate) fn apply_pointer_map_to_thread(
     pointer_map: &cratonvm_types::PointerMap,
     heap: &crate::memory::VmHeap,
 ) {
+    // Attribution for a later stale-reference report: this thread applied a
+    // relocation map through the STOP-THE-WORLD RESUME path. See
+    // `gc_quiescence::note_pointer_map_applied`.
+    if !pointer_map.is_empty() {
+        cratonvm_gc::gc_quiescence::note_pointer_map_applied(1);
+    }
     // JNI local references (INT-2, safepoint-resume half): rewrite THIS
     // thread's `JNI_LOCAL_FRAMES` handles through the pointer map — a JNI
     // native that re-entered Java and parked at the safepoint poll must not

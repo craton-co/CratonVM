@@ -16,6 +16,12 @@
 //! allocation side of the same simulation.
 
 use super::*;
+/// The kill switch and engagement counter for the open-inline-locals floor
+/// enforced in `reserve_spill_slots`. Declared beside their siblings in
+/// `inlining.rs` (which owns the splice whose locals the floor protects) and
+/// named here rather than glob-imported, so a reader of either file can find
+/// the other end.
+use super::inlining::{inline_locals_floor_disabled, note_inline_locals_floor};
 
 /// TEST-ONLY, opt-in: cap `spill_slots` at this many words, whatever
 /// `max_stack` asks for. Unset (the default) means no cap.
@@ -133,10 +139,254 @@ impl Compiler {
         // from these at read time rather than counted alongside them, so the
         // partition cannot drift and there is no second atomic to race with.
         crate::note_spill_cursor(why.column(), slots as u64);
-        let start = self.next_spill_offset;
+        // Never start inside the locals of an inline scope that is still open.
+        // The cursor can have been walked below them by any of the ~70 places
+        // that assign `next_spill_offset`, none of which can see those locals;
+        // this is the one place a word is actually handed out, so it is where
+        // the floor belongs. See `open_inline_locals_floor`.
+        let mut start = self.next_spill_offset;
+        if !inline_locals_floor_disabled() {
+            let floor = self.open_inline_locals_floor();
+            if start < floor {
+                start = floor;
+                note_inline_locals_floor();
+            }
+        }
         let end = self.checked_spill_range_end(start, slots)?;
+        self.dbg_note_spill_overlap(why, start, end);
         self.next_spill_offset = end;
         Some(start)
+    }
+
+    /// The lowest offset a reservation may start at without handing out a word
+    /// an OPEN inline scope's LOCALS still own.
+    ///
+    /// # The blind spot this closes
+    ///
+    /// Every cursor-lowering path in the compiler decides what is still owned
+    /// by scanning `self.stack`. That is the right question for the caller's
+    /// OPERAND stack and the wrong one for a spliced callee's LOCALS, which
+    /// live in the same spill area and are on no operand stack at all. A
+    /// splice reserves its locals once at `callee_local_base`; from then until
+    /// the wrapper pops the scope, every one of them is live storage the
+    /// enclosing body reads back, and no scan can see them.
+    ///
+    /// # Why this is enforced at the RESERVATION rather than at the descent
+    ///
+    /// The known-issue page proposed extending `try_emit_inline_body`'s
+    /// live-slot clamp — "a two-line change". That was tried first and
+    /// MEASURED: it engaged **3 times** on `CriteriaWindowFunctionTest` while
+    /// all 150 overlap reports stayed. The cursor does not reach an enclosing
+    /// scope's locals through the splice's return-value reclaim; it is walked
+    /// down there by ordinary pops and resets inside the nested body. Guarding
+    /// the two obvious descent paths (`pop_stack`'s reclaim arm and
+    /// `reset_spills`) was tried second and took 150 to 125 — better, and still
+    /// not the mechanism, because there are a dozen more places that assign
+    /// `next_spill_offset` and any one of them can leave it low.
+    ///
+    /// So the floor is enforced where a slot is actually HANDED OUT, which is
+    /// the one choke point all of them funnel through, and is where
+    /// `dbg_note_spill_overlap` already watches. A cursor left below the floor
+    /// is harmless until something reserves; the next reservation bumps past
+    /// the open locals and `next_spill_offset` self-heals above them.
+    ///
+    /// # Cost
+    ///
+    /// A slot that would have been reused is left alone while a splice that
+    /// owns it is open — the same "can only ever DELAY a reclaim" trade
+    /// `pop_stack`'s own live-slot scan documents, bounded the same way by
+    /// `checked_spill_range_end` (an exhausted reserve fails the compile and
+    /// falls back, rather than emitting a wrong body).
+    ///
+    /// Returns `i32::MIN` when no splice is open, so this is inert for every
+    /// non-inlined method.
+    ///
+    /// Its page:
+    /// `internal/fixed-bugs/inline-splice-return-value-lands-on-an-enclosing-callees-live-local-FIXED-20260907.md`.
+    /// # The INNERMOST scope is excluded, and that is not a softening
+    ///
+    /// It is the same split `dbg_note_spill_overlap` reports, for the same
+    /// reason. The innermost scope is the splice that is RETURNING: its
+    /// `xreturn` arm has already loaded the value into RAX and the wrapper pops
+    /// the scope a few lines later, so its locals are dead at that instruction
+    /// and the result landing on its own local 0 is exactly what
+    /// `caller_post_pop_spill == callee_local_base` means.
+    ///
+    /// Including it is not merely wasteful, it is WRONG, and the tree already
+    /// had the test that says so: `a_spliced_callees_result_lands_at_the_
+    /// callers_operand_depth`. A spliced callee's result must land at the
+    /// caller's operand depth; pushing it above the callee's locals instead is
+    /// the ECJ `OperandStack.pop(OperandCategory)` miscompile recorded in the
+    /// `xreturn` arm's own comments, where the value landed two slots deep and
+    /// every JSP compiled afterwards threw `AssertionError: Unexpected operand
+    /// at stack top`. The first cut of this floor included the innermost scope
+    /// and that test caught it.
+    ///
+    /// Nothing is lost by the exclusion. A reservation cannot reach the
+    /// innermost callee's locals from inside its own body: the callee's
+    /// operands start at `save_spill`, which is above `merge_base`, which is
+    /// above its locals, and `pop_stack` can only unwind slots something
+    /// actually pushed. The one path that reaches them is the return reclaim —
+    /// the harmless one.
+    pub(super) fn open_inline_locals_floor(&self) -> i32 {
+        // `len - 1` scopes: every open splice EXCEPT the innermost.
+        let enclosing = self.inline_oop_scopes.len().saturating_sub(1);
+        self.inline_oop_scopes
+            .iter()
+            .take(enclosing)
+            .map(|scope| scope.local_base + (scope.num_locals as i32) * 8) // Cast: x86-64 frame offset
+            .max()
+            .unwrap_or(i32::MIN)
+    }
+
+    /// Does an OPEN inline scope still publish any of the locals in
+    /// `[start, end)` as a GC ROOT at or after the pc it is stopped at?
+    ///
+    /// This is the "prove liveness" half the known-issue page asked for, and it
+    /// is deliberately named for what it actually proves. `InlineOopScope`'s
+    /// `masks` are a MUST-be-oop dataflow: bit `k` set at a reachable pc means
+    /// that on EVERY path to that pc the callee's local `k` holds a reference.
+    /// So a set bit at some reachable pc at or after `cur_pc` says the enclosing
+    /// scope will name that local as a reference root in the oop map of every
+    /// safepoint in the rest of its body.
+    ///
+    /// That is a stronger claim than "the local is read again", and a worse
+    /// hazard than the wrong-value one the page was written about: a second
+    /// owner storing a primitive into that word leaves the collector reading a
+    /// non-pointer as a pointer. `InlineOopScope` exists precisely because
+    /// locals "named by nothing" produced a miscompile once already.
+    ///
+    /// What a `false` does NOT mean is "safe". The dataflow constrains
+    /// REFERENCES, not liveness, so a local holding a live `int` reads as `0`
+    /// here. `false` is "not proven to be a root", which leaves the ordinary
+    /// wrong-value hazard the page describes entirely intact.
+    ///
+    /// `None` means the scope cannot answer -- an unsupported local count
+    /// (`compute_local_oop_masks` returns empty above 64 locals) or a range
+    /// covering none of its slots. That is the same refusal `mask_at_cur`
+    /// returns, and it is not an empty mask.
+    fn scope_publishes_overlapped_local_as_root(
+        scope: &InlineOopScope,
+        start: i32,
+        end: i32,
+    ) -> Option<bool> {
+        if scope.masks.is_empty() || scope.num_locals == 0 || scope.num_locals > 64 {
+            return None;
+        }
+        // Which of the callee's local slots the reservation actually covers.
+        // Slot `k` occupies `[local_base + k*8, local_base + (k+1)*8)`.
+        let first = usize::try_from((start - scope.local_base).max(0) / 8).ok()?;
+        let past = end - scope.local_base;
+        if past <= 0 {
+            return None;
+        }
+        let last_exclusive =
+            usize::try_from(past.div_euclid(8) + i32::from(past.rem_euclid(8) != 0)).ok()?;
+        let last_exclusive = last_exclusive.min(scope.num_locals);
+        if first >= last_exclusive {
+            return None;
+        }
+        let mut covered: u64 = 0;
+        for k in first..last_exclusive {
+            covered |= 1u64 << k;
+        }
+        // Any REACHABLE pc at or after the one this scope is stopped at.
+        // `cur_pc` is the invoke that opened the splice below it, so this is
+        // exactly "the rest of the enclosing callee's body".
+        for pc in scope.cur_pc..scope.masks.len() {
+            if !scope.reached.get(pc).copied().unwrap_or(false) {
+                continue;
+            }
+            if scope.masks[pc] & covered != 0 {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+
+    /// DIAGNOSTIC (`CRATONVM_DBG_JIT_SLOT_OVERLAP=1`): does this reservation
+    /// hand out a frame slot an ENCLOSING inline scope still owns?
+    ///
+    /// The live-slot clamp in `try_emit_inline_body` protects the caller's
+    /// OPERAND STACK from a rewound cursor. It says nothing about the LOCALS of
+    /// an inline scope that is still open, and those live in the same spill
+    /// area: when `processGroupResult` is spliced into `queryWindow`, its `long
+    /// offset` parameter IS a spill slot, and a splice deeper inside its body
+    /// that rewinds the cursor under it gets that slot handed to it a second
+    /// time. The enclosing scope then reads back whatever the new owner stored.
+    ///
+    /// The scope being CREATED is excluded: `try_emit_inline_body` pushes it
+    /// immediately after this reservation, so the top of the stack is only ever
+    /// this call's own range on the path that matters, and a range may of
+    /// course overlap itself.
+    fn dbg_note_spill_overlap(&self, why: SpillReason, start: i32, end: i32) {
+        if !crate::dbg_jit_slot_overlap() {
+            return;
+        }
+        let innermost = self.inline_oop_scopes.len().saturating_sub(1);
+        for (depth, scope) in self.inline_oop_scopes.iter().enumerate() {
+            let s_start = scope.local_base;
+            let s_end = scope.local_base + (scope.num_locals as i32) * 8;
+            if start < s_end && s_start < end {
+                // WHICH scope decides whether this is a hazard or a
+                // coincidence, and the first version of this line could not
+                // say. The INNERMOST scope is the splice that is RETURNING:
+                // the `xreturn` arm has already loaded the value into RAX, so
+                // that callee's locals are dead at this instruction and the
+                // wrapper pops the scope a few lines later. Landing the return
+                // value on its own local 0 is what `caller_post_pop_spill ==
+                // callee_local_base` means, and it is harmless.
+                //
+                // An ENCLOSING scope was the real hazard: that callee's body
+                // CONTINUES after the inner call returns, so its locals are
+                // live and the inner result overwrote one of them. Measured
+                // 2026-09-07 on `CriteriaWindowFunctionTest`: 151 of 303
+                // reports were that half, not the harmless one.
+                //
+                // FIXED the same day by `open_inline_locals_floor`, which
+                // `reserve_spill_slots` applies before this runs, so the
+                // ENCLOSING arm below should now be UNREACHABLE — 0 of 157 on
+                // the same workload. It is kept, and kept classified, for two
+                // reasons: it is the instrument that proves the population is
+                // empty rather than merely smaller, and
+                // `CRATONVM_JIT_NO_INLINE_LOCALS_FLOOR=1` restores the defect
+                // in the same binary, which is the only A/B this claim accepts.
+                // A non-zero ENCLOSING count on a default build is a
+                // regression in the floor, not a new discovery.
+                //
+                // `internal/fixed-bugs/inline-splice-return-value-lands-on-an-
+                //  enclosing-callees-live-local-FIXED-20260907.md` (wrapped).
+                let which = if depth == innermost {
+                    "INNERMOST (the splice that is returning; its locals are dead here)"
+                } else {
+                    "ENCLOSING (its body continues after this call - LIVE locals)"
+                };
+                // For an ENCLOSING scope, say whether the overlapped local is
+                // still published as a GC ROOT in the rest of that callee's
+                // body. `oop-root-after=yes` is the strong case: the word is
+                // named in the oop map of every later safepoint, so a second
+                // owner storing a primitive there hands the collector a
+                // non-pointer to relocate. `no` is NOT "safe" -- see
+                // `scope_publishes_overlapped_local_as_root`.
+                let root = if depth == innermost {
+                    "n/a"
+                } else {
+                    match Self::scope_publishes_overlapped_local_as_root(scope, start, end) {
+                        Some(true) => "yes",
+                        Some(false) => "no",
+                        None => "unknown",
+                    }
+                };
+                eprintln!(
+                    "[jit-slot-overlap] reservation {start}..{end} ({why:?}) overlaps OPEN \
+                     inline scope #{depth}/{} {which} locals {s_start}..{s_end} (num_locals={}) \
+                     oop-root-after={root} in {}",
+                    self.inline_oop_scopes.len(),
+                    scope.num_locals,
+                    self.method_label,
+                );
+            }
+        }
     }
 
     /// Ask-side: would this range fit? A QUESTION, with no answer that
@@ -775,6 +1025,48 @@ impl Compiler {
         self.xmm_assignments.get(idx).copied().flatten()
     }
 
+    /// DIAGNOSTIC: remember that this compile LOADS `offset`, with the Rust
+    /// call site that emitted it, so `dbg_report_never_stored_slots` can name
+    /// the emitter of a read of uninitialised stack.
+    fn dbg_note_slot_load(&mut self, offset: i32) {
+        if !crate::dbg_jit_slot_overlap() {
+            return;
+        }
+        // Cheap on purpose: one push of two integers. An earlier version
+        // captured a Rust backtrace per distinct slot and that was enough to
+        // change which methods tiered up at all -- the defect this exists for
+        // did not reproduce under it.
+        let pos = self.buf.pos();
+        self.dbg_loaded_slots.push((offset, pos));
+    }
+
+    /// DIAGNOSTIC: every frame slot this compile READS and never WRITES.
+    pub(super) fn dbg_report_never_stored_slots(&self) {
+        if !crate::dbg_jit_slot_overlap() {
+            return;
+        }
+        let mut seen: Vec<i32> = Vec::new();
+        for (off, pos) in &self.dbg_loaded_slots {
+            if seen.contains(off) {
+                continue;
+            }
+            seen.push(*off);
+            match self.dbg_stored_slots.iter().find(|(o, _)| o == off) {
+                None => eprintln!(
+                    "[jit-never-stored] {} reads [rbp-{off:X}h] at buf+{pos:X} and NEVER stores it",
+                    self.method_label,
+                ),
+                // The store was EMITTED. If the finished code has no store at
+                // that address the buffer was rewound under it -- which is the
+                // question this pairing exists to answer.
+                Some((_, spos)) => eprintln!(
+                    "[jit-slot-store] {} [rbp-{off:X}h] stored at buf+{spos:X}, read at buf+{pos:X}",
+                    self.method_label,
+                ),
+            }
+        }
+    }
+
     /// MOV reg, [rbp - offset]
     ///
     /// Reload elision (see the `slot_mirror` field doc): when the immediately
@@ -793,6 +1085,7 @@ impl Compiler {
                 }
             }
         }
+        self.dbg_note_slot_load(offset);
         self.rex_w_r(reg);
         self.buf.emit_byte(0x8B); // MOV r64, r/m64
         self.modrm_rbp_disp(reg, offset);
@@ -834,6 +1127,10 @@ impl Compiler {
 
     /// MOV [rbp - offset], reg
     pub(super) fn emit_store_local(&mut self, offset: i32, reg: u8) {
+        if crate::dbg_jit_slot_overlap() {
+            let pos = self.buf.pos();
+            self.dbg_stored_slots.push((offset, pos));
+        }
         self.rex_w_r(reg);
         self.buf.emit_byte(0x89); // MOV r/m64, r64
         self.modrm_rbp_disp(reg, offset);

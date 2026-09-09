@@ -4327,6 +4327,24 @@ pub(crate) fn define_class_via_full(
     // `define_class_full` (verifier OOB, ASM-emitted bytecode that
     // defeats our class file parser, etc.) returns a clean
     // ClassFormatError instead of unwinding to SIGABRT.
+    // GC: a reference held in a Rust local across an allocating or Java-re-entering
+    // call goes stale under a moving collector, and under the Generational
+    // non-moving young sweep an unrooted object is ZEROED in place. Pin and
+    // re-read. `safe_native_call_impl` truncates `native_pin_roots` when the native
+    // returns, so an unmatched pin costs nothing on an error path. See
+    // `internal/audits/wide-tranche-triage-20260907.md`.
+    // `define_class_full` defines a class and `get_class_mirror` below
+    // allocates the mirror, so BOTH incoming references — the `classData`
+    // object and the loader — are stale by the time they are stored and
+    // registered. The audit reported `loader`; reading found `class_data` too.
+    let class_data_pin = match class_data {
+        Some(Value::Object(Some(o))) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
+    let loader_pin = match loader {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
     let define_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ctx.define_class_full(name, &bytes, loader_id, opts)
     }));
@@ -4346,6 +4364,10 @@ pub(crate) fn define_class_via_full(
             let mirror = ctx.get_class_mirror(cid);
             // Stash classData (defineClass0 path) on the side-table.
             if let Some(data) = class_data {
+                let data = match class_data_pin {
+                    Some((p, o)) => Value::Object(Some(ctx.read_native_pin(p, o))),
+                    None => data,
+                };
                 set_class_data(mirror, data);
             }
             // Record the true defining loader (see the doc comment above)
@@ -4366,6 +4388,10 @@ pub(crate) fn define_class_via_full(
             // already has its own built-in-loader fallback).
             if loader_aware_resolution() {
                 if let Value::Object(Some(loader_obj)) = loader {
+                    let loader_obj = match loader_pin {
+                        Some((p, o)) => ctx.read_native_pin(p, o),
+                        None => loader_obj,
+                    };
                     if is_user_defined_loader(ctx, loader_obj) {
                         register_defining_loader(ctx.vm_identity(), cid.as_u32(), loader_obj);
                     }
@@ -8525,11 +8551,19 @@ pub(crate) fn ucl_try_define_local_class(
     };
     let (define_lock_mutex, define_lock_cvar) = &*define_lock;
     let mut in_progress = define_lock_mutex.lock().unwrap_or_else(|e| e.into_inner());
+    // GC-safety: this loop WAITS on a condvar, which is the widest window there
+    // is -- a peer thread's collection is exactly what runs while this one is
+    // parked -- and then re-probes with `loader`, a bare Rust local carried in
+    // from outside. `find_loaded_class_for_loader` can itself allocate, so even
+    // without the wait the second turn would be reading a pre-GC address. Pin
+    // it and re-read at the top of each turn.
+    let loader_pin = ctx.pin_native_root(loader);
     while *in_progress {
         let (guard, timeout) = define_lock_cvar
             .wait_timeout(in_progress, std::time::Duration::from_secs(30))
             .unwrap_or_else(|e| e.into_inner());
         in_progress = guard;
+        let loader = ctx.read_native_pin(loader_pin, loader);
         // The other thread may have finished defining it (success -- return
         // its result) or failed (we should try ourselves rather than loop
         // forever on a definition that will never arrive).
@@ -8557,6 +8591,7 @@ pub(crate) fn ucl_try_define_local_class(
     // auto-configuration conditions on a second thread and races the main one
     // for exactly these classes. HotSpot has no such window: `loadClass`
     // re-checks `findLoadedClass` after taking `getClassLoadingLock(name)`.
+    let loader = ctx.read_native_pin(loader_pin, loader);
     if let Some(mirror) = find_loaded_class_for_loader(ctx, loader, internal_name) {
         return Some(Ok(Some(Value::Object(Some(mirror)))));
     }
