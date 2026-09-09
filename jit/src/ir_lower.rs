@@ -1814,9 +1814,13 @@ impl<'a> Lowerer<'a> {
     /// trap. An optimizing OSR entry seeds this tier's locals at a loop header
     /// from the interpreter's frame, and it seeds HOME WORDS; a value whose
     /// home was dropped there would be seeded into a word nothing reads. The
-    /// door is already implicated in one miscompile
-    /// (`ir-osr-entry-miscompiles-a-spliced-merge-20260909.md`), so it gets the
-    /// conservative answer rather than a second argument.
+    /// door was implicated in one miscompile for exactly this reason
+    /// (`ir-osr-entry-miscompiles-a-spliced-merge-FIXED-20260909.md`: the stub
+    /// jumped past the block that writes a constant's home word). That one is
+    /// fixed, by MAKING the stub write the words it skipped rather than by
+    /// refusing anything — so this clause stands on its own argument, not on
+    /// that page: a dropped home is a word the seeding cannot write at all,
+    /// which is a different problem from a word it merely forgot to.
     fn compute_deopt_named_reachable(&self) -> Vec<bool> {
         let n = self.graph.nodes.len();
         let mut out = vec![false; n];
@@ -21023,7 +21027,10 @@ mod tests {").next().unwrap_or(src);
             cm.ir_osr_entry_addr(4).is_some(),
             "the loop header must carry an optimizing OSR entry even though a \
              spliced body contributed the merge inside it (entries: {:?})",
-            cm.ir_osr_entries.iter().map(|(b, _, _)| *b).collect::<Vec<_>>(),
+            cm.ir_osr_entries
+                .iter()
+                .map(|(b, _, _)| *b)
+                .collect::<Vec<_>>(),
         );
         // SAFETY: the stub builds and tears down its own frame, reads exactly
         // `locals[0..3]`, and returns the method's `int` result in RAX.
