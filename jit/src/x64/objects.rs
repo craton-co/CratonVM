@@ -1479,14 +1479,33 @@ impl Compiler {
         // branch silently dropped it. Two dwords per `new` is the same price
         // that comment already judged negligible.
         self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32, 0);
-        self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32 + 4, 0);
+        // The HIGH dword is not zero: it carries `GC_FLAG_HEADER`, the bit that
+        // makes a published header distinguishable from zeroed arena space. A
+        // JIT-inline `new Object()` is `ClassId(0)`, `shape = 0` and (before
+        // this) `mark = 0` — sixteen zero bytes, which the young non-moving
+        // sweep cannot parse and therefore never reclaims. See
+        // `cratonvm_types::GC_FLAG_HEADER`.
+        //
+        // Folded into the existing store rather than added as a fifth
+        // instruction: `GC_FLAGS_BYTE_OFFSET` is `MARK_WORD_OFFSET + 7`, i.e.
+        // byte 3 of THIS dword, so the flag is just the immediate shifted by
+        // 24. `header_offset_contract_gc_flags_live_in_the_mark_words_top_byte`
+        // pins that relationship.
+        const HEADER_FLAG_IN_HIGH_DWORD: i32 = (cratonvm_types::GC_FLAG_HEADER as i32) << 24;
+        self.emit_mov_dword_mem_disp32_imm32(
+            R11,
+            cratonvm_types::MARK_WORD_OFFSET as i32 + 4,
+            HEADER_FLAG_IN_HIGH_DWORD,
+        );
 
-        // AFTER the mark-word zeroing, which would otherwise erase it.
+        // AFTER the mark-word zeroing, which would otherwise erase it. The
+        // whole-byte store carries `GC_FLAG_HEADER` too, for the same reason —
+        // it overwrites the byte the flag was just written into.
         if compact_flag_pending {
             self.emit_mov_byte_mem_disp32_imm8(
                 R11,
                 cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
-                cratonvm_types::GC_FLAG_COMPACT,
+                cratonvm_types::GC_FLAG_COMPACT | cratonvm_types::GC_FLAG_HEADER,
             );
         }
 
@@ -1504,10 +1523,11 @@ impl Compiler {
             // written inline above, the header is complete enough for
             // both the GC walker and the runtime; no helper call needed.
             //
-            // Class, kind/flags, and shape are explicitly published above.
-            // Body defaults, forwarding_ptr=null, and
-            // mark_word=MARK_NEUTRAL come from the refill zeroing invariant
-            // unless the conservative opt-out repeats those stores inline.
+            // Class, kind/flags, shape and the whole mark word are explicitly
+            // published above — the mark word unconditionally, and with
+            // `GC_FLAG_HEADER` set, so the span is parseable as an object by
+            // the collector's linear walk. Only the body defaults come from
+            // the refill zeroing invariant.
             //
             // RAX = obj_ptr — both arms converge with RAX holding the
             // freshly-allocated object pointer.

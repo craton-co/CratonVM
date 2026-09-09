@@ -1,5 +1,20 @@
 # ZGC OOMs with 86% of the heap free: it was returned-frame RESIDUE, not an unregistered entry frame — FIXED 2026-09-08
 
+> **2026-09-08, same day: the DEFAULT this page ships was flipped back to OFF.**
+> The cause analysis below is correct and the `live_hit` re-probe is the right
+> question. The relocation licence it grants, however, lets ZGC MOVE an object
+> while a raw word in the conservatively-scanned band still holds its old
+> address — §4's "this switch can only change how often the collector is ALLOWED
+> TO COMPACT, never what it RETAINS" is true of retention, and retention is not
+> the failure. Measured on this binary at `MvsCreate 500000 --Xmx 2g`, where the
+> control does NOT OOM and is therefore a real control: **8/10 granted against
+> 10/10 withheld**, with `ClassCastException: class [B cannot be cast to class
+> [J`. §5's 32 green arms could not see it because every `MvsCreate` arm in them
+> is at `--Xmx256m`, where the control OOMs.
+> See `../../../known-issues/gc/zgc-residue-licence-relocates-under-a-conservative-root-20260908.md`.
+> `CRATONVM_JIT_UNREG_RESIDUE_LICENCE=1` still grants it.
+
+
 **RETIRES `docs/known-issues/h2/zgc-oom-on-mvstore-is-the-unregistered-entry-frame-blocking-compaction-20260907.md`.**
 That page characterised the failure correctly down to the last counter and then
 named the wrong frame. Its §5 concluded *"the fix is to make the entry frame
