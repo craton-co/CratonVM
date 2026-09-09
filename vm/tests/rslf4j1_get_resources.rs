@@ -16,7 +16,7 @@
 //!     synthetic-JDK mode has its own getResources stubs and a
 //!     `java/util/Enumeration$Impl` shape that diverges from the real
 //!     JDK's `Enumeration<URL>` interface dispatch.
-//!   * Therefore the test spawns the freshly-built `cratonvm.exe` as a
+//!   * Therefore the test spawns the freshly-built `cratonvm` binary as a
 //!     subprocess. Skips when neither the binary nor a JDK 25
 //!     `java-home` is available.
 //!
@@ -47,7 +47,7 @@ const RESOURCE_NAME: &str = "META-INF/services/cratonvm.foo.svc";
 /// Path to the freshly-built CLI binary the harness should exercise.
 /// Honors `CRATONVM_BIN` for callers that want to point at a custom
 /// build; otherwise resolves to the workspace's
-/// `target/release/cratonvm.exe`.
+/// `target/release/cratonvm{.exe}`.
 mod common;
 
 /// Prerequisite gate: the lookup below is unchanged — only a MISSING binary is
@@ -65,10 +65,18 @@ fn cratonvm_binary_lookup() -> Option<PathBuf> {
     }
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     // vm/Cargo.toml lives at <repo>/vm; binary lands at
-    // <repo>/target/release/cratonvm.exe.
+    // <repo>/target/release/cratonvm{.exe}. Probing ONLY `cratonvm.exe` made
+    // this fallback unsatisfiable off-Windows, so on Linux the test skipped
+    // (and still printed `ok`) unless `CRATONVM_BIN` was set -- which is what
+    // kept the hard-coded `;` above invisible for as long as it was.
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     let candidate = PathBuf::from(manifest_dir)
         .parent()
-        .map(|p| p.join("target").join("release").join("cratonvm.exe"))?;
+        .map(|p| p.join("target").join("release").join(exe))?;
     if candidate.exists() {
         Some(candidate)
     } else {
@@ -167,14 +175,20 @@ public class EnumLookup {{
     Some((fixture_dir, jar_path))
 }
 
-/// Format the classpath the way the cratonvm CLI's `-c` flag expects on
-/// Windows — semicolon-separated absolute paths.
+/// Format the classpath the way the cratonvm CLI's `-c` flag expects: absolute
+/// paths joined by the HOST's path separator — `;` on Windows, `:` everywhere
+/// else. Hard-coding `;` made this test Windows-only in fact while reading as
+/// portable: measured on Linux, `-c "/dir;/dir/e.jar"` yields
+/// `class not found: EnumLookup` (the whole string is taken as ONE entry) where
+/// `-c "/dir:/dir/e.jar"` runs. Same idiom as `differential.rs` and
+/// `wave1_b2_bootloader_resources.rs`.
 fn format_classpath(parts: &[&Path]) -> String {
+    let sep = if cfg!(windows) { ";" } else { ":" };
     parts
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect::<Vec<_>>()
-        .join(";")
+        .join(sep)
 }
 
 /// RSLF4J.1 acceptance: spawn the freshly-built cratonvm in real-JDK
@@ -188,7 +202,7 @@ fn system_classloader_get_resources_walks_jar_in_real_jdk_mode() {
         None => {
             eprintln!(
                 "Skipping: cratonvm release binary not available at \
-                 target/release/cratonvm.exe (build with `cargo build \
+                 target/release/cratonvm[.exe] (build with `cargo build \
                  --release -p cratonvm-cli`)"
             );
             return;
@@ -215,7 +229,7 @@ fn system_classloader_get_resources_walks_jar_in_real_jdk_mode() {
     let output = Command::new(&bin)
         .args(["--java-home", &java_home, "-c", &cp, "EnumLookup"])
         .output()
-        .expect("must spawn cratonvm.exe");
+        .expect("must spawn cratonvm");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

@@ -4188,10 +4188,12 @@ pub(super) fn execute_invokevirtual_fast_door(
 ) -> Option<Result<CachedCallResult, MethodCallFailed>> {
     use std::sync::atomic::Ordering;
     if crate::classloading::any_class_redefined() {
-        return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline("a class was redefined");
+            return None;
     }
     if crate::runtime::env_cache::loader_aware_resolution() && adapt_isin_seen() {
-        return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline("loader-aware resolution and adapt-isin seen");
+            return None;
     }
     let caller_class_id = thread.frames[frame_idx].class_id;
     let (receiver_class_id, cached, gate_generation) =
@@ -4203,17 +4205,30 @@ pub(super) fn execute_invokevirtual_fast_door(
             }) => (*receiver_class_id, Arc::clone(cached), gate.generation),
             _ => return None,
         };
-    if cached.is_synchronized || cached.is_static {
+    // A synchronized callee is decided at the push, by `door_monitor_acquire`:
+    // this door serves it whenever the monitor is free. See `door_sync_enabled`.
+    if cached.is_synchronized && !crate::runtime::interpreter::invoke_fast::door_sync_enabled() {
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline(
+            "callee is SYNCHRONIZED",
+        );
+        return None;
+    }
+    if cached.is_static {
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline(
+            "callee is static",
+        );
         return None;
     }
     let num_params = cached.num_params as usize;
     let total_args = num_params + 1;
     let stack = &thread.frames[frame_idx].stack;
     if stack.len() < total_args {
-        return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline("cached target is not VirtualBytecode");
+            return None;
     }
     let Some(recv_ptr) = stack.peek_compact_at(num_params).as_object_ptr() else {
-        return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline("operand stack shallower than the argument count");
+            return None;
     };
     if shared
         .mem
@@ -4221,21 +4236,25 @@ pub(super) fn execute_invokevirtual_fast_door(
         .is_object_address(recv_ptr as usize)
         .is_none()
     {
-        return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline("receiver slot is not an object pointer");
+            return None;
     }
     // SAFETY: `recv_ptr` is a registered object start on this heap.
     let header = unsafe { &*(recv_ptr as *const cratonvm_gc::ObjectHeader) };
     if header.kind() == cratonvm_types::ObjectKind::Array {
-        return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline("receiver is not a heap object address");
+            return None;
     }
     let actual_class_id = header.class_id;
     if actual_class_id != receiver_class_id {
-        return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline("receiver is an array");
+            return None;
     }
     if shared.classes.is_lambda_proxy_class(actual_class_id)
         || shared.classes.is_annotation_proxy_class(actual_class_id)
     {
-        return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline("receiver class differs from the cached one (site went polymorphic)");
+            return None;
     }
     // RECORD THE RECEIVER, exactly as `execute_invokevirtual_cached` does at
     // its own Step 5.
@@ -4273,6 +4292,7 @@ pub(super) fn execute_invokevirtual_fast_door(
                     recv == actual_class_id && decl == cached.declaring_class_id
                 });
         if !memo_hit {
+            crate::runtime::interpreter::invoke_fast::note_virtual_decline("receiver is a lambda or annotation proxy");
             return None;
         }
         site_stats::bump(site_stats::IFACE_SELECT_HIT);
@@ -4288,25 +4308,30 @@ pub(super) fn execute_invokevirtual_fast_door(
         )
     });
     if shape != 0 {
-        return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline("interface receiver-selection memo miss");
+            return None;
     }
     // `force_native_cache` is filled by the general path; until it has
     // answered `false` once, or if it answered `true`, this is not our call.
     if cached.force_native_cache.get() != Some(&false) {
-        return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline("callee is intercepted");
+            return None;
     }
     if thread.frames.len() >= shared.config.max_stack_depth {
-        return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline("force-native cache has not answered false");
+            return None;
     }
     if cratonvm_jit_api::descriptor_facts_disabled() {
-        return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline("frame stack is full");
+            return None;
     }
     let facts = cached.descriptor_facts();
     if facts.param_tags_overflow
         || num_params > cratonvm_jit_api::DescriptorFacts::INLINE_PARAMS
         || facts.param_tag_len as usize != num_params
     {
-        return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline("descriptor facts are disabled");
+            return None;
     }
     dbg_invoke_stats_record(0);
 
@@ -4509,6 +4534,18 @@ pub(super) fn execute_invokevirtual_fast_door(
     // return left behind. This tail used to be a second copy of the same
     // sequence, and the copy is exactly why the slot-reuse change reached the
     // static doors first and left `virtual1` flat.
+    // The receiver was validated above -- `recv_ptr` is a live heap object
+    // whose class matches the cached entry -- and nothing between that check
+    // and this push can safepoint.
+    // SAFETY: `recv_ptr` is a registered object start on this heap.
+    let recv = Some(unsafe { ObjectRef::from_raw(recv_ptr as *mut u8) });
+    let monitor = match invoke_fast::door_monitor_acquire(shared, thread, &cached, recv) {
+        Some(m) => m,
+        None => {
+            invoke_fast::note_virtual_decline("synchronized callee is contended");
+            return None;
+        }
+    };
     Some(Ok(invoke_fast::push_frame_verbatim(
         shared,
         thread,
@@ -4516,5 +4553,6 @@ pub(super) fn execute_invokevirtual_fast_door(
         cached,
         &slots,
         total_args,
+        monitor,
     )))
 }
