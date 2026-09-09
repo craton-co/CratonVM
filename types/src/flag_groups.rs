@@ -1361,6 +1361,14 @@ pub const INVENTORY: &[E] = &[
     // on: keep the profiler armed for every tier rather than only where the
     // tiering policy asks for it.
     E { group: Group::JIT, token: "tier-pgo-always", on_key: Some("CRATONVM_TIER_PGO_ALWAYS"), off_key: None, off_word: None, since: "2026-09-09" },
+    // Diagnosis lever, value-taking: a comma-separated list of conservative
+    // root-band CLASSES to skip (`operand-spill`,
+    // `outgoing-args-or-deopt-regs`, `safepoint-gpr-spill-image`). Absent
+    // means skip nothing, which is the only setting that is safe -- dropping a
+    // root frees what it named, and the lever exists to MEASURE the ceiling a
+    // real fix would reach, not to be run. Landed 2026-09-09 with the G1
+    // pinned-regions work and undeclared; see `band_skip_classes`.
+    E { group: Group::JIT, token: "band-skip", on_key: Some("CRATONVM_JIT_BAND_SKIP"), off_key: None, off_word: None, since: "2026-09-09" },
     E { group: Group::JIT, token: "ls-carry-relief", on_key: Some("CRATONVM_JIT_LS_CARRY_RELIEF"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "ir-reserve-carried", on_key: Some("CRATONVM_JIT_IR_RESERVE_CARRIED"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "osr-optimizing", on_key: Some("CRATONVM_JIT_OSR_OPTIMIZING"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
