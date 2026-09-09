@@ -1,10 +1,10 @@
-# The BindableTests residual is a FAMILY: four `ObjectRef`s held across an allocation, and one still open
+# The BindableTests residual is a FAMILY: ten `ObjectRef`s held across an allocation, and none of them the collector
 
 | | |
 |---|---|
-| **Status** | **FOUR ROOT-CAUSED AND FIXED**, 2026-09-09. One residual remains, named and instrumented — see [The residual](#the-residual-arguments-held-across-a-collection-in-the-invoke-prologue). |
+| **Status** | **TEN ROOT-CAUSED AND FIXED**, 2026-09-09. The crash is gone; what remains is a different symptom, filed separately — see [What is left](#what-is-left). |
 | **Was** | `docs/known-issues/springboot/bindabletests-local-holds-an-interior-word-of-a-retired-tlab-filler-20260909.md` |
-| **Scope** | `--XX:UseGc Generational`, `CRATONVM_DBG_GC_STRESS <= 262144`. Passes at every threshold `>= 524288`, and unset. |
+| **Scope** | `--XX:UseGc Generational`, `CRATONVM_DBG_GC_STRESS <= 262144`. Passes at every threshold `>= 393216`, and unset. |
 | **Reproducer** | `org.springframework.boot.context.properties.bind.BindableTests`, Linux x86-64 |
 
 ## The page this replaces was looking for a collector bug. There is none.
@@ -29,7 +29,7 @@ semispace is reset and re-served from the same base every cycle — so one addre
 is a valid object start on one cycle and the interior of a filler on the next.
 Dating the reports is what dissolved it.
 
-## The four defects
+## The first four defects
 
 Each was found by the same instrument, in this order, each one uncovered by
 fixing the one before it. All four are one shape — an `ObjectRef`, or a
@@ -116,6 +116,8 @@ of Rust wrote it".
 | flag | report | answers |
 |---|---|---|
 | `CRATONVM_DBG_DEADREF_STORE` | `[deadref-store]` | a reference STORE whose value names no live object, with the Rust caller |
+| ″ | `[deadref-nret]` | a NATIVE RETURN that names no live object, with the native and the Java call site — the only place that can name the native, since everything downstream sees an ordinary operand-stack value |
+| ″ | `[deadref-push]` | the operand-stack push, `Value` and compact paths both, so `dup`, a local reload and the cached field/return producers are covered |
 | ″ | `[deadref-pin]` | `pin_native_root` was handed an already-dead value — the caller is the defect, and no later refresh can recover it |
 | ″ | `[deadref-arg]` | an argument already dead as it is laid into the callee's locals — the argument slice was held across a collection |
 | ″ | `[deadref-local]` | the `set_local` where a dead reference becomes a Java-visible value |
@@ -151,56 +153,76 @@ re-issues it, which is exactly when these references are read, which is why the
 | 2 097 152 | PASS | **PASS** |
 | 1 048 576 | PASS | **PASS** |
 | 524 288 | PASS | **PASS** |
-| 262 144 | CRASH at moving cycle 2 398 | FAIL later, different defect — below |
+| 393 216 | *(untested)* | **PASS** |
+| 262 144 | CRASH at moving cycle 2 398 | one failed assertion, different defect — below |
+| 131 072 | CRASH | same |
+| 65 536 | CRASH | same |
 
-On the fixed binary at 262 144, the three `[tlab-audit]` counters,
-`[deadref-pin]`, `[deadref-capture]`, `[deadref-singleton]`, `[heap-stale]` and
-`[rset-verify]`'s missing-edge report all read **zero**. Before the fixes they
-read 3 560, 13 921, and one apiece.
+On the fixed binary at 262 144, in BOTH `--nojit` and JIT runs, EVERY probe
+reads **zero**: `[deadref-store]`, `[deadref-pin]`, `[deadref-arg]`,
+`[deadref-local]`, `[deadref-push]`, `[deadref-nret]`, `[deadref-capture]`,
+`[deadref-singleton]`, the three `[tlab-audit]` counters, `[heap-stale]`, and
+`[rset-verify]`'s missing-edge report. Before the fixes those same runs reported
+3 560 missing edges, 13 921 heap-stale lines, 12 pin hits, 8 argument hits, 8
+push hits and 2 stale native returns.
 
 `cargo test -p cratonvm-types --lib`: 604 passed, 0 failed — including
 `a_dbg_knob_declared_since_the_horizon_has_a_live_consumer`, which is what keeps
 the two new flags from being registry entries nothing reads.
 
-## The residual: arguments held across a collection in the invoke prologue
+## The other six
 
-At `<= 262144` the class still fails, and `[deadref-arg]` names the mechanism
-with no ambiguity left in it:
+The first four came out of the natives. Probing one step further upstream each
+time — the operand stack, then the native return boundary — produced six more,
+each uncovered by fixing the one before it:
 
-```text
-[deadref-arg] INACTIVE-SEMISPACE push_args_to_locals: arg[5] = 0x20012000228 is
-  already dead as it is laid into the callee's locals
-    at frame::push_args_to_locals
-    at frame::Frame::new_pooled
-    at interpreter::invoke::try_stackless_invoke:4779
-    at interpreter::invoke::execute_invoke_kind
-```
+5. **`Class.getProtectionDomain` unpinned `pd` one statement too early.**
+   `unpin_native_roots(url_pin)` truncates to a base BELOW `pd_pin`, so it
+   released `pd`'s pin too, and `populate_protection_domain_fields` — which
+   allocates — then ran with nothing rooting `pd`. The native returned the
+   pre-move address.
+6. **`ArrayList.addAll`'s general path** pinned `this` AFTER
+   `collect_collection_elements_or_real`, which drives a foreign collection's
+   real `iterator()`.
+7. **`HashSet.addAll`**, identical shape.
+8. **`collect_via_real_iterator` pinned the ITERATOR but not the ELEMENTS.**
+   Every `hasNext`/`next` runs arbitrary Java and `out` is a plain Rust `Vec`,
+   so each turn of the loop could relocate everything collected so far. This one
+   backs `toArray`, `addAll`, `forEach` and `stream` for every foreign
+   collection — the widest of the ten.
+9. **`build_empty_permissions`** returned the address it allocated rather than
+   the one its `<init>` left behind.
+10. **`try_lambda_dispatch`'s constructor-reference arguments** (defect 4 above,
+    counted here for the total).
 
-This is defect 4's shape at the GENERIC invoke path rather than the lambda one.
-`try_stackless_invoke` receives `args: &[Value]` — a slice the caller popped off
-the operand stack into a Rust `Vec`, which is neither scanned as a root nor
-remapped — and builds the callee frame from it after a prologue that can complete
-a moving young collection.
+### The interpreter was carrying them, not producing them
 
-**Narrowed further the same day, and the invoke path is exonerated too.** Probing
-the same predicate one step further up each time —
-`push_args_to_locals` → `try_stackless_invoke` entry →
-`InvokeArgsRootGuard::refresh` → `InvokeArgsRootGuard::new` — all four fire.
-`InvokeArgsRootGuard::new` runs immediately after the arguments are read out of
-the caller's operand stack, with nothing allocating in between, so the values
-were **dead on the operand stack**. The argument pinning is doing its job on
-values that were already wrong, and `load_and_forward` (applied to every popped
-reference a few lines earlier) cannot recover them because the forwarding word
-is gone once the allocator re-serves the span.
+Worth recording because two plausible fixes were considered and both were wrong.
 
-`[deadref-local]` reports zero, so it is not a `set_local`. The next probe is the
-operand-stack PUSH — a return value or a `getfield` result — and it needs to be
-cheap enough for that path. `--nojit` reproduces identically and names the same
-sites, which is what says the JIT is not involved.
+`InvokeArgsRootGuard` pins an invoke's arguments and refreshes them at each
+boundary, and `[deadref-arg]` fired at all four of its stages —
+`push_args_to_locals`, `try_stackless_invoke` entry, `refresh`, and finally
+`new`. `new` runs immediately after the arguments are read off the caller's
+operand stack with nothing allocating in between, so the guard was pinning
+values that were already dead. The invoke path needed no change.
 
-**Do not re-open the collector for this.** Each row of the ruled-out table is a
-measurement on this exact workload, and the residual's own report names a Rust
-slice, not a heap address.
+`safe_native_call` already heals a stale return through `load_and_forward`, and
+that could not help either: it reads the forwarding marker at the old address,
+and that marker is gone once the allocator has re-served the span — which is
+exactly the window a stale reference is read in. The heal is not wrong, it is
+simply blind in the one case that matters, the same blind spot `was_vacated`
+has.
+
+## What is left
+
+The crash is gone. At `<= 262144` one of the 27 tests now fails an ordinary
+AssertJ assertion (`AbstractAssert.objects` reads null), and **every
+stale-reference probe reads zero** in both `--nojit` and JIT runs, as does
+`CRATONVM_GC_VERIFY_RSET` and `CRATONVM_DBG_HEAP_STALE`. It is a different shape
+and it is filed as its own page:
+[`bindabletests-assertj-objects-field-null-under-gc-stress-20260909.md`](../../known-issues/springboot/bindabletests-assertj-objects-field-null-under-gc-stress-20260909.md).
+
+The threshold moved with it: 524 288 → **393 216**.
 
 ## A standing audit, from the same shape
 
