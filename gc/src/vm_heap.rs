@@ -3640,7 +3640,7 @@ impl VmHeap {
             // `survivors_walked` are the denominator that separates them.
             let (sv_runs, sv_survivors, sv_missed, sv_unreg) = h.slide_verification_stats();
             eprintln!(
-                "[GC] zgc-slide-verify: slides_verified={sv_runs} survivors_walked={sv_survivors}                  missed_rewrites={sv_missed} unregistered_targets={sv_unreg} enabled={}",
+                "[GC] zgc-slide-verify: slides_verified={sv_runs} survivors_walked={sv_survivors}                  missed_rewrites={sv_missed} unregistered_targets={sv_unreg} slide_verify_enabled={}",
                 crate::zgc::zgc_verify_slide_enabled(),
             );
             // CONCURRENT marking, on its own line and with five fields rather

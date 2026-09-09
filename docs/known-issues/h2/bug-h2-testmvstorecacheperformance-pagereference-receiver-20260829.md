@@ -59,7 +59,7 @@ so a stale or mis-indexed reference between them is the shape to look for, and
 if a `getfield` read the wrong receiver.
 
 That makes this a **wrong-receiver** defect, the same family as
-`bug-h2-testrandommapops-small-heap-corruption-20260829.md` and the G1 defect
+`docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md` and the G1 defect
 its parent page fixed — not a method-resolution defect, which is what the
 message's shape invites and what the page this was split out of called it.
 
@@ -169,6 +169,12 @@ CP="target/classes:target/test-classes:$(cat craton-testcp.txt)"
 
 - `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
   — the page this was split out of.
-- `docs/known-issues/h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`
+- `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md`
   — the same family, with the two ends of it named (who freed it vs who
-  allocated over it).
+  allocated over it). **RETIRED 2026-09-09**: 0 failures in 10 serial runs at
+  `--Xmx 256m` against its own 9-of-9 baseline, with
+  `CRATONVM_ZGC_ASSUME_REWRITABLE=1` — which forces relocation under every
+  unproven compiled frame — passing 3 of 3 as well. Its instruments and its
+  terminating driver (`probes/MvStoreRandomOps.java`) transfer here directly;
+  its CONCLUSIONS about a short oop map do not, and should not be carried over
+  without re-measuring on this class.

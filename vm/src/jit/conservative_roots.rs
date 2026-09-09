@@ -12447,7 +12447,7 @@ mod stale_word_oracle_tests {
 
     /// `local_offset(k) == 8*(k+1)`, so offset 40 is local 4 and offset 32 is
     /// local 3. This is the `StringConcatHelper.doConcat` witness that
-    /// `bug-h2-testrandommapops-small-heap-corruption-20260829.md` reported as
+    /// `bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md` reported as
     /// a missed root: mask `Some(19)` = locals 0, 1 and 4, and the stale word
     /// sat at offset 32 — local 3, which `javap` shows is an `int`
     /// (`25: istore_3`). The oracle has to call that dead storage, not a root.
