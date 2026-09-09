@@ -1954,6 +1954,7 @@ pub const INVENTORY: &[E] = &[
     // the ten-second H2 SIGSEGV, so the fix has a positive control rather than
     // only an absence of crashes.
     E { group: Group::JIT, token: "xt-pinned-peer-unpinnable", on_key: Some("CRATONVM_XT_PINNED_PEER_UNPINNABLE"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::JIT, token: "xt-no-safe-peer-read", on_key: Some("CRATONVM_XT_NO_SAFE_PEER_READ"), off_key: None, off_word: None, since: "2026-09-08" },
     E { group: Group::JIT, token: "xt-peer-shadow-scan", on_key: Some("CRATONVM_XT_PEER_SHADOW_SCAN"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "dbg-stale-frame-words", on_key: Some("CRATONVM_DBG_STALE_FRAME_WORDS"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "pin-unnamed-frame-refs", on_key: Some("CRATONVM_JIT_PIN_UNNAMED_FRAME_REFS"), off_key: None, off_word: None, since: "2026-09-03" },
