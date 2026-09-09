@@ -369,6 +369,23 @@ pub fn report_at_exit() {
             "[c2-supersede] ir cold branch arms pruned: {}",
             cratonvm_jit::ir::branch_prune_census(),
         );
+        // Multi-return splicing. `bodies=0` is the DEFAULT reading — the
+        // feature is off. With `CRATONVM_JIT_IR_SPLICE_MULTI_RETURN=1` a zero
+        // means no admitted callee had a second reachable `return`, which is a
+        // fact about the workload rather than about the feature.
+        let (mr_bodies, mr_edges) = cratonvm_jit::ir::multi_return_splice_census();
+        eprintln!(
+            "[c2-supersede] ir multi-return spliced bodies: bodies={mr_bodies} return_edges={mr_edges}"
+        );
+        // Reference residency. `admitted=0` under
+        // `CRATONVM_JIT_IR_REF_RESIDENCY=1` means no reference in this workload
+        // was worth a register; `admitted>0 dropped=0` would mean the
+        // invalidation is not wired, which is the one reading that must never
+        // be silent — it is a stale-oop bug, not a missed optimization.
+        let (ref_admitted, ref_dropped) = cratonvm_jit::ir_lower::ir_ref_residency_census();
+        eprintln!(
+            "[c2-supersede] ir reference residency: admitted={ref_admitted} copies_dropped={ref_dropped}"
+        );
         let (held, spent, retired) = cratonvm_jit::deferred_new_retry_census();
         eprintln!(
             "[c2-supersede] deferred-new retries: held={held} spent={spent} retired={retired} re_offered={}",

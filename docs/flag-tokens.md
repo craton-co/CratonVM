@@ -603,7 +603,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-400 tokens.
+411 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -732,6 +732,16 @@ export inherited from a parent shell.
 | `ir-reserve-carried` | `CRATONVM_JIT_IR_RESERVE_CARRIED` |
 | `osr-optimizing` | `CRATONVM_JIT_OSR_OPTIMIZING` |
 | `osr-optimizing-memo` | `CRATONVM_JIT_OSR_OPTIMIZING_MEMO` |
+| `osr-optimizing-cache` | `CRATONVM_JIT_OSR_OPTIMIZING_CACHE` |
+| `ir-splice-ldc` | `CRATONVM_JIT_IR_SPLICE_LDC` |
+| `ir-splice-branch` | `CRATONVM_JIT_IR_SPLICE_BRANCH` |
+| `ir-splice-multi-return` | `CRATONVM_JIT_IR_SPLICE_MULTI_RETURN` |
+| `ir-fallthrough` | `CRATONVM_JIT_IR_FALLTHROUGH` |
+| `ir-deopt-points-at-traps` | `CRATONVM_JIT_IR_DEOPT_POINTS_AT_TRAPS` |
+| `ir-reg-authoritative` | `CRATONVM_JIT_IR_REG_AUTHORITATIVE` |
+| `ir-ref-residency` | `CRATONVM_JIT_IR_REF_RESIDENCY` |
+| `ir-ref-residency-cross-safepoint` | `CRATONVM_JIT_IR_REF_RESIDENCY_CROSS_SAFEPOINT` |
+| `ir-speculate` | `CRATONVM_JIT_IR_SPECULATE` |
 | `ir-drop-phi-home` | `CRATONVM_JIT_IR_DROP_PHI_HOME` |
 | `ir-publish-at-def` | `CRATONVM_JIT_IR_PUBLISH_AT_DEF` |
 | `ir-drop-home` | `CRATONVM_JIT_IR_DROP_HOME` |
@@ -953,6 +963,7 @@ export inherited from a parent shell.
 | `tier-pgo` | `CRATONVM_TIER_PGO` |
 | `tier-pgo-receivers` | `CRATONVM_TIER_PGO_RECEIVERS` |
 | `tier-pgo-c2-window` | `CRATONVM_TIER_PGO_C2_WINDOW` |
+| `tier-pgo-always` | `CRATONVM_TIER_PGO_ALWAYS` |
 | `tiered` | `CRATONVM_TIER_ENABLED` |
 | `tlab-zero-elision` | `CRATONVM_NO_JIT_TLAB_ZERO_ELISION` |
 | `trivial-getter` | `CRATONVM_TRIVIAL_GETTER` |
