@@ -130,15 +130,65 @@ refutations in section 3.
 Keep `en-US` as a control in any locale probe: it reads the same on a healthy
 and a broken VM, so a run where the control differs is a broken probe.
 
-## 7. Where to look
+## 7. Root cause, located
 
-`ServiceLoader.loadInstalled(S)` is `ServiceLoader.load(S,
-ClassLoader.getPlatformClassLoader())`. So the question is why provider lookup
-against the PLATFORM loader yields nothing while the same lookup against the
-application loader yields the right providers -- module-provided services are
-found by walking the resolved modules readable by that loader, so start with
-what CratonVM's platform loader reports for that walk, not with `ServiceLoader`
-itself.
+`native-builtins/src/jboss_jdkspecific.rs`, `register_module_in_loader_catalog`
+(~line 526). It registers **every** module into the catalog of
+`ClassLoader.getSystemClassLoader()`:
+
+```rust
+let loader = match ctx.invoke(
+    "java/lang/ClassLoader", "getSystemClassLoader", "()Ljava/lang/ClassLoader;", &[],
+) { ... };
+let catalog = ctx.invoke("jdk/internal/module/ServicesCatalog", "getServicesCatalog",
+                         "(Ljava/lang/ClassLoader;)Ljdk/internal/module/ServicesCatalog;",
+                         &[Value::Object(Some(loader))]);
+```
+
+On a real JVM a module is registered in the catalog of **its own** class loader.
+`jdk.localedata` and `jdk.zipfs` belong to the PLATFORM loader (measured -- see
+below), so on HotSpot their providers live in the platform loader's catalog.
+CratonVM puts them all in the APP loader's catalog instead, and:
+
+* `ServiceLoader.load(S)` uses the thread-context loader, which is the app
+  loader, so it walks the catalog everything was dumped into -- and works.
+* `ServiceLoader.loadInstalled(S)` is `load(S, getPlatformClassLoader())`, so it
+  walks the platform loader's catalog -- into which nothing was ever
+  registered -- and returns empty.
+
+The module-to-loader mapping itself is CORRECT, which is why this took three
+refutations to find. Measured, identical on both VMs:
+
+```
+  jdk.localedata  loader = platform   jdk.zipfs  loader = platform
+  jdk.charsets    loader = platform   java.base  loader = null (boot)
+  CLDRLocaleDataMetaInfo   module = jdk.localedata   loader = platform
+```
+
+The function is named `register_module_in_loader_catalog` and takes the module,
+but never asks the module which loader it belongs to.
+
+**Proposed fix:** use the module's own loader (`Module.getClassLoader()`) rather
+than the system loader. Two things to get right, neither of which this page has
+tested:
+
+1. A module whose loader is the BOOT loader (`java.base`) answers `null`.
+   HotSpot keeps those in `BootLoader.getServicesCatalog()`, not in
+   `getServicesCatalog(null)`; check what CratonVM's
+   `ServicesCatalog.getServicesCatalog` does with a null argument before
+   assuming it is equivalent.
+2. The existing behaviour is load-bearing for the case this code was written
+   for -- `regression-suite/src/RJdkModule.java` and
+   `ServiceLoader.load(layer, Service.class)`. A `--module-path` module's loader
+   IS the app loader, so it should still land in the app catalog, but that
+   vector must be re-run rather than reasoned about.
+
+**Not attempted in the branch that found it.** This is a module/class-loader
+change and the branch it was found on was already through its full gate set; a
+change of this shape needs its own run of the whole set, not a late amendment to
+someone else's green.
 
 Related: `docs/known-issues/jdk-only/the-first-jdk-21-run-found-the-javalangaccess-carrier-is-pinned-to-system-1-20260908.md`
-finding #4, which this completes.
+finding #4, which this completes, and the `W6-11` diagnosis referenced from
+`jboss_jdkspecific.rs`, which is where the app-loader catalog registration came
+from in the first place.
