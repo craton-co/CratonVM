@@ -30,6 +30,7 @@ es_segalloc_arena_dispatch
 fjp_recursive
 getclass_concrete_class
 hib_dev_05_private_abstract_dispatch
+inet_address_hostname_contract
 inet_socket_address_port_only
 inputstream_super_read_probe
 instant_real_jdk_factory_tostring
@@ -37,6 +38,7 @@ intrinsic_diff
 jit_cold_new_cp
 jit_collection_ctor_identity
 jit_cov06_array_allocation
+jit_final_devirt_native_shadow
 jit_interp_differential
 jit_ir_athrow_dispatch
 jit_ir_exception_stub_throw_bci
@@ -48,6 +50,8 @@ native_alloc_oom_catchable
 native_io_dis_read_fully_pin
 native_io_dis_shared_stream
 nio_selector_build_set_gc
+null_receiver_cached_invoke
+osr_unbox_intrinsic_handler_frame
 plain_server_socket_contract
 private_invokevirtual_shadow
 probe_compile_guard
@@ -62,6 +66,7 @@ rslf4j1_get_resources
 runtime_halt
 sb_count_slot_guard_regression
 scheduled_executor_cancel_shutdown_regression
+sealed_bootstrap_permitted_subclasses
 server_socket_adaptor_accept
 socket_input_stream_timeout
 spring_io_enumset_regression
@@ -140,32 +145,68 @@ writer_flush_real
 #
 # Re-surveyed 2026-09-08 against a release binary and Temurin 25.0.3+9 on
 # Windows: 79 RUNS, 14 VACUOUS, 2 RED out of 95 (was 73/19/3 on 2026-08-30).
+# LATER THE SAME DAY one of those two REDs was fixed and ratcheted, leaving
+# ONE: `stack_trace_across_tiers`, at the bottom of this block.
 #
-# NINE of today's RUNS are not in the list above, and they are promotion
-# candidates rather than a promotion -- each was observed exactly ONCE, and one
-# of the nine is `vthread_probe_regression`, which the FLAKY block above says
-# failed 3 of 4 runs eight days ago. That it passed today is precisely why a
-# single observation does not earn a ratchet row. Re-run before promoting:
+# PROMOTED 2026-09-08 (second sitting), after `936536100` fixed the RED this
+# block used to carry (`null_receiver_cached_invoke`): five of the
+# nine candidates this block used to list are now in the ratcheted list above.
+# Each was observed RUNning twice -- the morning survey, then again against a
+# debug binary built from dev @ ebc5e46c4 -- which is the bar this file asks
+# for. `null_receiver_cached_invoke` was run 10 times, not 2, because its row
+# is JIT-timing dependent and a single green on such a row is a coin flip:
+# 10/10 ok at ~10s each, against FAILED at 4.15s before the fix.
 #
-#   inet_address_hostname_contract         jit_ir_phi_copy_register_alias
-#   jit_final_devirt_native_shadow         jit_site_trap_never_duplicates_a_side_effect
-#   jit_guarded_inline_native_shadow       osr_unbox_intrinsic_handler_frame
-#   sealed_bootstrap_permitted_subclasses  stack_trace_compiled_callee
-#   vthread_probe_regression  (FLAKY, see above -- do not promote on this run)
+#   inet_address_hostname_contract  13s      null_receiver_cached_invoke  10s
+#   jit_final_devirt_native_shadow  25s      osr_unbox_intrinsic_...      14s
+#   sealed_bootstrap_permitted_subclasses    10s
 #
-#   null_receiver_cached_invoke   `invokespecial` on a NULL receiver does not
-#                              throw NPE once the caller is JIT-warm, and the
-#                              callee runs with `this == null` (JVMS 6.5).
-#                              MODE-INDEPENDENT. The 2026-08-30 fix is intact
-#                              in bytecode_walk.rs's direct-call arm; the
-#                              inliner now claims the site first and the
-#                              spliced path carries no receiver null check.
-#                              Diagnosis, reproduction and DBG_JITC evidence:
-#                              invokespecial-on-a-null-receiver-lost-its-npe-again-and-the-gate-that-sees-it-is-unratcheted-20260908.md
+# FOUR of the nine passed the same bar and are still NOT promoted, on cost
+# alone. Ratcheting them would add ~5 minutes to a step whose whole list took
+# 34m55s here (Windows, debug, idle host) against ci.yml's `timeout-minutes:
+# 15`. That gap is not itself an alarm -- the step runs on ubuntu-latest only
+# and is green there -- but it is not headroom to spend blind either. Someone
+# with the Linux number should take these; the measurement is done:
+#
+#   jit_guarded_inline_native_shadow          97s
+#   jit_ir_phi_copy_register_alias            77s
+#   jit_site_trap_never_duplicates_a_side_effect  61s
+#   stack_trace_compiled_callee               57s
+#
+# The ninth, `vthread_probe_regression`, FAILED again on 2026-09-08 at 120s --
+# the FLAKY block above is right and its one green that morning was luck.
+#
+# ---------------------------------------------------------------------------
+# TWO TARGETS IN THE RATCHETED LIST ABOVE ARE FLAKY ON WINDOWS. Found by
+# running the whole list on 2026-09-08; both then re-run ALONE on an idle host,
+# because load manufactures exactly this shape:
+#
+#   socket_input_stream_timeout   1 of 3 alone. Failing run 86.9s, passing runs
+#                                 far under. The fixture is killed by the
+#                                 harness clock, not by its assertion.
+#   wave1_c_executor              1 of 3 alone, and 1 of 4 again with
+#                                 `--test-threads=1`. SERIALISING DOES NOT FIX
+#                                 IT, which refutes the obvious reading (five
+#                                 #[test] fns each spawning a VM, contending).
+#                                 A serialised pass runs all five in ~30s
+#                                 total; on a bad run ONE of them alone blows
+#                                 the fixture's hardcoded 30s wall. That is a
+#                                 5x stall in the VM, not a marginal timeout.
+#
+# THEY ARE LEFT RATCHETED ON PURPOSE. The FLAKY rule above would remove them,
+# but this step runs on `ubuntu-latest` only and every observation here is
+# Windows; unratcheting on that evidence would cut real Linux coverage to fix a
+# red nobody has seen. What is needed is the same rate measured on Linux. Until
+# then they are named here rather than left as a surprise.
 #
 #   stack_trace_across_tiers   `after_main_osr` loses the `mid`/`outer`
 #                              frames: "the callees the JIT inlined into their
 #                              caller's artifact contributing no frame at
-#                              all". Same family as the row above -- inlining
-#                              dropping a JVMS-visible property the
-#                              un-inlined path preserves.
+#                              all". Same family as the null-receiver RED this
+#                              block used to carry beside it -- inlining
+#                              dropping a JVMS-visible property that the
+#                              un-inlined path preserves. That one is now fixed
+#                              (`936536100`, an `Op::Guard` ahead of the IR
+#                              tier's splice) and ratcheted; this one is not,
+#                              and the fix there is not obviously the fix here:
+#                              an absent FRAME is not an absent CHECK.

@@ -6884,6 +6884,15 @@ fn append_ir_inline_site(
             // The receiver the deleted invoke used to null-check. See
             // `ir::IrInlineSite::receiver_is_arg0`.
             receiver_is_arg0: !site.callee_is_static,
+            // Whose bytecode this body is. The single-pass inliner has recorded
+            // the same pair since 2026-09-01 (`x64::inlining`'s
+            // `inline_site_label` / `InlineSite::class_id`); this tier spliced
+            // the body and dropped the identity, so every callee it inlined
+            // contributed no frame to a stack trace. Same string shape, built
+            // from the same three fields, so the two tiers' chains are
+            // indistinguishable to the consumer.
+            method_key: format!("{}.{}:{}", site.class_name, site.method_name, site.descriptor),
+            class_id: site.class_id,
         },
     );
     for &(cpc, field_index, type_tag) in &site.field_info {
@@ -25252,6 +25261,11 @@ fn try_compile_inner(
         // See `CompiledMethod::spliced_bodies_side_effect_free`. Vacuously true
         // until a body is actually spliced.
         let mut ir_spliced_bodies_pure = true;
+        // Combined-buffer pc → the spliced callees enclosing it. Built from the
+        // same site table the builder gets, and for a different consumer: this
+        // one is read at CALL RETURN sites by `ir_lower` so a stack trace can
+        // name the callees this tier inlined. Empty when nothing is spliced.
+        let mut ir_inline_frame_sites = ir::IrInlineFrameSites::default();
         if ir_inline_enabled() {
             if let (Some(ir_resolver), Some(invoke_resolver)) =
                 (ir_inline_resolver, cp_invoke_resolver)
@@ -25374,6 +25388,9 @@ fn try_compile_inner(
                     // land on zeroes rather than on whatever follows the Vec.
                     combined.push(0);
                     combined.push(0);
+                    // BEFORE the move: `apply_inline_tables` consumes
+                    // `tables`, and the resolver needs the same `sites` map.
+                    ir_inline_frame_sites = ir::IrInlineFrameSites::from_sites(&tables.sites);
                     builder.apply_inline_tables(tables);
                     ir_combined = Some(combined);
                 }
@@ -26022,6 +26039,7 @@ fn try_compile_inner(
                         &ir_direct_calls,
                         &ir_ic_slots,
                         &ir_compact_fields,
+                        &ir_inline_frame_sites,
                     );
                     drop(metrics_lower);
                     // The C1->C2 acceptance gate. A body that lowered but
