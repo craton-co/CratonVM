@@ -16234,6 +16234,34 @@ impl GenerationalHeap {
     /// every survivor is promoted regardless of age. This breaks the
     /// long-lived-tree semispace death spiral.
     #[allow(clippy::too_many_arguments)]
+    /// `CRATONVM_DBG_ROOT_REMAP_AUDIT`: the evacuator REFUSED to move a root.
+    ///
+    /// `forward_object_impl` has three refusal paths and every one of them
+    /// returns `old_ptr` unchanged, which `seed_roots` writes straight back
+    /// into the root slot. On the moving path that is indistinguishable from a
+    /// successful no-op: the object is left in from-space, gets no pointer-map
+    /// entry, and from-space is then reset -- so the slot dangles and nothing
+    /// downstream can say the evacuator declined it rather than the scan
+    /// missing it.
+    ///
+    /// The BindableTests residual is exactly that shape: `in_root_set=true`,
+    /// `scan_would_root=true`, and no pointer-map entry.
+    #[cold]
+    fn note_forward_refusal(old_ptr: *mut u8, reason: &'static str) {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOT_REMAP_AUDIT").is_none() {
+            return;
+        }
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 24 {
+            eprintln!(
+                "[forward-refused] {reason} old_ptr=0x{:x} (#{n}) -- the root stays in from-space \
+                 with no pointer-map entry, and from-space is about to be reset",
+                old_ptr as usize,
+            );
+        }
+    }
+
     fn forward_object(
         young_from: &Arena,
         young_object_starts: &crate::young_mark::ObjectStartBits,
@@ -16284,6 +16312,13 @@ impl GenerationalHeap {
         if !young_object_starts.contains(old_ptr as usize) {
             // Exact pre-GC membership rejects aligned interior words from
             // conservative roots before forwarding writes through them.
+            if young_from.contains(old_ptr) {
+                // ... but an address INSIDE from-space that the start bitmap
+                // does not know is not an interior word from a conservative
+                // root: it is an object the pre-GC walk that built the bitmap
+                // never saw.
+                Self::note_forward_refusal(old_ptr, "not-an-object-start");
+            }
             return old_ptr;
         }
         // HIB-DCAST-LATEPHASE.1: `young_object_starts.contains(old_ptr)` above
@@ -16324,6 +16359,7 @@ impl GenerationalHeap {
                 "gen_heap::forward_object: invalid kind/element_type tag — false root or \
                  corrupted header, not decoded as ObjectHeader",
             );
+            Self::note_forward_refusal(old_ptr, "invalid-kind-or-element-tag");
             return old_ptr;
         }
 
@@ -16406,6 +16442,7 @@ impl GenerationalHeap {
             // Leave the object unmoved; this is a suspected false root or
             // corrupted slot. Returning old_ptr preserves progress while the
             // eprintln above gives us the evidence needed to diagnose.
+            Self::note_forward_refusal(old_ptr, "suspect-header");
             return old_ptr;
         }
 
