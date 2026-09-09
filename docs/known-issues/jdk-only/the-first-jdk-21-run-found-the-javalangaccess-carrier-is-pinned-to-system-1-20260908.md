@@ -188,6 +188,18 @@ was silently absent.
 * **`21-linux` is untouched.** This is one platform. The 21 Linux leg still
   refuses, and a baseline from another key cannot adjudicate it.
 * **#4 is an observation.** No locale mechanism is identified.
+  **SUPERSEDED 2026-09-09 — the mechanism is now identified.** CratonVM’s
+  CLDR locale adapter reports only **5** supported locales where HotSpot
+  reports **1,063**, and the five are exactly the set that ships inside
+  `java.base`; the rest live in the `jdk.localedata` module, which is not
+  being picked up. `LocaleProviderAdapter.getAdapter` therefore finds no
+  adapter claiming `de-DE` and falls through to
+  `FallbackLocaleProviderAdapter`, whose root/English data IS the US
+  separators. Nothing throws anywhere, which is why this never appeared in
+  a stack trace. Full measurement, and an UNRESOLVED conflict with the
+  `--real-jdk` cell recorded above (Linux shows the fallback in BOTH modes,
+  Windows recorded `--real-jdk` correct):
+  the-cldr-adapter-sees-5-locales-instead-of-1063-because-jdk-localedata-never-loads-20260909.md
 * **The 87-method claim is about the class, not about CratonVM.** Only
   `parkVirtualThread(long)` and `encodeASCII` were observed failing; that the
   other 85 would fail the same way is a prediction from the mechanism, not a
