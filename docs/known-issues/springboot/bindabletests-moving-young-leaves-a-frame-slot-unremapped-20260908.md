@@ -6,7 +6,7 @@
 | **Scope** | `--XX:UseGc Generational`, JIT on, `CRATONVM_DBG_GC_STRESS <= 262144`. Passes at `>= 1048576`. |
 | **Collector** | the **MOVING** (Cheney) young cycle — `moving=1203 non_moving=0` on every failing run. This is NOT the non-moving sweep. |
 | **Reproducer** | `org.springframework.boot.context.properties.bind.BindableTests`, Linux x86-64, ~9–20 s |
-| **Found while** | chasing [the A5 non-moving reclaim](../../internal/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-FIXED-20260908.md), which does not reproduce on this host. This is a different defect that does. |
+| **Found while** | chasing [the ByteBuddy receiver reclaim](bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md). That one is the NON-MOVING sweep; this is the moving collector. |
 
 ## Repro
 

@@ -1545,8 +1545,17 @@ moving_young={moving_young} osr_fallback={moving_young_osr_fallback} incomplete=
         moving_young_precise_only = false;
     }
     if !moving_young_precise_only && !jit_scan_done {
+        // `_for_collection` below, not the bare scan: it marks this as the
+        // pass the collector marks from, which is what the opt-in above-chain
+        // conservative band keys on (`CRATONVM_JIT_ABOVE_CHAIN_SCAN`). Inert
+        // with that flag unset, which is the default — see
+        // `conservative_roots::above_chain_scan_enabled` for the measurement
+        // that says why it is opt-in.
         crate::memory::native_roots::rootprof::note_scan_caller(0); // gc-roots
-        crate::jit::conservative_roots::scan_active_jit_frames(&shared.mem.heap, &mut roots);
+        crate::jit::conservative_roots::scan_active_jit_frames_for_collection(
+            &shared.mem.heap,
+            &mut roots,
+        );
     }
     // G1 pin-in-place for conservative JIT roots: the generational collector
     // protects a conservatively-scanned JIT root (a register/spill slot the
@@ -1598,7 +1607,7 @@ moving_young={moving_young} osr_fallback={moving_young_osr_fallback} incomplete=
     // reason only. On an A5-only cycle the sweep therefore freed on
     // `GC_FLAG_MARKED` while the pass that exists to widen its root set was
     // off: exactly the asymmetry
-    // `docs/internal/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`
+    // `docs/known-issues/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`
     // names as its most specific lead.
     //
     // Widening step 1's predicate is not the repair, and that page says why:

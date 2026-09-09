@@ -150,6 +150,19 @@ fn maybe_dump_shutdown_reports() {
         // is wanted for end in `System.exit`.
         let (a5_cycles, a5_roots) = cratonvm_vm::memory::roots::a5_frame_pass::census();
         eprintln!("[GC] a5_frame_pass: cycles={a5_cycles} roots={a5_roots}");
+        // The above-chain conservative band, same reasoning. It is OPT-IN, so
+        // `enabled=false passes=0` is the ordinary reading and says the band
+        // was never walked; `enabled=true passes=0` would mean the lever is on
+        // but no collection had a live JIT chain, which is a different fact and
+        // the one a clean result must not be read against. `bytes` is what the
+        // lever costs in stack reads when it is on.
+        let (ac_passes, ac_roots, ac_bytes) =
+            cratonvm_vm::jit::conservative_roots::above_chain::census();
+        eprintln!(
+            "[GC] above_chain_scan: passes={ac_passes} roots={ac_roots} bytes={ac_bytes} \
+             enabled={}",
+            cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ABOVE_CHAIN_SCAN").is_some(),
+        );
         // The collector-state half of the same census -- see
         // `VM_FOR_SHUTDOWN`. Only reachable while the VM is alive, which is
         // the `System.exit` arm; on the normal-return arm `run()` has already

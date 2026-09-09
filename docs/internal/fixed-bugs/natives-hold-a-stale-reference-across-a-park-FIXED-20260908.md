@@ -290,11 +290,13 @@ and the Mockito failure are two separate pre-existing things in one class.
 Filed with the evidence, the ruled-out mechanisms, and the most specific lead
 (the predicate guarding the conservative frame-slot probe is narrower than the
 collector's own, so an A5 unregistered-JIT-frame cycle ran the non-moving sweep
-with the root-widening pass off). That lead was the defect, and it is now
-fixed:
-`docs/internal/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-FIXED-20260908.md`.
-The page listed THREE disagreeing predicates; one of the three was a disjunct
-that could only ever read `false` and has been deleted.
+with the root-widening pass off):
+`docs/known-issues/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`.
+
+That lead was a real gap and is fixed (`collect_roots` step 14a5), and of the
+THREE disagreeing predicates the page named, one turned out to be a disjunct
+that could only ever read `false` — deleted. Neither was the reclaim: the page
+now carries a two-minute Linux reproducer and stays OPEN.
 
 ## What this does NOT claim
 
