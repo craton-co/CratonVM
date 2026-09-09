@@ -90,15 +90,18 @@ cratonvm-types`:
 
 | | count |
 |---|---|
-| distinct `CRATONVM_*` identifiers appearing anywhere in Rust source | 1,347 |
-| exact string literals (i.e. actually named by code, not prose) | 1,272 |
+| distinct `CRATONVM_*` identifiers appearing anywhere in Rust source | 1,356 |
+| exact string literals (i.e. actually named by code, not prose) | 1,281 |
 | **declared** in `flag_groups::INVENTORY` + scalars + group variables | **1266** |
 | declared before this pass | 576 |
 | declared by this pass | **71** |
 | allowlisted as intentionally undeclared | 11 |
 | user-facing names an operator has to learn | 15 |
 
-The first two rows are **not** generated and no test enforces them, which is
+The first two rows are **not** generated, though since 2026-09 they ARE
+enforced -- `types/tests/doc_numeric_claims.rs::flag_inventory_surface_counts_are_current`
+re-derives both and fails when either drifts. Before that test existed nothing
+checked them, which is
 why they read 692 / 658 from 2026-08-06 until 2026-09-01 while the true figures
 were 1,056 / 993 — a gap large enough to make the declared count (986) look
 like it *exceeded* the number of flags in the source, which is not possible.
