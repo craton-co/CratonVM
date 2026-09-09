@@ -1,4 +1,10 @@
-# `Calendar` reports root week rules for every locale, because the provider lookup still answers `null` for `CalendarDataProvider`
+# `Calendar` reports root week rules for every locale
+
+**Title correction, 2026-09-09:** this page was first filed as "...because the
+provider lookup still answers `null` for `CalendarDataProvider`". That is the
+proximate cause but not the whole one: making the lookup answer non-null
+produces CLDR ROOT week data instead, which is worse. The `null` is real, and
+behind it sits a root-resource fault in the calendar path.
 
 **Status:** open, cause known, fix known and prescribed. Not a strict-mode row.
 **Applies to:** every mode and both JDK images — `--real-jdk` and `--jdk-only`,
@@ -44,11 +50,64 @@ no synthetic `Calendar` stub bypassing the walk in `--real-jdk` the way
 `DecimalFormatSymbols.initialize` bypasses it. Both modes take the real path,
 so both are wrong.
 
-## The fix
+## The obvious fix was TRIED and REFUTED, 2026-09-09
 
-Add the `CalendarDataProvider` arm to the switch in `locale_bootstrap.rs`,
-delegating to the receiver's `getCalendarDataProvider()`, exactly as the
-`DecimalFormatSymbolsProvider` arm now does.
+**Do not simply add the `CalendarDataProvider` arm.** It was written, built and
+measured, and it is a net REGRESSION. Recorded here so nobody spends the same
+build on it twice.
+
+Delegating `getLocaleServiceProvider(CalendarDataProvider.class)` to the
+receiver's real `getCalendarDataProvider()` gives:
+
+```
+                  HotSpot 21    before the arm    with the arm
+  en-US (control)   1 / 1         1 / 1  correct   2 / 1   WRONG (regressed)
+  de-DE             2 / 4         1 / 1  wrong     2 / 1   still wrong
+  fr-FR             2 / 4         1 / 1  wrong     2 / 1   still wrong
+```
+
+Every locale answers `2 / 1`, which is **CLDR root** (`firstDay=mon`,
+`minDays=1`). So the delegation does reach the provider -- and the provider
+then resolves against ROOT resources, the same root-resource fault as the
+`DecimalFormatSymbols` row, in a different service.
+
+The blanket `null` was hiding that behind a piece of luck.
+`CalendarDataUtility.retrieveFirstDayOfWeek` falls back to `1` (Sunday) when the
+pool yields nothing, and `retrieveMinimalDaysInFirstWeek` falls back to `1`.
+For `en-US` those defaults are the CORRECT answer, so the control looked healthy
+for the wrong reason. Delegating replaces a lucky default with wrong data, and
+breaks the one cell that was right.
+
+**This is why the wave-4 note says one SPI at a time with the suites re-run for
+each.** The `DecimalFormatSymbolsProvider` arm was uneventful; this one is not,
+and a blanket delegation of all ~11 would have shipped this regression silently
+alongside it.
+
+## What the real fix has to do
+
+Make the calendar resource lookup resolve for the REQUESTED locale rather than
+root -- i.e. the same question the retired `DecimalFormatSymbols` row answered,
+asked of `LocaleResources.getCalendarData` instead. Until that holds, the arm
+must stay undelegated: the `null` is wrong, but it is wrong in a way that is
+correct for `en-US` and no worse elsewhere.
+
+A useful next measurement: whether
+`CLDRLocaleProviderAdapter.getLocaleResources(de_DE)` (which the retired row
+proved returns a genuine `de_DE` resources object) yields the right week data
+when asked directly. If it does, the fault is again SELECTION -- which pool /
+adapter the calendar path ends on -- and not the data.
+
+## The fix that was proposed here first -- SUPERSEDED by the section above
+
+The original text of this page said, and it is left here because it is the
+obvious move and the next person will think of it too:
+
+> Add the `CalendarDataProvider` arm to the switch in `locale_bootstrap.rs`,
+> delegating to the receiver's `getCalendarDataProvider()`, exactly as the
+> `DecimalFormatSymbolsProvider` arm now does.
+
+That was tried on 2026-09-09 and it regresses `en-US`. See "TRIED and REFUTED"
+above before writing it again.
 
 The wave-4 caution above that registration still governs and should be obeyed
 rather than skipped because the first arm was uneventful: `get*Provider()`
