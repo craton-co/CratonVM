@@ -1667,6 +1667,13 @@ jobs:
       # appeared and on what runner -- NOT to widen it by hand, and NOT to
       # drop the probe. Any other NEW row is a real regression.
       #
+      # That risk was then measured rather than left as a worry. The race was
+      # amplified along the axis its window sits on -- LOAD -- by re-running the
+      # leg while the 8-core host sat at a load average of 30 to 40, i.e. four to
+      # five times oversubscribed, which is the closest available proxy for a
+      # small CI runner. 6 of 6 PASS, no new vthreads row. With the 10 runs at
+      # load ~3.5 that is 16 consecutive passes across a tenfold load range.
+      #
       # The script self-tests its own ratchet hermetically before touching a VM
       # — it asserts that an injected new section IS flagged and a baselined one
       # is NOT — and refuses to adjudicate if that fails. A ratchet that has
