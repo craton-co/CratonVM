@@ -524,7 +524,59 @@ than floors.
 **1414 native-won remain.** That is the scale of what is left, on one workload,
 after the largest single wave this table has taken.
 
-## 9. What this does NOT claim
+## 9. "Just remove them all" — re-taken on this tree
+
+`CRATONVM_ENFORCE_NATIVE_SHADOW=all` IS that script, and it was re-run on
+`d241f0dc105f676b` against the same corpus that is 132/132 unarmed:
+
+```text
+REGRESSION SUITE: 5 passed, 127 failed
+```
+
+**Not comparable to Phase 2's 64/118.** That arm armed the 236 classes the
+per-class sweep had called retire-safe; `all` is every class on the shadow
+surface, including the 34 the same sweep called load-bearing. Different scope,
+and the ratio says nothing about drift between the two dates.
+
+What the 127 are is the useful part, and they are NOT one bootstrap domino:
+
+```text
+RJdkHello        NPE: java.lang.System.props is null, from real System.getProperty
+RCollections     CoderMalfunctionError wrapping an NPE
+RStrings         ExceptionInInitializerError
+RCrypto          AbstractMethodError: MessageDigestSpi.engineUpdate([BII)
+RJdkViews        AssertionError: descendingMap key order [d, c, b, a]
+RExceptions      AssertionError: Class.forName on a reference array
+```
+
+Distinct root causes in distinct subsystems. `RJdkHello`'s is the one worth
+naming here because it is **this page's own defect, one level up**: real
+`System.getProperty` reads the static `System.props` field, this VM never
+populates it, and the first line of the first vector NPEs. `Properties.map` was
+the same shape and §3 is what fixed it — so the cluster-root comment in
+`native-builtins/src/lib.rs` was right that the receiver has to become real, and
+right that `getProperties` was only its first move.
+
+The dial's own health under this scope, from the door census:
+
+```text
+RCollections   reached=19830  yielded=19418  leaked=412
+  cache_revalidate 232 · step1 75 · parent_shadow 70 · cache_populate 33 · shared_native 2
+```
+
+Phase 2 recorded ZERO leaks. That is not a regression in the dial: a leak is a
+dispatch the door reached and could not decline, and arming EVERY class reaches
+rows with no concrete bytecode to yield to and reviewed `Intrinsic` rows that
+§1.4 exempts by construction. The 236-class scope had none of those in it.
+
+So the answer to *"can you just remove them all with one script and see what
+happens"* is unchanged in substance and sharper in detail: the removal is
+complete, it is not the hard part, and what fails afterwards is the VM's object
+model — a null `System.props`, a charset decoder, an SPI that never got its
+override, a map view that iterates the wrong way. Each is a §3-shaped fix
+standing between here and the next wave, and this page is one of them done.
+
+## 10. What this does NOT claim
 
 * Not that the wave is landed. 115 probes is the tree, and it is NOT the gate
   set: `regression-suite/run.sh` in its three arms, the `cargo test` crates, the
