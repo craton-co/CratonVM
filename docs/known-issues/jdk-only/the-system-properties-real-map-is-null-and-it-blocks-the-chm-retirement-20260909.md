@@ -557,6 +557,12 @@ the same shape and §3 is what fixed it — so the cluster-root comment in
 `native-builtins/src/lib.rs` was right that the receiver has to become real, and
 right that `getProperties` was only its first move.
 
+**That one is now fixed**, in
+[`the-system-props-static-field-is-null-20260909.md`](the-system-props-static-field-is-null-20260909.md),
+and `RJdkHello` under this same arm now fails one domino later on
+`sun.nio.cs.UTF_8.JLA` — a third null static in the same family. The chain is
+what this section is for.
+
 The dial's own health under this scope, from the door census:
 
 ```text

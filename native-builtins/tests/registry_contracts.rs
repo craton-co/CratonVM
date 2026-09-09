@@ -869,3 +869,63 @@ fn the_jdk_only_get_properties_arm_fills_the_real_map() {
          nothing else fills it."
     );
 }
+/// The `--jdk-only` `initPhase1` arm publishes `java.lang.System.props`.
+///
+/// Sibling of `the_jdk_only_get_properties_arm_fills_the_real_map`, one level
+/// up the same cluster. `System.getProperty` IS `props.getProperty(key)` in the
+/// real JDK, so a null static field is the first thing any real `System`
+/// bytecode hits -- MEASURED as the first line of the first corpus vector under
+/// `CRATONVM_ENFORCE_NATIVE_SHADOW=all`. The native `initPhase1` that replaced
+/// the real one has always documented setting that field as step 1 of what it
+/// models, and did not.
+///
+/// Both halves again, because either alone is a false green: the two modes must
+/// bind DIFFERENT bodies (a collapsed branch cannot pass a runtime check), and
+/// the `--jdk-only` body must reach the publisher (nothing here can execute a
+/// native without a live `NativeContext`).
+///
+/// `--real-jdk` binding the UNCHANGED body is part of the contract, not an
+/// omission: the singleton only acquires a real `map` on the `--jdk-only` path,
+/// so publishing it in compatible mode would hand real bytecode a `Properties`
+/// it still cannot read.
+#[test]
+fn the_jdk_only_init_phase1_arm_publishes_the_system_props_field() {
+    const TRIPLE: (&str, &str, &str) = ("java/lang/System", "initPhase1", "()V");
+    const BODY: &str = "native_system_init_phase1_jdk_only";
+    const PUBLISH: &str = "publish_real_system_props";
+
+    let (class, method, descriptor) = TRIPLE;
+
+    let production = production_registry();
+    let mut jdk_only = NativeMethodRegistry::new();
+    jdk_only.set_compatibility_mode(CompatibilityMode::JdkOnly);
+    register_essential_natives(&mut jdk_only);
+
+    let prod_body = production
+        .find(class, method, descriptor)
+        .expect("production mode must register System.initPhase1");
+    let jdk_body = jdk_only
+        .find(class, method, descriptor)
+        .expect("--jdk-only must register System.initPhase1");
+    assert!(
+        !std::ptr::fn_addr_eq(prod_body, jdk_body),
+        "both modes bound the same body for {class}.{method}{descriptor}; the          registration-time branch has collapsed and System.props is null again"
+    );
+
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+    let text = std::fs::read_to_string(&src).expect("lib.rs must be readable");
+    let body = strip_test_modules(&text);
+    let at = body
+        .find(&format!("fn {BODY}("))
+        .unwrap_or_else(|| panic!("{BODY} is gone from lib.rs"));
+    let end = body[at..]
+        .find("
+}
+")
+        .map(|rel| at + rel)
+        .unwrap_or(body.len());
+    assert!(
+        body[at..end].contains(PUBLISH),
+        "{BODY} no longer calls {PUBLISH}, so java.lang.System.props goes back          to null and real System.getProperty bytecode NPEs on its first call."
+    );
+}

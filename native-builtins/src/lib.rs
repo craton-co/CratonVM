@@ -7499,6 +7499,85 @@ fn native_system_get_properties(ctx: &mut dyn NativeContext, _args: &[Value]) ->
 /// `properties_sidetable` native until those triples are retired, so the two
 /// stores must agree rather than one replace the other. They are written from
 /// ONE snapshot, on the same call, for that reason.
+/// Make the system `Properties` singleton real and publish it on
+/// `java.lang.System.props`, returning whether the field now holds it.
+///
+/// # Why the static field matters on its own
+///
+/// `System.getProperty` IS `props.getProperty(key)` in the real JDK
+/// (`System.java:744`). This VM answers that method from a native, so the field
+/// has never mattered and has never been set -- `native_system_init_phase1`'s
+/// own doc comment lists *"Sets up the system properties map (`System.props`)"*
+/// as step 1 of what the real `initPhase1` does, and the body does everything
+/// but that.
+///
+/// It stops being free the moment any real `System` bytecode runs. MEASURED
+/// 2026-09-09, `CRATONVM_ENFORCE_NATIVE_SHADOW=all` on the whole corpus:
+///
+/// ```text
+/// NullPointerException: Cannot invoke "java.util.Properties.getProperty(String)"
+///   because "java.lang.System.props" is null
+///     at java/lang/System.getProperty(System.java:744)
+///     at RJdkHello.systemStreams(RJdkHello.java:42)
+/// ```
+///
+/// That is the FIRST line of the FIRST vector. It is the same defect as the
+/// null `Properties.map` this cluster just closed, one level up, and the
+/// cluster-root comment on the `getProperties` registration said as much:
+/// making that native return a real `Properties` was *the cluster's first
+/// move*, not its last.
+///
+/// # It publishes a POPULATED receiver or nothing
+///
+/// `replace_real_map` keeps the invariant that the real `map` holds the whole
+/// snapshot or is ABSENT, and returns the count it wrote. Publishing a
+/// `Properties` whose `map` is null would trade one NPE for the same NPE a
+/// frame deeper; publishing one whose `map` is EMPTY would be worse still,
+/// because `getProperty` stops throwing and starts answering `null` -- the
+/// 2026-07-14 `InternalError: null property: java.home` regression, reached
+/// from a third direction. So a zero return leaves the field exactly as it was.
+fn publish_real_system_props(ctx: &mut dyn NativeContext) -> bool {
+    let Ok(props) = system_properties_object(ctx) else {
+        return false;
+    };
+    let snapshot = ctx.list_system_properties();
+    crate::properties_sidetable::replace_sidetable(ctx, props, &snapshot);
+    if crate::properties_sidetable::replace_real_map(ctx, props, &snapshot) == 0 {
+        return false;
+    }
+    ctx.set_static_field_by_name("java/lang/System", "props", Value::Object(Some(props)));
+    true
+}
+
+/// `System.initPhase1()V` under `--jdk-only`: the real body, plus the field it
+/// has always been documented to set.
+///
+/// A registration-time branch rather than a check inside the shared body, for
+/// the reason the `getProperties` pair gives: `NativeCallback` is a bare `fn`
+/// pointer that captures nothing and `NativeContext` exposes no policy
+/// accessor, deliberately.
+///
+/// `--real-jdk` keeps the unchanged body and keeps the null field. That is not
+/// timidity: the singleton only acquires a real `map` on the `--jdk-only` path,
+/// so stamping it in compatible mode would publish a `Properties` that real
+/// bytecode cannot read -- the NPE moved one frame, which is the shape this
+/// whole cluster keeps producing when a receiver is made half-real.
+///
+/// Failure is silent and safe by construction. `initPhase1` runs before most of
+/// the Java world exists; if the `ConcurrentHashMap` cannot be constructed yet,
+/// `publish_real_system_props` writes nothing and the field stays null, which is
+/// exactly today's behaviour. `native_system_get_properties_jdk_only` retries on
+/// every call, so the field is published at the latest on the first
+/// `System.getProperties()`.
+fn native_system_init_phase1_jdk_only(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let result = lang_system::native_system_init_phase1(ctx, args)?;
+    publish_real_system_props(ctx);
+    Ok(result)
+}
+
 fn native_system_get_properties_jdk_only(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
@@ -7510,9 +7589,11 @@ fn native_system_get_properties_jdk_only(
     // once `java/util/Properties` is retired -- has to be folded back into the
     // store first or this call is what erases it.
     crate::properties_sidetable::harvest_real_map(ctx, props);
-    let snapshot = ctx.list_system_properties();
-    crate::properties_sidetable::replace_sidetable(ctx, props, &snapshot);
-    crate::properties_sidetable::replace_real_map(ctx, props, &snapshot);
+    // Re-publishes `java.lang.System.props` as a side effect, which is what
+    // makes the field correct after a `System.setProperties(p)` swapped the
+    // singleton, and what gives it a second chance if `initPhase1` ran too
+    // early to construct the backing map.
+    publish_real_system_props(ctx);
     Ok(Some(Value::Object(Some(props))))
 }
 
@@ -11792,7 +11873,11 @@ pub fn register_essential_natives_with_shims(
         "java/lang/System",
         "initPhase1",
         "()V",
-        lang_system::native_system_init_phase1,
+        if registry.compatibility_mode().is_jdk_only() {
+            native_system_init_phase1_jdk_only
+        } else {
+            lang_system::native_system_init_phase1
+        },
     );
 
     // --- java.lang.String (native methods + overrides) ---
