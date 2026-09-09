@@ -16335,6 +16335,31 @@ impl GenerationalHeap {
             if let Some(w) = LAST_OBJSTART_WALK.lock().as_ref() {
                 eprintln!("[forward-refused] ^ objstart_walk: {w}");
             }
+            // THE OBJECT THE WALK STRODE OVER THIS ADDRESS WITH.
+            //
+            // The refused address is either an INTERIOR word of the object at
+            // `nearest_recorded_start` -- in which case the reference itself is
+            // wrong and this refusal is correct -- or the walk mis-sized that
+            // object and strode over live ones. Its class, kind and computed
+            // stride say which, and it is the one fact the census could not
+            // supply.
+            if let Some(near) = near {
+                if near != old_ptr as usize {
+                    // SAFETY: `near` is an object start this cycle's own walk
+                    // recorded, inside from-space, which is mapped and not yet
+                    // reset.
+                    let h = unsafe { &*(near as *const ObjectHeader) };
+                    eprintln!(
+                        "[forward-refused] ^ object_at_nearest_start: addr=0x{near:x}                          class_id={} kind={:?} num_slots={} array_length={} stride=0x{:x}                          covers_refused={}",
+                        h.class_id.as_u32(),
+                        h.kind(),
+                        h.num_slots(),
+                        h.array_length(),
+                        gen_object_total_size(h),
+                        near + gen_object_total_size(h) > old_ptr as usize,
+                    );
+                }
+            }
         }
     }
 
