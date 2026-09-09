@@ -34025,9 +34025,36 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/lang/String;Ljava/lang/String;)Ljdk/internal/util/ClassFileDumper;",
         |ctx, args| {
+            // PIN THE ARGUMENTS ACROSS THE ALLOCATION. `args` is a snapshot of
+            // the operand stack taken before this native was entered, and
+            // `try_alloc_concurrent_synthetic` can run a moving young
+            // collection -- after which the two `String`s in it name the
+            // addresses the collector moved them away from. Storing those into
+            // the dumper's fields puts a dead address inside a LIVE object,
+            // where no frame remap reaches it and the allocator re-serves it
+            // to something else. Same shape as `URL.openConnection`; see
+            // `docs/internal/springboot/bindabletests-moving-young-leaves-a-frame-slot-unremapped-20260908.md`.
+            let key = args.first().copied().unwrap_or(Value::Object(None));
+            let dir = args.get(1).copied().unwrap_or(Value::Object(None));
+            let p_key = match key {
+                Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+                _ => None,
+            };
+            let p_dir = match dir {
+                Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+                _ => None,
+            };
             let d = try_alloc_concurrent_synthetic(ctx, "jdk/internal/util/ClassFileDumper", 4)?;
-            ctx.set_field(d, 0, args.first().copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(d, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
+            let key = match p_key {
+                Some((h, o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+                None => key,
+            };
+            let dir = match p_dir {
+                Some((h, o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+                None => dir,
+            };
+            ctx.set_field(d, 0, key);
+            ctx.set_field(d, 1, dir);
             ctx.set_field(d, 2, Value::Int(0)); // disabled
             ctx.set_field(d, 3, Value::Object(None));
             Ok(Some(Value::Object(Some(d))))

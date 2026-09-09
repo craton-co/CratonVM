@@ -1151,6 +1151,34 @@ impl VmHeap {
     /// UNvalidated even though the relocation table only holds live bases,
     /// because that keeps the flag's meaning to one sentence a caller can
     /// check rather than a chain of invariants it has to trust.
+    /// Rate limiter for the stale-barrier census in
+    /// [`Self::load_and_forward_inner`], keyed by CALL SITE.
+    ///
+    /// Returns true at most once per distinct Rust backtrace, and at most
+    /// `MAX_SITES` times overall. `CRATONVM_DBG_VACATED_FRAMES` only -- the
+    /// capture alone is far too expensive for any other run.
+    #[cold]
+    #[inline(never)]
+    fn stale_barrier_site_is_new() -> bool {
+        use std::collections::HashSet;
+        use std::hash::{Hash, Hasher};
+        const MAX_SITES: usize = 40;
+        static SEEN: std::sync::Mutex<Option<HashSet<u64>>> = std::sync::Mutex::new(None);
+        let bt = std::backtrace::Backtrace::force_capture().to_string();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bt.hash(&mut h);
+        let key = h.finish();
+        let mut g = match SEEN.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let set = g.get_or_insert_with(HashSet::new);
+        if set.len() >= MAX_SITES {
+            return false;
+        }
+        set.insert(key)
+    }
+
     #[inline]
     fn load_and_forward_inner(&self, obj: ObjectRef, pre_validated: bool) -> (ObjectRef, bool) {
         // KINDOF-SENTINEL: `obj` itself has been observed already invalid
@@ -1180,8 +1208,18 @@ impl VmHeap {
         // suspicion.
         if crate::gc_quiescence::vacated_frames_enabled() {
             if let Some(moved_to) = crate::gc_quiescence::was_vacated(obj.as_ptr() as usize) {
-                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+                // ONE REPORT PER CALL SITE, not per occurrence.
+                //
+                // This barrier is the choke point every raw `ObjectRef` a
+                // native still holds passes through -- `forward_boundary_value`
+                // for `set_field` / `set_array_element`, `forward_boundary_args`
+                // for the `invoke_*` family -- so a hit names a native that
+                // captured a reference before an allocation and used it after.
+                // The population is a handful of distinct sites hit thousands
+                // of times each, and a flat count of 12 reported the first site
+                // twelve times and every other one never. Keyed by the
+                // backtrace so the census is of SITES.
+                if Self::stale_barrier_site_is_new() {
                     tracing::error!(
                         target: "cratonvm::gc::guard",
                         obj = format!("{:#x}", obj.as_ptr() as usize),
