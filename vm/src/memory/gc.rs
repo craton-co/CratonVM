@@ -1743,6 +1743,17 @@ pub fn update_all_roots(
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOT_REMAP_AUDIT").is_some() {
         let destinations: rustc_hash::FxHashSet<usize> = pointer_map.values().copied().collect();
         let after = crate::memory::roots::collect_roots(shared, thread);
+        // ENGAGEMENT, for the reason this whole block exists: the audit only
+        // speaks when it finds something, so a run that printed nothing covered
+        // both "no scanned root names a vacated address" and "the audit never
+        // ran on a moving cycle" (an empty `pointer_map`, a misspelled flag, a
+        // collector that took another path). `root_remap_audit_stats` is the
+        // denominator; see the `[GC] root_remap_audit:` summary line.
+        root_remap_audit::CYCLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        root_remap_audit::ROOTS_RESCANNED
+            .fetch_add(after.len(), std::sync::atomic::Ordering::Relaxed);
+        root_remap_audit::MOVED_ENTRIES
+            .fetch_add(pointer_map.len(), std::sync::atomic::Ordering::Relaxed);
         let mut reported = 0usize;
         for (index, r) in after.iter().enumerate() {
             let a = r.as_ptr() as usize;
@@ -1767,6 +1778,7 @@ pub fn update_all_roots(
                 }
             }
         }
+        root_remap_audit::UNREMAPPED.fetch_add(reported, std::sync::atomic::Ordering::Relaxed);
         if reported > 0 {
             tracing::error!(
                 target: "cratonvm::gc::guard",
@@ -1777,6 +1789,38 @@ pub fn update_all_roots(
             );
         }
     }
+}
+
+/// Engagement counters for `CRATONVM_DBG_ROOT_REMAP_AUDIT=1`.
+///
+/// The audit reports only when it FINDS something, and it reports through
+/// `tracing::error!`, so silence is ambiguous in exactly the way this repo
+/// keeps paying for: it covers a clean answer and an audit that never ran. A
+/// zero `UNREMAPPED` is worth quoting only beside a non-zero `CYCLES`.
+pub mod root_remap_audit {
+    use std::sync::atomic::AtomicUsize;
+    /// Moving cycles on which the audit re-ran the root scan. The denominator.
+    pub static CYCLES: AtomicUsize = AtomicUsize::new(0);
+    /// Roots re-scanned across those cycles.
+    pub static ROOTS_RESCANNED: AtomicUsize = AtomicUsize::new(0);
+    /// `pointer_map` entries those cycles carried — i.e. objects that MOVED.
+    /// A run with `CYCLES > 0` and `MOVED_ENTRIES = 0` audited only
+    /// non-moving cycles and proves nothing.
+    pub static MOVED_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+    /// Scanned roots left naming an address the same cycle vacated.
+    pub static UNREMAPPED: AtomicUsize = AtomicUsize::new(0);
+}
+
+/// `(cycles, roots_rescanned, moved_entries, unremapped)` for the root-remap
+/// audit. See [`root_remap_audit`].
+pub fn root_remap_audit_stats() -> (usize, usize, usize, usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        root_remap_audit::CYCLES.load(Relaxed),
+        root_remap_audit::ROOTS_RESCANNED.load(Relaxed),
+        root_remap_audit::MOVED_ENTRIES.load(Relaxed),
+        root_remap_audit::UNREMAPPED.load(Relaxed),
+    )
 }
 
 /// Opt-in young-object size validator (`CRATONVM_DBG_VALIDATE_NEW=1`). Walks

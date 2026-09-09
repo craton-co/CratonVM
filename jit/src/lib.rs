@@ -1596,7 +1596,7 @@ pub struct OopMapEntry {
     /// mask is the in-tree oracle that turns such a word into one of "the
     /// dataflow proves this local is a reference" (a real miss) or "the dataflow
     /// proves it is not" (dead storage). See
-    /// `bug-h2-testrandommapops-small-heap-corruption-20260829.md` §5.
+    /// `bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md` §5.
     ///
     /// x86-64 single-pass only. The IR tier allocates frame slots rather than
     /// homing locals at `8*(k+1)`, so it records `None` and the oracle stays
@@ -13111,7 +13111,7 @@ fn box_unbox_intrinsic_disabled() -> bool {
         // 1200 s cap, three to 400 s), **zero SIGSEGV**. What those runs end on
         // instead -- a `NullPointerException` at a later seed -- appears
         // identically with the family OFF, and is the pre-existing failure
-        // `known-issues/h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`
+        // `known-issues/h2/bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md`
         // records.
         //
         // `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` still forces it off and still

@@ -99,8 +99,8 @@ find <the 22 member dirs> -name '*.rs' -type f \
   | xargs -0 cat | wc -l
 ```
 
-which reports roughly 2,140,000 lines (2,142,510 on 2026-09-09) across about
-920 files. Re-measure before quoting it: this figure and the table below stood
+which reports roughly 2,140,000 lines (2,142,548 on 2026-09-09) across 971
+files. Re-measure before quoting it: this figure and the table below stood
 at 1,350,000 for long enough to be wrong by 49%, because nothing regenerates
 them. If you change this paragraph, change the table too — they are derived
 from the same command.
@@ -108,17 +108,17 @@ from the same command.
 Rough size distribution, largest first, so newcomers know where the mass
 actually is:
 
-Measured 2026-09-06 with the command above, one directory at a time.
+Measured 2026-09-09 with the command above, one directory at a time.
 
 | Crate | LoC | Crate | LoC |
 |-------|----:|-------|----:|
-| `native-builtins` | 742,000 | `native-awt` | 18,000 |
-| `vm` | 472,000 | `types` | 43,000 |
-| `jit` | 262,000 | `native-api` | 36,000 |
-| `gc` | 184,000 | `reader` | 17,000 |
-| `native-collections` | 86,000 | `jfr` | 20,000 |
-| `native-io` | 82,000 | `jit-cuda` | 14,000 |
-| `classloading` | 74,000 | remaining 9 | < 13,000 each |
+| `native-builtins` | 753,000 | `native-awt` | 18,000 |
+| `vm` | 480,000 | `types` | 44,000 |
+| `jit` | 269,000 | `native-api` | 37,000 |
+| `gc` | 190,000 | `reader` | 17,000 |
+| `native-collections` | 88,000 | `jfr` | 20,000 |
+| `native-io` | 85,000 | `jit-cuda` | 14,000 |
+| `classloading` | 75,000 | remaining 9 | < 14,000 each |
 
 Several individual files are far larger than is comfortable. The two worst have
 been split at the section banners they already carried:

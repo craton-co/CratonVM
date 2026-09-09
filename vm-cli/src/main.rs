@@ -6352,6 +6352,17 @@ with_ref_hoist_span={fl_rh} with_arith_span={fl_ar}"
             // at a pre-move address, i.e. references no oop map named. FRAMES
             // is the denominator -- stale=0 with frames=0 means the audit never
             // ran, not that the frames were clean.
+            // Root-remap audit (`CRATONVM_DBG_ROOT_REMAP_AUDIT=1`): scanned
+            // roots left naming an address the same collection vacated. The
+            // audit only speaks when it finds something, so the three
+            // denominators are what make its zero a reading — `moved=0` in
+            // particular means every audited cycle was non-moving and the run
+            // says nothing at all.
+            let (rra_c, rra_r, rra_m, rra_u) = cratonvm_vm::memory::gc::root_remap_audit_stats();
+            eprintln!(
+                "[GC] root_remap_audit: cycles={rra_c} roots_rescanned={rra_r} \
+                 moved_entries={rra_m} UNREMAPPED={rra_u}"
+            );
             let sfw_f = cratonvm_vm::jit::conservative_roots::stale_frame_audit::FRAMES
                 .load(O::Relaxed);
             let sfw_s =
