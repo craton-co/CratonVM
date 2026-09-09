@@ -1,8 +1,8 @@
-# An invoke's argument slice is held across a moving collection, and the callee's locals get the pre-move addresses
+# A reference is already dead on the operand stack when an invoke pops it
 
 | | |
 |---|---|
-| **Status** | OPEN, filed 2026-09-09. Deterministic. **Root-caused to a mechanism and a call path**; the fix is scoped but not written. |
+| **Status** | OPEN, filed 2026-09-09. Deterministic. Narrowed to the operand stack by four probes; the producing PUSH is not yet named. |
 | **Scope** | `--XX:UseGc Generational`, `CRATONVM_DBG_GC_STRESS <= 262144`. Passes at every threshold `>= 524288`, and unset. |
 | **Reproducer** | `org.springframework.boot.context.properties.bind.BindableTests`, Linux x86-64, ~15 s |
 | **Not the collector** | Eight hypotheses about the GC were each refused by a measurement — see the ruled-out table in [the internal page](../../internal/springboot/bindabletests-stale-objectref-family-across-allocation-20260909.md). |
@@ -10,12 +10,15 @@
 
 ## The finding, in one line
 
-`interpreter::invoke::try_stackless_invoke` receives its arguments as
-`args: &[Value]` — a slice the caller popped off the operand stack into a Rust
-`Vec` — and builds the callee's frame from it after a prologue that can complete
-a moving young collection. The `Vec` is neither scanned as a GC root nor
-remapped, so every object argument in it names a pre-move address, and
-`push_args_to_locals` lays those straight into the callee's locals.
+An object reference sitting on an interpreter frame's OPERAND STACK names memory
+that no live object occupies, and the invoke path faithfully carries it into the
+callee's locals. The invoke path is not the defect — four probes, each a step
+further upstream, put the value already dead before the first of them. What
+pushed it onto the stack is the open question.
+
+The page was first filed with the invoke path as the culprit; the section
+[Where the chain actually terminates](#where-the-chain-actually-terminates-measured-2026-09-09-after-the-page-was-filed)
+is the measurement that moved it, and the reason the title changed.
 
 ## The report that names it
 
@@ -51,26 +54,50 @@ pwsh -NoProfile -Command "& '<repo>/apps/spring-boot-suite-runner/run-spring-boo
 reportable instead of a SIGSEGV. **`--nojit` reproduces identically and names the
 same sites** — that is what says the JIT is not involved.
 
-## What the fix has to be careful about
+## Where the chain actually terminates (measured 2026-09-09, after the page was filed)
 
-The idiom is settled: pin the object arguments, run the GC-capable work, read
-them back from the pins. Four sibling defects were fixed exactly that way on
-2026-09-09 (see the internal page). What makes this one different is only that it
-sits on the hottest path in the VM, so it must **not** become an unconditional
-pin per argument per invoke.
+The title above is where the report FIRES, not where the value goes bad. Four
+probes, each one step further up, moved it:
 
-The prologue between "args received" and "frame built" is what needs bracketing,
-not the whole function. Two candidates for the GC-capable step:
+| probe | fires? | what it means |
+|---|---|---|
+| `push_args_to_locals` | yes | the callee's locals get a dead value |
+| `try_stackless_invoke ENTRY` | yes | it was dead before that function's prologue — the prologue is not the producer |
+| `InvokeArgsRootGuard::refresh` | yes | the pin slots themselves hold a dead value |
+| `InvokeArgsRootGuard::new` | **yes** | **it was dead before the guard pinned it** |
 
-* class initialisation of the callee's declaring class (`<clinit>` runs
-  arbitrary Java and allocates), and
-* `monitor_enter_synchronized_method`, which blocks at a GC-safe point.
+`InvokeArgsRootGuard::new` runs immediately after `execute_invoke_kind` reads
+the arguments out of the caller's operand stack, and nothing between the two
+allocates. So:
 
-Confirm by which one, bracket that, and check `[deadref-arg]` goes silent. The
-same audit applies to `try_stackless_invoke`'s siblings —
-`execute_invokestatic`, `execute_invokevirtual_cached`, `execute_invoke_kind` —
-all of which reach `Frame::new_pooled` / `Frame::new_from_arcs` with a
-caller-owned slice.
+* the invoke path's argument pinning is **not** the defect — the guard is doing
+  exactly what it claims, on values that were already wrong;
+* `load_and_forward`, applied to every popped reference a few lines earlier,
+  did not recover it either — it reads the forwarding word at the old address,
+  and that word is gone once the allocator has re-served the span, which is
+  precisely the window these references are read in;
+* therefore **the caller's operand-stack slot held a dead reference**, and the
+  remaining question is what pushed it there.
+
+`[deadref-local]` covers `Frame::set_local` and reports zero, so it is not a
+local store. The next probe is the operand-stack push — most plausibly a
+return-value push or a `getfield` result — and it needs to be cheap enough for
+that path, which is why it was not simply added alongside the others.
+
+## What the next step is
+
+Probe the operand-stack PUSH with the same predicate
+(`gen_heap::dead_young_ref_reason_global`) and read the Rust backtrace. That path
+is hot, so the probe wants the same `OnceLock<bool>` gate the other five arms
+use, and it wants to sit on the few pushes that can carry a reference in from
+outside the frame — a method return value and a `getfield`/`aaload` result —
+rather than on `ValueStack::push` itself.
+
+Do **not** reach for the pin idiom here. It closed four sibling defects on
+2026-09-09 (see the internal page) and it is the right tool when a Rust local
+outlives an allocation, but an operand-stack slot is already a GC root: if the
+value in it is dead, either something wrote it dead, or the frame-root remap
+missed that slot. Those have different fixes and the probe distinguishes them.
 
 ## Ruled out
 

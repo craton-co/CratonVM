@@ -182,11 +182,20 @@ the operand stack into a Rust `Vec`, which is neither scanned as a root nor
 remapped — and builds the callee frame from it after a prologue that can complete
 a moving young collection.
 
-The fix is the same idiom, but this is the hottest path in the VM, so it must not
-become an unconditional pin per argument per invoke. The next step is to bracket
-only the GC-capable steps of that prologue — class initialisation and
-`monitor_enter_synchronized_method` are the two candidates — and confirm by
-`[deadref-arg]` going silent. `--nojit` reproduces identically and names the same
+**Narrowed further the same day, and the invoke path is exonerated too.** Probing
+the same predicate one step further up each time —
+`push_args_to_locals` → `try_stackless_invoke` entry →
+`InvokeArgsRootGuard::refresh` → `InvokeArgsRootGuard::new` — all four fire.
+`InvokeArgsRootGuard::new` runs immediately after the arguments are read out of
+the caller's operand stack, with nothing allocating in between, so the values
+were **dead on the operand stack**. The argument pinning is doing its job on
+values that were already wrong, and `load_and_forward` (applied to every popped
+reference a few lines earlier) cannot recover them because the forwarding word
+is gone once the allocator re-serves the span.
+
+`[deadref-local]` reports zero, so it is not a `set_local`. The next probe is the
+operand-stack PUSH — a return value or a `getfield` result — and it needs to be
+cheap enough for that path. `--nojit` reproduces identically and names the same
 sites, which is what says the JIT is not involved.
 
 **Do not re-open the collector for this.** Each row of the ruled-out table is a

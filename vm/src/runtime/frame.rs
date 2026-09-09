@@ -792,6 +792,12 @@ fn note_dead_arg(args: &[Value], site: &'static str) {
     }
 }
 
+/// Public shim for [`note_dead_arg`], so the invoke paths can ask the same
+/// question at their own entry — see the call in `try_stackless_invoke`.
+pub(crate) fn note_dead_arg_pub(args: &[Value], site: &'static str) {
+    note_dead_arg(args, site);
+}
+
 fn push_args_to_locals(
     locals: &mut Vec<CompactValue>,
     kinds: &mut Vec<u8>,
