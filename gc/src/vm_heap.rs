@@ -4332,6 +4332,29 @@ impl VmHeap {
         }
     }
 
+    /// Publish the young semispace geometry for
+    /// `gen_heap::dead_young_ref_reason_global`. No-op on the backends that
+    /// have no semispace pair.
+    pub fn publish_young_geometry(&self) {
+        if let VmHeap::Generational(h) = self {
+            h.publish_young_geometry();
+        }
+    }
+
+    /// Generational: is `addr` a young reference naming no live object, and
+    /// why? See `GenerationalHeap::dead_young_ref_reason`.
+    ///
+    /// `None` on every other backend — the predicate is defined in terms of a
+    /// semispace pair, and G1/ZGC have none.
+    pub fn dead_young_ref_reason(&self, addr: usize) -> Option<&'static str> {
+        match self {
+            VmHeap::Generational(h) => h.dead_young_ref_reason(addr),
+            VmHeap::G1(_) => None,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => None,
+        }
+    }
+
     /// Generational: is `addr` inside EITHER young semispace? Used by
     /// reference processing to detect stale PRE-GC Reference addresses
     /// (young + absent from the pointer map ⇒ did not survive the GC).

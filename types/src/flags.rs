@@ -1728,6 +1728,12 @@ pub struct GcFlags {
     pub dbg_sweep_liveness_value: Option<String>,
     /// `CRATONVM_DBG_BADREF`
     pub dbg_badref: bool,
+    /// `CRATONVM_DBG_DEADREF_STORE` — report a reference STORE whose value
+    /// names the inactive young semispace, which holds no live object by
+    /// construction. The producer-side half of the `[heap-stale]` verifier:
+    /// that one finds a dangling field long after the write, this one names
+    /// the write.
+    pub dbg_deadref_store: bool,
     /// `CRATONVM_DBG_CELLCORRUPT`
     pub dbg_cellcorrupt: bool,
     /// `CRATONVM_DBG_DESCTRACE`
@@ -2013,6 +2019,7 @@ impl GcFlags {
             dbg_sweep_liveness: present(src, "CRATONVM_DBG_SWEEP_LIVENESS"),
             dbg_sweep_liveness_value: utf8(src, "CRATONVM_DBG_SWEEP_LIVENESS"),
             dbg_badref: present(src, "CRATONVM_DBG_BADREF"),
+            dbg_deadref_store: present(src, "CRATONVM_DBG_DEADREF_STORE"),
             dbg_cellcorrupt: present(src, "CRATONVM_DBG_CELLCORRUPT"),
             dbg_desctrace: present(src, "CRATONVM_DBG_DESCTRACE"),
             dbg_fwdguard: present(src, "CRATONVM_DBG_FWDGUARD"),

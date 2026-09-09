@@ -1137,6 +1137,16 @@ pub(super) struct InvokeArgsRootGuard {
 
 impl InvokeArgsRootGuard {
     pub(super) fn new(thread: &mut JvmThread, args: &[Value]) -> Self {
+        // `CRATONVM_DBG_DEADREF_STORE`: were the arguments dead BEFORE the
+        // guard existed?
+        //
+        // A pin preserves whatever it is given. If the values popped off the
+        // operand stack were already stale, every `refresh` below hands them
+        // back faithfully and the guard looks like it is working. Splitting
+        // "pinned dead" from "died while pinned" is the whole question here:
+        // the first is a caller that popped its arguments too early, the
+        // second would be a gap in the `native_pin_roots` remap.
+        crate::runtime::frame::note_dead_arg_pub(args, "InvokeArgsRootGuard::new");
         let pin_base = thread.native_pin_roots.len();
         for value in args {
             if let Value::Object(Some(obj)) = value {
@@ -1155,12 +1165,15 @@ impl InvokeArgsRootGuard {
         // `thread` remains alive and exclusively owned by that invocation.
         let thread = unsafe { &*self.thread };
         let mut pin = self.pin_base;
-        for value in args {
+        for value in args.iter_mut() {
             if matches!(value, Value::Object(Some(_))) {
                 *value = Value::Object(Some(thread.native_pin_roots[pin]));
                 pin += 1;
             }
         }
+        // And the other half: a pin slot that is itself dead means the value
+        // died WHILE pinned, which the pin is supposed to make impossible.
+        crate::runtime::frame::note_dead_arg_pub(args, "InvokeArgsRootGuard::refresh");
         debug_assert_eq!(pin, self.pin_base + self.object_count);
     }
 
