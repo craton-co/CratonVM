@@ -129,10 +129,18 @@ After: a reclaimed `java.util.function.Supplier` in
 At `<= 262144` the class still crashes, for a reason this page never described
 and that only became reachable once the URL defect was fixed: a Java local
 reaches `invokevirtual` holding an interior word of a retired TLAB's tail
-filler -- a span that is dead by construction and never held an object base. It
-is filed as
-[`bindabletests-local-holds-an-interior-word-of-a-retired-tlab-filler-20260909.md`](../../known-issues/springboot/bindabletests-local-holds-an-interior-word-of-a-retired-tlab-filler-20260909.md),
-with the instruments that name it.
+filler -- a span that is dead by construction and never held an object base.
+
+**That page is retired too (2026-09-09), and its central reading was wrong.**
+The address was not an interior word: a young semispace is reset and re-served
+from the same base every cycle, so the same address is a valid object start on
+one cycle and inside a filler on the next, and the page was reading the cycle
+that reported it rather than the cycle that broke it. The real defect was one of
+FOUR of the same family as this page's own -- a bare `ObjectRef` held across an
+allocation -- all four now fixed. See
+[`bindabletests-stale-objectref-family-across-allocation-20260909.md`](bindabletests-stale-objectref-family-across-allocation-20260909.md)
+for the root causes, the eight measurements that exonerate the collector, and
+the single residual that remains.
 
 It is the SAME family as this page's defect — a stale reference reaching
 bytecode — with the producer not yet named. The difference is where the evidence

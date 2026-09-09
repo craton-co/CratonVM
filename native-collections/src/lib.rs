@@ -23855,7 +23855,33 @@ fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    let this = resync_values_view(ctx, this)?;
+    // GC-safety, and it has to happen HERE rather than at the pin group below.
+    //
+    // `resync_values_view` and `al_or_collection_elements` both allocate - the
+    // second materialises a whole element vector through the receiver's real
+    // iterator, which runs Java - so a moving young collection can relocate
+    // `this` and `action` before either is pinned. `action` is the one that
+    // bites, because nothing between here and `invoke_virtual` reads it: the
+    // pin-time canary caught `ctx.pin_native_root(action)` receiving an address
+    // that named no live object on BindableTests under
+    // `CRATONVM_DBG_GC_STRESS`, and the dead receiver reached `accept()`.
+    //
+    // `action_pin` is the group base: every pin taken below it is released by
+    // the single `unpin_native_roots(action_pin)` on the way out.
+    let action_pin = ctx.pin_native_root(action);
+    let this_pin_pre = ctx.pin_native_root(this);
+    let this = ctx.read_native_pin(this_pin_pre, this);
+    let this = match resync_values_view(ctx, this) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(action_pin);
+            return Err(e);
+        }
+    };
+    // Pin what `resync_values_view` RETURNED, not what it was given: it can
+    // rebuild the carrier, and a freshly allocated one is covered by no pin
+    // taken before the call.
+    let this_pin_mid = ctx.pin_native_root(this);
     // Collect elements first to avoid borrowing issues during invoke_virtual.
     // Use the generic helper so non-ArrayList collections (EnumSet/TreeSet/…)
     // routed here through the AbstractCollection/Iterable interface natives are
@@ -23863,7 +23889,15 @@ fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // (Before 2026-08-01 the helper had no such fallback — this comment
     // described `native_al_to_array`'s inlined copy of it, not what `forEach`
     // actually did, so an unmodelled receiver's `forEach` visited nothing.)
-    let elems = al_or_collection_elements(ctx, this)?;
+    let elems = match al_or_collection_elements(ctx, this) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(action_pin);
+            return Err(e);
+        }
+    };
+    let this = ctx.read_native_pin(this_pin_mid, this);
+    let action = ctx.read_native_pin(action_pin, action);
     // GC-safety: each `accept()` body runs arbitrary Java bytecode via
     // invoke_virtual and can allocate → moving young GC relocates `action` and
     // any object-typed element. The raw ObjectRefs captured here are NOT GC
@@ -23883,7 +23917,6 @@ fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // guessed, which is the direction `al_mod_count_slot`'s own doc calls safe.
     // `this` is pinned FIRST so the whole group still unwinds with one call.
     let this_pin = ctx.pin_native_root(this);
-    let expected_mod = al_mod_count(ctx, this);
     let pin_base = ctx.pin_native_root(action);
     let elem_pins: Vec<(Value, Option<(usize, ObjectRef)>)> = elems
         .iter()
@@ -23892,6 +23925,10 @@ fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             _ => (*v, None),
         })
         .collect();
+    // AFTER the pins, not before: it reads a field through the receiver, and
+    // every reference this native still held bare at that point would have
+    // been unprotected across it.
+    let expected_mod = al_mod_count(ctx, this);
     let mut result: MethodCallResult = Ok(None);
     for (orig, handle) in &elem_pins {
         let this_cur = ctx.read_native_pin(this_pin, this);
@@ -23921,7 +23958,8 @@ fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                 Err(cratonvm_types::error::RuntimeError::ConcurrentModificationException.into());
         }
     }
-    ctx.unpin_native_roots(this_pin);
+    // `action_pin` is the group base - see its comment above.
+    ctx.unpin_native_roots(action_pin);
     result
 }
 
@@ -67548,8 +67586,25 @@ fn native_list_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             }));
         }
     }
-    let backing = try_alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS)?;
-    native_al_init_from_collection(ctx, &[Value::Object(Some(backing)), src])?;
+    // GC-safety: the allocation and the copy-in below both collect, and `src`
+    // and `backing` are bare locals read after each. Same idiom, and the same
+    // reason, as `native_map_copy_of` — which had it and these two did not.
+    //
+    // Measured, not inferred: on BindableTests under `CRATONVM_DBG_GC_STRESS`
+    // `native_al_init_from_collection` relocated `backing`, and the pre-move
+    // address went into the wrapper's slot 0 and out to the program. See
+    // `docs/internal/springboot/`'s BindableTests residual page.
+    let src_pin = pin_value(ctx, src);
+    let mut backing = try_alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS)?;
+    let src = read_pinned_elem(ctx, src_pin, src);
+    let backing_at_call = backing;
+    let copied = rooted_across(ctx, &mut [&mut backing], |ctx| {
+        native_al_init_from_collection(ctx, &[Value::Object(Some(backing_at_call)), src])
+    });
+    if src_pin != usize::MAX {
+        ctx.unpin_native_roots(src_pin);
+    }
+    copied?;
     Ok(Some(Value::Object(Some(alloc_immutable_wrapper(
         ctx,
         UNMOD_LIST_CLASS,
@@ -67574,8 +67629,18 @@ fn native_set_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             }));
         }
     }
-    let backing = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
-    native_hs_init_from_collection(ctx, &[Value::Object(Some(backing)), src])?;
+    // GC-safety: see `native_list_copy_of` — identical shape, identical fix.
+    let src_pin = pin_value(ctx, src);
+    let mut backing = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
+    let src = read_pinned_elem(ctx, src_pin, src);
+    let backing_at_call = backing;
+    let copied = rooted_across(ctx, &mut [&mut backing], |ctx| {
+        native_hs_init_from_collection(ctx, &[Value::Object(Some(backing_at_call)), src])
+    });
+    if src_pin != usize::MAX {
+        ctx.unpin_native_roots(src_pin);
+    }
+    copied?;
     Ok(Some(Value::Object(Some(alloc_immutable_wrapper(
         ctx,
         UNMOD_SET_CLASS,

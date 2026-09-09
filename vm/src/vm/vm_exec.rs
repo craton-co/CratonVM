@@ -12100,6 +12100,41 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 }
             }
         }
+        // `CRATONVM_DBG_DEADREF_STORE`: the same pin-time canary for the case
+        // the two sources above are blind to.
+        //
+        // `debug_forwarded_target` and `was_vacated` both answer "this object
+        // MOVED and here is where to". Neither can see a reference to memory
+        // that holds no object at all — an address the evacuator refused, or
+        // one whose semispace was emptied — because nothing was ever forwarded
+        // from it. That is the shape `alloc_unmod_wrapper` and `build_module`
+        // both hit on BindableTests: the caller handed down an `ObjectRef` it
+        // had held across an allocation, the collection declined to relocate
+        // it, and the pin faithfully preserved a dead address.
+        //
+        // Pinning is the right place to ask, because a pin is a promise that
+        // the value is live: if it is not live HERE, no later refresh can
+        // recover it, and the caller named in the backtrace is the defect.
+        if cratonvm_types::flags().gc.dbg_deadref_store {
+            if let Some(reason) = self
+                .shared
+                .mem
+                .heap
+                .dead_young_ref_reason(obj.as_ptr() as usize)
+            {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 12 {
+                    eprintln!(
+                        "[deadref-pin] #{n} {reason} pin_native_root(0x{:x}) on tid={} — the                          value names no live object, so this pin preserves a dead address                          rather than protecting a live one. caller:
+{:?}",
+                        obj.as_ptr() as usize,
+                        self.thread.thread_id.0,
+                        std::backtrace::Backtrace::force_capture(),
+                    );
+                }
+            }
+        }
         // CRATONVM_DBG_BLOCKED_ACCESS: a pin pushed while this thread's
         // `in_blocked_region` flag is raised is invisible to BOTH the STW root
         // scan (which reads the deposit-time snapshot) and the blocked-thread

@@ -689,6 +689,23 @@ fn build_module(
     layer: ObjectRef,
 ) -> Result<ObjectRef, MethodCallFailed> {
     let registered = ctx.module_is_registered(name);
+    // `layer` arrives as a bare `ObjectRef`. Everything below it —
+    // `try_alloc_concurrent_synthetic`, `create_string`,
+    // `build_module_descriptor` — can run a moving young collection, and a
+    // relocated `layer` then gets STORED into the new Module's slot 0.
+    //
+    // That is not hypothetical and it is not benign: it is the defect
+    // `docs/known-issues/springboot/bindabletests-local-holds-an-interior-word-
+    // of-a-retired-tlab-filler-20260909.md` chased for two days. Under
+    // `CRATONVM_DBG_GC_STRESS` the pre-move address is handed back to the
+    // allocator within a cycle or two, so `Module.getLayer()` returns whatever
+    // was minted there next, and `[rset-verify]` reported the resulting
+    // `java/lang/Module slot=0 -> <dead young address>` edge on 3 560 of 3 594
+    // moving cycles. The caller already pins `layer` across
+    // `populate_boot_layer_modules` for exactly this reason; the pin has to
+    // extend through this function too, because this is where the allocations
+    // are.
+    let layer_pin = ctx.pin_native_root(layer);
     if registered {
         if let Some(cached) = ctx.get_cached_module_mirror(Some(name)) {
             // `Class.getModule()`'s builder never sets `layer`; seed it so
@@ -697,13 +714,21 @@ fn build_module(
                 ctx.get_field_by_name(cached, "layer"),
                 Value::Object(Some(_))
             ) {
+                let layer = ctx.read_native_pin(layer_pin, layer);
                 ctx.set_field_by_name(cached, "layer", Value::Object(Some(layer)));
             }
             record_module_packages(ctx, cached, name);
+            ctx.unpin_native_roots(layer_pin);
             return Ok(cached);
         }
     }
-    let module = try_alloc_concurrent_synthetic(ctx, "java/lang/Module", MODULE_FIELD_COUNT)?;
+    let module = match try_alloc_concurrent_synthetic(ctx, "java/lang/Module", MODULE_FIELD_COUNT) {
+        Ok(m) => m,
+        Err(e) => {
+            ctx.unpin_native_roots(layer_pin);
+            return Err(e);
+        }
+    };
     let pin = ctx.pin_native_root(module);
     let name_str = ctx.create_string(name);
     let module = ctx.read_native_pin(pin, module);
@@ -711,11 +736,18 @@ fn build_module(
     // NB: no raw slot write here. Slot 0 of a REAL `java.lang.Module` is
     // `layer`, not `name` — see the `MODULE_FIELD_COUNT` doc comment for the
     // Elasticsearch failure a slot-indexed write on this object already cost.
+    let layer = ctx.read_native_pin(layer_pin, layer);
     ctx.set_field_by_name(module, "layer", Value::Object(Some(layer)));
-    let desc = build_module_descriptor(ctx, name)?;
+    let desc = match build_module_descriptor(ctx, name) {
+        Ok(d) => d,
+        Err(e) => {
+            ctx.unpin_native_roots(layer_pin);
+            return Err(e);
+        }
+    };
     let module = ctx.read_native_pin(pin, module);
     ctx.set_field_by_name(module, "descriptor", Value::Object(Some(desc)));
-    ctx.unpin_native_roots(pin);
+    ctx.unpin_native_roots(layer_pin);
     // Recorded off-object in `module_packages_table` (see its doc comment)
     // instead of a field slot; `native_module_get_packages` reads it back
     // the same way.

@@ -2937,8 +2937,120 @@ fn fwd_walk_enabled() -> bool {
     })
 }
 
-/// See `GenerationalHeap::note_objstart_walk`.
+/// Young-semispace geometry, published once per collection so code with no heap
+/// handle can ask [`dead_young_ref_reason_global`].
+///
+/// `[active_lo, active_hi, inactive_lo, inactive_hi]`. All zero until the first
+/// publish, which makes the predicate answer `None` — "not known to be dead" —
+/// rather than guessing.
+static YOUNG_GEO: [AtomicUsize; 4] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
+
+/// The handle-free form of [`GenerationalHeap::dead_young_ref_reason`].
+///
+/// `Frame::set_local` is the one place a stale reference becomes a Java-visible
+/// value, and it holds no heap. The existing guard there reads the vacated
+/// ledger, which forgets an address the instant the allocator re-issues it —
+/// exactly the window in which this workload's stale references are installed,
+/// so it reports nothing. This predicate is derived from the semispace geometry
+/// and the bytes at the address, and has no such blind spot.
+pub fn dead_young_ref_reason_global(addr: usize) -> Option<&'static str> {
+    if addr == 0 || addr % 8 != 0 {
+        return None;
+    }
+    let g = |i: usize| YOUNG_GEO[i].load(Ordering::Relaxed);
+    let (alo, ahi, ilo, ihi) = (g(0), g(1), g(2), g(3));
+    if ahi == 0 && ihi == 0 {
+        return None;
+    }
+    if addr >= ilo && addr < ihi {
+        return Some("INACTIVE-SEMISPACE");
+    }
+    if addr >= alo && addr < ahi {
+        // SAFETY: 8-aligned and inside the mapped active semispace.
+        let h = unsafe { &*(addr as *const ObjectHeader) };
+        if h.class_id.as_u32() == 0
+            && h.num_slots() == 0
+            && h.array_length() == 0
+            && h.mark_word.load(Ordering::Relaxed) == 0
+        {
+            return Some("ZERO-HEADER-IN-YOUNG");
+        }
+    }
+    None
+}
+
+/// See `GenerationalHeap::note_objstart_walk`./// See `GenerationalHeap::note_objstart_walk`.
 static LAST_OBJSTART_WALK: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
+
+/// Addresses the evacuator REFUSED to forward on the most recent moving cycle,
+/// with the refusal reason. See [`forward_refusal_reason`].
+///
+/// Always on, unlike the `[forward-refused]` printout: the one reader is a
+/// post-GC verifier that fires at most a handful of times per run, and the
+/// question it answers has no other source. Bounded — a cycle that refuses more
+/// than this has a different problem, and the census counter says so.
+static LAST_CYCLE_REFUSALS: parking_lot::Mutex<Vec<(usize, &'static str)>> =
+    parking_lot::Mutex::new(Vec::new());
+/// Cap on [`LAST_CYCLE_REFUSALS`] entries per cycle.
+const REFUSAL_LEDGER_CAP: usize = 64;
+
+/// Why the evacuator declined to relocate `addr` on the collection that just
+/// ran, if it declined at all.
+///
+/// `Some(reason)` means the collector WAS handed this address and refused it:
+/// the object was not reclaimed out from under the holder, the address was
+/// never a live object start to begin with. `None` means it was never offered
+/// — a genuinely missing root, which is the opposite defect and the opposite
+/// fix.
+///
+/// `POST-GC RECLAIMED-WHILE-HELD` printed both cases identically until this
+/// existed, and separating them took the whole `[forward-refused]` chain by
+/// hand (see the BindableTests residual page, 2026-09-09).
+pub fn forward_refusal_reason(addr: usize) -> Option<&'static str> {
+    LAST_CYCLE_REFUSALS
+        .lock()
+        .iter()
+        .find(|(a, _)| *a == addr)
+        .map(|(_, r)| *r)
+}
+
+/// Are the identifying header words at `addr` all zero?
+///
+/// True of every span of young memory that is NOT an object: the tail past the
+/// allocation frontier, a swept free block, and the data area of a retired
+/// TLAB's tail filler. An allocation writes the header before it publishes the
+/// reference, so a live young object never reads this way.
+///
+/// # Safety
+/// `addr` must be an 8-aligned address inside a mapped young semispace; the
+/// callers screen for that with `is_in_young_either` first.
+unsafe fn header_is_zero(addr: usize) -> bool {
+    let h = unsafe { &*(addr as *const ObjectHeader) };
+    h.class_id.as_u32() == 0
+        && h.num_slots() == 0
+        && h.array_length() == 0
+        && h.mark_word.load(Ordering::Relaxed) == 0
+}
+
+/// Drop the previous cycle's refusals. Called once at the top of each moving
+/// young collection so a reader always sees THIS cycle's answer.
+fn reset_forward_refusals() {
+    LAST_CYCLE_REFUSALS.lock().clear();
+}
+
+/// Record one refusal. Cheap and unconditional: `forward_object_impl` reaches
+/// it only on a path that already declined to copy.
+fn record_forward_refusal(addr: usize, reason: &'static str) {
+    let mut v = LAST_CYCLE_REFUSALS.lock();
+    if v.len() < REFUSAL_LEDGER_CAP && !v.iter().any(|(a, _)| *a == addr) {
+        v.push((addr, reason));
+    }
+}
 
 impl GenerationalHeap {
     /// Bind this heap to its VM's compact-layout domain.
@@ -5396,6 +5508,16 @@ impl GenerationalHeap {
                 );
             }
         }
+        if gc_flags().dbg_deadref_store {
+            if let Value::Object(Some(p)) = value {
+                self.note_deadref_store(
+                    "set_field",
+                    obj_ref.as_ptr() as usize,
+                    index,
+                    p.as_ptr() as usize,
+                );
+            }
+        }
         // CRATONVM_DBG_STALE_OBJREF (cce0079): a stale VALUE stored into a
         // reference field is otherwise silent (only the receiver's header is
         // read below) — surface the store site itself while the quarantine
@@ -6031,6 +6153,110 @@ impl GenerationalHeap {
     /// Set an array element at the given index.
     ///
     /// Returns `Err` with the index if out of bounds.
+    /// Publish the semispace geometry for [`dead_young_ref_reason_global`].
+    ///
+    /// Called once per collection from `update_all_roots`, which is the one
+    /// place that runs on every collection path and already holds the heap.
+    pub fn publish_young_geometry(&self) {
+        let (ilo, ihi) = self.young_inactive_semispace_range();
+        let (alo, ahi) = {
+            let from = self.lock_young_from();
+            let base = from.base_ptr() as usize;
+            (base, base + from.capacity())
+        };
+        YOUNG_GEO[0].store(alo, Ordering::Relaxed);
+        YOUNG_GEO[1].store(ahi, Ordering::Relaxed);
+        YOUNG_GEO[2].store(ilo, Ordering::Relaxed);
+        YOUNG_GEO[3].store(ihi, Ordering::Relaxed);
+    }
+
+    /// Is `addr` a young reference that names no live object, and why?
+    ///
+    /// The two arms are independent, not a refinement of one another — see the
+    /// note in [`Self::note_deadref_store`]. Together they are exact for the
+    /// young generation: every young address that is not a live object base is
+    /// either in the emptied semispace or reads back as zeroed bytes.
+    ///
+    /// `None` for an old-gen or off-heap address; this answers about young only.
+    pub fn dead_young_ref_reason(&self, addr: usize) -> Option<&'static str> {
+        if addr == 0 || addr % 8 != 0 {
+            return None;
+        }
+        let (lo, hi) = self.young_inactive_semispace_range();
+        if addr >= lo && addr < hi {
+            return Some("INACTIVE-SEMISPACE");
+        }
+        if self.is_in_young_either(addr as *const u8) {
+            // SAFETY: screened as an 8-aligned address inside a mapped young
+            // semispace on the line above.
+            if unsafe { header_is_zero(addr) } {
+                return Some("ZERO-HEADER-IN-YOUNG");
+            }
+        }
+        None
+    }
+
+    /// `CRATONVM_DBG_DEADREF_STORE`: report a reference store whose VALUE names
+    /// the inactive young semispace.
+    ///
+    /// That semispace is the one the last moving cycle evacuated and emptied;
+    /// no live object is ever in it (`young_inactive_semispace_range`). So a
+    /// mutator storing an address from it is storing a reference to memory that
+    /// is already dead — the producer half of the defect the `[heap-stale]`
+    /// verifier can only find later, once a collection has zeroed the bytes or
+    /// re-served them under another class.
+    ///
+    /// The two halves are not interchangeable. `[heap-stale]` names the
+    /// REFERRER and the slot, which is where the bad value ended up;
+    /// this names the CALLER, which is what has to be fixed. On BindableTests
+    /// under GC stress the referrer half pointed at `java/lang/Module field[0]`
+    /// for thousands of cycles and never once said who wrote it.
+    ///
+    /// Takes the to-space arena lock, so it is strictly a diagnostic path:
+    /// the `gc_flags()` gate is a startup-static bool and the common case is
+    /// one predicted-not-taken branch.
+    #[cold]
+    fn note_deadref_store(&self, site: &str, holder: usize, slot: usize, value: usize) {
+        if value == 0 {
+            return;
+        }
+        let (lo, hi) = self.young_inactive_semispace_range();
+        let Some(reason) = self.dead_young_ref_reason(value) else {
+            return;
+        };
+        // Two ways a stored reference can already be dead, and the second one
+        // is the one that took the longest to see.
+        //
+        //  * INACTIVE-SEMISPACE — the address is in the semispace the last
+        //    moving cycle emptied. Unambiguous, and it is what caught
+        //    `build_module`'s unpinned `layer`.
+        //
+        //  * ZERO-HEADER-IN-YOUNG — the address is in the ACTIVE semispace, so
+        //    the arm above says nothing, but there is no object AT it: the
+        //    header words are zero. Live young memory is never in that state at
+        //    a reference store, because an allocation writes the header before
+        //    anything can name the object. Zeroed young bytes that are not an
+        //    object are dead by construction: the unwritten tail past the
+        //    allocation frontier, a reclaimed free block, and — the case here —
+        //    the interior of a retired TLAB's tail filler, whose data area
+        //    `install_tail_filler` zeroes.
+        //
+        // The second arm is not a refinement of the first. A generational young
+        // collection alternates its semispaces, so which arm a given dead
+        // address trips depends only on the parity of the cycle it died in.
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n >= 24 {
+            return;
+        }
+        eprintln!(
+            "[deadref-store] #{n} {reason} {site}: holder=0x{holder:x} slot={slot} <- 0x{value:x}              (inactive semispace is [0x{lo:x},0x{hi:x})) — the value named no live object at the              moment it was stored, so no later collection lost it: this write is the defect.              collection={}
+{:?}",
+            self.stats.minor_gc_count.load(Ordering::Relaxed),
+            std::backtrace::Backtrace::force_capture(),
+        );
+    }
+
     pub fn set_array_element(
         &self,
         obj_ref: ObjectRef,
@@ -6044,6 +6270,16 @@ impl GenerationalHeap {
             let a = p.as_ptr() as usize;
             if a != 0 && a < 0x1_0000 && gc_flags().dbg_badref {
                 eprintln!("[BADREF:set_array_element] idx={} ptr=0x{:x}", index, a);
+            }
+        }
+        if gc_flags().dbg_deadref_store {
+            if let Value::Object(Some(p)) = value {
+                self.note_deadref_store(
+                    "set_array_element",
+                    obj_ref.as_ptr() as usize,
+                    index,
+                    p.as_ptr() as usize,
+                );
             }
         }
         // CRATONVM_DBG_STALE_OBJREF (cce0079): a stale VALUE stored into a
@@ -7966,6 +8202,8 @@ impl GenerationalHeap {
         // ~6.1 s. See `ObjectStartBits`.
         let mut young_object_starts =
             crate::young_mark::ObjectStartBits::new(young_base, young_used);
+        // This cycle's refusals only — see `forward_refusal_reason`.
+        reset_forward_refusals();
         let mut start_walk_complete = true;
         // T-3: set when a reserved TLAB tail is published inside THIS
         // from-space on the moving path — see the escalation note below.
@@ -8254,6 +8492,21 @@ impl GenerationalHeap {
         // `forward_object` refuses to relocate. Explicit, immediately after
         // the walk, is the only correct placement.
         drop(start_run);
+        // Publish the cycle for the TLAB-side watch reports, which hold no heap
+        // handle of their own, and say what THIS walk concluded about the
+        // watched address — the one fact that dates a refusal to a cycle.
+        crate::tlab::WATCH_COLLECTION.store(
+            self.stats.minor_gc_count.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        if crate::tlab::watch_covers(young_base, young_base + young_used) {
+            let w = crate::tlab::watched();
+            crate::tlab::watch_note(format_args!(
+                "OBJECT-START WALK verdict: in_from_space=true is_object_start={}                  arena=[0x{young_base:x} used=0x{young_used:x}] starts={} complete={start_walk_complete}",
+                young_object_starts.contains(w),
+                young_object_starts.len(),
+            ));
+        }
         // gc-genpause F0: the walk proper ends here. `objstart_walk_bytes` is
         // the from-space extent it chased -- ALLOCATED bytes, not live ones --
         // so a slow walk beside a small `objects_copied` is the O(garbage)
@@ -8271,10 +8524,15 @@ impl GenerationalHeap {
                 .map(|&(off, sz)| format!("0x{off:x}+0x{sz:x}"))
                 .collect();
             Self::note_objstart_walk(format!(
-                "used=0x{young_used:x} starts_recorded={} parallel={walked_in_parallel} \
+                "collection={} used=0x{young_used:x} starts_recorded={} parallel={walked_in_parallel} \
                  chunks={objstart_chunk_count} complete={start_walk_complete} \
                  skips={} skip_bytes=0x{skip_bytes:x} first_skips=[{}] \
                  reserved_tails={moving_with_reserved_tails}",
+                // The cycle number, so a reader can tell the collection that DROPPED
+                // a reference from the many later ones that merely report the
+                // re-served address again. Without it every refusal of a recycled
+                // address reads as the same event.
+                self.stats.minor_gc_count.load(Ordering::Relaxed),
                 young_object_starts.len(),
                 start_skips.len(),
                 head.join(" "),
@@ -9230,6 +9488,23 @@ impl GenerationalHeap {
 
         mv_phase!("promotion_stats");
         // Phase 3: Clear card table and reset young from-space
+        // The watched address's fate on THIS cycle, read after the copy phase
+        // and before anything clears state. `Some` says the collector relocated
+        // it and every holder must have been rewritten through the map; `None`
+        // says it was never copied, so whatever still names it is dangling from
+        // here on. Those are the two halves the `[forward-refused]` census
+        // could not tell apart, because a refusal is only visible on the cycles
+        // that happen to walk that semispace.
+        if crate::tlab::watched() != 0 {
+            let w = crate::tlab::watched();
+            crate::tlab::watch_note(format_args!(
+                "POST-COPY fate: pointer_map={} (None means it was NOT copied, so every                  reference to it is dangling from this cycle on)",
+                match pointer_map.get(&w) {
+                    Some(&to) => format!("Some(0x{to:x})"),
+                    None => "None".to_string(),
+                },
+            ));
+        }
         card_table.clear_all();
         // Re-mark cards for promoted objects that still reference young gen.
         // These old→young cross-gen references were established during the
@@ -15936,6 +16211,13 @@ impl GenerationalHeap {
             // before the arena lock is released.
             unsafe { std::ptr::write_bytes(ptr, 0, size) };
             init(ptr);
+            if crate::tlab::watch_covers(ptr as usize, ptr as usize + size) {
+                crate::tlab::watch_note(format_args!(
+                    "ARENA SLOW PATH handed it out: ptr=0x{:x} size={size} arena_used=0x{:x}",
+                    ptr as usize,
+                    from.used(),
+                ));
+            }
             ptr
         };
         self.stats.young_allocations.fetch_add(1, Ordering::Relaxed);
@@ -16067,6 +16349,66 @@ impl GenerationalHeap {
             // Rust side can see for JIT-allocated workloads.
             let off = ptr as usize - from.base_ptr() as usize;
             from.note_object_start(off);
+            // TRIPWIRE, and it must be read BEFORE the zeroing below.
+            //
+            // A chunk the arena hands out is unallocated by construction, so
+            // its first word is zero. A live class id there means the allocator
+            // has handed this thread memory that already holds an object — and
+            // the very next statement zeroes it, destroying that object with no
+            // other trace. The twin tripwire in `Tlab::install_tail_filler`
+            // catches the other half of the same failure (the retire burying
+            // what the thread itself allocated); this one catches the arena
+            // double-issuing the span. Neither can be inferred from the other.
+            //
+            // SAFETY: `ptr` is `actual_size >= 256` bytes of arena memory just
+            // allocated to this caller.
+            if crate::tlab::watch_covers(ptr as usize, ptr as usize + actual_size) {
+                crate::tlab::watch_note(format_args!(
+                    "REFILL carved a chunk over it: chunk=[0x{:x},0x{:x}) arena_base=0x{:x} arena_used=0x{:x}",
+                    ptr as usize,
+                    ptr as usize + actual_size,
+                    from.base_ptr() as usize,
+                    from.used(),
+                ));
+            }
+            let mut occupant = unsafe { std::ptr::read_unaligned(ptr as *const u32) };
+            // The O(1) check above reads the chunk's FIRST word only, which is
+            // exactly the word a bump-allocated arena is most likely to have
+            // left clean. Under `CRATONVM_DBG_DEADREF_STORE` scan the whole
+            // span: unallocated arena memory is zero end to end, so ANY
+            // non-zero word in it is an object this refill is about to erase,
+            // wherever in the chunk it sits. Two runs apart, that is the
+            // difference between "the allocator double-issued this chunk from
+            // its base" and "it double-issued a chunk that overlaps live
+            // objects further along", and only the second was happening.
+            if occupant == 0 && gc_flags().dbg_deadref_store {
+                // SAFETY: `ptr..ptr+actual_size` is the chunk just allocated to
+                // this caller; 8-aligned and mapped for its whole length.
+                let words = actual_size / 8;
+                for i in 0..words {
+                    let w = unsafe { std::ptr::read_unaligned((ptr as *const u64).add(i)) };
+                    if w != 0 {
+                        occupant = w as u32;
+                        break;
+                    }
+                }
+            }
+            if occupant != 0 {
+                crate::tlab::REFILL_OVER_OBJECT.fetch_add(1, Ordering::Relaxed);
+                static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                if n < 8 || n.is_power_of_two() {
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        chunk = format!("{:#x}+{actual_size:#x}", ptr as usize),
+                        arena_base = format!("{:#x}", from.base_ptr() as usize),
+                        arena_used = format!("{:#x}", from.used()),
+                        occupant_class_id = occupant,
+                        occurrence = n + 1,
+                        "[tlab-audit] refill_tlab carved a chunk whose first word is a live                          class id — the arena handed out memory that already holds an object,                          and the zeroing on the next line is about to destroy it.",
+                    );
+                }
+            }
             // Zero the TLAB region
             // SAFETY: `ptr` was just allocated from the arena with `actual_size` bytes; zeroing is within bounds.
             unsafe { std::ptr::write_bytes(ptr, 0, actual_size) };
@@ -16319,6 +16661,10 @@ impl GenerationalHeap {
         young_from: &Arena,
         starts: &crate::young_mark::ObjectStartBits,
     ) {
+        // The ledger is recorded whether or not the printout is armed: the
+        // post-GC verifier that reads it must be able to answer on a FIRST
+        // occurrence, on a run nobody thought to pre-arm a flag for.
+        record_forward_refusal(old_ptr as usize, reason);
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOT_REMAP_AUDIT").is_none() {
             return;
         }

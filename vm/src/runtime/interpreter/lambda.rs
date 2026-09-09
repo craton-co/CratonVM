@@ -3598,7 +3598,42 @@ pub(crate) fn try_lambda_dispatch(
                 maybe_gc(shared, thread);
                 return Ok(Some(Some(Value::Object(Some(arr)))));
             }
-            ensure_class_initialized_shared(shared, thread, class_id)?;
+            // GC-safety: `full_args` is a bare `Vec<Value>` — the proxy's
+            // captured fields plus the call arguments — and it is NOT a GC
+            // root. Everything from here to the `<init>` dispatch can run a
+            // moving young collection: `ensure_class_initialized_shared` runs
+            // the class's `<clinit>`, and `gc_alloc_object` allocates. A
+            // collection there relocates the captured objects and leaves every
+            // entry in this vector naming the pre-move address, which is then
+            // laid straight into `<init>`'s locals.
+            //
+            // MEASURED on BindableTests under `CRATONVM_DBG_GC_STRESS=262144`:
+            // `TestMethodTestDescriptor::new`, reached as a constructor
+            // reference, received `arg[4]` — the `enclosingInstanceTypes`
+            // `Supplier` — at the address a collection had moved it away from
+            // one cycle earlier, and every later `get()` on it dispatched
+            // through an all-zero header. The `new_obj` pin below already
+            // documents exactly this hazard for the receiver; the arguments
+            // needed the same protection and did not have it.
+            //
+            // `fa_base` is the group base, so one `truncate` releases the whole
+            // set — including `new_obj`'s pin — on every exit from here on.
+            let fa_base = thread.native_pin_roots.len();
+            let fa_handles: Vec<Option<usize>> = full_args
+                .iter()
+                .map(|v| match v {
+                    Value::Object(Some(o)) => {
+                        let h = thread.native_pin_roots.len();
+                        thread.native_pin_roots.push(*o);
+                        Some(h)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if let Err(e) = ensure_class_initialized_shared(shared, thread, class_id) {
+                thread.native_pin_roots.truncate(fa_base);
+                return Err(e);
+            }
             // Use `num_total_fields` (inherited + declared instance fields),
             // matching the `New` opcode. `c.fields.len()` is wrong here: it
             // counts this class's declared fields *including statics* while
@@ -3612,7 +3647,22 @@ pub(crate) fn try_lambda_dispatch(
                 .get_class(class_id)
                 .map(|c| c.num_total_fields)
                 .unwrap_or(0);
-            let new_obj = gc_alloc_object(shared, thread, class_id, num_fields)?;
+            let new_obj = match gc_alloc_object(shared, thread, class_id, num_fields) {
+                Ok(o) => o,
+                Err(e) => {
+                    thread.native_pin_roots.truncate(fa_base);
+                    return Err(e);
+                }
+            };
+            // Refresh the arguments from their pins — the read that makes the
+            // pinning above worth anything.
+            for (j, h) in fa_handles.iter().enumerate() {
+                if let Some(h) = *h {
+                    if let Some(cur) = thread.native_pin_roots.get(h).copied() {
+                        full_args[j] = Value::Object(Some(cur));
+                    }
+                }
+            }
             // Build <init> args: [new_obj, ...full_args]. The constructor body
             // can allocate and trigger a moving GC; the Java frame/locals are
             // remapped, but this Rust local `new_obj` is not. Pin the receiver
@@ -3639,7 +3689,9 @@ pub(crate) fn try_lambda_dispatch(
                 .get(new_obj_pin)
                 .copied()
                 .unwrap_or(new_obj);
-            thread.native_pin_roots.truncate(new_obj_pin);
+            // Releases `new_obj`'s pin and the argument pins together —
+            // `fa_base` is below `new_obj_pin`.
+            thread.native_pin_roots.truncate(fa_base);
             init_result?;
             Ok(Some(Some(Value::Object(Some(forwarded)))))
         }
