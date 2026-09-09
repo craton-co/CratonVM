@@ -120,9 +120,9 @@ stored its receiver's pre-GC address in the carrier's `url` field.
 
 A third defect, reachable only once that one was fixed, keeps
 `CRATONVM_DBG_GC_STRESS <= 262144` failing and is filed as
-[`bindabletests-moving-evacuator-refuses-a-root-it-was-given-20260909.md`](../../known-issues/springboot/bindabletests-moving-evacuator-refuses-a-root-it-was-given-20260909.md).
-It is the moving collector, not the sweep, and it is not what this page
-described.
+[`bindabletests-local-holds-an-interior-word-of-a-retired-tlab-filler-20260909.md`](../../known-issues/springboot/bindabletests-local-holds-an-interior-word-of-a-retired-tlab-filler-20260909.md).
+It is the moving collector, not the sweep, and it is a stale reference reaching
+bytecode rather than a missed root — not what this page described.
 
 ## Re-check command
 

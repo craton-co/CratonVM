@@ -1607,7 +1607,7 @@ moving_young={moving_young} osr_fallback={moving_young_osr_fallback} incomplete=
     // reason only. On an A5-only cycle the sweep therefore freed on
     // `GC_FLAG_MARKED` while the pass that exists to widen its root set was
     // off: exactly the asymmetry
-    // `docs/known-issues/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`
+    // `docs/internal/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`
     // names as its most specific lead.
     //
     // Widening step 1's predicate is not the repair, and that page says why:

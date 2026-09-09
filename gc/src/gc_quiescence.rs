@@ -2906,7 +2906,7 @@ pub fn check_stale_use(addr: usize, site: &'static str) {
 /// It printed exactly that about a 1200-cycles-stale entry on 2026-09-08,
 /// while `CRATONVM_NO_LOCAL_LIVENESS=1` reproduced the failure the entry was
 /// being blamed for — see
-/// `docs/known-issues/springboot/bindabletests-moving-young-leaves-a-frame-slot-unremapped-20260908.md`.
+/// `docs/internal/springboot/bindabletests-moving-young-leaves-a-frame-slot-unremapped-20260908.md`.
 /// Carrying the collection index lets the reporter print the entry's age beside
 /// the claim, so a stale attribution can be discounted instead of acted on.
 static LIVENESS_FILTERED: parking_lot::RwLock<Option<rustc_hash::FxHashMap<usize, (String, u64)>>> =

@@ -127,17 +127,20 @@ After: a reclaimed `java.util.function.Supplier` in
 ## The residual, and why it is not this defect
 
 At `<= 262144` the class still crashes, for a reason this page never described
-and that only became reachable once the URL defect was fixed: the moving
-evacuator is handed a root it then refuses to copy, so a live object is
-reclaimed. It is filed as
-[`bindabletests-moving-evacuator-refuses-a-root-it-was-given-20260909.md`](../../known-issues/springboot/bindabletests-moving-evacuator-refuses-a-root-it-was-given-20260909.md),
+and that only became reachable once the URL defect was fixed: a Java local
+reaches `invokevirtual` holding an interior word of a retired TLAB's tail
+filler -- a span that is dead by construction and never held an object base. It
+is filed as
+[`bindabletests-local-holds-an-interior-word-of-a-retired-tlab-filler-20260909.md`](../../known-issues/springboot/bindabletests-local-holds-an-interior-word-of-a-retired-tlab-filler-20260909.md),
 with the instruments that name it.
 
-The discriminator is one line: this page's defect is a stale reference stored in
-a live object's field (the object exists, at a new address); the residual is an
-object that was never copied at all (the address holds nothing). The verifier
-that tells them apart — `POST-GC RECLAIMED-WHILE-HELD` — did not exist when this
-page was written and does now.
+It is the SAME family as this page's defect — a stale reference reaching
+bytecode — with the producer not yet named. The difference is where the evidence
+sits: here the object exists at a new address and a live field named the old
+one; there the address names nothing at all, and it took the whole
+`POST-GC RECLAIMED-WHILE-HELD` -> `in_root_set` -> `[forward-refused]` ->
+`object_at_nearest_start` chain to establish that the collector was right about
+it. None of those instruments existed when this page was written.
 
 ## Instruments added or repaired while chasing this
 

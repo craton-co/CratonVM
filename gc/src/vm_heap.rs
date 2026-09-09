@@ -599,7 +599,23 @@ impl VmHeap {
     /// object as a stale reference on the non-ZGC backends.
     #[inline]
     fn note_alloc(o: ObjectRef) -> ObjectRef {
-        crate::gc_quiescence::note_allocated(&[o.as_ptr() as usize]);
+        if !crate::gc_quiescence::vacated_frames_enabled() {
+            return o;
+        }
+        // The whole EXTENT, not just the base. An address the ledger holds
+        // because a small object was moved away from it stops being evidence
+        // the moment a LARGER object is allocated over it -- and only the base
+        // of that larger object would be purged by an address-keyed door, so
+        // every interior word stayed in the ledger for the rest of the run.
+        // On BindableTests that is a quarter-megabyte of stale entries per
+        // large array, which is the exact false-positive class this ledger was
+        // repaired to stop producing.
+        //
+        // SAFETY: `o` is an object the allocator has just finished laying out;
+        // its header is initialised and mapped.
+        let base = o.as_ptr() as usize;
+        let size = unsafe { crate::gen_heap::gen_object_total_size(&*(base as *const ObjectHeader)) };
+        crate::gc_quiescence::note_allocated_range(base, base.saturating_add(size.max(8)));
         o
     }
 
