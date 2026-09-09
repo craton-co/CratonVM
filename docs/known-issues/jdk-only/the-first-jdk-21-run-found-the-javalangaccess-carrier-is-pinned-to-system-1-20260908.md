@@ -79,10 +79,46 @@ row.
 | 3 | `JdkOnlyBreadthProbe` / `serialization` | **BOTH** | `SECTION-FAILED serialization: java.lang.RuntimeException: java.io.InvalidClassException: java.util.ArrayList; unable to create instance` |
 | 4 | `JdkOnlyBreadthProbe` / `textformat` | strict | grouping and decimal separators differ from the control: HotSpot 21 gives `df=1<nbsp>234,50`, CratonVM gives `df=1,234.50` |
 
+> **#3 NARROWED 2026-09-09 — it is two symptoms, not one, and the other one is
+> silent.** The section aborts at its first throw, so the `ArrayList` row above
+> hid the rest of it: on JDK 21 `Integer`, `Long` and `Boolean` also round-trip
+> wrongly, returning a bare `java.lang.Object` and throwing **nothing**. Both
+> are one contract violation — the serialization constructor allocates the
+> declaring superclass instead of the target — and whether it is loud or silent
+> is decided only by whether that ancestor is abstract (`AbstractList` throws;
+> `Object` does not). Reproducer, the 3x4 matrix, and two ruled-out mechanisms:
+> jdk-21-serialization-round-trip-returns-the-wrong-class-20260909.md. Reading
+> the row above as "one small divergence" understates it.
+
 #3 is mode-independent, so it is not a strict-mode question. #4 is
 strict-only and **not** diagnosed here — the control's separators are the
 locale's and CratonVM's are US-style, which is a lead about locale data, not a
 finding.
+
+> **#4 NARROWED 2026-09-09 — it is the locale DATA, not the default locale.**
+> The lead above ("a lead about locale data") is now measured, and the other
+> reading is ruled out: on the failing image `Locale.getDefault()` is `ru_RU`,
+> `Locale.getDefault(FORMAT)` is `ru_RU`, and `user.language`/`user.country`
+> are `ru`/`RU` — all correct, in strict mode. What is wrong is that a locale
+> asked for **explicitly by name** answers with US separators.
+> `DecimalFormatSymbols.getInstance(Locale.GERMANY)`:
+>
+> ```text
+>                              grouping   decimal
+>   HotSpot 21                 U+002E     U+002C
+>   CratonVM --real-jdk  21    U+002E     U+002C
+>   CratonVM --jdk-only  21    U+002C     U+002E   <-- the one wrong cell
+>   CratonVM --real-jdk  25    U+002E     U+002C
+>   CratonVM --jdk-only  25    U+002E     U+002C
+> ```
+>
+> So it is strict-only AND 21-only, and it is not reachable through
+> `user.*` properties — those are right. Every non-US locale collapses to US
+> separators, which is the shape of locale data resolving to root/US rather
+> than of a locale being chosen wrongly. Mechanism not yet identified.
+> `probes/Jdk21StrictLocaleData.java` reproduces it; it prints separators as
+> code points because ru-RU's is U+00A0 and "looks like a space" is not a
+> measurement (it also makes `grep` treat the transcript as binary).
 
 Neither reproduces on JDK 25: the `25-windows` and `25-linux` keys carry two
 sections each, both `vthreads`, and neither of these.
