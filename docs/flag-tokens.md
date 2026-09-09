@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-537 tokens.
+538 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -218,6 +218,7 @@ export inherited from a parent shell.
 | `gc-stress` | `CRATONVM_DBG_GC_STRESS` |
 | `oop-oracle-force-refute` | `CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE` |
 | `gc-verify-stale` | `CRATONVM_GC_VERIFY_STALE` |
+| `verify-reg-oop-maps` | `CRATONVM_DBG_VERIFY_REG_OOP_MAPS` |
 | `peer-reg-pairing` | `CRATONVM_DBG_PEER_REG_PAIRING` |
 | `static-slot-verify` | `CRATONVM_DBG_STATIC_SLOT_VERIFY` |
 | `gc-trigger-verify` | `CRATONVM_DBG_GC_TRIGGER_VERIFY` |
@@ -603,7 +604,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-411 tokens.
+412 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -827,6 +828,7 @@ export inherited from a parent shell.
 | `my-scratch-flush` | `CRATONVM_JIT_MY_SCRATCH_FLUSH` |
 | `my-selfcall-proof` | `CRATONVM_JIT_MY_SELFCALL_PROOF` |
 | `my-shadow-emission` | `CRATONVM_JIT_MY_SHADOW_EMISSION` |
+| `reg-oop-maps` | `CRATONVM_JIT_REG_OOP_MAPS` |
 | `native-ec-multiply` | `CRATONVM_NATIVE_EC_MULTIPLY` |
 | `native-matcher-find` | `CRATONVM_NATIVE_MATCHER_FIND` |
 | `native-pbe-keyfactory` | `CRATONVM_NATIVE_PBE_KEYFACTORY` |
@@ -1021,7 +1023,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-173 tokens.
+176 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1033,6 +1035,9 @@ export inherited from a parent shell.
 | `peer-pin-divert` | `CRATONVM_GC_NO_PEER_PIN_DIVERT` |
 | `conditional-tlab-skip-publish` | `CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH` |
 | `frame-trace-span-retire` | `CRATONVM_GC_NO_FRAME_TRACE_SPAN_RETIRE` |
+| `reg-oop-maps` | `CRATONVM_GC_REG_OOP_MAPS` |
+| `dead-spill-roots` | `CRATONVM_GC_DEAD_SPILL_ROOTS` |
+| `outgoing-arg-roots` | `CRATONVM_GC_OUTGOING_ARG_ROOTS` |
 | `moving-young-band-skip-in-map` | `CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP` |
 | `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
 | `gpu-min-work-giveup` | `CRATONVM_GPU_MIN_WORK_GIVEUP` |
