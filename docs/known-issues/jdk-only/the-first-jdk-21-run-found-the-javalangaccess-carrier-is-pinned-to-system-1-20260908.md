@@ -4,6 +4,21 @@
 (downloaded for this run; this host had only JDK 25), release binary built from
 `dev` @ `6502772c4`. Three arms: HotSpot 21 control, `--real-jdk`, `--jdk-only`.
 
+> **VERIFIED AGAINST A BINARY 2026-09-08.** Every row on this page came off a
+> real three-arm run, not a reading of the source. `scripts/jdk-only-strict-probes.sh`
+> with `CV` = a release `cratonvm` built from `dev` @ `6502772c4` (timestamp
+> checked against the build, and the same 16 sections came off a second binary
+> built at `0d79de121`), `JAVA_HOME` = Temurin `21.0.12.1+1`:
+> **16 divergent sections, 3 runs, `RESULT: PASS` at 16 observed / 16 baselined**,
+> and `RESULT: FAIL` rc=5 naming the row when one baselined row is removed.
+> The `NoSuchMethodError` texts in §1 are quoted from
+> `logs/JdkOnlyPlatformProbe.strict.txt` and `JdkOnlyCensusLoadProbe.strict.txt`
+> of that run. The `javap` method tables are from the two JDK images themselves.
+>
+> **This page proposes no fix**, so there is no fix to verify — §4 says so. The
+> phrase "never been run" below is about the JDK 21 *image* never having been
+> put through the corpus, not about an unverified repair.
+
 **This is what minting the `21-windows` key bought.** Both JDK 21 legs of the CI
 matrix had refused since the gate was written, for want of a baseline — so the
 corpus had never been run against a 21 image at all, on any platform. It was
