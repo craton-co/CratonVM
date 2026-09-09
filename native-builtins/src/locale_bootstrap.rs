@@ -1112,12 +1112,40 @@ fn jre_adapter_get_locale_service_provider(
     if spi.as_deref() == Some("java.text.spi.DecimalFormatSymbolsProvider") {
         // Not shadowed by any native, so this runs the adapter's own bytecode;
         // it does not re-enter this method.
-        return ctx.invoke_virtual(
+        match ctx.invoke_virtual(
             this,
             "getDecimalFormatSymbolsProvider",
             "()Ljava/text/spi/DecimalFormatSymbolsProvider;",
             &[],
-        );
+        ) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                // DEGRADE rather than propagate. `getDecimalFormatSymbolsProvider`
+                // instantiates the adapter's inner provider off
+                // `LocaleDataMetaInfo`/`LocaleResources` -- the resource-bundle
+                // chain this whole override exists to bypass. Before this arm
+                // existed the answer was an unconditional `null`, which
+                // `findAdapter` is written to skip; propagating instead would
+                // turn a wrong-but-working format call into a throw out of
+                // `DecimalFormatSymbols.getInstance` on any image that cannot
+                // walk that chain. Falling back to the old `null` means this arm
+                // can only improve on the previous behaviour and can never
+                // introduce a failure that was not there before.
+                //
+                // Logged rather than swallowed: a locale that quietly formats as
+                // English is exactly the defect that hides for months when
+                // nothing says anything.
+                tracing::warn!(
+                    error = ?e,
+                    "getDecimalFormatSymbolsProvider threw; falling back to the \
+                     legacy null. Number symbols then resolve against ROOT -- every \
+                     locale formats as English -- on any JDK whose \
+                     FallbackLocaleProviderAdapter is root-only, which JDK 21's is \
+                     and JDK 25's is not."
+                );
+                return Ok(Some(Value::Object(None)));
+            }
+        }
     }
     Ok(Some(Value::Object(None)))
 }
@@ -2050,6 +2078,48 @@ mod locale_service_provider_delegation_tests {
             got.ok().flatten(),
             Some(Value::Object(None)),
             "the match must be on the fully qualified name, not a suffix"
+        );
+    }
+
+    /// The degrade path. If the real getter throws, the arm must fall back to
+    /// the legacy `null` rather than propagate -- otherwise this change could
+    /// turn a wrong-but-working format call into a throw out of
+    /// `DecimalFormatSymbols.getInstance` on an image that cannot walk the
+    /// resource-bundle chain. Without this test the fallback is one `return`
+    /// away from being deleted as dead code by someone tidying the match.
+    #[test]
+    fn a_throwing_getter_degrades_to_the_legacy_null_instead_of_propagating() {
+        fn throwing_call(
+            _ctx: &mut MockNativeContext,
+            _receiver: ObjectRef,
+            method_name: &str,
+            _descriptor: &str,
+            _args: &[Value],
+        ) -> Option<MethodCallResult> {
+            if method_name == "getDecimalFormatSymbolsProvider" {
+                Some(Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
+                    message: "the resource-bundle chain is unavailable".to_string(),
+                }
+                .into()))
+            } else {
+                None
+            }
+        }
+
+        let mut ctx = MockNativeContext::new();
+        let (adapter, mirror) =
+            adapter_and_spi_mirror(&mut ctx, "java/text/spi/DecimalFormatSymbolsProvider");
+        ctx.set_invoke_virtual_hook(throwing_call);
+
+        let got = jre_adapter_get_locale_service_provider(
+            &mut ctx,
+            &[Value::Object(Some(adapter)), Value::Object(Some(mirror))],
+        );
+
+        assert_eq!(
+            got.ok().flatten(),
+            Some(Value::Object(None)),
+            "a throwing getter must degrade to null; propagating would make this              arm capable of breaking a call that merely formatted wrongly before"
         );
     }
 
