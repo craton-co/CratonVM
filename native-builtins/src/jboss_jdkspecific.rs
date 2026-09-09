@@ -501,13 +501,19 @@ fn populate_boot_layer_modules_body(
         // `:242` the layer one), and fixing the layer alone moved the failure
         // by zero lines.
         //
-        // Registering against the SYSTEM loader is what the real
+        // Registering against the application loader is what the real
         // `ModuleLayer.defineModules` does for boot-layer modules resolved from
         // `--module-path`: they are defined to the application loader, and its
-        // catalog is what the lookup walks. `getServicesCatalog` creates the
-        // catalog if absent, and `register(Module)` reads
-        // `descriptor.provides()`, so a module that declares none is a no-op
-        // rather than a special case.
+        // catalog is what the lookup walks. That is true of `--module-path`
+        // modules and NOT of the JDK's own, which the real JVM defines to the
+        // platform loader (`jdk.localedata`, `jdk.zipfs`) or the boot loader
+        // (`java.base`) -- so the callee asks each module which loader it
+        // belongs to rather than sending every one to the system loader, which
+        // is what it used to do and what left
+        // `ServiceLoader.loadInstalled` empty for every service.
+        // `getServicesCatalog` creates the catalog if absent, and
+        // `register(Module)` reads `descriptor.provides()`, so a module that
+        // declares none is a no-op rather than a special case.
         let module = ctx.read_native_pin(module_pin, module);
         register_module_in_loader_catalog(ctx, module);
 
@@ -517,41 +523,110 @@ fn populate_boot_layer_modules_body(
     Ok(())
 }
 
-/// Add `module` to the system class loader's `ServicesCatalog`.
+/// Add `module` to the `ServicesCatalog` of the loader the module ACTUALLY
+/// belongs to.
 ///
-/// Best-effort by design: every step is a real-JDK call that a synthetic-JDK
-/// build may not have, and a missing services catalog must not take the boot
-/// layer down with it. A caller that gets no catalog is exactly where it was
-/// before this existed.
+/// This used to register every module against
+/// `ClassLoader.getSystemClassLoader()` unconditionally. That is right for the
+/// case it was written for -- boot-layer modules resolved from
+/// `--module-path`, which a real `ModuleLayer.defineModules` does define to the
+/// application loader -- and wrong for every JDK module, which the real JVM
+/// defines to the PLATFORM loader (`jdk.localedata`, `jdk.zipfs`,
+/// `jdk.charsets`) or to the BOOT loader (`java.base`).
+///
+/// The consequence was that `ServiceLoader.loadInstalled(S)` -- which is
+/// `load(S, ClassLoader.getPlatformClassLoader())` -- returned **nothing, for
+/// every service**, because nothing had ever been registered in the platform
+/// loader's catalog. `ServiceLoader.load(S)` kept working because the
+/// thread-context loader is the application loader, i.e. exactly the catalog
+/// everything had been dumped into. Measured before this change:
+///
+/// ```text
+///                                     load()   loadInstalled()
+///   HotSpot 21  LocaleDataMetaInfo       2           2
+///   HotSpot 21  FileSystemProvider       2           2
+///   CratonVM 21 LocaleDataMetaInfo       2           0
+///   CratonVM 21 FileSystemProvider       2           0
+/// ```
+///
+/// Nothing throws on that path: an empty `ServiceLoader` iteration is
+/// indistinguishable from a service that genuinely has no providers, so every
+/// caller silently takes its no-provider arm. The visible symptom was
+/// `CLDRLocaleProviderAdapter`, whose static initialiser uses `loadInstalled`
+/// to find the supplementary `LocaleDataMetaInfo`: it got null, kept only
+/// `java.base`'s 5 base language tags instead of 1063, truthfully reported that
+/// it does not support `de-DE`, and `LocaleProviderAdapter.getAdapter` fell
+/// through to `FallbackLocaleProviderAdapter` -- whose root/English data IS the
+/// US separators every non-English locale was answering with.
+/// See docs/known-issues/serviceloader-loadinstalled-finds-nothing-so-every-platform-loader-service-is-empty-20260909.md
+///
+/// The boot loader is NOT `getServicesCatalog(null)`. `ServiceLoader` reads
+/// boot-module providers from `BootLoader.getServicesCatalog()` specifically
+/// (`ModuleServicesLookupIterator` branches on `loader == null` before it ever
+/// consults `ServicesCatalog`), so a plain `Module.getClassLoader()` swap would
+/// have silently dropped `java.base`'s own providers instead of moving them.
+/// That branch is why this is not a one-line change.
+///
+/// Best-effort by design, unchanged: every step is a real-JDK call that a
+/// synthetic-JDK build may not have, and a missing services catalog must not
+/// take the boot layer down with it. A caller that gets no catalog is exactly
+/// where it was before this existed.
 fn register_module_in_loader_catalog(ctx: &mut dyn NativeContext, module: ObjectRef) {
     let module_pin = ctx.pin_native_root(module);
-    let loader = match ctx.invoke(
-        "java/lang/ClassLoader",
-        "getSystemClassLoader",
-        "()Ljava/lang/ClassLoader;",
-        &[],
-    ) {
-        Ok(Some(Value::Object(Some(l)))) => l,
-        _ => {
-            ctx.unpin_native_roots(module_pin);
-            return;
-        }
+
+    // The module's OWN loader. `Module.getClassLoader()` answers null for a
+    // boot-loader module, which is a real answer here and not a failure.
+    let loader = match ctx.invoke_virtual(module, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+    {
+        Ok(Some(Value::Object(l))) => l,
+        // Could not ask. Fall back to the previous behaviour rather than
+        // skipping the module: the app-loader catalog is where `--module-path`
+        // modules belong, and half a catalog beats none.
+        _ => match ctx.invoke(
+            "java/lang/ClassLoader",
+            "getSystemClassLoader",
+            "()Ljava/lang/ClassLoader;",
+            &[],
+        ) {
+            Ok(Some(Value::Object(Some(l)))) => Some(l),
+            _ => {
+                ctx.unpin_native_roots(module_pin);
+                return;
+            }
+        },
     };
-    let loader_pin = ctx.pin_native_root(loader);
-    let loader = ctx.read_native_pin(loader_pin, loader);
-    let catalog = match ctx.invoke(
-        "jdk/internal/module/ServicesCatalog",
-        "getServicesCatalog",
-        "(Ljava/lang/ClassLoader;)Ljdk/internal/module/ServicesCatalog;",
-        &[Value::Object(Some(loader))],
-    ) {
+
+    let loader_pin = loader.map(|l| (ctx.pin_native_root(l), l));
+    let loader = loader_pin.map(|(pin, l)| ctx.read_native_pin(pin, l));
+
+    let catalog = match loader {
+        // A named loader (platform or app): its own catalog.
+        Some(l) => ctx.invoke(
+            "jdk/internal/module/ServicesCatalog",
+            "getServicesCatalog",
+            "(Ljava/lang/ClassLoader;)Ljdk/internal/module/ServicesCatalog;",
+            &[Value::Object(Some(l))],
+        ),
+        // Boot loader. `ServiceLoader` looks here and nowhere else for
+        // boot-module providers.
+        None => ctx.invoke(
+            "jdk/internal/loader/BootLoader",
+            "getServicesCatalog",
+            "()Ljdk/internal/module/ServicesCatalog;",
+            &[],
+        ),
+    };
+    let catalog = match catalog {
         Ok(Some(Value::Object(Some(c)))) => c,
         _ => {
-            ctx.unpin_native_roots(loader_pin);
+            if let Some((pin, _)) = loader_pin {
+                ctx.unpin_native_roots(pin);
+            }
             ctx.unpin_native_roots(module_pin);
             return;
         }
     };
+
     let catalog_pin = ctx.pin_native_root(catalog);
     let catalog = ctx.read_native_pin(catalog_pin, catalog);
     let module = ctx.read_native_pin(module_pin, module);
@@ -562,7 +637,9 @@ fn register_module_in_loader_catalog(ctx: &mut dyn NativeContext, module: Object
         &[Value::Object(Some(catalog)), Value::Object(Some(module))],
     );
     ctx.unpin_native_roots(catalog_pin);
-    ctx.unpin_native_roots(loader_pin);
+    if let Some((pin, _)) = loader_pin {
+        ctx.unpin_native_roots(pin);
+    }
     ctx.unpin_native_roots(module_pin);
 }
 
