@@ -1346,6 +1346,18 @@ pub const INVENTORY: &[E] = &[
     // that come out, which is the analysis the caller's `verified_code` cannot
     // supply for a region past its `code_len`.
     E { group: Group::JIT, token: "ir-splice-branch", on_key: Some("CRATONVM_JIT_IR_SPLICE_BRANCH"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // Splice a callee whose body reads a STATIC. `InlineSite::static_field_info`
+    // has carried the resolved rows all along; `IrInlineTables` now rebases
+    // them, so the builder's `0xb2` arm finds a spliced site exactly as it
+    // finds one of the caller's own. `putstatic` is refused separately and
+    // unconditionally -- the builder has no arm for it.
+    // Bind a surviving statically-bound call inside a spliced body to the
+    // callee's entry with a raw CALL, instead of letting it fall through to
+    // `jit_invoke_dispatch` and resolve the callee by name on every call. The
+    // resolver had bound and keep-alive-registered the entry all along; nothing
+    // put it where the lowerer looks.
+    E { group: Group::JIT, token: "ir-splice-direct-call", on_key: Some("CRATONVM_JIT_IR_SPLICE_DIRECT_CALL"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    E { group: Group::JIT, token: "ir-splice-getstatic", on_key: Some("CRATONVM_JIT_IR_SPLICE_GETSTATIC"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
     // R1. Memoize the ACCEPTED optimizing OSR artifact, not only the refusals.
     // Without it one run recompiled the same method 502 times.
     E { group: Group::JIT, token: "osr-optimizing-cache", on_key: Some("CRATONVM_JIT_OSR_OPTIMIZING_CACHE"), off_key: None, off_word: Some("0"), since: "2026-09-09" },

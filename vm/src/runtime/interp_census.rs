@@ -369,6 +369,17 @@ pub fn report_at_exit() {
             "[c2-supersede] ir cold branch arms pruned: {}",
             cratonvm_jit::ir::branch_prune_census(),
         );
+        // Calls this tier lowered to `jit_invoke_dispatch` -- a name
+        // resolution per execution. `in_splice` is the row to act on: a splice
+        // exists to delete a frame, and a resolution costs far more than the
+        // frame it removed, so a non-zero here means the optimizing body is
+        // very likely SLOWER than the single-pass one for that method. It read
+        // non-zero for every spliced statically-bound call until 2026-09-09;
+        // see `c2-splice-getstatic-and-the-calls-it-left-behind-20260909.md`.
+        let (bd_own, bd_splice) = cratonvm_jit::ir_lower::ir_blind_dispatch_census();
+        eprintln!(
+            "[c2-supersede] ir blind dispatches: own_code={bd_own} in_splice={bd_splice}"
+        );
         let (held, spent, retired) = cratonvm_jit::deferred_new_retry_census();
         eprintln!(
             "[c2-supersede] deferred-new retries: held={held} spent={spent} retired={retired} re_offered={}",

@@ -6459,8 +6459,23 @@ pub(super) fn compile_optimizing_artifact(
             resolve_receiver_inline_site(shared, callee_cid, cid, cp_class, name, desc, None)
         };
         // The optimizing tier's own inline resolver for this callee compile.
+        // No direct-bind resolver, and here the reason is scope rather than
+        // capability: this is the CALLEE-compile path, entered from planning
+        // for another method, and the only binder in reach
+        // (`callee_compiler`) compiles what it is asked about. Handing it to a
+        // resolver that runs inside planning would let one compile drive
+        // another through a door with no depth budget of its own. The calls a
+        // body spliced here leaves behind keep the dispatch helper; the main
+        // path below is where the rows are produced.
         let c_ir_inline_resolver = |callee_class: &str, callee_method: &str, callee_desc: &str| {
-            resolve_ir_inline_site(shared, callee_cid, callee_class, callee_method, callee_desc)
+            resolve_ir_inline_site(
+                shared,
+                callee_cid,
+                callee_class,
+                callee_method,
+                callee_desc,
+                None,
+            )
         };
         // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
         // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
@@ -6716,6 +6731,23 @@ pub(super) fn compile_optimizing_artifact(
 
     // The optimizing tier's own inline resolver — see `resolve_ir_inline_site`
     // for how its admission set differs in both directions.
+    //
+    // `callee_compiler` as the direct-bind resolver, which is the SAME one this
+    // compile hands `try_compile` for its own call sites and the same one the
+    // single-pass `inline_resolver` above hands its spliced bodies. Until
+    // 2026-09-09 this argument was absent, and the note where it should have
+    // been said "`IrBuilder` has no direct-call lowering inside a relocated
+    // body to bake an entry into". That was true; it no longer is
+    // (`ir_direct_calls` is keyed by combined-buffer pc and
+    // `append_ir_inline_site` fills it), and while it was true every
+    // statically-bound call an optimizing splice left behind lowered to
+    // `jit_invoke_dispatch` and resolved its callee BY NAME on every
+    // execution — the measured 3.5x loss the sibling's own comment describes,
+    // paid on the tier that is supposed to be the fast one.
+    //
+    // Using the same resolver as the sibling matters beyond symmetry: it bounds
+    // its own recursion (depth, cycle, fan-out), which is why the sibling's
+    // comment gives reuse as the reason not to write a lookup by hand here.
     let ir_inline_resolver = |callee_class: &str,
                               callee_method: &str,
                               callee_desc: &str|
@@ -6726,6 +6758,11 @@ pub(super) fn compile_optimizing_artifact(
             callee_class,
             callee_method,
             callee_desc,
+            if cratonvm_jit::ir_splice_direct_call_enabled() {
+                Some(&callee_compiler as InlineDirectBind<'_>)
+            } else {
+                None
+            },
         )
     };
     // Main-path small-method inlining is GATED default-OFF behind
@@ -8539,10 +8576,22 @@ pub(super) fn try_jit_compile_callee_slow(
     };
 
     // The optimizing tier's own inline resolver. Same three-name question, a
-    // different admission set — see `resolve_ir_inline_site`. No direct-bind
-    // resolver: a spliced body's remaining calls go through the dispatch helper
-    // on this path, and `IrBuilder` has no direct-call lowering inside a
-    // relocated body to bake an entry into.
+    // different admission set — see `resolve_ir_inline_site`.
+    //
+    // This passed NO direct-bind resolver until 2026-09-09, on the stated
+    // grounds that "`IrBuilder` has no direct-call lowering inside a relocated
+    // body to bake an entry into". That was true and is no longer: the
+    // `ir_direct_calls` map is keyed by COMBINED-BUFFER pc, `ir_lower`'s
+    // `Op::Call` arm looks a spliced pc up in it like any other, and
+    // `append_ir_inline_site` now produces the rows. Without the binder here
+    // those rows are all empty, so every statically-bound call a splice left
+    // behind kept resolving its callee BY NAME on every execution — the
+    // measured 3.5x loss the single-pass sibling's comment above describes,
+    // paid on the tier that is supposed to be the fast one.
+    //
+    // The same lookup-only closure the single-pass sibling uses, and for the
+    // same reason: it binds an ALREADY-compiled callee and never compiles one,
+    // so planning cannot recurse into compilation here.
     let ir_inline_resolver = |callee_class: &str,
                               callee_method: &str,
                               callee_desc: &str|
@@ -8553,6 +8602,11 @@ pub(super) fn try_jit_compile_callee_slow(
             callee_class,
             callee_method,
             callee_desc,
+            if cratonvm_jit::ir_splice_direct_call_enabled() {
+                Some(&direct_callee_lookup as InlineDirectBind<'_>)
+            } else {
+                None
+            },
         )
     };
 
@@ -9680,6 +9734,7 @@ pub(super) fn resolve_ir_inline_site(
     callee_class: &str,
     callee_method: &str,
     callee_desc: &str,
+    direct_bind: Option<InlineDirectBind<'_>>,
 ) -> Option<cratonvm_jit::InlineSite> {
     resolve_inline_site_from(
         shared,
@@ -9689,7 +9744,7 @@ pub(super) fn resolve_ir_inline_site(
         callee_method,
         callee_desc,
         0,
-        None,
+        direct_bind,
         true,
     )
 }
@@ -10184,10 +10239,51 @@ fn resolve_inline_site_from(
                 scan_pc += 1;
                 continue;
             }
-            // No `static_field_info` is rebased into the builder's tables, so a
-            // spliced `getstatic` would find no row and bail the whole method
-            // AFTER the walk had committed to the body.
-            0xb2 | 0xb3 if ir_mode => no!("ir-splice-static-field"),
+            // `getstatic` was refused here until 2026-09-09, with the note
+            // "no `static_field_info` is rebased into the builder's tables, so
+            // a spliced `getstatic` would find no row and bail the whole
+            // method AFTER the walk had committed to the body". That was an
+            // accurate description of the plumbing and not of any modelling
+            // problem: `static_field_info` below has resolved these rows for
+            // the single-pass inliner since it existed, and
+            // `append_ir_inline_site` now rebases them into
+            // `IrInlineTables::static_field_info`, which the builder's own
+            // `0xb2` arm reads exactly as it reads a caller's site.
+            //
+            // The refusal was expensive out of proportion to its cause, in the
+            // same way the `ldc` one was: `getstatic` is the single largest
+            // opcode in the ir-coverage survey (92 of 273 events), because a
+            // static-table read behind an accessor is what framework code is
+            // mostly made of.
+            //
+            // `putstatic` (0xb3) stays refused, and this one IS modelling. The
+            // builder has no arm for it at all, and a static reference write
+            // owes an SATB pre-barrier that lives on the single-pass
+            // `jit_putstatic_*` path — statics are a Rust-side table, not the
+            // heap, so no collector `set_field` barrier covers them.
+            0xb3 if ir_mode => no!("ir-splice-putstatic"),
+            //
+            // Handled here rather than by falling through to the ordinary
+            // `0xb2 | 0xb3` arm below, because that arm is guarded by
+            // `inline_no_static` — `CRATONVM_INLINE_ALLOW_STATIC`, which is
+            // OFF by default. That switch belongs to the single-pass inline
+            // mini-emitter (`x64/inlining.rs`), which materialises a static
+            // read as a baked address and is the reason the gate exists. The
+            // optimizing tier does not go through that emitter at all: its
+            // `0xb2` arm builds an `Op::LoadStatic` whose lowering picks
+            // between the direct load and `helpers.getstatic` on the
+            // resolver's own already-initialised answer. Falling through would
+            // have made this feature a no-op under its own default and left
+            // the refusal UNNAMED, which is the failure the `no!` macro at the
+            // top of this function exists to prevent.
+            0xb2 if ir_mode => {
+                if !cratonvm_jit::ir::ir_splice_getstatic_enabled() {
+                    no!("ir-splice-static-field");
+                }
+                has_static_field_ops = true;
+                scan_pc += 3;
+                continue;
+            }
             // invokevirtual / invokestatic / invokeinterface inside the
             // spliced body. These used to reject the site outright — the
             // emitter had no arm for them and, more fundamentally, nothing
@@ -10676,6 +10772,15 @@ fn resolve_inline_site_from(
                 type_tag,
                 resolved.is_volatile,
             ));
+        } else if ir_mode {
+            // An unresolvable site is DROPPED for the single-pass emitter,
+            // which bails that one site and keeps the rest of the body. The
+            // optimizing tier has no such fallback: a `getstatic` with no row
+            // bails the whole METHOD, after the splice has been committed to.
+            // Refuse the body instead — the callee is still compiled and still
+            // called, it is just not spliced. Same trade, and the same
+            // sentence, as `ir-splice-new-site-unresolved`.
+            no!("ir-splice-static-field-unresolved");
         }
     }
 
