@@ -538,3 +538,32 @@ At the shipped default these two classes are 0/4, and with the trigger alone
 0/4, because `unrewritable_conservative_jit_roots` refuses the cycles. It is a
 blocker for restoring moving-young engagement, not for the shipped
 configuration.
+
+### 16.9 A sibling with the same shape and a different mechanism
+
+`docs/known-issues/springboot/bindabletests-moving-young-leaves-a-frame-slot-unremapped-20260908.md`
+was filed the same day by another session and reports the same three-part
+signature from the other side of the tier boundary:
+
+* an **operand-stack** entry naming an address a moving young cycle vacated;
+* on a thread that was healed for that very collection
+  (`heap_collection == thread_last_heal`, the interpreter-side spelling of
+  §16.3's `cycle == relocating_cycles`);
+* deterministic, and only under the moving Cheney cycle.
+
+**They are not the same bug and should not be merged.** That page reports
+`moving-no-jit-frames-live=1203` — *no compiled frame is live at any collection
+in that workload* — so the JIT oop-marking gap §16.4 names cannot be its cause;
+its slots are `Value::Object(Some(_))` in interpreter frames, already tagged,
+and its open question is whether the address was in that cycle's `pointer_map`
+at all.
+
+What is worth carrying across is the shape. Both are **the most recently pushed
+operand** (theirs `stack[0]` eight times out of eight; mine the receiver staged
+for a pending call), both survive a remap that ran, and neither is a
+lost-tag/liveness-filter problem — that page ruled the liveness filter out with
+`CRATONVM_NO_LOCAL_LIVENESS=1`, and this one rules out lost tags because the
+JIT's own mark vector says `false` for a slot the bytecode proves is a
+reference. If one mechanism turns out to explain both, the top-of-operand-stack
+entry across a GC-capable call is where to look; until then they are two
+findings that agree about where to point.
