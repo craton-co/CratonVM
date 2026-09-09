@@ -1,6 +1,7 @@
 # `ServiceLoader.loadInstalled` finds nothing, so every service the JDK looks up through the platform loader is silently empty
 
-**Status:** open, root cause identified 2026-09-09.
+**Status:** FIXED 2026-09-09 (`claude/jdkonly-svcloader-20260909`). One
+locale residual remains and is localised in section 8.
 **Applies to:** JDK 21 and JDK 25, `--real-jdk` and `--jdk-only` (measured on
 Linux; see "scope" below).
 **Severity:** wide. This is not a locale defect. It is a `ServiceLoader` defect
@@ -91,13 +92,15 @@ empty, which is why this is stated as a general defect rather than a locale one.
 `java.time.chrono.Chronology` is 0 on BOTH VMs and is therefore a control, not
 evidence.
 
-**Not established:** that this is the whole story for the Windows `textformat`
-row. The 2026-09-08 Windows narrowing recorded `--real-jdk` answering German
-data CORRECTLY while only `--jdk-only` was wrong; on Linux both modes fall back.
-Candidates, untested: Windows has a real `HostLocaleProviderAdapter` that Linux
-does not, and it may claim `de-DE` on the `--real-jdk` arm and mask this;
-different builds/images/dates; mode as a second independent variable. Do not
-quote this page as "mode-independent" until that is resolved.
+**Not the whole story for the `textformat` row -- RESOLVED in section 8.** This
+section used to record an unexplained conflict: the 2026-09-08 Windows
+narrowing measured `--real-jdk` correct and `--jdk-only` wrong, while Linux
+showed both wrong, and "those cannot both be the whole story". They could not,
+and neither was: there were TWO variables stacked. `loadInstalled` is the
+dominant one and is mode-independent; removing it unmasks a second that is
+specific to `--jdk-only` on JDK 21, at which point the Linux result reproduces
+the Windows pattern exactly. The candidate blamed here at the time -- Windows
+having a real `HostLocaleProviderAdapter` -- was not needed to explain it.
 
 Also noticed and NOT chased: under `load()`, CratonVM's `JrtFileSystemProvider`
 instantiation reports a `NoSuchMethodError` where HotSpot does not. Unrelated to
@@ -130,65 +133,107 @@ refutations in section 3.
 Keep `en-US` as a control in any locale probe: it reads the same on a healthy
 and a broken VM, so a run where the control differs is a broken probe.
 
-## 7. Root cause, located
+## 7. Root cause, located -- and FIXED
 
-`native-builtins/src/jboss_jdkspecific.rs`, `register_module_in_loader_catalog`
-(~line 526). It registers **every** module into the catalog of
-`ClassLoader.getSystemClassLoader()`:
+`native-builtins/src/jboss_jdkspecific.rs::register_module_in_loader_catalog`
+registered **every** module against `ClassLoader.getSystemClassLoader()`. On a
+real JVM a module goes in the catalog of ITS OWN loader: `jdk.localedata`,
+`jdk.zipfs` and `jdk.charsets` belong to the PLATFORM loader and `java.base` to
+the BOOT loader. So `load()` (thread-context = app loader) walked the catalog
+everything had been dumped into and worked, while `loadInstalled()` (platform
+loader) walked one nothing was ever registered in.
 
-```rust
-let loader = match ctx.invoke(
-    "java/lang/ClassLoader", "getSystemClassLoader", "()Ljava/lang/ClassLoader;", &[],
-) { ... };
-let catalog = ctx.invoke("jdk/internal/module/ServicesCatalog", "getServicesCatalog",
-                         "(Ljava/lang/ClassLoader;)Ljdk/internal/module/ServicesCatalog;",
-                         &[Value::Object(Some(loader))]);
-```
+The module-to-loader MAPPING was already correct, which is why this needed
+three refutations to reach (`probes/ModuleLoaders.java` is that measurement).
 
-On a real JVM a module is registered in the catalog of **its own** class loader.
-`jdk.localedata` and `jdk.zipfs` belong to the PLATFORM loader (measured -- see
-below), so on HotSpot their providers live in the platform loader's catalog.
-CratonVM puts them all in the APP loader's catalog instead, and:
+Fixed on `claude/jdkonly-svcloader-20260909` by asking each module for its own
+loader, with the boot case routed to `BootLoader.getServicesCatalog()` --
+`ServiceLoader` reads boot-module providers from there specifically, so a plain
+`Module.getClassLoader()` swap would have silently dropped `java.base`'s own
+providers. A failed per-loader lookup degrades to the old system-loader
+behaviour rather than to no catalog at all.
 
-* `ServiceLoader.load(S)` uses the thread-context loader, which is the app
-  loader, so it walks the catalog everything was dumped into -- and works.
-* `ServiceLoader.loadInstalled(S)` is `load(S, getPlatformClassLoader())`, so it
-  walks the platform loader's catalog -- into which nothing was ever
-  registered -- and returns empty.
-
-The module-to-loader mapping itself is CORRECT, which is why this took three
-refutations to find. Measured, identical on both VMs:
+### Measured after the fix
 
 ```
-  jdk.localedata  loader = platform   jdk.zipfs  loader = platform
-  jdk.charsets    loader = platform   java.base  loader = null (boot)
-  CLDRLocaleDataMetaInfo   module = jdk.localedata   loader = platform
+CratonVM 21 --jdk-only        load()   loadInstalled()
+  LocaleDataMetaInfo             2            2          (was 0)
+  FileSystemProvider             2            2          (was 0)
+  Chronology                     0            0          control, 0 on HotSpot too
 ```
 
-The function is named `register_module_in_loader_catalog` and takes the module,
-but never asks the module which loader it belongs to.
+and the CLDR adapter's supported set is repaired in **every** cell:
 
-**Proposed fix:** use the module's own loader (`Module.getClassLoader()`) rather
-than the system loader. Two things to get right, neither of which this page has
-tested:
+```
+                            CLDR availableLocales
+  HotSpot 21                       1063
+  CratonVM 21 --real-jdk           1063     (was 5)
+  CratonVM 21 --jdk-only           1063     (was 5)
+  CratonVM 25 --real-jdk           1152     (was 5)   1152 is JDK 25's own count
+  CratonVM 25 --jdk-only           1152     (was 5)
+```
 
-1. A module whose loader is the BOOT loader (`java.base`) answers `null`.
-   HotSpot keeps those in `BootLoader.getServicesCatalog()`, not in
-   `getServicesCatalog(null)`; check what CratonVM's
-   `ServicesCatalog.getServicesCatalog` does with a null argument before
-   assuming it is equivalent.
-2. The existing behaviour is load-bearing for the case this code was written
-   for -- `regression-suite/src/RJdkModule.java` and
-   `ServiceLoader.load(layer, Service.class)`. A `--module-path` module's loader
-   IS the app loader, so it should still land in the app catalog, but that
-   vector must be re-run rather than reasoned about.
+The user-visible symptom is fixed in three of the four cells, matching HotSpot
+exactly including `fr-FR`'s narrow no-break space:
 
-**Not attempted in the branch that found it.** This is a module/class-loader
-change and the branch it was found on was already through its full gate set; a
-change of this shape needs its own run of the whole set, not a late amendment to
-someone else's green.
+```
+  DecimalFormatSymbols.getInstance(Locale.GERMANY)   decimal
+  HotSpot 21                                         U+002C
+  CratonVM 21 --real-jdk                             U+002C   fixed
+  CratonVM 21 --jdk-only                             U+002E   STILL WRONG
+  CratonVM 25 --real-jdk                             U+002C   fixed
+  CratonVM 25 --jdk-only                             U+002C   fixed
+```
+
+## 8. The residual, and what it resolves
+
+**`--jdk-only` on JDK 21 still answers US separators**, and it is now precisely
+localised: the adapter's supported set is a full 1063 in that cell, so the
+adapter KNOWS `de-DE` and the data lookup still comes back US. Whatever is left
+is downstream of the supported-locale set, is specific to `--jdk-only`, and is
+specific to JDK 21 (the same mode on JDK 25 is correct).
+
+That **resolves the conflict this page previously recorded as unexplained.** The
+2026-09-08 Windows narrowing measured `--real-jdk` correct and `--jdk-only`
+wrong; the Linux measurement before this fix showed both wrong. Both were true:
+there were two variables stacked. Removing the dominant one (`loadInstalled`,
+which is mode-independent) unmasks a second one that is mode- and
+version-specific -- and the Linux result now reproduces the Windows pattern
+exactly. The earlier "cannot both be the whole story" was right; neither was.
+
+**Correction to this page's own framing.** Section 2 attributed the symptom to
+`LocaleProviderAdapter.getAdapter` returning `FallbackLocaleProviderAdapter`.
+That reading is a correlated observation, not the deciding one: after the fix
+the reflective `getAdapter` call in `probes/LocaleAdapter.java` STILL reports
+`Fallback` in every cell, including the three where the separators are now
+correct. So that probe line does not reflect the path
+`DecimalFormatSymbols.getInstance` actually takes, and should not be used as the
+verdict. **The verdict is the separator values and the `availableLocales`
+count.** Read section 2's chain as the shape of the failure, not as five
+measured steps.
+
+## 9. Reproducing
+
+`probes/LoadInstalled.java` is the direct test and takes one run:
+
+```
+cratonvm -cp . LoadInstalled
+#   load()          = 2
+#   loadInstalled() = 2      <- 0 before the fix
+```
+
+`probes/CldrLocales.java` (the 1063 count), `probes/LocaleAdapter.java` (the
+separators -- read the separators, not the adapter line), `probes/CldrWhich.java`,
+`probes/LocaleModule.java` and `probes/LocaleTags.java` (the two refutations that
+showed a healthy module graph and healthy provider data).
+
+Keep `en-US` as a control in any locale probe: it reads the same on a healthy
+and a broken VM, so a run where the control differs is a broken probe.
+
+Also noticed and NOT chased: under `load()`, CratonVM's `JrtFileSystemProvider`
+instantiation reports a `NoSuchMethodError` where HotSpot does not. It does not
+appear under `loadInstalled()`. Unrelated, possibly its own defect.
 
 Related: `docs/known-issues/jdk-only/the-first-jdk-21-run-found-the-javalangaccess-carrier-is-pinned-to-system-1-20260908.md`
-finding #4, which this completes, and the `W6-11` diagnosis referenced from
-`jboss_jdkspecific.rs`, which is where the app-loader catalog registration came
-from in the first place.
+finding #4, and the `W6-11` diagnosis referenced from `jboss_jdkspecific.rs`,
+which is where the app-loader catalog registration came from.
