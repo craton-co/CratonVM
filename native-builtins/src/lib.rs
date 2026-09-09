@@ -7358,6 +7358,93 @@ pub(crate) fn java_long_to_string_radix(val: i64, radix: i32) -> String {
     buf.into_iter().rev().collect()
 }
 
+/// The process-wide `System.getProperties()` receiver, allocated once.
+///
+/// Factored out of that native's body because there are now two bodies for it,
+/// one per compatibility mode, and the object's IDENTITY is the half that
+/// must not differ between them: HotSpot returns the same `System.props` object
+/// on every call, and `StandardEnvironmentTests.getSystemProperties` asserts
+/// `isSameAs`. A second copy of the singleton lookup is the shape that
+/// eventually grows a second cache.
+fn system_properties_object(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    match crate::lang_system::system_props_singleton(ctx.vm_identity()) {
+        Some(cached) => Ok(cached),
+        None => {
+            let p = crate::try_alloc_concurrent_synthetic(ctx, "java/util/Properties", 16)?;
+            crate::properties_sidetable::mark_system_props(ctx, p);
+            Ok(crate::lang_system::set_system_props_singleton(
+                ctx.vm_identity(),
+                p,
+            ))
+        }
+    }
+}
+
+/// `java.lang.System.getProperties()` — the `--real-jdk` body, unchanged.
+///
+/// Lifted out of a closure when the strict body below joined it, so the two
+/// are one registration with two bodies rather than two registrations of one
+/// triple: a duplicate `register` of this triple is a `shadowed_registrations`
+/// row, and `native-builtins/tests/duplicate_registration_gate.rs` freezes
+/// that population.
+fn native_system_get_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // Return a lightweight synthetic Properties object.  The
+    // Properties.getProperty/getProperty(default) native overrides
+    // below intercept the common read paths and delegate to our
+    // VM's system property store — so individual lookups work
+    // without touching the inherited Hashtable slots.
+    //
+    // However, callers that *enumerate* (Properties.forEach,
+    // stringPropertyNames, size, entrySet) read from the
+    // side-table directly. SmallRye / Quarkus's
+    // `PropertiesConfigSource` iterates `System.getProperties()`
+    // to materialise its config map; if the side-table is empty,
+    // expressions like `${user.country:}` resolve to the empty
+    // default — producing values like `quarkus.locales=en-`.
+    // Pre-populate the side-table with the current system
+    // property snapshot so enumeration sees the live values.
+    // Identity: reuse the cached singleton so `System.getProperties()
+    // == System.getProperties()` holds — HotSpot returns the same
+    // `System.props` object every call (SC-env-classreading RC-A,
+    // StandardEnvironmentTests.getSystemProperties `isSameAs`). On the
+    // first call build the synthetic Properties and mark it as the
+    // system-properties view so writes through it (e.g.
+    // `System.getProperties().setProperty(...)`) propagate to the global
+    // store — regular `new Properties()` objects must NOT (they'd pollute
+    // system properties and cross-contaminate other Properties).
+    let props = system_properties_object(ctx)?;
+    // Resync the side-table to the current system-property snapshot on
+    // every call — whether the object is fresh or cached — so enumeration
+    // (forEach/stringPropertyNames/entrySet/size) and `getProperty` see
+    // the live values. A wholesale REPLACE (not additive store) is
+    // required for the cached singleton: it drops keys removed by
+    // `System.clearProperty(...)` between calls, matching HotSpot
+    // (additive merge would leave a cleared property visible).
+    let snapshot = ctx.list_system_properties();
+    crate::properties_sidetable::replace_sidetable(ctx, props, &snapshot);
+    Ok(Some(Value::Object(Some(props))))
+}
+
+/// `java.lang.System.getProperties()` under `--jdk-only`: the same object,
+/// plus a real, populated `map`.
+///
+/// See [`crate::properties_sidetable::replace_real_map`] for the measurement
+/// and for what reads that field. The side-table store is kept as well as the
+/// real map, deliberately: strict mode still dispatches every
+/// `properties_sidetable` native until those triples are retired, so the two
+/// stores must agree rather than one replace the other. They are written from
+/// ONE snapshot, on the same call, for that reason.
+fn native_system_get_properties_jdk_only(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let props = system_properties_object(ctx)?;
+    let snapshot = ctx.list_system_properties();
+    crate::properties_sidetable::replace_sidetable(ctx, props, &snapshot);
+    crate::properties_sidetable::replace_real_map(ctx, props, &snapshot);
+    Ok(Some(Value::Object(Some(props))))
+}
+
 pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     register_essential_natives_with_shims(registry, app_shims::ShimSelection::ALL);
 }
@@ -10987,53 +11074,26 @@ pub fn register_essential_natives_with_shims(
     // — the 67 are in `properties_sidetable.rs` (32), `deprecated_util.rs`,
     // `deprecated_io_util.rs` and `wildfly_naming.rs`. The full table and the
     // rest of the cluster are on `register_properties_sidetable`.
+    //
+    // 2026-09-09 — THE CLUSTER'S FIRST MOVE, taken under `--jdk-only`. The note
+    // above asks for it in these words: *"make THIS return a real `Properties`
+    // — real `<init>`, real `map`"*. Strict mode now populates the real
+    // `java.util.concurrent.ConcurrentHashMap` in the real `map` field, which is
+    // what every JDK 25 `Properties` body reads.
+    //
+    // The branch is on the REGISTRY's mode and picks a BODY, not a second
+    // registration: §1.4's lever is registration, `NativeCallback` is a bare
+    // `fn` pointer that captures nothing, and `NativeContext` exposes no policy
+    // accessor — deliberately. Same shape as the `Runtime.loadLibrary0` arm in
+    // `lang_system.rs`. `--real-jdk` keeps the null `map` it has always had.
     registry.register(
         "java/lang/System",
         "getProperties",
         "()Ljava/util/Properties;",
-        |ctx, _args| {
-            // Return a lightweight synthetic Properties object.  The
-            // Properties.getProperty/getProperty(default) native overrides
-            // below intercept the common read paths and delegate to our
-            // VM's system property store — so individual lookups work
-            // without touching the inherited Hashtable slots.
-            //
-            // However, callers that *enumerate* (Properties.forEach,
-            // stringPropertyNames, size, entrySet) read from the
-            // side-table directly. SmallRye / Quarkus's
-            // `PropertiesConfigSource` iterates `System.getProperties()`
-            // to materialise its config map; if the side-table is empty,
-            // expressions like `${user.country:}` resolve to the empty
-            // default — producing values like `quarkus.locales=en-`.
-            // Pre-populate the side-table with the current system
-            // property snapshot so enumeration sees the live values.
-            // Identity: reuse the cached singleton so `System.getProperties()
-            // == System.getProperties()` holds — HotSpot returns the same
-            // `System.props` object every call (SC-env-classreading RC-A,
-            // StandardEnvironmentTests.getSystemProperties `isSameAs`). On the
-            // first call build the synthetic Properties and mark it as the
-            // system-properties view so writes through it (e.g.
-            // `System.getProperties().setProperty(...)`) propagate to the global
-            // store — regular `new Properties()` objects must NOT (they'd pollute
-            // system properties and cross-contaminate other Properties).
-            let props = match crate::lang_system::system_props_singleton(ctx.vm_identity()) {
-                Some(cached) => cached,
-                None => {
-                    let p = crate::try_alloc_concurrent_synthetic(ctx, "java/util/Properties", 16)?;
-                    crate::properties_sidetable::mark_system_props(ctx, p);
-                    crate::lang_system::set_system_props_singleton(ctx.vm_identity(), p)
-                }
-            };
-            // Resync the side-table to the current system-property snapshot on
-            // every call — whether the object is fresh or cached — so enumeration
-            // (forEach/stringPropertyNames/entrySet/size) and `getProperty` see
-            // the live values. A wholesale REPLACE (not additive store) is
-            // required for the cached singleton: it drops keys removed by
-            // `System.clearProperty(...)` between calls, matching HotSpot
-            // (additive merge would leave a cleared property visible).
-            let snapshot = ctx.list_system_properties();
-            crate::properties_sidetable::replace_sidetable(ctx, props, &snapshot);
-            Ok(Some(Value::Object(Some(props))))
+        if registry.compatibility_mode().is_jdk_only() {
+            native_system_get_properties_jdk_only
+        } else {
+            native_system_get_properties
         },
     );
     // Surefire bootstrap: Maven wraps system properties in

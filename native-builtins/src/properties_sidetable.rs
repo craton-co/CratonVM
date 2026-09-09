@@ -1115,6 +1115,188 @@ pub fn replace_sidetable(ctx: &dyn NativeContext, obj: ObjectRef, entries: &[(St
     table().lock().insert(k, m);
 }
 
+/// Replace the receiver's REAL `java.util.Properties.map` backing with
+/// `entries`, creating it if the object has none.
+///
+/// # The one null field this exists for
+///
+/// JDK 9 moved `Properties`' storage into a `ConcurrentHashMap` field named
+/// `map`, and JDK 25's own bodies read it directly — `getProperty` at
+/// `Properties.java:1145`, `clone` at `:1526`, `store0` at `:920`. The object
+/// `System.getProperties()` hands back is VM-built, and its `map` has been
+/// **permanently null** by construction: every native in this module exists to
+/// make that object behave like a `Map` without it. The registration comment on
+/// `java/lang/System.getProperties` (`native-builtins/src/lib.rs`) names itself
+/// the root of that cluster and names this as the cluster's first move —
+/// *"make THIS return a real `Properties` — real `<init>`, real `map` — not to
+/// move a tag."*
+///
+/// # Why it is worth doing, MEASURED 2026-09-09
+///
+/// It is the single precondition standing under a large §1.4 retirement, and
+/// that is not an inference — it is what two probes' stack traces say. Armed
+/// with `CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/concurrent/ConcurrentHashMap,
+/// java/util/Properties` (JDK 25.0.3, `--jdk-only`), the pair that neither
+/// class can pass alone:
+///
+/// ```text
+///                          CHM alone              CHM + Properties
+///   MapViewsShadowSweep    53 diffs, DIED 261/302   0 diffs, 302/302
+///   ChmShadowSweep         0 over 28 671 yields     0 over 28 654 yields
+/// ```
+///
+/// `MapViewsShadowSweep` is the probe that rejected the `ConcurrentHashMap`
+/// retirement on 2026-08-30, and it goes clean the moment CHM's *user* is
+/// retired with it — the coupling was never CHM's own state. What is left is
+/// two crashes, and both name this field:
+///
+/// ```text
+///   NullPointerException: Cannot invoke
+///     "java.util.concurrent.ConcurrentHashMap.get(Object)" because "this.map" is null
+///       at java/util/Properties.getProperty(Properties.java:1145)
+///       at jdk/internal/util/StaticProperty.<clinit>
+///
+///   NullPointerException: Cannot invoke "java.util.Map.size()" because "m" is null
+///       at java/util/Properties.clone(Properties.java:1526)
+///       at java/util/concurrent/ConcurrentHashMap.<init>(ConcurrentHashMap.java:863)
+/// ```
+///
+/// It is also the standing precondition the `retired_shadow` G60-1 section
+/// records for retiring `Properties.getProperty`'s two overloads, in those
+/// words: *"the native which builds the system `Properties` initialise the real
+/// `map` field."*
+///
+/// # Wholesale replace, not an additive merge
+///
+/// Same contract as [`replace_sidetable`], and for the same reason: this runs
+/// on EVERY `System.getProperties()` call against a cached singleton, so an
+/// additive store would leave a property cleared by `System.clearProperty`
+/// between calls visible to any body that reads the real map. `clear()` first.
+///
+/// # The return value is the fact a caller cannot otherwise get
+///
+/// Entries actually written, and `0` whenever the fill did not complete. The
+/// difference between "populated" and "silently empty" is invisible from the
+/// receiver — both are a non-null `map` — and it is the difference between the
+/// real bytecode working and it answering `null` for `java.home`.
+///
+/// # GC
+///
+/// Every `put` re-enters Java and is therefore a GC point, so the receiver and
+/// the map are pinned and re-read across the loop rather than carried. This is
+/// the loop-carried stale receiver the 2026-09 sweep pinned 52 of; a raw
+/// `ObjectRef` held across `invoke_virtual` names a from-space address, and a
+/// write through one is a wrong answer nothing reports.
+pub fn replace_real_map(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    entries: &[(String, String)],
+) -> usize {
+    let this_pin = ctx.pin_native_root(this);
+    let mut this_cur = ctx.read_native_pin(this_pin, this);
+
+    let existing = match ctx.get_field_by_name(this_cur, "map") {
+        Value::Object(Some(m)) => Some(m),
+        _ => None,
+    };
+    let chm = match existing {
+        Some(m) => m,
+        None => {
+            // `new_object_initialized` rather than `new_object` + a separate
+            // `invoke`: the two-step form leaves the fresh object unrooted
+            // across the constructor call.
+            let created =
+                ctx.new_object_initialized("java/util/concurrent/ConcurrentHashMap", "()V", &[]);
+            let m = match created {
+                Ok(Some(Value::Object(Some(m)))) => m,
+                other => {
+                    if props_stderr_diag() {
+                        eprintln!("[PROPS-REAL-MAP] could not construct the backing map: {other:?}");
+                    }
+                    ctx.unpin_native_roots(this_pin);
+                    return 0;
+                }
+            };
+            this_cur = ctx.read_native_pin(this_pin, this_cur);
+            ctx.set_field_by_name(this_cur, "map", Value::Object(Some(m)));
+            m
+        }
+    };
+
+    let chm_pin = ctx.pin_native_root(chm);
+    let mut chm_cur = ctx.read_native_pin(chm_pin, chm);
+    let mut trouble: Option<String> = None;
+
+    // Only a map we did NOT just create can hold anything to drop. The
+    // distinction is not tidiness: an unconditional `clear()` whose failure
+    // returned early left the receiver holding a NON-NULL EMPTY map, and that
+    // is strictly worse than the null it replaced. Real `Properties.getProperty`
+    // stops throwing and starts answering `null`, `StaticProperty.<clinit>`
+    // turns that into `InternalError: null property: java.home`, and every
+    // `size()`/`keySet()` reads 0 on a live system-properties object. MEASURED
+    // that way on the first cut of this function: `SysPropsRealMapProbe` armed
+    // answered `false` on six of ten rows where unarmed answered `true`.
+    if existing.is_some() {
+        if let Err(e) = ctx.invoke_virtual(chm_cur, "clear", "()V", &[]) {
+            trouble = Some(format!("clear: {e:?}"));
+        }
+        chm_cur = ctx.read_native_pin(chm_pin, chm_cur);
+    }
+
+    let mut written = 0usize;
+    for (key, value) in entries {
+        if key.len() > MAX_KV_LEN || value.len() > MAX_KV_LEN {
+            continue;
+        }
+        let k_obj = ctx.create_string(key);
+        let k_pin = ctx.pin_native_root(k_obj);
+        let v_obj = ctx.create_string(value);
+        let k_cur = ctx.read_native_pin(k_pin, k_obj);
+        chm_cur = ctx.read_native_pin(chm_pin, chm_cur);
+        let put = ctx.invoke_virtual(
+            chm_cur,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(k_cur)), Value::Object(Some(v_obj))],
+        );
+        match put {
+            Ok(_) => written += 1,
+            Err(e) => {
+                if trouble.is_none() {
+                    trouble = Some(format!("put {key:?}: {e:?}"));
+                }
+            }
+        }
+        ctx.unpin_native_roots(k_pin);
+        chm_cur = ctx.read_native_pin(chm_pin, chm_cur);
+    }
+
+    // The invariant: the real `map` holds the snapshot, or it is ABSENT. A
+    // half-filled or empty map is the one state nothing can detect — every
+    // reader answers plausibly and wrongly — so an incomplete fill puts the
+    // receiver back the way it was found and lets the null be loud again.
+    // Safe to do unconditionally here because the only receiver this runs on is
+    // the VM's own `System.getProperties()` singleton, whose real map has no
+    // writer but this function.
+    let complete = trouble.is_none() && written > 0;
+    if !complete {
+        this_cur = ctx.read_native_pin(this_pin, this_cur);
+        ctx.set_field_by_name(this_cur, "map", Value::Object(None));
+        written = 0;
+    }
+    if props_stderr_diag() && !complete {
+        eprintln!(
+            "[PROPS-REAL-MAP] INCOMPLETE: wrote {written} of {} entries, pre-existing map = {},              first trouble = {}",
+            entries.len(),
+            existing.is_some(),
+            trouble.as_deref().unwrap_or("none (empty snapshot?)")
+        );
+    }
+
+    ctx.unpin_native_roots(this_pin);
+    written
+}
+
 /// Public snapshot of side-table entries for a given object, used by
 /// surefire `setAsSystemProperties` etc. to iterate entries without
 /// going through the inner Map field.
