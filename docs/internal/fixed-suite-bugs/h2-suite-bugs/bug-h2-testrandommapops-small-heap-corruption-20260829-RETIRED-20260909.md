@@ -43,9 +43,9 @@ operation sequence — same key range, same fifteen-way op mix, same
 "file" whose header the `NullPointerException` face fails to read is the same
 heap-resident byte arrays — with a bounded pass count, and RETURNS.
 
-At `--Xmx 256m`: **`MVSTORE_RANDOM_OPS PASS`** on **twelve** full-size runs
+At `--Xmx 256m`: **`MVSTORE_RANDOM_OPS PASS`** on **fifteen** full-size runs
 (40 × 3000, or 25 × 3000 for one) across every arm below, 459–1131 s each,
-plus two shorter smoke runs. Those are passes, not caps — the driver returns
+plus one each at `1g` and `4g` and two shorter smoke runs. Those are passes, not caps — the driver returns
 `0` having checked every operation against a `TreeMap` oracle, including the
 `get`/`ceilingKey`/`floorKey`/`higherKey`/`lowerKey`/`size`/`firstKey`/
 `lastKey` comparison and six cursor range scans on every one of the 120 000
@@ -59,6 +59,27 @@ SIGTERMed VM never reaches `vm-cli`'s exit summary, and that summary is where
 process that was killed before it could print one** — which is
 indistinguishable from a counter that never fired, and is the exact failure
 mode the page spent two addenda learning to recognise in other instruments.
+
+### The heap axis, which the 2026-08-30 L7 addendum said was the wrong premise
+
+That addendum's headline was *"it is NOT a small-heap defect — 4g fails
+too"*, on rows reading `1g FAIL 4 of 4` and `4g FAIL 1053s`. The
+2026-09-02 (later) addendum already withdrew them (1500 s clean at both).
+Re-measured here on the terminating driver, so these are passes rather than
+caps:
+
+| heap | runs | verdict | time |
+|---|---:|---|---|
+| `--Xmx 256m` | 2 | `MVSTORE_RANDOM_OPS PASS` | 715 s, 661 s |
+| `--Xmx 1g` | 1 | `MVSTORE_RANDOM_OPS PASS` | 647 s |
+| `--Xmx 4g` | 1 | `MVSTORE_RANDOM_OPS PASS` | 693 s |
+
+The `AssertionError: Expected: N actual: M` face — a map short of entries,
+which that addendum called *"silent data loss … the one that scales UP with
+heap"* — does not appear at any of the three. The driver checks `size()`,
+`get`, all four navigation methods and six cursor range scans against a
+`TreeMap` oracle after **every** operation, so a short map has 120 000
+opportunities per run to be caught.
 
 ## The controls, which are the reason this is a closure and not a quiet week
 
@@ -296,6 +317,13 @@ Arms worth having, in the order to run them:
 **Record `/proc/loadavg` beside `rc` on every run.** That rule is the one
 piece of methodology this page got right early and had to re-learn twice, and
 it is why the ten runs above are serial.
+
+## Gates
+
+`regression-suite/run.sh` on the same binary: **92 passed, 0 failed** (92 of
+92 scheduled vectors, 0 list/coverage errors, 0 harness-blindness flags).
+`cargo test` green for `cratonvm-types`, `cratonvm-gc`, `cratonvm-jit --lib`
+and `cratonvm-vm --lib`.
 
 ---
 
