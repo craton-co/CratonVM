@@ -1462,11 +1462,14 @@ impl IrInlineFrameSites {
 /// resolution pass, and applying half of them would leave the walk bailing in
 /// the middle of a body it had already committed to.
 ///
-/// What is NOT here is what v1 refuses in a spliced body: `ldc` / `ldc2_w`
-/// (the resolver records a raw `i64` where the builder wants the value plus its
-/// float/double discriminator, and inventing that bit is how a `long` constant
-/// becomes a `double`), `getstatic` / `putstatic`, `anewarray`, `checkcast` and
-/// `instanceof`. A callee using any of them is refused whole at resolution.
+/// What is NOT here is what the resolver still refuses in a spliced body:
+/// `putstatic`, `anewarray`, `checkcast` and `instanceof`. A callee using any
+/// of them is refused whole at resolution. `ldc` / `ldc2_w` and `getstatic`
+/// were on that list and came off it, in both cases because the refusal was
+/// PLUMBING rather than modelling -- the rows existed and nothing rebased
+/// them. `putstatic` is the one that is genuinely modelling: the builder has
+/// no arm for it, and a static reference write owes an SATB pre-barrier the
+/// single-pass `jit_putstatic_*` path carries.
 #[derive(Clone, Debug, Default)]
 pub struct IrInlineTables {
     /// The bodies themselves, keyed by CALLER pc.
@@ -1497,6 +1500,24 @@ pub struct IrInlineTables {
     /// `pc → (bits, is_double)` for the `ldc2_w` sites inside spliced bodies.
     /// Same shape and same reason as [`Self::ldc_info`].
     pub ldc2w_info: HashMap<usize, (i64, bool)>,
+    /// `pc -> (class_id, field_index, type_tag, is_volatile)` for the
+    /// `getstatic` sites inside spliced bodies, rebased into combined-buffer
+    /// coordinates and merged into the builder's own `static_field_info`.
+    ///
+    /// Same shape and same reason as [`Self::ldc_info`], and the same class of
+    /// cause: the rows were resolvable all along -- `InlineSite` has carried
+    /// `static_field_info` for the single-pass inliner since it existed -- and
+    /// the optimizing tier refused every callee containing a `getstatic`
+    /// (`ir-splice-static-field`) because nothing rebased them. `getstatic` is
+    /// the single largest opcode in the ir-coverage survey (92 of 273 events),
+    /// so the refusal fell on the callee shape framework code is mostly made
+    /// of: a static-table read behind an accessor.
+    ///
+    /// `putstatic` (0xb3) stays refused, and not for a plumbing reason: the
+    /// builder has no arm for it at all, and a static reference WRITE owes an
+    /// SATB pre-barrier that lives on the single-pass `jit_putstatic_*` path.
+    /// The resolver refuses it separately so the two sides cannot disagree.
+    pub static_field_info: HashMap<usize, (u32, usize, u8, bool)>,
 }
 
 /// The builder's state for one splice in progress.
@@ -5550,6 +5571,7 @@ impl IrBuilder {
             object_init_pcs,
             ldc_info,
             ldc2w_info,
+            static_field_info,
         } = tables;
         self.inline_sites.extend(sites);
         self.field_info.extend(field_info);
@@ -5562,6 +5584,11 @@ impl IrBuilder {
         // spaces are disjoint by construction.
         self.ldc_info.extend(ldc_info);
         self.ldc2w_info.extend(ldc2w_info);
+        // Same merge and same disjointness argument as the `ldc` rows above:
+        // `set_static_field_info` has already installed the caller's own
+        // `getstatic` sites, keyed by its own pcs, and a spliced body's pcs are
+        // combined-buffer pcs at or past `code_len`.
+        self.static_field_info.extend(static_field_info);
     }
 
     /// How many splices [`Self::build`] performed. Diagnostic only.
@@ -6528,7 +6555,6 @@ impl IrBuilder {
         // expansion's two loads need. See `string_access_site_pcs`.
         reset_string_access_sites();
         reset_site_traps_this_build();
-        SPLICED_MERGE_SEEN.with(|c| c.set(false));
         // Consume the verifier's canonical decode/CFG contract instead of
         // maintaining a second opcode-length scanner in the compiler.
         let verified = cratonvm_reader::verified_code(code.get(..code_len)?).ok()?;
@@ -6683,11 +6709,6 @@ impl IrBuilder {
             // so the locals and operand stack this snapshots are the callee's
             // throughout — the same invariant the caller's own merges rely on.
             if self.merges.contains_key(&pc) {
-                // A merge inside a relocated body disqualifies this artifact
-                // from the optimizing OSR door. See `SPLICED_MERGE_SEEN`.
-                if !self.splice.is_empty() {
-                    note_spliced_merge();
-                }
                 // Add current state as predecessor (fall-through). On a loop
                 // header this is the forward-entry predecessor; the back-edge
                 // arrives later and is back-patched (see add_merge_predecessor).
@@ -10363,6 +10384,31 @@ pub fn ir_splice_branch_enabled() -> bool {
     })
 }
 
+/// May a spliced callee body contain a `getstatic`? **Default ON**;
+/// `CRATONVM_JIT_IR_SPLICE_GETSTATIC=0` restores the `ir-splice-static-field`
+/// refusal.
+///
+/// Read by BOTH halves, for the same reason and with the same hazard as
+/// [`ir_splice_branch_enabled`]: the splice scanner in `jit_bridge` decides
+/// whether to admit such a callee, and [`IrInlineTables::static_field_info`] is
+/// what carries the rows the builder's `0xb2` arm then looks up. A body
+/// admitted without its rows does not fall back -- the builder bails the whole
+/// METHOD at the first spliced `getstatic`, which is how the `ldc` rows
+/// behaved for their first hour. Neither half may be flipped alone.
+///
+/// `putstatic` is NOT covered by this switch in either direction. It stays
+/// refused unconditionally; see [`IrInlineTables::static_field_info`].
+pub fn ir_splice_getstatic_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPLICE_GETSTATIC").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
 pub fn ir_scalar_intrinsics_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -10377,50 +10423,6 @@ pub fn ir_scalar_intrinsics_enabled() -> bool {
 /// Scalar-intrinsic sites lowered as arithmetic, this process.
 static SCALAR_INTRINSICS_LOWERED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-
-thread_local! {
-    /// Did the build just finished activate a merge INSIDE a spliced body?
-    ///
-    /// Set by [`IrBuilder::build`]'s walk, reset at its entry, and read by
-    /// `try_compile_inner` the moment it returns — the same one-shot
-    /// thread-local shape `reset_string_access_sites` /
-    /// `string_access_site_pcs` already use, and for the same reason: the
-    /// builder is consumed by `build`, so there is nothing left to ask
-    /// afterwards.
-    ///
-    /// # What it gates, and why
-    ///
-    /// A body with a merge inside a relocated callee MUST NOT be entered
-    /// through the optimizing OSR door. Measured on `Min1.clamp` (an
-    /// `if/else if/else` funnelling to one return, spliced into a counted
-    /// loop): entering the optimizing artifact at the loop header produces a
-    /// WRONG and RUN-TO-RUN VARYING checksum, while the identical body reached
-    /// through the method-entry compile is correct on the same workload
-    /// (`Min2`, 400 000 invocations, exact parity with HotSpot). Turning off
-    /// only `CRATONVM_JIT_IR_OSR_ENTRY` restores correctness with the splice
-    /// still enabled, which is what localises the defect to the OSR entry stub
-    /// rather than to the splice or to the graph — the graph was read node by
-    /// node and its phis are right.
-    ///
-    /// So the refusal is placed at the door that is broken, not at the feature
-    /// that exposed it: such an artifact publishes NO `ir_osr_entries`, the OSR
-    /// door finds no stub for its pc and falls back to the single-pass OSR
-    /// body, and the method-entry population keeps the inlining.
-    ///
-    /// Lifting this needs `emit_osr_entry_stubs` understood and fixed; it is
-    /// not a property of splicing that cannot be supported.
-    static SPLICED_MERGE_SEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-fn note_spliced_merge() {
-    SPLICED_MERGE_SEEN.with(|c| c.set(true));
-}
-
-/// Did the most recent [`IrBuilder::build`] on this thread activate a merge
-/// inside a spliced body? See [`SPLICED_MERGE_SEEN`].
-pub fn spliced_merge_was_built() -> bool {
-    SPLICED_MERGE_SEEN.with(|c| c.get())
-}
 
 /// Conditional branches replaced by a guard plus an unconditional jump, this
 /// process. See [`IrBuilder::prune_always_taken_branch`].
@@ -11258,6 +11260,71 @@ mod tests {
         assert!(has_if, "Should contain an If node");
         let has_cmp = graph.nodes.iter().any(|n| matches!(n.op, Op::Cmp(_)));
         assert!(has_cmp, "Should contain a Cmp node");
+    }
+
+    /// A spliced `getstatic` resolves through `IrInlineTables::static_field_info`,
+    /// and a MISSING row bails the whole method.
+    ///
+    /// Both halves matter, and the second is the one with no other witness.
+    /// `ldc` spent its first hour in exactly this state -- the resolver
+    /// admitting a callee whose rows nothing rebased, and the builder refusing
+    /// the METHOD 65 bytes later, which from outside is indistinguishable from
+    /// a workload that has no such callee. Asserting only the positive would
+    /// leave the same hole: a future edit that drops the row from
+    /// `apply_inline_tables` would still pass.
+    #[test]
+    fn a_spliced_getstatic_resolves_through_the_rebased_rows() {
+        // Caller: `static int f() { return g(); }`
+        //   pc 0  invokestatic #1   (spliced)
+        //   pc 3  ireturn
+        // Callee body, relocated to combined pc 5:
+        //   pc 5  getstatic #2
+        //   pc 8  ireturn
+        let code = [
+            0xb8, 0x00, 0x01, 0xac, 0x00, // caller, code_len 4 (byte 4 is padding)
+            0xb2, 0x00, 0x02, 0xac, // relocated callee at [5, 9)
+            0, 0,
+        ];
+        let site = IrInlineSite {
+            base: 5,
+            code_len: 4,
+            num_args: 0,
+            max_locals: 0,
+            arg_local_slots: Vec::new(),
+            returns_value: true,
+            receiver_is_arg0: false,
+            method_key: "P.g:()I".to_string(),
+            class_id: 7,
+        };
+
+        let mut with_rows = IrBuilder::new(0, 1);
+        let mut tables = IrInlineTables::default();
+        tables.sites.insert(0, site.clone());
+        // The row `append_ir_inline_site` rebases: CALLEE pc 0 + base 5.
+        tables
+            .static_field_info
+            .insert(5, (7u32, 0usize, b'I', false));
+        with_rows.apply_inline_tables(tables);
+        let graph = with_rows
+            .build(&code, 4)
+            .expect("a spliced getstatic with its row must build");
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::LoadStatic { class_id: 7, .. })),
+            "the spliced `getstatic` must lower to an Op::LoadStatic naming the              resolved class, not to a call left behind by a skipped splice",
+        );
+
+        // Same site, same bytes, no row.
+        let mut without_rows = IrBuilder::new(0, 1);
+        let mut bare = IrInlineTables::default();
+        bare.sites.insert(0, site);
+        without_rows.apply_inline_tables(bare);
+        assert!(
+            without_rows.build(&code, 4).is_none(),
+            "with no row the builder must bail the METHOD -- that is the failure              mode the resolver's admission has to stay in step with",
+        );
     }
 
     #[test]

@@ -1646,10 +1646,41 @@ jobs:
       # baseline's own note names the page that diagnoses them.
       #
       # `21-linux` was minted 2026-09-09 against Temurin 21.0.12+8, so ALL FOUR
-      # legs now adjudicate and none refuses. It carries 16 sections -- the same
-      # count as `21-windows`, but NOT the same set: Linux does not diverge on
-      # `textformat` (that row is locale data and this is a different host), and
-      # it carries a vthreads row Windows does not.
+      # legs now adjudicate and none refuses. It was minted at 16 sections --
+      # the same count as `21-windows`, though NOT the same set: Linux does not
+      # diverge on `textformat` (that row is locale data and this is a different
+      # host), and it carries a vthreads row Windows does not.
+      #
+      # It was RE-FROZEN at 10 sections later the same day, when the JDK 21
+      # serialization defect was fixed and its six `JdkOnlyBreadthProbe` rows
+      # stopped diverging (that probe is now byte-identical to HotSpot in both
+      # modes). GONE rows pass, so leaving them would not have gone red -- it
+      # would just have left six rows of slack in the ratchet, which is exactly
+      # the state a re-freeze exists to remove.
+      #
+      # `21-windows` STILL CARRIES THOSE SIX ROWS, and that asymmetry is
+      # deliberate rather than an oversight: the fix is platform-independent, so
+      # they will read as GONE there too and the leg passes, but re-minting a
+      # key requires running the gate against a real JDK 21 image on that OS and
+      # the Windows host no longer has one. The Windows 21 leg is therefore six
+      # rows looser than the Linux one until someone with a Windows JDK 21
+      # re-freezes it. Anyone who does: expect exactly those six rows to drop.
+      #
+      # LATER THE SAME DAY a SEVENTH `21-windows` row joined them:
+      # `JdkOnlyBreadthProbe/strict/textformat`. The JDK 21 strict locale defect
+      # behind it was fixed on 2026-09-09 -- the provider lookup answered null
+      # for every SPI, so adapter selection fell through to the fallback
+      # adapter, whose `LocaleResources` is root-only on JDK 21. Expect that row
+      # to read GONE too and to drop on the same re-mint, making it seven.
+      #
+      # That row is also why this fix has NO corpus arm that can verify it.
+      # `21-linux` never froze a `textformat` row: the defect is invisible
+      # wherever the machine default locale is already `en-US`, which the Linux
+      # host's is -- and `21-windows`, the leg that does carry it, is the one
+      # that cannot be re-minted. The verification of record is therefore
+      # `probes/LocaleSelect.java`, which asks for `de-DE` BY NAME rather than
+      # relying on the default locale, and which reads identical to HotSpot 21
+      # in all four mode/image cells.
       #
       # It was not accepted from one mint. The vthreads section is an
       # intermittent race, so a baseline minted from a run that saw the smaller
@@ -1658,6 +1689,14 @@ jobs:
       # MAXIMAL observed set (every later run is then a subset, and GONE always
       # passes); it was required to pass ten consecutive gate runs, and the
       # paired ratchet was then re-run against it to prove it can still fail.
+      #
+      # IF THE 21-LINUX LEG GOES RED ON A vthreads ROW, THIS IS WHY, and it is
+      # not a regression. The maximal set was observed on an 8-core host; a
+      # runner with a different core count can lose the race a way that was
+      # never seen here and produce a vthreads section identity the baseline
+      # does not carry. The fix is to re-freeze with a note saying which row
+      # appeared and on what runner -- NOT to widen it by hand, and NOT to
+      # drop the probe. Any other NEW row is a real regression.
       #
       # IF THE 21-LINUX LEG GOES RED ON A vthreads ROW, THIS IS WHY, and it is
       # not a regression. The maximal set was observed on an 8-core host; a
