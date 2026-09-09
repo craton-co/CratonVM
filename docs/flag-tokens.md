@@ -603,7 +603,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-400 tokens.
+408 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -728,6 +728,14 @@ export inherited from a parent shell.
 | `ir-skip-republish` | `CRATONVM_JIT_IR_SKIP_REPUBLISH` |
 | `ir-deopt-regs` | `CRATONVM_JIT_IR_DEOPT_REGS` |
 | `ir-osr-entry` | `CRATONVM_JIT_IR_OSR_ENTRY` |
+| `ir-splice-ldc` | `CRATONVM_JIT_IR_SPLICE_LDC` |
+| `ir-splice-branch` | `CRATONVM_JIT_IR_SPLICE_BRANCH` |
+| `osr-optimizing-cache` | `CRATONVM_JIT_OSR_OPTIMIZING_CACHE` |
+| `ir-fallthrough` | `CRATONVM_JIT_IR_FALLTHROUGH` |
+| `ir-deopt-points-at-traps` | `CRATONVM_JIT_IR_DEOPT_POINTS_AT_TRAPS` |
+| `ir-reg-authoritative` | `CRATONVM_JIT_IR_REG_AUTHORITATIVE` |
+| `ir-speculate` | `CRATONVM_JIT_IR_SPECULATE` |
+| `tier-pgo-always` | `CRATONVM_TIER_PGO_ALWAYS` |
 | `ls-carry-relief` | `CRATONVM_JIT_LS_CARRY_RELIEF` |
 | `ir-reserve-carried` | `CRATONVM_JIT_IR_RESERVE_CARRIED` |
 | `osr-optimizing` | `CRATONVM_JIT_OSR_OPTIMIZING` |
