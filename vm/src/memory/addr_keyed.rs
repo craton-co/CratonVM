@@ -196,10 +196,10 @@ mod census {
                           through this module and is driven from \
                           vm/src/memory/gc.rs. Still ONE table: the fourth \
                           declaration (2026-09-05) is drain_locked's `&mut` \
-                          parameter, the eviction half of \
-                          drain_compiled_writes split out so that the DIRTY \
-                          read-clear and the eviction it authorises happen \
-                          under a single hold of the cache mutex. It borrows \
+                          parameter: the drain takes the caller's guard, so \
+                          that the DIRTY read-clear and the eviction it \
+                          authorises happen under a single hold of the cache \
+                          mutex. It borrows \
                           the same map rather than introducing another, so \
                           the remap+sweep disposition above covers it \
                           unchanged.",
