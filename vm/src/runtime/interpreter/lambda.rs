@@ -2049,6 +2049,13 @@ pub(crate) fn lambda_site_bump_unresumable() {
 /// would read as zero engagement on a run where the other door did all the
 /// work, which is precisely the shape
 /// `lambda-callee-deopt-is-orphaned-by-the-sam-name-check-20260908` had.
+///
+/// **`pub` for `vm/tests/`, and it has to be.** Its only readers are
+/// integration tests, which live in a separate crate: they see neither
+/// `pub(crate)` nor `#[cfg(test)]`. That makes this a permanent entry on the
+/// test-only-public-API ratchet, carried deliberately -- see the
+/// "third disposition" note in `vm/tests/no_test_only_public_api.rs` before
+/// trying to gate or delete it.
 pub fn lambda_site_deopt_outcomes() -> (u64, u64) {
     use std::sync::atomic::Ordering;
     (

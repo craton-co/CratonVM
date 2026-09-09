@@ -157,7 +157,31 @@ use std::path::{Path, PathBuf};
 /// which `bench-gpu/GpuAsyncChainBench.java` already calls) or an
 /// executor-close path drains the map. Either gives this item a production
 /// caller, and the number comes down in that change.
-const BASELINE_OFFENDERS: usize = 297;
+/// # A third disposition: `pub` for `vm/tests/`
+///
+/// The assertion below offers two remedies — delete it, or make it
+/// `#[cfg(test)]`. There is a class that dichotomy cannot serve, and the
+/// 2026-09-09 sweep walked into it: an item that exists for an INTEGRATION
+/// test. `vm/tests/*` is a separate crate, so it reaches only `pub` API and is
+/// compiled WITHOUT `cfg(test)` — gating such an item hides it from the very
+/// tests it exists for, and deleting it deletes their instrument. The scan
+/// counts those references as test references, correctly, so the item reads as
+/// an offender and cannot stop being one.
+///
+/// Two of the 296 are exactly this, both deopt-census accessors read by
+/// end-to-end tests that spawn a VM:
+///
+/// ```text
+/// fn lambda_site_deopt_outcomes     vm/src/runtime/interpreter/lambda.rs
+/// fn reset_deopt_frame_bail_counts  vm/src/runtime/interpreter/deopt_resume.rs
+/// ```
+///
+/// Neither is dead and neither can be gated. They are carried, and named here
+/// for the reason `admit_direct_native_entry` is: so that the next person to
+/// lower this number does not spend an afternoon rediscovering that
+/// `#[cfg(test)]` breaks the tests that item exists to serve.
+///
+const BASELINE_OFFENDERS: usize = 296;
 
 /// Minimum number of declarations the scan must find before its result means
 /// anything.

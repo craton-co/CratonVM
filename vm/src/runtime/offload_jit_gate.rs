@@ -351,7 +351,7 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
         match array_writer_policy() {
             ArrayWriterPolicy::Barrier => {
                 // Nothing to trade any more: the compiled tiers mark what
-                // they wrote and `input_cache::drain_compiled_writes`
+                // they wrote and `input_cache::drain_locked`
                 // evicts it before the next read. The method compiles AND
                 // the cache stays coherent. See `cratonvm_jit::gpu_barrier`.
                 cratonvm_types::gpu_jit_gate_census::note_released_array_writer();
@@ -1004,7 +1004,7 @@ fn scan_code(code: &[u8]) -> (Vec<u16>, bool) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArrayWriterPolicy {
     /// Compile the method AND keep the cache: the compiled store marks
-    /// its bucket and `input_cache::drain_compiled_writes` evicts before
+    /// its bucket and `input_cache::drain_locked` evicts before
     /// the next read. The default whenever
     /// [`cratonvm_jit::gpu_barrier::is_armed`], i.e. on an x86_64
     /// `--gpu` run without the kill switch.
