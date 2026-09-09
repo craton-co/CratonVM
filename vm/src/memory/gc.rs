@@ -862,6 +862,30 @@ pub fn update_all_roots(
     // objects away FROM, so the next safepoint's frame audit can name any slot
     // still holding one. No-op unless the flag is set.
     cratonvm_gc::gc_quiescence::record_vacated(pointer_map, shared.mem.heap.collection_count());
+    // The class-discriminated HISTORY ledger, whose only producer was ZGC's
+    // `relocate_stw` until 2026-09-08. The exact ledger above forgets an
+    // address the instant the allocator re-issues it -- and that is precisely
+    // when a stale holder becomes visible, because until re-issue it reads a
+    // zeroed corpse and nothing looks wrong. The two windows do not overlap,
+    // which is why `stale_use_verdict` reported zero on every failing
+    // generational run: it had no history to read.
+    //
+    // The BindableTests moving-young failure is exactly the shape this ledger
+    // discriminates -- `ServiceLoader$LazyClassPathLookupIterator.parse`
+    // invoking `openStream()` on a receiver that reads back as a
+    // `java.util.Hashtable` because the address was re-served.
+    if cratonvm_gc::gc_quiescence::vacated_frames_enabled() {
+        let classed: Vec<(usize, usize, u32)> = pointer_map
+            .iter()
+            .map(|(from, to)| {
+                // SAFETY: `to` is a post-copy object base this collection just
+                // wrote; its header is mapped.
+                let at = unsafe { ObjectRef::from_raw(*to as *mut u8) };
+                (*from, *to, shared.mem.heap.class_id_of(at).as_u32())
+            })
+            .collect();
+        cratonvm_gc::gc_quiescence::record_moved_history(&classed);
+    }
     crate::runtime::interpreter::remap_trace_push(
         shared,
         thread,

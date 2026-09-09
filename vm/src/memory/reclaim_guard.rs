@@ -645,6 +645,42 @@ pub(crate) fn audit_thread_frames(shared: &SharedVm, thread: &JvmThread, site: &
                     );
                 }
             }
+            // The RE-SERVED face, which the exact ledger above cannot see.
+            // `was_vacated` drops an address the moment the allocator hands it
+            // out again -- and that is exactly when a stale holder stops being
+            // harmless (until re-issue it reads a zeroed corpse). The history
+            // ledger keeps the pair for the whole run and uses the CLASS at the
+            // address as the discriminator, so a hit here says: this slot names
+            // an address whose object was moved away and something of a
+            // DIFFERENT class now lives there.
+            if let Some((moved_to, class_at_moved_to, class_here)) =
+                cratonvm_gc::gc_quiescence::stale_use_verdict(a)
+            {
+                static W: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if W.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MAX_REPORTS {
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        obj = format!("{a:#x}"),
+                        site = site,
+                        tid = thread.thread_id.0,
+                        frame = fi,
+                        class = %fr.class_name(),
+                        method = %fr.method_name(),
+                        pc = fr.pc,
+                        slot = format!("{what}[{idx}]"),
+                        moved_to = format!("{moved_to:#x}"),
+                        class_at_moved_to = %class_name_of(shared, class_at_moved_to),
+                        class_here_now = %class_name_of(shared, class_here),
+                        heap_collection = heap.collection_count(),
+                        thread_last_heal = thread.last_heal_collection,
+                        "a LIVE frame slot names an address the collector moved an object away \
+                         from and the allocator has since RE-SERVED to an object of a different \
+                         class. Every read through this slot returns the wrong object. This is \
+                         the face the exact vacated ledger cannot see, and the first safepoint \
+                         at which the owning frame, method, pc and slot are all still in hand.",
+                    );
+                }
+            }
             if heap.class_id_of(o).as_u32() != 0 || heap.kind_of(o) != ObjectKind::Object {
                 return;
             }

@@ -28660,6 +28660,15 @@ fn invoke_on_class_shared_inner(
                 // bug-h2-classid0-stale-address-family-FIXED.md.
                 if let Some(Value::Object(Some(recv))) = args.first().copied() {
                     let addr = recv.as_ptr() as usize;
+                    // The RE-SERVED face. The free-list verdict below answers
+                    // for a receiver still sitting in reclaimed memory; once
+                    // the allocator has handed the address out again it reads
+                    // as a perfectly valid object of an unrelated class and
+                    // every probe there stays silent. That is precisely this
+                    // dispatch miss's shape -- `Hashtable.openStream()` for a
+                    // `URL` receiver. The history ledger discriminates it, and
+                    // the backtrace names the VM code still holding it.
+                    cratonvm_gc::gc_quiescence::check_stale_use(addr, "invoke dispatch");
                     if crate::memory::reclaim_guard::report_reclaimed_receiver(
                         shared,
                         addr,
