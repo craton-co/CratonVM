@@ -4599,6 +4599,9 @@ pub(crate) fn apply_pending_blocked_fixups(shared: &SharedVm, thread: &mut JvmTh
         // function runs ON the waking thread, before it can re-enter compiled
         // code. Re-remapping an already-rewritten slot is harmless -- a second
         // lookup of a to-space address misses.
+        // Attribution: this thread applied a relocation map through the
+        // LEAKED-REGION FALLBACK.
+        cratonvm_gc::gc_quiescence::note_pointer_map_applied(3);
         apply_blocked_wake_jit_remap(shared, thread, &fixup);
         for frame in &mut thread.frames {
             frame.update_local_refs(&fixup, &shared.mem.heap);
@@ -7342,6 +7345,9 @@ impl<'a> NativeContextImpl<'a> {
             // A blocked peer is the same bug one path over, and it is the
             // population a moving young cycle relocates under whenever the
             // cross-thread coverage handshake credits it.
+            // Attribution: this thread applied a relocation map through the
+            // ORDINARY BLOCKED-REGION WAKE.
+            cratonvm_gc::gc_quiescence::note_pointer_map_applied(2);
             apply_blocked_wake_jit_remap(self.shared, self.thread, &fixup);
             for frame in &mut self.thread.frames {
                 frame.update_local_refs(&fixup, &self.shared.mem.heap);

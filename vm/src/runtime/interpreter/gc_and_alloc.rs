@@ -6039,6 +6039,12 @@ pub(crate) fn apply_pointer_map_to_thread(
     pointer_map: &cratonvm_types::PointerMap,
     heap: &crate::memory::VmHeap,
 ) {
+    // Attribution for a later stale-reference report: this thread applied a
+    // relocation map through the STOP-THE-WORLD RESUME path. See
+    // `gc_quiescence::note_pointer_map_applied`.
+    if !pointer_map.is_empty() {
+        cratonvm_gc::gc_quiescence::note_pointer_map_applied(1);
+    }
     // JNI local references (INT-2, safepoint-resume half): rewrite THIS
     // thread's `JNI_LOCAL_FRAMES` handles through the pointer map — a JNI
     // native that re-entered Java and parked at the safepoint poll must not
