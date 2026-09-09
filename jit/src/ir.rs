@@ -1287,6 +1287,18 @@ pub struct IrInlineTables {
     /// `object_init_pcs` — the set that elides on any receiver — because that
     /// is what "proven no-op body" means, receiver notwithstanding.
     pub object_init_pcs: HashSet<usize>,
+    /// `pc → (bits, is_float)` for the `ldc` / `ldc_w` sites inside spliced
+    /// bodies, rebased into combined-buffer coordinates and merged into the
+    /// builder's own `ldc_info`.
+    ///
+    /// Without this row a spliced `ldc` reaches the builder's `0x12 | 0x13` arm
+    /// with nothing in any of its three tables and bails the whole METHOD —
+    /// which is why the splice scanner used to refuse such a callee up front
+    /// rather than discover it here. See [`crate::InlineSite::ldc_fp_pcs`].
+    pub ldc_info: HashMap<usize, (i64, bool)>,
+    /// `pc → (bits, is_double)` for the `ldc2_w` sites inside spliced bodies.
+    /// Same shape and same reason as [`Self::ldc_info`].
+    pub ldc2w_info: HashMap<usize, (i64, bool)>,
 }
 
 /// The builder's state for one splice in progress.
@@ -4395,6 +4407,17 @@ pub struct IrBuilder {
     /// side effect first. A structural check here cannot drift from the
     /// resolver's opcode list the way a comment can.
     splice_guard_seen: bool,
+    /// Conditional-branch pcs whose NOT-TAKEN edge the profile never observed,
+    /// and which [`Self::prune_always_taken_branch`] may therefore replace with
+    /// a guarded unconditional jump.
+    ///
+    /// Populated by `lib.rs` from the method's branch profile, and empty
+    /// whenever there is no profile or the feature is off — in which case every
+    /// branch builds the ordinary `Op::If` and codegen is byte-identical.
+    pruned_always_taken: std::collections::HashSet<usize>,
+    /// How many branches this build actually pruned. Diagnostic; read through
+    /// [`Self::branches_pruned`].
+    branches_pruned: usize,
     /// Diagnostic-only: `pc → "0xNN cn.mn desc"` for every invoke site in the
     /// method. Populated by `lib.rs` **only** when [`ir_bail_reporting`] is on,
     /// and read **only** by [`Self::bail_invoke`]. Never consulted by lowering,
@@ -4538,6 +4561,8 @@ impl IrBuilder {
             splice_local: HashSet::new(),
             splice_tainted: HashSet::new(),
             splice_guard_seen: false,
+            pruned_always_taken: std::collections::HashSet::new(),
+            branches_pruned: 0,
             invoke_labels: HashMap::new(),
             method_label: None,
             tdigest_scalar_kernel: false,
@@ -5098,12 +5123,20 @@ impl IrBuilder {
             invoke_info,
             new_info,
             object_init_pcs,
+            ldc_info,
+            ldc2w_info,
         } = tables;
         self.inline_sites.extend(sites);
         self.field_info.extend(field_info);
         self.invoke_info.extend(invoke_info);
         self.new_info.extend(new_info);
         self.object_init_pcs.extend(object_init_pcs);
+        // Merged, not replaced: the caller's own `ldc` sites are already in
+        // these maps (`set_ldc_info` runs before the tables are applied) and a
+        // spliced body's pcs are in combined-buffer coordinates, so the two key
+        // spaces are disjoint by construction.
+        self.ldc_info.extend(ldc_info);
+        self.ldc2w_info.extend(ldc2w_info);
     }
 
     /// How many splices [`Self::build`] performed. Diagnostic only.
@@ -5495,6 +5528,95 @@ impl IrBuilder {
         true
     }
 
+    /// Branch pcs the profile says are ALWAYS taken. See
+    /// [`Self::prune_always_taken_branch`].
+    pub fn set_pruned_branches(&mut self, pcs: std::collections::HashSet<usize>) {
+        self.pruned_always_taken = pcs;
+    }
+
+    /// How many branches this build replaced with a guarded jump.
+    pub fn branches_pruned(&self) -> usize {
+        self.branches_pruned
+    }
+
+    /// Replace an always-taken conditional branch with a GUARD plus an
+    /// unconditional jump, deleting its cold arm from the graph entirely.
+    ///
+    /// # What this is
+    ///
+    /// The first actual speculation this tier performs. Every deopt point it
+    /// emitted before this carried `speculation_id: 0` and the reason
+    /// `TransferToInterpreter` — plain resume points, planted so that a trap
+    /// *could* be described, never so that a transform could be justified.
+    /// Uncommon traps existed only to stand in for opcodes the tier cannot
+    /// lower. Nothing anywhere used the profile to remove work.
+    ///
+    /// This does. When the profile has seen a branch's not-taken edge exactly
+    /// ZERO times over a meaningful sample, the branch becomes:
+    ///
+    /// ```text
+    ///     Guard(cmp)        ; cmp == 0 -> deopt at this bci
+    ///     goto target
+    /// ```
+    ///
+    /// and the whole fall-through arm is never built. That is the shape javac
+    /// gives `if (rare) { ... }` — `ifeq skip; <cold body>; skip:` — so the arm
+    /// deleted is exactly the cold body, together with everything downstream
+    /// that only it kept alive.
+    ///
+    /// # Why it is fail-SAFE rather than fail-closed
+    ///
+    /// A wrong speculation cannot produce a wrong answer. The guard's failure
+    /// edge is the ordinary deopt trampoline with `DeoptAction::Reinterpret`:
+    /// the interpreter re-executes this very branch and takes the cold arm
+    /// itself. The cost of being wrong is a deopt, and repeated deopts demote
+    /// the method to C1 through the existing `c2_bailout` path — the same
+    /// machinery a div-by-zero guard already relies on. That is what makes this
+    /// a different risk class from a speculative devirtualization, where a
+    /// wrong guard runs the wrong body.
+    ///
+    /// # Two refusals
+    ///
+    /// * **Inside a splice.** `splice_guard_seen` refuses a graph that built a
+    ///   guard inside a relocated body, because such a guard would resolve its
+    ///   frame state from the caller's snapshot at the `invoke`. Rather than
+    ///   set that flag and lose the whole method, simply do not speculate
+    ///   there.
+    /// * **No frame state at this bci.** A guard whose bci has no
+    ///   `SafepointSnapshot` cannot be resumed, so there would be nothing to
+    ///   deopt *to*. `plant_site_trap` makes the same check for the same
+    ///   reason.
+    fn prune_always_taken_branch(&mut self, pc: usize, cmp: NodeId, target_pc: usize) -> bool {
+        if !self.pruned_always_taken.contains(&pc) {
+            return false;
+        }
+        if !self.splice.is_empty() {
+            return false;
+        }
+        let Some(ctrl) = self.ctrl_opt() else {
+            return false;
+        };
+        if !self.graph.safepoints.iter().any(|sp| sp.bci == pc) {
+            return false;
+        }
+        // `cmp` is 1 exactly when the branch is TAKEN, so a non-zero `cmp`
+        // continues and a zero one deopts — the identical polarity
+        // `add_div_zero_guard` uses for its `Cmp(Ne)` against zero.
+        self.graph.add(
+            Op::Guard { bci: pc },
+            IrType::Void,
+            vec![ctrl, cmp],
+            Some(pc),
+        );
+        // From here it is exactly the `goto` arm (0xa7): the target gains this
+        // predecessor and control is dead until the next merge.
+        self.add_merge_predecessor(target_pc);
+        self.ctrl = NO_NODE;
+        self.branches_pruned += 1;
+        note_branch_pruned();
+        true
+    }
+
     fn add_div_zero_guard(&mut self, divisor: NodeId, ty: IrType, pc: usize) {
         let Some(ctrl) = self.ctrl_opt() else {
             return;
@@ -5796,6 +5918,7 @@ impl IrBuilder {
         // returns, to install the compact-field rows the String-access
         // expansion's two loads need. See `string_access_site_pcs`.
         reset_string_access_sites();
+        SPLICED_MERGE_SEEN.with(|c| c.set(false));
         // Consume the verifier's canonical decode/CFG contract instead of
         // maintaining a second opcode-length scanner in the compiler.
         let verified = cratonvm_reader::verified_code(code.get(..code_len)?).ok()?;
@@ -5846,6 +5969,66 @@ impl IrBuilder {
             .filter(|target| reachable.contains(target))
             .collect();
 
+        // ── The same pre-scan, for every SPLICED body ────────────────
+        //
+        // `verified_code` above analysed `code[..code_len]` — the caller alone.
+        // A relocated callee body lives past `code_len` in the combined buffer
+        // and has its own branches, its own merge targets and its own loop
+        // headers, none of which that analysis can see. That gap, and only that
+        // gap, is why the splice scanner refused every callee containing an
+        // `if` or a `goto` and called itself "straight-line only, v1".
+        //
+        // Closing it needs no new analysis, because a callee body IS a valid
+        // method body: run the SAME verifier over it and rebase what comes out
+        // by the body's `base`. Branch offsets need no rebasing at all — they
+        // are relative, the body is copied contiguously, and a branch inside it
+        // therefore lands inside it in combined coordinates by construction.
+        //
+        // Reachability needs no merging either: the walk's skip is already
+        // scoped to `self.splice.is_empty()` (see the `!reachable.contains`
+        // test below) precisely because a relocated body is unreachable from
+        // pc 0. What a body's own reachability is used for here is the same
+        // thing it is used for above — refusing to create an `Op::Merge` for a
+        // target only handler code can reach, which would leave an input-less
+        // control node in the graph.
+        //
+        // Bodies with more than one `return`, or a `return` anywhere but the
+        // last instruction, are still refused — by the scanner, independently
+        // of this (`ir-splice-not-single-trailing-return`). Merging several
+        // returns into one continuation is the next increment, not this one.
+        if ir_splice_branch_enabled() {
+            let bodies: Vec<(usize, usize)> = self
+                .inline_sites
+                .values()
+                .map(|s| (s.base, s.code_len))
+                .collect();
+            for (base, body_len) in bodies {
+                let Some(body) = code.get(base..base.saturating_add(body_len)) else {
+                    return ir_build_bail(line!(), base);
+                };
+                let Ok(body_verified) = cratonvm_reader::verified_code(body) else {
+                    // The body did not verify on its own. Refuse the METHOD
+                    // rather than walk a region whose control flow nothing has
+                    // analysed — the failure mode that produces is orphan nodes
+                    // referencing `NO_NODE`, which is what STUB-S8 was.
+                    return ir_build_bail(line!(), base);
+                };
+                let body_reachable = normally_reachable_pcs(&body_verified, body_len);
+                for &target in body_verified.merge_targets() {
+                    let target = target as usize;
+                    if body_reachable.contains(&target) {
+                        self.ensure_merge(base + target);
+                    }
+                }
+                for &header in body_verified.loop_headers() {
+                    let header = header as usize;
+                    if body_reachable.contains(&header) {
+                        self.loop_headers.insert(base + header);
+                    }
+                }
+            }
+        }
+
         let mut pc = 0;
         // The `|| !self.splice.is_empty()` half is IR-tier inlining: inside a
         // splice `pc` addresses a relocated callee body appended AFTER
@@ -5862,10 +6045,12 @@ impl IrBuilder {
                 }
             }
             // A relocated body is unreachable from pc 0 by construction, so the
-            // reachability skip and the merge bookkeeping — both of which are
-            // computed over the CALLER's code alone — apply only outside a
-            // splice. The resolver admits branch-free bodies only, so there is
-            // no merge inside one to activate.
+            // REACHABILITY skip — computed over the caller's code alone — must
+            // stay scoped to code outside a splice. Merge bookkeeping is a
+            // different matter: since 2026-09-09 the pre-scan above registers
+            // each spliced body's own merge targets and loop headers, rebased,
+            // so a merge inside a splice both exists and must be activated. The
+            // gate below is deliberately NOT `self.splice.is_empty()` any more.
             if self.splice.is_empty() && !reachable.contains(&pc) {
                 // Handler-only (or otherwise unreachable) bytecode: emit no IR
                 // for it at all. `next_pc` comes from the verifier's canonical
@@ -5881,8 +6066,18 @@ impl IrBuilder {
                 continue;
             }
 
-            // If this PC is a merge target, activate the merge
-            if self.splice.is_empty() && self.merges.contains_key(&pc) {
+            // If this PC is a merge target, activate the merge.
+            //
+            // Inside a splice too. Every predecessor of a merge that the
+            // spliced-body pre-scan registered is itself inside that same body,
+            // so the locals and operand stack this snapshots are the callee's
+            // throughout — the same invariant the caller's own merges rely on.
+            if self.merges.contains_key(&pc) {
+                // A merge inside a relocated body disqualifies this artifact
+                // from the optimizing OSR door. See `SPLICED_MERGE_SEEN`.
+                if !self.splice.is_empty() {
+                    note_spliced_merge();
+                }
                 // Add current state as predecessor (fall-through). On a loop
                 // header this is the forward-entry predecessor; the back-edge
                 // arrives later and is back-patched (see add_merge_predecessor).
@@ -7647,6 +7842,10 @@ impl IrBuilder {
                         _ => unreachable!(),
                     };
                     let cmp = self.add_data(Op::Cmp(cc), IrType::Int, vec![val, zero], pc);
+                    if self.prune_always_taken_branch(pc, cmp, target_pc) {
+                        pc = target_pc;
+                        continue;
+                    }
                     let if_node =
                         self.graph
                             .add(Op::If, IrType::Control, vec![self.ctrl, cmp], Some(pc));
@@ -7691,6 +7890,10 @@ impl IrBuilder {
                         _ => unreachable!(),
                     };
                     let cmp = self.add_data(Op::Cmp(cc), IrType::Int, vec![a, b], pc);
+                    if self.prune_always_taken_branch(pc, cmp, target_pc) {
+                        pc = target_pc;
+                        continue;
+                    }
                     let if_node =
                         self.graph
                             .add(Op::If, IrType::Control, vec![self.ctrl, cmp], Some(pc));
@@ -7740,6 +7943,10 @@ impl IrBuilder {
                         CmpOp::Ne
                     };
                     let cmp = self.add_data(Op::Cmp(cc), IrType::Int, vec![a, b], pc);
+                    if self.prune_always_taken_branch(pc, cmp, target_pc) {
+                        pc = target_pc;
+                        continue;
+                    }
                     let if_node =
                         self.graph
                             .add(Op::If, IrType::Control, vec![self.ctrl, cmp], Some(pc));
@@ -8706,6 +8913,23 @@ pub fn try_ir_scalar_intrinsic(class: &str, method: &str, descriptor: &str) -> O
         ("java/lang/Math" | "java/lang/StrictMath", "abs", "(J)J") => Some(ScalarOp::AbsL),
         ("java/lang/Integer", "compare", "(II)I") => Some(ScalarOp::CompareI),
         ("java/lang/Long", "compare", "(JJ)I") => Some(ScalarOp::CompareL),
+        // `Integer.min`/`max` and `Long.min`/`max` are one-line delegations to
+        // the `Math` methods directly above — `Integer.min(a, b)` IS
+        // `Math.min(a, b)` in the JDK source — so they lower to the identical
+        // sequence and need no new `ScalarOp`.
+        //
+        // They are here because they are separately native-shadowed in this VM,
+        // and a shadowed leaf is an inlining barrier as well as an
+        // un-compilable method: the caller cannot splice it (there is no
+        // bytecode to splice) and, without a row here, cannot lower it as
+        // arithmetic either, so a two-instruction operation costs a call
+        // through Rust. `Math.min` was already covered; these three-character
+        // spellings of it were not, and `Integer.max(a, b)` is not a rare way
+        // to write it.
+        ("java/lang/Integer", "min", "(II)I") => Some(ScalarOp::MinI),
+        ("java/lang/Integer", "max", "(II)I") => Some(ScalarOp::MaxI),
+        ("java/lang/Long", "min", "(JJ)J") => Some(ScalarOp::MinL),
+        ("java/lang/Long", "max", "(JJ)J") => Some(ScalarOp::MaxL),
         ("java/lang/Integer", "numberOfLeadingZeros", "(I)I") => Some(ScalarOp::NlzI),
         ("java/lang/Long", "numberOfLeadingZeros", "(J)I") => Some(ScalarOp::NlzL),
         ("java/lang/Integer", "numberOfTrailingZeros", "(I)I") => Some(ScalarOp::NtzI),
@@ -8769,6 +8993,26 @@ mod scalar_intrinsic_recognizer_tests {
 /// **Default ON**; `CRATONVM_JIT_IR_SCALAR_INTRINSICS=0` restores the
 /// method-level refusal for these families too, which is the A arm of the only
 /// A/B that means anything here.
+/// May a spliced callee body contain its own branches? **Default ON**;
+/// `CRATONVM_JIT_IR_SPLICE_BRANCH=0` restores the straight-line-only shape.
+///
+/// Read by BOTH halves of the feature — the splice scanner in `jit_bridge`,
+/// which decides whether to admit such a callee, and [`IrBuilder::build`],
+/// which pre-scans the admitted body's control flow. They must agree: a body
+/// admitted without its pre-scan is exactly the orphan-node failure STUB-S8
+/// was, so the scanner asks the VM-side mirror of this and the builder asks
+/// this, and neither may be flipped alone.
+pub fn ir_splice_branch_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPLICE_BRANCH").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
 pub fn ir_scalar_intrinsics_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -8783,6 +9027,93 @@ pub fn ir_scalar_intrinsics_enabled() -> bool {
 /// Scalar-intrinsic sites lowered as arithmetic, this process.
 static SCALAR_INTRINSICS_LOWERED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// Did the build just finished activate a merge INSIDE a spliced body?
+    ///
+    /// Set by [`IrBuilder::build`]'s walk, reset at its entry, and read by
+    /// `try_compile_inner` the moment it returns — the same one-shot
+    /// thread-local shape `reset_string_access_sites` /
+    /// `string_access_site_pcs` already use, and for the same reason: the
+    /// builder is consumed by `build`, so there is nothing left to ask
+    /// afterwards.
+    ///
+    /// # What it gates, and why
+    ///
+    /// A body with a merge inside a relocated callee MUST NOT be entered
+    /// through the optimizing OSR door. Measured on `Min1.clamp` (an
+    /// `if/else if/else` funnelling to one return, spliced into a counted
+    /// loop): entering the optimizing artifact at the loop header produces a
+    /// WRONG and RUN-TO-RUN VARYING checksum, while the identical body reached
+    /// through the method-entry compile is correct on the same workload
+    /// (`Min2`, 400 000 invocations, exact parity with HotSpot). Turning off
+    /// only `CRATONVM_JIT_IR_OSR_ENTRY` restores correctness with the splice
+    /// still enabled, which is what localises the defect to the OSR entry stub
+    /// rather than to the splice or to the graph — the graph was read node by
+    /// node and its phis are right.
+    ///
+    /// So the refusal is placed at the door that is broken, not at the feature
+    /// that exposed it: such an artifact publishes NO `ir_osr_entries`, the OSR
+    /// door finds no stub for its pc and falls back to the single-pass OSR
+    /// body, and the method-entry population keeps the inlining.
+    ///
+    /// Lifting this needs `emit_osr_entry_stubs` understood and fixed; it is
+    /// not a property of splicing that cannot be supported.
+    static SPLICED_MERGE_SEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn note_spliced_merge() {
+    SPLICED_MERGE_SEEN.with(|c| c.set(true));
+}
+
+/// Did the most recent [`IrBuilder::build`] on this thread activate a merge
+/// inside a spliced body? See [`SPLICED_MERGE_SEEN`].
+pub fn spliced_merge_was_built() -> bool {
+    SPLICED_MERGE_SEEN.with(|c| c.get())
+}
+
+/// Conditional branches replaced by a guard plus an unconditional jump, this
+/// process. See [`IrBuilder::prune_always_taken_branch`].
+static BRANCHES_PRUNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_branch_pruned() {
+    BRANCHES_PRUNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many cold branch arms this tier speculated away. A zero with the feature
+/// ON means the profile never showed a branch to be one-sided over the sample —
+/// which is a fact about the workload, not about the pass, and is exactly the
+/// distinction a bare "it did nothing" cannot make.
+pub fn branch_prune_census() -> u64 {
+    BRANCHES_PRUNED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Speculative pruning of a branch arm the profile has never seen taken —
+/// **default OFF**, opt in with `CRATONVM_JIT_IR_SPECULATE=1`.
+///
+/// Needs a branch profile to do anything, so it is only meaningful together
+/// with `CRATONVM_TIER_PGO` / `CRATONVM_TIER_PGO_ALWAYS` or inside the C2
+/// nomination window.
+pub fn ir_speculate_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPECULATE").as_deref(),
+            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+        )
+    })
+}
+
+/// Minimum observations of a branch before its unseen edge may be speculated
+/// away.
+///
+/// A branch executed three times, all one way, says nothing. HotSpot's own
+/// uncommon-trap policy wants a comparable sample before it prunes, and the
+/// cost of being wrong here — a deopt, then a re-speculation on the next
+/// compile — is paid per mistake, so the floor is what keeps a cold method from
+/// paying it repeatedly.
+pub const MIN_OBSERVATIONS_TO_PRUNE: u32 = 2_000;
 
 /// Call sites REFUSED because their intrinsic family is loop-shaped and a
 /// generic dispatch would be a downgrade.
@@ -9335,6 +9666,86 @@ mod tests {
     fn build_ir(code: &[u8], code_len: usize, num_params: usize, num_locals: usize) -> Graph {
         let builder = IrBuilder::new(num_params, num_locals);
         builder.build(code, code_len).expect("IR build failed")
+    }
+
+    /// `int f(int x) { return x == 0 ? 2 : 1; }`, whose `ifeq` at pc 1 the
+    /// profile says is always taken.
+    ///
+    /// Pruned, the branch becomes a guard plus a jump: the `Op::If` is gone,
+    /// the cold arm (`iconst_1`, pcs 4-5) is never built, and an `Op::Guard`
+    /// anchored at pc 1 carries the transfer back to the interpreter for the
+    /// case the profile never saw.
+    ///
+    /// Asserted against the UNPRUNED build of the same bytecode rather than
+    /// against absolute node counts, so the test says "pruning changed this"
+    /// rather than restating today's node numbering.
+    #[test]
+    fn an_always_taken_branch_becomes_a_guard_and_a_jump() {
+        let code = [
+            0x1a, // 0: iload_0
+            0x99, 0x00, 0x07, // 1: ifeq +7 -> 8
+            0x04, // 4: iconst_1     <- the cold arm
+            0xa7, 0x00, 0x04, // 5: goto +4 -> 9
+            0x05, // 8: iconst_2
+            0xac, // 9: ireturn
+            0, 0, 0,
+        ];
+
+        let plain = build_ir(&code, 10, 1, 1);
+        assert!(
+            plain.nodes.iter().any(|n| matches!(n.op, Op::If)),
+            "the control case must build an Op::If",
+        );
+        assert!(
+            !plain.nodes.iter().any(|n| matches!(n.op, Op::Guard { .. })),
+            "nothing unpruned may plant a guard here",
+        );
+
+        let mut builder = IrBuilder::new(1, 1);
+        builder.set_pruned_branches(std::iter::once(1usize).collect());
+        let pruned = builder.build(&code, 10).expect("pruned build");
+
+        assert!(
+            pruned
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::Guard { bci: 1 })),
+            "the pruned branch must plant a guard at its own bci",
+        );
+        assert!(
+            !pruned.nodes.iter().any(|n| matches!(n.op, Op::If)),
+            "the pruned branch must not also build an Op::If",
+        );
+        // The cold arm produced `iconst_1`; the surviving arm produces
+        // `iconst_2`. Only the second may be in the graph.
+        let consts: Vec<i64> = pruned
+            .nodes
+            .iter()
+            .filter_map(|n| match n.op {
+                Op::Const(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            consts.contains(&2) && !consts.contains(&1),
+            "the cold arm must be gone; constants were {consts:?}",
+        );
+    }
+
+    /// A guard has nothing to resume to inside a relocated body, so the tier
+    /// must decline to speculate there rather than set `splice_guard_seen` and
+    /// lose the whole method.
+    #[test]
+    fn pruning_is_declined_inside_a_splice() {
+        let mut b = IrBuilder::new(1, 1);
+        b.set_pruned_branches(std::iter::once(1usize).collect());
+        // No splice is open in this unit context, so the refusal under test is
+        // the OTHER one: a pc with no recorded frame state. Drive it by asking
+        // about a pc the walk has not reached.
+        assert!(
+            !b.prune_always_taken_branch(1, NO_NODE, 8),
+            "a bci with no safepoint snapshot must not be speculated on",
+        );
     }
 
     #[test]

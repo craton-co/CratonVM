@@ -3498,6 +3498,121 @@ fn osr_optimizing_already_refused(key: (u32, u64, usize)) -> bool {
         .unwrap_or(false)
 }
 
+/// May the optimizing tier splice a callee containing `ldc` / `ldc_w` /
+/// `ldc2_w`? **Default ON**; `CRATONVM_JIT_IR_SPLICE_LDC=0` restores the
+/// blanket refusal, so one binary can be A/B'd against its own pre-change
+/// behaviour. See the `0x12 | 0x13 | 0x14` arm of the splice scanner.
+fn ir_splice_ldc_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPLICE_LDC").as_deref(),
+            Ok("0") | Ok("false")
+        )
+    })
+}
+
+/// Optimizing OSR artifacts this door has already built and ACCEPTED, keyed
+/// exactly like the refusal memo beside it.
+///
+/// # Why this exists
+///
+/// Only refusals were remembered. A success was wrapped in a fresh `Arc`,
+/// entered, and dropped when the OSR'd frame left — so the next back edge
+/// rebuilt the same artifact from bytecode, and the one after that, for the
+/// life of the process. The single-pass door has never worked this way: it
+/// publishes its artifact and every later entry reports `OSR-reuse`.
+///
+/// Measured before this, on a counted-loop probe entered 20 000 times
+/// (`CRATONVM_JIT_METRICS=1`): **502 compiles of one method**, 63.3 ms of
+/// compile wall on a 262 ms run — 24 % of the process, spent rebuilding a body
+/// that was byte-identical every time. Switching the door off with
+/// `CRATONVM_JIT_OSR_OPTIMIZING=0` recovered all of it, which is what
+/// identified the cache rather than the codegen as the cost.
+///
+/// # Lifetime
+///
+/// The map holds an `Arc`, so a cached artifact's `ExecutableBuffer` stays
+/// mapped for the life of the process. That is *safer* than the previous
+/// behaviour, not less safe: an artifact used to be unmapped as soon as the
+/// last OSR frame in it returned, which is precisely the retired-code hazard
+/// `ExecutableBuffer::drop` and `defer_jit_owner` exist to police. Retained
+/// executable code is this VM's standing policy.
+///
+/// # Redefinition
+///
+/// Unlike the refusal memo — where a stale entry costs only a missed
+/// optimization — a stale entry HERE would run pre-redefinition code. So the
+/// read is gated on `class_was_redefined` for the exact class, and a redefined
+/// class is never served from, nor added to, the cache. `any_class_redefined`
+/// makes that one relaxed load on every run that never redefines anything.
+static OSR_OPTIMIZING_ACCEPTED: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<(u32, u64, usize), Arc<cratonvm_jit::CompiledMethod>>,
+    >,
+> = std::sync::OnceLock::new();
+
+/// The artifact this door built for `key`, when it may still be entered.
+///
+/// Re-checks the two properties the build site checked before accepting, rather
+/// than trusting that they were checked once: an entry stub for THIS pc, and a
+/// body that cannot return the deopt sentinel. They are properties of the
+/// artifact and cannot change while it is cached, so this is a cheap assertion
+/// of the contract at the point of use, not a second policy.
+fn osr_optimizing_cached(
+    shared: &SharedVm,
+    class_id: ClassId,
+    key: (u32, u64, usize),
+    entry_pc: usize,
+) -> Option<Arc<cratonvm_jit::CompiledMethod>> {
+    if osr_optimizing_cache_disabled() {
+        return None;
+    }
+    if crate::runtime::redefine_state::class_was_redefined(shared, class_id) {
+        return None;
+    }
+    let cached = OSR_OPTIMIZING_ACCEPTED
+        .get_or_init(Default::default)
+        .lock()
+        .ok()?
+        .get(&key)
+        .cloned()?;
+    // Cast: a bci fits u32 (`IR_MAX_BYTECODE_SIZE` is far below it).
+    if cached.ir_osr_entry_addr(entry_pc as u32).is_some() && cached.ir_osr_sentinel_free {
+        Some(cached)
+    } else {
+        None
+    }
+}
+
+/// Keep an accepted optimizing OSR artifact for the next entry at this pc.
+fn remember_osr_optimizing_artifact(
+    key: (u32, u64, usize),
+    artifact: &Arc<cratonvm_jit::CompiledMethod>,
+) {
+    if osr_optimizing_cache_disabled() {
+        return;
+    }
+    if let Ok(mut m) = OSR_OPTIMIZING_ACCEPTED.get_or_init(Default::default).lock() {
+        m.insert(key, Arc::clone(artifact));
+    }
+}
+
+/// `CRATONVM_JIT_OSR_OPTIMIZING_CACHE=0` restores the pre-cache behaviour —
+/// rebuild the artifact on every entry — so the two arms can be measured from
+/// ONE binary. Comparing an intermittent event across two builds is not a
+/// comparison; this is the same argument `CRATONVM_JIT_OSR_OPTIMIZING_MEMO`
+/// makes for the refusal memo, and the same spelling.
+fn osr_optimizing_cache_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_OSR_OPTIMIZING_CACHE").as_deref(),
+            Ok("0") | Ok("false")
+        )
+    })
+}
+
 /// Record a refusal so the next attempt at this pc skips straight to
 /// single-pass.
 ///
@@ -3588,9 +3703,23 @@ pub(super) fn try_osr(
     // Anything else falls through to the single-pass path below, unchanged.
     let osr_opt_key =
         osr_optimizing_refusal_key(class_id, &method_name, &method_descriptor, entry_pc);
-    let ir_osr: Option<Arc<cratonvm_jit::CompiledMethod>> = if osr_optimizing_tier_enabled()
-        && !osr_optimizing_already_refused(osr_opt_key)
-    {
+    // The artifact this door built the LAST time it was asked for this pc.
+    //
+    // Reusing it is the whole point: without this the door is a compiler, not a
+    // cache, and the single-pass door beside it — which publishes its artifact
+    // and reports `OSR-reuse` on every later entry — was the only one of the
+    // two that behaved like a tier.
+    let ir_osr: Option<Arc<cratonvm_jit::CompiledMethod>> = if !osr_optimizing_tier_enabled() {
+        None
+    } else if let Some(cached) = osr_optimizing_cached(shared, class_id, osr_opt_key, entry_pc) {
+        cratonvm_jit::metrics::record_osr_event("osr_optimizing_artifact_reused");
+        if crate::runtime::env_cache::dbg_jitc() {
+            eprintln!(
+                "[cratonvm-jitc] osr optimizing REUSE {class_name}.{method_name} pc={entry_pc}"
+            );
+        }
+        Some(cached)
+    } else if !osr_optimizing_already_refused(osr_opt_key) {
         // The frame's own handle when it has one, and a resolution when it does
         // not. `main` is entered by the launcher rather than through the invoke
         // cache, so its frame carries no `CachedBytecodeMethod` — and a method
@@ -3637,7 +3766,13 @@ pub(super) fn try_osr(
                 };
                 // Cast: a bci fits u32 (`IR_MAX_BYTECODE_SIZE` is far below it).
                 if cm.ir_osr_entry_addr(entry_pc as u32).is_some() && cm.ir_osr_sentinel_free {
-                    Some(Arc::new(cm))
+                    // Keep it. Every OSR entry at this pc used to rebuild this
+                    // artifact from bytecode and drop it again when the frame
+                    // left — see `remember_osr_optimizing_artifact` for the
+                    // measurement that motivates the cache.
+                    let artifact = Arc::new(cm);
+                    remember_osr_optimizing_artifact(osr_opt_key, &artifact);
+                    Some(artifact)
                 } else {
                     note_osr_optimizing_refusal(osr_opt_key);
                     None
@@ -9979,15 +10114,58 @@ fn resolve_inline_site_from(
             // A relocated body's control flow would need the merge/loop-header
             // bookkeeping `IrBuilder` computes over the CALLER's code alone.
             // Straight-line only, v1.
-            0x99..=0xa9 | 0xc6 | 0xc7 | 0xc8 | 0xc9 if ir_mode => no!("ir-splice-branch"),
+            // `jsr` / `ret` / `jsr_w` — subroutines. Refused unconditionally
+            // and separately from the ordinary branches below: `IrBuilder` has
+            // no lowering for a return address, and the verifier's CFG for one
+            // is not the shape `normally_reachable_pcs` walks. No JDK-9+
+            // compiler emits them.
+            0xa8 | 0xa9 | 0xc9 if ir_mode => no!("ir-splice-subroutine"),
+            // Ordinary intra-body control flow — every `if`, `goto` and
+            // `goto_w`. Refused until 2026-09-09 with the note "straight-line
+            // only, v1", and the missing piece was one pre-scan: the builder
+            // ran the verifier's CFG analysis over the CALLER's bytecode alone,
+            // so a relocated body's merge targets and loop headers were invisible
+            // to it. `IrBuilder::build` now runs the same analysis over each
+            // spliced body and rebases the result — see its `ir_splice_branch_enabled`
+            // block, which reads the SAME switch this arm does.
+            //
+            // The cost of the refusal was not marginal: a callee with an `if`
+            // is most callees. On a four-callee probe it refused the one
+            // remaining body after the `ldc` refusal was lifted.
+            //
+            // Still refused, by the check further down and independently of
+            // this: a body with more than one `return`, or a `return` that is
+            // not its last instruction. Branching bodies that funnel to a
+            // single trailing return — a ternary, an accumulate-then-return, a
+            // loop — are what this admits.
+            0x99..=0xa7 | 0xc6 | 0xc7 | 0xc8
+                if ir_mode && !cratonvm_jit::ir::ir_splice_branch_enabled() =>
+            {
+                no!("ir-splice-branch")
+            }
             // The only guard `IrBuilder` emits is div-zero, and a guard inside a
             // spliced region deopts to "re-execute the invoke" rather than to
             // itself. Keeping division out means a spliced region carries no
             // guard of its own at all.
             0x6c | 0x6d | 0x70 | 0x71 if ir_mode => no!("ir-splice-division"),
-            // `InlineSite` records a raw `i64` for these; the builder needs the
-            // value AND whether it is a float/double. See `resolve_ir_inline_site`.
-            0x12 | 0x13 | 0x14 if ir_mode => no!("ir-splice-ldc"),
+            // `ldc` / `ldc_w` / `ldc2_w` were refused here until 2026-09-09,
+            // and the reason was plumbing rather than modelling: `InlineSite`
+            // recorded a raw `i64` and dropped the float/double tag the builder
+            // needs to choose between `Op::Const` and `Op::ConstF`. The tag now
+            // rides along in `InlineSite::ldc_fp_pcs` and
+            // `append_ir_inline_site` rebases both tables into
+            // `IrInlineTables`, so the builder's own `0x12 | 0x13` and `0x14`
+            // arms resolve a spliced constant exactly as they resolve one in
+            // the caller's own code.
+            //
+            // The refusal was expensive out of all proportion to its cause: a
+            // constant wider than `sipush` is ordinary Java, and on a
+            // four-callee probe this term alone refused two of the four. What
+            // is still refused is what the RESOLVER refuses — an `ldc` naming a
+            // String, a Class, a MethodHandle, a MethodType or a condy site,
+            // each of which has resolution side effects (interning, class
+            // loading, `<clinit>`) that a spliced immediate would skip.
+            0x12 | 0x13 | 0x14 if ir_mode && !ir_splice_ldc_enabled() => no!("ir-splice-ldc"),
             0xac..=0xb1 if ir_mode => {
                 ir_return_pcs.push(scan_pc);
                 scan_pc += 1;
@@ -10384,6 +10562,12 @@ fn resolve_inline_site_from(
     // still CALLED — it just is not spliced — which is what "cannot model it"
     // has to mean.
     let mut ldc_info = Vec::new();
+    // Callee PCs whose constant is a float or a double. The optimizing tier
+    // cannot splice a body without this — see `InlineSite::ldc_fp_pcs` — and
+    // recording it here rather than re-deriving it downstream is what keeps the
+    // tag and the value from disagreeing: both come out of the same
+    // constant-pool match.
+    let mut ldc_fp_pcs: Vec<usize> = Vec::new();
     if has_ldc {
         let mut fpc = 0;
         while fpc < code_len {
@@ -10391,7 +10575,10 @@ fn resolve_inline_site_from(
                 let cp_idx = code[fpc + 1] as u16; // Cast: bytecode operand decoding
                 let val = match callee_class_info.constant_pool.get(cp_idx) {
                     Some(ConstantPoolEntry::Integer(v)) => *v as i64, // JVM spec: bounded float-to-long conversion
-                    Some(ConstantPoolEntry::Float(v)) => (*v as f32).to_bits() as i32 as i64, // Cast: JIT ABI -- float bits to i64
+                    Some(ConstantPoolEntry::Float(v)) => {
+                        ldc_fp_pcs.push(fpc);
+                        (*v as f32).to_bits() as i32 as i64 // Cast: JIT ABI -- float bits to i64
+                    }
                     _ => return None,
                 };
                 ldc_info.push((fpc, val));
@@ -10400,7 +10587,10 @@ fn resolve_inline_site_from(
                 let cp_idx = ((code[fpc + 1] as u16) << 8) | code[fpc + 2] as u16; // Cast: bytecode operand decoding
                 let val = match callee_class_info.constant_pool.get(cp_idx) {
                     Some(ConstantPoolEntry::Integer(v)) => *v as i64, // JVM spec: bounded float-to-long conversion
-                    Some(ConstantPoolEntry::Float(v)) => (*v as f32).to_bits() as i32 as i64, // Cast: JIT ABI -- float bits to i64
+                    Some(ConstantPoolEntry::Float(v)) => {
+                        ldc_fp_pcs.push(fpc);
+                        (*v as f32).to_bits() as i32 as i64 // Cast: JIT ABI -- float bits to i64
+                    }
                     _ => return None,
                 };
                 ldc_info.push((fpc, val));
@@ -10422,7 +10612,10 @@ fn resolve_inline_site_from(
                 let cp_idx = ((code[fpc + 1] as u16) << 8) | code[fpc + 2] as u16; // Cast: bytecode operand decoding
                 let val = match callee_class_info.constant_pool.get(cp_idx)? {
                     ConstantPoolEntry::Long(v) => *v,
-                    ConstantPoolEntry::Double(v) => v.to_bits() as i64, // Cast: JIT ABI -- float bits to i64
+                    ConstantPoolEntry::Double(v) => {
+                        ldc_fp_pcs.push(fpc);
+                        v.to_bits() as i64 // Cast: JIT ABI -- float bits to i64
+                    }
                     _ => return None,
                 };
                 ldc2w_info.push((fpc, val));
@@ -10825,6 +11018,7 @@ fn resolve_inline_site_from(
         static_field_info,
         ldc_info,
         ldc2w_info,
+        ldc_fp_pcs,
         needs_heap,
         class_name: inlined_body_class_name,
         class_id: inlined_body_class_id,
