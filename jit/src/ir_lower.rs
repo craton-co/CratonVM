@@ -8915,6 +8915,20 @@ impl<'a> Lowerer<'a> {
                         }
                     }
                 }
+                // Everything above returned. Reaching here means this call is
+                // lowered to `jit_invoke_dispatch`, which resolves the callee
+                // BY NAME on every execution -- ~175 ns against a direct
+                // `CALL`'s ~4. That is sometimes the only correct answer (a
+                // megamorphic site with no cache, a kind this tier cannot
+                // bind), and it was silently also the answer for every
+                // statically-bound call inside a SPLICED body, whose
+                // `ir_direct_calls` row nothing produced. Count it, split by
+                // whether the site is inside a relocated body, so that failure
+                // has a reading instead of only a wall clock.
+                note_ir_blind_dispatch(
+                    node.bytecode_pc
+                        .is_some_and(|pc| self.pc_is_in_a_spliced_body(pc)),
+                );
                 // 1. Marshal each Java arg into the staging region.
                 for i in 0..num_args {
                     let arg = node.inputs[2 + i];
@@ -10005,6 +10019,18 @@ impl<'a> Lowerer<'a> {
             }
         }
         bci
+    }
+
+    /// Is `pc` a combined-buffer pc inside a RELOCATED callee body?
+    ///
+    /// The same scan [`Self::resume_bci`] does, asked for its predicate rather
+    /// than its answer, and kept beside it so the two cannot come to disagree
+    /// about what "inside a splice" means. Diagnostic-only; see
+    /// [`ir_blind_dispatch_census`].
+    fn pc_is_in_a_spliced_body(&self, pc: usize) -> bool {
+        self.spliced_ranges
+            .iter()
+            .any(|&(start, end, _)| pc >= start && pc < end)
     }
 
     fn resolve_frame_state_for_bci(&self, bci: usize) -> FrameState {
@@ -13396,6 +13422,37 @@ pub fn ir_fallthrough_census() -> (u64, u64) {
     (
         FALLTHROUGHS_ELIDED.load(std::sync::atomic::Ordering::Relaxed),
         BLOCK_JMPS_EMITTED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Calls this tier lowered to the blind `jit_invoke_dispatch` helper:
+/// `[0]` in the compiling method's own code, `[1]` inside a spliced body.
+///
+/// The split is the whole point. A blind dispatch in the method's own code is
+/// ordinary -- an unbindable kind, a site with no inline cache. One inside a
+/// SPLICED body is a contradiction: the splice exists to delete a frame, and
+/// paying a name resolution for the calls left behind costs far more than the
+/// frame it removed. That combination is what made `SpliceCallProbe`'s
+/// optimizing body 8.5x slower than its single-pass one (~455 ms against
+/// 53 ms), and it had no reading of any kind -- which is how it survived a
+/// measurement campaign that concluded the two bodies were
+/// throughput-neutral. With the rows produced, this row reads 0 on that probe
+/// and the optimizing body is at parity.
+static IR_BLIND_DISPATCH: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+fn note_ir_blind_dispatch(in_splice: bool) {
+    IR_BLIND_DISPATCH[usize::from(in_splice)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(in the method's own code, inside a spliced body)`. See
+/// [`IR_BLIND_DISPATCH`]; a non-zero second element is the one to act on.
+pub fn ir_blind_dispatch_census() -> (u64, u64) {
+    (
+        IR_BLIND_DISPATCH[0].load(std::sync::atomic::Ordering::Relaxed),
+        IR_BLIND_DISPATCH[1].load(std::sync::atomic::Ordering::Relaxed),
     )
 }
 

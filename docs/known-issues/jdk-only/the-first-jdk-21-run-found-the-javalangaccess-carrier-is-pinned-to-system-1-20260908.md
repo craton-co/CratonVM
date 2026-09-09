@@ -185,6 +185,29 @@ was silently absent.
 > Two of the four defects on this page are therefore now frozen on BOTH
 > platforms rather than one.
 
+> **SUPERSEDED 2026-09-09 -- `21-linux` is minted and gating.** Run on an
+> azure Linux host against Temurin 21.0.12+8 with a release binary built from
+> `origin/dev` @ 5487287dc. All four matrix legs now adjudicate; none refuses.
+>
+> The Linux key carries **16 sections, the same count as `21-windows` but not
+> the same set**: Linux does not diverge on `textformat` (that row is locale
+> data, and the Windows measurement was taken on a host whose default locale is
+> ru_RU -- see the #4 note above), and Linux carries a `real/vthreads` row
+> Windows does not.
+>
+> **It was not accepted from one mint, and the first two attempts would have
+> been a gate that went red at random.** The vthreads section is an
+> intermittent race, and because the baseline records section IDENTITY, a
+> baseline minted from a run that saw the smaller set reads the larger set as
+> NEW. Attempt 1 minted 15 sections, passed one gate run and failed the next.
+> The accepted baseline is the MAXIMAL observed set -- every later run is then
+> a subset, and GONE always passes -- and it was held to ten consecutive
+> passing gate runs before acceptance, with the paired ratchet then re-run
+> against it (remove one row -> rc=5 naming that row; restore -> rc=0).
+>
+> Two of the four defects on this page are therefore now frozen on BOTH
+> platforms rather than one.
+
 * **`21-linux` is untouched.** This is one platform. The 21 Linux leg still
   refuses, and a baseline from another key cannot adjudicate it.
 * **#4 is an observation.** No locale mechanism is identified.
