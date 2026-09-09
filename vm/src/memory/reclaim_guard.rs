@@ -265,15 +265,31 @@ fn report_reclaimed_receiver_inner(
     // be read again — so a hit here names the method and slot where the
     // analysis is wrong, which is the only thing that turns "disable the
     // filter and the corruption stops" into a fix.
-    if let Some(where_) = cratonvm_gc::gc_quiescence::liveness_filtered_at(addr) {
+    //
+    // THE AGE IS PART OF THE CLAIM. The ledger is keyed by address and the
+    // allocator re-serves addresses, so an entry from many collections ago
+    // describes whatever object held this address THEN. Reported without it,
+    // this line named a 1200-cycles-stale frame as the cause of a failure that
+    // `CRATONVM_NO_LOCAL_LIVENESS=1` went on to reproduce
+    // (`bindabletests-moving-young-leaves-a-frame-slot-unremapped-20260908.md`).
+    // `filtered_on` == `heap_collection` is the reading worth acting on.
+    if let Some((where_, on)) = cratonvm_gc::gc_quiescence::liveness_filtered_at(addr) {
         static L: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if L.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MAX_REPORTS {
+            let now = shared.mem.heap.collection_count();
             tracing::error!(
                 target: "cratonvm::gc::guard",
                 obj = format!("{addr:#x}"),
                 site = site,
                 filtered_at = %where_,
-                "…and the per-bci local-liveness filter DROPPED this address from a root                  snapshot at the frame named here. The filter guarantees such a slot is never                  read again; it was.",
+                filtered_on = on,
+                heap_collection = now,
+                collections_since = now.saturating_sub(on),
+                "…and the per-bci local-liveness filter DROPPED this address from a root \
+                 snapshot at the frame named here. The filter guarantees such a slot is never \
+                 read again. `collections_since` is how stale the attribution is: the ledger \
+                 is keyed by ADDRESS, so a non-zero value means the allocator may have \
+                 re-served it and the frame named is about a different object.",
             );
         }
     }
