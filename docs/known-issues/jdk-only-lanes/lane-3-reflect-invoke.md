@@ -201,6 +201,27 @@ what HotSpot refuses, and none refuses what HotSpot admits.
 `W4-1-publiclookup-allowedmodes-never-checked.md` is **not** wrong to say the
 gate is CLOSED; it is closed for the PRIVATE-bit-clear case it gates.
 
+**And the split is exactly where the code says it is, which is the useful
+result.** The same non-nestmate target, through core reflection instead of
+`Lookup`, is *correctly refused*:
+
+```text
+FG private field read without setAccessible        IllegalAccessException  BOTH VMs
+FG private method invoke without setAccessible     IllegalAccessException  BOTH VMs
+FG private constructor without setAccessible       IllegalAccessException  BOTH VMs
+```
+
+Only the throwing frame and the message wording differ — ours constructs the
+exception at the call site, HotSpot in `Reflection.newIllegalAccessException`.
+So [`../jdk-only/L15-nestmate-access-field-and-constructor.md`](../jdk-only/L15-nestmate-access-field-and-constructor.md)
+is **independently corroborated** by this instrument: its
+`caller_may_access_member` funnel fires on all three of the field, method and
+constructor paths it claims to cover.
+
+Core reflection checks the caller; `java.lang.invoke` deliberately does not.
+That is one sentence to hand to whoever closes the `Lookup` residual, and it
+took a non-nestmate fixture to say it.
+
 **The leak is the genuine defect,** and it has nothing to do with those guards.
 It follows from §5's copy model failing: `getDeclaredField("x") ==
 getDeclaredField("x")` is **`true`** here and `false` on HotSpot, for `Field`,
