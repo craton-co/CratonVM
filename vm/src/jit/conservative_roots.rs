@@ -9071,6 +9071,7 @@ fn scan_one_compiled_frame_with_layout(
     cm: &cratonvm_jit::CompiledMethod,
     heap: &VmHeap,
     out: &mut Vec<ObjectRef>,
+    remap_covered: bool,
 ) -> bool {
     let frame_size = cm.osr_frame_size;
     if frame_size <= 0 {
@@ -9103,7 +9104,7 @@ fn scan_one_compiled_frame_with_layout(
     // with a resolved layout -- a foreign innermost frame has none, and it
     // already forces the non-moving sweep through `FOREIGN_INNERMOST_RBP`, so
     // there is no move to veto there.
-    publish_unrewritable_band_roots(rbp, frame_size, cm, reg_mask, heap);
+    publish_unrewritable_band_roots(rbp, frame_size, cm, reg_mask, heap, remap_covered);
     true
 }
 
@@ -9151,7 +9152,10 @@ fn scan_compiled_frame_bands(
             // pin. See `band_path`.
             band_path::FOREIGN_INNERMOST.fetch_add(1, Ordering::Relaxed);
             scan_one_frame(scanner_sp, rbp, heap, out);
-        } else if !scan_one_compiled_frame_with_layout(rbp, cm, heap, out) {
+        } else if !scan_one_compiled_frame_with_layout(rbp, cm, heap, out, true) {
+            // `true`: this frame is on the REGISTERED chain, which is the set
+            // `remap_register_image_words` walks, so its register image is
+            // rewritten after a move.
             return false;
         }
 
@@ -9834,7 +9838,10 @@ fn scan_a5_band_as_frames(
         // and the relocation walker both rest on.
         let cm: &cratonvm_jit::CompiledMethod =
             unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
-        if scan_one_compiled_frame_with_layout(rbp, cm, heap, out) {
+        // `false`: a frame recovered by INSPECTION is not on the entry chain,
+        // and `remap_register_image_words` walks the chain -- so nothing
+        // rewrites this frame's register image and its words must still pin.
+        if scan_one_compiled_frame_with_layout(rbp, cm, heap, out, false) {
             seen_rbp.push(rbp);
             scanned += 1;
             band_path::A5_FRAMES.fetch_add(1, Ordering::Relaxed);
@@ -9928,6 +9935,19 @@ pub mod band_path {
     }
 }
 
+/// Words that were UNVERIFIABLE yet published movable because
+/// `remap_register_image_words` rewrites them anyway.
+///
+/// The number that says whether the "unverifiable" and "unrewritten" sets had
+/// actually drifted apart: a non-zero count is a word that was being pinned for
+/// a rewrite that was already happening.
+static REMAPPED_NOT_PINNED: AtomicUsize = AtomicUsize::new(0);
+
+/// Diagnostic counterpart of [`unrewritable_band_root_count`].
+pub fn remapped_not_pinned_count() -> usize {
+    REMAPPED_NOT_PINNED.load(Ordering::Relaxed)
+}
+
 /// Objects published MOVABLE from a verifiable band word this run.
 ///
 /// The complement of [`unrewritable_band_root_count`], and the two are read
@@ -10016,6 +10036,7 @@ fn publish_unrewritable_band_roots(
     cm: &cratonvm_jit::CompiledMethod,
     reg_mask: Option<u16>,
     heap: &VmHeap,
+    remap_covered: bool,
 ) {
     if frame_size == 0 || frame_size > rbp {
         return;
@@ -10101,6 +10122,32 @@ fn publish_unrewritable_band_roots(
             }
         }
         if heap.is_object_address(qword).is_some() {
+            // UNVERIFIABLE, but not necessarily unrewritten. `band_slot_is_verifiable`
+            // asks whether the JIT's abstract interpreter MODELS the region;
+            // the pin decision needs the different question of whether anything
+            // REWRITES the word, and for one region the answer is already yes.
+            //
+            // `remap_register_image_words` runs on every collection
+            // (`CRATONVM_REGISTER_IMAGE_REMAP`, default on) and rewrites exactly
+            // what `register_image_remap_admits` accepts, which by default is
+            // the callee-saved GPR image. Those words are therefore fixed up
+            // after a move already, and pinning them bought nothing -- it just
+            // held a megabyte-granular G1 region for an object that was going
+            // to be rewritten anyway.
+            //
+            // Two conditions, and both are needed. The region has to be one the
+            // remap admits, and the FRAME has to be one the remap reaches:
+            // `remap_register_image_words` walks the registered entry chain, so
+            // a frame recovered by inspection in the A5 band is not covered and
+            // `remap_covered` is false for it.
+            if remap_covered && register_image_remap_admits(off, &cm.frame_layout) {
+                cratonvm_gc::gc_quiescence::add_movable_jit_root(qword);
+                MOVABLE_BAND_ROOTS.fetch_add(1, Ordering::Relaxed);
+                REMAPPED_NOT_PINNED.fetch_add(1, Ordering::Relaxed);
+                // `addr` was advanced at the read above, so `continue` is the
+                // whole of what this needs to do.
+                continue;
+            }
             cratonvm_gc::gc_quiescence::add_unrewritable_jit_root(qword);
             published += 1;
             // `CRATONVM_DBG_JIT_ROOTSCAN=1` — WHICH unverifiable region this
