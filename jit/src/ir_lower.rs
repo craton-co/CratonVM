@@ -4067,12 +4067,13 @@ impl<'a> Lowerer<'a> {
     /// adds 10 and not 6. The load stays a single aligned 32-bit read, so it is
     /// as atomic as the `MOV ECX` it replaces.
     ///
-    /// **Sound here and NOT in the single-pass backend**, for the reason
-    /// `emit_test_safepoint_flag_rip` gives two hundred lines below: this
-    /// lowerer never duplicates emitted bytes to a second address, so a
-    /// displacement that is right when emitted stays right. `x64`'s twin of
-    /// this guard sits inside a body its native unroller byte-copies, and is
-    /// deliberately left alone.
+    /// Sound here **for free**: this lowerer never duplicates emitted bytes to
+    /// a second address, so a displacement that is right when emitted stays
+    /// right — the reason `emit_test_safepoint_flag_rip` gives two hundred
+    /// lines below. `x64`'s twin sits inside a body its native unroller
+    /// byte-copies and needs the fixup pass to earn the same shape; it has one
+    /// (`rip_abs_disp32_patches`, declaring a 4-byte trail for the `imm32`)
+    /// and emits the same instruction since 2026-09-10.
     fn emit_cmp_layout_epoch_rip(&mut self, addr: usize, expected: u32) -> bool {
         if !ir_epoch_guard_rip_enabled() {
             return false;

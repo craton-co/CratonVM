@@ -1415,6 +1415,18 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-reg-authoritative", on_key: Some("CRATONVM_JIT_IR_REG_AUTHORITATIVE"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
     E { group: Group::JIT, token: "ir-gp-wide", on_key: Some("CRATONVM_JIT_IR_GP_WIDE"), off_key: None, off_word: None, since: "2026-09-10" },
     E { group: Group::JIT, token: "ir-epoch-guard-rip", on_key: Some("CRATONVM_JIT_IR_EPOCH_GUARD_RIP"), off_key: None, off_word: Some("0"), since: "2026-09-10" },
+    // The single-pass twin of the row above, and the arm that unrolls: the
+    // `osr/sp` body of a four-field loop carries eight of these guards.
+    E { group: Group::JIT, token: "sp-epoch-guard-rip", on_key: Some("CRATONVM_JIT_SP_EPOCH_GUARD_RIP"), off_key: None, off_word: Some("0"), since: "2026-09-10" },
+    // Default ON and UNSOUND when clear: it restores a baked compact body
+    // offset that survives a layout replacement. It exists so the guard's
+    // price is a number from one binary, not an argument.
+    E { group: Group::JIT, token: "sp-field-layout-guard", on_key: Some("CRATONVM_JIT_SP_FIELD_LAYOUT_GUARD"), off_key: None, off_word: Some("0"), since: "2026-09-10" },
+    // Diagnosis lever, default OFF: put the layout-replacement epoch back in
+    // `.data` so its LOCATION is A/B-able independently of the encoding it
+    // shipped with. Must not be combined with `code-near-globals`, whose
+    // placement anchor is this counter.
+    E { group: Group::JIT, token: "layout-epoch-static", on_key: Some("CRATONVM_JIT_LAYOUT_EPOCH_STATIC"), off_key: None, off_word: None, since: "2026-09-10" },
     E { group: Group::JIT, token: "code-near-globals", on_key: Some("CRATONVM_JIT_CODE_NEAR_GLOBALS"), off_key: None, off_word: None, since: "2026-09-10" },
     E { group: Group::JIT, token: "ir-speculate", on_key: Some("CRATONVM_JIT_IR_SPECULATE"), off_key: None, off_word: None, since: "2026-09-09" },
     // Diagnosis lever, value-taking: a comma-separated list of conservative
