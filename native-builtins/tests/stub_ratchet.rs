@@ -1481,7 +1481,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// the defect this file's header describes, where two such ratchets disagreed
 /// by 364 registrations for weeks. Here it is a units difference, not a
 /// measurement error -- but only enumerating the added set showed which.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1974;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1958;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1532,7 +1532,30 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1974;
 /// 25.0.3+9. Nothing was removed. The equality of the three deltas is the
 /// useful part of the check: a table that moved one configuration and not
 /// another would mean a `#[cfg]`-gated registrar was in the wave, and none is.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1963;
+/// # Re-frozen DOWNWARD, 1963 -> 1947: sixteen L0 retirements withdrawn
+///
+/// ```text
+/// NO_MANAGEMENT   1963 -> 1947      MANAGEMENT   1974 -> 1958
+/// SYNTHETIC_JDK   1963 -> 1947
+/// ```
+///
+/// Minus 16 in all three, for the 16 triples withdrawn from
+/// `RETIRED_SHADOW_L0_TRIPLES` after the `--jdk-only` corpus arm came back
+/// **97 of 132** where four earlier binaries had scored 132/0. Sixteen
+/// triples, sixteen registrations, 1:1 -- see that table's doc comment for why
+/// they were wrong, which is a methodology finding and not a clerical one.
+///
+/// **This movement was invisible to this gate, and that is the note's real
+/// point.** The assertion is `<=`, so a DECREASE passes silently: the
+/// constants sat at 1963/1974/1963 against a tree measuring 1947/1958/1947
+/// and every arm was green. The number was recovered by temporarily setting
+/// each baseline to 1 and reading the failure's own paste-ready line -- the
+/// paired-ratchet method -- because nothing in a passing run prints it.
+///
+/// A ratchet that only guards one direction cannot be used to detect that
+/// work was UNDONE. If a wave withdraws entries, re-freeze from a forced
+/// failure, never from arithmetic on the old constant.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1947;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1589,7 +1612,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1963;
 /// re-freeze ALL THREE — see the pointer on both siblings.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1963;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1947;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///

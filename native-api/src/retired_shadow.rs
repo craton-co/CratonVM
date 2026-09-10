@@ -1590,8 +1590,72 @@ static RETIRED_SHADOW_L3_TRIPLES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// # 54 became 38: the DIAL is not a faithful simulator of a RETIREMENT
+///
+/// **This table shipped 16 triples the corpus disproved, and the reason is
+/// methodological rather than clerical.** Lane L0's wave was validated with
+/// `CRATONVM_ENFORCE_NATIVE_SHADOW` -- the shadow dial, which makes a native
+/// DECLINE at a dispatch door -- and never with the retirement itself, which
+/// refuses the REGISTRATION. Those are not the same experiment, and that run's
+/// own census said so in a line nobody read:
+///
+/// ```text
+/// [DIAL_DOOR_CENSUS] armed=true reached=3680 yielded=3593 leaked=87
+/// ```
+///
+/// **87 dispatches reached the dial and were not yielded.** A leaked row
+/// reports the NATIVE's answer while reading, in a three-arm diff, as "the
+/// bytecode is fine here". `Class.isArray` was one of them: the armed arm
+/// printed `true/false`, matching HotSpot exactly, and the real retirement
+/// answers `false/false`.
+///
+/// Re-measured with no dial anywhere -- control binary (pre-table) against
+/// retired binary against HotSpot, on the same 129-row probe:
+///
+/// ```text
+/// 117  OK -> OK      retirement safe
+///   4  BAD -> OK     retirement REPAIRS a disagreement
+///   8  OK -> BAD     retirement BREAKS a correct answer   <- shipped anyway
+/// ```
+///
+/// Those eight cost **35 of 132 vectors** on the `--jdk-only` corpus arm,
+/// which had been 132/0 on four consecutive earlier binaries (`p4`, `p7`,
+/// `p8`, `p9`). The arm is the only instrument that caught it, which is
+/// exactly why the landing protocol lists it and why it must not be skipped
+/// when a goal changes mid-wave -- this wave's arms were deferred when the
+/// session moved to lane L3, and that is how the eight got in.
+///
+/// ## The eight, and why they are really four causes
+///
+/// * **The array family is ONE bad triple with a cascade.** `componentType`
+///   was retired; this VM never fills the `componentType` FIELD (this table's
+///   own held list records `descriptorString` NPE-ing on exactly that); and
+///   JDK 22+ implements `isArray()` as `componentType != null`. So `isArray`
+///   answers `false`, and `getTypeName`/`getSimpleName`/`getCanonicalName`
+///   fall back to the internal form for arrays -- `[[I` where HotSpot says
+///   `int[][]`. Six triples withdrawn for one root cause.
+/// * **Generic and annotated signature resolution** raises
+///   `TypeNotPresentException` for a type that is plainly on the class path.
+///   Four triples.
+/// * **The reflection-data copy model** flips: `field copies not same` goes
+///   `true -> false`, so the VM stops handing out copies. Note the direction,
+///   because lane L3 measured the SAME defect from the other side and found
+///   that yielding REPAIRS copying for `Field`/`Method`/`Constructor`. Same
+///   mechanism, opposite sign, depending on which end owns the accessor.
+/// * **`Class.getClassLoader`** yields null for the application loader, and
+///   **`ClassValue.get`** loses a recomputation. One triple each.
+///
+/// `Module.getClassLoader` is NOT withdrawn: it measured `OK -> OK` on the
+/// no-dial arm and its row is not a default-value agreement.
+///
+/// ## What this means for the next wave, in one line
+///
+/// **A dial arm is a screening instrument, not evidence.** Score a retirement
+/// with two BINARIES -- one without the table, one with it -- and require
+/// `OK -> BAD == 0` before the corpus arm, not after. If a dial arm is used at
+/// all, read its `leaked` counter first: `leaked > 0` means some rows in that
+/// arm never yielded and cannot be cited.
 static RETIRED_SHADOW_L0_TRIPLES: &[(&str, &str, &str)] = &[
-    ("java/lang/Class", "arrayType", "()Ljava/lang/Class;"),
     (
         "java/lang/Class",
         "asSubclass",
@@ -1602,7 +1666,6 @@ static RETIRED_SHADOW_L0_TRIPLES: &[(&str, &str, &str)] = &[
         "cast",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
     ),
-    ("java/lang/Class", "componentType", "()Ljava/lang/Class;"),
     ("java/lang/Class", "desiredAssertionStatus", "()Z"),
     (
         "java/lang/Class",
@@ -1618,26 +1681,6 @@ static RETIRED_SHADOW_L0_TRIPLES: &[(&str, &str, &str)] = &[
         "java/lang/Class",
         "forName",
         "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;",
-    ),
-    (
-        "java/lang/Class",
-        "getAnnotatedInterfaces",
-        "()[Ljava/lang/reflect/AnnotatedType;",
-    ),
-    (
-        "java/lang/Class",
-        "getAnnotatedSuperclass",
-        "()Ljava/lang/reflect/AnnotatedType;",
-    ),
-    (
-        "java/lang/Class",
-        "getCanonicalName",
-        "()Ljava/lang/String;",
-    ),
-    (
-        "java/lang/Class",
-        "getClassLoader",
-        "()Ljava/lang/ClassLoader;",
     ),
     (
         "java/lang/Class",
@@ -1658,16 +1701,6 @@ static RETIRED_SHADOW_L0_TRIPLES: &[(&str, &str, &str)] = &[
         "java/lang/Class",
         "getDeclaredConstructors",
         "()[Ljava/lang/reflect/Constructor;",
-    ),
-    (
-        "java/lang/Class",
-        "getDeclaredField",
-        "(Ljava/lang/String;)Ljava/lang/reflect/Field;",
-    ),
-    (
-        "java/lang/Class",
-        "getDeclaredFields",
-        "()[Ljava/lang/reflect/Field;",
     ),
     (
         "java/lang/Class",
@@ -1701,26 +1734,6 @@ static RETIRED_SHADOW_L0_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/lang/Class",
-        "getField",
-        "(Ljava/lang/String;)Ljava/lang/reflect/Field;",
-    ),
-    (
-        "java/lang/Class",
-        "getFields",
-        "()[Ljava/lang/reflect/Field;",
-    ),
-    (
-        "java/lang/Class",
-        "getGenericInterfaces",
-        "()[Ljava/lang/reflect/Type;",
-    ),
-    (
-        "java/lang/Class",
-        "getGenericSuperclass",
-        "()Ljava/lang/reflect/Type;",
-    ),
-    (
-        "java/lang/Class",
         "getMethod",
         "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
     ),
@@ -1731,23 +1744,15 @@ static RETIRED_SHADOW_L0_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     ("java/lang/Class", "getPackageName", "()Ljava/lang/String;"),
     ("java/lang/Class", "getSigners", "()[Ljava/lang/Object;"),
-    ("java/lang/Class", "getSimpleName", "()Ljava/lang/String;"),
-    ("java/lang/Class", "getTypeName", "()Ljava/lang/String;"),
     (
         "java/lang/Class",
         "getTypeParameters",
         "()[Ljava/lang/reflect/TypeVariable;",
     ),
     ("java/lang/Class", "isAnnotation", "()Z"),
-    ("java/lang/Class", "isArray", "()Z"),
     ("java/lang/Class", "isEnum", "()Z"),
     ("java/lang/Class", "isInterface", "()Z"),
     ("java/lang/Class", "isPrimitive", "()Z"),
-    (
-        "java/lang/ClassValue",
-        "get",
-        "(Ljava/lang/Class;)Ljava/lang/Object;",
-    ),
     (
         "java/lang/Module",
         "addExports",
@@ -3336,6 +3341,29 @@ Ljava/nio/channels/FileChannel;"
                 "java/lang/Class",
                 "getDeclaredAnnotation",
                 "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
+            ),
+            // WITHDRAWN 2026-09-10 after the corpus arm: retired on a dial
+            // arm that leaked, `OK -> BAD` on a no-dial re-measure. See the
+            // table's doc comment.
+            ("java/lang/Class", "arrayType", "()Ljava/lang/Class;"),
+            ("java/lang/Class", "componentType", "()Ljava/lang/Class;"),
+            ("java/lang/Class", "isArray", "()Z"),
+            ("java/lang/Class", "getTypeName", "()Ljava/lang/String;"),
+            ("java/lang/Class", "getSimpleName", "()Ljava/lang/String;"),
+            (
+                "java/lang/Class",
+                "getCanonicalName",
+                "()Ljava/lang/String;",
+            ),
+            (
+                "java/lang/Class",
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;",
+            ),
+            (
+                "java/lang/ClassValue",
+                "get",
+                "(Ljava/lang/Class;)Ljava/lang/Object;",
             ),
             (
                 "java/lang/Class",
