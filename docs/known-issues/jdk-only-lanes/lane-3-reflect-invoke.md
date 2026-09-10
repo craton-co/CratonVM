@@ -264,22 +264,36 @@ reads as a spectacular improvement and was the artefact described below.
 
 ### Interface carriers: 8 of 9 never dispatch, and one does
 
-Nine registrations name a class that method resolution does not yield as the
-declaring class — `TypeVariable` (6), `GenericArrayType`, `ParameterizedType`
-and `WildcardType` `.equals`. The oracle prints the resolution rather than
-asserting it: `TypeVariable.equals` resolves to `TypeVariableImpl`,
-`getTypeName` to `Type`, `ParameterizedType.equals` to
-`ParameterizedTypeImpl`. A door asking about the declaring class can never ask
-about the interface.
+Nine registrations name a class the JDK does not treat as the declaring class
+of the method — `TypeVariable` (6), plus `.equals` on `GenericArrayType`,
+`ParameterizedType` and `WildcardType`. The oracle prints the resolution rather
+than asserting it: `TypeVariable.equals` resolves to `TypeVariableImpl`,
+`getTypeName` to `Type`, `ParameterizedType.equals` to `ParameterizedTypeImpl`.
 
-**But `GenericArrayType.equals` counted `inv=1`** while its three siblings
-counted zero. So "an interface registration is unreachable" is a good heuristic
-with a live counterexample, and the counterexample is evidence about *this
-VM's* method resolution, not about the JDK. Do not delete these nine on the
-heuristic; the one that fires needs its declaring class printed first.
+The tempting conclusion is that a door asking about the declaring class can
+never ask about the interface, so all nine are dead. **That conclusion is
+wrong, and the data says so twice.** `GenericArrayType.equals` counted `inv=1`
+while its three siblings counted zero, and the wider pattern is worse for the
+rule:
 
-`Executable.getParameters` is **not** in that set — the oracle resolves it to
-`java.lang.reflect.Executable`, so registering there is reachable.
+```text
+Field.canAccess       inherited from AccessibleObject   inv=6   FIRES
+Field.setAccessible   inherited from AccessibleObject   inv=0   never
+```
+
+Two methods, one carrier, one bucket, opposite outcomes — and the probe calls
+both many times. So a registration on a class that merely INHERITS the method
+can fire in this VM; whether it does is decided per method by something this
+lane has not identified. **8 of 30 bucket-B rows dispatched, 22 did not.**
+
+Do not delete anything on the heuristic. What lane 3 can honestly hand over is
+the measurement: 92 of the 242 never dispatched under an instrument that calls
+many of them (70 bucket-A, 22 bucket-B), and the `canAccess`/`setAccessible`
+pair is the cheapest reproducer for whoever owns dispatch routing.
+
+`Executable.getParameters` is **not** in the dead set on any reading — the
+oracle resolves it to `java.lang.reflect.Executable` and it counted `inv=1`
+(`Constructor`) and `inv=3` (`Method`).
 
 ---
 
