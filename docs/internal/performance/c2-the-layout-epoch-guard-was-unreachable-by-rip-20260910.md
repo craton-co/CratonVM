@@ -80,6 +80,34 @@ fallback both stay. Moving the counter makes the short form **reachable**, not
 certain — and `CRATONVM_JIT_IR_EPOCH_GUARD_RIP=0` exercises the fallback
 deliberately rather than waiting for an address space that produces it.
 
+> **And on System V it was never certain, it was never true.** Checked on
+> retirement, on an Ubuntu 24.04 x86-64 host, one process:
+>
+> | | address |
+> |---|---|
+> | `LAYOUT_REPLACE_EPOCH`, the leaked `Box` | `0x2001E8103F0` |
+> | `stw_requested_flag`, the poll's cell | `0x2000CD6E2C0` |
+> | the optimizing tier's code buffer | `0x7A53DBCB8000` |
+>
+> The two heap cells are 295 MB apart — comfortably in reach of each other —
+> and the code is **130 TB** from both. So on Linux `MultiFieldLoop.sumGuarded`
+> emits **zero** short-form guards with `EPOCH_GUARD_RIP=1` and zero with it
+> off: byte-identical bodies, and the 14.5% below is a Windows number in its
+> entirety. **The back-edge safepoint poll is in the same position** — its
+> `TEST byte [rip+disp32]` also never encodes there, which retires this file's
+> "the poll gets away with it because its flag is not a static" as an
+> explanation that happens to be true only on Windows. The real rule is that
+> `mmap(NULL, …)` places code in the kernel's own high region while mimalloc
+> reserves its arenas near 2 TB, and nothing moves those towards each other.
+>
+> That is a placement problem, not an encoder one, and it now has a lever:
+> `CRATONVM_JIT_CODE_NEAR_GLOBALS=1` gives `mmap` an address HINT derived from
+> the epoch counter, so code buffers land inside the window when the address
+> space allows. Hint only — no `MAP_FIXED`, so it can never overlap the heap,
+> a reserved arena, or anything the GC reads, and a placement out of window is
+> released and retried. See §"On Linux the counter was in the right place and
+> the CODE was in the wrong one" below.
+
 ## Engagement
 
 `MultiFieldLoop.sumGuarded`, `full/ir` body, one binary:
@@ -129,6 +157,132 @@ the encoding's, measured cleanly; the heap move's own cost is **unmeasured**.
 It is one global counter whose location changed, read by the same instruction
 count in the off arm, so there is no mechanism for it to matter — but that is
 an argument, not a number, and the two are not the same thing.
+
+## On Linux the counter was in the right place and the CODE was in the wrong one
+
+**Added 2026-09-10, on retirement.** Everything above was measured on Windows.
+Checked on Linux, none of it engages, and the reason is worth as much as the
+original finding.
+
+`MultiFieldLoop.sumGuarded`, Ubuntu 24.04 x86-64, `full/ir` body, both arms of
+the flag:
+
+| arm | `81 3D` guards | body bytes |
+|---|---:|---:|
+| `EPOCH_GUARD_RIP=1` | **0** | 1865 |
+| `EPOCH_GUARD_RIP=0` | **0** | 1865 |
+
+Byte-identical bodies. The flag this file is about changes nothing on Linux,
+and neither does the heap move that made it possible — because the code buffer
+is not in the heap's part of the address space:
+
+```text
+LAYOUT_REPLACE_EPOCH (mimalloc heap)   0x2001E8103F0
+stw_requested_flag   (mimalloc heap)   0x2000CD6E2C0    295 MB from the counter
+optimizing tier's code buffer (mmap)   0x7A53DBCB8000   ~130 TB from both
+```
+
+So the back-edge safepoint poll takes the long form here too — `MOV R11,
+imm64` then `TEST BYTE [R11], 0FFh` — which retires this file's explanation of
+why the poll "gets away with it". It gets away with it **on Windows**, where
+the VM heap and the JIT's code cache are both in the same low region. On Linux
+`mmap(NULL, …)` places anonymous mappings in the kernel's high region and
+mimalloc reserves its arena at 2TB, and nothing pulls those together.
+
+### It is a placement problem, and placement is a hint away
+
+`CRATONVM_JIT_CODE_NEAR_GLOBALS=1` (`jit::platform`, **default OFF**, Unix
+only) supplies `mmap` with an address hint derived from the epoch counter, so
+code buffers land inside the ±2GB window when the address space allows. A hint
+and nothing more — no `MAP_FIXED` — so it cannot overlap the heap, a reserved
+arena, or anything the GC reads; a placement that comes back out of window is
+released and the next hint tried, and a whole ladder of misses retires the
+strategy for the process.
+
+The first version of that walk found nothing, and `/proc/<pid>/maps` says why —
+it is the same kind of fact as the 140TB above and deserves the same billing:
+
+```text
+20000000000-20040000000 rw-p [anon:mimalloc]
+```
+
+**One 16GB reservation with the anchor 511MB inside it.** A cursor walking
+*up* from the anchor is inside that mapping for the whole reachable window, so
+every hint was relocated. The free space is *below* it — the arena is reserved
+upward from its base, so the room is underneath. The hint ladder now probes
+both sides with doubling offsets, below first, and
+`the_ladder_probes_below_the_anchor_first` pins that as a property rather than
+as a comment.
+
+### It engages, and the arithmetic checks out
+
+Same probe, same binary, `MultiFieldLoop.sumGuarded`:
+
+| arm | code buffer | `81 3D` guards | `F6 05` polls | body bytes |
+|---|---|---:|---:|---:|
+| `CODE_NEAR_GLOBALS=0` | `0x768E40F56000` | 0 | 0 | 1865 |
+| `CODE_NEAR_GLOBALS=1` | `0x1FFFEC00000` | **4** | **2** | **1815** |
+
+The ON arm's buffer sits at `0x1FFFEC00000` — 20MB below mimalloc's arena base
+and 511MB below the counter, which is the ladder's 512MB rung landing exactly
+where `/proc/self/maps` said the room was. 50 bytes = 4 guards x 9 + 2 polls x
+7, so every guard AND every back-edge poll in the body took the short form and
+none was left behind.
+
+That is the same engagement table as the Windows one further up, reached on the
+platform where the original change did nothing at all.
+
+### And it is worth 7% on the four-site loop
+
+`flag-ab.sh`, one binary, `CRATONVM_JIT_FORCE_C2=1` in both arms,
+`probe.reps=8000`, `MultiFieldLoop`, twice:
+
+| run | host load | A | C | B | floor | effect |
+|---|---:|---:|---:|---:|---:|---:|
+| 12 rounds | 7 | 928.5 | 921.5 | **860.5** | 0.8% | **−7.0% — ON FASTER** |
+| 14 rounds | 38 | 1131.0 | 1103.5 | **1077.5** | 2.5% | **−3.6% — ON FASTER** |
+
+Checksums identical in every run (`acc=4161300000`). Two invocations, one on a
+quiet host and one on a saturated one, agreeing on the sign — which after this
+file's companion (`…gp-register-file…`, §5.2) is the bar a few-percent claim
+has to clear, not a single clean floor.
+
+Half the Windows figure for the same shape. That is roughly what it should be:
+the Windows 14.5% is the guard alone on a machine where the poll was already
+short; this is the guard *and* the poll on one where neither was, against a
+baseline loop that is faster to begin with, so the same absolute saving is a
+smaller fraction of it.
+
+**The one-site companion is NOT resolved here**, and that matters because
+site-scaling is how the Windows result was validated. `FieldLoop` was attempted
+four times:
+
+| attempt | floor | effect |
+|---|---:|---:|
+| 12 rounds, reps 8000 | 18.2% | −10.7% |
+| 12 rounds, reps 25000 | 5.0% | −4.3% |
+| 14 rounds, reps 25000 | 3.8% | −3.1% |
+| 14 rounds, reps 25000 | 2.1% | **+2.9%** |
+
+Three negative, one positive, and the only one whose floor clears the bar is
+the one that disagrees with the other three. The host sat at a load average
+above 30 on 8 cores for most of them. **Open, and honestly open** — not "flat,
+as predicted".
+
+It is also not the same experiment as the Windows one, which is why a flat
+result would not have meant the same thing: this lever shortens the **back-edge
+poll** as well as the guards, and every loop has a poll whether or not it has
+four guarded field reads. A one-site loop here is not predicted to be flat the
+way it was there.
+
+**It ships default OFF anyway**, and that is a deliberately conservative call
+rather than a doubt about the number. This moves where every JIT code buffer in
+the process lives, which is a bigger surface than an encoding switch: it wants
+a differential run against the Spring, H2 and WildFly suites before it becomes
+what every Linux user gets. The fast regression suite is green with it on
+(`CV=… CRATONVM_JIT_CODE_NEAR_GLOBALS=1 bash regression-suite/run.sh`), and
+`cargo test -p cratonvm-jit` is 2347/2347, which is the floor for turning it on
+deliberately — not the ceiling for turning it on by default.
 
 ## Routes 2 and 3 are refused, and this is the part worth keeping
 
@@ -181,3 +335,16 @@ bash tools/tier-ab/flag-ab.sh -Exe "$PWD/target/release/cratonvm" \
 Check the box is quiet first. Both numbers above came from runs whose control
 pair agreed to under 3%; the ones that did not are retracted in this file
 rather than in a later one.
+
+On Linux, add `CRATONVM_JIT_CODE_NEAR_GLOBALS=1` to both arms — without it the
+flag under test changes nothing there, because neither encoding is reachable:
+
+```bash
+# does the short form engage at all on this host?
+for f in 0 1; do
+  CRATONVM_JIT_CODE_NEAR_GLOBALS=$f CRATONVM_JIT_FORCE_C2=1 \
+  CRATONVM_DBG=jit-disasm CRATONVM_DBG_JIT_DISASM=MultiFieldLoop.sumGuarded \
+    ./target/release/cratonvm -cp /tmp/pc -Dprobe.reps=3000 MultiFieldLoop 2>&1 \
+    | awk '/full\/ir MultiFieldLoop/{n++} n==1' | grep -c 813d
+done
+```
