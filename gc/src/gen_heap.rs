@@ -10128,9 +10128,17 @@ impl GenerationalHeap {
         // mark_if_young: mark a candidate young pointer and enqueue it.
         // SAFETY contract: `ptr` is only dereferenced after `in_young`
         // confirms it lands inside the live from-space region.
+        //
+        // Returns `true` exactly when this call NEWLY claimed a young object —
+        // i.e. nothing had marked it yet. Every seeding caller ignores the
+        // value; the finalizer-resurrection phase below is the one consumer,
+        // because "was this candidate already marked by the root closure?" is
+        // precisely the question that separates a still-reachable finalizable
+        // object from a dead one (see that phase for why it must run last).
         let mark_young = |ptr: *mut u8,
                           worklist: &mut Vec<usize>,
-                          bits: &crate::young_mark::YoungMarkBits| {
+                          bits: &crate::young_mark::YoungMarkBits|
+         -> bool {
             let addr = ptr as usize;
             // The conservative arm: a root-vector entry or a finalizable
             // address. Reported BEFORE base resolution, because "a root
@@ -10140,7 +10148,7 @@ impl GenerationalHeap {
                 report_young_mark_why(addr, "conservative-root");
             }
             if !in_young(addr) {
-                return;
+                return false;
             }
             let insertion = young_object_ranges.partition_point(|(start, _)| *start <= addr);
             let covering = insertion
@@ -10166,7 +10174,7 @@ impl GenerationalHeap {
                             d.push(addr);
                         }
                     }
-                    return;
+                    return false;
                 }
                 // Outside every proved span (no anchor interval held this
                 // candidate, or that interval's chain failed to land) — fall
@@ -10211,7 +10219,7 @@ impl GenerationalHeap {
                             );
                     }
                 }
-                return;
+                return false;
             }
             // DoHead comb-7 fix (2026-07-03): also validate the object's
             // EXTENT. The field bounds above still admit a corrupt header
@@ -10281,7 +10289,7 @@ impl GenerationalHeap {
                             },
                         }
                 }
-                return;
+                return false;
             }
             // Family-A fix (2026-07-03): EVERY conservative root candidate
             // takes the SIDE path now — alive and traced, but the header is
@@ -10346,7 +10354,9 @@ impl GenerationalHeap {
             // never-write-through, full stop.
             if bits.try_mark(addr) {
                 worklist.push(addr);
+                return true;
             }
+            false
         };
 
         // Precise-edge marker (perf/halfgap-20260717): for values read out of
@@ -10376,11 +10386,12 @@ impl GenerationalHeap {
             mark_young(root.as_ptr(), &mut worklist, &side_bits);
         }
 
-        // Seed: finalizable objects — keep them alive so finalize() runs.
-        for &addr in finalizer_addrs {
-            mark_young(addr as *mut u8, &mut worklist, &side_bits);
-        }
-
+        // NOTE: `finalizer_addrs` is deliberately NOT seeded here. Finalizable
+        // objects are seeded by the resurrection phase AFTER the root closure
+        // is complete, because seeding them alongside the real roots makes the
+        // two indistinguishable in the mark set — and "reachable from a real
+        // root" vs "present in the candidate list" is exactly the question
+        // that decides whether `finalize()` may run. See that phase below.
         report_phase("mark-root-seed");
 
         // DIAG/EXPERIMENT (CRATONVM_SWEEP_FULL_OLD_SCAN): seed old→young edges
@@ -10731,6 +10742,66 @@ impl GenerationalHeap {
             }
         }
         report_phase("mark-late-resolve-dropped");
+
+        // ----- Finalizer resurrection --------------------------------------
+        //
+        // Runs HERE — after the root closure AND both late-resolution passes —
+        // because "unmarked" only means "unreachable" once every root-derived
+        // mark is in.
+        //
+        // Until 2026-09-10 this function seeded `finalizer_addrs` alongside the
+        // real roots and then returned `finalizer_addrs.to_vec()` — the entire
+        // candidate list, unconditionally — as its dead set. Callers treat that
+        // list as "these are dead, run `finalize()`" (`force_gc_from_native`
+        // enqueues every entry on the finalizer thread), and `System.gc()`
+        // always routes Generational through this sweep via `explicit_full_gc`,
+        // so one `System.gc()` finalized every pending finalizable object in the
+        // process whether or not anything still referenced it. Holding an object
+        // in a static field or a live local was enough:
+        // `probes/ReachableFinalizeProbe.java` measured 11 of 11 strongly
+        // reachable objects finalized under `-XX:+UseGenerationalGC` and 0 under
+        // G1, ZGC and HotSpot.
+        //
+        // The other three implementations of this phase already ask the question
+        // this one now asks, and skip a candidate the ordinary mark reached:
+        // `pointer_map.contains_key` in the moving Cheney path's Phase 2.5 and
+        // in `G1Collector::resurrect_dead_finalizers`, `mark_is_set` in ZGC's.
+        //
+        // `mark_young` reports whether it NEWLY claimed the object, which is
+        // that same "was it already marked?" test expressed through the exact
+        // base resolution and header screening every other mark goes through —
+        // so a candidate is judged by the identical machinery that decides
+        // retention, not by a second, divergent notion of liveness.
+        //
+        // The drain is deliberately AFTER the loop, not inside it: two
+        // finalizable objects that reference only each other are both
+        // unreachable and must both be enqueued (`reference.rs`'s
+        // `mutually_reachable_finalizers_both_enqueued`). Draining inside the
+        // loop would let the first one's closure mark the second and hide it.
+        let mut dead_finalizers: Vec<usize> = Vec::new();
+        for &addr in finalizer_addrs {
+            if !in_young(addr) {
+                // Old gen, or not a heap address: not this collection's to
+                // judge, so it stays registered rather than being finalized —
+                // exactly what the moving path's `if !young_from.contains(..)`
+                // does with it.
+                continue;
+            }
+            if mark_young(addr as *mut u8, &mut worklist, &side_bits) {
+                // Nothing had marked it, so no root reaches it: it is dead. The
+                // mark just made keeps it — and, once the drain below runs,
+                // everything it references — alive for `finalize()` to use.
+                dead_finalizers.push(addr);
+            }
+        }
+        if !worklist.is_empty() {
+            crate::young_mark::drain_parallel(
+                std::mem::take(&mut worklist),
+                mark_threads,
+                |addr, work| scan_young_object(addr, &mark_ctx, &side_bits, work),
+            );
+        }
+        report_phase("finalizer-resurrect");
 
         // Sorted view of the side mark set for O(1)-amortized lockstep checks
         // in the linear walks below (same pattern as the free-block skip).
@@ -14335,8 +14406,14 @@ impl GenerationalHeap {
                 // CRATONVM_SELECTIVE_PROMOTE gate is off (true non-moving).
                 pointer_map: evac_map,
             },
-            // Resurrected finalizers keep their addresses (non-moving).
-            finalizer_addrs.to_vec(),
+            // The candidates the resurrection phase PROVED unreachable — not
+            // the whole input list, which is what this returned until
+            // 2026-09-10 and which finalized reachable objects. Addresses are
+            // unchanged: the sweep does not move, and selective promotion pins
+            // every young `finalizer_addrs` entry (see its pin set), so a
+            // resurrected object cannot have been evacuated out from under the
+            // address reported here.
+            dead_finalizers,
         )
     }
 
@@ -22858,6 +22935,82 @@ mod tests {
 
         let new_live = roots[0];
         assert_eq!(heap.get_field(new_live, 0).as_int(), Some(999));
+    }
+
+    /// A `System.gc()` must not finalize an object something still points at.
+    ///
+    /// `request_major_gc` is what `force_gc_from_native` does, and it routes
+    /// Generational through `sweep_young_non_moving` (`explicit_full_gc` in
+    /// `divert_non_moving`). That sweep used to return its whole
+    /// `finalizer_addrs` input as the dead set, so every pending finalizable
+    /// object in the process was finalized by any explicit GC no matter what
+    /// referenced it — measured as 11-of-11 strongly reachable objects
+    /// finalized by `probes/ReachableFinalizeProbe.java`, against 0 on G1, ZGC
+    /// and HotSpot.
+    #[test]
+    fn an_explicit_full_gc_finalizes_only_the_unreachable_candidate() {
+        let heap = small_gen_heap();
+        let monitors = NoOpMonitors;
+
+        let reachable = heap.alloc_object(ClassId::new(1), 1);
+        heap.set_field(reachable, 0, Value::Int(4242));
+        let unreachable = heap.alloc_object(ClassId::new(2), 1);
+
+        let reachable_addr = reachable.as_ptr() as usize;
+        let unreachable_addr = unreachable.as_ptr() as usize;
+
+        // Both are registered finalizables; only one of them is rooted.
+        let fin_addrs = vec![reachable_addr, unreachable_addr];
+        let mut roots = vec![reachable];
+
+        crate::gc_quiescence::request_major_gc();
+        let (_result, dead) =
+            heap.collect_garbage_with_finalizers(&stw(), &mut roots, &fin_addrs, &monitors);
+
+        assert!(
+            !dead.contains(&reachable_addr),
+            "a finalizable object still reachable from a root must NOT be \
+             reported dead — reporting it is what runs finalize() on a live object"
+        );
+        assert!(
+            dead.contains(&unreachable_addr),
+            "an unreachable finalizable object must still be reported dead, \
+             or finalize() would never run at all"
+        );
+        // The survivor is untouched and still usable (the sweep does not move).
+        assert_eq!(heap.get_field(roots[0], 0).as_int(), Some(4242));
+    }
+
+    /// Two finalizable objects that reference only each other are both
+    /// unreachable, so BOTH must be enqueued — the invariant
+    /// `reference.rs`'s `mutually_reachable_finalizers_both_enqueued` states.
+    ///
+    /// This is what pins the resurrection drain to AFTER the candidate loop:
+    /// draining inside it would let the first object's closure mark the second
+    /// and hide it as "still reachable" for as long as the pair survives.
+    #[test]
+    fn two_mutually_referencing_dead_finalizables_are_both_reported() {
+        let heap = small_gen_heap();
+        let monitors = NoOpMonitors;
+
+        let a = heap.alloc_object(ClassId::new(1), 1);
+        let b = heap.alloc_object(ClassId::new(2), 1);
+        heap.set_field(a, 0, Value::Object(Some(b)));
+        heap.set_field(b, 0, Value::Object(Some(a)));
+
+        let (a_addr, b_addr) = (a.as_ptr() as usize, b.as_ptr() as usize);
+        let fin_addrs = vec![a_addr, b_addr];
+        let mut roots: Vec<ObjectRef> = Vec::new();
+
+        crate::gc_quiescence::request_major_gc();
+        let (_result, dead) =
+            heap.collect_garbage_with_finalizers(&stw(), &mut roots, &fin_addrs, &monitors);
+
+        assert!(
+            dead.contains(&a_addr) && dead.contains(&b_addr),
+            "both halves of an unreachable finalizable cycle must be reported \
+             dead, got {dead:?}"
+        );
     }
 
     #[test]
