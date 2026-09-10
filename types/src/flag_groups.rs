@@ -498,12 +498,24 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "gc-stress", on_key: Some("CRATONVM_DBG_GC_STRESS"), off_key: None, off_word: None, since: "2026-06-03" },
     E { group: Group::DBG, token: "oop-oracle-force-refute", on_key: Some("CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE"), off_key: None, off_word: None, since: "2026-08-22" },
     E { group: Group::DBG, token: "gc-verify-stale", on_key: Some("CRATONVM_GC_VERIFY_STALE"), off_key: None, off_word: None, since: "2026-05-23" },
+    // The reachability oracle that judges the three narrowings above.
+    E { group: Group::DBG, token: "verify-reg-oop-maps", on_key: Some("CRATONVM_DBG_VERIFY_REG_OOP_MAPS"), off_key: None, off_word: None, since: "2026-09-09" },
     E { group: Group::GC, token: "late-resolve-dropped", on_key: Some("CRATONVM_GC_LATE_RESOLVE_DROPPED"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "tlab-skip", on_key: None, off_key: Some("CRATONVM_GC_NO_TLAB_SKIP"), off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "g1-only-jit-pins", on_key: Some("CRATONVM_GC_G1_ONLY_JIT_PINS"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "peer-pin-divert", on_key: None, off_key: Some("CRATONVM_GC_NO_PEER_PIN_DIVERT"), off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "conditional-tlab-skip-publish", on_key: Some("CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "frame-trace-span-retire", on_key: None, off_key: Some("CRATONVM_GC_NO_FRAME_TRACE_SPAN_RETIRE"), off_word: None, since: "2026-09-06" },
+    // The three conservative-JIT-root narrowings the register oop maps
+    // license, each its own lever because each rests on a DIFFERENT claim and a
+    // regression has to be attributable to one of them: the compiler's register
+    // model, the operand-spill cursor, and the outgoing-argument reserve.
+    E { group: Group::GC, token: "reg-oop-maps", on_key: Some("CRATONVM_GC_REG_OOP_MAPS"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    E { group: Group::GC, token: "dead-spill-roots", on_key: Some("CRATONVM_GC_DEAD_SPILL_ROOTS"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    E { group: Group::GC, token: "outgoing-arg-roots", on_key: Some("CRATONVM_GC_OUTGOING_ARG_ROOTS"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // G1's pin set honouring the movable/rewritable partition the
+    // generational path has always honoured.
+    E { group: Group::GC, token: "g1-movable-pins", on_key: Some("CRATONVM_GC_G1_MOVABLE_PINS"), off_key: None, off_word: None, since: "2026-09-09" },
     E { group: Group::DBG, token: "peer-reg-pairing", on_key: Some("CRATONVM_DBG_PEER_REG_PAIRING"), off_key: None, off_word: None, since: "2026-09-06" },
     // Coverage oracle for the slot list `static-root-slots` builds: after the
     // fast path has patched the recorded slots, re-walk every static the slow
@@ -1634,6 +1646,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "my-scratch-flush", on_key: Some("CRATONVM_JIT_MY_SCRATCH_FLUSH"), off_key: None, off_word: Some("0"), since: "2026-07-30" },
     E { group: Group::JIT, token: "my-selfcall-proof", on_key: Some("CRATONVM_JIT_MY_SELFCALL_PROOF"), off_key: None, off_word: Some("0"), since: "2026-07-30" },
     E { group: Group::JIT, token: "my-shadow-emission", on_key: Some("CRATONVM_JIT_MY_SHADOW_EMISSION"), off_key: None, off_word: Some("0"), since: "2026-07-31" },
+    // Emit side of the register oop maps: `OopMapEntry::reg_oop_mask`.
+    E { group: Group::JIT, token: "reg-oop-maps", on_key: Some("CRATONVM_JIT_REG_OOP_MAPS"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
     E { group: Group::JIT, token: "native-ec-multiply", on_key: Some("CRATONVM_NATIVE_EC_MULTIPLY"), off_key: None, off_word: None, since: "2026-06-04" },
     E { group: Group::JIT, token: "native-matcher-find", on_key: Some("CRATONVM_NATIVE_MATCHER_FIND"), off_key: None, off_word: Some("0"), since: "2026-07-11" },
     E { group: Group::JIT, token: "native-pbe-keyfactory", on_key: Some("CRATONVM_NATIVE_PBE_KEYFACTORY"), off_key: None, off_word: None, since: "2026-06-22" },

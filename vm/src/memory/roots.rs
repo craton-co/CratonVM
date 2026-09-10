@@ -572,6 +572,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // `band_slot_is_verifiable` refuses to inspect, and the young sweep pins
     // those whatever the movable set says.
     cratonvm_gc::gc_quiescence::clear_unrewritable_jit_roots();
+    // The register-oop mask's oracle records what it EXCLUDED this pass, so it
+    // is reset on the same schedule as the sets above and checked against the
+    // finished root set below.
+    crate::jit::conservative_roots::clear_excluded_spill_words();
     // G1 pin-in-place: reset the conservative-JIT-root pin set too, so it
     // reflects only THIS collection's stack (republished by the JIT-frame scan
     // below, under G1). See that scan site and `G1Collector::young_collection`.
@@ -1622,6 +1626,12 @@ moving_young={moving_young} osr_fallback={moving_young_osr_fallback} incomplete=
         }
         cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&addrs);
     }
+    // `CRATONVM_DBG_VERIFY_REG_OOP_MAPS=1` — every blind-spill word the
+    // register oop mask dropped, re-checked against the root set that was
+    // actually built. It has to run here rather than in the band scan: the
+    // question is whether anything ELSE names the object, and inside the scan
+    // the answer is still being assembled.
+    crate::jit::conservative_roots::verify_excluded_band_words(&roots, &shared.mem.heap);
     // 14a5. A5 CONSERVATIVE FRAME PASS — the second half of step 1, run here
     // because this is the first point in the pass at which the answer is known.
     //
@@ -1703,6 +1713,19 @@ moving_young={moving_young} osr_fallback={moving_young_osr_fallback} incomplete=
         // buckets above — read the growth between two lines.
         let (fc_no_slot, fc_misaligned, fc_no_map, fc_incomplete, fc_ok) =
             crate::jit::conservative_roots::frame_coverage_reason::snapshot();
+        // The register-oop mask, both sides. Emit-side causes are cumulative
+        // over compiles, consume-side over frame walks; read the growth.
+        let ro_e = cratonvm_jit::x64::reg_oop_mask_cause::snapshot();
+        let ro_u = crate::jit::conservative_roots::reg_oop_mask_census();
+        let ro_o = crate::jit::conservative_roots::reg_oop_mask_oracle();
+        eprintln!(
+            "[regoop] emit=(disabled={} staged={} desync={} inexact={} windows={} inline={} \
+             dataflow={} PUBLISHED={}) use=(masked={} unmasked={} regwords={} \
+             deadspill={} outgoing={}) \
+             oracle=(words={} reachable={} UNREACHABLE={} walk_incomplete={})",
+            ro_e.0, ro_e.1, ro_e.2, ro_e.3, ro_e.4, ro_e.5, ro_e.6, ro_e.7,
+            ro_u.0, ro_u.1, ro_u.2, ro_u.3, ro_u.4, ro_o.0, ro_o.1, ro_o.2, ro_o.3,
+        );
         // Engagement counter for the cross-thread coverage handshake, printed
         // beside the verdict it produces so any claim about it carries the
         // number of cycles it actually decided.
