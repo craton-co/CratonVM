@@ -4067,12 +4067,13 @@ impl<'a> Lowerer<'a> {
     /// adds 10 and not 6. The load stays a single aligned 32-bit read, so it is
     /// as atomic as the `MOV ECX` it replaces.
     ///
-    /// **Sound here and NOT in the single-pass backend**, for the reason
-    /// `emit_test_safepoint_flag_rip` gives two hundred lines below: this
-    /// lowerer never duplicates emitted bytes to a second address, so a
-    /// displacement that is right when emitted stays right. `x64`'s twin of
-    /// this guard sits inside a body its native unroller byte-copies, and is
-    /// deliberately left alone.
+    /// Sound here **for free**: this lowerer never duplicates emitted bytes to
+    /// a second address, so a displacement that is right when emitted stays
+    /// right — the reason `emit_test_safepoint_flag_rip` gives two hundred
+    /// lines below. `x64`'s twin sits inside a body its native unroller
+    /// byte-copies and needs the fixup pass to earn the same shape; it has one
+    /// (`rip_abs_disp32_patches`, declaring a 4-byte trail for the `imm32`)
+    /// and emits the same instruction since 2026-09-10.
     fn emit_cmp_layout_epoch_rip(&mut self, addr: usize, expected: u32) -> bool {
         if !ir_epoch_guard_rip_enabled() {
             return false;
@@ -4875,6 +4876,10 @@ impl<'a> Lowerer<'a> {
     /// whole poll in one 7-byte instruction, reporting whether the flag was
     /// within ±2GB RIP reach of it.
     ///
+    /// Reach only. Whether the short form is WANTED is
+    /// `jit_rip_safepoint_poll_enabled()`, and the sole caller asks that first
+    /// — see [`Self::emit_safepoint_poll`].
+    ///
     /// Mirrors `x64/emit.rs`'s `emit_test_mem8_abs_imm8`; the two backends
     /// emit the same poll and this keeps them saying the same thing. `F6 /0 ib`
     /// with ModRM `mod=00, rm=101` is the RIP-relative form, and the
@@ -4903,16 +4908,28 @@ impl<'a> Lowerer<'a> {
     /// Emit the default-on cooperative poll used at method entries and loop
     /// back-edges. The lowerer keeps all live values in frame slots, so the
     /// no-argument slow path may be called directly.
+    ///
+    /// Both gates come from `x64::licm` rather than being re-derived here, and
+    /// that is the whole point of routing through them. This function used to
+    /// parse `CRATONVM_JIT_SAFEPOINT_POLLS` inline — once per emitted poll site
+    /// rather than once per process — and never looked at
+    /// `CRATONVM_JIT_RIP_SAFEPOINT_POLL` at all, so the lever documented as
+    /// "emit the pre-2026-09-02 form so the two encodings can be priced in one
+    /// binary" reached only the single-pass backend. Measured 2026-09-10 on a
+    /// hot counted loop: with the switch set, **392 of 394** poll sites still
+    /// took the RIP form, because everything hot is compiled here and not
+    /// there.
     fn emit_safepoint_poll(&mut self) {
-        let enabled = cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SAFEPOINT_POLLS")
-            .and_then(|v| v.into_string().ok())
-            .is_none_or(|v| v != "0");
-        if !enabled || self.safepoint_flag_addr == 0 || self.safepoint_slow_path == 0 {
+        if !crate::x64::jit_safepoint_polls_enabled()
+            || self.safepoint_flag_addr == 0
+            || self.safepoint_slow_path == 0
+        {
             return;
         }
-        if !self.emit_test_safepoint_flag_rip() {
-            // Out of ±2GB RIP reach — materialize the address and read
-            // through it, the shape this poll had before 2026-09-02.
+        if !crate::x64::jit_rip_safepoint_poll_enabled() || !self.emit_test_safepoint_flag_rip() {
+            // The kill switch is set, or the flag is out of ±2GB RIP reach —
+            // materialize the address and read through it, the shape this poll
+            // had before 2026-09-02.
             self.emit_mov_reg_imm64(R11, self.safepoint_flag_addr as u64);
             self.buf.emit(&[0x41, 0xF6, 0x03, 0xFF]); // TEST byte ptr [R11], 0xff
         }
@@ -9171,10 +9188,38 @@ impl<'a> Lowerer<'a> {
                 // `ir_direct_calls` row nothing produced. Count it, split by
                 // whether the site is inside a relocated body, so that failure
                 // has a reading instead of only a wall clock.
-                note_ir_blind_dispatch(
-                    node.bytecode_pc
-                        .is_some_and(|pc| self.pc_is_in_a_spliced_body(pc)),
-                );
+                let in_splice = node
+                    .bytecode_pc
+                    .is_some_and(|pc| self.pc_is_in_a_spliced_body(pc));
+                note_ir_blind_dispatch(in_splice);
+                // The census counts these; it does not say WHICH site or why,
+                // and `c2-splice-checkcast-and-instanceof-20260909.md` closes
+                // on exactly that question ("that is the next thing to look
+                // at, and it is a bug, not a gap") with only a count to go on.
+                // Name the site and the state of every gate that could have
+                // routed it here, so the answer is read rather than guessed.
+                if crate::ir_stage_reporting() {
+                    let pc = node.bytecode_pc.unwrap_or(usize::MAX);
+                    // SAFETY: `info_ptr` is the same address this arm is
+                    // about to bake into the helper call as its `info_ptr`
+                    // argument; it points at a `JitInvokeInfo` owned by this
+                    // compile's `owned_invoke_infos` for the artifact's life.
+                    let info = unsafe { &*(*info_ptr as *const crate::JitInvokeInfo) };
+                    eprintln!(
+                        "[ir] blind-dispatch pc={pc} in_splice={in_splice} {}.{}{} kind={}                          num_args={num_args} ic_slot={} direct_row={} mic_helper={} abi_regs={}                          direct_calls_gate={}",
+                        info.class_name,
+                        info.method_name,
+                        info.descriptor,
+                        info.invoke_kind,
+                        self.ic_slots.get(&pc).map_or("none".to_string(), |&(m, p)| format!(
+                            "mic={m:#x},pic={p:#x}"
+                        )),
+                        self.direct_calls.contains_key(&pc),
+                        self.invoke_virtual_mic != 0,
+                        ENTRY_ABI_REGS.len(),
+                        crate::direct_jit_callee_calls_enabled(),
+                    );
+                }
                 // 1. Marshal each Java arg into the staging region.
                 for i in 0..num_args {
                     let arg = node.inputs[2 + i];
@@ -13912,6 +13957,12 @@ static IR_BLIND_DISPATCH: [std::sync::atomic::AtomicU64; 2] = [
 
 fn note_ir_blind_dispatch(in_splice: bool) {
     IR_BLIND_DISPATCH[usize::from(in_splice)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Also charge it to THIS compile, so the acceptance gate can price the
+    // splice trade for the body in front of it. The census above is cumulative
+    // across every compile in the process and cannot answer that question.
+    if in_splice {
+        crate::ir_evidence::note_blind_dispatch_in_splice();
+    }
 }
 
 /// `(in the method's own code, inside a spliced body)`. See

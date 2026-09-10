@@ -984,7 +984,8 @@ downgrade that gate was shut for.
 2. **Every compiled call still republishes RBP and pushes/reloads the shadow
    stack.** Those buy precise roots, not nothing, and removing them is a GC
    trade rather than a codegen one.
-3. **Nothing compares a C2 body against the C1 body it replaces.** The
+3. **Nothing compares a C2 body against the C1 body it replaces.**
+   *(Partly closed 2026-09-10 — see the note at the end of this item.)* The
    policy question is unchanged and deliberately still open — the obvious
    static metrics both misjudge the good cases, since a bigger body is usually
    inlining or unrolling and more call sites can be a callee's own calls after
@@ -993,6 +994,30 @@ downgrade that gate was shut for.
    also does is remove the causes that made a C2 body worse — the tier now has
    an inline TLAB bump, gated inline reference stores, and a register file.
    **What that instrument then said is below.**
+   **2026-09-10, what is now closed of item 3.** The acceptance gate no longer
+   judges only by *what the tier did*. `ir_evidence::CompileRecord` carries the
+   per-execution cost a compile introduced beside its transform bitset, and
+   `is_worth_publishing` refuses a body whose priced cost went UP however much
+   it transformed. Evidence is now necessary, not sufficient.
+
+   The prices are the two this crate already reasons in — a blind
+   `jit_invoke_dispatch` resolves by name at ~175 ns against a direct `CALL`'s
+   ~4 — and the trade they settle is splicing: a spliced frame saves a call, a
+   call the splice strands without a bindable target costs a resolution on every
+   execution. What is NOT modelled is site execution frequency, so a resolution
+   on a cold branch is charged like one in a loop; that errs toward refusing,
+   which is the safe direction, and it is the first thing to fix if the gate is
+   ever measured refusing better bodies.
+
+   This is still not a general C1-vs-C2 comparison. It prices one specific trade
+   because that trade has measured constants; the rest of item 3 stands.
+   `[c2-supersede] refused as a cost regression: bodies=N est_ns_per_execution_declined=M`
+   is the reading. It came out of a case where a transform's presence was the
+   evidence that published a 3x regression — `Objects.checkIndex` spliced into
+   `ArrayList.get` set `Inlined`, the stranded call was native-shadowed, and the
+   published body ran its probe in 897 ms against the single-pass 338. See
+   `internal/performance/c2-splice-checkcast-and-instanceof-20260909.md`.
+
 4. **`Node` is still 48 bytes against HotSpot's 24.** Unchanged, structural,
    and a GC item: see
    `known-issues/perf/perf-bintrees-9x-gap-characterised.md`.

@@ -308,33 +308,92 @@ static LAYOUT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// overwhelming majority of real programs, keeps every inline arm.
 ///
 /// Coarse and correct beats precise and absent.
-/// **On the heap, deliberately, and not in this image's `.data`.**
+/// **On the Rust heap, deliberately, and not in this image's `.data`.**
 ///
 /// A JIT site guards on this counter by baking its ADDRESS, and the cheapest
 /// encoding for that is `CMP dword [rip+disp32], imm32` — one 10-byte
 /// instruction against `MOV R11, imm64` + `MOV ECX, [R11]` + `CMP ECX, imm32`,
 /// which is three instructions and nineteen bytes and burns two registers.
 /// `disp32` reaches ±2GB from the instruction, and on Windows the executable
-/// image and the JIT's code buffer are around 140TB apart — measured, on this
+/// image and the JIT's code buffer are around 140TB apart — measured, on that
 /// box: the counter sat at `0x7FF6BDFB9AF4` as a static while the optimizing
 /// tier's buffer was at `0x1B430060000`, so every guard took the long form.
 ///
 /// A leaked `Box` is allocated from the same heap the VM's own structures come
-/// from, which is where `stw_requested_flag_addr` already lives — and that
-/// flag's poll DOES encode as `TEST BYTE [rip+disp32], 0xFF`. Same heap, same
-/// region, same reach.
+/// from, which is where `stw_requested_flag_addr` already lives — measured on
+/// Linux, 295MB apart. **That proximity to the OTHER guard cell is now
+/// load-bearing and not incidental**: `jit::platform`'s `near_globals` anchors
+/// its code-placement hint on THIS counter and relies on the safepoint flag
+/// being near it, so both come into RIP reach together. Moving this cell out
+/// of the allocator that holds the flag — to its own `mmap` page, say — would
+/// bring the counter into reach and leave the poll behind.
+///
+/// The constraint binds symmetrically, and the flag side honours it:
+/// `jit::platform::alloc_code_adjacent_cell` — which otherwise hands the
+/// safepoint flag a cell from the code cache's own `mmap` — returns `None`
+/// whenever `CRATONVM_JIT_CODE_NEAR_GLOBALS` is set, so the flag stays in this
+/// allocator, beside this counter, for as long as this counter is the anchor.
+/// Exactly one strategy may own placement, and that one owns it whenever it is
+/// on.
+///
+/// The counter being in the right place was never sufficient on System V: the
+/// CODE was in the wrong one, ~130TB away, until `near_globals` gave `mmap` a
+/// hint. See
+/// `docs/internal/performance/c2-the-layout-epoch-guard-was-unreachable-by-rip-20260910.md`.
 ///
 /// This is best-effort and not a guarantee: nothing promises an allocator puts
-/// two allocations within 2GB of each other, so
-/// `ir_lower::emit_layout_epoch_guard` range-checks the displacement and keeps
-/// the materialize-the-address form as its fallback. Moving the counter here
-/// makes the short form REACHABLE; it does not make it certain.
+/// two allocations within 2GB, so `ir_lower::emit_layout_epoch_guard` and
+/// `x64::objects`' twin range-check the displacement and keep the
+/// materialize-the-address form as their fallback.
 ///
 /// The address must also be STABLE for the life of the process, because JIT
 /// code bakes it. `Box::leak` gives exactly that, and `LazyLock` makes the
 /// allocation happen once, before any compile can observe it.
+///
+/// `CRATONVM_JIT_LAYOUT_EPOCH_STATIC=1` puts it back in `.data`
+/// ([`LAYOUT_REPLACE_EPOCH_IMAGE`]) — the arm that makes the move itself
+/// measurable rather than merely argued.
 static LAYOUT_REPLACE_EPOCH: LazyLock<&'static std::sync::atomic::AtomicU32> =
-    LazyLock::new(|| Box::leak(Box::new(std::sync::atomic::AtomicU32::new(0))));
+    LazyLock::new(|| {
+        if layout_epoch_static_enabled() {
+            return &LAYOUT_REPLACE_EPOCH_IMAGE;
+        }
+        Box::leak(Box::new(std::sync::atomic::AtomicU32::new(0)))
+    });
+
+/// The `.data` counter [`LAYOUT_REPLACE_EPOCH`] used to be, kept for one
+/// purpose: making the MOVE to the heap A/B-able inside one binary.
+///
+/// The move shipped together with the RIP encoding, and only the ENCODING was
+/// A/B-able — both arms of that comparison carried the heap counter. So the
+/// heap move's own cost was argued (one global whose address changed, read by
+/// the same instruction count in the long-form arm, so there is no mechanism
+/// for it to matter) and not measured, and an argument is not a number.
+///
+/// Selecting this arm answers it. Hold the ENCODING fixed at the long form —
+/// `CRATONVM_JIT_IR_EPOCH_GUARD_RIP=0 CRATONVM_JIT_SP_EPOCH_GUARD_RIP=0`,
+/// which is what a static forces anyway since it is ~140TB out of disp32
+/// reach — and the only thing that differs between the arms is which word the
+/// guard reads.
+///
+/// It is a diagnosis lever and not a supported configuration, and it must NOT
+/// be combined with `CRATONVM_JIT_CODE_NEAR_GLOBALS`: that strategy anchors
+/// its code-placement hint on whatever address this returns, so selecting the
+/// image cell would aim the whole code cache at `.data` and leave the
+/// safepoint flag out of reach. The two levers answer different questions and
+/// only one of them can own the anchor.
+static LAYOUT_REPLACE_EPOCH_IMAGE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// `CRATONVM_JIT_LAYOUT_EPOCH_STATIC=1` — see [`LAYOUT_REPLACE_EPOCH_IMAGE`].
+///
+/// Read once, inside the `LazyLock` that picks the cell, so the choice cannot
+/// change under a compile that already baked an address.
+fn layout_epoch_static_enabled() -> bool {
+    crate::flags::runtime_var_os("CRATONVM_JIT_LAYOUT_EPOCH_STATIC")
+        .and_then(|v| v.into_string().ok())
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
 
 /// `(address, value)` of the global replacement epoch, for a JIT site to bake
 /// and compare. See [`LAYOUT_REPLACE_EPOCH`].
@@ -1743,6 +1802,46 @@ mod tests {
     use crate::heap_types::{ArrayElementType, ObjectKind, HEADER_SIZE};
 
     static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The replacement epoch a JIT site bakes must be the HEAP cell, not the
+    /// one in this image's `.data`.
+    ///
+    /// Two things rest on that and neither would fail a behaviour test if a
+    /// refactor "simplified" the `LazyLock` back into a plain `static`:
+    ///
+    /// * `CMP dword [rip+disp32], imm32` needs the counter within ±2GB of the
+    ///   code, and as a `static` it sat ~140TB away — every guard would
+    ///   silently return to three instructions and nineteen bytes;
+    /// * `jit::platform`'s `near_globals` ANCHORS its code-placement hint on
+    ///   this address, and its whole premise is that the safepoint flag is a
+    ///   few hundred megabytes from it because both come from the same
+    ///   allocator. A counter in `.data`, or in its own `mmap` page, aims the
+    ///   code cache somewhere the flag is not.
+    ///
+    /// So the default arm is pinned here. Only the default:
+    /// `CRATONVM_JIT_LAYOUT_EPOCH_STATIC=1` deliberately selects the image
+    /// cell, and the choice is latched by the `LazyLock` before any test could
+    /// flip it, so that arm belongs to a separate process and not to an
+    /// assertion here.
+    #[test]
+    fn the_baked_epoch_address_is_the_heap_cell_by_default() {
+        if layout_epoch_static_enabled() {
+            return; // this process asked for the image cell.
+        }
+        let (addr, _) = layout_replace_epoch_guard();
+        assert!(!addr.is_null(), "a JIT site has an address to bake");
+        assert_ne!(
+            addr,
+            &LAYOUT_REPLACE_EPOCH_IMAGE as *const std::sync::atomic::AtomicU32 as *const u32,
+            "the guarded counter must be the leaked heap cell, not the `.data` one",
+        );
+        // JIT code reads it as one aligned 32-bit load; nothing else makes
+        // that as atomic as the `MOV ECX` it replaced.
+        assert_eq!(addr as usize % 4, 0, "the counter is 4-byte aligned");
+        // And it is STABLE, because compiled code bakes it.
+        let (again, _) = layout_replace_epoch_guard();
+        assert_eq!(addr, again, "the baked address may not move under a compile");
+    }
 
     /// `HIB-DCAST-LATEPHASE.1`: a legacy (non-compact) object whose `shape`
     /// field holds an implausible `num_slots` (e.g. from a GC walk that
