@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 2026-09-10 The safepoint poll's flag byte was on the Rust heap, 124 TB from the code that polls it
+
+The one-instruction RIP-relative safepoint poll added 2026-09-02 never engaged
+on Linux. `TEST BYTE [rip+disp32], 0FFh` reaches ±2 GB;
+`GcBarrier::stw_requested` was an inline field of a struct reached only through
+`Arc<SharedVm>`, i.e. from mimalloc, whose Linux arenas sit nowhere near the
+anonymous mapping the JIT code cache comes from. Reported from
+20.80.105.49: code buffer `0x7DE4D7F9E000`, flag `0x2000CD6E2C0` — **123.9 TB
+apart**, so every compiled loop back edge and method entry in the process took
+the `MOV R11, imm64 ; TEST BYTE [R11], 0FFh` fallback: 15 bytes and a clobbered
+register instead of 7 and none.
+
+Nothing failed, which is why it stood for eight days. The fallback reads the
+same byte and branches the same way; it is only longer, and nothing in the tree
+asserted anything about where the flag sits.
+
+The byte now comes from `platform::alloc_code_adjacent_cell` — a bump allocator
+over 64 KiB chunks taken from the same `mmap(NULL, …)` / `VirtualAlloc(NULL, …)`
+that `alloc_executable` hands the code cache, carving 64-byte cache-line
+isolated cells that are never unmapped. `CacheLineFlag` becomes a `&'static
+AtomicBool` into one, with `Box::leak` as the correctness floor; its four
+methods are unchanged, so all 75 `stw_requested` call sites are untouched.
+Placement is a hint, not a guarantee — the OS picks — so both emitters keep
+their per-site ±2 GB test and their fallback, and two new tests assert the
+reach, one of them through `stw_requested_flag_addr` itself.
+
+`execute_frame` now hoists the flag reference once, beside the existing
+`async_exception_slot` hoist. Without that, the two **per-bytecode** interpreter
+reads would each have become a dependent pair of loads through a pointer word
+sharing a cache line with `gc_generation`, `threads_blocked` and the barrier
+mutex — the exact neighbours `CacheLineFlag` exists to avoid.
+
+Measured on Windows x86-64, before and after, same tree: 489 MiB apart before,
+**128 KiB** after, and the short form on both — this host was already in reach,
+since mimalloc on Windows goes through `VirtualAlloc` and lands in the same low
+region. The Linux confirmation is still owed and is the one that matters. See
+`docs/internal/performance/safepoint-poll-flag-was-on-the-rust-heap-FIXED-20260910.md`.
+
+Found while verifying it: `CRATONVM_JIT_RIP_SAFEPOINT_POLL=0`, the lever for
+pricing the two encodings inside one binary, reached only the single-pass
+backend. `ir_lower.rs::emit_safepoint_poll` — the optimizing tier, where
+everything hot is compiled — called its RIP emitter unconditionally, so on a
+real workload the switch moved **2 of 394** poll sites. Both gates in
+`x64/licm.rs` are now `pub(crate)` and the lowerer calls them; the switch moves
+398 of 398, and both arms print the same answer.
+
 ### 2026-09-02 `String` is `final`, and that is what killed its own intrinsic — 170x on `charAt`
 
 `String.charAt` in a compiled counted loop cost ~400 ns/char while a
