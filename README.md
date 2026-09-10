@@ -47,28 +47,43 @@ install, no `rt.jar`, one self-contained binary.
 CPU, vs HotSpot JDK 25 C2 — same flags both sides, checksum-verified against
 HotSpot on every run (zero mismatches):
 
-| Benchmark               | JDK 25 C2 | CratonVM  | Ratio     | Growth       |
-|--------------------------|-----------|-----------|-----------|--------------|
-| Arithmetic (2B ops)     | 1,852 ms  | 3,601 ms  | 1.94x     | linear       |
-| Fibonacci(44)           | 1,449 ms  | 5,059 ms  | 3.49x     | linear       |
-| Sieve (100K × 20K)      | 2,333 ms  | 2,360 ms  | **1.01x** | parity       |
-| Matrix 1280×1280        | 2,106 ms  | 2,094 ms  | **0.99x** | parity       |
-| HashMap (10M put/get)   | 983 ms    | 2,049 ms  | 2.08x     | super-linear |
-| String/Regex (100K)     | 50 ms     | 200 ms    | 4.00x     | super-linear |
-| Binary Trees (depth 18) | 176 ms    | 1,700 ms  | 9.66x     | super-linear |
+| Benchmark                | JDK 25 C2 | CratonVM   | Ratio     | Growth        |
+|--------------------------|-----------|------------|-----------|---------------|
+| Arithmetic (2B ops)      | 1,852 ms  | 3,601 ms   | 1.94x     | linear        |
+| Fibonacci(44)            | 1,449 ms  | 5,059 ms   | 3.49x     | linear        |
+| Sieve (100K × 20K)       | 2,333 ms  | 2,360 ms   | **1.01x** | parity        |
+| Matrix 1280×1280         | 2,106 ms  | 2,094 ms   | **0.99x** | parity        |
+| Binary Trees (depth 16)‡ | 49 ms     | 259 ms     | 5.29x     | super-linear  |
+| Binary Trees (depth 18)‡ | 183 ms    | 1,195 ms   | 6.53x     | super-linear  |
+| Binary Trees (depth 20)‡ | 898 ms    | 6,649 ms   | 7.40x     | super-linear  |
+| HashMap (1M put/get)‡    | 45 ms     | 553 ms     | 12.29x    | non-monotonic |
+| HashMap (10M put/get)‡   | 1,039 ms  | 5,499 ms   | 5.29x     | non-monotonic |
+| HashMap (100M put/get)‡  | 11,455 ms | 120,465 ms | 10.52x    | non-monotonic |
+| String/Regex (100K)‡     | 54 ms     | 242 ms     | 4.48x     | super-linear  |
+| String/Regex (1M)‡       | 138 ms    | 2,320 ms   | 16.81x    | super-linear  |
+| String/Regex (10M)‡      | 466 ms    | 23,359 ms  | 50.13x    | super-linear  |
 
-Two rows (Matrix, Sieve) are at parity with HotSpot C2. **Growth** is how the
-ratio moves when N grows several-fold at each row's own kernel (e.g.
-Arithmetic 2B→8B ops, Fibonacci 44→48, HashMap 10M→50M put/get, String/Regex
-100K→1M→10M, Binary Trees depth 18→20) — `linear` means the ratio stays
-roughly flat, `super-linear` means CratonVM's disadvantage compounds with N
-rather than staying proportional. The three `super-linear` rows are exactly
-the three allocation/GC-heavy kernels; the two `linear` rows are
-compute-bound with minimal allocation — pointing at GC/allocation machinery,
-not the interpreter or JIT compute path, as the shared mechanism. Full
-methodology, per-row footnotes (HotSpot's Sieve bimodality, the Fibonacci
-gap), the growth measurements, and historical context:
-[BENCHMARK.md](BENCHMARK.md).
+Two rows (Matrix, Sieve) are at parity with HotSpot C2. **Growth** is what the
+ratio does as N scales up several-fold *within* one kernel — the point of
+showing three sizes per row instead of one is to make that visible instead of
+asserting it. `linear` means the ratio stays roughly flat as N grows;
+`super-linear` means CratonVM's disadvantage **compounds** with N — its
+absolute time grows faster than HotSpot's, not just larger by a fixed factor.
+String/Regex shows this most sharply: the ratio nearly triples at each 10x
+step in N (4.48x → 16.81x → 50.13x). Binary Trees compounds more gently
+(5.29x → 6.53x → 7.40x) as each two-level depth increase roughly quadruples
+the node count. HashMap does not follow that pattern here — its ratio moves
+12.29x → 5.29x → 10.52x, non-monotonic rather than steadily compounding, most
+likely because the 1M run is short enough (553 ms) for fixed per-process
+costs to still be a meaningful share of it on both sides.
+
+‡ These nine rows run CratonVM under G1 (`--XX:UseGc G1`; HotSpot already
+defaults to G1 on JDK 25) rather than the Generational collector this project
+defaults to. G1 is a large but uneven win here: 7.4-7.6x faster than
+Generational on Binary Trees at every depth measured, a smaller win on
+HashMap and small String/Regex, and a measured ~21% **regression** at
+String/Regex 10M. Full per-size data, checksums, CV, and the
+Generational-vs-G1 delta are in [BENCHMARK.md](BENCHMARK.md).
 
 GPU offload, vs HotSpot C2 and [TornadoVM](https://github.com/beehive-lab/TornadoVM)
 4.0.1 (RTX 2060, N = 2²⁴, warm, full H2D+kernel+D2H round-trip, checksums
