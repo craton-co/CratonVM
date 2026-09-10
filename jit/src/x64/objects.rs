@@ -1705,13 +1705,16 @@ impl Compiler {
     ///
     /// The compare is `CMP DWORD [rip+disp32], imm32` — see
     /// [`Self::emit_cmp_mem32_abs_imm32`] — which is why "two" and not the
-    /// "four" this comment said until 2026-09-10. The counter has to be in
-    /// disp32 reach of the code buffer for that, and it is because it lives in
-    /// an OS page from the same `mmap`/`VirtualAlloc` this backend's code
-    /// buffer comes from: as a `static` in `.data` it sat ~140TB away, and as
-    /// a Rust heap allocation it sat 124TB away on Linux, so the short form
-    /// was unreachable by construction on every compile. See
-    /// `LAYOUT_REPLACE_EPOCH` in `cratonvm_types::field_layout`, and
+    /// "four" this comment said until 2026-09-10.
+    ///
+    /// Whether that form is REACHABLE is not this emitter's decision. The
+    /// counter has to be within ±2GB of the buffer, which took moving it off
+    /// `.data` (Windows: ~140TB away as a `static`) and then, on System V,
+    /// moving the CODE — `jit::platform`'s `near_globals`, where
+    /// `mmap(NULL, …)` had been putting buffers ~130TB from the heap the
+    /// counter lives in. Where neither holds, the range check below declines
+    /// and the long form is emitted. See `LAYOUT_REPLACE_EPOCH` in
+    /// `cratonvm_types::field_layout`, and
     /// `docs/internal/performance/c2-the-layout-epoch-guard-was-unreachable-by-rip-20260910.md`.
     ///
     /// Reach is best-effort, so the materialize-the-address form stays as the
