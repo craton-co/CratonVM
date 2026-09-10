@@ -1223,6 +1223,27 @@ const RETIRED_SHADOW_PREFIXES: &[&str] = &[
     // see `RETIRED_SHADOW_PHASE2_TRIPLES`. A prefix admits a package to the
     // binary search; the table decides what is retired, and it retires one row.
     "sun/nio/ch/",
+
+    // 2026-09-10, lane L6 (`docs/known-issues/jdk-only-lanes/lane-6-net-security.md`).
+    // TWO prefixes for a lane that owns nine, and both deliberately the NARROW
+    // spelling: `java/net/` and not `java/`;
+    // `javax/security/auth/x500/` and not `javax/security/`.
+    //
+    // Only these two have a table. The lane's other seven prefixes were each
+    // armed on the whole probe tree and each either moved a probe AWAY from
+    // HotSpot or never reached the dial at all — see
+    // `RETIRED_SHADOW_L6_TRIPLES`' header for the per-arm numbers. Adding a
+    // prefix whose table is empty is provably inert, but it would also read,
+    // to the next lane, as a claim that something under it was retired, and
+    // `the_lane_l6_security_and_tls_prefixes_are_not_admitted` exists to keep
+    // that claim from being made by accident.
+    //
+    // `javax/security/auth/x500/` is the narrow one for a reason that is not
+    // style: arming `javax/security/` whole is untested, and arming
+    // `java/security/` + `sun/security/` + `javax/crypto/` + `javax/security/`
+    // together took `SecuritySurfaceSweep` from 0 diffs to 2,594.
+    "java/net/",
+    "javax/security/auth/x500/",
 ];
 
 /// The 2026-08-30 Phase 2 wave: ONE triple, and the size is the finding.
@@ -2271,6 +2292,274 @@ static RETIRED_SHADOW_PHASE3_TRIPLES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// The 2026-09-10 lane-L6 wave: `java/net/` and `X500Principal`, and nothing
+/// else in a lane of nine prefixes.
+///
+/// A fifth table rather than rows merged into a sibling, for the reason the
+/// second gives for existing: these were adjudicated by a different METHOD --
+/// eight differential probes written for this lane, each scored through the
+/// whole probe tree with `scripts/jdk-only-phase2-battery.sh` -- and the method
+/// is the part worth being able to see at a glance.
+///
+/// # The lane is 966 bucket-A/B rows and this retires 124 of them
+///
+/// That ratio is the finding, not a shortfall. Measured 2026-09-10 from
+/// `--dump-native-registry --explain-jdk-only` on JDK 25.0.4+7/linux: the
+/// lane's nine prefixes carry 1,224 registrations that own their slot with
+/// effective kind `Bridge` -- 731 bucket A, 235 bucket B, and 258 that are
+/// C/D/E/F and therefore shadow no bytecode at all. Of the 966 in the goal
+/// this wave retires the 124 that passed all four preconditions of
+/// `docs/contributing/jdk-only-lane-operations.md` §7.
+///
+/// The rest did not fail for want of effort. Each of the lane's other seven
+/// prefixes was armed ALONE on the whole 125-probe tree, and each failed in
+/// one of two ways -- either it moved a probe away from the oracle, or the
+/// dial was never asked at all:
+///
+/// ```text
+///   arm                                     probes worse   note
+///   java/net/                                     0        TAKEN, 114 rows
+///   javax/security/auth/x500/                     0        TAKEN,  10 rows
+///   javax/net/                                    2        L6TlsParamSweep 66 -> 94
+///   java/security/,sun/security/,
+///     javax/crypto/,javax/security/               8        SecuritySurfaceSweep 0 -> 2594
+///   sun/net/                                      0        123 of 125 VACUOUS
+///   jdk/net/,jdk/internal/net/                    0        123 of 125 VACUOUS
+/// ```
+///
+/// A VACUOUS arm is not a pass. `sun/net/` and the two `jdk` prefixes reached
+/// the dial in 2 probes of 125, which means arming them changed nothing and
+/// read as the best possible result -- precondition 1, and the trap 146 of
+/// Phase 2's 236 candidates fell into.
+///
+/// Three structural reasons sit behind those numbers, and each predicts what a
+/// future lane will find:
+///
+///  1. **`javax/net/ssl/` and `sun/security/ssl/` are an IMPLEMENTATION, not a
+///     shadow.** This VM's TLS is rustls (`native-builtins/src/t27_tls.rs`,
+///     20,630 lines, plus `net_phase_e.rs`'s `register_re6_ssl_context`).
+///     Yielding those rows to `sun.security.ssl` bytecode does not restore a
+///     JDK behaviour this VM was approximating -- it removes TLS. Armed on the
+///     security prefixes, `SecuritySurfaceSweep` goes from 0 diffs to 2,594,
+///     `JcaFunctional` from 0 to 30, and `DhAgree` stops producing output.
+///     This is `StrictMath`'s situation: a 0-diff probe is evidence the family
+///     WORKS, never on its own a reason to retire it.
+///  2. **The `HttpsURLConnectionImpl` rows are a workaround for a null
+///     `delegate`, not a shim in front of bytecode.** 67 rows, the largest
+///     single class in the lane. `register_https_delegate_forwarders`
+///     (`native-builtins/src/http_url_connection.rs`) exists because this VM
+///     ALLOCATES that carrier rather than constructing it, so `delegate` is
+///     null and every inherited method the Impl overrides would NPE. Each
+///     forwarder runs the SUPERCLASS body the Impl overrides -- which is to
+///     say the retirement's own remedy is already what these natives do.
+///     Retiring them restores the NPE that took out the TLS half of the Tomcat
+///     suite.
+///  3. **A base-class row loses the dispatch to its own subclass.**
+///     `java/net/InetAddress` has 18 bucket-A rows and exactly 3 of them are
+///     ever dispatched: every instance is an `Inet4Address` or an
+///     `Inet6Address`, the door asks the registry about the DECLARING class,
+///     and the subclass registration wins. The other 15 are unreachable
+///     through instance dispatch and retiring them would move nothing. They
+///     are counted here as unretired rather than quietly claimed.
+///
+/// # What the 124 fix, per probe, on one binary
+///
+/// Armed on the two prefixes, against HotSpot 25.0.4+7 as oracle. Every other
+/// probe in the 125-probe tree scored delta exactly 0 in both arms:
+///
+/// ```text
+///   L6UriSweep         80 diffs -> 0      (925 rows,  7,179 yields)
+///   L6UrlSweep         14 diffs -> 0      (446 rows, 10,555 yields)
+///   L6X500Sweep       276 diffs -> 0      (401 rows,  4,669 yields)
+///   L6InetSweep       380 diffs -> 160    (848 rows,  1,156 yields)
+///   L6HttpLogicSweep   64 diffs -> 60     (164 rows,  2,913 yields)
+/// ```
+///
+/// Two rows in each arm's summary moved and are NOT evidence, both flagged by
+/// the driver itself: `VtHandoffProbe` is the campaign's named noise floor --
+/// it oscillates in both directions on virtual-thread counts nobody has fixed
+/// -- and `L4FileSweep`/`L4FilesSweep` in the X500 arm reported a delta beside
+/// `y/r=0/0`, meaning the dial was never asked and the arming cannot have
+/// caused it. Both re-ran 3/3 clean, 0 diffs, in both arms.
+///
+/// # The rows those deltas are made of
+///
+/// The perimeter this campaign predicts, and the happy path never reaches:
+/// `DatagramSocket.connect(addr, 65536)` was ACCEPTED, and so were
+/// `connect(null, 9)`, `bind` on an already-bound socket,
+/// `MulticastSocket.setTimeToLive(256)` and `joinGroup(null)`.
+/// `HttpURLConnection.setRequestMethod` accepted `CONNECT` and silently
+/// upper-cased `get`; `setRequestProperty` did not REPLACE what
+/// `addRequestProperty` had appended; `getRequestProperties` handed back a
+/// MODIFIABLE map; the RFC-850 and asctime date formats parsed as -1. `URL`
+/// answered `false` for `http://h:80/p equals http://h/p`, where the default
+/// port makes them equal. `X500Principal` did not recognise the `#hex` DER
+/// form of an attribute value at all, dropped a trailing escaped space, and
+/// encoded `emailAddress` as a `UTF8String` where the JDK writes an
+/// `IA5String`. And `InetAddress.getByName` sent malformed literals --
+/// `256.1.1.1`, `1:2:3:4:5:6:7:8:9` -- to the RESOLVER, which HotSpot rejects
+/// without a lookup: those rows were not merely wrong, they were a function of
+/// the host's DNS.
+///
+/// # The four preconditions, and what each one removed
+///
+/// Applied per triple against a dump from a run of the very probes whose
+/// improvement is cited above -- not against a corpus census, which is a
+/// different workload (this is the `FileChannelImpl.open` mistake recorded in
+/// `RETIRED_SHADOW_PHASE2_TRIPLES`):
+///
+/// ```text
+///   owns the slot + effective kind Bridge   -34 not-owner, -55 already retagged
+///   bucket A or B (something to yield to)   -91 C/D/F
+///   dispatched by the instrument (inv > 0) -127 never reached
+///   registrar not held by lane T             -4 the throwable ctor table
+/// ```
+///
+/// The last is lane-0 §3's rule and it costs four rows:
+/// `MalformedURLException` and `UnknownHostException` are registered by
+/// `lang_misc.rs`'s `register_throwable_subclass_natives` and by the `lib.rs`
+/// `getMessage` loop, both of which span seven lanes' prefixes. A fifth,
+/// `MalformedURLException.initCause`, comes from a different site and would
+/// have been this lane's to take; it is excluded with its two siblings because
+/// splitting one throwable's surface across two waves is how a family ends up
+/// half-retired with nothing recording which half.
+///
+/// # The refusals are not inert
+///
+/// A refusal is a retirement only when nothing already owns the triple, and
+/// `JdkOnlyViolation::SyntheticNativeRegistered` carries a `survivor` for the
+/// case where an earlier registration keeps serving -- strict mode then runs
+/// THAT native instead of the bytecode the policy asked for, and every probe
+/// reads exactly as it did before. The survivor count for these two prefixes
+/// is recorded with this wave in `docs/internal/retired/`, taken from a
+/// `--jdk-only-report` of the trial binary running the probe tree.
+static RETIRED_SHADOW_L6_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/net/DatagramSocket", "<init>", "(ILjava/net/InetAddress;)V"),
+    ("java/net/DatagramSocket", "<init>", "(Ljava/net/SocketAddress;)V"),
+    ("java/net/DatagramSocket", "bind", "(Ljava/net/SocketAddress;)V"),
+    ("java/net/DatagramSocket", "close", "()V"),
+    ("java/net/DatagramSocket", "connect", "(Ljava/net/InetAddress;I)V"),
+    ("java/net/DatagramSocket", "connect", "(Ljava/net/SocketAddress;)V"),
+    ("java/net/DatagramSocket", "disconnect", "()V"),
+    ("java/net/DatagramSocket", "getBroadcast", "()Z"),
+    ("java/net/DatagramSocket", "getInetAddress", "()Ljava/net/InetAddress;"),
+    ("java/net/DatagramSocket", "getLocalAddress", "()Ljava/net/InetAddress;"),
+    ("java/net/DatagramSocket", "getLocalPort", "()I"),
+    ("java/net/DatagramSocket", "getLocalSocketAddress", "()Ljava/net/SocketAddress;"),
+    ("java/net/DatagramSocket", "getOption", "(Ljava/net/SocketOption;)Ljava/lang/Object;"),
+    ("java/net/DatagramSocket", "getPort", "()I"),
+    ("java/net/DatagramSocket", "getReceiveBufferSize", "()I"),
+    ("java/net/DatagramSocket", "getReuseAddress", "()Z"),
+    ("java/net/DatagramSocket", "getSendBufferSize", "()I"),
+    ("java/net/DatagramSocket", "getSoTimeout", "()I"),
+    ("java/net/DatagramSocket", "getTrafficClass", "()I"),
+    ("java/net/DatagramSocket", "isBound", "()Z"),
+    ("java/net/DatagramSocket", "isClosed", "()Z"),
+    ("java/net/DatagramSocket", "isConnected", "()Z"),
+    ("java/net/DatagramSocket", "receive", "(Ljava/net/DatagramPacket;)V"),
+    ("java/net/DatagramSocket", "send", "(Ljava/net/DatagramPacket;)V"),
+    ("java/net/DatagramSocket", "setOption", "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/net/DatagramSocket;"),
+    ("java/net/DatagramSocket", "setReceiveBufferSize", "(I)V"),
+    ("java/net/DatagramSocket", "setSendBufferSize", "(I)V"),
+    ("java/net/DatagramSocket", "setSoTimeout", "(I)V"),
+    ("java/net/DatagramSocket", "setTrafficClass", "(I)V"),
+    ("java/net/DatagramSocket", "supportedOptions", "()Ljava/util/Set;"),
+    ("java/net/HttpURLConnection", "<init>", "(Ljava/net/URL;)V"),
+    ("java/net/HttpURLConnection", "addRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V"),
+    ("java/net/HttpURLConnection", "getHeaderFieldDate", "(Ljava/lang/String;J)J"),
+    ("java/net/HttpURLConnection", "getInstanceFollowRedirects", "()Z"),
+    ("java/net/HttpURLConnection", "getRequestMethod", "()Ljava/lang/String;"),
+    ("java/net/HttpURLConnection", "getRequestProperties", "()Ljava/util/Map;"),
+    ("java/net/HttpURLConnection", "getRequestProperty", "(Ljava/lang/String;)Ljava/lang/String;"),
+    ("java/net/HttpURLConnection", "setChunkedStreamingMode", "(I)V"),
+    ("java/net/HttpURLConnection", "setConnectTimeout", "(I)V"),
+    ("java/net/HttpURLConnection", "setDoOutput", "(Z)V"),
+    ("java/net/HttpURLConnection", "setFixedLengthStreamingMode", "(I)V"),
+    ("java/net/HttpURLConnection", "setReadTimeout", "(I)V"),
+    ("java/net/HttpURLConnection", "setRequestMethod", "(Ljava/lang/String;)V"),
+    ("java/net/HttpURLConnection", "setRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V"),
+    ("java/net/Inet4Address", "equals", "(Ljava/lang/Object;)Z"),
+    ("java/net/Inet4Address", "getAddress", "()[B"),
+    ("java/net/Inet4Address", "getHostAddress", "()Ljava/lang/String;"),
+    ("java/net/Inet4Address", "hashCode", "()I"),
+    ("java/net/Inet4Address", "isAnyLocalAddress", "()Z"),
+    ("java/net/Inet4Address", "isLoopbackAddress", "()Z"),
+    ("java/net/Inet4Address", "isMulticastAddress", "()Z"),
+    ("java/net/Inet4Address", "toString", "()Ljava/lang/String;"),
+    ("java/net/Inet6Address", "getAddress", "()[B"),
+    ("java/net/Inet6Address", "getHostAddress", "()Ljava/lang/String;"),
+    ("java/net/Inet6Address", "hashCode", "()I"),
+    ("java/net/Inet6Address", "isAnyLocalAddress", "()Z"),
+    ("java/net/Inet6Address", "isLoopbackAddress", "()Z"),
+    ("java/net/Inet6Address", "isMulticastAddress", "()Z"),
+    ("java/net/Inet6Address", "toString", "()Ljava/lang/String;"),
+    ("java/net/InetAddress", "getByAddress", "([B)Ljava/net/InetAddress;"),
+    ("java/net/InetAddress", "getByName", "(Ljava/lang/String;)Ljava/net/InetAddress;"),
+    ("java/net/InetAddress", "getLoopbackAddress", "()Ljava/net/InetAddress;"),
+    ("java/net/MulticastSocket", "<init>", "(I)V"),
+    ("java/net/MulticastSocket", "close", "()V"),
+    ("java/net/MulticastSocket", "getOption", "(Ljava/net/SocketOption;)Ljava/lang/Object;"),
+    ("java/net/MulticastSocket", "getTimeToLive", "()I"),
+    ("java/net/MulticastSocket", "joinGroup", "(Ljava/net/SocketAddress;Ljava/net/NetworkInterface;)V"),
+    ("java/net/MulticastSocket", "setTimeToLive", "(I)V"),
+    ("java/net/ProxySelector", "getDefault", "()Ljava/net/ProxySelector;"),
+    ("java/net/URI", "<init>", "(Ljava/lang/String;)V"),
+    ("java/net/URI", "compareTo", "(Ljava/net/URI;)I"),
+    ("java/net/URI", "create", "(Ljava/lang/String;)Ljava/net/URI;"),
+    ("java/net/URI", "equals", "(Ljava/lang/Object;)Z"),
+    ("java/net/URI", "getAuthority", "()Ljava/lang/String;"),
+    ("java/net/URI", "getFragment", "()Ljava/lang/String;"),
+    ("java/net/URI", "getHost", "()Ljava/lang/String;"),
+    ("java/net/URI", "getPath", "()Ljava/lang/String;"),
+    ("java/net/URI", "getPort", "()I"),
+    ("java/net/URI", "getQuery", "()Ljava/lang/String;"),
+    ("java/net/URI", "getRawAuthority", "()Ljava/lang/String;"),
+    ("java/net/URI", "getRawFragment", "()Ljava/lang/String;"),
+    ("java/net/URI", "getRawPath", "()Ljava/lang/String;"),
+    ("java/net/URI", "getRawQuery", "()Ljava/lang/String;"),
+    ("java/net/URI", "getRawSchemeSpecificPart", "()Ljava/lang/String;"),
+    ("java/net/URI", "getRawUserInfo", "()Ljava/lang/String;"),
+    ("java/net/URI", "getScheme", "()Ljava/lang/String;"),
+    ("java/net/URI", "getSchemeSpecificPart", "()Ljava/lang/String;"),
+    ("java/net/URI", "getUserInfo", "()Ljava/lang/String;"),
+    ("java/net/URI", "hashCode", "()I"),
+    ("java/net/URI", "isAbsolute", "()Z"),
+    ("java/net/URI", "isOpaque", "()Z"),
+    ("java/net/URI", "normalize", "()Ljava/net/URI;"),
+    ("java/net/URI", "parseServerAuthority", "()Ljava/net/URI;"),
+    ("java/net/URI", "relativize", "(Ljava/net/URI;)Ljava/net/URI;"),
+    ("java/net/URI", "resolve", "(Ljava/lang/String;)Ljava/net/URI;"),
+    ("java/net/URI", "resolve", "(Ljava/net/URI;)Ljava/net/URI;"),
+    ("java/net/URI", "toString", "()Ljava/lang/String;"),
+    ("java/net/URI", "toURL", "()Ljava/net/URL;"),
+    ("java/net/URL", "<init>", "(Ljava/lang/String;)V"),
+    ("java/net/URL", "equals", "(Ljava/lang/Object;)Z"),
+    ("java/net/URL", "getDefaultPort", "()I"),
+    ("java/net/URL", "getFile", "()Ljava/lang/String;"),
+    ("java/net/URL", "getHost", "()Ljava/lang/String;"),
+    ("java/net/URL", "getPath", "()Ljava/lang/String;"),
+    ("java/net/URL", "getPort", "()I"),
+    ("java/net/URL", "getProtocol", "()Ljava/lang/String;"),
+    ("java/net/URL", "getQuery", "()Ljava/lang/String;"),
+    ("java/net/URL", "getRef", "()Ljava/lang/String;"),
+    ("java/net/URL", "hashCode", "()I"),
+    ("java/net/URL", "openConnection", "()Ljava/net/URLConnection;"),
+    ("java/net/URL", "sameFile", "(Ljava/net/URL;)Z"),
+    ("java/net/URL", "toExternalForm", "()Ljava/lang/String;"),
+    ("java/net/URL", "toString", "()Ljava/lang/String;"),
+    ("java/net/URL", "toURI", "()Ljava/net/URI;"),
+    ("javax/security/auth/x500/X500Principal", "<init>", "(Ljava/io/InputStream;)V"),
+    ("javax/security/auth/x500/X500Principal", "<init>", "(Ljava/lang/String;)V"),
+    ("javax/security/auth/x500/X500Principal", "<init>", "(Ljava/lang/String;Ljava/util/Map;)V"),
+    ("javax/security/auth/x500/X500Principal", "<init>", "([B)V"),
+    ("javax/security/auth/x500/X500Principal", "equals", "(Ljava/lang/Object;)Z"),
+    ("javax/security/auth/x500/X500Principal", "getEncoded", "()[B"),
+    ("javax/security/auth/x500/X500Principal", "getName", "()Ljava/lang/String;"),
+    ("javax/security/auth/x500/X500Principal", "getName", "(Ljava/lang/String;)Ljava/lang/String;"),
+    ("javax/security/auth/x500/X500Principal", "hashCode", "()I"),
+    ("javax/security/auth/x500/X500Principal", "toString", "()Ljava/lang/String;"),
+];
+
 /// Is this exact triple a retired §1.4 shadow?
 ///
 /// The class-name prefix test is a cheap discriminator: every entry is under
@@ -2298,6 +2587,7 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
         || RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(&key).is_ok()
+        || RETIRED_SHADOW_L6_TRIPLES.binary_search(&key).is_ok()
 }
 
 #[cfg(test)]
@@ -2358,6 +2648,110 @@ mod tests {
                     && RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(t).is_err()
                     && RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(t).is_err(),
                 "{t:?} is in the phase-3 table and an earlier one"
+            );
+        }
+        for t in RETIRED_SHADOW_L6_TRIPLES {
+            assert!(
+                RETIRED_SHADOW_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(t).is_err(),
+                "{t:?} is in the L6 table and an earlier one"
+            );
+        }
+    }
+
+    /// Sorted and binary-searched like every sibling. An out-of-order entry
+    /// makes the predicate answer `false` for a row that IS present, which
+    /// reads as "not retired" and is invisible in a workload — the one failure
+    /// mode of this file that no gate downstream can see.
+    #[test]
+    fn the_l6_table_is_sorted_and_unique() {
+        for w in RETIRED_SHADOW_L6_TRIPLES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "out of order or duplicated: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    /// Every L6 entry is asked through the REAL predicate, not through the
+    /// table it lives in.
+    ///
+    /// This wave added a prefix (`java/net/`), which is the case where a
+    /// missing one would be caught — but it is also the case where a
+    /// MIS-SPELLED one would not be, because a table whose every row starts
+    /// with `java/net/` and a prefix list containing `java/nett/` produce a
+    /// predicate that answers `false` for all 114 rows and a build that
+    /// compiles and passes every other test in this file.
+    #[test]
+    fn every_l6_entry_is_reachable() {
+        for (c, m, d) in RETIRED_SHADOW_L6_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "unreachable entry: {c}.{m}{d}"
+            );
+        }
+    }
+
+    /// The lane's OTHER eight prefixes retire nothing, and that is deliberate.
+    ///
+    /// `javax/net/`, `sun/net/`, `java/security/`, `sun/security/`,
+    /// `javax/crypto/`, `javax/security/`, `jdk/net/` and `jdk/internal/net/`
+    /// were each armed on the whole probe tree and each moved at least one
+    /// probe AWAY from HotSpot — the TLS stack because it is rustls rather
+    /// than a shim, the `HttpsURLConnectionImpl` rows because they forward to
+    /// a superclass body in place of a null `delegate`. Their absence from
+    /// `RETIRED_SHADOW_PREFIXES` is a measured verdict, so this test states it
+    /// as one: if a future wave adds a table under one of them it must delete
+    /// this test in the same commit, which is the point.
+    #[test]
+    fn the_lane_l6_security_and_tls_prefixes_are_not_admitted() {
+        for p in [
+            "javax/net/",
+            "sun/net/",
+            "java/security/",
+            "sun/security/",
+            "javax/crypto/",
+            "javax/security/",
+            "jdk/net/",
+            "jdk/internal/net/",
+        ] {
+            assert!(
+                !RETIRED_SHADOW_PREFIXES.contains(&p),
+                "{p} is admitted, but no L6 table retires anything under it"
+            );
+        }
+        // ...and the two that ARE admitted carry every row of the table
+        // between them. `javax/security/auth/x500/` is a SUBTREE of the
+        // `javax/security/` this test forbids, which is the whole point: the
+        // wide prefix was measured and refused, the narrow one was measured
+        // and taken.
+        for (c, _, _) in RETIRED_SHADOW_L6_TRIPLES {
+            assert!(
+                c.starts_with("java/net/") || c.starts_with("javax/security/auth/x500/"),
+                "{c} is in the L6 table but outside both prefixes that admit it"
+            );
+        }
+    }
+
+    /// The four rows lane T holds must NOT be here.
+    ///
+    /// `MalformedURLException` and `UnknownHostException` sit inside this
+    /// lane's prefix set and are produced by `lang_misc.rs`'s throwable-family
+    /// registrar, which spans seven lanes. Lane-0 §3: while lane T holds a
+    /// registrar, no prefix lane may retire any triple that registrar
+    /// produces — even one inside its own prefixes. They were candidates and
+    /// they were dropped; a later wave that adds them without lane T's
+    /// registrar moving is the mistake this test names.
+    #[test]
+    fn the_throwable_family_rows_are_left_to_lane_t() {
+        for (c, _, _) in RETIRED_SHADOW_L6_TRIPLES {
+            assert!(
+                !c.ends_with("Exception"),
+                "{c} is registered by the cross-lane throwable table"
             );
         }
     }
