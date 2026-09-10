@@ -240,7 +240,9 @@ interleaved rounds, checksum `-931971200` on all fifteen samples:
 | single-pass (`C2_ACCEPT=never`) | 344 335 338 370 318 | 338 |
 
 **2.25x faster, won in 5 of 5 paired rounds, with no overlap between the two
-distributions at all.** The census row this page ended on goes to
+distributions at all.** Under the default `evidence` policy, which is what
+production runs, it is **2.84x** — see "The number that was hiding behind it"
+below for why the forced-acceptance arm UNDERSTATES this fix. The census row this page ended on goes to
 `own_code=0 in_splice=0`, and `step` still gets its 3 spliced bodies — the
 refusal lands on `ArrayList.get`'s compile, not on the type-check splices this
 page is about.
@@ -249,10 +251,77 @@ page is about.
 with the refusal against 199/211/206 without. It has no unbindable survivor,
 which is the same reason it was the right attribution probe in the first place.
 
-### What is left, stated as a remainder and not as a win
+### What is left, and where it actually was
 
-This does not close the gap, it closes most of it. The optimizing body was 3.3x
-the single-pass one (1112 against 338); it is now **1.46x** (493 against 338).
-Something else on the container path still costs, and this page should not be
-read as having found it. What is now true is that the remaining gap has no
-blind dispatch in it, so whatever it is, it is not a name resolution.
+The 1.46x above is real, and it is not in this lane, in `step`, or in the
+type-check splices. It is an artifact of the harness setting used to defeat the
+tier race — and chasing it turned up the more important number.
+
+**Isolation.** Four variants, same accessors and loop, `C2_ACCEPT` forced both
+ways, checksums identical within each:
+
+| variant | the read is | `always` | `never` | ratio |
+|---|---|---|---|---|
+| `SpliceCastProbe` | `List.get` (invokeinterface) | 469 492 473 | 362 378 305 | 1.32x |
+| V2 | `ArrayList.get` (invokevirtual) | 481 519 492 | 339 344 | 1.44x |
+| V4 | `ArrayList.get`, **no casts at all** | 256 239 240 | 115 108 108 | **2.2x** |
+| V3 | bare `Object[]` load | 225 211 207 | 208 242 208 | 1.0x |
+| V5 | a USER container: bounds check + array load | 69 71 69 | 79 74 63 | **0.96x** |
+
+V2 says it is not interface dispatch — invokevirtual has the same gap. V4 says
+it is not the casts — strip them entirely and the gap grows. V5 says it is not
+the *shape*: a user-written container with `get`'s exact structure is FASTER
+under the optimizing tier. V4 against V5 is the finding: 240 ms against 69 ms
+for the same work, so the cost is `ArrayList.get` specifically.
+
+**What it is.** `Objects.checkIndex(II)I` is one line — `return
+Preconditions.checkIndex(index, length, null)`. Its single-pass body is 277
+bytes. Its optimizing body is **694**. `ArrayList.get`'s are 2672 and 2770.
+`C2_ACCEPT=always` forces those bodies onto JDK internals where the optimizing
+tier's fixed overhead is a straight loss — the same family as this page's
+sibling records for statics behind accessors. Under the DEFAULT `evidence`
+policy both are refused (`acceptance ...: REFUSED (evidence: none) -- keeping
+the single-pass body`), so no production run ever sees them.
+
+So the 1.46x is a property of the lever, not of the tier. Which is worth saying
+plainly: **`C2_ACCEPT=always` is not "the optimizing tier's number". It is the
+optimizing tier with its acceptance gate removed, including on JDK code where
+that gate is the only thing standing between a program and a slower body.**
+
+### The number that was hiding behind it
+
+Re-run under the default policy — the one production uses — and the
+unbindable-call refusal is worth more, not less:
+
+| default (`evidence`) policy | samples (ms) | median |
+|---|---|---|
+| refusal on | 320 307 331 312 | **316** |
+| refusal off | 898 893 954 897 | **897** |
+
+**2.84x, 4 of 4 paired rounds, no overlap — and 316 ms is below the single-pass
+338 ms**, so with the refusal in place the optimizing tier is no longer behind
+on this probe at all.
+
+The mechanism is the part worth keeping:
+
+```
+refusal off: [ir] inline-plan java/util/ArrayList.get: 1 site(s), 1 spliced body, 7 bytes appended
+             ... and no acceptance line: the body is PUBLISHED
+refusal on:  [ir] acceptance java/util/ArrayList.get: REFUSED (evidence: none)
+             -- keeping the single-pass body
+```
+
+Splicing `Objects.checkIndex` into `ArrayList.get` was the only transform in
+that compile, and `is_worth_publishing` reads "a transform happened" as
+evidence. **So the splice was the evidence that got the slower body published.**
+The harmful transform paid for its own admission. Refusing it removes the
+transform, which removes the false evidence, which leaves the single-pass body
+in place — three effects from one refusal, and only the first was intended.
+
+That is the failure mode `c2-splice-getstatic-and-the-calls-it-left-behind-20260909.md`
+§7 named and declined to fix: "`is_worth_publishing` still judges a body by
+whether it changed, not by whether it helped." This is that gate mis-firing in
+production, on JDK container code, on the default policy — not a lab artifact.
+Fixing the gate to judge by measurement is still not done here, and is still
+the more valuable repair; what is done is removing one transform that was
+lying to it.

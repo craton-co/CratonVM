@@ -33,8 +33,15 @@ import java.util.List;
  * behind is native-shadowed, which the direct-bind path declines. The splice
  * traded a bound CALL for a name resolution. Refusing that trade
  * (`CRATONVM_JIT_IR_SPLICE_REFUSE_UNBINDABLE`, default on) takes this probe's
- * optimizing body from 1112 ms to 493 ms against a single-pass 338 ms. The
- * remaining 1.46x is not a blind dispatch and is not yet explained.
+ * optimizing body from 1112 ms to 493 ms against a single-pass 338 ms.
+ *
+ * The residual 1.46x there is the HARNESS, not the tier: `C2_ACCEPT=always`
+ * also forces optimizing bodies onto `ArrayList.get` and the one-line
+ * `Objects.checkIndex` (694 bytes optimizing against 277 single-pass), which
+ * the default `evidence` policy refuses. Measured on the DEFAULT policy the
+ * refusal is worth 897 ms -> 316 ms, i.e. below the single-pass 338 ms,
+ * because the splice it removes was also the only "evidence" that got the
+ * slower body published.
  *
  * Usage: SpliceCastProbe [reps]     default 4,000,000
  */
