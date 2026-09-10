@@ -18,7 +18,7 @@ probes. Artifacts: `registry-{real,strict}.json`, `classes-{real,strict}.json`,
 | 2 | final native registry has zero `SyntheticStub` | **MET** — at registration; see §2 |
 | 3 | zero `CompatibilityStub` classes | **MET WITHIN REACH** — the census saw 22% of the classes |
 | 4 | every strict dispatch is bridge / service / intrinsic | **NOT MET**, and undercounted by construction |
-| 5 | strict errors are actionable | **PARTIAL** — the startup error is; the violation rows are not |
+| 5 | strict errors are actionable | **PARTIAL** — only the class ORIGIN is missing; see §5 |
 | 6 | corpus shows no new divergence **and** CI census is blocking | **HALF** — corpus yes (today); blocking no |
 
 ## 1. Startup refusal — MET
@@ -126,22 +126,65 @@ measured at **398** on 2026-08-22
 figure here needs `+398 exempt` beside it, and re-kinding a row `Intrinsic`
 removes it from the census without changing behaviour.
 
-## 5. Actionable strict errors — PARTIAL
+## 5. Actionable strict errors — PARTIAL, and narrower than this page first said
 
-The criterion asks for class, method, descriptor, origin, attempted native kind,
-JDK version and fallback instructions.
+> **CORRECTED 2026-09-10, same day.** The first version of this section was
+> written from `report-strict.json` alone and concluded that fallback
+> instructions were missing. **They are not.** A strict run emits violations
+> through `JdkOnlyViolation::render`, not through the JSON, and reading one
+> artifact and generalising to "strict errors" is the whole error. Recorded
+> rather than quietly replaced, because acting on the wrong version would have
+> meant adding a remediation line that is already there and already tested.
 
-| field | on a violation row | where it is |
+There are two surfaces and the criterion is about the first one.
+
+**The rendered error** — `types/src/error.rs::render`, what an operator sees:
+
+```text
+CratonVM --jdk-only: policy violation [native-shadows-bytecode]
+  requested class:   ...
+  requested member:  ...
+  requested from:    ...
+  initiating loader: ...
+  reason:            ...
+  JDK:
+    feature version: 25
+    java.home:       ...
+    module:          ...
+  Remediation:
+    ...
+    re-run with --real-jdk to restore the current compatibility behaviour
+    capture the full machine-readable report with --jdk-only-report <FILE>
+```
+
+| criterion field | present? | where |
 |---|---|---|
-| class, method, descriptor | yes | row |
-| attempted native kind | yes | `native_kind` |
-| JDK version | no | `jdk_feature`, report top level |
-| class origin | **no** | not on the row |
-| fallback instructions | **no** on the row | present in the *startup* error (§1) |
+| class | yes | `requested class` |
+| method, descriptor | yes | `requested member` |
+| attempted native kind | yes | inside `reason` (`bridge native shadows bytecode of …`) |
+| JDK version | yes | `JDK: feature version`, plus `java.home` and `module` |
+| fallback instructions | **yes** | `REMEDIATION_FALLBACK`, pinned as the penultimate line |
+| class origin | **no** | — |
 
-A row reads `bridge native shadows bytecode of java/io/File.isDirectory()Z
-[bytecode-won]`. That is a good diagnostic and it is not what §11 specifies.
-The gap is the per-violation rows, not the launcher.
+The fallback is not incidental: `remediation_ends_with_the_two_fixed_lines`
+iterates `all_variants()` and asserts the fallback is the penultimate line and
+the capture hint the last, for every variant.
+
+**The JSON row** — `to_json`, the machine-readable report: carries `kind`,
+`summary`, `class`, `method`, `descriptor`, and per-variant fields
+(`native_kind`, `outcome`, `registered_by`, …). JDK version is at the report top
+level as `jdk_feature` rather than per row, and the fallback string is not
+repeated 1799 times, which is the right call for a constant.
+
+**So the one unambiguous gap, on both surfaces, is the class ORIGIN.**
+
+And it may not be satisfiable uniformly. Six of the fourteen construction sites
+build `SyntheticNativeRegistered`, which fires at REGISTRATION — before any
+class is loaded, so there is no class origin in existence to report. The field
+is meaningful for the class-facing variants (`CompatibilityClassRequested`,
+`NativeShadowsBytecode`) and vacuous for the registration-time ones. A change
+that adds `origin: null` to the latter to tick the box would make the criterion
+read as met without telling anyone anything.
 
 ## 6. Corpus green **and** a blocking CI census — HALF
 
