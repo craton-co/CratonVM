@@ -16,7 +16,7 @@ probes. Artifacts: `registry-{real,strict}.json`, `classes-{real,strict}.json`,
 |---|---|---|
 | 1 | cannot start without a valid real JDK image | **MET** |
 | 2 | final native registry has zero `SyntheticStub` | **MET** — at registration; see §2 |
-| 3 | zero `CompatibilityStub` classes | **MET WITHIN REACH** — the census saw 22% of the classes |
+| 3 | zero `CompatibilityStub` classes | **MET over 886 classes, with a live control** — see §3 |
 | 4 | every strict dispatch is bridge / service / intrinsic | **NOT MET**, and undercounted by construction |
 | 5 | strict errors are actionable | **PARTIAL** — only the class ORIGIN is missing; see §5 |
 | 6 | corpus shows no new divergence **and** CI census is blocking | **HALF** — corpus yes (today); blocking no |
@@ -97,13 +97,40 @@ workload actually loaded:
   of those, loaded during the probe run     290   (22.4%)
 ```
 
-So criterion 3 is adjudicated over roughly a fifth of the surface, and the
-verdict should be read as *no compatibility class appeared in the classes this
-workload touched* — not as a whole-image property. Widening it is a matter of
-`PROBE_CP` / `PROBE_CLASS` (the census script takes both) rather than of new
-machinery, and until someone does, a class-origin claim from this artifact
-carries "over 484 classes" beside it the way a shadow count carries
-"+398 exempt".
+### Widened, same day — and the narrow probe *was* hiding one
+
+`scripts/jdk-only-census.sh` takes `PROBE_CP` and `PROBE_CLASS` to census a real
+application instead of the built-in probe. Nothing in the tree had used them.
+Re-run with `JdkOnlyCensusLoadProbe` as the workload — the corpus probe whose
+purpose is loading broadly:
+
+```text
+                    classes in census   compatibility-stub
+  narrow  --real-jdk        475                 13
+  narrow  --jdk-only        484                  0
+  wide    --real-jdk        765                 14      <- one MORE than narrow
+  wide    --jdk-only        886                  0
+```
+
+**The compatible-mode column is the control, and it is live.** A strict zero
+only means something if the instrument can see a compatibility class at all;
+these runs see 13 and 14 of them. So `--jdk-only` showing zero over 886 classes
+is a real measurement, not a silent instrument.
+
+**And the wide run found a compatibility class the narrow one missed** —
+`cratonvm/internal/StreamCollector`, absent from the 13. That is the reach
+concern made concrete: the narrow probe's population was not merely smaller, it
+was missing a member of the very set criterion 3 is about.
+
+**Two different denominators, which are easy to conflate.** The class-origin
+census grew 484 → 886 (+83%), but the share of *registry* classes actually
+loaded moved only 290 → 354 of 1297 (22.4% → 27.3%). Criterion 3 is about class
+origins, so 886 is the relevant figure; the 27.3% is the right number for any
+claim about the native surface, and it is still low.
+
+To widen further, point `PROBE_CP`/`PROBE_CLASS` at a real application — a
+regression-suite corpus or H2 — rather than at a probe. The lever exists and
+costs one census run.
 
 ## 4. Every strict dispatch is a bridge, a reviewed service, or an intrinsic — NOT MET
 
