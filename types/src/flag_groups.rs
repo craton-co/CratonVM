@@ -1371,6 +1371,12 @@ pub const INVENTORY: &[E] = &[
     // resolver had bound and keep-alive-registered the entry all along; nothing
     // put it where the lowerer looks.
     E { group: Group::JIT, token: "ir-splice-direct-call", on_key: Some("CRATONVM_JIT_IR_SPLICE_DIRECT_CALL"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // Splice a callee whose body carries a `checkcast` or an `instanceof`.
+    // `IrBuilder` has had both arms since cov-05; the splice scanner refused
+    // the shape because nothing resolved the callee's targets or rebased the
+    // rows. An unresolved target refuses the CALLEE rather than being dropped,
+    // because a missing row bails the whole method.
+    E { group: Group::JIT, token: "ir-splice-typecheck", on_key: Some("CRATONVM_JIT_IR_SPLICE_TYPECHECK"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
     E { group: Group::JIT, token: "ir-splice-getstatic", on_key: Some("CRATONVM_JIT_IR_SPLICE_GETSTATIC"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
     // R1. Memoize the ACCEPTED optimizing OSR artifact, not only the refusals.
     // Without it one run recompiled the same method 502 times.

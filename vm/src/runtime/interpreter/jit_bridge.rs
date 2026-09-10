@@ -10147,6 +10147,8 @@ fn resolve_inline_site_from(
     // This is the row whose absence bailed `VolumeShort2.loadFromArray` out of
     // the IR tier altogether, and with it out of escape analysis.
     let mut ir_new_sites: Vec<(usize, u16)> = Vec::new();
+    // IR-tier only: `(pc, cp_idx, is_checkcast)` for the body's type checks.
+    let mut ir_typecheck_sites: Vec<(usize, u16, bool)> = Vec::new();
     // IR-tier only: pcs of the body's return opcodes. A relocated body is walked
     // straight through with no merge bookkeeping, so exactly one return, at the
     // end, is the shape the splice can honour.
@@ -10168,6 +10170,38 @@ fn resolve_inline_site_from(
             }
             0xbb | 0xbd | 0xc5 => no!("new/anewarray/multianewarray"),
             0xbf => no!("athrow"),
+            // `checkcast` / `instanceof`. Refused for both tiers until
+            // 2026-09-09, and for the optimizing tier the refusal was the same
+            // shape as `ir-splice-static-field`'s: `IrBuilder` has had both
+            // arms since cov-05, keyed by pc off `checkcast_info` /
+            // `instanceof_info`, and nothing rebased a spliced body's rows into
+            // them. The survey that motivated those arms counted 306 events on
+            // this pair -- the largest single whole-method refusal, more than
+            // every opcode gap combined -- because every typed read out of an
+            // untyped container is a `checkcast`.
+            //
+            // Unlike `getstatic`, the rows are RESOLVED here rather than
+            // already carried: `InlineSite` had no typecheck field, and the
+            // target class can only be named through the CALLEE's constant
+            // pool. See the resolution below, which refuses the body when a
+            // target is not loaded rather than admitting it with rows missing:
+            // a missing row bails the whole METHOD, so the caller would lose
+            // its optimizing compile over a callee it merely wanted inlined.
+            //
+            // The single-pass emitter still has no arm for either, so its
+            // refusal is unchanged.
+            0xc0 | 0xc1 if ir_mode => {
+                if !cratonvm_jit::ir::ir_splice_typecheck_enabled() {
+                    no!("ir-splice-typecheck");
+                }
+                if scan_pc + 2 >= code_len {
+                    return None;
+                }
+                let cp_idx = ((code[scan_pc + 1] as u16) << 8) | code[scan_pc + 2] as u16; // Cast: bytecode operand decoding
+                ir_typecheck_sites.push((scan_pc, cp_idx, code[scan_pc] == 0xc0));
+                scan_pc += 3;
+                continue;
+            }
             0xc0 | 0xc1 => no!("checkcast/instanceof"),
             0xc2 | 0xc3 => no!("monitorenter/monitorexit"),
             // A relocated body's control flow would need the merge/loop-header
@@ -10419,6 +10453,45 @@ fn resolve_inline_site_from(
     let Some(callee_class_info) = cm.get_class(declaring_id) else {
         no!("declaring-class-info-unavailable");
     };
+
+    // Resolve the body's `checkcast` / `instanceof` targets against the
+    // CALLEE's constant pool -- the only pool that can name them.
+    //
+    // Admitted only when the target class is already RESOLVED AND LOADED, which
+    // is the same bar the caller's own sites are held to and for the same
+    // reason: the not-yet-loaded path runs `jit_typecheck_resolve`, which can
+    // call a user classloader's `loadClass`, arbitrary Java this tier does not
+    // host inside a helper call. `resolve_jit_new_site` answers exactly that
+    // question for a `CONSTANT_Class` entry, which is the shape both opcodes
+    // take, so this reuses it rather than adding a second resolver; the field
+    // count and init flags it also carries are irrelevant here.
+    //
+    // An unresolved target refuses the whole CALLEE, the same trade as
+    // `ir-splice-new-site-unresolved`: a missing row bails the METHOD, so
+    // admitting the body without one costs the CALLER its optimizing compile
+    // over a callee it merely wanted inlined. Refusing costs the site its
+    // inline and nothing else.
+    //
+    // The builder's `0xc0`/`0xc1` arms appear to be gentler -- a missing row
+    // reaches `plant_uncommon_trap`. It is gated off by default
+    // (`ir_unresolved_class_trap_enabled`), so the plant refuses and the arm
+    // bails; and with it ON the trap fires and, inside a splice, deopts to
+    // re-execute the invoke on every call. Neither setting makes admitting an
+    // unresolved body the right move.
+    let mut ir_typecheck_info: Vec<(usize, u32, String, bool)> = Vec::new();
+    for &(tpc, cp_idx, is_checkcast) in &ir_typecheck_sites {
+        let Some(cratonvm_jit::JitNewSite::Resolved {
+            class_id: target_id,
+            ..
+        }) = resolve_jit_new_site(&cm, declaring_id, cp_idx)
+        else {
+            no!("ir-splice-typecheck-target-not-loaded");
+        };
+        let Some(name) = callee_class_info.constant_pool.get_class_name(cp_idx) else {
+            no!("ir-splice-typecheck-target-unnamed");
+        };
+        ir_typecheck_info.push((tpc, target_id, name.to_string(), is_checkcast));
+    }
 
     // Validate the deferred invokespecial sites: every one must be a
     // resolver-PROVEN no-op super-constructor call, or the whole callee is
@@ -11161,6 +11234,7 @@ fn resolve_inline_site_from(
         resolved_invoke_infos: Vec::new(),
         nested_sites,
         ir_new_info,
+        ir_typecheck_info,
     })
 }
 
