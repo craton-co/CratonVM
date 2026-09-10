@@ -217,7 +217,7 @@ on in-flight frames, because cache invalidation governs future entries to a
 method and not a frame already executing one — the same fact that retired
 artifact displacement. Full write-up, including the address measurement that
 explains why the obvious encoding had never worked, in
-[`c2-the-layout-epoch-guard-was-unreachable-by-rip-20260910.md`](c2-the-layout-epoch-guard-was-unreachable-by-rip-20260910.md).
+[`c2-the-layout-epoch-guard-was-unreachable-by-rip-FIXED-20260910.md`](../../internal/performance/c2-the-layout-epoch-guard-was-unreachable-by-rip-FIXED-20260910.md).
 
 ## 9. Reproducing
 

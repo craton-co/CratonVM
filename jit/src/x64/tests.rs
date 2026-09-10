@@ -4859,7 +4859,8 @@ fn every_single_pass_compact_field_site_guards_its_baked_offset() {
         Vec::new(),
         Vec::new(),
         Vec::new(), // pic_slots — no PIC sites
-        Vec::new(),
+        Vec::new(), // ldc_info
+        Vec::new(), // ldc2w_info
         HashMap::new(),
         HashMap::new(),
         &helpers,
@@ -4906,7 +4907,8 @@ fn every_single_pass_compact_field_site_guards_its_baked_offset() {
         Vec::new(),
         Vec::new(),
         Vec::new(), // pic_slots — no PIC sites
-        Vec::new(),
+        Vec::new(), // ldc_info
+        Vec::new(), // ldc2w_info
         HashMap::new(),
         HashMap::new(),
         &set_helpers,
