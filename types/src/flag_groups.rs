@@ -520,6 +520,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "movable-band-roots", on_key: Some("CRATONVM_GC_MOVABLE_BAND_ROOTS"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
     // UNSAFE pricing lever for the A5 unregistered-frame span sweep.
     E { group: Group::JIT, token: "a5-mark-span", on_key: Some("CRATONVM_JIT_A5_MARK_SPAN"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // Recover frames from the A5 band instead of sweeping it as a raw span.
+    E { group: Group::JIT, token: "a5-frame-scan", on_key: Some("CRATONVM_JIT_A5_FRAME_SCAN"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
     E { group: Group::DBG, token: "peer-reg-pairing", on_key: Some("CRATONVM_DBG_PEER_REG_PAIRING"), off_key: None, off_word: None, since: "2026-09-06" },
     // Coverage oracle for the slot list `static-root-slots` builds: after the
     // fast path has patched the recorded slots, re-walk every static the slow

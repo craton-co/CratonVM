@@ -6559,8 +6559,15 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
                         // Counted separately because it covers a SPAN rather
                         // than a frame, so one accept can contribute many.
                         let __a5_before = out.len();
+                        // Recover FRAMES from the band and scan each with its
+                        // layout; fall back to the raw span sweep only when
+                        // nothing is recognised. See `scan_a5_band_as_frames`.
                         if a5_mark_span_enabled() {
-                            scan_one_frame(search_lo, high, heap, out);
+                            if !a5_frame_scan_enabled()
+                                || scan_a5_band_as_frames(search_lo, high, heap, out) == 0
+                            {
+                                scan_one_frame(search_lo, high, heap, out);
+                            }
                         }
                         band_path::A5_SWEEPS.fetch_add(1, Ordering::Relaxed);
                         band_path::A5_ROOTS
@@ -9048,6 +9055,58 @@ fn frame_bands_enabled() -> bool {
     })
 }
 
+/// Scan ONE compiled frame's own band using its layout, and publish the
+/// movable/unrewritable partition for it.
+///
+/// Returns `false` when the frame's recorded size is unusable, which is the
+/// caller's signal to fall back to a layout-free sweep.
+///
+/// Factored out of [`scan_compiled_frame_bands`] so the A5 unregistered-frame
+/// path can reach it: a frame found by inspection is still a compiled frame
+/// with a layout, and scanning it as one is the difference between a bounded
+/// band that publishes a partition and a raw span sweep that pins everything
+/// it touches.
+fn scan_one_compiled_frame_with_layout(
+    rbp: usize,
+    cm: &cratonvm_jit::CompiledMethod,
+    heap: &VmHeap,
+    out: &mut Vec<ObjectRef>,
+) -> bool {
+    let frame_size = cm.osr_frame_size;
+    if frame_size <= 0 {
+        return false;
+    }
+    let frame_size = frame_size as usize;
+    const MAX_COMPILED_FRAME_BYTES: usize = 1024 * 1024;
+    if frame_size > MAX_COMPILED_FRAME_BYTES || frame_size > rbp {
+        return false;
+    }
+    // The register-file half of this frame's active oop map. `None` keeps the
+    // whole blind image in the scan, which is what every frame did before
+    // 2026-09-09.
+    let reg_mask = active_reg_oop_mask(rbp, cm);
+    if reg_mask.is_some() {
+        REGOOP_FRAMES_MASKED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        REGOOP_FRAMES_UNMASKED.fetch_add(1, Ordering::Relaxed);
+    }
+    let skip = band_skip_classes();
+    if skip.is_some() || reg_mask.is_some() || gc_dead_spill_roots_enabled() {
+        scan_one_frame_filtered(rbp, frame_size, cm, skip, reg_mask, heap, out);
+    } else {
+        scan_one_frame(rbp - frame_size, rbp, heap, out);
+    }
+    // The band was just read as marking roots, which is what keeps these
+    // objects alive across the pause AND what gets them copied. Say which of
+    // them arrived through a word no channel rewrites, so the pin decision can
+    // veto a movable claim made elsewhere for the same address. Only reachable
+    // with a resolved layout -- a foreign innermost frame has none, and it
+    // already forces the non-moving sweep through `FOREIGN_INNERMOST_RBP`, so
+    // there is no move to veto there.
+    publish_unrewritable_band_roots(rbp, frame_size, cm, reg_mask, heap);
+    true
+}
+
 fn scan_compiled_frame_bands(
     info: PreciseFrameInfo,
     scanner_sp: usize,
@@ -9092,40 +9151,8 @@ fn scan_compiled_frame_bands(
             // pin. See `band_path`.
             band_path::FOREIGN_INNERMOST.fetch_add(1, Ordering::Relaxed);
             scan_one_frame(scanner_sp, rbp, heap, out);
-        } else {
-            let frame_size = cm.osr_frame_size;
-            if frame_size <= 0 {
-                return false;
-            }
-            let frame_size = frame_size as usize;
-            const MAX_COMPILED_FRAME_BYTES: usize = 1024 * 1024;
-            if frame_size > MAX_COMPILED_FRAME_BYTES || frame_size > rbp {
-                return false;
-            }
-            // The register-file half of this frame's active oop map. `None`
-            // keeps the whole blind image in the scan, which is what every
-            // frame did before 2026-09-09.
-            let reg_mask = active_reg_oop_mask(rbp, cm);
-            if reg_mask.is_some() {
-                REGOOP_FRAMES_MASKED.fetch_add(1, Ordering::Relaxed);
-            } else {
-                REGOOP_FRAMES_UNMASKED.fetch_add(1, Ordering::Relaxed);
-            }
-            let skip = band_skip_classes();
-            if skip.is_some() || reg_mask.is_some() || gc_dead_spill_roots_enabled() {
-                scan_one_frame_filtered(rbp, frame_size, cm, skip, reg_mask, heap, out);
-            } else {
-                scan_one_frame(rbp - frame_size, rbp, heap, out);
-            }
-            // The band was just read as marking roots, which is what keeps
-            // these objects alive across the pause AND what gets them copied.
-            // Say which of them arrived through a word no channel rewrites, so
-            // the pin decision can veto a movable claim made elsewhere for the
-            // same address. Only reachable with a resolved layout — the foreign
-            // innermost frame above has none, and it already forces the
-            // non-moving sweep through `FOREIGN_INNERMOST_RBP`, so there is no
-            // move to veto there.
-            publish_unrewritable_band_roots(rbp, frame_size, cm, reg_mask, heap);
+        } else if !scan_one_compiled_frame_with_layout(rbp, cm, heap, out) {
+            return false;
         }
 
         // `[rbp]` and `[rbp + 8]` hold the saved caller RBP and return PC.
@@ -9736,6 +9763,105 @@ static UNREWRITABLE_BAND_ROOTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Addresses published to the unrewritable-root veto since process start.
 ///
+/// Scan the A5 band as FRAMES rather than as a span.
+///
+/// Returns the number of compiled frames it scanned; `0` means it recognised
+/// nothing and the caller must fall back to the raw sweep.
+///
+/// # The problem this solves
+///
+/// When the A5 probe accepts, `[search_lo, high)` is swept whole. That span is
+/// not a frame -- it is every byte of native stack between the scanner and the
+/// entry, including the interpreter, native and Rust frames the compiled code
+/// called into. Every object-looking word in it becomes a marking root with no
+/// layout behind it, so it publishes NEITHER half of the movable/unrewritable
+/// partition and pins its G1 region unarguably. Measured on H2
+/// `TestValueMemory`: `a5_roots=4794` against the band path's `movable=132
+/// unrewritable=298`, and turning the sweep off took Type 3 from ~10000 to
+/// 4882, with the pin set going 34 addresses / 14 regions -> 6 / 5.
+///
+/// # Why frames can be recovered from the span
+///
+/// A compiled x64 frame's return address sits at `[rbp + 8]`, so a slot holding
+/// a return address into JIT code implies `rbp = slot - 8`.
+/// [`a5_slot_has_frame_shape`] already validates that shape -- saved caller RBP
+/// 8-aligned, strictly older, with room for its own return slot -- and it was
+/// written as a pricing instrument for exactly this question. From `rbp` the
+/// frame is an ordinary compiled frame with a `CompiledMethod` and a layout, so
+/// [`scan_one_compiled_frame_with_layout`] applies unchanged.
+///
+/// # Where this is weaker than the sweep, said plainly
+///
+/// The sweep marks every object-looking word in the span; this marks only the
+/// words of frames it RECOGNISES. A live compiled frame whose return slot fails
+/// the shape test is missed, and a missed root is a use-after-free --
+/// `bug-g1-evacuates-live-jit-reference-20260819-FIXED.md` is what that costs.
+/// Two things bound the risk and neither is an argument that it is zero:
+/// recognition is the same predicate the coverage probe already trusts, and
+/// recognising nothing at all falls back to the sweep rather than to silence.
+///
+/// It is therefore gated (`CRATONVM_JIT_A5_FRAME_SCAN=0`) and the gate is the
+/// first thing to try against any stale-pointer report.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn scan_a5_band_as_frames(
+    search_lo: usize,
+    high: usize,
+    heap: &VmHeap,
+    out: &mut Vec<ObjectRef>,
+) -> usize {
+    let mut scanned = 0usize;
+    let mut seen_rbp: Vec<usize> = Vec::new();
+    let mut slot = (search_lo + 7) & !7usize;
+    while slot + 8 <= high {
+        // SAFETY: aligned word inside this thread's own native stack, in the
+        // band the caller has already bounded and the sweep would have read.
+        let word = unsafe { (slot as *const usize).read() };
+        let Some(cm_ptr) = cratonvm_jit::lookup_jit_code_range(word) else {
+            slot += 8;
+            continue;
+        };
+        if !is_plausible_return_pc(word) || !a5_slot_has_frame_shape(slot, high) {
+            slot += 8;
+            continue;
+        }
+        let rbp = slot - 8;
+        if seen_rbp.contains(&rbp) {
+            slot += 8;
+            continue;
+        }
+        // SAFETY: a code range retains its `CompiledMethod` metadata for the
+        // lifetime of an active frame -- the same contract the registered walk
+        // and the relocation walker both rest on.
+        let cm: &cratonvm_jit::CompiledMethod =
+            unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
+        if scan_one_compiled_frame_with_layout(rbp, cm, heap, out) {
+            seen_rbp.push(rbp);
+            scanned += 1;
+            band_path::A5_FRAMES.fetch_add(1, Ordering::Relaxed);
+        }
+        slot += 8;
+    }
+    scanned
+}
+
+/// `CRATONVM_JIT_A5_FRAME_SCAN=0` -- sweep the A5 band as a raw span again
+/// instead of recovering frames from it. **Default ON.**
+///
+/// The bisect lever for [`scan_a5_band_as_frames`], and the first thing to try
+/// against a stale-pointer report on a JIT workload: the narrowing marks only
+/// the frames it recognises, so a frame it fails to recognise is a root it
+/// fails to publish.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn a5_frame_scan_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_A5_FRAME_SCAN").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
 /// `CRATONVM_JIT_A5_MARK_SPAN=0` — **a MEASUREMENT LEVER, and unsafe. Default
 /// ON, which is byte-for-byte today's scan.**
 ///
@@ -9783,9 +9909,13 @@ pub mod band_path {
     /// addresses nothing can argue about.
     pub static A5_SWEEPS: AtomicUsize = AtomicUsize::new(0);
     pub static A5_ROOTS: AtomicUsize = AtomicUsize::new(0);
+    /// Frames RECOVERED from an A5 band and scanned with a layout. The
+    /// denominator for the narrowing: `A5_FRAMES=0` with `A5_SWEEPS>0` means
+    /// every accept fell back to the raw span.
+    pub static A5_FRAMES: AtomicUsize = AtomicUsize::new(0);
 
-    /// `(bands, fallback, foreign_innermost, a5_sweeps, a5_roots)`.
-    pub fn snapshot() -> (usize, usize, usize, usize, usize) {
+    /// `(bands, fallback, foreign_innermost, a5_sweeps, a5_roots, a5_frames)`.
+    pub fn snapshot() -> (usize, usize, usize, usize, usize, usize) {
         let g = |c: &AtomicUsize| c.load(Ordering::Relaxed);
         (
             g(&BANDS),
@@ -9793,6 +9923,7 @@ pub mod band_path {
             g(&FOREIGN_INNERMOST),
             g(&A5_SWEEPS),
             g(&A5_ROOTS),
+            g(&A5_FRAMES),
         )
     }
 }

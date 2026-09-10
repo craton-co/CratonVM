@@ -1722,12 +1722,13 @@ moving_young={moving_young} osr_fallback={moving_young_osr_fallback} incomplete=
         // census shows neither, and both decide whether a pin is arguable.
         let bp = crate::jit::conservative_roots::band_path::snapshot();
         eprintln!(
-            "[bandpath] bands={} fallback={} foreign_innermost={} a5_sweeps={}              a5_roots={} published=(movable={} unrewritable={})",
+            "[bandpath] bands={} fallback={} foreign_innermost={} a5_sweeps={}              a5_roots={} a5_frames={} published=(movable={} unrewritable={})",
             bp.0,
             bp.1,
             bp.2,
             bp.3,
             bp.4,
+            bp.5,
             crate::jit::conservative_roots::movable_band_root_count(),
             crate::jit::conservative_roots::unrewritable_band_root_count(),
         );
