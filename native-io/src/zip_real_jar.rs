@@ -209,6 +209,32 @@ fn identity_handle_table() -> &'static Mutex<HashMap<i32, i64>> {
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Every receiver `open_and_register` has ever handed an archive handle to,
+/// by identity hash. APPEND-ONLY, deliberately: `identity_handle_table` drops
+/// its entry at `close`, and a closed `JarFile` is still a REAL archive whose
+/// `close`/`getName` must keep answering from the natives rather than from a
+/// real JDK body that would NPE on the `res` field CratonVM never populates.
+///
+/// Read from the interpreter's redefine-immunity gate through
+/// [`identity_is_known_archive`]; see `zip_immunity_waived_for_receiver` in
+/// `vm/src/runtime/interpreter/native_override.rs` for what it decides.
+fn known_archive_ids() -> &'static Mutex<std::collections::HashSet<i32>> {
+    static T: OnceLock<Mutex<std::collections::HashSet<i32>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Has an archive ever been opened ON the object with this identity hash?
+///
+/// `false` for a `JarFile`/`ZipFile` instance that no constructor ever ran on
+/// -- which on this VM means exactly one thing in practice: a Mockito INLINE
+/// mock, allocated by objenesis. Such a receiver has no handle for the natives
+/// to find and no `res` field graph for the real JDK body to read, so the
+/// natives can only answer `null`/0 for it, silently, without recording the
+/// invocation the test is verifying.
+pub fn identity_is_known_archive(id: i32) -> bool {
+    known_archive_ids().lock().contains(&id)
+}
+
 /// `System.identityHashCode(this)` — stable per object across GC.
 fn identity_hash(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<i32> {
     match ctx.invoke(
@@ -418,6 +444,7 @@ fn open_and_register(
     // slot (plain ZipFile): map its identity hash → handle.
     if let Some(id) = identity_hash(ctx, this) {
         identity_handle_table().lock().insert(id, handle);
+        known_archive_ids().lock().insert(id);
     }
     // Also store the name on the parent ZipFile's `name` field if present.
     let name_str = ctx.create_string(path_str);
