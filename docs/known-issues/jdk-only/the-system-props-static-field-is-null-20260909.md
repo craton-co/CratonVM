@@ -268,7 +268,107 @@ implementation work, individually harder and individually smaller, and they are
 what the `--jdk-only` goal actually consists of once the object-model
 scaffolding stops being the answer to every question.
 
-## 8. What this does NOT claim
+## 9. All 108 classified, and `VM.savedProps` is the third field
+
+§7 left 108 failures and a claim that they were "real semantic gaps". That was
+an inference from six sampled vectors. **Every one of the 108 was then run
+directly and classified by the exception the VM actually reported**, because the
+harness's per-vector message is the last line of stderr and for 44 of them that
+line is the dial's own door census -- a message that says nothing about the
+cause.
+
+```text
+ 41  AssertionError                        a real behavioural difference
+ 22  NullPointerException                  of which 12 are a null java.lang.Module
+ 11  IllegalStateException                 ALL of them "Not yet initialized"
+ 10  <no exception line>                   an output diff, not a crash
+  6  IllegalArgumentException
+  4  InternalError
+  3  ServiceConfigurationError
+  2  each: UnsatisfiedLinkError, RuntimeException, IllegalStateException,
+        AbstractMethodError
+  1  each: SocketException, ClassNotFoundException, ArithmeticException,
+        FileNotFoundException
+```
+
+So §7 was right that the null-field era was over as the DOMINANT cause and
+wrong that it was over: 23 of 108 are still one, in two families of 11 and 12.
+
+### `jdk.internal.misc.VM.savedProps`, and it throws
+
+The eleven are one field, and it is the same shape as `System.props` and the
+`SharedSecrets` pair -- with one difference that makes it worse:
+
+```java
+    public static String getSavedProperty(String key) {
+        if (savedProps == null)
+            throw new IllegalStateException("Not yet initialized");
+```
+
+The other two answer `null`. This one THROWS, so its absence is not a wrong
+answer somewhere downstream, it is an `ExceptionInInitializerError` out of
+whichever `<clinit>` asks first:
+
+```text
+<clinit> failed, class jdk/internal/loader/ClassLoaders
+  caused by IllegalStateException: Not yet initialized
+    at jdk/internal/misc/VM.getSavedProperty(VM.java:211)
+    at jdk/internal/loader/ClassLoaders.<clinit>(ClassLoaders.java:66)
+```
+
+`publish_vm_saved_props` fills it with a real `java/util/HashMap`, built by
+`new_object_initialized` and filled through its own `put` bytecode -- real code
+calls `get` on this, so a carrier will not do. Same absent-or-complete
+invariant as the rest of the cluster: a partially filled map would stop
+throwing and start answering `null`, and `getSavedProperty("java.home")`
+answering null is the 2026-07-14 `InternalError: null property: java.home`
+regression yet again.
+
+### Where the eleven go next, and why this increment stops here
+
+```text
+RJdkForkJoin      AssertionError: CountedCompleter leaves: 128     <- a real gap
+RLangPackages     NoClassDefFoundError: jdk/internal/loader/BuiltinClassLoader
+RBufferPoolCount  NoClassDefFoundError: jdk/internal/loader/BuiltinClassLoader
+RLoaderIdentity   NoClassDefFoundError: jdk/internal/loader/BuiltinClassLoader
+```
+
+`ClassLoaders.<clinit>` now gets eleven lines further -- from line 66 to line
+77 -- and dies constructing the builtin loader hierarchy. That is not another
+null field: `jdk/internal/loader/BuiltinClassLoader` is in the image and this VM
+cannot load or link it. **Structural class-loading work, and outside what a
+field publish can reach**, so it is recorded rather than attempted.
+
+The remaining 12-vector family is a null `java.lang.Module` --
+`ClassLoader.getUnnamedModule()` answering null through
+`ClassLoader.postDefineClass` -> `NamedPackage.<init>`. That one may still be
+field-shaped (`ClassLoader.unnamedModule`, set by the real `ClassLoader`
+constructor) and is the next thing to price, with the same warning §5 earned:
+read the image before assuming the carrier is missing.
+
+### Measured, and the count barely moves
+
+```text
+probe tree, control = the same tree without this change
+  115 probes, 1 moved: JdkOnlyPlatformProbe +2, the known-flaky handoff count
+  (delta 0, -2, 0, 0, +2 across the five A/Bs of this lane -- see
+   ../../contributing/jdk-only-lane-operations.md)
+--jdk-only corpus     132 passed, 0 failed
+SUITE=all             132 passed, 0 failed
+CRATONVM_ENFORCE_NATIVE_SHADOW=all   24 passed -> 25 passed of 132
+```
+
+**Eleven vectors cleared their first failure and the total moved by one.** Both
+facts are real and neither is the other's correction: ten of the eleven walked
+into the `BuiltinClassLoader` link failure above, which no field publish
+reaches. §5's rule holds in the direction that flatters nobody -- a first-failure
+count cannot score a fix in a chain, and that is as true of a fix worth having
+as of one that is not.
+
+The number to read for this increment is 11 first-failures removed and one new
+structural blocker NAMED, not +1.
+
+## 10. What this does NOT claim
 
 * Not that the `java/lang/System` property natives are retirable. They are not
   in any table, and retiring them needs a problem this change does not solve:

@@ -417,3 +417,18 @@ the one to distrust. Before recording an improvement, read the ROWS that moved
 and ask whether the probe could have produced that delta with no change at all —
 `measure a flaky vector's noise floor before explaining it` applies to the good
 news too.
+
+**Two named offenders, with the evidence, so the next lane does not re-derive
+it.** `VtHandoffProbe` and `JdkOnlyPlatformProbe` both count virtual-thread
+handoffs, and both counts are nondeterministic on this VM. Five successive
+whole-tree A/Bs across the 2026-09-09 waves scored `JdkOnlyPlatformProbe` at
+delta `0, -2, 0, 0, +2` — it oscillates in BOTH directions — and the row is one
+field of one line:
+
+```text
+HotSpot   ... handoffs=64 ...
+observed  ... handoffs=50 / 63 / 64 ...   across binaries that differ elsewhere
+```
+
+A delta from either probe is a coin flip until someone fixes the handoff count.
+Neither is a reason to hold a retirement, and neither is a win to claim.

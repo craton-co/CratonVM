@@ -7565,6 +7565,100 @@ fn publish_shared_secrets(ctx: &mut dyn NativeContext) -> usize {
     published
 }
 
+/// Fill `jdk.internal.misc.VM.savedProps`, which the real `initPhase1` sets
+/// through `VM.saveProperties(Map)`.
+///
+/// # Why it is not optional
+///
+/// `VM.getSavedProperty` is not a convenience wrapper; it THROWS when the map
+/// is absent:
+///
+/// ```java
+///     public static String getSavedProperty(String key) {
+///         if (savedProps == null)
+///             throw new IllegalStateException("Not yet initialized");
+/// ```
+///
+/// So a null here is not a null answer, it is an exception out of whatever
+/// `<clinit>` happened to ask first -- and the classes that ask are the ones
+/// every program needs:
+///
+/// ```text
+/// ExceptionInInitializerError, class jdk/internal/loader/ClassLoaders
+///   caused by IllegalStateException: Not yet initialized
+///     at jdk/internal/misc/VM.getSavedProperty(VM.java:211)
+///     at jdk/internal/loader/ClassLoaders.<clinit>(ClassLoaders.java:66)
+/// ```
+///
+/// MEASURED 2026-09-09 by classifying all 108 remaining failures of
+/// `CRATONVM_ENFORCE_NATIVE_SHADOW=all`: **11 of them are this field**, the
+/// largest single mechanical family left after the `SharedSecrets` wave.
+///
+/// # A real `HashMap`, filled through its own bytecode
+///
+/// `savedProps` is a `Map<String, String>` and real code calls `get` on it, so
+/// what goes in has to be a working map rather than a carrier. Built with
+/// `new_object_initialized` and filled with `invoke_virtual`, exactly as
+/// [`crate::properties_sidetable::replace_real_map`] fills the `Properties`
+/// backing map -- same GC discipline for the same reason: every `put` re-enters
+/// Java and is a collection point, so the receiver is pinned and re-read
+/// across the loop.
+///
+/// # Absent or complete, never half
+///
+/// The same invariant the rest of this cluster keeps. A partially filled
+/// `savedProps` would stop throwing and start answering `null` for keys it is
+/// missing, and `VM.getSavedProperty("java.home")` answering null is the shape
+/// of the 2026-07-14 `InternalError: null property: java.home` regression. On
+/// any failure the field is left exactly as it was.
+fn publish_vm_saved_props(ctx: &mut dyn NativeContext) -> bool {
+    let entries = ctx.list_system_properties();
+    if entries.is_empty() {
+        return false;
+    }
+    let created = ctx.new_object_initialized("java/util/HashMap", "()V", &[]);
+    let map = match created {
+        Ok(Some(Value::Object(Some(m)))) => m,
+        _ => return false,
+    };
+    let map_pin = ctx.pin_native_root(map);
+    let mut map_cur = ctx.read_native_pin(map_pin, map);
+    let mut written = 0usize;
+    let mut failed = false;
+    for (key, value) in &entries {
+        let k = ctx.create_string(key);
+        let k_pin = ctx.pin_native_root(k);
+        let v = ctx.create_string(value);
+        let k_cur = ctx.read_native_pin(k_pin, k);
+        map_cur = ctx.read_native_pin(map_pin, map_cur);
+        let put = ctx.invoke_virtual(
+            map_cur,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(k_cur)), Value::Object(Some(v))],
+        );
+        ctx.unpin_native_roots(k_pin);
+        match put {
+            Ok(_) => written += 1,
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+        map_cur = ctx.read_native_pin(map_pin, map_cur);
+    }
+    ctx.unpin_native_roots(map_pin);
+    if failed || written != entries.len() {
+        return false;
+    }
+    ctx.set_static_field_by_name(
+        "jdk/internal/misc/VM",
+        "savedProps",
+        Value::Object(Some(map_cur)),
+    );
+    true
+}
+
 /// Make the system `Properties` singleton real and publish it on
 /// `java.lang.System.props`, returning whether the field now holds it.
 ///
@@ -7658,6 +7752,7 @@ fn native_system_init_phase1_jdk_only(
     // class loader is still coming up.
     publish_real_system_props(ctx);
     publish_shared_secrets(ctx);
+    publish_vm_saved_props(ctx);
     Ok(result)
 }
 

@@ -945,4 +945,17 @@ fn the_jdk_only_init_phase1_arm_publishes_the_system_props_field() {
         body[at..end].contains(PUBLISH_JLA),
         "{BODY} no longer calls {PUBLISH_JLA}. SharedSecrets.getJavaLangAccess()          is a shadow like any other; declined, the real accessor returns the          static, and nothing else sets it."
     );
+
+    // `jdk.internal.misc.VM.savedProps`, the third field of the same family and
+    // the only one that THROWS rather than answering null:
+    // `VM.getSavedProperty` is `if (savedProps == null) throw new
+    // IllegalStateException("Not yet initialized")`. So its absence is an
+    // ExceptionInInitializerError out of whichever `<clinit>` asks first --
+    // `jdk/internal/loader/ClassLoaders` in the measured case -- and it was 11
+    // of the 108 failures remaining under `CRATONVM_ENFORCE_NATIVE_SHADOW=all`.
+    const PUBLISH_SAVED: &str = "publish_vm_saved_props";
+    assert!(
+        body[at..end].contains(PUBLISH_SAVED),
+        "{BODY} no longer calls {PUBLISH_SAVED}, so VM.getSavedProperty throws          IllegalStateException(\"Not yet initialized\") for the first class          whose <clinit> reads a saved property."
+    );
 }
