@@ -320,6 +320,16 @@ pub fn report_at_exit() {
         eprintln!(
             "[c2-supersede] refusals by optimizer activity: simplified={ref_simpl} inert={ref_inert}"
         );
+        // The third refusal reason, and the one that means the opposite of the
+        // other two: these bodies DID carry evidence the list accepts and were
+        // refused anyway, because the transform they carried made them slower.
+        // A non-zero count is the priced gate catching what the transform list
+        // alone published -- see `ir_evidence`'s header for the 897 ms against
+        // 338 ms that motivated pricing it.
+        let (cost_ref, cost_ns) = cratonvm_jit::ir_evidence::cost_regression_census();
+        eprintln!(
+            "[c2-supersede] refused as a cost regression: bodies={cost_ref} est_ns_per_execution_declined={cost_ns}"
+        );
         // Array guard elision. Elided AND emitted on both rows, always: an
         // elision count alone cannot tell a working pass from a workload that
         // compiles no array accesses in this tier.
