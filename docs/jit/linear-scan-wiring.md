@@ -1,5 +1,20 @@
 # Wiring linear scan into `ir_lower`
 
+> **Status banner, 2026-09-10.** This file describes the FIRST increment, when
+> the path was XMM-only and default **off**. Both halves of that are now stale:
+> `CRATONVM_JIT_IR_LINEAR_SCAN` is **default ON**, there is a **GP** file as
+> well as an FP one (`regalloc::xmm_roles::IR_GP_LINEAR_SCAN`), and
+> `ir-drop-home` / `ir-deopt-regs` / `ir-reg-authoritative` have since made some
+> home stores droppable. Read `docs/config/flag-inventory.md` for what is
+> actually on.
+>
+> What is NOT stale is this file's central claim, and it is the reason to keep
+> reading it: **write-through buys loads, not stores.** That ceiling was
+> re-measured from the other side on 2026-09-10 by widening the GP file to the
+> seven registers Win64 offers — residency rose, splits halved, and the code
+> got **4.6% slower**. See
+> `docs/internal/performance/c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md`.
+
 `jit/src/regalloc.rs` has had a complete, self-verifying linear-scan register
 allocator (`allocate_linear_scan`, `verify_allocation`, `resolve_parallel_copy`)
 and no production consumer — which is what
