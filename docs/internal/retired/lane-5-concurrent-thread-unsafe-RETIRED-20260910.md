@@ -1,0 +1,371 @@
+# Lane 5 — `java.util.concurrent`, `Thread`, `Unsafe` — RETIRED 2026-09-10
+
+| | |
+|---|---|
+| **Status** | Retired. Every bucket-A/B row in the lane's prefix set is retired, classified, or blocked with the blocker named and measured. |
+| **Was** | `docs/known-issues/jdk-only-lanes/lane-5-concurrent-thread-unsafe.md` |
+| **Table** | [`RETIRED_SHADOW_L5_TRIPLES`](../../../native-api/src/retired_shadow.rs) |
+| **Ownership authority** | [`lane-0-integration-and-gates.md`](../../known-issues/jdk-only-lanes/lane-0-integration-and-gates.md) |
+| **Method** | [`jdk-only-lane-operations.md`](../../contributing/jdk-only-lane-operations.md) |
+
+The lane page said its own §7: *every bucket-A/B row in the prefix set is
+retired, classified as C/D/E/F, a reviewed `Intrinsic` with its probe, or
+blocked with the blocker named — with the sub-word atomics covered at all four
+byte offsets, `ScopedMemoryAccess` settled jointly with L4, and every cited
+delta backed by a noise floor from the same probe.* That is what this page
+records, so the page it replaces can go.
+
+**The headline is not the retirement.** 81 rows moved; three defects were
+found, and two of them were live in shipped `--jdk-only` behaviour rather than
+in the retirement:
+
+- **`Unsafe.getAndSet*` / `getAndAdd*` on an ARRAY ELEMENT was a read-then-write.**
+  Not atomic, and the reason `RJdkForkJoin` reported `CountedCompleter leaves:
+  128`.
+- **`ExecutorService.submit(Runnable, T)` and `invokeAny` ran the task on the
+  CALLING thread** and returned an already-completed future, so a real
+  `ThreadPoolExecutor` never saw it.
+- **`Thread.State.valueOf("NOPE")` returned an enum constant** instead of
+  throwing — fixed by the retirement rather than by an edit.
+
+---
+
+## 1. The scope is 405 rows, and getting there is two subtractions
+
+A prefix filter over `--dump-native-registry --explain-jdk-only` reports **516**
+bucket-A/B eligible rows under `java/util/concurrent/`, `jdk/internal/misc/`,
+`sun/misc/`, `java/lang/Thread*`, `jdk/internal/vm/`. Two subtractions, both
+lane-0 rules rather than this lane's choice, take that to the 405 the lane page
+claimed:
+
+```text
+  516   bucket A/B, owns_slot, effective kind Bridge, in the L5 prefix set
+ -111   rows from a registrar whose classes span more than one lane  (lane T's)
+  405   this lane's scope, over 23 classes
+```
+
+Both numbers are from a dump taken with **this lane's own binary**. A dump from
+`dev`'s tip on 2026-09-10 reports 659 instead of 516, because that binary
+predates the Phase 3 `ConcurrentHashMap` wave and still registers its 99 rows.
+*Take the dump from the binary you are about to change.*
+
+The 111 cross-lane rows matter more than their count suggests. Lane 0 §3:
+**the unit of work for a cross-cutting registrar is the registrar, and lane T
+owns it whole.** `CopyOnWriteArraySet.equals` is registered by the same
+`native-collections/src/lib.rs` line as `HashSet.equals` and
+`LinkedHashSet.equals` — so 21 of `CopyOnWriteArraySet`'s 22 rows are lane T's,
+and this lane owns exactly one of them (`retainAll`). That single row is not
+retired either; see §4.
+
+```text
+  91  jdk/internal/misc/Unsafe            11  CompletableFuture
+  82  sun/misc/Unsafe                      9  PriorityBlockingQueue
+  33  java/lang/Thread                     9  TimeUnit
+  30  jdk/internal/misc/ScopedMemoryAccess 9  jdk/internal/misc/VM
+  25  ForkJoinTask                         8  jdk/internal/vm/Continuation
+  19  ForkJoinPool                         5  sun/misc/Signal
+  16  CopyOnWriteArrayList                 4  AbstractExecutorService
+  15  ThreadPoolExecutor                   4  jdk/internal/misc/Signal
+  14  RecursiveTask                        3  jdk/internal/vm/ContinuationScope
+  12  RecursiveAction                      2  Thread$State
+                                           2  ScheduledThreadPoolExecutor
+                                           1  Thread$FieldHolder
+                                           1  CopyOnWriteArraySet
+```
+
+## 2. `getAndSetReference` on an array was not atomic, and that is the ForkJoin gap
+
+The lane page called `RJdkForkJoin`'s `AssertionError: CountedCompleter leaves:
+128` "a genuine behavioural difference" and this lane's first correctness
+target. It is, and it is not in `CountedCompleter`'s pending-count protocol.
+
+`unsafe_natives_ext.rs` splits every `Unsafe.getAndSet*` / `getAndAdd*` on the
+receiver's **shape**. The field arm has always been a `compare_and_swap_field`
+retry loop. The ARRAY arm was a bare `get_array_element` + `set_array_element`
+pair. So the atomicity of one method depended on what you called it on, and no
+field-shaped probe could see it.
+
+`apps/probes/L5CasRace.java` asks the array arm directly — 2000 slots, 4
+threads, and the only correct answer is one claim per slot:
+
+```text
+                             HotSpot   CratonVM before   after
+  getAndSetReference claims    2000          2035         2000
+  compareAndSetReference       2000          2000         2000   <- the control
+  getAndSetInt claims          2000          2000         2000
+  getAndAddInt total          80000         71698        80000
+  getAndAddLong total         80000         68399        80000
+  compareAndSetInt total      80000         80000        80000   <- the control
+```
+
+**Read the controls, not the reds.** `compareAndSetReference` runs on the same
+array through the same offset decoder and is exact, so this is not offset
+decoding and not the heap; it is the missing loop. And the two `getAndAdd`
+rows lose ~10% *every* run while `getAndSetReference` lost claims only
+sometimes — a probe that asked only the reference row would have called this a
+flake.
+
+**Why the corpus saw it in exactly one vector.** `ForkJoinPool$WorkQueue`
+claims a queued task with `U.getAndSetReference(a, slotOffset(k), null)`, so a
+doubled claim is a task EXECUTED TWICE. A divide-and-conquer SUM is idempotent
+— a pool running everything twice still sums correctly — so every ordinary
+ForkJoin assertion passes over it. `RJdkForkJoin.countedCompleter` is the one
+assertion in the corpus that counts SIDE EFFECTS instead of reducing values.
+
+`apps/probes/L5CountedCompleter.java` is that question asked three ways, and
+the fix is scored on it with the real `ForkJoinPool` bytecode running
+(`CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/concurrent/ForkJoinPool,java/util/concurrent/ForkJoinTask`),
+eight runs each:
+
+```text
+  ccTree depth=6, 64 leaves expected
+    before   64, 64, 76, 64, 100, 91, 128, 96
+    after    64, 64, 64, 64,  64, 64, 121, 64
+```
+
+**Not fixed, improved** — and §3 says what the residue is.
+
+## 3. The residue: a real `ForkJoinPool` claims an external submission twice
+
+With the atomicity fix in, one shape still doubles, and it is deterministic
+rather than racy. `apps/probes/L5CountedCompleter.java`'s `fanOut` reads
+`rootComputes=2/1` on every run, and a reduced form isolates it to the
+submission path:
+
+```text
+  arming ForkJoinPool only          main runs the task, then a worker runs it too
+    pool.invoke(task)               computes=2   (HotSpot 1)
+    pool.execute(task); task.join() computes=2   (HotSpot 1)
+    pool.submit(task).get()         computes=2   (HotSpot 1)
+    task.invoke()                   computes=1   (HotSpot 1)   <- the control
+```
+
+Both executions enter with `isDone()==false` and overlap, so they are
+concurrent rather than sequential re-entry. The control identifies the
+boundary: a task that never enters the pool is fine, so this is the external
+submission being claimed by both the submitter's help path and a worker.
+
+The primitives underneath are not the cause, and that is measured rather than
+assumed. `apps/probes/L5CasRace.java` is exact on every row after the fix, and
+a targeted sweep of the fields and array slots the real `WorkQueue` uses —
+`objectFieldOffset` on five adjacent `int` fields, `putIntOpaque` /
+`getIntOpaque` / `putIntRelease` / `getIntAcquire` / `getAndBitwiseOrInt` on
+each, `putReferenceRelease` / `getReferenceAcquire` at four array indices,
+mixed with plain bytecode reads and writes — is byte-identical to HotSpot.
+
+**So `ForkJoinPool` is held, and it holds `ForkJoinTask`, `RecursiveTask` and
+`RecursiveAction` with it.** That is 51 more rows, and it is one unit rather
+than four decisions: a retired task class waits on the real pool. Armed on the
+task classes alone, `apps/probes/L5ExecutorSweep.java` hangs at
+`ForkJoinPool.submit(...).get()` and `ForkJoinShadowSweep` at
+`invokeAll(t1, t2)` — 178 rows before the arm, 92 after, and the missing tail
+is what `diff` reports as 86 differing rows.
+
+## 4. What was retired: 81 rows over 9 classes
+
+| class | rows | what the whole-tree arm measured |
+|---|---|---|
+| `CopyOnWriteArrayList` | 16 | 0 worse, 2 better, 0 truncated, 0 vacuous |
+| `ThreadPoolExecutor` | 15 | 0 worse in the same arm |
+| `jdk/internal/misc/ScopedMemoryAccess` | 16 | 0 worse, 2 better; 518 dial yields on L4's own buffer sweeps |
+| `CompletableFuture` | 11 | 0 worse |
+| `PriorityBlockingQueue` | 9 | 0 worse |
+| `TimeUnit` | 9 | 0 worse |
+| `Thread$State` | 2 | fixes a defect — see below |
+| `ScheduledThreadPoolExecutor` | 2 | 0 worse |
+| `Thread$FieldHolder` | 1 | 0 worse |
+
+Each row also carries a dispatch observed per triple, from a probe run's
+`--dump-native-registry` or from one of the 132 `--jdk-only` corpus reports.
+That precondition is the one that decided the size of this wave, and §5 is
+about what it cost.
+
+**`Thread$State.valueOf` is a retirement that FIXES something.**
+`Thread.State.valueOf("NOPE")` returned the enum constant `NOPE` — a value that
+does not exist — instead of throwing `IllegalArgumentException`. Arming
+`java/lang/Thread$` alone takes `L5ExecutorSweep` from 4 diffs to 2, and the
+row that closes is that one. This is §1.4 working as designed: the remedy is to
+delete the shim, not to write the check into it.
+
+**The `*Internal` twin rule, which is why 16 `ScopedMemoryAccess` rows and not
+8.** Eight were dispatched (`L4ByteBufferSweep`, `L4TypedBufferSweep`). Each is
+a public wrapper whose only body calls its own `@ForceInline` `…Internal` twin,
+and the twin is registered too — so retiring the wrapper alone produces a
+configuration nobody measured: real outer, native inner. The class-wide arm
+that measured clean yielded both halves, so each retired wrapper brings its
+twin. The 14 rows with no dispatch on either half stay out.
+
+**`ScopedMemoryAccess`, settled with L4.** The lane page required this jointly,
+because a liveness check split across two lanes is a liveness check nobody
+owns. It is settled by measurement on **L4's own instruments**: the whole-tree
+arm on `jdk/internal/misc/ScopedMemoryAccess` alone is 0 worse and 2 better,
+and the dial was asked 323 times in `L4ByteBufferSweep` and 199 in
+`L4TypedBufferSweep` — the two probes that drive `ByteBuffer` bulk operations
+through it. The 14 aligned accessors nobody calls are held, so L4 is not handed
+a half-retired session check. Note for L4: the `get*Unaligned` names here are
+NOT the `Unsafe` rows of the same name — these take a `MemorySegment` base and
+a real byte offset, which is a different number from an `Unsafe` slot index,
+and that is why one family retires and the other cannot.
+
+## 5. What was held, with the blocker
+
+324 rows. Every one has a measurement, not a judgement.
+
+### 143 rows: the class's whole arm moves the VM AWAY from HotSpot
+
+| class | rows | measured |
+|---|---|---|
+| `jdk/internal/misc/Unsafe` | 91 | 8 probes worse, 5 truncated. `L4BridgeSweep` 499 rows → 0, `L4ByteBufferSweep` 406 → 111, `L4TailSweep2` 189 → 26, `SecuritySurfaceSweep` +380 |
+| `java/lang/Thread` | 33 | 9 worse, 5 truncated. `ThreadShadowSweep` 122 rows → 54, `ConcurrentStressSweep` +54 |
+| `ForkJoinPool` | 19 | §3 |
+
+`Unsafe`'s blast radius is `java.nio`, and that is the shape to expect: the
+class is a memory-access API, so its users are every buffer in the image.
+
+### 105 rows: no instrument in this tree dispatches them
+
+| class | rows | measured |
+|---|---|---|
+| `sun/misc/Unsafe` | 82 | **121 of 121 probes report the dial VACUOUS** on this scope. The corpus reaches 18 of the 82 |
+| `jdk/internal/misc/ScopedMemoryAccess` | 14 | the aligned accessors and their twins; 0 dispatches in probes or corpus |
+| `jdk/internal/vm/Continuation` | 8 | 0 dispatches |
+| `sun/misc/Signal` | 5 | 0 dispatches |
+| `jdk/internal/misc/Signal` | 4 | 0 dispatches |
+| `jdk/internal/vm/ContinuationScope` | 3 | 0 dispatches |
+
+`sun/misc/Unsafe` is the one to read twice. The lane page called it "bucket B,
+one unit" with `jdk/internal/misc/Unsafe` — *retire them together or the two
+disagree about the same memory* — and that is still right; but the reason it is
+not retired is independent and stronger. **The probe tree cannot ask about it
+at all.** Precondition 1 fails by measurement rather than by omission, and a
+future wave has to bring a workload that uses the legacy façade before it can
+say anything.
+
+### 51 rows: one unit with a held class
+
+`ForkJoinTask` (25), `RecursiveTask` (14), `RecursiveAction` (12) — see §3.
+
+### 22 rows: structurally unretirable over this object model
+
+Inside `jdk/internal/misc/Unsafe`'s 91, and counted there. Recorded separately
+because the blocker is different in kind: these cannot be retired by any future
+wave that does not change what `objectFieldOffset` returns.
+
+**`objectFieldOffset` answers a SLOT INDEX, and the JDK's sub-word atomics are
+byte arithmetic.** `compareAndSetByte` and its relatives are implemented in
+Java over a 4-byte CAS:
+
+```java
+    long wordOffset = offset & ~3;
+    int  shift      = (int)(offset & 3) << 3;   // 24 - shift when BE
+    ...  getIntVolatile(o, wordOffset) ... weakCompareAndSetInt(...)
+```
+
+Over a slot index, `offset & ~3` names a **different field**. The same applies
+to the eight `get*Unaligned` / `put*Unaligned` rows, which decompose a byte
+range a slot index does not have.
+
+**The lane page asked for this at all four byte positions, and here it is.**
+`apps/probes/L5SubwordAtomics.java` asks `compareAndSet`, `compareAndExchange`,
+`getAndAdd`, `getAndSet`, `getAndBitwiseOr`, `weakCompareAndSet` and the
+volatile accessors at four ADJACENT fields and four ADJACENT array indices, for
+`byte`, `boolean`, `short` and `char`, printing all four values on every row so
+that wrong shift arithmetic shows up as a clobbered NEIGHBOUR rather than only
+as a wrong target:
+
+```text
+  132 rows, 0 diffs against HotSpot 25.0.4+7, unarmed
+```
+
+The natives are right. It is the retirement that would be wrong — which is the
+opposite of the usual finding and the reason the lane page put it first.
+
+### 4 rows: a dead registration, a door that never opens
+
+`AbstractExecutorService.submit` ×3 and `invokeAny` are registered on a class
+that is abstract. A dispatch door asks the registry about the DECLARING class
+of the resolved method, and every concrete executor in the image —
+`ThreadPoolExecutor`, `ForkJoinPool` — carries its own registration of the same
+names, so the abstract one is never the answer.
+`apps/probes/L5ExecutorSweep.java` builds the one receiver shape that could
+reach it (a direct subclass declaring only `execute`) and the rows still read
+`invocations: 0`. Lane 0 §1: **deleting these is worth doing and is not a
+retirement**, so they are not in the table and must not be counted as one.
+
+### 1 row: a partial that has evidence against it
+
+`CopyOnWriteArraySet.retainAll` is this lane's only row on that class; the other
+21 are lane T's. Retiring one row of a class whose state model the other 21
+maintain is the configuration the Phase 3 note already has evidence against
+("arming `ConcurrentHashMap$` alone killed `ChmShadowSweep` at row 13 of 208
+where arming the whole class left it byte-identical"), and the measurement
+agrees: arming `java/util/concurrent/CopyOnWrite` empties the set out —
+`IoSystemSweep` reads `cow set sorted |[]|` — while arming
+`CopyOnWriteArrayList` alone is 0 worse over the whole tree.
+
+### 9 rows: `jdk/internal/misc/VM`
+
+See §7 — the arm is recorded there.
+
+## 6. The two probes the lane page named, and their noise floor
+
+The lane page said `JdkOnlyPlatformProbe` and `VtHandoffProbe` are unusable and
+that a delta from either is a coin flip. This session produced the cleanest
+evidence of that yet, without meaning to.
+
+A whole-tree battery prints the dial's `yielded/reached` beside every row. In
+three of the arms above, both probes moved **while the dial was never asked** —
+`y/r = 0/0`, meaning the armed run and the base run were the same run:
+
+```text
+  arm                          probe                  delta   y/r
+  ForkJoinTask,RecursiveTask   JdkOnlyPlatformProbe     +2     0/0
+  ForkJoinTask,RecursiveTask   VtHandoffProbe           +4     0/0
+  sun/misc/Unsafe              JdkOnlyPlatformProbe     -2     0/0
+  sun/misc/Unsafe              VtHandoffProbe          +14     0/0
+```
+
+That is a noise floor of at least 14 lines on `VtHandoffProbe`, measured on one
+binary with nothing armed. **No delta from either probe is cited anywhere in
+this record**, and the two of them account for four of the "worse" rows in the
+summaries above.
+
+## 7. Instruments added, and what each was for
+
+| probe | rows | what it asks that nothing else did |
+|---|---|---|
+| `L5CasRace` | 8 | is an `Unsafe` read-modify-write on an ARRAY ELEMENT atomic (needs `--add-exports`) |
+| `L5SubwordAtomics` | 132 | the sub-word family at all four byte positions of a word (needs `--add-exports`) |
+| `L5CountedCompleter` | 8 | "a forked task runs exactly once", asked three ways |
+| `L5CowSweep` | 67 | `CopyOnWriteArrayList`/`Set` snapshot isolation, refusals, `addIfAbsent` |
+| `L5ExecutorSweep` | 104 | the executor and task-status surface, written to DISPATCH rows nothing calls |
+| `L5TpeCount` | 6 | does the POOL see the task, per submission shape |
+| `l5run.sh` | — | the runner for the two `--add-exports` probes the battery correctly excludes |
+
+`L5ExecutorSweep` is the one worth copying. 84 rows in this lane's *clean*
+classes had `invocations: 0` in every probe run and in all 132 corpus reports —
+not wrong, just never called. A row nothing calls cannot be retired, and, as
+`L5TpeCount` then showed, cannot be known to be right either. Writing the
+caller moved 60 of those 84 into the table and found a live defect on the way.
+
+The remaining 24 are the four dead `AbstractExecutorService` rows and the
+twenty `ScopedMemoryAccess` aligned accessors — both cases where the probe
+would have to construct a receiver shape the image does not otherwise produce.
+
+## 8. What the next wave should do, in order
+
+1. **`ForkJoinPool`'s external submission.** §3 localises it to the submitter's
+   help path racing a worker, with the `Unsafe` primitives underneath proven
+   exact. It unblocks 70 rows (`ForkJoinPool` + the three task classes) and it
+   is the last thing standing between this lane and its largest family.
+2. **A `sun.misc.Unsafe` workload.** 82 rows that no instrument in the tree
+   reaches. Until one exists, that count is not evidence of anything.
+3. **Delete the four `AbstractExecutorService` registrations** — dead weight,
+   not a shadow, and not a retirement.
+4. **`jdk/internal/misc/Unsafe`, per triple rather than per class.** The
+   class-wide arm is destructive, but the destruction is concentrated in the
+   memory-address family; the delegating wrappers (`getAndAddInt`,
+   `weakCompareAndSet*`, the `Acquire`/`Release` variants) reach the same
+   `ACC_NATIVE` primitives through the same offsets and are the obvious first
+   subset. That needs a build per iteration, because the dial arms a class and
+   the table is per triple.

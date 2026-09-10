@@ -2306,16 +2306,30 @@ static RETIRED_SHADOW_PHASE3_TRIPLES: &[(&str, &str, &str)] = &[
 ///   * 99 are the `ConcurrentHashMap` family, retired by the 2026-09-09 Phase 3
 ///     wave and already in [`RETIRED_SHADOW_PHASE3_TRIPLES`].
 ///
-/// # 81 of 405, and the other 324 are classified rather than deferred
+/// # 100 of 405, and the other 305 are classified rather than deferred
 ///
 /// | disposition | rows |
 /// |---|---|
-/// | retired here | **81** |
-/// | held: the class's whole arm moves the VM AWAY from HotSpot | 143 |
-/// | held: no instrument in this tree dispatches the row | 105 |
-/// | held: structurally unretirable over this object model | 22 |
-/// | held: one unit with a held class | 50 |
+/// | retired here | **100** |
+/// | held: the class's whole arm moves the VM AWAY from HotSpot | 127 |
+/// | held: no instrument in this tree dispatches the row | 102 |
+/// | held: one unit with a held class | 71 |
 /// | dead registration — a door that never opens | 4 |
+/// | held: a partial with evidence against it | 1 |
+///
+/// # The `Unsafe` subset that IS retired, and the line it is drawn on
+///
+/// Sixteen `jdk/internal/misc/Unsafe` rows are here and seventy-five are not,
+/// and the line is not a judgement call: **an atomic or a fence that delegates
+/// to an `ACC_NATIVE` primitive at the SAME offset** is retirable, because the
+/// JDK's Java body is then a loop over calls this VM already serves correctly
+/// — `getAndAddInt` is `do { v = getIntVolatile(o, offset); } while
+/// (!weakCompareAndSetInt(o, offset, v, v + delta));` and every term in it is
+/// one of ours. Anything that does ARITHMETIC on the offset is not, because
+/// this VM's offsets are slot indices.
+///
+/// That is why `getAndSetReference` retires and `getAndSetByte` cannot, though
+/// they are neighbours in the same file with the same shape.
 ///
 /// The per-class record, with the measurement behind each blocker, is on the
 /// lane page. Three of the blockers are properties of this VM rather than of
@@ -2447,6 +2461,25 @@ static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
     ("jdk/internal/misc/ScopedMemoryAccess", "putLongUnalignedInternal", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JJZ)V"),
     ("jdk/internal/misc/ScopedMemoryAccess", "putShortUnaligned", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JSZ)V"),
     ("jdk/internal/misc/ScopedMemoryAccess", "putShortUnalignedInternal", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JSZ)V"),
+    ("jdk/internal/misc/Unsafe", "getAndAddInt", "(Ljava/lang/Object;JI)I"),
+    ("jdk/internal/misc/Unsafe", "getAndAddLong", "(Ljava/lang/Object;JJ)J"),
+    ("jdk/internal/misc/Unsafe", "getAndSetInt", "(Ljava/lang/Object;JI)I"),
+    ("jdk/internal/misc/Unsafe", "getAndSetLong", "(Ljava/lang/Object;JJ)J"),
+    ("jdk/internal/misc/Unsafe", "getAndSetReference", "(Ljava/lang/Object;JLjava/lang/Object;)Ljava/lang/Object;"),
+    ("jdk/internal/misc/Unsafe", "getReferenceAcquire", "(Ljava/lang/Object;J)Ljava/lang/Object;"),
+    ("jdk/internal/misc/Unsafe", "loadFence", "()V"),
+    ("jdk/internal/misc/Unsafe", "putIntOpaque", "(Ljava/lang/Object;JI)V"),
+    ("jdk/internal/misc/Unsafe", "putReferenceOpaque", "(Ljava/lang/Object;JLjava/lang/Object;)V"),
+    ("jdk/internal/misc/Unsafe", "putReferenceRelease", "(Ljava/lang/Object;JLjava/lang/Object;)V"),
+    ("jdk/internal/misc/Unsafe", "storeFence", "()V"),
+    ("jdk/internal/misc/Unsafe", "storeStoreFence", "()V"),
+    ("jdk/internal/misc/Unsafe", "weakCompareAndSetInt", "(Ljava/lang/Object;JII)Z"),
+    ("jdk/internal/misc/Unsafe", "weakCompareAndSetIntPlain", "(Ljava/lang/Object;JII)Z"),
+    ("jdk/internal/misc/Unsafe", "weakCompareAndSetLong", "(Ljava/lang/Object;JJJ)Z"),
+    ("jdk/internal/misc/Unsafe", "weakCompareAndSetReference", "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z"),
+    ("jdk/internal/misc/VM", "getSavedProperty", "(Ljava/lang/String;)Ljava/lang/String;"),
+    ("jdk/internal/misc/VM", "isBooted", "()Z"),
+    ("jdk/internal/misc/VM", "maxDirectMemory", "()J"),
 ];
 
 /// Is this exact triple a retired §1.4 shadow?
