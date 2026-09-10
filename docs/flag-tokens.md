@@ -606,10 +606,12 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-416 tokens.
+418 tokens.
 
 | Token | Expands to |
 | --- | --- |
+| `a5-mark-span` | `CRATONVM_JIT_A5_MARK_SPAN` |
+| `a5-frame-scan` | `CRATONVM_JIT_A5_FRAME_SCAN` |
 | `aaload-licm` | `CRATONVM_DISABLE_AALOAD_LICM` |
 | `gpu-approx-math` | `CRATONVM_GPU_APPROX_MATH` |
 | `gpu-dispatch-memo` | `CRATONVM_GPU_DISPATCH_MEMO` |
@@ -1029,7 +1031,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-177 tokens.
+178 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1045,6 +1047,7 @@ export inherited from a parent shell.
 | `dead-spill-roots` | `CRATONVM_GC_DEAD_SPILL_ROOTS` |
 | `outgoing-arg-roots` | `CRATONVM_GC_OUTGOING_ARG_ROOTS` |
 | `g1-movable-pins` | `CRATONVM_GC_G1_MOVABLE_PINS` |
+| `movable-band-roots` | `CRATONVM_GC_MOVABLE_BAND_ROOTS` |
 | `moving-young-band-skip-in-map` | `CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP` |
 | `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
 | `gpu-min-work-giveup` | `CRATONVM_GPU_MIN_WORK_GIVEUP` |
