@@ -4816,6 +4816,11 @@ fn layout_epoch_guards(compiled: &CompiledMethod) -> usize {
 /// would race every sibling that compiled an inline compact arm before it.
 #[test]
 fn every_single_pass_compact_field_site_guards_its_baked_offset() {
+    if !jit_sp_field_layout_guard_enabled() {
+        // This process asked for the unguarded shape, which is what that
+        // switch is for. Pricing a guard requires being able to turn it off.
+        return;
+    }
     // ── the inline compact getfield ────────────────────────────────────
     // int get(Obj this) { return this.x; }
     let get_code: Vec<u8> = vec![

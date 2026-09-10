@@ -2403,6 +2403,33 @@ pub(super) fn jit_rip_safepoint_poll_enabled() -> bool {
 ///
 /// Reaching for the out-of-reach fallback is NOT what this switch is for:
 /// that path is chosen per site by `emit_cmp_mem32_abs_imm32`'s own ±2GB test.
+/// `CRATONVM_JIT_SP_FIELD_LAYOUT_GUARD=0` — emit the single-pass inline
+/// compact `getfield` and the ungated compact reference `putfield` with **no**
+/// layout-replacement guard, the shape they had until 2026-09-10.
+///
+/// Default ON, and **off is UNSOUND**. It restores a baked compact body offset
+/// that survives a `register_class_layout` replacement, which is the hazard
+/// the allocation emitters' own comment calls "confirmed heap corruption" —
+/// this is not a safety valve, and nothing should run with it clear.
+///
+/// It exists because the guard has a price and the price has to be a number
+/// from one binary rather than an argument. Those two sites are the hottest
+/// field paths the single-pass tier has, and this tier UNROLLS, so a four-site
+/// body at 4x carries sixteen guards; "correctness costs something here" and
+/// "correctness costs 3% here" are different claims and only the second one
+/// can be checked. Same reasoning, and same shape, as
+/// `CRATONVM_JIT_IR_PHI_HOME_PUBLISH_GUARD`, which restores a miscompile for
+/// the same purpose.
+pub(super) fn jit_sp_field_layout_guard_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SP_FIELD_LAYOUT_GUARD")
+            .and_then(|v| v.into_string().ok())
+            .is_none_or(|v| v != "0")
+    })
+}
+
 pub(super) fn jit_sp_epoch_guard_rip_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();

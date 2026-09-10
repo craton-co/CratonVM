@@ -5544,8 +5544,12 @@ impl Compiler {
                         // Emitted BEFORE the receiver load because the
                         // fallback form clobbers R11 and RCX, exactly as
                         // `objects.rs`'s three call sites do.
-                        let mut layout_bail: Vec<usize> =
-                            self.emit_layout_epoch_guard().into_iter().collect();
+                        let mut layout_bail: Vec<usize> = if jit_sp_field_layout_guard_enabled()
+                        {
+                            self.emit_layout_epoch_guard().into_iter().collect()
+                        } else {
+                            Vec::new()
+                        };
                         self.load_slot_to_reg(RAX, obj_slot);
                         let (mut slow_patches, null_patch) = if raw_mode {
                             // Null check: TEST RAX,RAX; JZ <null> (result 0).
@@ -6180,7 +6184,9 @@ impl Compiler {
                                 // `bail` here already means "take the
                                 // compact-aware helper", so it is the same
                                 // vector and the same destination.
-                                bail.extend(self.emit_layout_epoch_guard());
+                                if jit_sp_field_layout_guard_enabled() {
+                                    bail.extend(self.emit_layout_epoch_guard());
+                                }
                                 // F-08 — the G1 arm. Under G1 the guard
                                 // below rejects every receiver (empty
                                 // store-side table), so this whole inline path

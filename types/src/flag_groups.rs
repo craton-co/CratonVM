@@ -1399,6 +1399,10 @@ pub const INVENTORY: &[E] = &[
     // The single-pass twin of the row above, and the arm that unrolls: a 4x
     // copy of a four-field body carries sixteen of these guards.
     E { group: Group::JIT, token: "sp-epoch-guard-rip", on_key: Some("CRATONVM_JIT_SP_EPOCH_GUARD_RIP"), off_key: None, off_word: Some("0"), since: "2026-09-10" },
+    // Default ON and UNSOUND when clear: it restores a baked compact body
+    // offset that survives a layout replacement. It exists so the guard's
+    // price is a number from one binary, not an argument.
+    E { group: Group::JIT, token: "sp-field-layout-guard", on_key: Some("CRATONVM_JIT_SP_FIELD_LAYOUT_GUARD"), off_key: None, off_word: Some("0"), since: "2026-09-10" },
     // Diagnosis lever, default OFF: put the layout-replacement epoch back in
     // `.data` so the HEAP MOVE is A/B-able independently of the encoding it
     // shipped with. On it, the RIP form is out of reach by construction.
