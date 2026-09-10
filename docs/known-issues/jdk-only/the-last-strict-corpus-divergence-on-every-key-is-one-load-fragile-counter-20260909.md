@@ -1,8 +1,61 @@
 # After the carrier fix, the only thing the strict corpus still diverges on — on all four keys — is one load-fragile counter that a page from ten days ago already ruled unusable
 
-**Status:** open, and it is a PROBE change, not a VM change.
+**Status: FIXED 2026-09-10.** `handoffs=<count>` is now
+`handoffsPositive=<bool> handoffsBounded=<bool>`, and **both Linux keys are at
+ZERO rows.**
 **Found:** 2026-09-09, by re-freezing `21-linux` after the `JavaLangAccess`
 carrier fix and finding that what was left was not a defect.
+
+## 0. The measurement that closed it, and the one that did not
+
+Section 5 below set the acceptance test in advance: *the section must stop
+appearing on a LOADED host*, because on an idle host it already agrees. The
+first attempt at that failed to earn a verdict and was discarded:
+
+```text
+attempt 1 -- four CPU spinners, load average driven from 2.3 to 7.5
+  CONTROL (raw count)  observed=0  handoffs=64/64/64   <-- did not diverge
+  shaped               observed=0  x5
+  => VOID. Steady CPU burn is not what perturbs a SynchronousQueue handoff,
+     so this run could not tell "the fix worked" from "the host was quiet".
+```
+
+The condition that does perturb it is the one §7 of the phase-2 adjudication
+already named -- **several probe instances overlapping** -- not load average:
+
+```text
+attempt 2 -- three corpus instances at once, same machine, arms back to back
+  CONTROL (raw count)  observed  1 / 0 / 2    handoff cells  64 / 59 / 64
+  SHAPED               observed  0 / 0 / 0    handoffsPositive=true handoffsBounded=true
+```
+
+**That control line is also the clearest picture anyone has of why minting this
+key was a lottery**: one binary, three runs, minutes apart, produced 0, 1 and 2
+divergent sections. Every previous mint drew from that distribution, which is
+why the accepted `21-linux` baseline needed three attempts and ten consecutive
+passing runs, and why `21-windows` and `21-linux` disagreed about a
+`real/vthreads` row that was never a platform difference.
+
+Both Linux keys were then re-minted to zero rows and both pass. An empty
+baseline cannot be proven with the usual paired ratchet -- there is no row left
+to remove -- so the inverse was run instead: the OLD raw-count probe against the
+NEW empty baseline, under the same concurrent condition.
+
+```text
+  instance 1: rc=0
+  instance 2: rc=5   NEW DIVERGENCES -- the ratchet fired: + JdkOnlyPlatformProbe/strict/vthreads
+  instance 3: rc=5   NEW DIVERGENCES -- the ratchet fired: + JdkOnlyPlatformProbe/strict/vthreads
+```
+
+The gate is still watching the section it no longer records.
+
+**The Windows keys are untouched and that is fine.** `21-windows` and
+`25-windows` still carry their vthreads rows and cannot be re-minted from this
+build machine, but a row that stops diverging reads as GONE and PASSES. They are
+simply looser, as they already are for the seven rows the 2026-09-09 fixes
+closed.
+
+Everything below is the record as filed on 2026-09-09.
 **Blocks:** the four strict-corpus baselines being empty, and the `vthreads`
 section being a deterministic gate instead of one whose mint is a lottery.
 
