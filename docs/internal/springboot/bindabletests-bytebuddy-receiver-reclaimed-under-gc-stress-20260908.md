@@ -118,11 +118,14 @@ The page filed alongside this one —
 — was the MOVING collector, and it is fixed rather than retired: `URL.openConnection`
 stored its receiver's pre-GC address in the carrier's `url` field.
 
-A third defect, reachable only once that one was fixed, keeps
-`CRATONVM_DBG_GC_STRESS <= 262144` failing and is filed as
-[`bindabletests-local-holds-an-interior-word-of-a-retired-tlab-filler-20260909.md`](../../known-issues/springboot/bindabletests-local-holds-an-interior-word-of-a-retired-tlab-filler-20260909.md).
-It is the moving collector, not the sweep, and it is a stale reference reaching
-bytecode rather than a missed root — not what this page described.
+Further defects, reachable only once that one was fixed, kept
+`CRATONVM_DBG_GC_STRESS <= 262144` failing. They turned out to be FOUR more of
+the same family — a bare `ObjectRef` held across an allocation — and are
+root-caused and fixed in
+[`bindabletests-stale-objectref-family-across-allocation-20260909.md`](bindabletests-stale-objectref-family-across-allocation-20260909.md),
+which also records the eight measurements that exonerate the collector. None of
+them is the moving collector and none is a missed root — not what this page
+described.
 
 ## Re-check command
 

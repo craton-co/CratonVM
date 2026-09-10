@@ -3626,6 +3626,23 @@ impl VmHeap {
                 // way anyone consumes it.
                 "[GC] zgc-high-compaction: high_cycles={hi_cycles} high_declined={hi_declined}                  high_objects_relocated={hi_moved} high_bytes_copied={hi_bytes}                  high_vacated_spans={vac_spans} high_vacated_bytes={vac_bytes}"
             );
+            // THE SLIDE VERIFIER'S OWN ENGAGEMENT, so that a clean run under
+            // `CRATONVM_DBG_ZGC_VERIFY_SLIDE=1` is a READING rather than an
+            // absence of output.
+            //
+            // `verify_no_dangling_slots_after_slide` reports a finding at
+            // `error!` and a pass at `debug!`, and `release_max_level_info`
+            // deletes the `debug!` from a release build. So on the binary
+            // anybody actually reproduces with, "it printed nothing" covered
+            // both "every reference slot resolved to a live base" and "the flag
+            // was misspelled / no slide ran / the gate returned early" — and
+            // only the first is evidence. `slides_verified` and
+            // `survivors_walked` are the denominator that separates them.
+            let (sv_runs, sv_survivors, sv_missed, sv_unreg) = h.slide_verification_stats();
+            eprintln!(
+                "[GC] zgc-slide-verify: slides_verified={sv_runs} survivors_walked={sv_survivors}                  missed_rewrites={sv_missed} unregistered_targets={sv_unreg} slide_verify_enabled={}",
+                crate::zgc::zgc_verify_slide_enabled(),
+            );
             // CONCURRENT marking, on its own line and with five fields rather
             // than one, because four different runs look identical in any
             // smaller summary:
@@ -4309,6 +4326,29 @@ impl VmHeap {
     pub fn young_inactive_semispace_range(&self) -> Option<(usize, usize)> {
         match self {
             VmHeap::Generational(h) => Some(h.young_inactive_semispace_range()),
+            VmHeap::G1(_) => None,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => None,
+        }
+    }
+
+    /// Publish the young semispace geometry for
+    /// `gen_heap::dead_young_ref_reason_global`. No-op on the backends that
+    /// have no semispace pair.
+    pub fn publish_young_geometry(&self) {
+        if let VmHeap::Generational(h) = self {
+            h.publish_young_geometry();
+        }
+    }
+
+    /// Generational: is `addr` a young reference naming no live object, and
+    /// why? See `GenerationalHeap::dead_young_ref_reason`.
+    ///
+    /// `None` on every other backend — the predicate is defined in terms of a
+    /// semispace pair, and G1/ZGC have none.
+    pub fn dead_young_ref_reason(&self, addr: usize) -> Option<&'static str> {
+        match self {
+            VmHeap::Generational(h) => h.dead_young_ref_reason(addr),
             VmHeap::G1(_) => None,
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(_) => None,

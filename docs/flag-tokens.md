@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-537 tokens.
+539 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -106,6 +106,8 @@ export inherited from a parent shell.
 | `atomic-updater` | `CRATONVM_DBG_ATOMIC_UPDATER` |
 | `badrecv` | `CRATONVM_DBG_BADRECV` |
 | `badref` | `CRATONVM_DBG_BADREF` |
+| `deadref-store` | `CRATONVM_DBG_DEADREF_STORE` |
+| `watch-addr` | `CRATONVM_DBG_WATCH_ADDR` |
 | `bb` | `CRATONVM_DBG_BB` |
 | `bblp` | `CRATONVM_DBG_BBLP` |
 | `bd-debug` | `CRATONVM_BD_DEBUG` |
@@ -603,7 +605,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-411 tokens.
+414 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -737,22 +739,14 @@ export inherited from a parent shell.
 | `ir-deopt-points-at-traps` | `CRATONVM_JIT_IR_DEOPT_POINTS_AT_TRAPS` |
 | `ir-reg-authoritative` | `CRATONVM_JIT_IR_REG_AUTHORITATIVE` |
 | `ir-speculate` | `CRATONVM_JIT_IR_SPECULATE` |
-| `tier-pgo-always` | `CRATONVM_TIER_PGO_ALWAYS` |
 | `band-skip` | `CRATONVM_JIT_BAND_SKIP` |
 | `ls-carry-relief` | `CRATONVM_JIT_LS_CARRY_RELIEF` |
 | `ir-reserve-carried` | `CRATONVM_JIT_IR_RESERVE_CARRIED` |
 | `osr-optimizing` | `CRATONVM_JIT_OSR_OPTIMIZING` |
 | `osr-optimizing-memo` | `CRATONVM_JIT_OSR_OPTIMIZING_MEMO` |
-| `osr-optimizing-cache` | `CRATONVM_JIT_OSR_OPTIMIZING_CACHE` |
-| `ir-splice-ldc` | `CRATONVM_JIT_IR_SPLICE_LDC` |
-| `ir-splice-branch` | `CRATONVM_JIT_IR_SPLICE_BRANCH` |
 | `ir-splice-multi-return` | `CRATONVM_JIT_IR_SPLICE_MULTI_RETURN` |
-| `ir-fallthrough` | `CRATONVM_JIT_IR_FALLTHROUGH` |
-| `ir-deopt-points-at-traps` | `CRATONVM_JIT_IR_DEOPT_POINTS_AT_TRAPS` |
-| `ir-reg-authoritative` | `CRATONVM_JIT_IR_REG_AUTHORITATIVE` |
 | `ir-ref-residency` | `CRATONVM_JIT_IR_REF_RESIDENCY` |
 | `ir-ref-residency-cross-safepoint` | `CRATONVM_JIT_IR_REF_RESIDENCY_CROSS_SAFEPOINT` |
-| `ir-speculate` | `CRATONVM_JIT_IR_SPECULATE` |
 | `ir-drop-phi-home` | `CRATONVM_JIT_IR_DROP_PHI_HOME` |
 | `ir-publish-at-def` | `CRATONVM_JIT_IR_PUBLISH_AT_DEF` |
 | `ir-drop-home` | `CRATONVM_JIT_IR_DROP_HOME` |
