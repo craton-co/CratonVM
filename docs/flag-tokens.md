@@ -606,7 +606,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-417 tokens.
+418 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -736,6 +736,7 @@ export inherited from a parent shell.
 | `ir-splice-ldc` | `CRATONVM_JIT_IR_SPLICE_LDC` |
 | `ir-splice-branch` | `CRATONVM_JIT_IR_SPLICE_BRANCH` |
 | `ir-splice-direct-call` | `CRATONVM_JIT_IR_SPLICE_DIRECT_CALL` |
+| `ir-splice-typecheck` | `CRATONVM_JIT_IR_SPLICE_TYPECHECK` |
 | `ir-splice-getstatic` | `CRATONVM_JIT_IR_SPLICE_GETSTATIC` |
 | `osr-optimizing-cache` | `CRATONVM_JIT_OSR_OPTIMIZING_CACHE` |
 | `ir-fallthrough` | `CRATONVM_JIT_IR_FALLTHROUGH` |

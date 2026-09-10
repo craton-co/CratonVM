@@ -13639,6 +13639,7 @@ fn make_inline_site(
         resolved_invoke_infos: Vec::new(),
         nested_sites: Vec::new(),
         ir_new_info: Vec::new(),
+        ir_typecheck_info: Vec::new(),
     }
 }
 

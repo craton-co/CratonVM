@@ -25236,6 +25236,16 @@ fn invoke_on_class_shared_inner(
                                 | ("java/lang/System$1", "addOpens", "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V")
                                 | ("java/lang/System$1", "addOpensToAllUnnamed", "(Ljava/lang/Module;Ljava/lang/String;)V")
                                 | ("java/lang/System$1", "addUses", "(Ljava/lang/Module;Ljava/lang/Class;)V")
+                                // Same eight, on the name this carrier has
+                                // on JDK 21 (see JLA_CARRIER_CANDIDATES).
+                                | ("java/lang/System$2", "addReads", "(Ljava/lang/Module;Ljava/lang/Module;)V")
+                                | ("java/lang/System$2", "addReadsAllUnnamed", "(Ljava/lang/Module;)V")
+                                | ("java/lang/System$2", "addExports", "(Ljava/lang/Module;Ljava/lang/String;)V")
+                                | ("java/lang/System$2", "addExports", "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V")
+                                | ("java/lang/System$2", "addExportsToAllUnnamed", "(Ljava/lang/Module;Ljava/lang/String;)V")
+                                | ("java/lang/System$2", "addOpens", "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V")
+                                | ("java/lang/System$2", "addOpensToAllUnnamed", "(Ljava/lang/Module;Ljava/lang/String;)V")
+                                | ("java/lang/System$2", "addUses", "(Ljava/lang/Module;Ljava/lang/Class;)V")
                                 | ("jdk/jfr/internal/Type", "getKnownType", "(Ljava/lang/Class;)Ljdk/jfr/internal/Type;")
                                 | ("jdk/jfr/internal/util/Utils", "getValidType", "(Ljava/lang/Class;Ljava/lang/String;)Ljdk/jfr/internal/Type;")
                                 | ("jdk/jfr/internal/JDKEvents", "initialize", "()V")

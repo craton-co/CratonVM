@@ -6801,6 +6801,30 @@ pub struct InlineSite {
     /// `Deferred` target refuses the whole splice rather than leaving a row out
     /// — a missing row bails the METHOD, not the site.
     pub ir_new_info: Vec<(usize, u32, usize)>,
+    /// Resolved `checkcast` / `instanceof` sites in the callee body:
+    /// `(callee_pc, target_class_id, target_class_name, is_checkcast)`.
+    ///
+    /// Filled by `resolve_ir_inline_site` only, and an UNRESOLVED target
+    /// refuses the whole splice rather than leaving a row out -- the same
+    /// trade, and the same sentence, as [`Self::ir_new_info`]'s: a missing row
+    /// bails the METHOD, so admitting the body without one would cost the
+    /// CALLER its optimizing compile over a callee it merely wanted inlined.
+    ///
+    /// The builder's `0xc0`/`0xc1` arms look gentler than that -- a missing row
+    /// reaches `plant_uncommon_trap` rather than `ir_build_bail`. By default it
+    /// is not: `TrapCause::UnresolvedTypeCheck` is gated off
+    /// (`ir_unresolved_class_trap_enabled`), so the plant refuses and the arm
+    /// bails after all. With that gate ON the trap does fire, and inside a
+    /// splice it deopts to re-execute the invoke on every call. Refusing at
+    /// resolution is the answer that does not depend on which way that flag is
+    /// set.
+    ///
+    /// The NAME rides along rather than being re-derived downstream: it is read
+    /// out of the CALLEE's constant pool, which is the only pool that can
+    /// answer, and the same lookup that produced `target_class_id`. Interning
+    /// happens in `append_ir_inline_site` because that is where the
+    /// combined-buffer pc is known.
+    pub ir_typecheck_info: Vec<(usize, u32, String, bool)>,
 }
 
 /// How many levels of splice-inside-a-splice the OPTIMIZING tier's resolver
@@ -6974,6 +6998,12 @@ fn append_ir_inline_site(
     // which is what `ir_lower`'s `Op::Call` arm consults before falling
     // through to the dispatch helper.
     direct_call_sites: &mut Vec<(usize, (usize, bool))>,
+    // Set when a spliced body carries a `checkcast`. The artifact then owes
+    // `has_dispatch`, exactly as it does for one of the caller's own: a
+    // definitive refusal publishes its `ClassCastException` through the
+    // `JIT_THREAD` TLS, and the `!has_dispatch` fast entry never sets that TLS.
+    // An obligation, not an optimization -- see `ir_needs_dispatch_for_checkcast`.
+    spliced_checkcast_seen: &mut bool,
 ) -> bool {
     let code_len = site.callee_code_len;
     if code_len == 0 || site.callee_code.len() < code_len || code_len > *budget {
@@ -7101,6 +7131,37 @@ fn append_ir_inline_site(
         // disagree. See `ir::ir_splice_getstatic_enabled`.
         return false;
     }
+    // Type checks, rebased. The resolver has already refused the body unless
+    // every site's target class was loaded and named, so a row here is
+    // complete; interning is done at this point rather than there because this
+    // is where the combined-buffer pc is known, and because
+    // `intern_typecheck_target` is the jit crate's table.
+    //
+    // The interned `(ptr, len)` is process-lifetime and deliberately NOT owned
+    // by this compile -- see `intern_typecheck_class_name` on why the pair the
+    // type-check helpers memoize on must never be recycled for another class --
+    // so unlike the invoke rows these need no keep-alive entry on the artifact.
+    if ir::ir_splice_typecheck_enabled() {
+        for (cpc, class_id, name, is_checkcast) in &site.ir_typecheck_info {
+            let expected = if *is_checkcast { 0xc0 } else { 0xc1 };
+            if site.callee_code.get(*cpc).copied() != Some(expected) {
+                return false;
+            }
+            let (ptr, len) = intern_typecheck_target(name, Some(*class_id));
+            let row = (ptr as usize, len);
+            if *is_checkcast {
+                tables.checkcast_info.insert(base + *cpc, row);
+                *spliced_checkcast_seen = true;
+            } else {
+                tables.instanceof_info.insert(base + *cpc, row);
+            }
+        }
+    } else if !site.ir_typecheck_info.is_empty() {
+        // Kill switch set; the scanner mirror should already have refused.
+        // Refuse here too -- the halves must not be able to disagree. See
+        // `ir::ir_splice_typecheck_enabled`.
+        return false;
+    }
     // The resolver PROVED these bodies are no-ops, which is what
     // `object_init_pcs` means — elidable on any receiver, not only on a fresh
     // `Op::New`. `trivial_init_pcs` is the narrower set and would refuse the
@@ -7144,6 +7205,7 @@ fn append_ir_inline_site(
             ir_emit_fp,
             static_init_classes_out,
             direct_call_sites,
+            spliced_checkcast_seen,
         ) {
             return false;
         }
@@ -7271,6 +7333,8 @@ fn merge_ir_inline_tables(into: &mut ir::IrInlineTables, from: ir::IrInlineTable
         ldc_info,
         ldc2w_info,
         static_field_info,
+        checkcast_info,
+        instanceof_info,
     } = from;
     into.sites.extend(sites);
     into.field_info.extend(field_info);
@@ -7280,6 +7344,8 @@ fn merge_ir_inline_tables(into: &mut ir::IrInlineTables, from: ir::IrInlineTable
     into.ldc_info.extend(ldc_info);
     into.ldc2w_info.extend(ldc2w_info);
     into.static_field_info.extend(static_field_info);
+    into.checkcast_info.extend(checkcast_info);
+    into.instanceof_info.extend(instanceof_info);
 }
 
 /// Turn a spliced body's resolver-side [`InlineInvokeTarget`]s into the
@@ -8419,6 +8485,7 @@ mod profile_guided_inlining_tests {
             resolved_invoke_infos: Vec::new(),
             nested_sites: Vec::new(),
             ir_new_info: Vec::new(),
+            ir_typecheck_info: Vec::new(),
         }
     }
 
@@ -9206,6 +9273,7 @@ mod inline_selection_tests {
             resolved_invoke_infos: Vec::new(),
             nested_sites: Vec::new(),
             ir_new_info: Vec::new(),
+            ir_typecheck_info: Vec::new(),
         }
     }
 
@@ -25631,6 +25699,7 @@ fn try_compile_inner(
                     // code never reads.
                     let mut sub_static_init: Vec<u32> = Vec::new();
                     let mut sub_direct_calls: Vec<(usize, (usize, bool))> = Vec::new();
+                    let mut sub_checkcast_seen = false;
                     let ok = append_ir_inline_site(
                         site,
                         pc,
@@ -25646,9 +25715,16 @@ fn try_compile_inner(
                         ir_emit_fp,
                         &mut sub_static_init,
                         &mut sub_direct_calls,
+                        &mut sub_checkcast_seen,
                     );
                     if ok {
                         merge_ir_inline_tables(&mut tables, sub);
+                        // A spliced `checkcast` obliges the artifact exactly as
+                        // one of the caller's own does. Merged only on success,
+                        // like every other row: a rolled-back body must not
+                        // leave the artifact carrying `has_dispatch` for a cast
+                        // its code does not contain.
+                        ir_needs_dispatch_for_checkcast |= sub_checkcast_seen;
                         // The surviving statically-bound calls in the spliced
                         // bodies, at their combined-buffer pcs. Merged only on
                         // success, and keyed past `code_len`, so the spliced-pc
