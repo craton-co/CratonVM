@@ -156,3 +156,53 @@ can act on a fact rather than a guess.
 **What is safe to conclude meanwhile:** `no_new_mode_drift` is weaker than its
 green suggests, by an amount that grew on 2026-08-22 and is now unbounded by its
 own ceiling.
+
+---
+
+## 2026-09-10 — a SECOND instance of `the_drift_baseline_has_no_stale_rows`, with a different cause
+
+Still OPEN, still not the reporting branch's. Found by lane 2 of the nine-lane
+campaign, whose acceptance run went red on this one test with 4263 of 4264
+passing.
+
+```text
+  BASELINE_TOTAL_DRIFT   1224 in the tree, 1223 regenerated
+  BASELINE_TOTAL_PAIRS   1357 in the tree, 1356 regenerated
+  the single stale row:  ("java/lang/Class", "getModule", "()Ljava/lang/Module;")
+```
+
+**The cause is `register` becoming `register_with_kind`.** The scanner counts
+`register(` call sites, and lane 0 re-tagged `Class.getModule` as a reviewed
+`Intrinsic` — `native-builtins/src/lib.rs:12878` now reads
+`registry.register_with_kind("java/lang/Class", "getModule", ...)`. That is a
+correct and documented lane-0 action
+([`../jdk-only-lanes/lane-0-integration-and-gates.md`](../jdk-only-lanes/lane-0-integration-and-gates.md) §7),
+and it silently invalidated one baseline row.
+
+So this file's headline generalises: **a source-scanning drift gate goes stale
+on any edit that changes the SHAPE of a registration**, not only on the
+class-parameterised refactor of §1. A helper refactor hides rows; a kind re-tag
+removes one. Both read as the baseline being wrong.
+
+### The attribution, which cost one command rather than a bisect
+
+The gate is a pure function of the tree it reads at RUNTIME, so one prebuilt
+test binary scores any revision — no rebuild:
+
+```text
+  git stash push -- <the three source files this branch changed>
+  target/debug/deps/registrar_drift-a7573acec3fc41b0 the_drift_baseline_has_no_stale_rows
+  -> FAILED, identically
+  git stash pop
+```
+
+`git diff origin/dev` was empty for `registrar_drift.rs` and for every file that
+registers `getModule`, which is the same proof from the other side.
+
+**Not fixed here on purpose.** The stale row is lane 0's, the retirement it
+records is lane 0's, and lane 0 §4 keeps shared gate cells with their owner
+precisely so that two lanes do not re-freeze one ratchet from two trees. The
+movement is a single row with a stated cause, which is exactly what the gate's
+own paste-ready output asks for — *"say in the record WHICH rows moved and why.
+A re-take with no explanation is how a ratchet becomes a rubber stamp"* — so
+lane 0 can re-take it in one edit.
