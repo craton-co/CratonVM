@@ -166,22 +166,49 @@ is satisfied for 150 and open for 92 (lane 0's probe reached 74%; this reaches
 These are live defects, not retirement candidates. Note the unit: `arm3.sh`
 prints `d(hs,base)=58`, which is diff LINES at two per changed row. **34 rows.**
 
-**Four missing access checks.** The VM grants access it should refuse:
+**Four rows where the VM grants access HotSpot refuses — but only ONE of them
+is news.** Read the code before filing any of these:
 
-| row | HotSpot | this VM |
-|---|---|---|
-| `setAccessible` leaks to a fresh handle | `false` | **`true`** |
-| `Lookup.unreflect` on a private method | `IllegalAccessException` | **NO-THROW, working handle** |
-| `Lookup.findVirtual` on a private method | `IllegalAccessException` | **NO-THROW** |
-| `privateLookupIn(java.base)` | `IllegalAccessException: does not open` | **NO-THROW, modes 31** |
+| row | HotSpot | this VM | status |
+|---|---|---|---|
+| `setAccessible` leaks to a fresh handle | `false` | **`true`** | **defect** |
+| `Lookup.unreflect` on a private method | `IllegalAccessException` | NO-THROW, working handle | documented residual |
+| `Lookup.findVirtual` on a private method | `IllegalAccessException` | NO-THROW | documented residual |
+| `privateLookupIn(java.base)` | `IllegalAccessException: does not open` | NO-THROW, modes 31 | documented residual |
 
-The leak follows directly from §5's copy model failing: `getDeclaredField("x")
-== getDeclaredField("x")` is **`true`** here and `false` on HotSpot, for
-`Field`, `Method` and `Constructor` alike. The VM hands back the *same* object,
-so one `setAccessible(true)` grants access to every holder of that member.
-§5 predicted this pairing; it is now measured. Same species as lane 0's
-`Module.addExports` answering `PERMITTED` — this VM's access-control layer is
-permissive, and that is one finding across two lanes rather than two.
+The three residuals are **one root cause and it is deliberate.** Both guards
+short-circuit identically —
+
+```rust
+// native-builtins/src/lang_invoke.rs:6520 (find*) and :6744 (unreflect*)
+if (modes & LK_MODE_PRIVATE) != 0 {
+    return Ok(());
+}
+```
+
+— and the PRIVATE bit means "may reach privates of its own lookup class/nest",
+not "may reach any private anywhere". `lk_enforce_find_access`'s own doc
+comment states the omission and the reason: *"nestmate relationships,
+`protected`-receiver rules, module `exports`/`opens` — is NOT enforced… it can
+only admit something HotSpot would refuse, never refuse something HotSpot
+admits"*, because `lookupClass` comes from a stack walk and a wrong answer
+there must never become a refusal.
+
+So this lane's contribution here is a **measurement of a residual the code
+describes in prose**: a concrete reproducer (`L3Foreign`, a non-nestmate), and
+confirmation that the one-directional claim holds — every one of these admits
+what HotSpot refuses, and none refuses what HotSpot admits.
+`W4-1-publiclookup-allowedmodes-never-checked.md` is **not** wrong to say the
+gate is CLOSED; it is closed for the PRIVATE-bit-clear case it gates.
+
+**The leak is the genuine defect,** and it has nothing to do with those guards.
+It follows from §5's copy model failing: `getDeclaredField("x") ==
+getDeclaredField("x")` is **`true`** here and `false` on HotSpot, for `Field`,
+`Method` and `Constructor` alike. The VM hands back the *same* object, so one
+`setAccessible(true)` grants access to every holder of that member. §5
+predicted the pairing; it is now measured. And the copy rows classify
+**`BAD -> OK`** — *yielding to bytecode repairs the copy model*, so this
+defect is closed by the retirement rather than blocking it.
 
 **`java.lang.reflect.Proxy` is down entirely** (5 rows): every row fails with
 `IllegalArgumentException: L3ReflectInvokeSurface$Iface referenced from a
