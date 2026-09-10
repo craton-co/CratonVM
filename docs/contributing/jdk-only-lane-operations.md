@@ -428,15 +428,30 @@ news too.
 
 **Two named offenders, with the evidence, so the next lane does not re-derive
 it.** `VtHandoffProbe` and `JdkOnlyPlatformProbe` both count virtual-thread
-handoffs, and both counts are nondeterministic on this VM. Five successive
-whole-tree A/Bs across the 2026-09-09 waves scored `JdkOnlyPlatformProbe` at
-delta `0, -2, 0, 0, +2` — it oscillates in BOTH directions — and the row is one
-field of one line:
+handoffs, and both counts are nondeterministic on this VM. Six successive
+whole-tree A/Bs across the 2026-09-09/10 waves scored `JdkOnlyPlatformProbe` at
+delta `0, -2, 0, 0, +2, +2` — it oscillates in BOTH directions — and the row is
+one line of one probe.
+
+**The proof that no binary attribution is possible.** `cratonvm-p8.exe`
+differed from HotSpot on this row when it was the TRIAL arm of one A/B, and was
+byte-identical to HotSpot when the very next A/B used it as the CONTROL. One
+binary, one probe, opposite verdicts. That is the noise floor, measured, and it
+is wider than any delta this campaign has claimed from this probe.
+
+**And it is two fields, not one** — a correction to the earlier note here,
+which named `handoffs` alone:
 
 ```text
-HotSpot   ... handoffs=64 ...
-observed  ... handoffs=50 / 63 / 64 ...   across binaries that differ elsewhere
+HotSpot   ... handoffs=64  allJoined=true  ...
+observed  ... handoffs=50 / 60 / 63 / 64   allJoined=true / false
 ```
 
-A delta from either probe is a coin flip until someone fixes the handoff count.
+They drift independently, so a run can match on `handoffs` and differ on
+`allJoined` — which is exactly what the 2026-09-10 `+2` was. A lane that
+chases only the handoff count is looking at the wrong half of the line about as
+often as the right one. `diff` scores the whole line either way, so the delta
+is `2` whichever field moved, and the delta alone cannot tell you which.
+
+A delta from either probe is a coin flip until someone fixes both counts.
 Neither is a reason to hold a retirement, and neither is a win to claim.

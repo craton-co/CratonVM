@@ -66,9 +66,18 @@ This lane's instruments are the flakiest in the campaign, and the numbers are on
 record:
 
 - `JdkOnlyPlatformProbe` and `VtHandoffProbe` produced deltas of
-  **0, −2, 0, 0, +2** across five A/Bs of the *same* change.
-- The field at issue is `handoffs`: HotSpot reports **64**; this VM has been
-  observed at **50, 63 and 64**.
+  **0, −2, 0, 0, +2, +2** across six A/Bs of *different* changes, none of
+  which touched virtual threads.
+- **The same binary gives opposite verdicts.** `cratonvm-p8.exe` differed from
+  HotSpot when it was the trial arm, and was byte-identical to HotSpot when the
+  next A/B used it as the control. No binary attribution is possible on this
+  probe.
+- **Two fields drift, not one.** On the `vthreads` line HotSpot reports
+  `handoffs=64 allJoined=true`; this VM has been observed at `handoffs=` **50,
+  60, 63 and 64** and `allJoined=` **true and false**, in independent
+  combinations. A reader who chases only `handoffs` -- as this campaign's
+  earlier note did -- is looking at the wrong half about as often as the right
+  one.
 
 Therefore: **measure a vector's noise floor before explaining its delta.** Run
 the unchanged binary against itself N times first. A negative delta on either of
