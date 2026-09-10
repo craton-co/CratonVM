@@ -209,6 +209,26 @@ public class L3ReflectInvokeSurface {
         }
     }
 
+    /** A genuine INNER (non-static) class, so javac emits the synthetic
+     *  `this$0` field -- the only way `Field.isSynthetic` answers `true`. */
+    class Inner {
+        int v;
+
+        /** This reference is REQUIRED, not decoration. Since JDK 18 javac
+         *  omits the synthetic `this$0` field when an inner class never uses
+         *  its enclosing instance -- the first version of this fixture had no
+         *  such use and the row answered `no-synthetic-field-found` on
+         *  HotSpot, which is a fixture that discriminates nothing. */
+        Object outer() {
+            // `L3ReflectInvokeSurface.this` and nothing weaker. The second
+            // version of this fixture read `rows`, a STATIC field of the outer
+            // class -- static access needs no enclosing instance, so javac
+            // still omitted `this$0` and the row still found no synthetic
+            // field. Only an explicit qualified `this` forces the capture.
+            return L3ReflectInvokeSurface.this;
+        }
+    }
+
     interface Iface {
         int one();
 
@@ -985,6 +1005,130 @@ public class L3ReflectInvokeSurface {
         t("FG trySetAccessible on a private member", () ->
                 FG.getDeclaredField("secret").trySetAccessible());
 
+        // ============ WAVE 2: discriminating fixtures ============
+        // Wave 1 deferred twelve triples because every row touching them agreed
+        // only at the value a blanket yield returns anyway -- `false`, `true`,
+        // `[]`, `0`. An agreement there is indistinguishable from the default
+        // and is not evidence. Each row below is chosen so the CORRECT answer
+        // differs from that default, which is the only thing that can promote
+        // those triples. Appended, not substituted, so wave 1's row numbers
+        // survive and its recorded verdicts stay comparable.
+
+        // isSynthetic: `false` is the default. A compiler-generated field is
+        // the only way to get `true` -- an inner class's `this$0`.
+        t("W2 F isSynthetic TRUE on this$0", () -> {
+            for (Field f : Inner.class.getDeclaredFields()) {
+                if (f.isSynthetic()) {
+                    return "synthetic:" + f.getName();
+                }
+            }
+            return "no-synthetic-field-found";
+        });
+        // isEnumConstant: `false` is the default; an enum's own constants are
+        // the only `true`.
+        t("W2 F isEnumConstant TRUE", () -> {
+            Field f = Color.class.getDeclaredField("RED");
+            return f.isEnumConstant();
+        });
+        t("W2 F isEnumConstant FALSE on a normal field", () -> {
+            Field f = Color.class.getDeclaredField("label");
+            return f.isEnumConstant();
+        });
+        // setBoolean: wave 1's row set `false` and read it back, which is
+        // exactly what a broken getter returns. Set TRUE, and read it back
+        // through a path that is not `getBoolean`.
+        t("W2 F setBoolean TRUE read via get()", () -> {
+            Holder hh = new Holder();
+            Field x = fl(H, "z");
+            x.setBoolean(hh, true);
+            return String.valueOf(x.get(hh));
+        });
+        t("W2 F setBoolean TRUE read via toString of Boolean", () -> {
+            Holder hh = new Holder();
+            Field x = fl(H, "z");
+            x.setBoolean(hh, true);
+            return ((Boolean) x.get(hh)).booleanValue() ? "TRUE" : "FALSE";
+        });
+        // trySetAccessible: `true` is the default answer. A member this probe
+        // may NOT open is the discriminating case -- a JDK-internal field.
+        t("W2 F trySetAccessible FALSE on a JDK-internal field", () -> {
+            Field f = Class.forName("java.lang.System").getDeclaredField("props");
+            return f.trySetAccessible();
+        });
+        // isBridge: `false` is the default. A generic override mints a bridge.
+        t("W2 M isBridge TRUE on a generic override", () -> {
+            int bridges = 0;
+            for (Method mm : SubBox.class.getDeclaredMethods()) {
+                if (mm.getName().equals("set") && mm.isBridge()) {
+                    bridges++;
+                }
+            }
+            return "bridges:" + bridges;
+        });
+        // isSynthetic on a method: an inner class's access$ accessor, or the
+        // enum's own `values`/`valueOf` are compiler-generated.
+        t("W2 M isSynthetic count on an enum", () -> {
+            int n = 0;
+            for (Method mm : Color.class.getDeclaredMethods()) {
+                if (mm.isSynthetic()) {
+                    n++;
+                }
+            }
+            return "synthetic-methods:" + n;
+        });
+        // isVarArgs: wave 1 only had a `true`. The FALSE case discriminates.
+        t("W2 M isVarArgs FALSE on a fixed-arity method", () ->
+                m(H, "add", int.class, int.class).isVarArgs());
+        // isDefault: wave 1 only had a `true`. An abstract interface method is
+        // the FALSE case, and a class method is another.
+        t("W2 M isDefault FALSE on an abstract iface method", () ->
+                m(Iface.class, "one").isDefault());
+        t("W2 M isDefault FALSE on a class method", () ->
+                m(H, "add", int.class, int.class).isDefault());
+        // Constructor.isVarArgs / isSynthetic / getExceptionTypes: wave 1 saw
+        // only `false`, `false`, `[]`.
+        t("W2 C isVarArgs TRUE", () ->
+                VarCtor.class.getDeclaredConstructor(String[].class).isVarArgs());
+        t("W2 C getExceptionTypes NON-EMPTY", () -> names(
+                Thrower2.class.getDeclaredConstructor(int.class).getExceptionTypes()));
+        // `Constructor.isSynthetic` has NO fixture here and stays deferred.
+        // An enum's constructor is not synthetic on JDK 25, and nestmates
+        // removed the old synthetic access-constructor that javac used to emit
+        // for a private inner class. Printed as a census so the absence is
+        // recorded rather than assumed -- if a future JDK mints one, this row
+        // stops answering 0 and the deferral can be revisited.
+        t("W2 C synthetic-ctor census across four fixtures", () -> {
+            int n = 0;
+            for (Class<?> c : new Class<?>[] {Color.class, Inner.class,
+                                              VarCtor.class, Holder.class}) {
+                for (Constructor<?> k : c.getDeclaredConstructors()) {
+                    if (k.isSynthetic()) {
+                        n++;
+                    }
+                }
+            }
+            return "synthetic-ctors:" + n;
+        });
+        // Constructor.setAccessible: wave 1's row returned the string "ok",
+        // which is in the default set. Discriminate by observing the FLAG and
+        // a refusal, not by the constructed object.
+        t("W2 C setAccessible then canAccess", () -> {
+            Constructor<?> k = FG.getDeclaredConstructor(String.class);
+            boolean before = k.canAccess(null);
+            k.setAccessible(true);
+            return "before=" + before + " after=" + k.canAccess(null);
+        });
+        // `Integer(int)` is PUBLIC in an exported package, so setAccessible on
+        // it legitimately succeeds -- the first version of this row answered
+        // NO-THROW on HotSpot and measured nothing. `Runtime`'s constructor is
+        // private, which is the discriminating case.
+        access("W2 C setAccessible on a PRIVATE JDK constructor", () -> {
+            Constructor<?> k = Class.forName("java.lang.Runtime")
+                    .getDeclaredConstructor();
+            k.setAccessible(true);
+            return "no-throw";
+        });
+
         System.out.println("ROWS " + rows);
     }
 
@@ -1038,5 +1182,46 @@ class L3Foreign {
 
     private String hidden() {
         return "foreign-hidden";
+    }
+}
+
+/** Wave 2 fixtures. Each exists so some triple's CORRECT answer differs from
+ *  the value a blanket yield returns, which is the only kind of row that can
+ *  promote a wave-1 default-value deferral. */
+enum Color {
+    RED("r"),
+    GREEN("g");
+
+    private final String label;
+
+    Color(String label) {
+        this.label = label;
+    }
+
+    String label() {
+        return label;
+    }
+}
+
+class Box<T> {
+    void set(T t) {
+    }
+}
+
+/** A generic override mints a BRIDGE method: `set(Object)` alongside
+ *  `set(String)`. That is the only way `Method.isBridge` answers `true`. */
+class SubBox extends Box<String> {
+    @Override
+    void set(String s) {
+    }
+}
+
+class VarCtor {
+    VarCtor(String... a) {
+    }
+}
+
+class Thrower2 {
+    Thrower2(int i) throws IllegalStateException, java.io.IOException {
     }
 }
