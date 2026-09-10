@@ -2306,23 +2306,148 @@ static RETIRED_SHADOW_PHASE3_TRIPLES: &[(&str, &str, &str)] = &[
 ///   * 99 are the `ConcurrentHashMap` family, retired by the 2026-09-09 Phase 3
 ///     wave and already in [`RETIRED_SHADOW_PHASE3_TRIPLES`].
 ///
-/// # What this table does NOT contain, and why that is the finding
+/// # 81 of 405, and the other 324 are classified rather than deferred
 ///
-/// See the lane page for the per-class record. The two structural refusals are
-/// worth restating here, because both are properties of this VM's object model
-/// rather than of any one method:
+/// | disposition | rows |
+/// |---|---|
+/// | retired here | **81** |
+/// | held: the class's whole arm moves the VM AWAY from HotSpot | 143 |
+/// | held: no instrument in this tree dispatches the row | 105 |
+/// | held: structurally unretirable over this object model | 22 |
+/// | held: one unit with a held class | 50 |
+/// | dead registration — a door that never opens | 4 |
+///
+/// The per-class record, with the measurement behind each blocker, is on the
+/// lane page. Three of the blockers are properties of this VM rather than of
+/// any one method, and are restated here because a future wave will re-derive
+/// them otherwise:
 ///
 ///   * **`objectFieldOffset` returns a SLOT INDEX, not a byte offset.** The
 ///     JDK implements the whole sub-word atomic family in Java over a 4-byte
 ///     CAS — `long wordOffset = offset & ~3; int shift = (int)(offset & 3) << 3`
-///     — so retiring `compareAndSetByte` and its eleven relatives hands that
+///     — so retiring `compareAndSetByte` and its relatives hands that
 ///     arithmetic a number it does not describe: `offset & ~3` names a
 ///     DIFFERENT FIELD. `unsafe_natives_ext.rs` says the same from the other
-///     side and carries the HotSpot comparison that established it.
-///   * the eight `get*Unaligned` / `put*Unaligned` rows are the same defect in
-///     a different family: they decompose a byte range, and a slot index has
-///     no bytes.
-static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[];
+///     side and carries the HotSpot comparison that established it, and
+///     `apps/probes/L5SubwordAtomics.java` scores the family at all four byte
+///     positions of a word, on a field and on an array element, for
+///     `byte`/`boolean`/`short`/`char`: **132 rows, 0 diffs, unarmed.** The
+///     natives are right; it is the retirement that would be wrong.
+///   * the `get*Unaligned` / `put*Unaligned` rows on `Unsafe` are the same
+///     defect in a different family: they decompose a byte range, and a slot
+///     index has no bytes. (The identically-named `ScopedMemoryAccess` rows
+///     ARE retired — they take a `MemorySegment` base and a real byte offset,
+///     which is a different number.)
+///   * **`sun/misc/Unsafe`'s 82 rows are dispatched by nothing here.** All 121
+///     probes report the dial VACUOUS on that scope, and the 132 `--jdk-only`
+///     corpus reports reach 18 of the 82. Precondition 1 fails by measurement,
+///     not by omission.
+///
+/// # The `*Internal` twin rule, which is why 16 `ScopedMemoryAccess` rows
+///
+/// Eight `ScopedMemoryAccess` rows were dispatched (`L4ByteBufferSweep` and
+/// `L4TypedBufferSweep`, 518 dial yields between them, delta 0). Each is a
+/// public wrapper whose only body calls its own `@ForceInline` `…Internal`
+/// twin, and the twin is registered too — so retiring the wrapper alone would
+/// produce a configuration NOBODY measured: real outer, native inner. The
+/// class-wide arm that measured clean yielded both. So each retired wrapper
+/// brings its twin, and the fourteen rows with no dispatch on either half stay
+/// out.
+///
+/// # `AbstractExecutorService`'s four rows are a door that never opens
+///
+/// `submit` ×3 and `invokeAny` are registered on `AbstractExecutorService`,
+/// which is abstract. A dispatch door asks the registry about the DECLARING
+/// class of the resolved method, and every concrete executor in the image —
+/// `ThreadPoolExecutor`, `ForkJoinPool` — carries its own registration of the
+/// same names, so the abstract one is never the answer.
+/// `apps/probes/L5ExecutorSweep.java` builds the one receiver shape that could
+/// reach it (a direct subclass declaring only `execute`) and the rows still
+/// read `invocations: 0`. Lane 0 §1: deleting these is worth doing and is
+/// **not** a retirement, so they are not in this table.
+static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/lang/Thread$FieldHolder", "<init>", "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;JIZ)V"),
+    ("java/lang/Thread$State", "valueOf", "(Ljava/lang/String;)Ljava/lang/Thread$State;"),
+    ("java/lang/Thread$State", "values", "()[Ljava/lang/Thread$State;"),
+    ("java/util/concurrent/CompletableFuture", "allOf", "([Ljava/util/concurrent/CompletableFuture;)Ljava/util/concurrent/CompletableFuture;"),
+    ("java/util/concurrent/CompletableFuture", "anyOf", "([Ljava/util/concurrent/CompletableFuture;)Ljava/util/concurrent/CompletableFuture;"),
+    ("java/util/concurrent/CompletableFuture", "complete", "(Ljava/lang/Object;)Z"),
+    ("java/util/concurrent/CompletableFuture", "completeExceptionally", "(Ljava/lang/Throwable;)Z"),
+    ("java/util/concurrent/CompletableFuture", "completeValue", "(Ljava/lang/Object;)Z"),
+    ("java/util/concurrent/CompletableFuture", "isCompletedExceptionally", "()Z"),
+    ("java/util/concurrent/CompletableFuture", "thenAcceptAsync", "(Ljava/util/function/Consumer;)Ljava/util/concurrent/CompletableFuture;"),
+    ("java/util/concurrent/CompletableFuture", "thenApplyAsync", "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;"),
+    ("java/util/concurrent/CompletableFuture", "thenCombine", "(Ljava/util/concurrent/CompletionStage;Ljava/util/function/BiFunction;)Ljava/util/concurrent/CompletableFuture;"),
+    ("java/util/concurrent/CompletableFuture", "thenComposeAsync", "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;"),
+    ("java/util/concurrent/CompletableFuture", "thenRunAsync", "(Ljava/lang/Runnable;)Ljava/util/concurrent/CompletableFuture;"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "add", "(ILjava/lang/Object;)V"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "add", "(Ljava/lang/Object;)Z"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "addAll", "(Ljava/util/Collection;)Z"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "addIfAbsent", "(Ljava/lang/Object;)Z"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "bulkRemove", "(Ljava/util/function/Predicate;)Z"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "clear", "()V"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "contains", "(Ljava/lang/Object;)Z"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "get", "(I)Ljava/lang/Object;"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "indexOf", "(Ljava/lang/Object;)I"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "isEmpty", "()Z"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "iterator", "()Ljava/util/Iterator;"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "remove", "(I)Ljava/lang/Object;"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "remove", "(Ljava/lang/Object;)Z"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "set", "(ILjava/lang/Object;)Ljava/lang/Object;"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "size", "()I"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "toArray", "()[Ljava/lang/Object;"),
+    ("java/util/concurrent/PriorityBlockingQueue", "<init>", "()V"),
+    ("java/util/concurrent/PriorityBlockingQueue", "isEmpty", "()Z"),
+    ("java/util/concurrent/PriorityBlockingQueue", "offer", "(Ljava/lang/Object;)Z"),
+    ("java/util/concurrent/PriorityBlockingQueue", "peek", "()Ljava/lang/Object;"),
+    ("java/util/concurrent/PriorityBlockingQueue", "poll", "()Ljava/lang/Object;"),
+    ("java/util/concurrent/PriorityBlockingQueue", "poll", "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;"),
+    ("java/util/concurrent/PriorityBlockingQueue", "put", "(Ljava/lang/Object;)V"),
+    ("java/util/concurrent/PriorityBlockingQueue", "size", "()I"),
+    ("java/util/concurrent/PriorityBlockingQueue", "take", "()Ljava/lang/Object;"),
+    ("java/util/concurrent/ScheduledThreadPoolExecutor", "<init>", "(ILjava/util/concurrent/ThreadFactory;Ljava/util/concurrent/RejectedExecutionHandler;)V"),
+    ("java/util/concurrent/ScheduledThreadPoolExecutor", "getCorePoolSize", "()I"),
+    ("java/util/concurrent/ThreadPoolExecutor", "awaitTermination", "(JLjava/util/concurrent/TimeUnit;)Z"),
+    ("java/util/concurrent/ThreadPoolExecutor", "getActiveCount", "()I"),
+    ("java/util/concurrent/ThreadPoolExecutor", "getCompletedTaskCount", "()J"),
+    ("java/util/concurrent/ThreadPoolExecutor", "getCorePoolSize", "()I"),
+    ("java/util/concurrent/ThreadPoolExecutor", "getMaximumPoolSize", "()I"),
+    ("java/util/concurrent/ThreadPoolExecutor", "getPoolSize", "()I"),
+    ("java/util/concurrent/ThreadPoolExecutor", "getTaskCount", "()J"),
+    ("java/util/concurrent/ThreadPoolExecutor", "invokeAny", "(Ljava/util/Collection;)Ljava/lang/Object;"),
+    ("java/util/concurrent/ThreadPoolExecutor", "isShutdown", "()Z"),
+    ("java/util/concurrent/ThreadPoolExecutor", "isTerminated", "()Z"),
+    ("java/util/concurrent/ThreadPoolExecutor", "shutdown", "()V"),
+    ("java/util/concurrent/ThreadPoolExecutor", "shutdownNow", "()Ljava/util/List;"),
+    ("java/util/concurrent/ThreadPoolExecutor", "submit", "(Ljava/lang/Runnable;)Ljava/util/concurrent/Future;"),
+    ("java/util/concurrent/ThreadPoolExecutor", "submit", "(Ljava/lang/Runnable;Ljava/lang/Object;)Ljava/util/concurrent/Future;"),
+    ("java/util/concurrent/ThreadPoolExecutor", "submit", "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;"),
+    ("java/util/concurrent/TimeUnit", "convert", "(JLjava/util/concurrent/TimeUnit;)J"),
+    ("java/util/concurrent/TimeUnit", "sleep", "(J)V"),
+    ("java/util/concurrent/TimeUnit", "toDays", "(J)J"),
+    ("java/util/concurrent/TimeUnit", "toHours", "(J)J"),
+    ("java/util/concurrent/TimeUnit", "toMicros", "(J)J"),
+    ("java/util/concurrent/TimeUnit", "toMillis", "(J)J"),
+    ("java/util/concurrent/TimeUnit", "toMinutes", "(J)J"),
+    ("java/util/concurrent/TimeUnit", "toNanos", "(J)J"),
+    ("java/util/concurrent/TimeUnit", "toSeconds", "(J)J"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "copyMemory", "(Ljdk/internal/foreign/MemorySessionImpl;Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JLjava/lang/Object;JJ)V"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "copyMemoryInternal", "(Ljdk/internal/foreign/MemorySessionImpl;Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JLjava/lang/Object;JJ)V"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "getIntUnaligned", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)I"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "getIntUnalignedInternal", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)I"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "getLongUnaligned", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)J"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "getLongUnalignedInternal", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)J"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "getShortUnaligned", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)S"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "getShortUnalignedInternal", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)S"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "putInt", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JI)V"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "putIntInternal", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JI)V"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "putIntUnaligned", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JIZ)V"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "putIntUnalignedInternal", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JIZ)V"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "putLongUnaligned", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JJZ)V"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "putLongUnalignedInternal", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JJZ)V"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "putShortUnaligned", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JSZ)V"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "putShortUnalignedInternal", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JSZ)V"),
+];
 
 /// Is this exact triple a retired §1.4 shadow?
 ///
