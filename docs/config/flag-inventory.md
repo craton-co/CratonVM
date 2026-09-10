@@ -1242,7 +1242,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH` | GC | `CRATONVM_GC=conditional-tlab-skip-publish` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_GC_DEAD_SPILL_ROOTS` | GC | `CRATONVM_GC=dead-spill-roots` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_GC_FULL_RSET_SCAN` | GC | `CRATONVM_GC=full-rset-scan` | opt-in | off | behaviour | snapshot | types |
-| `CRATONVM_GC_G1_MOVABLE_PINS` | GC | `CRATONVM_GC=g1-movable-pins` | default-on | on | behaviour | snapshot | gc |
+| `CRATONVM_GC_G1_MOVABLE_PINS` | GC | `CRATONVM_GC=g1-movable-pins` | opt-in | off | behaviour | snapshot | gc |
 | `CRATONVM_GC_G1_ONLY_JIT_PINS` | GC | `CRATONVM_GC=g1-only-jit-pins` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_GC_JIT_REF_STORE_GATES` | GC | `CRATONVM_GC=jit-ref-store-gates` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_GC_LATE_RESOLVE_DROPPED` | GC | `CRATONVM_GC=late-resolve-dropped` | opt-in | off | behaviour | snapshot | types |

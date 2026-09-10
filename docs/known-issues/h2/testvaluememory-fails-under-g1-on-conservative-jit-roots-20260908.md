@@ -440,6 +440,24 @@ The alternative, sub-region pinning, is not available: G1 frees a region by
 evacuating everything out of it, so one unmovable object holds the whole
 megabyte whatever the collector does around it.
 
+### Status of the two switches after this pass
+
+Both are **off by default**, and the reason is the same number.
+
+`CRATONVM_GC_MOVABLE_BAND_ROOTS` (producer) is ON: it publishes the verifiable
+half of the band partition, which `publish_unrewritable_band_roots` already
+computed and dropped. That is a correctness completion, not a behaviour change
+on its own, and the generational path has consumed the partition for as long as
+it has existed.
+
+`CRATONVM_GC_G1_MOVABLE_PINS` (consumer) is **off**. It is correct and it is
+wired, and on this row it drops **1 pin out of 34** — an A/B on the row lands
+inside host noise (on 10975/9972, off 8961/13005). It cannot do better while
+4794 of ~5200 JIT roots arrive from a span sweep that makes no claim either way.
+A live GC behaviour change bought for one pin in thirty-four is risk without
+return; it is one flag away for whoever gives the unregistered-frame band a
+layout.
+
 **What is NOT the fix**, each refuted by measurement on this page: narrowing the
 band scan (no effect), narrowing G1's pin set by the movable partition alone
 (the partition is starved, not wrong), shrinking the region size (arithmetic

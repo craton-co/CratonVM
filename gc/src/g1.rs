@@ -5739,38 +5739,41 @@ impl Drop for G1Collector {
     }
 }
 
-/// `CRATONVM_GC_G1_MOVABLE_PINS=0` — pin the region of EVERY conservative JIT
-/// root, ignoring the movable/rewritable partition. **Default ON**, i.e. the
-/// partition is honoured, as it already is on the generational path.
+/// `CRATONVM_GC_G1_MOVABLE_PINS=1` — let G1's pin set honour the
+/// movable/rewritable partition, as the generational path already does.
+/// **Default OFF.**
 ///
-/// # It shipped off for one day, and why it is on now
+/// # Correct, wired, and still not worth a default
 ///
-/// The filter was correct and inert. Measured on H2 `TestValueMemory` Type 3:
+/// Two things that once made it inert are fixed. The whole-cycle
+/// `coverage_incomplete` gate is gone from this path (see the comment at
+/// `honour_movable` for why that is the generational collector's question, not
+/// G1's), and `publish_unrewritable_band_roots` now publishes the verifiable
+/// half of the band partition instead of computing it and dropping it.
+///
+/// What did not change is the yield, and that is the number this default rests
+/// on. On H2 `TestValueMemory` Type 3 the filter drops **1 pin out of 34**:
 ///
 /// ```text
-/// [g1][MOVPIN] snapshot=38 kept=38 movable_claimed=2 unrew_veto=9
-///              honour_movable=false coverage_incomplete=true movable_set=2
+/// [g1][MOVPIN] snapshot=34 kept=33 movable_claimed=2 unrew_veto=7
 /// ```
 ///
-/// Two blockers, both since fixed. The whole-cycle `coverage_incomplete` gate
-/// disabled it outright and is gone from this path -- see the comment at
-/// `honour_movable` for why that gate is the generational collector's question
-/// and not G1's. And only 2 of 38 addresses were CLAIMED movable, because
-/// nothing published the verifiable half of the band partition;
-/// `publish_unrewritable_band_roots` now does.
+/// and an A/B on the row itself lands inside this host's noise (on 10975/9972,
+/// off 8961/13005). The reason is not this filter: 4794 of ~5200 JIT roots come
+/// from the A5 unregistered-frame SPAN sweep, which has no per-frame layout and
+/// so publishes neither half of the partition — nothing here can act on roots
+/// that never made a claim. See the H2 page for that measurement.
 ///
-/// This is the bisect lever for the CONSUMER. `CRATONVM_GC_MOVABLE_BAND_ROOTS`
-/// is the one for the producer, and they are separate because a wrong movable
-/// claim and a filter that ignores the veto are different bugs.
+/// So it ships off, for the same reason it shipped off the first time: a live
+/// GC behaviour change bought for one pin in thirty-four is risk without
+/// return. It is kept, correct and one flag away, for whoever gives the
+/// unregistered-frame band a layout.
 fn g1_movable_pins_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(
         || match cratonvm_types::flags::runtime_var("CRATONVM_GC_G1_MOVABLE_PINS") {
-            Ok(v) => !matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "off" | "no"
-            ),
-            Err(_) => true,
+            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"),
+            Err(_) => false,
         },
     )
 }
