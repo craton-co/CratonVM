@@ -200,6 +200,19 @@
 #   treatment -- an Intrinsic keeps winning at every door, a retired triple
 #   stops being registered under --jdk-only at all.
 # class	name	descriptor	ordinal	kind	kind_stated	kind_chosen
+# 2026-09-10, lane L3 wave 1: 24 rows bridge -> synthetic-stub, being
+# RETIRED_SHADOW_L3_TRIPLES. 24 triples, 24 rows, one ordinal apiece -- unlike
+# lane L0's amendment immediately before it, which touched 56 rows for 54
+# triples because two ModuleDescriptor$Version triples are registered twice.
+# Since the key here is (class, name, descriptor, ORDINAL), that difference is
+# visible in this file and nowhere else, so it is stated rather than left for a
+# reader to rediscover: L3's numbers agree because its registrations are 1:1.
+# The rows are core reflection's metadata accessors on Field, Method and
+# Constructor plus three MethodType accessors, measured per row against HotSpot
+# 25.0.3+9 with apps/probes/L3ReflectInvokeSurface.java (254 rows). The 218
+# rows of lane 3's population NOT amended here each have a recorded reason --
+# 88 held, 24 wrong both ways, 92 never dispatched, 12 agreeing only at a
+# default value -- see RETIRED_SHADOW_L3_TRIPLES' doc comment.
 CratonVM$HttpServerLoop	run	()V	0	bridge	0	1
 brave/internal/collect/WeakConcurrentMap$WeakKey	equals	(Ljava/lang/Object;)Z	0	bridge	0	1
 com/carrotsearch/randomizedtesting/RandomizedContext	context	(Ljava/lang/Thread;)Lcom/carrotsearch/randomizedtesting/RandomizedContext;	0	bridge	0	1
@@ -4084,10 +4097,10 @@ java/lang/invoke/MethodType	methodType	(Ljava/lang/Class;Ljava/lang/Class;)Ljava
 java/lang/invoke/MethodType	methodType	(Ljava/lang/Class;Ljava/lang/Class;[Ljava/lang/Class;)Ljava/lang/invoke/MethodType;	0	bridge	0	1
 java/lang/invoke/MethodType	methodType	(Ljava/lang/Class;[Ljava/lang/Class;)Ljava/lang/invoke/MethodType;	0	bridge	0	1
 java/lang/invoke/MethodType	parameterArray	()[Ljava/lang/Class;	0	bridge	0	1
-java/lang/invoke/MethodType	parameterCount	()I	0	bridge	0	1
+java/lang/invoke/MethodType	parameterCount	()I	0	synthetic-stub	0	1
 java/lang/invoke/MethodType	parameterType	(I)Ljava/lang/Class;	0	bridge	0	1
-java/lang/invoke/MethodType	returnType	()Ljava/lang/Class;	0	bridge	0	1
-java/lang/invoke/MethodType	toString	()Ljava/lang/String;	0	bridge	0	1
+java/lang/invoke/MethodType	returnType	()Ljava/lang/Class;	0	synthetic-stub	0	1
+java/lang/invoke/MethodType	toString	()Ljava/lang/String;	0	synthetic-stub	0	1
 java/lang/invoke/MutableCallSite	dynamicInvoker	()Ljava/lang/invoke/MethodHandle;	0	bridge	0	1
 java/lang/invoke/MutableCallSite	setTarget	(Ljava/lang/invoke/MethodHandle;)V	0	bridge	0	1
 java/lang/invoke/VarHandle	accessModeTypeUncached	(Ljava/lang/invoke/VarHandle$AccessType;)Ljava/lang/invoke/MethodType;	0	bridge	0	1
@@ -4349,14 +4362,14 @@ java/lang/reflect/Constructor	getAnnotatedParameterTypes	()[Ljava/lang/reflect/A
 java/lang/reflect/Constructor	getAnnotation	(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;	0	bridge	0	1
 java/lang/reflect/Constructor	getAnnotations	()[Ljava/lang/annotation/Annotation;	0	bridge	0	1
 java/lang/reflect/Constructor	getDeclaredAnnotations	()[Ljava/lang/annotation/Annotation;	0	bridge	0	1
-java/lang/reflect/Constructor	getDeclaringClass	()Ljava/lang/Class;	0	bridge	0	1
+java/lang/reflect/Constructor	getDeclaringClass	()Ljava/lang/Class;	0	synthetic-stub	0	1
 java/lang/reflect/Constructor	getExceptionTypes	()[Ljava/lang/Class;	0	bridge	0	1
-java/lang/reflect/Constructor	getGenericParameterTypes	()[Ljava/lang/reflect/Type;	0	bridge	0	1
-java/lang/reflect/Constructor	getModifiers	()I	0	bridge	0	1
-java/lang/reflect/Constructor	getName	()Ljava/lang/String;	0	bridge	0	1
+java/lang/reflect/Constructor	getGenericParameterTypes	()[Ljava/lang/reflect/Type;	0	synthetic-stub	0	1
+java/lang/reflect/Constructor	getModifiers	()I	0	synthetic-stub	0	1
+java/lang/reflect/Constructor	getName	()Ljava/lang/String;	0	synthetic-stub	0	1
 java/lang/reflect/Constructor	getParameterAnnotations	()[[Ljava/lang/annotation/Annotation;	0	bridge	0	1
-java/lang/reflect/Constructor	getParameterCount	()I	0	bridge	0	1
-java/lang/reflect/Constructor	getParameterTypes	()[Ljava/lang/Class;	0	bridge	0	1
+java/lang/reflect/Constructor	getParameterCount	()I	0	synthetic-stub	0	1
+java/lang/reflect/Constructor	getParameterTypes	()[Ljava/lang/Class;	0	synthetic-stub	0	1
 java/lang/reflect/Constructor	getParameters	()[Ljava/lang/reflect/Parameter;	0	bridge	0	1
 java/lang/reflect/Constructor	getRoot	()Ljava/lang/reflect/Constructor;	0	bridge	0	1
 java/lang/reflect/Constructor	getTypeParameters	()[Ljava/lang/reflect/TypeVariable;	0	bridge	0	1
@@ -4379,17 +4392,17 @@ java/lang/reflect/Field	getBoolean	(Ljava/lang/Object;)Z	0	bridge	0	1
 java/lang/reflect/Field	getByte	(Ljava/lang/Object;)B	0	bridge	0	1
 java/lang/reflect/Field	getChar	(Ljava/lang/Object;)C	0	bridge	0	1
 java/lang/reflect/Field	getDeclaredAnnotations	()[Ljava/lang/annotation/Annotation;	0	bridge	0	1
-java/lang/reflect/Field	getDeclaringClass	()Ljava/lang/Class;	0	bridge	0	1
+java/lang/reflect/Field	getDeclaringClass	()Ljava/lang/Class;	0	synthetic-stub	0	1
 java/lang/reflect/Field	getDouble	(Ljava/lang/Object;)D	0	bridge	0	1
 java/lang/reflect/Field	getFloat	(Ljava/lang/Object;)F	0	bridge	0	1
 java/lang/reflect/Field	getGenericType	()Ljava/lang/reflect/Type;	0	bridge	0	1
 java/lang/reflect/Field	getInt	(Ljava/lang/Object;)I	0	bridge	0	1
 java/lang/reflect/Field	getLong	(Ljava/lang/Object;)J	0	bridge	0	1
-java/lang/reflect/Field	getModifiers	()I	0	bridge	0	1
-java/lang/reflect/Field	getName	()Ljava/lang/String;	0	bridge	0	1
+java/lang/reflect/Field	getModifiers	()I	0	synthetic-stub	0	1
+java/lang/reflect/Field	getName	()Ljava/lang/String;	0	synthetic-stub	0	1
 java/lang/reflect/Field	getRoot	()Ljava/lang/reflect/Field;	0	bridge	0	1
 java/lang/reflect/Field	getShort	(Ljava/lang/Object;)S	0	bridge	0	1
-java/lang/reflect/Field	getType	()Ljava/lang/Class;	0	bridge	0	1
+java/lang/reflect/Field	getType	()Ljava/lang/Class;	0	synthetic-stub	0	1
 java/lang/reflect/Field	getTypeAnnotationBytes0	()[B	0	bridge	1	1
 java/lang/reflect/Field	isAnnotationPresent	(Ljava/lang/Class;)Z	0	bridge	0	1
 java/lang/reflect/Field	isEnumConstant	()Z	0	bridge	0	1
@@ -4459,25 +4472,25 @@ java/lang/reflect/InvocationTargetException	toString	()Ljava/lang/String;	1	brid
 java/lang/reflect/Method	canAccess	(Ljava/lang/Object;)Z	0	bridge	0	1
 java/lang/reflect/Method	copy	()Ljava/lang/reflect/Method;	0	bridge	0	1
 java/lang/reflect/Method	getAnnotatedParameterTypes	()[Ljava/lang/reflect/AnnotatedType;	0	bridge	0	1
-java/lang/reflect/Method	getAnnotatedReturnType	()Ljava/lang/reflect/AnnotatedType;	0	bridge	0	1
+java/lang/reflect/Method	getAnnotatedReturnType	()Ljava/lang/reflect/AnnotatedType;	0	synthetic-stub	0	1
 java/lang/reflect/Method	getAnnotation	(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;	0	bridge	0	1
 java/lang/reflect/Method	getAnnotations	()[Ljava/lang/annotation/Annotation;	0	bridge	0	1
 java/lang/reflect/Method	getAnnotationsByType	(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;	0	bridge	0	1
 java/lang/reflect/Method	getDeclaredAnnotations	()[Ljava/lang/annotation/Annotation;	0	bridge	0	1
 java/lang/reflect/Method	getDeclaredAnnotationsByType	(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;	0	bridge	0	1
-java/lang/reflect/Method	getDeclaringClass	()Ljava/lang/Class;	0	bridge	0	1
+java/lang/reflect/Method	getDeclaringClass	()Ljava/lang/Class;	0	synthetic-stub	0	1
 java/lang/reflect/Method	getDefaultValue	()Ljava/lang/Object;	0	bridge	0	1
-java/lang/reflect/Method	getExceptionTypes	()[Ljava/lang/Class;	0	bridge	0	1
-java/lang/reflect/Method	getGenericExceptionTypes	()[Ljava/lang/reflect/Type;	0	bridge	0	1
+java/lang/reflect/Method	getExceptionTypes	()[Ljava/lang/Class;	0	synthetic-stub	0	1
+java/lang/reflect/Method	getGenericExceptionTypes	()[Ljava/lang/reflect/Type;	0	synthetic-stub	0	1
 java/lang/reflect/Method	getGenericParameterTypes	()[Ljava/lang/reflect/Type;	0	bridge	0	1
 java/lang/reflect/Method	getGenericReturnType	()Ljava/lang/reflect/Type;	0	bridge	0	1
-java/lang/reflect/Method	getModifiers	()I	0	bridge	0	1
-java/lang/reflect/Method	getName	()Ljava/lang/String;	0	bridge	0	1
+java/lang/reflect/Method	getModifiers	()I	0	synthetic-stub	0	1
+java/lang/reflect/Method	getName	()Ljava/lang/String;	0	synthetic-stub	0	1
 java/lang/reflect/Method	getParameterAnnotations	()[[Ljava/lang/annotation/Annotation;	0	bridge	0	1
-java/lang/reflect/Method	getParameterCount	()I	0	bridge	0	1
-java/lang/reflect/Method	getParameterTypes	()[Ljava/lang/Class;	0	bridge	0	1
+java/lang/reflect/Method	getParameterCount	()I	0	synthetic-stub	0	1
+java/lang/reflect/Method	getParameterTypes	()[Ljava/lang/Class;	0	synthetic-stub	0	1
 java/lang/reflect/Method	getParameters	()[Ljava/lang/reflect/Parameter;	0	bridge	0	1
-java/lang/reflect/Method	getReturnType	()Ljava/lang/Class;	0	bridge	0	1
+java/lang/reflect/Method	getReturnType	()Ljava/lang/Class;	0	synthetic-stub	0	1
 java/lang/reflect/Method	getRoot	()Ljava/lang/reflect/Method;	0	bridge	0	1
 java/lang/reflect/Method	getTypeParameters	()[Ljava/lang/reflect/TypeVariable;	0	bridge	0	1
 java/lang/reflect/Method	invoke	(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
@@ -4487,8 +4500,8 @@ java/lang/reflect/Method	isBridge	()Z	0	bridge	0	1
 java/lang/reflect/Method	isDefault	()Z	0	bridge	0	1
 java/lang/reflect/Method	isSynthetic	()Z	0	bridge	0	1
 java/lang/reflect/Method	isVarArgs	()Z	0	bridge	0	1
-java/lang/reflect/Method	setAccessible	(Z)V	0	bridge	0	1
-java/lang/reflect/Method	toString	()Ljava/lang/String;	0	bridge	0	1
+java/lang/reflect/Method	setAccessible	(Z)V	0	synthetic-stub	0	1
+java/lang/reflect/Method	toString	()Ljava/lang/String;	0	synthetic-stub	0	1
 java/lang/reflect/Method	trySetAccessible	()Z	0	bridge	0	1
 java/lang/reflect/Parameter	getAnnotatedType	()Ljava/lang/reflect/AnnotatedType;	0	bridge	0	1
 java/lang/reflect/Parameter	isImplicit	()Z	0	bridge	0	1

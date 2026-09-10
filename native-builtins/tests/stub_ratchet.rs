@@ -1481,7 +1481,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// the defect this file's header describes, where two such ratchets disagreed
 /// by 364 registrations for weeks. Here it is a units difference, not a
 /// measurement error -- but only enumerating the added set showed which.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1950;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1974;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1510,7 +1510,29 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1950;
 /// unowned for three days before it had a constant at all.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1939;
+/// # Lane L3 wave 1: +24 in all three configurations, and the units AGREE
+///
+/// ```text
+/// NO_MANAGEMENT   1939 -> 1963
+/// MANAGEMENT      1950 -> 1974
+/// SYNTHETIC_JDK   1939 -> 1963
+/// ```
+///
+/// `RETIRED_SHADOW_L3_TRIPLES` holds **24** triples and every constant moved by
+/// **24**. Worth stating explicitly, because lane L0's wave immediately above
+/// moved 54 triples and 56 registrations -- two `ModuleDescriptor$Version`
+/// triples registered at two ordinals each -- and a reader who has just read
+/// that account will reasonably ask which kind of number this is. It is the
+/// simple kind: 24 triples, 24 registrations, one ordinal apiece, in all three
+/// configurations alike.
+///
+/// The added set is core reflection's metadata accessors on `Field`, `Method`,
+/// `Constructor` and three `MethodType` accessors -- measured per row with
+/// `apps/probes/L3ReflectInvokeSurface.java`, 254 rows against HotSpot
+/// 25.0.3+9. Nothing was removed. The equality of the three deltas is the
+/// useful part of the check: a table that moved one configuration and not
+/// another would mean a `#[cfg]`-gated registrar was in the wave, and none is.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1963;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1567,7 +1589,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1939;
 /// re-freeze ALL THREE — see the pointer on both siblings.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1939;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1963;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///

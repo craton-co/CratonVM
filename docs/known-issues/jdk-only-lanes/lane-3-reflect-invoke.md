@@ -1,6 +1,9 @@
 # Lane 3 — core reflection and `java.lang.invoke`
 
-**Scope: 251 §1.4 shadows over 36 classes, from 246 registration sites.**
+**Scope: 242 §1.4 shadows over 35 classes** — re-measured 2026-09-10 from
+an adjudicated `--dump-native-registry`; the 251/36 this line carried came
+from a different tree and counted rows lane T owns. **24 retired, 48
+(class, name) pairs deferred with reasons** — see §8.
 Prefixes: `java/lang/reflect/`, `jdk/internal/reflect/`, `sun/reflect/`,
 `java/lang/invoke/`.
 
@@ -280,29 +283,89 @@ across the board: 105 destroyed reads, per
 The second is a native handing back an instance of an ABSTRACT class, which no
 bytecode could have produced.
 
-### Retirement: blocked on the armed arm, and why
+### The armed arm, and wave 1: 24 retired of 242
 
-**Both halves of this lane aborted the VM under the dial, at different rows —
-and it is ONE defect, not two.**
+With the descriptor panic fixed, all three arms complete on one run of the
+whole prefix set — `rc=0/0/0`, 255/255/255 lines — which confirms the two
+aborts were one defect.
 
 ```text
-reflect/ armed   dies row 126  Lookup.unreflect     invoke.rs:2845
-invoke/  armed   dies row 166  MethodHandle.bindTo  invoke.rs:2845
+d(hs,base) 68 diff lines    d(hs,armed) 224    delta +156
+
+per ROW (254)   OK -> OK   132   retire
+                BAD -> OK   10   yielding FIXES it -> retire
+                OK -> BAD   88   hold
+                BAD -> BAD  24   investigate
 ```
 
-Same line, same message: `start byte index 1 is out of bounds for string of
-length 0` — the unguarded tail slice in `split_method_descriptor_ref`. Both
-halves reach it with an empty descriptor by different routes. **Fixed** in the
-preceding commit; a malformed descriptor must not be able to take the VM down.
+**142 of 254 rows are retirable behind a `delta` of +156.** The aggregate says
+"retire nothing" for the second lane running.
 
-This was very nearly written up as two independent blockers, on the strength of
-two different failing rows in two different packages. Two crashes at two call
-sites is not two bugs until you have read the panic site of each — and here the
-second stderr capture cost one command and removed a whole line of enquiry.
+The ten `BAD -> OK` rows are the argument for doing this at all:
 
-Arming the two halves separately is still the right method while the counts are
-being taken, because the first whole-prefix run scored `delta=-58` — which
-reads as a spectacular improvement and was the artefact described below.
+```text
+45/82/103  F/M/C copy == is false        yielding REPAIRS the copy model
+251        setAccessible does not leak   yielding fixes the LEAK that follows
+133        privateLookupIn(java.base)    yielding restores IllegalAccessException
+246        private field read            yielding gives HotSpot's exact frame
+134 accessClass · 138 LK toString · 36 NPE message · 236 getCallerClass
+```
+
+So the retirement **closes** the `lk_enforce_*` access-control residual rather
+than merely measuring it, and closes the `setAccessible` leak with it.
+
+**`RETIRED_SHADOW_L3_TRIPLES` — 24 triples**, core reflection's metadata
+accessors on `Field`, `Method` and `Constructor` plus three `MethodType`
+accessors. Prefixes added: `java/lang/reflect/` and `java/lang/invoke/` only —
+`jdk/internal/reflect/` and `sun/reflect/` are lane 3's too and are
+deliberately **absent**, because wave 1 retires nothing under them and a
+prefix with no table entry behind it is exactly what L0 §4 warns about.
+
+Ratchets moved by **+24 in all three configurations** (1939→1963, 1950→1974,
+1939→1963) and the kind map amended **24 rows for 24 triples, 0 missed** — a
+clean 1:1, unlike L0's 54 triples over 56 registrations.
+
+### Why the other 218 are not in the table
+
+A row is not a triple. Only triples a row-to-triple mapping can justify are in
+it: the tag names one method of one class, the census holds exactly one A/B
+triple for that name, `invocations > 0` in this probe's own run, and **every**
+attributed row is `OK -> OK` or `BAD -> OK`. 48 (class, name) pairs were
+reached and rejected, each with its reason recorded. Four rules did the work,
+and three of them removed something that had looked clean:
+
+* **`invocations == 0`** — precondition 4, per triple, from the dump. 92 of
+  242.
+* **held** — any `OK -> BAD` row. 88 rows, and they cluster: **32 are
+  `Field`'s primitive accessors**, which the same run explains — the
+  descriptor-coercion census reports **105** field reads whose value
+  contradicted the slot's descriptor and was DESTROYED. Ten more are the
+  generic-signature family, where yielding erases `Map<String,List<T>>` to
+  `Map`, `T` to `Number` and `T[]` to `[LNumber;`. Five more are annotations
+  coming back empty — **the same family lane 0 held**, so that is one
+  cross-lane root cause and not two lane findings.
+* **`BAD -> BAD`** — the bytecode is wrong too, so "yielding is correct here"
+  is false. Not a regression; not a justified retirement either. This is what
+  removed `Method.invoke` and `Constructor.newInstance`, which looked like
+  clean seven-row and five-row keeps until the non-nestmate rows 247 and 248
+  were attributed to them. **A mapping keyed on the row's tag misses rows that
+  drive the same triple under another tag**, and the miss runs in the
+  dangerous direction.
+* **agreement at a DEFAULT value** — twelve entries. The sharp one is
+  `Field.setBoolean`, whose only row sets `z` to `false` and reads it back
+  through `getBoolean`, which row 15 proves broken: retiring it on
+  `false == false` would be lane 0's `Module.isOpen` mistake exactly.
+
+`the_l3_held_triples_are_not_retired` pins 26 of these, at least one per rule,
+so a later wave cannot take them on the family's reputation.
+
+**Structurally not retirable: the `java.lang.invoke` surface**, minus the three
+`MethodType` accessors. §4 predicted `MemberName`/`MethodHandle` would be
+VM-coupled and the measurement agrees — 14 `MethodHandles`, 8 `MethodHandle`
+and 5 `CallSite` rows hold or are wrong both ways, and the run's
+uninstantiable-receiver census names `MethodHandle` and `VarHandle` as abstract
+classes a native instantiates. Those need the reviewed-`Intrinsic` protocol or
+a repair, not a retirement.
 
 ### Three instrument defects found and fixed, all of which produced a wrong number
 

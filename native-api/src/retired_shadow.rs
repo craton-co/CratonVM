@@ -1223,6 +1223,16 @@ const RETIRED_SHADOW_PREFIXES: &[&str] = &[
     // see `RETIRED_SHADOW_PHASE2_TRIPLES`. A prefix admits a package to the
     // binary search; the table decides what is retired, and it retires one row.
     "sun/nio/ch/",
+    // 2026-09-10, lane L3. The narrowest prefixes that cover
+    // `RETIRED_SHADOW_L3_TRIPLES`, and NO WIDER. The lane's scope is four
+    // prefixes -- it also owns `jdk/internal/reflect/` and `sun/reflect/` --
+    // and those two are deliberately ABSENT here, because wave 1 retires
+    // nothing under them. A prefix with no table entry behind it is the exact
+    // shape L0 §4 warns about: every test stays green while
+    // `a_prefix_alone_retires_nothing` quietly loses a guard. Add them in the
+    // wave that needs them.
+    "java/lang/invoke/",
+    "java/lang/reflect/",
     // 2026-09-10, lane L0. The narrowest prefixes that cover
     // `RETIRED_SHADOW_L0_TRIPLES`, and no wider: `java/lang/Class` also admits
     // `ClassValue`, `ClassFrameInfo` and `Class$Atomic` (all L0's), and
@@ -1422,6 +1432,164 @@ static RETIRED_SHADOW_PHASE2_TRIPLES: &[(&str, &str, &str)] = &[(
 /// bytecode, so the JDK's method served the call and the registration was
 /// never dispatched -- an inert row, which is a finding rather than a
 /// retirement, and it is why the count is taken per triple and not per row.
+/// Lane L3 wave 1 -- core reflection's metadata accessors, 24 triples.
+///
+/// Measured 2026-09-10 with `apps/probes/L3ReflectInvokeSurface.java` (254
+/// rows, oracle HotSpot 25.0.3+9, deterministic across two runs) against a
+/// release build of the merged tree. Lane 3's population is **242** bucket-A/B
+/// rows over 35 classes, re-derived from a `--dump-native-registry` taken with
+/// `--explain-jdk-only` -- not the lane page's 251, which came from a different
+/// tree and counted rows lane T owns.
+///
+/// # The aggregate said "retire nothing" and it was wrong again
+///
+/// ```text
+/// d(hs,base) 68 diff lines   d(hs,armed) 224   delta +156
+///
+/// per ROW (254 rows)   OK -> OK   132   retire
+///                      BAD -> OK   10   yielding FIXES it -> retire
+///                      OK -> BAD   88   hold
+///                      BAD -> BAD  24   investigate
+/// ```
+///
+/// 142 of 254 rows are retirable behind a `delta` of +156. Same lesson as L0,
+/// four times the scale.
+///
+/// **The ten `BAD -> OK` rows are the reason to do this at all.** Yielding
+/// repairs the `Field`/`Method`/`Constructor` copy model
+/// (`getDeclaredField("x") == getDeclaredField("x")` is `true` here and `false`
+/// on HotSpot), and with it the `setAccessible` LEAK that follows from handing
+/// back the same object -- one `setAccessible(true)` currently grants access to
+/// every holder of that member. It also restores HotSpot's
+/// `IllegalAccessException` on `privateLookupIn(java.base)`, which is the
+/// documented one-directional residual in `lk_enforce_find_access`. A
+/// retirement that closes an access-control gap is worth more than one that
+/// deletes code.
+///
+/// # 24 of 242, and why the other 218 are not here
+///
+/// A row is not a triple, and this table only contains triples a row-to-triple
+/// mapping can justify: the probe tag names one method of one class, the census
+/// holds exactly ONE A/B triple for that name, `invocations > 0` in the probe's
+/// own run, and **every** row touching it is `OK -> OK` or `BAD -> OK`. 48
+/// (class, name) pairs were reached and rejected, each with its reason
+/// recorded; the four rules that did the rejecting:
+///
+/// * **`invocations == 0`** -- precondition 4, per triple, from the dump.
+/// * **held** -- any `OK -> BAD` row. 88 rows hold, 32 of them `Field`'s
+///   primitive accessors, which the same run explains: the
+///   descriptor-coercion census reports **105** field reads whose value
+///   contradicted the slot's descriptor and was DESTROYED. Ten more are the
+///   generic-signature family, where yielding erases
+///   `Map<String,List<T>>` to `Map` and `T` to `Number`.
+/// * **`BAD -> BAD`** -- the bytecode is wrong too, so "yielding is correct
+///   here" is false. This is what removed `Method.invoke` and
+///   `Constructor.newInstance`, which had looked like clean seven-row and
+///   five-row keeps until the non-nestmate rows 247 and 248 were attributed to
+///   them. Not a regression; not a justified retirement either.
+/// * **agreement at a DEFAULT value** -- L0 held `Module.isOpen` for this and
+///   it removed twelve entries here. The sharpest is `Field.setBoolean`, whose
+///   only row sets `z` to `false` and reads it back: yielded `getBoolean`
+///   answers `false` by default, and `Field.getBoolean` is PROVEN broken by
+///   row 15. Retiring `setBoolean` on `false == false` would be exactly the
+///   mistake the rule exists to prevent.
+///
+/// # What is NOT retired, structurally
+///
+/// The whole `java.lang.invoke` surface except three `MethodType` accessors.
+/// §4 of the lane page predicted `MemberName`/`MethodHandle` would be
+/// VM-coupled and the measurement agrees: 14 `MethodHandles` rows, 8
+/// `MethodHandle` rows and 5 `CallSite` rows hold or are wrong both ways, and
+/// the run's uninstantiable-receiver census names `MethodHandle` and
+/// `VarHandle` as abstract classes a native instantiates. Those rows need the
+/// reviewed-`Intrinsic` protocol or a repair, not a retirement.
+static RETIRED_SHADOW_L3_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/lang/invoke/MethodType", "parameterCount", "()I"),
+    (
+        "java/lang/invoke/MethodType",
+        "returnType",
+        "()Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/invoke/MethodType",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/reflect/Constructor",
+        "getDeclaringClass",
+        "()Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/reflect/Constructor",
+        "getGenericParameterTypes",
+        "()[Ljava/lang/reflect/Type;",
+    ),
+    ("java/lang/reflect/Constructor", "getModifiers", "()I"),
+    (
+        "java/lang/reflect/Constructor",
+        "getName",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/reflect/Constructor", "getParameterCount", "()I"),
+    (
+        "java/lang/reflect/Constructor",
+        "getParameterTypes",
+        "()[Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/reflect/Field",
+        "getDeclaringClass",
+        "()Ljava/lang/Class;",
+    ),
+    ("java/lang/reflect/Field", "getModifiers", "()I"),
+    ("java/lang/reflect/Field", "getName", "()Ljava/lang/String;"),
+    ("java/lang/reflect/Field", "getType", "()Ljava/lang/Class;"),
+    (
+        "java/lang/reflect/Method",
+        "getAnnotatedReturnType",
+        "()Ljava/lang/reflect/AnnotatedType;",
+    ),
+    (
+        "java/lang/reflect/Method",
+        "getDeclaringClass",
+        "()Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/reflect/Method",
+        "getExceptionTypes",
+        "()[Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/reflect/Method",
+        "getGenericExceptionTypes",
+        "()[Ljava/lang/reflect/Type;",
+    ),
+    ("java/lang/reflect/Method", "getModifiers", "()I"),
+    (
+        "java/lang/reflect/Method",
+        "getName",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/reflect/Method", "getParameterCount", "()I"),
+    (
+        "java/lang/reflect/Method",
+        "getParameterTypes",
+        "()[Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/reflect/Method",
+        "getReturnType",
+        "()Ljava/lang/Class;",
+    ),
+    ("java/lang/reflect/Method", "setAccessible", "(Z)V"),
+    (
+        "java/lang/reflect/Method",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+];
+
 static RETIRED_SHADOW_L0_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/lang/Class", "arrayType", "()Ljava/lang/Class;"),
     (
@@ -2619,6 +2787,7 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
         || RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_L0_TRIPLES.binary_search(&key).is_ok()
+        || RETIRED_SHADOW_L3_TRIPLES.binary_search(&key).is_ok()
 }
 
 #[cfg(test)]
@@ -2692,6 +2861,16 @@ mod tests {
                     && RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(t).is_err()
                     && RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(t).is_err(),
                 "{t:?} is in the L0 table and an earlier one"
+            );
+        }
+        for t in RETIRED_SHADOW_L3_TRIPLES {
+            assert!(
+                RETIRED_SHADOW_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_L0_TRIPLES.binary_search(t).is_err(),
+                "{t:?} is in the L3 table and an earlier one"
             );
         }
     }
@@ -2916,6 +3095,177 @@ Ljava/nio/channels/FileChannel;"
                     && !c.starts_with("java/lang/ClassNotFound")
                     && !c.starts_with("java/lang/ClassCast"),
                 "another lane's class matched L0's prefix: {c}.{m}{d}"
+            );
+        }
+    }
+
+    /// Sorted, for the reason every sibling table is: an out-of-order entry
+    /// makes the predicate answer `false` for a row that IS present, which
+    /// reads as "not retired" and is invisible in a workload.
+    #[test]
+    fn the_l3_table_is_sorted_and_unique() {
+        for w in RETIRED_SHADOW_L3_TRIPLES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "out of order or duplicated: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    /// An entry outside every prefix answers `false` silently. L3 added
+    /// `java/lang/reflect/` and `java/lang/invoke/` for exactly these rows and
+    /// deliberately did NOT add its other two scope prefixes, which retire
+    /// nothing yet.
+    #[test]
+    fn every_l3_entry_is_reachable() {
+        for (c, m, d) in RETIRED_SHADOW_L3_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "unreachable entry: {c}.{m}{d}"
+            );
+        }
+    }
+
+    /// Wave 1 is four classes and nothing crept in. In particular the two
+    /// throwables inside lane 3's prefix set --
+    /// `java/lang/reflect/InaccessibleObjectException` and
+    /// `InvocationTargetException` -- belong to the cross-cutting registrar
+    /// lane, not here, and `java/lang/reflect/` admits both.
+    #[test]
+    fn the_l3_wave_stays_inside_lane_three() {
+        for (c, m, d) in RETIRED_SHADOW_L3_TRIPLES {
+            let ok = *c == "java/lang/reflect/Field"
+                || *c == "java/lang/reflect/Method"
+                || *c == "java/lang/reflect/Constructor"
+                || *c == "java/lang/invoke/MethodType";
+            assert!(ok, "not lane L3 wave 1's class: {c}.{m}{d}");
+            assert!(
+                !c.ends_with("Exception"),
+                "lane T's throwable matched L3's prefix: {c}.{m}{d}"
+            );
+        }
+    }
+
+    /// The triples lane L3 measured and DECLINED to retire, one per rejection
+    /// rule, so a later wave cannot quietly take them on the family's
+    /// reputation.
+    ///
+    /// * `Field.getInt`/`getChar`/`getBoolean` and the rest of the primitive
+    ///   accessors are `OK -> BAD`: the same run's descriptor-coercion census
+    ///   reports 105 field reads DESTROYED by primitive-into-reference
+    ///   coercion, and yielded `getChar` answers `0` where HotSpot answers
+    ///   `q`.
+    /// * `Field.getGenericType` is `OK -> BAD` four ways: yielding erases
+    ///   `Map<String,List<T>>` to `Map`, `T` to `Number`, `T[]` to
+    ///   `[LNumber;`.
+    /// * `Method.invoke` and `Constructor.newInstance` are `BAD -> BAD` on the
+    ///   non-nestmate rows 247/248 -- the bytecode is wrong too, so the
+    ///   retirement's own justification is false for them.
+    /// * `Field.setBoolean` and `Method.isBridge` and their kind agree ONLY at
+    ///   a value a blanket yield returns anyway. `setBoolean` is the sharp
+    ///   one: its row reads back `false` through `getBoolean`, which row 15
+    ///   proves broken.
+    #[test]
+    fn the_l3_held_triples_are_not_retired() {
+        for (c, m, d) in [
+            // Primitive field access -- the coercion census explains all of it.
+            ("java/lang/reflect/Field", "getInt", "(Ljava/lang/Object;)I"),
+            (
+                "java/lang/reflect/Field",
+                "getChar",
+                "(Ljava/lang/Object;)C",
+            ),
+            (
+                "java/lang/reflect/Field",
+                "getBoolean",
+                "(Ljava/lang/Object;)Z",
+            ),
+            (
+                "java/lang/reflect/Field",
+                "getLong",
+                "(Ljava/lang/Object;)J",
+            ),
+            (
+                "java/lang/reflect/Field",
+                "getDouble",
+                "(Ljava/lang/Object;)D",
+            ),
+            (
+                "java/lang/reflect/Field",
+                "getFloat",
+                "(Ljava/lang/Object;)F",
+            ),
+            (
+                "java/lang/reflect/Field",
+                "getByte",
+                "(Ljava/lang/Object;)B",
+            ),
+            (
+                "java/lang/reflect/Field",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            // Generic signatures erase to raw when yielded.
+            (
+                "java/lang/reflect/Field",
+                "getGenericType",
+                "()Ljava/lang/reflect/Type;",
+            ),
+            (
+                "java/lang/reflect/Field",
+                "getAnnotatedType",
+                "()Ljava/lang/reflect/AnnotatedType;",
+            ),
+            // Annotations come back empty -- the same family L0 held.
+            (
+                "java/lang/reflect/Field",
+                "getAnnotation",
+                "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
+            ),
+            (
+                "java/lang/reflect/Field",
+                "getDeclaredAnnotations",
+                "()[Ljava/lang/annotation/Annotation;",
+            ),
+            // BAD -> BAD: the bytecode is wrong too.
+            (
+                "java/lang/reflect/Method",
+                "invoke",
+                "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            (
+                "java/lang/reflect/Constructor",
+                "newInstance",
+                "([Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            // Agreement only at a DEFAULT value.
+            (
+                "java/lang/reflect/Field",
+                "setBoolean",
+                "(Ljava/lang/Object;Z)V",
+            ),
+            ("java/lang/reflect/Field", "isSynthetic", "()Z"),
+            ("java/lang/reflect/Field", "isEnumConstant", "()Z"),
+            ("java/lang/reflect/Field", "trySetAccessible", "()Z"),
+            ("java/lang/reflect/Method", "isBridge", "()Z"),
+            ("java/lang/reflect/Method", "isSynthetic", "()Z"),
+            ("java/lang/reflect/Method", "isVarArgs", "()Z"),
+            ("java/lang/reflect/Method", "isDefault", "()Z"),
+            ("java/lang/reflect/Constructor", "isSynthetic", "()Z"),
+            ("java/lang/reflect/Constructor", "isVarArgs", "()Z"),
+            (
+                "java/lang/reflect/Constructor",
+                "getExceptionTypes",
+                "()[Ljava/lang/Class;",
+            ),
+            ("java/lang/reflect/Constructor", "setAccessible", "(Z)V"),
+        ] {
+            assert!(
+                !triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} was HELD by lane L3's measurement and must not be \
+                 retired"
             );
         }
     }
