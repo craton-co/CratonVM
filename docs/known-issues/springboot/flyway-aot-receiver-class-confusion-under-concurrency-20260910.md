@@ -85,7 +85,7 @@ this row from fewer than ~40 paired runs.
 
 ## Relationship to the Kafka row
 
-`known-issues/springboot/kafka-scala-statics-anyhash-jit-miscompile-20260910.md`
+`internal/fixed-suite-bugs/springboot/kafka-scala-statics-anyhash-jit-miscompile-FIXED-20260910.md`
 is a JIT-only, nondeterministic wrong-VALUE defect in a compiled body;
 this is a JIT-only, nondeterministic wrong-RECEIVER defect. They may be the
 same underlying frame/slot fault seen through two different consumers, and the
@@ -109,3 +109,48 @@ or, minimally, launch eight concurrent
 ```
 
 and expect roughly one failure per ten JIT processes.
+
+## Re-measured 2026-09-10, later the same day: it reproduces ALONE
+
+**The concurrency in this page's title is no longer needed to see it, and the
+title is now wrong.** Against `dev` at `0d18c01bd` (plus the inline-locals-floor
+fix), one class in one process, no interleaving and no sibling arms:
+
+| arm | runs | result |
+|---|---|---|
+| CratonVM, JIT on | 9 | **9 failed** (1 of 3 tests, every run) |
+| CratonVM `--nojit` | 4 | 4 clean |
+| stock HotSpot 25 | 3 | 3 clean |
+
+So it is a JIT defect that now fails deterministically in a single process.
+When this page was written the same class passed 6 of 6 alone and needed an
+interleaved 8-way burst to fail 4 of 40; the vector got sharper on its own as
+`dev` moved. **Do not start from the concurrency harness — one process
+reproduces it.**
+
+### The signature, which is now legible
+
+```text
+NoSuchMethodError: 'boolean org.springframework.context.annotation.ScopedProxyMode
+                    .isAssignableFrom(java.lang.Class)'
+  method="org/springframework/context/annotation/ScopedProxyMode.isAssignableFrom(Ljava/lang/Class;)Z"
+  caller="org/springframework/util/ClassUtils.isAssignable(Ljava/lang/Class;Ljava/lang/Class;)Z @pc=17"
+```
+
+`ClassUtils.isAssignable(Class<?> lhsType, Class<?> rhsType)` at pc 17 is
+`lhsType.isAssignableFrom(rhsType)`. The receiver there must be a
+`java.lang.Class`; the VM found a `ScopedProxyMode` enum CONSTANT and resolved
+the call against its class. That is the same shape as the two symptoms this
+page was filed for (`AbstractMethodError: AnnotatedElement.getDeclaredAnnotations
+() has no Code attribute` and `NoSuchMethodError: String.isPrimitive()`) and it
+is the sharpest of the three, because both the wrong receiver and the slot it
+belongs to are named.
+
+### It is NOT the inline-locals floor
+
+Filed with a note that it might share a cause with the Kafka row. It does not.
+The floor fix (`internal/fixed-bugs/inline-locals-floor-moved-reservations-that-overlapped-nothing-FIXED-20260910.md`)
+closes Kafka completely and leaves this one exactly where it was: interleaved,
+same host, same session, pre-fix binary 2 of 3 failed and post-fix binary 3 of
+3 failed. Try the Kafka reproducer FIRST is no longer the advice; that door is
+closed.
