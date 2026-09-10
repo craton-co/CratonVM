@@ -46,7 +46,13 @@ public class SpliceCastThrow {
         for (int i = 0; i < 1_500_000; i++) warm = step(warm, i);
         int acc = 0;
         for (int i = 0; i < reps; i++) acc = step(acc, i);
-        System.out.println("splicecastthrow [" + acc + "]");
+        // The rep count is part of the output on purpose. This checksum is only
+        // comparable against another taken at the SAME count, and printing only
+        // the checksum is how a CratonVM run at 300 000 and a Temurin run at this
+        // method's 2 000 000 default were once read as a VM difference -- see
+        // docs/internal/performance/c2-splice-getstatic-and-the-calls-it-left-behind-20260909.md
+        // section 8.3. `SpliceCastProbe` has always printed its reps; this now matches it.
+        System.out.println("splicecastthrow (" + reps + ") [" + acc + "]");
         if (warm == 0x7FFFFFFF) System.out.println(warm);
     }
 }

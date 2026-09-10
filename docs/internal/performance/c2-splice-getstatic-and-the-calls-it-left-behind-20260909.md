@@ -330,33 +330,80 @@ body, indistinguishable from the OFF arm). Against the OFF median the fast
 mode alone is **−14.1 %**. Nothing here is a claim about the race, which §7
 already flagged as untouched and which this work does not touch either.
 
-### 8.3 Why it is off anyway
+### 8.3 The parity gap that never existed
 
 Soak-clean: `tools/jit-flag-soak.sh` over the 39 deterministic workloads in
 `vm/tests/resources/cratonvm`, under Generational, G1 and ZGC —
 `divergent=0 nondeterministic=0` in all three.
 
-What is missing is the one thing `getstatic` never had to answer. **A spliced
-type check is the first spliced site that can THROW on a value the caller
-produced.** `bench/SpliceCastThrow.java` drives the failing cast, the null
-that must pass the cast and then fail the deref, and the `instanceof` that
-must answer false, all from inside a relocated body; both arms agree with each
-other exactly (`-1589077594` on 300 000 reps, TYPECHECK=0 and =1), so the
-splice is semantics-preserving on this shape.
+**A spliced type check is the first spliced site that can THROW on a value the
+caller produced.** `bench/SpliceCastThrow.java` drives the failing cast, the
+null that must pass the cast and then fail the deref, and the `instanceof`
+that must answer false, all from inside a relocated body. At 300 000 reps,
+`TYPECHECK=0`, `TYPECHECK=1` and Temurin JDK 25 all return `-1589077594`.
 
-It does NOT agree with Temurin (`-1521462424`), and that gap is **not this
-feature's**: it is there with the switch off, on the single-pass body, and it
-survives folding the exception message out of the checksum. Something about
-this VM's behaviour on that probe differs from HotSpot's independently of
-splicing. Until that is chased down there is no clean end-to-end
-exception-path parity to point at, and a switch whose novel risk is exactly
-the exception path does not get flipped on without one.
+An earlier revision of this section reported that CratonVM did **not** agree
+with Temurin (`-1521462424`), called that an unexplained pre-existing
+difference "independent of splicing", and held the switch off until somebody
+chased it down. **That was this page's error, not the VM's.** The two arms
+were run at different rep counts: the CratonVM arm passed `300000`, the
+Temurin arm passed nothing and took `main`'s built-in default of `2_000_000`.
+Both checksums are correct for the count that produced them. An independent
+oracle that reimplements `step` in 32-bit arithmetic returns `-1589077594` at
+300 000 reps and `-1521462424` at 2 000 000 — and Temurin re-run at 300 000
+returns `-1589077594`, matching CratonVM exactly. There is no exception-path
+divergence between this VM and HotSpot on this probe, and there never was one
+to chase.
 
-So: the plumbing is here, the soak is clean, the measurement is real, and the
-default stays OFF until the probe above can be checksum-compared against
-HotSpot rather than only against itself.
+The lesson is narrower than the retraction: a checksum is only comparable
+against another checksum taken at the same input size, and a probe whose
+default rep count differs from the one the A/B passes will manufacture a
+difference out of nothing. `SpliceCastThrow` now prints the count it used —
 
-### 8.4 What is next, on the same evidence
+```
+splicecastthrow (300000) [-1589077594]      <- CratonVM and Temurin JDK 25
+splicecastthrow (2000000) [-1521462424]     <- the default, and the whole "gap"
+```
+
+— which is the convention `SpliceCastProbe` already had (`1. splicecast
+(4000000) : ... ms [164255232]`), and is why §8.2's comparison was never at
+risk while this one was.
+
+### 8.4 Why it still ships off
+
+With §8.3's blocker retracted, the honest question is whether anything is left.
+§7 named one thing that could be: admitting more splices spends inline budget,
+and on `probes/StackTraceAfterOsr.java` admitting `getstatic` pushed `outer`
+from 493 to 731 bytes and cost an OSR-compiled `main` its inline of `probe`.
+That is a real, measured, non-monotone effect — it is just not this flag's.
+Asked of the type-check switch on the same probe, with
+`CRATONVM_C2_ACCEPT=always` and `CRATONVM_DBG=jitc`:
+
+| probe | `TYPECHECK=0` | `TYPECHECK=1` |
+|---|---|---|
+| `StackTraceAfterOsr` | 22 bodies, 198 B, 4 inline-planned | **identical** |
+| `SpliceCastProbe` | 2 bodies, 64 B | 8 bodies, 127 B |
+
+The budget-sensitive probe does not move at all; the probe built for this
+feature is the one that splices more, which is the feature working. So the
+§7 concern does not reproduce here.
+
+That leaves no measurement arguing against the default — which is a weaker
+position than the one this section used to hold, and it should be said
+plainly rather than dressed back up. What remains is exposure, not evidence:
+the path is one day old, and HotSpot parity for it rests on two probe shapes
+(`SpliceCastProbe`'s `164255232` and `SpliceCastThrow`'s `-1589077594`) while
+the 39-workload soak compares CratonVM against *itself* — flag on versus flag
+off — which is self-consistency and not parity.
+
+So the switch stays off for one cycle, on that reason and no other. Nothing
+listed above needs re-deriving to flip it: it wants the suite green with the
+flag on, in dev, for a cycle. If a later reader finds this section still
+saying "off" with nothing new under it, the answer is to flip it, not to look
+for a fresh justification — the last time this section held a switch off, the
+reason turned out to be a rep-count mismatch nobody had re-checked in a day.
+
+### 8.5 What is next, on the same evidence
 
 `bench/CratonBenchC2.java`'s refusal census was §6's basis for naming
 `checkcast`/`instanceof` next. Of the three reasons it listed —
