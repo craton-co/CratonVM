@@ -16986,7 +16986,23 @@ impl<'a> NativeExceptionAccess for NativeContextImpl<'a> {
     }
 
     fn capture_throwable_stack_trace(&mut self, throwable: ObjectRef) -> Vec<StackTraceEntry> {
-        let trace = self.capture_current_stack_trace();
+        let mut trace = self.capture_current_stack_trace();
+        // HotSpot's `fill_in_stack_trace` skip, applied HERE rather than at the
+        // `fillInStackTrace` native, because this is the one entry point every
+        // "record this throwable's origin" path goes through — the twelve
+        // `native_exc_init_*` bodies via `capture_throwable_trace`, and
+        // `Throwable.fillInStackTrace(int)` itself. Doing it at one of those
+        // instead would leave the other reporting the filling machinery as the
+        // throw site. See `stackwalker::trim_throwable_fill_frames`.
+        let throwable_class = self.class_id_of_object(throwable);
+        {
+            let cm = self.shared.classes.class_manager.read();
+            crate::runtime::stackwalker::trim_throwable_fill_frames(
+                &cm.class_store,
+                Some(throwable_class),
+                &mut trace,
+            );
+        }
         self.shared
             .store_throwable_stack_trace(throwable, trace.clone());
         trace

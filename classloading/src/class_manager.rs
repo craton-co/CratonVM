@@ -5460,8 +5460,34 @@ impl ClassManager {
                 // Not declared here. Ask the hierarchy, in the order both JVMS
                 // §5.4.3.3 and CratonVM's dispatch use: superclass chain, then
                 // superinterfaces.
-                let inherited =
-                    self.resolve_in_image_hierarchy(&mut parsed, class, name, descriptor);
+                //
+                // EXCEPT for the two initialization methods, which are not
+                // inherited and must not be resolved up the hierarchy. JVMS
+                // §6.5 `invokespecial`: "if the resolved method is an instance
+                // initialization method, and the class in which it is declared
+                // is not the class symbolically referenced by the instruction,
+                // a `NoSuchMethodError` is thrown" — so a `<init>` found on a
+                // SUPERTYPE is not a target this registration could ever yield
+                // to. `<clinit>` is never resolved by name at all.
+                //
+                // This is not a nicety: `inherited_has_code` is what puts a row
+                // in the `--jdk-only` campaign's bucket B, i.e. in the
+                // population a retirement wave may refuse. MEASURED on JDK 25,
+                // 2026-09-10: **31 registrations** carried an inherited `<init>`
+                // verdict, 23 of them live `Bridge` rows in the goal
+                // population, and 17 of those inherited `java/lang/Object`'s
+                // no-arg constructor — which initialises nothing. Retiring one
+                // would have refused a native that populates a VM-minted
+                // receiver's fields and yielded to a body that writes none of
+                // them: a silent field-init loss on
+                // `java/lang/management/*MXBean`, `HttpURLConnection`,
+                // `SSLEngineImpl` and `MBeanServer`. They are bucket F —
+                // "class present, method absent" — and always were.
+                let inherited = if name == "<init>" || name == "<clinit>" {
+                    None
+                } else {
+                    self.resolve_in_image_hierarchy(&mut parsed, class, name, descriptor)
+                };
                 match inherited {
                     Some((declarer, acc_native, has_code)) => ImageMethodVerdict {
                         image_has_class: true,

@@ -1432,7 +1432,36 @@ use cratonvm_types::compat::CompatibilityMode;
 /// removes the slack, and it is why this wave's delta reads +251 against the
 /// tree and +237/+248/+251 against the constants.
 ///
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1894;
+/// # Re-frozen 2026-09-10: +1021 rows on ALL THREE arms, and the whole of it is
+/// one wave
+///
+/// `native-api`'s `RETIRED_SHADOW_LT_TRIPLES` retires the throwable family --
+/// **906 triples over the 62 classes of `THROWABLE_FAMILY_CLASSES`** -- as a
+/// §1.4 shadow wave. `NativeMethodRegistry::register` re-tags a retired triple
+/// `SyntheticStub` wherever `effective_category()` is `Bridge`, regardless of
+/// compatibility mode, so a `--jdk-only` retirement moves this compatible-mode
+/// census. It changes the KIND and not the body.
+///
+/// The account, measured on the three arms rather than derived from one:
+///
+/// ```text
+///   management       1894 -> 2915   +1021
+///   no-management    1883 -> 2904   +1021
+///   synthetic-jdk    1883 -> 2904   +1021
+/// ```
+///
+/// **The same +1021 three times, and it is the paired number rather than
+/// arithmetic**: `--dump-native-registry` on the pre-wave binary counts 1021
+/// registrations of those 906 triples (906 owning + 115 superseded), all of
+/// them ambient `register()` under a `set_category(Bridge)` scope, so the
+/// re-tag reaches every one and none is left over. A delta that had NOT
+/// matched the registration count would have meant the table reaches rows the
+/// census does not attribute to it.
+///
+/// The per-file breakdown this run prints says the same from the other side:
+/// `native-builtins/src/lang_misc.rs` goes to 907 stub rows, which is
+/// `register_throwable_subclass_natives`' whole output.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2915;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1461,7 +1490,36 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1894;
 /// unowned for three days before it had a constant at all.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1883;
+/// # Re-frozen 2026-09-10: +1021 rows on ALL THREE arms, and the whole of it is
+/// one wave
+///
+/// `native-api`'s `RETIRED_SHADOW_LT_TRIPLES` retires the throwable family --
+/// **906 triples over the 62 classes of `THROWABLE_FAMILY_CLASSES`** -- as a
+/// §1.4 shadow wave. `NativeMethodRegistry::register` re-tags a retired triple
+/// `SyntheticStub` wherever `effective_category()` is `Bridge`, regardless of
+/// compatibility mode, so a `--jdk-only` retirement moves this compatible-mode
+/// census. It changes the KIND and not the body.
+///
+/// The account, measured on the three arms rather than derived from one:
+///
+/// ```text
+///   management       1894 -> 2915   +1021
+///   no-management    1883 -> 2904   +1021
+///   synthetic-jdk    1883 -> 2904   +1021
+/// ```
+///
+/// **The same +1021 three times, and it is the paired number rather than
+/// arithmetic**: `--dump-native-registry` on the pre-wave binary counts 1021
+/// registrations of those 906 triples (906 owning + 115 superseded), all of
+/// them ambient `register()` under a `set_category(Bridge)` scope, so the
+/// re-tag reaches every one and none is left over. A delta that had NOT
+/// matched the registration count would have meant the table reaches rows the
+/// census does not attribute to it.
+///
+/// The per-file breakdown this run prints says the same from the other side:
+/// `native-builtins/src/lang_misc.rs` goes to 907 stub rows, which is
+/// `register_throwable_subclass_natives`' whole output.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2904;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1518,7 +1576,36 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1883;
 /// re-freeze ALL THREE — see the pointer on both siblings.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1883;
+/// # Re-frozen 2026-09-10: +1021 rows on ALL THREE arms, and the whole of it is
+/// one wave
+///
+/// `native-api`'s `RETIRED_SHADOW_LT_TRIPLES` retires the throwable family --
+/// **906 triples over the 62 classes of `THROWABLE_FAMILY_CLASSES`** -- as a
+/// §1.4 shadow wave. `NativeMethodRegistry::register` re-tags a retired triple
+/// `SyntheticStub` wherever `effective_category()` is `Bridge`, regardless of
+/// compatibility mode, so a `--jdk-only` retirement moves this compatible-mode
+/// census. It changes the KIND and not the body.
+///
+/// The account, measured on the three arms rather than derived from one:
+///
+/// ```text
+///   management       1894 -> 2915   +1021
+///   no-management    1883 -> 2904   +1021
+///   synthetic-jdk    1883 -> 2904   +1021
+/// ```
+///
+/// **The same +1021 three times, and it is the paired number rather than
+/// arithmetic**: `--dump-native-registry` on the pre-wave binary counts 1021
+/// registrations of those 906 triples (906 owning + 115 superseded), all of
+/// them ambient `register()` under a `set_category(Bridge)` scope, so the
+/// re-tag reaches every one and none is left over. A delta that had NOT
+/// matched the registration count would have meant the table reaches rows the
+/// census does not attribute to it.
+///
+/// The per-file breakdown this run prints says the same from the other side:
+/// `native-builtins/src/lang_misc.rs` goes to 907 stub rows, which is
+/// `register_throwable_subclass_natives`' whole output.
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2904;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -2224,7 +2311,37 @@ fn essential_registry_is_populated() {
 /// `MIN_TOTAL_REGISTRATIONS`, the floor takes the SMALLER configuration and
 /// keeps the same ~300 rows of deliberate headroom, so it survives the next
 /// re-tag of that size while still detecting a shed module.
-const STRICT_MIN_TOTAL_REGISTRATIONS: usize = 10_900;
+/// # 10,900 -> 10,400, 2026-09-10
+///
+/// Lowered by 500 for a strict registry of 10,716, and **lowering a collapse
+/// detector is exactly the move it exists to make suspicious**, so here is the
+/// evidence it cannot see.
+///
+/// The 2026-08-11 entry above says a re-tag "moved this total by zero", and
+/// that was true of the COMPATIBLE census it was measuring. It is not true of
+/// the strict one: a re-tagged `SyntheticStub` is refused by
+/// `allowed_in(JdkOnly)`, so every row a retirement wave re-tags leaves the
+/// strict registry. The logging wave's 104 rows did not reach this floor; lane
+/// T's 1021 do.
+///
+/// The arithmetic is exact and the test prints all of it:
+///
+/// ```text
+///   compatible 13623 rows (2904 stubs) -> strict 10716 rows
+///   2907 rows dropped, 2925 refusals recorded
+/// ```
+///
+/// 2907 dropped for 2904 stubs -- the extra three are the alias fallout
+/// [`strict_registry_drops_only_the_stubs`] documents, unchanged by this wave.
+/// The fall is 11,737 -> 10,716, which is the wave's 1021 registrations and
+/// nothing else. A registry shedding whole modules does not produce that diff,
+/// and `strict_registry_drops_only_the_stubs` is the assertion that says so
+/// independently of this floor.
+///
+/// 10,400 keeps the same ~300 rows of headroom the 2026-08-11 entry chose, on
+/// the smaller (no-management) configuration, so the detector survives the next
+/// re-tag of a few hundred rows and still catches a shed module.
+const STRICT_MIN_TOTAL_REGISTRATIONS: usize = 10_400;
 
 /// Build the default native registry the way `--jdk-only` does: set the
 /// VM-scoped strict policy *first*, then run the same boot sequence

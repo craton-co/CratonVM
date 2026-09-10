@@ -39,6 +39,15 @@ Beat it one triple at a time with that triple's own measurement, or not at all.
 
 ## 3. Channels overlap lane T — coordinate before you start
 
+> **WITHDRAWN 2026-09-10 — the channel rows are YOURS, and there is no hold.**
+> `concrete_receiver.rs:185` is class-parameterised, which is what hides it from
+> the source-scanning drift gate, but it is not CROSS-LANE: all 191 of its goal
+> rows are under `sun/nio/`, so lane 0 §2's rule puts every one of them in this
+> lane, and lane 0's 1,100 for LT excludes them (1,100 + 191 is not 1,100).
+> Measured from `--dump-native-registry --explain-jdk-only`; see [the lane T record](../../internal/jdk-only/lane-t-the-throwable-family-retired-and-the-two-defects-the-arm-had-to-find-first-20260910.md) §0.
+> Take them with the rest of your `sun/nio/ch` surface — and take §2's package
+> verdict as the default while you do.
+
 `native-io/src/concrete_receiver.rs:185` is a **cross-lane registrar**: 191 rows
 over 21 classes, including `SocketChannelImpl`, `DatagramChannelImpl` and
 `ServerSocketChannelImpl`, which are your three biggest `sun/nio/ch` classes.

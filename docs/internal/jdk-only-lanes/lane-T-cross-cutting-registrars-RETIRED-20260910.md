@@ -1,10 +1,28 @@
 # Lane T — the cross-cutting registrars
 
+> **RETIRED 2026-09-10.** The lane is closed: all 57 cross-cutting registrars
+> are classified, 906 triples are retired, and the two defects the arm had to
+> find first are fixed. The measurements, the four blocked groups with their
+> blockers, and the corrections this page needed are in
+> [`../jdk-only/lane-t-the-throwable-family-retired-and-the-two-defects-the-arm-had-to-find-first-20260910.md`](../jdk-only/lane-t-the-throwable-family-retired-and-the-two-defects-the-arm-had-to-find-first-20260910.md).
+>
+> **Two things below are WRONG and the record says so with the census that
+> settles them.** §1's row list and §5 assign
+> `native-io/src/concrete_receiver.rs:185` to this lane; its 191 goal rows are
+> all under `sun/nio/`, so lane 0 §2's own rule puts it in **L4**, and lane 0's
+> 1,100 total excludes it. And §1's `lib.rs:42662`/`42668` line numbers had
+> already drifted to `42649`/`42655` when this page was written — regenerate,
+> as §3 says, rather than reading the snapshot.
+>
+> Kept verbatim below the line: the reasoning is what the record is a reply to.
+
+---
+
 **Scope: 1,100 §1.4 shadows over 87 classes, from 57 registration call sites.**
 The largest single lane in the campaign, and the only one whose ownership is not
 a class-name prefix.
 
-Read [`lane-0-integration-and-gates.md`](lane-0-integration-and-gates.md) §2-§6 first: the ownership table, the
+Read [`lane-0-integration-and-gates.md`](../../known-issues/jdk-only-lanes/lane-0-integration-and-gates.md) §2-§6 first: the ownership table, the
 shared cells, the build queue, and the merge protocol. The method, the four
 retirement preconditions and the landing protocol are in
 [`../jdk-only-lane-operations.md`](../../contributing/jdk-only-lane-operations.md).

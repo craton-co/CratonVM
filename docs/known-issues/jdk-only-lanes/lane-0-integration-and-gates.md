@@ -37,6 +37,18 @@ mechanism can act on at all. But eligible is not the goal:
 **The goal's population is A + B = 5,549.** The other 3,837 eligible rows
 cannot be retired by yielding, because there is no real bytecode behind them:
 
+> **CORRECTION, 2026-09-10 (lane T): the goal population is 5,530.** Bucket B
+> admitted 23 `<init>` rows whose only target is an INHERITED constructor — 17
+> of them `java/lang/Object.<init>()V`, which initialises nothing. A constructor
+> is not inherited (JVMS §6.5: an `invokespecial` whose resolved instance
+> initializer is declared elsewhere than the class named by the instruction
+> throws `NoSuchMethodError`), so those rows are bucket F and always were.
+> `class_manager.rs::adjudicate_natives_against_image` no longer walks the
+> hierarchy for `<init>`/`<clinit>`. Retiring one of them would have refused a
+> native that fills a VM-minted receiver's fields and yielded to a body that
+> writes none of them. Record:
+> [`../../internal/jdk-only/lane-t-the-throwable-family-retired-and-the-two-defects-the-arm-had-to-find-first-20260910.md`](../../internal/jdk-only/lane-t-the-throwable-family-retired-and-the-two-defects-the-arm-had-to-find-first-20260910.md) §3.
+
 - **D (693) is out of scope permanently.** Contract §1.5 *requires* an
   `ACC_NATIVE` method to bind to a `Bridge`. Retiring one is a defect, not
   progress. `java/lang/Class.initClassName` is the worked example — it sits
@@ -62,7 +74,7 @@ Sets are disjoint; the totals below reconcile to 5,549 exactly.
 | lane | scope | shadows | classes | reg sites |
 |---|---|---|---|---|
 | **L0** (this page) | `java/lang/Class*`, `java/lang/Module*`, `java/lang/module/` | 131 | 9 | 131 |
-| **LT** | *whole cross-cutting registrars* (see §3) | **1,100** | 87 | **57** |
+| **LT** — **CLOSED 2026-09-10** | *whole cross-cutting registrars* (see §3) | **1,100** | 87 | **57** |
 | **L1** | `java/util/` (less `concurrent/`), `java/text/`, `sun/util/`, `java/time/` | 963 | 98 | 726 |
 | **L2** | `java/lang/` remainder, `java/math/` | 434 | 68 | 303 |
 | **L3** | `java/lang/reflect/`, `jdk/internal/reflect/`, `sun/reflect/`, `java/lang/invoke/` | 251 | 36 | 246 |
@@ -80,6 +92,18 @@ A lane that wants one **claims it by amending this table in its own commit**,
 which serialises the claim through this file. Do not retire an unowned row.
 
 ## 3. Lane T exists because 1,100 rows come from 57 call sites
+
+> **CLOSED 2026-09-10.** All 57 registrars are classified: the throwable family
+> (13 sites, 872 rows) is RETIRED as `RETIRED_SHADOW_LT_TRIPLES` — 906 triples,
+> class-scoped — and the keystore (136), HashSet (59), panama (23) and FFM
+> layout (4) groups are blocked with their blockers measured; the six `jmx` rows
+> are not shadows (see §1's correction). The lane page moved to
+> [`../../internal/jdk-only-lanes/lane-T-cross-cutting-registrars-RETIRED-20260910.md`](../../internal/jdk-only-lanes/lane-T-cross-cutting-registrars-RETIRED-20260910.md);
+> the record is
+> [`../../internal/jdk-only/lane-t-the-throwable-family-retired-and-the-two-defects-the-arm-had-to-find-first-20260910.md`](../../internal/jdk-only/lane-t-the-throwable-family-retired-and-the-two-defects-the-arm-had-to-find-first-20260910.md).
+> **`native-io/src/concrete_receiver.rs:185` was never lane T's** — its 191 goal
+> rows are all under `sun/nio/`, one lane, so §2's own rule gives it to L4 and
+> the 1,100 above already excludes it.
 
 A pure prefix split is *wrong* for this codebase, and the census says so.
 `native-builtins/src/lang_misc.rs:3416-3568` is one function,

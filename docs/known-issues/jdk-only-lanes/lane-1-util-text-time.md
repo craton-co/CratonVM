@@ -10,6 +10,11 @@ preconditions and the landing protocol are in
 
 ---
 
+> **Lane T closed 2026-09-10.** Its throwable-family rows are RETIRED
+> (`RETIRED_SHADOW_LT_TRIPLES`, 906 triples over 62 classes), so a triple this
+> page defers to lane T is either already retired or classified as blocked —
+> check the table before treating it as unowned. Record: [the lane T record](../../internal/jdk-only/lane-t-the-throwable-family-retired-and-the-two-defects-the-arm-had-to-find-first-20260910.md).
+
 ## 1. Why this lane goes first among the prefix lanes
 
 It has the only fully worked precedent. The 2026-09-09 Phase 3 wave retired 185

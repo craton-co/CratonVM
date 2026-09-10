@@ -943,6 +943,47 @@ fn build_module_object(
 /// wildfly-parallel-boot-stale-objectref-residual.md).
 /// Centralized here instead of repeating the pin/read/unpin dance at each
 /// call site.
+///
+/// # Slot 0 is NOT `detailMessage` on a real JDK layout, and both writes are load-bearing
+///
+/// The `alloc_object` layout in the header above is the SYNTHETIC-STUB one.
+/// Thirty-one of this function's call sites name `java/lang/ClassNotFoundException`,
+/// `NoClassDefFoundError` or `NullPointerException`, and under `--real-jdk` /
+/// `--jdk-only` those are the REAL classes, whose slot 0 is
+/// `Throwable.backtrace` — `detailMessage` is a different slot.
+///
+/// A bare `set_field(exc, 0, msg)` was nevertheless observable as the message,
+/// because `native_throwable_get_message` reads slot 0 back whenever the
+/// receiver's OWN class declares no `detailMessage` (`resolve_field_index` does
+/// not walk to `Throwable`) and the slot happens to hold a `java/lang/String`.
+/// Two wrongs cancelling: the loader wrote the wrong field and the shadow
+/// `getMessage` read the wrong field.
+///
+/// **The first `getMessage` to run as real bytecode found the null.** MEASURED
+/// 2026-09-10 while retiring the throwable family's shadows:
+///
+/// ```text
+///   Class.forName("no.such.Klass") -> e.getMessage()
+///     HotSpot                          no.such.Klass
+///     with Throwable.getMessage retired   null
+/// ```
+///
+/// So both writes stay, and neither is redundant:
+///
+///  * `set_field(exc, 0, ..)` keeps COMPATIBLE mode byte-for-byte identical —
+///    the shadow `getMessage` is still what runs there and it still reads
+///    slot 0;
+///  * [`write_throwable_detail_message`] puts the message where the REAL
+///    `Throwable.getMessage()` bytecode looks. On a real layout it resolves
+///    `Throwable.detailMessage`'s index and writes that; on a synthetic stub
+///    the index does not fit the object and it falls back to slot 0, writing
+///    the same value the line above already wrote.
+///
+/// The honest fix is for these sites to construct through `<init>(String)`
+/// like `create_exception_object` does, which would also give the throwable a
+/// stack trace and a `cause` sentinel it does not have today. That is a wider
+/// change than a shadow retirement should carry, and it is recorded in the lane
+/// T write-up rather than attempted here.
 pub fn alloc_single_message_exception(
     ctx: &mut dyn NativeContext,
     class_name: &str,
@@ -955,6 +996,7 @@ pub fn alloc_single_message_exception(
     let exc = ctx.read_native_pin(exc_pin, exc);
     ctx.unpin_native_roots(exc_pin);
     ctx.set_field(exc, 0, Value::Object(Some(msg)));
+    crate::lang_misc::write_throwable_detail_message(ctx, exc, Value::Object(Some(msg)));
     Ok(exc)
 }
 
