@@ -3906,13 +3906,59 @@ impl<'a> Lowerer<'a> {
         if addr.is_null() {
             return None;
         }
-        self.emit_mov_reg_imm64(R11, addr as u64);
-        // MOV ECX, dword [R11]
-        self.buf.emit(&[0x41, 0x8B, 0x0B]);
-        // CMP ECX, imm32
-        self.buf.emit(&[0x81, 0xF9]);
-        self.buf.emit(&(expected as i32).to_le_bytes());
+        if !self.emit_cmp_layout_epoch_rip(addr as usize, expected) {
+            // Out of ±2GB RIP reach, or the encoding switched off: materialize
+            // the address and read through it. This is the shape the guard had
+            // before 2026-09-10, kept verbatim as the fallback.
+            self.emit_mov_reg_imm64(R11, addr as u64);
+            // MOV ECX, dword [R11]
+            self.buf.emit(&[0x41, 0x8B, 0x0B]);
+            // CMP ECX, imm32
+            self.buf.emit(&[0x81, 0xF9]);
+            self.buf.emit(&(expected as i32).to_le_bytes());
+        }
         Some(self.emit_jcc_rel32(0x85)) // JNE -> the caller's slow path
+    }
+
+    /// `CMP dword [rip+disp32], imm32` against the replacement epoch — the
+    /// whole guard in one 10-byte instruction, reporting whether the counter
+    /// was within ±2GB RIP reach of it.
+    ///
+    /// Replaces `MOV R11, imm64` + `MOV ECX, [R11]` + `CMP ECX, imm32`: three
+    /// instructions and 19 bytes become one and ten, and neither R11 nor RCX is
+    /// clobbered. The guard is emitted once per INLINE FIELD ACCESS SITE and
+    /// executed on every one of them, so a loop containing a `getfield` paid
+    /// all three every iteration — 4 of the ~27 instructions in
+    /// `probes/FieldLoop.java`'s loop body, for a counter only a layout
+    /// REPLACEMENT bumps.
+    ///
+    /// `81 /7 id` with ModRM `mod=00, rm=101` is the RIP-relative form
+    /// (`0x3D`), and the displacement is measured from the end of the WHOLE
+    /// instruction — past the trailing `imm32`, which is why the reach test
+    /// adds 10 and not 6. The load stays a single aligned 32-bit read, so it is
+    /// as atomic as the `MOV ECX` it replaces.
+    ///
+    /// **Sound here and NOT in the single-pass backend**, for the reason
+    /// `emit_test_safepoint_flag_rip` gives two hundred lines below: this
+    /// lowerer never duplicates emitted bytes to a second address, so a
+    /// displacement that is right when emitted stays right. `x64`'s twin of
+    /// this guard sits inside a body its native unroller byte-copies, and is
+    /// deliberately left alone.
+    fn emit_cmp_layout_epoch_rip(&mut self, addr: usize, expected: u32) -> bool {
+        if !ir_epoch_guard_rip_enabled() {
+            return false;
+        }
+        // 81 3D <disp32> <imm32>
+        const LEN: usize = 10;
+        // Cast: buffer base plus a non-negative offset.
+        let here = self.buf.as_ptr() as usize + self.buf.pos();
+        let Some(disp) = rip_disp32(here, LEN, addr) else {
+            return false;
+        };
+        self.buf.emit(&[0x81, 0x3D]);
+        self.buf.emit(&disp.to_le_bytes());
+        self.buf.emit(&(expected as i32).to_le_bytes()); // Cast: the baked epoch
+        true
     }
 
     /// Receiver alignment + containment in one of the three published
@@ -4716,15 +4762,11 @@ impl<'a> Lowerer<'a> {
         const LEN: usize = 7;
         // Cast: non-negative index/count to usize
         let here = self.buf.as_ptr() as usize + self.buf.pos();
-        let next_pc = here.wrapping_add(LEN);
-        // Widening: i64/usize -> i128 (no truncation, for range check)
-        let delta: i128 = (self.safepoint_flag_addr as i128) - (next_pc as i128);
-        // Widening: i64/usize -> i128 (no truncation, for range check)
-        if delta < i32::MIN as i128 || delta > i32::MAX as i128 {
+        let Some(disp) = rip_disp32(here, LEN, self.safepoint_flag_addr) else {
             return false;
-        }
+        };
         self.buf.emit(&[0xF6, 0x05]);
-        self.buf.emit(&(delta as i32).to_le_bytes()); // Cast: rel32 displacement
+        self.buf.emit(&disp.to_le_bytes());
         self.buf.emit_byte(0xFF);
         true
     }
@@ -13028,6 +13070,52 @@ fn ir_gp_file() -> &'static [u8] {
     } else {
         &IR_LOWER_LS_GPRS[..crate::regalloc::xmm_roles::IR_GP_LINEAR_SCAN_NARROW]
     }
+}
+
+/// `CRATONVM_JIT_IR_EPOCH_GUARD_RIP=0` — emit the layout-replacement epoch
+/// guard as `MOV R11, imm64` + `MOV ECX, [R11]` + `CMP ECX, imm32` again,
+/// instead of the single RIP-relative `CMP dword [rip+disp32], imm32`.
+/// **Default ON.**
+///
+/// Semantically identical — same counter, same comparison, same aligned 32-bit
+/// load — so this is an ENCODING switch, not a behaviour one. It exists
+/// because a shape that is three instructions shorter still has to be shown to
+/// be faster rather than assumed, and both arms have to come from one binary
+/// for that to be measurable on a host with this one's drift.
+///
+/// The off arm is also what runs when the counter is out of ±2GB RIP reach, so
+/// setting this exercises the fallback path deliberately rather than waiting
+/// for an address-space layout that produces it.
+/// The `disp32` a RIP-relative operand needs to reach `target` from an
+/// instruction that STARTS at `here` and encodes to `len` bytes, or `None` when
+/// the target is outside ±2GB.
+///
+/// x86-64 measures a RIP-relative displacement from the end of the WHOLE
+/// instruction — past every immediate — so `len` is the full encoded length,
+/// not the offset of the displacement field. Getting that wrong does not
+/// fault and does not fail a smoke test: the operand silently names a word `k`
+/// bytes from the intended one, and for a GUARD that means comparing an
+/// unrelated global against a baked epoch. Hence one function, two callers and
+/// `a_rip_displacement_resolves_to_its_target`.
+fn rip_disp32(here: usize, len: usize, target: usize) -> Option<i32> {
+    let next_pc = here.wrapping_add(len);
+    // Widening: usize -> i128 (no truncation, for the range check).
+    let delta: i128 = (target as i128) - (next_pc as i128);
+    if delta < i32::MIN as i128 || delta > i32::MAX as i128 {
+        return None;
+    }
+    Some(delta as i32) // Cast: range-checked immediately above.
+}
+
+fn ir_epoch_guard_rip_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_EPOCH_GUARD_RIP").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
 }
 
 /// The GP registers [`Lowerer::emit_prologue`] MAY save — the widest file this
@@ -23549,6 +23637,42 @@ mod tests {").next().unwrap_or(src);
                  keeps its home word correct at every bci",
             );
         assert!(residency.promoted > 0);
+    }
+
+    /// A RIP-relative displacement must resolve to the word it names.
+    ///
+    /// The one property both RIP emitters rest on, and the one whose failure
+    /// is silent: x86-64 adds the displacement to the address of the NEXT
+    /// instruction, so `here + len + disp` has to BE the target. A `len` that
+    /// forgets the trailing immediate — 6 instead of 7 for the poll's `imm8`,
+    /// or 6 instead of 10 for the guard's `imm32` — still assembles, still
+    /// runs, and reads a neighbouring global forever.
+    #[test]
+    fn a_rip_displacement_resolves_to_its_target() {
+        // Both encoded lengths in use: the poll's `F6 05 <disp32> <imm8>` and
+        // the epoch guard's `81 3D <disp32> <imm32>`.
+        for len in [7usize, 10] {
+            for (here, target) in [
+                (0x1_0000usize, 0x2_0000usize), // forward
+                (0x2_0000, 0x1_0000),           // backward
+                (0x1000, 0x1000),               // degenerate: names itself
+                (0usize, i32::MAX as usize),    // the far positive edge
+            ] {
+                let disp = rip_disp32(here, len, target)
+                    .unwrap_or_else(|| panic!("len={len} here={here:#x} should be in reach"));
+                let next = here.wrapping_add(len);
+                // Cast: two's-complement re-add of a signed displacement.
+                let resolved = (next as i64).wrapping_add(disp as i64) as usize;
+                assert_eq!(
+                    resolved, target,
+                    "len={len}: disp {disp} from {here:#x} resolved to {resolved:#x},                      not {target:#x}",
+                );
+            }
+        }
+        // Out of ±2GB in both directions is refused, so the caller emits its
+        // materialize-the-address fallback rather than a truncated disp32.
+        assert!(rip_disp32(0, 10, u32::MAX as usize + 1).is_none());
+        assert!(rip_disp32(usize::MAX / 2, 10, 0).is_none());
     }
 
     /// The GP file may not name a register this emitter uses for a FIXED
