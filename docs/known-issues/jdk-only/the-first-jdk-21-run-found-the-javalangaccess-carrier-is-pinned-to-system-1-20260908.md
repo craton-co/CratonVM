@@ -27,8 +27,19 @@ like the two pages named in the table above. `scripts/baselines/jdk-only-strict-
 points here by path, that file is generated and never hand-edited, and it cannot
 be re-minted: the Windows key needs a Windows host carrying a JDK 21 image, and
 the machine this repo builds on has only JDK 25. Its 16 rows therefore still
-need this page to explain them, and 7 of those rows are now permanently GONE
-(which passes) rather than removable.
+need this page to explain them.
+
+**As of 2026-09-10 all 16 are stale, not 7.** Six serialization rows and one
+textformat row closed on 2026-09-09; eight carrier rows closed with the fix
+above; and the two vthreads rows stopped being a divergence when the probe was
+changed to report the handoff SHAPE instead of a load-fragile count
+(`50b9c2482`). Every row in that file now reads GONE, which PASSES, so the
+Windows 21 leg gates nothing today -- it is a ratchet with no teeth rather than
+a wrong one. **This is a prediction for the rows, not a measurement**: no
+Windows JDK 21 image exists on any machine this repo builds on, so nobody has
+run the corpus against one since 2026-09-08. Whoever next has that image should
+re-mint the key and expect zero rows; if it is not zero, that difference is a
+finding and this paragraph is where it starts.
 
 **The 2026-09-08 measurement below is unchanged**, and is the record the fixes
 were made against: Windows 11, Temurin `21.0.12.1+1`
