@@ -65,6 +65,27 @@ measurement of nothing, and it looks exactly like a null result.
 * **They do not know whether the host was quiet.** A floor above ~3% means the
   run is telling you about the machine. Check the load before believing a
   verdict, and re-run a surprising one.
+* **The control arm bounds the drift INSIDE one invocation and says nothing
+  about the drift between invocations.** This is the trap that a clean floor
+  makes worse rather than better, because a clean floor reads as permission to
+  stop. Measured on 2026-09-10, `CRATONVM_JIT_IR_GP_WIDE` on
+  `probes/FieldLoop.java` `sum`, one binary, three invocations of 14 rounds
+  each on the same host within the hour:
+
+  | invocation | floor | effect |
+  |---|---:|---:|
+  | 2 | 1.0% | **-3.4%** (ON faster) |
+  | 3 | 0.5% | +1.1% (ON slower) |
+  | 4 | 0.1% | +1.5% (ON slower) |
+
+  Floors of 0.1% and 0.5%, and a 4.5-point disagreement about a lever that
+  changes nothing in the emission between them. **A few-percent claim needs
+  repeated invocations, not a tighter floor** — report the spread ACROSS runs,
+  or report the effect as inside it. Anything above ~10% (a tier comparison, a
+  guard removal on a four-site loop) is nowhere near this regime and one clean
+  invocation is fine. Full write-up:
+  `docs/internal/performance/c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md`
+  section 5.2.
 * **No warmup control of their own** — that is the probe's job, and a probe
   whose warmup does not reach the tier under test measures the interpreter in
   both arms.
