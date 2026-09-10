@@ -606,10 +606,11 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-415 tokens.
+416 tokens.
 
 | Token | Expands to |
 | --- | --- |
+| `a5-mark-span` | `CRATONVM_JIT_A5_MARK_SPAN` |
 | `aaload-licm` | `CRATONVM_DISABLE_AALOAD_LICM` |
 | `gpu-approx-math` | `CRATONVM_GPU_APPROX_MATH` |
 | `gpu-dispatch-memo` | `CRATONVM_GPU_DISPATCH_MEMO` |

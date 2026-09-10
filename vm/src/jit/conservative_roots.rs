@@ -6559,7 +6559,9 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
                         // Counted separately because it covers a SPAN rather
                         // than a frame, so one accept can contribute many.
                         let __a5_before = out.len();
-                        scan_one_frame(search_lo, high, heap, out);
+                        if a5_mark_span_enabled() {
+                            scan_one_frame(search_lo, high, heap, out);
+                        }
                         band_path::A5_SWEEPS.fetch_add(1, Ordering::Relaxed);
                         band_path::A5_ROOTS
                             .fetch_add(out.len() - __a5_before, Ordering::Relaxed);
@@ -9734,6 +9736,31 @@ static UNREWRITABLE_BAND_ROOTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Addresses published to the unrewritable-root veto since process start.
 ///
+/// `CRATONVM_JIT_A5_MARK_SPAN=0` — **a MEASUREMENT LEVER, and unsafe. Default
+/// ON, which is byte-for-byte today's scan.**
+///
+/// Drops the A5 unregistered-frame span sweep, so a compiled frame the entry
+/// chain does not cover contributes no marking roots at all. It exists because
+/// that sweep turned out to dominate the G1 pin set by an order of magnitude --
+/// `a5_roots=4794` against the band path's `movable=132 unrewritable=298` on
+/// H2 `TestValueMemory` -- and the alternative to a number is an argument.
+///
+/// **Do not enable this in production.** The sweep is the backstop for a live
+/// compiled frame with no `JitEntryGuard`; dropping it frees what it named, and
+/// `bug-g1-evacuates-live-jit-reference-20260819-FIXED.md` is what that costs.
+/// The lever measures the ceiling of narrowing the sweep, it does not narrow
+/// it.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn a5_mark_span_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_A5_MARK_SPAN").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
 /// Which JIT-root scan path each pass took.
 ///
 /// `scan_compiled_frame_bands` walks each compiled frame's own
