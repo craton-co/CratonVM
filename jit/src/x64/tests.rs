@@ -7532,6 +7532,103 @@ fn rip_relative_safepoint_poll_addresses_the_flag_byte() {
     );
 }
 
+/// The layout-epoch guard's RIP-relative compare must name the counter, and
+/// must register the trail the unroll duplicator needs.
+///
+/// Two failures this catches, both silent:
+///
+/// * a displacement measured from the wrong reference point — `+ 6` instead of
+///   `+ 10`, forgetting the trailing `imm32` — compares a word four bytes from
+///   the epoch against the baked value. That is not a fault. It is a guard
+///   that answers about an unrelated global forever, which means an inline
+///   field access that keeps its baked offset across a layout REPLACEMENT:
+///   the "confirmed heap corruption" the allocation emitters' own guard
+///   comment names.
+/// * a `rip_abs_disp32_patches` entry whose trail is not 4. The unroller
+///   copies body bytes verbatim and re-resolves each entry against the copy's
+///   own PC; a trail that under-counts by 3 (the poll's 1, transcribed) makes
+///   every UNROLLED copy of the guard read three bytes off while the original
+///   stays correct — so the first iteration is right and the rest are not.
+#[test]
+fn rip_relative_epoch_guard_addresses_the_counter_and_declares_its_trail() {
+    static EPOCH: u32 = 0;
+
+    let alloc_result = crate::regalloc::RegAllocResult {
+        assignments: Vec::new(),
+        xmm_assignments: Vec::new(),
+        used_callee_saved: Vec::new(),
+        used_xmm_regs: Vec::new(),
+        block_live_in: Vec::new(),
+    };
+    let mut c = Compiler::new(
+        "rip-epoch-guard-test".to_string(),
+        ExecutableBuffer::new(4096).expect("test executable buffer"),
+        0,
+        0,
+        8,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        alloc_result,
+        false,
+        test_helpers(),
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Vec::new(),
+    );
+
+    let epoch_addr = &EPOCH as *const u32 as usize;
+    let start = c.buf.pos();
+    let patches_before = c.rip_abs_disp32_patches.len();
+    if !c.emit_cmp_mem32_abs_imm32(epoch_addr, 0x1234_5678) {
+        // The buffer landed more than 2GB from this test binary's data
+        // segment — which is exactly the shape a `static` counter has, and
+        // exactly why the epoch lives on the heap. The fallback is the
+        // materialize-the-address form.
+        assert_eq!(c.buf.pos(), start, "a refused encoding emits nothing");
+        assert_eq!(
+            c.rip_abs_disp32_patches.len(),
+            patches_before,
+            "a refused encoding registers no patch site either",
+        );
+        return;
+    }
+    let bytes: Vec<u8> = c.buf.as_slice()[start..c.buf.pos()].to_vec();
+    assert_eq!(bytes.len(), 10, "81 3D <disp32> <imm32>");
+    assert_eq!(&bytes[..2], &[0x81, 0x3D], "CMP r/m32, imm32 via [rip+d32]");
+    assert_eq!(
+        i32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]),
+        0x1234_5678,
+        "the baked epoch is the trailing imm32",
+    );
+
+    let disp = i32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
+    // RIP is the address of the NEXT instruction — past the imm32, not past
+    // the displacement. `+ 10`, not `+ 6`.
+    let insn_end = c.buf.as_ptr() as usize + start + 10;
+    let resolved = (insn_end as i64).wrapping_add(disp as i64) as usize;
+    assert_eq!(
+        resolved, epoch_addr,
+        "the RIP-relative displacement must land exactly on the epoch counter"
+    );
+
+    let (patch_off, trail) = *c
+        .rip_abs_disp32_patches
+        .last()
+        .expect("the guard registers its displacement for the unroll duplicator");
+    assert_eq!(patch_off, start + 2, "the disp32 follows the two opcode bytes");
+    assert_eq!(trail, 4, "the imm32 is part of the instruction the CPU measures from");
+}
+
 #[test]
 fn test_find_loop_hoists_conditional_body_still_detected() {
     // The detector deliberately hoists a sequence that sits BEHIND a

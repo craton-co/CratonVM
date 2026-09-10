@@ -2381,6 +2381,38 @@ pub(super) fn jit_rip_safepoint_poll_enabled() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_SP_EPOCH_GUARD_RIP=0` — emit this tier's layout-replacement
+/// epoch guard as `MOV R11, imm64 ; MOV ECX, [R11] ; CMP ECX, imm32` again
+/// instead of the one-instruction `CMP DWORD [rip+disp32], imm32`.
+///
+/// Default ON, and the single-pass twin of the optimizing tier's
+/// `CRATONVM_JIT_IR_EPOCH_GUARD_RIP`. Same counter, same comparison, same
+/// aligned 32-bit load — an ENCODING switch, not a behaviour one — so what it
+/// buys is a one-binary A/B of a shape that is two instructions and nine bytes
+/// shorter at every inline field access site.
+///
+/// The guard is emitted once per site and executed on every one of them, and
+/// this tier UNROLLS: a four-times-unrolled loop over a four-field body
+/// carries sixteen of them. That is also what made this the last tier to get
+/// the short form. The unroller copies body bytes verbatim, and a
+/// displacement that was right at the original site names `target + shift`
+/// from the copy — which is exactly what `rip_abs_disp32_patches` exists to
+/// re-resolve, the mechanism the safepoint poll above already rides. The
+/// guard's entry declares a trail of 4 for its `imm32` where the poll's
+/// declares 1 for its `imm8`; the trail is the whole difference.
+///
+/// Reaching for the out-of-reach fallback is NOT what this switch is for:
+/// that path is chosen per site by `emit_cmp_mem32_abs_imm32`'s own ±2GB test.
+pub(super) fn jit_sp_epoch_guard_rip_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SP_EPOCH_GUARD_RIP")
+            .and_then(|v| v.into_string().ok())
+            .is_none_or(|v| v != "0")
+    })
+}
+
 /// `CRATONVM_JIT_FUSED_BOUNDS_LOAD=0` — emit the array bounds check as
 /// `MOV R10D, [RAX+len] ; CMP ECX, R10D ; JAE stub` again instead of the fused
 /// `CMP ECX, [RAX+len] ; JAE stub`.

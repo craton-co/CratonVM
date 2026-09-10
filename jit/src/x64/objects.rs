@@ -1700,23 +1700,44 @@ impl Compiler {
     ///
     /// So they guard on the process-wide replacement epoch instead — coarser,
     /// and affordable because only a REPLACEMENT bumps it, never a new class
-    /// registration. Four instructions; a mismatch permanently routes the site
+    /// registration. Two instructions; a mismatch permanently routes the site
     /// to the always-correct helper.
     ///
+    /// The compare is `CMP DWORD [rip+disp32], imm32` — see
+    /// [`Self::emit_cmp_mem32_abs_imm32`] — which is why "two" and not the
+    /// "four" this comment said until 2026-09-10. The counter has to be in
+    /// disp32 reach of the code buffer for that, and it is because it is a
+    /// leaked heap allocation rather than a `static` in this image's `.data`:
+    /// as a static it sat ~140TB away and the short form was unreachable by
+    /// construction, on every compile. See `LAYOUT_REPLACE_EPOCH` in
+    /// `cratonvm_types::field_layout`, and
+    /// `docs/internal/performance/c2-the-layout-epoch-guard-was-unreachable-by-rip-20260910.md`.
+    ///
+    /// Reach is best-effort, so the materialize-the-address form stays as the
+    /// fallback — and `CRATONVM_JIT_SP_EPOCH_GUARD_RIP=0` selects it
+    /// deliberately rather than waiting for an address space that produces it.
+    ///
     /// Returns `None` when the caller should emit no guard at all, which today
-    /// never happens — the epoch address is a `'static` and always available —
-    /// but keeps the shape honest if that ever changes.
+    /// never happens — the epoch address is always available — but keeps the
+    /// shape honest if that ever changes.
     pub(super) fn emit_layout_epoch_guard(&mut self) -> Option<usize> {
         let (addr, expected) = cratonvm_types::layout_replace_epoch_guard();
         if addr.is_null() {
             return None;
         }
-        self.emit_mov_imm64_full(R11, addr as i64);
-        self.emit_mov_r32_mem_disp32(RCX, R11, 0);
-        // CMP ECX, imm32.
-        self.buf.emit_byte(0x81);
-        self.buf.emit_byte(0xF9);
-        self.buf.emit(&(expected as i32).to_le_bytes());
+        if !jit_sp_epoch_guard_rip_enabled()
+            || !self.emit_cmp_mem32_abs_imm32(addr as usize, expected)
+        {
+            // Out of ±2GB RIP reach, or the encoding switch is off:
+            // materialize the address and read through it. This is the shape
+            // the guard had before 2026-09-10, kept verbatim as the fallback.
+            self.emit_mov_imm64_full(R11, addr as i64);
+            self.emit_mov_r32_mem_disp32(RCX, R11, 0);
+            // CMP ECX, imm32.
+            self.buf.emit_byte(0x81);
+            self.buf.emit_byte(0xF9);
+            self.buf.emit(&(expected as i32).to_le_bytes());
+        }
         Some(self.emit_jcc_rel32_patch(0x85)) // JNE -> helper
     }
 

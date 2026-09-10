@@ -1396,6 +1396,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-reg-authoritative", on_key: Some("CRATONVM_JIT_IR_REG_AUTHORITATIVE"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
     E { group: Group::JIT, token: "ir-gp-wide", on_key: Some("CRATONVM_JIT_IR_GP_WIDE"), off_key: None, off_word: None, since: "2026-09-10" },
     E { group: Group::JIT, token: "ir-epoch-guard-rip", on_key: Some("CRATONVM_JIT_IR_EPOCH_GUARD_RIP"), off_key: None, off_word: Some("0"), since: "2026-09-10" },
+    // The single-pass twin of the row above, and the arm that unrolls: a 4x
+    // copy of a four-field body carries sixteen of these guards.
+    E { group: Group::JIT, token: "sp-epoch-guard-rip", on_key: Some("CRATONVM_JIT_SP_EPOCH_GUARD_RIP"), off_key: None, off_word: Some("0"), since: "2026-09-10" },
+    // Diagnosis lever, default OFF: put the layout-replacement epoch back in
+    // `.data` so the HEAP MOVE is A/B-able independently of the encoding it
+    // shipped with. On it, the RIP form is out of reach by construction.
+    E { group: Group::JIT, token: "layout-epoch-static", on_key: Some("CRATONVM_JIT_LAYOUT_EPOCH_STATIC"), off_key: None, off_word: None, since: "2026-09-10" },
     E { group: Group::JIT, token: "ir-speculate", on_key: Some("CRATONVM_JIT_IR_SPECULATE"), off_key: None, off_word: None, since: "2026-09-09" },
     // Diagnosis lever, value-taking: a comma-separated list of conservative
     // root-band CLASSES to skip (`operand-spill`,
