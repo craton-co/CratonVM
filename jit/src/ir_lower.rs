@@ -1692,6 +1692,134 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Why each PROMOTED value that kept its home kept it, per cause:
+    /// `[switch, deopt, type,
+    /// op]`, in the order [`Self::value_home_droppable`] tests them.
+    ///
+    /// # Why a per-cause census and not a count
+    ///
+    /// `plan_register_residency` used to print a `home: droppable=… ` line
+    /// computed from a NAIVE rule — "some safepoint's locals or stack names
+    /// it" — that predates `ir-deopt-regs`, `ir-reg-authoritative` and
+    /// `ir-drop-phi-home`. By 2026-09-10 it read `droppable=0` on
+    /// `probes/FieldLoop.java` `sum` while the emission on the SAME compile
+    /// dropped three homes, and
+    /// `internal/performance/c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md`
+    /// quoted the zero and built an argument on it. A diagnostic that is wrong
+    /// in the direction of "nothing works" is worse than none: it retires
+    /// levers that are in fact engaged.
+    ///
+    /// This one is computed from the predicates that actually decide, at the
+    /// moment they decide, so it cannot drift from them — and the four causes
+    /// call for four different next steps, which a bare count cannot say:
+    ///
+    ///   * `switch` — a flag in the conjunction is off. Nothing to chase.
+    ///   * `deopt`  — a reachable frame state names it and the register is not
+    ///     exclusively its own. **This is the one the architecture change is
+    ///     for**: it wants a register bank the frame reconstructor can read at
+    ///     an arbitrary bci, not another heuristic.
+    ///   * `type`   — `Ref` (needs a register bank in the OOP MAP, a different
+    ///     and larger change) or FP (a different file).
+    ///   * `op`     — the defining arm does not write its home through one
+    ///     `store_rax`, so there is no single store to drop.
+    ///
+    /// Deliberately counts only values the residency plan actually promoted: a
+    /// value with no register has no home to drop and would swamp the census
+    /// with a cause nobody can act on. Called at the END of lowering, after
+    /// [`Self::extend_home_drops_to_carried_values`] has had its say, so
+    /// "kept" means what the emission really did rather than what the plan
+    /// intended.
+    ///
+    /// # The accounting identity, which is what stops this one drifting
+    ///
+    /// Every promoted value is either dropped or attributed to exactly one
+    /// cause, and the assertion at the bottom says so. That is not decoration:
+    /// the diagnostic it replaces went wrong precisely by computing its own
+    /// answer instead of reading the one the emission used, and an identity
+    /// that ties the census to `home_dropped` cannot do that. A future clause
+    /// added to `value_home_droppable` and not here fails this immediately
+    /// under `cargo test`, because `lower_inner_with_scopes` calls this on
+    /// every debug lowering and not only when the diagnostic is on.
+    fn census_home_blocks(&self) -> [usize; 4] {
+        let (mut switch, mut deopt, mut ty, mut op) = (0usize, 0, 0, 0);
+        let mut promoted = 0usize;
+        let mut dropped = 0usize;
+        for id in 0..self.home_dropped.len() {
+            if self.gp_reg_of.get(id).copied().flatten().is_none() {
+                continue;
+            }
+            promoted += 1;
+            if self.home_dropped[id] {
+                dropped += 1;
+                continue;
+            }
+            // Cast: an index into the node arena is a `NodeId`.
+            let nid = id as NodeId;
+            // No node behind a promoted index is not a shape this can
+            // attribute, and dropping it silently would break the identity
+            // below. `op` is the honest bucket: whatever it is, its home store
+            // is not one this pass can reason about.
+            let Some(node) = self.graph.nodes.get(id) else {
+                op += 1;
+                continue;
+            };
+            let is_phi = matches!(node.op, crate::ir::Op::Phi);
+            let switches_on = if is_phi {
+                ir_drop_phi_home_enabled()
+                    && ir_deopt_regs_enabled()
+                    && ir_phi_copy_regs_enabled()
+                    && ir_skip_live_republish_enabled()
+            } else {
+                ir_drop_home_enabled()
+                    && ir_publish_at_def_enabled()
+                    && ir_deopt_regs_enabled()
+                    && ir_skip_live_republish_enabled()
+                    && ir_phi_copy_regs_enabled()
+            };
+            if !switches_on {
+                switch += 1;
+                continue;
+            }
+            // The frame-state obligation, in the same widening order the
+            // predicates use: nameable in a register, or named by no deopt
+            // that can happen (a phi's own publisher makes the trap-free arm
+            // redundant for it, which is why the two spellings differ).
+            let named_reachable = self
+                .deopt_named_reachable
+                .get(id)
+                .copied()
+                .unwrap_or(true);
+            let nameable = self.deopt_nameable.get(id).copied().unwrap_or(false);
+            let frame_ok = if is_phi {
+                nameable || !named_reachable
+            } else {
+                nameable
+                    || (self.graph_cannot_deopt() && self.assigned_gpr(nid).is_some())
+                    || (!named_reachable && self.assigned_gpr(nid).is_some())
+            };
+            if !frame_ok {
+                deopt += 1;
+                continue;
+            }
+            if !matches!(node.ty, IrType::Int | IrType::Long) {
+                ty += 1;
+                continue;
+            }
+            // A phi has no defining arm to certify; reaching here means the
+            // predicate said yes, so this is unreachable for one. Ordinary
+            // values fall to the store-shape clause.
+            if is_phi || !op_home_is_one_store_rax(&node.op) {
+                op += 1;
+            }
+        }
+        debug_assert_eq!(
+            dropped + switch + deopt + ty + op,
+            promoted,
+            "the home census lost a promoted value: {dropped} dropped, [{switch}, {deopt}, {ty}, {op}] kept, against {promoted} promoted. Every clause of `value_home_droppable` / `phi_home_droppable` needs a cause here, or this line reads low for a reason nobody can chase -- which is exactly how the census it replaced came to report zero on a compile that dropped three homes."
+        );
+        [switch, deopt, ty, op]
+    }
+
     /// May this phi's home word go unwritten?
     ///
     /// **Every clause is load-bearing, and the point of writing them as one
@@ -3250,8 +3378,9 @@ impl<'a> Lowerer<'a> {
     /// Restore the callee-saved registers. Emitted at every exit, and it must
     /// not disturb RAX — a method's return value and the `i64::MIN`
     /// exception/deopt sentinel both travel there. `MOVUPS` into an XMM
-    /// satisfies that for free, and the GPR restores target RBX/R12–R15, which
-    /// is a set RAX could never have been in: see `IR_GP_LINEAR_SCAN`.
+    /// satisfies that for free, and the GPR restores target RBX/R12–R15 (plus
+    /// RSI/RDI on Win64), a set RAX could never have been in because every
+    /// member of it is callee-saved and RAX is not: see `IR_GP_LINEAR_SCAN`.
     fn emit_callee_saved_restore(&mut self) {
         let restores: Vec<(u8, i32)> = self.saved_xmm_regs().collect();
         for (reg, off) in restores {
@@ -13038,9 +13167,14 @@ const IR_LOWER_LS_GPRS: &[u8] = &crate::regalloc::xmm_roles::IR_GP_LINEAR_SCAN;
 /// ("it buys loads, not stores"), reached here by widening the file until the
 /// cost showed.
 ///
-/// The frame reserves all seven slots in BOTH arms ([`ir_gp_file`] narrows the
-/// handout, not the reservation), so the two arms have identical frame layouts
-/// and the measurement isolates residency rather than frame size.
+/// The numbers above were taken while the frame reserved all seven slots in
+/// BOTH arms, so they isolate residency rather than frame size. That is no
+/// longer how it is wired: [`ir_saved_gpr_bytes`] sizes the save area from
+/// [`ir_gp_file`], so the reservation now follows the handout and the OFF arm
+/// is byte-identical to the pre-widening tree. Re-running this A/B therefore
+/// compares seven-slot frames against five-slot ones and can only look BETTER
+/// for the OFF arm than the 4.6% above — which is why the number is recorded
+/// as the one taken under the older wiring rather than silently re-attributed.
 ///
 /// Worth re-running if home-slot elimination ever lands: the register file is
 /// not the binding constraint while the frame stays authoritative, and this
@@ -13058,12 +13192,19 @@ fn ir_gp_wide_enabled() -> bool {
 
 /// The GP registers THIS compile may allocate over.
 ///
-/// [`IR_LOWER_LS_GPRS`] is the file the frame is SIZED for (every entry gets a
-/// save slot reserved); this is the subset the allocator may hand out. They
-/// differ only when the kill switch is off, and narrowing the handout without
-/// narrowing the reservation is deliberate: the frame layout must not depend on
-/// a flag that `saved_gpr_regs` re-reads, which is the drift
-/// `saved_xmm_bytes`' own comment warns about.
+/// [`IR_LOWER_LS_GPRS`] is the widest file the platform's ABI offers; this is
+/// the subset THIS compile may hand out, and they differ only when the kill
+/// switch is off. The reservation follows the handout — [`ir_saved_gpr_bytes`]
+/// and `Lowerer::saved_gpr_regs` both size from here, not from the constant —
+/// so with the switch off the frame is byte-identical to the pre-widening tree
+/// rather than paying 16 bytes for two registers nothing can name.
+///
+/// Safe only because this is a `OnceLock`: every reader resolves the same
+/// answer for the life of the process, so the frame layout cannot drift from
+/// the handout between `Lowerer::new` and an emission site. That is exactly
+/// the hazard `saved_xmm_bytes`' own comment warns about, and the `OnceLock`
+/// is what discharges it — a per-compile or thread-local re-read here would
+/// reintroduce it.
 fn ir_gp_file() -> &'static [u8] {
     if ir_gp_wide_enabled() {
         IR_LOWER_LS_GPRS
@@ -13145,7 +13286,7 @@ const IR_LOWER_SAVED_GPRS: &[u8] = crate::regalloc::xmm_roles::IR_GP_PROLOGUE_SA
 /// "the IR lowerer keeps every live value in a frame slot, so no register file
 /// is needed". That is what makes a deopt-named value's home word mandatory,
 /// and therefore what stops a register-resident value from ever losing it --
-/// see `plan_register_residency`'s `blocked_deopt` census.
+/// see the `deopt` cause of [`Lowerer::census_home_blocks`].
 /// Drop the home-word store for a loop-carried value that a deopt frame can
 /// name in its register -- **default ON** since 2026-09-05;
 /// `CRATONVM_JIT_IR_DROP_PHI_HOME=0` is the kill switch.
@@ -13421,7 +13562,7 @@ fn ir_alu_imm_enabled() -> bool {
 ///
 /// `graph.safepoints` records the FULL OPERAND STACK at every bci, so an
 /// intermediate is "deopt-named" from its definition until its consumer pops
-/// it. Both `plan_register_residency` (`blocked_deopt`) and the single-use
+/// it. Both the `deopt` cause of [`Lowerer::census_home_blocks`] and the single-use
 /// carry (`still_deopt_named`) refuse on that. Yet `OsrTierBench.kernel`
 /// reports `sentinel_free=true` — the body emits no deopt stub and no
 /// call-exception stub, so it cannot transfer to the interpreter from anywhere
@@ -14612,6 +14753,11 @@ fn verify_mir_allocation(
 /// and 1.4%). So this file closed the part of the gap it was built for and the
 /// remaining case is elsewhere — see `docs/JIT_OPTIMIZATION.md`.
 ///
+/// **Retaken 2026-09-10** on `probes/FieldLoop.java` `sum`, after seven more
+/// register flags went default-ON: **1.594x** (503 ms against 812 ms over a
+/// 2.6% floor). Still there, and widening the GP file does not close it
+/// either — see [`ir_gp_wide_enabled`].
+///
 /// Off is exactly the pre-change emission: no register is handed out, no save
 /// area is reserved, every read goes to its home word.
 ///
@@ -15542,54 +15688,37 @@ fn plan_register_residency(
     let gp_promoted = gp_reg_of.iter().filter(|r| r.is_some()).count();
     let promoted = fp_promoted + gp_promoted;
 
-    // ── Could the home slot be dropped? A census, before building it ──
+    // ── Could the home slot be dropped? The census that ASKED, retired ──
     //
     // `docs/feature-designs/ir-optional-home-slot.md` argues that a value which
-    // lives in a register for its whole range needs no frame word, and rests
-    // that on `LiveModel::pinned` covering every deopt-named value. **On this
-    // path it does not**: `release_deopt_pins` above deliberately releases
-    // exactly those pins, and pays for it by keeping every home the COLOURER
-    // planned. So a promoted value here may very well be named by a deopt
-    // frame, and its home is what that frame reads.
+    // lives in a register for its whole range needs no frame word, and rested
+    // that on `LiveModel::pinned` covering every deopt-named value. On this
+    // path it does not: `release_deopt_pins` above deliberately releases
+    // exactly those pins. So a promoted value here may very well be named by a
+    // deopt frame, and — as the design stood — its home was what that frame
+    // read.
     //
-    // Which makes the size of the opportunity an empirical question rather than
-    // a design one, and this counts it before anything is built:
+    // A census printed here counted that, under the only rule available at the
+    // time: "promoted, and named by NO safepoint, and not a phi". It answered
+    // `droppable=0` on real bytecode, and the answer was acted on — the next
+    // move it named, deopt metadata that can describe a REGISTER, is
+    // `ir-deopt-regs`, and `ir-reg-authoritative` / `ir-drop-phi-home` /
+    // `ir-phi-copy-regs` followed it.
     //
-    //   `home_droppable`  promoted, and named by no safepoint and not a phi
-    //   `blocked_deopt`   promoted, but some safepoint's locals/stack names it
-    //   `blocked_phi`     promoted, but its home is written by the edge copies
+    // **Which is why the line is gone.** Those flags widened the rule and the
+    // census did not follow: on 2026-09-10 it read `droppable=0` on
+    // `probes/FieldLoop.java` `sum` while the emission on that same compile
+    // dropped THREE homes, and
+    // `internal/performance/c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md`
+    // quoted the zero as evidence that home elimination "does not yet reach"
+    // this loop. It does. A stale diagnostic reading zero is not a neutral
+    // gap — it retires levers that are engaged.
     //
-    // A `home_droppable` of zero on real bytecode refutes the design as
-    // written, and says the next move is deopt metadata that can name a
-    // register — not a refactor of the lowering arms.
-    let (home_droppable, blocked_deopt, blocked_phi) = {
-        let mut deopt_named = vec![false; n];
-        for sp in &graph.safepoints {
-            for &v in sp.locals.iter().chain(sp.stack.iter()) {
-                if let Some(cell) = deopt_named.get_mut(v as usize) {
-                    *cell = true;
-                }
-            }
-        }
-        let (mut ok, mut deopt, mut phi) = (0usize, 0usize, 0usize);
-        for id in 0..n {
-            if gp_reg_of.get(id).copied().flatten().is_none() {
-                continue;
-            }
-            if graph
-                .nodes
-                .get(id)
-                .is_some_and(|node| matches!(node.op, Op::Phi))
-            {
-                phi += 1;
-            } else if deopt_named.get(id).copied().unwrap_or(false) {
-                deopt += 1;
-            } else {
-                ok += 1;
-            }
-        }
-        (ok, deopt, phi)
-    };
+    // The replacement is computed from the predicates that actually decide,
+    // where they decide, so it cannot drift from them again: `home_dropped`
+    // (`[ir-ls] homes: dropped_values=`) is the outcome, and
+    // `Lowerer::census_home_blocks` (`[ir-ls] homes kept:`) is the per-cause
+    // breakdown of what is left.
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
         eprintln!(
             "[ir-ls] nodes={n} positions={} peak_live={} deopt_pins_released={released} \
@@ -15610,10 +15739,7 @@ fn plan_register_residency(
              const={skip_const} single_use={skip_single_use} param_copies={param_copies} \
              spilled={skip_spilled} no_alloc={skip_no_alloc} carried_reserved={carried_reserved}"
         );
-        eprintln!(
-            "[ir-ls] home: droppable={home_droppable} blocked_deopt={blocked_deopt} blocked_phi={blocked_phi} safepoints={}",
-            graph.safepoints.len(),
-        );
+        eprintln!("[ir-ls] safepoints={}", graph.safepoints.len());
     }
     if promoted == 0 {
         return Ok(ls_refuse(
@@ -16863,6 +16989,23 @@ pub(crate) fn lower_inner_with_scopes(
             lowerer.reg_publishes_at_def,
             lowerer.homes_dropped_at_def,
         );
+        // The counterpart to `dropped_values`, and the line to read when it is
+        // low: of the values this compile PROMOTED, why each one still writes
+        // its home. See `Lowerer::census_home_blocks`.
+        let c = lowerer.census_home_blocks();
+        eprintln!(
+            "[ir-ls] homes kept: switch={} deopt={} type={} op={}",
+            c[0], c[1], c[2], c[3],
+        );
+    }
+    // The accounting identity inside `census_home_blocks` is the thing that
+    // keeps this census tied to `home_dropped`, and a check that only runs
+    // under a diagnostic env var is a check no test performs — which is the
+    // shape of the failure it exists to prevent. So a debug build pays for one
+    // extra pass and gets the assertion on every lowering, diagnostics or not.
+    #[cfg(debug_assertions)]
+    {
+        let _ = lowerer.census_home_blocks();
     }
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
         eprintln!(
