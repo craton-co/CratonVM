@@ -995,6 +995,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "stw-native-ring", on_key: Some("CRATONVM_DBG_STW_NATIVE_RING"), off_key: None, off_word: None, since: "2026-07-05" },
     E { group: Group::DBG, token: "surefire-ipc-dbg", on_key: Some("CRATONVM_SUREFIRE_IPC_DBG"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::DBG, token: "swchain", on_key: Some("CRATONVM_DBG_SWCHAIN"), off_key: None, off_word: None, since: "2026-08-20" },
+    // One line per starvation-watchdog sample: the carrier pool's queue depth,
+    // busy/live counts and dispatch counter, plus the per-state thread census.
+    // This is the reading that showed the pool running away from its base 32 to
+    // 233 on `VthreadGcStress` while `dispatch_count` sat frozen -- the shape a
+    // wall clock reports only as "the VM hung". Sampled on the watchdog's own
+    // interval, so it costs nothing when off and nothing hot when on.
+    E { group: Group::DBG, token: "carrier", on_key: Some("CRATONVM_DBG_CARRIER"), off_key: None, off_word: None, since: "2026-09-09" },
     E { group: Group::DBG, token: "sweep-census", on_key: Some("CRATONVM_DBG_SWEEP_CENSUS"), off_key: None, off_word: None, since: "2026-07-07" },
     E { group: Group::DBG, token: "sweep-edges", on_key: Some("CRATONVM_DBG_SWEEP_EDGES"), off_key: None, off_word: None, since: "2026-06-03" },
     E { group: Group::DBG, token: "unreg-declined", on_key: Some("CRATONVM_DBG_UNREG_DECLINED"), off_key: None, off_word: None, since: "2026-09-06" },
@@ -1384,6 +1391,13 @@ pub const INVENTORY: &[E] = &[
     // because a missing row bails the whole method.
     E { group: Group::JIT, token: "ir-splice-typecheck", on_key: Some("CRATONVM_JIT_IR_SPLICE_TYPECHECK"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
     E { group: Group::JIT, token: "ir-splice-getstatic", on_key: Some("CRATONVM_JIT_IR_SPLICE_GETSTATIC"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // Splice a callee whose body contains a `checkcast` or an `instanceof`.
+    // The same rebase as the two above, and the refusal that page named as
+    // the next one to take: every typed read out of an untyped container is a
+    // `checkcast`. Opt-IN and default OFF -- the plumbing is here, the soak is
+    // not, and a spliced type check is the first spliced site that can THROW
+    // on a caller-produced value. Read site accepts `1`/`true`/`on`/`yes` and
+    // nothing else, so there is no off-word: removing the key is the way back.
     // R1. Memoize the ACCEPTED optimizing OSR artifact, not only the refusals.
     // Without it one run recompiled the same method 502 times.
     E { group: Group::JIT, token: "osr-optimizing-cache", on_key: Some("CRATONVM_JIT_OSR_OPTIMIZING_CACHE"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
@@ -2099,6 +2113,13 @@ pub const INVENTORY: &[E] = &[
     // setting it restores the pre-fix behaviour exactly, SIGSEGV included.
     E { group: Group::JIT, token: "xt-no-safe-peer-read", on_key: Some("CRATONVM_XT_NO_SAFE_PEER_READ"), off_key: None, off_word: None, since: "2026-09-08" },
     E { group: Group::JIT, token: "xt-jit-root-scan", on_key: Some("CRATONVM_XT_JIT_ROOT_SCAN"), off_key: None, off_word: None, since: "2026-06-23" },
+    // Verification-only, and expensive on purpose: re-walks the WHOLE system
+    // thread table on every take-over pass to prove the process-local roster
+    // `take_over_pass` uses did not miss a thread that was in compiled code.
+    // Kept off the `xt-jit-root-scan` debug token deliberately — that walk is
+    // the ~83 ms/pass cost the roster removed, so bundling the two would make
+    // the scan impossible to observe without reintroducing what it fixed.
+    E { group: Group::JIT, token: "xt-root-scan-audit", on_key: Some("CRATONVM_XT_ROOT_SCAN_AUDIT"), off_key: None, off_word: None, since: "2026-09-10" },
     // Value token, milliseconds: `CRATONVM_JIT=xt-peer-deadline-ms=50`. Unset
     // means the built-in 20 ms, and `0` is rejected by the parser's own filter,
     // so there is no off state to spell.

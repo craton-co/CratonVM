@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-540 tokens.
+541 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -535,6 +535,7 @@ export inherited from a parent shell.
 | `stw-native-ring` | `CRATONVM_DBG_STW_NATIVE_RING` |
 | `surefire-ipc-dbg` | `CRATONVM_SUREFIRE_IPC_DBG` |
 | `swchain` | `CRATONVM_DBG_SWCHAIN` |
+| `carrier` | `CRATONVM_DBG_CARRIER` |
 | `sweep-census` | `CRATONVM_DBG_SWEEP_CENSUS` |
 | `sweep-edges` | `CRATONVM_DBG_SWEEP_EDGES` |
 | `unreg-declined` | `CRATONVM_DBG_UNREG_DECLINED` |
@@ -606,7 +607,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-420 tokens.
+421 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1010,6 +1011,7 @@ export inherited from a parent shell.
 | `xt-helper-window-scan` | `CRATONVM_XT_HELPER_WINDOW_SCAN` |
 | `xt-no-safe-peer-read` | `CRATONVM_XT_NO_SAFE_PEER_READ` |
 | `xt-jit-root-scan` | `CRATONVM_XT_JIT_ROOT_SCAN` |
+| `xt-root-scan-audit` | `CRATONVM_XT_ROOT_SCAN_AUDIT` |
 | `xt-peer-deadline-ms` | `CRATONVM_XT_PEER_DEADLINE_MS` |
 | `xt-peer-total-ms` | `CRATONVM_XT_PEER_TOTAL_MS` |
 | `direct-call-arg-maps` | `CRATONVM_JIT_DIRECT_CALL_ARG_MAPS` |
