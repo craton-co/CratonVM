@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-538 tokens.
+540 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -106,6 +106,8 @@ export inherited from a parent shell.
 | `atomic-updater` | `CRATONVM_DBG_ATOMIC_UPDATER` |
 | `badrecv` | `CRATONVM_DBG_BADRECV` |
 | `badref` | `CRATONVM_DBG_BADREF` |
+| `deadref-store` | `CRATONVM_DBG_DEADREF_STORE` |
+| `watch-addr` | `CRATONVM_DBG_WATCH_ADDR` |
 | `bb` | `CRATONVM_DBG_BB` |
 | `bblp` | `CRATONVM_DBG_BBLP` |
 | `bd-debug` | `CRATONVM_BD_DEBUG` |

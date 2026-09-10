@@ -124,7 +124,7 @@ pub mod map_incomplete_cause {
     /// slots, sets no `map_incomplete`, and bumps nothing, so the safepoint
     /// would publish a map claiming complete coverage while every live reference
     /// local is unnamed. That is a real hole in the shape of the one
-    /// `bug-h2-testrandommapops-small-heap-corruption-20260829.md` is about.
+    /// `bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md` is about.
     ///
     /// **Measured 2026-09-02, and it reads ZERO** on every method of
     /// `probes/SafepointMapResidue.java`, including the one whose frames the

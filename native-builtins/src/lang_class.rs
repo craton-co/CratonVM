@@ -23524,12 +23524,24 @@ pub(crate) fn build_empty_permissions(
     ctx: &mut dyn NativeContext,
 ) -> Result<ObjectRef, MethodCallFailed> {
     let perms = crate::try_alloc_concurrent_synthetic(ctx, "java/security/Permissions", 2)?;
+    // The `<init>` below runs Java and allocates, so it can relocate `perms` —
+    // and this function was returning the address it started with. The callee
+    // gets a rooted copy through the invoke's own argument handling; this local
+    // is what the CALLER keeps, and nothing rooted it.
+    //
+    // MEASURED on BindableTests under `CRATONVM_DBG_GC_STRESS=262144`:
+    // `[deadref-pin]` fired on `populate_protection_domain_fields`' pin of this
+    // return value — the pin being handed an address that already named no live
+    // object.
+    let perms_pin = ctx.pin_native_root(perms);
     let _ = ctx.invoke(
         "java/security/Permissions",
         "<init>",
         "()V",
         &[Value::Object(Some(perms))],
     );
+    let perms = ctx.read_native_pin(perms_pin, perms);
+    ctx.unpin_native_roots(perms_pin);
     Ok(perms)
 }
 
@@ -23569,8 +23581,22 @@ pub(crate) fn populate_protection_domain_fields(
     };
     let cl_pin = cl_obj.map(|o| ctx.pin_native_root(o));
 
+    // `perms` is allocated and then `new_array` allocates again before it is
+    // read, so a moving young collection between the two relocates it and the
+    // `set_field_by_name("permissions", ...)` below stored the pre-move
+    // address. Every other reference in this function is pinned across exactly
+    // this hazard; `perms` was the one that was not.
+    //
+    // MEASURED on BindableTests under `CRATONVM_DBG_GC_STRESS=262144`:
+    // `[deadref-store]` named this function storing a value that named no live
+    // object, reached from `native_class_get_protection_domain0`.
     let perms = build_empty_permissions(ctx);
+    let perms_pin = perms.as_ref().ok().map(|o| ctx.pin_native_root(*o));
     let principals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+    let perms = match (perms, perms_pin) {
+        (Ok(o), Some(p)) => Ok(ctx.read_native_pin(p, o)),
+        (other, _) => other,
+    };
 
     let pd = ctx.read_native_pin(pd_pin, pd);
     let codesource = match (cs_obj, cs_pin) {
@@ -23824,8 +23850,27 @@ pub(crate) fn native_class_get_protection_domain0(
         .unwrap_or(Value::Object(None));
     let pd = ctx.read_native_pin(pd_pin, pd);
     let cs = ctx.read_native_pin(cs_pin, cs);
+    // The unpin used to be HERE, one statement too early.
+    //
+    // `url_pin` is below `pd_pin`, so releasing it releases `pd`'s pin as well
+    // — and `populate_protection_domain_fields` allocates. A moving young
+    // collection inside it therefore relocated `pd` with nothing rooting it,
+    // and this function returned the pre-move address.
+    //
+    // The interpreter's return-value barrier cannot recover that:
+    // `safe_native_call` heals a stale return through `load_and_forward`, which
+    // reads the forwarding marker at the old address, and that marker is gone
+    // once the allocator has re-served the span. MEASURED on BindableTests
+    // under `CRATONVM_DBG_GC_STRESS=262144`: `[deadref-nret]` named this native
+    // returning an address in the emptied semispace, reached from ByteBuddy's
+    // `trySelfResolve(Class)` and `JavaDispatcher$DynamicClassLoader.invoker()`.
+    let populated =
+        populate_protection_domain_fields(ctx, pd, Value::Object(Some(cs)), classloader);
+    // Read `pd` back through its pin BEFORE the unpin, then release the whole
+    // group at once.
+    let pd = ctx.read_native_pin(pd_pin, pd);
     ctx.unpin_native_roots(url_pin);
-    populate_protection_domain_fields(ctx, pd, Value::Object(Some(cs)), classloader)?;
+    populated?;
 
     Ok(Some(Value::Object(Some(pd))))
 }

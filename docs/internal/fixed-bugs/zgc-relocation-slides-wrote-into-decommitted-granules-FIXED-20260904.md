@@ -101,7 +101,7 @@ The mitigation existed for this crash and nothing else. With the slides fixed:
 What those runs end on instead is a `NullPointerException` at a **later** seed
 (`seed:4604578705726772870`), and it appears identically with the family OFF —
 so it is not this page's defect. It is the pre-existing failure
-`known-issues/h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`
+`docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md`
 records, which the page itself listed as pre-dating its bisect range.
 
 `box_unbox_is_opt_in_until_the_relocation_defect_is_closed` asked to be

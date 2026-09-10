@@ -351,6 +351,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "atomic-updater", on_key: Some("CRATONVM_DBG_ATOMIC_UPDATER"), off_key: None, off_word: None, since: "2026-07-09" },
     E { group: Group::DBG, token: "badrecv", on_key: Some("CRATONVM_DBG_BADRECV"), off_key: None, off_word: None, since: "2026-06-05" },
     E { group: Group::DBG, token: "badref", on_key: Some("CRATONVM_DBG_BADREF"), off_key: None, off_word: None, since: "2026-06-05" },
+    E { group: Group::DBG, token: "deadref-store", on_key: Some("CRATONVM_DBG_DEADREF_STORE"), off_key: None, off_word: None, since: "2026-09-09" },
+    E { group: Group::DBG, token: "watch-addr", on_key: Some("CRATONVM_DBG_WATCH_ADDR"), off_key: None, off_word: None, since: "2026-09-09" },
     E { group: Group::DBG, token: "bb", on_key: Some("CRATONVM_DBG_BB"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::DBG, token: "bblp", on_key: Some("CRATONVM_DBG_BBLP"), off_key: None, off_word: None, since: "2026-05-24" },
     E { group: Group::DBG, token: "bd-debug", on_key: Some("CRATONVM_BD_DEBUG"), off_key: None, off_word: None, since: "2026-05-20" },

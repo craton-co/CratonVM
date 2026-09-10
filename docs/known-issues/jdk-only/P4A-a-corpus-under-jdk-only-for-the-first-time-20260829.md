@@ -345,7 +345,7 @@ neither belongs to this lane:
   against an 18 s HotSpot pass. The 20x wall-clock gap is its own question.
 * **`org.h2.test.store.TestRandomMapOps`** — compatible mode dies with
   `seed:3698333351056078266 op:1571 java.lang.NullPointerException`.
-  **Already owned:** `h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`,
+  **Already owned:** `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md`,
   whose own history records that the printed seeds do NOT replay, so that number
   is not the lead it looks like. What this lane's measurement did add is on that
   page as an addendum: the defect is **not** confined to the small heap the page
@@ -353,6 +353,17 @@ neither belongs to this lane:
   safety, and at 1g and above the dominant face is a WRONG ANSWER
   (`Expected: 247 actual: 198`, a map short of entries) rather than the crash the
   page opens with.
+
+  **RETIRED 2026-09-09.** That page closed: 0 failures in 10 serial runs at
+  `--Xmx 256m` on a quiet host against its own 9-of-9 baseline, with the
+  forcing control (`CRATONVM_ZGC_ASSUME_REWRITABLE=1`, which relocates under
+  every unproven compiled frame) also passing 3 of 3, and three independent
+  audits reading zero against seven-figure denominators. The 1g/4g rows this
+  lane contributed were re-measured clean on 2026-09-02 and do not reproduce
+  on current `dev`. If this class fails a corpus leg again, re-open with
+  `probes/MvStoreRandomOps.java` — it drives the same op mix, terminates, and
+  therefore actually prints the GC summary that every earlier attempt was
+  killed before reaching.
 
 ### The 21 that still do not finish
 
