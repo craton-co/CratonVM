@@ -2371,7 +2371,16 @@ pub(super) fn shadow_no_savebase() -> bool {
 ///
 /// Reaching for the out-of-reach fallback is NOT what this switch is for: that
 /// path is chosen per site by `emit_test_mem8_abs_imm8`'s own ±2GB test.
-pub(super) fn jit_rip_safepoint_poll_enabled() -> bool {
+///
+/// `pub(crate)` rather than `pub(super)` because BOTH x86-64 backends emit this
+/// poll and the switch has to mean the same thing to both. It reached only
+/// this one until 2026-09-10; `ir_lower.rs::emit_safepoint_poll` called its RIP
+/// emitter unconditionally, so on a real workload the switch moved **2 of 394**
+/// poll sites — everything hot is compiled by the optimizing tier, and the
+/// lever meant to price the two encodings against each other in one binary
+/// left 99.5% of them on the same arm. Whoever adds a third emitter of this
+/// poll owes it the same call.
+pub(crate) fn jit_rip_safepoint_poll_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
@@ -2466,7 +2475,12 @@ pub(super) fn jit_fused_bounds_load_enabled() -> bool {
 /// `stw_requested` flag byte) at method entry and loop back-edges. Polling is
 /// enabled by default; `CRATONVM_JIT_SAFEPOINT_POLLS=0` is the diagnostic
 /// opt-out.
-pub(super) fn jit_safepoint_polls_enabled() -> bool {
+///
+/// `pub(crate)` for the same reason as
+/// [`jit_rip_safepoint_poll_enabled`]: the optimizing tier polls too, and used
+/// to parse this variable itself, once per emitted poll site rather than once
+/// per process.
+pub(crate) fn jit_safepoint_polls_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {

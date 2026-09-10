@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 2026-09-10 The safepoint poll's flag byte, from the code cache's own allocator
+
+The second half of the placement problem `CRATONVM_JIT_CODE_NEAR_GLOBALS`
+opened. That strategy moves the CODE to the globals: it hints `mmap` to place
+each buffer within 1.5 GB of `layout_replace_epoch_guard()`, and the safepoint
+flag comes along because it is a few hundred megabytes away in the same
+mimalloc band. It is **default OFF**, so on a default Linux run the code buffer
+is still ~130 TB from the flag and every back-edge poll and method-entry poll
+in the process still emits `MOV R11, imm64 ; TEST BYTE [R11], 0FFh` — 15 bytes
+and a clobbered register — instead of the 7-byte `TEST BYTE [rip+disp32], 0FFh`
+the 2026-09-02 work added. Nothing fails; the fallback reads the same byte and
+branches the same way, which is why it went unnoticed.
+
+For that default configuration the flag now comes from
+`platform::alloc_code_adjacent_cell` — a bump allocator over 64 KiB chunks
+taken from the same `mmap(NULL, …)` / `VirtualAlloc(NULL, …)` that
+`alloc_executable` hands the code cache, carving 64-byte cache-line-isolated
+cells that are never unmapped. `CacheLineFlag` becomes a `&'static AtomicBool`
+into one; its four methods are unchanged, so all 75 `stw_requested` call sites
+are untouched.
+
+**The two strategies now compose, where `82bf52efd` correctly said they could
+not.** `alloc_code_adjacent_cell` returns `None` when
+`CRATONVM_JIT_CODE_NEAR_GLOBALS` is engaged, and `CacheLineFlag` falls back to
+the leaked `Box` — so with that flag on, the flag stays in the allocator band
+its anchor lives in and behaviour is bit-identical to before this change. The
+same reasoning that made `alloc_epoch_page` wrong for the epoch counter makes
+declining the cell right here: whoever owns the placement must own it for every
+cell at once, and `near_globals` owns it whenever it is on.
+
+Placement is a hint either way — the OS picks — so both emitters keep their
+per-site ±2 GB test and their fallback. Two tests assert the reach, one of them
+through `stw_requested_flag_addr` itself, and both skip when `near_globals` is
+engaged.
+
+`execute_frame` hoists the flag REFERENCE once, beside the existing
+`async_exception_slot` hoist. This is not the hoist the loop-top comment
+refuses: that one caches the flag's VALUE at frame entry and would cut poll
+frequency, which is time-to-safepoint. Every poll still loads the byte; what is
+resolved once is the address, which is now a pointer indirection and one whose
+source word shares a line with `gc_generation`, `threads_blocked` and the
+barrier mutex.
+
+Measured Windows x86-64, before and after, same tree: 489 MiB apart before,
+**128 KiB** after, short form on both — Windows already lands in reach, which is
+why `near_globals` does not build there either. **The Linux confirmation is
+still owed and is the one that matters.** See
+`docs/internal/performance/safepoint-poll-flag-was-on-the-rust-heap-FIXED-20260910.md`.
+
+Found while verifying it: `CRATONVM_JIT_RIP_SAFEPOINT_POLL=0`, the lever for
+pricing the two encodings inside one binary, reached only the single-pass
+backend. `ir_lower.rs::emit_safepoint_poll` — the optimizing tier, where
+everything hot is compiled — called its RIP emitter unconditionally, so on a
+real workload the switch moved **2 of 394** poll sites. Both gates in
+`x64/licm.rs` are now `pub(crate)` and the lowerer calls them; the switch moves
+398 of 398, and both arms print the same answer.
+
 ### 2026-09-09 `checkcast` / `instanceof` in a spliced callee — the third rebase, and the bug it uncovered
 
 The third instance of one pattern, after `ldc` and `getstatic`: `IrBuilder` has

@@ -5693,6 +5693,20 @@ fn execute_frame_from_index(
         .threads
         .thread_registry
         .self_async_slot_handle(thread.thread_id);
+    // The STW flag byte, hoisted for the same reason and into the same scope.
+    //
+    // `GcBarrier::stw_requested` stopped being an inline field on 2026-09-10:
+    // it is now a `&'static AtomicBool` into a cell allocated from the JIT's
+    // own page allocator, so that compiled code can poll it with a
+    // RIP-relative `TEST BYTE [rip+disp32]` instead of materializing a 64-bit
+    // address (`CacheLineFlag`). Spelled inline, the two per-bytecode reads
+    // below would each become a dependent PAIR of loads — fetch the pointer
+    // out of `GcBarrier`, then the byte — and the pointer word shares a line
+    // with `gc_generation`, `threads_blocked` and the barrier mutex, i.e. with
+    // exactly the neighbours whose writes `CacheLineFlag` exists to stay away
+    // from. Resolving it once per `execute_frame` leaves each read a single
+    // load from a line no one ever writes but the collector.
+    let stw_flag = shared.mem.gc_barrier.stw_requested.flag();
     // The condition every back edge now tests before paying for
     // `safepoint_check`. Written as a macro rather than a closure because the
     // four call sites sit inside `&mut thread` borrows and a closure capturing
@@ -5781,11 +5795,7 @@ fn execute_frame_from_index(
     macro_rules! backedge_poll_needed {
         () => {
             backedge_poll_gate_off
-                || shared
-                    .mem
-                    .gc_barrier
-                    .stw_requested
-                    .load(std::sync::atomic::Ordering::Acquire)
+                || stw_flag.load(std::sync::atomic::Ordering::Acquire)
                 || async_exception_slot
                     .as_ref()
                     .is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed) != 0)
@@ -6101,12 +6111,14 @@ fn execute_frame_from_index(
         // `ldar`, a real ordering instruction, and one per bytecode is not
         // free. Whoever brings up that port owns this line; the x86-64
         // reasoning above does not carry over.
-        if shared
-            .mem
-            .gc_barrier
-            .stw_requested
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        //
+        // `stw_flag` is NOT that refused hoist. It is the flag's ADDRESS,
+        // resolved once at the top of `execute_frame`; the load below still
+        // happens on every bytecode, so poll frequency and time-to-safepoint
+        // are exactly what they were. What it avoids is the indirection
+        // `CacheLineFlag` acquired when it stopped being an inline field — see
+        // its own doc, and the hoist site beside `async_exception_slot`.
+        if stw_flag.load(std::sync::atomic::Ordering::Acquire) {
             safepoint_check(shared, thread);
         }
 
