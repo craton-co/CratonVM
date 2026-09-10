@@ -1223,6 +1223,21 @@ const RETIRED_SHADOW_PREFIXES: &[&str] = &[
     // see `RETIRED_SHADOW_PHASE2_TRIPLES`. A prefix admits a package to the
     // binary search; the table decides what is retired, and it retires one row.
     "sun/nio/ch/",
+    // 2026-09-10, lane 5 (`java/util/concurrent/`, `jdk/internal/misc/`,
+    // `sun/misc/`, `java/lang/Thread*`, `jdk/internal/vm/`). `java/util/`
+    // above already admits `java/util/concurrent/`; these four are the rest of
+    // that lane's prefix set.
+    //
+    // Adding a prefix while its table is empty is PROVABLY INERT: the list is
+    // only an early-out in front of the binary searches, so a wider list plus
+    // an empty table answers `false` for exactly the same inputs. That is what
+    // makes it safe to land the prefixes and the table in one commit —
+    // `the_l5_prefixes_retire_nothing_on_their_own` is the guard that says so
+    // for every triple this lane declined.
+    "jdk/internal/misc/",
+    "jdk/internal/vm/",
+    "java/lang/Thread",
+    "sun/misc/",
 ];
 
 /// The 2026-08-30 Phase 2 wave: ONE triple, and the size is the finding.
@@ -2271,6 +2286,44 @@ static RETIRED_SHADOW_PHASE3_TRIPLES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Lane 5 — `java/util/concurrent/`, `Thread`, `Unsafe`, retired 2026-09-10.
+///
+/// `docs/known-issues/jdk-only-lanes/lane-5-concurrent-thread-unsafe.md` is the
+/// page; this is the table it fills. The lane's population is **405 bucket-A/B
+/// rows over 22 classes**, which is not the 659 a prefix filter over
+/// `--dump-native-registry --explain-jdk-only` reports. Two subtractions get
+/// from one to the other, and both are lane-0 rules rather than this lane's
+/// choice:
+///
+///   * 155 rows come from a registrar whose classes span more than one lane
+///     (`register_throwable_subclass_natives` and the `native-collections`
+///     collection-family loops). Lane 0 §3: **the unit of work for a
+///     cross-cutting registrar is the registrar, and lane T owns it whole** —
+///     so `CopyOnWriteArraySet.equals`, registered by the same
+///     `native-collections/src/lib.rs` line as `HashSet.equals` and
+///     `LinkedHashSet.equals`, is not this lane's row to retire even though the
+///     receiver is;
+///   * 99 are the `ConcurrentHashMap` family, retired by the 2026-09-09 Phase 3
+///     wave and already in [`RETIRED_SHADOW_PHASE3_TRIPLES`].
+///
+/// # What this table does NOT contain, and why that is the finding
+///
+/// See the lane page for the per-class record. The two structural refusals are
+/// worth restating here, because both are properties of this VM's object model
+/// rather than of any one method:
+///
+///   * **`objectFieldOffset` returns a SLOT INDEX, not a byte offset.** The
+///     JDK implements the whole sub-word atomic family in Java over a 4-byte
+///     CAS — `long wordOffset = offset & ~3; int shift = (int)(offset & 3) << 3`
+///     — so retiring `compareAndSetByte` and its eleven relatives hands that
+///     arithmetic a number it does not describe: `offset & ~3` names a
+///     DIFFERENT FIELD. `unsafe_natives_ext.rs` says the same from the other
+///     side and carries the HotSpot comparison that established it.
+///   * the eight `get*Unaligned` / `put*Unaligned` rows are the same defect in
+///     a different family: they decompose a byte range, and a slot index has
+///     no bytes.
+static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[];
+
 /// Is this exact triple a retired §1.4 shadow?
 ///
 /// The class-name prefix test is a cheap discriminator: every entry is under
@@ -2298,6 +2351,7 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
         || RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(&key).is_ok()
+        || RETIRED_SHADOW_L5_TRIPLES.binary_search(&key).is_ok()
 }
 
 #[cfg(test)]
@@ -2394,6 +2448,93 @@ mod tests {
                 triple_is_retired_shadow(c, m, d),
                 "unreachable entry: {c}.{m}{d}"
             );
+        }
+    }
+
+    /// Sorted and duplicate-free, for the reason every sibling table is: the
+    /// predicate binary-searches it, so an out-of-order entry answers `false`
+    /// for a row that is present -- which reads as "not retired" and is
+    /// invisible in a workload.
+    #[test]
+    fn the_l5_table_is_sorted_and_unique() {
+        for w in RETIRED_SHADOW_L5_TRIPLES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "out of order or duplicated: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    /// Every L5 entry is asked through the REAL predicate, not through the
+    /// table it lives in. Lane 5 added four prefixes
+    /// (`jdk/internal/misc/`, `jdk/internal/vm/`, `java/lang/Thread`,
+    /// `sun/misc/`) and inherited `java/util/`, so this is exactly the wave
+    /// where a missing one would go unnoticed for the rows under the prefix
+    /// that was already there.
+    #[test]
+    fn every_l5_entry_is_reachable() {
+        for (c, m, d) in RETIRED_SHADOW_L5_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "unreachable entry: {c}.{m}{d}"
+            );
+        }
+    }
+
+    /// No triple may be claimed by two waves. Harmless to the predicate, which
+    /// ORs; NOT harmless to the record, because two waves would each report
+    /// having retired it and the next reader cannot tell which measurement
+    /// backs the decision.
+    #[test]
+    fn the_l5_table_is_disjoint_from_the_earlier_four() {
+        for t in RETIRED_SHADOW_L5_TRIPLES {
+            assert!(
+                RETIRED_SHADOW_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(t).is_err(),
+                "{t:?} is in the L5 table and an earlier one"
+            );
+        }
+    }
+
+    /// The four prefixes lane 5 added are an EARLY-OUT, not a licence.
+    ///
+    /// This is the gate on scope creep for this lane, and it is written as a
+    /// list of rows the lane measured and DECLINED rather than as a count.
+    /// Each one is a live `Bridge` on a receiver whose prefix is now admitted
+    /// to the binary search, so "not in the table" has to be checkable rather
+    /// than inferred from absence.
+    ///
+    /// The sub-word atomics are here because their refusal is structural: this
+    /// VM's `objectFieldOffset` answers a SLOT INDEX, and the JDK's Java-level
+    /// implementation of these methods computes `offset & ~3` and
+    /// `(offset & 3) << 3` over what it believes is a byte offset. Retiring one
+    /// does not produce a wrong answer at the margin; it names a different
+    /// field.
+    #[test]
+    fn the_l5_prefixes_retire_nothing_on_their_own() {
+        for (c, m, d) in [
+            // The sub-word CAS layer -- see this table's doc comment.
+            ("jdk/internal/misc/Unsafe", "compareAndSetByte", "(Ljava/lang/Object;JBB)Z"),
+            ("jdk/internal/misc/Unsafe", "compareAndSetShort", "(Ljava/lang/Object;JSS)Z"),
+            ("jdk/internal/misc/Unsafe", "compareAndExchangeByte", "(Ljava/lang/Object;JBB)B"),
+            ("jdk/internal/misc/Unsafe", "compareAndExchangeShort", "(Ljava/lang/Object;JSS)S"),
+            ("jdk/internal/misc/Unsafe", "getAndAddByte", "(Ljava/lang/Object;JB)B"),
+            ("jdk/internal/misc/Unsafe", "getAndAddShort", "(Ljava/lang/Object;JS)S"),
+            // The unaligned family: a slot index has no bytes to address.
+            ("jdk/internal/misc/Unsafe", "getIntUnaligned", "(Ljava/lang/Object;J)I"),
+            ("jdk/internal/misc/Unsafe", "getLongUnaligned", "(Ljava/lang/Object;J)J"),
+            ("jdk/internal/misc/Unsafe", "getShortUnaligned", "(Ljava/lang/Object;J)S"),
+            ("jdk/internal/misc/Unsafe", "getCharUnaligned", "(Ljava/lang/Object;J)C"),
+            ("jdk/internal/misc/Unsafe", "putIntUnaligned", "(Ljava/lang/Object;JI)V"),
+            ("jdk/internal/misc/Unsafe", "putLongUnaligned", "(Ljava/lang/Object;JJ)V"),
+            ("jdk/internal/misc/Unsafe", "putShortUnaligned", "(Ljava/lang/Object;JS)V"),
+            ("jdk/internal/misc/Unsafe", "putCharUnaligned", "(Ljava/lang/Object;JC)V"),
+        ] {
+            assert!(!triple_is_retired_shadow(c, m, d), "wrongly retired: {c}.{m}{d}");
         }
     }
 
