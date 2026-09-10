@@ -2927,6 +2927,21 @@ Ljava/nio/channels/FileChannel;"
     /// of them trades a correct answer for a wrong one -- and for most of these
     /// the wrong answer does not throw, which is worse. The table's doc comment
     /// carries the row numbers and the observed values.
+    /// **23 triples, and it enumerated 21 until an arithmetic reconciliation
+    /// found the other two.** Lane L0's dispatched population is 77 of 104, and
+    /// 77 - 54 retired = 23; the array held 21, so
+    /// `getAnnotationsByType` and `getDeclaredAnnotationsByType` were measured
+    /// `OK -> BAD` (HotSpot `1`, yielded `0`, rows 75 and 76) and then left
+    /// unpinned. Nothing was red: the retirement table did not contain them, so
+    /// every test passed while two members of a family whose other five ARE
+    /// pinned sat unguarded, one wave away from being retired on the family's
+    /// reputation.
+    ///
+    /// The prose said 23 and the code said 21 for the same reason the prose was
+    /// right: `getAnnotation*` is six methods, not four. **Close the population
+    /// by subtraction and check the residue is empty** -- retired + held +
+    /// undispatched must equal the surface, and here the residue was exactly
+    /// the two rows nobody had typed out.
     #[test]
     fn the_l0_held_families_are_not_retired() {
         for (c, m, d) in [
@@ -2971,6 +2986,16 @@ Ljava/nio/channels/FileChannel;"
                 "java/lang/Class",
                 "getDeclaredAnnotation",
                 "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
+            ),
+            (
+                "java/lang/Class",
+                "getAnnotationsByType",
+                "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;",
+            ),
+            (
+                "java/lang/Class",
+                "getDeclaredAnnotationsByType",
+                "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;",
             ),
             (
                 "java/lang/Class",

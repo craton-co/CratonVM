@@ -234,6 +234,11 @@ A release build is **17-50 minutes** and the host is shared. Rules:
 `module/ModuleDescriptor$Version` (5), `ModuleLayer` (4), `Class$Atomic` (3),
 `ClassValue` (2), `Class$ReflectionData` (1).
 
+**The account closes exactly: 54 retired + 23 held + 27 undispatched = 104.**
+The two reviewed `Intrinsic`s sit outside that sum -- adjudicating a kind
+removes a triple from the `Bridge` population, so they are no longer shadows to
+count.
+
 **Instrument:** `apps/probes/L0ClassModuleSurface.java`, 129 rows over the
 whole surface, measured three ways against HotSpot 25.0.3+9 -- unarmed, and
 with every native declining. `ClassNameSweep` reached only 10 of the 104; this
@@ -291,13 +296,27 @@ ordinals each), enumerated rather than assumed.
 |---|---|
 | `Class.descriptorString` | NPE — `componentType` field is null |
 | `Class.getModifiers` | wrong **flag bits** (`public synchronized` for `Object`; `static` lost on a nested interface) |
-| `Class.getAnnotation*`, `isAnnotationPresent` (6) | annotations come back **empty** |
+| `Class.getAnnotation`/`getAnnotations`/`getDeclaredAnnotation`/`getDeclaredAnnotations`/`getAnnotationsByType`/`getDeclaredAnnotationsByType`, `isAnnotationPresent` (7) | annotations come back **empty** (`[]`, `null`, `0`, `false`) |
 | `Class.newInstance` | `cachedConstructor` is null |
 | `Module.getLayer`, `isExported` ×2, `isOpen` ×2 | answer `false` where HotSpot is `true` |
 | `ModuleLayer.boot`/`findModule`/`modules`/`configuration` | `boot()` yields null |
 | `Class.getPackage`/`getResource`/`getResourceAsStream`, `Module.getResourceAsStream` | **`NoClassDefFoundError`** — blocked pending **L7** |
 
-`the_l0_held_families_are_not_retired` pins all of them.
+`the_l0_held_families_are_not_retired` pins all of them -- **after a
+correction.** It enumerated 21 of the 23 for a while, and nothing was red,
+because a missing hold is only a hole: the two absentees were
+`getAnnotationsByType` and `getDeclaredAnnotationsByType`, measured `OK -> BAD`
+on rows 75 and 76 (HotSpot `1`, yielded `0`) and then never typed into the
+array. Five of their seven siblings were pinned, which is the worst case -- the
+family looks guarded.
+
+It surfaced by **closing the population by subtraction and checking the residue
+is empty**: 77 dispatched - 54 retired = 23, the array held 21, and the two
+survivors of `dispatched - retired - held` were exactly the pair. The prose
+above said 23 and the code said 21 for the same reason the prose was right,
+that `getAnnotation*` is six methods and the row now spells them out. Any lane
+adding a table should run that subtraction rather than trusting a hand count of
+its own bullet list.
 
 **`Module.isOpen` is held on a judgement, not a measurement, and that is
 stated in the table.** Its rows agree with HotSpot when yielded — but they
@@ -309,20 +328,44 @@ unnamed module; until that fixture exists, held.
 
 ### Not retired for want of an instrument: 27
 
-Precondition 4 is per-instrument and these read `invocations == 0` even in the
-probe written to reach them. Twelve cannot be called from Java at all —
-`getClassLoader0`, `getEnumConstantsShared`, `reflectionData`,
-`newReflectionData`, `setSigners`, three `Class$Atomic` CAS methods,
-`Class$ReflectionData.<init>` and the five `ClassFrameInfo` accessors are
-package-private plumbing reached only from inside `java.lang.Class` and the
-stack walker. Eight are `Module.implAdd*`.
+Precondition 4 is per-instrument, and these read `invocations == 0` even in the
+probe written to reach them. **14 + 8 + 5:**
 
-`ModuleDescriptor$Version.compareTo` and `ClassValue.remove` are the
-instructive two: the probe **does** exercise both and both still count zero.
-Row 126's failure names `ts1`, a local in `Version.compareTo`'s own bytecode —
-so the JDK's method served the call and the registration was never dispatched.
-An inert row, which is a finding rather than a retirement, and it is why the
-count is taken per triple and never per row.
+**Fourteen cannot be called from Java at all** -- `getClassLoader0`,
+`getEnumConstantsShared`, `reflectionData`, `newReflectionData`, `setSigners`,
+the three `Class$Atomic` CAS methods, `Class$ReflectionData.<init>` and the
+five `ClassFrameInfo` accessors are package-private plumbing reached only from
+inside `java.lang.Class` and the stack walker. No probe will ever move these;
+they need a unit test against the registry, not a Java fixture.
+
+**Eight are `Module.implAdd*`** -- `implAddExports` x2, `implAddExportsNoSync`
+x2, `implAddExportsToAllUnnamed`, `implAddOpens` x2,
+`implAddOpensToAllUnnamed`. Same story one layer out: the module system's own
+bytecode calls them.
+
+**Five are exercised and still do not dispatch,** which is the interesting
+group and not an instrument gap at all:
+
+```text
+Class.forPrimitiveName      probe calls Class.forName("int")          line 212
+Class.getComponentType      probe calls Object[].class.getComponentType()  194
+Class.getProtectionDomain   probe reads its own ProtectionDomain      line 322
+ClassValue.remove           probe calls cv.remove(Integer.class)      line 343
+Version.compareTo           probe compares parsed versions      lines 462-467
+```
+
+`Version.compareTo` is the one with a proven mechanism: row 126's failure names
+`ts1`, a local in `Version.compareTo`'s **own bytecode**, so the JDK's method
+served the call and the registration was never consulted. The other four share
+the signature -- called, counted zero -- and their mechanism is **not
+established per row**, so they are recorded here rather than explained. Five
+registrations that a caller cannot reach are five candidates for deletion
+outright, and that is a different question from retirement.
+
+This is also why precondition 4 is taken per **triple** from
+`--dump-native-registry` and never from "my probe calls this". A row that runs
+green proves something about the JDK's bytecode, not about the native
+underneath it.
 
 ### The two reviewed `Intrinsic`s
 
