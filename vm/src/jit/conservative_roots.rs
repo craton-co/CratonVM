@@ -9851,20 +9851,34 @@ fn scan_a5_band_as_frames(
     scanned
 }
 
-/// `CRATONVM_JIT_A5_FRAME_SCAN=0` -- sweep the A5 band as a raw span again
-/// instead of recovering frames from it. **Default ON.**
+/// `CRATONVM_JIT_A5_FRAME_SCAN=1` -- recover frames from the A5 band instead of
+/// sweeping it as a raw span. **Default OFF.**
 ///
-/// The bisect lever for [`scan_a5_band_as_frames`], and the first thing to try
-/// against a stale-pointer report on a JIT workload: the narrowing marks only
-/// the frames it recognises, so a frame it fails to recognise is a root it
-/// fails to publish.
+/// # Why it is measured, kept, and off
+///
+/// It works, and it is worth 20% of the number it was built for: Type 3 of H2
+/// `TestValueMemory` goes ~10000 -> 7932 and `a5_roots` halves from 4794 to
+/// 2538. It is off because that is not enough to make the test pass, and what
+/// it costs is soundness rather than speed.
+///
+/// The span it replaces is not all JIT frames. `[search_lo, high)` also covers
+/// the VM's own Rust frames and the interpreter frames the compiled code called
+/// into, and a conservative sweep of those is exactly what catches "an object
+/// that has been allocated and not yet stored anywhere tracked" -- the hazard
+/// `scan_compiled_frame_bands`' own comment names, with
+/// `bug-g1-evacuates-live-jit-reference-20260819-FIXED.md` behind it. Marking
+/// only the frames a shape test RECOGNISES drops every one of those words.
+///
+/// So the trade is a real use-after-free risk for a partial win on one row.
+/// Turning it on is a decision someone should make deliberately, with a
+/// stale-pointer soak behind it, and not inherit from a default.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn a5_frame_scan_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        !matches!(
+        matches!(
             cratonvm_types::flags::runtime_var("CRATONVM_JIT_A5_FRAME_SCAN").as_deref(),
-            Ok("0") | Ok("false") | Ok("off")
+            Ok("1") | Ok("true") | Ok("on")
         )
     })
 }
@@ -10094,7 +10108,16 @@ fn publish_unrewritable_band_roots(
             // reaching an unverifiable word is vetoed by
             // `add_unrewritable_jit_root` below -- the pin set is keyed by
             // OBJECT, and the veto outranks every movable claim.
-            if gc_movable_band_roots_enabled() {
+            //
+            // `remap_covered` is REQUIRED, and leaving it out was a defect in
+            // the first version of this: both arms of the claim above name a
+            // rewriter (`remap_one_jit_frame`) or rest on the word being dead,
+            // and the first is only true for a frame the remap actually walks.
+            // A frame recovered by inspection in the A5 band is not on the
+            // entry chain and nothing rewrites its slots, so publishing its
+            // words movable would have licensed moving an object out from under
+            // a slot that keeps pointing at the old address.
+            if gc_movable_band_roots_enabled() && remap_covered {
                 // SAFETY: aligned read inside this thread's own live compiled
                 // frame, bounded by the recorded frame size -- the same word
                 // `scan_one_frame` has already read.

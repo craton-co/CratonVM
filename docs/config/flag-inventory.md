@@ -1336,7 +1336,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JDK_SCANNER` | COMPAT | `CRATONVM_COMPAT=jdk-scanner` | opt-in | off | behaviour | snapshot | native-io |
 | `CRATONVM_JFR_ENABLE_EVENTS` | — | `CRATONVM_JFR_ENABLE_EVENTS` | scalar | unset | behaviour | snapshot | vm |
 | `CRATONVM_JIT` | JIT | `CRATONVM_JIT=…` | group | unset | — | snapshot | types |
-| `CRATONVM_JIT_A5_FRAME_SCAN` | JIT | `CRATONVM_JIT=a5-frame-scan` | default-on | on | behaviour | snapshot | vm |
+| `CRATONVM_JIT_A5_FRAME_SCAN` | JIT | `CRATONVM_JIT=a5-frame-scan` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_A5_MARK_SPAN` | JIT | `CRATONVM_JIT=a5-mark-span` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_A5_RESIDUE_FILTER` | JIT | `CRATONVM_JIT=a5-residue-filter` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_A5_SHAPE_FILTER` | JIT | `CRATONVM_JIT=a5-shape-filter` | opt-in | off | behaviour | snapshot | vm |
