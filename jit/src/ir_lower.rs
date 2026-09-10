@@ -4067,12 +4067,13 @@ impl<'a> Lowerer<'a> {
     /// adds 10 and not 6. The load stays a single aligned 32-bit read, so it is
     /// as atomic as the `MOV ECX` it replaces.
     ///
-    /// **Sound here and NOT in the single-pass backend**, for the reason
-    /// `emit_test_safepoint_flag_rip` gives two hundred lines below: this
-    /// lowerer never duplicates emitted bytes to a second address, so a
-    /// displacement that is right when emitted stays right. `x64`'s twin of
-    /// this guard sits inside a body its native unroller byte-copies, and is
-    /// deliberately left alone.
+    /// Sound here **for free**: this lowerer never duplicates emitted bytes to
+    /// a second address, so a displacement that is right when emitted stays
+    /// right — the reason `emit_test_safepoint_flag_rip` gives two hundred
+    /// lines below. `x64`'s twin sits inside a body its native unroller
+    /// byte-copies and needs the fixup pass to earn the same shape; it has one
+    /// (`rip_abs_disp32_patches`, declaring a 4-byte trail for the `imm32`)
+    /// and emits the same instruction since 2026-09-10.
     fn emit_cmp_layout_epoch_rip(&mut self, addr: usize, expected: u32) -> bool {
         if !ir_epoch_guard_rip_enabled() {
             return false;
@@ -9171,10 +9172,38 @@ impl<'a> Lowerer<'a> {
                 // `ir_direct_calls` row nothing produced. Count it, split by
                 // whether the site is inside a relocated body, so that failure
                 // has a reading instead of only a wall clock.
-                note_ir_blind_dispatch(
-                    node.bytecode_pc
-                        .is_some_and(|pc| self.pc_is_in_a_spliced_body(pc)),
-                );
+                let in_splice = node
+                    .bytecode_pc
+                    .is_some_and(|pc| self.pc_is_in_a_spliced_body(pc));
+                note_ir_blind_dispatch(in_splice);
+                // The census counts these; it does not say WHICH site or why,
+                // and `c2-splice-checkcast-and-instanceof-20260909.md` closes
+                // on exactly that question ("that is the next thing to look
+                // at, and it is a bug, not a gap") with only a count to go on.
+                // Name the site and the state of every gate that could have
+                // routed it here, so the answer is read rather than guessed.
+                if crate::ir_stage_reporting() {
+                    let pc = node.bytecode_pc.unwrap_or(usize::MAX);
+                    // SAFETY: `info_ptr` is the same address this arm is
+                    // about to bake into the helper call as its `info_ptr`
+                    // argument; it points at a `JitInvokeInfo` owned by this
+                    // compile's `owned_invoke_infos` for the artifact's life.
+                    let info = unsafe { &*(*info_ptr as *const crate::JitInvokeInfo) };
+                    eprintln!(
+                        "[ir] blind-dispatch pc={pc} in_splice={in_splice} {}.{}{} kind={}                          num_args={num_args} ic_slot={} direct_row={} mic_helper={} abi_regs={}                          direct_calls_gate={}",
+                        info.class_name,
+                        info.method_name,
+                        info.descriptor,
+                        info.invoke_kind,
+                        self.ic_slots.get(&pc).map_or("none".to_string(), |&(m, p)| format!(
+                            "mic={m:#x},pic={p:#x}"
+                        )),
+                        self.direct_calls.contains_key(&pc),
+                        self.invoke_virtual_mic != 0,
+                        ENTRY_ABI_REGS.len(),
+                        crate::direct_jit_callee_calls_enabled(),
+                    );
+                }
                 // 1. Marshal each Java arg into the staging region.
                 for i in 0..num_args {
                     let arg = node.inputs[2 + i];
@@ -13912,6 +13941,12 @@ static IR_BLIND_DISPATCH: [std::sync::atomic::AtomicU64; 2] = [
 
 fn note_ir_blind_dispatch(in_splice: bool) {
     IR_BLIND_DISPATCH[usize::from(in_splice)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Also charge it to THIS compile, so the acceptance gate can price the
+    // splice trade for the body in front of it. The census above is cumulative
+    // across every compile in the process and cannot answer that question.
+    if in_splice {
+        crate::ir_evidence::note_blind_dispatch_in_splice();
+    }
 }
 
 /// `(in the method's own code, inside a spliced body)`. See

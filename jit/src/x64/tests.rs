@@ -4757,6 +4757,192 @@ fn test_getfield_guarded_inline_fast_and_fallback() {
     assert_eq!(result, 424242, "null receiver must route to the helper");
 }
 
+/// How many layout-replacement epoch guards a compiled body carries, counting
+/// BOTH encodings.
+///
+/// The guard is `CMP DWORD [rip+disp32], imm32` where the counter is in
+/// disp32 reach and `MOV R11, imm64` + `MOV ECX, [R11]` + `CMP ECX, imm32`
+/// where it is not, and which one a given run gets is a property of the
+/// process's address space — so a test that recognised only one of them would
+/// pass or fail by luck. Both are matched by RESOLVING to the epoch's address,
+/// which is also what makes this stronger than counting opcodes: a `81 3D`
+/// naming some other global is not a guard.
+fn layout_epoch_guards(compiled: &CompiledMethod) -> usize {
+    let (epoch, _) = cratonvm_types::layout_replace_epoch_guard();
+    let epoch = epoch as usize; // Cast: the address the guard must name
+    let code = compiled.code_bytes();
+    let base = code.as_ptr() as usize; // Cast: buffer base for RIP resolution
+    let mut n = 0usize;
+    for i in 0..code.len() {
+        // RIP form: 81 3D <disp32> <imm32>, measured from the END.
+        if i + 10 <= code.len() && code[i] == 0x81 && code[i + 1] == 0x3D {
+            let d = i32::from_le_bytes([code[i + 2], code[i + 3], code[i + 4], code[i + 5]]);
+            // Cast: sign-extend the disp32 for wrapping address arithmetic
+            if base.wrapping_add(i).wrapping_add(10).wrapping_add(d as isize as usize) == epoch {
+                n += 1;
+            }
+        }
+        // Fallback form: MOV R11, imm64 ; MOV ECX, [R11] ; CMP ECX, imm32.
+        //
+        // The load has two encodings and this backend emits the LONGER one:
+        // `emit_mov_r32_mem_disp32` goes through `Disp::encode_for_base`,
+        // which picks `mod=10` with an explicit zero disp32
+        // (`41 8B 8B 00000000`, 7 bytes) rather than the `mod=00` short form
+        // (`41 8B 0B`, 3). Measured, not assumed — and matching only the short
+        // one would make this test pass on a box where the counter is in RIP
+        // reach and fail on one where it is not, which is the single worst
+        // property a guard-census test could have.
+        if i + 2 <= code.len() && code[i] == 0x49 && code[i + 1] == 0xBB && i + 10 <= code.len() {
+            let mut imm = [0u8; 8];
+            imm.copy_from_slice(&code[i + 2..i + 10]);
+            if u64::from_le_bytes(imm) as usize == epoch {
+                let load = &code[i + 10..code.len().min(i + 17)];
+                let after = if load.starts_with(&[0x41, 0x8B, 0x8B, 0, 0, 0, 0]) {
+                    Some(i + 17)
+                } else if load.starts_with(&[0x41, 0x8B, 0x0B]) {
+                    Some(i + 13)
+                } else {
+                    None
+                };
+                if let Some(cmp_at) = after {
+                    if cmp_at + 2 <= code.len() && code[cmp_at..cmp_at + 2] == [0x81, 0xF9] {
+                        n += 1;
+                    }
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Every single-pass emitter that BAKES a compact body offset must guard it
+/// against a layout replacement — including the two the guard's own census
+/// missed.
+///
+/// `51aee440b` set out to guard "every baked compact cell offset" and listed
+/// five sites. The inline compact `getfield` — the hottest field path in the
+/// VM — and the UNGATED compact reference `putfield` were not among them, and
+/// went on baking `HEADER_SIZE + packed_body_offset` with nothing to stop them
+/// using it after `register_class_layout` replaced that layout. The allocation
+/// emitters' own comment for the same hazard is "confirmed heap corruption".
+///
+/// The failure mode this pins is a MISSING guard, not a broken one, so it is
+/// worth saying what it deliberately does not do: it does not bump the epoch.
+/// That the guard routes correctly when it fires is
+/// `a_replaced_layout_routes_the_gated_store_to_the_helper`'s job, in the
+/// optimizing tier, by execution; a second test bumping a process-wide counter
+/// would race every sibling that compiled an inline compact arm before it.
+#[test]
+fn every_single_pass_compact_field_site_guards_its_baked_offset() {
+    if !jit_sp_field_layout_guard_enabled() {
+        // This process asked for the unguarded shape, which is what that
+        // switch is for. Pricing a guard requires being able to turn it off.
+        return;
+    }
+    // ── the inline compact getfield ────────────────────────────────────
+    // int get(Obj this) { return this.x; }
+    let get_code: Vec<u8> = vec![
+        0x2a, // 0: aload_0
+        0xb4, 0x00, 0x01, // 1: getfield #1
+        0xac, // 4: ireturn
+        0, 0,
+    ];
+    let mut helpers = test_helpers();
+    // The guarded arm bakes this; a zero table sends the compact arm's
+    // admission test down the helper-only road and there would be nothing to
+    // guard.
+    static BOUNDS: [std::sync::atomic::AtomicUsize; 6] = [
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+    ];
+    helpers.read_bounds_addr = BOUNDS.as_ptr() as usize; // Cast: static address
+    set_pending_compact_field_info(vec![(1, 0, false)]);
+    let get = compile(
+        &get_code,
+        5,
+        1,
+        1,
+        false,
+        Vec::new(),
+        vec![(1usize, 0usize, b'I')],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(), // pic_slots — no PIC sites
+        Vec::new(), // ldc_info
+        Vec::new(), // ldc2w_info
+        HashMap::new(),
+        HashMap::new(),
+        &helpers,
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        None, // string_layout
+    )
+    .expect("a compact getfield must compile");
+    assert_eq!(
+        layout_epoch_guards(&get),
+        1,
+        "the inline compact getfield bakes a body offset and must guard it",
+    );
+
+    // ── the UNGATED compact reference putfield ─────────────────────────
+    // void set(Obj this, Object v) { this.f = v; }
+    //
+    // `test_helpers()` publishes no reference-store barrier plan, so
+    // `emit_gated_compact_ref_putfield` declines and this is the arm that
+    // runs — the one that had no guard.
+    let set_code: Vec<u8> = vec![
+        0x2a, // 0: aload_0
+        0x2b, // 1: aload_1
+        0xb5, 0x00, 0x01, // 2: putfield #1 (reference)
+        0xb1, // 5: return
+        0, 0,
+    ];
+    let mut set_helpers = test_helpers();
+    set_helpers.region_bounds_addr = BOUNDS.as_ptr() as usize; // Cast: static address
+    set_pending_compact_field_info(vec![(2, 0, true)]);
+    let set = compile(
+        &set_code,
+        6,
+        2,
+        2,
+        true, // needs_heap — the reference putfield helper takes it
+        Vec::new(),
+        vec![(2usize, 0usize, b'L')],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(), // pic_slots — no PIC sites
+        Vec::new(), // ldc_info
+        Vec::new(), // ldc2w_info
+        HashMap::new(),
+        HashMap::new(),
+        &set_helpers,
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        None, // string_layout
+    )
+    .expect("a compact reference putfield must compile");
+    assert_eq!(
+        layout_epoch_guards(&set),
+        1,
+        "the ungated inline compact reference putfield bakes a body offset \
+         and must guard it",
+    );
+}
+
 /// A REFERENCE field whose 16-byte cell does not hold a reference must not be
 /// read as one by the inline arm.
 ///
@@ -7530,6 +7716,103 @@ fn rip_relative_safepoint_poll_addresses_the_flag_byte() {
         resolved, flag_addr,
         "the RIP-relative displacement must land exactly on the flag byte"
     );
+}
+
+/// The layout-epoch guard's RIP-relative compare must name the counter, and
+/// must register the trail the unroll duplicator needs.
+///
+/// Two failures this catches, both silent:
+///
+/// * a displacement measured from the wrong reference point — `+ 6` instead of
+///   `+ 10`, forgetting the trailing `imm32` — compares a word four bytes from
+///   the epoch against the baked value. That is not a fault. It is a guard
+///   that answers about an unrelated global forever, which means an inline
+///   field access that keeps its baked offset across a layout REPLACEMENT:
+///   the "confirmed heap corruption" the allocation emitters' own guard
+///   comment names.
+/// * a `rip_abs_disp32_patches` entry whose trail is not 4. The unroller
+///   copies body bytes verbatim and re-resolves each entry against the copy's
+///   own PC; a trail that under-counts by 3 (the poll's 1, transcribed) makes
+///   every UNROLLED copy of the guard read three bytes off while the original
+///   stays correct — so the first iteration is right and the rest are not.
+#[test]
+fn rip_relative_epoch_guard_addresses_the_counter_and_declares_its_trail() {
+    static EPOCH: u32 = 0;
+
+    let alloc_result = crate::regalloc::RegAllocResult {
+        assignments: Vec::new(),
+        xmm_assignments: Vec::new(),
+        used_callee_saved: Vec::new(),
+        used_xmm_regs: Vec::new(),
+        block_live_in: Vec::new(),
+    };
+    let mut c = Compiler::new(
+        "rip-epoch-guard-test".to_string(),
+        ExecutableBuffer::new(4096).expect("test executable buffer"),
+        0,
+        0,
+        8,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        alloc_result,
+        false,
+        test_helpers(),
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Vec::new(),
+    );
+
+    let epoch_addr = &EPOCH as *const u32 as usize;
+    let start = c.buf.pos();
+    let patches_before = c.rip_abs_disp32_patches.len();
+    if !c.emit_cmp_mem32_abs_imm32(epoch_addr, 0x1234_5678) {
+        // The buffer landed more than 2GB from this test binary's data
+        // segment — which is exactly the shape a `static` counter has, and
+        // exactly why the epoch lives on the heap. The fallback is the
+        // materialize-the-address form.
+        assert_eq!(c.buf.pos(), start, "a refused encoding emits nothing");
+        assert_eq!(
+            c.rip_abs_disp32_patches.len(),
+            patches_before,
+            "a refused encoding registers no patch site either",
+        );
+        return;
+    }
+    let bytes: Vec<u8> = c.buf.as_slice()[start..c.buf.pos()].to_vec();
+    assert_eq!(bytes.len(), 10, "81 3D <disp32> <imm32>");
+    assert_eq!(&bytes[..2], &[0x81, 0x3D], "CMP r/m32, imm32 via [rip+d32]");
+    assert_eq!(
+        i32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]),
+        0x1234_5678,
+        "the baked epoch is the trailing imm32",
+    );
+
+    let disp = i32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
+    // RIP is the address of the NEXT instruction — past the imm32, not past
+    // the displacement. `+ 10`, not `+ 6`.
+    let insn_end = c.buf.as_ptr() as usize + start + 10;
+    let resolved = (insn_end as i64).wrapping_add(disp as i64) as usize;
+    assert_eq!(
+        resolved, epoch_addr,
+        "the RIP-relative displacement must land exactly on the epoch counter"
+    );
+
+    let (patch_off, trail) = *c
+        .rip_abs_disp32_patches
+        .last()
+        .expect("the guard registers its displacement for the unroll duplicator");
+    assert_eq!(patch_off, start + 2, "the disp32 follows the two opcode bytes");
+    assert_eq!(trail, 4, "the imm32 is part of the instruction the CPU measures from");
 }
 
 #[test]
