@@ -88,12 +88,16 @@ end state landing.
 
 1. **Register-describing metadata.** Give `OopMapEntry` a register bank and let
    deopt frame values name registers (`FrameValue::Register`, `RegisterLong`,
-   `RegisterRef` already exist and the resume path already reads them). This is
-   the single blocker that keeps *references* out of registers in the IR tier and
-   forces the conservative whole-frame re-sweep in the baseline. It pays in both
-   backends before anything is unified.
+   `RegisterRef` already exist and the resume path already reads them). This
+   was written down as the single blocker keeping *references* out of registers
+   in the IR tier, and as the thing forcing the conservative whole-frame
+   re-sweep in the baseline.
 
-   **Note (2026-09-09):** this was assumed to block `int`/`long` too. It does
+   **It is not the IR tier's blocker, and the IR tier's blocker is not
+   metadata.** Both halves of that were tested on 2026-09-09 and both were
+   wrong; what replaced them is below.
+
+   **Note 1 (2026-09-09):** this was assumed to block `int`/`long` too. It does
    not. What blocked those was `deopt_nameable` — a whole-method
    register-exclusivity proxy standing in for the per-value question "can a
    deopt that can actually happen name this?". `compute_deopt_named_reachable`
@@ -101,9 +105,44 @@ end state landing.
    `extend_home_drops_to_carried_values` applies it to the single-use
    intermediates the residency planner skips on purpose. Together they remove
    dead frame stores worth ~3.4 % on a counted-loop kernel
-   (`CRATONVM_JIT_IR_REG_AUTHORITATIVE=1`, 11 of 12 paired rounds) with no
-   reference ever entering a register. Only reference promotion still needs the
-   oop-map work.
+   (`CRATONVM_JIT_IR_REG_AUTHORITATIVE=1`, 11 of 12 paired rounds).
+
+   **Note 2 (2026-09-09): references do not need the oop-map work either, and
+   promoting them does not pay.** Two separate findings, both measured.
+
+   *The metadata was never missing.* This backend's register file is a
+   write-through read **cache** over a frame slot, not an authoritative
+   location. The slot is written at every definition — `value_home_droppable`
+   and `phi_home_droppable` refuse `Ref` and still do — and
+   `emit_safepoint_map` publishes that slot. So the collector's view of a
+   promoted reference was always complete: it can find it and it can relocate
+   it. The only thing a collection invalidates is the *copy*, and the fix for
+   that is not to describe the register but to stop reading it —
+   `ir_lower::invalidate_ref_residency` drops every cached reference at each
+   point control can leave the body and come back. `OopMapEntry` is untouched,
+   and `CRATONVM_JIT_IR_REF_RESIDENCY=1` is the whole feature.
+
+   *What actually blocks it is the slow-path rejoin.* Every `getfield` and
+   `putfield` this backend emits is a guarded inline read with the checked
+   helper as its slow path, and that slow path **returns into the body** — on
+   G1 and ZGC, which publish no read bounds for reference loads, it is taken on
+   100 % of reference accesses (`emit_inline_compact_getfield`). A cached
+   reference is therefore invalid again immediately after nearly every
+   instruction that would have used it. The census says exactly that: on
+   `bintrees`, `admitted=6 copies_dropped=6` — six references promoted, six
+   copies thrown away.
+
+   So the promotion costs a reserved register and a prologue save and avoids no
+   reload. Measured on `bintrees`, interleaved and order-flipped, medians of
+   ten: **+1.0 % with the range allowed to cross a safepoint (faster in 1 of 10
+   rounds), +0.8 % restricted to safepoint-free ranges (2 of 10)**. Both
+   directions lose, so the flag stays default-off and is kept for the
+   measurement rather than for the speed.
+
+   The consequence for this document is that reference promotion is not a
+   metadata project. It is downstream of giving field access a path that does
+   not call — which is the same work as step (4), and is where the ordering
+   below now points.
 2. **Frame state only where a deopt can arrive** — calls, allocations, guards,
    back-edge polls — instead of at every bytecode index. Removes the store
    pinning that `release_deopt_pins` currently has to undo, and cuts the deopt

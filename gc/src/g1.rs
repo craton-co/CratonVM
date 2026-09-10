@@ -5739,6 +5739,44 @@ impl Drop for G1Collector {
     }
 }
 
+/// `CRATONVM_GC_G1_MOVABLE_PINS=1` — let G1's pin set honour the
+/// movable/rewritable partition, as the generational path already does.
+/// **Default OFF.**
+///
+/// # Why this ships off
+///
+/// The filter is right and it is inert, and the second half is why it is not
+/// on. Measured on H2 `TestValueMemory` Type 3, the pause that pins 14 regions
+/// for 12474 KB:
+///
+/// ```text
+/// [g1][MOVPIN] snapshot=38 kept=38 movable_claimed=2 unrew_veto=9
+///              honour_movable=false coverage_incomplete=true movable_set=2
+/// ```
+///
+/// Two independent reasons nothing is filtered. `coverage_incomplete=true`
+/// disables the whole-cycle proof, so `honour_movable` is false outright; and
+/// even with it forced on, only 2 of the 38 addresses are CLAIMED movable,
+/// because `add_movable_jit_root` is reached only from the shadow-stack scan
+/// and only when that scan is not publishing pinned. The other 36 are precise
+/// oop-map roots, which `remap_active_jit_frames` does rewrite but which
+/// nothing publishes to the movable set.
+///
+/// So the ceiling of this filter today is 2 pins out of 38, and turning it on
+/// by default would be a live GC behaviour change bought for nothing. It is
+/// kept, and kept off, because the shortfall is in what feeds the partition
+/// rather than in the partition: whoever teaches the precise map roots to
+/// publish themselves movable will want this already here and already correct.
+fn g1_movable_pins_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_GC_G1_MOVABLE_PINS") {
+            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"),
+            Err(_) => false,
+        },
+    )
+}
+
 impl G1Collector {
     /// Bind this heap to its VM's compact-layout domain.
     pub fn set_layout_domain(&self, domain: u32) {
@@ -19482,10 +19520,79 @@ impl G1Collector {
         set
     }
 
+    /// The regions a live JIT frame forces out of the collection set.
+    ///
+    /// # The movable partition, which this used to ignore
+    ///
+    /// Not every conservative JIT root has to be pinned. A reference the shadow
+    /// stack published is PRECISE and REWRITABLE -- `shadow_stack.remap`
+    /// rewrites it after a move and the JIT's post-safepoint reload refreshes
+    /// the register from the (rewritten) frame slot -- so its object may be
+    /// evacuated like any other. `gc_quiescence` carries that partition, and
+    /// `gen_heap::collect_garbage_inner` has consulted it since the moving
+    /// young generation shipped:
+    ///
+    /// ```text
+    /// let movable = honour_movable
+    ///     && is_movable_jit_root(a)
+    ///     && !is_unrewritable_jit_root(a);
+    /// if is_y(a) && !movable { pin_base_of(a, &mut pinned); }
+    /// ```
+    ///
+    /// G1 applied NO such filter: every address in the snapshot pinned its
+    /// region. On a region-granular collector that is the expensive way to be
+    /// wrong -- a pinned region leaves the collection set WHOLESALE, so one
+    /// rewritable reference costs a whole megabyte at `-Xmx2g`. On H2's
+    /// `TestValueMemory` Type 3 it pinned 14 regions for 12474 KB from 38
+    /// addresses of which only 10 were actually unrewritable, and G1 read
+    /// ~11000 where the generational collector read 1149 and ZGC 1205 on the
+    /// same row.
+    ///
+    /// The three conjuncts are the generational path's, unchanged and for its
+    /// reasons: `honour_movable` is the whole-cycle proof that precise coverage
+    /// held, `is_movable_jit_root` is the per-address claim that a rewritable
+    /// channel names it, and `is_unrewritable_jit_root` is the VETO -- the pin
+    /// set is keyed by OBJECT, so one rewritable channel naming an address must
+    /// not license moving it out from under every other word that also holds
+    /// it, such as a compiled frame's callee-saved register image, which
+    /// `band_slot_is_verifiable` refuses to inspect and no channel rewrites.
+    ///
+    /// Gated OFF by default on `CRATONVM_GC_G1_MOVABLE_PINS` — see that function
+    /// for the measurement that says why.
     fn jit_pinned_region_set(&self) -> RegionSet {
+        let honour_movable = g1_movable_pins_enabled()
+            && !crate::gc_quiescence::moving_young_coverage_incomplete();
         let mut set: RegionSet = if crate::gc_quiescence::is_active() {
-            crate::gc_quiescence::pinned_jit_roots_snapshot()
-                .into_iter()
+            let snap = crate::gc_quiescence::pinned_jit_roots_snapshot();
+            let (mut n_mov, mut n_unrew) = (0usize, 0usize);
+            let kept: Vec<usize> = snap
+                .iter()
+                .copied()
+                .filter(|&addr| {
+                    let claimed = crate::gc_quiescence::is_movable_jit_root(addr);
+                    let vetoed = crate::gc_quiescence::is_unrewritable_jit_root(addr);
+                    if claimed {
+                        n_mov += 1;
+                    }
+                    if vetoed {
+                        n_unrew += 1;
+                    }
+                    !(honour_movable && claimed && !vetoed)
+                })
+                .collect();
+            if gc_flags().g1_dbg_pins {
+                tracing::warn!(
+                    "[g1][MOVPIN] snapshot={} kept={} movable_claimed={} unrew_veto={}                      honour_movable={} coverage_incomplete={} movable_set={}",
+                    snap.len(),
+                    kept.len(),
+                    n_mov,
+                    n_unrew,
+                    honour_movable,
+                    crate::gc_quiescence::moving_young_coverage_incomplete(),
+                    crate::gc_quiescence::movable_jit_root_count(),
+                );
+            }
+            kept.into_iter()
                 .filter_map(|addr| self.lookup_region_for_addr(addr))
                 .collect()
         } else {

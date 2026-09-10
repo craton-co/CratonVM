@@ -1,6 +1,338 @@
-# `TestRandomMapOps` at a small heap — heap corruption with THREE faces, and no reproducer worth bisecting yet
+# `TestRandomMapOps` at a small heap — RETIRED 2026-09-09: 0 of 10, against this page's own 9 of 9
 
-## Status
+## Status: RETIRED 2026-09-09
+
+**The defect this page is named after no longer reproduces, and the arm that
+was designed to bring it back does not bring it back either.**
+
+`org.h2.test.store.TestRandomMapOps`, `--Xmx 256m`, 900 s cap, ten runs taken
+**serially** on a quiet host — which is the measurement this page's own
+2026-09-02 addendum said had to be made before any number here was worth
+anything:
+
+| arm | binary | runs | failures | times | `/proc/loadavg` at start |
+|---|---|---:|---:|---|---|
+| shipped default | release, `dev@61e9df8f1` | **10** | **0** | 900 s cap ×10 | 2.36 – 12.65 |
+
+The page's own baselines for the same class, same heap, same host:
+
+| when | runs | failures | median |
+|---|---:|---:|---|
+| 2026-08-29, quiet host, three arms interleaved | 9 | **9** | ~40 s (22–471 s) |
+| 2026-09-02 (later), release binary, quiet host, batch A | 3 | **2** | 388 s, 866 s |
+| **2026-09-09, this closure** | **10** | **0** | — |
+
+0/10 against 9/9 is Fisher's exact p ≈ 1.1 × 10⁻⁵ (one arrangement in
+C(19,9) = 92 378). Against the pooled 2026-09-02 release batches — 2 failures
+in 8 — the same test gives only p ≈ 0.18, which is exactly why this closure
+does not rest on the count alone. That page's own warning applies to this
+page too: *"the per-batch rate is not stable and no rate quoted from a single
+batch is worth anything."* The controls below are what carry it.
+
+### And there is now a PASSING run, which this page records as never having existed
+
+The 2026-08-30 L7 addendum's third finding was *"there is still no passing
+CratonVM run at any heap"* — every clean row on this page is a run that hit a
+wall-clock cap, and a cap is not a pass. That gap was a property of the
+harness, not of the VM: `TestRandomMapOps.main` runs ten passes of a hundred
+seeds and returns inside no cap anybody runs it under.
+
+`probes/MvStoreRandomOps.java` (added with this closure) drives the same
+operation sequence — same key range, same fifteen-way op mix, same
+`keysPerPage(7).autoCommitDisabled()` store, same `memFS:` backing, so the
+"file" whose header the `NullPointerException` face fails to read is the same
+heap-resident byte arrays — with a bounded pass count, and RETURNS.
+
+At `--Xmx 256m`: **`MVSTORE_RANDOM_OPS PASS`** on **fifteen** full-size runs
+(40 × 3000, or 25 × 3000 for one) across every arm below, 459–1131 s each,
+plus one each at `1g` and `4g` and two shorter smoke runs. Those are passes, not caps — the driver returns
+`0` having checked every operation against a `TreeMap` oracle, including the
+`get`/`ceilingKey`/`floorKey`/`higherKey`/`lowerKey`/`size`/`firstKey`/
+`lastKey` comparison and six cursor range scans on every one of the 120 000
+operations.
+
+Making the workload terminate is also what made it measurable at all. A
+SIGTERMed VM never reaches `vm-cli`'s exit summary, and that summary is where
+`CRATONVM_GC_STATS=1` prints `compaction_cycles`,
+`zgc-relocation-skip-reason`, `stale_frame_words` and `unmapped_dupe_remap`.
+**Every engagement counter quoted on this page before today was read off a
+process that was killed before it could print one** — which is
+indistinguishable from a counter that never fired, and is the exact failure
+mode the page spent two addenda learning to recognise in other instruments.
+
+### The heap axis, which the 2026-08-30 L7 addendum said was the wrong premise
+
+That addendum's headline was *"it is NOT a small-heap defect — 4g fails
+too"*, on rows reading `1g FAIL 4 of 4` and `4g FAIL 1053s`. The
+2026-09-02 (later) addendum already withdrew them (1500 s clean at both).
+Re-measured here on the terminating driver, so these are passes rather than
+caps:
+
+| heap | runs | verdict | time |
+|---|---:|---|---|
+| `--Xmx 256m` | 2 | `MVSTORE_RANDOM_OPS PASS` | 715 s, 661 s |
+| `--Xmx 1g` | 1 | `MVSTORE_RANDOM_OPS PASS` | 647 s |
+| `--Xmx 4g` | 1 | `MVSTORE_RANDOM_OPS PASS` | 693 s |
+
+The `AssertionError: Expected: N actual: M` face — a map short of entries,
+which that addendum called *"silent data loss … the one that scales UP with
+heap"* — does not appear at any of the three. The driver checks `size()`,
+`get`, all four navigation methods and six cursor range scans against a
+`TreeMap` oracle after **every** operation, so a short map has 120 000
+opportunities per run to be caught.
+
+## The controls, which are the reason this is a closure and not a quiet week
+
+A clean arm proves nothing if the mechanism has merely gone dormant. Two arms
+were run to force it back, both on one release binary at `--Xmx 256m` against
+`probes/MvStoreRandomOps` 40 × 3000, with the engagement counters printed.
+
+### 1. `CRATONVM_ZGC_ASSUME_REWRITABLE=1` — relocate under frames NOBODY proved rewritable
+
+This flag exists for exactly one purpose, stated in `zgc.rs`: *"It relocates
+under frames nobody proved rewritable; expect corruption if the answer is
+no."* It is the strongest available restatement of this page's central
+hypothesis — *the map is short, relocation rewrites what it names and leaves a
+live reference behind*.
+
+| arm | rep | `compaction_cycles` / `collections` | `relocation_skipped_jit` | `relocation_on_proven_jit` | `objects_relocated` | verdict |
+|---|---|---|---:|---:|---:|---|
+| shipped default | — | 79 / 245 | 166 | 71 | 322 584 | PASS |
+| shipped default | — | 66 / 229 | 163 | 60 | 311 698 | PASS |
+| `ASSUME_REWRITABLE=1` | 1 | **236 / 236** | **0** | **230** | **675 364** | PASS |
+| `ASSUME_REWRITABLE=1` | 2 | **232 / 232** | **0** | **229** | **689 092** | PASS |
+| `ASSUME_REWRITABLE=1` | 3 | **227 / 227** | **0** | **221** | **711 868** | PASS |
+
+The control ENGAGED as hard as it can, on all three reps: **every single
+collection compacted** (236/236, 232/232, 227/227 against 66–79 of ~230 on
+the default), every refusal was suppressed, ~225 cycles per run relocated
+with a live compiled frame whose coverage was never proven, and **twice the
+objects moved**. The workload passed 3 of 3.
+
+That is the finding this page has been reaching for since 2026-08-29, arrived
+at from the opposite direction. The refusals are not what is protecting this
+workload. The frames really are rewritable.
+
+### 2. `CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE=0` — restore the pre-2026-08-30 behaviour
+
+The fail-closed wire this page landed on 2026-08-30, switched off in one
+binary. It is **inert on this workload today**:
+
+| arm | rep | `compaction_cycles` | `objects_relocated` | skip reasons | verdict |
+|---|---|---:|---:|---|---|
+| shipped default | — | 79 | 322 584 | `coverage-proof-incomplete=90`, all `unregistered-jit-frame-on-stack` | PASS |
+| shipped default | — | 66 | 311 698 | `coverage-proof-incomplete=163`, same | PASS |
+| `..._MAP_INCOMPLETE=0` | 1 | 70 | 307 508 | `coverage-proof-incomplete=159`, same | PASS |
+| `..._MAP_INCOMPLETE=0` | 2 | 64 | 301 988 | `coverage-proof-incomplete=160`, same | PASS |
+| `..._MAP_INCOMPLETE=0` | 3 | 71 | 319 065 | `coverage-proof-incomplete=156`, same | PASS |
+
+Not one refusal on either arm is attributed to `compiled-frame-oop-not-
+published`. The 2026-08-30 cost table (`compaction_cycles` 26 → 0 with the
+gate on) is gone, exactly as the 2026-09-01 addendum reported, and so is the
+gate's effect in the other direction: this lever no longer moves this
+workload at all, in either direction. **It is not what closed the page and it
+is not what was hiding the defect.**
+
+## The three audits, now with denominators
+
+The 2026-09-02 (later) addendum's closing instruction was *"the next INSTRUMENT
+is not another frame-word oracle — look outside the compiled frame."* Three
+in-tree audits do exactly that, and all three were run. Two of them could not
+be quoted before today because **their clean answer was invisible**:
+`ZgcRealHeap::verify_no_dangling_slots_after_slide` reports a finding at
+`error!` and a pass at `debug!`, and `release_max_level_info` deletes the
+`debug!` from a release build; `CRATONVM_DBG_ROOT_REMAP_AUDIT` speaks only
+when it finds something. Both now carry engagement counters (this closure's
+commit), so a zero is a reading rather than an absence of output.
+
+`probes/MvStoreRandomOps` 40 × 3000 at `--Xmx 256m`, shipped default:
+
+| audit | what it can see | denominator | finding |
+|---|---|---|---|
+| `[GC] zgc-slide-verify` | every reference slot of every survivor, after the slide | 66 slides, **3 840 149 survivor reference-slot walks** | `missed_rewrites=0` `unregistered_targets=0` |
+| `[GC] root_remap_audit` | the whole root scan re-run and intersected with the cycle's `pointer_map` — ~40 scan sections, not just the native-root registry | 66 cycles, **1 615 174 roots re-scanned**, **311 698 objects actually moved** | `UNREMAPPED=0` |
+| `[GC] stale_frame_words` | every word of every live compiled frame, after its oop map was applied | **399 frames audited** over 66 compaction cycles | `stale=0` |
+
+`moved_entries=311698` is the load-bearing figure for the second row: a
+root-remap audit over cycles that moved nothing proves nothing, and that is
+precisely the reading the counter exists to make impossible.
+
+The third is worth its own line. `CRATONVM_JIT_REMAP_UNMAPPED_DUPES`'s own
+doc records `duplicate_of_mapped=47946355` on `TestCachedQueryResults` — one
+reference living in four frame slots with the map naming one — and this page's
+2026-09-02 census found the same shape here (`duplicate_of_mapped=55` of 61
+frames) and dismissed it as costing nothing. **On this workload today the
+population is not merely harmless, it is empty**: `stale=0` over 399 frames
+on the default arm, and over 1 221 frames with every refusal forced off.
+Whatever that census was counting is not present in these frames any more.
+
+### The two controls crossed: the audits under `ASSUME_REWRITABLE=1`
+
+The clean audits above were taken on the shipped default, where 163 of 229
+cycles refuse to relocate at all. A sceptic's reading of them is *"of course
+nothing is stale — the collector barely moved anything under a compiled
+frame."* So the same three audits were run again with every refusal forced
+off, which is the arm that relocates under frames nobody proved rewritable:
+
+```text
+[GC] zgc-features:  compaction_cycles=225 objects_relocated=688341
+                    relocation_skipped_jit=0 relocation_on_proven_jit=220
+[GC] zgc-slide-verify:  slides_verified=225 survivors_walked=14108853
+                        missed_rewrites=0 unregistered_targets=0
+[GC] root_remap_audit:  cycles=225 roots_rescanned=5946814
+                        moved_entries=688341 UNREMAPPED=0
+[GC] stale_frame_words: frames_audited=1221 stale=0
+MVSTORE_RANDOM_OPS PASS   (706 s, load 3.36 -> 2.91)
+```
+
+**Two hundred and twenty cycles relocated under a live compiled frame whose
+oop-map coverage was never proven; 688 341 objects moved; fourteen million
+survivor reference-slot walks; 1 221 compiled frames swept word by word after
+their maps were applied — and not one stale word, not one missed rewrite, not
+one root left naming a vacated address.**
+
+That is the claim this page opened with, tested at the point where it should
+break hardest, and it does not break. The hypothesis of 2026-08-29 — *the map
+is short, relocation rewrites what it names and leaves a live reference
+behind* — is now refuted on this workload by direct measurement rather than by
+an absence of crashes.
+
+### And what CANNOT be attributed here, stated so nobody re-chases it
+
+Every run that reached an exit summary — which, as noted above, means every
+`MvStoreRandomOps` run and none of the capped `TestRandomMapOps` ones —
+reports
+
+```text
+[GC] xt_peer_scan: unclassified_peers=0 cycles_with_unclassified=0 taken_over=0
+                   xt_roots=0 helper_windows=0 hw_pinned=0 hw_refused=0
+                   resignals=0 classified_after_retry=0 enabled=true
+[GC] blocked_peer_stack_remap: captured=0 adopted=0 written=0 ... enabled=true
+[GC] xt_peer_shadow: sh_windows=0 sh_slots=0 sh_roots=0 sh_untrusted=0 enabled=true
+```
+
+`enabled=true` on each, so these are engagement zeros in the good sense: the
+machinery was armed and found nothing to do. Both drivers open the store with
+`autoCommitDisabled()`, so there is no MVStore background-writer thread, and
+no peer is ever in compiled code at a safepoint of the run.
+
+Every frozen-peer hypothesis — `unrewritable_peer_state`, the helper-window
+discharge, `XT_TAKEOVER`, the 2026-09-06 "stale reference lives in a frozen
+peer's SPILL SLOTS" finding — is therefore **structurally inert on this
+workload**, and no result on this page can be evidence for or against any of
+them. They are live questions; they are somebody else's page.
+
+## What actually closed it
+
+No single commit. The page's own record plus today's controls narrow it to
+this, in the order the fixes landed:
+
+1. **`bbd9d05a9` (2026-08-30) — a direct call's staged argument oops are named
+   in its safepoint map.** This closed the dominant `staged_unmappable`
+   population, which the 2026-08-30 census showed was the ONLY cause firing
+   (`staged_unmappable=19`, every other cause zero) and which produced the
+   `String.substring(II)` safepoint-41 witness this page treated as its
+   minimal reproducer. The 2026-09-01 addendum measured its effect and found
+   the gate's cost gone.
+2. **The oop-map coverage work through 2026-09-02**, which is why
+   `local_oop` and `inline_local_oop` were already zero over ~370 frames on
+   two workloads and both binaries by the time that addendum was written —
+   and why `ASSUME_REWRITABLE=1` can now relocate under 220 unproven frames
+   per run without leaving a single stale frame word behind it.
+3. **`Arena::commit_for_relocation` (2026-09-05)** — the slide writing into
+   granules the give-back had decommitted. That closed the SIGSEGV face
+   outright (5/10 → 0/10, p = 0.016), recorded at the top of the historical
+   section below.
+4. **The 2026-09-05…09 GC/JIT merges on `dev`** — the frozen-peer spill-slot
+   work, the OSR entry FP-register seed, the G1 pinned-region work. None of
+   these is attributable *from here*, for the reason in the section above:
+   this workload never freezes a peer. They are listed because the 0/10 was
+   measured on a tip that contains them and honesty requires saying so.
+
+**What is NOT claimed:** that any one of those is *the* fix. The page never
+had a bisectable single-commit failure — it had a rate — and the rate is now
+zero over ten serial runs with the strongest available forcing arm also
+passing. That is a closure by measurement, and it is stated as such.
+
+## Every `Next` item this page raised, and where it ended
+
+| item | status |
+|---|---|
+| **1.** *"`String.substring(II)` at safepoint 41 is a one-method reproducer … a unit test that asserts `stale_live == 0` would fail today"* | **Moot, and it would not fail today.** The witness was retracted by the page itself on 2026-09-02: offset 32 is local 3, `javap -c` shows `25: istore_3`, so the slot holds an `int` and the map naming locals 0/1/4 was exactly right. `classify_stale_local` has a unit test pinning precisely that case (`mask Some(19)`, offset 32 → `local-not-oop`). The assertion the item asks for is on a quantity the page later proved is not a defect. |
+| **2.** *"Repair direction … either the lowerer names every live-band slot holding a reference, or `coverable` is cleared whenever it cannot prove it did"* | **Closed by the second branch, and then by measurement.** The fail-closed wire landed 2026-08-30; today `ASSUME_REWRITABLE=1` shows the first branch is also satisfied in practice — 236 of 236 cycles relocated under unproven frames with no corruption and `stale_frame_words=0`. |
+| **3.** *"Consider defaulting `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT` to OFF"* | **Closed 2026-09-01 and re-confirmed today.** There is no cost to justify it: the gate is inert on this workload in both directions. |
+| **§5 (2026-09-01)** *"Before any repair, the instrument needs to be able to say live"* | **Closed 2026-09-02**: `local_oop_mask`, `inline_local_scopes`, `non_oop_stack_slots`, `classify_stale_local` with 8 unit tests. |
+| **2026-09-02 residual:** *"The IR tier has no oracle"* | **Superseded rather than fixed.** `ir_lower` publishes every provably-primitive spill slot as `OopMapEntry::non_oop_stack_slots` with `stack_marks_exact`, so `stack_not_oop` speaks for the IR tier. It is untested here because there is no residue left to classify: `stale_frame_words=0`. |
+| **2026-09-02 (later) residual:** *"the next measurement is a SERIAL batch on an idle host — at least 10 runs at 256m"* | **Done. This page's headline.** |
+| **2026-09-02 (later) residual:** *"the next INSTRUMENT is not another frame-word oracle; look outside the compiled frame"* | **Done.** The slide verifier and the root-remap audit are exactly that, and both now report with a denominator. |
+| **2026-08-30 L7:** *"there is still no passing CratonVM run at any heap"* | **Closed.** Twelve full-size `MVSTORE_RANDOM_OPS PASS` runs at 256m, on four different flag arms. |
+| **2026-08-30 L7 caution about the `G30` coercion guard** | Stands as written — an observation, not a discriminator. Nothing here changes it. |
+
+## Two switches this page brushed against that are still OFF, and are NOT this page's to close
+
+Recorded so the next reader does not mistake this closure for a statement
+about them. Both are inert on this workload (no frozen peers; no residual
+frame dupes), so nothing measured here bears on either:
+
+* **`CRATONVM_ZGC_UNREWRITABLE_PEER_REFUSES`** — default OFF. Its own doc in
+  `gc/src/zgc.rs` argues that a frozen peer's derived pointer is *"a statement
+  about peer STATE, not about proof completeness, so it belongs in the chain
+  on its own"*, and then ships the term inert; it needs
+  `CRATONVM_XT_KEEP_UNREWRITABLE_ON_DISCHARGE` too, and *"either alone is
+  inert"*. A workload with real blocked peers has to price that pair.
+* **`CRATONVM_JIT_REMAP_UNMAPPED_DUPES`** — default OFF, against a measured
+  `duplicate_of_mapped=47946355` on `TestCachedQueryResults`. The residual
+  risk it carries (a primitive holding a moved object's exact base gets
+  conservatively rewritten) is narrowable with oracles that now exist —
+  `local_oop_mask` and `non_oop_stack_slots` both say which slots are proven
+  primitives — but that is a repair for the page that can measure it.
+
+## Reproducing, for anyone who needs to re-open this
+
+```bash
+source /data/toolchain/env.sh
+cd /data/cratonvm/apps/h2database/h2
+CP="target/classes:target/test-classes:$(cat craton-testcp.txt)"
+
+# The historical workload — never terminates; use a cap and expect rc=124.
+<cratonvm-bin> --java-home /data/toolchain/jdk-25 --Xmx 256m \
+    -c "$CP" org.h2.test.store.TestRandomMapOps
+
+# The terminating driver — same op mix, prints PASS/FAIL and the GC summary.
+javac -cp "$CP" -d /tmp/probeclasses probes/MvStoreRandomOps.java
+CRATONVM_GC_STATS=1 <cratonvm-bin> --java-home /data/toolchain/jdk-25 --Xmx 256m \
+    -c "/tmp/probeclasses:$CP" MvStoreRandomOps 40 3000
+```
+
+Arms worth having, in the order to run them:
+
+| flag | what it answers |
+|---|---|
+| `CRATONVM_ZGC_ASSUME_REWRITABLE=1` | is the coverage proof load-bearing, or is the workload simply correct? Forces every refusal off. |
+| `CRATONVM_DBG_ZGC_VERIFY_SLIDE=1` | did the slide's rewrite pass miss a heap reference slot? Read `[GC] zgc-slide-verify`, and read `slides_verified` before `missed_rewrites`. |
+| `CRATONVM_DBG_ROOT_REMAP_AUDIT=1` (+ `CRATONVM_DBG_ROOT_SOURCE=1`) | did a scanned ROOT keep naming a vacated address? Read `[GC] root_remap_audit`, and read `moved_entries` before `UNREMAPPED`. |
+| `CRATONVM_DBG_STALE_FRAME_WORDS=1` | did a live compiled frame keep a moved address in a slot no map named? Read `frames_audited` before `stale`. |
+| `CRATONVM_DBG_REMAP_RESIDUE=1` | the per-frame oracle: `local_oop` is the only count that names a missed root. |
+
+**Record `/proc/loadavg` beside `rc` on every run.** That rule is the one
+piece of methodology this page got right early and had to re-learn twice, and
+it is why the ten runs above are serial.
+
+## Gates
+
+`regression-suite/run.sh` on the same binary: **92 passed, 0 failed** (92 of
+92 scheduled vectors, 0 list/coverage errors, 0 harness-blindness flags).
+`cargo test` green for `cratonvm-types`, `cratonvm-gc`, `cratonvm-jit --lib`
+and `cratonvm-vm --lib`.
+
+---
+
+*Everything below this line is the historical record as it stood on
+2026-09-05, unchanged. It contains three readings the page itself later
+withdrew; each is marked where it was withdrawn. Read the status above first.*
+
+
+## Status (as recorded 2026-09-05 — SUPERSEDED, see the top of this page)
 
 **OPEN, split out 2026-08-29** from
 `bug-h2-testrandommapops-classcastexception-20260821.md`, which retired with
@@ -957,10 +1289,21 @@ private `testOps(String,int,long)` so a seed can be pinned; it prints
 usable as a bisect target once one exists. It does not reproduce this row —
 the failure is a GC/JIT schedule, not a function of the operation sequence.
 
+> **2026-09-09:** that class is no longer in the tree (`find` over
+> `apps/h2database` returns nothing), so this paragraph is history. Its
+> successor is `probes/MvStoreRandomOps.java`, which needs no reflection
+> because it owns the loop, takes `(passes, ops, firstSeed)` on the command
+> line, and — unlike `TestRandomMapOps` itself — RETURNS, which is what makes
+> the exit-time `[GC]` summary readable at all. See the top of this page.
+
 ## Related
 
-- `bug-h2-testrandommapops-classcastexception-20260821-RETIRED-20260829.md`
+- `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testrandommapops-classcastexception-20260821-RETIRED-20260829.md`
   — the parent page, with the G1 fix and the eleven-run non-reproduction.
+- `probes/MvStoreRandomOps.java` — the terminating driver this closure added.
+- `docs/internal/fixed-suite-bugs/bug-testlargeblob-segv-decommit-under-live-memcpy-20260904.md`
+  and `docs/internal/fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
+  — the SIGSEGV face's root cause, closed 2026-09-05.
 - `docs/known-issues/gc/G30-1-the-silent-reference-slot-coercion-20260817.md`
   — the WARN family this may or may not belong to. The parent page's own
   history is that reading that WARN as a discriminator was wrong twice.

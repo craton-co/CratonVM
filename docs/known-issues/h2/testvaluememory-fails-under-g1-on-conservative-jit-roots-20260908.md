@@ -5,10 +5,17 @@
 Measured 2026-09-09: the "where to start" list is now run to the end, two of its
 three items are REFUTED by measurement, and the third has a number on it.*
 
+*Updated 2026-09-09 (second pass): item 2 is IMPLEMENTED and Type 0 now passes
+on G1. The failure moved to Type 3, which measurement then showed is not this
+page's problem at all — see [Type 0 is fixed; Type 3 is a different
+bug](#type-0-is-fixed-type-3-is-a-different-bug).*
+
 ## Status
 
-**OPEN, and the number is unchanged.** `org.h2.test.unit.TestValueMemory`,
-`-Xmx2g`, dev `fc70730d5`:
+**OPEN at Type 3; Type 0 is FIXED.** `org.h2.test.unit.TestValueMemory`,
+`-Xmx2g`.
+
+Before (dev `fc70730d5`):
 
 | arm | result | worst row |
 |---|---|---|
@@ -17,13 +24,21 @@ three items are REFUTED by measurement, and the third has a number on it.*
 | CratonVM `-XX:+UseG1GC` | **FAIL at Type 0** | **3.30x** |
 | HotSpot JDK 25 | PASS | 0.5x |
 
-```
-AssertionError: Type: 0 Used memory: 3224 calculated: 976 length: 125000 size: 1
-```
+After precise register oop maps (`claude/jit-reg-oop-maps-20260909`):
 
-The assertion is `used > memory * 3`, so the threshold is 2928 KB and G1 reads
-3224. What has changed since 2026-09-08 is not the number but what is known
-about it, and the first correction is to what this test measures at all.
+| arm | Type 0 | result |
+|---|---|---|
+| CratonVM default (ZGC) | 2227 | **PASS** |
+| CratonVM `-XX:+UseGenerationalGC` | 2227 | **PASS** |
+| CratonVM `-XX:+UseG1GC` | **2227** | FAIL at Type 3 (~10000) |
+
+G1's Type 0 went 3224 -> 2227, which is the same number the other two
+collectors read, i.e. the G1-specific excess on that row is GONE. All three
+arms are now identical there.
+
+The assertion is `used > memory * 3`, so the threshold is 2928 KB. What has
+changed since 2026-09-08 is not just the number but what is known about it, and
+the first correction is to what this test measures at all.
 
 ## The 977 KB floor is a LIVE object, and the predecessor page mis-stated it
 
@@ -226,7 +241,103 @@ class, so any two-of-three leaves all three regions pinned and the number
 unmoved. There is no incremental landing here; a partial precise root set gets
 zero.
 
+## Type 0 is fixed; Type 3 is a different bug
+
+Item 2 was implemented (`OopMapEntry::reg_oop_mask`, plus the two companion
+narrowings item 0 and item 1 called for). Type 0 on G1 went **3224 -> 2227**,
+identical to ZGC and generational on the same row. That is this page's headline
+number, and it is discharged.
+
+The suite still fails, now at Type 3, and the rest of this section is the
+measurement that says **Type 3 does not belong to this page**.
+
+### Skipping EVERY conservative band class changes nothing at Type 3
+
+`CRATONVM_JIT_BAND_SKIP` exists to price exactly this. Set to all ten of
+`region_name`'s classes it is the absolute ceiling of the conservative-root
+line of work — no compiled-frame word is a marking root at all:
+
+| `CRATONVM_JIT_BAND_SKIP` | Type 3, three runs |
+|---|---|
+| unset | 10976, 10967, 12998 |
+| all ten classes | 11979, 11986, 11987 |
+
+Indistinguishable, and if anything higher with the skip. **The remaining Type 3
+excess is not in the band scan**, so no amount of further root-set precision —
+including the deopt `SavedRegisters` block, which the previous revision of this
+page named as the next step — can reach it. That plan is retired.
+
+The JIT is still implicated: `--nojit` reads **793** on G1, twice, exactly. So
+the cost arrives through the JIT by some channel other than the band scan.
+
+### The channel is precise oop-map roots, pinned a megabyte at a time
+
+Under the full band skip, G1 still pins 12 regions:
+
+```
+pin_addrs=30 pin_regions={7,8,9,10,14,15,16,17,21,23,24,68} pinned_bytes=9708K
+```
+
+Thirty pin addresses survive a total band skip because they were never band
+words. They are the frames' **precise** roots — `frame_slot_offsets` from the
+oop maps, i.e. references the compiler positively asserts are live. They are
+correct roots. The cost is that G1 excludes a pinned region from the collection
+set WHOLESALE, so ~30 live references scattered across 12 regions cost ~10 MB at
+`-Xmx2g`, against a 2928 KB threshold.
+
+That is a G1 pinning-granularity problem, not a root-precision problem, and it
+is why the same 30 references cost ZGC 1205 and the generational collector 1149
+on the identical row.
+
+### The movable partition is right, inert, and starved
+
+Precise map roots are exactly the ones `remap_active_jit_frames` rewrites after
+a move, so they ought not to be pinned at all. `gen_heap` already acts on that
+distinction; `G1Collector::jit_pinned_region_set` did not, and now can, behind
+`CRATONVM_GC_G1_MOVABLE_PINS=1` (**default off**). It is off because measuring
+it showed the filter is starved, not wrong:
+
+```
+[g1][MOVPIN] snapshot=38 kept=38 movable_claimed=2 unrew_veto=9
+             honour_movable=false coverage_incomplete=true movable_set=2
+```
+
+Two independent blockers. `coverage_incomplete=true` disables the whole-cycle
+proof outright. And even forced on, only **2 of 38** addresses are claimed
+movable, because `add_movable_jit_root` is reached only from the shadow-stack
+scan and only when it is not publishing pinned — the 36 precise map roots
+publish themselves to nothing.
+
+So the next person's job is not the filter. It is **teaching the precise oop-map
+roots to publish themselves movable**, at which point the filter is already
+here and already correct. Until then it stays off, because turning on a live GC
+behaviour change worth 2 pins in 38 is a risk bought for nothing.
+
+### Corrected: the "ordering defect" was the diagnostic, not the collector
+
+The previous revision closed with *"the ordering defect means the partition is
+not even computed at the point G1 reads it"*. That is wrong and this page
+should not have said it. The `[jitpins]` line prints at step 14 and the
+shadow-stack scan runs at 14b, so `movable_set=0` on that line is an artefact of
+**where the diagnostic prints**. By the time G1 calls `jit_pinned_region_set`
+the set is populated — `movable_set=2`, as the `MOVPIN` census above shows from
+inside G1's own read. The real defect was simpler and worse: G1 applied no
+movable filter at all.
+
+The rest of that paragraph — do not narrow G1's pin set on the strength of this
+page — still stands, now for a measured reason rather than a mistaken one.
+
 ## What to do, and what not to
+
+> **DONE 2026-09-09.** All three parts below are implemented on
+> `claude/jit-reg-oop-maps-20260909` and jointly take Type 0 from 3224 to 2227.
+> Each is separately switchable (`CRATONVM_GC_DEAD_SPILL_ROOTS`,
+> `CRATONVM_GC_OUTGOING_ARG_ROOTS`, `CRATONVM_GC_REG_OOP_MAPS`) and all three
+> are load-bearing: any one alone leaves Type 0 at 3224. Item 1 was NOT solved
+> by the prologue-zeroing this list proposed — the safepoint's own
+> `pending_staged_args_unmapped` already proves the reserve holds nothing of
+> this frame's, so a `Some` register mask carries the proof and the reserve can
+> simply be skipped. The list is kept as written for the record.
 
 **The fix is per-safepoint liveness for compiled-frame words** — the compiled
 analogue of `runtime::local_liveness::live_locals_mask`, which is exactly why
@@ -258,8 +369,10 @@ test measures something real, two of three arms pass it, and the region count is
 held near 2048 on purpose (`G1_TARGET_REGION_COUNT`).
 
 **Do not** narrow G1's pin set by the movable/unrewritable partition on the
-strength of this page. It is refuted above, and the ordering defect means the
-partition is not even computed at the point G1 reads it.
+strength of this page — see [the movable partition is right, inert, and
+starved](#the-movable-partition-is-right-inert-and-starved) for the measurement,
+and note that this paragraph's original reason (an "ordering defect") was itself
+wrong and is corrected there.
 
 ## Reproducer
 

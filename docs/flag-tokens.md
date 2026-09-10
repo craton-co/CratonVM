@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-539 tokens.
+540 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -220,6 +220,7 @@ export inherited from a parent shell.
 | `gc-stress` | `CRATONVM_DBG_GC_STRESS` |
 | `oop-oracle-force-refute` | `CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE` |
 | `gc-verify-stale` | `CRATONVM_GC_VERIFY_STALE` |
+| `verify-reg-oop-maps` | `CRATONVM_DBG_VERIFY_REG_OOP_MAPS` |
 | `peer-reg-pairing` | `CRATONVM_DBG_PEER_REG_PAIRING` |
 | `static-slot-verify` | `CRATONVM_DBG_STATIC_SLOT_VERIFY` |
 | `gc-trigger-verify` | `CRATONVM_DBG_GC_TRIGGER_VERIFY` |
@@ -605,7 +606,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-411 tokens.
+415 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -739,12 +740,14 @@ export inherited from a parent shell.
 | `ir-deopt-points-at-traps` | `CRATONVM_JIT_IR_DEOPT_POINTS_AT_TRAPS` |
 | `ir-reg-authoritative` | `CRATONVM_JIT_IR_REG_AUTHORITATIVE` |
 | `ir-speculate` | `CRATONVM_JIT_IR_SPECULATE` |
-| `tier-pgo-always` | `CRATONVM_TIER_PGO_ALWAYS` |
 | `band-skip` | `CRATONVM_JIT_BAND_SKIP` |
 | `ls-carry-relief` | `CRATONVM_JIT_LS_CARRY_RELIEF` |
 | `ir-reserve-carried` | `CRATONVM_JIT_IR_RESERVE_CARRIED` |
 | `osr-optimizing` | `CRATONVM_JIT_OSR_OPTIMIZING` |
 | `osr-optimizing-memo` | `CRATONVM_JIT_OSR_OPTIMIZING_MEMO` |
+| `ir-splice-multi-return` | `CRATONVM_JIT_IR_SPLICE_MULTI_RETURN` |
+| `ir-ref-residency` | `CRATONVM_JIT_IR_REF_RESIDENCY` |
+| `ir-ref-residency-cross-safepoint` | `CRATONVM_JIT_IR_REF_RESIDENCY_CROSS_SAFEPOINT` |
 | `ir-drop-phi-home` | `CRATONVM_JIT_IR_DROP_PHI_HOME` |
 | `ir-publish-at-def` | `CRATONVM_JIT_IR_PUBLISH_AT_DEF` |
 | `ir-drop-home` | `CRATONVM_JIT_IR_DROP_HOME` |
@@ -829,6 +832,7 @@ export inherited from a parent shell.
 | `my-scratch-flush` | `CRATONVM_JIT_MY_SCRATCH_FLUSH` |
 | `my-selfcall-proof` | `CRATONVM_JIT_MY_SELFCALL_PROOF` |
 | `my-shadow-emission` | `CRATONVM_JIT_MY_SHADOW_EMISSION` |
+| `reg-oop-maps` | `CRATONVM_JIT_REG_OOP_MAPS` |
 | `native-ec-multiply` | `CRATONVM_NATIVE_EC_MULTIPLY` |
 | `native-matcher-find` | `CRATONVM_NATIVE_MATCHER_FIND` |
 | `native-pbe-keyfactory` | `CRATONVM_NATIVE_PBE_KEYFACTORY` |
@@ -966,6 +970,7 @@ export inherited from a parent shell.
 | `tier-pgo` | `CRATONVM_TIER_PGO` |
 | `tier-pgo-receivers` | `CRATONVM_TIER_PGO_RECEIVERS` |
 | `tier-pgo-c2-window` | `CRATONVM_TIER_PGO_C2_WINDOW` |
+| `tier-pgo-always` | `CRATONVM_TIER_PGO_ALWAYS` |
 | `tiered` | `CRATONVM_TIER_ENABLED` |
 | `tlab-zero-elision` | `CRATONVM_NO_JIT_TLAB_ZERO_ELISION` |
 | `trivial-getter` | `CRATONVM_TRIVIAL_GETTER` |
@@ -1023,7 +1028,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-173 tokens.
+177 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1035,6 +1040,10 @@ export inherited from a parent shell.
 | `peer-pin-divert` | `CRATONVM_GC_NO_PEER_PIN_DIVERT` |
 | `conditional-tlab-skip-publish` | `CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH` |
 | `frame-trace-span-retire` | `CRATONVM_GC_NO_FRAME_TRACE_SPAN_RETIRE` |
+| `reg-oop-maps` | `CRATONVM_GC_REG_OOP_MAPS` |
+| `dead-spill-roots` | `CRATONVM_GC_DEAD_SPILL_ROOTS` |
+| `outgoing-arg-roots` | `CRATONVM_GC_OUTGOING_ARG_ROOTS` |
+| `g1-movable-pins` | `CRATONVM_GC_G1_MOVABLE_PINS` |
 | `moving-young-band-skip-in-map` | `CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP` |
 | `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
 | `gpu-min-work-giveup` | `CRATONVM_GPU_MIN_WORK_GIVEUP` |

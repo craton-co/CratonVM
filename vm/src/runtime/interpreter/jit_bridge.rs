@@ -10369,11 +10369,31 @@ fn resolve_inline_site_from(
         scan_pc += inline_instr_length(code, scan_pc);
     }
 
-    // The relocated body is walked straight through from its first byte to its
-    // return, with the caller's frame parked in `SpliceFrame`. More than one
-    // return means an early exit the walk would never reach the second half of;
-    // a return that is not last means live code after it.
-    if ir_mode && (ir_return_pcs.len() != 1 || ir_return_pcs[0] + 1 != code_len) {
+    // The relocated body is walked from its first byte through to `code_len`
+    // with the caller's frame parked in `SpliceFrame`, so the LAST instruction
+    // must be a `return` — otherwise the walk runs off the end of the body into
+    // whatever `lib.rs` appended next.
+    //
+    // More than one return was refused outright until 2026-09-09, on the
+    // grounds that the walk leaves the splice at the first one and would never
+    // reach the code after it. It no longer leaves: `IrBuilder::splice_return`
+    // turns each return into an edge into a continuation built at the body's
+    // end (`finish_multi_return_splice`), which is the ordinary
+    // several-predecessors join the builder already performs for a caller's own
+    // branches. Default OFF — `CRATONVM_JIT_IR_SPLICE_MULTI_RETURN=1` lifts the
+    // refusal, and `ir_splice_multi_return_enabled` says why it is not lifted
+    // by default (it is neutral on throughput and forfeits the optimizing OSR
+    // door while `emit_osr_entry_stubs` is unfixed);
+    // the builder reads the SAME switch, and neither half may be flipped alone.
+    //
+    // Every `return` opcode is one byte, so "last instruction" is exactly
+    // `last + 1 == code_len` with no length table needed.
+    let multi_return_ok = ir_mode && cratonvm_jit::ir::ir_splice_multi_return_enabled();
+    if ir_mode
+        && (ir_return_pcs.is_empty()
+            || ir_return_pcs[ir_return_pcs.len() - 1] + 1 != code_len
+            || (!multi_return_ok && ir_return_pcs.len() != 1))
+    {
         no!("ir-splice-not-single-trailing-return");
     }
 

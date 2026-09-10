@@ -1051,6 +1051,26 @@ struct ZgcCounters {
     /// Cycles that relocated the unpinned pages despite an incomplete coverage
     /// proof. See [`Self::coverage_incompleteness_is_page_pinnable`].
     relocation_on_page_pins: AtomicUsize,
+    /// ENGAGEMENT for [`ZgcRealHeap::verify_no_dangling_slots_after_slide`]:
+    /// slides it actually walked, and survivors it walked them over.
+    ///
+    /// Without these the verifier's clean answer is INVISIBLE in a release
+    /// build. It reports a finding at `error!` and a pass at `debug!`, and
+    /// `tracing`'s `release_max_level_info` compiles the `debug!` away — so a
+    /// release run under `CRATONVM_DBG_ZGC_VERIFY_SLIDE=1` prints nothing
+    /// whether every slot resolved or the verifier never ran, and "no output"
+    /// was the only thing a reader could quote. That is the
+    /// zero-from-an-instrument-armed-where-it-cannot-fire shape this collector
+    /// already refuses to accept from `pinned_jit_roots_snapshot` (see
+    /// `gc_quiescence::conservative_jit_scans`), and it applies to a verifier
+    /// exactly as it applies to a pin set.
+    slide_verifications: AtomicUsize,
+    slide_verified_survivors: AtomicUsize,
+    /// Reference slots the verifier judged dangling, split the way its own
+    /// report splits them: `missed_rewrite` is the collector's fault, the rest
+    /// were never live bases.
+    slide_verify_missed_rewrites: AtomicUsize,
+    slide_verify_unregistered: AtomicUsize,
     /// The stop-the-world mark pool, kept ALIVE BETWEEN CYCLES so its worker
     /// threads are spawned once rather than per collection. `(workers, pool)`:
     /// a changed worker count rebuilds it. See `persistent_mark_pool`.
@@ -2059,6 +2079,10 @@ impl ZgcRealHeap {
                 conc_black_claims: AtomicUsize::new(0),
             tlab_retire_skipped_at_safepoint: AtomicUsize::new(0),
                 relocation_on_page_pins: AtomicUsize::new(0),
+                slide_verifications: AtomicUsize::new(0),
+                slide_verified_survivors: AtomicUsize::new(0),
+                slide_verify_missed_rewrites: AtomicUsize::new(0),
+                slide_verify_unregistered: AtomicUsize::new(0),
                 mark_pool: Mutex::new(None),
                 vm_tlab_enabled: AtomicBool::new(zgc_vm_tlab_enabled_by_default()),
                 jit_tlab_skip: Mutex::new(Vec::new()),
@@ -5305,6 +5329,25 @@ impl ZgcRealHeap {
     pub fn relocation_on_page_pins(&self) -> usize {
         self.counters.relocation_on_page_pins.load(Ordering::Relaxed)
     }
+
+    /// `(slides_verified, survivors_walked, missed_rewrites, unregistered_targets)`
+    /// for [`Self::verify_no_dangling_slots_after_slide`].
+    ///
+    /// The first two are the DENOMINATOR. `missed_rewrites=0` with
+    /// `slides_verified=0` means the verifier never ran — which is what a
+    /// release build under `CRATONVM_DBG_ZGC_VERIFY_SLIDE=1` looked like from
+    /// the outside before this existed, since the clean-case log line is a
+    /// `debug!` and `release_max_level_info` deletes it.
+    pub fn slide_verification_stats(&self) -> (usize, usize, usize, usize) {
+        (
+            self.counters.slide_verifications.load(Ordering::Relaxed),
+            self.counters.slide_verified_survivors.load(Ordering::Relaxed),
+            self.counters
+                .slide_verify_missed_rewrites
+                .load(Ordering::Relaxed),
+            self.counters.slide_verify_unregistered.load(Ordering::Relaxed),
+        )
+    }
 }
 
 fn zgc_relocate_under_proven_jit() -> bool {
@@ -7245,6 +7288,15 @@ impl ZgcRealHeap {
         if !zgc_verify_slide_enabled() {
             return;
         }
+        // ENGAGEMENT FIRST, and before any early return below it. A release
+        // build compiles the clean-case `debug!` away, so these counters are
+        // the only thing that can tell "every slot resolved" from "the
+        // verifier never ran" — see the field docs on
+        // `ZgcCounters::slide_verifications`.
+        self.counters.slide_verifications.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .slide_verified_survivors
+            .fetch_add(live_now.len(), Ordering::Relaxed);
         use census::ZCensusHeapView;
         // Extents of every survivor, sorted, so a dangling target can be asked
         // the question that actually matters: does it land INSIDE a live
@@ -7321,6 +7373,12 @@ impl ZgcRealHeap {
                 }
             });
         }
+        self.counters
+            .slide_verify_missed_rewrites
+            .fetch_add(missed, Ordering::Relaxed);
+        self.counters
+            .slide_verify_unregistered
+            .fetch_add(unregistered, Ordering::Relaxed);
         if dangling > 0 {
             tracing::error!(
                 target: "cratonvm::gc::guard",
@@ -10487,7 +10545,7 @@ accessor_reads_punned_nonzero={} accessor_stores={} accessor_stores_primitive={}
     );
 }
 
-fn zgc_verify_slide_enabled() -> bool {
+pub(crate) fn zgc_verify_slide_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ZGC_VERIFY_SLIDE").is_some()

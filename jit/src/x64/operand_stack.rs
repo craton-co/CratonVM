@@ -507,6 +507,18 @@ impl Compiler {
     /// makes `pop_stack` clear `stack_oop_marks_exact`, which
     /// `emit_oop_map_for_safepoint` already treats as an incomplete map — so a
     /// desync cannot turn into a silently unnamed argument.
+    ///
+    /// # It also records the argument REGISTERS
+    ///
+    /// This pop is the moment a live reference stops being described by the
+    /// simulated operand stack while still physically occupying a register, and
+    /// the `CALL` that follows is a safepoint. `live_oop_register_mask` reads
+    /// the simulated stack, so from here to the call its mask would have the
+    /// bit for that register CLEAR while the blind spill image holds the only
+    /// conservative sighting of the object — a narrowed scan then walks past a
+    /// live reference. `pending_call_oop_arg_regs` carries the fact across that
+    /// window, and this is the right place to set it because every invoke path
+    /// funnels through here.
     pub(super) fn pop_invoke_args(&mut self, n: usize) -> (Vec<StackSlot>, Vec<bool>) {
         let mut slots = Vec::with_capacity(n);
         let mut oops = Vec::with_capacity(n);
@@ -516,6 +528,17 @@ impl Compiler {
         }
         slots.reverse();
         oops.reverse();
+        // Register homes of the reference arguments, for the register mask.
+        // `Frame` and `Xmm` homes contribute nothing: the first is not in the
+        // spill image at all, the second is not a GPR.
+        for (slot, &is_oop) in slots.iter().zip(oops.iter()) {
+            if !is_oop {
+                continue;
+            }
+            if let StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg, ..) = *slot {
+                self.pending_call_oop_arg_regs |= crate::x64::licm::spill_gpr_bit(reg);
+            }
+        }
         (slots, oops)
     }
 

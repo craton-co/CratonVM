@@ -157,6 +157,13 @@ use std::path::{Path, PathBuf};
 /// which `bench-gpu/GpuAsyncChainBench.java` already calls) or an
 /// executor-close path drains the map. Either gives this item a production
 /// caller, and the number comes down in that change.
+/// **299 -> 297 on the 2026-09-09 `origin/dev` merge.** Neither side crossed
+/// on its own — both branches declare 299 — so the two items came off the list
+/// only once the two sets of `vm/src` changes were in one tree. Lowered here
+/// because the gate's own ratchet arm requires it in the same change: a win
+/// left unlocked leaks back silently, which is the whole reason that arm
+/// exists (ARCH-2026-08-04 A7).
+///
 /// # A third disposition: `pub` for `vm/tests/`
 ///
 /// The assertion below offers two remedies — delete it, or make it
