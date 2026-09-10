@@ -3222,12 +3222,17 @@ impl<'a> Lowerer<'a> {
     fn saved_gpr_regs(&self) -> impl Iterator<Item = (u8, i32)> + '_ {
         let base = self.spill_cap_off + self.saved_xmm_bytes;
         let reserved = self.saved_gpr_bytes;
-        IR_LOWER_SAVED_GPRS
+        // `ir_gp_file()`, not `IR_LOWER_SAVED_GPRS`: the save area covers the
+        // registers this compile could HAND OUT, so with the kill switch off
+        // the frame is byte-identical to the pre-widening tree rather than
+        // paying 16 bytes for two registers nothing can name.
+        ir_gp_file()
             .iter()
             .enumerate()
             .filter(move |_| reserved > 0)
             .filter(move |(_, reg)| self.gp_reg_of.iter().any(|r| *r == Some(**reg)))
-            // Cast: `IR_LOWER_SAVED_GPRS` has five elements.
+            // Cast: `IR_LOWER_SAVED_GPRS` is a small compile-time constant
+            // (five registers, or seven on Win64).
             .map(move |(i, reg)| (*reg, base + (i as i32 + 1) * 8))
     }
 
@@ -12965,13 +12970,76 @@ fn ir_saved_xmm_bytes() -> i32 {
 /// The one obligation that is genuinely new is the **safepoint** one, and it is
 /// discharged by type rather than by structure: see
 /// `regalloc::xmm_roles::IR_GP_LINEAR_SCAN`.
-const IR_LOWER_LS_GPRS: [u8; 5] = crate::regalloc::xmm_roles::IR_GP_LINEAR_SCAN;
+const IR_LOWER_LS_GPRS: &[u8] = &crate::regalloc::xmm_roles::IR_GP_LINEAR_SCAN;
 
-/// The GP registers [`Lowerer::emit_prologue`] saves and every exit restores.
+/// `CRATONVM_JIT_IR_GP_WIDE=1` — widen the GP file to the seven registers Win64
+/// makes callee-saved (RBX, R12–R15 **and RSI/RDI**) instead of the historical
+/// five. **Default OFF, and off because it was MEASURED, not because it is
+/// unsoaked.**
 ///
-/// All of [`IR_LOWER_LS_GPRS`]: every one is callee-saved on both System V and
-/// Win64, which is why they are the file. Unlike the XMM list this is not
-/// platform-conditional.
+/// It engages, and engaging is not the same as paying. On
+/// `probes/FieldLoop.java` (`sum`, one accumulator, `probe.reps=25000`), one
+/// binary, arms interleaved BAAB/ABBA with a second copy of the OFF arm as the
+/// control:
+///
+/// ```text
+/// resident 5 -> 6   splits 5 -> 2   scan_spills 1 -> 0   scan_reloads 2 -> 0
+/// A (off)  909 ms | C (control) 903 ms | B (on) 948 ms
+/// noise floor 0.7%   effect +4.6%   => ON is SLOWER, above the floor
+/// ```
+///
+/// Better residency, worse code, and the write-through value model is why:
+/// `lower_data_node` stores every value to its home word whether or not it also
+/// got a register, so promoting a value ADDS its publish move and REMOVES no
+/// store. A wider file buys more publishes, not fewer stores. That is the same
+/// conclusion `docs/jit/linear-scan-wiring.md` reaches from the other end
+/// ("it buys loads, not stores"), reached here by widening the file until the
+/// cost showed.
+///
+/// The frame reserves all seven slots in BOTH arms ([`ir_gp_file`] narrows the
+/// handout, not the reservation), so the two arms have identical frame layouts
+/// and the measurement isolates residency rather than frame size.
+///
+/// Worth re-running if home-slot elimination ever lands: the register file is
+/// not the binding constraint while the frame stays authoritative, and this
+/// flag is the ready-made instrument for asking again once it does not.
+fn ir_gp_wide_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_GP_WIDE").as_deref(),
+            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+        )
+    })
+}
+
+/// The GP registers THIS compile may allocate over.
+///
+/// [`IR_LOWER_LS_GPRS`] is the file the frame is SIZED for (every entry gets a
+/// save slot reserved); this is the subset the allocator may hand out. They
+/// differ only when the kill switch is off, and narrowing the handout without
+/// narrowing the reservation is deliberate: the frame layout must not depend on
+/// a flag that `saved_gpr_regs` re-reads, which is the drift
+/// `saved_xmm_bytes`' own comment warns about.
+fn ir_gp_file() -> &'static [u8] {
+    if ir_gp_wide_enabled() {
+        IR_LOWER_LS_GPRS
+    } else {
+        &IR_LOWER_LS_GPRS[..crate::regalloc::xmm_roles::IR_GP_LINEAR_SCAN_NARROW]
+    }
+}
+
+/// The GP registers [`Lowerer::emit_prologue`] MAY save — the widest file this
+/// platform offers. What a given compile actually saves is
+/// [`ir_gp_file`], which the kill switch narrows; this constant is the
+/// ABI fact and that function is the policy.
+///
+/// All of [`IR_LOWER_LS_GPRS`]: every one is callee-saved on the target ABI,
+/// which is why they are the file. Like the XMM list this IS
+/// platform-conditional — RSI/RDI join it on Win64 — and like the XMM list only
+/// the registers the residency plan actually used are saved, so a wider file
+/// that goes unused emits no extra instruction.
 const IR_LOWER_SAVED_GPRS: &[u8] = crate::regalloc::xmm_roles::IR_GP_PROLOGUE_SAVED;
 
 /// Bytes the frame reserves for [`IR_LOWER_SAVED_GPRS`].
@@ -13861,8 +13929,13 @@ fn ir_saved_gpr_bytes() -> i32 {
     if IR_LOWER_SAVED_GPRS.is_empty() || !linear_scan_enabled() {
         return 0;
     }
-    // Cast: a five-element compile-time constant.
-    IR_LOWER_SAVED_GPRS.len() as i32 * 8
+    // Sized from the file this compile may hand out, so `CRATONVM_JIT_IR_GP_WIDE`
+    // moves the reservation and the handout together and the OFF arm reserves
+    // exactly what it reserved before RSI/RDI existed. Both this and
+    // `Lowerer::new` read it through one `OnceLock`, so the two cannot disagree
+    // mid-process — the drift `saved_xmm_bytes` warns about.
+    // Cast: a small compile-time constant — five registers, seven on Win64.
+    ir_gp_file().len() as i32 * 8
 }
 
 /// `CRATONVM_JIT_IR_ISEL_SHADOW` — run the instruction selector over this
@@ -14899,7 +14972,7 @@ fn plan_register_residency(
     //
     // Two banks, not one. The GP half is what makes an `int` loop counter
     // register-resident; the FP half is unchanged.
-    let gp_specs = IR_LOWER_LS_GPRS.iter().map(|&n| RegSpec {
+    let gp_specs = ir_gp_file().iter().map(|&n| RegSpec {
         reg: PhysReg::gp(n),
         // RBX and R12–R15 are callee-saved on BOTH ABIs, and this prologue
         // saves every one it hands out (`IR_LOWER_SAVED_GPRS` is the whole
@@ -15259,7 +15332,7 @@ fn plan_register_residency(
         let mut taken: Vec<u8> = gp_reg_of.iter().flatten().copied().collect();
         taken.sort_unstable();
         taken.dedup();
-        let mut free: Vec<u8> = IR_LOWER_LS_GPRS
+        let mut free: Vec<u8> = ir_gp_file()
             .iter()
             .copied()
             .filter(|r| !taken.contains(r))
@@ -15343,7 +15416,7 @@ fn plan_register_residency(
         let mut taken: Vec<u8> = gp_reg_of.iter().flatten().copied().collect();
         taken.sort_unstable();
         taken.dedup();
-        let mut free: Vec<u8> = IR_LOWER_LS_GPRS
+        let mut free: Vec<u8> = ir_gp_file()
             .iter()
             .copied()
             .filter(|r| !taken.contains(r))
@@ -22588,7 +22661,13 @@ mod tests {").next().unwrap_or(src);
         // bytes to the same fixed part. Read from the function the frame is
         // laid out with rather than folded into the literal, so the bound
         // still means "no spill" on a configuration that reserves neither.
-        let fixed = 192 + ir_deopt_regs_bytes() as usize;
+        //
+        // The GP save area is now read the same way, for the same reason: it
+        // is 40 bytes on System V and 56 on Win64, where RSI/RDI joined
+        // `IR_GP_LINEAR_SCAN` (2026-09-10). It had been folded into the 192,
+        // which made this bound a Windows-vs-Linux coin the moment the file
+        // stopped being the same width on both.
+        let fixed = 152 + ir_saved_gpr_bytes() as usize + ir_deopt_regs_bytes() as usize;
         assert!(
             after <= fixed,
             "{after} bytes for a 4-slot working set (fixed part is {fixed})",
@@ -23470,6 +23549,64 @@ mod tests {").next().unwrap_or(src);
                  keeps its home word correct at every bci",
             );
         assert!(residency.promoted > 0);
+    }
+
+    /// The GP file may not name a register this emitter uses for a FIXED
+    /// purpose, on either ABI.
+    ///
+    /// The argument that RSI/RDI are promotable on Win64 rests entirely on
+    /// them being neither an argument register nor a deopt-trampoline
+    /// argument THERE, while being both on System V — a claim about six
+    /// `#[cfg]`-selected constants that no compiler checks and that a reader
+    /// has to assemble by hand. It is checked here instead, and it is checked
+    /// on whichever platform the tests run on, so the arm that is wrong is the
+    /// arm that fails.
+    ///
+    /// This is the invariant whose absence produced the two clobber gaps
+    /// `docs/jit/linear-scan-wiring.md` records under "Calls the op model does
+    /// not see": a register the allocator believed survived a call, destroyed
+    /// by an emitter that never told the model it writes there.
+    #[test]
+    fn the_gp_file_names_no_register_this_emitter_reserves() {
+        let mut reserved: Vec<(u8, &str)> = vec![
+            (RAX, "RAX — the GP value tier"),
+            (RCX, "RCX — the GP value tier"),
+            (RDX, "RDX — IDIV and FCmp's SETcc"),
+            (R10, "R10 — thread pointer / shadow-stack scratch"),
+            (R11, "R11 — safepoint flag and epoch-guard scratch"),
+            (DEOPT_ARG0, "DEOPT_ARG0"),
+            (DEOPT_ARG1, "DEOPT_ARG1"),
+            (DEOPT_ARG2, "DEOPT_ARG2"),
+        ];
+        for &r in CALL_ARG_REGS.iter() {
+            reserved.push((r, "CALL_ARG_REGS"));
+        }
+        for &r in ENTRY_ABI_REGS.iter() {
+            reserved.push((r, "ENTRY_ABI_REGS"));
+        }
+        for &f in IR_LOWER_LS_GPRS.iter() {
+            if let Some((_, why)) = reserved.iter().find(|(r, _)| *r == f) {
+                panic!(
+                    "IR_GP_LINEAR_SCAN names r{f}, which this emitter reserves: {why}.                      A value promoted there is destroyed by an emission the                      MachineModel does not model as a clobber."
+                );
+            }
+        }
+        // …and the file is exactly as wide as the platform's callee-saved set
+        // allows, so a future edit that adds a register has to come here.
+        let expected = if cfg!(windows) { 7 } else { 5 };
+        assert_eq!(
+            IR_LOWER_LS_GPRS.len(),
+            expected,
+            "the GP file is {} on this platform, expected {expected}",
+            IR_LOWER_LS_GPRS.len(),
+        );
+        // The narrow prefix the kill switch restores must be a PREFIX, or
+        // `ir_gp_file()`'s slice is not the historical file.
+        assert_eq!(
+            &IR_LOWER_LS_GPRS[..crate::regalloc::xmm_roles::IR_GP_LINEAR_SCAN_NARROW],
+            &[3u8, 12, 13, 14, 15][..],
+            "the narrow prefix is no longer RBX + R12-R15",
+        );
     }
 
     /// The GC cliff, stated as a property rather than a comment: no reference
