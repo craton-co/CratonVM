@@ -2170,6 +2170,29 @@ fn jks_protect_key(plain_pkcs8: &[u8], password_bytes: &[u8]) -> Option<Vec<u8>>
 }
 
 /// Whether a JKS key entry is still wrapped in Sun's KeyProtector envelope.
+/// Is this key material still inside an encryption envelope?
+///
+/// Two envelopes reach `engineGetKey` on this VM, and neither is a private key:
+///
+///  * the JKS key protector, which [`is_jks_encrypted_private_key`] recognises
+///    by its OID and which `load_jks` stores verbatim until a `getKey`
+///    password opens it;
+///  * a PKCS#12 `EncryptedPrivateKeyInfo`, which `load_pkcs12` keeps as a
+///    placeholder `key_der` when the STORE password did not open the shrouded
+///    bag (its `unwrap_or_else` arm says so) -- deliberately, so alias and
+///    chain pairing still work for an entry whose key is separately protected.
+///
+/// The discrimination is exact rather than heuristic. A plaintext PKCS#8
+/// `PrivateKeyInfo` opens with an INTEGER version where an
+/// `EncryptedPrivateKeyInfo` opens with an `AlgorithmIdentifier` SEQUENCE, so
+/// a real key cannot parse as an envelope.
+pub(crate) fn is_encrypted_private_key(der: &[u8]) -> bool {
+    if is_jks_encrypted_private_key(der) {
+        return true;
+    }
+    yasna::parse_ber(der, p12::EncryptedPrivateKeyInfo::parse).is_ok()
+}
+
 pub(crate) fn is_jks_encrypted_private_key(der: &[u8]) -> bool {
     const JKS_KEY_PROTECTOR_OID: &[u8] = b"\x06\x0a\x2b\x06\x01\x04\x01\x2a\x02\x11\x01\x01";
     der.windows(JKS_KEY_PROTECTOR_OID.len())
@@ -2917,6 +2940,39 @@ pub(crate) fn engine_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
 
     if let EntryKind::PrivateKey { key_der, .. } = &entry.kind {
+        // KS-1: the password did not open this entry, so there is no key to
+        // return. Before this check the still-encrypted envelope was wrapped in
+        // the `PrivateKey` mirror below and handed to the application, which
+        // cannot tell: the mirror answers `getAlgorithm()` and `getFormat()`
+        // from fields, so ciphertext reads as `RSA/PKCS#8` and only
+        // `getEncoded()` -> `KeyFactory` shows it is not a key.
+        //
+        // MEASURED 2026-09-10 against HotSpot 25.0.3+9
+        // (`apps/probes/KSInteropWriteRead.java`, and the matrix in
+        // `docs/known-issues/jdk-only/keystore-getkey-accepts-any-
+        //  password-and-the-key-does-not-round-trip-20260910.md`): on a
+        // HotSpot-written JKS this VM already DISCRIMINATES correctly: the
+        // entry password yields a usable key and the other two yield the
+        // envelope, so the whole of the defect on that path was returning it
+        // instead of throwing. `keystore_unlock_private_keys` above is the verification;
+        // this is the verdict.
+        //
+        // The message is chosen by the ENVELOPE, not the store type, because
+        // the envelope is what this VM actually holds: HotSpot's JKS
+        // `KeyProtector` says "Cannot recover key", and SunPKCS12 reports the
+        // JCE padding failure behind a "Get Key failed: " prefix.
+        if is_encrypted_private_key(key_der) {
+            let msg = if is_jks_encrypted_private_key(key_der) {
+                "Cannot recover key"
+            } else {
+                "Get Key failed: Given final block not properly padded. Such issues can arise if a bad key is used during decryption."
+            };
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "java/security/UnrecoverableKeyException",
+                msg,
+            ));
+        }
         // Allocate the synthetic PrivateKey mirror. Field layout matches the
         // existing convention (algo_idx=0, key_size_bits=1, key_len_bytes=2,
         // key_id=3) so the TLS path keeps working. We additionally stash the
@@ -4744,6 +4800,42 @@ mod tests {
 
     // -- BER -> DER length normalisation -----------------------------------
 
+    /// The discrimination `engine_get_key` refuses on: a real key must never
+    /// read as an envelope, or a correct password starts throwing.
+    ///
+    /// It is exact rather than heuristic, and this states why: a PKCS#8
+    /// `PrivateKeyInfo` opens with an INTEGER version where an
+    /// `EncryptedPrivateKeyInfo` opens with an `AlgorithmIdentifier` SEQUENCE,
+    /// so the two cannot be confused by a parser that reads the first element.
+    #[test]
+    fn an_envelope_is_told_from_a_key_exactly() {
+        // SEQUENCE { INTEGER 0, SEQUENCE { OID rsaEncryption, NULL },
+        //            OCTET STRING 4 } -- a well-formed, if tiny, PKCS#8.
+        let plain: &[u8] = &[
+            0x30, 0x18, 0x02, 0x01, 0x00, 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86,
+            0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00, 0x04, 0x04, 0xde, 0xad, 0xbe, 0xef,
+        ];
+        assert!(
+            !is_encrypted_private_key(plain),
+            "a plaintext PKCS#8 key must not read as an envelope -- if it does,              every getKey with the CORRECT password throws"
+        );
+
+        let wrapped = jks_protect_key(plain, b"changeit")
+            .expect("OS entropy is available in the test environment");
+        assert!(
+            is_encrypted_private_key(&wrapped),
+            "the JKS key protector's own output must read as an envelope"
+        );
+        assert!(is_jks_encrypted_private_key(&wrapped));
+
+        // And it round-trips, so the envelope this recognises is one the
+        // right password still opens.
+        assert_eq!(
+            jks_recover_key(&wrapped, b"changeit").as_deref(),
+            Some(plain)
+        );
+        assert_eq!(jks_recover_key(&wrapped, b"wrong"), None);
+    }
     #[test]
     fn der_input_is_returned_unchanged() {
         // SEQUENCE { INTEGER 5 }, already definite-length.

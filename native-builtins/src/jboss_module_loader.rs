@@ -959,9 +959,28 @@ fn try_construct_single_message_exception(
     class_name: &str,
     message: &str,
 ) -> Option<ObjectRef> {
+    /// Clears the guard on the way out, including on an UNWIND.
+    ///
+    /// The workspace is `panic = "unwind"` and the VM holds 37
+    /// `std::panic::catch_unwind` sites, so a panic raised under the `<init>`
+    /// below can be caught above this frame and the thread carry on. A bare
+    /// `set(false)` after the call is not reached on that path, and the flag
+    /// stays true for the life of the thread — every later mint silently takes
+    /// the flat path and the defect this function exists to fix comes back with
+    /// nothing reporting it. A guard that fails by quietly restoring the old
+    /// behaviour is worse than no guard, because the vector still passes in a
+    /// fresh process.
+    struct ClearOnDrop;
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            MINTING_EXCEPTION.with(|f| f.set(false));
+        }
+    }
+
     if MINTING_EXCEPTION.with(|f| f.replace(true)) {
         return None;
     }
+    let _clear = ClearOnDrop;
     let detail = ctx.create_string(message);
     // The VM's `new_object_initialized` pins the argument values before it can
     // allocate, so `detail` needs no pin of its own here.
@@ -970,7 +989,6 @@ fn try_construct_single_message_exception(
         "(Ljava/lang/String;)V",
         &[Value::Object(Some(detail))],
     );
-    MINTING_EXCEPTION.with(|f| f.set(false));
     match built {
         Ok(Some(Value::Object(Some(obj)))) => Some(obj),
         _ => None,
