@@ -47,7 +47,7 @@ cannot be retired by yielding, because there is no real bytecode behind them:
 > hierarchy for `<init>`/`<clinit>`. Retiring one of them would have refused a
 > native that fills a VM-minted receiver's fields and yielded to a body that
 > writes none of them. Record:
-> [`../../internal/jdk-only/lane-t-the-throwable-family-retired-and-the-two-defects-the-arm-had-to-find-first-20260910.md`](../../internal/jdk-only/lane-t-the-throwable-family-retired-and-the-two-defects-the-arm-had-to-find-first-20260910.md) §3.
+> [`../../internal/jdk-only/lane-t-the-throwable-family-retired-and-the-three-defects-the-arm-had-to-find-first-20260910.md`](../../internal/jdk-only/lane-t-the-throwable-family-retired-and-the-three-defects-the-arm-had-to-find-first-20260910.md) §3.
 
 - **D (693) is out of scope permanently.** Contract §1.5 *requires* an
   `ACC_NATIVE` method to bind to a `Bridge`. Retiring one is a defect, not
@@ -100,7 +100,7 @@ which serialises the claim through this file. Do not retire an unowned row.
 > are not shadows (see §1's correction). The lane page moved to
 > [`../../internal/jdk-only-lanes/lane-T-cross-cutting-registrars-RETIRED-20260910.md`](../../internal/jdk-only-lanes/lane-T-cross-cutting-registrars-RETIRED-20260910.md);
 > the record is
-> [`../../internal/jdk-only/lane-t-the-throwable-family-retired-and-the-two-defects-the-arm-had-to-find-first-20260910.md`](../../internal/jdk-only/lane-t-the-throwable-family-retired-and-the-two-defects-the-arm-had-to-find-first-20260910.md).
+> [`../../internal/jdk-only/lane-t-the-throwable-family-retired-and-the-three-defects-the-arm-had-to-find-first-20260910.md`](../../internal/jdk-only/lane-t-the-throwable-family-retired-and-the-three-defects-the-arm-had-to-find-first-20260910.md).
 > **`native-io/src/concrete_receiver.rs:185` was never lane T's** — its 191 goal
 > rows are all under `sun/nio/`, one lane, so §2's own rule gives it to L4 and
 > the 1,100 above already excludes it.

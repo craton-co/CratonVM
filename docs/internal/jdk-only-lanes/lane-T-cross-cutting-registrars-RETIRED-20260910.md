@@ -4,7 +4,7 @@
 > are classified, 906 triples are retired, and the two defects the arm had to
 > find first are fixed. The measurements, the four blocked groups with their
 > blockers, and the corrections this page needed are in
-> [`../jdk-only/lane-t-the-throwable-family-retired-and-the-two-defects-the-arm-had-to-find-first-20260910.md`](../jdk-only/lane-t-the-throwable-family-retired-and-the-two-defects-the-arm-had-to-find-first-20260910.md).
+> [`../jdk-only/lane-t-the-throwable-family-retired-and-the-three-defects-the-arm-had-to-find-first-20260910.md`](../jdk-only/lane-t-the-throwable-family-retired-and-the-three-defects-the-arm-had-to-find-first-20260910.md).
 >
 > **Two things below are WRONG and the record says so with the census that
 > settles them.** §1's row list and §5 assign

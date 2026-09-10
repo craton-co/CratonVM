@@ -1,4 +1,4 @@
-# Lane T — the throwable family retired, and the two defects the arm had to find first
+# Lane T — the throwable family retired, and the three defects the arm had to find first
 
 **Status: CLOSED.** 2026-09-10, branch
 `claude/lane-t-cross-cutting-registrars-20260910`, worktree
@@ -10,10 +10,10 @@ over 87 classes from 57 registration call sites** — the only lane whose
 ownership is not a class-name prefix. This is what it found, what it retired,
 and what it could not.
 
-Headline: **906 triples retired**, two present-tense defects fixed (both in
-BOTH compatibility modes), one census mis-classification corrected, one security
-defect filed, and four registrar groups classified as blocked with the blocker
-named.
+Headline: **906 triples retired**, three present-tense defects fixed (all three
+in BOTH compatibility modes), one census mis-classification corrected, one
+security defect filed, and four registrar groups classified as blocked with the
+blocker named.
 
 **The largest of those is not a `--jdk-only` defect at all.** The frame skip
 this wave needed for its constructor rows turns out to be what
@@ -32,7 +32,7 @@ The lane page said to regenerate the registrar list from a fresh dump. Done, on
 `lane-0-integration-and-gates.md` §1 and its lane prefix sets:
 
 ```text
-   total registrations                12,849 -> (this tree) 12,918
+   total registrations                12,889
    goal population, A+B eligible       5,553
    cross-LANE registrars                  57 sites, 1,100 rows, 87 classes
 ```
@@ -52,7 +52,7 @@ rest of this page comparable to the campaign's own numbers. The seven groups:
 
 ### The lane page named a registrar that is not in this set
 
-`lane-T-cross-cutting-registrars.md` §1 and §5 assign
+[`lane-T-cross-cutting-registrars-RETIRED-20260910.md`](../jdk-only-lanes/lane-T-cross-cutting-registrars-RETIRED-20260910.md) §1 and §5 assign
 `native-io/src/concrete_receiver.rs:185` ("191 rows / 21 classes") to this lane
 and spend a whole section on it. It is **not cross-lane**: its 191 goal rows are
 every one of them under `sun/nio/`, which is L4's prefix set, so lane 0 §2's own
@@ -68,7 +68,7 @@ never lane T's to place.**
 
 ---
 
-## 1. The two defects, and why the arm was the only thing that could find them
+## 1. The three defects, and which instrument found each
 
 The instrument is `CRATONVM_ENFORCE_NATIVE_SHADOW` over the 62 class names of
 `THROWABLE_FAMILY_CLASSES`, run against the 64 promoted probes of
@@ -76,7 +76,7 @@ The instrument is `CRATONVM_ENFORCE_NATIVE_SHADOW` over the 62 class names of
 control. One binary, no build.
 
 **The first arming was VACUOUS and said so.** The scope was joined with `+`
-(`blast-radius.sh`'s group syntax) instead of commas, and read out of a CRLF
+(`scripts/jdk-only-blast-radius.sh`'s group syntax) instead of commas, and read out of a CRLF
 file, so it became one 2,219-byte prefix that matched nothing. The probe tree
 came back byte-identical — a perfect result — and `enforcement_dial.reached` was
 **0**. Comma-separated and CR-stripped:
@@ -89,7 +89,8 @@ came back byte-identical — a perfect result — and `enforcement_dial.reached`
 ```
 
 Ten lines, two root causes, and **both are present-tense defects in BOTH
-compatibility modes** rather than artefacts of the arming:
+compatibility modes** rather than artefacts of the arming. A third (LT-3) the
+dial structurally could not see, and only the trial binary found:
 
 ### LT-1 — `Throwable.fillInStackTrace()` reported ITSELF as the throw site
 
@@ -189,6 +190,65 @@ Re-run on the fixed binary, same 64 probes, same scope:
    (FfmCarrierProbe stays at its pre-existing 5, armed and unarmed alike.)
 ```
 
+### LT-3 — the one the DIAL could not find, and the trial binary did
+
+The armed arm was clean on all 64 probes. The trial binary carrying the table
+was not: `ThrowableFamilySweep` moved by 2.
+
+```text
+   Class.forName("no.such.Klass") -> e.getMessage()
+     HotSpot                  no.such.Klass
+     control (lt2)            no.such.Klass
+     trial   (lt3)            null
+   ... and `--real-jdk` on the same trial binary is unaffected.
+```
+
+`jboss_module_loader::alloc_single_message_exception` — 31 call sites for
+`ClassNotFoundException`, `NoClassDefFoundError` and `NullPointerException` —
+writes the message into **slot 0**, which is the SYNTHETIC-stub layout's
+`detailMessage` and the REAL layout's `Throwable.backtrace`. It read back
+correctly only because `native_throwable_get_message` also reads slot 0 whenever
+the receiver's own class declares no `detailMessage` (`resolve_field_index` does
+not walk to `Throwable`) and the slot happens to hold a `String`. **Two wrongs
+cancelling**, and retiring the shadow removed the second one.
+
+This is the difference between a dial arm and a retirement that
+`jdk-only-lane-operations.md` states as permanent: the loader mints its CNFE
+from inside a native, and *a call that originates in a native is not one of the
+dial's doors*. Armed, `alloc_single_message_exception` still reached the shadow
+`getMessage`; retired, the registration is gone. **The wave was accepted on a
+trial binary and could not have been accepted on a dial arm** — the same
+sentence the phase-3 CHM wave had to write, for the same reason, from the other
+direction.
+
+The fix keeps BOTH writes. The slot-0 write is what keeps compatible mode
+byte-for-byte identical (the shadow still runs there and still reads slot 0);
+`write_throwable_detail_message` puts the message where real
+`Throwable.getMessage()` bytecode looks, and falls back to slot 0 on a synthetic
+layout, writing the same value. The honest fix — constructing through
+`<init>(String)` like `create_exception_object` does, which would also give
+these throwables the stack trace and `cause` sentinel they do not have — is
+wider than a shadow retirement should carry and is left named rather than
+attempted.
+
+**And it closed a SECOND divergence nobody was chasing.**
+`ClassNotFoundException.toString()` on a loader-minted instance had been
+`java.lang.ClassNotFoundException` where HotSpot has
+`java.lang.ClassNotFoundException: no.such.Klass` — both modes, both binaries,
+before this wave. `toString` composes the header from `getLocalizedMessage()`,
+which is `getMessage()`, so a message written into the wrong field was missing
+from it too. MEASURED on the acceptance binary, both modes:
+
+```text
+   forName getMessage   no.such.Klass
+   forName toString     java.lang.ClassNotFoundException: no.such.Klass
+```
+
+`ThrowableFamilySweep` never asked that question of a loader-minted throwable,
+and it is worth saying why the row was invisible rather than merely absent: the
+probe builds its throwables with `new`, and `new` was the one path that had
+always been right.
+
 ---
 
 ## 2. The retirement: 906 triples, class-scoped
@@ -256,6 +316,104 @@ is refused by `allowed_in(JdkOnly)` and leaves the registry. The test prints the
 whole account: `compatible 13623 rows (2904 stubs) -> strict 10716 rows; 2907
 rows dropped, 2925 refusals recorded`. 2,907 dropped for 2,904 stubs; the extra
 three are the alias fallout `strict_registry_drops_only_the_stubs` documents.
+
+### What the trial binary measured
+
+Control is the same tree WITHOUT the table (`cratonvm-lt2`); trial is the same
+tree WITH it (`cratonvm-lt3`). Both `--jdk-only`, both against a HotSpot 25.0.3+9
+oracle on the same class files.
+
+```text
+   refusals on the 62 classes   1022, and ZERO with a survivor
+   the 64 promoted probes       64 of 64 at delta 0 (after LT-3)
+   RThrowableFillFrames         PASS in both modes on the trial binary
+   goal population              5,553 -> 4,624
+   lane T's own scope           57 sites / 1,100 rows / 87 classes
+                                -> 42 sites /   224 rows / 22 classes
+```
+
+And on the ACCEPTANCE binary — the merged tree with all three fixes and the
+table — the same 64 probes are compared against HotSpot in absolute terms
+rather than as a delta:
+
+```text
+   64 of 64 probes byte-identical to HotSpot, except FfmCarrierProbe at its
+   pre-existing 5 (identical armed and unarmed, before and after this wave).
+```
+
+**1,022 refusals and no survivor** is the check
+`jdk-only-lane-operations.md` puts first after a build: a refusal is a
+retirement only when nothing already owns the triple. The census predicted it —
+all 1,021 registrations of these triples are ambient `register()` under a
+`set_category(Bridge)` scope — and the report confirms it, plus the one row that
+was already a `SyntheticStub`.
+
+**The goal population moves by 929, and the two halves account for all of it**:
+906 retired + 23 reclassified by §3. Nothing else moved, which is the arithmetic
+saying the table retires exactly what it names.
+
+Lane T's remaining 224 rows, all four groups blocked:
+
+| group | sites | rows | classes | blocker |
+|---|---:|---:|---:|---|
+| keystore | 17 | 136 | 8 | the TLS identity side table (§4.1) |
+| HashSet family | 21 | 59 | 3 | `CopyOnWriteArraySet` iterates empty (§4.2) |
+| panama segments | 2 | 23 | 5 | `NoSuchMethodError` (§4.3) |
+| FFM layouts | 1 | 4 | 4 | zero members (§4.4) |
+| jmx | 1 | 2 | 2 | `enforcement_dial.reached` is **0** — no instrument in the tree dispatches `ThreadMXBean.getThreadInfo([JZZI)`, so precondition 4 cannot be met |
+| | **42** | **224** | **22** | |
+
+### The corpus, which is the acceptance measurement
+
+`SUITE=all TIMEOUT=600`, 133 scheduled vectors, sequential arms on one host.
+Control is `origin/dev` `39a90d2f4` (`cratonvm-lt1`); trial is the merged tree
+with the wave (`cratonvm-lt4`).
+
+```text
+                                  control (dev)      trial
+   SUITE=all --jdk-only           132 / 133          133 / 133
+   the one control failure        RThrowableFillFrames — the vector this wave
+                                  adds, on a binary without the fixes
+```
+
+**The trial is green on the whole strict corpus**, and the control's single
+failure is the new vector demonstrating its own sensitivity rather than a
+regression: every other vector passes in both arms, `RMapGcStress` included.
+
+The per-vector `--jdk-only-report` census the suite unions over all 133 vectors
+is the third independent measurement of the wave's size:
+
+```text
+                                        control      trial
+   native-shadows-bytecode, native-won     1418        1351     -67
+   ... bytecode-won                         459         448
+   synthetic-native-registered, UNION      1858        2879   +1021
+   interpreter_shadow_unenforced, SUM     13131       13070
+```
+
+**+1021 again**, and this one is a union of per-vector refusal sets over a real
+workload rather than a registration replay — the same number the three
+stub-ratchet arms and the census's own registration count give. `native-won`,
+the column the campaign calls "the defect", falls by 67: the throwable natives
+this corpus actually dispatched.
+
+The DEFAULT-mode arms, which is where "compatible mode stays byte-for-byte
+unchanged" is checked:
+
+```text
+                                  control (dev)      trial
+   SUITE=all (default)            132 / 133          133 / 133
+   the control's one failure      RThrowableFillFrames, again
+```
+
+The trial's default arm read 132/133 the FIRST time, with `RMapGcStress` at
+`rc=124`, and that was a load artefact of this session rather than a result:
+that arm was the one running while `cargo test` and `cargo clippy --workspace`
+were compiling. `RMapGcStress` passed on the same binary in the strict arm and
+on the control in both, and alone at idle it takes **3m04s wall including the
+javac** against a 900 s budget. Re-run with nothing else on the host the arm is
+**133 / 133, rc=0** — measured, not inferred. *A hang cell is a claim about your
+timeout.*
 
 ---
 
@@ -356,7 +514,7 @@ refused while any `SET_VIEW_CARRIERS` entry outside the moving family is still
 `allocateFrom` rows the registrar loops over seven descriptors × three
 allocators cannot yield to bytecode that expects a real
 `HeapMemorySegmentImpl`. Same family as the nine FFM defects already recorded in
-`ffm-segment-surface-nine-behavioural-defects-...-20260829.md`.
+[`ffm-segment-surface-nine-behavioural-defects-and-the-interface-classed-family-20260829.md`](ffm-segment-surface-nine-behavioural-defects-and-the-interface-classed-family-20260829.md).
 
 ### 4.4 FFM layouts — 4 rows, zero members
 
@@ -376,11 +534,13 @@ VM-side state is right and the real accessor cannot see it.
 ## 5. What was measured, and what it cost
 
 ```text
-   builds                3 release builds (48, 49, 27 minutes)
+   builds                4 release builds, 48 / 50 / 50 minutes and the
+                         acceptance build on the merged tree
    arms with no build    6 dial arms x 64 probes x 3 (HotSpot, cratonvm,
-                         cratonvm-armed) = 1,152 probe runs
+                         cratonvm-armed) = 1,152 probe runs, plus one
+                         control-vs-trial pass of the same 64
    probes written        LTKeyStoreEngineSweep (52 rows)
-   vectors written       RThrowableFillFrames (13 checks)
+   vectors written       RThrowableFillFrames (17 checks)
 ```
 
 Every arm here priced a retirement for one environment variable and no build,
@@ -401,5 +561,25 @@ the table, never on a dial arm.
   tagged it `Intrinsic` without the four-edit remedy `lane-0` §7 describes.
   Verified by reverting this branch's `retired_shadow.rs` to `HEAD` and
   re-running: the same one stale pair. It is L0's row and L0's remedy.
+* **CI's BLOCKING `Clippy` step is RED on `origin/dev`**, and this is worth a
+  line because a gate nobody can go green through is the shape `H3-1` found
+  once already. `cargo clippy --workspace --all-targets -- -D warnings` fails
+  with four `drop_non_drop` errors in
+  `jit/tests/intrinsic_string_narrow_oops.rs:425-428`, from `534e1921b`
+  ("the narrow-oop fixtures were four mallocs"), which
+  `git merge-base --is-ancestor 534e1921b origin/dev` confirms is on `dev`.
+  Nothing on this branch touches that file. The fix is four lines and it is the
+  JIT lane's.
 * **The goal denominator is 5,530** after §3, and the campaign's published
   5,549 / 5,553 both include the 23 inherited-constructor rows.
+* **`alloc_single_message_exception` still does not construct.** LT-3's fix puts
+  the message in both places; it does not give a loader-minted
+  `ClassNotFoundException` a stack trace or a `cause` sentinel, because it never
+  runs a constructor. `create_exception_object` is the shape that does, and
+  moving these 31 sites onto it is the residual — `getStackTrace()` on a
+  `Class.forName` failure is still empty where HotSpot has the loader's frames.
+* **`apps/probes/LTKeyStoreEngineSweep.java` is NOT promoted**, and must not be
+  while it is red: promoting a divergent probe freezes the divergence as
+  acceptable, which is the bar
+  `scripts/baselines/jdk-only-strict-corpus-25-*.probes` states in its own
+  header. Promote it in the commit that closes §4.1's four rows.
