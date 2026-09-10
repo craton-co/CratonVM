@@ -461,6 +461,33 @@ RJdkServices         Module null  ->  NoClassDefFoundError, BuiltinClassLoader
 `bridge -> intrinsic` with `kind_stated 0 -> 1`, carrying this rationale. The
 gate's own header allows exactly that movement and calls it adjudication.
 
+```text
+CRATONVM_ENFORCE_NATIVE_SHADOW=all, whole corpus   25 passed -> 26 passed
+```
+
+Twelve first-failures removed, one net pass. Same arithmetic as §9 and the same
+reason: five of the twelve walked into the `URLStreamHandler`,
+`FileSystemProvider`/`InetAddressResolver` and `BuiltinClassLoader` gaps listed
+above. **The count is not the deliverable in a chain** -- what this increment
+bought is twelve vectors moved off a null field that the contract's own remedy
+could never have filled, and the shadow census losing a row it should never have
+carried.
+
+### Where the lane leaves the arm
+
+```text
+   5 passed   the wave that opened this record
+  24 passed   + SharedSecrets
+  25 passed   + VM.savedProps
+  26 passed   + the Class.getModule review
+```
+
+and 106 remaining, whose composition is the useful part: 41 `AssertionError`s
+that are individual semantic gaps, the `BuiltinClassLoader` link failure, the
+service-provider families (`FileSystemProvider`, `InetAddressResolver`, CLDR),
+`URLStreamHandler`, and a long singleton tail. Every one of those is
+implementation work with a name, which is not where this record started.
+
 ## 12. What this does NOT claim
 
 * Not that the `java/lang/System` property natives are retirable. They are not
