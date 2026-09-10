@@ -585,13 +585,34 @@ pub fn type_sig_to_java(
                 // "Cannot resolve T", breaking Mockito mocks of any generic type
                 // (e.g. Gradle `RepositoryHandler`). Resolving up the scope hands
                 // back the real `TypeVariableImpl`, matching HotSpot.
+                // The pinned root has to FOLLOW the walk. Before 2026-09-10
+                // this loop opened with `let mut scope =
+                // ctx.read_native_pin(scope_pin, scope);`, which SHADOWED the
+                // outer binding: `scope = enclosing` at the bottom wrote the
+                // shadow, the shadow died with the iteration, and the next pass
+                // re-read the ORIGINAL `decl` out of the one pin that was ever
+                // taken. The walk therefore re-tested the immediate declaration
+                // sixteen times and never climbed once, so every method-level
+                // bound that names its CLASS's variable still fell through to
+                // the synthetic stand-in below -- exactly the case the comment
+                // above says this loop exists to handle. Re-pin on each climb
+                // so `read_native_pin` returns the CURRENT scope, and release
+                // the whole run of pins on the way out (the old code leaked one
+                // pin per conversion, and every `return` inside the loop leaked
+                // it unconditionally).
+                let pin_base = ctx.pin_native_root(decl);
+                let mut scope_pin = pin_base;
                 let mut scope = decl;
-                let scope_pin = ctx.pin_native_root(scope);
+                let mut resolved: Option<Value> = None;
                 for _ in 0..16 {
-                    let mut scope = ctx.read_native_pin(scope_pin, scope);
+                    scope = ctx.read_native_pin(scope_pin, scope);
                     if let Some(real) = resolve_declared_type_variable(ctx, scope, name) {
-                        return Ok(real);
+                        resolved = Some(real);
+                        break;
                     }
+                    // `resolve_declared_type_variable` invokes
+                    // `getTypeParameters()`, which allocates.
+                    scope = ctx.read_native_pin(scope_pin, scope);
                     // Climb one lexical level. `getDeclaringClass` is the right
                     // question for a method/constructor decl and for a MEMBER
                     // class, but it answers NULL for an ANONYMOUS or LOCAL class
@@ -625,22 +646,33 @@ pub fn type_sig_to_java(
                     };
                     let next = match next {
                         Some(n) => Some(n),
-                        None => match ctx.invoke_virtual(
-                            scope,
-                            "getEnclosingClass",
-                            "()Ljava/lang/Class;",
-                            &[],
-                        ) {
-                            Ok(Some(Value::Object(Some(enclosing)))) if enclosing != scope => {
-                                Some(enclosing)
+                        None => {
+                            // The `getDeclaringClass` call above allocates.
+                            let scope = ctx.read_native_pin(scope_pin, scope);
+                            match ctx.invoke_virtual(
+                                scope,
+                                "getEnclosingClass",
+                                "()Ljava/lang/Class;",
+                                &[],
+                            ) {
+                                Ok(Some(Value::Object(Some(enclosing)))) if enclosing != scope => {
+                                    Some(enclosing)
+                                }
+                                _ => None,
                             }
-                            _ => None,
-                        },
+                        }
                     };
                     match next {
-                        Some(enclosing) => scope = enclosing,
+                        Some(enclosing) => {
+                            scope = enclosing;
+                            scope_pin = ctx.pin_native_root(scope);
+                        }
                         None => break,
                     }
+                }
+                ctx.unpin_native_roots(pin_base);
+                if let Some(real) = resolved {
+                    return Ok(real);
                 }
             }
             // Fallback (no resolvable declaration in scope): synthetic

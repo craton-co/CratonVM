@@ -76,7 +76,7 @@ Sets are disjoint; the totals below reconcile to 5,549 exactly.
 | **L0** (this page) | `java/lang/Class*`, `java/lang/Module*`, `java/lang/module/` | 131 | 9 | 131 |
 | **LT** — **CLOSED 2026-09-10** | *whole cross-cutting registrars* (see §3) | **1,100** | 87 | **57** |
 | **L1** | `java/util/` (less `concurrent/`), `java/text/`, `sun/util/`, `java/time/` | 963 | 98 | 726 |
-| **L2** | `java/lang/` remainder, `java/math/` | 434 | 68 | 303 |
+| **L2** | `java/lang/` remainder, `java/math/` | 390 | 57 | 279 |
 | **L3** | `java/lang/reflect/`, `jdk/internal/reflect/`, `sun/reflect/`, `java/lang/invoke/` | 251 | 36 | 246 |
 | **L4** | `java/io/`, `java/nio/`, `sun/nio/`, `jdk/internal/foreign` | 1,110 | 131 | 615 |
 | **L5** | `java/util/concurrent/`, `jdk/internal/misc/`, `sun/misc/`, `java/lang/Thread*`, `jdk/internal/vm/` | 405 | 23 | 345 |
@@ -84,6 +84,27 @@ Sets are disjoint; the totals below reconcile to 5,549 exactly.
 | **L7** | `java/lang/ClassLoader*`, `jdk/internal/loader/` **+ the bootstrap failure triage** | 20 | 6 | 18 |
 | — | **UNOWNED, frozen** | 316 | 83 | 291 |
 | | **TOTAL** | **5,549** | **631** | **3,395** |
+
+**L2's row was re-derived on 2026-09-10 and is 390/57/279, not 434/68/303.**
+The lane re-took the funnel on `7a8b79526` and reconciled the per-class shape
+exactly (62 `StringBuilder`, 61 `AbstractStringBuilder`, 28 `System$1`, 24
+`BigInteger`, 23 `System`, 21 `AssertionError`), so the two counts share a
+method and differ by three weeks of `dev` plus one thing worth stating: **the
+lane-T carve-out is "the registrar spans more than one LANE", not "more than one
+CLASS"**, and applying the class rule instead moves 212 rows — it would hand
+lane T `StringBuilder` + `AbstractStringBuilder` and `System$1`, which are
+two-class registrars wholly inside L2's prefix set. Same dump, campaign total
+**5,584** against §1's 5,549. Re-derive your own row; do not plan against this
+table.
+
+**Bucket B is inflated by 23 phantom constructors, and they are the rows where
+retiring is a defect.** A constructor is never inherited in Java, so a `<init>`
+row whose target was resolved by walking up the hierarchy has found
+`Object.<init>()V` and is reporting a method that cannot be dispatched. All
+seven of L2's bucket-B `<init>` rows are that — six on `java.lang.management`
+INTERFACES, which have no constructor at all. Campaign-wide: 23 such rows over
+21 classes of 1,719. They belong in C/F. See
+[`lane-2-lang-values.md`](lane-2-lang-values.md) §6.
 
 **The 316 unowned rows are frozen, not unassigned-by-accident.** They are
 `jdk/internal/foreign/layout` leftovers, `java/beans`, `sun/java2d`,
