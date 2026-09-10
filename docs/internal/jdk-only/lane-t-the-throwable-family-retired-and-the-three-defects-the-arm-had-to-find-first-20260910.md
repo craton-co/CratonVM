@@ -572,14 +572,85 @@ the table, never on a dial arm.
   JIT lane's.
 * **The goal denominator is 5,530** after §3, and the campaign's published
   5,549 / 5,553 both include the 23 inherited-constructor rows.
-* **`alloc_single_message_exception` still does not construct.** LT-3's fix puts
-  the message in both places; it does not give a loader-minted
+* **`alloc_single_message_exception` still does not construct.** ~~LT-3's fix
+  puts the message in both places; it does not give a loader-minted
   `ClassNotFoundException` a stack trace or a `cause` sentinel, because it never
-  runs a constructor. `create_exception_object` is the shape that does, and
-  moving these 31 sites onto it is the residual — `getStackTrace()` on a
-  `Class.forName` failure is still empty where HotSpot has the loader's frames.
+  runs a constructor.~~ **CLOSED the same day — §7.** The funnel now runs the
+  class's own `<init>(String)`, in both compatibility modes, with the flat path
+  kept as the fallback.
 * **`apps/probes/LTKeyStoreEngineSweep.java` is NOT promoted**, and must not be
   while it is red: promoting a divergent probe freezes the divergence as
   acceptable, which is the bar
   `scripts/baselines/jdk-only-strict-corpus-25-*.probes` states in its own
   header. Promote it in the commit that closes §4.1's four rows.
+
+---
+
+## 7. LT-4: the residual, closed — a loader-minted exception now runs its constructor
+
+§6 handed on one residual that was this lane's own rather than another lane's:
+`alloc_single_message_exception` **allocates and stamps**. LT-3 put the detail
+message in both places a `getMessage` might look, and stopped there, because a
+shadow retirement should not carry a constructor rewrite. This is that rewrite.
+
+### 7.1 What the application actually caught
+
+Thirty-one call sites across the class loader, the JBoss module loader,
+`Class.forName` and constant-pool resolution mint exactly four classes this
+way — `ClassNotFoundException` (21 sites), `NullPointerException` (6),
+`NoClassDefFoundError` (3), `org/jboss/modules/ModuleNotFoundException` (1).
+None of them had ever run a constructor, and `regression-suite/src/RLoaderExceptionShape.java`
+is the vector that says what that costs. On the binary that preceded this
+change, in **both** compatibility modes:
+
+```text
+   RLoaderExceptionShape        AssertionError: askForwardName: the trace is not empty
+   HotSpot                      PASS RLoaderExceptionShape (23 checks)
+```
+
+The message, `toString` and `getCause()` checks pass on that binary — LT-3's
+fix holding — so the vector fails on the first check that is about the
+*constructor* rather than the message. Three things were missing:
+
+* **`getStackTrace()` was empty.** Every logging framework prints that trace,
+  and a plugin loader that reports *which of my callers asked for this class*
+  reads it. HotSpot's is the real call stack.
+* **`cause` was the unset sentinel**, so `initCause` SUCCEEDED where HotSpot
+  refuses it. `ClassNotFoundException(String)` is `super(s, null)`: the cause
+  is set, to null, and a second one is an `IllegalStateException`. That check
+  is the sharpest of the twenty-three, because it cannot be satisfied by
+  writing a field — only by running the constructor that writes it.
+* **Nothing else the class's own `<init>` does** ran either.
+
+### 7.2 The fix is one funnel and a fallback that is not decoration
+
+`try_construct_single_message_exception` runs
+`<init>(Ljava/lang/String;)V` through `NativeContext::new_object_initialized`
+— the GC-safe constructor entry every reflective path already uses — and
+returns `None` on any refusal, at which point the historical
+allocate-and-stamp body runs unchanged. The three refusals are all real shapes
+this funnel has to survive: a synthetic class with no such constructor (the
+`--synthetic-jdk` arm's `ModuleNotFoundException`), a constructor that throws,
+and a **re-entrant mint**.
+
+The re-entrancy guard is the load-bearing part. The callers of this funnel are
+the class loader; running a constructor from inside one can load a class, and a
+load that fails comes back through this same funnel. Without the guard that is
+unbounded recursion on the one input the funnel exists to report. With it, the
+inner mint takes the flat path, which allocates and cannot re-enter.
+
+**Both modes gain, for different reasons**, which is why the vector is a
+regression-suite vector and not a `--jdk-only` probe:
+
+| mode | what `<init>(String)` resolves to | what captures the trace |
+|---|---|---|
+| `--jdk-only` | real `Throwable` bytecode | `fillInStackTrace()`, and LT-1's trim |
+| `compatible` | the family's `<init>` shadow | `capture_throwable_trace`, same trim |
+
+`ClassNotFoundException`'s shadow row is `native_exc_init_message_null_cause`
+— `super(s, null)` — so the `initCause` check is satisfied in compatible mode
+by the shadow that was already written to model it, not by the retirement.
+
+### 7.3 What it measured
+
+MEASUREMENTS PENDING — filled from the acceptance run.
