@@ -394,7 +394,12 @@ const FAMILY_DRIFT_EXPOSURE: &[(&str, usize)] = &[
     ("register_byte_array_output_stream", 0),
     ("register_cds_natives", 0),
     ("register_classfile_api_natives", 0),
-    ("register_classloader_natives", 81),
+    // 81 -> 82 on 2026-09-09: `java/lang/System$2.defineClass(..)`, the JDK 21
+    // spelling of the `JavaLangAccess` carrier, joined the `System$1` row this
+    // subtree already carried. Both registrars that name the carrier now cover
+    // both names, so the twin exists under both. `registrar_drift.rs` was
+    // re-taken in the same commit and carries the matching row.
+    ("register_classloader_natives", 82),
     ("register_completable_future_natives", 3),
     ("register_concurrent_extras", 3),
     ("register_crypto_impl_natives", 2),
