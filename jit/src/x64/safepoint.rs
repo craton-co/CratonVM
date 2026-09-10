@@ -621,13 +621,29 @@ impl Compiler {
     /// `array-element-load-baseline-codegen-20260901` for the sizing.
     ///
     /// The RIP-relative form needs the flag to sit within ±2GB of the emitted
-    /// instruction. The JIT code cache and the VM's data segment are separate
-    /// mappings, so that is a property of the process layout and not
+    /// instruction, which is a property of the process layout and not
     /// something this emitter may assume: `emit_test_mem8_abs_imm8` reports
     /// the reach failure and the old `MOV R11, imm64` sequence is emitted
     /// instead. R11 is never a Java-local home (see `LOCAL_REGS`) nor an
     /// `ARG_REGS`/`SCRATCH_REGS` member, so it stays free to clobber on that
     /// path.
+    ///
+    /// The allocation side cooperates, and did not until 2026-09-10. The flag
+    /// used to be an inline field of `GcBarrier`, i.e. Rust-heap memory, and
+    /// under mimalloc that put it ~130 TB from the code cache on Linux — so
+    /// the fallback above ran at EVERY poll site in every process and nothing
+    /// said so, the poll being correct at any address.
+    ///
+    /// Two mechanisms now address that, and exactly one of them is ever
+    /// engaged. `CRATONVM_JIT_CODE_NEAR_GLOBALS` moves the CODE, hinting each
+    /// buffer near `layout_replace_epoch_guard()` and carrying the flag along
+    /// because it is a few hundred megabytes away in the same allocator.
+    /// Otherwise the flag comes from `platform::alloc_code_adjacent_cell`, the
+    /// code cache's own OS primitive, so the two land in the same region — see
+    /// `vm/src/threading/gc_barrier.rs::CacheLineFlag`, and that allocator's
+    /// doc for why it declines when the other strategy owns placement.
+    ///
+    /// Both are hints — the OS picks — which is why the fallback stays.
     ///
     /// The slow helper resolves the current VM and Java thread from published
     /// process state/TLS, so the sequence is valid in pure methods too.

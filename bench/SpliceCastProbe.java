@@ -21,11 +21,27 @@ import java.util.List;
  * MEASURED 2026-09-09. The gate does what it says -- spliced bodies 2 -> 6 --
  * and the throughput here is dominated by something else: the optimizing body
  * is ~3x slower than the single-pass one in BOTH arms (931-1065 ms against
- * 306-443 ms). `ir blind dispatches: own_code=0 in_splice=1` names the suspect,
- * a surviving `invokevirtual` (ArrayList.elementData) inside a relocated body
- * that got neither a direct bind nor its MIC/PIC. SpliceCastArrayProbe is the
- * attribution: same accessors, no container, and there the optimizing body is
- * the faster one.
+ * 306-443 ms). `ir blind dispatches: own_code=0 in_splice=1` names the suspect.
+ * SpliceCastArrayProbe is the attribution: same accessors, no container, and
+ * there the optimizing body is the faster one.
+ *
+ * UPDATED 2026-09-10. That suspect was misidentified here as a virtual
+ * `ArrayList.elementData` missing its MIC/PIC. It is
+ * `jdk/internal/util/Preconditions.checkIndex`, `invokestatic` -- so not
+ * entitled to a MIC/PIC -- reached because `Objects.checkIndex`, which IS
+ * direct-bound, gets spliced into `ArrayList.get` and the call its body leaves
+ * behind is native-shadowed, which the direct-bind path declines. The splice
+ * traded a bound CALL for a name resolution. Refusing that trade
+ * (`CRATONVM_JIT_IR_SPLICE_REFUSE_UNBINDABLE`, default on) takes this probe's
+ * optimizing body from 1112 ms to 493 ms against a single-pass 338 ms.
+ *
+ * The residual 1.46x there is the HARNESS, not the tier: `C2_ACCEPT=always`
+ * also forces optimizing bodies onto `ArrayList.get` and the one-line
+ * `Objects.checkIndex` (694 bytes optimizing against 277 single-pass), which
+ * the default `evidence` policy refuses. Measured on the DEFAULT policy the
+ * refusal is worth 897 ms -> 316 ms, i.e. below the single-pass 338 ms,
+ * because the splice it removes was also the only "evidence" that got the
+ * slower body published.
  *
  * Usage: SpliceCastProbe [reps]     default 4,000,000
  */

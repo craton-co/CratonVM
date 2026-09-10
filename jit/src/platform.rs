@@ -577,6 +577,16 @@ mod near_globals {
     /// limit it must stay inside rather than restating the number.
     pub(super) const WINDOW: usize = NEAR_WINDOW;
 
+    /// Whether this strategy owns placement in this process.
+    ///
+    /// Read by [`super::alloc_code_adjacent_cell`], which must NOT hand out a
+    /// cell while this is on — see its doc. Not `stats().2`: a strategy that
+    /// has retired still owned the decision, and the cells it declined were
+    /// declined for the whole process.
+    pub(super) fn engaged() -> bool {
+        enabled()
+    }
+
     /// `(placed in reach, fell back, retired)` — for the diagnostic line and
     /// for a test that would otherwise be unable to tell "the flag works" from
     /// "the flag is inert on this machine".
@@ -797,12 +807,230 @@ fn platform_make_writable(ptr: *mut u8, size: usize) -> Result<(), JitError> {
 }
 
 // ---------------------------------------------------------------------------
+// Code-adjacent data cells
+// ---------------------------------------------------------------------------
+
+/// Whether `near_globals` owns code/data placement in this process.
+///
+/// Always `false` where that module is not built: Windows lands in reach
+/// without help and macOS/ARM64 allocates `MAP_JIT` pages on the kernel's
+/// terms, so neither has the strategy and neither has the conflict.
+#[cfg(all(
+    not(target_os = "windows"),
+    not(all(target_os = "macos", target_arch = "aarch64"))
+))]
+fn near_globals_engaged() -> bool {
+    near_globals::engaged()
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+fn near_globals_engaged() -> bool {
+    false
+}
+
+/// One cell: a full cache line, so a cell can never share a line with an
+/// unrelated one and a writer of one cannot invalidate another's.
+///
+/// x86-64's destructive-interference size, and the same 64 the two in-tree
+/// `#[repr(align(64))]` precedents (`gc/src/zgc/census.rs`,
+/// `gc/src/collector.rs`) already use.
+pub const CODE_ADJACENT_CELL_SIZE: usize = 64;
+
+/// How much address space one arena chunk covers.
+///
+/// 64 KiB rather than a single 4 KiB page because that is Windows' allocation
+/// GRANULARITY: `VirtualAlloc(NULL, 4096, ...)` reserves 64 KiB regardless and
+/// wastes the other 60 KiB of address space, so asking for less buys nothing.
+/// On Unix the extra pages are demand-faulted and cost one page-table entry
+/// each until touched. At [`CODE_ADJACENT_CELL_SIZE`] per cell that is 1024
+/// cells per chunk, so in practice a process allocates exactly one chunk.
+const ARENA_CHUNK: usize = 64 * 1024;
+
+/// `(bump cursor, chunk end)`. `(0, 0)` means "no chunk yet".
+static CELL_ARENA: std::sync::Mutex<(usize, usize)> = std::sync::Mutex::new((0, 0));
+
+/// Hand out one zero-filled, cache-line-isolated, never-unmapped
+/// [`CODE_ADJACENT_CELL_SIZE`]-byte cell for a word that JIT-compiled code
+/// READS DIRECTLY, from the same OS primitive [`alloc_executable`] uses.
+///
+/// # Why the allocator matters
+///
+/// A word compiled code polls wants to be within ±2 GB of the code that polls
+/// it, because that is the reach of x86-64's `disp32` and therefore the
+/// difference between the one-instruction, no-register RIP-relative form and a
+/// materialize-the-address fallback (`MOV r64, imm64` + the access: 15 bytes
+/// and a clobbered register instead of 7 and none). Nothing FAILS when the
+/// word is out of reach — every emitter that wants the short form checks the
+/// delta and falls back — so the cost is silent, and no test notices.
+///
+/// The Rust heap cannot supply that adjacency. The default allocator here is
+/// mimalloc (`vm-cli/src/main.rs`), which reserves its arenas from an address
+/// range unrelated to the one an anonymous `mmap` / `VirtualAlloc(NULL, ...)`
+/// hands out; measured on Linux, a `GcBarrier` field and a code buffer sat
+/// ~124 TB apart. Two allocations from THE SAME primitive land in the same
+/// region of the address space, which is what puts them in `disp32` range.
+///
+/// This is a placement HINT, not a guarantee: the OS chooses, and a caller
+/// must stay correct when it chooses badly. Every caller therefore keeps its
+/// out-of-reach fallback, and none may assume the cell is close to anything.
+///
+/// # Lifetime
+///
+/// Chunks are never unmapped and cells are never recycled, so an address
+/// handed out here is valid for the rest of the process and can be baked into
+/// generated code as an immediate. The cost is
+/// [`CODE_ADJACENT_CELL_SIZE`] bytes per cell ever requested, permanently —
+/// affordable only because callers are per-VM-ish singletons, not per-object.
+/// Do not call this from anything that runs more than a bounded number of
+/// times.
+///
+/// # It defers to `near_globals`, and must
+///
+/// There are two strategies for getting a polled word and the code that polls
+/// it into one `disp32` window, and they point in opposite directions. This one
+/// moves the WORD to the code's allocator. [`near_globals`] moves the CODE to
+/// the allocator the VM's globals already live in, by hinting `mmap` — and it
+/// anchors on `layout_replace_epoch_guard()`, relying on every other polled
+/// cell being a few hundred megabytes away in that same mimalloc band.
+///
+/// Handing out a cell while that strategy is engaged would take the safepoint
+/// flag OUT of the band the anchor is pulling the code towards, and leave the
+/// poll ~130 TB behind — the precise failure `82bf52efd` describes for the
+/// epoch counter, in the other cell. So this returns `None` whenever
+/// `near_globals` owns placement, and the caller's ordinary-allocation fallback
+/// is then the CORRECT answer rather than a degraded one.
+///
+/// Whoever owns placement must own it for every cell at once. Today that is
+/// `near_globals` when `CRATONVM_JIT_CODE_NEAR_GLOBALS` is set and this
+/// allocator otherwise.
+///
+/// Returns `None` if the OS refuses the mapping, or if `near_globals` is
+/// engaged; a caller must then fall back to ordinary allocation. In the first
+/// case it accepts the long encoding, in the second it is how it gets the short
+/// one.
+pub fn alloc_code_adjacent_cell() -> Option<*mut u8> {
+    if near_globals_engaged() {
+        return None;
+    }
+    // A poisoned arena mutex would mean a panic while holding it, and the only
+    // thing done under it is integer arithmetic plus `platform_alloc` — take
+    // the lock back rather than propagating a `None` that would silently
+    // downgrade every later caller's encoding.
+    let mut arena = CELL_ARENA.lock().unwrap_or_else(|e| e.into_inner());
+    let (cursor, end) = *arena;
+    if cursor == 0 || cursor + CODE_ADJACENT_CELL_SIZE > end {
+        // `platform_alloc` returns page-aligned (Unix) or 64 KiB-granule
+        // aligned (Windows) memory, both a multiple of the cell size, so the
+        // bump cursor stays cache-line aligned without any rounding here.
+        let base = platform_alloc(ARENA_CHUNK)? as usize;
+        *arena = (base, base + ARENA_CHUNK);
+    }
+    let cell = arena.0;
+    arena.0 += CODE_ADJACENT_CELL_SIZE;
+    // Fresh anonymous pages are zero-filled by both `mmap(MAP_ANONYMOUS)` and
+    // `VirtualAlloc(MEM_COMMIT)`, so this is redundant on the first cell of a
+    // chunk. Written anyway: the guarantee a caller needs is "this cell reads
+    // as zero", and making it depend on which cell of which chunk it happened
+    // to get is the kind of thing that holds until someone adds recycling.
+    // SAFETY: `cell` is the cell just carved out of a mapping this arena owns
+    // and never releases; the bump cursor guarantees it is in bounds and that
+    // no other reference to it exists.
+    unsafe { std::ptr::write_bytes(cell as *mut u8, 0, CODE_ADJACENT_CELL_SIZE) };
+    Some(cell as *mut u8)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cells must be distinct, cache-line aligned, and zero.
+    ///
+    /// Zero is the part with teeth: `CacheLineFlag::new` writes the initial
+    /// value itself, but every other prospective caller (a counter, an epoch)
+    /// will read the cell before writing it, and "fresh anonymous pages are
+    /// zero-filled" is a property of the FIRST cell of a chunk, not of the
+    /// 900th.
+    #[test]
+    fn code_adjacent_cells_are_distinct_aligned_and_zero() {
+        if near_globals_engaged() {
+            // The allocator declines by design here; there are no cells to
+            // assert about. See `alloc_code_adjacent_cell`.
+            return;
+        }
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..8 {
+            let cell = alloc_code_adjacent_cell().expect("cell allocation failed");
+            let addr = cell as usize;
+            assert_eq!(
+                addr % CODE_ADJACENT_CELL_SIZE,
+                0,
+                "cell {addr:#x} is not cache-line aligned, so it can share a \
+                 line with its neighbour"
+            );
+            assert!(seen.insert(addr), "cell {addr:#x} was handed out twice");
+            // SAFETY: a freshly carved cell of exactly this size that nothing
+            // else holds a reference to.
+            let bytes = unsafe { std::slice::from_raw_parts(cell, CODE_ADJACENT_CELL_SIZE) };
+            assert!(
+                bytes.iter().all(|&b| b == 0),
+                "cell {addr:#x} is not zeroed"
+            );
+            // Dirty it, so the next iteration's zero check is about the
+            // allocator rather than about untouched pages.
+            // SAFETY: as above; this cell is ours for the rest of the process.
+            unsafe { std::ptr::write_bytes(cell, 0xA5, CODE_ADJACENT_CELL_SIZE) };
+        }
+    }
+
+    /// The whole point: a cell must land within `disp32` reach of JIT code.
+    ///
+    /// This is the property `jit/src/x64/safepoint.rs::emit_safepoint_poll`
+    /// silently loses when it does not hold — the poll stays correct and grows
+    /// from 7 bytes to 15 plus a clobbered register, at every loop back edge
+    /// and method entry in the process. Nothing else in the tree fails, which
+    /// is exactly why it went unnoticed from 2026-09-02 to 2026-09-10 with the
+    /// flag on the mimalloc heap, ~124 TB from the code cache.
+    ///
+    /// x86-64 only: `disp32` reach is what makes the distance matter, and
+    /// aarch64's `ADRP` has its own (±4 GB) window that no emitter uses yet.
+    ///
+    /// Both sides come from `platform_alloc`, so this asserts that the OS puts
+    /// two allocations from one primitive in one region. That is true of every
+    /// mapper we run on but is not architecturally guaranteed; if it ever
+    /// fails, the fallback still runs and this test is the notification.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_cell_is_within_disp32_of_a_code_buffer() {
+        if near_globals_engaged() {
+            // `near_globals` owns placement and this allocator declines, so
+            // there is no cell whose distance means anything. Reach in that
+            // configuration is that strategy's own claim, asserted by
+            // `near_globals_tests`.
+            return;
+        }
+        let code = alloc_executable(4096).expect("alloc_executable failed");
+        let cell = alloc_code_adjacent_cell().expect("cell allocation failed");
+        // Widening: usize -> i128, so the subtraction cannot wrap.
+        let delta = (cell as usize as i128) - (code as usize as i128);
+        let in_reach = delta >= i32::MIN as i128 && delta <= i32::MAX as i128;
+        free_executable(code, 4096);
+        assert!(
+            in_reach,
+            "code buffer {:#x} and data cell {:#x} are {:.1} GB apart; a \
+             RIP-relative poll cannot reach, so every safepoint poll in the \
+             process falls back to MOV r64, imm64",
+            code as usize,
+            cell as usize,
+            (delta.unsigned_abs() as f64) / (1024.0 * 1024.0 * 1024.0),
+        );
+    }
 
     #[test]
     fn alloc_write_free() {
