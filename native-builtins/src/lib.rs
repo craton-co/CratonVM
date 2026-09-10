@@ -13550,13 +13550,52 @@ pub fn register_essential_natives_with_shims(
         lang_class::native_class_get_name,
         NativeKind::Bridge,
     );
-    // getName() is a Java method that caches via initClassName(). Override with
-    // native since JDK's Class field layout differs from our mirror layout.
-    registry.register(
+    // REVIEWED `Intrinsic`, 2026-09-10, and the review is
+    // `apps/probes/ClassNameSweep.java`.
+    //
+    // getName() is a Java method that caches via initClassName(). It is
+    // overridden here because JDK's Class field layout differs from our mirror
+    // layout -- and that sentence, which this comment has carried since long
+    // before §1.4 existed, is exactly why the tag has to be `Intrinsic` rather
+    // than the ambient `Bridge` it was.
+    //
+    // Real `Class.getName()` is `String name = this.name; return name != null ?
+    // name : initClassName();`. It reads a field only a VM fills, in a layout
+    // this VM does not share, so §1.4's remedy -- yield to the bytecode -- does
+    // not answer null here. **It answers the INTERNAL form:**
+    //
+    //     HotSpot   java.lang.Object   [Ljava.lang.String;   Object
+    //     yielded   java/lang/Object   [Ljava/lang/String;   java/lang/Object
+    //
+    // which is worse than a null, because nothing throws and the wrong string
+    // propagates into every name comparison in `java.base`. MEASURED as the
+    // cause of `ServiceLoader.checkCaller` failing with *"module java.base does
+    // not declare `uses`"* on three corpus vectors: `descriptor.uses()` holds
+    // `java.nio.file.spi.FileSystemProvider` and the lookup asks for
+    // `java/nio/file/spi/FileSystemProvider`.
+    //
+    // The `Intrinsic` claim is semantics-preserving and `ClassNameSweep` earns
+    // it: 24 rows over `getName`/`getTypeName`/`getCanonicalName`/
+    // `getSimpleName` across ordinary, nested, local, anonymous, enum, lambda,
+    // primitive and array-of-both receivers, plus `Class.forName` round trips
+    // and the `uses`/`canUse` pair above.
+    //
+    //     unarmed   0 diffs of 24 against HotSpot 25.0.3+9
+    //     yielded  24 diffs of 24
+    //
+    // Every row is wrong when the native yields and right when it runs, which
+    // is the whole case: there is nothing here to fix by yielding.
+    //
+    // NOT the same as its `initClassName` sibling above, which stays `Bridge`
+    // deliberately. That one IS `ACC_NATIVE` in the JDK, so §1.5 governs it and
+    // `Bridge` is the correct tag. `getName` is ordinary bytecode, which is why
+    // it needed §1.4's reviewed exception instead.
+    registry.register_with_kind(
         "java/lang/Class",
         "getName",
         "()Ljava/lang/String;",
         lang_class::native_class_get_name,
+        NativeKind::Intrinsic,
     );
     registry.register(
         "java/lang/Class",

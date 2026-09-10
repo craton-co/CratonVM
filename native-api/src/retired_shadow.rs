@@ -1223,6 +1223,18 @@ const RETIRED_SHADOW_PREFIXES: &[&str] = &[
     // see `RETIRED_SHADOW_PHASE2_TRIPLES`. A prefix admits a package to the
     // binary search; the table decides what is retired, and it retires one row.
     "sun/nio/ch/",
+    // 2026-09-10, lane L0. The narrowest prefixes that cover
+    // `RETIRED_SHADOW_L0_TRIPLES`, and no wider: `java/lang/Class` also admits
+    // `ClassValue`, `ClassFrameInfo` and `Class$Atomic` (all L0's), and
+    // `java/lang/Module` admits `ModuleLayer`. Both also admit classes that are
+    // NOT L0's -- `ClassLoader`, `ClassNotFoundException`, `ClassCastException`
+    // -- because a prefix is a string and there is no way to say "this class
+    // exactly". That is safe and is not an accident: a prefix admits a package
+    // to the binary search, the TABLE decides what is retired, and none of
+    // those classes appear in any table. `java/lang/ref/` is still absent, so
+    // the belt-and-braces guard in `a_prefix_alone_retires_nothing` is intact.
+    "java/lang/Class",
+    "java/lang/Module",
 ];
 
 /// The 2026-08-30 Phase 2 wave: ONE triple, and the size is the finding.
@@ -1307,8 +1319,316 @@ const RETIRED_SHADOW_PREFIXES: &[&str] = &[
 /// the carrier is this VM's own allocation shape, and matching the JDK's class
 /// name is not a thing to fix — not by fabricating a name, and not by
 /// retirement either.
-static RETIRED_SHADOW_PHASE2_TRIPLES: &[(&str, &str, &str)] = &[
-    ("sun/nio/ch/FileChannelImpl", "truncate", "(J)Ljava/nio/channels/FileChannel;"),
+static RETIRED_SHADOW_PHASE2_TRIPLES: &[(&str, &str, &str)] = &[(
+    "sun/nio/ch/FileChannelImpl",
+    "truncate",
+    "(J)Ljava/nio/channels/FileChannel;",
+)];
+
+/// Lane L0's wave, 2026-09-10: `java.lang.Class`, `Module` and
+/// `ModuleDescriptor.Version` -- 54 triples of the lane's 104, with the other
+/// 50 accounted for below rather than left unexamined.
+///
+/// # The instrument, and why the aggregate number is the wrong one to read
+///
+/// `apps/probes/L0ClassModuleSurface.java`, 129 rows over the whole lane
+/// surface, measured three ways against HotSpot 25.0.3+9 -- unarmed, and with
+/// every native declining (`CRATONVM_ENFORCE_NATIVE_SHADOW=all`):
+///
+/// ```text
+/// unarmed   8 diff lines of 130     armed  58 diff lines of 130
+/// ```
+///
+/// Read as an aggregate that says "do not retire anything here", and it would
+/// be the wrong conclusion drawn from a true number. Per ROW:
+///
+/// ```text
+///  96  OK -> OK    the native is right and so is the bytecode  -> RETIRE
+///   4  BAD -> OK   the native is WRONG and yielding fixes it   -> RETIRE
+///  29  OK -> BAD   the native is right, yielding breaks it     -> HELD
+///   0  BAD -> BAD
+/// ```
+///
+/// The four unarmed diffs are exactly the `BAD -> OK` rows, so **every
+/// disagreement this VM has with HotSpot on lane 0's surface is one that
+/// retirement repairs.**
+///
+/// # What the four repairs are, because one is not a cosmetic
+///
+/// ```text
+/// Module.addExports("jdk.internal.misc", unnamed) on java.base
+///   HotSpot  threw java.lang.IllegalCallerException
+///   native   PERMITTED
+/// ModuleDescriptor.Version.parse("")
+///   HotSpot  IllegalArgumentException: Empty version string
+///   native   returned a Version   (validation skipped entirely)
+/// Version.compareTo x2
+///   native   NPE in JDK bytecode: "ts1 is null" -- `parse` built a Version
+///            whose internal lists were never filled
+/// ```
+///
+/// The first is an access-control check the native does not perform: only a
+/// module may widen its own exports, and this VM let an unnamed module widen
+/// `java.base`'s. The rest are the JDK's own argument validation, which is the
+/// surface a retirement usually buys.
+///
+/// # The 23 HELD triples, each with the row that held it
+///
+/// ```text
+/// Class.descriptorString        row 2      NPE: componentType field is null
+/// Class.getModifiers            rows 14-16 wrong FLAG BITS ("public
+///                                          synchronized" for Object; `static`
+///                                          lost on a nested interface)
+/// Class.getAnnotation*, isAnnotationPresent
+///                               rows 71-77 annotations come back EMPTY
+/// Class.newInstance             rows 87-88  cachedConstructor is null
+/// Module.getLayer               row 103     answers false where HotSpot is true
+/// Module.isExported x2          rows 108,110 answers false
+/// Module.isOpen x2              family of isExported -- see the note below
+/// ModuleLayer.boot/findModule/modules/configuration
+///                               rows 118-121 boot() yields null
+/// Class.getPackage, getResource, getResourceAsStream, Module.getResourceAsStream
+///                               rows 13,81-83,105  NoClassDefFoundError,
+///                                          `jdk/internal/loader/ClassLoaders`
+///                                          and `BuiltinClassLoader`
+/// ```
+///
+/// **`Module.isOpen` is held on a judgement, not a measurement, and that is
+/// deliberate.** Its two rows agree with HotSpot when yielded -- but they agree
+/// at `false`, which is also what a blanket yield returns for everything in
+/// this family, and its sibling `isExported` demonstrably breaks. An agreement
+/// that cannot be distinguished from the default answer is not evidence. It
+/// needs a receiver whose correct answer is `true`, which `java.base` does not
+/// provide to an unnamed module; until someone builds that fixture, held.
+///
+/// The last group is not this lane's to fix: the builtin class loader
+/// hierarchy does not link, which is lane L7's named blocker. Those four are
+/// held *pending L7*, not held on their own merits.
+///
+/// # The 27 not retired for want of an instrument
+///
+/// Precondition 4 is per-instrument and these have `invocations == 0` even in
+/// the probe written to reach them. Twelve cannot be called from Java at all --
+/// `Class.getClassLoader0`, `getEnumConstantsShared`, `reflectionData`,
+/// `newReflectionData`, `setSigners`, the three `Class$Atomic` CAS methods,
+/// `Class$ReflectionData.<init>` and the five `ClassFrameInfo` accessors are
+/// package-private plumbing called only from inside `java.lang.Class` and the
+/// stack walker. Eight are `Module.implAdd*`, reached only through
+/// `AccessibleObject` paths this probe does not take.
+///
+/// `ModuleDescriptor$Version.compareTo` and `ClassValue.remove` are the
+/// interesting two: the probe DOES exercise both, and both still count zero.
+/// The row-126 failure names `ts1`, a local in `Version.compareTo`'s own
+/// bytecode, so the JDK's method served the call and the registration was
+/// never dispatched -- an inert row, which is a finding rather than a
+/// retirement, and it is why the count is taken per triple and not per row.
+static RETIRED_SHADOW_L0_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/lang/Class", "arrayType", "()Ljava/lang/Class;"),
+    (
+        "java/lang/Class",
+        "asSubclass",
+        "(Ljava/lang/Class;)Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/Class",
+        "cast",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    ("java/lang/Class", "componentType", "()Ljava/lang/Class;"),
+    ("java/lang/Class", "desiredAssertionStatus", "()Z"),
+    (
+        "java/lang/Class",
+        "forName",
+        "(Ljava/lang/Module;Ljava/lang/String;)Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/Class",
+        "forName",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/Class",
+        "forName",
+        "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/Class",
+        "getAnnotatedInterfaces",
+        "()[Ljava/lang/reflect/AnnotatedType;",
+    ),
+    (
+        "java/lang/Class",
+        "getAnnotatedSuperclass",
+        "()Ljava/lang/reflect/AnnotatedType;",
+    ),
+    (
+        "java/lang/Class",
+        "getCanonicalName",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/Class",
+        "getClassLoader",
+        "()Ljava/lang/ClassLoader;",
+    ),
+    (
+        "java/lang/Class",
+        "getConstructor",
+        "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
+    ),
+    (
+        "java/lang/Class",
+        "getConstructors",
+        "()[Ljava/lang/reflect/Constructor;",
+    ),
+    (
+        "java/lang/Class",
+        "getDeclaredConstructor",
+        "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
+    ),
+    (
+        "java/lang/Class",
+        "getDeclaredConstructors",
+        "()[Ljava/lang/reflect/Constructor;",
+    ),
+    (
+        "java/lang/Class",
+        "getDeclaredField",
+        "(Ljava/lang/String;)Ljava/lang/reflect/Field;",
+    ),
+    (
+        "java/lang/Class",
+        "getDeclaredFields",
+        "()[Ljava/lang/reflect/Field;",
+    ),
+    (
+        "java/lang/Class",
+        "getDeclaredMethod",
+        "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
+    ),
+    (
+        "java/lang/Class",
+        "getDeclaredMethods",
+        "()[Ljava/lang/reflect/Method;",
+    ),
+    (
+        "java/lang/Class",
+        "getEnclosingClass",
+        "()Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/Class",
+        "getEnclosingConstructor",
+        "()Ljava/lang/reflect/Constructor;",
+    ),
+    (
+        "java/lang/Class",
+        "getEnclosingMethod",
+        "()Ljava/lang/reflect/Method;",
+    ),
+    (
+        "java/lang/Class",
+        "getEnumConstants",
+        "()[Ljava/lang/Object;",
+    ),
+    (
+        "java/lang/Class",
+        "getField",
+        "(Ljava/lang/String;)Ljava/lang/reflect/Field;",
+    ),
+    (
+        "java/lang/Class",
+        "getFields",
+        "()[Ljava/lang/reflect/Field;",
+    ),
+    (
+        "java/lang/Class",
+        "getGenericInterfaces",
+        "()[Ljava/lang/reflect/Type;",
+    ),
+    (
+        "java/lang/Class",
+        "getGenericSuperclass",
+        "()Ljava/lang/reflect/Type;",
+    ),
+    (
+        "java/lang/Class",
+        "getMethod",
+        "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
+    ),
+    (
+        "java/lang/Class",
+        "getMethods",
+        "()[Ljava/lang/reflect/Method;",
+    ),
+    ("java/lang/Class", "getPackageName", "()Ljava/lang/String;"),
+    ("java/lang/Class", "getSigners", "()[Ljava/lang/Object;"),
+    ("java/lang/Class", "getSimpleName", "()Ljava/lang/String;"),
+    ("java/lang/Class", "getTypeName", "()Ljava/lang/String;"),
+    (
+        "java/lang/Class",
+        "getTypeParameters",
+        "()[Ljava/lang/reflect/TypeVariable;",
+    ),
+    ("java/lang/Class", "isAnnotation", "()Z"),
+    ("java/lang/Class", "isArray", "()Z"),
+    ("java/lang/Class", "isEnum", "()Z"),
+    ("java/lang/Class", "isInterface", "()Z"),
+    ("java/lang/Class", "isPrimitive", "()Z"),
+    (
+        "java/lang/ClassValue",
+        "get",
+        "(Ljava/lang/Class;)Ljava/lang/Object;",
+    ),
+    (
+        "java/lang/Module",
+        "addExports",
+        "(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;",
+    ),
+    (
+        "java/lang/Module",
+        "addOpens",
+        "(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;",
+    ),
+    (
+        "java/lang/Module",
+        "addUses",
+        "(Ljava/lang/Class;)Ljava/lang/Module;",
+    ),
+    ("java/lang/Module", "canRead", "(Ljava/lang/Module;)Z"),
+    ("java/lang/Module", "canUse", "(Ljava/lang/Class;)Z"),
+    (
+        "java/lang/Module",
+        "getClassLoader",
+        "()Ljava/lang/ClassLoader;",
+    ),
+    (
+        "java/lang/Module",
+        "getDescriptor",
+        "()Ljava/lang/module/ModuleDescriptor;",
+    ),
+    ("java/lang/Module", "getName", "()Ljava/lang/String;"),
+    ("java/lang/Module", "getPackages", "()Ljava/util/Set;"),
+    (
+        "java/lang/module/ModuleDescriptor$Version",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/lang/module/ModuleDescriptor$Version",
+        "hashCode",
+        "()I",
+    ),
+    (
+        "java/lang/module/ModuleDescriptor$Version",
+        "parse",
+        "(Ljava/lang/String;)Ljava/lang/module/ModuleDescriptor$Version;",
+    ),
+    (
+        "java/lang/module/ModuleDescriptor$Version",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
 ];
 
 /// The 2026-09-09 Phase 3 wave: `ConcurrentHashMap` and `Properties`, as ONE
@@ -2298,6 +2618,7 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
         || RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(&key).is_ok()
+        || RETIRED_SHADOW_L0_TRIPLES.binary_search(&key).is_ok()
 }
 
 #[cfg(test)]
@@ -2358,6 +2679,19 @@ mod tests {
                     && RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(t).is_err()
                     && RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(t).is_err(),
                 "{t:?} is in the phase-3 table and an earlier one"
+            );
+        }
+
+        // Five tables. The cascade is quadratic in the number of tables and
+        // the next lane makes it worse; a lane adding a table adds one arm
+        // here and nowhere else.
+        for t in RETIRED_SHADOW_L0_TRIPLES {
+            assert!(
+                RETIRED_SHADOW_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(t).is_err(),
+                "{t:?} is in the L0 table and an earlier one"
             );
         }
     }
@@ -2533,6 +2867,171 @@ Ljava/nio/channels/FileChannel;"
             "toString",
             "()Ljava/lang/String;"
         ));
+    }
+
+    /// Binary-searched like every sibling, so ordering is correctness.
+    #[test]
+    fn the_l0_table_is_sorted_and_unique() {
+        for w in RETIRED_SHADOW_L0_TRIPLES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "out of order or duplicated: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    /// An entry outside every prefix answers `false`, which reads as "not
+    /// retired" and is invisible in a workload. L0 added `java/lang/Class` and
+    /// `java/lang/Module` for exactly these rows.
+    #[test]
+    fn every_l0_entry_is_reachable() {
+        for (c, m, d) in RETIRED_SHADOW_L0_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "unreachable entry: {c}.{m}{d}"
+            );
+        }
+    }
+
+    /// The wave is exactly three class families, and nothing crept in from a
+    /// neighbouring lane. `java/lang/Class` is a PREFIX of
+    /// `java/lang/ClassLoader`, which is L7's, and of the two throwable
+    /// classes that belong to the cross-cutting-registrar lane -- the first
+    /// draft of the lane split got all three wrong, so this is asserted rather
+    /// than trusted.
+    #[test]
+    fn the_l0_wave_stays_inside_lane_zero() {
+        for (c, m, d) in RETIRED_SHADOW_L0_TRIPLES {
+            let ok = *c == "java/lang/Class"
+                || c.starts_with("java/lang/Class$")
+                || c.starts_with("java/lang/ClassValue")
+                || *c == "java/lang/Module"
+                || c.starts_with("java/lang/ModuleLayer")
+                || c.starts_with("java/lang/module/");
+            assert!(ok, "not lane L0's class: {c}.{m}{d}");
+            assert!(
+                !c.starts_with("java/lang/ClassLoader")
+                    && !c.starts_with("java/lang/ClassNotFound")
+                    && !c.starts_with("java/lang/ClassCast"),
+                "another lane's class matched L0's prefix: {c}.{m}{d}"
+            );
+        }
+    }
+
+    /// The 21 triples lane L0 measured and DECLINED to retire.
+    ///
+    /// Each is `OK -> BAD` in `apps/probes/L0ClassModuleSurface.java`: the
+    /// native answers as HotSpot does and the bytecode does not. Retiring any
+    /// of them trades a correct answer for a wrong one -- and for most of these
+    /// the wrong answer does not throw, which is worse. The table's doc comment
+    /// carries the row numbers and the observed values.
+    #[test]
+    fn the_l0_held_families_are_not_retired() {
+        for (c, m, d) in [
+            // VM-filled state that no Java code can fill.
+            (
+                "java/lang/Class",
+                "descriptorString",
+                "()Ljava/lang/String;",
+            ),
+            ("java/lang/Class", "getModifiers", "()I"),
+            ("java/lang/Class", "newInstance", "()Ljava/lang/Object;"),
+            ("java/lang/Module", "getLayer", "()Ljava/lang/ModuleLayer;"),
+            ("java/lang/ModuleLayer", "boot", "()Ljava/lang/ModuleLayer;"),
+            ("java/lang/ModuleLayer", "modules", "()Ljava/util/Set;"),
+            (
+                "java/lang/ModuleLayer",
+                "configuration",
+                "()Ljava/lang/module/Configuration;",
+            ),
+            (
+                "java/lang/ModuleLayer",
+                "findModule",
+                "(Ljava/lang/String;)Ljava/util/Optional;",
+            ),
+            // The annotation subsystem comes back EMPTY when yielded.
+            (
+                "java/lang/Class",
+                "getAnnotations",
+                "()[Ljava/lang/annotation/Annotation;",
+            ),
+            (
+                "java/lang/Class",
+                "getDeclaredAnnotations",
+                "()[Ljava/lang/annotation/Annotation;",
+            ),
+            (
+                "java/lang/Class",
+                "getAnnotation",
+                "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
+            ),
+            (
+                "java/lang/Class",
+                "getDeclaredAnnotation",
+                "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
+            ),
+            (
+                "java/lang/Class",
+                "isAnnotationPresent",
+                "(Ljava/lang/Class;)Z",
+            ),
+            // The export/open predicate family.
+            ("java/lang/Module", "isExported", "(Ljava/lang/String;)Z"),
+            (
+                "java/lang/Module",
+                "isExported",
+                "(Ljava/lang/String;Ljava/lang/Module;)Z",
+            ),
+            ("java/lang/Module", "isOpen", "(Ljava/lang/String;)Z"),
+            (
+                "java/lang/Module",
+                "isOpen",
+                "(Ljava/lang/String;Ljava/lang/Module;)Z",
+            ),
+            // Held PENDING LANE L7: the builtin loader hierarchy does not link,
+            // so yielding raises NoClassDefFoundError rather than answering.
+            ("java/lang/Class", "getPackage", "()Ljava/lang/Package;"),
+            (
+                "java/lang/Class",
+                "getResource",
+                "(Ljava/lang/String;)Ljava/net/URL;",
+            ),
+            (
+                "java/lang/Class",
+                "getResourceAsStream",
+                "(Ljava/lang/String;)Ljava/io/InputStream;",
+            ),
+            (
+                "java/lang/Module",
+                "getResourceAsStream",
+                "(Ljava/lang/String;)Ljava/io/InputStream;",
+            ),
+        ] {
+            assert!(
+                !triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is HELD by lane L0's measurement and must not be retired"
+            );
+        }
+    }
+
+    /// `Class.getName` and `Class.getModule` are reviewed `Intrinsic`s, NOT
+    /// retirements, and the difference matters: an `Intrinsic` keeps winning at
+    /// every dispatch door, while a retired triple stops being registered under
+    /// `--jdk-only` at all. Putting either in a retirement table would yield to
+    /// bytecode that answers the internal name form and a null module.
+    #[test]
+    fn the_two_reviewed_intrinsics_are_not_retirements() {
+        for (c, m, d) in [
+            ("java/lang/Class", "getName", "()Ljava/lang/String;"),
+            ("java/lang/Class", "getModule", "()Ljava/lang/Module;"),
+        ] {
+            assert!(
+                !triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is a reviewed Intrinsic, not a retirement"
+            );
+        }
     }
 
     /// `java/lang/ref/` stays whole, and this is the record of WHY — the

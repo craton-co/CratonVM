@@ -61,7 +61,7 @@ Sets are disjoint; the totals below reconcile to 5,549 exactly.
 
 | lane | scope | shadows | classes | reg sites |
 |---|---|---|---|---|
-| **L0** (this page) | `java/lang/Class*`, `java/lang/Module*`, `java/lang/module/` | 131 | 9 | 131 |
+| **L0** (this page) | `java/lang/Class` + `Class$*`, `ClassValue`, `ClassFrameInfo`, `Module*`, `java/lang/module/` — **not** `ClassLoader*` | 104 | 8 | 104 |
 | **LT** | *whole cross-cutting registrars* (see §3) | **1,100** | 87 | **57** |
 | **L1** | `java/util/` (less `concurrent/`), `java/text/`, `sun/util/`, `java/time/` | 963 | 98 | 726 |
 | **L2** | `java/lang/` remainder, `java/math/` | 434 | 68 | 303 |
@@ -69,9 +69,16 @@ Sets are disjoint; the totals below reconcile to 5,549 exactly.
 | **L4** | `java/io/`, `java/nio/`, `sun/nio/`, `jdk/internal/foreign` | 1,110 | 131 | 615 |
 | **L5** | `java/util/concurrent/`, `jdk/internal/misc/`, `sun/misc/`, `java/lang/Thread*`, `jdk/internal/vm/` | 405 | 23 | 345 |
 | **L6** | `java/net/`, `sun/net/`, `javax/net/`, `java/security/`, `sun/security/`, `javax/crypto/`, `javax/security/`, `jdk/net/` | 819 | 90 | 663 |
-| **L7** | `java/lang/ClassLoader*`, `jdk/internal/loader/` **+ the bootstrap failure triage** | 20 | 6 | 18 |
+| **L7** | `java/lang/ClassLoader*`, `jdk/internal/loader/` **+ the bootstrap failure triage** | 47 | 12 | 45 |
 | — | **UNOWNED, frozen** | 316 | 83 | 291 |
 | | **TOTAL** | **5,549** | **631** | **3,395** |
+
+**A prefix is a string, and `java/lang/Class` is a prefix of
+`java/lang/ClassLoader`.** The first cut of this table was computed that way
+and silently gave L0 all 27 `ClassLoader` rows plus, before the lane-T pass,
+`ClassNotFoundException` and `ClassCastException`. L0's row above is now the
+explicit set and L7's carries the `ClassLoader` rows that were never L0's
+business. If you add a prefix anywhere, check what else it is a prefix of.
 
 **The 316 unowned rows are frozen, not unassigned-by-accident.** They are
 `jdk/internal/foreign/layout` leftovers, `java/beans`, `sun/java2d`,
@@ -119,7 +126,7 @@ census, never with the scanner.
 |---|---|---|
 | `native-api/src/retired_shadow.rs` — **your own** `RETIRED_SHADOW_L<N>_TRIPLES` | the lane | fill your array literal only |
 | same file — `triple_is_retired_shadow()` chain | **L0** | pre-created; never edit |
-| same file — `RETIRED_SHADOW_PREFIXES` | **L0** | pre-populated; never edit |
+| same file — `RETIRED_SHADOW_PREFIXES` | the lane | append **your** prefix in the same commit as your first entry — see below |
 | same file — the N-way disjointness test | **L0** | never edit; it must fail if you collide |
 | `native-builtins/tests/stub_ratchet.rs` — the three `BASELINE_*` constants | **L0** | **never edit.** Report your measured delta in your commit message |
 | `scripts/baselines/jdk-only-kind-map-25-linux.tsv` — **rows** | the lane | keyed class+name+descriptor, disjoint by construction |
@@ -128,20 +135,58 @@ census, never with the scanner.
 | [`../jdk-only-lane-operations.md`](../jdk-only-lane-operations.md) | **L0** | propose via your lane page |
 | `apps/probes/L<N>*.java` | the lane | namespace your probes; `apps/` is gitignored, so `git add -f` |
 
-### The skeleton commit makes the chain conflict-free
+### How a lane adds its table without touching another lane's work
 
-L0 lands this **before any lane starts**:
+`triple_is_retired_shadow` is a chain of `||` arms over sorted tables, and the
+disjointness test is a hand-unrolled cascade. Both grow with the number of
+tables, so a lane adds:
 
-1. Nine empty tables, `RETIRED_SHADOW_L0_TRIPLES` … `RETIRED_SHADOW_LT_TRIPLES`.
-2. Nine `||` arms in `triple_is_retired_shadow`, one per table, in a fixed order.
-3. Every lane's prefixes pre-added to `RETIRED_SHADOW_PREFIXES`.
-4. An N-way disjointness test over all tables, and a sortedness test per table.
+1. its own `RETIRED_SHADOW_L<N>_TRIPLES`, with the doc comment carrying its
+   measurement;
+2. one `||` arm in the predicate;
+3. one arm in `the_two_tables_are_disjoint`;
+4. its own sortedness, reachability and held-families tests.
 
-Adding a prefix while its table is empty is **provably inert**: the prefix list
-is only an early-out for the binary search, so a wider list plus an empty table
-answers `false` for exactly the same inputs. That is what makes it safe to land
-all nine prefixes up front — and it is why a lane never has to touch the
-prefixes or the chain, so two lanes never conflict textually in this file.
+Steps 2 and 3 are one line each in a shared function, which is small enough
+that two lanes rarely collide and a collision is a trivial merge.
+
+**An earlier draft of this page promised nine empty tables pre-created up
+front.** That was dropped after building the real thing: an empty table needs a
+sortedness test that trivially passes, a reachability test with nothing to
+reach, and a name in the registry with no measurement behind it -- eight
+placeholders that assert nothing and that a reader has to check are genuinely
+empty rather than genuinely finished. The cascade being O(n2) in the source is
+the honest cost, and it is paid one line at a time by the lane that benefits.
+
+### Prefixes are the exception: they stay narrow and lane-owned
+
+An earlier draft of this page said L0 would pre-add every lane's prefixes,
+arguing that a prefix with an empty table is provably inert. The inertness claim
+is true — the list is only an early-out for the binary search, so a wider list
+plus an empty table answers `false` for the same inputs. **The conclusion drawn
+from it was still wrong**, and `a_prefix_alone_retires_nothing` says why in its
+own comment:
+
+```rust
+// HELD by the arm, and the prefix list does not admit it — belt and
+// braces, because a widening of that list must not silently re-retire
+// what RClassUnloadSweep rejected.
+assert!(!triple_is_retired_shadow("java/lang/ref/Reference", "clear", "()V"));
+```
+
+The narrowness is a *second* guard, deliberately redundant with the tables.
+`java/lang/ref/` is absent on purpose, and `sun/nio/` is admitted only as
+`sun/nio/fs/` and `sun/nio/ch/` because a package-scoped dial sweep scored
+34/36 against retiring it. Pre-adding a broad `java/lang/` or `sun/nio/` would
+keep every current test green **and** delete that guard for the next reader.
+
+So: **each lane appends its own prefix, in the same commit as its first entry
+there.** The list is short and appends land in different places, so the conflict
+risk is small — and forgetting is caught loudly, because an entry outside every
+prefix makes the predicate answer `false` for a row that is present, which the
+registry-driven reachability test fails on. Add the narrowest prefix that covers
+your entry, and if you are widening one that carries a note, beat that note's
+measurement in the same commit.
 
 ### Why the ratchet constants are L0's alone
 
@@ -183,27 +228,110 @@ A release build is **17-50 minutes** and the host is shared. Rules:
 6. Nothing is pushed without the human asking for it. `git push origin HEAD:dev`
    is its own command, keyed on the gate result.
 
-## 7. This lane's own retirement scope
+## 7. This lane's own scope: 104 shadows, all accounted for
 
-131 shadows over 9 classes: `java/lang/Class` (61), `java/lang/ClassLoader`
-(27 — **L7 owns the loader story; L0 owns only rows whose remedy is a `Class`
-question**), `java/lang/Module` (23), `ClassNotFoundException` (15) and
-`ClassCastException` (14) — *both of which belong to lane T's throwable
-registrar, not here* — plus `ModuleLayer`, `ClassValue`, `Class$Atomic`.
+`java/lang/Class` (61), `Module` (23), `ClassFrameInfo` (5),
+`module/ModuleDescriptor$Version` (5), `ModuleLayer` (4), `Class$Atomic` (3),
+`ClassValue` (2), `Class$ReflectionData` (1).
 
-Two are already resolved and are the pattern the other lanes should copy:
+**Instrument:** `apps/probes/L0ClassModuleSurface.java`, 129 rows over the
+whole surface, measured three ways against HotSpot 25.0.3+9 -- unarmed, and
+with every native declining. `ClassNameSweep` reached only 10 of the 104; this
+probe reaches 77.
 
-- **`Class.getModule` → reviewed `Intrinsic`.** Not `ACC_NATIVE`, so §1.4 makes
-  it a shadow; but `Class.module` is written only by a real VM at class
-  definition, so yielding returns **null**, which is 12 of the corpus failures.
-  Reviewed with `apps/probes/ClassModuleSweep.java` (32 rows, 31 matching).
-- **`Class.getName` → reviewed `Intrinsic`.** Yielding returns the **internal
-  form** (`java/lang/Object`), which is worse than null because nothing throws;
-  it propagates into every JDK name comparison and is why `ServiceLoader`
-  reports *"module java.base does not declare `uses`"*. Reviewed with
-  `apps/probes/ClassNameSweep.java`: **0 diffs of 24 unarmed, 24 of 24 when
-  yielded, and 2 of 24 after the tag** — one tag repaired 22 rows, because the
-  JDK derives `getTypeName`/`getCanonicalName`/`getSimpleName` from `getName`.
+```text
+unarmed   8 diff lines of 130      yielded  58 diff lines of 130
+```
+
+Read as an aggregate that says *retire nothing here*, and it would be a wrong
+conclusion drawn from a true number. **Per row:**
+
+| | rows | verdict |
+|---|---|---|
+| OK → OK | 96 | native right, bytecode right → **retire** |
+| BAD → OK | 4 | native **wrong**, yielding fixes it → **retire** |
+| OK → BAD | 29 | native right, yielding breaks it → **hold** |
+| BAD → BAD | 0 | |
+
+The four unarmed diffs are exactly the BAD → OK rows, so **every disagreement
+this VM has with HotSpot on lane 0's surface is one that retirement repairs.**
+
+### The four repairs, one of which is not cosmetic
+
+```text
+Module.addExports("jdk.internal.misc", unnamed) on java.base
+  HotSpot  threw java.lang.IllegalCallerException
+  native   PERMITTED
+ModuleDescriptor.Version.parse("")
+  HotSpot  IllegalArgumentException: Empty version string
+  native   returned a Version      (validation skipped)
+Version.compareTo x2
+  native   NPE in JDK bytecode, "ts1 is null" -- parse() built a Version whose
+           internal lists were never filled
+```
+
+The first is an access-control check the native does not perform: only a module
+may widen its own exports, and this VM let an unnamed module widen
+`java.base`'s. The rest are the JDK's argument-validation layer, which is the
+surface a retirement usually buys.
+
+### Landed: 54 triples in `RETIRED_SHADOW_L0_TRIPLES`
+
+Prefixes added: `java/lang/Class` and `java/lang/Module`, the narrowest that
+cover the table. Both also admit classes that are *not* L0's, because a prefix
+is a string; the table decides, and `java/lang/ref/` stays out so
+`a_prefix_alone_retires_nothing` keeps its guard. Ratchets re-frozen from the
+gates' own output: stubs 1883→1939 / 1894→1950 / 1883→1939, and the 54-vs-56
+gap is a units difference (two `Version` triples are registered at two
+ordinals each), enumerated rather than assumed.
+
+### Held: 23 triples, each with the row that held it
+
+| triples | why |
+|---|---|
+| `Class.descriptorString` | NPE — `componentType` field is null |
+| `Class.getModifiers` | wrong **flag bits** (`public synchronized` for `Object`; `static` lost on a nested interface) |
+| `Class.getAnnotation*`, `isAnnotationPresent` (6) | annotations come back **empty** |
+| `Class.newInstance` | `cachedConstructor` is null |
+| `Module.getLayer`, `isExported` ×2, `isOpen` ×2 | answer `false` where HotSpot is `true` |
+| `ModuleLayer.boot`/`findModule`/`modules`/`configuration` | `boot()` yields null |
+| `Class.getPackage`/`getResource`/`getResourceAsStream`, `Module.getResourceAsStream` | **`NoClassDefFoundError`** — blocked pending **L7** |
+
+`the_l0_held_families_are_not_retired` pins all of them.
+
+**`Module.isOpen` is held on a judgement, not a measurement, and that is
+stated in the table.** Its rows agree with HotSpot when yielded — but they
+agree at `false`, which is also what a blanket yield returns for the whole
+family, and its sibling `isExported` demonstrably breaks. *An agreement that
+cannot be distinguished from the default answer is not evidence.* It needs a
+receiver whose correct answer is `true`, which `java.base` does not offer an
+unnamed module; until that fixture exists, held.
+
+### Not retired for want of an instrument: 27
+
+Precondition 4 is per-instrument and these read `invocations == 0` even in the
+probe written to reach them. Twelve cannot be called from Java at all —
+`getClassLoader0`, `getEnumConstantsShared`, `reflectionData`,
+`newReflectionData`, `setSigners`, three `Class$Atomic` CAS methods,
+`Class$ReflectionData.<init>` and the five `ClassFrameInfo` accessors are
+package-private plumbing reached only from inside `java.lang.Class` and the
+stack walker. Eight are `Module.implAdd*`.
+
+`ModuleDescriptor$Version.compareTo` and `ClassValue.remove` are the
+instructive two: the probe **does** exercise both and both still count zero.
+Row 126's failure names `ts1`, a local in `Version.compareTo`'s own bytecode —
+so the JDK's method served the call and the registration was never dispatched.
+An inert row, which is a finding rather than a retirement, and it is why the
+count is taken per triple and never per row.
+
+### The two reviewed `Intrinsic`s
+
+`Class.getModule` and `Class.getName` are **not** retirements and
+`the_two_reviewed_intrinsics_are_not_retirements` pins that. Yielding gives a
+null module and the internal name form (`java/lang/Object`) — worse than null,
+because nothing throws. `getName` alone repaired 22 of 24 `ClassNameSweep`
+rows, since the JDK derives `getTypeName`/`getCanonicalName`/`getSimpleName`
+from it.
 
 ### The §1.4 reviewed-`Intrinsic` protocol, which every lane will need
 
@@ -222,12 +350,79 @@ contract's exception is a *reviewed* `Intrinsic`, and the review is a probe:
 5. `register` → `register_with_kind(..., NativeKind::Intrinsic)`, with the
    measurement in the rationale, and amend the kind-map row `bridge` →
    `intrinsic`, `kind_stated 0` → `1`.
+6. **`registrar_drift` should now stay green. If it does not, read the bodies
+   before touching the baseline.**
 
-An `Intrinsic` is **exempt at every dispatch door and exempt from the census by
-construction**. That is a real cost: it removes the row from the population the
-dial can ever ask about. Earn it with numbers or leave it a `Bridge`.
+Until 2026-09-10 this step was a trap, and it is worth knowing why because the
+same species will recur. `registrar_drift.rs` matched a registration by
+requiring the byte after `register` to be `(`, so **`register_with_kind(..)`
+was invisible to it** — 757 sites tree-wide, and not a uniform sample of the
+registry: exactly the sites whose kind had been adjudicated. Since
+`register` → `register_with_kind` is *this protocol's own remedy*, every
+adjudication silently deleted the shipping half of whatever drift pair the
+triple was in, and the gate reported the deletion as
 
-## 8. What "done" looks like
+```text
+STALE BASELINE — recorded drift pair(s) no longer drift.
+```
+
+Good news wearing a defect's clothes, once per adjudication. The scanner now
+accepts `_with_kind`, which surfaced **54 real pairs** that the blind spot had
+been covering (see §8 — they are routed, not adjudicated).
+
+So if this gate reddens after your tag:
+
+- **Read both registrations' bodies first.** Same function ⇒ genuinely not
+  drift, and `FIXED_NOT_DRIFTING` is right — with both-modes
+  `--dump-native-registry` evidence, where `overwrote = null` is the
+  load-bearing field. Different closures ⇒ the drift is real and the scanner
+  has gone blind again; fix the scanner, not the baseline. Getting this
+  backwards is how a false "fixed" assertion gets landed — it nearly was here.
+- `DRIFT_TRIPLES` is the **allowed known-drift baseline**, not a defect list.
+  `SSLContext.getProvider` was *added* to it. So an adjudicated triple usually
+  belongs exactly where it already was and needs no baseline edit.
+- Any re-take comes from the gate's own paste-ready block
+  (`-- --nocapture`), never from arithmetic — and
+  `registrar_reachability.rs`'s `FAMILY_DRIFT_EXPOSURE` must be re-taken in the
+  **same commit**, which its own panic prescribes. It cross-checks per family
+  and caught the phantom independently.
+- Say in the record which rows moved and why. Both gates put it the same way:
+  *"a re-take with no explanation is how a ratchet becomes a rubber stamp."*
+
+**And run the gate set as `--tests`, never by naming targets.**
+`cargo test -p <crate> --tests` stops at the first failing target, so a red
+`registrar_drift` hid a red `registrar_reachability` behind it — and naming two
+`--test` targets by hand hid both, which is how the `getModule` adjudication
+shipped with this gate already red.
+
+## 8. The 54 newly-visible drift pairs, routed
+
+Widening the scanner surfaced 54 `(pass, triple)` pairs where one triple has
+two implementations, one per compatibility mode: the synthetic-only body wins
+under `--features synthetic-jdk`, and the shipping body is the only one in
+every mode that ships, `--jdk-only` included. **They are recorded in
+`DRIFT_TRIPLES`, not adjudicated** — each needs its own answer to "do the two
+bodies agree?", and several are not cosmetic:
+
+| triple(s) | owning lane |
+|---|---|
+| `ClassLoader.defineClass0` / `1` / `2` | **L7** |
+| `Class.getSuperclass`, `isInstance`, `isAssignableFrom`, `isHidden`, `getPrimitiveClass`, `desiredAssertionStatus0`, `registerNatives` | **L0** |
+| `ObjectStreamClass.hasStaticInitializer`, `initNative` | **L4** |
+| `Unsafe.defineClass0` | **L5** |
+| the remainder | by the ownership table in §2 |
+
+The families whose exposure counts rose are `register_classloader_natives`
+(81→84), `register_enterprise_final_natives` (118→135),
+`register_java_lang_extras_natives` (27→28), `register_phase69_natives`
+(8→11), `register_serialization_natives` (2→4) and
+`register_unsafe_define_class` (1→2).
+
+A lane adjudicating one of these does **not** need a release build: the
+question is whether two bodies agree, which is a source question plus a
+`--dump-native-registry` in both modes.
+
+## 9. What "done" looks like
 
 Per lane: its table covers every bucket-A/B row in its prefix set that passed
 the four preconditions; every row it could not retire is classified in its page

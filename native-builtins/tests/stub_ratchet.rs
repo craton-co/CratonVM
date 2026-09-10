@@ -1432,7 +1432,56 @@ use cratonvm_types::compat::CompatibilityMode;
 /// removes the slack, and it is why this wave's delta reads +251 against the
 /// tree and +237/+248/+251 against the constants.
 ///
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1894;
+/// **Re-frozen 2026-09-10 by lane L0, +56 in all three configurations.**
+/// 1883 -> 1939 (no-management), 1894 -> 1950 (management), 1883 -> 1939
+/// (synthetic-jdk). All three numbers were PASTED from this gate's own
+/// failure output, never computed -- the constant next door drifted by
+/// 3/3/12 from being subtracted by hand.
+///
+/// # The account, taken with the paired ratchet rather than by arithmetic
+///
+/// The cause is `RETIRED_SHADOW_L0_TRIPLES`: 54 triples of `java.lang.Class`,
+/// `Module` and `ModuleDescriptor.Version` retired after a per-row measurement
+/// against HotSpot (`apps/probes/L0ClassModuleSurface.java`). A retirement
+/// re-tags `Bridge` -> `SyntheticStub` in `NativeMethodRegistry::register`,
+/// and that re-tag is NOT gated on compatibility mode, which is why a
+/// `--jdk-only` retirement moves a compatible-mode stub count at all.
+///
+/// `dump_synthetic_stubs` was run on this tree with the L0 table reverted and
+/// again with it applied -- one binary, two revisions of one file:
+///
+/// ```text
+/// before   1704 distinct        after   1758 distinct        added 54, removed 0
+/// ```
+///
+/// Every one of the 54 added rows is a `java/lang/Class`, `java/lang/Module`
+/// or `java/lang/module/` triple, and the added set contains nothing else. So
+/// the movement is entirely this lane's, and it is entirely the table.
+///
+/// # 54 triples, 56 registrations -- the gap, closed
+///
+/// The dump moved by **54** and this constant moves by **56**, in all three
+/// configurations alike. Both numbers are right, and they count different
+/// things: `dump_synthetic_stubs` emits one line per DISTINCT triple, while
+/// this census counts REGISTRATIONS. Two triples are registered twice --
+///
+/// ```text
+/// java/lang/module/ModuleDescriptor$Version.equals(Ljava/lang/Object;)Z   2 ordinals
+/// java/lang/module/ModuleDescriptor$Version.hashCode()I                   2 ordinals
+/// ```
+///
+/// -- so 54 triples re-tag 56 registrations. Confirmed independently by the
+/// kind-map amendment, whose rows are keyed `(class, name, descriptor,
+/// ORDINAL)`: it reported "touched 56 rows of the 54", which is the same fact
+/// arriving from a different file.
+///
+/// It is worth keeping the arithmetic visible rather than just the total,
+/// because the alternative reading was available and wrong: a two-row
+/// discrepancy between two censuses of "the same" VM is exactly the shape of
+/// the defect this file's header describes, where two such ratchets disagreed
+/// by 364 registrations for weeks. Here it is a units difference, not a
+/// measurement error -- but only enumerating the added set showed which.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1950;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1461,7 +1510,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1894;
 /// unowned for three days before it had a constant at all.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1883;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1939;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1518,7 +1567,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1883;
 /// re-freeze ALL THREE — see the pointer on both siblings.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1883;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1939;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
