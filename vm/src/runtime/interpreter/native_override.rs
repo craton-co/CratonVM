@@ -9482,7 +9482,11 @@ mod redefine_immunity_tests {
         // the aggregator bodies and ask whether the call is inside one. If an
         // aggregator is ever renamed this stops finding it and its own arms
         // start failing — loud, and the right direction to fail in.
-        let aggregator_bodies: Vec<(usize, usize)> = [
+        //
+        // The list IS the exemption, and its LENGTH is the findability
+        // check: a composer added here can never silently widen the gate's
+        // blind spot without also being visible in this array.
+        const EXEMPT_BODIES: [&str; 3] = [
             "redefine_immune_layout_native",
             "redefine_immune_forced_native",
             // The receiver-aware composer. It names the ZIP arm for the same
@@ -9491,22 +9495,26 @@ mod redefine_immunity_tests {
             // and this is not one — every dispatch site calls
             // `redefine_immune_forced_native_for_receiver`, never this.
             "zip_immunity_waived_for_receiver",
-        ]
-        .iter()
-        .filter_map(|name| {
-            let start = src.find(&format!("fn {name}("))?;
-            // A top-level body ends at the first `}` in column 0 after it.
-            let end = src[start..]
-                .find("\n}")
-                .map_or(src.len(), |i| start + i + 2);
-            Some((start, end))
-        })
-        .collect();
-        assert_eq!(
-            aggregator_bodies.len(),
-            2,
-            "both aggregators must be findable, or this gate exempts nothing \
-             and polices everything"
+        ];
+        let aggregator_bodies: Vec<(usize, usize)> = EXEMPT_BODIES
+            .iter()
+            .filter_map(|name| {
+                let start = src.find(&format!("fn {name}("))?;
+                // A top-level body ends at the first `}` in column 0 after it.
+                let end = src[start..]
+                    .find("\n}")
+                    .map_or(src.len(), |i| start + i + 2);
+                Some((start, end))
+            })
+            .collect();
+        let missing: Vec<&str> = EXEMPT_BODIES
+            .iter()
+            .copied()
+            .filter(|name| !src.contains(&format!("fn {name}(")))
+            .collect();
+        assert!(
+            missing.is_empty() && aggregator_bodies.len() == EXEMPT_BODIES.len(),
+            "every exempt body must be findable. Not found: {missing:?}"
         );
 
         let mut offenders = Vec::new();
