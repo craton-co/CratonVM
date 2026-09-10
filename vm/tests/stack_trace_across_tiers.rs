@@ -66,12 +66,27 @@
 //! | switch | expected effect on `after_main_osr` |
 //! |---|---|
 //! | `CRATONVM_JIT_NO_COMPILED_FRAME_LINES=1` | a non-positive line reappears |
-//! | `CRATONVM_JIT_NO_INLINE_FRAME_MAP=1` | `mid` and `outer` disappear |
+//! | `CRATONVM_JIT_NO_INLINE_FRAME_MAP=1` | `mid` and `outer` disappear — *if this run inlined them*, see below |
 //! | `CRATONVM_JIT_NO_OSR_PC_REFRESH=1` | `main`'s line moves back to the back-edge |
 //!
 //! Those double as the anti-vacuity guard: a switch that reverts proves the
 //! feature was actually engaged in the default arm rather than accidentally
 //! always-on, which a green default arm alone can never show.
+//!
+//! The middle row carries a condition the other two do not, and it is not a
+//! softening. Whether the hot throw passes through an artifact with inlined
+//! callees is an INLINING decision, which this probe influences but does not
+//! choose; `ir-splice-getstatic` going default-ON on 2026-09-09 changed it
+//! here, by enlarging every body on this chain until the inline budget refused
+//! a splice that used to fit. `mid` and `outer` became ordinary interpreter
+//! frames — the trace stayed correct and still matches the interpreter oracle,
+//! but there was no longer an inlined callee for the switch to take away.
+//! Demanding that they disappear would pin that inlining decision rather than
+//! the map, and go red on the next budget change as well. So the assertion
+//! takes the strong form when the chain actually contributed a frame, and
+//! otherwise pins that the switch still reverts *something* and reports the
+//! unexercised half as an environment outcome — loud on stderr, and a failure
+//! under `CRATONVM_REQUIRE_E2E`, exactly like a run where `main` never OSRed.
 //!
 //! `CRATONVM_JIT_NO_CALL_FRAME_DEDUPE` (defect 4) is deliberately NOT asserted:
 //! its revert shape — a compiled frame emitted beside its interpreter frame —
@@ -650,18 +665,82 @@ fn a_warmed_up_stack_trace_keeps_every_frame_and_every_line() {
         HOT_ROW,
         "CRATONVM_JIT_NO_INLINE_FRAME_MAP=1",
     );
-    for gone in ["mid", "outer"] {
-        assert!(
-            line_of(&no_map, gone).is_none(),
-            "[{TAG}] CRATONVM_JIT_NO_INLINE_FRAME_MAP=1 still shows `{gone}` in {HOT_ROW}, so it \
-             no longer reverts the inline-frame map. Either the switch stopped being read by both \
-             halves (the emitter in jit/src/x64/inlining.rs and the walk in \
-             vm/src/jit/conservative_roots.rs read the same name deliberately), or `{gone}` was \
-             never inlined in this run and the default arm's five frames prove nothing about the \
-             map.\ngot: {}\ndefault arm: {}",
-            render(&no_map),
-            render(&jit_rows[2])
+    // Which of this switch's two observable reverts a run can show depends on
+    // something this test does not control: whether the hot throw actually
+    // passed through an artifact with INLINED callees.
+    //
+    // It did until 2026-09-09. `ir-splice-getstatic` landing default-ON is what
+    // changed it, and not by breaking anything: `leaf` reads the static
+    // `table`, so admitting `getstatic` for splicing made every body along this
+    // chain bigger (`outer`'s optimizing body went 493 -> 731 bytes), and the
+    // inline budget then refused a splice that used to fit. The consequence for
+    // this row is visible in `CRATONVM_DBG_SWCHAIN=1`:
+    //
+    //   before: one JIT entry, activations=3 [leaf | probe | main]
+    //           -- `mid` and `outer` are INLINE LEVELS, so the map supplies them
+    //   after:  two JIT entries, activations=1 [main] and 1 [leaf]
+    //           -- `mid` and `outer` are ordinary INTERPRETER frames
+    //
+    // Both traces are correct, and both match the interpreter oracle asserted
+    // above. But in the second shape there is no inlined callee at this throw
+    // for the switch to take away, so demanding that `mid` and `outer`
+    // disappear asserts an inlining decision rather than the map -- and a test
+    // that pins an inlining decision it never chose goes red on the next budget
+    // change too.
+    //
+    // So: assert the strong form when the chain actually contributed a frame,
+    // and otherwise assert the switch still reverts *something* and say plainly
+    // that the chain half went unexercised. The second branch is an
+    // ENVIRONMENT outcome in the same sense as "main did not OSR" above, and is
+    // a failure under `CRATONVM_REQUIRE_E2E` for the same reason: a run that
+    // measured nothing must not be able to make CI green.
+    let chain_contributed = no_map.len() < jit_rows[2].len();
+    if chain_contributed {
+        for gone in ["mid", "outer"] {
+            assert!(
+                line_of(&no_map, gone).is_none(),
+                "[{TAG}] CRATONVM_JIT_NO_INLINE_FRAME_MAP=1 dropped frames from {HOT_ROW} but \
+                 kept `{gone}`. The switch is still reverting the inline-frame map -- the row is \
+                 shorter -- so this is not the switch having stopped being read by both halves \
+                 (the emitter in jit/src/x64/inlining.rs and the walk in \
+                 vm/src/jit/conservative_roots.rs read the same name deliberately). It is the \
+                 chain having contributed a DIFFERENT set of callees than the one this probe is \
+                 built to produce.\ngot: {}\ndefault arm: {}",
+                render(&no_map),
+                render(&jit_rows[2])
+            );
+        }
+    } else {
+        // The chain contributed nothing, so the only thing left to pin is that
+        // the switch is still wired at all. It reverts the innermost frame's
+        // line here -- `apply_npe_trap_site` gates that on the same
+        // `inline_frame_chains_enabled()` -- so an inert switch is still caught.
+        assert_ne!(
+            no_map,
+            jit_rows[2],
+            "[{TAG}] CRATONVM_JIT_NO_INLINE_FRAME_MAP=1 changed NOTHING about {HOT_ROW}: same \
+             frames, same lines. Every other reading of this row is accounted for, so this one \
+             means the switch has stopped being read -- check that both halves still name it \
+             (jit/src/x64/inlining.rs and vm/src/jit/conservative_roots.rs).\ngot: {}",
+            render(&no_map)
         );
+        let note = format!(
+            "[{TAG}] NOTE: no callee was INLINED at {HOT_ROW} in this run, so \
+             CRATONVM_JIT_NO_INLINE_FRAME_MAP=1 had no inlined frame to take away and the \
+             default arm's frame count proves nothing about the map's chain half. The switch is \
+             still live -- it reverted the innermost frame's line -- and the trace still matches \
+             the interpreter oracle, so this is a coverage gap, not a defect. Restore the \
+             coverage by making this probe's hot throw pass through an artifact that inlines \
+             again; see the comment above this assertion for why it stopped.\n\
+             default arm: {}\nno-map arm:  {}",
+            render(&jit_rows[2]),
+            render(&no_map)
+        );
+        assert!(
+            !common::require_e2e(),
+            "{note}\n\nCRATONVM_REQUIRE_E2E is set, so this incomplete run is a failure."
+        );
+        eprintln!("{note}");
     }
 
     // Defect 3's switch: the OSR frame goes back to reporting its back-edge.

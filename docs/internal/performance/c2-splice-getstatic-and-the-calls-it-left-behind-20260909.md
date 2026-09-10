@@ -247,6 +247,19 @@ The fast regression suite is 92 of 92 against HotSpot, and the crate suites are
   14x body it accepted here it accepted for a reason it still cannot see. What
   changes is that the specific way a body could be that much worse now has a
   census row instead of only a wall clock.
+* **It spends inline budget, and that is not free.** Admitting `getstatic`
+  makes the bodies along an accessor chain bigger — on
+  `probes/StackTraceAfterOsr.java`, whose `leaf` reads a static array,
+  `outer`'s optimizing body went 493 → 731 bytes — and the inline budget
+  (`MAX_INLINE_BUDGET`, 750) then refuses a splice further out that used to
+  fit. On that probe an OSR-compiled `main` stopped inlining `probe`, so `mid`
+  and `outer` went from inline levels to ordinary interpreter frames. Nothing
+  about the traces got worse (they still match the interpreter oracle exactly)
+  and nothing measured got slower, but "more splicing at the bottom" is not
+  monotone with "more inlining overall", and this is the first shape where that
+  showed. It was found by
+  `vm/tests/stack_trace_across_tiers.rs`, whose kill-switch arm went red
+  because it had no inlined callee left to revert — see the comment there.
 * **One host, one shape.** These numbers are from a Windows dev box, not the
   Azure bench host `BENCHMARK.md`'s table comes from, so the absolutes are not
   comparable to it. The A/B is: same binary, same window, alternated and
