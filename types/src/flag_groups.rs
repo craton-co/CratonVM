@@ -1390,6 +1390,11 @@ pub const INVENTORY: &[E] = &[
     // rows. An unresolved target refuses the CALLEE rather than being dropped,
     // because a missing row bails the whole method.
     E { group: Group::JIT, token: "ir-splice-typecheck", on_key: Some("CRATONVM_JIT_IR_SPLICE_TYPECHECK"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // Default ON. A splice must not leave behind a call worse than the one it
+    // replaced: a surviving statically-bound call with no `direct_entry` has
+    // no inline cache to fall back on and lowers to a blind name resolution.
+    // Setting this to 0 re-admits that trade, for measuring it.
+    E { group: Group::JIT, token: "ir-splice-refuse-unbindable", on_key: Some("CRATONVM_JIT_IR_SPLICE_REFUSE_UNBINDABLE"), off_key: None, off_word: Some("0"), since: "2026-09-10" },
     E { group: Group::JIT, token: "ir-splice-getstatic", on_key: Some("CRATONVM_JIT_IR_SPLICE_GETSTATIC"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
     // Splice a callee whose body contains a `checkcast` or an `instanceof`.
     // The same rebase as the two above, and the refusal that page named as

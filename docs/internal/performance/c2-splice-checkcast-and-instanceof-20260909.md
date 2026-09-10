@@ -101,6 +101,15 @@ because a virtual site is supposed to get the MIC/PIC cascade instead. It did
 not get one here. **That is the next thing to look at, and it is a bug, not a
 gap.**
 
+> **Corrected 2026-09-10.** The identification in this paragraph is wrong on
+> every count, and the section at the end of this page has the measured
+> version: the surviving call is `Preconditions.checkIndex`, it is
+> `invokestatic` and so is not entitled to a MIC/PIC at all, and it is blind
+> because it is native-shadowed and the direct-bind path declines those.
+> Fixing it made the optimizing body 2.25x faster on this probe. The paragraph
+> is left standing because the wrong guess is the reason the diagnostic that
+> found the right answer exists.
+
 `bench/SpliceCastArrayProbe.java` is the attribution: identical accessors,
 identical loop, an `Object[]` in place of the `List`. There the optimizing body
 is *not* slower — ~193 ms against the single-pass ~226 ms. The 3x follows the
@@ -154,3 +163,96 @@ its refusal is untouched.
 
 92 of 92 fast-regression vectors match HotSpot; 2330 jit, 2639 vm and 606 types
 tests green.
+
+---
+
+## The blind dispatch, taken — and it was not what this page said it was
+
+**2026-09-10.** The section above closed on `ir blind dispatches:
+own_code=0 in_splice=1`, named a virtual `ArrayList.elementData` as the
+surviving call "that got neither a direct bind nor the MIC/PIC cascade it
+should have", and called it the next thing to look at. It was the next thing
+to look at. It was not that call, not that kind, and not that remedy.
+
+The count was the only evidence there was, so the first step was to make the
+lowerer say which site it is. `CRATONVM_DBG=jitc` now prints one line per blind
+dispatch naming the target and the state of every gate that could have routed
+it elsewhere:
+
+```
+[ir] blind-dispatch pc=18 in_splice=true
+     jdk/internal/util/Preconditions.checkIndex(IILjava/util/function/BiFunction;)I
+     kind=3 num_args=3 ic_slot=none direct_row=false
+     mic_helper=true abi_regs=4 direct_calls_gate=true
+```
+
+`kind=3` is `invokestatic`. A statically bound call is not supposed to get a
+MIC/PIC — the cascade selects on a runtime receiver and there is not one — so
+"the MIC/PIC cascade it should have" was the wrong remedy for a site that was
+never entitled to one. `mic_helper`, `abi_regs` and `direct_calls_gate` say the
+inline-cache machinery was available and unblocked; it simply does not apply.
+
+What the site was missing is a **direct bind**, and the compiler's own log says
+why it has none:
+
+```
+bg-direct-call BOUND    java/util/Objects.checkIndex(II)I
+bg-direct-call DECLINED jdk/internal/util/Preconditions.checkIndex(...): native-shadow
+inline-resolve REFUSED  jdk/internal/util/Preconditions.checkIndex(...): native-shadow
+```
+
+`Objects.checkIndex(II)I` is compiled and direct-bound. It is then spliced into
+`ArrayList.get`, whose code is 15 bytes, at the call `ArrayList.get` makes to
+it; the call that spliced body leaves behind sits at callee pc 3, so combined
+pc **18** — the pc in the diagnostic. That surviving call is
+`Preconditions.checkIndex`, which is **native-shadowed**, and the direct-bind
+path declines a native shadow.
+
+So the splice replaced a bound direct `CALL` (~4 ns) with a blind name
+resolution (~175 ns), per element, on the hot path.
+
+### That trade already had a rule against it
+
+The single-pass resolver refuses a splice on exactly this ground: *a spliced
+call must not be worse than the call it replaced*. IR mode was exempted from
+it, on the stated grounds that "the IR tier's spliced call is a call, not a
+resolution" (`c2-splice-getstatic-and-the-calls-it-left-behind-20260909.md`
+§3). That premise holds whenever a surviving call can be lowered to something
+better than the helper, and there is one shape where it cannot: a statically
+bound call with no `direct_entry` has no cache to fall back on. Virtual and
+interface survivors are fine — the cascade needs no plan-time binding.
+
+`append_ir_inline_site` now refuses a site whose body leaves such a call,
+before `intern_inline_invoke_targets`, so a refused site also registers no
+keep-alive entry for a callee the artifact will not call.
+`CRATONVM_JIT_IR_SPLICE_REFUSE_UNBINDABLE=0` re-admits the trade, for measuring
+it rather than arguing about it.
+
+### What it is worth
+
+`bench/SpliceCastProbe.java`, 4 000 000 reps, `C2_ACCEPT=always`, five
+interleaved rounds, checksum `-931971200` on all fifteen samples:
+
+| arm | samples (ms) | median |
+|---|---|---|
+| optimizing, **refusal on** | 493 472 539 581 477 | **493** |
+| optimizing, refusal off | 1074 1112 1195 1091 1129 | 1112 |
+| single-pass (`C2_ACCEPT=never`) | 344 335 338 370 318 | 338 |
+
+**2.25x faster, won in 5 of 5 paired rounds, with no overlap between the two
+distributions at all.** The census row this page ended on goes to
+`own_code=0 in_splice=0`, and `step` still gets its 3 spliced bodies — the
+refusal lands on `ArrayList.get`'s compile, not on the type-check splices this
+page is about.
+
+`bench/SpliceCastArrayProbe.java` is unchanged, as it must be: 206/145/161 ms
+with the refusal against 199/211/206 without. It has no unbindable survivor,
+which is the same reason it was the right attribution probe in the first place.
+
+### What is left, stated as a remainder and not as a win
+
+This does not close the gap, it closes most of it. The optimizing body was 3.3x
+the single-pass one (1112 against 338); it is now **1.46x** (493 against 338).
+Something else on the container path still costs, and this page should not be
+read as having found it. What is now true is that the remaining gap has no
+blind dispatch in it, so whatever it is, it is not a name resolution.
