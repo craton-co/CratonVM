@@ -175,7 +175,7 @@ public class L5CowSweep {
     static void setBasics() {
         CopyOnWriteArraySet<String> s = new CopyOnWriteArraySet<>();
         say("setEmpty", s + " size=" + s.size() + " empty=" + s.isEmpty());
-        say("setAddNew", s.add("a") + s.add("b") + s.add("a") + " -> " + s);
+        say("setAddNew", "" + s.add("a") + s.add("b") + s.add("a") + " -> " + s);
         say("setAddAll", s.addAll(Arrays.asList("b", "c", "c")) + " -> " + s);
         say("setInsertionOrder", s.toString());
         say("setRemove", s.remove("b") + "/" + s.remove("zz") + " -> " + s);
