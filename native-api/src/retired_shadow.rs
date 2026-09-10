@@ -1223,8 +1223,8 @@ const RETIRED_SHADOW_PREFIXES: &[&str] = &[
     // see `RETIRED_SHADOW_PHASE2_TRIPLES`. A prefix admits a package to the
     // binary search; the table decides what is retired, and it retires one row.
     "sun/nio/ch/",
-
-    // 2026-09-10, lane L6 (`docs/known-issues/jdk-only-lanes/lane-6-net-security.md`).
+    // 2026-09-10, lane L6. The whole adjudication, all 1,414 rows of it, is in
+    // `docs/internal/retired/lane-6-net-security-RETIRED-20260910.md`.
     // TWO prefixes for a lane that owns nine, and both deliberately the NARROW
     // spelling: `java/net/` and not `java/`;
     // `javax/security/auth/x500/` and not `javax/security/`.
@@ -2431,8 +2431,9 @@ static RETIRED_SHADOW_PHASE3_TRIPLES: &[(&str, &str, &str)] = &[
 /// case where an earlier registration keeps serving -- strict mode then runs
 /// THAT native instead of the bytecode the policy asked for, and every probe
 /// reads exactly as it did before. The survivor count for these two prefixes
-/// is recorded with this wave in `docs/internal/retired/`, taken from a
-/// `--jdk-only-report` of the trial binary running the probe tree.
+/// is in `docs/internal/retired/lane-6-net-security-RETIRED-20260910.md`,
+/// taken from a `--jdk-only-report` of the trial binary running the probe
+/// tree.
 static RETIRED_SHADOW_L6_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/net/DatagramSocket", "<init>", "(ILjava/net/InetAddress;)V"),
     ("java/net/DatagramSocket", "<init>", "(Ljava/net/SocketAddress;)V"),
