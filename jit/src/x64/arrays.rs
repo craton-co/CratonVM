@@ -314,8 +314,30 @@ impl Compiler {
         }
         // JEP 358: the trapping opcode IS at `code[bc_pc]` (the array-store
         // arm passes its own pc), so derive the per-element-type action.
+        let action = array_opcode_npe_action(code, bc_pc);
+        // PRECISE array NPE, on the same terms as the bounds check above: only
+        // inside a protected range, where an unpublished frame is what RBC.6
+        // refuses the whole method for. The ACTION travels with the bci -- see
+        // `precise_npe_action_by_bci` -- because reason 10 was written for
+        // `putfield`, whose action is always `NONE`, and baking that constant in
+        // here would downgrade every array NPE message inside a try block.
+        if self.precise_exception_frames && self.pc_is_protected(bc_pc) {
+            let bci = self.orig_bci(bc_pc);
+            if !self.exc_frame_box_ptr_by_bci.contains_key(&bci) {
+                let box_ptr = self
+                    .build_and_record_deopt_point(bci, crate::deopt::DeoptReason::PendingException);
+                self.exc_frame_box_ptr_by_bci.insert(bci, box_ptr);
+            }
+            self.precise_npe_action_by_bci.insert(bci, action);
+            self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+            self.buf.emit(&[0x0F, 0x84]); // JZ rel32 -> precise NPE stub
+            let patch_offset = self.buf.pos();
+            self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+            self.deopt_stubs.push((patch_offset, bci, 10));
+            return;
+        }
         let key = crate::x64::inlining::record_npe_trap_site(bc_pc);
-        self.emit_null_check_array_store(array_opcode_npe_action(code, bc_pc), key);
+        self.emit_null_check_array_store(action, key);
     }
 
     /// Round-9 HIGH fix (asymmetric coverage): emit an inline null check
@@ -508,6 +530,23 @@ impl Compiler {
         self.buf.emit(&[0x0F, 0x83]);
         let patch_offset = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
+        // PRECISE AIOOBE. Outside a protected range the cheap shared pad stays
+        // -- a frame is only useful where this method's own exception table can
+        // catch. Inside one, the pad returns the sentinel through the epilogue
+        // and the handler is entered from the INTERPRETER's frame, which is
+        // exactly the unpublished-frame case RBC.6 refuses the whole method
+        // for. Reason 11 publishes the AIOOBE and then materialises the frame,
+        // the same shape reason 10 uses for a locally-detected NPE.
+        if self.precise_exception_frames && self.pc_is_protected(bc_pc) {
+            let bci = self.orig_bci(bc_pc);
+            if !self.exc_frame_box_ptr_by_bci.contains_key(&bci) {
+                let box_ptr = self
+                    .build_and_record_deopt_point(bci, crate::deopt::DeoptReason::PendingException);
+                self.exc_frame_box_ptr_by_bci.insert(bci, box_ptr);
+            }
+            self.deopt_stubs.push((patch_offset, bci, 11));
+            return;
+        }
         self.bounds_check_stubs.push((patch_offset, bc_pc));
     }
 }

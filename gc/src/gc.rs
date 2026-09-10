@@ -1361,3 +1361,102 @@ mod tests {
         assert_eq!(GC_HOOK_FINISHES.with(Cell::get), before_finish + 1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Reference walk for the root-narrowing reachability oracle
+// ---------------------------------------------------------------------------
+
+/// Call `f` with the address of every reference this object holds.
+///
+/// Returns `false` when the walk DECLINED — the object is larger than
+/// `max_bytes`, or its header does not decode — in which case `f` may have been
+/// called for a prefix and the caller must treat the result as incomplete.
+/// There is no partial-credit reading of this: an oracle that counts a declined
+/// walk as "no references" would report an object unreachable because it never
+/// looked.
+///
+/// # Why it declines on size
+///
+/// A G1 humongous object is REGION-FRAGMENTED, so reading its payload at a flat
+/// offset from the object base runs off the end of the start region and into
+/// whatever follows. `G1Collector::scan_object_refs` handles that with a
+/// region-aware translation this free function has no access to, so the honest
+/// answer here is to decline rather than to read the wrong bytes and call the
+/// result reachability.
+///
+/// # Precision
+///
+/// Reference fields come from the class layout (`ref_offsets`) for compact
+/// objects and from the `Value` discriminant for legacy ones — the same two
+/// paths `gc::collect_garbage` and `G1Collector::scan_object_refs` use. It does
+/// NOT use `region::scan_object_refs`'s "any aligned non-zero word is a
+/// reference" heuristic: that over-approximates the child set, which
+/// over-approximates reachability, which is the direction that would let the
+/// oracle call a lost object safe.
+///
+/// # Safety
+///
+/// The caller must hold the world stopped and must have validated `obj` with
+/// `is_object_address`.
+pub unsafe fn for_each_object_reference(
+    obj: usize,
+    max_bytes: usize,
+    f: &mut dyn FnMut(usize),
+) -> bool {
+    if obj == 0 || obj & 0x7 != 0 {
+        return false;
+    }
+    let header = unsafe { &*(obj as *const ObjectHeader) };
+    let Some(total) = crate::concurrent_mark::concurrent_mark_object_size(
+        obj as *const ObjectHeader,
+    ) else {
+        return false;
+    };
+    if total > max_bytes {
+        return false;
+    }
+    if header.kind() == ObjectKind::Array {
+        if header.element_type() == ArrayElementType::Reference {
+            let len = header.array_length() as usize;
+            let data = obj + HEADER_SIZE;
+            for i in 0..len {
+                let raw = unsafe { *((data + i * 8) as *const usize) };
+                if raw != 0 {
+                    f(raw);
+                }
+            }
+        }
+        return true;
+    }
+    if cratonvm_types::is_compact_object(header) {
+        let mut ok = false;
+        let _ = cratonvm_types::with_class_layout(
+            header.class_id.as_u32(),
+            header.num_slots(),
+            |layout| {
+                ok = true;
+                for &offset in &layout.ref_offsets {
+                    let raw = unsafe { *((obj + HEADER_SIZE + offset as usize) as *const u64) };
+                    if raw != 0 {
+                        f(raw as usize);
+                    }
+                }
+            },
+        );
+        return ok;
+    }
+    // Legacy layout: one 16-byte `Value` cell per field. Discriminant-screened,
+    // exactly as the collectors read it -- a corrupt cell decodes to
+    // `Value::Object(None)` and is skipped rather than transmuted.
+    let num_slots = header.num_slots() as usize;
+    for i in 0..num_slots {
+        let slot = obj + HEADER_SIZE + i * cratonvm_types::SLOT_SIZE;
+        let value = unsafe {
+            crate::heap::read_value_cell_checked(slot as *const Value, "oracle-walk")
+        };
+        if let Value::Object(Some(r)) = value {
+            f(r.as_ptr() as usize);
+        }
+    }
+    true
+}

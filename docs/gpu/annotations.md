@@ -24,7 +24,9 @@ the GPU offload reference in [`README.md`](README.md).
 
 ## Quick start
 
-The annotations are bundled with the JVM via the `craton-gpu` crate.
+The annotations are bundled with the JVM via the `craton-gpu4j` crate,
+which compiles them from the [gpu4j](https://github.com/craton-co/gpu4j)
+repository at build time.
 There is nothing to install: any `.class` file produced by `javac`
 against a classpath that includes `craton-gpu-annotations.jar` (shipped
 in the JVM distribution) carries the annotations through to runtime,

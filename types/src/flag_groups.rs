@@ -351,6 +351,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "atomic-updater", on_key: Some("CRATONVM_DBG_ATOMIC_UPDATER"), off_key: None, off_word: None, since: "2026-07-09" },
     E { group: Group::DBG, token: "badrecv", on_key: Some("CRATONVM_DBG_BADRECV"), off_key: None, off_word: None, since: "2026-06-05" },
     E { group: Group::DBG, token: "badref", on_key: Some("CRATONVM_DBG_BADREF"), off_key: None, off_word: None, since: "2026-06-05" },
+    E { group: Group::DBG, token: "deadref-store", on_key: Some("CRATONVM_DBG_DEADREF_STORE"), off_key: None, off_word: None, since: "2026-09-09" },
+    E { group: Group::DBG, token: "watch-addr", on_key: Some("CRATONVM_DBG_WATCH_ADDR"), off_key: None, off_word: None, since: "2026-09-09" },
     E { group: Group::DBG, token: "bb", on_key: Some("CRATONVM_DBG_BB"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::DBG, token: "bblp", on_key: Some("CRATONVM_DBG_BBLP"), off_key: None, off_word: None, since: "2026-05-24" },
     E { group: Group::DBG, token: "bd-debug", on_key: Some("CRATONVM_BD_DEBUG"), off_key: None, off_word: None, since: "2026-05-20" },
@@ -433,6 +435,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "diag-jca", on_key: Some("CRATONVM_DIAG_JCA"), off_key: None, off_word: None, since: "2026-06-02" },
     E { group: Group::DBG, token: "diag-method-invoke-null", on_key: Some("CRATONVM_DIAG_METHOD_INVOKE_NULL"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::DBG, token: "diag-properties", on_key: Some("CRATONVM_DIAG_PROPERTIES"), off_key: None, off_word: None, since: "2026-05-20" },
+    E { group: Group::DBG, token: "deadrecv", on_key: Some("CRATONVM_DBG_DEADRECV"), off_key: None, off_word: None, since: "2026-09-07" },
+    E { group: Group::REAL, token: "props-unrooted-receivers", on_key: Some("CRATONVM_PROPS_UNROOTED_RECEIVERS"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::DBG, token: "diag-serviceloader", on_key: Some("CRATONVM_DIAG_SERVICELOADER"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::DBG, token: "dispatch-tally", on_key: Some("CRATONVM_DBG_DISPATCH_TALLY"), off_key: None, off_word: None, since: "2026-07-28" },
     E { group: Group::DBG, token: "dopriv", on_key: Some("CRATONVM_DBG_DOPRIV"), off_key: None, off_word: None, since: "2026-05-20" },
@@ -494,12 +498,30 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "gc-stress", on_key: Some("CRATONVM_DBG_GC_STRESS"), off_key: None, off_word: None, since: "2026-06-03" },
     E { group: Group::DBG, token: "oop-oracle-force-refute", on_key: Some("CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE"), off_key: None, off_word: None, since: "2026-08-22" },
     E { group: Group::DBG, token: "gc-verify-stale", on_key: Some("CRATONVM_GC_VERIFY_STALE"), off_key: None, off_word: None, since: "2026-05-23" },
+    // The reachability oracle that judges the three narrowings above.
+    E { group: Group::DBG, token: "verify-reg-oop-maps", on_key: Some("CRATONVM_DBG_VERIFY_REG_OOP_MAPS"), off_key: None, off_word: None, since: "2026-09-09" },
     E { group: Group::GC, token: "late-resolve-dropped", on_key: Some("CRATONVM_GC_LATE_RESOLVE_DROPPED"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "tlab-skip", on_key: None, off_key: Some("CRATONVM_GC_NO_TLAB_SKIP"), off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "g1-only-jit-pins", on_key: Some("CRATONVM_GC_G1_ONLY_JIT_PINS"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "peer-pin-divert", on_key: None, off_key: Some("CRATONVM_GC_NO_PEER_PIN_DIVERT"), off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "conditional-tlab-skip-publish", on_key: Some("CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "frame-trace-span-retire", on_key: None, off_key: Some("CRATONVM_GC_NO_FRAME_TRACE_SPAN_RETIRE"), off_word: None, since: "2026-09-06" },
+    // The three conservative-JIT-root narrowings the register oop maps
+    // license, each its own lever because each rests on a DIFFERENT claim and a
+    // regression has to be attributable to one of them: the compiler's register
+    // model, the operand-spill cursor, and the outgoing-argument reserve.
+    E { group: Group::GC, token: "reg-oop-maps", on_key: Some("CRATONVM_GC_REG_OOP_MAPS"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    E { group: Group::GC, token: "dead-spill-roots", on_key: Some("CRATONVM_GC_DEAD_SPILL_ROOTS"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    E { group: Group::GC, token: "outgoing-arg-roots", on_key: Some("CRATONVM_GC_OUTGOING_ARG_ROOTS"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // G1's pin set honouring the movable/rewritable partition the
+    // generational path has always honoured.
+    E { group: Group::GC, token: "g1-movable-pins", on_key: Some("CRATONVM_GC_G1_MOVABLE_PINS"), off_key: None, off_word: None, since: "2026-09-09" },
+    // The producer half: publishing the verifiable band partition as movable.
+    E { group: Group::GC, token: "movable-band-roots", on_key: Some("CRATONVM_GC_MOVABLE_BAND_ROOTS"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // UNSAFE pricing lever for the A5 unregistered-frame span sweep.
+    E { group: Group::JIT, token: "a5-mark-span", on_key: Some("CRATONVM_JIT_A5_MARK_SPAN"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // Recover frames from the A5 band instead of sweeping it as a raw span.
+    E { group: Group::JIT, token: "a5-frame-scan", on_key: Some("CRATONVM_JIT_A5_FRAME_SCAN"), off_key: None, off_word: None, since: "2026-09-09" },
     E { group: Group::DBG, token: "peer-reg-pairing", on_key: Some("CRATONVM_DBG_PEER_REG_PAIRING"), off_key: None, off_word: None, since: "2026-09-06" },
     // Coverage oracle for the slot list `static-root-slots` builds: after the
     // fast path has patched the recorded slots, re-walk every static the slow
@@ -565,6 +587,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "heap-stale", on_key: Some("CRATONVM_DBG_HEAP_STALE"), off_key: None, off_word: None, since: "2026-06-02" },
     E { group: Group::DBG, token: "fmt-wrongtype", on_key: Some("CRATONVM_DBG_FMT_WRONGTYPE"), off_key: None, off_word: None, since: "2026-08-22" },
     E { group: Group::DBG, token: "heap-trace", on_key: Some("CRATONVM_DBG_HEAP_TRACE"), off_key: None, off_word: None, since: "2026-07-25" },
+    E { group: Group::DBG, token: "young-mark-watch", on_key: Some("CRATONVM_DBG_YOUNG_MARK_WATCH"), off_key: None, off_word: None, since: "2026-09-07" },
     E { group: Group::DBG, token: "heapcopy", on_key: Some("CRATONVM_DBG_HEAPCOPY"), off_key: None, off_word: None, since: "2026-06-05" },
     E { group: Group::DBG, token: "heartbeat", on_key: Some("CRATONVM_DBG_HEARTBEAT"), off_key: None, off_word: None, since: "2026-07-25" },
     E { group: Group::DBG, token: "hm-trace", on_key: Some("CRATONVM_HM_TRACE"), off_key: None, off_word: None, since: "2026-05-20" },
@@ -616,6 +639,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "jit-code-free", on_key: Some("CRATONVM_DBG_JIT_CODE_FREE"), off_key: None, off_word: None, since: "2026-07-28" },
     E { group: Group::DBG, token: "jit-compiled", on_key: Some("CRATONVM_DBG_JIT_COMPILED"), off_key: None, off_word: None, since: "2026-07-27" },
     E { group: Group::DBG, token: "jit-disasm", on_key: Some("CRATONVM_DBG_JIT_DISASM"), off_key: None, off_word: None, since: "2026-06-11" },
+    E { group: Group::DBG, token: "jit-slot-overlap", on_key: Some("CRATONVM_DBG_JIT_SLOT_OVERLAP"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::DBG, token: "jit-dispatch", on_key: Some("CRATONVM_DBG_JIT_DISPATCH"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::DBG, token: "jit-entry", on_key: Some("CRATONVM_DBG_JIT_ENTRY"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::DBG, token: "jit-borrow-sites", on_key: Some("CRATONVM_DBG_JIT_BORROW_SITES"), off_key: None, off_word: None, since: "2026-08-18" },
@@ -971,9 +995,17 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "stw-native-ring", on_key: Some("CRATONVM_DBG_STW_NATIVE_RING"), off_key: None, off_word: None, since: "2026-07-05" },
     E { group: Group::DBG, token: "surefire-ipc-dbg", on_key: Some("CRATONVM_SUREFIRE_IPC_DBG"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::DBG, token: "swchain", on_key: Some("CRATONVM_DBG_SWCHAIN"), off_key: None, off_word: None, since: "2026-08-20" },
+    // One line per starvation-watchdog sample: the carrier pool's queue depth,
+    // busy/live counts and dispatch counter, plus the per-state thread census.
+    // This is the reading that showed the pool running away from its base 32 to
+    // 233 on `VthreadGcStress` while `dispatch_count` sat frozen -- the shape a
+    // wall clock reports only as "the VM hung". Sampled on the watchdog's own
+    // interval, so it costs nothing when off and nothing hot when on.
+    E { group: Group::DBG, token: "carrier", on_key: Some("CRATONVM_DBG_CARRIER"), off_key: None, off_word: None, since: "2026-09-09" },
     E { group: Group::DBG, token: "sweep-census", on_key: Some("CRATONVM_DBG_SWEEP_CENSUS"), off_key: None, off_word: None, since: "2026-07-07" },
     E { group: Group::DBG, token: "sweep-edges", on_key: Some("CRATONVM_DBG_SWEEP_EDGES"), off_key: None, off_word: None, since: "2026-06-03" },
     E { group: Group::DBG, token: "unreg-declined", on_key: Some("CRATONVM_DBG_UNREG_DECLINED"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::DBG, token: "above-chain-kb", on_key: Some("CRATONVM_DBG_ABOVE_CHAIN_KB"), off_key: None, off_word: None, since: "2026-09-08" },
     E { group: Group::DBG, token: "sweep-referrers", on_key: Some("CRATONVM_DBG_SWEEP_REFERRERS"), off_key: None, off_word: None, since: "2026-08-03" },
     E { group: Group::DBG, token: "sweep-zero", on_key: Some("CRATONVM_DBG_SWEEP_ZERO"), off_key: None, off_word: None, since: "2026-06-16" },
     E { group: Group::DBG, token: "sweep-trace-class", on_key: Some("CRATONVM_DBG_SWEEP_TRACE_CLASS"), off_key: None, off_word: None, since: "2026-09-06" },
@@ -1081,8 +1113,22 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "moving-young-band-liveness-screen", on_key: None, off_key: Some("CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN"), off_word: None, since: "2026-09-03" },
     E { group: Group::GC, token: "moving-young-band-thread-window", on_key: None, off_key: Some("CRATONVM_MOVING_YOUNG_NO_BAND_THREAD_WINDOW"), off_word: None, since: "2026-09-04" },
     E { group: Group::JIT, token: "unreg-accept-residue", on_key: Some("CRATONVM_JIT_UNREG_ACCEPT_RESIDUE"), off_key: None, off_word: None, since: "2026-08-07" },
+    // 2026-09-08. OPT-IN: the collection's own root pass also scans the
+    // native-stack band ABOVE the JIT entry chain conservatively. Written as a
+    // fix for the BindableTests ByteBuddy reclaim and measured NOT to be one —
+    // kept as the lever that says so. See `above_chain_scan_enabled`.
+    E { group: Group::JIT, token: "above-chain-scan", on_key: Some("CRATONVM_JIT_ABOVE_CHAIN_SCAN"), off_key: None, off_word: None, since: "2026-09-08" },
+    E { group: Group::JIT, token: "above-chain-all-paths", on_key: Some("CRATONVM_JIT_ABOVE_CHAIN_ALL_PATHS"), off_key: None, off_word: None, since: "2026-09-08" },
+    E { group: Group::JIT, token: "above-chain-from-sp", on_key: Some("CRATONVM_JIT_ABOVE_CHAIN_FROM_SP"), off_key: None, off_word: None, since: "2026-09-08" },
     E { group: Group::JIT, token: "a5-residue-filter", on_key: Some("CRATONVM_JIT_A5_RESIDUE_FILTER"), off_key: None, off_word: Some("0"), since: "2026-09-06" },
     E { group: Group::JIT, token: "a5-shape-filter", on_key: Some("CRATONVM_JIT_A5_SHAPE_FILTER"), off_key: None, off_word: None, since: "2026-09-06" },
+    // 2026-09-08. Default-ON kill switch over the RELOCATION LICENCE half of the
+    // unregistered-JIT-frame probe: `0` restores the pre-fix behaviour, where a
+    // hit the returned-frame residue mark explained still refused compaction for
+    // the cycle. Marking is unaffected either way, so this can only change how
+    // often the collector is allowed to compact. See
+    // docs/internal/fixed-suite-bugs/gc/zgc-oom-on-mvstore-was-returned-frame-residue-FIXED-20260908.md
+    E { group: Group::JIT, token: "unreg-residue-licence", on_key: Some("CRATONVM_JIT_UNREG_RESIDUE_LICENCE"), off_key: None, off_word: None, since: "2026-09-08" },
     // A/B opt-in restoring the pre-2026-07-31 single global `Mutex` in
     // `types::jit_activation`; presence-parsed (`runtime_var_os(..).is_some()`),
     // so `=0` still enables it and `off_word` must stay `None`.
@@ -1140,6 +1186,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "real-new-site-flags", on_key: Some("CRATONVM_JIT_REAL_NEW_SITE_FLAGS"), off_key: None, off_word: None, since: "2026-08-17" },
     E { group: Group::JIT, token: "deny", on_key: Some("CRATONVM_JIT_DENY"), off_key: None, off_word: None, since: "2026-07-03" },
     E { group: Group::JIT, token: "deopt-real", on_key: Some("CRATONVM_DEOPT_REAL"), off_key: None, off_word: None, since: "2026-06-17" },
+    // The tier-up deopt sink's precise resume. Default-ON with a `0` opt-out:
+    // off, the sink asks `can_deopt_resume` again and raises the hard
+    // `InternalError: ... refusing side-effecting replay` an optimizing-tier
+    // artifact could never avoid. Measurement lever, not a configuration.
+    E { group: Group::JIT, token: "deopt-sink-resume", on_key: Some("CRATONVM_JIT_DEOPT_SINK_RESUME"), off_key: None, off_word: Some("0"), since: "2026-09-07" },
     E { group: Group::JIT, token: "direct-callee-calls", on_key: Some("CRATONVM_JIT_DIRECT_CALLEE_CALLS"), off_key: None, off_word: None, since: "2026-07-25" },
     E { group: Group::JIT, token: "dispatch-cache-direct-entry", on_key: Some("CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY"), off_key: None, off_word: None, since: "2026-07-22" },
     E { group: Group::JIT, token: "dispatch-cache-virtual-direct-entry", on_key: Some("CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY"), off_key: None, off_word: None, since: "2026-07-25" },
@@ -1213,6 +1264,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "string-access-inline-rows", on_key: None, off_key: Some("CRATONVM_JIT_NO_STRING_ACCESS_INLINE_ROWS"), off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "licm-read-hoist", on_key: None, off_key: Some("CRATONVM_JIT_NO_LICM_READ_HOIST"), off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "inline-live-slot-clamp", on_key: None, off_key: Some("CRATONVM_JIT_NO_INLINE_LIVE_SLOT_CLAMP"), off_word: None, since: "2026-08-24" },
+    E { group: Group::JIT, token: "inline-locals-floor", on_key: None, off_key: Some("CRATONVM_JIT_NO_INLINE_LOCALS_FLOOR"), off_word: None, since: "2026-09-08" },
     E { group: Group::JIT, token: "inline-new", on_key: None, off_key: Some("CRATONVM_JIT_DISABLE_INLINE_NEW"), off_word: None, since: "2026-05-28" },
     E { group: Group::JIT, token: "inline-putfield", on_key: None, off_key: Some("CRATONVM_NO_JIT_INLINE_PUTFIELD"), off_word: None, since: "2026-07-24" },
     E { group: Group::JIT, token: "inline-self-guard", on_key: Some("CRATONVM_JIT_INLINE_SELF_GUARD"), off_key: None, off_word: None, since: "2026-07-10" },
@@ -1278,6 +1330,11 @@ pub const INVENTORY: &[E] = &[
     // `MVMap.flushAppendBuffer` -- 15.2% of CPU on a contended H2 workload --
     // permanently interpreted.
     E { group: Group::JIT, token: "precise-indy", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_INDY"), off_word: None, since: "2026-09-06" },
+    // Array loads and PRIMITIVE array stores. A real lowering change, not
+    // bookkeeping: the AIOOBE pad and the array null-check stub both published
+    // nothing, and now route to deopt-stub reasons 11 and 10. `aastore` is
+    // excluded -- its ZGC-barrier fallback arm still does not publish.
+    E { group: Group::JIT, token: "precise-array-access", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_ARRAY_ACCESS"), off_word: None, since: "2026-09-06" },
     // Opt-in. The GP register file landed beside the FP one on 2026-09-02, but
     // the flip still wants a wall-clock measurement -- see
     // `ir_lower::linear_scan_enabled`. `since` stays 2026-08-01: the flag is the
@@ -1295,14 +1352,113 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-const-imm", on_key: Some("CRATONVM_JIT_IR_CONST_IMM"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "ir-phi-residency", on_key: Some("CRATONVM_JIT_IR_PHI_RESIDENCY"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "ir-phi-copy-regs", on_key: Some("CRATONVM_JIT_IR_PHI_COPY_REGS"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
+    E { group: Group::JIT, token: "ir-phi-home-publish-guard", on_key: Some("CRATONVM_JIT_IR_PHI_HOME_PUBLISH_GUARD"), off_key: None, off_word: Some("0"), since: "2026-09-07" },
     E { group: Group::JIT, token: "ir-phi-edge-interfere", on_key: Some("CRATONVM_JIT_IR_PHI_EDGE_INTERFERE"), off_key: None, off_word: Some("0"), since: "2026-09-06" },
     E { group: Group::JIT, token: "ir-skip-republish", on_key: Some("CRATONVM_JIT_IR_SKIP_REPUBLISH"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "ir-deopt-regs", on_key: Some("CRATONVM_JIT_IR_DEOPT_REGS"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "ir-osr-entry", on_key: Some("CRATONVM_JIT_IR_OSR_ENTRY"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
+    // ── The nine C2-cost changes of 2026-09-09 (`d21ae9e3f`) ──────────
+    //
+    // Landed on `dev` with no INVENTORY rows, which held the pre-push
+    // flag-surface gate red for every branch cut from it. Declared here from
+    // their read sites; the defaults below are what those sites actually do,
+    // not what the commit message summarised.
+    //
+    // R2a. Splice a callee whose body carries `ldc`/`ldc2_w`: `IrInlineTables`
+    // carries the constants now, so the builder no longer needs to invent the
+    // float/double discriminator `InlineSite`'s raw `i64` dropped.
+    E { group: Group::JIT, token: "ir-splice-ldc", on_key: Some("CRATONVM_JIT_IR_SPLICE_LDC"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // R2b. Splice a callee whose body BRANCHES. The builder re-verifies each
+    // relocated body on its own and rebases the merge targets and loop headers
+    // that come out, which is the analysis the caller's `verified_code` cannot
+    // supply for a region past its `code_len`.
+    E { group: Group::JIT, token: "ir-splice-branch", on_key: Some("CRATONVM_JIT_IR_SPLICE_BRANCH"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // Splice a callee whose body reads a STATIC. `InlineSite::static_field_info`
+    // has carried the resolved rows all along; `IrInlineTables` now rebases
+    // them, so the builder's `0xb2` arm finds a spliced site exactly as it
+    // finds one of the caller's own. `putstatic` is refused separately and
+    // unconditionally -- the builder has no arm for it.
+    // Bind a surviving statically-bound call inside a spliced body to the
+    // callee's entry with a raw CALL, instead of letting it fall through to
+    // `jit_invoke_dispatch` and resolve the callee by name on every call. The
+    // resolver had bound and keep-alive-registered the entry all along; nothing
+    // put it where the lowerer looks.
+    E { group: Group::JIT, token: "ir-splice-direct-call", on_key: Some("CRATONVM_JIT_IR_SPLICE_DIRECT_CALL"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // Splice a callee whose body carries a `checkcast` or an `instanceof`.
+    // `IrBuilder` has had both arms since cov-05; the splice scanner refused
+    // the shape because nothing resolved the callee's targets or rebased the
+    // rows. An unresolved target refuses the CALLEE rather than being dropped,
+    // because a missing row bails the whole method.
+    E { group: Group::JIT, token: "ir-splice-typecheck", on_key: Some("CRATONVM_JIT_IR_SPLICE_TYPECHECK"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // Default ON. A splice must not leave behind a call worse than the one it
+    // replaced: a surviving statically-bound call with no `direct_entry` has
+    // no inline cache to fall back on and lowers to a blind name resolution.
+    // Setting this to 0 re-admits that trade, for measuring it.
+    E { group: Group::JIT, token: "ir-splice-refuse-unbindable", on_key: Some("CRATONVM_JIT_IR_SPLICE_REFUSE_UNBINDABLE"), off_key: None, off_word: Some("0"), since: "2026-09-10" },
+    E { group: Group::JIT, token: "ir-splice-getstatic", on_key: Some("CRATONVM_JIT_IR_SPLICE_GETSTATIC"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // Splice a callee whose body contains a `checkcast` or an `instanceof`.
+    // The same rebase as the two above, and the refusal that page named as
+    // the next one to take: every typed read out of an untyped container is a
+    // `checkcast`. Opt-IN and default OFF -- the plumbing is here, the soak is
+    // not, and a spliced type check is the first spliced site that can THROW
+    // on a caller-produced value. Read site accepts `1`/`true`/`on`/`yes` and
+    // nothing else, so there is no off-word: removing the key is the way back.
+    // R1. Memoize the ACCEPTED optimizing OSR artifact, not only the refusals.
+    // Without it one run recompiled the same method 502 times.
+    E { group: Group::JIT, token: "osr-optimizing-cache", on_key: Some("CRATONVM_JIT_OSR_OPTIMIZING_CACHE"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // R7. Elide the `JMP` to a block that is physically next.
+    E { group: Group::JIT, token: "ir-fallthrough", on_key: Some("CRATONVM_JIT_IR_FALLTHROUGH"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // R3, R4 and R6: opt-IN, default OFF pending their soaks. Each read site
+    // accepts `1`/`true`/`on`/`yes` and nothing else, so there is no off-word
+    // to state -- removing the key is the way back.
+    E { group: Group::JIT, token: "ir-deopt-points-at-traps", on_key: Some("CRATONVM_JIT_IR_DEOPT_POINTS_AT_TRAPS"), off_key: None, off_word: None, since: "2026-09-09" },
+    E { group: Group::JIT, token: "ir-reg-authoritative", on_key: Some("CRATONVM_JIT_IR_REG_AUTHORITATIVE"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    E { group: Group::JIT, token: "ir-gp-wide", on_key: Some("CRATONVM_JIT_IR_GP_WIDE"), off_key: None, off_word: None, since: "2026-09-10" },
+    E { group: Group::JIT, token: "ir-epoch-guard-rip", on_key: Some("CRATONVM_JIT_IR_EPOCH_GUARD_RIP"), off_key: None, off_word: Some("0"), since: "2026-09-10" },
+    // The single-pass twin of the row above, and the arm that unrolls: the
+    // `osr/sp` body of a four-field loop carries eight of these guards.
+    E { group: Group::JIT, token: "sp-epoch-guard-rip", on_key: Some("CRATONVM_JIT_SP_EPOCH_GUARD_RIP"), off_key: None, off_word: Some("0"), since: "2026-09-10" },
+    // Default ON and UNSOUND when clear: it restores a baked compact body
+    // offset that survives a layout replacement. It exists so the guard's
+    // price is a number from one binary, not an argument.
+    E { group: Group::JIT, token: "sp-field-layout-guard", on_key: Some("CRATONVM_JIT_SP_FIELD_LAYOUT_GUARD"), off_key: None, off_word: Some("0"), since: "2026-09-10" },
+    // Diagnosis lever, default OFF: put the layout-replacement epoch back in
+    // `.data` so its LOCATION is A/B-able independently of the encoding it
+    // shipped with. Must not be combined with `code-near-globals`, whose
+    // placement anchor is this counter.
+    E { group: Group::JIT, token: "layout-epoch-static", on_key: Some("CRATONVM_JIT_LAYOUT_EPOCH_STATIC"), off_key: None, off_word: None, since: "2026-09-10" },
+    E { group: Group::JIT, token: "code-near-globals", on_key: Some("CRATONVM_JIT_CODE_NEAR_GLOBALS"), off_key: None, off_word: None, since: "2026-09-10" },
+    E { group: Group::JIT, token: "ir-speculate", on_key: Some("CRATONVM_JIT_IR_SPECULATE"), off_key: None, off_word: None, since: "2026-09-09" },
+    // Diagnosis lever, value-taking: a comma-separated list of conservative
+    // root-band CLASSES to skip (`operand-spill`,
+    // `outgoing-args-or-deopt-regs`, `safepoint-gpr-spill-image`). Absent
+    // means skip nothing, which is the only setting that is safe -- dropping a
+    // root frees what it named, and the lever exists to MEASURE the ceiling a
+    // real fix would reach, not to be run. Landed 2026-09-09 with the G1
+    // pinned-regions work and undeclared; see `band_skip_classes`.
+    E { group: Group::JIT, token: "band-skip", on_key: Some("CRATONVM_JIT_BAND_SKIP"), off_key: None, off_word: None, since: "2026-09-09" },
     E { group: Group::JIT, token: "ls-carry-relief", on_key: Some("CRATONVM_JIT_LS_CARRY_RELIEF"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "ir-reserve-carried", on_key: Some("CRATONVM_JIT_IR_RESERVE_CARRIED"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "osr-optimizing", on_key: Some("CRATONVM_JIT_OSR_OPTIMIZING"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "osr-optimizing-memo", on_key: Some("CRATONVM_JIT_OSR_OPTIMIZING_MEMO"), off_key: None, off_word: Some("0"), since: "2026-09-06" },
+    // The remaining three of the 2026-09-09 C2-cost switches. The rest of that
+    // work is declared in the block above; these are the ones whose read sites
+    // arrived on a different branch.
+    //
+    // A spliced body with more than one `return`. Read by BOTH halves -- the
+    // scanner in `jit_bridge` and `IrBuilder::splice_return` -- and off
+    // because it measures neutral while forfeiting the optimizing OSR door
+    // for every method it applies to; see `ir_splice_multi_return_enabled`.
+    E { group: Group::JIT, token: "ir-splice-multi-return", on_key: Some("CRATONVM_JIT_IR_SPLICE_MULTI_RETURN"), off_key: None, off_word: None, since: "2026-09-09" },
+    // Let a REFERENCE be register-resident, with the cached copy invalidated
+    // at every point a collector could have run. Off because it does not pay,
+    // not because it is unsafe.
+    E { group: Group::JIT, token: "ir-ref-residency", on_key: Some("CRATONVM_JIT_IR_REF_RESIDENCY"), off_key: None, off_word: None, since: "2026-09-09" },
+    // The two halves of `ir-ref-residency` cost different things: crossing a
+    // safepoint admits the shapes that matter but RESERVES a register the
+    // invalidation then makes unreadable for most of the range. Separated so
+    // both are timeable from one binary. Only meaningful with the above on.
+    E { group: Group::JIT, token: "ir-ref-residency-cross-safepoint", on_key: Some("CRATONVM_JIT_IR_REF_RESIDENCY_CROSS_SAFEPOINT"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
     E { group: Group::JIT, token: "ir-drop-phi-home", on_key: Some("CRATONVM_JIT_IR_DROP_PHI_HOME"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "ir-publish-at-def", on_key: Some("CRATONVM_JIT_IR_PUBLISH_AT_DEF"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "ir-drop-home", on_key: Some("CRATONVM_JIT_IR_DROP_HOME"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
@@ -1484,6 +1640,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "deferred-new-retry-blind", on_key: Some("CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "deferred-new-looks", on_key: Some("CRATONVM_JIT_DEFERRED_NEW_LOOKS"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "ir-site-trap", on_key: Some("CRATONVM_JIT_IR_SITE_TRAP"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::JIT, token: "ir-trap-replay-guard", on_key: Some("CRATONVM_JIT_IR_TRAP_REPLAY_GUARD"), off_key: None, off_word: None, since: "2026-09-07" },
     E { group: Group::JIT, token: "ir-scalar-intrinsics", on_key: Some("CRATONVM_JIT_IR_SCALAR_INTRINSICS"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "ir-aastore", on_key: Some("CRATONVM_JIT_IR_AASTORE"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "ir-check-elim", on_key: Some("CRATONVM_JIT_IR_CHECK_ELIM"), off_key: None, off_word: None, since: "2026-09-06" },
@@ -1549,6 +1706,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "my-scratch-flush", on_key: Some("CRATONVM_JIT_MY_SCRATCH_FLUSH"), off_key: None, off_word: Some("0"), since: "2026-07-30" },
     E { group: Group::JIT, token: "my-selfcall-proof", on_key: Some("CRATONVM_JIT_MY_SELFCALL_PROOF"), off_key: None, off_word: Some("0"), since: "2026-07-30" },
     E { group: Group::JIT, token: "my-shadow-emission", on_key: Some("CRATONVM_JIT_MY_SHADOW_EMISSION"), off_key: None, off_word: Some("0"), since: "2026-07-31" },
+    // Emit side of the register oop maps: `OopMapEntry::reg_oop_mask`.
+    E { group: Group::JIT, token: "reg-oop-maps", on_key: Some("CRATONVM_JIT_REG_OOP_MAPS"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
     E { group: Group::JIT, token: "native-ec-multiply", on_key: Some("CRATONVM_NATIVE_EC_MULTIPLY"), off_key: None, off_word: None, since: "2026-06-04" },
     E { group: Group::JIT, token: "native-matcher-find", on_key: Some("CRATONVM_NATIVE_MATCHER_FIND"), off_key: None, off_word: Some("0"), since: "2026-07-11" },
     E { group: Group::JIT, token: "native-pbe-keyfactory", on_key: Some("CRATONVM_NATIVE_PBE_KEYFACTORY"), off_key: None, off_word: None, since: "2026-06-22" },
@@ -1727,6 +1886,13 @@ pub const INVENTORY: &[E] = &[
     // `frame-slot-reuse` — off routes every frame's buffers back through
     // the thread pools on return instead of retiring the frame in place.
     E { group: Group::JIT, token: "frame-slot-reuse", on_key: None, off_key: Some("CRATONVM_JIT_NO_FRAME_SLOT_REUSE"), off_word: None, since: "2026-09-02" },
+    // 2026-09-08. Opt-in restore of the pre-door refusal of `synchronized`
+    // callees. That refusal was the single largest reason any fast door
+    // declined anything -- 888,105 of 2.47 M interpreted calls on a
+    // `java.text` collator workload, 36% of them -- because ICU's normaliser
+    // drives `StringBuffer` one character at a time. See
+    // `invoke_fast::door_sync_enabled`.
+    E { group: Group::JIT, token: "door-sync", on_key: None, off_key: Some("CRATONVM_JIT_NO_DOOR_SYNC"), off_word: None, since: "2026-09-08" },
     // `frame-emplace` — off builds the frame on the Rust stack and moves it
     // into the slot instead of constructing it there.
     E { group: Group::JIT, token: "frame-emplace", on_key: None, off_key: Some("CRATONVM_JIT_NO_FRAME_EMPLACE"), off_word: None, since: "2026-09-03" },
@@ -1878,6 +2044,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "tier-pgo", on_key: Some("CRATONVM_TIER_PGO"), off_key: None, off_word: None, since: "2026-06-22" },
     E { group: Group::JIT, token: "tier-pgo-receivers", on_key: Some("CRATONVM_TIER_PGO_RECEIVERS"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "tier-pgo-c2-window", on_key: Some("CRATONVM_TIER_PGO_C2_WINDOW"), off_key: None, off_word: None, since: "2026-09-06" },
+    // `tier-pgo` turns profiling on for a WINDOW; this turns it on for the
+    // whole run, which is what a branch profile needs to be worth reading at
+    // the moment a method tiers up. Affordable since the counters went
+    // lock-free (measured 0.6% on an always-on run), and default OFF only
+    // until that measurement has been repeated on a soak.
+    // Presence-tested (`runtime_var_os(..).is_some()`), so any value turns it on.
+    E { group: Group::JIT, token: "tier-pgo-always", on_key: Some("CRATONVM_TIER_PGO_ALWAYS"), off_key: None, off_word: None, since: "2026-09-09" },
     E { group: Group::JIT, token: "tiered", on_key: Some("CRATONVM_TIER_ENABLED"), off_key: None, off_word: Some("0"), since: "2026-06-22" },
     E { group: Group::JIT, token: "tlab-zero-elision", on_key: None, off_key: Some("CRATONVM_NO_JIT_TLAB_ZERO_ELISION"), off_word: None, since: "2026-07-30" },
     // Interpreter-side, but it lives with the execution-engine knobs like
@@ -1928,14 +2101,43 @@ pub const INVENTORY: &[E] = &[
     // Default-ON since 2026-09-05, so it takes an `off_word`: presence alone no
     // longer decides it and `=0` has to be able to turn it off.
     E { group: Group::JIT, token: "local-mask-unreached-fail-closed", on_key: Some("CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
-    E { group: Group::GC, token: "blocked-wake-jit-remap", on_key: Some("CRATONVM_BLOCKED_WAKE_JIT_REMAP"), off_key: None, off_word: None, since: "2026-09-03" },
+    // Default-ON kill switch as of 2026-09-08, hence `off_key` only: the JIT
+    // half of a blocked-region wake (active compiled frames, register images,
+    // shadow stack). It shipped opt-in and wired only into the LEAKED-region
+    // fallback, so the wake that actually runs remapped interpreter frames and
+    // nothing compiled -- a peer that blocked with compiled frames below it
+    // resumed with every JIT oop at its pre-move address.
+    E { group: Group::GC, token: "blocked-wake-jit-remap", on_key: None, off_key: Some("CRATONVM_NO_BLOCKED_WAKE_JIT_REMAP"), off_word: None, since: "2026-09-03" },
+    // Default-ON kill switch, hence `off_key` only: a blocked peer's
+    // conservatively-scanned native-stack words are written back on wake. The
+    // objects were kept alive AND relocated while it slept, nothing else
+    // rewrites those words, and the pin that nominally protected them is a
+    // no-op on a Cheney copy.
+    E { group: Group::GC, token: "blocked-peer-stack-remap", on_key: None, off_key: Some("CRATONVM_GC_NO_BLOCKED_PEER_STACK_REMAP"), off_word: None, since: "2026-09-07" },
     E { group: Group::JIT, token: "xt-keep-unrewritable-on-discharge", on_key: Some("CRATONVM_XT_KEEP_UNREWRITABLE_ON_DISCHARGE"), off_key: None, off_word: None, since: "2026-09-04" },
     E { group: Group::GC, token: "zgc-unrewritable-peer-refuses", on_key: Some("CRATONVM_ZGC_UNREWRITABLE_PEER_REFUSES"), off_key: None, off_word: None, since: "2026-09-04" },
-    E { group: Group::JIT, token: "xt-helper-window-pin-resolve", on_key: Some("CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE"), off_key: None, off_word: None, since: "2026-09-04" },
+    // Default-ON since 2026-09-08. It shipped opt-in, and the helper-window
+    // DISCHARGE (default-on, same family) then made the pin load-bearing: a
+    // discharged cycle relocates on the strength of "every window pinned", and
+    // `is_heap_addr` -- the predicate it used to pin with -- drops a misaligned
+    // interior pointer and a one-past-the-end cursor, which are the two shapes a
+    // compiled loop leaves in a frozen peer's registers. `0` is the kill switch.
+    E { group: Group::JIT, token: "xt-helper-window-pin-resolve", on_key: Some("CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "xt-helper-window-interior", on_key: Some("CRATONVM_XT_HELPER_WINDOW_INTERIOR"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "xt-helper-window-pin", on_key: Some("CRATONVM_XT_HELPER_WINDOW_PIN"), off_key: None, off_word: None, since: "2026-09-01" },
     E { group: Group::JIT, token: "xt-helper-window-scan", on_key: Some("CRATONVM_XT_HELPER_WINDOW_SCAN"), off_key: None, off_word: None, since: "2026-07-02" },
+    // Kill switch for the `process_vm_readv` peer-stack reader, so the reader
+    // and the historical direct load are A/B-able inside one binary. Opt-in:
+    // setting it restores the pre-fix behaviour exactly, SIGSEGV included.
+    E { group: Group::JIT, token: "xt-no-safe-peer-read", on_key: Some("CRATONVM_XT_NO_SAFE_PEER_READ"), off_key: None, off_word: None, since: "2026-09-08" },
     E { group: Group::JIT, token: "xt-jit-root-scan", on_key: Some("CRATONVM_XT_JIT_ROOT_SCAN"), off_key: None, off_word: None, since: "2026-06-23" },
+    // Verification-only, and expensive on purpose: re-walks the WHOLE system
+    // thread table on every take-over pass to prove the process-local roster
+    // `take_over_pass` uses did not miss a thread that was in compiled code.
+    // Kept off the `xt-jit-root-scan` debug token deliberately — that walk is
+    // the ~83 ms/pass cost the roster removed, so bundling the two would make
+    // the scan impossible to observe without reintroducing what it fixed.
+    E { group: Group::JIT, token: "xt-root-scan-audit", on_key: Some("CRATONVM_XT_ROOT_SCAN_AUDIT"), off_key: None, off_word: None, since: "2026-09-10" },
     // Value token, milliseconds: `CRATONVM_JIT=xt-peer-deadline-ms=50`. Unset
     // means the built-in 20 ms, and `0` is rejected by the parser's own filter,
     // so there is no off state to spell.
@@ -2028,8 +2230,14 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "g1-narrow-fixup", on_key: Some("CRATONVM_G1_NARROW_FIXUP"), off_key: None, off_word: Some("0"), since: "2026-08-18" },
     E { group: Group::GC, token: "g1-parallel-evac-in-jit", on_key: Some("CRATONVM_G1_PARALLEL_EVAC_IN_JIT"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::GC, token: "g1-parallel-evac-screen", on_key: Some("CRATONVM_G1_PARALLEL_EVAC_SCREEN"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
+    E { group: Group::GC, token: "g1-serial-evac-holder-screen", on_key: Some("CRATONVM_G1_SERIAL_EVAC_HOLDER_SCREEN"), off_key: None, off_word: Some("0"), since: "2026-09-06" },
+    E { group: Group::GC, token: "g1-verify-forwards-retired", on_key: Some("CRATONVM_G1_VERIFY_FORWARDS_RETIRED"), off_key: None, off_word: None, since: "2026-09-07" },
     E { group: Group::GC, token: "g1-evac-copy-watch", on_key: Some("CRATONVM_G1_EVAC_COPY_WATCH"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "g1-parallel-evac-shared-dest", on_key: Some("CRATONVM_G1_PARALLEL_EVAC_SHARED_DEST"), off_key: None, off_word: Some("0"), since: "2026-09-06" },
+    E { group: Group::GC, token: "g1-evac-supply-screen", on_key: Some("CRATONVM_G1_EVAC_SUPPLY_SCREEN"), off_key: None, off_word: Some("0"), since: "2026-09-08" },
+    E { group: Group::GC, token: "g1-evac-candidate-arena-screen", on_key: Some("CRATONVM_G1_EVAC_CANDIDATE_ARENA_SCREEN"), off_key: None, off_word: Some("0"), since: "2026-09-08" },
+    E { group: Group::GC, token: "g1-evac-empty-header-grid-proof", on_key: Some("CRATONVM_G1_EVAC_EMPTY_HEADER_GRID_PROOF"), off_key: None, off_word: Some("0"), since: "2026-09-08" },
+    E { group: Group::GC, token: "g1-ref-write-watch", on_key: Some("CRATONVM_G1_REF_WRITE_WATCH"), off_key: None, off_word: None, since: "2026-09-08" },
     E { group: Group::GC, token: "g1-parallel-evac-resume-dest", on_key: Some("CRATONVM_G1_PARALLEL_EVAC_RESUME_DEST"), off_key: None, off_word: Some("0"), since: "2026-09-06" },
     E { group: Group::GC, token: "g1-evac-ref-implausible-refuse", on_key: Some("CRATONVM_G1_EVAC_REF_IMPLAUSIBLE_REFUSE"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "g1-cleanup-walk", on_key: Some("CRATONVM_G1_CLEANUP_WALK"), off_key: None, off_word: None, since: "2026-09-02" },
@@ -2456,6 +2664,13 @@ pub const INVENTORY: &[E] = &[
     // switch. THREADS rather than a JMX group because the group vocabulary
     // has no JMX and this is a threading capability the bean exposes.
     E { group: Group::THREADS, token: "jmx-owned-synchronizers", on_key: Some("CRATONVM_JMX_OWNED_SYNCHRONIZERS"), off_key: None, off_word: Some("0"), since: "2026-08-27" },
+    // 2026-09-08. Default-ON kill switch over the uncontended monitorenter /
+    // monitorexit fast path (peek-first opcode operand, per-thread cached JMX
+    // monitor book). `0` restores the previous path in the SAME binary, which is
+    // what `probes/SyncCost.java` needs: a sequential pair of builds on a shared
+    // host is not a measurement. Behaviour is identical either way --
+    // `probes/JmxMonitorOwnership.java` is green on both.
+    E { group: Group::THREADS, token: "monitor-fastpath", on_key: Some("CRATONVM_MONITOR_FASTPATH"), off_key: None, off_word: Some("0"), since: "2026-09-08" },
     E { group: Group::THREADS, token: "assert-single-os-thread", on_key: Some("CRATONVM_ASSERT_SINGLE_OS_THREAD"), off_key: None, off_word: None, since: "2026-06-21" },
     E { group: Group::THREADS, token: "async-handoff-sleep-floor-ms", on_key: Some("CRATONVM_ASYNC_HANDOFF_SLEEP_FLOOR_MS"), off_key: None, off_word: None, since: "2026-07-04" },
     E { group: Group::THREADS, token: "async-submit-grace-ms", on_key: Some("CRATONVM_ASYNC_SUBMIT_GRACE_MS"), off_key: None, off_word: None, since: "2026-07-04" },
@@ -3416,6 +3631,11 @@ mod tests {
                 "CRATONVM_JIT",
                 "xt-peer-shadow-scan",
                 "CRATONVM_XT_PEER_SHADOW_SCAN",
+            ),
+            (
+                "CRATONVM_JIT",
+                "xt-helper-window-pin-resolve",
+                "CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE",
             ),
         ] {
             let off = case(&[(group, &format!("-{token}"))]);

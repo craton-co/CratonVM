@@ -13,6 +13,97 @@ use crate::threading::jvm_thread::JvmThread;
 use crate::types::{ObjectRef, Value};
 use crate::vm::SharedVm;
 
+/// The process-level half of [`conservative_locals_enabled`]: is the
+/// conservative frame probe COMPILED IN for this run at all?
+///
+/// Split out from the per-cycle half so the A5 second pass in [`collect_roots`]
+/// can ask the same opt-out question without also asking `is_active()`, which
+/// is false on exactly the cycle that pass exists for.
+///
+/// `real_forkjoinpool` is the gate the multi-thread reclamation bug lives under
+/// (see the FJP-worker test case). It DEFAULTS ON — the synthetic pool is the
+/// opt-in (`CRATONVM_SYNTHETIC_FORKJOINPOOL`) — so this is true for the whole
+/// app gauntlet, not the narrow opt-in lane an earlier revision of this comment
+/// claimed. Any blast-radius argument that reads "off by default here" is
+/// reading a default that has not existed since the flag was inverted; the
+/// real bound on the probe is the per-cycle non-moving condition below.
+/// `CRATONVM_NO_CONSERVATIVE_LOCALS` turns it off outright.
+#[inline]
+fn conservative_locals_compiled_in() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        cratonvm_types::flags::flags().natives.real_forkjoinpool
+            && cratonvm_types::flags::runtime_var_os("CRATONVM_NO_CONSERVATIVE_LOCALS").is_none()
+    })
+}
+
+/// Does step 14a5 run on THIS cycle?
+///
+/// `step1_ran` is [`collect_roots`]' own `conservative_locals`: when step 1
+/// already probed the frames there is nothing left to add, and re-running it
+/// would only double the root vector.
+///
+/// A free function rather than an inline condition so the truth table is
+/// testable without driving a whole collection — the flag it reads is set from
+/// inside `collect_roots` (by step 14's JIT scan), which is exactly what makes
+/// the in-line form untestable.
+#[inline]
+fn a5_frame_pass_engages(step1_ran: bool) -> bool {
+    !step1_ran
+        && conservative_locals_compiled_in()
+        && cratonvm_gc::gc_quiescence::unregistered_jit_frame_on_stack()
+}
+
+/// The conservative frame probe itself: every local and operand-stack slot of
+/// every frame on `thread`, liveness-unfiltered and tag-independent.
+///
+/// Shared by step 1 (via `conservative_locals`, inline there because it
+/// interleaves with the tag-filtered scan) and step 14a5. Sound ONLY where the
+/// collection provably does not relocate — see [`conservative_locals_enabled`].
+fn conservative_frame_pass(shared: &SharedVm, thread: &JvmThread, roots: &mut Vec<ObjectRef>) {
+    for frame in thread.frames.iter() {
+        // Liveness-unfiltered, for the reason `scan_local_objects_all_live`
+        // documents: under this collector an extra dead reference can only
+        // over-retain, while a missed live one is reclaimed in place.
+        frame.scan_local_objects_all_live(roots, &shared.mem.heap);
+        frame.scan_locals_conservative(roots, &shared.mem.heap);
+        frame
+            .stack
+            .scan_object_refs_conservative(roots, &shared.mem.heap);
+    }
+}
+
+/// Engagement census for the A5 conservative frame pass in [`collect_roots`]
+/// (step 14a5).
+///
+/// A repair that fires on no cycle and a repair that fires on every cycle look
+/// identical in a passing test run, and the page this pass closes was reopened
+/// twice by exactly that ambiguity. These two numbers say which.
+pub mod a5_frame_pass {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Collections on which the pass ran — i.e. the non-moving sweep was
+    /// selected by the A5 unregistered-JIT-frame flag alone, with
+    /// `gc_quiescence::is_active()` false, so step 1's probe was off.
+    pub static CYCLES: AtomicU64 = AtomicU64::new(0);
+    /// Roots the pass added beyond the tag-filtered scan, summed over cycles.
+    pub static ROOTS: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn note(added: usize) {
+        CYCLES.fetch_add(1, Ordering::Relaxed);
+        ROOTS.fetch_add(added as u64, Ordering::Relaxed);
+    }
+
+    /// `(cycles, roots)` — for the shutdown census.
+    pub fn census() -> (u64, u64) {
+        (
+            CYCLES.load(Ordering::Relaxed),
+            ROOTS.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// True when interpreter-frame locals should be scanned CONSERVATIVELY (every
 /// pointer-shaped slot, validated by the strict `is_object_address` header
 /// probe) in addition to the tag-filtered scan. Enabled exactly when the
@@ -21,23 +112,39 @@ use crate::vm::SharedVm;
 /// false-positive root is harmless (nothing is relocated). Off on the moving
 /// (no-JIT) path, where a pointer-shaped `long` rooted here would be relocated
 /// and corrupted. Opt out entirely with `CRATONVM_NO_CONSERVATIVE_LOCALS`.
+///
+/// # This is not the only way the non-moving sweep gets selected
+///
+/// `is_active()` is one of the collector's TWO reasons to run the non-moving
+/// sweep; the other is `gc_quiescence::unregistered_jit_frame_on_stack()` (A5 —
+/// a compiled frame live without a `JitEntryGuard`). That flag cannot be read
+/// here: `collect_roots` clears it at the top of the pass and only step 14's
+/// `scan_active_jit_frames` re-sets it, so at step 1 it is false by
+/// construction. The repair is a SECOND pass after step 14 rather than a wider
+/// predicate here — see `a5_conservative_frame_pass` — because by then the
+/// answer is known for THIS cycle and the non-moving sweep is guaranteed.
 #[inline]
 pub(crate) fn conservative_locals_enabled() -> bool {
-    use std::sync::OnceLock;
-    // Blast-radius bound: only under the opt-in real-ForkJoinPool gate (the gate
-    // the multi-thread reclamation bug lives under — see the FJP-worker test
-    // case). With it OFF — the default for the entire app gauntlet and the
-    // bintrees benchmarks — this returns false and the root scan is byte-
-    // identical to baseline (no extra `is_object_address` probes, no over-pin
-    // risk). Opt out even under the gate with `CRATONVM_NO_CONSERVATIVE_LOCALS`.
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    let base = *ENABLED.get_or_init(|| {
-        cratonvm_types::flags::flags().natives.real_forkjoinpool
-            && cratonvm_types::flags::runtime_var_os("CRATONVM_NO_CONSERVATIVE_LOCALS").is_none()
-    });
-    base && cratonvm_gc::gc_quiescence::is_active()
+    conservative_locals_compiled_in() && cratonvm_gc::gc_quiescence::is_active()
 }
 
+/// Is this cycle one of the safe full-mark windows in which class metadata may
+/// be pinned CONDITIONALLY (weak mode) rather than rooted outright?
+///
+/// # The A5 term is deliberately absent
+///
+/// `gc_quiescence::young_marker_follows_side_tables` — the same question, asked
+/// by the collector — carries an `unregistered_jit_frame_on_stack()` disjunct,
+/// and its own doc records that the flag "is always `false` at the mirror call
+/// site" and that this function "correctly never had the term". It DID have it
+/// between 2026-08 and 2026-09-08, and the term was inert for exactly the
+/// reason that note gives: [`collect_roots`] clears the flag a few statements
+/// above this call and only step 14 re-sets it, so it could only ever read
+/// `false` here. It is deleted rather than fixed because the honest answer at
+/// this point in the pass is "not yet known", and `false` is the safe
+/// direction — it keeps the conservative unconditional rooting, which
+/// over-retains. A live term would also have had to survive a cycle that then
+/// took the moving path, which weak mode is not sound for.
 #[inline]
 fn conditional_loader_metadata(shared: &SharedVm) -> bool {
     if !cratonvm_native_builtins::classloader::loader_unload_enabled() {
@@ -46,7 +153,6 @@ fn conditional_loader_metadata(shared: &SharedVm) -> bool {
     match shared.config.gc_algorithm {
         crate::config::GcAlgorithm::Generational => {
             cratonvm_gc::gc_quiescence::is_active()
-                || cratonvm_gc::gc_quiescence::unregistered_jit_frame_on_stack()
                 || cratonvm_gc::gc_quiescence::major_gc_requested()
         }
         crate::config::GcAlgorithm::G1 => cratonvm_gc::gc_quiescence::class_unload_marking(),
@@ -466,6 +572,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // `band_slot_is_verifiable` refuses to inspect, and the young sweep pins
     // those whatever the movable set says.
     cratonvm_gc::gc_quiescence::clear_unrewritable_jit_roots();
+    // The register-oop mask's oracle records what it EXCLUDED this pass, so it
+    // is reset on the same schedule as the sets above and checked against the
+    // finished root set below.
+    crate::jit::conservative_roots::clear_excluded_spill_words();
     // G1 pin-in-place: reset the conservative-JIT-root pin set too, so it
     // reflects only THIS collection's stack (republished by the JIT-frame scan
     // below, under G1). See that scan site and `G1Collector::young_collection`.
@@ -1373,10 +1483,15 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         // eye and a genuine PEER blocker (`compiled_uninterruptible`, or a
         // second running thread) is visible.
         eprintln!(
-            "[reloc-blockers] coverage_proven={coverage_proven} blockers={} \
+            "[reloc-blockers] coverage_proven={coverage_proven} blockers={} peer_blockers={} \
 (java={} vm={} native={} deopt={} compiled_uninterruptible={} parked={} blocked={}) \
 moving_young={moving_young} osr_fallback={moving_young_osr_fallback} incomplete={}",
             census.relocation_blockers(),
+            // The count the obligation is actually about: `Forbidden` AND
+            // `may_hold_unrewritable_object_refs`, with this thread subtracted
+            // so a zero is reachable. `blockers` beside it is kept only so the
+            // two can be compared — see `relocation_blockers`' own doc.
+            census.peer_relocation_blockers(TES::VmRunning),
             census.get(TES::JavaRunning),
             census.get(TES::VmRunning),
             census.get(TES::NativeRunning),
@@ -1434,8 +1549,17 @@ moving_young={moving_young} osr_fallback={moving_young_osr_fallback} incomplete=
         moving_young_precise_only = false;
     }
     if !moving_young_precise_only && !jit_scan_done {
+        // `_for_collection` below, not the bare scan: it marks this as the
+        // pass the collector marks from, which is what the opt-in above-chain
+        // conservative band keys on (`CRATONVM_JIT_ABOVE_CHAIN_SCAN`). Inert
+        // with that flag unset, which is the default — see
+        // `conservative_roots::above_chain_scan_enabled` for the measurement
+        // that says why it is opt-in.
         crate::memory::native_roots::rootprof::note_scan_caller(0); // gc-roots
-        crate::jit::conservative_roots::scan_active_jit_frames(&shared.mem.heap, &mut roots);
+        crate::jit::conservative_roots::scan_active_jit_frames_for_collection(
+            &shared.mem.heap,
+            &mut roots,
+        );
     }
     // G1 pin-in-place for conservative JIT roots: the generational collector
     // protects a conservatively-scanned JIT root (a register/spill slot the
@@ -1472,7 +1596,93 @@ moving_young={moving_young} osr_fallback={moving_young_osr_fallback} incomplete=
             .iter()
             .map(|r| r.as_ptr() as usize)
             .collect();
+        // `CRATONVM_DBG_JIT_ROOTSCAN=1` — each DISTINCT address this pass is
+        // about to pin, with the two facts that decide whether it needs to be
+        // pinned at all. `scan_added=15 unrewritable=4` on the line below is a
+        // pair of totals over different domains (words, then objects) and the
+        // arithmetic between them is not available anywhere: 15 words dedupe to
+        // 5 addresses, and which of THOSE five are held only through rewritable
+        // storage is the whole of what a narrowed pin set could drop.
+        if dbg_jit_rootscan() {
+            let mut distinct: Vec<usize> = addrs.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            let mut line = String::new();
+            for a in &distinct {
+                line.push_str(&format!(
+                    " 0x{a:x}(unrew={},movable={})",
+                    cratonvm_gc::gc_quiescence::is_unrewritable_jit_root(*a) as u8,
+                    cratonvm_gc::gc_quiescence::is_movable_jit_root(*a) as u8,
+                ));
+            }
+            eprintln!(
+                "[jitpins] words={} distinct={} unrew_set={} movable_set={}{}",
+                addrs.len(),
+                distinct.len(),
+                cratonvm_gc::gc_quiescence::unrewritable_jit_root_count(),
+                cratonvm_gc::gc_quiescence::movable_jit_root_count(),
+                line,
+            );
+        }
         cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&addrs);
+    }
+    // `CRATONVM_DBG_VERIFY_REG_OOP_MAPS=1` — every blind-spill word the
+    // register oop mask dropped, re-checked against the root set that was
+    // actually built. It has to run here rather than in the band scan: the
+    // question is whether anything ELSE names the object, and inside the scan
+    // the answer is still being assembled.
+    crate::jit::conservative_roots::verify_excluded_band_words(&roots, &shared.mem.heap);
+    // 14a5. A5 CONSERVATIVE FRAME PASS — the second half of step 1, run here
+    // because this is the first point in the pass at which the answer is known.
+    //
+    // The collector runs its non-moving sweep for either of two reasons:
+    // `gc_quiescence::is_active()` (a registered JIT frame) or
+    // `unregistered_jit_frame_on_stack()` (A5 — a compiled frame live without a
+    // `JitEntryGuard`, e.g. the compiled entry point while an interpreted
+    // callee runs). Step 1's `conservative_locals` — the probe that recovers an
+    // object reference from a frame slot whose CompactValue tag was lost, and
+    // that suppresses the per-bci local-liveness filter — keyed on the FIRST
+    // reason only. On an A5-only cycle the sweep therefore freed on
+    // `GC_FLAG_MARKED` while the pass that exists to widen its root set was
+    // off: exactly the asymmetry
+    // `docs/internal/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`
+    // names as its most specific lead.
+    //
+    // Widening step 1's predicate is not the repair, and that page says why:
+    // `unregistered_jit_frame_on_stack()` is cleared at the top of this
+    // function and re-set only by the JIT scan a few lines above, so at step 1
+    // it is false by construction — reading it there answers about the wrong
+    // cycle. Running the probe HERE answers about THIS one.
+    //
+    // Soundness — the same argument `conservative_locals_enabled` makes, and it
+    // holds strictly harder here. A conservatively-recovered root may be a
+    // pointer-shaped `long`, so it is only safe where nothing is relocated. The
+    // scan above did not merely set the A5 flag; it also called
+    // `mark_moving_young_coverage_incomplete_because(UNREGISTERED_JIT_FRAME)`,
+    // and `collect_garbage_inner` honours that through
+    // `divert_for_incomplete_moving_coverage`, which overrides even
+    // `CRATONVM_DBG_FORCE_MOVING`. So on every cycle this branch fires, the
+    // young collection provably does not move, and a false positive can only
+    // over-retain.
+    //
+    // G1/ZGC: unreachable. Both take their own root paths, and the A5 flag is
+    // the generational collector's signal — but the pass is keyed on the flag,
+    // not on the backend, so the extra roots simply pin (G1 pins conservative
+    // JIT roots out of the CSet; ZGC withholds their page), which is the same
+    // over-retention. It is deliberately NOT folded into `pinned_jit_roots`
+    // above: these are interpreter frame slots, not compiled-frame band words.
+    if a5_frame_pass_engages(conservative_locals) {
+        mark_scan_section(
+            roots.len(),
+            "14a5: A5 conservative interpreter-frame pass (unregistered JIT frame)",
+        );
+        let before = roots.len();
+        conservative_frame_pass(shared, thread, &mut roots);
+        // ENGAGEMENT, in the house style: a repair whose cycle count is
+        // unknown cannot be argued about later. `cycles` is how often the A5
+        // path took the non-moving sweep without step 1's probe; `roots` is
+        // what this pass added on top of the tag-filtered scan.
+        a5_frame_pass::note(roots.len() - before);
     }
     // `CRATONVM_DBG_JIT_ROOTSCAN=1` — one line per COLLECTION naming why this
     // cycle's JIT pin set came out the size it did.
@@ -1503,6 +1713,35 @@ moving_young={moving_young} osr_fallback={moving_young_osr_fallback} incomplete=
         // buckets above — read the growth between two lines.
         let (fc_no_slot, fc_misaligned, fc_no_map, fc_incomplete, fc_ok) =
             crate::jit::conservative_roots::frame_coverage_reason::snapshot();
+        // The register-oop mask, both sides. Emit-side causes are cumulative
+        // over compiles, consume-side over frame walks; read the growth.
+        let ro_e = cratonvm_jit::x64::reg_oop_mask_cause::snapshot();
+        let ro_u = crate::jit::conservative_roots::reg_oop_mask_census();
+        let ro_o = crate::jit::conservative_roots::reg_oop_mask_oracle();
+        // Which scan path ran, and what the band partition published. A pin
+        // census shows neither, and both decide whether a pin is arguable.
+        let bp = crate::jit::conservative_roots::band_path::snapshot();
+        eprintln!(
+            "[bandpath] bands={} fallback={} foreign_innermost={} a5_sweeps={}              a5_roots={} a5_frames={} published=(movable={} unrewritable={} \
+             remapped_not_pinned={})",
+            bp.0,
+            bp.1,
+            bp.2,
+            bp.3,
+            bp.4,
+            bp.5,
+            crate::jit::conservative_roots::movable_band_root_count(),
+            crate::jit::conservative_roots::unrewritable_band_root_count(),
+            crate::jit::conservative_roots::remapped_not_pinned_count(),
+        );
+        eprintln!(
+            "[regoop] emit=(disabled={} staged={} desync={} inexact={} windows={} inline={} \
+             dataflow={} PUBLISHED={}) use=(masked={} unmasked={} regwords={} \
+             deadspill={} outgoing={}) \
+             oracle=(words={} reachable={} UNREACHABLE={} walk_incomplete={})",
+            ro_e.0, ro_e.1, ro_e.2, ro_e.3, ro_e.4, ro_e.5, ro_e.6, ro_e.7,
+            ro_u.0, ro_u.1, ro_u.2, ro_u.3, ro_u.4, ro_o.0, ro_o.1, ro_o.2, ro_o.3,
+        );
         // Engagement counter for the cross-thread coverage handshake, printed
         // beside the verdict it produces so any claim about it carries the
         // number of cycles it actually decided.
@@ -2025,6 +2264,94 @@ mod tests {
 
         let roots = collect_roots(&shared, &thread);
         assert!(roots.contains(&obj));
+    }
+
+    /// **THE A5 PASS RECOVERS WHAT THE TAG-FILTERED SCAN IS DESIGNED TO DROP.**
+    ///
+    /// A JIT callee's object return value can reach an interpreter local under
+    /// a non-object tag. `scan_local_objects` then correctly omits it — a
+    /// `long`-tagged slot is a primitive by JVM spec, and rooting it on the
+    /// MOVING path would let the collector rewrite a number. The non-moving
+    /// sweep has no such hazard and must not free the object, which is what
+    /// `scan_locals_conservative` exists for.
+    ///
+    /// Both halves are asserted. "The conservative pass finds it" alone would
+    /// pass just as well if the ordinary scan already did, and then the pass
+    /// this test is about could be deleted without failing anything.
+    #[test]
+    fn the_a5_pass_recovers_a_lost_tag_local_the_tag_filtered_scan_drops() {
+        let shared = test_shared_vm();
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let addr = obj.as_ptr() as usize;
+
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        thread.frames.push(Frame::new(
+            ClassId::new(0),
+            "TestClass".to_string(),
+            "test".to_string(),
+            "()V".to_string(),
+            None,
+            vec![],
+            vec![],
+            10,
+            5,
+            // The lost tag: the address is in the slot, but as a `long`.
+            &[Value::Long(addr as i64), Value::Int(42)],
+        ));
+
+        assert!(
+            !collect_roots(&shared, &thread).contains(&obj),
+            "a long-tagged slot must NOT be a root on the ordinary path — if it \
+             is, the moving collector would rewrite a primitive, and step 14a5 \
+             is not what keeps this object alive"
+        );
+
+        let mut roots = Vec::new();
+        conservative_frame_pass(&shared, &thread, &mut roots);
+        assert!(
+            roots.contains(&obj),
+            "the A5 pass must recover the reference: on that cycle the sweep \
+             frees on GC_FLAG_MARKED, so a slot no scan reports is a slot whose \
+             object is zeroed and returned to the free list while still in use"
+        );
+    }
+
+    /// **AND IT RUNS ON EXACTLY THE CYCLES THAT NEED IT.**
+    ///
+    /// The pass is only sound where nothing is relocated, and only useful where
+    /// step 1's probe was off. Both conditions are in one predicate so the
+    /// truth table can be pinned here; the flag it reads is set from inside
+    /// `collect_roots`, so an end-to-end test cannot reach this state.
+    #[test]
+    fn the_a5_pass_engages_only_on_the_unregistered_jit_frame_path() {
+        // The flag is a `thread_local!` `Cell`, so this cannot perturb a test
+        // running beside it. Restore it either way.
+        let restore = cratonvm_gc::gc_quiescence::unregistered_jit_frame_on_stack();
+
+        cratonvm_gc::gc_quiescence::clear_unregistered_jit_frame_on_stack();
+        assert!(
+            !a5_frame_pass_engages(false),
+            "with no unregistered JIT frame the young cycle may MOVE, and a \
+             pointer-shaped long rooted by this pass would be relocated and \
+             corrupted"
+        );
+
+        cratonvm_gc::gc_quiescence::set_unregistered_jit_frame_on_stack();
+        assert_eq!(
+            a5_frame_pass_engages(false),
+            conservative_locals_compiled_in(),
+            "with the A5 flag set the sweep is non-moving and the pass must run \
+             — unless the probe is compiled out of this run entirely"
+        );
+        assert!(
+            !a5_frame_pass_engages(true),
+            "step 1 already probed these frames; running again only doubles the \
+             root vector"
+        );
+
+        if !restore {
+            cratonvm_gc::gc_quiescence::clear_unregistered_jit_frame_on_stack();
+        }
     }
 
     #[test]

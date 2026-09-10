@@ -4327,6 +4327,24 @@ pub(crate) fn define_class_via_full(
     // `define_class_full` (verifier OOB, ASM-emitted bytecode that
     // defeats our class file parser, etc.) returns a clean
     // ClassFormatError instead of unwinding to SIGABRT.
+    // GC: a reference held in a Rust local across an allocating or Java-re-entering
+    // call goes stale under a moving collector, and under the Generational
+    // non-moving young sweep an unrooted object is ZEROED in place. Pin and
+    // re-read. `safe_native_call_impl` truncates `native_pin_roots` when the native
+    // returns, so an unmatched pin costs nothing on an error path. See
+    // `internal/audits/wide-tranche-triage-20260907.md`.
+    // `define_class_full` defines a class and `get_class_mirror` below
+    // allocates the mirror, so BOTH incoming references — the `classData`
+    // object and the loader — are stale by the time they are stored and
+    // registered. The audit reported `loader`; reading found `class_data` too.
+    let class_data_pin = match class_data {
+        Some(Value::Object(Some(o))) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
+    let loader_pin = match loader {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
     let define_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ctx.define_class_full(name, &bytes, loader_id, opts)
     }));
@@ -4346,6 +4364,10 @@ pub(crate) fn define_class_via_full(
             let mirror = ctx.get_class_mirror(cid);
             // Stash classData (defineClass0 path) on the side-table.
             if let Some(data) = class_data {
+                let data = match class_data_pin {
+                    Some((p, o)) => Value::Object(Some(ctx.read_native_pin(p, o))),
+                    None => data,
+                };
                 set_class_data(mirror, data);
             }
             // Record the true defining loader (see the doc comment above)
@@ -4366,6 +4388,10 @@ pub(crate) fn define_class_via_full(
             // already has its own built-in-loader fallback).
             if loader_aware_resolution() {
                 if let Value::Object(Some(loader_obj)) = loader {
+                    let loader_obj = match loader_pin {
+                        Some((p, o)) => ctx.read_native_pin(p, o),
+                        None => loader_obj,
+                    };
                     if is_user_defined_loader(ctx, loader_obj) {
                         register_defining_loader(ctx.vm_identity(), cid.as_u32(), loader_obj);
                     }
@@ -4699,12 +4725,34 @@ pub fn register_classloader_define_class(r: &mut NativeMethodRegistry) {
         cl_define_class0,
     );
 
-    r.register(
-        "java/lang/System$1",
-        "defineClass",
-        "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BLjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;",
-        jla_system_define_class,
-    );
+    // `defineClass` is a JavaLangAccess method, and that interface's carrier
+    // class is not spelled the same on every JDK -- see
+    // `shared_secrets_bridge::JLA_CARRIER_CANDIDATES`. Register on each
+    // candidate; the ones that are not the carrier on this image have no class
+    // for anything to dispatch through.
+    //
+    // **Spelled inline rather than looped over that const, deliberately.**
+    // `native-builtins/tests/registrar_drift.rs` scans this file as TEXT: its
+    // `parse_loops` accepts `for x in [ .. ]` over literal elements and skips
+    // any `for` whose `in` is not followed by `[`. Written as
+    // `for carrier in JLA_CARRIER_CANDIDATES` this registration becomes
+    // invisible to it -- measured, on 2026-09-09: total drift pairs 1356 ->
+    // 1355 and `the_drift_baseline_has_no_stale_rows` reporting this very call
+    // as "no longer drift[ing] ... registered by: <not registered anywhere
+    // this scan can see>". The registration had not stopped happening; the
+    // gate had stopped seeing it, and taking the regenerated baseline would
+    // have retired a live row on a parser's blind spot.
+    //
+    // `jla_define_class_is_registered_on_every_carrier_candidate` below keeps
+    // this list and that const from drifting apart, since the compiler cannot.
+    for carrier in ["java/lang/System$1", "java/lang/System$2"] {
+        r.register(
+            carrier,
+            "defineClass",
+            "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BLjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;",
+            jla_system_define_class,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5117,7 +5165,8 @@ pub(crate) fn first_resource_url(
     ctx: &mut dyn NativeContext,
     resource_name: &str,
 ) -> Option<String> {
-    if get_resource_first_hit_enabled() && ctx.resource_name_supports_incremental_scan(resource_name)
+    if get_resource_first_hit_enabled()
+        && ctx.resource_name_supports_incremental_scan(resource_name)
     {
         return ctx
             .next_resource_url(resource_name, 0, 0)
@@ -8047,10 +8096,8 @@ pub(crate) fn package_class_files_visible_to_loader(
     // built-in chain) keeps the historical global probe, unchanged.
     let namespace = loader_namespace_id(ctx, loader);
     if namespace >= cratonvm_types::ClassLoaderId::NATIVE_FIRST_USER_DEFINED {
-        return ctx.any_loaded_class_in_package_for_loader(
-            &package_name.replace('.', "/"),
-            namespace,
-        );
+        return ctx
+            .any_loaded_class_in_package_for_loader(&package_name.replace('.', "/"), namespace);
     }
     !ctx.find_all_resource_urls(class_glob).is_empty()
 }
@@ -8525,11 +8572,19 @@ pub(crate) fn ucl_try_define_local_class(
     };
     let (define_lock_mutex, define_lock_cvar) = &*define_lock;
     let mut in_progress = define_lock_mutex.lock().unwrap_or_else(|e| e.into_inner());
+    // GC-safety: this loop WAITS on a condvar, which is the widest window there
+    // is -- a peer thread's collection is exactly what runs while this one is
+    // parked -- and then re-probes with `loader`, a bare Rust local carried in
+    // from outside. `find_loaded_class_for_loader` can itself allocate, so even
+    // without the wait the second turn would be reading a pre-GC address. Pin
+    // it and re-read at the top of each turn.
+    let loader_pin = ctx.pin_native_root(loader);
     while *in_progress {
         let (guard, timeout) = define_lock_cvar
             .wait_timeout(in_progress, std::time::Duration::from_secs(30))
             .unwrap_or_else(|e| e.into_inner());
         in_progress = guard;
+        let loader = ctx.read_native_pin(loader_pin, loader);
         // The other thread may have finished defining it (success -- return
         // its result) or failed (we should try ourselves rather than loop
         // forever on a definition that will never arrive).
@@ -8557,6 +8612,7 @@ pub(crate) fn ucl_try_define_local_class(
     // auto-configuration conditions on a second thread and races the main one
     // for exactly these classes. HotSpot has no such window: `loadClass`
     // re-checks `findLoadedClass` after taking `getClassLoadingLock(name)`.
+    let loader = ctx.read_native_pin(loader_pin, loader);
     if let Some(mirror) = find_loaded_class_for_loader(ctx, loader, internal_name) {
         return Some(Ok(Some(Value::Object(Some(mirror)))));
     }
@@ -11525,6 +11581,31 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod classloader_tests {
     use super::*;
+
+    /// The two names in `register_classloader_define_class` are written out
+    /// instead of looped over `JLA_CARRIER_CANDIDATES` so the drift scanner can
+    /// read them (see the comment there). Nothing in the language ties the two
+    /// lists together, so tie them here: a candidate added to the const and not
+    /// to that call site is a carrier on which `defineClass` silently is not
+    /// registered, which on the image where it IS the carrier is a
+    /// `NoSuchMethodError` from `BootLoader` during boot.
+    #[test]
+    fn jla_define_class_is_registered_on_every_carrier_candidate() {
+        const DESC: &str = "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BLjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;";
+        let mut r = NativeMethodRegistry::new();
+        register_classloader_define_class(&mut r);
+        let rows = r.dump_registrations();
+        for cand in crate::shared_secrets_bridge::JLA_CARRIER_CANDIDATES {
+            assert!(
+                rows.iter().any(|(cls, name, desc, _)| *cls == cand
+                    && *name == "defineClass"
+                    && *desc == DESC),
+                "no defineClass registration for carrier candidate {cand}; \
+                 the inline list in register_classloader_define_class has \
+                 drifted from JLA_CARRIER_CANDIDATES"
+            );
+        }
+    }
     use crate::test_utils::MockNativeContext;
     #[allow(unused_imports)]
     use cratonvm_native_api::{

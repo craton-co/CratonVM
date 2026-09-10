@@ -544,9 +544,255 @@ pub struct MethodProfile {
     /// invocation counts cannot — a call in a rarely-taken branch of a hot
     /// method looks identical to one on the hot path).
     pub call_sites: FxHashMap<usize, u32>,
+    /// Lock-free branch counters for this method, when one has been allocated.
+    ///
+    /// The recording path writes HERE, not into [`Self::branches`]; the two are
+    /// folded together by [`Self::snapshot`] on the way to a compiler. See
+    /// [`BranchCounters`] for why.
+    ///
+    /// `None` on a snapshot (the fold has already happened) and on any method
+    /// that has never had a branch recorded through the fast path.
+    pub flat_branches: Option<Arc<BranchCounters>>,
+}
+
+/// Per-method conditional-branch counters, one cell per bytecode offset.
+///
+/// # The problem
+///
+/// Branch recording used to cost, at every conditional branch the interpreter
+/// executed: a 64-bit fingerprint of `(class_id, name, descriptor)`, a shard
+/// `RwLock` read, an index probe, a `MethodKey` comparison, a
+/// `parking_lot::Mutex` acquire and an `FxHashMap` entry. That is why
+/// `CRATONVM_TIER_PGO` has never shipped on — the module header above says so
+/// in as many words: *"a GLOBAL cost paid for a LOCAL benefit"*.
+///
+/// The workaround was a window that switched profiling on globally when a
+/// method was nominated for the optimizing tier and off again when the compile
+/// finished, a few milliseconds later. Measured on a mixed probe, that window
+/// opened five times in a whole process — so the scheduler's `branch_counts`
+/// was empty at essentially every compile, and frequency-driven block layout,
+/// branch-polarity selection and every speculation built on top of them were
+/// running on static heuristics.
+///
+/// # The shape
+///
+/// One `AtomicU32` per bytecode offset per direction, indexed directly by pc.
+/// Recording is a bounds-checked index and one relaxed `fetch_add` — no hash,
+/// no lock, no map, and no contention beyond the cache line itself. This is
+/// HotSpot's MDO in miniature, and it is cheap enough to leave on.
+///
+/// Indexed by pc rather than by a compacted branch-site table so that recording
+/// needs no side lookup at all. The cost is 8 bytes per bytecode of the method,
+/// allocated lazily on the first branch recorded — 1.6 KB for a 200-byte
+/// method, and nothing at all for a method that never branches or never runs.
+///
+/// # Saturation
+///
+/// Every counter in this module saturates rather than wrapping, and this one
+/// must too: `record_receiver`'s comment already documents what wrapping costs
+/// — at 2^32 observations the majority direction reads as the minority and
+/// every decision downstream inverts. A relaxed `fetch_add` cannot saturate on
+/// its own, so a counter that has reached the ceiling is pinned back to it. The
+/// re-store races benignly against other recorders: the worst outcome is that
+/// one increment is lost from a counter that is already pinned at `u32::MAX`.
+pub struct BranchCounters {
+    taken: Box<[AtomicU32]>,
+    not_taken: Box<[AtomicU32]>,
+}
+
+impl std::fmt::Debug for BranchCounters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BranchCounters")
+            .field("bytecodes", &self.taken.len())
+            .finish()
+    }
+}
+
+impl BranchCounters {
+    /// Counters for a method of `code_len` bytes.
+    pub fn new(code_len: usize) -> Self {
+        let mk = || (0..code_len).map(|_| AtomicU32::new(0)).collect();
+        Self {
+            taken: mk(),
+            not_taken: mk(),
+        }
+    }
+
+    /// Record one observation. Out-of-range `pc` is dropped rather than
+    /// panicking: this is a heuristic on the interpreter's hot path, and a
+    /// disagreement between the recorded code length and the pc being executed
+    /// must never take the VM down from a dispatch loop.
+    #[inline]
+    pub fn record(&self, pc: usize, taken: bool) {
+        let bank = if taken { &self.taken } else { &self.not_taken };
+        let Some(cell) = bank.get(pc) else { return };
+        if cell.fetch_add(1, Ordering::Relaxed) == u32::MAX {
+            cell.store(u32::MAX, Ordering::Relaxed);
+        }
+    }
+
+    /// `(taken, not_taken)` at `pc`; `(0, 0)` for a pc with no observation.
+    #[inline]
+    pub fn counts(&self, pc: usize) -> (u32, u32) {
+        let t = self.taken.get(pc).map_or(0, |c| c.load(Ordering::Relaxed));
+        let n = self
+            .not_taken
+            .get(pc)
+            .map_or(0, |c| c.load(Ordering::Relaxed));
+        (t, n)
+    }
+
+    /// How many bytecodes this was sized for.
+    pub fn code_len(&self) -> usize {
+        self.taken.len()
+    }
+
+    /// Every pc with at least one observation, in pc order.
+    pub fn observed(&self) -> impl Iterator<Item = (usize, u32, u32)> + '_ {
+        (0..self.taken.len()).filter_map(move |pc| {
+            let (t, n) = self.counts(pc);
+            (t != 0 || n != 0).then_some((pc, t, n))
+        })
+    }
+}
+
+#[cfg(test)]
+mod branch_counter_tests {
+    use super::*;
+
+    #[test]
+    fn records_both_directions_independently() {
+        let c = BranchCounters::new(4);
+        c.record(1, true);
+        c.record(1, true);
+        c.record(1, false);
+        assert_eq!(c.counts(1), (2, 1));
+        assert_eq!(c.counts(0), (0, 0));
+        assert_eq!(c.observed().collect::<Vec<_>>(), vec![(1, 2, 1)]);
+    }
+
+    /// A pc past the end is DROPPED, never a panic: this runs on the
+    /// interpreter's dispatch loop, and a disagreement between the recorded
+    /// code length and the pc executing must not take the VM down.
+    #[test]
+    fn an_out_of_range_pc_is_dropped_rather_than_panicking() {
+        let c = BranchCounters::new(2);
+        c.record(9999, true);
+        assert_eq!(c.counts(9999), (0, 0));
+        assert!(c.observed().next().is_none());
+    }
+
+    /// Saturating, not wrapping. `record_receiver`'s comment states what
+    /// wrapping costs — the majority direction reading as the minority — and
+    /// this counter is read by the same consumers.
+    #[test]
+    fn a_counter_at_the_ceiling_stays_there() {
+        let c = BranchCounters::new(1);
+        c.taken[0].store(u32::MAX, Ordering::Relaxed);
+        c.record(0, true);
+        c.record(0, true);
+        assert_eq!(c.counts(0), (u32::MAX, 0));
+    }
+
+    /// The fold is what every compiler-side reader actually sees, and it must
+    /// ADD the two sources rather than let one shadow the other: a method can
+    /// legitimately be recorded through both (a frame with a
+    /// `CachedBytecodeMethod` uses the fast path, one without does not).
+    #[test]
+    fn snapshot_adds_the_flat_counters_to_the_map() {
+        let mut p = MethodProfile::default();
+        p.record_branch(3, true); // map side
+        let flat = p.flat_branches_for(8);
+        flat.record(3, true); // fast side, same pc
+        flat.record(5, false);
+
+        let snap = p.snapshot();
+        assert_eq!(snap.branches[&3].taken, 2, "both sources must be counted");
+        assert_eq!(snap.branches[&5].not_taken, 1);
+        assert!(
+            snap.flat_branches.is_none(),
+            "a snapshot must not fold twice",
+        );
+    }
+
+    /// Growing the array drains the old counts into the map rather than
+    /// dropping them, so `snapshot` still reports every observation.
+    #[test]
+    fn resizing_keeps_the_observations_already_recorded() {
+        let mut p = MethodProfile::default();
+        p.flat_branches_for(4).record(2, true);
+        let _bigger = p.flat_branches_for(64);
+        assert_eq!(p.snapshot().branches[&2].taken, 1);
+    }
 }
 
 impl MethodProfile {
+    /// A compiler-facing copy of this profile, with the lock-free branch
+    /// counters folded into [`Self::branches`].
+    ///
+    /// Every reader of a profile — the scheduler's `branch_counts`, the
+    /// branch-polarity hints, the inline planner — sees one map, exactly as
+    /// before the fast path existed. That is the whole point of folding here
+    /// rather than teaching each of them about two sources: a consumer that
+    /// forgot the second one would silently read a method as unprofiled.
+    ///
+    /// The two sources are ADDED rather than one replacing the other. They can
+    /// both be populated for one method: the fast path needs a frame carrying a
+    /// `CachedBytecodeMethod`, and a frame without one (the launcher's `main`,
+    /// some reflective entries) still records through the map. Adding is right
+    /// because each observation was recorded exactly once, into exactly one of
+    /// them.
+    ///
+    /// The result's own `flat_branches` is `None`: it is a snapshot, and a
+    /// second fold would double-count.
+    pub fn snapshot(&self) -> MethodProfile {
+        let mut branches = self.branches.clone();
+        if let Some(flat) = &self.flat_branches {
+            for (pc, taken, not_taken) in flat.observed() {
+                let entry = branches.entry(pc).or_default();
+                entry.taken = entry.taken.saturating_add(taken);
+                entry.not_taken = entry.not_taken.saturating_add(not_taken);
+            }
+        }
+        MethodProfile {
+            branches,
+            receivers: self.receivers.clone(),
+            loops: self.loops.clone(),
+            call_sites: self.call_sites.clone(),
+            flat_branches: None,
+        }
+    }
+
+    /// The lock-free counters for this method, allocating them on first use.
+    ///
+    /// `code_len` sizes the allocation. A later call with a LARGER length
+    /// reallocates — a method's code length is fixed, so this can only happen
+    /// if two callers disagree about it, and growing is the fail-safe direction
+    /// (the alternative silently drops every observation past the old end).
+    pub fn flat_branches_for(&mut self, code_len: usize) -> Arc<BranchCounters> {
+        match &self.flat_branches {
+            Some(c) if c.code_len() >= code_len => Arc::clone(c),
+            _ => {
+                let fresh = Arc::new(BranchCounters::new(code_len));
+                // Carry what the old (shorter) array holds into the MAP rather
+                // than into the new array. Both are folded together by
+                // `snapshot`, so the evidence survives, and draining into the
+                // map keeps this path free of any assumption about which cells
+                // of the new array a concurrent recorder may already be
+                // touching.
+                if let Some(old) = self.flat_branches.take() {
+                    for (pc, t, n) in old.observed() {
+                        let entry = self.branches.entry(pc).or_default();
+                        entry.taken = entry.taken.saturating_add(t);
+                        entry.not_taken = entry.not_taken.saturating_add(n);
+                    }
+                }
+                self.flat_branches = Some(Arc::clone(&fresh));
+                fresh
+            }
+        }
+    }
+
     /// Record a branch observation at `pc`.
     ///
     /// `taken` is `true` when the branch was taken (condition was true).
@@ -1286,6 +1532,30 @@ impl ProfileStore {
         slot.lock().record_branch(pc, taken);
     }
 
+    /// The lock-free branch counters for one method, allocating them on first
+    /// use.
+    ///
+    /// This is the SLOW half of the fast path, and it is meant to run once per
+    /// method rather than once per branch: it pays the fingerprint, the shard
+    /// lock and the slot mutex exactly as [`Self::record_branch_borrowed`]
+    /// does, and hands back a handle the caller can keep. Every recording
+    /// through that handle afterwards is one relaxed `fetch_add`.
+    ///
+    /// Deliberately NOT gated on [`is_profiling_enabled`]: the caller decides
+    /// whether to record, and a caller that already holds the handle must not
+    /// have to re-ask this function to find out.
+    pub fn branch_counters_borrowed(
+        &self,
+        class_id: u32,
+        method_name: &Arc<str>,
+        descriptor: &Arc<str>,
+        code_len: usize,
+    ) -> Arc<BranchCounters> {
+        let slot = self.get_or_insert_borrowed(class_id, method_name, descriptor);
+        let mut p = slot.lock();
+        p.flat_branches_for(code_len)
+    }
+
     /// Borrowed-key counterpart of [`record_backedge`].
     #[inline]
     pub fn record_backedge_borrowed(
@@ -1407,13 +1677,9 @@ impl ProfileStore {
             Arc::clone(read.get(key)?)
         };
         let p = slot_arc.lock();
-        // Snapshot: clone branch + receiver + loop maps
-        Some(MethodProfile {
-            branches: p.branches.clone(),
-            receivers: p.receivers.clone(),
-            loops: p.loops.clone(),
-            call_sites: p.call_sites.clone(),
-        })
+        // Snapshot: clone branch + receiver + loop maps, folding in the
+        // lock-free branch counters (`MethodProfile::snapshot`).
+        Some(p.snapshot())
     }
 
     /// Snapshot all method profiles: returns (MethodKey, MethodProfile) pairs.
@@ -1444,15 +1710,7 @@ impl ProfileStore {
         arcs.into_iter()
             .map(|(k, slot)| {
                 let p = slot.lock();
-                (
-                    k,
-                    MethodProfile {
-                        branches: p.branches.clone(),
-                        receivers: p.receivers.clone(),
-                        loops: p.loops.clone(),
-                        call_sites: p.call_sites.clone(),
-                    },
-                )
+                (k, p.snapshot())
             })
             .collect()
     }

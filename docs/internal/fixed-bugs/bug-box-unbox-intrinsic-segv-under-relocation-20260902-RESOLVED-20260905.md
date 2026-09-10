@@ -154,7 +154,7 @@ is why it did not show up in the perf work that landed the intrinsic.
 * only `SIGSEGV` counted as BAD. The `NullPointerException` and the
   fragmentation `OutOfMemoryError` this workload also produces both PRE-DATE
   the range (see
-  `known-issues/h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`),
+  `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md`),
   and counting them would have bisected to the wrong defect. One commit in the
   range failed twice with `rc=1` and was still, correctly, scored GOOD.
 
@@ -191,7 +191,7 @@ that relocation moved without rewriting — a root the safepoint's oop map does
 not name.
 
 That is the same family as
-`known-issues/h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`,
+`docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md`,
 which has been hunting an unnamed root in a compiled frame for days and whose
 oracle reports `local_oop=0`. This is a fresh, cheap, 100%-reproducible
 instance of that shape — and unlike that page's witness, this one has a switch
@@ -280,7 +280,8 @@ names — or, worse, names as holding the primitive that replaced it.
 `org.h2.test.jdbc.TestCachedQueryResults` SIGSEGVs 2 of 3 runs (185 s, 100 s) on
 merged dev with the box/unbox intrinsic at its new default -- OFF. The enable
 flag appears nowhere in those logs. Details and arms:
-`known-issues/h2/bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829.md`.
+`fixed-suite-bugs/h2-suite-bugs/bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829-RESOLVED-20260908.md`
+(retired 2026-09-08).
 
 What makes that workload crash is an experimental change
 (`CRATONVM_XT_PINNED_PEER_DEPTH=1` + `CRATONVM_XT_PEER_SHADOW_SCAN=1`) whose
@@ -470,7 +471,8 @@ peer that blocked with compiled frames below it resumes with every JIT-frame oop
 at its pre-move address.
 
 Pinning those peers is what the ZGC pinned-peer credit does
-(`bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829.md`), and pinning is
+(`bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829-RESOLVED-20260908.md`, retired
+2026-09-08), and pinning is
 not sufficient: a pin withholds the PAGE, and the conservative scan that finds
 what to pin cannot see a reference that never left a register. Hence the guard
 -- which refuses whenever any thread is in JIT -- being the only effective
@@ -556,7 +558,7 @@ That contradicts two things this page and its sibling rest on. This page says
 the failures pre-dating the bisect range are a `NullPointerException` and a
 fragmentation `OutOfMemoryError`; the blocker is neither, so a bisect scored the
 way this page describes would now score every commit BAD for the wrong reason.
-And `h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md` says `--Xmx
+And `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md` says `--Xmx
 1g` and `4g` are "clean over 1500 s each" -- at 1g this fails in 13-15 s. That
 page also calls its defect one with "no reproducer worth bisecting yet". It has
 one now, and it is 13 seconds long.
@@ -647,7 +649,8 @@ does not exist.
 
 It does **not** say the refusal prevents the OOM livelock. Pair 1's control is
 one instance of exactly the failure
-`h2/bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829.md` exists for, and
+`fixed-suite-bugs/h2-suite-bugs/bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829-RESOLVED-20260908.md`
+exists for, and
 pair 2's control did not reproduce it (2 OOMs, completed). One occurrence in
 two runs is a coin, not a mechanism. Recorded because it is the opposite of the
 direction this flag was feared to move things, and because that page may want

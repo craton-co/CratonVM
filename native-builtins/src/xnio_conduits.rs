@@ -1339,7 +1339,9 @@ fn notify_source_readable_with_delays(
         None => return,
     };
 
+    let source_pin = ctx.pin_native_root(source);
     for delay in delays {
+        let source = ctx.read_native_pin(source_pin, source);
         if *delay > 0 {
             thread::sleep(Duration::from_millis(*delay));
         }

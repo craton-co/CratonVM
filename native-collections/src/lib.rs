@@ -2142,12 +2142,12 @@ fn materialize_hm_int_fast(
         };
         let iter_pin_base = ctx.pin_native_root(key_ref);
         let value_pin = pin_value(ctx, value);
-        let current = ctx.read_native_pin(map_pin, this);
+        let mut current = ctx.read_native_pin(map_pin, this);
         let key_ref = ctx.read_native_pin(iter_pin_base, key_ref);
         let value = read_pinned_elem(ctx, value_pin, value);
         native_map_put_evict_pinned(
             ctx,
-            current,
+            &mut current,
             Value::Object(Some(key_ref)),
             value,
             true,
@@ -6642,22 +6642,53 @@ fn collect_via_real_iterator(
         Ok(_) => return Ok(Vec::new()),
     };
     let mut out = Vec::new();
-    loop {
-        match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
-            Ok(Some(Value::Int(n))) if n != 0 => {}
-            Err(e) => return Err(e),
-            _ => break,
+    let it_pin = ctx.pin_native_root(it);
+    // GC-safety for the ELEMENTS, not just the iterator.
+    //
+    // Every `hasNext`/`next` here runs arbitrary Java and can complete a moving
+    // young collection, and `out` is a plain Rust `Vec` — no GC root, no remap.
+    // So each turn of this loop can relocate every element collected so far,
+    // and the caller receives a vector whose earlier entries name pre-move
+    // addresses. It is the generic form of the defect: this one function backs
+    // `toArray`, `addAll`, `forEach` and `stream` for every foreign collection.
+    //
+    // MEASURED on BindableTests under `CRATONVM_DBG_GC_STRESS=262144`:
+    // `[deadref-pin]` fired inside `native_al_to_array`'s `pin_value_slice`,
+    // pinning an element this loop had already let go stale.
+    //
+    // `it_pin` is the group base, so one `unpin_native_roots(it_pin)` releases
+    // the iterator and every element pin together.
+    let mut handles: Vec<usize> = Vec::new();
+    let result = (|| -> Result<(), MethodCallFailed> {
+        loop {
+            let it = ctx.read_native_pin(it_pin, it);
+            match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
+                Ok(Some(Value::Int(n))) if n != 0 => {}
+                Err(e) => return Err(e),
+                _ => break,
+            }
+            match ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[]) {
+                Ok(Some(v)) => {
+                    handles.push(pin_value(ctx, v));
+                    out.push(v);
+                }
+                Err(e) => return Err(e),
+                _ => break,
+            }
+            // Safety bound against a misbehaving iterator that never reports done.
+            if out.len() > 16_777_216 {
+                break;
+            }
         }
-        match ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[]) {
-            Ok(Some(v)) => out.push(v),
-            Err(e) => return Err(e),
-            _ => break,
-        }
-        // Safety bound against a misbehaving iterator that never reports done.
-        if out.len() > 16_777_216 {
-            break;
-        }
+        Ok(())
+    })();
+    // Read every element back through its pin before the group is released —
+    // the point of taking them.
+    for (i, h) in handles.iter().enumerate() {
+        out[i] = read_pinned_elem(ctx, *h, out[i]);
     }
+    ctx.unpin_native_roots(it_pin);
+    result?;
     Ok(out)
 }
 
@@ -7547,16 +7578,33 @@ fn native_al_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // `_or_real` adds the real-`toArray()` fallback so a real-bytecode source
     // (ConcurrentLinkedQueue, LinkedList, …) the layout heuristics can't read
     // still contributes its elements.
-    let elems = collect_collection_elements_or_real(ctx, other)?;
+    // GC-SAFETY, and the pin has to be taken BEFORE this call rather than after
+    // it: `collect_collection_elements_or_real` sees through every wrapper and,
+    // for a real-bytecode source, calls the collection's own `toArray()` — so it
+    // allocates and can run arbitrary Java. `this` is live across it and was
+    // being read afterwards unprotected.
+    //
+    // MEASURED on BindableTests under `CRATONVM_DBG_GC_STRESS=262144`:
+    // `[deadref-pin]` caught the `pin_native_root(this)` that used to sit below
+    // this call being handed an address naming no live object — the pin
+    // faithfully preserving a dead value instead of protecting a live one.
+    let this_pin = ctx.pin_native_root(this);
+    let elems = match collect_collection_elements_or_real(ctx, other) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
+    let this = ctx.read_native_pin(this_pin, this);
     if elems.is_empty() {
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Int(0)));
     }
     let (_, my_size) = al_state(ctx, this);
     let my_size = my_size as usize;
-    // GC-SAFETY: same `al_ensure_capacity` allocation hazard -- `this` (used
-    // again in `al_set_size`) and every object-typed element of `elems`
-    // (written into `buf` below) are live across it.
-    let this_pin = ctx.pin_native_root(this);
+    // Same `al_ensure_capacity` allocation hazard as `native_al_add`: every
+    // object-typed element of `elems` is written into `buf` after it.
     let (_, elems_handles) = pin_value_slice(ctx, &elems);
     let this = ctx.read_native_pin(this_pin, this);
     let buf = al_ensure_capacity(ctx, this, my_size + elems.len())?;
@@ -8752,7 +8800,9 @@ fn native_sli_for_each_remaining(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // Bounded by the size read at entry, re-read each round: the consumer can
     // legally mutate nothing here, but a shrinking view must end the loop
     // rather than index past it.
+    let consumer_pin = ctx.pin_native_root(consumer);
     loop {
+        let consumer = ctx.read_native_pin(consumer_pin, consumer);
         let Some((view, cursor, _)) = sli_state(&*ctx, this) else {
             return Ok(None);
         };
@@ -12345,10 +12395,7 @@ fn native_hashtable_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -
         if !load_factor.is_finite() || *load_factor <= 0.0 {
             return Err(
                 cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                    message: format!(
-                        "Illegal Load: {}",
-                        java_float_to_string(*load_factor)
-                    ),
+                    message: format!("Illegal Load: {}", java_float_to_string(*load_factor)),
                 }
                 .into(),
             );
@@ -12999,7 +13046,7 @@ fn native_map_put_evict(
     let value_pin = pin_value(ctx, value);
     let result = native_map_put_evict_pinned(
         ctx,
-        this,
+        &mut this,
         key_val,
         value,
         evict,
@@ -13031,7 +13078,7 @@ pub fn native_hashmap_put_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let mat_base = ctx.pin_native_root(this);
     let mat_key = pin_value(ctx, key_val);
     let mat_val = pin_value(ctx, value);
-    let this = materialize_hm_int_fast(ctx, this)?;
+    let mut this = materialize_hm_int_fast(ctx, this)?;
     key_val = read_pinned_elem(ctx, mat_key, key_val);
     value = read_pinned_elem(ctx, mat_val, value);
     ctx.unpin_native_roots(mat_base);
@@ -13040,7 +13087,7 @@ pub fn native_hashmap_put_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let value_pin = pin_value(ctx, value);
     let result = native_map_put_evict_pinned(
         ctx,
-        this,
+        &mut this,
         key_val,
         value,
         true,
@@ -13054,7 +13101,7 @@ pub fn native_hashmap_put_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 
 fn native_map_put_evict_pinned(
     ctx: &mut dyn NativeContext,
-    this: ObjectRef,
+    this: &mut ObjectRef,
     key_val: Value,
     value: Value,
     evict: bool,
@@ -13066,7 +13113,7 @@ fn native_map_put_evict_pinned(
     // (`CF_IDENTITY_MAP`) instead of virtual `hashCode()`/`equals()` — see
     // `map_hash_key_identity`. `this` is fresh here (just pinned by the
     // caller, no GC-triggering call has run yet), so this read is safe.
-    let identity_mode = is_identity_map_receiver(ctx, this);
+    let identity_mode = is_identity_map_receiver(ctx, *this);
 
     // Handle null key: hash=0, bucket=0, key field stores null
     // hashCode() can collect before this helper reaches its first field access;
@@ -13084,7 +13131,7 @@ fn native_map_put_evict_pinned(
         Value::Object(None) => (0, true),
         _ => return Ok(Some(Value::Object(None))), // non-object keys not supported
     };
-    let mut this = ctx.read_native_pin(put_pin_base, this);
+    *this = ctx.read_native_pin(put_pin_base, *this);
     let key_val = read_pinned_elem(ctx, key_pin, key_val);
     let value = read_pinned_elem(ctx, value_pin, value);
     let key_ref = match key_val {
@@ -13100,12 +13147,12 @@ fn native_map_put_evict_pinned(
     // were None, dropping `type` from `@ComponentScan.Filter` AnnotationAttributes
     // and surfacing as `IllegalArgumentException: Attribute 'type' not found`
     // deep in Spring's bean factory).
-    let (initial_buckets, size, cap) = map_state(ctx, this);
+    let (initial_buckets, size, cap) = map_state(ctx, *this);
     if initial_buckets.is_none() || size + 1 > (cap * 3) / 4 {
-        map_resize(ctx, &mut this);
+        map_resize(ctx, this);
     }
 
-    let (buckets, size, cap) = map_state(ctx, this);
+    let (buckets, size, cap) = map_state(ctx, *this);
     let buckets = match buckets {
         Some(b) => b,
         None => return Ok(Some(Value::Object(None))),
@@ -13145,7 +13192,7 @@ fn native_map_put_evict_pinned(
         if walk_count > CHAIN_WALK_LIMIT {
             eprintln!(
                 "[HM-PUT-GUARD] aborting chain walk at {} nodes (suspected cycle); map={:?} idx={} cap={}",
-                walk_count, this, idx, cap
+                walk_count, *this, idx, cap
             );
             return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                 message: "hashmap chain exceeded safety cap; possible hash-collision DoS"
@@ -13237,7 +13284,7 @@ fn native_map_put_evict_pinned(
             if std::ptr::eq(nx.as_ptr(), node.as_ptr()) {
                 eprintln!(
                     "[HM-PUT-GUARD] self-cycle node detected at walk {}; map={:?} idx={}",
-                    walk_count, this, idx
+                    walk_count, *this, idx
                 );
                 break;
             }
@@ -13258,7 +13305,7 @@ fn native_map_put_evict_pinned(
     // it here -- before it is used to seed the new `this_pin` below -- to
     // guarantee `this` is current regardless of how many GCs the walk
     // triggered. See wildfly-parallel-boot-stale-objectref-residual.md.
-    this = ctx.read_native_pin(put_pin_base, this);
+    *this = ctx.read_native_pin(put_pin_base, *this);
 
     // Key not found — append at the TAIL of the chain. This matches HotSpot
     // HashMap.putVal (JDK 8+), which links the new node after the last bin
@@ -13278,7 +13325,7 @@ fn native_map_put_evict_pinned(
     // it — the observed `{raw ptr, 0}` corrupt Value cells in a neighboring
     // live object (Fork6Hard$StrTask / Thread mirror). Pin the cross-allocation
     // roots and re-read them after the allocation.
-    let this_pin = ctx.pin_native_root(this);
+    let this_pin = ctx.pin_native_root(*this);
     let tail_pin = tail_node.map(|t| ctx.pin_native_root(t));
     // `key_val`/`value` are also consumed AFTER the alloc (into new_node's
     // slots); the bare local copies would go stale even though the natives
@@ -13343,7 +13390,7 @@ fn native_map_put_evict_pinned(
     // has bound its node to the REAL `java/util/LinkedHashMap$Entry` since
     // `7bf427af1`, and that probe's set-membership, map-view, serialization and
     // 2000-entry-resize sections all pass over it.
-    let node_cid = map_node_class_for(ctx, this, key_val, value);
+    let node_cid = map_node_class_for(ctx, *this, key_val, value);
     // `H23-2` §7.1's enforcement, written. `node_cid == 0` means this mapping
     // carries a primitive `Value` and gets the untyped carrier; if the table it
     // is about to head is typed to the class this receiver's REAL nodes use,
@@ -13358,11 +13405,11 @@ fn native_map_put_evict_pinned(
     // also self-limiting: the replacement array carries the sentinel id, which
     // is never equal to `want`.
     if node_cid == ClassId::new(0) {
-        let want = map_carrier_class_for_receiver(ctx, this);
-        let this = ctx.read_native_pin(this_pin, this);
+        let want = map_carrier_class_for_receiver(ctx, *this);
+        *this = ctx.read_native_pin(this_pin, *this);
         let buckets_now = ctx.read_native_pin(buckets_pin, buckets);
         if want != ClassId::new(0) && ctx.class_id_of_object(buckets_now) == want {
-            degrade_bucket_table_to_untyped(ctx, this_pin, this, buckets_pin, buckets_now, cap);
+            degrade_bucket_table_to_untyped(ctx, this_pin, *this, buckets_pin, buckets_now, cap);
         }
     }
     // Every reference used below is re-read from a live pin, so the two
@@ -13399,9 +13446,9 @@ fn native_map_put_evict_pinned(
     // reached from `resync_view_set`'s per-key `native_map_put` loop during
     // WildFly parallel-extension-add). Re-read `this` from its pin
     // immediately before this last use.
-    let this = ctx.read_native_pin(this_pin, this);
-    set_map_size(ctx, this, size + 1);
-    bump_map_mod_count(ctx, this);
+    *this = ctx.read_native_pin(this_pin, *this);
+    set_map_size(ctx, *this, size + 1);
+    bump_map_mod_count(ctx, *this);
     ctx.unpin_native_roots(this_pin);
 
     Ok(Some(Value::Object(None))) // no old value
@@ -14873,7 +14920,7 @@ fn native_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let sync = wants_synchronized_views(&*ctx, this);
     let this_pin = ctx.pin_native_root(this);
     let keys = map_collect_keys(ctx, this);
-    let set = make_view_set_of(ctx, this, VIEW_KIND_KEYSET, &keys)?;
+    let set = make_view_set_of(ctx, &mut this, VIEW_KIND_KEYSET, &keys)?;
     let set = if sync {
         wrap_synchronized_view(ctx, set, true)?
     } else {
@@ -14980,7 +15027,7 @@ pub fn make_live_values_list(
         let val = read_pinned_elem(ctx, val_handles[i], *val);
         ctx.set_array_element(buf, i, val);
     }
-    let source = ctx.read_native_pin(source_pin, source);
+    let mut source = ctx.read_native_pin(source_pin, source);
     ctx.set_array_element(buf, cap - 1, Value::Object(Some(source)));
     let list = ctx.read_native_pin(list_pin, list);
     store_view_carrier_backref(ctx, list, source);
@@ -15024,8 +15071,8 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let set = alloc_set_view_carrier(ctx, carrier)?;
     let set_pin = ctx.pin_native_root(set);
     let cap = std::cmp::max(entry_count.next_power_of_two(), MAP_DEFAULT_CAPACITY);
-    let this = ctx.read_native_pin(this_pin, this);
-    let backing_map = alloc_view_backing(ctx, this, VIEW_KIND_ENTRYSET, cap)?;
+    let mut this = ctx.read_native_pin(this_pin, this);
+    let backing_map = alloc_view_backing(ctx, &mut this, VIEW_KIND_ENTRYSET, cap)?;
     let backing_pin = ctx.pin_native_root(backing_map);
     let set = ctx.read_native_pin(set_pin, set);
     let backing_map = ctx.read_native_pin(backing_pin, backing_map);
@@ -15159,8 +15206,8 @@ pub fn make_static_entry_set(
     let set = alloc_set_view_carrier(ctx, carrier)?;
     let set_pin = ctx.pin_native_root(set);
     let cap = std::cmp::max(entries.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
-    let source_now = ctx.read_native_pin(source_pin, source);
-    let backing_map = alloc_view_backing(ctx, source_now, VIEW_KIND_ENTRYSET_STATIC, cap)?;
+    let mut source_now = ctx.read_native_pin(source_pin, source);
+    let backing_map = alloc_view_backing(ctx, &mut source_now, VIEW_KIND_ENTRYSET_STATIC, cap)?;
     let backing_pin = ctx.pin_native_root(backing_map);
     let set_now = ctx.read_native_pin(set_pin, set);
     hs_set_backing_map(ctx, set_now, backing_map);
@@ -15226,10 +15273,10 @@ pub fn make_static_entry_set(
 /// machinery (`native_hs_remove` consults the view backing).
 pub fn make_static_key_set(
     ctx: &mut dyn NativeContext,
-    source: ObjectRef,
+    source: &mut ObjectRef,
     keys: &[Value],
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let sync = wants_synchronized_views(&*ctx, source);
+    let sync = wants_synchronized_views(&*ctx, *source);
     let set = make_view_set_of(ctx, source, VIEW_KIND_KEYSET_STATIC, keys)?;
     if sync {
         return wrap_synchronized_view(ctx, set, true);
@@ -15706,7 +15753,7 @@ fn static_view_accessor(kind: i32) -> Option<(&'static str, &'static str)> {
 /// the high slots.
 fn alloc_view_backing(
     ctx: &mut dyn NativeContext,
-    source: ObjectRef,
+    source: &mut ObjectRef,
     kind: i32,
     cap: usize,
 ) -> Result<ObjectRef, MethodCallFailed> {
@@ -15715,8 +15762,7 @@ fn alloc_view_backing(
     // backing allocation, and `buckets` outlives the last two — all as bare
     // Rust locals. A freshly allocated bucket array that nothing references yet
     // is reclaimed outright by a collection here. See `rooted_across`.
-    let mut source = source;
-    let mut buckets = rooted_across(ctx, &mut [&mut source], |ctx| alloc_ref_array(ctx, cap));
+    let mut buckets = rooted_across(ctx, &mut [source], |ctx| alloc_ref_array(ctx, cap));
 
     // Build the view backing with the REAL `java/util/HashMap` field layout
     // (buckets at the resolved `table` slot), NOT the legacy synthetic
@@ -15737,7 +15783,7 @@ fn alloc_view_backing(
     // resolved `size`), so the view's own population/iterator/remove natives are
     // unaffected. Falls back to the legacy synthetic `MapViewBacking` layout if
     // the real HashMap class is not yet resolvable (early bootstrap).
-    rooted_across(ctx, &mut [&mut source, &mut buckets], |ctx| {
+    rooted_across(ctx, &mut [source, &mut buckets], |ctx| {
         let _ = ctx.ensure_class_initialized("java/util/HashMap");
     });
     let f_table = ctx.resolve_field_index("java/util/HashMap", "table");
@@ -15764,7 +15810,7 @@ fn alloc_view_backing(
         .max()
         .unwrap_or(0);
         let n_fields = std::cmp::max(real_max + 1, VIEW_BACKING_FIELDS);
-        let backing = rooted_across(ctx, &mut [&mut source, &mut buckets], |ctx| {
+        let backing = rooted_across(ctx, &mut [source, &mut buckets], |ctx| {
             ctx.alloc_object(hashmap_cid, n_fields)
         });
         ctx.set_field(backing, f_table, Value::Object(Some(buckets)));
@@ -15788,19 +15834,19 @@ fn alloc_view_backing(
             ctx.set_field(backing, f, Value::Object(None));
         }
         ctx.set_field(backing, VIEW_BACKING_KIND_SLOT, Value::Int(kind));
-        ctx.set_field(backing, VIEW_BACKING_SRC_SLOT, Value::Object(Some(source)));
+        ctx.set_field(backing, VIEW_BACKING_SRC_SLOT, Value::Object(Some(*source)));
         return Ok(backing);
     }
 
     // Fallback: legacy synthetic `(buckets, size, capacity)` MapViewBacking
     // layout, used before the real `java/util/HashMap` class is resolvable.
-    let backing = rooted_across(ctx, &mut [&mut source, &mut buckets], |ctx| {
+    let backing = rooted_across(ctx, &mut [source, &mut buckets], |ctx| {
         try_alloc_synthetic(ctx, "cratonvm/util/MapViewBacking", VIEW_BACKING_FIELDS)
     })?;
     publish_map_table(ctx, backing, buckets, cap as i32);
     set_map_size(ctx, backing, 0);
     ctx.set_field(backing, VIEW_BACKING_KIND_SLOT, Value::Int(kind));
-    ctx.set_field(backing, VIEW_BACKING_SRC_SLOT, Value::Object(Some(source)));
+    ctx.set_field(backing, VIEW_BACKING_SRC_SLOT, Value::Object(Some(*source)));
     Ok(backing)
 }
 
@@ -16426,7 +16472,7 @@ fn collect_entries_via_iterator_inner(
 /// the source map (+ kind) so removals write through.
 fn make_view_set_of(
     ctx: &mut dyn NativeContext,
-    source: ObjectRef,
+    source: &mut ObjectRef,
     kind: i32,
     elems: &[Value],
 ) -> Result<ObjectRef, MethodCallFailed> {
@@ -16439,19 +16485,19 @@ fn make_view_set_of(
     // further down dispatches `hashCode()`, which is arbitrary Java and may
     // mutate the source — in which case the generation moves past this stamp
     // and the next read rebuilds. That is the safe direction.
-    let source_gen = view_source_generation(&*ctx, source, kind);
+    let source_gen = view_source_generation(&*ctx, *source, kind);
     let (elem_base, elem_handles) = pin_value_slice(ctx, elems);
-    let source_pin = ctx.pin_native_root(source);
+    let source_pin = ctx.pin_native_root(*source);
     let first_pin = if elem_base == usize::MAX {
         source_pin
     } else {
         elem_base
     };
-    let carrier = set_view_carrier_for(&*ctx, source, kind);
+    let carrier = set_view_carrier_for(&*ctx, *source, kind);
     let set = alloc_set_view_carrier(ctx, carrier)?;
     let set_pin = ctx.pin_native_root(set);
     let cap = std::cmp::max(elems.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
-    let source = ctx.read_native_pin(source_pin, source);
+    *source = ctx.read_native_pin(source_pin, *source);
     let backing = alloc_view_backing(ctx, source, kind, cap)?;
     let backing_pin = ctx.pin_native_root(backing);
     // A fresh allocation can land on an address a dead overlay tenant was
@@ -16464,9 +16510,9 @@ fn make_view_set_of(
     // The declared enclosing-instance field, next to the undeclared backing
     // slot above. `source` was re-read from its pin two lines up and nothing
     // has allocated since.
-    let source = ctx.read_native_pin(source_pin, source);
+    *source = ctx.read_native_pin(source_pin, *source);
     let set = ctx.read_native_pin(set_pin, set);
-    store_set_view_backref(ctx, set, source);
+    store_set_view_backref(ctx, set, *source);
     let sentinel = Value::Int(1);
     for (i, elem) in elems.iter().enumerate() {
         let backing = ctx.read_native_pin(backing_pin, backing);
@@ -18506,7 +18552,9 @@ pub fn make_hashset_with_elements(
             let mut existing_head = ctx.get_array_element(buckets, idx);
             let mut dup = false;
             let mut probe = existing_head;
+            let key_obj_pin = ctx.pin_native_root(key_obj);
             while let Value::Object(Some(probe_obj)) = probe {
+                let key_obj = ctx.read_native_pin(key_obj_pin, key_obj);
                 let probe_hash = match ctx.get_field(probe_obj, n_hash) {
                     Value::Int(hash) => hash,
                     _ => 0,
@@ -23853,7 +23901,33 @@ fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    let this = resync_values_view(ctx, this)?;
+    // GC-safety, and it has to happen HERE rather than at the pin group below.
+    //
+    // `resync_values_view` and `al_or_collection_elements` both allocate - the
+    // second materialises a whole element vector through the receiver's real
+    // iterator, which runs Java - so a moving young collection can relocate
+    // `this` and `action` before either is pinned. `action` is the one that
+    // bites, because nothing between here and `invoke_virtual` reads it: the
+    // pin-time canary caught `ctx.pin_native_root(action)` receiving an address
+    // that named no live object on BindableTests under
+    // `CRATONVM_DBG_GC_STRESS`, and the dead receiver reached `accept()`.
+    //
+    // `action_pin` is the group base: every pin taken below it is released by
+    // the single `unpin_native_roots(action_pin)` on the way out.
+    let action_pin = ctx.pin_native_root(action);
+    let this_pin_pre = ctx.pin_native_root(this);
+    let this = ctx.read_native_pin(this_pin_pre, this);
+    let this = match resync_values_view(ctx, this) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(action_pin);
+            return Err(e);
+        }
+    };
+    // Pin what `resync_values_view` RETURNED, not what it was given: it can
+    // rebuild the carrier, and a freshly allocated one is covered by no pin
+    // taken before the call.
+    let this_pin_mid = ctx.pin_native_root(this);
     // Collect elements first to avoid borrowing issues during invoke_virtual.
     // Use the generic helper so non-ArrayList collections (EnumSet/TreeSet/…)
     // routed here through the AbstractCollection/Iterable interface natives are
@@ -23861,7 +23935,15 @@ fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // (Before 2026-08-01 the helper had no such fallback — this comment
     // described `native_al_to_array`'s inlined copy of it, not what `forEach`
     // actually did, so an unmodelled receiver's `forEach` visited nothing.)
-    let elems = al_or_collection_elements(ctx, this)?;
+    let elems = match al_or_collection_elements(ctx, this) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(action_pin);
+            return Err(e);
+        }
+    };
+    let this = ctx.read_native_pin(this_pin_mid, this);
+    let action = ctx.read_native_pin(action_pin, action);
     // GC-safety: each `accept()` body runs arbitrary Java bytecode via
     // invoke_virtual and can allocate → moving young GC relocates `action` and
     // any object-typed element. The raw ObjectRefs captured here are NOT GC
@@ -23881,7 +23963,6 @@ fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // guessed, which is the direction `al_mod_count_slot`'s own doc calls safe.
     // `this` is pinned FIRST so the whole group still unwinds with one call.
     let this_pin = ctx.pin_native_root(this);
-    let expected_mod = al_mod_count(ctx, this);
     let pin_base = ctx.pin_native_root(action);
     let elem_pins: Vec<(Value, Option<(usize, ObjectRef)>)> = elems
         .iter()
@@ -23890,6 +23971,10 @@ fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             _ => (*v, None),
         })
         .collect();
+    // AFTER the pins, not before: it reads a field through the receiver, and
+    // every reference this native still held bare at that point would have
+    // been unprotected across it.
+    let expected_mod = al_mod_count(ctx, this);
     let mut result: MethodCallResult = Ok(None);
     for (orig, handle) in &elem_pins {
         let this_cur = ctx.read_native_pin(this_pin, this);
@@ -23919,7 +24004,8 @@ fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                 Err(cratonvm_types::error::RuntimeError::ConcurrentModificationException.into());
         }
     }
-    ctx.unpin_native_roots(this_pin);
+    // `action_pin` is the group base - see its comment above.
+    ctx.unpin_native_roots(action_pin);
     result
 }
 
@@ -28505,7 +28591,7 @@ fn native_stream_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// invokes a lambda and never errors — `?` at call sites is then a no-op.)
 fn stream_elements(
     ctx: &mut dyn NativeContext,
-    mut stream: ObjectRef,
+    stream: &mut ObjectRef,
 ) -> Result<Vec<Value>, MethodCallFailed> {
     // GC-SAFETY: `materialize_lazy_stream`/`stream_apply_chain_full` (and the
     // `toArray()` fallback below) allocate / drive an allocating spliterator
@@ -28513,11 +28599,19 @@ fn stream_elements(
     // (class lookup, field read, toArray dispatch) must see the forwarded
     // reference, or we read a zeroed header and mis-dispatch
     // (`Object.toArray()` / empty stream). Pin it.
-    let stream_pin = ctx.pin_native_root(stream);
+    //
+    // `&mut ObjectRef`, NOT a by-value copy, and that is the whole contract:
+    // the relocation this pin absorbs is just as visible to the CALLER, which
+    // in ~85 of the sites below goes on using its own receiver afterwards.
+    // This used to be `mut stream: ObjectRef` while `stream_elements_mut`'s
+    // doc comment asserted "`stream_elements` is now `&mut`" — the refresh
+    // reached the copy and died at the closing brace. See
+    // `docs/internal/audits/natives-refresh-contract-laundered-by-a-by-value-wrapper-RETIRED-20260907.md`.
+    let stream_pin = ctx.pin_native_root(*stream);
     // For our synthetic Stream object, field 0 holds an Object[] of elements.
     // But some streams are real JDK ReferencePipeline instances (returned by
     // e.g. Spring's MergedAnnotations.stream()) — materialize those via toArray().
-    let class_id = ctx.class_id_of_object(stream);
+    let class_id = ctx.class_id_of_object(*stream);
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
     // W7-65: `AbstractPipeline.linkedOrConsumed`. This is the single funnel
     // every operation on a synthetic stream reaches, so it is the single place
@@ -28528,11 +28622,15 @@ fn stream_elements(
     // Nothing has allocated between `stream_pin` and here — `class_id_of_object`
     // and `class_name_of_id` are pure lookups — so `stream` is still current.
     let linked = if class_name == "java/util/stream/Stream" {
-        stream_link_or_consume(ctx, stream)
+        stream_link_or_consume(ctx, *stream)
     } else {
         Ok(())
     };
-    // Single-exit so the `stream` pin is always released (see GC-SAFETY above).
+    // Single-exit so the `stream` pin is always released AND the caller's
+    // reference is always refreshed (see GC-SAFETY above). The
+    // `materialize_lazy_stream(..)?` below used to `?` straight out of the
+    // function, past both the write-back and the `unpin_native_roots` this
+    // comment promises; it is a `match` now.
     let result: Result<Vec<Value>, MethodCallFailed> = if let Err(e) = linked {
         Err(e)
     } else if is_synthetic_stream(&class_name) {
@@ -28550,21 +28648,26 @@ fn stream_elements(
         // element at a time. Doing the plain `materialize_lazy_stream` drain
         // unconditionally BEFORE this check (the old code) ran the raw
         // dumb-collector drain fully disconnected from the chain -- the bug.
-        if lazy_streams_enabled() && stream_has_chain(ctx, stream) {
-            stream_apply_chain_full(ctx, stream)
+        if lazy_streams_enabled() && stream_has_chain(ctx, *stream) {
+            stream_apply_chain_full(ctx, *stream)
         } else {
             // No chain: either an ordinary eager stream, or a lazy stream with
             // no intermediate ops at all (e.g. `StreamSupport.stream(sp,
             // false).collect(...)` directly) -- draining it raw here is
             // correct/unavoidable in that case (there is no downstream
             // processing to interleave with `tryAdvance` either way).
-            materialize_lazy_stream(ctx, &mut stream)?;
-            let stream = ctx.read_native_pin(stream_pin, stream);
-            if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
-                let len = ctx.array_length(arr);
-                Ok((0..len).map(|i| ctx.get_array_element(arr, i)).collect())
-            } else {
-                Ok(Vec::new())
+            match materialize_lazy_stream(ctx, stream) {
+                Err(e) => Err(e),
+                Ok(()) => {
+                    *stream = ctx.read_native_pin(stream_pin, *stream);
+                    if let Value::Object(Some(arr)) = ctx.get_field(*stream, STREAM_FIELD_ELEMENTS)
+                    {
+                        let len = ctx.array_length(arr);
+                        Ok((0..len).map(|i| ctx.get_array_element(arr, i)).collect())
+                    } else {
+                        Ok(Vec::new())
+                    }
+                }
             }
         }
     } else {
@@ -28572,7 +28675,7 @@ fn stream_elements(
         // materialize via the object toArray. (Real PRIMITIVE pipelines don't
         // reach here — `Arrays.stream(int[])` / `IntStream.of(...)` are
         // intercepted to produce synthetic primitive streams.)
-        match ctx.invoke_virtual(stream, "toArray", "()[Ljava/lang/Object;", &[]) {
+        match ctx.invoke_virtual(*stream, "toArray", "()[Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(arr)))) => {
                 let len = ctx.array_length(arr);
                 Ok((0..len).map(|i| ctx.get_array_element(arr, i)).collect())
@@ -28581,6 +28684,10 @@ fn stream_elements(
             Err(e) => Err(e),
         }
     };
+    // The write-back is what makes the `&mut` mean anything: on every arm --
+    // including the two that ran real bytecode -- the caller's own reference
+    // becomes the post-GC address before this returns.
+    *stream = ctx.read_native_pin(stream_pin, *stream);
     ctx.unpin_native_roots(stream_pin);
     result
 }
@@ -28605,15 +28712,6 @@ fn is_synthetic_stream(class_name: &str) -> bool {
     )
 }
 
-/// Back-compat alias: `stream_elements` is now `&mut` and itself materialises
-/// lazy streams + real `ReferencePipeline`s via `toArray`.
-fn stream_elements_mut(
-    ctx: &mut dyn NativeContext,
-    stream: ObjectRef,
-) -> Result<Vec<Value>, MethodCallFailed> {
-    stream_elements(ctx, stream)
-}
-
 /// Materialise a possibly-REAL primitive stream's elements. CratonVM's synthetic
 /// primitive streams keep elements in `STREAM_FIELD_ELEMENTS`, but factories like
 /// `IntStream.of(int...)` delegate to `Arrays.stream` and return a real
@@ -28628,30 +28726,40 @@ fn stream_elements_mut(
 /// `_ => Vec::new()` turned both a thrown exception and a strict refusal into
 /// "that sub-stream was empty", which `flatMap` then concatenated into its
 /// result as if it were.
+///
+/// `&mut` for the same reason [`stream_elements`] is: `materialize_lazy_stream`
+/// states a refresh contract in its parameter mode, and a by-value wrapper
+/// satisfies it with a copy the caller never sees.
 fn prim_stream_values(
     ctx: &mut dyn NativeContext,
-    mut stream: ObjectRef,
+    stream: &mut ObjectRef,
     toarray_desc: &str,
 ) -> Result<Vec<Value>, MethodCallFailed> {
-    materialize_lazy_stream(ctx, &mut stream)?;
+    materialize_lazy_stream(ctx, stream)?;
     let cn = ctx
-        .class_name_of_id(ctx.class_id_of_object(stream))
+        .class_name_of_id(ctx.class_id_of_object(*stream))
         .unwrap_or_default();
     if is_synthetic_stream(&cn) {
-        if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
+        if let Value::Object(Some(arr)) = ctx.get_field(*stream, STREAM_FIELD_ELEMENTS) {
             let len = ctx.array_length(arr);
             return Ok((0..len).map(|i| ctx.get_array_element(arr, i)).collect());
         }
         return Ok(Vec::new());
     }
-    match ctx.invoke_virtual(stream, "toArray", toarray_desc, &[]) {
+    // A REAL pipeline: `toArray` is bytecode, so it can collect and relocate
+    // the receiver. Refresh the caller's reference across it.
+    let stream_pin = ctx.pin_native_root(*stream);
+    let out = match ctx.invoke_virtual(*stream, "toArray", toarray_desc, &[]) {
         Ok(Some(Value::Object(Some(arr)))) => {
             let len = ctx.array_length(arr);
             Ok((0..len).map(|i| ctx.get_array_element(arr, i)).collect())
         }
         Err(e) => Err(e),
         _ => Ok(Vec::new()),
-    }
+    };
+    *stream = ctx.read_native_pin(stream_pin, *stream);
+    ctx.unpin_native_roots(stream_pin);
+    out
 }
 
 // JDK-ONLY-CLASSIFY: unknown — needs census. Same abstract-interface hazard as
@@ -29044,7 +29152,7 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
         "mapToLong",
         "(Ljava/util/function/ToLongFunction;)Ljava/util/stream/LongStream;",
         |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
@@ -29052,7 +29160,7 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(f))) => *f,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let elements = stream_elements(ctx, this)?;
+            let elements = stream_elements(ctx, &mut this)?;
             let mapped: Vec<Value> = elements
                 .iter()
                 .map(|e| {
@@ -29062,7 +29170,7 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
                         .unwrap_or(Value::Long(0))
                 })
                 .collect();
-            let stream = try_alloc_synthetic(ctx, "java/util/stream/LongStream", 1)?;
+            let mut stream = try_alloc_synthetic(ctx, "java/util/stream/LongStream", 1)?;
             let arr = alloc_ref_array(ctx, mapped.len());
             for (i, v) in mapped.iter().enumerate() {
                 ctx.set_array_element(arr, i, *v);
@@ -29081,7 +29189,7 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
         "flatMapToInt",
         "(Ljava/util/function/Function;)Ljava/util/stream/IntStream;",
         |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
@@ -29089,9 +29197,14 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(f))) => *f,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let elements = stream_elements_mut(ctx, this)?;
+            // GC-safety: `apply` is an arbitrary user lambda, dispatched
+            // on `mapper` once per element, and `mapper` came out of `args`
+            // before `stream_elements` re-entered Java.
+            let mapper_pin = ctx.pin_native_root(mapper);
+            let elements = stream_elements(ctx, &mut this)?;
             let mut flat: Vec<Value> = Vec::new();
             for e in elements {
+                let mapper = ctx.read_native_pin(mapper_pin, mapper);
                 let sub = ctx
                     .invoke_virtual(
                         mapper,
@@ -29112,7 +29225,7 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
                     }
                 }
             }
-            let stream = try_alloc_synthetic(ctx, "java/util/stream/IntStream", 1)?;
+            let mut stream = try_alloc_synthetic(ctx, "java/util/stream/IntStream", 1)?;
             let arr = alloc_ref_array(ctx, flat.len());
             for (i, v) in flat.iter().enumerate() {
                 ctx.set_array_element(arr, i, *v);
@@ -29127,7 +29240,7 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
         "flatMapToLong",
         "(Ljava/util/function/Function;)Ljava/util/stream/LongStream;",
         |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
@@ -29135,9 +29248,14 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(f))) => *f,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let elements = stream_elements_mut(ctx, this)?;
+            // GC-safety: `apply` is an arbitrary user lambda, dispatched
+            // on `mapper` once per element, and `mapper` came out of `args`
+            // before `stream_elements` re-entered Java.
+            let mapper_pin = ctx.pin_native_root(mapper);
+            let elements = stream_elements(ctx, &mut this)?;
             let mut flat: Vec<Value> = Vec::new();
             for e in elements {
+                let mapper = ctx.read_native_pin(mapper_pin, mapper);
                 let sub = ctx
                     .invoke_virtual(
                         mapper,
@@ -29158,7 +29276,7 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
                     }
                 }
             }
-            let stream = try_alloc_synthetic(ctx, "java/util/stream/LongStream", 1)?;
+            let mut stream = try_alloc_synthetic(ctx, "java/util/stream/LongStream", 1)?;
             let arr = alloc_ref_array(ctx, flat.len());
             for (i, v) in flat.iter().enumerate() {
                 ctx.set_array_element(arr, i, *v);
@@ -29173,7 +29291,7 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
         "flatMapToDouble",
         "(Ljava/util/function/Function;)Ljava/util/stream/DoubleStream;",
         |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
@@ -29181,9 +29299,14 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(f))) => *f,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let elements = stream_elements_mut(ctx, this)?;
+            // GC-safety: `apply` is an arbitrary user lambda, dispatched
+            // on `mapper` once per element, and `mapper` came out of `args`
+            // before `stream_elements` re-entered Java.
+            let mapper_pin = ctx.pin_native_root(mapper);
+            let elements = stream_elements(ctx, &mut this)?;
             let mut flat: Vec<Value> = Vec::new();
             for e in elements {
+                let mapper = ctx.read_native_pin(mapper_pin, mapper);
                 let sub = ctx
                     .invoke_virtual(
                         mapper,
@@ -29204,7 +29327,7 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
                     }
                 }
             }
-            let stream = try_alloc_synthetic(ctx, "java/util/stream/DoubleStream", 1)?;
+            let mut stream = try_alloc_synthetic(ctx, "java/util/stream/DoubleStream", 1)?;
             let arr = alloc_ref_array(ctx, flat.len());
             for (i, v) in flat.iter().enumerate() {
                 ctx.set_array_element(arr, i, *v);
@@ -29220,7 +29343,7 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
         "mapToDouble",
         "(Ljava/util/function/ToDoubleFunction;)Ljava/util/stream/DoubleStream;",
         |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
@@ -29228,7 +29351,7 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(f))) => *f,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let elements = stream_elements(ctx, this)?;
+            let elements = stream_elements(ctx, &mut this)?;
             let mapped: Vec<Value> = elements
                 .iter()
                 .map(|e| {
@@ -29238,7 +29361,7 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
                         .unwrap_or(Value::Double(0.0))
                 })
                 .collect();
-            let stream = try_alloc_synthetic(ctx, "java/util/stream/DoubleStream", 1)?;
+            let mut stream = try_alloc_synthetic(ctx, "java/util/stream/DoubleStream", 1)?;
             let arr = alloc_ref_array(ctx, mapped.len());
             for (i, v) in mapped.iter().enumerate() {
                 ctx.set_array_element(arr, i, *v);
@@ -29289,7 +29412,7 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
 /// Streams (field-0 array read) and real-JDK ReferencePipeline instances
 /// (materialised via `toArray()` inside `stream_elements_mut`).
 fn native_stream_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
             // Null receiver — return an empty spliterator.
@@ -29301,7 +29424,7 @@ fn native_stream_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             return Ok(Some(Value::Object(Some(spl))));
         }
     };
-    let elements = stream_elements_mut(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     let n = elements.len();
     // GC-SAFETY: `elements` are bare refs; `alloc_ref_array` / `alloc_synthetic`
     // below can trigger a moving GC that relocates them and `arr`. Pin every
@@ -29386,23 +29509,23 @@ fn native_stream_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
 /// `StreamSupport.stream(realSpliterator, false)`).
 fn stream_elements_concat_bounded(
     ctx: &mut dyn NativeContext,
-    stream: ObjectRef,
+    stream: &mut ObjectRef,
 ) -> Result<Vec<Value>, MethodCallFailed> {
     // Synthetic streams (including lazy-spliterator-backed ones, which are
     // already bounded via `drain_spliterator_to_array`'s 1M cap inside
     // `materialize_lazy_stream`) are unaffected by this bug — delegate
     // straight to the ordinary path.
-    let class_id = ctx.class_id_of_object(stream);
+    let class_id = ctx.class_id_of_object(*stream);
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
     if is_synthetic_stream(&class_name) {
         return stream_elements(ctx, stream);
     }
-    let stream_pin = ctx.pin_native_root(stream);
+    let stream_pin = ctx.pin_native_root(*stream);
     let result: Result<Vec<Value>, MethodCallFailed> = match ctx.invoke_special(
         "java/util/stream/AbstractPipeline",
         "spliterator",
         "()Ljava/util/Spliterator;",
-        &[Value::Object(Some(stream))],
+        &[Value::Object(Some(*stream))],
     ) {
         Ok(Some(Value::Object(Some(spl)))) => {
             // Smaller cap than the shared 1,000,000 default: this path exists
@@ -29419,8 +29542,8 @@ fn stream_elements_concat_bounded(
         // to the original unbounded toArray() path so we never regress a
         // real, finite, non-pipeline Stream implementation.
         _ => {
-            let stream = ctx.read_native_pin(stream_pin, stream);
-            match ctx.invoke_virtual(stream, "toArray", "()[Ljava/lang/Object;", &[]) {
+            *stream = ctx.read_native_pin(stream_pin, *stream);
+            match ctx.invoke_virtual(*stream, "toArray", "()[Ljava/lang/Object;", &[]) {
                 Ok(Some(Value::Object(Some(arr)))) => {
                     let len = ctx.array_length(arr);
                     Ok((0..len).map(|i| ctx.get_array_element(arr, i)).collect())
@@ -29430,6 +29553,9 @@ fn stream_elements_concat_bounded(
             }
         }
     };
+    // Write the refresh back: the `spliterator` drain above runs real bytecode
+    // and `native_stream_concat` reuses its own receiver for operand B.
+    *stream = ctx.read_native_pin(stream_pin, *stream);
     ctx.unpin_native_roots(stream_pin);
     result
 }
@@ -29486,8 +29612,8 @@ fn native_stream_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // must tolerate an unbounded/infinite real-pipeline operand.
     let a = match a_ref {
         Some(r) => {
-            let r = ctx.read_native_pin(a_pin, r);
-            match stream_elements_concat_bounded(ctx, r) {
+            let mut r = ctx.read_native_pin(a_pin, r);
+            match stream_elements_concat_bounded(ctx, &mut r) {
                 Ok(v) => v,
                 Err(e) => bail!(e),
             }
@@ -29498,8 +29624,8 @@ fn native_stream_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let (a_elem_base, a_handles) = pin_value_slice(ctx, &a);
     let b = match b_ref {
         Some(r) => {
-            let r = ctx.read_native_pin(b_pin, r);
-            match stream_elements_concat_bounded(ctx, r) {
+            let mut r = ctx.read_native_pin(b_pin, r);
+            match stream_elements_concat_bounded(ctx, &mut r) {
                 Ok(v) => v,
                 Err(e) => {
                     if a_elem_base != usize::MAX {
@@ -29932,9 +30058,9 @@ fn native_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             return Err(e);
         }
     }
-    let this = ctx.read_native_pin(this_pin, this);
+    let mut this = ctx.read_native_pin(this_pin, this);
     let predicate = ctx.read_native_pin(pred_pin, predicate);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(this_pin);
@@ -30007,9 +30133,9 @@ fn native_stream_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             return Err(e);
         }
     }
-    let this = ctx.read_native_pin(this_pin, this);
+    let mut this = ctx.read_native_pin(this_pin, this);
     let function = ctx.read_native_pin(fn_pin, function);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(this_pin);
@@ -30080,9 +30206,9 @@ fn native_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             return Err(e);
         }
     }
-    let this = ctx.read_native_pin(this_pin, this);
+    let mut this = ctx.read_native_pin(this_pin, this);
     let function = ctx.read_native_pin(fn_pin, function);
-    let elements = match stream_elements_mut(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(this_pin);
@@ -30109,9 +30235,9 @@ fn native_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
                 return Err(e);
             }
         };
-        if let Some(Value::Object(Some(inner_stream))) = result {
+        if let Some(Value::Object(Some(mut inner_stream))) = result {
             let inner_pin = ctx.pin_native_root(inner_stream);
-            let inner = match stream_elements_mut(ctx, inner_stream) {
+            let inner = match stream_elements(ctx, &mut inner_stream) {
                 Ok(v) => v,
                 Err(e) => {
                     ctx.unpin_native_roots(this_pin);
@@ -30169,14 +30295,14 @@ fn numeric_sort_key(ctx: &dyn NativeContext, val: &Value) -> Option<f64> {
 }
 
 fn native_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — `this`
     // is used again for the derived-stream build after the allocating key loop.
     let this_pin = ctx.pin_native_root(this);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(this_pin);
@@ -30264,8 +30390,8 @@ fn native_stream_sorted_cmp(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let this_pin = ctx.pin_native_root(this);
     let cmp_pin = ctx.pin_native_root(comparator);
     let result = (|| -> MethodCallResult {
-        let this = ctx.read_native_pin(this_pin, this);
-        let elems = stream_elements(ctx, this)?;
+        let mut this = ctx.read_native_pin(this_pin, this);
+        let elems = stream_elements(ctx, &mut this)?;
 
         // GC-SAFETY: the Comparator dispatch (and any key-extractor `apply`) allocates
         // and re-enters Java → a moving young GC relocates the comparator and the
@@ -30315,14 +30441,14 @@ fn native_stream_sorted_cmp(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — `this`
     // is used again for the derived-stream build after the `equals` loops.
     let this_pin = ctx.pin_native_root(this);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(this_pin);
@@ -30371,7 +30497,7 @@ fn native_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_stream_limit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
@@ -30386,7 +30512,7 @@ fn native_stream_limit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — `this`
     // is used again for the derived-stream build after materialization.
     let this_pin = ctx.pin_native_root(this);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(this_pin);
@@ -30400,7 +30526,7 @@ fn native_stream_limit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 fn native_stream_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
@@ -30415,7 +30541,7 @@ fn native_stream_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — `this`
     // is used again for the derived-stream build after materialization.
     let this_pin = ctx.pin_native_root(this);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(this_pin);
@@ -30451,9 +30577,9 @@ fn native_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             return Err(e);
         }
     }
-    let this = ctx.read_native_pin(this_pin, this);
+    let mut this = ctx.read_native_pin(this_pin, this);
     let consumer = ctx.read_native_pin(con_pin, consumer);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(this_pin);
@@ -30479,7 +30605,7 @@ fn native_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 // -- Terminal operations --
 
 fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
@@ -30539,7 +30665,7 @@ fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
                     Err(e) => break Err(e),
                 }
             };
-            let this = ctx.read_native_pin(this_pin, this);
+            let mut this = ctx.read_native_pin(this_pin, this);
             // `con_pin` is the first pin owned by this native; one truncate clears
             // it and the later `this`/`spl` pins without violating stack order.
             ctx.unpin_native_roots(con_pin);
@@ -30548,7 +30674,7 @@ fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             return result;
         }
     }
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     // GC-SAFETY: `accept` re-enters Java and can trigger a moving young GC that
     // relocates the consumer and the materialized elements; pin them and re-read
     // each from its handle before the (allocating) dispatch.
@@ -30583,11 +30709,11 @@ fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_stream_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     Ok(Some(Value::Long(elements.len() as i64)))
 }
 
@@ -30619,7 +30745,7 @@ fn native_stream_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// (last-writer-wins), so for `Stream`/`BaseStream` THIS function is the one
 /// that runs. The two must both box or the surface is only half covered.
 fn native_stream_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let arr = alloc_ref_array(ctx, 0);
@@ -30629,7 +30755,7 @@ fn native_stream_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             return make_iterator_from_array(ctx, arr, 0);
         }
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     // Box BEFORE pinning: the returned wrappers are already re-read past any
     // collection `valueOf` caused, and nothing allocates between here and the
     // `pin_value_slice` on the next line.
@@ -30659,14 +30785,14 @@ fn native_stream_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_stream_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let arr = alloc_ref_array(ctx, 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     let (elem_base, elem_handles) = pin_value_slice(ctx, &elements);
     let arr = alloc_ref_array(ctx, elements.len());
     let arr_pin = ctx.pin_native_root(arr);
@@ -30699,7 +30825,7 @@ fn native_stream_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 /// `ConfigException: Invalid value PLAINTEXT for configuration
 /// security.inter.broker.protocol: String must be one of:`.
 fn native_stream_to_array_gen(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let arr = alloc_ref_array(ctx, 0);
@@ -30713,7 +30839,7 @@ fn native_stream_to_array_gen(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — a `?`
     // here leaked `gen_pin` on the error path (pin-stack imbalance).
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             if let Some(p) = gen_pin {
@@ -30770,7 +30896,7 @@ fn native_stream_to_array_gen(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 }
 
 fn native_stream_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let opt = try_alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS)?;
@@ -30806,7 +30932,7 @@ fn native_stream_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         }
         return Ok(Some(Value::Object(Some(opt))));
     }
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     let first_pin = elements.first().and_then(|v| match v {
         Value::Object(Some(o)) => Some(ctx.pin_native_root(*o)),
         _ => None,
@@ -30826,7 +30952,7 @@ fn native_stream_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_stream_any_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
@@ -30853,7 +30979,7 @@ fn native_stream_any_match(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     }
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let pred_pin = ctx.pin_native_root(predicate);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(pred_pin);
@@ -30881,7 +31007,7 @@ fn native_stream_any_match(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn native_stream_all_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(1))),
     };
@@ -30908,7 +31034,7 @@ fn native_stream_all_match(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     }
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let pred_pin = ctx.pin_native_root(predicate);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(pred_pin);
@@ -30936,7 +31062,7 @@ fn native_stream_all_match(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn native_stream_none_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(1))),
     };
@@ -30963,7 +31089,7 @@ fn native_stream_none_match(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     }
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let pred_pin = ctx.pin_native_root(predicate);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(pred_pin);
@@ -30991,7 +31117,7 @@ fn native_stream_none_match(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_stream_reduce_identity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(args.get(1).copied()),
     };
@@ -31007,7 +31133,7 @@ fn native_stream_reduce_identity(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Value::Object(Some(o)) => ctx.pin_native_root(o),
         _ => usize::MAX,
     };
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(op_pin);
@@ -31055,7 +31181,7 @@ fn native_stream_reduce_identity(ctx: &mut dyn NativeContext, args: &[Value]) ->
 /// user-supplied `BiFunction.apply` is pinned: the callback can allocate and
 /// therefore move the young generation.
 fn native_stream_reduce_general(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(args.get(1).copied()),
     };
@@ -31071,7 +31197,7 @@ fn native_stream_reduce_general(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let pin_base = ctx.pin_native_root(this);
     let mut acc_pin = pin_value(ctx, acc);
     let accumulator_pin = ctx.pin_native_root(accumulator);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(pin_base);
@@ -31106,7 +31232,7 @@ fn native_stream_reduce_general(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 }
 
 fn native_stream_reduce_optional(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let opt = try_alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS)?;
@@ -31122,7 +31248,7 @@ fn native_stream_reduce_optional(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let op_pin = ctx.pin_native_root(operator);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(op_pin);
@@ -31169,7 +31295,7 @@ fn native_stream_reduce_optional(ctx: &mut dyn NativeContext, args: &[Value]) ->
 }
 
 fn native_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let opt = try_alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS)?;
@@ -31185,7 +31311,7 @@ fn native_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let cmp_pin = ctx.pin_native_root(comparator);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(cmp_pin);
@@ -31226,7 +31352,7 @@ fn native_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 fn native_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let opt = try_alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS)?;
@@ -31242,7 +31368,7 @@ fn native_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let cmp_pin = ctx.pin_native_root(comparator);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(cmp_pin);
@@ -31283,16 +31409,16 @@ fn native_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 fn native_stream_to_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_list_of(ctx, &[]),
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     make_list_of(ctx, &elements)
 }
 
 fn native_stream_map_to_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_int_stream(ctx, &[]),
     };
@@ -31304,7 +31430,7 @@ fn native_stream_map_to_int(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // `this`/`function` BEFORE `stream_elements`, which can dispatch and collect.
     let this_pin = ctx.pin_native_root(this);
     let fn_pin = ctx.pin_native_root(function);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(this_pin);
@@ -33233,7 +33359,7 @@ fn collect_via_collector_protocol(
 ///   `return c;`
 /// The combiner is parallel-only and intentionally ignored.
 fn native_stream_collect_3arg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -33249,7 +33375,7 @@ fn native_stream_collect_3arg(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let sup_pin = ctx.pin_native_root(supplier);
     let acc_pin = ctx.pin_native_root(accumulator);
-    let elements = match stream_elements_mut(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(sup_pin);
@@ -33403,7 +33529,7 @@ fn make_summary_statistics(
 }
 
 fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -33417,7 +33543,7 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // mistaken for whichever object later occupies its old address (observed as
     // tag 1 / ArrayList returned where the caller requires Set).
     let collector_pin = ctx.pin_native_root(collector);
-    let elements = match stream_elements_mut(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(elements) => elements,
         Err(err) => {
             ctx.unpin_native_roots(collector_pin);
@@ -34813,7 +34939,10 @@ fn make_int_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCal
 /// where any is held, which is why the conversion is its own change with its own
 /// review surface. Recorded in
 /// docs/known-issues/jdk-only/W7-65-stream-reuse-throws.md §5.1.
-fn int_stream_elements(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
+/// `&mut` for the same reason [`stream_elements`] is: a by-value wrapper in
+/// front of a refreshing API satisfies its `&mut` with a copy and drops the
+/// refresh on the floor.
+fn int_stream_elements(ctx: &mut dyn NativeContext, stream: &mut ObjectRef) -> Vec<Value> {
     stream_elements(ctx, stream).unwrap_or_default()
 }
 
@@ -34860,7 +34989,7 @@ fn primitive_iterator_next_value(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> Result<Value, cratonvm_types::error::MethodCallFailed> {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
             return Err(cratonvm_types::error::RuntimeError::NullPointerException {
@@ -34905,7 +35034,7 @@ fn native_primitive_iterator_has_next(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
@@ -34976,7 +35105,7 @@ fn native_primitive_iterator_next_boxed(
 // =============================================================================
 
 fn native_int_stream_map_to_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_long_stream(ctx, &[]),
     };
@@ -34986,7 +35115,7 @@ fn native_int_stream_map_to_long(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let op_pin = ctx.pin_native_root(op);
-    let els = int_stream_elements(ctx, this);
+    let els = int_stream_elements(ctx, &mut this);
     let mut out = Vec::with_capacity(els.len());
     for e in &els {
         let op = ctx.read_native_pin(op_pin, op);
@@ -35006,7 +35135,7 @@ fn native_int_stream_map_to_double(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_double_stream(ctx, &[]),
     };
@@ -35016,7 +35145,7 @@ fn native_int_stream_map_to_double(
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let op_pin = ctx.pin_native_root(op);
-    let els = int_stream_elements(ctx, this);
+    let els = int_stream_elements(ctx, &mut this);
     let mut out = Vec::with_capacity(els.len());
     for e in &els {
         let op = ctx.read_native_pin(op_pin, op);
@@ -35033,11 +35162,11 @@ fn native_int_stream_map_to_double(
 }
 
 fn native_int_stream_as_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_long_stream(ctx, &[]),
     };
-    let out: Vec<Value> = int_stream_elements(ctx, this)
+    let out: Vec<Value> = int_stream_elements(ctx, &mut this)
         .iter()
         .map(|v| Value::Long(if let Value::Int(i) = v { *i as i64 } else { 0 }))
         .collect();
@@ -35045,11 +35174,11 @@ fn native_int_stream_as_long(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn native_int_stream_as_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_double_stream(ctx, &[]),
     };
-    let out: Vec<Value> = int_stream_elements(ctx, this)
+    let out: Vec<Value> = int_stream_elements(ctx, &mut this)
         .iter()
         .map(|v| {
             Value::Double(if let Value::Int(i) = v {
@@ -35066,7 +35195,7 @@ fn native_int_stream_as_double(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// supplied by the per-stream caller (IntPredicate.test(I)Z etc.).
 fn stream_match(
     ctx: &mut dyn NativeContext,
-    this: ObjectRef,
+    this: &mut ObjectRef,
     pred: ObjectRef,
     desc: &str,
     kind: u8,
@@ -35107,7 +35236,7 @@ fn stream_match(
 }
 
 fn native_int_stream_any_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
@@ -35115,10 +35244,10 @@ fn native_int_stream_any_match(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    stream_match(ctx, this, p, "(I)Z", 0)
+    stream_match(ctx, &mut this, p, "(I)Z", 0)
 }
 fn native_int_stream_all_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(1))),
     };
@@ -35126,10 +35255,10 @@ fn native_int_stream_all_match(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(1))),
     };
-    stream_match(ctx, this, p, "(I)Z", 1)
+    stream_match(ctx, &mut this, p, "(I)Z", 1)
 }
 fn native_int_stream_none_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(1))),
     };
@@ -35137,7 +35266,7 @@ fn native_int_stream_none_match(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(1))),
     };
-    stream_match(ctx, this, p, "(I)Z", 2)
+    stream_match(ctx, &mut this, p, "(I)Z", 2)
 }
 
 fn stream_limit_n(args: &[Value]) -> usize {
@@ -35148,25 +35277,25 @@ fn stream_limit_n(args: &[Value]) -> usize {
 }
 
 fn native_int_stream_limit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_int_stream(ctx, &[]),
     };
     let n = stream_limit_n(args);
-    let els = int_stream_elements(ctx, this);
+    let els = int_stream_elements(ctx, &mut this);
     make_int_stream(ctx, &els[..n.min(els.len())])
 }
 fn native_int_stream_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_int_stream(ctx, &[]),
     };
     let n = stream_limit_n(args);
-    let els = int_stream_elements(ctx, this);
+    let els = int_stream_elements(ctx, &mut this);
     make_int_stream(ctx, &els[n.min(els.len())..])
 }
 fn native_int_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_int_stream(ctx, &[]),
     };
@@ -35176,7 +35305,7 @@ fn native_int_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let c_pin = c.map(|r| ctx.pin_native_root(r));
-    let els = int_stream_elements(ctx, this);
+    let els = int_stream_elements(ctx, &mut this);
     if let (Some(c), Some(c_pin)) = (c, c_pin) {
         for e in &els {
             let c = ctx.read_native_pin(c_pin, c);
@@ -35190,7 +35319,7 @@ fn native_int_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     make_int_stream(ctx, &els)
 }
 fn native_int_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_int_stream(ctx, &[]),
     };
@@ -35205,7 +35334,7 @@ fn native_int_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let f_pin = ctx.pin_native_root(f);
     // `f_pin` is live, so this unwinds exactly as the `apply` arm below does.
-    let els = match prim_stream_values(ctx, this, "()[I") {
+    let els = match prim_stream_values(ctx, &mut this, "()[I") {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(f_pin);
@@ -35216,13 +35345,15 @@ fn native_int_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     for e in &els {
         let f = ctx.read_native_pin(f_pin, f);
         match ctx.invoke_virtual(f, "apply", "(I)Ljava/lang/Object;", &[*e]) {
-            Ok(Some(Value::Object(Some(sub)))) => match prim_stream_values(ctx, sub, "()[I") {
-                Ok(v) => out.extend(v),
-                Err(e) => {
-                    ctx.unpin_native_roots(f_pin);
-                    return Err(e);
+            Ok(Some(Value::Object(Some(mut sub)))) => {
+                match prim_stream_values(ctx, &mut sub, "()[I") {
+                    Ok(v) => out.extend(v),
+                    Err(e) => {
+                        ctx.unpin_native_roots(f_pin);
+                        return Err(e);
+                    }
                 }
-            },
+            }
             Ok(_) => {}
             Err(e) => {
                 ctx.unpin_native_roots(f_pin);
@@ -35499,11 +35630,11 @@ fn native_int_stream_range_closed(ctx: &mut dyn NativeContext, args: &[Value]) -
 }
 
 fn native_int_stream_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_primitive_iterator(ctx, "java/util/PrimitiveIterator$OfInt", &[]),
     };
-    let elements = int_stream_elements(ctx, this);
+    let elements = int_stream_elements(ctx, &mut this);
     make_primitive_iterator(ctx, "java/util/PrimitiveIterator$OfInt", &elements)
 }
 
@@ -35550,11 +35681,11 @@ fn native_int_stream_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 fn native_int_stream_sum(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let elements = int_stream_elements(ctx, this);
+    let elements = int_stream_elements(ctx, &mut this);
     // JDK `IntStream.sum()` has wrapping (two's-complement) overflow
     // semantics; using `Iterator::sum` would panic in debug builds, so fold
     // with `wrapping_add` instead.
@@ -35583,7 +35714,7 @@ fn native_int_stream_reduce_seeded(
         Some(Value::Int(i)) => *i,
         _ => 0,
     };
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(identity))),
     };
@@ -35593,7 +35724,7 @@ fn native_int_stream_reduce_seeded(
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let op_pin = ctx.pin_native_root(op);
-    let elements = int_stream_elements(ctx, this);
+    let elements = int_stream_elements(ctx, &mut this);
     let mut acc = identity;
     for elem in &elements {
         let e = match elem {
@@ -35624,7 +35755,7 @@ fn native_int_stream_reduce_seeded(
 
 fn native_int_stream_reduce(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // OptionalInt reduce(IntBinaryOperator op)
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let o = make_opt_prim(ctx, "java/util/OptionalInt", None)?;
@@ -35640,7 +35771,7 @@ fn native_int_stream_reduce(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let op_pin = ctx.pin_native_root(op);
-    let elements = int_stream_elements(ctx, this);
+    let elements = int_stream_elements(ctx, &mut this);
     let mut acc: Option<i32> = None;
     for elem in &elements {
         let e = match elem {
@@ -35688,7 +35819,7 @@ fn native_long_stream_reduce_seeded(
         Some(Value::Int(i)) => *i as i64,
         _ => 0,
     };
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Long(identity))),
     };
@@ -35698,7 +35829,7 @@ fn native_long_stream_reduce_seeded(
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let op_pin = ctx.pin_native_root(op);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(op_pin);
@@ -35736,7 +35867,7 @@ fn native_long_stream_reduce_seeded(
 
 fn native_long_stream_reduce(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // OptionalLong reduce(LongBinaryOperator op)
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let o = make_opt_prim(ctx, "java/util/OptionalLong", None)?;
@@ -35752,7 +35883,7 @@ fn native_long_stream_reduce(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let op_pin = ctx.pin_native_root(op);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(op_pin);
@@ -35798,23 +35929,23 @@ fn native_long_stream_reduce(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn native_int_stream_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let elements = int_stream_elements(ctx, this);
+    let elements = int_stream_elements(ctx, &mut this);
     Ok(Some(Value::Long(elements.len() as i64)))
 }
 
 fn native_int_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let opt = make_opt_prim(ctx, "java/util/OptionalInt", None)?;
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
-    let elements = int_stream_elements(ctx, this);
+    let elements = int_stream_elements(ctx, &mut this);
     let opt = make_opt_prim(ctx, "java/util/OptionalInt", None)?;
     if let Some(min) = elements
         .iter()
@@ -35830,14 +35961,14 @@ fn native_int_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 fn native_int_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let opt = make_opt_prim(ctx, "java/util/OptionalInt", None)?;
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
-    let elements = int_stream_elements(ctx, this);
+    let elements = int_stream_elements(ctx, &mut this);
     let opt = make_opt_prim(ctx, "java/util/OptionalInt", None)?;
     if let Some(max) = elements
         .iter()
@@ -35864,14 +35995,14 @@ fn native_int_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// preserved by `int_stream_elements`, matching `findFirst`; `findAny` may return
 /// any element and the first is a valid choice.
 fn native_int_stream_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let opt = make_opt_prim(ctx, "java/util/OptionalInt", None)?;
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
-    let elements = int_stream_elements(ctx, this);
+    let elements = int_stream_elements(ctx, &mut this);
     let opt = make_opt_prim(ctx, "java/util/OptionalInt", None)?;
     if let Some(&Value::Int(first)) = elements.first() {
         set_opt_prim_value(ctx, opt, Value::Int(first));
@@ -35901,7 +36032,7 @@ fn is_spring_spel_mixed_mode_int_consumer(
 }
 
 fn native_int_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
@@ -35912,7 +36043,7 @@ fn native_int_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
     // pin must precede materialization, not just the accept loop below.
     let consumer_pin = ctx.pin_native_root(consumer);
-    let elements = int_stream_elements(ctx, this);
+    let elements = int_stream_elements(ctx, &mut this);
     let consumer = ctx.read_native_pin(consumer_pin, consumer);
     let limit = if is_spring_spel_mixed_mode_int_consumer(ctx, consumer, elements.len()) {
         // Spring's mixed-mode compiler test uses a million-element
@@ -35955,7 +36086,7 @@ fn native_int_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 /// through `accumulator.accept(container, value)`. The container is pinned
 /// across the accumulator calls (each may allocate and trigger a moving GC).
 fn native_int_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -35971,7 +36102,7 @@ fn native_int_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let sup_pin = ctx.pin_native_root(supplier);
     let acc_pin = ctx.pin_native_root(accumulator);
-    let elements = int_stream_elements(ctx, this);
+    let elements = int_stream_elements(ctx, &mut this);
     let supplier = ctx.read_native_pin(sup_pin, supplier);
     let container = match ctx.invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[]) {
         Ok(Some(Value::Object(Some(c)))) => c,
@@ -36010,11 +36141,11 @@ fn native_int_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 /// calls it, so every Groovy script failed to compile
 /// (SpringRepositoriesExtensionTests).
 fn native_int_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_int_stream(ctx, &[]),
     };
-    let mut elements = int_stream_elements(ctx, this);
+    let mut elements = int_stream_elements(ctx, &mut this);
     elements.sort_by_key(|v| match v {
         Value::Int(i) => *i,
         _ => 0,
@@ -36039,11 +36170,11 @@ fn native_int_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 /// rather than silently dropped, so a layout defect elsewhere shows up as a
 /// wrong count instead of as an empty stream.
 fn native_int_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_int_stream(ctx, &[]),
     };
-    let elements = int_stream_elements(ctx, this);
+    let elements = int_stream_elements(ctx, &mut this);
     let mut seen: std::collections::HashSet<i32> = std::collections::HashSet::new();
     let mut out: Vec<Value> = Vec::with_capacity(elements.len());
     for e in &elements {
@@ -36060,7 +36191,7 @@ fn native_int_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 }
 
 fn native_int_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_int_stream(ctx, &[]),
     };
@@ -36070,7 +36201,7 @@ fn native_int_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let pred_pin = ctx.pin_native_root(predicate);
-    let elements = int_stream_elements(ctx, this);
+    let elements = int_stream_elements(ctx, &mut this);
     let mut kept = Vec::new();
     for elem in &elements {
         let predicate = ctx.read_native_pin(pred_pin, predicate);
@@ -36090,7 +36221,7 @@ fn native_int_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_int_stream_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_int_stream(ctx, &[]),
     };
@@ -36100,7 +36231,7 @@ fn native_int_stream_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let op_pin = ctx.pin_native_root(operator);
-    let elements = int_stream_elements(ctx, this);
+    let elements = int_stream_elements(ctx, &mut this);
     let mut mapped = Vec::with_capacity(elements.len());
     for elem in &elements {
         let operator = ctx.read_native_pin(op_pin, operator);
@@ -36123,7 +36254,7 @@ fn native_int_stream_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// Code attribute`. JUnit5 jupiter-params hits this for every primitive
 /// @ValueSource (`IntStream.range(0, n).mapToObj(i -> Array.get(src, i))`).
 fn native_int_stream_map_to_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
@@ -36133,7 +36264,7 @@ fn native_int_stream_map_to_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let fn_pin = ctx.pin_native_root(function);
-    let elements = int_stream_elements(ctx, this);
+    let elements = int_stream_elements(ctx, &mut this);
     let mut mapped = Vec::with_capacity(elements.len());
     let mut mapped_handles: Vec<usize> = Vec::with_capacity(elements.len());
     for elem in &elements {
@@ -36156,14 +36287,14 @@ fn native_int_stream_map_to_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 }
 
 fn native_int_stream_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
-    let elements = int_stream_elements(ctx, this);
+    let elements = int_stream_elements(ctx, &mut this);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, elements.len());
     for (i, val) in elements.iter().enumerate() {
         ctx.set_array_element(arr, i, *val);
@@ -36228,24 +36359,24 @@ fn box_primitive_stream_elements(
 }
 
 fn native_int_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
-    let elements = int_stream_elements(ctx, this);
+    let elements = int_stream_elements(ctx, &mut this);
     let boxed = box_primitive_stream_elements(ctx, &elements)?;
     make_stream(ctx, &boxed)
 }
 
 fn native_int_stream_average(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None)?;
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
-    let elements = int_stream_elements(ctx, this);
+    let elements = int_stream_elements(ctx, &mut this);
     let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None)?;
     if !elements.is_empty() {
         let sum: i64 = elements
@@ -36292,7 +36423,7 @@ fn make_long_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCa
 // LongStream — missing ops (element Value::Long via stream_elements). See the
 // IntStream block above for rationale (synthetic stream → AbstractMethodError).
 fn native_long_stream_map_to_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_int_stream(ctx, &[]),
     };
@@ -36302,7 +36433,7 @@ fn native_long_stream_map_to_int(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let op_pin = ctx.pin_native_root(op);
-    let els = match stream_elements(ctx, this) {
+    let els = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(op_pin);
@@ -36327,7 +36458,7 @@ fn native_long_stream_map_to_double(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_double_stream(ctx, &[]),
     };
@@ -36337,7 +36468,7 @@ fn native_long_stream_map_to_double(
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let op_pin = ctx.pin_native_root(op);
-    let els = match stream_elements(ctx, this) {
+    let els = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(op_pin);
@@ -36359,7 +36490,7 @@ fn native_long_stream_map_to_double(
     make_double_stream(ctx, &out)
 }
 fn native_long_stream_any_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
@@ -36367,10 +36498,10 @@ fn native_long_stream_any_match(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    stream_match(ctx, this, p, "(J)Z", 0)
+    stream_match(ctx, &mut this, p, "(J)Z", 0)
 }
 fn native_long_stream_all_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(1))),
     };
@@ -36378,10 +36509,10 @@ fn native_long_stream_all_match(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(1))),
     };
-    stream_match(ctx, this, p, "(J)Z", 1)
+    stream_match(ctx, &mut this, p, "(J)Z", 1)
 }
 fn native_long_stream_none_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(1))),
     };
@@ -36389,28 +36520,28 @@ fn native_long_stream_none_match(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(1))),
     };
-    stream_match(ctx, this, p, "(J)Z", 2)
+    stream_match(ctx, &mut this, p, "(J)Z", 2)
 }
 fn native_long_stream_limit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_long_stream(ctx, &[]),
     };
     let n = stream_limit_n(args);
-    let els = stream_elements(ctx, this)?;
+    let els = stream_elements(ctx, &mut this)?;
     make_long_stream(ctx, &els[..n.min(els.len())])
 }
 fn native_long_stream_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_long_stream(ctx, &[]),
     };
     let n = stream_limit_n(args);
-    let els = stream_elements(ctx, this)?;
+    let els = stream_elements(ctx, &mut this)?;
     make_long_stream(ctx, &els[n.min(els.len())..])
 }
 fn native_long_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_long_stream(ctx, &[]),
     };
@@ -36420,7 +36551,7 @@ fn native_long_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let cn_pin = cn.map(|r| ctx.pin_native_root(r));
-    let els = match stream_elements(ctx, this) {
+    let els = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             if let Some(p) = cn_pin {
@@ -36442,7 +36573,7 @@ fn native_long_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     make_long_stream(ctx, &els)
 }
 fn native_long_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_long_stream(ctx, &[]),
     };
@@ -36453,7 +36584,7 @@ fn native_long_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let f_pin = ctx.pin_native_root(f);
     // `f_pin` is live, so this unwinds exactly as the `apply` arm below does.
-    let els = match prim_stream_values(ctx, this, "()[J") {
+    let els = match prim_stream_values(ctx, &mut this, "()[J") {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(f_pin);
@@ -36464,13 +36595,15 @@ fn native_long_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     for e in &els {
         let f = ctx.read_native_pin(f_pin, f);
         match ctx.invoke_virtual(f, "apply", "(J)Ljava/lang/Object;", &[*e]) {
-            Ok(Some(Value::Object(Some(sub)))) => match prim_stream_values(ctx, sub, "()[J") {
-                Ok(v) => out.extend(v),
-                Err(e) => {
-                    ctx.unpin_native_roots(f_pin);
-                    return Err(e);
+            Ok(Some(Value::Object(Some(mut sub)))) => {
+                match prim_stream_values(ctx, &mut sub, "()[J") {
+                    Ok(v) => out.extend(v),
+                    Err(e) => {
+                        ctx.unpin_native_roots(f_pin);
+                        return Err(e);
+                    }
                 }
-            },
+            }
             Ok(_) => {}
             Err(e) => {
                 ctx.unpin_native_roots(f_pin);
@@ -36488,11 +36621,11 @@ fn native_long_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// and unregistered, so the call died with `AbstractMethodError: … has no Code
 /// attribute` on the interface exactly as `summaryStatistics` did.
 fn native_long_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_long_stream(ctx, &[]),
     };
-    let mut elements = stream_elements(ctx, this)?;
+    let mut elements = stream_elements(ctx, &mut this)?;
     elements.sort_by_key(|v| match v {
         Value::Long(l) => *l,
         Value::Int(i) => *i as i64,
@@ -36504,11 +36637,11 @@ fn native_long_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 /// `LongStream.distinct()` — see [`native_int_stream_distinct`]. `Long.equals`
 /// is value equality, so a set of the raw `i64`s is the JDK's dedupe.
 fn native_long_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_long_stream(ctx, &[]),
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut out: Vec<Value> = Vec::with_capacity(elements.len());
     for e in &elements {
@@ -36537,14 +36670,14 @@ fn native_long_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// `stream_elements` preserves encounter order, so the first element satisfies
 /// `findFirst`; `findAny` may return any element and the first is a valid choice.
 fn native_long_stream_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let opt = make_opt_prim(ctx, "java/util/OptionalLong", None)?;
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     let first = match elements.first() {
         Some(Value::Long(l)) => Some(Value::Long(*l)),
         Some(Value::Int(i)) => Some(Value::Long(*i as i64)),
@@ -36750,7 +36883,7 @@ fn register_long_stream_natives(r: &mut NativeMethodRegistry) {
 }
 
 fn native_long_stream_map_to_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
@@ -36760,7 +36893,7 @@ fn native_long_stream_map_to_obj(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let fn_pin = ctx.pin_native_root(mapper);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(fn_pin);
@@ -36823,11 +36956,11 @@ fn native_long_stream_range_closed(
 }
 
 fn native_long_stream_sum(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     // JDK `LongStream.sum()` has wrapping (two's-complement) overflow
     // semantics; fold with `wrapping_add` to match and avoid debug-build
     // panics from `Iterator::sum`.
@@ -36839,23 +36972,23 @@ fn native_long_stream_sum(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_long_stream_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     Ok(Some(Value::Long(elements.len() as i64)))
 }
 
 fn native_long_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let opt = make_opt_prim(ctx, "java/util/OptionalLong", None)?;
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     let opt = make_opt_prim(ctx, "java/util/OptionalLong", None)?;
     if let Some(min) = elements
         .iter()
@@ -36871,14 +37004,14 @@ fn native_long_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_long_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let opt = make_opt_prim(ctx, "java/util/OptionalLong", None)?;
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     let opt = make_opt_prim(ctx, "java/util/OptionalLong", None)?;
     if let Some(max) = elements
         .iter()
@@ -36894,14 +37027,14 @@ fn native_long_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_long_stream_average(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None)?;
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None)?;
     if !elements.is_empty() {
         let sum: i64 = elements
@@ -36918,7 +37051,7 @@ fn native_long_stream_average(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 }
 
 fn native_long_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
@@ -36928,7 +37061,7 @@ fn native_long_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let con_pin = ctx.pin_native_root(consumer);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(con_pin);
@@ -36950,7 +37083,7 @@ fn native_long_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// `native_int_stream_collect` for the rationale (missing 3-arg collect →
 /// AbstractMethodError). `accept` takes `(Object, long)`.
 fn native_long_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -36965,7 +37098,7 @@ fn native_long_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let sup_pin = ctx.pin_native_root(supplier);
     let acc_pin = ctx.pin_native_root(accumulator);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(sup_pin);
@@ -37004,7 +37137,7 @@ fn native_long_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 }
 
 fn native_long_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_long_stream(ctx, &[]),
     };
@@ -37014,7 +37147,7 @@ fn native_long_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let pred_pin = ctx.pin_native_root(predicate);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(pred_pin);
@@ -37040,7 +37173,7 @@ fn native_long_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn native_long_stream_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_long_stream(ctx, &[]),
     };
@@ -37050,7 +37183,7 @@ fn native_long_stream_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let op_pin = ctx.pin_native_root(operator);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(op_pin);
@@ -37074,14 +37207,14 @@ fn native_long_stream_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_long_stream_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, elements.len());
     for (i, val) in elements.iter().enumerate() {
         ctx.set_array_element(arr, i, *val);
@@ -37090,30 +37223,30 @@ fn native_long_stream_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 }
 
 fn native_long_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     let boxed = box_primitive_stream_elements(ctx, &elements)?;
     make_stream(ctx, &boxed)
 }
 
 fn native_long_stream_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_primitive_iterator(ctx, "java/util/PrimitiveIterator$OfLong", &[]),
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     make_primitive_iterator(ctx, "java/util/PrimitiveIterator$OfLong", &elements)
 }
 
 fn native_long_stream_as_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_double_stream(ctx, &[]),
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     let doubles: Vec<Value> = elements
         .iter()
         .map(|v| match v {
@@ -37154,7 +37287,7 @@ fn make_double_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> Method
 
 // DoubleStream — missing ops (element Value::Double). See IntStream block above.
 fn native_double_stream_all_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(1))),
     };
@@ -37162,13 +37295,13 @@ fn native_double_stream_all_match(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(1))),
     };
-    stream_match(ctx, this, p, "(D)Z", 1)
+    stream_match(ctx, &mut this, p, "(D)Z", 1)
 }
 fn native_double_stream_none_match(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(1))),
     };
@@ -37176,28 +37309,28 @@ fn native_double_stream_none_match(
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(1))),
     };
-    stream_match(ctx, this, p, "(D)Z", 2)
+    stream_match(ctx, &mut this, p, "(D)Z", 2)
 }
 fn native_double_stream_limit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_double_stream(ctx, &[]),
     };
     let n = stream_limit_n(args);
-    let els = stream_elements(ctx, this)?;
+    let els = stream_elements(ctx, &mut this)?;
     make_double_stream(ctx, &els[..n.min(els.len())])
 }
 fn native_double_stream_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_double_stream(ctx, &[]),
     };
     let n = stream_limit_n(args);
-    let els = stream_elements(ctx, this)?;
+    let els = stream_elements(ctx, &mut this)?;
     make_double_stream(ctx, &els[n.min(els.len())..])
 }
 fn native_double_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_double_stream(ctx, &[]),
     };
@@ -37207,7 +37340,7 @@ fn native_double_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let cn_pin = cn.map(|r| ctx.pin_native_root(r));
-    let els = match stream_elements(ctx, this) {
+    let els = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             if let Some(p) = cn_pin {
@@ -37229,7 +37362,7 @@ fn native_double_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     make_double_stream(ctx, &els)
 }
 fn native_double_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_double_stream(ctx, &[]),
     };
@@ -37240,7 +37373,7 @@ fn native_double_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let f_pin = ctx.pin_native_root(f);
     // `f_pin` is live, so this unwinds exactly as the `apply` arm below does.
-    let els = match prim_stream_values(ctx, this, "()[D") {
+    let els = match prim_stream_values(ctx, &mut this, "()[D") {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(f_pin);
@@ -37251,13 +37384,15 @@ fn native_double_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) ->
     for e in &els {
         let f = ctx.read_native_pin(f_pin, f);
         match ctx.invoke_virtual(f, "apply", "(D)Ljava/lang/Object;", &[*e]) {
-            Ok(Some(Value::Object(Some(sub)))) => match prim_stream_values(ctx, sub, "()[D") {
-                Ok(v) => out.extend(v),
-                Err(e) => {
-                    ctx.unpin_native_roots(f_pin);
-                    return Err(e);
+            Ok(Some(Value::Object(Some(mut sub)))) => {
+                match prim_stream_values(ctx, &mut sub, "()[D") {
+                    Ok(v) => out.extend(v),
+                    Err(e) => {
+                        ctx.unpin_native_roots(f_pin);
+                        return Err(e);
+                    }
                 }
-            },
+            }
             Ok(_) => {}
             Err(e) => {
                 ctx.unpin_native_roots(f_pin);
@@ -37311,7 +37446,7 @@ fn stream_elem_as_f64(v: &Value) -> Option<f64> {
 /// so `DoubleStream.anyMatch` alone died with `AbstractMethodError: … has no
 /// Code attribute` on the interface declaration.
 fn native_double_stream_any_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
@@ -37319,7 +37454,7 @@ fn native_double_stream_any_match(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    stream_match(ctx, this, p, "(D)Z", 0)
+    stream_match(ctx, &mut this, p, "(D)Z", 0)
 }
 
 /// `double DoubleStream.reduce(double identity, DoubleBinaryOperator op)`.
@@ -37329,7 +37464,7 @@ fn native_double_stream_reduce_seeded(
     args: &[Value],
 ) -> MethodCallResult {
     let identity = args.get(1).and_then(stream_elem_as_f64).unwrap_or(0.0);
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Double(identity))),
     };
@@ -37339,7 +37474,7 @@ fn native_double_stream_reduce_seeded(
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let op_pin = ctx.pin_native_root(op);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(op_pin);
@@ -37374,7 +37509,7 @@ fn native_double_stream_reduce_seeded(
 /// `OptionalDouble DoubleStream.reduce(DoubleBinaryOperator op)` — the
 /// no-identity overload. Empty stream → empty `OptionalDouble`.
 fn native_double_stream_reduce(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let o = make_opt_prim(ctx, "java/util/OptionalDouble", None)?;
@@ -37390,7 +37525,7 @@ fn native_double_stream_reduce(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let op_pin = ctx.pin_native_root(op);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(op_pin);
@@ -37437,14 +37572,14 @@ fn native_double_stream_find_first(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None)?;
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     let first = elements.first().and_then(stream_elem_as_f64);
     let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None)?;
     if let Some(d) = first {
@@ -37456,11 +37591,11 @@ fn native_double_stream_find_first(
 /// `DoubleStream.sorted()` — `Arrays.sort(double[])` order, i.e.
 /// [`java_double_compare`], not `f64`'s `PartialOrd`.
 fn native_double_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_double_stream(ctx, &[]),
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     // Normalised to `Value::Double` on the way out, not just sorted: the result
     // goes to `make_double_stream`, which allocates a `double[]`, so an integral
     // `Value` that slipped in from an upstream widening op would be stored into
@@ -37478,11 +37613,11 @@ fn native_double_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// [`java_double_to_long_bits`]: all NaNs are one value and `-0.0` is distinct
 /// from `+0.0`, which is the opposite of what `==` on `f64` says for both.
 fn native_double_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_double_stream(ctx, &[]),
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut out: Vec<Value> = Vec::with_capacity(elements.len());
     for e in &elements {
@@ -37676,11 +37811,11 @@ fn native_double_stream_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn native_double_stream_sum(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Double(0.0))),
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     let sum: f64 = elements
         .iter()
         .map(|v| match v {
@@ -37692,23 +37827,23 @@ fn native_double_stream_sum(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_double_stream_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     Ok(Some(Value::Long(elements.len() as i64)))
 }
 
 fn native_double_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None)?;
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None)?;
     if let Some(min) = elements
         .iter()
@@ -37724,14 +37859,14 @@ fn native_double_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_double_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None)?;
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None)?;
     if let Some(max) = elements
         .iter()
@@ -37747,14 +37882,14 @@ fn native_double_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_double_stream_average(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None)?;
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None)?;
     if !elements.is_empty() {
         let sum: f64 = elements
@@ -37771,7 +37906,7 @@ fn native_double_stream_average(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 }
 
 fn native_double_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
@@ -37781,7 +37916,7 @@ fn native_double_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let con_pin = ctx.pin_native_root(consumer);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(con_pin);
@@ -37802,7 +37937,7 @@ fn native_double_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) ->
 /// `DoubleStream.collect(Supplier, ObjDoubleConsumer, BiConsumer)` — see
 /// `native_int_stream_collect` for rationale. `accept` takes `(Object, double)`.
 fn native_double_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -37817,7 +37952,7 @@ fn native_double_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let sup_pin = ctx.pin_native_root(supplier);
     let acc_pin = ctx.pin_native_root(accumulator);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(sup_pin);
@@ -37856,7 +37991,7 @@ fn native_double_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 }
 
 fn native_double_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_double_stream(ctx, &[]),
     };
@@ -37866,7 +38001,7 @@ fn native_double_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let pred_pin = ctx.pin_native_root(predicate);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(pred_pin);
@@ -37892,7 +38027,7 @@ fn native_double_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 }
 
 fn native_double_stream_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_double_stream(ctx, &[]),
     };
@@ -37902,7 +38037,7 @@ fn native_double_stream_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let op_pin = ctx.pin_native_root(operator);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(op_pin);
@@ -37926,14 +38061,14 @@ fn native_double_stream_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_double_stream_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Double, 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Double, elements.len());
     for (i, val) in elements.iter().enumerate() {
         ctx.set_array_element(arr, i, *val);
@@ -37942,21 +38077,21 @@ fn native_double_stream_to_array(ctx: &mut dyn NativeContext, args: &[Value]) ->
 }
 
 fn native_double_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     let boxed = box_primitive_stream_elements(ctx, &elements)?;
     make_stream(ctx, &boxed)
 }
 
 fn native_double_stream_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_primitive_iterator(ctx, "java/util/PrimitiveIterator$OfDouble", &[]),
     };
-    let elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, &mut this)?;
     make_primitive_iterator(ctx, "java/util/PrimitiveIterator$OfDouble", &elements)
 }
 
@@ -37964,7 +38099,7 @@ fn native_double_stream_map_to_obj(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
@@ -37974,7 +38109,7 @@ fn native_double_stream_map_to_obj(
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let fn_pin = ctx.pin_native_root(mapper);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(fn_pin);
@@ -38002,7 +38137,7 @@ fn native_double_stream_map_to_long(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_long_stream(ctx, &[]),
     };
@@ -38012,7 +38147,7 @@ fn native_double_stream_map_to_long(
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let fn_pin = ctx.pin_native_root(func);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(fn_pin);
@@ -38039,7 +38174,7 @@ fn native_double_stream_map_to_int(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_int_stream(ctx, &[]),
     };
@@ -38049,7 +38184,7 @@ fn native_double_stream_map_to_int(
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let fn_pin = ctx.pin_native_root(func);
-    let elements = match stream_elements(ctx, this) {
+    let elements = match stream_elements(ctx, &mut this) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(fn_pin);
@@ -38581,7 +38716,9 @@ fn native_map_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // malformed-call no-op, the distinction `reject_null_functional` draws.
     if matches!(args.get(1), Some(Value::Object(None))) {
         return Err(RuntimeError::NullPointerException {
-            message: Some("Cannot invoke \"java.util.Map.size()\" because \"m\" is null".to_string()),
+            message: Some(
+                "Cannot invoke \"java.util.Map.size()\" because \"m\" is null".to_string(),
+            ),
         }
         .into());
     }
@@ -38768,7 +38905,9 @@ fn native_hashmap_write_object(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         &[Value::Object(Some(oos)), Value::Int(size)],
     )?;
     // internalWriteEntries: key then value for each mapping.
+    let oos_pin = ctx.pin_native_root(oos);
     for (key, value) in entries {
+        let oos = ctx.read_native_pin(oos_pin, oos);
         ctx.invoke(
             oos_cls,
             "writeObject",
@@ -41673,13 +41812,10 @@ fn lli_target_index(ctx: &dyn NativeContext, this: ObjectRef, cursor: i32) -> i3
 /// stale the instant they return; every later `next()` would walk the old
 /// elements. Re-snapshotting is O(n) per mutation and is what keeps this
 /// iterator's reads agreeing with the list it just edited.
-fn lli_resnapshot(ctx: &mut dyn NativeContext, this: ObjectRef, list: ObjectRef) {
-    let mut this = this;
+fn lli_resnapshot(ctx: &mut dyn NativeContext, this: &mut ObjectRef, list: ObjectRef) {
     let list_at_call = list;
-    let arr = rooted_across(ctx, &mut [&mut this], |ctx| {
-        ll_snapshot_array(ctx, list_at_call)
-    });
-    ctx.set_field(this, LLI_FIELD_ARR, Value::Object(Some(arr)));
+    let arr = rooted_across(ctx, &mut [this], |ctx| ll_snapshot_array(ctx, list_at_call));
+    ctx.set_field(*this, LLI_FIELD_ARR, Value::Object(Some(arr)));
 }
 
 // ===========================================================================
@@ -42422,7 +42558,7 @@ fn native_ll_listitr_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// all reach it — so the stub did not merely lose a feature, it made every
 /// default method that drains a `LinkedList` through its list-iterator throw.
 fn native_ll_listitr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Err(sli_illegal_state(ctx)),
     };
@@ -42441,7 +42577,7 @@ fn native_ll_listitr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     if let Some(node) = ll_node_at(&*ctx, list, idx) {
         ll_unlink_node(ctx, list, node);
     }
-    lli_resnapshot(ctx, this, list);
+    lli_resnapshot(ctx, &mut this, list);
     // The JDK's `cursor` bookkeeping: removing an element the iterator has
     // already passed shifts everything after it down by one.
     if idx < cursor {
@@ -42455,7 +42591,7 @@ fn native_ll_listitr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 /// element goes where `next()` would have read, `nextIndex()` advances past it,
 /// and `lastRet` is cleared so an immediately following `set`/`remove` raises.
 fn native_ll_listitr_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
@@ -42472,7 +42608,7 @@ fn native_ll_listitr_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         ctx,
         &[Value::Object(Some(list)), Value::Int(cursor.max(0)), elem],
     )?;
-    lli_resnapshot(ctx, this, list);
+    lli_resnapshot(ctx, &mut this, list);
     ctx.set_field(this, LLI_FIELD_CURSOR, Value::Int(cursor.max(0) + 1));
     lli_set_last_ret(ctx, this, -1);
     Ok(None)
@@ -45080,7 +45216,9 @@ fn native_lhm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // helpful NPE naming the method and its own parameter name.
     if matches!(args.get(1), Some(Value::Object(None))) {
         return Err(RuntimeError::NullPointerException {
-            message: Some("Cannot invoke \"java.util.Map.size()\" because \"m\" is null".to_string()),
+            message: Some(
+                "Cannot invoke \"java.util.Map.size()\" because \"m\" is null".to_string(),
+            ),
         }
         .into());
     }
@@ -45680,7 +45818,7 @@ fn native_lhm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // `reversed()`'s live half: rebuild from the source if it has moved. A receiver
     // that is not a reversed view is returned unchanged, at the cost of one overlay
     // lookup. See `resync_reversed_map`.
-    let this = resync_reversed_map(ctx, this)?;
+    let mut this = resync_reversed_map(ctx, this)?;
     // See `native_map_key_set`: a live view can be handed out again rather than
     // rebuilt, and this is the receiver the workload that motivated it uses.
     if let Some(cached) = cached_live_view(ctx, this, VIEW_KIND_KEYSET) {
@@ -45692,7 +45830,7 @@ fn native_lhm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // routes through LinkedHashMap.remove via virtual dispatch).
     let this_pin = ctx.pin_native_root(this);
     let keys = lhm_collect_keys(ctx, this);
-    let set = make_view_set_of(ctx, this, VIEW_KIND_KEYSET, &keys)?;
+    let set = make_view_set_of(ctx, &mut this, VIEW_KIND_KEYSET, &keys)?;
     let this = ctx.read_native_pin(this_pin, this);
     store_live_view(ctx, this, VIEW_KIND_KEYSET, set);
     ctx.unpin_native_roots(this_pin);
@@ -45772,9 +45910,9 @@ fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         alloc_set_view_carrier(ctx, carrier)
     })?;
     let cap = std::cmp::max(pairs.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
-    let this_at_call = this;
+    let mut this_at_call = this;
     let mut backing_map = rooted_across(ctx, &mut [&mut this, &mut set], |ctx| {
-        alloc_view_backing(ctx, this_at_call, VIEW_KIND_ENTRYSET, cap)
+        alloc_view_backing(ctx, &mut this_at_call, VIEW_KIND_ENTRYSET, cap)
     })?;
     hs_set_backing_map(ctx, set, backing_map);
     // `LinkedHashMap` has its OWN entrySet native — it does not reach
@@ -46144,7 +46282,11 @@ fn ad_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
     // construction. It is only unambiguous because the buffer is never full --
     // see `ad_ensure_capacity` for why that spare slot is load-bearing.
     let cap = data.map_or(0, |d| ctx.array_length(d)) as i32;
-    let size = if cap <= 0 { 0 } else { (tail - head).rem_euclid(cap) };
+    let size = if cap <= 0 {
+        0
+    } else {
+        (tail - head).rem_euclid(cap)
+    };
     (data, head, tail, size)
 }
 
@@ -46187,8 +46329,8 @@ fn ad_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
 /// is why it was found at all — an empty collection reads as a pass at every
 /// caller that only iterates, so the probe that caught this prints element
 /// CONTENT for every member rather than a verdict.
-fn ad_grow(ctx: &mut dyn NativeContext, this: ObjectRef, needed: i32) {
-    let (data, head, _tail, _size) = ad_state(ctx, this);
+fn ad_grow(ctx: &mut dyn NativeContext, this: &mut ObjectRef, needed: i32) {
+    let (data, head, _tail, _size) = ad_state(ctx, *this);
     let Some(old_buf) = data else {
         return;
     };
@@ -46196,14 +46338,17 @@ fn ad_grow(ctx: &mut dyn NativeContext, this: ObjectRef, needed: i32) {
     if old_cap <= 0 {
         return;
     }
-    let jump = if old_cap < 64 { old_cap + 2 } else { old_cap >> 1 };
+    let jump = if old_cap < 64 {
+        old_cap + 2
+    } else {
+        old_cap >> 1
+    };
     let new_cap = old_cap + if jump < needed { needed } else { jump };
 
     // GC-safety: the allocation can complete a moving young GC; `this` and the
     // old buffer are both bare Rust locals used below. See `rooted_across`.
-    let mut this = this;
     let mut old = old_buf;
-    let new_buf = rooted_across(ctx, &mut [&mut this, &mut old], |ctx| {
+    let new_buf = rooted_across(ctx, &mut [this, &mut old], |ctx| {
         alloc_ref_array(ctx, new_cap as usize)
     });
 
@@ -46217,14 +46362,14 @@ fn ad_grow(ctx: &mut dyn NativeContext, this: ObjectRef, needed: i32) {
         let v = ctx.get_array_element(old, k);
         ctx.set_array_element(new_buf, k, v);
     }
-    ctx.set_field(this, AD_FIELD_DATA, Value::Object(Some(new_buf)));
+    ctx.set_field(*this, AD_FIELD_DATA, Value::Object(Some(new_buf)));
 
     // The wrap-slide. When the elements straddle the end of the buffer, the
     // first leg has to stay flush against the end, so it moves up by exactly
     // the space gained and `head` follows it. `tail == head` is ambiguous
     // between full and empty, and the JDK disambiguates it the same way we do
     // everywhere else -- by looking at whether the head slot holds anything.
-    let tail = match ctx.get_field(this, AD_FIELD_TAIL) {
+    let tail = match ctx.get_field(*this, AD_FIELD_TAIL) {
         Value::Int(v) => v,
         _ => 0,
     };
@@ -46243,7 +46388,7 @@ fn ad_grow(ctx: &mut dyn NativeContext, this: ObjectRef, needed: i32) {
         for k in head..(head + new_space) {
             ctx.set_array_element(new_buf, k as usize, Value::Object(None));
         }
-        ctx.set_field(this, AD_FIELD_HEAD, Value::Int(head + new_space));
+        ctx.set_field(*this, AD_FIELD_HEAD, Value::Int(head + new_space));
     }
 }
 
@@ -46388,10 +46533,7 @@ fn register_array_deque_natives(r: &mut NativeMethodRegistry) {
 /// `collect_collection_elements_or_real` re-enters Java and every `addLast`
 /// can grow the backing array, so `this` is pinned and each element re-read
 /// per iteration rather than held across the call.
-fn native_ad_init_from_collection(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_ad_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     reject_null_collection(args.get(1))?;
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
@@ -46505,7 +46647,7 @@ fn native_ad_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn native_ad_add_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
@@ -46535,13 +46677,13 @@ fn native_ad_add_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     }
     ctx.set_field(this, AD_FIELD_HEAD, Value::Int(new_head));
     if new_head == tail {
-        ad_grow(ctx, this, 1);
+        ad_grow(ctx, &mut this, 1);
     }
     Ok(None)
 }
 
 fn native_ad_add_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
@@ -46562,7 +46704,7 @@ fn native_ad_add_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let new_tail = (tail + 1) % cap;
     ctx.set_field(this, AD_FIELD_TAIL, Value::Int(new_tail));
     if head == new_tail {
-        ad_grow(ctx, this, 1);
+        ad_grow(ctx, &mut this, 1);
     }
     Ok(None)
 }
@@ -47013,8 +47155,6 @@ fn ad_collect_elements(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     elems
 }
 
-
-
 fn native_ad_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -47077,17 +47217,16 @@ fn pq_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
     (data, size)
 }
 
-fn pq_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, min_cap: usize) {
-    let (data, _size) = pq_state(ctx, this);
+fn pq_ensure_capacity(ctx: &mut dyn NativeContext, this: &mut ObjectRef, min_cap: usize) {
+    let (data, _size) = pq_state(ctx, *this);
     let old_cap = data.map_or(0, |d| ctx.array_length(d));
     if min_cap <= old_cap {
         return;
     }
     let new_cap = std::cmp::max(old_cap + old_cap / 2 + 1, min_cap);
     // GC-safety: see `rooted_across`.
-    let mut this = this;
-    let mut old = data.unwrap_or(this);
-    let new_buf = rooted_across(ctx, &mut [&mut this, &mut old], |ctx| {
+    let mut old = data.unwrap_or(*this);
+    let new_buf = rooted_across(ctx, &mut [this, &mut old], |ctx| {
         alloc_ref_array(ctx, new_cap)
     });
     let data = data.map(|_| old);
@@ -47097,7 +47236,7 @@ fn pq_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, min_cap: usi
             ctx.set_array_element(new_buf, i, val);
         }
     }
-    ctx.set_field(this, PQ_FIELD_DATA, Value::Object(Some(new_buf)));
+    ctx.set_field(*this, PQ_FIELD_DATA, Value::Object(Some(new_buf)));
 }
 
 /// Compare two elements using comparator or natural ordering (string/int/long comparison).
@@ -47346,10 +47485,7 @@ fn sorted_source_comparator(ctx: &mut dyn NativeContext, source: ObjectRef) -> O
     }
 }
 
-fn native_pq_init_from_collection(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_pq_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     reject_null_collection(args.get(1))?;
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
@@ -47487,7 +47623,7 @@ fn native_pq_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn native_pq_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
@@ -47533,7 +47669,7 @@ fn native_pq_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let this_pin = ctx.pin_native_root(this);
     let eh = pin_value(ctx, elem);
     let (_, size) = pq_state(ctx, this);
-    pq_ensure_capacity(ctx, this, (size + 1) as usize);
+    pq_ensure_capacity(ctx, &mut this, (size + 1) as usize);
     let this = ctx.read_native_pin(this_pin, this);
     let elem = read_pinned_elem(ctx, eh, elem);
     ctx.unpin_native_roots(this_pin);
@@ -49302,12 +49438,25 @@ fn native_hs_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let elems = collect_collection_elements_or_real(ctx, coll)?;
+    // GC-safety: `collect_collection_elements_or_real` drives the source's real
+    // `iterator()` for a foreign collection, so it allocates and runs Java.
+    // `this` is live across it and the pin below was being taken AFTERWARDS —
+    // `[deadref-pin]` caught it receiving an address that named no live object
+    // on BindableTests under `CRATONVM_DBG_GC_STRESS=262144`. Same shape, same
+    // fix, as `native_al_add_all`.
+    let this_pin = ctx.pin_native_root(this);
+    let elems = match collect_collection_elements_or_real(ctx, coll) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
+    let this = ctx.read_native_pin(this_pin, this);
     // Family-1 fix (cce0079): each `native_hs_add` is GC-capable — an
     // earlier iteration's GC left `this` and every later `elems` slot stale
     // (the callee pins its own args, but was being handed already-dead
     // addresses). Pin and refresh per iteration.
-    let this_pin = ctx.pin_native_root(this);
     let (_, handles) = pin_value_slice(ctx, &elems);
     let mut this = this;
     let mut modified = false;
@@ -51589,7 +51738,9 @@ fn tm_migrate_fast_to_array(ctx: &mut dyn NativeContext, this_out: &mut ObjectRe
     // Now insert each entry through the array path. The fast-mode check
     // in `native_tm_put` will skip because `tm_force_array_set` is set
     // before we get here (caller's responsibility).
+    let this_pin = ctx.pin_native_root(this);
     for (k, v) in boxed {
+        let this = ctx.read_native_pin(this_pin, this);
         let _ = native_tm_put(ctx, &[Value::Object(Some(this)), k, v]);
     }
     *this_out = this;
@@ -54901,8 +55052,7 @@ fn cached_tm_view(
     {
         return None;
     }
-    let cached_source =
-        ts_view_source(&*ctx, view).or_else(|| values_view_source(&*ctx, view))?;
+    let cached_source = ts_view_source(&*ctx, view).or_else(|| values_view_source(&*ctx, view))?;
     if !std::ptr::eq(cached_source.as_ptr(), source.as_ptr()) {
         return None;
     }
@@ -55701,7 +55851,9 @@ fn native_tm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // helpful NPE naming the method and its own parameter name.
     if matches!(args.get(1), Some(Value::Object(None))) {
         return Err(RuntimeError::NullPointerException {
-            message: Some("Cannot invoke \"java.util.Map.size()\" because \"map\" is null".to_string()),
+            message: Some(
+                "Cannot invoke \"java.util.Map.size()\" because \"map\" is null".to_string(),
+            ),
         }
         .into());
     }
@@ -56417,7 +56569,11 @@ fn native_ts_read_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         ts_install_backing_array(ctx, this, (size as usize).max(TS_DEFAULT_CAPACITY));
     ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(0));
     ts_set_slot(ctx, this, TS_FIELD_COMPARATOR, comparator);
+    let ois_pin = ctx.pin_native_root(ois);
+    let this_pin = ctx.pin_native_root(this);
     for _ in 0..size {
+        let ois = ctx.read_native_pin(ois_pin, ois);
+        let this = ctx.read_native_pin(this_pin, this);
         let e = ctx
             .invoke(
                 ois_cls,
@@ -60114,7 +60270,9 @@ fn native_chm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // because the caller does not learn it passed null until much later.
     if matches!(args.get(1), None | Some(Value::Object(None))) {
         return Err(RuntimeError::NullPointerException {
-            message: Some("Cannot invoke \"java.util.Map.size()\" because \"m\" is null".to_string()),
+            message: Some(
+                "Cannot invoke \"java.util.Map.size()\" because \"m\" is null".to_string(),
+            ),
         }
         .into());
     }
@@ -61287,7 +61445,9 @@ fn native_chm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // class -- which is why this arm is keyed on the measurement.
     if matches!(args.get(1), Some(Value::Object(None))) {
         return Err(RuntimeError::NullPointerException {
-            message: Some("Cannot invoke \"java.util.Map.entrySet()\" because \"m\" is null".to_string()),
+            message: Some(
+                "Cannot invoke \"java.util.Map.entrySet()\" because \"m\" is null".to_string(),
+            ),
         }
         .into());
     }
@@ -61562,8 +61722,8 @@ fn native_chm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // sorted queue and never rolled back (Hibernate `TransactionTimeoutTest`).
     // Reads resync from the live map via `collect_entries_any`, which routes a
     // segmented CHM through `chm_collect_all_entries`.
-    let this_now = ctx.read_native_pin(this_pin, this);
-    let backing = alloc_view_backing(ctx, this_now, VIEW_KIND_ENTRYSET, cap)?;
+    let mut this_now = ctx.read_native_pin(this_pin, this);
+    let backing = alloc_view_backing(ctx, &mut this_now, VIEW_KIND_ENTRYSET, cap)?;
     let backing_pin = ctx.pin_native_root(backing);
     let set_now = ctx.read_native_pin(set_pin, set);
     hs_set_backing_map(ctx, set_now, backing);
@@ -64693,7 +64853,9 @@ fn native_props_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // text rather than dispatching back to JDK Properties for parity —
     // the previous implementation silently truncated/corrupted any
     // real-world `.properties` file with escapes or continuations.
+    let this_pin = ctx.pin_native_root(this);
     for (key, value) in props_parse_logical_lines(&text) {
+        let this = ctx.read_native_pin(this_pin, this);
         if key.is_empty() {
             continue;
         }
@@ -66821,7 +66983,9 @@ fn native_unmod_entry_set_for_each(
         Some(Value::Object(Some(i))) => i,
         _ => return Ok(None),
     };
+    let itr_pin = ctx.pin_native_root(itr);
     loop {
+        let itr = ctx.read_native_pin(itr_pin, itr);
         let has_next = matches!(
             ctx.invoke_virtual(itr, "hasNext", "()Z", &[])?,
             Some(Value::Int(n)) if n != 0
@@ -67481,8 +67645,25 @@ fn native_list_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             }));
         }
     }
-    let backing = try_alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS)?;
-    native_al_init_from_collection(ctx, &[Value::Object(Some(backing)), src])?;
+    // GC-safety: the allocation and the copy-in below both collect, and `src`
+    // and `backing` are bare locals read after each. Same idiom, and the same
+    // reason, as `native_map_copy_of` — which had it and these two did not.
+    //
+    // Measured, not inferred: on BindableTests under `CRATONVM_DBG_GC_STRESS`
+    // `native_al_init_from_collection` relocated `backing`, and the pre-move
+    // address went into the wrapper's slot 0 and out to the program. See
+    // `docs/internal/springboot/`'s BindableTests residual page.
+    let src_pin = pin_value(ctx, src);
+    let mut backing = try_alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS)?;
+    let src = read_pinned_elem(ctx, src_pin, src);
+    let backing_at_call = backing;
+    let copied = rooted_across(ctx, &mut [&mut backing], |ctx| {
+        native_al_init_from_collection(ctx, &[Value::Object(Some(backing_at_call)), src])
+    });
+    if src_pin != usize::MAX {
+        ctx.unpin_native_roots(src_pin);
+    }
+    copied?;
     Ok(Some(Value::Object(Some(alloc_immutable_wrapper(
         ctx,
         UNMOD_LIST_CLASS,
@@ -67507,8 +67688,18 @@ fn native_set_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             }));
         }
     }
-    let backing = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
-    native_hs_init_from_collection(ctx, &[Value::Object(Some(backing)), src])?;
+    // GC-safety: see `native_list_copy_of` — identical shape, identical fix.
+    let src_pin = pin_value(ctx, src);
+    let mut backing = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
+    let src = read_pinned_elem(ctx, src_pin, src);
+    let backing_at_call = backing;
+    let copied = rooted_across(ctx, &mut [&mut backing], |ctx| {
+        native_hs_init_from_collection(ctx, &[Value::Object(Some(backing_at_call)), src])
+    });
+    if src_pin != usize::MAX {
+        ctx.unpin_native_roots(src_pin);
+    }
+    copied?;
     Ok(Some(Value::Object(Some(alloc_immutable_wrapper(
         ctx,
         UNMOD_SET_CLASS,
@@ -68472,7 +68663,7 @@ fn native_cld_peek_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 /// offerFirst — prepend element; ArrayList backing means O(n) shift but
 /// correctness is preserved under concurrent access via the `this` monitor.
 fn native_cld_offer_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(Value::Object(Some(this))) = args.first().copied() else {
+    let Some(Value::Object(Some(mut this))) = args.first().copied() else {
         return Ok(Some(Value::Int(0)));
     };
     let elem = args.get(1).cloned().unwrap_or(Value::Object(None));
@@ -68500,7 +68691,7 @@ fn native_cld_offer_first(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     }
     // Slow path: head == 0, no front room. Grow/compact so the window fits,
     // then shift the live elements right by one to open index 0.
-    lbq_ensure_capacity(ctx, this, size + 1);
+    lbq_ensure_capacity(ctx, &mut this, size + 1);
     let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
         Value::Object(Some(a)) => a,
         _ => {
@@ -68568,18 +68759,18 @@ fn native_abq_init_fair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 /// buffer when even a compacted window doesn't fit. Resets `head` to 0
 /// whenever it relocates elements. Logical element layout (`head + i`) is
 /// preserved.
-fn lbq_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usize) {
-    let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
+fn lbq_ensure_capacity(ctx: &mut dyn NativeContext, this: &mut ObjectRef, needed: usize) {
+    let arr = match ctx.get_field(*this, LBQ_FIELD_HEAD) {
         Value::Object(Some(a)) => a,
         _ => return,
     };
     let old_len = ctx.array_length(arr);
-    let head = lbq_head(ctx, this);
+    let head = lbq_head(ctx, *this);
     // Fits in the current window — nothing to do.
     if head + needed <= old_len {
         return;
     }
-    let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
+    let size = match ctx.get_field(*this, LBQ_FIELD_SIZE) {
         Value::Int(v) if v >= 0 => v as usize,
         _ => 0,
     };
@@ -68593,23 +68784,22 @@ fn lbq_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usi
         for i in size..old_len {
             ctx.set_array_element(arr, i, Value::Object(None));
         }
-        lbq_set_head(ctx, this, 0);
+        lbq_set_head(ctx, *this, 0);
         return;
     }
     // Grow: allocate a larger buffer and copy the live window to index 0.
     let new_len = (old_len * 2).max(needed).max(16);
     // GC-safety: the allocation can complete a moving young GC; `this` and the
     // old buffer are both bare Rust locals used below. See `rooted_across`.
-    let mut this = this;
     let mut arr = arr;
-    let new_arr = rooted_across(ctx, &mut [&mut this, &mut arr], |ctx| {
+    let new_arr = rooted_across(ctx, &mut [this, &mut arr], |ctx| {
         alloc_ref_array(ctx, new_len)
     });
     for i in 0..size {
         ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, head + i));
     }
-    ctx.set_field(this, LBQ_FIELD_HEAD, Value::Object(Some(new_arr)));
-    lbq_set_head(ctx, this, 0);
+    ctx.set_field(*this, LBQ_FIELD_HEAD, Value::Object(Some(new_arr)));
+    lbq_set_head(ctx, *this, 0);
 }
 
 // =====================================================================
@@ -68643,7 +68833,7 @@ fn lbq_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usi
 /// Grows the backing array unconditionally — capacity is enforced by the
 /// caller (offer_bool / put_blocking).
 fn native_lbq_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
@@ -68652,7 +68842,7 @@ fn native_lbq_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Value::Int(v) => v,
         _ => 0,
     };
-    lbq_ensure_capacity(ctx, this, (size + 1) as usize);
+    lbq_ensure_capacity(ctx, &mut this, (size + 1) as usize);
     let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
         Value::Object(Some(a)) => a,
         _ => return Ok(None),
@@ -68695,7 +68885,7 @@ fn native_lbq_offer_bool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// Loop predicate is re-checked after each wake (handles spurious wakeups
 /// and the case where another producer raced in to fill the gap).
 fn native_lbq_put_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
@@ -68704,7 +68894,17 @@ fn native_lbq_put_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => i32::MAX,
     };
     ctx.monitor_enter(this);
+    let this_pin = ctx.pin_native_root(this);
+    // The ELEMENT crosses the wait too — it is handed to `native_lbq_offer`
+    // below, after the loop — so it needs the same pin as the receiver.
+    // `args` is the interpreter's pre-call snapshot and nothing refreshes it.
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let elem_pin = match elem {
+        Value::Object(Some(o)) => Some(ctx.pin_native_root(o)),
+        _ => None,
+    };
     loop {
+        this = ctx.read_native_pin(this_pin, this);
         let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
             Value::Int(v) => v,
             _ => 0,
@@ -68718,21 +68918,37 @@ fn native_lbq_put_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         // `monitor_notify_all` is a no-op.
         let _ = ctx.monitor_wait(this, Some(50));
     }
-    let r = native_lbq_offer(ctx, args);
+    // `monitor_wait` above PARKS, so a collection can have moved (or, for an
+    // object the sweep proved dead, reclaimed) both the receiver and the
+    // element inside the loop. The shadowed `this` used to be scoped to the
+    // loop BODY, so everything below ran on the pre-wait address:
+    // `native_lbq_offer` appended into a stale queue, and `monitor_exit`
+    // released a monitor at an address `MonitorTable::exit` then dereferenced.
+    // Assign through the outer binding instead, and refresh the element the
+    // same way.
+    this = ctx.read_native_pin(this_pin, this);
+    let elem = match (elem, elem_pin) {
+        (Value::Object(Some(o)), Some(h)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+        _ => elem,
+    };
+    let r = native_lbq_offer(ctx, &[Value::Object(Some(this)), elem]);
     // Wake any thread parked in `take()` waiting for an element to arrive.
     let _ = ctx.monitor_notify_all(this);
     ctx.monitor_exit(this);
+    ctx.unpin_native_roots(this_pin);
     r
 }
 
 /// Blocking take: waits until an element is available using monitor wait/notify.
 fn native_lbq_take_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
     ctx.monitor_enter(this);
+    let this_pin = ctx.pin_native_root(this);
     loop {
+        this = ctx.read_native_pin(this_pin, this);
         let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
             Value::Int(v) => v,
             _ => 0,
@@ -68742,10 +68958,15 @@ fn native_lbq_take_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         }
         let _ = ctx.monitor_wait(this, Some(50));
     }
+    // See `native_lbq_put_blocking`: the refresh has to reach the OUTER
+    // binding, or the dequeue and the monitor exit below both run on the
+    // pre-wait address.
+    this = ctx.read_native_pin(this_pin, this);
     let r = lbq_poll_locked(ctx, this);
     // Wake any thread parked in `put()` waiting for a slot to free up.
     let _ = ctx.monitor_notify_all(this);
     ctx.monitor_exit(this);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(r))
 }
 
@@ -70641,40 +70862,47 @@ fn cslm_arrays(
     (this, keys, values, size)
 }
 
+/// Grow the key/value arrays if `size + 1` no longer fits, IN PLACE through
+/// `&mut`.
+///
+/// All three references are `&mut` and none is returned, which is the whole
+/// contract: two allocations run here, `rooted_across` refreshes what it is
+/// given, and a by-value parameter would have handed that refresh to a copy the
+/// caller never sees. The old signature took all three by value and returned
+/// `(new_keys, new_values)` — so the arrays were fine (the caller rebound them)
+/// and `this` was not: `native_cslm_put` had to pin and re-read it by hand
+/// around the call, and any future caller that forgot would have read a pre-GC
+/// map header.
 fn cslm_ensure_capacity(
     ctx: &mut dyn NativeContext,
-    this: ObjectRef,
+    this: &mut ObjectRef,
     size: i32,
-    keys: ObjectRef,
-    values: ObjectRef,
-) -> (ObjectRef, ObjectRef) {
-    let arr_len = ctx.array_length(keys);
+    keys: &mut ObjectRef,
+    values: &mut ObjectRef,
+) {
+    let arr_len = ctx.array_length(*keys);
     let needed = (size + 1) as usize;
     if needed <= arr_len {
-        return (keys, values);
+        return;
     }
     let new_cap = (arr_len * 2).max(needed).max(CSLM_DEFAULT_CAPACITY);
     // GC-safety: two allocations in a row with `this` and both source arrays
     // live across them (and `new_keys` live across the second). See
     // `rooted_across`.
-    let mut this = this;
-    let mut keys = keys;
-    let mut values = values;
-    let mut new_keys = rooted_across(ctx, &mut [&mut this, &mut keys, &mut values], |ctx| {
+    let mut new_keys = rooted_across(ctx, &mut [this, keys, values], |ctx| {
         alloc_ref_array(ctx, new_cap)
     });
-    let new_values = rooted_across(
-        ctx,
-        &mut [&mut this, &mut keys, &mut values, &mut new_keys],
-        |ctx| alloc_ref_array(ctx, new_cap),
-    );
+    let new_values = rooted_across(ctx, &mut [this, keys, values, &mut new_keys], |ctx| {
+        alloc_ref_array(ctx, new_cap)
+    });
     for i in 0..(size as usize) {
-        ctx.set_array_element(new_keys, i, ctx.get_array_element(keys, i));
-        ctx.set_array_element(new_values, i, ctx.get_array_element(values, i));
+        ctx.set_array_element(new_keys, i, ctx.get_array_element(*keys, i));
+        ctx.set_array_element(new_values, i, ctx.get_array_element(*values, i));
     }
-    ctx.set_field(this, CSLM_FIELD_KEYS, Value::Object(Some(new_keys)));
-    ctx.set_field(this, CSLM_FIELD_VALUES, Value::Object(Some(new_values)));
-    (new_keys, new_values)
+    ctx.set_field(*this, CSLM_FIELD_KEYS, Value::Object(Some(new_keys)));
+    ctx.set_field(*this, CSLM_FIELD_VALUES, Value::Object(Some(new_values)));
+    *keys = new_keys;
+    *values = new_values;
 }
 
 fn cslm_state(
@@ -70834,14 +71062,16 @@ fn native_cslm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             // these pins a growth-triggered young collection made the `size`
             // write land in a dead address (the map silently kept its old
             // count) and stored dangling key/value refs into the array.
-            let this_pin = ctx.pin_native_root(this);
+            // `this` no longer needs a pin of its own here —
+            // `cslm_ensure_capacity` takes it (and both arrays) by `&mut` and
+            // refreshes them in place. `key`/`value` are `Value`s, not part of
+            // that contract, and still do.
             let key_pin = pin_value(ctx, key);
             let value_pin = pin_value(ctx, value);
-            let (keys, values_arr) = cslm_ensure_capacity(ctx, this, size, keys, values_arr);
-            let this = ctx.read_native_pin(this_pin, this);
+            let mut values_arr = values_arr;
+            cslm_ensure_capacity(ctx, &mut this, size, &mut keys, &mut values_arr);
             let key = read_pinned_elem(ctx, key_pin, key);
             let value = read_pinned_elem(ctx, value_pin, value);
-            ctx.unpin_native_roots(this_pin);
             let s = size as usize;
             for i in (pos..s).rev() {
                 let k = ctx.get_array_element(keys, i);
@@ -71536,6 +71766,15 @@ fn register_priority_blocking_queue_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "<init>", "()V", native_pbq_init);
     r.register(c, "offer", "(Ljava/lang/Object;)Z", native_pbq_offer);
     r.register(c, "poll", "()Ljava/lang/Object;", native_pbq_poll);
+    // The TIMED poll too — see `native_pbq_poll_timed` for why leaving it to
+    // real bytecode is not an option: that body walks these same two fields as
+    // a binary HEAP while every native here keeps them a sorted array.
+    r.register(
+        c,
+        "poll",
+        "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
+        native_pbq_poll_timed,
+    );
     r.register(c, "peek", "()Ljava/lang/Object;", native_pbq_peek);
     r.register(c, "put", "(Ljava/lang/Object;)V", native_pbq_put);
     r.register(c, "take", "()Ljava/lang/Object;", native_pbq_take);
@@ -71871,6 +72110,131 @@ fn native_pbq_take(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             break;
         }
         let _ = ctx.monitor_wait(this, Some(50));
+        this = ctx.read_native_pin(h_this, this);
+    }
+    let head = pbq_poll_locked(ctx, this);
+    let h_head = pin_value(ctx, head);
+    ctx.monitor_exit(this);
+    let head = read_pinned_elem(ctx, h_head, head);
+    ctx.unpin_native_roots(h_this);
+    Ok(Some(head))
+}
+
+/// A `java.util.concurrent.TimeUnit` constant's timeout in MILLISECONDS.
+///
+/// The real `TimeUnit` is a JDK enum: its ordinal lives in the `Enum` base
+/// field `ordinal`, while object slot 0 holds the enum `name` (a `String`).
+/// Reading slot 0 for the ordinal works against a synthetic one-field stand-in
+/// and is WRONG for the real enum — `await(N, SECONDS)` then waits `N` ms — so
+/// the named field is preferred and slot 0 is only the fallback.
+///
+/// This duplicates `native-builtins`' `time_unit_ordinal` /
+/// `convert_time_unit_to_millis` pair, and the duplication is a crate boundary
+/// rather than a choice: both are private to that crate and `native-collections`
+/// does not depend on it. If a third copy is ever wanted, move this one into
+/// `native-api` instead of adding it — the scaling-UP arms below have to
+/// SATURATE (HotSpot's `TimeUnit.SECONDS.toMillis(Long.MAX_VALUE)` is
+/// `Long.MAX_VALUE`, not a wrapped negative), and that is exactly the kind of
+/// rule that goes wrong when it is written out a third time.
+fn pbq_timeout_millis(ctx: &mut dyn NativeContext, value: i64, unit: Option<ObjectRef>) -> i64 {
+    let ordinal = match unit {
+        Some(u) => match ctx.get_field_by_name(u, "ordinal") {
+            Value::Int(v) => v,
+            _ => match ctx.get_field(u, 0) {
+                Value::Int(v) => v,
+                _ => 2,
+            },
+        },
+        None => 2,
+    };
+    match ordinal {
+        0 => value / 1_000_000,
+        1 => value / 1_000,
+        2 => value,
+        3 => value.saturating_mul(1_000),
+        4 => value.saturating_mul(60_000),
+        5 => value.saturating_mul(3_600_000),
+        6 => value.saturating_mul(86_400_000),
+        _ => value,
+    }
+}
+
+/// `poll(long, TimeUnit)` — the TIMED blocking read.
+///
+/// # Why this has to be a native, and what happened when it was not
+///
+/// The natives above own `offer`/`put`/`poll()`/`take()` and keep the queue in
+/// a SORTED ARRAY (`PBQ_FIELD_DATA` ascending, `PBQ_FIELD_SIZE` its length).
+/// The real `java.util.concurrent.PriorityBlockingQueue` keeps a BINARY HEAP in
+/// the same two fields and its own `dequeue()` sifts down through them. The two
+/// representations agree only for zero or one element.
+///
+/// Leaving `poll(long, TimeUnit)` to real bytecode therefore mixed them, and
+/// both possible outcomes are bad:
+///
+/// * **As shipped**, the real body waits on `notEmpty` under `lock`, and the
+///   natives signal the receiver's OBJECT MONITOR instead — no `Condition`
+///   waiter is on that — so a consumer that actually had to wait was woken only
+///   by whatever periodic re-check its `await` made. Measured against HotSpot
+///   with an empty queue and a producer that puts after 300 ms: HotSpot returns
+///   in under a second, this VM took more than one, and
+///   `probes/ConcurrencyUnderGcSweep.java` expired a 120 s phase deadline
+///   draining 480 elements.
+/// * **Signalling `notEmpty` from the native insert** — the obvious repair, and
+///   it was tried — wakes the real `dequeue()` promptly and it then sifts a
+///   sorted array as if it were a heap: `NullPointerException: Cannot invoke
+///   "java.lang.Comparable.compareTo(Object)" because "key" is null`, and 1 of
+///   480 elements consumed. Waking the mixed path is worse than starving it.
+///
+/// So the fix is to stop mixing: this is `native_pbq_take` with a deadline, on
+/// the native representation, coordinated through the same object monitor as
+/// every other native here. `null` on timeout, per the `BlockingQueue`
+/// contract.
+///
+/// The remaining real-bytecode readers (`drainTo`, `remove(Object)`,
+/// `iterator`) still see the sorted array through a heap-shaped body. That is
+/// pre-existing and unchanged here; the representation mismatch is the real
+/// defect and it wants its own page.
+fn native_pbq_poll_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let timeout = match args.get(1) {
+        // WP4.5 tag erasure: a `long` popped generically can come back tagged
+        // `Double` with the bits intact, exactly as `Object.wait(J)` handles.
+        Some(Value::Long(v)) => *v,
+        Some(Value::Double(d)) => d.to_bits() as i64,
+        _ => 0,
+    };
+    let unit = match args.get(2) {
+        Some(Value::Object(Some(u))) => Some(*u),
+        _ => None,
+    };
+    let timeout_ms = pbq_timeout_millis(ctx, timeout, unit).max(0) as u64;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    // Family-1: this method BLOCKS, so pin the receiver and re-read it after
+    // every blocking call — see `native_pbq_take`.
+    let h_this = ctx.pin_native_root(this);
+    let this = ctx.monitor_enter_gc_safe(this);
+    let mut this = ctx.read_native_pin(h_this, this);
+    loop {
+        let size = match ctx.get_field(this, PBQ_FIELD_SIZE) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        if size > 0 {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            ctx.monitor_exit(this);
+            ctx.unpin_native_roots(h_this);
+            return Ok(Some(Value::Object(None)));
+        }
+        // Bounded, so the deadline is re-checked even if a notify is lost.
+        let wait_ms = (remaining.as_millis().min(50) as u64).max(1);
+        let _ = ctx.monitor_wait(this, Some(wait_ms));
         this = ctx.read_native_pin(h_this, this);
     }
     let head = pbq_poll_locked(ctx, this);
@@ -72613,24 +72977,24 @@ const COWAL_CLASS: &str = "java/util/concurrent/CopyOnWriteArrayList";
 /// Real JDK `CopyOnWriteArrayList` uses named `lock` + `array`. Legacy
 /// synthetic stubs mirrored `ArrayList` with slot 0 = backing `Object[]`,
 /// slot 1 = `int` size.
-fn cowal_ensure_lock_and_array(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
+fn cowal_ensure_lock_and_array(
+    ctx: &mut dyn NativeContext,
+    this: &mut ObjectRef,
+) -> MethodCallResult {
     // GC-safety: `new_object`, `invoke_special` and `new_array` can each
     // complete a moving young GC, and every `set_field` below targets `this` —
     // a bare Rust local that nothing rewrites. The freshly created lock object
     // is likewise reachable only from a Rust local until it is stored, so a
     // collection there reclaims it outright. See `rooted_across`.
-    let mut this = this;
     if let Some(ls) = ctx.resolve_field_index(COWAL_CLASS, "lock") {
-        if matches!(ctx.get_field(this, ls), Value::Object(None)) {
-            let made = rooted_across(ctx, &mut [&mut this], |ctx| {
-                ctx.new_object("java/lang/Object")
-            });
+        if matches!(ctx.get_field(*this, ls), Value::Object(None)) {
+            let made = rooted_across(ctx, &mut [this], |ctx| ctx.new_object("java/lang/Object"));
             if let Ok(Some(Value::Object(Some(lo)))) = made {
                 let mut lo = lo;
                 // The receiver passed to `<init>` is the address that is
                 // current *at the call*; `lo` itself is rewritten on return.
                 let lo_at_call = lo;
-                rooted_across(ctx, &mut [&mut this, &mut lo], |ctx| {
+                rooted_across(ctx, &mut [this, &mut lo], |ctx| {
                     let _ = ctx.invoke_special(
                         "java/lang/Object",
                         "<init>",
@@ -72638,23 +73002,23 @@ fn cowal_ensure_lock_and_array(ctx: &mut dyn NativeContext, this: ObjectRef) -> 
                         &[Value::Object(Some(lo_at_call))],
                     );
                 });
-                ctx.set_field(this, ls, Value::Object(Some(lo)));
+                ctx.set_field(*this, ls, Value::Object(Some(lo)));
             }
         }
     }
     if let Some(slot) = ctx.resolve_field_index(COWAL_CLASS, "array") {
-        if matches!(ctx.get_field(this, slot), Value::Object(None)) {
-            let a = rooted_across(ctx, &mut [&mut this], |ctx| {
+        if matches!(ctx.get_field(*this, slot), Value::Object(None)) {
+            let a = rooted_across(ctx, &mut [this], |ctx| {
                 ctx.new_array(ArrayElementType::Reference, 0)
             });
-            ctx.set_field(this, slot, Value::Object(Some(a)));
+            ctx.set_field(*this, slot, Value::Object(Some(a)));
         }
-    } else if matches!(ctx.get_field(this, 0), Value::Object(None)) {
-        let a = rooted_across(ctx, &mut [&mut this], |ctx| {
+    } else if matches!(ctx.get_field(*this, 0), Value::Object(None)) {
+        let a = rooted_across(ctx, &mut [this], |ctx| {
             ctx.new_array(ArrayElementType::Reference, 0)
         });
-        ctx.set_field(this, 0, Value::Object(Some(a)));
-        ctx.set_field(this, 1, Value::Int(0));
+        ctx.set_field(*this, 0, Value::Object(Some(a)));
+        ctx.set_field(*this, 1, Value::Int(0));
     }
     Ok(None)
 }
@@ -72771,11 +73135,11 @@ fn cowal_exit_monitor(ctx: &mut dyn NativeContext, this: ObjectRef, lock_obj: Op
 }
 
 fn native_cowal_add_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    cowal_ensure_lock_and_array(ctx, this)?;
+    cowal_ensure_lock_and_array(ctx, &mut this)?;
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
 
     let lock_obj = cowal_enter_monitor(ctx, this);
@@ -72832,11 +73196,11 @@ fn native_cowal_add_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 }
 
 fn native_cowal_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    cowal_ensure_lock_and_array(ctx, this)?;
+    cowal_ensure_lock_and_array(ctx, &mut this)?;
     let needle = args.get(1).copied().unwrap_or(Value::Object(None));
     // Match by Java `equals` semantics, not reference identity — real
     // `CopyOnWriteArrayList.contains` uses `o.equals(elem)`.
@@ -72854,7 +73218,7 @@ fn native_cowal_bulk_remove_predicate(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
@@ -72868,7 +73232,7 @@ fn native_cowal_bulk_remove_predicate(
         }
     };
 
-    cowal_ensure_lock_and_array(ctx, this)?;
+    cowal_ensure_lock_and_array(ctx, &mut this)?;
 
     let lock_obj: Option<ObjectRef> = if let Some(ls) = ctx.resolve_field_index(COWAL_CLASS, "lock")
     {
@@ -72900,28 +73264,62 @@ fn native_cowal_bulk_remove_predicate(
         return Ok(Some(Value::Int(0)));
     };
 
-    let mut survivors: Vec<Value> = Vec::with_capacity(n);
+    // Family-1 (stale ObjectRef across a Java re-entry). `predicate.test` runs
+    // USER code on every turn, so it allocates and can collect: the receiver,
+    // the snapshot array, the predicate and the monitor all move under this
+    // loop. Three of the four were kept as pre-loop addresses — `arr` was
+    // dereferenced again on the next turn, and `exit_mon` released a monitor at
+    // an address `MonitorTable::exit` dereferences, which is a fault when the
+    // slot was reclaimed and a permanently leaked lock when it merely moved.
+    //
+    // Survivors are recorded as INDICES rather than as `Value`s for the same
+    // reason: a `Vec<Value>` of raw references held across the remaining turns
+    // is N more stale addresses, and the elements are already kept alive by the
+    // snapshot array itself (which `this` roots).
+    let this_pin = ctx.pin_native_root(this);
+    let arr_pin = ctx.pin_native_root(arr);
+    let lock_pin = lock_obj.map(|lo| ctx.pin_native_root(lo));
+    let pred_pin = ctx.pin_native_root(pred);
+    let refresh_lock = |ctx: &dyn NativeContext, lock_obj: Option<ObjectRef>| -> Option<ObjectRef> {
+        match (lock_obj, lock_pin) {
+            (Some(lo), Some(h)) => Some(ctx.read_native_pin(h, lo)),
+            _ => lock_obj,
+        }
+    };
+
+    let mut survivors: Vec<usize> = Vec::with_capacity(n);
     for i in 0..n {
+        let pred = ctx.read_native_pin(pred_pin, pred);
+        let arr = ctx.read_native_pin(arr_pin, arr);
         let elem = ctx.get_array_element(arr, i);
-        let remove = match ctx.invoke_virtual(pred, "test", "(Ljava/lang/Object;)Z", &[elem]) {
-            Ok(Some(Value::Int(1))) => true,
-            _ => false,
-        };
+        let remove = matches!(
+            ctx.invoke_virtual(pred, "test", "(Ljava/lang/Object;)Z", &[elem]),
+            Ok(Some(Value::Int(1)))
+        );
         if !remove {
-            survivors.push(elem);
+            survivors.push(i);
         }
     }
 
+    let this = ctx.read_native_pin(this_pin, this);
+    let lock_obj = refresh_lock(ctx, lock_obj);
     if survivors.len() == n {
         exit_mon(ctx, lock_obj, this);
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Int(0)));
     }
 
     let new_arr = ctx.new_array(ArrayElementType::Reference, survivors.len());
-    for (i, v) in survivors.iter().enumerate() {
-        ctx.set_array_element(new_arr, i, *v);
+    let new_pin = ctx.pin_native_root(new_arr);
+    for (i, &src) in survivors.iter().enumerate() {
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        let new_arr = ctx.read_native_pin(new_pin, new_arr);
+        let v = ctx.get_array_element(arr, src);
+        ctx.set_array_element(new_arr, i, v);
     }
 
+    let this = ctx.read_native_pin(this_pin, this);
+    let new_arr = ctx.read_native_pin(new_pin, new_arr);
     if let Some(aslot) = ctx.resolve_field_index(COWAL_CLASS, "array") {
         ctx.set_field(this, aslot, Value::Object(Some(new_arr)));
         cowal_bump_mod_count(ctx, this);
@@ -72930,12 +73328,14 @@ fn native_cowal_bulk_remove_predicate(
         ctx.set_field(this, 1, Value::Int(survivors.len() as i32));
     }
 
+    let lock_obj = refresh_lock(ctx, lock_obj);
     exit_mon(ctx, lock_obj, this);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Int(1)))
 }
 
 fn native_cowal_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
@@ -72948,7 +73348,7 @@ fn native_cowal_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             .into());
         }
     };
-    cowal_ensure_lock_and_array(ctx, this)?;
+    cowal_ensure_lock_and_array(ctx, &mut this)?;
 
     let Some(aslot) = ctx.resolve_field_index(COWAL_CLASS, "array") else {
         // Synthetic two-field layout: fall back to repeated `add` (legacy).
@@ -72958,7 +73358,14 @@ fn native_cowal_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         };
         let n = ctx.array_length(arr_obj);
         let mut any_added = 0i32;
+        let this_pin = ctx.pin_native_root(this);
+        // `arr_obj` crosses the same `add` re-entry the receiver does, and the
+        // element is read OUT of it on every turn — pinning only `this` left
+        // the source array as a pre-call address from the second turn on.
+        let arr_pin = ctx.pin_native_root(arr_obj);
         for i in 0..n {
+            let this = ctx.read_native_pin(this_pin, this);
+            let arr_obj = ctx.read_native_pin(arr_pin, arr_obj);
             let elem = ctx.get_array_element(arr_obj, i);
             if matches!(
                 ctx.invoke_virtual(this, "add", "(Ljava/lang/Object;)Z", &[elem]),
@@ -72967,6 +73374,7 @@ fn native_cowal_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
                 any_added = 1;
             }
         }
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Int(any_added)));
     };
 
@@ -72995,16 +73403,35 @@ fn native_cowal_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         }
     };
 
-    let cs = match ctx.invoke_virtual(coll, "toArray", "()[Ljava/lang/Object;", &[]) {
+    // `collection.toArray()` is USER code (any `Collection` implementation),
+    // so it allocates and can collect. The receiver and the monitor both cross
+    // it, and the monitor is what `exit_mon` dereferences below — the whole
+    // reason this function could leak a lock or fault on the way out. Pin
+    // before the call, re-read after it. `ctx.new_array` below is another
+    // collection point, so `base` and `cs` are pinned across it too.
+    let this_pin = ctx.pin_native_root(this);
+    let lock_pin = lock_obj.map(|lo| ctx.pin_native_root(lo));
+    let refresh_lock = |ctx: &dyn NativeContext, lock_obj: Option<ObjectRef>| -> Option<ObjectRef> {
+        match (lock_obj, lock_pin) {
+            (Some(lo), Some(h)) => Some(ctx.read_native_pin(h, lo)),
+            _ => lock_obj,
+        }
+    };
+    let cs = ctx.invoke_virtual(coll, "toArray", "()[Ljava/lang/Object;", &[]);
+    let this = ctx.read_native_pin(this_pin, this);
+    let lock_obj = refresh_lock(ctx, lock_obj);
+    let cs = match cs {
         Ok(Some(Value::Object(Some(a)))) => a,
         _ => {
             exit_mon(ctx, lock_obj, this);
+            ctx.unpin_native_roots(this_pin);
             return Ok(Some(Value::Int(0)));
         }
     };
     let add_n = ctx.array_length(cs);
     if add_n == 0 {
         exit_mon(ctx, lock_obj, this);
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Int(0)));
     }
 
@@ -73012,20 +73439,30 @@ fn native_cowal_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Value::Object(Some(a)) => a,
         _ => {
             exit_mon(ctx, lock_obj, this);
+            ctx.unpin_native_roots(this_pin);
             return Ok(Some(Value::Int(0)));
         }
     };
     let base_n = ctx.array_length(base);
+    let cs_pin = ctx.pin_native_root(cs);
+    let base_pin = ctx.pin_native_root(base);
     let out = ctx.new_array(ArrayElementType::Reference, base_n + add_n);
+    let cs = ctx.read_native_pin(cs_pin, cs);
+    let base = ctx.read_native_pin(base_pin, base);
+    let this = ctx.read_native_pin(this_pin, this);
     for i in 0..base_n {
-        ctx.set_array_element(out, i, ctx.get_array_element(base, i));
+        let v = ctx.get_array_element(base, i);
+        ctx.set_array_element(out, i, v);
     }
     for i in 0..add_n {
-        ctx.set_array_element(out, base_n + i, ctx.get_array_element(cs, i));
+        let v = ctx.get_array_element(cs, i);
+        ctx.set_array_element(out, base_n + i, v);
     }
     ctx.set_field(this, aslot, Value::Object(Some(out)));
     cowal_bump_mod_count(ctx, this);
+    let lock_obj = refresh_lock(ctx, lock_obj);
     exit_mon(ctx, lock_obj, this);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Int(1)))
 }
 
@@ -74163,7 +74600,9 @@ fn interrupt_tpe_workers(ctx: &mut dyn NativeContext, exec: ObjectRef) -> bool {
         }
     };
     let mut n = 0;
+    let it_pin = ctx.pin_native_root(it);
     for _ in 0..4096 {
+        let it = ctx.read_native_pin(it_pin, it);
         match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
             Ok(Some(Value::Int(1))) => {}
             _ => break,

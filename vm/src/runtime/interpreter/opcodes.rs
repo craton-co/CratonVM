@@ -2037,35 +2037,14 @@ pub(super) fn op_monitorexit(
     thread: &mut JvmThread,
     frame_idx: usize,
 ) -> Result<(), MethodCallFailed> {
-    let pc_snap = thread.frames[frame_idx].pc;
-    // JEP 358 increment 2: monitor object at top of stack (depth 0).
-    let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
-    let npe_code = Arc::clone(&thread.frames[frame_idx].code);
-    let npe_cid = thread.frames[frame_idx].class_id;
-    let npe_mname = thread.frames[frame_idx].method_name_arc();
-    let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
-    let npe_bci = thread.frames[frame_idx].last_instr_pc;
-    let obj_ref = {
-        let frame_ref = &thread.frames[frame_idx];
-        // Cast: reinterpret pointer/address to typed pointer
-        let cls_ptr = frame_ref.class_name() as *const str;
-        // Cast: reinterpret pointer/address to typed pointer
-        let mth_ptr = frame_ref.method_name() as *const str;
-        let stack = &mut thread.frames[frame_idx].stack;
-        pop_object_ref_ctx_with(stack, &shared.mem.heap, || {
-            if jep358 {
-                let action = crate::runtime::exceptions::helpful_npe::action_monitor();
-                helpful_npe_opcode_message_parts(
-                    shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 0,
-                )
-            } else {
-                // SAFETY: see Monitorenter — frame metadata is stable
-                // across the stack pop performed by `pop_object_ref_ctx_with`.
-                let cls = unsafe { &*cls_ptr };
-                let mth = unsafe { &*mth_ptr };
-                format!("monitorexit in {cls}.{mth} pc={pc_snap}")
-            }
-        })?
+    let obj_ref = match thread.frames[frame_idx].stack.peek_checked() {
+        Ok(Value::Object(Some(obj_ref)))
+            if crate::threading::thread_registry::monitor_fastpath_enabled() =>
+        {
+            thread.frames[frame_idx].stack.pop()?;
+            obj_ref
+        }
+        _ => monitor_operand_slow(shared, thread, frame_idx, false)?,
     };
     // Round-9 JFR MED-6 fix (audit `round9-jfr.md`): the previous
     // code read `monitors.jfr_enter_recorded(obj_ref)` and discarded
@@ -2087,6 +2066,61 @@ pub(super) fn op_monitorexit(
     Ok(())
 }
 
+/// Pop the `monitorenter` / `monitorexit` operand for every operand shape the
+/// fast path in those two handlers does not take: a null reference, an
+/// `Uninitialized` slot, or a `long` / `double` slot carrying a smuggled
+/// `jobject`. `pop_object_ref_ctx_with` is what classifies those, and the
+/// JEP 358 message it may need is what makes the path expensive.
+///
+/// Split out so the common case costs nothing. Building the message context
+/// requires three `Arc` clones (frame code, method name, method descriptor)
+/// because the formatting closure cannot borrow the frame while the stack is
+/// borrowed mutably, and until 2026-09-08 both handlers paid for them on every
+/// single acquire and release. `perf` on `probes/SyncCost.java`'s
+/// `synchronized`-block loop put the two prologues at 16.7% of the loop against
+/// 3.8% for `MonitorTable::{enter_or_contend,exit}` -- four times the cost of
+/// the locking they introduce.
+///
+/// Behaviour here is verbatim what those handlers used to do inline, so every
+/// non-fast operand shape still produces the identical exception and message.
+#[cold]
+fn monitor_operand_slow(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    entering: bool,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let pc_snap = thread.frames[frame_idx].pc;
+    let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
+    let npe_code = Arc::clone(&thread.frames[frame_idx].code);
+    let npe_cid = thread.frames[frame_idx].class_id;
+    let npe_mname = thread.frames[frame_idx].method_name_arc();
+    let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
+    let npe_bci = thread.frames[frame_idx].last_instr_pc;
+    let frame_ref = &thread.frames[frame_idx];
+    // Cast: reinterpret pointer/address to typed pointer
+    let cls_ptr = frame_ref.class_name() as *const str;
+    // Cast: reinterpret pointer/address to typed pointer
+    let mth_ptr = frame_ref.method_name() as *const str;
+    let stack = &mut thread.frames[frame_idx].stack;
+    pop_object_ref_ctx_with(stack, &shared.mem.heap, || {
+        if jep358 {
+            let action = crate::runtime::exceptions::helpful_npe::action_monitor();
+            helpful_npe_opcode_message_parts(
+                shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 0,
+            )
+        } else {
+            // SAFETY: cls/mth originate from `frame_ref.inner`, which is not
+            // mutated by the stack ops `pop_object_ref_ctx_with` performs; the
+            // pointers are valid for the duration of the closure call.
+            let cls = unsafe { &*cls_ptr };
+            let mth = unsafe { &*mth_ptr };
+            let op = if entering { "monitorenter" } else { "monitorexit" };
+            format!("{op} in {cls}.{mth} pc={pc_snap}")
+        }
+    })
+}
+
 /// `monitorenter` — acquire the receiver monitor.
 ///
 /// Moved verbatim out of `execute_instruction`'s match arm so the
@@ -2100,47 +2134,14 @@ pub(super) fn op_monitorenter(
     thread: &mut JvmThread,
     frame_idx: usize,
 ) -> Result<(), MethodCallFailed> {
-    let pc_snap = thread.frames[frame_idx].pc;
-    // JEP 358 increment 2: `Cannot enter synchronized block because
-    // "<expr>" is null`. The monitor object is at the top of the
-    // operand stack (depth 0).
-    let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
-    let npe_code = Arc::clone(&thread.frames[frame_idx].code);
-    let npe_cid = thread.frames[frame_idx].class_id;
-    let npe_mname = thread.frames[frame_idx].method_name_arc();
-    let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
-    let npe_bci = thread.frames[frame_idx].last_instr_pc;
-    let obj_ref = {
-        // Capture &str borrows of class/method into the closure
-        // without allocating Strings on the hot path. The frame
-        // borrow is dropped before `monitors.enter` runs.
-        let frame_ref = &thread.frames[frame_idx];
-        let cls = frame_ref.class_name();
-        let mth = frame_ref.method_name();
-        // SAFETY: extend lifetime of borrowed names to the closure
-        // body — both are inside `frame_ref.inner` which is not
-        // mutated by `pop_object_ref_ctx_with` (which only touches
-        // the stack vec). We re-borrow `stack` from a fresh index.
-        // Cast: reinterpret pointer/address to typed pointer
-        let cls_ptr = cls as *const str;
-        // Cast: reinterpret pointer/address to typed pointer
-        let mth_ptr = mth as *const str;
-        let stack = &mut thread.frames[frame_idx].stack;
-        pop_object_ref_ctx_with(stack, &shared.mem.heap, || {
-            if jep358 {
-                let action = crate::runtime::exceptions::helpful_npe::action_monitor();
-                helpful_npe_opcode_message_parts(
-                    shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 0,
-                )
-            } else {
-                // SAFETY: cls/mth originate from `frame_ref.inner`,
-                // which is not mutated by stack ops; the pointers are
-                // valid for the duration of the closure call.
-                let cls = unsafe { &*cls_ptr };
-                let mth = unsafe { &*mth_ptr };
-                format!("monitorenter in {cls}.{mth} pc={pc_snap}")
-            }
-        })?
+    let obj_ref = match thread.frames[frame_idx].stack.peek_checked() {
+        Ok(Value::Object(Some(obj_ref)))
+            if crate::threading::thread_registry::monitor_fastpath_enabled() =>
+        {
+            thread.frames[frame_idx].stack.pop()?;
+            obj_ref
+        }
+        _ => monitor_operand_slow(shared, thread, frame_idx, true)?,
     };
     // Snapshot the JFR-enabled flag *before* the acquire so the
     // matching exit can decide whether to emit a paired event

@@ -181,16 +181,26 @@ fn write_handle(ctx: &mut dyn NativeContext, this: ObjectRef, fd: FdId) {
     // length/read/seek behaves as a closed/empty file: `length()`=0, `read()`=-1,
     // and commons-compress's seek-from-EOF computes a negative offset
     // ("seek before beginning of file"). Create the FileDescriptor on demand.
+    // GC: `new_object` allocates and the store that follows goes through
+    // `this`. Not reported by the audit's parameter rule — the allocation and
+    // the stale store share one `let … match` statement, and the rule asks
+    // whether a use comes after the statement the call is in.
+    let pin = ctx.pin_native_root(this);
     let fd_obj = match raf_fd_object(ctx, this) {
         Some(o) => o,
         None => match ctx.new_object("java/io/FileDescriptor") {
             Ok(Some(Value::Object(Some(fd_obj)))) => {
+                let this = ctx.read_native_pin(pin, this);
                 ctx.set_field_by_name(this, "fd", Value::Object(Some(fd_obj)));
                 fd_obj
             }
-            _ => return,
+            _ => {
+                ctx.unpin_native_roots(pin);
+                return;
+            }
         },
     };
+    ctx.unpin_native_roots(pin);
     // Store the same id in both slots so code looking at either
     // gets a consistent value (and so `nio_native::fd_from_descriptor`,
     // which prefers `handle`, resolves the same fd_table entry).  JDK's

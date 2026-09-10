@@ -187,10 +187,24 @@ fn drain_to_lbq_bounded(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         }
     };
     let n = size.min(max);
+    // PINNED ACROSS THE LOOP, and re-read INSIDE it.
+    // `invoke_virtual(coll, "add", ..)` runs Java on every iteration, so from
+    // the second iteration on `coll` and `arr` are pre-GC addresses -- and
+    // `this` is used after the loop as well. The re-reads shadow within the
+    // body, so the outer bindings are untouched. No unpin: this is a native
+    // entry point and `safe_native_call` truncates the pin stack to its entry
+    // floor on return.
+    let this_pin = ctx.pin_native_root(this);
+    let coll_pin = ctx.pin_native_root(coll);
+    let arr_pin = ctx.pin_native_root(arr);
     for i in 0..n as usize {
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        let coll = ctx.read_native_pin(coll_pin, coll);
         let elem = ctx.get_array_element(arr, i);
         ctx.invoke_virtual(coll, "add", "(Ljava/lang/Object;)Z", &[elem])?;
     }
+    let this = ctx.read_native_pin(this_pin, this);
+    let arr = ctx.read_native_pin(arr_pin, arr);
     if n < size {
         for i in 0..(size - n) as usize {
             let elem = ctx.get_array_element(arr, n as usize + i);
@@ -238,11 +252,25 @@ fn drain_to_abq_bounded(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => 0,
     };
     let n = size.min(max);
+    // PINNED ACROSS THE LOOP, and re-read INSIDE it.
+    // `invoke_virtual(coll, "add", ..)` runs Java on every iteration, so from
+    // the second iteration on `coll` and `arr` are pre-GC addresses -- and
+    // `this` is used after the loop as well. The re-reads shadow within the
+    // body, so the outer bindings are untouched. No unpin: this is a native
+    // entry point and `safe_native_call` truncates the pin stack to its entry
+    // floor on return.
+    let this_pin = ctx.pin_native_root(this);
+    let coll_pin = ctx.pin_native_root(coll);
+    let arr_pin = ctx.pin_native_root(arr);
     for i in 0..n {
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        let coll = ctx.read_native_pin(coll_pin, coll);
         let idx = ((head + i) % cap.max(1)) as usize;
         let elem = ctx.get_array_element(arr, idx);
         ctx.invoke_virtual(coll, "add", "(Ljava/lang/Object;)Z", &[elem])?;
     }
+    let this = ctx.read_native_pin(this_pin, this);
+    let _ = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(this, 1, Value::Int(size - n));
     if cap > 0 {
         ctx.set_field(this, 2, Value::Int((head + n) % cap));

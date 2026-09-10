@@ -107,6 +107,20 @@ use crate::threading::thread_state::{self, ThreadExecState};
 /// run with `CRATONVM_DBG_JIT_DISASM=*` and read any loop body:
 /// `test byte [rel ...]` means in reach, `mov r11, <imm64>` means it is not.
 ///
+/// # Under `CRATONVM_JIT_CODE_NEAR_GLOBALS`, the `Box::leak` arm is correct
+///
+/// That strategy solves the same problem from the other end — it hints `mmap`
+/// so each code buffer lands near `layout_replace_epoch_guard()`, and it works
+/// on this flag only because the flag is a few hundred megabytes from that
+/// anchor in the same mimalloc band. A cell would take the flag OUT of that
+/// band and leave the poll ~130 TB behind the code the anchor just pulled in.
+///
+/// So `alloc_code_adjacent_cell` declines while that flag is set, and the
+/// `Box::leak` arm below is then the RIGHT answer rather than a fallback: the
+/// heap is where the flag belongs when something else owns placement. The two
+/// strategies do not compose and are not meant to; what composes is that
+/// exactly one of them is ever engaged.
+///
 /// The 64-byte cell is never freed, so a process that constructs `GcBarrier`
 /// N times keeps 64N bytes forever. That is a real leak and it is bounded by
 /// how many VMs a process creates; see `alloc_code_adjacent_cell`'s lifetime
@@ -249,6 +263,47 @@ struct GcBarrierInner {
     /// through (`arrive_and_wait_auto`), makes the check race-free by
     /// construction instead of inferred.
     excluded_blocked: HashSet<u64>,
+}
+
+/// Monotonic count of stop-the-world pauses STARTED, process-wide.
+///
+/// A pause parks every mutator, so any counter that only a running mutator
+/// advances is frozen for its duration. A sampler that reads such a counter
+/// twice and concludes "stalled" is therefore measuring the pause, not the
+/// thing it meant to measure -- see
+/// `virtual_threads::spawn_starvation_watchdog`, whose carrier-pool growth
+/// this exists to keep honest.
+///
+/// Process-global rather than a `GcBarrier` field because the reader is the
+/// virtual-thread starvation watchdog, which is started by
+/// `VirtualThreadManager::start_carriers` and has no handle to the barrier --
+/// and must not be given one, since the unit tests construct a bare manager
+/// with no VM around it.
+pub static STW_PAUSE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a stop-the-world pause is in progress RIGHT NOW. See
+/// [`STW_PAUSE_EPOCH`], which is the one to read across an interval.
+pub static STW_PAUSE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// `(epoch, in_progress)` -- the pair a sampler needs to decide whether the
+/// interval it just measured contained a pause.
+/// Bump [`STW_PAUSE_EPOCH`] and mark a pause in progress. Called from every
+/// accepted `request_stw*`, paired with [`note_pause_end`] in `complete_gc`.
+fn note_pause_begin() {
+    STW_PAUSE_IN_PROGRESS.store(true, Ordering::Release);
+    STW_PAUSE_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Clear the in-progress flag set by [`note_pause_begin`].
+fn note_pause_end() {
+    STW_PAUSE_IN_PROGRESS.store(false, Ordering::Release);
+}
+
+pub fn stw_pause_state() -> (u64, bool) {
+    (
+        STW_PAUSE_EPOCH.load(Ordering::Acquire),
+        STW_PAUSE_IN_PROGRESS.load(Ordering::Acquire),
+    )
 }
 
 impl GcBarrier {
@@ -451,6 +506,7 @@ impl GcBarrier {
         // that one and an over-count is the ledger's only unsound state.
         cratonvm_gc::gc_quiescence::reset_peer_proven_jit_depth();
         self.stw_requested.store(true, Ordering::Release);
+        note_pause_begin();
         true
     }
 
@@ -787,6 +843,7 @@ impl GcBarrier {
         inner.map_generation = self.gc_generation.load(Ordering::Acquire) + 1;
         self.gc_generation.fetch_add(1, Ordering::Release);
         self.stw_requested.store(false, Ordering::Release);
+        note_pause_end();
         self.gc_complete.notify_all();
     }
 
@@ -1071,6 +1128,61 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    /// A pause must be VISIBLE to a sampler that is not the initiator and holds
+    /// no barrier handle.
+    ///
+    /// This is the contract `virtual_threads::spawn_starvation_watchdog` rests
+    /// on. That watchdog grows the carrier pool when `dispatch_count` has not
+    /// moved since its last sample — and a stop-the-world pause parks every
+    /// carrier, so `dispatch_count` CANNOT move across one. Without a way to
+    /// tell "stopped" from "starved" it grew the pool once per pause, and each
+    /// added carrier is one more OS thread for the next pause to stop (and, on
+    /// Windows, one more for `xt_root_scan::take_over_pass` to suspend and
+    /// resume): slower pause -> more stalled samples -> more carriers. Measured
+    /// on `VthreadGcStress`, the pool ran from its base 32 to 233 and
+    /// `dispatch_count` froze permanently.
+    ///
+    /// # What is and is not assertable here
+    ///
+    /// [`STW_PAUSE_EPOCH`] and [`STW_PAUSE_IN_PROGRESS`] describe THE VM, of
+    /// which production has exactly one — but this test binary builds many
+    /// `GcBarrier`s and runs their tests in parallel, so a sibling pause can
+    /// advance the epoch or clear the flag between any two lines below. Only
+    /// MONOTONICITY survives that, and monotonicity is what the watchdog needs:
+    /// it compares the epoch against its own previous sample and asks whether
+    /// it changed, never what it changed by. The per-instance `stw_requested`
+    /// is asserted alongside it because that one IS deterministic here.
+    #[test]
+    fn a_pause_is_visible_to_a_sampler_with_no_barrier_handle() {
+        let barrier = GcBarrier::new();
+        let (epoch_before, _) = stw_pause_state();
+
+        assert!(
+            barrier.request_stw(ThreadId(1), 1),
+            "the first request on a fresh barrier must be accepted",
+        );
+        let (epoch_during, _) = stw_pause_state();
+        assert!(
+            epoch_during > epoch_before,
+            "requesting a pause must advance the global epoch, or a sampler holding no handle to this barrier cannot tell a stopped VM from a starved one (epoch {epoch_before} -> {epoch_during})",
+        );
+        assert!(
+            barrier.stw_requested.load(Ordering::Acquire),
+            "the per-instance flag must be set while the pause is outstanding",
+        );
+
+        barrier.complete_gc(cratonvm_types::PointerMap::default());
+        assert!(
+            !barrier.stw_requested.load(Ordering::Acquire),
+            "completing the collection must clear the per-instance flag",
+        );
+        let (epoch_after, _) = stw_pause_state();
+        assert!(
+            epoch_after >= epoch_during,
+            "the epoch counts pauses STARTED and must never go backwards",
+        );
+    }
+
     #[test]
     fn barrier_no_stw_by_default() {
         let barrier = GcBarrier::new();
@@ -1096,6 +1208,14 @@ mod tests {
     fn stw_requested_flag_is_within_disp32_of_the_code_cache() {
         use cratonvm_jit::platform::{alloc_executable, free_executable};
 
+        if cratonvm_jit::platform::alloc_code_adjacent_cell().is_none() {
+            // Either the OS refused the mapping or `CRATONVM_JIT_CODE_NEAR_GLOBALS`
+            // owns placement and the cell allocator declines by design — in
+            // which case the flag is SUPPOSED to stay on the VM heap, beside
+            // the anchor that strategy pulls the code towards, and its distance
+            // from an unhinted buffer means nothing.
+            return;
+        }
         let barrier = GcBarrier::new();
         let flag = barrier.stw_requested_flag_addr() as usize;
         let code = alloc_executable(4096).expect("alloc_executable failed");

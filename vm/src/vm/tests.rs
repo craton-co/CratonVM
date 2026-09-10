@@ -73847,7 +73847,12 @@ fn p90_jmx_memory_mxbean_reflects_real_heap() {
     // Note: we capture heap BEFORE calling getMemoryMXBean, but the call itself
     // allocates objects. The MXBean reads heap_allocated_bytes() at call time,
     // so its value will be >= our pre-call measurement.
-    let heap_before = shared.mem.heap.allocated_bytes();
+    //
+    // `live_bytes_estimate`, matching what `heap_allocated_bytes` answers with
+    // as of 2026-09-08. Reading the raw cursor here instead would compare two
+    // different quantities and the inequality below would be about the young
+    // free list rather than about the bean.
+    let heap_before = shared.mem.heap.live_bytes_estimate();
 
     let result = p90_call_native(
         &shared,

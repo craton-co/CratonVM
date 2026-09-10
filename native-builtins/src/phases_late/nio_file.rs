@@ -6613,29 +6613,55 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "newFileChannel",
         "(Ljava/nio/file/Path;Ljava/util/Set;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/channels/FileChannel;",
         |ctx, args| {
+            // `args` IS A PRE-CALL SNAPSHOT. `safe_native_call_impl` pins every
+            // argument, so nothing here can be collected — but it rebuilds the
+            // snapshot from those pins only for a collection it runs itself,
+            // BEFORE the callback. `p57_read_path` allocates, and any other
+            // thread can request a collection at any safepoint, so by the time
+            // `args.get(2)` is read below the option set may have MOVED and the
+            // slice still names its old address. Reading it here, before the
+            // first allocation, and keeping it in a handle is what makes the
+            // two `set` dereferences below safe.
+            //
+            // Same family as the FileDescriptor construction further down, and
+            // as the print natives fixed on 2026-09-06 — see
+            // `internal/fixed-bugs/native-arg-snapshot-stale-across-java-reentry-FIXED-20260906.md`.
             let path_obj = obj_arg(args, 1)?;
-            let p = p57_read_path(ctx, path_obj);
-            // Inspect option set: look for WRITE/APPEND/CREATE/CREATE_NEW/READ/
-            // TRUNCATE_EXISTING via toString.
-            let set_obj = match args.get(2) {
+            let set_obj_at_entry = match args.get(2) {
                 Some(Value::Object(Some(o))) => Some(*o),
                 _ => None,
             };
             let (mut writable, mut create, mut append, mut read_opt, mut truncate) =
                 (false, false, false, false, false);
-            if let Some(set) = set_obj {
-                // Try to iterate by calling toString() on the Set first (cheap & robust)
-                if let Ok(Some(Value::Object(Some(s)))) =
-                    ctx.invoke_virtual(set, "toString", "()Ljava/lang/String;", &[])
-                {
-                    let s = ctx.read_string(s).unwrap_or_default();
-                    writable = s.contains("WRITE") || s.contains("APPEND");
-                    create = s.contains("CREATE"); // matches CREATE and CREATE_NEW
-                    append = s.contains("APPEND");
-                    read_opt = s.contains("READ");
-                    truncate = s.contains("TRUNCATE_EXISTING");
+            let (p, set_obj) = {
+                let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+                let path_h = scope.root(path_obj);
+                let set_h = set_obj_at_entry.map(|o| scope.root(o));
+                let path_now = scope.get(&path_h);
+                let p = p57_read_path(&mut *scope, path_now);
+                // Inspect option set: look for WRITE/APPEND/CREATE/CREATE_NEW/
+                // READ/TRUNCATE_EXISTING via toString.
+                if let Some(h) = set_h.as_ref() {
+                    let set = scope.get(h);
+                    // Try to iterate by calling toString() on the Set first
+                    // (cheap & robust)
+                    if let Ok(Some(Value::Object(Some(s)))) =
+                        scope.invoke_virtual(set, "toString", "()Ljava/lang/String;", &[])
+                    {
+                        let s = scope.read_string(s).unwrap_or_default();
+                        writable = s.contains("WRITE") || s.contains("APPEND");
+                        create = s.contains("CREATE"); // matches CREATE and CREATE_NEW
+                        append = s.contains("APPEND");
+                        read_opt = s.contains("READ");
+                        truncate = s.contains("TRUNCATE_EXISTING");
+                    }
                 }
-            }
+                // `toString` ran interpreted bytecode; re-read the set for the
+                // `fsp_scan_open_options` call below rather than handing it the
+                // address it had before.
+                let set_now = set_h.as_ref().map(|h| scope.get(h));
+                (p, set_now)
+            };
             // JDK FileChannel.open contract: a channel with neither READ nor
             // WRITE is read-only; WRITE without READ is write-only.
             let readable = read_opt || !writable;
@@ -6724,17 +6750,49 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // FileChannelImpl.open(fd, path, readable, writable, sync, direct,
             //   parent) — mirrors FileOutputStream.getChannel's call shape.
             let real_channel = (|| -> Option<Value> {
-                let fd_obj = match ctx.new_object("java/io/FileDescriptor").ok()?? {
-                    Value::Object(Some(o)) => o,
-                    _ => return None,
+                // GC DISCIPLINE. The `FileDescriptor` and the path `String`
+                // below are freshly allocated and NOTHING in Java refers to
+                // either until `FileChannelImpl.open` stores them, so a Rust
+                // local is each one's only reference — across `create_string`,
+                // which allocates, and `ensure_class_initialized`, which runs
+                // `FileChannelImpl`'s class initializer, i.e. arbitrary
+                // bytecode. Under a moving collector the locals go stale;
+                // under the Generational collector's NON-MOVING young sweep an
+                // unreachable object is ZEROED IN PLACE, and a zeroed
+                // `FileDescriptor` reads its `fd`/`handle` back as 0.
+                //
+                // That is the shape of
+                // `known-issues/springboot/generational-non-moving-sweep-zeroes-a-live-filechannel-20260906.md`,
+                // whose symptom is `FileChannel.map: invalid fd` from a
+                // channel that opened cleanly. `native_fcimpl_open` and
+                // `new_native_thread_set` in `native-io` were converted on
+                // 2026-09-06; this site is the same construction one provider
+                // layer up and was missed, because it lives in a CLOSURE
+                // registered inside `register_phase57_nio_file` and both
+                // shipped audits index by top-level `fn`.
+                //
+                // Local reproducer: `test_classes/gc/NioChannelChurn.java`.
+                let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+                let fd_h = {
+                    let o = match scope.new_object("java/io/FileDescriptor").ok()?? {
+                        Value::Object(Some(o)) => o,
+                        _ => return None,
+                    };
+                    scope.root(o)
                 };
                 // `handle` is the Windows fd slot fd_from_descriptor prefers;
                 // also set `fd` for the POSIX read path.
-                ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd_id as i64));
-                ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd_id as i32));
-                let path_str = ctx.create_string(&p);
-                ctx.ensure_class_initialized("sun/nio/ch/FileChannelImpl").ok()?;
-                match ctx.invoke(
+                let fd_obj = scope.get(&fd_h);
+                scope.set_field_by_name(fd_obj, "handle", Value::Long(fd_id as i64));
+                let fd_obj = scope.get(&fd_h);
+                scope.set_field_by_name(fd_obj, "fd", Value::Int(fd_id as i32));
+                let path_h = {
+                    let o = scope.create_string(&p);
+                    scope.root(o)
+                };
+                scope.ensure_class_initialized("sun/nio/ch/FileChannelImpl").ok()?;
+                let (fd_obj, path_str) = (scope.get(&fd_h), scope.get(&path_h));
+                match scope.invoke(
                     "sun/nio/ch/FileChannelImpl",
                     "open",
                     "(Ljava/io/FileDescriptor;Ljava/lang/String;ZZZZLjava/io/Closeable;)Ljava/nio/channels/FileChannel;",
@@ -13287,7 +13345,19 @@ pub(crate) const FILE_STORE_IMPLS: &[&str] = &[
 pub(crate) const FILE_STORE_SLOTS: usize = 1;
 
 /// Where a minted `FileStore`'s private slot starts on `this`.
-pub(crate) fn file_store_base(ctx: &mut dyn NativeContext, this: ObjectRef) -> usize {
+///
+/// `&dyn`, not `&mut dyn`, and that is load-bearing rather than tidiness: it
+/// makes reaching for `<clinit>` or any Java re-entry while resolving a
+/// private-slot base a COMPILE ERROR. (Scope, stated exactly in
+/// `appended_slots::base_for_class_id`: `&dyn` blocks every `&mut self` method,
+/// which is where `<clinit>` and re-entry live, but NOT a `&self` method using
+/// interior mutability.) Until 2026-09-07 this path reached `ensure_class_initialized`
+/// and therefore `<clinit>`, so an ordinary private field read was a Java
+/// re-entry that could move — or under the generational young sweep zero — every
+/// unpinned `ObjectRef` its caller was holding. Widening this back to `&mut`
+/// would silently make that possible again; the borrow checker is the only
+/// guard that survives a reader who has not read this comment.
+pub(crate) fn file_store_base(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     cratonvm_native_api::appended_slots::base_for_object(ctx, this, FILE_STORE_SLOTS)
 }
 
@@ -13306,7 +13376,19 @@ pub(crate) const DIR_STREAM_IMPLS: &[&str] = &[
 pub(crate) const DIR_STREAM_SLOTS: usize = 3;
 
 /// Where a minted `DirectoryStream`'s private map starts on `this`.
-pub(crate) fn dir_stream_base(ctx: &mut dyn NativeContext, this: ObjectRef) -> usize {
+///
+/// `&dyn`, not `&mut dyn`, and that is load-bearing rather than tidiness: it
+/// makes reaching for `<clinit>` or any Java re-entry while resolving a
+/// private-slot base a COMPILE ERROR. (Scope, stated exactly in
+/// `appended_slots::base_for_class_id`: `&dyn` blocks every `&mut self` method,
+/// which is where `<clinit>` and re-entry live, but NOT a `&self` method using
+/// interior mutability.) Until 2026-09-07 this path reached `ensure_class_initialized`
+/// and therefore `<clinit>`, so an ordinary private field read was a Java
+/// re-entry that could move — or under the generational young sweep zero — every
+/// unpinned `ObjectRef` its caller was holding. Widening this back to `&mut`
+/// would silently make that possible again; the borrow checker is the only
+/// guard that survives a reader who has not read this comment.
+pub(crate) fn dir_stream_base(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     cratonvm_native_api::appended_slots::base_for_object(ctx, this, DIR_STREAM_SLOTS)
 }
 
@@ -17327,30 +17409,35 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let ok = fs_set_permission(&path, FS_ACCESS_WRITE, writable, owner_only);
         Ok(Some(Value::Int(i32::from(ok))))
     });
+    // THE ONE-ARGUMENT FORM WAS THE ONE THIS BLOCK'S OWN COMMENT MISSED.
+    //
+    // `setReadable(Z)`, `setReadable(ZZ)`, `setWritable(Z)`, `setWritable(ZZ)`
+    // and `setExecutable(ZZ)` all delegate to `fs_set_permission`. This one
+    // hand-rolled its own body, and it was wrong on BOTH platforms:
+    //
+    //   * on Windows it answered `std::fs::metadata(path).is_ok()` -- "does
+    //     this file exist?" -- so `setExecutable(false)` reported TRUE. That is
+    //     exactly the fabricated success the comment above says was removed
+    //     from the other three; it survived here because the earlier sweep
+    //     never asked the DISABLE direction on Windows. The JDK's
+    //     `WinNTFileSystem` cannot revoke execute and reports the request back:
+    //     `enable`. Measured against HotSpot 25 by `apps/probes/L4FileSweep.java`,
+    //     the row `setExecutable false` -- HotSpot `false`, CratonVM `true`, in
+    //     BOTH `--real-jdk` and `--jdk-only`;
+    //
+    //   * on Unix it toggled `0o111`, all three execute bits, where the
+    //     one-argument form is DEFINED as the two-argument form with
+    //     `ownerOnly = true` -- so it should touch `0o100` only.
+    //     `fs_set_permission` already makes that distinction, which is the
+    //     second reason to call it rather than to re-derive it.
+    //
+    // Delegating fixes both and leaves one implementation of the rule.
     r.register(file, "setExecutable", "(Z)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let _path = file_read_path(ctx, this);
-        let _exec = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) != 0;
-        // On unix, toggle 0o100 bit; on Windows, no-op (treat as success)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let ok = std::fs::metadata(&_path)
-                .and_then(|meta| {
-                    let mut perms = meta.permissions();
-                    let mode = perms.mode();
-                    let new_mode = if _exec { mode | 0o111 } else { mode & !0o111 };
-                    perms.set_mode(new_mode);
-                    std::fs::set_permissions(&_path, perms)
-                })
-                .is_ok();
-            Ok(Some(Value::Int(if ok { 1 } else { 0 })))
-        }
-        #[cfg(not(unix))]
-        {
-            let ok = std::fs::metadata(&_path).is_ok();
-            Ok(Some(Value::Int(if ok { 1 } else { 0 })))
-        }
+        let path = file_read_path(ctx, this);
+        let exec = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) != 0;
+        let ok = fs_set_permission(&path, FS_ACCESS_EXECUTE, exec, true);
+        Ok(Some(Value::Int(i32::from(ok))))
     });
     r.register(file, "setExecutable", "(ZZ)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -23252,7 +23339,12 @@ pub(crate) fn posix_permission_bits_from_set(ctx: &mut dyn NativeContext, set: O
     let _ = ctx.ensure_class_initialized(pfp);
     let cid = ctx.class_id_by_name(pfp);
     let mut mode = 0u32;
+    // GC-safety: `Set.contains` is a virtual dispatch into real bytecode
+    // (`hashCode`/`equals` on the caller's own set), run once per permission
+    // constant. `set` is a bare Rust parameter, stale from the second turn on.
+    let set_pin = ctx.pin_native_root(set);
     for i in 0..BITS.len().min(POSIX_FILE_PERMISSION_CONSTANTS.len()) {
+        let set = ctx.read_native_pin(set_pin, set);
         let Some(c) = cid else { break };
         let Some(slot) = ctx.static_field_index_by_name(c, POSIX_FILE_PERMISSION_CONSTANTS[i])
         else {
@@ -23635,7 +23727,12 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
             let _ = ctx.ensure_class_initialized(pfp);
             let cid = ctx.class_id_by_name(pfp);
             let mut out = String::with_capacity(9);
+            // GC-safety: `Set.contains` below is a virtual dispatch into the
+            // caller's own set, run once per permission constant, and `set` is
+            // carried in from outside the loop.
+            let set_pin = ctx.pin_native_root(set);
             for i in 0..9 {
+                let set = ctx.read_native_pin(set_pin, set);
                 let present = if let Some(c) = cid {
                     match ctx.static_field_index_by_name(c, POSIX_FILE_PERMISSION_CONSTANTS[i]) {
                         Some(slot) => {

@@ -553,6 +553,32 @@ pub(crate) fn altrace_enabled_vm() -> bool {
     *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ALTRACE").is_some())
 }
 
+/// The address set `collect_roots` produced for the collection now running.
+///
+/// `CRATONVM_DBG_ROOT_REMAP_AUDIT` only. The post-GC verifiers can say a frame
+/// slot named an object the cycle did not copy; they cannot say whether the
+/// scan had handed that slot to the collector, and the two verdicts have
+/// nothing in common. "The scan would root it" (re-running the frame's own scan
+/// afterwards) is a proxy that answers about the frame as it is NOW; this
+/// answers about the list the collector was actually given.
+static ROOT_SET_SNAPSHOT: parking_lot::Mutex<Option<rustc_hash::FxHashSet<usize>>> =
+    parking_lot::Mutex::new(None);
+
+/// Record the root set a collection is about to mark from.
+pub fn note_root_set(roots: &[ObjectRef]) {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOT_REMAP_AUDIT").is_none() {
+        return;
+    }
+    let set: rustc_hash::FxHashSet<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
+    *ROOT_SET_SNAPSHOT.lock() = Some(set);
+}
+
+/// `Some(true|false)` when the snapshot is armed and populated, `None` when it
+/// is not -- so a report can say "not measured" rather than "absent".
+pub fn root_set_contains(addr: usize) -> Option<bool> {
+    ROOT_SET_SNAPSHOT.lock().as_ref().map(|s| s.contains(&addr))
+}
+
 pub(crate) fn watch_addr() -> Option<usize> {
     use std::sync::OnceLock;
     static W: OnceLock<Option<usize>> = OnceLock::new();
@@ -780,6 +806,11 @@ pub fn update_all_roots(
     thread: &mut crate::threading::jvm_thread::JvmThread,
     pointer_map: &cratonvm_types::PointerMap,
 ) {
+    // Refresh the semispace geometry the handle-free dead-reference predicate
+    // reads (`gen_heap::dead_young_ref_reason_global`). This is the one
+    // function every collection path calls, and it runs after the swap, so the
+    // ranges it publishes describe the heap the mutator is about to resume on.
+    shared.mem.heap.publish_young_geometry();
     let __fx_guard = rootfixup_census_on().then(|| {
         struct C(std::time::Instant, usize);
         impl Drop for C {
@@ -858,10 +889,40 @@ pub fn update_all_roots(
         return;
     }
     gcpart_record(shared.mem.heap.collection_count(), pointer_map);
+    // Every relocating cycle, counted unconditionally: it is the denominator
+    // for `gc_quiescence::last_pointer_map_applied`, which says whether a
+    // thread holding a stale reference had ever been handed the map it is
+    // missing. See `RELOCATING_CYCLES`.
+    cratonvm_gc::gc_quiescence::RELOCATING_CYCLES
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // `CRATONVM_DBG_VACATED_FRAMES` — remember what this collection moved
     // objects away FROM, so the next safepoint's frame audit can name any slot
     // still holding one. No-op unless the flag is set.
-    cratonvm_gc::gc_quiescence::record_vacated(pointer_map);
+    cratonvm_gc::gc_quiescence::record_vacated(pointer_map, shared.mem.heap.collection_count());
+    // The class-discriminated HISTORY ledger, whose only producer was ZGC's
+    // `relocate_stw` until 2026-09-08. The exact ledger above forgets an
+    // address the instant the allocator re-issues it -- and that is precisely
+    // when a stale holder becomes visible, because until re-issue it reads a
+    // zeroed corpse and nothing looks wrong. The two windows do not overlap,
+    // which is why `stale_use_verdict` reported zero on every failing
+    // generational run: it had no history to read.
+    //
+    // The BindableTests moving-young failure is exactly the shape this ledger
+    // discriminates -- `ServiceLoader$LazyClassPathLookupIterator.parse`
+    // invoking `openStream()` on a receiver that reads back as a
+    // `java.util.Hashtable` because the address was re-served.
+    if cratonvm_gc::gc_quiescence::vacated_frames_enabled() {
+        let classed: Vec<(usize, usize, u32)> = pointer_map
+            .iter()
+            .map(|(from, to)| {
+                // SAFETY: `to` is a post-copy object base this collection just
+                // wrote; its header is mapped.
+                let at = unsafe { ObjectRef::from_raw(*to as *mut u8) };
+                (*from, *to, shared.mem.heap.class_id_of(at).as_u32())
+            })
+            .collect();
+        cratonvm_gc::gc_quiescence::record_moved_history(&classed);
+    }
     crate::runtime::interpreter::remap_trace_push(
         shared,
         thread,
@@ -1657,7 +1718,7 @@ pub fn update_all_roots(
     //     fixup cannot rewrite another VM's entries.
 
     // Post-GC verification: check that no frame refs still point to relocated addresses.
-    verify_no_stale_refs(thread, pointer_map);
+    verify_no_stale_refs(thread, pointer_map, Some(&shared.mem.heap));
     // Opt-in (CRATONVM_DBG_HEAP_STALE=1) deep heap-walk: catch un-forwarded /
     // reclaimed reference fields in OTHER objects (not just this thread's
     // frames) — where the residual ClassLoader/Locale stale-ref actually lives.
@@ -1682,6 +1743,17 @@ pub fn update_all_roots(
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOT_REMAP_AUDIT").is_some() {
         let destinations: rustc_hash::FxHashSet<usize> = pointer_map.values().copied().collect();
         let after = crate::memory::roots::collect_roots(shared, thread);
+        // ENGAGEMENT, for the reason this whole block exists: the audit only
+        // speaks when it finds something, so a run that printed nothing covered
+        // both "no scanned root names a vacated address" and "the audit never
+        // ran on a moving cycle" (an empty `pointer_map`, a misspelled flag, a
+        // collector that took another path). `root_remap_audit_stats` is the
+        // denominator; see the `[GC] root_remap_audit:` summary line.
+        root_remap_audit::CYCLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        root_remap_audit::ROOTS_RESCANNED
+            .fetch_add(after.len(), std::sync::atomic::Ordering::Relaxed);
+        root_remap_audit::MOVED_ENTRIES
+            .fetch_add(pointer_map.len(), std::sync::atomic::Ordering::Relaxed);
         let mut reported = 0usize;
         for (index, r) in after.iter().enumerate() {
             let a = r.as_ptr() as usize;
@@ -1706,6 +1778,7 @@ pub fn update_all_roots(
                 }
             }
         }
+        root_remap_audit::UNREMAPPED.fetch_add(reported, std::sync::atomic::Ordering::Relaxed);
         if reported > 0 {
             tracing::error!(
                 target: "cratonvm::gc::guard",
@@ -1716,6 +1789,38 @@ pub fn update_all_roots(
             );
         }
     }
+}
+
+/// Engagement counters for `CRATONVM_DBG_ROOT_REMAP_AUDIT=1`.
+///
+/// The audit reports only when it FINDS something, and it reports through
+/// `tracing::error!`, so silence is ambiguous in exactly the way this repo
+/// keeps paying for: it covers a clean answer and an audit that never ran. A
+/// zero `UNREMAPPED` is worth quoting only beside a non-zero `CYCLES`.
+pub mod root_remap_audit {
+    use std::sync::atomic::AtomicUsize;
+    /// Moving cycles on which the audit re-ran the root scan. The denominator.
+    pub static CYCLES: AtomicUsize = AtomicUsize::new(0);
+    /// Roots re-scanned across those cycles.
+    pub static ROOTS_RESCANNED: AtomicUsize = AtomicUsize::new(0);
+    /// `pointer_map` entries those cycles carried — i.e. objects that MOVED.
+    /// A run with `CYCLES > 0` and `MOVED_ENTRIES = 0` audited only
+    /// non-moving cycles and proves nothing.
+    pub static MOVED_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+    /// Scanned roots left naming an address the same cycle vacated.
+    pub static UNREMAPPED: AtomicUsize = AtomicUsize::new(0);
+}
+
+/// `(cycles, roots_rescanned, moved_entries, unremapped)` for the root-remap
+/// audit. See [`root_remap_audit`].
+pub fn root_remap_audit_stats() -> (usize, usize, usize, usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        root_remap_audit::CYCLES.load(Relaxed),
+        root_remap_audit::ROOTS_RESCANNED.load(Relaxed),
+        root_remap_audit::MOVED_ENTRIES.load(Relaxed),
+        root_remap_audit::UNREMAPPED.load(Relaxed),
+    )
 }
 
 /// Opt-in young-object size validator (`CRATONVM_DBG_VALIDATE_NEW=1`). Walks
@@ -1786,6 +1891,34 @@ pub fn validate_object_sizes(shared: &crate::vm::SharedVm) {
     }
 }
 
+/// Which region of the generational heap an address falls in, for the
+/// heap-stale report.
+///
+/// The distinction that matters there is ACTIVE vs INACTIVE semispace: an
+/// address in the inactive one is memory the last cycle emptied, so a live
+/// field naming it is a reference the collector dropped; an address in the
+/// ACTIVE one is memory that cycle copied INTO, so a zeroed header there is a
+/// destination the collector reserved and never filled. Those are opposite
+/// bugs and they print identically without this.
+fn heap_region_name(heap: &cratonvm_gc::vm_heap::VmHeap, addr: usize) -> &'static str {
+    if addr == 0 {
+        return "null";
+    }
+    let in_inactive = heap
+        .young_inactive_semispace_range()
+        .is_some_and(|(lo, hi)| addr >= lo && addr < hi);
+    if in_inactive {
+        return "young INACTIVE semispace (emptied)";
+    }
+    if heap.is_in_young_addr(addr) {
+        return "young ACTIVE semispace";
+    }
+    if heap.is_heap_addr(addr).is_some() {
+        return "old gen";
+    }
+    "off-heap"
+}
+
 /// Opt-in deep heap-stale verifier (`CRATONVM_DBG_HEAP_STALE=1`). After a
 /// moving GC, walks EVERY live plain object and checks each reference field for
 /// a dangling target — the proven method for pinning the residual intermittent
@@ -1808,6 +1941,39 @@ pub fn verify_heap_object_fields(
     shared: &crate::vm::SharedVm,
     pointer_map: &cratonvm_types::PointerMap,
 ) {
+    verify_heap_object_fields_phase(shared, pointer_map, "post-gc");
+}
+
+/// PRE-collection half of [`verify_heap_object_fields`], and the reason the
+/// pair exists.
+///
+/// The post-GC pass alone cannot say WHEN a field went stale. A generational
+/// young collection alternates its two semispaces, so a dead address in
+/// semispace A is reported on every cycle that empties A and on no other — and
+/// the same report is produced by "cycle N dropped this referent" and by "the
+/// field has held a dead address since cycle N-20 and nobody noticed". Those
+/// have opposite fixes.
+///
+/// Running the identical walk BEFORE the collection separates them outright:
+///
+/// * clean pre-GC, stale post-GC — THIS collection dropped the referent;
+/// * already stale pre-GC — the field was written stale, or an earlier
+///   collection dropped it, and the mutator is where to look.
+///
+/// Both halves print their phase, so one run answers it.
+pub fn verify_heap_object_fields_pre_gc(shared: &crate::vm::SharedVm) {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HEAP_STALE").is_none() {
+        return;
+    }
+    let empty = cratonvm_types::PointerMap::new();
+    verify_heap_object_fields_phase(shared, &empty, "PRE-gc");
+}
+
+fn verify_heap_object_fields_phase(
+    shared: &crate::vm::SharedVm,
+    pointer_map: &cratonvm_types::PointerMap,
+    phase: &str,
+) {
     use crate::types::Value;
     use cratonvm_types::{
         ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET, HEADER_SIZE,
@@ -1828,7 +1994,14 @@ pub fn verify_heap_object_fields(
             .unwrap_or_else(|| format!("cid#{}", cid.as_u32()))
     };
     let mut reported = 0usize;
-    const CAP: usize = 40;
+    // Distinct (referrer class, slot, reason) triples already reported THIS
+    // collection. Without it one repeated pair burns the whole cap and hides
+    // every other referrer: on BindableTests under GC stress a single
+    // `java/lang/Module field[0]` accounted for 2272 of 2280 lines, and nothing
+    // else in the heap was ever reachable by this pass.
+    let mut seen: std::collections::HashSet<(u32, usize, &'static str)> =
+        std::collections::HashSet::new();
+    const CAP: usize = 200;
     // Recycled-destination filter — the same ambiguity `verify_no_stale_refs`
     // documents at length, which this pass was missing.
     //
@@ -1858,6 +2031,19 @@ pub fn verify_heap_object_fields(
         if heap.is_heap_addr(addr).is_none() {
             return Some("OFF-HEAP(reclaimed)");
         }
+        // The inactive semispace holds no live object BY CONSTRUCTION, so a
+        // field naming it is dangling whether or not the wipe has run yet.
+        // Tested BEFORE the zero-header arm on purpose: the wipe is what makes
+        // the header zero, so reading staleness off the header dates the
+        // finding to when the memory was cleared rather than to when the
+        // reference died. This arm needs no such inference, which is what makes
+        // the PRE-gc phase able to answer at all.
+        if heap
+            .young_inactive_semispace_range()
+            .is_some_and(|(lo, hi)| addr >= lo && addr < hi)
+        {
+            return Some("DANGLING(inactive-semispace)");
+        }
         let h = unsafe { &*(addr as *const ObjectHeader) };
         if h.class_id.as_u32() == 0
             && h.mark_word.load(std::sync::atomic::Ordering::Relaxed) == 0
@@ -1880,16 +2066,41 @@ pub fn verify_heap_object_fields(
             for i in 0..nf {
                 if let Value::Object(Some(target)) = heap.get_field(referrer, i) {
                     if let Some(reason) = classify(target.as_ptr() as usize) {
-                        eprintln!(
-                            "[heap-stale] {} OBJ {} field[{}] -> 0x{:x}",
-                            reason,
-                            class_name(r_cid),
-                            i,
-                            target.as_ptr() as usize,
-                        );
-                        reported += 1;
-                        if reported >= CAP {
-                            break;
+                        if seen.insert((r_cid.as_u32(), i, reason)) {
+                            eprintln!(
+                                "[heap-stale][{}] {} OBJ {} field[{}] -> 0x{:x} (referrer 0x{:x})",
+                                phase,
+                                reason,
+                                class_name(r_cid),
+                                i,
+                                target.as_ptr() as usize,
+                                ptr as usize,
+                            );
+                            // WHO WROTE IT. A stale field is either a slot the
+                            // collector never rewrote, or one it rewrote to an
+                            // address it then failed to fill. `dest=true` is the
+                            // second: THIS cycle's map names that address as a
+                            // copy destination, so the rewrite was the
+                            // collector's and the destination is what is wrong.
+                            // Without this line the two are indistinguishable
+                            // and the reader guesses (BindableTests
+                            // `java/lang/Module field[0]`, 2026-09-09).
+                            eprintln!(
+                                "[heap-stale] ^ target_is_this_cycles_destination={}                                  sources_forwarded_here={:?} target_region={}                                  referrer_region={}",
+                                destinations.contains(&(target.as_ptr() as usize)),
+                                pointer_map
+                                    .iter()
+                                    .filter(|(_, v)| **v == target.as_ptr() as usize)
+                                    .map(|(k, _)| format!("0x{k:x}"))
+                                    .take(4)
+                                    .collect::<Vec<_>>(),
+                                heap_region_name(heap, target.as_ptr() as usize),
+                                heap_region_name(heap, ptr as usize),
+                            );
+                            reported += 1;
+                            if reported >= CAP {
+                                break;
+                            }
                         }
                     }
                 }
@@ -1904,16 +2115,23 @@ pub fn verify_heap_object_fields(
                     unsafe { (ptr as *const u8).add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
                 let raw = unsafe { read_ref_slot(s_ptr) } as usize;
                 if let Some(reason) = classify(raw) {
-                    eprintln!(
-                        "[heap-stale] {} ARR {}[{}] -> 0x{:x}",
-                        reason,
-                        class_name(r_cid),
-                        i,
-                        raw,
-                    );
-                    reported += 1;
-                    if reported >= CAP {
-                        break;
+                    // Arrays dedupe on the CLASS and the reason only: the index
+                    // is data, and a 4096-element array with one dangling slot
+                    // must not read as 4096 distinct findings.
+                    if seen.insert((r_cid.as_u32(), usize::MAX, reason)) {
+                        eprintln!(
+                            "[heap-stale][{}] {} ARR {}[{}] -> 0x{:x} (referrer 0x{:x})",
+                            phase,
+                            reason,
+                            class_name(r_cid),
+                            i,
+                            raw,
+                            ptr as usize,
+                        );
+                        reported += 1;
+                        if reported >= CAP {
+                            break;
+                        }
                     }
                 }
             }
@@ -1921,8 +2139,10 @@ pub fn verify_heap_object_fields(
     }
     if reported > 0 {
         eprintln!(
-            "[heap-stale] ^ {} stale field(s) this GC (pointer_map size={})",
+            "[heap-stale][{}] ^ {} distinct stale (class, slot, reason) triple(s) at collection {}              (pointer_map size={})",
+            phase,
             reported,
+            heap.collection_count(),
             pointer_map.len(),
         );
     }
@@ -2006,11 +2226,37 @@ pub fn audit_overlay_refs(shared: &crate::vm::SharedVm) {
 fn verify_no_stale_refs(
     thread: &crate::threading::jvm_thread::JvmThread,
     pointer_map: &cratonvm_types::PointerMap,
+    heap: Option<&crate::memory::VmHeap>,
 ) -> usize {
     use crate::types::Value;
     use cratonvm_types::ObjectHeader;
 
     let mut genuine_reports = 0usize;
+    // THE OTHER HALF OF THE INVARIANT: a slot naming a from-space address the
+    // pointer map does NOT contain.
+    //
+    // Everything else in this function asks "did the remap rewrite every slot
+    // whose object MOVED". That question cannot see the opposite failure: an
+    // object that was never copied at all because the root scan missed the slot
+    // holding it. After a Cheney cycle the inactive semispace holds nothing
+    // live, so a live frame slot naming an address inside it is proof that the
+    // collection reclaimed an object a frame still held -- and this is the last
+    // moment at which the frame, method, pc and slot are all in hand. Every
+    // reader-side reporter downstream sees only an address and a failed
+    // dispatch, an unbounded number of collections later.
+    //
+    // Live-filtered, because a DEAD local naming a reclaimed object is the
+    // collector working as designed -- that is precisely what the per-bci
+    // liveness filter is for. Operand-stack slots are always live.
+    //
+    // Found the BindableTests residual this way: a `java.util.function.Supplier`
+    // in `DisplayNameUtils.determineDisplayNameForMethod` local[0].
+    let inactive_young: Option<(usize, usize)> =
+        heap.and_then(|h| h.young_inactive_semispace_range());
+    let mut reclaimed_reports = 0usize;
+    // Cap for the ACTIVE-semispace arm, counted separately from
+    // `reclaimed_reports` so one noisy face cannot starve the other.
+    let mut dead_ref_reports = 0usize;
     // Lazily-built set of this pause's destination addresses (map VALUES),
     // used to recognise recycled destinations. Built only when a candidate
     // stale slot is actually found, so the common (clean) path pays nothing.
@@ -2048,6 +2294,9 @@ fn verify_no_stale_refs(
     for (fi, frame) in thread.frames.iter().enumerate() {
         let cname = frame.class_name();
         let mname = frame.method_name();
+        // The frame's own per-bci liveness mask, for the RECLAIMED-WHILE-HELD
+        // arm: a DEAD local naming a reclaimed object is the filter working.
+        let live_mask = frame.live_locals_mask_here();
         // Check locals
         for li in 0..frame.locals_len() {
             let val = frame.get_local(li as u16);
@@ -2079,6 +2328,118 @@ fn verify_no_stale_refs(
                                 "POST-GC STALE LOCAL: frame[{}] {}.{} local[{}] still points to \
                                  relocated addr 0x{:x} (should be 0x{:x})",
                                 fi, cname, mname, li, addr, new_addr,
+                            );
+                        }
+                    }
+                }
+                // The ACTIVE-semispace half of the same question, and it is
+                // not covered by the arm below.
+                //
+                // That arm tests membership of the INACTIVE semispace, which a
+                // dead young address only satisfies on the cycles that empty
+                // ITS semispace — the pair alternates, so a slot that went bad
+                // in the other one reads as ordinary young memory here and is
+                // reported by nothing. `dead_young_ref_reason` closes it: an
+                // address in the ACTIVE semispace whose header words are zero
+                // is unallocated memory (past the frontier, a swept block, or a
+                // carved-but-unhanded-out TLAB chunk), and a live frame slot
+                // naming it is dangling on THIS cycle, whichever semispace it
+                // died in.
+                //
+                // Added 2026-09-09: without it the BindableTests residual's
+                // first report was 2 398 collections after the reference went
+                // bad, which is what made it look like the LAST cycle's fault.
+                if let Some(h) = heap {
+                    let live = li >= 64 || live_mask & (1u64 << li) != 0;
+                    if live && dead_ref_reports < 8 {
+                        if let Some("ZERO-HEADER-IN-YOUNG") = h.dead_young_ref_reason(addr) {
+                            dead_ref_reports += 1;
+                            genuine_reports += 1;
+                            eprintln!(
+                                "POST-GC DEAD-YOUNG-REF LOCAL: frame[{}] {}.{} local[{}] pc={}                                  holds 0x{:x}, which is inside the ACTIVE young semispace but                                  reads as unallocated (zero header) — the slot names no live                                  object. collection={} evacuator_verdict={:?}",
+                                fi,
+                                cname,
+                                mname,
+                                li,
+                                frame.pc,
+                                addr,
+                                h.collection_count(),
+                                cratonvm_gc::gen_heap::forward_refusal_reason(addr),
+                            );
+                        }
+                    }
+                }
+                if let Some((lo, hi)) = inactive_young {
+                    let live = li >= 64 || live_mask & (1u64 << li) != 0;
+                    if live
+                        && addr >= lo
+                        && addr < hi
+                        && !pointer_map.contains_key(&addr)
+                        && reclaimed_reports < 8
+                    {
+                        reclaimed_reports += 1;
+                        genuine_reports += 1;
+                        // WHY the scan skipped it, since `scan_local_objects`
+                        // has exactly two ways to drop a LIVE object local:
+                        // the `local_kinds` LONG/DOUBLE gate, and the
+                        // `is_heap_addr` screen. They have completely
+                        // different fixes, and neither is the liveness
+                        // filter this arm has already excluded.
+                        eprintln!(
+                            "POST-GC RECLAIMED-WHILE-HELD LOCAL: frame[{}] {}.{} local[{}] pc={} \
+                             holds 0x{:x}, inside the semispace this cycle emptied, and the \
+                             pointer map has no entry for it -- the object was NOT copied, so \
+                             this slot was not in the root set. local_kind={} in_heap={} \
+                             collection={}",
+                            fi,
+                            cname,
+                            mname,
+                            li,
+                            frame.pc,
+                            addr,
+                            frame.local_kind_at(li),
+                            heap.map(|h| h.is_heap_addr(addr).is_some()).unwrap_or(false),
+                            heap.map(|h| h.collection_count()).unwrap_or(0),
+                        );
+                        // AND WHETHER THE COLLECTOR WAS GIVEN IT. Armed by
+                        // `CRATONVM_DBG_ROOT_REMAP_AUDIT`; `None` prints as
+                        // "not measured" rather than as an absence.
+                        eprintln!(
+                            "POST-GC RECLAIMED-WHILE-HELD LOCAL ^ in_root_set={:?}",
+                            root_set_contains(addr),
+                        );
+                        // WHICH OF THE TWO OPPOSITE DEFECTS THIS IS. The
+                        // headline above says "the object was NOT copied", and
+                        // that sentence has two readings with opposite fixes:
+                        // the collector reclaimed a live object a frame still
+                        // held, or the frame held an address that was never a
+                        // live object start. Only the evacuator can tell them
+                        // apart, and it already decided — `forward_refusal_reason`
+                        // is that decision, kept for exactly this reader.
+                        match cratonvm_gc::gen_heap::forward_refusal_reason(addr) {
+                            Some(reason) => eprintln!(
+                                "POST-GC RECLAIMED-WHILE-HELD LOCAL ^ evacuator_verdict=REFUSED                                  ({reason}) -- the collector was handed this address and                                  declined it, so nothing live was reclaimed here: the SLOT is                                  wrong, and the write that put this value in it is the defect",
+                            ),
+                            None => eprintln!(
+                                "POST-GC RECLAIMED-WHILE-HELD LOCAL ^ evacuator_verdict=NEVER-OFFERED                                  -- the evacuator was never asked about this address, so the                                  root scan is the place to look",
+                            ),
+                        }
+                        // AND WHETHER THE SCAN WOULD PRODUCE IT AT ALL. Re-run
+                        // the frame's own root scan -- the very call `roots.rs`
+                        // step 1 makes -- and look for the address. TRUE means
+                        // the root set contained this slot and the collection
+                        // dropped the object anyway, which is a marking or
+                        // copying fault, not a scanning one. FALSE means the
+                        // scan is the place to look, and `local_kind` /
+                        // `in_heap` above say which of its two filters did it.
+                        if let Some(h) = heap {
+                            let mut probe: Vec<ObjectRef> = Vec::new();
+                            frame.scan_local_objects(&mut probe, h);
+                            eprintln!(
+                                "POST-GC RECLAIMED-WHILE-HELD LOCAL ^ scan_would_root={} \
+                                 (frame's own scan yields {} roots)",
+                                probe.iter().any(|r| r.as_ptr() as usize == addr),
+                                probe.len(),
                             );
                         }
                     }
@@ -2146,6 +2507,52 @@ fn verify_no_stale_refs(
                                 fi, cname, mname, si, addr, new_addr,
                             );
                         }
+                    }
+                }
+                // ACTIVE-semispace half — see the matching arm on locals.
+                // Operand-stack slots are always live, so there is no mask to
+                // consult here.
+                if let Some(h) = heap {
+                    if dead_ref_reports < 8 {
+                        if let Some("ZERO-HEADER-IN-YOUNG") = h.dead_young_ref_reason(addr) {
+                            dead_ref_reports += 1;
+                            genuine_reports += 1;
+                            eprintln!(
+                                "POST-GC DEAD-YOUNG-REF STACK: frame[{}] {}.{} stack[{}] pc={}                                  holds 0x{:x}, which is inside the ACTIVE young semispace but                                  reads as unallocated (zero header) — the slot names no live                                  object. collection={} evacuator_verdict={:?}",
+                                fi,
+                                cname,
+                                mname,
+                                si,
+                                frame.pc,
+                                addr,
+                                h.collection_count(),
+                                cratonvm_gc::gen_heap::forward_refusal_reason(addr),
+                            );
+                        }
+                    }
+                }
+                if let Some((lo, hi)) = inactive_young {
+                    if addr >= lo
+                        && addr < hi
+                        && !pointer_map.contains_key(&addr)
+                        && reclaimed_reports < 8
+                    {
+                        reclaimed_reports += 1;
+                        genuine_reports += 1;
+                        eprintln!(
+                            "POST-GC RECLAIMED-WHILE-HELD STACK: frame[{}] {}.{} stack[{}] pc={} \
+                             holds 0x{:x}, inside the semispace this cycle emptied, and the \
+                             pointer map has no entry for it -- the object was NOT copied, so \
+                             this slot was not in the root set. in_heap={} collection={}",
+                            fi,
+                            cname,
+                            mname,
+                            si,
+                            frame.pc,
+                            addr,
+                            heap.map(|h| h.is_heap_addr(addr).is_some()).unwrap_or(false),
+                            heap.map(|h| h.collection_count()).unwrap_or(0),
+                        );
                     }
                 }
                 if heavy && addr != 0 {
@@ -2546,7 +2953,7 @@ mod tests {
         thread.frames.push(frame);
 
         assert_eq!(
-            verify_no_stale_refs(&thread, &map),
+            verify_no_stale_refs(&thread, &map, None),
             1,
             "recycled destination must be benign; unrewritten key must report"
         );

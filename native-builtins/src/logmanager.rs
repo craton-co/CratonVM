@@ -2008,25 +2008,37 @@ fn apply_jul_config_entries(
     // handler built this way is publish-silent. Detect the unset field
     // and patch in the documented default pattern directly, sidestepping
     // the broken `invokedynamic` path without reimplementing it.
+    // GC-safety: `new_object_initialized` and `create_string` both allocate,
+    // and `handler` is an element of a Rust `Vec` that no collection rewrites
+    // -- so on every turn but the first, `setFormatter` was dispatched on the
+    // handler's pre-GC address. The formatter itself is live only in a Rust
+    // local between its construction and its store, and `create_string` sits
+    // between them. Pin both, per turn, and release them at the foot of the
+    // body so the pin stack does not grow with the handler count.
     for (idx, (_, handler)) in created.iter().enumerate() {
         if formatter_configured[idx] {
             continue;
         }
+        let handler_pin = ctx.pin_native_root(*handler);
         if let Ok(Some(Value::Object(Some(fmt)))) =
             ctx.new_object_initialized("java/util/logging/SimpleFormatter", "()V", &[])
         {
+            let fmt_pin = ctx.pin_native_root(fmt);
             // Always overwrite: the broken constructor doesn't reliably
             // leave `format` exactly null (observed non-null-but-wrong
             // values too), so a null-only guard under-detects.
             let pattern = ctx.create_string("%1$tc%n%4$s: %5$s%n%6$s%n");
+            let fmt = ctx.read_native_pin(fmt_pin, fmt);
             ctx.set_field_by_name(fmt, "format", Value::Object(Some(pattern)));
+            let handler_now = ctx.read_native_pin(handler_pin, *handler);
             let _ = ctx.invoke_virtual(
-                *handler,
+                handler_now,
                 "setFormatter",
                 "(Ljava/util/logging/Formatter;)V",
                 &[Value::Object(Some(fmt))],
             );
         }
+        ctx.unpin_native_roots(handler_pin);
     }
     Ok(None)
 }
@@ -4679,7 +4691,7 @@ fn notify_jul_logger_filter(
     // Its real-JDK constructor may walk unmaterialized time/sequence state
     // before a filter gets to inspect the record, so use the same compact
     // allocation strategy as the established handler bridge below.
-    let record = match ctx.new_object("java/util/logging/LogRecord") {
+    let mut record = match ctx.new_object("java/util/logging/LogRecord") {
         Ok(Some(Value::Object(Some(record)))) => record,
         _ => {
             ctx.unpin_native_roots(level_pin);
@@ -4687,12 +4699,12 @@ fn notify_jul_logger_filter(
         }
     };
     let record_pin = ctx.pin_native_root(record);
-    let record = ctx.read_native_pin(record_pin, record);
+    record = ctx.read_native_pin(record_pin, record);
     let level = ctx.read_native_pin(level_pin, level);
     let message = ctx.read_native_pin(message_pin, message);
     ctx.set_field_by_name(record, "level", Value::Object(Some(level)));
     ctx.set_field_by_name(record, "message", Value::Object(Some(message)));
-    stamp_inferred_caller(ctx, record);
+    stamp_inferred_caller(ctx, &mut record);
     let _ = ctx.invoke_virtual(
         record,
         "setLevel",
@@ -4784,14 +4796,14 @@ fn publish_jul_handlers_src(
         // materialized on our compact JUL path. Handlers require the public
         // record fields, in particular `message`, so initialize that stable
         // surface directly.
-        let record = match ctx.new_object("java/util/logging/LogRecord") {
+        let mut record = match ctx.new_object("java/util/logging/LogRecord") {
             Ok(Some(Value::Object(Some(record)))) => record,
             _ => continue,
         };
         let record_pin = ctx.pin_native_root(record);
         ctx.set_field_by_name(record, "level", Value::Object(Some(level)));
         ctx.set_field_by_name(record, "message", Value::Object(Some(message)));
-        stamp_inferred_caller(ctx, record);
+        stamp_inferred_caller(ctx, &mut record);
         // Real JDK LogRecord's instance layout is level, sequenceNumber,
         // sourceClassName, sourceMethodName, message. Keep a slot fallback for
         // the private-field resolver path used by compact allocations.
@@ -5195,7 +5207,7 @@ fn jul_trace_marker(ctx: &mut dyn NativeContext, args: &[Value], marker: &str) -
 /// inference is lazy and fails once its frames are gone. Nothing rests on that
 /// null — `SimpleFormatter` reads during `publish`, where both now answer
 /// identically — and being deterministic is the better failure mode.
-fn stamp_inferred_caller(ctx: &mut dyn NativeContext, record: ObjectRef) {
+fn stamp_inferred_caller(ctx: &mut dyn NativeContext, record: &mut ObjectRef) {
     let frames = ctx.capture_stack_trace(0);
     // Outermost-first, so the innermost frame — the direct caller of the log
     // method — is the LAST one. Skip any logging/reflection frame a re-entrant
@@ -5211,14 +5223,17 @@ fn stamp_inferred_caller(ctx: &mut dyn NativeContext, record: ObjectRef) {
     };
     let class = frame.class_name.replace('/', ".");
     let method = frame.method_name.as_ref().to_string();
-    let record_pin = ctx.pin_native_root(record);
+    let record_pin = ctx.pin_native_root(*record);
     let cls_obj = ctx.create_string(&class);
     let cls_pin = ctx.pin_native_root(cls_obj);
     let mth_obj = ctx.create_string(&method);
     let cls_obj = ctx.read_native_pin(cls_pin, cls_obj);
-    let record = ctx.read_native_pin(record_pin, record);
-    ctx.set_field_by_name(record, "sourceClassName", Value::Object(Some(cls_obj)));
-    ctx.set_field_by_name(record, "sourceMethodName", Value::Object(Some(mth_obj)));
+    // Written back through `&mut`: this function already re-read its own copy,
+    // but the CALLER's copy stayed at the pre-`capture_stack_trace` address and
+    // three call sites kept using it.
+    *record = ctx.read_native_pin(record_pin, *record);
+    ctx.set_field_by_name(*record, "sourceClassName", Value::Object(Some(cls_obj)));
+    ctx.set_field_by_name(*record, "sourceMethodName", Value::Object(Some(mth_obj)));
     // The real setters clear this; stamping the fields directly must too, or
     // the pair is written into a record that still believes it owes an
     // inference. That was inert while `getSourceClassName` was a shadow doing a
@@ -5233,8 +5248,8 @@ fn stamp_inferred_caller(ctx: &mut dyn NativeContext, record: ObjectRef) {
     //
     // Inert in `Compatible`, where the four accessors still dispatch as natives
     // and none of them reads this flag. W7-56-infercaller-strict.md
-    if crate::log_record_real_layout(ctx, record) {
-        ctx.set_field_by_name(record, "needToInferCaller", Value::Int(0));
+    if crate::log_record_real_layout(ctx, *record) {
+        ctx.set_field_by_name(*record, "needToInferCaller", Value::Int(0));
     }
     ctx.unpin_native_roots(cls_pin);
     ctx.unpin_native_roots(record_pin);
@@ -5560,7 +5575,7 @@ fn publish_to_jul_handlers_full(
         let logger = ctx.read_native_pin(base_pin, logger);
         let level = ctx.read_native_pin(level_pin, level);
         let message = ctx.read_native_pin(message_pin, message);
-        let record = match ctx.new_object_initialized(
+        let mut record = match ctx.new_object_initialized(
             "java/util/logging/LogRecord",
             "(Ljava/util/logging/Level;Ljava/lang/String;)V",
             &[Value::Object(Some(level)), Value::Object(Some(message))],
@@ -5605,7 +5620,7 @@ fn publish_to_jul_handlers_full(
         // surface explicit just as the direct-handler bridge does.
         ctx.set_field_by_name(record, "level", Value::Object(Some(level)));
         ctx.set_field_by_name(record, "message", Value::Object(Some(message)));
-        stamp_inferred_caller(ctx, record);
+        stamp_inferred_caller(ctx, &mut record);
         ctx.set_field(record, 4, Value::Object(Some(message)));
         // FIX (logbackloggingsystemtests-julbridge-loggername-null): this
         // synthetic `LogRecord` bypasses `Logger.log(LogRecord)`'s real

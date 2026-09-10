@@ -331,6 +331,19 @@ impl NativeClassAccess for MockNativeContext {
         // SAFETY: single-threaded test code.
         unsafe { &*self.class_ids_by_name.get() }.get(n).copied()
     }
+    /// Every field [`MockNativeContext::declare_class`] records is an instance
+    /// field, so the declared layout IS the total count.
+    ///
+    /// The trait default is a flat `0`, which collapsed every layout this mock
+    /// can model onto one answer: `appended_slots::base_for_class` returned 0
+    /// for a declared class and for an unresolvable one alike, so no test could
+    /// tell a base that was computed from a base that was never reached.
+    fn class_num_total_fields(&self, class_id: ClassId) -> usize {
+        // SAFETY: single-threaded test code.
+        unsafe { &*self.declared_fields.get() }
+            .get(&class_id.as_u32())
+            .map_or(0, Vec::len)
+    }
     fn loader_id_of_class(&self, _c: ClassId) -> i32 {
         2
     } // Application loader by default

@@ -7,42 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### 2026-09-10 The safepoint poll's flag byte was on the Rust heap, 124 TB from the code that polls it
+### 2026-09-10 The safepoint poll's flag byte, from the code cache's own allocator
 
-The one-instruction RIP-relative safepoint poll added 2026-09-02 never engaged
-on Linux. `TEST BYTE [rip+disp32], 0FFh` reaches ±2 GB;
-`GcBarrier::stw_requested` was an inline field of a struct reached only through
-`Arc<SharedVm>`, i.e. from mimalloc, whose Linux arenas sit nowhere near the
-anonymous mapping the JIT code cache comes from. Reported from
-20.80.105.49: code buffer `0x7DE4D7F9E000`, flag `0x2000CD6E2C0` — **123.9 TB
-apart**, so every compiled loop back edge and method entry in the process took
-the `MOV R11, imm64 ; TEST BYTE [R11], 0FFh` fallback: 15 bytes and a clobbered
-register instead of 7 and none.
+The second half of the placement problem `CRATONVM_JIT_CODE_NEAR_GLOBALS`
+opened. That strategy moves the CODE to the globals: it hints `mmap` to place
+each buffer within 1.5 GB of `layout_replace_epoch_guard()`, and the safepoint
+flag comes along because it is a few hundred megabytes away in the same
+mimalloc band. It is **default OFF**, so on a default Linux run the code buffer
+is still ~130 TB from the flag and every back-edge poll and method-entry poll
+in the process still emits `MOV R11, imm64 ; TEST BYTE [R11], 0FFh` — 15 bytes
+and a clobbered register — instead of the 7-byte `TEST BYTE [rip+disp32], 0FFh`
+the 2026-09-02 work added. Nothing fails; the fallback reads the same byte and
+branches the same way, which is why it went unnoticed.
 
-Nothing failed, which is why it stood for eight days. The fallback reads the
-same byte and branches the same way; it is only longer, and nothing in the tree
-asserted anything about where the flag sits.
+For that default configuration the flag now comes from
+`platform::alloc_code_adjacent_cell` — a bump allocator over 64 KiB chunks
+taken from the same `mmap(NULL, …)` / `VirtualAlloc(NULL, …)` that
+`alloc_executable` hands the code cache, carving 64-byte cache-line-isolated
+cells that are never unmapped. `CacheLineFlag` becomes a `&'static AtomicBool`
+into one; its four methods are unchanged, so all 75 `stw_requested` call sites
+are untouched.
 
-The byte now comes from `platform::alloc_code_adjacent_cell` — a bump allocator
-over 64 KiB chunks taken from the same `mmap(NULL, …)` / `VirtualAlloc(NULL, …)`
-that `alloc_executable` hands the code cache, carving 64-byte cache-line
-isolated cells that are never unmapped. `CacheLineFlag` becomes a `&'static
-AtomicBool` into one, with `Box::leak` as the correctness floor; its four
-methods are unchanged, so all 75 `stw_requested` call sites are untouched.
-Placement is a hint, not a guarantee — the OS picks — so both emitters keep
-their per-site ±2 GB test and their fallback, and two new tests assert the
-reach, one of them through `stw_requested_flag_addr` itself.
+**The two strategies now compose, where `82bf52efd` correctly said they could
+not.** `alloc_code_adjacent_cell` returns `None` when
+`CRATONVM_JIT_CODE_NEAR_GLOBALS` is engaged, and `CacheLineFlag` falls back to
+the leaked `Box` — so with that flag on, the flag stays in the allocator band
+its anchor lives in and behaviour is bit-identical to before this change. The
+same reasoning that made `alloc_epoch_page` wrong for the epoch counter makes
+declining the cell right here: whoever owns the placement must own it for every
+cell at once, and `near_globals` owns it whenever it is on.
 
-`execute_frame` now hoists the flag reference once, beside the existing
-`async_exception_slot` hoist. Without that, the two **per-bytecode** interpreter
-reads would each have become a dependent pair of loads through a pointer word
-sharing a cache line with `gc_generation`, `threads_blocked` and the barrier
-mutex — the exact neighbours `CacheLineFlag` exists to avoid.
+Placement is a hint either way — the OS picks — so both emitters keep their
+per-site ±2 GB test and their fallback. Two tests assert the reach, one of them
+through `stw_requested_flag_addr` itself, and both skip when `near_globals` is
+engaged.
 
-Measured on Windows x86-64, before and after, same tree: 489 MiB apart before,
-**128 KiB** after, and the short form on both — this host was already in reach,
-since mimalloc on Windows goes through `VirtualAlloc` and lands in the same low
-region. The Linux confirmation is still owed and is the one that matters. See
+`execute_frame` hoists the flag REFERENCE once, beside the existing
+`async_exception_slot` hoist. This is not the hoist the loop-top comment
+refuses: that one caches the flag's VALUE at frame entry and would cut poll
+frequency, which is time-to-safepoint. Every poll still loads the byte; what is
+resolved once is the address, which is now a pointer indirection and one whose
+source word shares a line with `gc_generation`, `threads_blocked` and the
+barrier mutex.
+
+Measured Windows x86-64, before and after, same tree: 489 MiB apart before,
+**128 KiB** after, short form on both — Windows already lands in reach, which is
+why `near_globals` does not build there either. **The Linux confirmation is
+still owed and is the one that matters.** See
 `docs/internal/performance/safepoint-poll-flag-was-on-the-rust-heap-FIXED-20260910.md`.
 
 Found while verifying it: `CRATONVM_JIT_RIP_SAFEPOINT_POLL=0`, the lever for
@@ -52,6 +63,129 @@ everything hot is compiled — called its RIP emitter unconditionally, so on a
 real workload the switch moved **2 of 394** poll sites. Both gates in
 `x64/licm.rs` are now `pub(crate)` and the lowerer calls them; the switch moves
 398 of 398, and both arms print the same answer.
+
+### 2026-09-09 `checkcast` / `instanceof` in a spliced callee — the third rebase, and the bug it uncovered
+
+The third instance of one pattern, after `ldc` and `getstatic`: `IrBuilder` has
+had `0xc0`/`0xc1` arms since cov-05, and the splice scanner refused the shape
+for both tiers in one arm — so the optimizing tier inherited a refusal that
+belongs to the single-pass emitter, which genuinely has no arm for either. It
+fell on the commonest accessor in typed Java: the survey that motivated those
+arms counted 306 events on this pair, the largest single whole-method refusal it
+found, more than every opcode gap combined.
+
+Unlike `getstatic`, there were no rows to rebase — `InlineSite` gains
+`ir_typecheck_info` and the resolver fills it against the CALLEE's constant
+pool, the only pool that can name the target. An unresolved target refuses the
+callee, because a missing row bails the whole method. A spliced `checkcast`
+also carries the `has_dispatch` obligation its caller-side twin does: a
+definitive refusal publishes its `ClassCastException` through the `JIT_THREAD`
+TLS the no-dispatch fast entry never sets.
+
+Reach: spliced bodies 2 → 6 on `bench/SpliceCastProbe.java`. Throughput: the
+body it produces is ~30% faster (~133 ms against ~193 ms on
+`bench/SpliceCastArrayProbe.java`, 34 interleaved rounds, a mode the off arm
+never reaches), and the run median is NEUTRAL because that body is installed in
+about a quarter of runs — the tier race, not this lane.
+
+Found in passing and NOT fixed: on `SpliceCastProbe` the optimizing body is ~3x
+slower than the single-pass one in BOTH arms, and `ir blind dispatches:
+own_code=0 in_splice=1` names the suspect — a surviving `invokevirtual`
+(`ArrayList.elementData`) inside a relocated body that got neither a direct bind
+(correctly — it is virtual) nor the MIC/PIC cascade it should have. Written up
+as the next thing to look at. `CRATONVM_JIT_IR_SPLICE_TYPECHECK=0` restores the
+refusal.
+
+### 2026-09-09 A `getstatic` in a callee cost the optimizing tier the inline, and the calls a splice left behind were name resolutions
+
+The C2 tier published a body **15x slower than the C1 body it replaced** on the
+callee shape framework code is mostly made of — a hot method whose accessors
+read statics — and the default acceptance gate only avoided it by abandoning
+the supersede for an unrelated reason on most runs.
+
+Two causes, both plumbing. A callee containing `getstatic` was refused for
+splicing because nothing rebased its already-resolved rows into
+`IrInlineTables`; and a statically-bound call that SURVIVED a splice got no
+`ir_direct_calls` row, so it fell through to `jit_invoke_dispatch` and resolved
+its callee by name on every execution. The second is the expensive one and it
+is worse than not splicing at all: the resolver had bound the callee entry and
+registered it on the artifact's keep-alive list, so the compile paid to pin a
+target for a direct call it never emitted.
+
+Measured per BODY, because whether the optimizing body is installed before a
+timed loop starts is a race and a run median mixes the two: on
+`bench/SpliceStaticProbe.java` the optimizing body goes **~830 ms → ~23 ms**
+(from 15x worse than the single-pass body to 2.4x better), and on
+`bench/SpliceCallProbe.java` **~455 ms → ~57 ms** (from 8.5x worse to parity).
+Single-pass is 56 ms in every arm, every sample checksum-matched to Temurin
+JDK 25. All seven `CratonBench` phases are inside 1% with matching checksums;
+92 of 92 fast-regression vectors match HotSpot. `CRATONVM_JIT_IR_SPLICE_GETSTATIC=0`
+and `CRATONVM_JIT_IR_SPLICE_DIRECT_CALL=0` restore the old behaviour arm for
+arm. `putstatic` stays refused — the builder has no arm for it, and a static
+reference write owes an SATB pre-barrier the single-pass path carries.
+`[c2-supersede] ir blind dispatches: own_code=N in_splice=M` gives the failure a
+reading: a non-zero `in_splice` says that method's optimizing body is very
+likely slower than its single-pass one.
+
+### 2026-09-08 `new Object()` published sixteen zero bytes, so `System.gc()` kept every one of them
+
+`java/lang/Object` is `ClassId(0)`, a field-less object's `shape` is `0`, and
+`MARK_NEUTRAL` / `ObjectKind::Object` / `ArrayElementType::Reference` all encode
+as `0` — so the commonest object in Java reached the heap as sixteen zero bytes,
+byte-for-byte identical to reclaimed, zeroed, unlisted arena space. The young
+non-moving sweep, which every `System.gc()` diverts to, cannot parse that: runs
+of such objects were either stepped over without being freed or treated as a
+walk desync that unwound every reclaim decision since the last anchor. An
+allocation-only workload retained ~100% of its garbage under
+`-XX:+UseGenerationalGC`, ~2.1 MB a round, monotonic, until the collector
+thrashed — `ChurnLoop 40 125000` did not finish inside 300 s.
+
+`GC_FLAG_HEADER` (mark-word bit 59) now says *these bytes are a published object
+header*. It is set by `ObjectHeader::new` and by both JIT inline-allocation
+emitters, never cleared, and preserved by every mark-word transition. HotSpot has
+never had the problem for the same reason it needs no such bit: its unlocked mark
+word is `0b01`. `ChurnLoop` is flat and finishes 40 rounds in 1.4 s;
+`zero_spans`, `zero_empty_runs` and the sweep's `live_inside` refusals all go to
+zero, and `SWEEP_NO_HEADER_FLAG` — new, printed unconditionally in the
+young-sweep census — measures the allocator invariant rather than assuming it.
+
+Second, separable defect on the same page: `Runtime.freeMemory()` answered from
+the young arena's raw bump cursor, which the in-place sweep never retreats, so
+the reported heap filled once and never emptied. `heap_allocated_bytes` now
+answers from `live_bytes_estimate` (`young.used − young.free_list + old.used`),
+which is what its own doc always described.
+
+`org.h2.test.unit.TestValueMemory` under `-XX:+UseGenerationalGC` goes from FAIL
+at Type 0 (`Used memory: 7018`, 7.2x a 3x threshold) to PASS on all 40 types with
+a worst row of 2.30x. The remaining distance to HotSpot's 0.5x is measured and
+attributed: it is conservative JIT-frame root retention, and `--nojit` reads
+976-977 on every arm. That also turned up a failure nobody had run for — the same class
+fails under `-XX:+UseG1GC`, identically on the binary before this work, because
+G1's conservative roots retain at region granularity; split out as
+`docs/known-issues/h2/testvaluememory-fails-under-g1-on-conservative-jit-roots-20260908.md`
+rather than folded in here. Full write-up:
+[`docs/internal/fixed-bugs/h2-testvaluememory-system-gc-retained-every-empty-object-FIXED-20260908.md`](docs/internal/fixed-bugs/h2-testvaluememory-system-gc-retained-every-empty-object-FIXED-20260908.md).
+
+The VM had already met these sixteen bytes three times and written each one down
+as a cost rather than a defect, none of them naming the collector: `invoke.rs`
+demoted its "Stale pointer detected" WARN to `debug!` for `java/lang/Object`
+call sites because "a bare `new Object()` IS all-zero, legitimately";
+`h1_tlab_object_header_has_nonzero_hash_at_allocation` was *inverted* from
+`assert_ne!` to `assert_eq!` on exactly that array; and `init_object_header`'s
+doc claimed an eager identity hash that had not existed since the 24 → 16
+shrink. All three are corrected, and the WARN is restored for `Object`
+(`ClassLoader` keeps its separately-justified demotion) — measured at zero
+"Stale pointer detected" lines across the suite, the H2 corpus and the probes on
+all three collectors. The eager hash all three reach for is the wrong repair:
+minting one at allocation makes every `synchronized` block lose its thin-lock
+CAS and inflate a monitor.
+
+Adding the flag also inverted two "list of every defined flag" screens that had
+to grow it in the same commit: `concurrent_mark_object_size`'s `known_flags` —
+without which G1's concurrent mark refused every gray entry as a torn header,
+took `cleanup`'s retain-everything fail-safe and stopped unloading classes — and
+`header_reserved_fields_plausible`, whose `gc_flags` clause became a tautology
+and which now screens the mark word's two reserved bits instead.
 
 ### 2026-09-02 `String` is `final`, and that is what killed its own intrinsic — 170x on `charAt`
 
@@ -654,7 +788,7 @@ First systematic validation of the GPU offload stack on real hardware (RTX
 day: a morning validation run that found and fixed two dispatch-correctness
 bugs, and an evening feature wave that closed most of the follow-ups the
 morning pass turned up. See
-`docs/known-issues/gpu-offload-followups-20260711.md` for full detail and
+`gpu-offload-followups-20260711.md` for full detail and
 remaining open items.
 
 #### Fixed (morning validation pass)
@@ -677,7 +811,7 @@ remaining open items.
 #### Known follow-ups
 - `GpuFuture` completion is now poll-driven but still not push-driven: `isDone()`/`getNow()` do a real non-blocking device check and finalize inline, but nothing drives that check without an application thread calling it — no background thread or driver callback completes a future on its own yet.
 - 2-D/nested loops and general (non-loop-guard) branches are still rejected by the analyzer; `)F`/`)D` reductions remain CPU-only by design.
-- Full open-items list in `docs/known-issues/gpu-offload-followups-20260711.md`.
+- Full open-items list in `gpu-offload-followups-20260711.md`.
 
 ---
 

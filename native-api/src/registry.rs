@@ -3633,7 +3633,20 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     /// Get the number of fields (slots) of a heap object.
     fn object_num_fields(&self, obj: ObjectRef) -> usize;
 
-    /// Returns the total number of bytes allocated on the heap.
+    /// Bytes of the Java heap that are **currently occupied by live objects**
+    /// — the "used" half of `Runtime.freeMemory()`, `MemoryUsage.getUsed()`
+    /// and every other heap-occupancy report.
+    ///
+    /// Occupancy, not a high-water mark. That distinction is the whole content
+    /// of this doc comment, because a bump-pointer arena makes the two easy to
+    /// confuse and the VM answered with the wrong one until 2026-09-08: the
+    /// generational young sweep reclaims in place, into a free list, WITHOUT
+    /// retreating the arena cursor, so the raw cursor stays pinned at its
+    /// high-water mark for the rest of the process. Programs that size caches
+    /// or buffers from the free heap then see a heap that never empties: H2's
+    /// `TestValueMemory` is `totalMemory() - freeMemory()` around a pair of
+    /// `System.gc()` calls, and on the generational arm it read 6715 KB against
+    /// a 2928 KB threshold where occupancy is 2228.
     fn heap_allocated_bytes(&self) -> usize;
 
     /// Cumulative bytes the **calling** thread has allocated since it started,

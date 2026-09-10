@@ -748,10 +748,16 @@ fn ws_poll_event_names0_native(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // dead row that would answer wrongly if it woke up is not worth keeping as
     // one.
     let arr = crate::new_string_array(ctx, names.len());
+    // GC: one `create_string` per element, with the array itself unrooted.
+    let arr_pin = ctx.pin_native_root(arr);
+    let mut arr = arr;
     for (i, name) in names.iter().enumerate() {
         let s = ctx.create_string(name);
+        arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(s)));
     }
+    arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
     Ok(Some(Value::Object(Some(arr))))
 }
 

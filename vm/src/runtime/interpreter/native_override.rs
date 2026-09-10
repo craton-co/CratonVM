@@ -4078,7 +4078,7 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     // JavaLangAccess is implemented by the concrete System$1 singleton. The
     // JDK module bootstrap calls these ordinary Java methods through that
     // receiver, so native registrations must win over its real bytecode.
-    if class_name == "java/lang/System$1"
+    if matches!(class_name, "java/lang/System$1" | "java/lang/System$2")
         && matches!(
             (method_name, method_descriptor),
             ("addReads", "(Ljava/lang/Module;Ljava/lang/Module;)V")

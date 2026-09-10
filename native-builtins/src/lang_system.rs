@@ -3139,6 +3139,13 @@ pub(crate) fn native_runtime_total_memory(
 /// separately and without a lock, so a concurrent allocation can make used
 /// exceed the committed figure read a moment earlier. HotSpot never reports a
 /// negative free heap; report 0 rather than a wrapped `Long`.
+///
+/// `used` is heap OCCUPANCY and must stay occupancy. It answered with the
+/// generational young arena's raw bump cursor until 2026-09-08, and that cursor
+/// never retreats under the in-place non-moving sweep — so `freeMemory()`
+/// reported a heap that filled once and never emptied, however much the
+/// collector reclaimed. See `NativeContext::heap_allocated_bytes`, whose doc
+/// carries the H2 measurement.
 pub(crate) fn native_runtime_free_memory(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
@@ -6512,8 +6519,20 @@ pub(crate) fn native_classloader_define_class1(
     // `WebappClassLoader` serving `/WEB-INF/lib` jars) would otherwise fail to
     // define a class whose super lives in the same jar (JSTL `JstlCoreTLV` в†’
     // `JstlBaseTLV`). No-op for built-in/app-loader defines.
-    if let Some(Value::Object(Some(loader_obj))) = args.first() {
-        preload_supertypes_via_loader(ctx, *loader_obj, &bytes);
+    // GC: `preload_supertypes_via_loader` LOADS CLASSES, and `define_class_full`
+    // / `get_class_mirror` below allocate, so the loader read out of `args` is a
+    // pre-call address at every later use. `args` is the snapshot
+    // `safe_native_call_impl` took before this native was entered; a collection
+    // that happens INSIDE the callback does not rewrite it. Pin once and re-read
+    // at each use. Three sibling entry points carry the identical shape — this
+    // is one of them. See `internal/audits/wide-tranche-triage-20260907.md`.
+    let loader_pin = match args.first() {
+        Some(Value::Object(Some(o))) => Some((ctx.pin_native_root(*o), *o)),
+        _ => None,
+    };
+    if let Some((p, o)) = loader_pin {
+        let loader_obj = ctx.read_native_pin(p, o);
+        preload_supertypes_via_loader(ctx, loader_obj, &bytes);
     }
 
     // `CRATONVM_DBG_DEFINE=1` + `CRATONVM_DBG_DUPCLASS_FILTER=<substring>` --
@@ -6550,21 +6569,25 @@ pub(crate) fn native_classloader_define_class1(
             let mirror = ctx.get_class_mirror(class_id);
             // The JDK's Class.getClassLoader bytecode reads this instance
             // field directly. Keep it aligned with the VM's loader registry.
-            if let Some(Value::Object(Some(loader_obj))) = args.first() {
+            if let Some((p, o)) = loader_pin {
+                let loader_obj = ctx.read_native_pin(p, o);
                 crate::classloader::register_defining_loader(
                     ctx.vm_identity(),
                     class_id.as_u32(),
-                    *loader_obj,
+                    loader_obj,
                 );
-                ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(*loader_obj)));
+                let loader_obj = ctx.read_native_pin(p, o);
+                ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(loader_obj)));
             }
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(msg) => {
-            if let Some(Value::Object(Some(loader_obj))) = args.first() {
-                match classify_duplicate_define(ctx, *loader_obj, &name, loader_id, &msg) {
+            if let Some((p, o)) = loader_pin {
+                let loader_obj = ctx.read_native_pin(p, o);
+                match classify_duplicate_define(ctx, loader_obj, &name, loader_id, &msg) {
                     DuplicateDefine::SameLoaderObject => {
-                        return Err(duplicate_define_error(ctx, *loader_obj, &name));
+                        let loader_obj = ctx.read_native_pin(p, o);
+                        return Err(duplicate_define_error(ctx, loader_obj, &name));
                     }
                     DuplicateDefine::ServeExisting(mirror) => {
                         return Ok(Some(Value::Object(Some(mirror))));
@@ -6631,8 +6654,20 @@ pub(crate) fn native_classloader_define_class2(
         _ => None,
     };
 
-    if let Some(Value::Object(Some(loader_obj))) = args.first() {
-        preload_supertypes_via_loader(ctx, *loader_obj, &bytes);
+    // GC: `preload_supertypes_via_loader` LOADS CLASSES, and `define_class_full`
+    // / `get_class_mirror` below allocate, so the loader read out of `args` is a
+    // pre-call address at every later use. `args` is the snapshot
+    // `safe_native_call_impl` took before this native was entered; a collection
+    // that happens INSIDE the callback does not rewrite it. Pin once and re-read
+    // at each use. Three sibling entry points carry the identical shape — this
+    // is one of them. See `internal/audits/wide-tranche-triage-20260907.md`.
+    let loader_pin = match args.first() {
+        Some(Value::Object(Some(o))) => Some((ctx.pin_native_root(*o), *o)),
+        _ => None,
+    };
+    if let Some((p, o)) = loader_pin {
+        let loader_obj = ctx.read_native_pin(p, o);
+        preload_supertypes_via_loader(ctx, loader_obj, &bytes);
     }
 
     let opts = cratonvm_native_api::DefineClassFull {
@@ -6642,21 +6677,25 @@ pub(crate) fn native_classloader_define_class2(
     match ctx.define_class_full(&name, &bytes, loader_id, opts) {
         Ok(class_id) => {
             let mirror = ctx.get_class_mirror(class_id);
-            if let Some(Value::Object(Some(loader_obj))) = args.first() {
+            if let Some((p, o)) = loader_pin {
+                let loader_obj = ctx.read_native_pin(p, o);
                 crate::classloader::register_defining_loader(
                     ctx.vm_identity(),
                     class_id.as_u32(),
-                    *loader_obj,
+                    loader_obj,
                 );
-                ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(*loader_obj)));
+                let loader_obj = ctx.read_native_pin(p, o);
+                ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(loader_obj)));
             }
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(msg) => {
-            if let Some(Value::Object(Some(loader_obj))) = args.first() {
-                match classify_duplicate_define(ctx, *loader_obj, &name, loader_id, &msg) {
+            if let Some((p, o)) = loader_pin {
+                let loader_obj = ctx.read_native_pin(p, o);
+                match classify_duplicate_define(ctx, loader_obj, &name, loader_id, &msg) {
                     DuplicateDefine::SameLoaderObject => {
-                        return Err(duplicate_define_error(ctx, *loader_obj, &name));
+                        let loader_obj = ctx.read_native_pin(p, o);
+                        return Err(duplicate_define_error(ctx, loader_obj, &name));
                     }
                     DuplicateDefine::ServeExisting(mirror) => {
                         return Ok(Some(Value::Object(Some(mirror))));
@@ -6779,16 +6818,29 @@ pub(crate) fn native_classloader_define_class0(
         nest_host_class_name,
         ..Default::default()
     };
+    // GC: `preload_supertypes_via_loader` LOADS CLASSES, and `define_class_full`
+    // / `get_class_mirror` below allocate, so the loader read out of `args` is a
+    // pre-call address at every later use. `args` is the snapshot
+    // `safe_native_call_impl` took before this native was entered; a collection
+    // that happens INSIDE the callback does not rewrite it. Pin once and re-read
+    // at each use. Three sibling entry points carry the identical shape — this
+    // is one of them. See `internal/audits/wide-tranche-triage-20260907.md`.
+    let loader_pin = match args.first() {
+        Some(Value::Object(Some(o))) => Some((ctx.pin_native_root(*o), *o)),
+        _ => None,
+    };
     match ctx.define_class_full(&effective_name, &bytes, loader_id, opts) {
         Ok(class_id) => {
             let mirror = ctx.get_class_mirror(class_id);
-            if let Some(Value::Object(Some(loader_obj))) = args.first() {
+            if let Some((p, o)) = loader_pin {
+                let loader_obj = ctx.read_native_pin(p, o);
                 crate::classloader::register_defining_loader(
                     ctx.vm_identity(),
                     class_id.as_u32(),
-                    *loader_obj,
+                    loader_obj,
                 );
-                ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(*loader_obj)));
+                let loader_obj = ctx.read_native_pin(p, o);
+                ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(loader_obj)));
             }
             Ok(Some(Value::Object(Some(mirror))))
         }

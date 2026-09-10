@@ -56,8 +56,8 @@ use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, write_ref_slot
 pub use cratonvm_types::{
     array_data_size, array_data_size_checked, array_element_type_from_tag, element_byte_size,
     object_kind_from_tag, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET,
-    ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, GC_FLAG_COMPACT, GC_FLAG_MARKED, GC_FLAG_OLD_GEN,
-    HEADER_SIZE, REF_ELEMENT_SIZE, REF_FIELD_SIZE, SLOT_SIZE,
+    ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, GC_FLAG_COMPACT, GC_FLAG_HEADER, GC_FLAG_MARKED,
+    GC_FLAG_OLD_GEN, HEADER_SIZE, REF_ELEMENT_SIZE, REF_FIELD_SIZE, SLOT_SIZE,
 };
 use cratonvm_types::{class_layout_for_fields, is_compact_object, CompactLayout};
 use std::sync::Arc;
@@ -3159,9 +3159,41 @@ pub fn set_young_mark_watch(addr: usize) {
 }
 
 /// See [`YOUNG_MARK_WATCH`].
+///
+/// `CRATONVM_DBG_YOUNG_MARK_WATCH=1` arms it at address 1 instead, which is
+/// below every from-space base and so satisfies the `w != 0 && w >= from_base`
+/// gate on the MARKWHY *census* blocks without naming a victim. Those blocks
+/// print per-cycle totals — the disposition tally and the `sweep done` line —
+/// and answer the one question a watch address is not needed for: when
+/// `dead_regions` comes out EMPTY, was everything classified live, or were
+/// spans collected and then unwound? Arming previously required the
+/// `add_mirror_pin` hook to have seen an interesting `ClassLoader`, so on a
+/// workload with no such object the census could not be reached at all.
+///
+/// The per-object watch paths keep their own `w == addr` compares, so an
+/// address of 1 never matches one and this cannot forge a per-object report.
 #[inline]
 pub fn young_mark_watch() -> usize {
-    YOUNG_MARK_WATCH.load(std::sync::atomic::Ordering::Relaxed)
+    let w = YOUNG_MARK_WATCH.load(std::sync::atomic::Ordering::Relaxed);
+    if w != 0 {
+        return w;
+    }
+    static ENV: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_YOUNG_MARK_WATCH") {
+            Some(raw) => {
+                let s = raw.to_string_lossy().trim().to_ascii_lowercase();
+                if s.is_empty() || s == "0" {
+                    0
+                } else if let Some(hex) = s.strip_prefix("0x") {
+                    usize::from_str_radix(hex, 16).unwrap_or(1)
+                } else {
+                    s.parse::<usize>().unwrap_or(1)
+                }
+            }
+            None => 0,
+        }
+    })
 }
 
 /// See [`DYNAMIC_WATCH`].
