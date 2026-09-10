@@ -4783,14 +4783,32 @@ fn layout_epoch_guards(compiled: &CompiledMethod) -> usize {
             }
         }
         // Fallback form: MOV R11, imm64 ; MOV ECX, [R11] ; CMP ECX, imm32.
-        if i + 19 <= code.len() && code[i] == 0x49 && code[i + 1] == 0xBB {
+        //
+        // The load has two encodings and this backend emits the LONGER one:
+        // `emit_mov_r32_mem_disp32` goes through `Disp::encode_for_base`,
+        // which picks `mod=10` with an explicit zero disp32
+        // (`41 8B 8B 00000000`, 7 bytes) rather than the `mod=00` short form
+        // (`41 8B 0B`, 3). Measured, not assumed — and matching only the short
+        // one would make this test pass on a box where the counter is in RIP
+        // reach and fail on one where it is not, which is the single worst
+        // property a guard-census test could have.
+        if i + 2 <= code.len() && code[i] == 0x49 && code[i + 1] == 0xBB && i + 10 <= code.len() {
             let mut imm = [0u8; 8];
             imm.copy_from_slice(&code[i + 2..i + 10]);
-            if u64::from_le_bytes(imm) as usize == epoch
-                && code[i + 10..i + 13] == [0x41, 0x8B, 0x0B]
-                && code[i + 13..i + 15] == [0x81, 0xF9]
-            {
-                n += 1;
+            if u64::from_le_bytes(imm) as usize == epoch {
+                let load = &code[i + 10..code.len().min(i + 17)];
+                let after = if load.starts_with(&[0x41, 0x8B, 0x8B, 0, 0, 0, 0]) {
+                    Some(i + 17)
+                } else if load.starts_with(&[0x41, 0x8B, 0x0B]) {
+                    Some(i + 13)
+                } else {
+                    None
+                };
+                if let Some(cmp_at) = after {
+                    if cmp_at + 2 <= code.len() && code[cmp_at..cmp_at + 2] == [0x81, 0xF9] {
+                        n += 1;
+                    }
+                }
             }
         }
     }

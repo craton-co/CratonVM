@@ -168,8 +168,8 @@ answer about whatever is three bytes past it — which is why
 `rip_relative_epoch_guard_addresses_the_counter_and_declares_its_trail` asserts
 the registered trail and not just the encoding.
 
-This tier unrolls, so the saving is per site **per copy**: a 4x copy of a
-four-field body carries sixteen of these.
+This tier unrolls, so the saving is per site **per copy**: `MultiFieldLoop`'s
+four sites become eight guards in the `osr/sp` body that actually runs.
 
 ## 6. Two single-pass sites had no guard at all
 
@@ -202,18 +202,41 @@ it never had one.
 `every_single_pass_compact_field_site_guards_its_baked_offset` pins both, and
 counts guards by RESOLVING to the counter's address so it recognises either
 encoding — a test that knew only the short form would pass or fail by which
-band the allocator picked that day.
+band the allocator picked that day. Writing it caught a second version of the
+same mistake: the fallback's load is `41 8B 8B 00000000` here, not the
+`41 8B 0B` an emitter that wanted the shortest encoding would produce, and a
+matcher written from the manual rather than from the disassembly would have
+recognised neither arm on a box where the counter is out of reach.
 
 ## 7. Engagement
 
-`MultiFieldLoop.sumGuarded`, one binary, Linux:
+`MultiFieldLoop.sumGuarded`, one binary, Linux. Guards are counted by
+RESOLVING each candidate to the counter's address, because `813d` also occurs
+inside unrelated `MOV RAX, imm64` operands and counting opcodes gets it wrong:
 
-| arm | `81 3D` guards | long-form guards | body bytes |
+| tier, arm | short-form guards | long-form guards | body bytes |
 |---|---:|---:|---:|
 | `full/ir`, `IR_EPOCH_GUARD_RIP=1` | **4** | 0 | **1829** |
 | `full/ir`, `IR_EPOCH_GUARD_RIP=0` | 0 | 4 | 1865 |
+| `osr/sp`, `SP_EPOCH_GUARD_RIP=1` | **8** | 0 | **2423** |
+| `osr/sp`, `SP_EPOCH_GUARD_RIP=0` | 0 | 8 | 2527 |
+| `osr/sp`, `SP_FIELD_LAYOUT_GUARD=0` — §6's fix removed | 0 | 0 | 2287 |
 
-36 bytes = 4 sites × 9. Exactly the arithmetic, and no site left behind.
+Three separate pieces of arithmetic, and all three come out:
+
+* **36 = 4 × 9** in the optimizing tier. Its fallback is `MOV R11, imm64` (10)
+  + `MOV ECX, [R11]` (3) + `CMP ECX, imm32` (6) = 19, against 10.
+* **104 = 8 × 13** in the single-pass tier, and the extra four bytes per site
+  are real rather than a miscount: this backend's load goes through
+  `Disp::encode_for_base`, which emits `41 8B 8B 00000000` — `mod=10` with an
+  explicit zero disp32, 7 bytes — so its long form is 23 and not 19.
+* **136 = 8 × 17** for the guard's own existence, of which 16 is the compare
+  and its `JNE` and the last byte is displacements widening around them.
+
+Eight guards for four sites is the unroll: the `osr/sp` body carries two
+copies, each with its four, and each copy's displacement was re-resolved
+against its own PC by `rip_abs_disp32_patches` — which is the fixup §5 is
+about, working.
 
 ## 8. The measurement
 
