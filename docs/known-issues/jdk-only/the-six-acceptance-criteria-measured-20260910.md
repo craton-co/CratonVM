@@ -16,7 +16,7 @@ probes. Artifacts: `registry-{real,strict}.json`, `classes-{real,strict}.json`,
 |---|---|---|
 | 1 | cannot start without a valid real JDK image | **MET** |
 | 2 | final native registry has zero `SyntheticStub` | **MET** — at registration; see §2 |
-| 3 | zero `CompatibilityStub` classes | **MET over 886 classes, with a live control** — see §3 |
+| 3 | zero `CompatibilityStub` classes | **MET over 1351 classes, three live controls** — see §3 |
 | 4 | every strict dispatch is bridge / service / intrinsic | **NOT MET**, and undercounted by construction |
 | 5 | strict errors are actionable | **PARTIAL** — only the class ORIGIN is missing; see §5 |
 | 6 | corpus shows no new divergence **and** CI census is blocking | **HALF** — corpus yes (today); blocking no |
@@ -131,6 +131,40 @@ claim about the native surface, and it is still low.
 To widen further, point `PROBE_CP`/`PROBE_CLASS` at a real application — a
 regression-suite corpus or H2 — rather than at a probe. The lever exists and
 costs one census run.
+
+### Three workloads, three live controls
+
+One workload is one sample. Repeated across all three strict-corpus probes,
+each with its own paired compatible-mode control:
+
+```text
+  probe                      policy   classes   compatibility
+  JdkOnlyCensusLoadProbe     real       765          14
+  JdkOnlyCensusLoadProbe     strict     886           0
+  JdkOnlyBreadthProbe        real       891          14
+  JdkOnlyBreadthProbe        strict     929           0
+  JdkOnlyPlatformProbe       real       753          17
+  JdkOnlyPlatformProbe       strict     843           0
+
+  UNION of classes seen under --jdk-only:  1351
+  every strict arm zero AND every control live:  true
+```
+
+**Every control is live** — 14, 14 and 17 compatibility classes respectively —
+so none of the three zeros is a mute instrument. The check is mechanical: the
+script fails the run if any compatible-mode arm reports zero compatibility
+classes, because a strict zero next to a compatible zero measures nothing.
+
+`JdkOnlyPlatformProbe` sees 17 where the others see 14, so which compatibility
+classes appear is workload-dependent — one more reason a single probe's verdict
+is worth less than three.
+
+**Criterion 3 therefore reads: no `CompatibilityStub` class was observed under
+`--jdk-only` across 1351 distinct classes, on three workloads whose controls
+each saw between 14 and 17.** That is a real verdict. It is still not a
+whole-image proof, and the honest next step is unchanged: point
+`PROBE_CP`/`PROBE_CLASS` at a real application rather than at a probe.
+
 
 ## 4. Every strict dispatch is a bridge, a reviewed service, or an intrinsic — NOT MET
 
