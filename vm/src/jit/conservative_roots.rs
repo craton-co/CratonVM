@@ -6552,7 +6552,17 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
                         // unchanged from pre-fix behavior. Only the detection
                         // scan itself is narrowed above, never the marking scope
                         // once something is actually found.
+                        // A5 UNREGISTERED-FRAME SWEEP. Like the whole-band
+                        // fallback, it has no per-frame layout, so it publishes
+                        // neither half of the movable/unrewritable partition and
+                        // every object it marks becomes an unarguable G1 pin.
+                        // Counted separately because it covers a SPAN rather
+                        // than a frame, so one accept can contribute many.
+                        let __a5_before = out.len();
                         scan_one_frame(search_lo, high, heap, out);
+                        band_path::A5_SWEEPS.fetch_add(1, Ordering::Relaxed);
+                        band_path::A5_ROOTS
+                            .fetch_add(out.len() - __a5_before, Ordering::Relaxed);
                         // MARKING AND THE RELOCATION LICENCE ARE TWO QUESTIONS,
                         // and until 2026-09-08 this site answered both with the
                         // one `accept` above.
@@ -9740,11 +9750,23 @@ pub mod band_path {
     pub static BANDS: AtomicUsize = AtomicUsize::new(0);
     pub static FALLBACK: AtomicUsize = AtomicUsize::new(0);
     pub static FOREIGN_INNERMOST: AtomicUsize = AtomicUsize::new(0);
+    /// The A5 unregistered-frame sweep, and the roots it contributed. It
+    /// covers a SPAN, not a frame, so the root count is the number that
+    /// matters -- one accept can hand the pin set an unbounded set of
+    /// addresses nothing can argue about.
+    pub static A5_SWEEPS: AtomicUsize = AtomicUsize::new(0);
+    pub static A5_ROOTS: AtomicUsize = AtomicUsize::new(0);
 
-    /// `(bands, fallback, foreign_innermost)`.
-    pub fn snapshot() -> (usize, usize, usize) {
+    /// `(bands, fallback, foreign_innermost, a5_sweeps, a5_roots)`.
+    pub fn snapshot() -> (usize, usize, usize, usize, usize) {
         let g = |c: &AtomicUsize| c.load(Ordering::Relaxed);
-        (g(&BANDS), g(&FALLBACK), g(&FOREIGN_INNERMOST))
+        (
+            g(&BANDS),
+            g(&FALLBACK),
+            g(&FOREIGN_INNERMOST),
+            g(&A5_SWEEPS),
+            g(&A5_ROOTS),
+        )
     }
 }
 
