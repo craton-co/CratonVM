@@ -300,14 +300,73 @@ public class L5ExecutorSweep {
         st.shutdown();
         say("stpe terminated", st.awaitTermination(60, TimeUnit.SECONDS));
 
-        // AbstractExecutorService's own rows, on a subclass that adds nothing.
-        ExecutorService aes = new ForkJoinPool(2);
-        say("aes submitCallable", aes.submit(() -> "c").get());
-        say("aes submitRunnable", String.valueOf(aes.submit((Runnable) () -> { }).get()));
-        say("aes submitRunnableWithValue", aes.submit(() -> { }, "v").get());
-        say("aes invokeAny", aes.invokeAny(Arrays.asList(() -> "a")));
-        aes.shutdown();
-        say("aes terminated", aes.awaitTermination(60, TimeUnit.SECONDS));
+        // AbstractExecutorService's OWN four rows.
+        //
+        // They are unreachable through `ThreadPoolExecutor` or `ForkJoinPool`:
+        // a dispatch door asks the registry about the DECLARING class of the
+        // resolved method, and both of those classes carry their own
+        // registration of `submit`/`invokeAny`, so the one declared on
+        // `AbstractExecutorService` never fires for them. The receiver that
+        // reaches it is a direct subclass that declares only `execute` --
+        // which is also the shape a real application writes.
+        ExecutorService direct = new Inline();
+        say("aes submitCallable", direct.submit(() -> "c").get());
+        say("aes submitRunnable", String.valueOf(direct.submit((Runnable) () -> { }).get()));
+        say("aes submitRunnableWithValue", direct.submit(() -> { }, "v").get());
+        say("aes invokeAny", direct.invokeAny(Arrays.asList(() -> "a")));
+        say("aes invokeAll", collect(direct.invokeAll(Arrays.asList(() -> "x", () -> "y"))));
+        direct.shutdown();
+        say("aes isShutdown", direct.isShutdown());
+        say("aes terminated", direct.awaitTermination(60, TimeUnit.SECONDS));
+
+        ExecutorService fjp = new ForkJoinPool(2);
+        say("fjp submitCallable", fjp.submit(() -> "c").get());
+        fjp.shutdown();
+        say("fjp terminated", fjp.awaitTermination(60, TimeUnit.SECONDS));
+    }
+
+    /** A direct `AbstractExecutorService` subclass: it declares only `execute`. */
+    static final class Inline extends AbstractExecutorService {
+        private volatile boolean down;
+
+        @Override
+        public void execute(Runnable command) {
+            command.run();
+        }
+
+        @Override
+        public void shutdown() {
+            down = true;
+        }
+
+        @Override
+        public List<Runnable> shutdownNow() {
+            down = true;
+            return new ArrayList<>();
+        }
+
+        @Override
+        public boolean isShutdown() {
+            return down;
+        }
+
+        @Override
+        public boolean isTerminated() {
+            return down;
+        }
+
+        @Override
+        public boolean awaitTermination(long timeout, TimeUnit unit) {
+            return down;
+        }
+    }
+
+    static String collect(List<Future<String>> fs) throws Exception {
+        StringBuilder b = new StringBuilder();
+        for (Future<String> f : fs) {
+            b.append(f.get());
+        }
+        return b.toString();
     }
 
     static void queueRows() throws Exception {
