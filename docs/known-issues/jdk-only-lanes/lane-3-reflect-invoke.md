@@ -117,17 +117,164 @@ reached only through those paths, and it is otherwise untested territory.
    in **your** instrument's run.
 2. Probe + HotSpot oracle. No build needed.
 3. Fill `RETIRED_SHADOW_L3_TRIPLES`, sorted and unique. Note that
-   `java/lang/reflect/`, `java/lang/invoke/` and `sun/reflect/` must be present
-   in `RETIRED_SHADOW_PREFIXES` — L0's skeleton commit adds them; an entry
+   `java/lang/reflect/`, `java/lang/invoke/`, `jdk/internal/reflect/` and
+   `sun/reflect/` must be present in `RETIRED_SHADOW_PREFIXES` — an entry
    outside every prefix silently answers "not retired" and is invisible in a
    workload.
+
+   **This lane adds its own prefixes; L0's skeleton commit does not exist.**
+   That plan was dropped — see L0 §4, "How a lane adds its table" — because
+   pre-adding a broad prefix keeps every test green while deleting the second
+   guard `a_prefix_alone_retires_nothing` provides. Add the narrowest prefixes
+   that cover your table, in the same commit as the table.
 4. Build token (L0 §5); one build per wave.
 5. `N refusals, 0 survivors`.
 6. Probe-tree A/B, `--jdk-only` corpus, `SUITE=all` at `TIMEOUT=600`, `all`-arm
    count.
 7. Full gate set. Kind-map rows. Commit. Do not push.
 
-## 8. Done
+## 8. Measured, 2026-09-10
+
+### The population is 242, not 251
+
+Re-derived from a `--dump-native-registry` taken with `--explain-jdk-only`,
+which is what populates the image columns (see the trap below), minus lane T's
+two throwable classes:
+
+```text
+owns_slot + kind=bridge in the prefix set   346 rows / 38 classes
+  A  declared with Code   212       D  ACC_NATIVE (§1.5: Bridge is CORRECT)  73
+  B  inherited Code        30       C  declared, no Code                     21
+                                    E  class absent 3      F  method absent 7
+A+B, the goal's population  242 rows / 35 classes
+```
+
+`Field 35 + Method 33 + Constructor 23 = 91` reproduces §5 exactly, so the top
+of §1's table was sound; the 251 came from a different tree. **D is 73 rows** —
+nearly a third of the prefix set is `ACC_NATIVE` in the image, where §1.5 makes
+a `Bridge` correct and there is nothing to retire.
+
+### Instrument
+
+`apps/probes/L3ReflectInvokeSurface.java`, **254 rows**, oracle deterministic
+across two runs. **150 of the 242 dispatched** in its own run, so precondition 4
+is satisfied for 150 and open for 92 (lane 0's probe reached 74%; this reaches
+62%).
+
+### 34 rows disagree with HotSpot UNARMED — before any retirement
+
+These are live defects, not retirement candidates. Note the unit: `arm3.sh`
+prints `d(hs,base)=58`, which is diff LINES at two per changed row. **34 rows.**
+
+**Four missing access checks.** The VM grants access it should refuse:
+
+| row | HotSpot | this VM |
+|---|---|---|
+| `setAccessible` leaks to a fresh handle | `false` | **`true`** |
+| `Lookup.unreflect` on a private method | `IllegalAccessException` | **NO-THROW, working handle** |
+| `Lookup.findVirtual` on a private method | `IllegalAccessException` | **NO-THROW** |
+| `privateLookupIn(java.base)` | `IllegalAccessException: does not open` | **NO-THROW, modes 31** |
+
+The leak follows directly from §5's copy model failing: `getDeclaredField("x")
+== getDeclaredField("x")` is **`true`** here and `false` on HotSpot, for
+`Field`, `Method` and `Constructor` alike. The VM hands back the *same* object,
+so one `setAccessible(true)` grants access to every holder of that member.
+§5 predicted this pairing; it is now measured. Same species as lane 0's
+`Module.addExports` answering `PERMITTED` — this VM's access-control layer is
+permissive, and that is one finding across two lanes rather than two.
+
+**`java.lang.reflect.Proxy` is down entirely** (5 rows): every row fails with
+`IllegalArgumentException: L3ReflectInvokeSurface$Iface referenced from a
+method is not visible from class loader`. Re-price after L7.
+
+**Nine `MethodHandles` combinators are broken:** `zero` (`InternalError: Failed
+to link speciesData to speciesCode`), `empty` and `countedLoop`
+(`NoClassDefFoundError: java/lang/invoke/BoundMethodHandle`), `arrayLength` and
+`arrayConstructor` (`IllegalArgumentException: not an array: class [I` — they
+refuse a genuine array class), `spreadInvoker`/`exactInvoker`/`invoker`
+(return **null** instead of the value), `throwException` (`NPE: cannot invoke
+MethodTypeForm.basicType() because this.form is null`).
+
+The rest are shape: `MethodHandle.toString` and `Lookup.toString` drop their
+type/lookup-class, `NPE` messages are `null` where HotSpot is helpful, and
+three access rows throw from the call site rather than from
+`Reflection.newIllegalAccessException` — which is §3's caller-skip-list area,
+visible only because `access()` prints the throwing frame.
+
+### Two censuses the armed run printed for free
+
+```text
+descriptor-coercion: total=105 primitive-into-reference[read=105]
+  -- field reads whose value contradicted the slot's descriptor and was DESTROYED
+JVMS 6.5 uninstantiable-receiver: java/lang/invoke/MethodHandle (abstract, lang_invoke.rs:10776)
+                                  java/lang/invoke/VarHandle   (abstract, lang_invoke.rs:2946)
+```
+
+The first explains the yielded `Field.getX` family answering `0`/`NaN`/`0.0`
+across the board: 105 destroyed reads, per
+`docs/known-issues/.../G30-1-the-silent-reference-slot-coercion-20260817.md`.
+The second is a native handing back an instance of an ABSTRACT class, which no
+bytecode could have produced.
+
+### Retirement: blocked on the armed arm, and why
+
+**Both halves of this lane were independently fatal under the dial.**
+
+- Core reflection armed (`java/lang/reflect/,jdk/internal/reflect/,sun/reflect/`)
+  aborted the VM at row 126, `Lookup.unreflect`, on an unguarded descriptor
+  slice in `vm/src/runtime/interpreter/invoke.rs`. **Fixed** — a malformed
+  descriptor must not be able to take the VM down; see the commit.
+- `java/lang/invoke/` armed alone aborts at row 166, `MethodHandle.bindTo`.
+  Not yet diagnosed. §4 predicted this half would be VM-coupled and it is.
+
+So arm the two halves **separately**. Arming the whole prefix set lets the
+invoke failure swamp core reflection's rows, and the first run of it scored
+`delta=-58`, which reads as a spectacular improvement and was an artefact.
+
+### Three instrument defects found and fixed, all of which produced a wrong number
+
+1. **A crashing arm scored as a PERFECT match.** `Field.getChar` yielded `0`,
+   the probe printed it raw, and one NUL byte made `diff` answer `Binary files
+   ... differ` — a single line matching neither `^<` nor `^>`, so
+   `grep -c '^[<>]'` returned **0**. Only the line-count guard caught it, and it
+   would not have caught a full-length run with a NUL in it. `arm3.sh` now
+   passes `-a` and counts NULs per arm; `scrub()` escapes every control
+   character, so a probe can no longer emit a byte its own comparator chokes on.
+2. **Six access-control rows were vacuous.** They targeted `Holder`, a NESTED
+   class — a nestmate, whose private members `main` may read with no
+   `setAccessible` at all. The oracle said so itself: `private read without
+   setAccessible` answered `NO-THROW 13` on **HotSpot**. A row where the oracle
+   does not throw is not measuring an access check. The fixture is now
+   `L3Foreign`, a sibling top-level class, and it found three of the four
+   missing checks above on its first run.
+3. **The funnel bucketed 346 rows as "class absent from the image"** when the
+   dump simply had not run the adjudication pass. The schema publishes
+   `image_adjudication` at the top level precisely so a null column is never
+   ambiguous, and the funnel ignored it. It now refuses to bucket an
+   un-adjudicated dump instead of answering confidently.
+
+### Interface carriers: 8 of 9 never dispatch, and one does
+
+Nine registrations name a class that method resolution does not yield as the
+declaring class — `TypeVariable` (6), `GenericArrayType`, `ParameterizedType`
+and `WildcardType` `.equals`. The oracle prints the resolution rather than
+asserting it: `TypeVariable.equals` resolves to `TypeVariableImpl`,
+`getTypeName` to `Type`, `ParameterizedType.equals` to
+`ParameterizedTypeImpl`. A door asking about the declaring class can never ask
+about the interface.
+
+**But `GenericArrayType.equals` counted `inv=1`** while its three siblings
+counted zero. So "an interface registration is unreachable" is a good heuristic
+with a live counterexample, and the counterexample is evidence about *this
+VM's* method resolution, not about the JDK. Do not delete these nine on the
+heuristic; the one that fires needs its declaring class printed first.
+
+`Executable.getParameters` is **not** in that set — the oracle resolves it to
+`java.lang.reflect.Executable`, so registering there is reachable.
+
+---
+
+## 9. Done
 
 Every bucket-A/B row in the prefix set is retired, classified as C/D/E/F, a
 reviewed `Intrinsic` with its probe, or blocked with the blocker named — with
