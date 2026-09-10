@@ -1,5 +1,24 @@
 # WORKER-4-NOTE-6 — the NIO buffer and channel bodies: 170 cases, ZERO diffs, and 47 of 100 shadows actually reached
 
+> **RETIRED 2026-09-10 — N2 is closed.** §8's remaining nomination asked for
+> the typed VIEW classes "at every width, over BOTH backings and BOTH byte
+> orders". `apps/probes/L4TypedBufferSweep.java` had answered the widths and the
+> backings since 2026-08-28 (501 rows, 0-diff), and carried exactly ONE row of
+> one byte order — the line `view takes the order at creation`. The order is not
+> a display setting for this family: it is half of the implementation class's
+> NAME (`ByteBufferAsCharBufferB` versus `…L`), so a big-endian-only sweep
+> exercises one of every pair and reports it as the family.
+>
+> That probe now runs both orders over all six view factories, with the
+> read-only view of each (a second class per pair, `…RB` / `…RL`), the
+> underlying BYTE PATTERN after a write through each width — the only thing that
+> can tell a view that is wrong about its order from one that is right, since a
+> wrong view still round-trips — the `slice`/`duplicate` order rules, and the
+> implementation class NAME of each. `L4TypedBufferSweep` is now **991 rows, 0-diff in both modes** (it was 501), and the second order found a defect: a read-only view accepted a bulk `put` and wrote through to the caller's `ByteBuffer`. See `internal/jdk-only/L4-residuals-the-dispatch-finding-was-a-boolean-20260910.md` §4.
+>
+> Kept for §4 and §7, which are the honest coverage numbers this note exists
+> for and which no later probe supersedes.
+
 **Status: MEASURED. No source change — two probes and a coverage number.**
 2026-08-22, Linux (Azure host 2), Temurin 25.0.4+7, on the handoff tip
 `8104bfd2f` built unmodified.
@@ -155,7 +174,9 @@ write it.
 **N1 — CLOSED by §6, in the same session it was raised.** `W4Direct` reaches 19
 `DirectByteBuffer` rows and finds no divergence.
 
-**N2 — the typed VIEW classes are 30 of the 53 rows still unreached.** §7. A
+**N2 — CLOSED 2026-09-10**, see the banner at the top of this file.
+
+**N2 (as written) — the typed VIEW classes are 30 of the 53 rows still unreached.** §7. A
 probe driving `asIntBuffer` / `asCharBuffer` / `asLongBuffer` / `asShortBuffer`
 / `asFloatBuffer` / `asDoubleBuffer` at every width, over BOTH backings and BOTH
 byte orders, with write-through checked back through the parent's bytes. The

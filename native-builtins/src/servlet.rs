@@ -4454,6 +4454,73 @@ fn s2_bb_is_read_only(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
     cratonvm_native_io::buffer_is_read_only(ctx, buf)
 }
 
+/// The abstract public buffer classes this crate stamps on a carrier it
+/// allocated itself.
+///
+/// A name test, but on the PUBLIC API classes, not on the JDK's generated
+/// implementation names — `java.nio.IntBuffer` cannot be renamed by a JDK
+/// release without breaking every program in the world, which is not true of
+/// `ByteBufferAsIntBufferRB`.
+#[inline]
+fn s2_is_our_buffer_carrier(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
+    let cid = ctx.class_id_of_object(buf);
+    matches!(
+        ctx.class_name_arc_of_id(cid).as_deref(),
+        Some(
+            "java/nio/ByteBuffer"
+                | "java/nio/CharBuffer"
+                | "java/nio/IntBuffer"
+                | "java/nio/LongBuffer"
+                | "java/nio/ShortBuffer"
+                | "java/nio/FloatBuffer"
+                | "java/nio/DoubleBuffer"
+        )
+    )
+}
+
+/// [`s2_bb_is_read_only`], **plus the answer for a receiver that keeps its
+/// read-only-ness in an OVERRIDDEN METHOD rather than in the field.**
+///
+/// `buffer_is_read_only` reads the `isReadOnly` FIELD by name, and that field
+/// is the whole answer for `HeapByteBufferR` and friends, whose constructors
+/// set it. It is NOT the answer for the `ByteBufferAs<T>Buffer R{B,L}` family —
+/// the views `ByteBuffer.as<T>Buffer().asReadOnlyBuffer()` returns — which
+/// leave the field FALSE and override `isReadOnly()` to return `true`. Measured
+/// on Temurin 25.0.4+7:
+///
+/// ```text
+/// viewRo.isReadOnly()                 HotSpot true    this VM true
+/// IntBuffer.isReadOnly (the FIELD)    HotSpot false   this VM false
+/// viewRo.put(new int[]{5}, 0, 1)      HotSpot ReadOnlyBufferException
+///                                     this VM no-throw, and bb.getInt(0) == 5
+/// ```
+///
+/// **A silent write through a read-only handle, into the caller's own
+/// `ByteBuffer`.** It reached exactly one door and no other: the JDK's
+/// read-only view classes DECLARE `put(int)` and `put(int,int)` — so those
+/// dispatch to their own bodies and refuse — and do NOT declare
+/// `put(int[],int,int)`, whose most-derived declaration is on the abstract
+/// `IntBuffer` this crate registers against. *The door asks about the
+/// DECLARING class*, so one of a family's three `put` overloads was ours and
+/// two were the JDK's, which is why the scalar row passed and the bulk row did
+/// not.
+///
+/// The second question is one virtual call and is asked only of a receiver this
+/// crate did not allocate; our own carriers carry the flag in the field and
+/// answer before it.
+fn s2_buf_read_only(ctx: &mut dyn NativeContext, buf: ObjectRef) -> bool {
+    if s2_bb_is_read_only(ctx, buf) {
+        return true;
+    }
+    if s2_is_our_buffer_carrier(ctx, buf) {
+        return false;
+    }
+    matches!(
+        ctx.invoke_virtual(buf, "isReadOnly", "()Z", &[]),
+        Ok(Some(Value::Int(v))) if v != 0
+    )
+}
+
 /// The WRITE half of [`s2_bb_is_read_only`], for the four view producers.
 ///
 /// `slice()`, `slice(int,int)` and `duplicate()` inherit the source's flag and
@@ -7657,7 +7724,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             /// (`DirectIntBufferRS`).
             fn $put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 let this = obj_arg(args, 0)?;
-                if s2_bb_is_read_only(ctx, this) {
+                if s2_buf_read_only(ctx, this) {
                     return Err(RuntimeError::ReadOnlyBufferException.into());
                 }
                 let v = args.get(1).cloned().unwrap_or(Value::Int(0));
@@ -7677,7 +7744,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             /// `put(index, x)` — see `$put`. Same class, same null message.
             fn $put_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 let this = obj_arg(args, 0)?;
-                if s2_bb_is_read_only(ctx, this) {
+                if s2_buf_read_only(ctx, this) {
                     return Err(RuntimeError::ReadOnlyBufferException.into());
                 }
                 let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
@@ -7879,7 +7946,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             /// guard since F5; the typed views never did.
             fn $compact(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 let this = obj_arg(args, 0)?;
-                if s2_bb_is_read_only(ctx, this) {
+                if s2_buf_read_only(ctx, this) {
                     return Err(RuntimeError::ReadOnlyBufferException.into());
                 }
                 let pos = s2_bb_pos(ctx, this);
@@ -7961,7 +8028,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             /// reordering would remove.
             fn $put_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 let this = obj_arg(args, 0)?;
-                if s2_bb_is_read_only(ctx, this) {
+                if s2_buf_read_only(ctx, this) {
                     return Err(RuntimeError::ReadOnlyBufferException.into());
                 }
                 let src = obj_arg(args, 1)?;

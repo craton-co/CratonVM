@@ -38,6 +38,14 @@ public class L4TypedBufferSweep {
         catch (Throwable e) { System.out.println(tag + " |THREW " + e.getClass().getName() + "|"); }
     }
     interface ThrowingRun { void run() throws Throwable; }
+    /** `len` bytes of `a` from `off`, as lowercase hex. The byte pattern is the
+     *  only thing that can distinguish a view that is wrong about its order
+     *  from one that is right, because a wrong view still round-trips. */
+    static String hex(byte[] a, int off, int len) {
+        StringBuilder b = new StringBuilder();
+        for (int i = off; i < off + len; i++) b.append(String.format("%02x", a[i]));
+        return b.toString();
+    }
 
     static String st(Buffer b) {
         return "p=" + b.position() + " l=" + b.limit() + " c=" + b.capacity()
@@ -316,6 +324,65 @@ public class L4TypedBufferSweep {
         p("view capacity is bytes/4", v.capacity());
         bb.order(ByteOrder.LITTLE_ENDIAN);
         p("view takes the order at creation", bb.asIntBuffer().order());
+
+        // 6. THE BYTE-ORDER ARM.
+        //
+        // WORKER-4-NOTE-6 N2 asked for the view classes "at every width, over
+        // BOTH backings and BOTH byte orders", and this probe had ONE row of
+        // one order — the line directly above. The order is not a display
+        // setting for these classes: it is part of the IMPLEMENTATION CLASS's
+        // name (`ByteBufferAsCharBufferB` versus `...L`), so a big-endian-only
+        // sweep exercises one of every pair and reports it as the family.
+        // Little-endian is also the host order on every platform this VM
+        // supports, so it is the arm an application actually gets from
+        // `order(nativeOrder())`.
+        for (ByteOrder o : new ByteOrder[] { ByteOrder.BIG_ENDIAN, ByteOrder.LITTLE_ENDIAN }) {
+            String k = (o == ByteOrder.BIG_ENDIAN) ? "BE" : "LE";
+            ints("int/view/" + k, ByteBuffer.allocate(16).order(o).asIntBuffer(), true);
+            longs("long/view/" + k, ByteBuffer.allocate(32).order(o).asLongBuffer(), true);
+            shorts("short/view/" + k, ByteBuffer.allocate(8).order(o).asShortBuffer(), true);
+            floats("float/view/" + k, ByteBuffer.allocate(16).order(o).asFloatBuffer(), true);
+            doubles("double/view/" + k, ByteBuffer.allocate(32).order(o).asDoubleBuffer(), true);
+            chars("char/view/" + k, ByteBuffer.allocate(8).order(o).asCharBuffer(), true);
+            // Read-only views of each order: a second implementation class per
+            // pair (`...RB` / `...RL`), and the one that must refuse.
+            ints("int/view/ro/" + k, ByteBuffer.allocate(16).order(o).asIntBuffer().asReadOnlyBuffer(), false);
+            chars("char/view/ro/" + k, ByteBuffer.allocate(8).order(o).asCharBuffer().asReadOnlyBuffer(), false);
+
+            // The BYTES, not the round trip. A view that is wrong about its
+            // order still reads back what it wrote, so only the underlying
+            // buffer can tell the two apart.
+            ByteBuffer src = ByteBuffer.allocate(8).order(o);
+            src.asIntBuffer().put(0, 0x01020304);
+            p("int view byte pattern " + k, hex(src.array(), 0, 4));
+            src = ByteBuffer.allocate(8).order(o);
+            src.asShortBuffer().put(0, (short) 0x0102);
+            p("short view byte pattern " + k, hex(src.array(), 0, 2));
+            src = ByteBuffer.allocate(8).order(o);
+            src.asLongBuffer().put(0, 0x0102030405060708L);
+            p("long view byte pattern " + k, hex(src.array(), 0, 8));
+            src = ByteBuffer.allocate(8).order(o);
+            src.asCharBuffer().put(0, '\u0041');
+            p("char view byte pattern " + k, hex(src.array(), 0, 2));
+            src = ByteBuffer.allocate(8).order(o);
+            src.asFloatBuffer().put(0, 1.0f);
+            p("float view byte pattern " + k, hex(src.array(), 0, 4));
+            src = ByteBuffer.allocate(8).order(o);
+            src.asDoubleBuffer().put(0, 1.0d);
+            p("double view byte pattern " + k, hex(src.array(), 0, 8));
+
+            // `slice()` on a VIEW keeps the view's order — unlike `ByteBuffer
+            // .slice()`, which resets to BIG_ENDIAN (the quirk W4Nio pins).
+            p("int view slice order " + k, ByteBuffer.allocate(16).order(o).asIntBuffer().slice().order());
+            p("int view duplicate order " + k, ByteBuffer.allocate(16).order(o).asIntBuffer().duplicate().order());
+            p("bytebuffer slice order " + k, ByteBuffer.allocate(16).order(o).slice().order());
+            // The view's class NAME encodes backing and order; it is the
+            // identity claim this arm exists to compare.
+            p("int view class " + k, ByteBuffer.allocate(16).order(o).asIntBuffer().getClass().getName());
+            p("char view class " + k, ByteBuffer.allocate(8).order(o).asCharBuffer().getClass().getName());
+            p("char ro view class " + k,
+              ByteBuffer.allocate(8).order(o).asCharBuffer().asReadOnlyBuffer().getClass().getName());
+        }
 
         System.out.println("rows " + rows);
         System.out.println("DONE L4TypedBufferSweep");

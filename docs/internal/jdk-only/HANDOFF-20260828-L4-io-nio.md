@@ -18,7 +18,9 @@
 > **RETIRED 2026-08-28 — the lane is done and this brief is history.**
 >
 > Read the record instead:
-> `known-issues/jdk-only/L4-the-io-and-nio-worklist-49-defects-and-a-bounds-check-that-killed-the-vm-20260828.md`.
+> `internal/jdk-only/L4-the-io-and-nio-worklist-49-defects-and-a-bounds-check-that-killed-the-vm-20260828.md` — RETIRED THERE 2026-09-10,
+> with every residual closed or re-measured; the follow-up record is
+> `internal/jdk-only/L4-residuals-the-dispatch-finding-was-a-boolean-20260910.md`.
 >
 > **What the lane did.** The `native-won` surface was mined rather than guessed:
 > **199 distinct triples** across `java/io` and `java/nio`, from a
