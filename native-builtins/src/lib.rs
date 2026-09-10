@@ -12833,7 +12833,49 @@ pub fn register_essential_natives_with_shims(
     // This intentionally mirrors the synthetic-mode override at
     // `phases_late.rs::register_p59_module` so real-JDK and synthetic-jdk
     // boot paths see the same Module shape — see vm/tests/wave3_console_module.rs.
-    registry.register(
+    // REVIEWED `Intrinsic`, 2026-09-10, and the review is
+    // `apps/probes/ClassModuleSweep.java`.
+    //
+    // This is a §1.4 shadow by the letter and NOT one in substance, which is
+    // the case §1.4's reviewed-`Intrinsic` exception exists for.
+    // `Class.getModule()` is not `ACC_NATIVE` -- its body is `return module;`
+    // -- so a native in front of it shadows real bytecode and the contract's
+    // remedy is to yield. **That remedy cannot work here.**
+    // `java.lang.Class.module` is `private transient Module` and NO JAVA CODE
+    // WRITES IT: a real JVM populates it at class-definition time through
+    // `Module.defineModule0`. Yielding returns null, and a null Module is what
+    // 12 of the 108 remaining failures under
+    // `CRATONVM_ENFORCE_NATIVE_SHADOW=all` were -- a null `module`,
+    // `callerModule` or `thisModule` one or two frames later, through
+    // `ClassLoader.postDefineClass` -> `NamedPackage.<init>`.
+    //
+    // The tag was `Bridge` with `kind_stated: false` -- ambient, never chosen
+    // (see the module header on `NativeKind` being ambient). So this states a
+    // decision rather than overturning one.
+    //
+    // An `Intrinsic` claims SEMANTICS-PRESERVING, and that claim is earned
+    // rather than asserted. `ClassModuleSweep` is 32 rows against HotSpot
+    // 25.0.3+9 -- module names for `java.base`, a platform module, the unnamed
+    // module, primitives, arrays of both, nested/anonymous/lambda classes;
+    // Module identity WITHIN one VM, which the JDK depends on because `Module`
+    // does not override `equals`; and `isNamed`/`getName`/`getClassLoader`/
+    // `getDescriptor`/`isOpen`/`isExported`/`canRead`/`getLayer`.
+    //
+    //     31 of 32 rows byte-identical to HotSpot.
+    //
+    // The ONE deviation is recorded and NOT fixed here:
+    //
+    //     32 layer of unnamed is null    HotSpot true, this VM false
+    //
+    // `Module.getLayer()` on the UNNAMED module should be null and is not. That
+    // is a defect in `Module.getLayer`, not in `getModule`, and tagging this
+    // triple does not freeze it -- the sweep is checked in, so the row goes red
+    // the day it is fixed or the day this answer drifts.
+    //
+    // What this does NOT license: the rest of the `java/lang/Module` surface
+    // stays `Bridge`. The claim here is about ONE triple whose backing field no
+    // Java code can fill.
+    registry.register_with_kind(
         "java/lang/Class",
         "getModule",
         "()Ljava/lang/Module;",
@@ -12991,6 +13033,7 @@ pub fn register_essential_natives_with_shims(
             ctx.cache_module_mirror(module_name.as_deref(), m_obj);
             Ok(Some(Value::Object(Some(m_obj))))
         },
+        NativeKind::Intrinsic,
     );
 
     // `java.lang.Module` access checks — registry-backed exports/opens modeling.

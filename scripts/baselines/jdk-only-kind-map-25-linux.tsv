@@ -123,6 +123,25 @@
 #   compatible-mode baseline at all. It changes the KIND, not the body:
 #   `SyntheticStub` is refused only by `allowed_in(JdkOnly)`, so compatible
 #   mode keeps dispatching the same native.
+# amended: 2026-09-10, the Class.getModule review. ONE row edited by
+#   hand, not re-measured: bridge -> intrinsic, kind_stated 0 -> 1.
+#
+#   The gate's own header says the one-way half of it is adjudication and
+#   that `kind_stated` may go 0 -> 1; this is that, for a row whose tag was
+#   AMBIENT. `Class.getModule()` is not ACC_NATIVE -- its body is
+#   `return module;` -- so a native in front of it is a 1.4 shadow by the
+#   letter, and the letter's remedy cannot apply: java.lang.Class.module is
+#   written by no Java code at all, only by a JVM at class-definition time.
+#   Yielding returns null, which was 12 of the 108 failures under
+#   CRATONVM_ENFORCE_NATIVE_SHADOW=all.
+#
+#   The Intrinsic claim is SEMANTICS-PRESERVING and is earned by
+#   apps/probes/ClassModuleSweep.java: 32 rows against HotSpot 25.0.3+9,
+#   31 byte-identical. The one deviation -- Module.getLayer() on the
+#   UNNAMED module answers non-null where HotSpot answers null -- is a
+#   defect in getLayer, is recorded, and is NOT frozen by this row: the
+#   sweep is checked in and goes red when it is fixed or when this answer
+#   drifts. Nothing else on java/lang/Module moves; this is one triple.
 # class	name	descriptor	ordinal	kind	kind_stated	kind_chosen
 CratonVM$HttpServerLoop	run	()V	0	bridge	0	1
 brave/internal/collect/WeakConcurrentMap$WeakKey	equals	(Ljava/lang/Object;)Z	0	bridge	0	1
@@ -1957,7 +1976,7 @@ java/lang/Class	getInterfaces0	()[Ljava/lang/Class;	0	bridge	1	1
 java/lang/Class	getMethod	(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;	0	bridge	0	1
 java/lang/Class	getMethods	()[Ljava/lang/reflect/Method;	0	bridge	0	1
 java/lang/Class	getModifiers	()I	0	bridge	0	1
-java/lang/Class	getModule	()Ljava/lang/Module;	0	bridge	0	1
+java/lang/Class	getModule	()Ljava/lang/Module;	0	intrinsic	1	1
 java/lang/Class	getName	()Ljava/lang/String;	0	bridge	0	1
 java/lang/Class	getNestHost0	()Ljava/lang/Class;	0	bridge	1	1
 java/lang/Class	getNestMembers0	()[Ljava/lang/Class;	0	bridge	1	1

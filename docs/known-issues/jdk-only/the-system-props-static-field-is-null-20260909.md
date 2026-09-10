@@ -368,7 +368,100 @@ as of one that is not.
 The number to read for this increment is 11 first-failures removed and one new
 structural blocker NAMED, not +1.
 
-## 10. What this does NOT claim
+## 11. `Class.getModule` is a shadow the contract cannot remedy
+
+The 12-vector `Module` family, and the only increment of this lane that changes
+a KIND rather than filling a field.
+
+### The letter and the substance disagree
+
+`Class.getModule()` is not `ACC_NATIVE`. Its body is `return module;`, so a
+native registered in front of it shadows real bytecode, §1.4 applies by the
+letter, and §1.4's remedy is to yield. **The remedy cannot work.**
+`java.lang.Class.module` is `private transient Module` and **no Java code
+writes it** -- a real JVM populates it at class-definition time through
+`Module.defineModule0`. Yield and the field answers null:
+
+```text
+NullPointerException: Cannot invoke "java.lang.Module.isNamed()"
+  because "module" is null
+    at java/lang/ClassLoader.postDefineClass(ClassLoader.java:871)
+    at java/lang/NamedPackage.<init>(NamedPackage.java:48)
+```
+
+Twelve of the 108 are that null, spelled `module`, `callerModule` or
+`thisModule` a frame or two along.
+
+So this is a native doing a VM's job, which is the case §1.4's
+reviewed-`Intrinsic` exception exists for. The tag was `bridge` with
+`kind_stated: false` -- **ambient, never chosen** -- so this states a decision
+rather than overturning one.
+
+### The review, because `Intrinsic` is a claim
+
+An `Intrinsic` claims semantics-preserving, and the only way to earn that is to
+compare answers with the oracle. `apps/probes/ClassModuleSweep.java` is 32 rows
+against HotSpot 25.0.3+9: module names for `java.base`, a platform module and
+the unnamed module; primitives, arrays of primitives and of references, nested,
+anonymous and lambda classes; Module IDENTITY within one VM, which the JDK
+depends on because `Module` does not override `equals`; and
+`isNamed`/`getName`/`getClassLoader`/`getDescriptor`/`isOpen`/`isExported`/
+`canRead`/`getLayer`.
+
+```text
+31 of 32 rows byte-identical to HotSpot.
+```
+
+The one deviation is recorded and NOT fixed here:
+
+```text
+32 layer of unnamed is null    HotSpot true, this VM false
+```
+
+`Module.getLayer()` on the UNNAMED module should be null. That is a defect in
+`getLayer`, not in `getModule`, and the tag does not freeze it: the sweep is
+checked in, so the row goes red the day it is fixed or the day this answer
+drifts. Nothing else on `java/lang/Module` moves -- the claim is about one
+triple whose backing field no Java code can fill.
+
+### The mechanism was verified, not assumed
+
+The dial declines exactly one kind:
+
+```rust
+let strict_bridge = policy.is_jdk_only() && kind == NativeKind::Bridge;
+```
+
+`Intrinsic` is exempt at all nine doors, and the shadow census exempts it by
+construction. So the re-tag both survives the `all` arm and truthfully leaves
+the census -- it stops being counted as a shadow because it stops being one.
+
+### Measured
+
+```text
+probe tree, control = the same tree without this change
+  115 probes, 1 moved: VtHandoffProbe -4, the OTHER known-flaky handoff
+  counter named in ../../contributing/jdk-only-lane-operations.md
+--jdk-only corpus     132 passed, 0 failed
+SUITE=all             132 passed, 0 failed
+```
+
+and the family itself, under `CRATONVM_ENFORCE_NATIVE_SHADOW=all`:
+
+```text
+RLoaderChurnDefine   Module null  ->  PASS
+RJdkDefineClass      Module null  ->  URLStreamHandler NPE
+RJdkHidden           Module null  ->  URLStreamHandler NPE
+RFsSingleton         Module null  ->  ServiceConfigurationError, FileSystemProvider
+RJdkNet              Module null  ->  ServiceConfigurationError, InetAddressResolver
+RJdkServices         Module null  ->  NoClassDefFoundError, BuiltinClassLoader
+```
+
+`scripts/baselines/jdk-only-kind-map-25-linux.tsv` gains one hand-amended row,
+`bridge -> intrinsic` with `kind_stated 0 -> 1`, carrying this rationale. The
+gate's own header allows exactly that movement and calls it adjudication.
+
+## 12. What this does NOT claim
 
 * Not that the `java/lang/System` property natives are retirable. They are not
   in any table, and retiring them needs a problem this change does not solve:
