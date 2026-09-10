@@ -4876,6 +4876,10 @@ impl<'a> Lowerer<'a> {
     /// whole poll in one 7-byte instruction, reporting whether the flag was
     /// within ±2GB RIP reach of it.
     ///
+    /// Reach only. Whether the short form is WANTED is
+    /// `jit_rip_safepoint_poll_enabled()`, and the sole caller asks that first
+    /// — see [`Self::emit_safepoint_poll`].
+    ///
     /// Mirrors `x64/emit.rs`'s `emit_test_mem8_abs_imm8`; the two backends
     /// emit the same poll and this keeps them saying the same thing. `F6 /0 ib`
     /// with ModRM `mod=00, rm=101` is the RIP-relative form, and the
@@ -4904,16 +4908,28 @@ impl<'a> Lowerer<'a> {
     /// Emit the default-on cooperative poll used at method entries and loop
     /// back-edges. The lowerer keeps all live values in frame slots, so the
     /// no-argument slow path may be called directly.
+    ///
+    /// Both gates come from `x64::licm` rather than being re-derived here, and
+    /// that is the whole point of routing through them. This function used to
+    /// parse `CRATONVM_JIT_SAFEPOINT_POLLS` inline — once per emitted poll site
+    /// rather than once per process — and never looked at
+    /// `CRATONVM_JIT_RIP_SAFEPOINT_POLL` at all, so the lever documented as
+    /// "emit the pre-2026-09-02 form so the two encodings can be priced in one
+    /// binary" reached only the single-pass backend. Measured 2026-09-10 on a
+    /// hot counted loop: with the switch set, **392 of 394** poll sites still
+    /// took the RIP form, because everything hot is compiled here and not
+    /// there.
     fn emit_safepoint_poll(&mut self) {
-        let enabled = cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SAFEPOINT_POLLS")
-            .and_then(|v| v.into_string().ok())
-            .is_none_or(|v| v != "0");
-        if !enabled || self.safepoint_flag_addr == 0 || self.safepoint_slow_path == 0 {
+        if !crate::x64::jit_safepoint_polls_enabled()
+            || self.safepoint_flag_addr == 0
+            || self.safepoint_slow_path == 0
+        {
             return;
         }
-        if !self.emit_test_safepoint_flag_rip() {
-            // Out of ±2GB RIP reach — materialize the address and read
-            // through it, the shape this poll had before 2026-09-02.
+        if !crate::x64::jit_rip_safepoint_poll_enabled() || !self.emit_test_safepoint_flag_rip() {
+            // The kill switch is set, or the flag is out of ±2GB RIP reach —
+            // materialize the address and read through it, the shape this poll
+            // had before 2026-09-02.
             self.emit_mov_reg_imm64(R11, self.safepoint_flag_addr as u64);
             self.buf.emit(&[0x41, 0xF6, 0x03, 0xFF]); // TEST byte ptr [R11], 0xff
         }

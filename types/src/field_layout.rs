@@ -328,6 +328,14 @@ static LAYOUT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// of the allocator that holds the flag — to its own `mmap` page, say — would
 /// bring the counter into reach and leave the poll behind.
 ///
+/// The constraint binds symmetrically, and the flag side honours it:
+/// `jit::platform::alloc_code_adjacent_cell` — which otherwise hands the
+/// safepoint flag a cell from the code cache's own `mmap` — returns `None`
+/// whenever `CRATONVM_JIT_CODE_NEAR_GLOBALS` is set, so the flag stays in this
+/// allocator, beside this counter, for as long as this counter is the anchor.
+/// Exactly one strategy may own placement, and that one owns it whenever it is
+/// on.
+///
 /// The counter being in the right place was never sufficient on System V: the
 /// CODE was in the wrong one, ~130TB away, until `near_globals` gave `mmap` a
 /// hint. See
