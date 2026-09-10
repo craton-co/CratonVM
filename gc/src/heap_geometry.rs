@@ -213,13 +213,44 @@ mod tests {
     fn an_out_of_range_slot_is_declined_rather_than_wrapping_onto_another() {
         let _serial = TEST_LOCK.lock();
         // The failure this rules out is a write that lands on slot 0 by
-        // arithmetic and silently redescribes the live young generation.
-        let before: Vec<(usize, usize)> = (0..HEAP_SPAN_SLOTS).map(heap_span).collect();
-        publish_heap_span(HEAP_SPAN_SLOTS, 0x1000, 0x2000);
-        publish_heap_span(usize::MAX, 0x1000, 0x2000);
-        let after: Vec<(usize, usize)> = (0..HEAP_SPAN_SLOTS).map(heap_span).collect();
-        assert_eq!(before, after);
+        // arithmetic -- `HEAP_SPAN_SLOTS % HEAP_SPAN_SLOTS` is 0 -- and
+        // silently redescribes the live young generation.
+        //
+        // Asserted with a SENTINEL rather than by snapshotting the table before
+        // and after, and that is the whole of the 2026-09-10 rewrite. The old
+        // form compared `(0..HEAP_SPAN_SLOTS).map(heap_span)` across the two
+        // out-of-range publishes, which is precisely what `TEST_LOCK`'s doc
+        // calls "a test that reads more of the table than it wrote": slots 0
+        // and 1 belong to whatever heap another test in this process is
+        // building (`gen_heap` publishes one per generation, `zgc` publishes
+        // slot 0), and `TEST_LOCK` does not serialise against those.
+        //
+        // It flaked exactly there under full-workspace load: slots 0 and 1 came
+        // back holding EACH OTHER's spans -- one concurrent generational heap
+        // build, not a wrap. Sorting the two sides would have made it pass by
+        // destroying the slot-to-value binding the assertion exists to check,
+        // which is why it is not what this does.
+        //
+        // A span no real heap can hold answers the actual question -- did the
+        // out-of-range write land anywhere in range? -- and a sibling
+        // publishing a genuine heap cannot perturb it.
+        const SENTINEL: (usize, usize) = (0xDEAD_0000, 0xDEAD_1000);
+        let prev = heap_span(TEST_SLOT);
+        for out_of_range in [HEAP_SPAN_SLOTS, HEAP_SPAN_SLOTS + 1, usize::MAX] {
+            publish_heap_span(out_of_range, SENTINEL.0, SENTINEL.1);
+        }
+        for slot in 0..HEAP_SPAN_SLOTS {
+            assert_ne!(
+                heap_span(slot),
+                SENTINEL,
+                "an out-of-range publish wrapped onto slot {slot}",
+            );
+        }
+        // The read side declines too, and for the same reason: an out-of-range
+        // READ must not fold onto an in-range slot and report its span.
         assert_eq!(heap_span(HEAP_SPAN_SLOTS), (0, 0));
+        assert_eq!(heap_span(usize::MAX), (0, 0));
+        restore(prev);
     }
 
     /// **Every backend must publish.** A source witness, and it has to be one.
