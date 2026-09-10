@@ -1249,7 +1249,41 @@ const REFLECTION_INTERNAL_CLASSES: &[&str] = &[
 /// treatment. Widening this to all of `sun/reflect/` would be a fail-OPEN
 /// change if any accessor-like class ever lands there again, and the skip list
 /// is what keeps `Method.invoke` attributed to real user code.
-const REFLECTION_INTERNAL_EXCEPTIONS: &[&str] = &["sun/reflect/misc/"];
+///
+/// `ReflectionFactory` (2026-09-09) is the second entry, and it is the case the
+/// paragraph above got wrong. That paragraph asserts that the classes left
+/// under `sun/reflect/` are "none of which sit between a caller and a
+/// reflection native" -- but `ReflectionFactory.newConstructorForSerialization`
+/// does exactly that, and so does its `jdk.internal.reflect` delegate:
+///
+///     SerTrace.show                                         <- was resolved as the caller
+///     sun.reflect.ReflectionFactory.newConstructorForSerialization      skipped
+///     jdk.internal.reflect.ReflectionFactory.newConstructorForSerialization  skipped
+///     jdk.internal.reflect.ReflectionFactory.generateConstructor        skipped
+///       -> c.setAccessible(true)                            ReflectionFactory.java:437
+///
+/// `generateConstructor` marks the constructor it just built accessible,
+/// because serialization must construct types nobody opened. Skipping those
+/// frames walked out to the application class, decided the accessor was the
+/// unnamed module, and threw `InaccessibleObjectException: module java.base
+/// does not "opens java.util" to unnamed module` -- on BOTH JDK images and in
+/// BOTH modes, where HotSpot allows it with no `--add-opens`. This is the same
+/// failure shape as the `MethodUtil` entry above, one package over.
+///
+/// Kryo, XStream, Objenesis and several ORMs allocate through this exact entry
+/// point, so the blast radius is larger than the one probe that found it.
+///
+/// Why trusting this frame is not fail-open: `ReflectionFactory` calls
+/// `setAccessible` only on a `Constructor` it generated itself, and the JDK
+/// makes that constructor accessible by design. Exposing the frame therefore
+/// grants exactly what HotSpot grants. It is spelled as two exact class names
+/// rather than a package prefix so that nothing else under either package
+/// inherits the trust.
+const REFLECTION_INTERNAL_EXCEPTIONS: &[&str] = &[
+    "sun/reflect/misc/",
+    "sun/reflect/ReflectionFactory",
+    "jdk/internal/reflect/ReflectionFactory",
+];
 
 /// Walk the current Java call stack and return the ClassId of the first
 /// non-reflection frame вЂ” i.e. the user code that invoked the reflection
@@ -23490,12 +23524,24 @@ pub(crate) fn build_empty_permissions(
     ctx: &mut dyn NativeContext,
 ) -> Result<ObjectRef, MethodCallFailed> {
     let perms = crate::try_alloc_concurrent_synthetic(ctx, "java/security/Permissions", 2)?;
+    // The `<init>` below runs Java and allocates, so it can relocate `perms` —
+    // and this function was returning the address it started with. The callee
+    // gets a rooted copy through the invoke's own argument handling; this local
+    // is what the CALLER keeps, and nothing rooted it.
+    //
+    // MEASURED on BindableTests under `CRATONVM_DBG_GC_STRESS=262144`:
+    // `[deadref-pin]` fired on `populate_protection_domain_fields`' pin of this
+    // return value — the pin being handed an address that already named no live
+    // object.
+    let perms_pin = ctx.pin_native_root(perms);
     let _ = ctx.invoke(
         "java/security/Permissions",
         "<init>",
         "()V",
         &[Value::Object(Some(perms))],
     );
+    let perms = ctx.read_native_pin(perms_pin, perms);
+    ctx.unpin_native_roots(perms_pin);
     Ok(perms)
 }
 
@@ -23535,8 +23581,22 @@ pub(crate) fn populate_protection_domain_fields(
     };
     let cl_pin = cl_obj.map(|o| ctx.pin_native_root(o));
 
+    // `perms` is allocated and then `new_array` allocates again before it is
+    // read, so a moving young collection between the two relocates it and the
+    // `set_field_by_name("permissions", ...)` below stored the pre-move
+    // address. Every other reference in this function is pinned across exactly
+    // this hazard; `perms` was the one that was not.
+    //
+    // MEASURED on BindableTests under `CRATONVM_DBG_GC_STRESS=262144`:
+    // `[deadref-store]` named this function storing a value that named no live
+    // object, reached from `native_class_get_protection_domain0`.
     let perms = build_empty_permissions(ctx);
+    let perms_pin = perms.as_ref().ok().map(|o| ctx.pin_native_root(*o));
     let principals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+    let perms = match (perms, perms_pin) {
+        (Ok(o), Some(p)) => Ok(ctx.read_native_pin(p, o)),
+        (other, _) => other,
+    };
 
     let pd = ctx.read_native_pin(pd_pin, pd);
     let codesource = match (cs_obj, cs_pin) {
@@ -23790,8 +23850,27 @@ pub(crate) fn native_class_get_protection_domain0(
         .unwrap_or(Value::Object(None));
     let pd = ctx.read_native_pin(pd_pin, pd);
     let cs = ctx.read_native_pin(cs_pin, cs);
+    // The unpin used to be HERE, one statement too early.
+    //
+    // `url_pin` is below `pd_pin`, so releasing it releases `pd`'s pin as well
+    // — and `populate_protection_domain_fields` allocates. A moving young
+    // collection inside it therefore relocated `pd` with nothing rooting it,
+    // and this function returned the pre-move address.
+    //
+    // The interpreter's return-value barrier cannot recover that:
+    // `safe_native_call` heals a stale return through `load_and_forward`, which
+    // reads the forwarding marker at the old address, and that marker is gone
+    // once the allocator has re-served the span. MEASURED on BindableTests
+    // under `CRATONVM_DBG_GC_STRESS=262144`: `[deadref-nret]` named this native
+    // returning an address in the emptied semispace, reached from ByteBuddy's
+    // `trySelfResolve(Class)` and `JavaDispatcher$DynamicClassLoader.invoker()`.
+    let populated =
+        populate_protection_domain_fields(ctx, pd, Value::Object(Some(cs)), classloader);
+    // Read `pd` back through its pin BEFORE the unpin, then release the whole
+    // group at once.
+    let pd = ctx.read_native_pin(pd_pin, pd);
     ctx.unpin_native_roots(url_pin);
-    populate_protection_domain_fields(ctx, pd, Value::Object(Some(cs)), classloader)?;
+    populated?;
 
     Ok(Some(Value::Object(Some(pd))))
 }
@@ -29337,5 +29416,71 @@ mod serialization_constructor_accessor_tests {
             Some(Value::Int(0x5E21)),
             "an unrelated accessor was routed into the serialization arm"
         );
+    }
+}
+
+#[cfg(test)]
+mod reflection_factory_caller_visibility_tests {
+    use super::is_reflection_internal_frame;
+
+    /// `ReflectionFactory.generateConstructor` calls `setAccessible(true)` on
+    /// the constructor it just generated. If its frame is skipped as
+    /// "reflection plumbing", the caller walk continues out to the application
+    /// class, the accessor is judged to be the unnamed module, and
+    /// `newConstructorForSerialization` throws
+    /// `InaccessibleObjectException: module java.base does not "opens
+    /// java.util" to unnamed module` -- where HotSpot succeeds with no
+    /// `--add-opens`, on both JDK images and in both modes.
+    #[test]
+    fn both_reflection_factory_frames_stay_visible_as_the_caller() {
+        assert!(
+            !is_reflection_internal_frame("jdk/internal/reflect/ReflectionFactory"),
+            "the jdk.internal delegate must stay visible; it is the frame that \
+             actually calls setAccessible (ReflectionFactory.java:437)"
+        );
+        assert!(
+            !is_reflection_internal_frame("sun/reflect/ReflectionFactory"),
+            "the jdk.unsupported entry point must stay visible too, or the walk \
+             simply skips to the application class one frame later"
+        );
+    }
+
+    /// The controls that make the test above mean something. These are the
+    /// accessor classes the skip list exists FOR: if they stopped being
+    /// skipped, every `Method.invoke` would be attributed to reflection
+    /// plumbing instead of to the real user caller, and the deep-reflection
+    /// gate would trust user code.
+    #[test]
+    fn the_real_reflection_plumbing_is_still_skipped() {
+        for plumbing in [
+            "jdk/internal/reflect/NativeMethodAccessorImpl",
+            "jdk/internal/reflect/DelegatingMethodAccessorImpl",
+            "jdk/internal/reflect/GeneratedConstructorAccessor3",
+            "java/lang/reflect/Method",
+            "java/lang/reflect/Constructor",
+            "java/lang/invoke/MethodHandles",
+            "java/lang/AccessibleObject",
+            "java/lang/Class",
+        ] {
+            assert!(
+                is_reflection_internal_frame(plumbing),
+                "{plumbing} must stay skipped -- it really does sit between a \
+                 caller and a reflection native"
+            );
+        }
+    }
+
+    /// The exception is spelled as exact class names rather than a package
+    /// prefix, so the rest of both packages keeps its existing treatment. A
+    /// prefix entry here would be a fail-open change the moment another
+    /// accessor-like class lands in either package.
+    #[test]
+    fn the_exception_did_not_widen_to_the_whole_package() {
+        // A DIFFERENT class in the same two packages is still skipped, which
+        // is what "narrow on purpose" means.
+        assert!(is_reflection_internal_frame("jdk/internal/reflect/Reflection"));
+        assert!(is_reflection_internal_frame("sun/reflect/annotation/AnnotationParser"));
+        // ... while the pre-existing MethodUtil carve-out is untouched.
+        assert!(!is_reflection_internal_frame("sun/reflect/misc/MethodUtil"));
     }
 }

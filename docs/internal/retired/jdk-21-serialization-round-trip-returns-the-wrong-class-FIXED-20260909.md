@@ -86,7 +86,9 @@ Every row this page tabulated is fixed -- the three silent `Object` rows
 
 The two residual failures are NOT this defect and were present on JDK 25 all
 along, which is why the "after" column matches the 25 "before" column exactly:
-see `docs/known-issues/jdk-only/the-serialization-constructor-is-refused-by-the-module-check-on-both-images-20260909.md`.
+see `docs/internal/retired/the-serialization-constructor-refused-by-the-module-check-FIXED-20260909.md`
+(it was FIXED later the same day: `ReflectionFactory` was being skipped as
+reflection plumbing, so the caller walk blamed the application class).
 
 At the gate level, the `21-linux` strict corpus reports the whole probe clean:
 

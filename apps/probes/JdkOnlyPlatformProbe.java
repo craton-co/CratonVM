@@ -420,7 +420,16 @@ public class JdkOnlyPlatformProbe {
                     + "/" + sawVirtual[1] + " name=" + name[0] + " latched=" + latched
                     + " completed=" + completed.get() + " sum=" + sum
                     + " terminated=" + terminated
-                    + " handoffs=" + handoffs.get() + " allJoined=" + allJoined
+                    // NOT the raw count: it is load-fragile on HotSpot too (see
+                    // docs/known-issues/jdk-only/the-last-strict-corpus-divergence-on-every-key-is-one-load-fragile-counter-20260909.md)
+                    // and it was the only cell the strict corpus still diverged
+                    // on, on every key. The two booleans carry what the row was
+                    // actually asserting -- the carrier did not deadlock, and
+                    // the count is in range -- without reporting how busy the
+                    // machine was.
+                    + " handoffsPositive=" + (handoffs.get() > 0)
+                    + " handoffsBounded=" + (handoffs.get() >= 0 && handoffs.get() <= 64)
+                    + " allJoined=" + allJoined
                     + " pinned=" + pinnedRan[0] + "/" + pinnedJoined
                     + " tl=" + tlOk.get() + " mainPlatform=" + platformIsNotVirtual);
         } catch (InterruptedException | ExecutionException | TimeoutException e) {

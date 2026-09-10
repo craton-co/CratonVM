@@ -8,6 +8,32 @@ cargo test -p cratonvm-native-builtins --test stub_ratchet -- --nocapture
 
 The baseline equals the exact default-registry count. There is no slack.
 
+**That is the policy, and the gate cannot enforce it.** The assertion is
+`observed <= BASELINE`, so every DECREASE passes silently and the constant sits
+above the tree until someone re-freezes it. Measured 2026-09-09 by disabling the
+change's own arm and re-reading the printed number instead of subtracting from
+the constant:
+
+```text
+                 constant   tree     slack
+NO_MANAGEMENT      1635      1632       3
+MANAGEMENT         1646      1643       3
+SYNTHETIC_JDK      1644      1632      12
+```
+
+The change being measured moved all three by exactly +251. Against the
+constants the same uniform movement reads +248 / +248 / +239 — three numbers for
+one movement, and the account written from them would have attributed the drift
+to the change. The `synthetic-jdk` arm's 12 is its own finding: its true count
+is IDENTICAL to `no-management`'s, so that configuration adds no stub row at all
+and its constant was frozen against a tree that no longer exists.
+
+**So before re-freezing, take the before-number.** A one-line `false &&` in
+whatever predicate your change added, then rebuild the test target only, is
+cheaper than the worktree recipe below and answers the question the worktree
+cannot: how far the constant had already drifted from the tree it claims to
+freeze.
+
 - If a change removes stubs, lower `BASELINE_SYNTHETIC_STUBS` to the printed
   count in the same commit.
 - If it adds one, implement the behavior as real bytecode, a Bridge, or an

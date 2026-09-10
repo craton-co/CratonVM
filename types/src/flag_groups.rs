@@ -351,6 +351,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "atomic-updater", on_key: Some("CRATONVM_DBG_ATOMIC_UPDATER"), off_key: None, off_word: None, since: "2026-07-09" },
     E { group: Group::DBG, token: "badrecv", on_key: Some("CRATONVM_DBG_BADRECV"), off_key: None, off_word: None, since: "2026-06-05" },
     E { group: Group::DBG, token: "badref", on_key: Some("CRATONVM_DBG_BADREF"), off_key: None, off_word: None, since: "2026-06-05" },
+    E { group: Group::DBG, token: "deadref-store", on_key: Some("CRATONVM_DBG_DEADREF_STORE"), off_key: None, off_word: None, since: "2026-09-09" },
+    E { group: Group::DBG, token: "watch-addr", on_key: Some("CRATONVM_DBG_WATCH_ADDR"), off_key: None, off_word: None, since: "2026-09-09" },
     E { group: Group::DBG, token: "bb", on_key: Some("CRATONVM_DBG_BB"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::DBG, token: "bblp", on_key: Some("CRATONVM_DBG_BBLP"), off_key: None, off_word: None, since: "2026-05-24" },
     E { group: Group::DBG, token: "bd-debug", on_key: Some("CRATONVM_BD_DEBUG"), off_key: None, off_word: None, since: "2026-05-20" },
@@ -496,12 +498,30 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "gc-stress", on_key: Some("CRATONVM_DBG_GC_STRESS"), off_key: None, off_word: None, since: "2026-06-03" },
     E { group: Group::DBG, token: "oop-oracle-force-refute", on_key: Some("CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE"), off_key: None, off_word: None, since: "2026-08-22" },
     E { group: Group::DBG, token: "gc-verify-stale", on_key: Some("CRATONVM_GC_VERIFY_STALE"), off_key: None, off_word: None, since: "2026-05-23" },
+    // The reachability oracle that judges the three narrowings above.
+    E { group: Group::DBG, token: "verify-reg-oop-maps", on_key: Some("CRATONVM_DBG_VERIFY_REG_OOP_MAPS"), off_key: None, off_word: None, since: "2026-09-09" },
     E { group: Group::GC, token: "late-resolve-dropped", on_key: Some("CRATONVM_GC_LATE_RESOLVE_DROPPED"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "tlab-skip", on_key: None, off_key: Some("CRATONVM_GC_NO_TLAB_SKIP"), off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "g1-only-jit-pins", on_key: Some("CRATONVM_GC_G1_ONLY_JIT_PINS"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "peer-pin-divert", on_key: None, off_key: Some("CRATONVM_GC_NO_PEER_PIN_DIVERT"), off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "conditional-tlab-skip-publish", on_key: Some("CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "frame-trace-span-retire", on_key: None, off_key: Some("CRATONVM_GC_NO_FRAME_TRACE_SPAN_RETIRE"), off_word: None, since: "2026-09-06" },
+    // The three conservative-JIT-root narrowings the register oop maps
+    // license, each its own lever because each rests on a DIFFERENT claim and a
+    // regression has to be attributable to one of them: the compiler's register
+    // model, the operand-spill cursor, and the outgoing-argument reserve.
+    E { group: Group::GC, token: "reg-oop-maps", on_key: Some("CRATONVM_GC_REG_OOP_MAPS"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    E { group: Group::GC, token: "dead-spill-roots", on_key: Some("CRATONVM_GC_DEAD_SPILL_ROOTS"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    E { group: Group::GC, token: "outgoing-arg-roots", on_key: Some("CRATONVM_GC_OUTGOING_ARG_ROOTS"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // G1's pin set honouring the movable/rewritable partition the
+    // generational path has always honoured.
+    E { group: Group::GC, token: "g1-movable-pins", on_key: Some("CRATONVM_GC_G1_MOVABLE_PINS"), off_key: None, off_word: None, since: "2026-09-09" },
+    // The producer half: publishing the verifiable band partition as movable.
+    E { group: Group::GC, token: "movable-band-roots", on_key: Some("CRATONVM_GC_MOVABLE_BAND_ROOTS"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // UNSAFE pricing lever for the A5 unregistered-frame span sweep.
+    E { group: Group::JIT, token: "a5-mark-span", on_key: Some("CRATONVM_JIT_A5_MARK_SPAN"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // Recover frames from the A5 band instead of sweeping it as a raw span.
+    E { group: Group::JIT, token: "a5-frame-scan", on_key: Some("CRATONVM_JIT_A5_FRAME_SCAN"), off_key: None, off_word: None, since: "2026-09-09" },
     E { group: Group::DBG, token: "peer-reg-pairing", on_key: Some("CRATONVM_DBG_PEER_REG_PAIRING"), off_key: None, off_word: None, since: "2026-09-06" },
     // Coverage oracle for the slot list `static-root-slots` builds: after the
     // fast path has patched the recorded slots, re-walk every static the slow
@@ -1364,6 +1384,12 @@ pub const INVENTORY: &[E] = &[
     // resolver had bound and keep-alive-registered the entry all along; nothing
     // put it where the lowerer looks.
     E { group: Group::JIT, token: "ir-splice-direct-call", on_key: Some("CRATONVM_JIT_IR_SPLICE_DIRECT_CALL"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // Splice a callee whose body carries a `checkcast` or an `instanceof`.
+    // `IrBuilder` has had both arms since cov-05; the splice scanner refused
+    // the shape because nothing resolved the callee's targets or rebased the
+    // rows. An unresolved target refuses the CALLEE rather than being dropped,
+    // because a missing row bails the whole method.
+    E { group: Group::JIT, token: "ir-splice-typecheck", on_key: Some("CRATONVM_JIT_IR_SPLICE_TYPECHECK"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
     E { group: Group::JIT, token: "ir-splice-getstatic", on_key: Some("CRATONVM_JIT_IR_SPLICE_GETSTATIC"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
     // Splice a callee whose body contains a `checkcast` or an `instanceof`.
     // The same rebase as the two above, and the refusal that page named as
@@ -1372,7 +1398,6 @@ pub const INVENTORY: &[E] = &[
     // not, and a spliced type check is the first spliced site that can THROW
     // on a caller-produced value. Read site accepts `1`/`true`/`on`/`yes` and
     // nothing else, so there is no off-word: removing the key is the way back.
-    E { group: Group::JIT, token: "ir-splice-typecheck", on_key: Some("CRATONVM_JIT_IR_SPLICE_TYPECHECK"), off_key: None, off_word: None, since: "2026-09-09" },
     // R1. Memoize the ACCEPTED optimizing OSR artifact, not only the refusals.
     // Without it one run recompiled the same method 502 times.
     E { group: Group::JIT, token: "osr-optimizing-cache", on_key: Some("CRATONVM_JIT_OSR_OPTIMIZING_CACHE"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
@@ -1383,6 +1408,8 @@ pub const INVENTORY: &[E] = &[
     // to state -- removing the key is the way back.
     E { group: Group::JIT, token: "ir-deopt-points-at-traps", on_key: Some("CRATONVM_JIT_IR_DEOPT_POINTS_AT_TRAPS"), off_key: None, off_word: None, since: "2026-09-09" },
     E { group: Group::JIT, token: "ir-reg-authoritative", on_key: Some("CRATONVM_JIT_IR_REG_AUTHORITATIVE"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    E { group: Group::JIT, token: "ir-gp-wide", on_key: Some("CRATONVM_JIT_IR_GP_WIDE"), off_key: None, off_word: None, since: "2026-09-10" },
+    E { group: Group::JIT, token: "ir-epoch-guard-rip", on_key: Some("CRATONVM_JIT_IR_EPOCH_GUARD_RIP"), off_key: None, off_word: Some("0"), since: "2026-09-10" },
     E { group: Group::JIT, token: "ir-speculate", on_key: Some("CRATONVM_JIT_IR_SPECULATE"), off_key: None, off_word: None, since: "2026-09-09" },
     // Diagnosis lever, value-taking: a comma-separated list of conservative
     // root-band CLASSES to skip (`operand-spill`,
@@ -1661,6 +1688,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "my-scratch-flush", on_key: Some("CRATONVM_JIT_MY_SCRATCH_FLUSH"), off_key: None, off_word: Some("0"), since: "2026-07-30" },
     E { group: Group::JIT, token: "my-selfcall-proof", on_key: Some("CRATONVM_JIT_MY_SELFCALL_PROOF"), off_key: None, off_word: Some("0"), since: "2026-07-30" },
     E { group: Group::JIT, token: "my-shadow-emission", on_key: Some("CRATONVM_JIT_MY_SHADOW_EMISSION"), off_key: None, off_word: Some("0"), since: "2026-07-31" },
+    // Emit side of the register oop maps: `OopMapEntry::reg_oop_mask`.
+    E { group: Group::JIT, token: "reg-oop-maps", on_key: Some("CRATONVM_JIT_REG_OOP_MAPS"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
     E { group: Group::JIT, token: "native-ec-multiply", on_key: Some("CRATONVM_NATIVE_EC_MULTIPLY"), off_key: None, off_word: None, since: "2026-06-04" },
     E { group: Group::JIT, token: "native-matcher-find", on_key: Some("CRATONVM_NATIVE_MATCHER_FIND"), off_key: None, off_word: Some("0"), since: "2026-07-11" },
     E { group: Group::JIT, token: "native-pbe-keyfactory", on_key: Some("CRATONVM_NATIVE_PBE_KEYFACTORY"), off_key: None, off_word: None, since: "2026-06-22" },

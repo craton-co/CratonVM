@@ -931,6 +931,11 @@ pub fn deopt_frame_bail_total() -> u64 {
 
 /// Reset the census. **Tests only** — a test that warms a VM and then measures
 /// one trapping call needs the warm-up's declines out of the way.
+///
+/// `pub` because that test is an INTEGRATION test in `vm/tests/`, a separate
+/// crate that sees neither `pub(crate)` nor `#[cfg(test)]`. Carried on the
+/// test-only-public-API ratchet for that reason -- see the "third disposition"
+/// note in `vm/tests/no_test_only_public_api.rs`.
 pub fn reset_deopt_frame_bail_counts() {
     for c in DEOPT_FRAME_BAILS.iter() {
         c.store(0, std::sync::atomic::Ordering::Relaxed);

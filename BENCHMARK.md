@@ -59,21 +59,32 @@ file's own methodology section warns about. All seven phases come from **one
 binary in one window**, load 1.8–3.8 throughout, with the series aborted and
 retried if load left the band mid-run.
 
-| Benchmark                         | JDK 25 C2 | CratonVM  | Ratio     | CV (CratonVM) | was (2026-07) |
-|-----------------------------------|-----------|-----------|-----------|---------------|---------------|
-| Arithmetic (2B ops)               | 1,852 ms  | 3,601 ms  | 1.94x     | 0.6% | 2.44x |
-| Fibonacci(44)                     | 1,449 ms  | 5,059 ms‡ | 3.49x‡    | 0.6% | 2.79x |
-| Sieve (100K × 20,000)             | 2,333 ms† | 2,360 ms  | **1.01x** | 2.0% | 2.28x |
-| Matrix 1280×1280                  | 2,106 ms  | 2,094 ms  | **0.99x** | 0.2% | 2.93x |
-| HashMap (10M put/get, isolated)   | 983 ms    | 2,049 ms  | 2.08x     | 0.6% | **1.75x** |
-| String/Regex (100K, isolated)     | 50 ms     | 200 ms    | 4.00x     | 0.9% | **7.7x** |
-| Binary Trees (depth 18, isolated) | 176 ms    | 1,700 ms  | 9.66x     | 1.1% | 8.34x |
+| Benchmark                             | JDK 25 C2 | CratonVM   | Ratio     | CV (CratonVM) | was (2026-07) |
+|----------------------------------------|-----------|------------|-----------|---------------|---------------|
+| Arithmetic (2B ops)                   | 1,852 ms  | 3,601 ms   | 1.94x     | 0.6% | 2.44x |
+| Fibonacci(44)                         | 1,449 ms  | 5,059 ms‡  | 3.49x‡    | 0.6% | 2.79x |
+| Sieve (100K × 20,000)                 | 2,333 ms† | 2,360 ms   | **1.01x** | 2.0% | 2.28x |
+| Matrix 1280×1280                      | 2,106 ms  | 2,094 ms   | **0.99x** | 0.2% | 2.93x |
+| Binary Trees (depth 16, isolated)§    | 49 ms     | 259 ms     | 5.29x     | 8.3% | — |
+| Binary Trees (depth 18, isolated)§    | 183 ms    | 1,195 ms   | 6.53x     | 2.4% | 8.34x |
+| Binary Trees (depth 20, isolated)§    | 898 ms    | 6,649 ms   | 7.40x     | 1.0% | — |
+| HashMap (1M put/get, isolated)§       | 45 ms     | 553 ms     | 12.29x    | 2.4% | — |
+| HashMap (10M put/get, isolated)§      | 1,039 ms  | 5,499 ms   | 5.29x     | 0.4% | **1.75x** |
+| HashMap (100M put/get, isolated)§     | 11,455 ms | 120,465 ms | 10.52x    | 0.3% | — |
+| String/Regex (100K, isolated)§        | 54 ms     | 242 ms     | 4.48x     | 3.6% | **7.7x** |
+| String/Regex (1M, isolated)§          | 138 ms    | 2,320 ms   | 16.81x    | 1.3% | — |
+| String/Regex (10M, isolated)§         | 466 ms    | 23,359 ms  | 50.13x    | 0.4% | — |
 
 This replaces an older table whose rows were taken across four separate
 sessions on a host that has since been re-provisioned and three of which this
 document already flagged as unverified. Every row above comes from **one**
-interleaved series, so the rows are comparable to each other. CratonVM's
-run-to-run spread is under 1% on five of the seven rows.
+interleaved series per collector, so the rows are comparable to each other
+within a collector. CratonVM's run-to-run spread is under 1% on eight of the
+thirteen rows; the widest is Binary Trees depth 16 (8.3%, on a run so short
+— 259 ms median — that a couple of milliseconds of scheduling noise reads as
+a large percentage). The `was (2026-07)` column, where present, was measured
+under the Generational collector — see `§` below before comparing it to the
+Ratio column of a G1 row directly.
 
 **Two rows are at parity with HotSpot C2**: Matrix and Sieve. HashMap and
 Binary Trees sit above their `was (2026-07)` figures, but those earlier
@@ -119,6 +130,81 @@ The optimizing tier declines a method whose loops the single-pass backend
 would lower better, and what that backend can do and the IR tier cannot is
 enumerated in `jit/src/x64/single_pass_only.rs` rather than discovered one
 regression at a time.
+
+### § Growth across N: Binary Trees / HashMap / String-Regex under G1 (2026-09-10)
+
+Measured with a one-off sized harness (`CratonBenchSized`, one phase + one
+size per argv, not part of the checked-in `bench/` tree) so each of these
+three GC/allocation-heavy kernels could be run at three sizes in one
+interleaved series instead of the single proxy size the rest of this
+document uses. **CratonVM ran with `--XX:UseGc G1`; HotSpot needed no flag,
+since G1 has been its default collector since JDK 9.** This is a deliberate
+collector switch for these three rows only — the rest of this table, and the
+codebase default, is the Generational collector (see README.md Highlights).
+
+Azure host (`dev` @ `330773e1`, fat-LTO, sha256 `bc2bb8b0a044…`), CPU 7
+pinned via `taskset`, alternating CratonVM/HotSpot arms, 9 reps per
+size/kernel combination, no sample discarded, checksum-verified every rep.
+Load stayed at 2.1–2.3 for the entire series (quietest of any run in this
+document); memory headroom was 25GB+ available throughout, including the
+100M-entry HashMap run given `-Xmx24g`. **Zero checksum mismatches — every
+rep, every size, both VMs agree exactly.**
+
+| kernel | size | JDK 25 (G1, default) | CratonVM (G1) | ratio | CV (CratonVM) |
+|---|---|---:|---:|---:|---:|
+| Binary Trees | depth 16 | 49 ms | 259 ms | 5.29x | 8.3% |
+| Binary Trees | depth 18 | 183 ms | 1,195 ms | 6.53x | 2.4% |
+| Binary Trees | depth 20 | 898 ms | 6,649 ms | 7.40x | 1.0% |
+| HashMap | 1M put/get | 45 ms | 553 ms | 12.29x | 2.4% |
+| HashMap | 10M put/get | 1,039 ms | 5,499 ms | 5.29x | 0.4% |
+| HashMap | 100M put/get | 11,455 ms | 120,465 ms | 10.52x | 0.3% |
+| String/Regex | 100K | 54 ms | 242 ms | 4.48x | 3.6% |
+| String/Regex | 1M | 138 ms | 2,320 ms | 16.81x | 1.3% |
+| String/Regex | 10M | 466 ms | 23,359 ms | 50.13x | 0.4% |
+
+**Binary Trees and String/Regex compound with N; HashMap does not.** Binary
+Trees' ratio rises steadily as depth increases (5.29x → 6.53x → 7.40x, each
+step roughly quadrupling live-node count). String/Regex compounds far more
+sharply — the ratio nearly triples at each 10x step in N (4.48x → 16.81x →
+50.13x) — consistent with CratonVM's per-match `String` allocation
+(`Matcher.group(1)`) and `StringBuilder` growth paying an increasing GC tax
+as the retained string and match count both grow. HashMap's ratio is
+**non-monotonic** (12.29x → 5.29x → 10.52x): the 1M run completes in 553 ms,
+short enough that fixed per-process costs (JVM/VM bring-up, class loading)
+are still a real share of both columns, which is the more likely explanation
+than a genuine reversal of the scaling trend — this row would need a
+finer-grained sweep (e.g. 1M/3M/10M/30M/100M) to separate "small-N fixed
+overhead" from "true non-monotonic scaling" with confidence, which this
+series does not attempt to do.
+
+**G1 vs the Generational default, same binary, isolated same-day
+measurement** (CratonVM-only, no HotSpot column — this isolates the
+collector's own effect):
+
+| kernel | size | Generational | G1 | G1 effect |
+|---|---|---:|---:|---:|
+| Binary Trees | depth 16 | 1,978 ms | 259 ms | **7.6x faster** |
+| Binary Trees | depth 18 | 8,956 ms | 1,195 ms | **7.5x faster** |
+| Binary Trees | depth 20 | 49,361 ms | 6,649 ms | **7.4x faster** |
+| HashMap | 1M | 747 ms | 553 ms | 1.35x faster |
+| HashMap | 10M | 7,468 ms | 5,499 ms | 1.36x faster |
+| HashMap | 100M | 139,000 ms | 120,465 ms | 1.15x faster |
+| String/Regex | 100K | 343 ms | 242 ms | 1.42x faster |
+| String/Regex | 10M | 19,311 ms | 23,359 ms | **1.21x slower** |
+
+G1 is a **large, uneven** win, not a uniform one: it more than halves Binary
+Trees' wall time at every depth tested, helps HashMap and small String/Regex
+modestly, and measurably **regresses** String/Regex at 10M — the collector
+that helps most on one allocation-heavy kernel is the one that hurts on
+another. (The String/Regex 1M row is omitted from this delta table: the
+Generational-side sample for that size landed exactly as an unrelated
+session's build spiked host load to 8.4, so that specific comparison isn't
+trustworthy — see the raw sample data below.)
+
+Raw samples, manifest, and environment record for both series:
+`/data/cratonvm/regression-suite/perf/results/vs-hotspot-sized-g1-20260910T125919Z/`
+(G1) and `/data/cratonvm/regression-suite/perf/results/vs-hotspot-sized-20260910T121415Z/`
+(Generational) on the Azure benchmark host.
 
 ### Sieve was 6.50x yesterday
 

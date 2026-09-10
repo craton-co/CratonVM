@@ -3594,6 +3594,17 @@ pub(super) fn try_stackless_invoke(
         cratonvm_native_api::registry::lookup_census::INVOKE_STACKLESS,
     );
 
+    // `CRATONVM_DBG_DEADREF_STORE`: were the arguments ALREADY dead on entry?
+    //
+    // `[deadref-arg]` fires where the arguments are laid into the callee's
+    // locals, which is the last statement of a long prologue and cannot say
+    // whether the collection that killed them ran inside that prologue or
+    // before this function was ever called. Asking the same question at entry
+    // splits it: a hit HERE means the caller handed down a slice it had already
+    // held across a collection, and the fix belongs upstream; a hit only at the
+    // frame build means the prologue is what needs bracketing.
+    crate::runtime::frame::note_dead_arg_pub(args, "try_stackless_invoke ENTRY");
+
     // Memo for the constant `DowncallHandle.type()` triple resolved in the
     // receiver-class-gated arm below (native-dispatch-memoization §3, B4).
     // ONE STATIC, ONE TRIPLE: the single `.callback` below passes three

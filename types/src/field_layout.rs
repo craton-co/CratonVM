@@ -308,15 +308,43 @@ static LAYOUT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// overwhelming majority of real programs, keeps every inline arm.
 ///
 /// Coarse and correct beats precise and absent.
-static LAYOUT_REPLACE_EPOCH: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
+/// **On the heap, deliberately, and not in this image's `.data`.**
+///
+/// A JIT site guards on this counter by baking its ADDRESS, and the cheapest
+/// encoding for that is `CMP dword [rip+disp32], imm32` — one 10-byte
+/// instruction against `MOV R11, imm64` + `MOV ECX, [R11]` + `CMP ECX, imm32`,
+/// which is three instructions and nineteen bytes and burns two registers.
+/// `disp32` reaches ±2GB from the instruction, and on Windows the executable
+/// image and the JIT's code buffer are around 140TB apart — measured, on this
+/// box: the counter sat at `0x7FF6BDFB9AF4` as a static while the optimizing
+/// tier's buffer was at `0x1B430060000`, so every guard took the long form.
+///
+/// A leaked `Box` is allocated from the same heap the VM's own structures come
+/// from, which is where `stw_requested_flag_addr` already lives — and that
+/// flag's poll DOES encode as `TEST BYTE [rip+disp32], 0xFF`. Same heap, same
+/// region, same reach.
+///
+/// This is best-effort and not a guarantee: nothing promises an allocator puts
+/// two allocations within 2GB of each other, so
+/// `ir_lower::emit_layout_epoch_guard` range-checks the displacement and keeps
+/// the materialize-the-address form as its fallback. Moving the counter here
+/// makes the short form REACHABLE; it does not make it certain.
+///
+/// The address must also be STABLE for the life of the process, because JIT
+/// code bakes it. `Box::leak` gives exactly that, and `LazyLock` makes the
+/// allocation happen once, before any compile can observe it.
+static LAYOUT_REPLACE_EPOCH: LazyLock<&'static std::sync::atomic::AtomicU32> =
+    LazyLock::new(|| Box::leak(Box::new(std::sync::atomic::AtomicU32::new(0))));
 
 /// `(address, value)` of the global replacement epoch, for a JIT site to bake
 /// and compare. See [`LAYOUT_REPLACE_EPOCH`].
 pub fn layout_replace_epoch_guard() -> (*const u32, u32) {
+    // `LazyLock<T>: Deref<Target = T>` and `T` is itself `&'static …`, so one
+    // deref hands back the leaked reference rather than a borrow of the lock.
+    let cell: &'static std::sync::atomic::AtomicU32 = *LAYOUT_REPLACE_EPOCH;
     (
-        &LAYOUT_REPLACE_EPOCH as *const std::sync::atomic::AtomicU32 as *const u32,
-        LAYOUT_REPLACE_EPOCH.load(std::sync::atomic::Ordering::Acquire),
+        cell as *const std::sync::atomic::AtomicU32 as *const u32,
+        cell.load(std::sync::atomic::Ordering::Acquire),
     )
 }
 

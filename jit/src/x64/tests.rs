@@ -13626,7 +13626,6 @@ fn make_inline_site(
         field_info: Vec::new(),
         compact_field_info: Vec::new(),
         static_field_info: Vec::new(),
-        typecheck_info: Vec::new(),
         ldc_info: Vec::new(),
         ldc2w_info: Vec::new(),
         ldc_fp_pcs: Vec::new(),
@@ -13640,6 +13639,7 @@ fn make_inline_site(
         resolved_invoke_infos: Vec::new(),
         nested_sites: Vec::new(),
         ir_new_info: Vec::new(),
+        ir_typecheck_info: Vec::new(),
     }
 }
 

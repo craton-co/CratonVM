@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 2026-09-09 `checkcast` / `instanceof` in a spliced callee — the third rebase, and the bug it uncovered
+
+The third instance of one pattern, after `ldc` and `getstatic`: `IrBuilder` has
+had `0xc0`/`0xc1` arms since cov-05, and the splice scanner refused the shape
+for both tiers in one arm — so the optimizing tier inherited a refusal that
+belongs to the single-pass emitter, which genuinely has no arm for either. It
+fell on the commonest accessor in typed Java: the survey that motivated those
+arms counted 306 events on this pair, the largest single whole-method refusal it
+found, more than every opcode gap combined.
+
+Unlike `getstatic`, there were no rows to rebase — `InlineSite` gains
+`ir_typecheck_info` and the resolver fills it against the CALLEE's constant
+pool, the only pool that can name the target. An unresolved target refuses the
+callee, because a missing row bails the whole method. A spliced `checkcast`
+also carries the `has_dispatch` obligation its caller-side twin does: a
+definitive refusal publishes its `ClassCastException` through the `JIT_THREAD`
+TLS the no-dispatch fast entry never sets.
+
+Reach: spliced bodies 2 → 6 on `bench/SpliceCastProbe.java`. Throughput: the
+body it produces is ~30% faster (~133 ms against ~193 ms on
+`bench/SpliceCastArrayProbe.java`, 34 interleaved rounds, a mode the off arm
+never reaches), and the run median is NEUTRAL because that body is installed in
+about a quarter of runs — the tier race, not this lane.
+
+Found in passing and NOT fixed: on `SpliceCastProbe` the optimizing body is ~3x
+slower than the single-pass one in BOTH arms, and `ir blind dispatches:
+own_code=0 in_splice=1` names the suspect — a surviving `invokevirtual`
+(`ArrayList.elementData`) inside a relocated body that got neither a direct bind
+(correctly — it is virtual) nor the MIC/PIC cascade it should have. Written up
+as the next thing to look at. `CRATONVM_JIT_IR_SPLICE_TYPECHECK=0` restores the
+refusal.
+
 ### 2026-09-09 A `getstatic` in a callee cost the optimizing tier the inline, and the calls a splice left behind were name resolutions
 
 The C2 tier published a body **15x slower than the C1 body it replaced** on the

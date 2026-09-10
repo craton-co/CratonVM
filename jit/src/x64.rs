@@ -1076,6 +1076,29 @@ struct Compiler {
     /// `pending_live_frame_hi`, so a staging site that emits no map cannot leak
     /// its slots into a later safepoint's map.
     pending_staged_arg_oops: Vec<i32>,
+    /// The REGISTER homes of the reference arguments the pending call popped
+    /// off the simulated operand stack, as a bitmask over
+    /// [`crate::x64::licm::ALL_SPILL_GPRS`] positions.
+    ///
+    /// `pop_invoke_args` pops the argument entries, and from that moment the
+    /// simulated stack no longer mentions them -- but the machine registers
+    /// that held them are unchanged until something overwrites them, and the
+    /// `CALL` in between is a safepoint. `live_oop_register_mask` builds its
+    /// mask from the simulated stack and the live oop locals, so without this
+    /// field a reference sitting in, say, `r14` (a `StackSlot::CalleeSaved`
+    /// home) is in the blind spill image with its bit CLEAR, and the narrowed
+    /// scan walks past the only conservative sighting of a live object.
+    ///
+    /// The sibling `pending_staged_arg_oops` does not cover it: that field
+    /// names the FRAME slots the arguments were staged into, which answers "is
+    /// it findable somewhere" for the map, not "which register may still hold
+    /// it" for the register mask. The two are the same fact seen through the
+    /// two channels, and both are needed.
+    ///
+    /// Same lifecycle as `pending_staged_arg_oops`: set at the staging site,
+    /// taken by the next `emit_oop_map_for_safepoint`, so it cannot leak into a
+    /// later safepoint.
+    pending_call_oop_arg_regs: u16,
     /// A reference argument was staged somewhere this compiler cannot name in
     /// an oop map — the native-ABI outgoing-argument area
     /// (`emit_stack_arg_setup`), the direct-call service slots, or an inlined
@@ -2948,6 +2971,7 @@ impl Compiler {
             stack_oop_marks: Vec::with_capacity(16),
             stack_oop_marks_exact: true,
             pending_staged_arg_oops: Vec::new(),
+            pending_call_oop_arg_regs: 0,
             pending_staged_args_unmapped: false,
             local_oop_windows: 0,
             local_oop_stride: 0,

@@ -5,10 +5,17 @@
 Measured 2026-09-09: the "where to start" list is now run to the end, two of its
 three items are REFUTED by measurement, and the third has a number on it.*
 
+*Updated 2026-09-09 (second pass): item 2 is IMPLEMENTED and Type 0 now passes
+on G1. The failure moved to Type 3, which measurement then showed is not this
+page's problem at all — see [Type 0 is fixed; Type 3 is a different
+bug](#type-0-is-fixed-type-3-is-a-different-bug).*
+
 ## Status
 
-**OPEN, and the number is unchanged.** `org.h2.test.unit.TestValueMemory`,
-`-Xmx2g`, dev `fc70730d5`:
+**OPEN at Type 3; Type 0 is FIXED.** `org.h2.test.unit.TestValueMemory`,
+`-Xmx2g`.
+
+Before (dev `fc70730d5`):
 
 | arm | result | worst row |
 |---|---|---|
@@ -17,13 +24,21 @@ three items are REFUTED by measurement, and the third has a number on it.*
 | CratonVM `-XX:+UseG1GC` | **FAIL at Type 0** | **3.30x** |
 | HotSpot JDK 25 | PASS | 0.5x |
 
-```
-AssertionError: Type: 0 Used memory: 3224 calculated: 976 length: 125000 size: 1
-```
+After precise register oop maps (`claude/jit-reg-oop-maps-20260909`):
 
-The assertion is `used > memory * 3`, so the threshold is 2928 KB and G1 reads
-3224. What has changed since 2026-09-08 is not the number but what is known
-about it, and the first correction is to what this test measures at all.
+| arm | Type 0 | result |
+|---|---|---|
+| CratonVM default (ZGC) | 2227 | **PASS** |
+| CratonVM `-XX:+UseGenerationalGC` | 2227 | **PASS** |
+| CratonVM `-XX:+UseG1GC` | **2227** | FAIL at Type 3 (~10000) |
+
+G1's Type 0 went 3224 -> 2227, which is the same number the other two
+collectors read, i.e. the G1-specific excess on that row is GONE. All three
+arms are now identical there.
+
+The assertion is `used > memory * 3`, so the threshold is 2928 KB. What has
+changed since 2026-09-08 is not just the number but what is known about it, and
+the first correction is to what this test measures at all.
 
 ## The 977 KB floor is a LIVE object, and the predecessor page mis-stated it
 
@@ -226,7 +241,240 @@ class, so any two-of-three leaves all three regions pinned and the number
 unmoved. There is no incremental landing here; a partial precise root set gets
 zero.
 
+## Type 0 is fixed; Type 3 is a different bug
+
+Item 2 was implemented (`OopMapEntry::reg_oop_mask`, plus the two companion
+narrowings item 0 and item 1 called for). Type 0 on G1 went **3224 -> 2227**,
+identical to ZGC and generational on the same row. That is this page's headline
+number, and it is discharged.
+
+The suite still fails, now at Type 3, and the rest of this section is the
+measurement that says **Type 3 does not belong to this page**.
+
+### Skipping EVERY conservative band class changes nothing at Type 3
+
+`CRATONVM_JIT_BAND_SKIP` exists to price exactly this. Set to all ten of
+`region_name`'s classes it is the absolute ceiling of the conservative-root
+line of work — no compiled-frame word is a marking root at all:
+
+| `CRATONVM_JIT_BAND_SKIP` | Type 3, three runs |
+|---|---|
+| unset | 10976, 10967, 12998 |
+| all ten classes | 11979, 11986, 11987 |
+
+Indistinguishable, and if anything higher with the skip. **The remaining Type 3
+excess is not in the band scan**, so no amount of further root-set precision —
+including the deopt `SavedRegisters` block, which the previous revision of this
+page named as the next step — can reach it. That plan is retired.
+
+The JIT is still implicated: `--nojit` reads **793** on G1, twice, exactly. So
+the cost arrives through the JIT by some channel other than the band scan.
+
+### The channel is precise oop-map roots, pinned a megabyte at a time
+
+Under the full band skip, G1 still pins 12 regions:
+
+```
+pin_addrs=30 pin_regions={7,8,9,10,14,15,16,17,21,23,24,68} pinned_bytes=9708K
+```
+
+Thirty pin addresses survive a total band skip because they were never band
+words.
+
+> **CORRECTED 2026-09-09 (second pass).** This paragraph then guessed they were
+> the frames' precise `frame_slot_offsets` roots. They are not. They come from
+> the **A5 unregistered-frame span sweep**, which contributes 4794 roots to the
+> band scan's 430 and publishes no partition at all — see [the section
+> above](#where-the-pins-come-from-and-it-is-not-the-band-scan). The guess was
+> reasonable and it was still a guess; the census that settled it is
+> `[bandpath]`.
+
+That is a G1 pinning-granularity problem, not a root-precision problem, and it
+is why the same 30 references cost ZGC 1205 and the generational collector 1149
+on the identical row.
+
+### The movable partition is right, inert, and starved
+
+Precise map roots are exactly the ones `remap_active_jit_frames` rewrites after
+a move, so they ought not to be pinned at all. `gen_heap` already acts on that
+distinction; `G1Collector::jit_pinned_region_set` did not, and now can, behind
+`CRATONVM_GC_G1_MOVABLE_PINS=1` (**default off**). It is off because measuring
+it showed the filter is starved, not wrong:
+
+```
+[g1][MOVPIN] snapshot=38 kept=38 movable_claimed=2 unrew_veto=9
+             honour_movable=false coverage_incomplete=true movable_set=2
+```
+
+Two independent blockers. `coverage_incomplete=true` disables the whole-cycle
+proof outright. And even forced on, only **2 of 38** addresses are claimed
+movable, because `add_movable_jit_root` is reached only from the shadow-stack
+scan and only when it is not publishing pinned — the 36 precise map roots
+publish themselves to nothing.
+
+So the next person's job is not the filter. It is **teaching the precise oop-map
+roots to publish themselves movable**, at which point the filter is already
+here and already correct. Until then it stays off, because turning on a live GC
+behaviour change worth 2 pins in 38 is a risk bought for nothing.
+
+### Corrected: the "ordering defect" was the diagnostic, not the collector
+
+The previous revision closed with *"the ordering defect means the partition is
+not even computed at the point G1 reads it"*. That is wrong and this page
+should not have said it. The `[jitpins]` line prints at step 14 and the
+shadow-stack scan runs at 14b, so `movable_set=0` on that line is an artefact of
+**where the diagnostic prints**. By the time G1 calls `jit_pinned_region_set`
+the set is populated — `movable_set=2`, as the `MOVPIN` census above shows from
+inside G1's own read. The real defect was simpler and worse: G1 applied no
+movable filter at all.
+
+The rest of that paragraph — do not narrow G1's pin set on the strength of this
+page — still stands, now for a measured reason rather than a mistaken one.
+
+## Type 3, run to the end: the pin set is the whole problem, and the A5 span sweep is most of it
+
+*Measured 2026-09-09, second pass, on `claude/g1-movable-jit-pins-20260909`.*
+
+### The floor says there is nothing else wrong
+
+`CRATONVM_DBG_NO_JIT_ROOT_SCAN=1` publishes no conservative JIT roots at all —
+unsound, and the point is the number:
+
+| G1, `-Xmx2g` | Type 3 | pins |
+|---|---|---|
+| default | 10975 | 34 addresses, 13 regions, 10826 KB |
+| no conservative JIT roots | **1206** | **0 addresses, 1 region** |
+
+Every type passes in that arm. So the JIT pin set is not *a* contributor to Type
+3, it is the entire excess, and any fix that drives it to zero makes the row
+pass with room to spare. Nothing else about G1 needs to change — which also
+retires "shrink the region size" for good: thirteen pinned regions at 128 KiB
+would still be ~1.6 MB against a 2928 KB threshold with 1206 KB already spent,
+and `G1_TARGET_REGION_COUNT` is held near 2048 on purpose.
+
+### Where the pins come from, and it is not the band scan
+
+Two producers reach the pin set, and they are wildly unequal:
+
+```
+[bandpath] bands=84 fallback=0 foreign_innermost=0 a5_sweeps=48
+           a5_roots=4794 published=(movable=132 unrewritable=298)
+```
+
+The per-frame band scan walks `[rbp - frame_size, rbp)` **with the frame's
+layout**, so it can split its words into the half a remap rewrites and the half
+nothing does. It contributes ~430 roots.
+
+The **A5 unregistered-frame probe** contributes **4794** — an order of magnitude
+more — and publishes neither half, because it has no layout to split with. On
+accept it sweeps `[search_lo, high)` whole, and that span is not a frame: it is
+every byte of native stack between the scanner and the entry, including the
+VM's own Rust frames and the interpreter frames the compiled code called into.
+Every object-shaped word in it becomes a marking root that pins its G1 region
+with no argument available against it.
+
+This is why `CRATONVM_JIT_BAND_SKIP` set to all ten `region_name` classes
+changed nothing in the previous pass: the band scan was never the cost.
+
+### Narrowing the A5 sweep works, and is not safe enough to default
+
+`CRATONVM_JIT_A5_FRAME_SCAN=1` recovers frames from the band instead of
+sweeping it — a return address into JIT code at `[rbp + 8]` implies
+`rbp = slot - 8`, and `a5_slot_has_frame_shape` already validates that shape.
+Each recovered frame is then scanned with its layout, so it also publishes the
+partition.
+
+| arm | Type 3 | a5_roots | pins |
+|---|---|---|---|
+| span sweep (default) | ~10975 | 4794 | 34 / 13 regions |
+| frame recovery | **7932** | 2538 | 22 / 8 regions |
+| sweep disabled outright (`CRATONVM_JIT_A5_MARK_SPAN=0`, unsound) | **4882** | 0 | 6 / 5 regions |
+
+It ships **off**. The span it replaces covers Rust and interpreter frames, and
+sweeping those conservatively is exactly what catches "an object that has been
+allocated and not yet stored anywhere tracked" —
+`bug-g1-evacuates-live-jit-reference-20260819-FIXED.md` is what missing one
+costs. Marking only the frames a shape test recognises drops all of them. A
+use-after-free risk for 20% of one row is not a trade to inherit from a default.
+
+**And it would not be enough anyway.** Disabling the sweep entirely — the
+ceiling of every possible narrowing — still reads 4882 against a 2928
+threshold, because five regions stay pinned by the band scan's own unrewritable
+words.
+
+### The remaining pins are words nothing rewrites, and one of them was a mistake
+
+With the A5 sweep off, the refusals that remain are all `callee-saved`:
+
+| region | words |
+|---|---|
+| `outgoing-args-or-deopt-regs` (the deopt `SavedRegisters` block) | 594 |
+| `safepoint-gpr-spill-image` | 120 |
+| `callee-saved-gpr-image` | 30 |
+
+The last row was being pinned for nothing. `remap_register_image_words` runs on
+every collection (`CRATONVM_REGISTER_IMAGE_REMAP`, default on) and rewrites
+exactly what `register_image_remap_admits` accepts, which by default is the
+callee-saved GPR image — so those words are fixed up after a move already, and
+the pin held a megabyte-granular region for an object that was going to be
+rewritten anyway. That is fixed: the pin decision now asks whether anything
+REWRITES the word, not only whether the abstract interpreter MODELS it.
+
+The other two rows are only rewritten under
+`CRATONVM_JIT_REMAP_ALL_UNVERIFIABLE=1`, whose own doc says it is a diagnostic
+and not a proposed default. With it on, 252 more words divert from pin to
+movable — and the row does not move, because the A5 frames' vetoes dominate:
+the pin set is keyed by OBJECT and one unrewritable sighting outranks every
+movable claim.
+
+### What would actually fix it
+
+**Precise roots for the unregistered-frame band.** The A5 sweep exists because a
+compiled frame can be live without a `JitEntryGuard`, and a conservative sweep
+is the only answer available when nothing describes the frame. Give those
+frames the same oop maps the registered ones have and the sweep is unnecessary,
+the pin set collapses to the band scan's residue, and — by the floor
+measurement above — Type 3 passes with room to spare.
+
+The alternative, sub-region pinning, is not available: G1 frees a region by
+evacuating everything out of it, so one unmovable object holds the whole
+megabyte whatever the collector does around it.
+
+### Status of the two switches after this pass
+
+Both are **off by default**, and the reason is the same number.
+
+`CRATONVM_GC_MOVABLE_BAND_ROOTS` (producer) is ON: it publishes the verifiable
+half of the band partition, which `publish_unrewritable_band_roots` already
+computed and dropped. That is a correctness completion, not a behaviour change
+on its own, and the generational path has consumed the partition for as long as
+it has existed.
+
+`CRATONVM_GC_G1_MOVABLE_PINS` (consumer) is **off**. It is correct and it is
+wired, and on this row it drops **1 pin out of 34** — an A/B on the row lands
+inside host noise (on 10975/9972, off 8961/13005). It cannot do better while
+4794 of ~5200 JIT roots arrive from a span sweep that makes no claim either way.
+A live GC behaviour change bought for one pin in thirty-four is risk without
+return; it is one flag away for whoever gives the unregistered-frame band a
+layout.
+
+**What is NOT the fix**, each refuted by measurement on this page: narrowing the
+band scan (no effect), narrowing G1's pin set by the movable partition alone
+(the partition is starved, not wrong), shrinking the region size (arithmetic
+above), and the deopt `SavedRegisters` block on its own (594 of 744 remaining
+words, but they are not what keeps the last five regions pinned).
+
 ## What to do, and what not to
+
+> **DONE 2026-09-09.** All three parts below are implemented on
+> `claude/jit-reg-oop-maps-20260909` and jointly take Type 0 from 3224 to 2227.
+> Each is separately switchable (`CRATONVM_GC_DEAD_SPILL_ROOTS`,
+> `CRATONVM_GC_OUTGOING_ARG_ROOTS`, `CRATONVM_GC_REG_OOP_MAPS`) and all three
+> are load-bearing: any one alone leaves Type 0 at 3224. Item 1 was NOT solved
+> by the prologue-zeroing this list proposed — the safepoint's own
+> `pending_staged_args_unmapped` already proves the reserve holds nothing of
+> this frame's, so a `Some` register mask carries the proof and the reserve can
+> simply be skipped. The list is kept as written for the record.
 
 **The fix is per-safepoint liveness for compiled-frame words** — the compiled
 analogue of `runtime::local_liveness::live_locals_mask`, which is exactly why
@@ -258,8 +506,10 @@ test measures something real, two of three arms pass it, and the region count is
 held near 2048 on purpose (`G1_TARGET_REGION_COUNT`).
 
 **Do not** narrow G1's pin set by the movable/unrewritable partition on the
-strength of this page. It is refuted above, and the ordering defect means the
-partition is not even computed at the point G1 reads it.
+strength of this page — see [the movable partition is right, inert, and
+starved](#the-movable-partition-is-right-inert-and-starved) for the measurement,
+and note that this paragraph's original reason (an "ordering defect") was itself
+wrong and is corrected there.
 
 ## Reproducer
 

@@ -124,7 +124,7 @@ pub mod map_incomplete_cause {
     /// slots, sets no `map_incomplete`, and bumps nothing, so the safepoint
     /// would publish a map claiming complete coverage while every live reference
     /// local is unnamed. That is a real hole in the shape of the one
-    /// `bug-h2-testrandommapops-small-heap-corruption-20260829.md` is about.
+    /// `bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md` is about.
     ///
     /// **Measured 2026-09-02, and it reads ZERO** on every method of
     /// `probes/SafepointMapResidue.java`, including the one whose frames the
@@ -984,6 +984,144 @@ impl Compiler {
         true
     }
 
+    /// Which GPRs may hold a LIVE object reference at the current safepoint, as
+    /// a bitmask over [`ALL_SPILL_GPRS`] positions — [`crate::OopMapEntry::reg_oop_mask`].
+    ///
+    /// `emit_pre_safepoint_spill` writes the register file into the frame so a
+    /// conservative scan can see it, and that image is BLIND: every register's
+    /// last value is retained, live or not. This is the narrowing, and it is the
+    /// register-file counterpart of the `frame_slot_offsets` the same map
+    /// already carries.
+    ///
+    /// # What licenses excluding a register
+    ///
+    /// Exactly one claim: **a live reference is either on the simulated operand
+    /// stack, or in a live oop local, or staged for the pending call.** All
+    /// three are modelled here register-by-register.
+    ///
+    /// The third one was originally waved through on the grounds that a staged
+    /// argument is "frame-resident by the time this runs", since
+    /// `pending_staged_arg_oops` holds FRAME offsets. That is true and it is
+    /// not enough. Frame-residency answers the MAP's question — is the object
+    /// findable at all — and this function is asking the REGISTER file's
+    /// question, which is a different one. `pop_invoke_args` takes the argument
+    /// entries off the simulated stack while the registers that held them still
+    /// hold them, so between that pop and the `CALL` a reference sits in, say,
+    /// `r14` with its mask bit clear. Copying a value to the frame does not
+    /// erase it from the register. `pending_call_oop_arg_regs` is the missing
+    /// half, and the two channels are now both consulted.
+    ///
+    /// This is the same model `collect_live_oop_homes` publishes to the shadow
+    /// stack, read for a different question. That function asks "what must I
+    /// make rewritable"; this asks "what may hold a reference at all", which is
+    /// a superset — it keeps `Scratch` and XMM-adjacent cases the shadow push
+    /// refuses, because for a mask they are answers rather than refusals.
+    ///
+    /// # Fail-open, in one direction only
+    ///
+    /// Every uncertainty returns `None`, which means "no claim" and leaves the
+    /// consumer scanning the whole image — the behaviour from before this
+    /// existed. A `Some` that is too NARROW frees a live object, so each
+    /// refusal below is load-bearing rather than tidy:
+    ///
+    /// * marks out of sync with the stack, or not exact — the marks are then not
+    ///   a type map and an unmarked entry may still be a reference;
+    /// * the local oop dataflow did not reach this pc — no per-bci statement
+    ///   about which locals hold references;
+    /// * an inline scope whose mask is unavailable — a spliced callee's locals
+    ///   are references this frame's mask does not describe;
+    /// * `local_oop_window_count` refusing the method outright;
+    /// * `pending_staged_args_unmapped` — a reference argument was staged into
+    ///   the native outgoing-argument area, the direct-call service slots, or an
+    ///   inlined callee's parameter locals, none of which this compiler can
+    ///   name. Its own doc calls that fail-closed, and this is the same close.
+    ///
+    /// `RAX` is kept unconditionally. It is where the emitter materialises every
+    /// loaded, allocated and returned reference before it is pushed or stored,
+    /// so it can hold one in flight at a point the simulated stack does not yet
+    /// describe. One slot is not worth the argument.
+    fn live_oop_register_mask(
+        &self,
+        staged_args_unmapped: bool,
+        call_oop_arg_regs: u16,
+    ) -> Option<u16> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !reg_oop_maps_enabled() || self.failed {
+            reg_oop_mask_cause::DISABLED.fetch_add(1, Relaxed);
+            return None;
+        }
+        // A reference staged where no map can name it. Fail closed.
+        //
+        // PASSED IN, not read from `self`: `emit_oop_map_for_safepoint` takes
+        // the flag before it calls this, so reading the field here always saw
+        // `false` and this clause was dead code wearing the appearance of a
+        // guard.
+        if staged_args_unmapped {
+            reg_oop_mask_cause::STAGED_ARGS_UNMAPPED.fetch_add(1, Relaxed);
+            return None;
+        }
+        if self.stack.len() != self.stack_oop_marks.len() {
+            reg_oop_mask_cause::MARK_DESYNC.fetch_add(1, Relaxed);
+            return None;
+        }
+        if !self.stack.is_empty() && !self.stack_oop_marks_exact {
+            reg_oop_mask_cause::MARKS_INEXACT.fetch_add(1, Relaxed);
+            return None;
+        }
+        if crate::x64::licm::local_oop_window_count(self.num_locals).is_none() {
+            reg_oop_mask_cause::LOCAL_WINDOWS.fetch_add(1, Relaxed);
+            return None;
+        }
+        for scope in &self.inline_oop_scopes {
+            if scope.mask_at_cur().is_none() {
+                reg_oop_mask_cause::INLINE_SCOPE.fetch_add(1, Relaxed);
+                return None;
+            }
+        }
+        let bit = crate::x64::licm::spill_gpr_bit;
+        // RAX — see the doc above.
+        let mut mask = bit(RAX);
+        // The pending call's own reference arguments, in the registers they
+        // still occupy. `pop_invoke_args` took them off the simulated stack, so
+        // the loop below cannot see them; see `pending_call_oop_arg_regs`.
+        mask |= call_oop_arg_regs;
+        // Operand-stack entries the marks call references, in whichever
+        // register holds them. `Scratch` is included rather than refused: it is
+        // flushed before every call, so it is normally empty here, and when it
+        // is not the honest answer is a set bit.
+        let n = self.stack.len().min(self.stack_oop_marks.len());
+        for i in 0..n {
+            if !self.stack_oop_marks[i] {
+                continue;
+            }
+            match self.stack[i] {
+                StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg, ..) => mask |= bit(reg),
+                StackSlot::Frame(_) | StackSlot::Xmm(_) => {}
+            }
+        }
+        // Reference locals live at THIS pc, in their register homes. The
+        // frame-homed ones need no bit: they are not in the spill image.
+        let mut reached = true;
+        let mut regs: Vec<u8> = Vec::new();
+        let ok = self.for_each_oop_local_at_current_pc(|k| {
+            if let Some(r) = self.reg_for_local(k) {
+                regs.push(r);
+            }
+        });
+        if !ok {
+            reached = false;
+        }
+        if !reached {
+            reg_oop_mask_cause::LOCAL_DATAFLOW.fetch_add(1, Relaxed);
+            return None;
+        }
+        for r in regs {
+            mask |= bit(r);
+        }
+        reg_oop_mask_cause::PUBLISHED.fetch_add(1, Relaxed);
+        Some(mask)
+    }
+
     /// Return whether the shadow-stack push can prove it will publish every
     /// live oop for the current safepoint. Any `false` result is a correctness
     /// signal to the GC: if this frame is live here, moving-young must divert to
@@ -1834,7 +1972,21 @@ impl Compiler {
         // A reference staged somewhere no map can name it (native-ABI outgoing
         // args, direct-call service slots, inlined-callee parameter locals).
         // Fail closed.
-        if std::mem::take(&mut self.pending_staged_args_unmapped) {
+        //
+        // Taken into a LOCAL because `live_oop_register_mask` refuses on this
+        // same bit and runs later in this function -- see the call site, which
+        // once carried a comment claiming the state was "still un-taken at this
+        // point". It was not: this take is ~140 lines above it, so the mask's
+        // fail-closed clause read a flag that had already been cleared and the
+        // refusal could never fire. The cause counter reading zero looked like
+        // "nothing ever stages unmappably" and was really "the question is
+        // never asked".
+        let staged_args_unmapped = std::mem::take(&mut self.pending_staged_args_unmapped);
+        // Same discipline, same reason: taken here so a staging site that emits
+        // no map cannot leak its argument registers into a later safepoint's
+        // mask, and passed to `live_oop_register_mask` rather than re-read.
+        let call_oop_arg_regs = std::mem::take(&mut self.pending_call_oop_arg_regs);
+        if staged_args_unmapped {
             map_incomplete = true;
             map_incomplete_cause::STAGED_ARG_UNMAPPABLE
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1966,6 +2118,14 @@ impl Compiler {
                     map_incomplete,
                 ),
                 live_frame_hi,
+                // The register-file half of this map. Computed here rather than
+                // in `emit_shadow_push` for the same reason
+                // `moving_young_coverage_complete` is fixed up here: this is
+                // where the map is actually built. The staged-argument state it
+                // refuses on has ALREADY been taken by this point, so it is
+                // passed in rather than re-read -- see `staged_args_unmapped`.
+                reg_oop_mask: self
+                    .live_oop_register_mask(staged_args_unmapped, call_oop_arg_regs),
                 // The oracle a stale-word report needs to say "live". Taken
                 // through the shared accessor so the method-entry poll records
                 // its parameter mask rather than a `None` (see

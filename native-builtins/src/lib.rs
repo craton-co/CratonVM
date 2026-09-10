@@ -145,6 +145,60 @@ fn system_property_check_key(
     Ok(key)
 }
 
+/// What `System.getProperty` answers, in precedence order.
+///
+/// Three sources, and the order is the whole content of this function:
+///
+///  1. the system `Properties` object's own real `map`, when it has one;
+///  2. the VM's system-property store;
+///  3. [`system_property_fallback`], the bootstrap defaults.
+///
+/// (1) is new with the Phase 3 `java/util/Properties` retirement and is the
+/// half a mirror cannot do. `System.setProperty` and `System.clearProperty`
+/// write BOTH stores, so those two never disagree. What has no mirror is real
+/// JDK bytecode reached through a reference the caller already holds --
+/// `System.getProperties().setProperty(k, v)` -- which writes the map and
+/// nothing else. Asking the map first is what makes that write visible here.
+///
+/// It cannot be the ONLY source: the map is refilled from the store by
+/// `System.getProperties()`, so between two such calls it legitimately lags a
+/// property the VM has set, and every miss has to fall through. The two orders
+/// are not interchangeable -- store-first would answer the STALE value for a
+/// key written through the receiver, which is the update half of the same
+/// defect and would have left `SystemRuntimeObjectSweep` row 39 green for the
+/// wrong reason (it adds a key rather than changing one).
+///
+/// # The residual, and why this order and not the other
+///
+/// A property written into the VM store by RUST -- `set_system_property` from
+/// somewhere in the VM, with no `System.setProperty` involved -- is masked here
+/// by an older value in the map, until the next `System.getProperties()` call
+/// refills it. The reverse order has a residual too, and a worse one: it masks
+/// every write through a held `Properties` reference, which is Java-visible.
+///
+/// The tie-break is not a guess about which is rarer. On a real JDK there is
+/// exactly one store and it IS the `Properties` object -- `System.getProperty`
+/// is literally `props.getProperty(key)`. This VM's own store is the shim, so
+/// when the two disagree the object is the one telling the truth about what
+/// Java did, and the store is the one that has to catch up. That is the same
+/// direction the whole §1.4 retirement campaign moves in.
+///
+/// Cost: one `invoke_virtual` per call, and only once a system `Properties`
+/// singleton exists with a filled `map`. MEASURED as affordable rather than
+/// assumed -- `System.getProperty`'s native carries `invocations: 0` in the
+/// probe-tree census, because the VM's own reads go through
+/// `NativeContext::get_system_property` in Rust and JDK callers go through
+/// `StaticProperty`'s cached statics. This is not a hot path.
+pub(crate) fn system_property_read(ctx: &mut dyn NativeContext, key: &str) -> Option<String> {
+    if let Some(props) = crate::lang_system::system_props_singleton(ctx.vm_identity()) {
+        if let Some(v) = crate::properties_sidetable::lookup_in_real_map(ctx, props, key) {
+            return Some(v);
+        }
+    }
+    ctx.get_system_property(key)
+        .or_else(|| system_property_fallback(ctx, key))
+}
+
 pub(crate) fn system_property_fallback(ctx: &dyn NativeContext, key: &str) -> Option<String> {
     // An explicit `System.setProperties(p)` REPLACES the property map, and a
     // key absent from the replacement is absent -- not a cue to fall back to a
@@ -7369,6 +7423,358 @@ pub(crate) fn java_long_to_string_radix(val: i64, radix: i32) -> String {
     buf.into_iter().rev().collect()
 }
 
+/// The process-wide `System.getProperties()` receiver, allocated once.
+///
+/// Factored out of that native's body because there are now two bodies for it,
+/// one per compatibility mode, and the object's IDENTITY is the half that
+/// must not differ between them: HotSpot returns the same `System.props` object
+/// on every call, and `StandardEnvironmentTests.getSystemProperties` asserts
+/// `isSameAs`. A second copy of the singleton lookup is the shape that
+/// eventually grows a second cache.
+fn system_properties_object(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    match crate::lang_system::system_props_singleton(ctx.vm_identity()) {
+        Some(cached) => Ok(cached),
+        None => {
+            let p = crate::try_alloc_concurrent_synthetic(ctx, "java/util/Properties", 16)?;
+            crate::properties_sidetable::mark_system_props(ctx, p);
+            Ok(crate::lang_system::set_system_props_singleton(
+                ctx.vm_identity(),
+                p,
+            ))
+        }
+    }
+}
+
+/// `java.lang.System.getProperties()` — the `--real-jdk` body, unchanged.
+///
+/// Lifted out of a closure when the strict body below joined it, so the two
+/// are one registration with two bodies rather than two registrations of one
+/// triple: a duplicate `register` of this triple is a `shadowed_registrations`
+/// row, and `native-builtins/tests/duplicate_registration_gate.rs` freezes
+/// that population.
+fn native_system_get_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // Return a lightweight synthetic Properties object.  The
+    // Properties.getProperty/getProperty(default) native overrides
+    // below intercept the common read paths and delegate to our
+    // VM's system property store — so individual lookups work
+    // without touching the inherited Hashtable slots.
+    //
+    // However, callers that *enumerate* (Properties.forEach,
+    // stringPropertyNames, size, entrySet) read from the
+    // side-table directly. SmallRye / Quarkus's
+    // `PropertiesConfigSource` iterates `System.getProperties()`
+    // to materialise its config map; if the side-table is empty,
+    // expressions like `${user.country:}` resolve to the empty
+    // default — producing values like `quarkus.locales=en-`.
+    // Pre-populate the side-table with the current system
+    // property snapshot so enumeration sees the live values.
+    // Identity: reuse the cached singleton so `System.getProperties()
+    // == System.getProperties()` holds — HotSpot returns the same
+    // `System.props` object every call (SC-env-classreading RC-A,
+    // StandardEnvironmentTests.getSystemProperties `isSameAs`). On the
+    // first call build the synthetic Properties and mark it as the
+    // system-properties view so writes through it (e.g.
+    // `System.getProperties().setProperty(...)`) propagate to the global
+    // store — regular `new Properties()` objects must NOT (they'd pollute
+    // system properties and cross-contaminate other Properties).
+    let props = system_properties_object(ctx)?;
+    // Resync the side-table to the current system-property snapshot on
+    // every call — whether the object is fresh or cached — so enumeration
+    // (forEach/stringPropertyNames/entrySet/size) and `getProperty` see
+    // the live values. A wholesale REPLACE (not additive store) is
+    // required for the cached singleton: it drops keys removed by
+    // `System.clearProperty(...)` between calls, matching HotSpot
+    // (additive merge would leave a cleared property visible).
+    let snapshot = ctx.list_system_properties();
+    crate::properties_sidetable::replace_sidetable(ctx, props, &snapshot);
+    Ok(Some(Value::Object(Some(props))))
+}
+
+/// `java.lang.System.getProperties()` under `--jdk-only`: the same object,
+/// plus a real, populated `map`.
+///
+/// See [`crate::properties_sidetable::replace_real_map`] for the measurement
+/// and for what reads that field. The side-table store is kept as well as the
+/// real map, deliberately: strict mode still dispatches every
+/// `properties_sidetable` native until those triples are retired, so the two
+/// stores must agree rather than one replace the other. They are written from
+/// ONE snapshot, on the same call, for that reason.
+/// The `SharedSecrets` access objects the real `initPhase1` publishes, and the
+/// image class that implements each.
+///
+/// `jdk.internal.access.SharedSecrets` is a box of `private static` fields, one
+/// per subsystem, each holding an object that lets `java.base` internals reach
+/// across package boundaries. The real JDK fills them during bootstrap --
+/// `System.setJavaLangAccess()` from `initPhase1`, the reflect one from
+/// `AccessibleObject`'s initialisation -- and every getter is
+/// `return theField;`.
+///
+/// This VM registers NATIVES for those getters, so the fields have never
+/// mattered. They start mattering the moment a getter is declined: the real
+/// accessor runs and returns null, and the null does not stay local, because
+/// real JDK classes capture the result into statics of their OWN during class
+/// initialisation. `sun.nio.cs.UTF_8.JLA` and
+/// `jdk.internal.constant.ConstantUtils.JLA` are two such copies.
+///
+/// # The entries are measured, not enumerated
+///
+/// `SharedSecrets` has around thirty of these fields. Only the ones a corpus
+/// vector actually reached are here, each with the vector that named it, so the
+/// list stays a record of what was needed rather than a guess at what might be.
+///
+/// # Every carrier is a REAL image class, and that is the whole trick
+///
+/// `java.lang.System$1` implements all 88 members of `JavaLangAccess` in
+/// bytecode; `java.lang.reflect.ReflectAccess` does the same for
+/// `JavaLangReflectAccess`. `try_alloc_concurrent_synthetic` resolves the real
+/// class id when the image has it, so what is published is a genuine instance
+/// and every method real code calls on it has a real body. There is nothing to
+/// implement here -- the objects already work, they were simply never handed
+/// to the field that the JDK reads them from.
+const SHARED_SECRETS_TO_PUBLISH: &[(&str, &str)] = &[
+    // `sun.nio.cs.UTF_8.JLA` -> `uncheckedEncodeASCII`, reached through
+    // `PrintStream.write`. Named by RJdkHello, RCollections, RJdkCollections,
+    // RJdkRecords and RImmutableFactoryTypes.
+    ("javaLangAccess", "java/lang/System$1"),
+    // `JavaLangReflectAccess.getExecutableSharedParameterTypes`, reached
+    // through the reflection machinery. Named by RJdkHello and RJdkRecords
+    // once the entry above stopped being their first failure.
+    ("javaLangReflectAccess", "java/lang/reflect/ReflectAccess"),
+];
+
+/// Publish the [`SHARED_SECRETS_TO_PUBLISH`] carriers, returning how many
+/// landed.
+///
+/// Idempotent, and silent on failure by design: this runs during `initPhase1`,
+/// before most of the Java world exists, and a carrier whose class cannot be
+/// allocated yet simply leaves its field as it was -- which is exactly the
+/// behaviour every one of these fields had before this function existed.
+fn publish_shared_secrets(ctx: &mut dyn NativeContext) -> usize {
+    let mut published = 0usize;
+    for (field, carrier) in SHARED_SECRETS_TO_PUBLISH {
+        let Ok(obj) = try_alloc_concurrent_synthetic(ctx, carrier, 1) else {
+            continue;
+        };
+        ctx.set_static_field_by_name(
+            "jdk/internal/access/SharedSecrets",
+            field,
+            Value::Object(Some(obj)),
+        );
+        published += 1;
+    }
+    published
+}
+
+/// Fill `jdk.internal.misc.VM.savedProps`, which the real `initPhase1` sets
+/// through `VM.saveProperties(Map)`.
+///
+/// # Why it is not optional
+///
+/// `VM.getSavedProperty` is not a convenience wrapper; it THROWS when the map
+/// is absent:
+///
+/// ```java
+///     public static String getSavedProperty(String key) {
+///         if (savedProps == null)
+///             throw new IllegalStateException("Not yet initialized");
+/// ```
+///
+/// So a null here is not a null answer, it is an exception out of whatever
+/// `<clinit>` happened to ask first -- and the classes that ask are the ones
+/// every program needs:
+///
+/// ```text
+/// ExceptionInInitializerError, class jdk/internal/loader/ClassLoaders
+///   caused by IllegalStateException: Not yet initialized
+///     at jdk/internal/misc/VM.getSavedProperty(VM.java:211)
+///     at jdk/internal/loader/ClassLoaders.<clinit>(ClassLoaders.java:66)
+/// ```
+///
+/// MEASURED 2026-09-09 by classifying all 108 remaining failures of
+/// `CRATONVM_ENFORCE_NATIVE_SHADOW=all`: **11 of them are this field**, the
+/// largest single mechanical family left after the `SharedSecrets` wave.
+///
+/// # A real `HashMap`, filled through its own bytecode
+///
+/// `savedProps` is a `Map<String, String>` and real code calls `get` on it, so
+/// what goes in has to be a working map rather than a carrier. Built with
+/// `new_object_initialized` and filled with `invoke_virtual`, exactly as
+/// [`crate::properties_sidetable::replace_real_map`] fills the `Properties`
+/// backing map -- same GC discipline for the same reason: every `put` re-enters
+/// Java and is a collection point, so the receiver is pinned and re-read
+/// across the loop.
+///
+/// # Absent or complete, never half
+///
+/// The same invariant the rest of this cluster keeps. A partially filled
+/// `savedProps` would stop throwing and start answering `null` for keys it is
+/// missing, and `VM.getSavedProperty("java.home")` answering null is the shape
+/// of the 2026-07-14 `InternalError: null property: java.home` regression. On
+/// any failure the field is left exactly as it was.
+fn publish_vm_saved_props(ctx: &mut dyn NativeContext) -> bool {
+    let entries = ctx.list_system_properties();
+    if entries.is_empty() {
+        return false;
+    }
+    let created = ctx.new_object_initialized("java/util/HashMap", "()V", &[]);
+    let map = match created {
+        Ok(Some(Value::Object(Some(m)))) => m,
+        _ => return false,
+    };
+    let map_pin = ctx.pin_native_root(map);
+    let mut map_cur = ctx.read_native_pin(map_pin, map);
+    let mut written = 0usize;
+    let mut failed = false;
+    for (key, value) in &entries {
+        let k = ctx.create_string(key);
+        let k_pin = ctx.pin_native_root(k);
+        let v = ctx.create_string(value);
+        let k_cur = ctx.read_native_pin(k_pin, k);
+        map_cur = ctx.read_native_pin(map_pin, map_cur);
+        let put = ctx.invoke_virtual(
+            map_cur,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(k_cur)), Value::Object(Some(v))],
+        );
+        ctx.unpin_native_roots(k_pin);
+        match put {
+            Ok(_) => written += 1,
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+        map_cur = ctx.read_native_pin(map_pin, map_cur);
+    }
+    ctx.unpin_native_roots(map_pin);
+    if failed || written != entries.len() {
+        return false;
+    }
+    ctx.set_static_field_by_name(
+        "jdk/internal/misc/VM",
+        "savedProps",
+        Value::Object(Some(map_cur)),
+    );
+    true
+}
+
+/// Make the system `Properties` singleton real and publish it on
+/// `java.lang.System.props`, returning whether the field now holds it.
+///
+/// # Why the static field matters on its own
+///
+/// `System.getProperty` IS `props.getProperty(key)` in the real JDK
+/// (`System.java:744`). This VM answers that method from a native, so the field
+/// has never mattered and has never been set -- `native_system_init_phase1`'s
+/// own doc comment lists *"Sets up the system properties map (`System.props`)"*
+/// as step 1 of what the real `initPhase1` does, and the body does everything
+/// but that.
+///
+/// It stops being free the moment any real `System` bytecode runs. MEASURED
+/// 2026-09-09, `CRATONVM_ENFORCE_NATIVE_SHADOW=all` on the whole corpus:
+///
+/// ```text
+/// NullPointerException: Cannot invoke "java.util.Properties.getProperty(String)"
+///   because "java.lang.System.props" is null
+///     at java/lang/System.getProperty(System.java:744)
+///     at RJdkHello.systemStreams(RJdkHello.java:42)
+/// ```
+///
+/// That is the FIRST line of the FIRST vector. It is the same defect as the
+/// null `Properties.map` this cluster just closed, one level up, and the
+/// cluster-root comment on the `getProperties` registration said as much:
+/// making that native return a real `Properties` was *the cluster's first
+/// move*, not its last.
+///
+/// # It publishes a POPULATED receiver or nothing
+///
+/// `replace_real_map` keeps the invariant that the real `map` holds the whole
+/// snapshot or is ABSENT, and returns the count it wrote. Publishing a
+/// `Properties` whose `map` is null would trade one NPE for the same NPE a
+/// frame deeper; publishing one whose `map` is EMPTY would be worse still,
+/// because `getProperty` stops throwing and starts answering `null` -- the
+/// 2026-07-14 `InternalError: null property: java.home` regression, reached
+/// from a third direction. So a zero return leaves the field exactly as it was.
+fn publish_real_system_props(ctx: &mut dyn NativeContext) -> bool {
+    let Ok(props) = system_properties_object(ctx) else {
+        return false;
+    };
+    let snapshot = ctx.list_system_properties();
+    crate::properties_sidetable::replace_sidetable(ctx, props, &snapshot);
+    if crate::properties_sidetable::replace_real_map(ctx, props, &snapshot) == 0 {
+        return false;
+    }
+    ctx.set_static_field_by_name("java/lang/System", "props", Value::Object(Some(props)));
+    true
+}
+
+
+/// `System.initPhase1()V` under `--jdk-only`: the real body, plus the field it
+/// has always been documented to set.
+///
+/// A registration-time branch rather than a check inside the shared body, for
+/// the reason the `getProperties` pair gives: `NativeCallback` is a bare `fn`
+/// pointer that captures nothing and `NativeContext` exposes no policy
+/// accessor, deliberately.
+///
+/// `--real-jdk` keeps the unchanged body and keeps the null field. That is not
+/// timidity: the singleton only acquires a real `map` on the `--jdk-only` path,
+/// so stamping it in compatible mode would publish a `Properties` that real
+/// bytecode cannot read -- the NPE moved one frame, which is the shape this
+/// whole cluster keeps producing when a receiver is made half-real.
+///
+/// Failure is silent and safe by construction. `initPhase1` runs before most of
+/// the Java world exists; if the `ConcurrentHashMap` cannot be constructed yet,
+/// `publish_real_system_props` writes nothing and the field stays null, which is
+/// exactly today's behaviour. `native_system_get_properties_jdk_only` retries on
+/// every call, so the field is published at the latest on the first
+/// `System.getProperties()`.
+fn native_system_init_phase1_jdk_only(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // BEFORE the body, and this ordering is measured rather than tidy.
+    // `native_system_init_phase1` installs charsets on the system streams,
+    // which initialises `java/nio/charset/Charset` and with it `sun.nio.cs.UTF_8`
+    // -- whose `<clinit>` CAPTURES `SharedSecrets.getJavaLangAccess()` into its
+    // own `JLA` static. Published after the body, the field is set and
+    // `UTF_8.JLA` still holds the null it captured on the way past.
+    //
+    // MEASURED: publishing after the body cleared
+    // `jdk.internal.constant.ConstantUtils.JLA` (initialised later) and left
+    // `sun.nio.cs.UTF_8.JLA` null, which is the same NPE one vector further on.
+    publish_shared_secrets(ctx);
+    let result = lang_system::native_system_init_phase1(ctx, args)?;
+    // AFTER, for the two that need a working Java world. `publish_real_system_props`
+    // constructs a `ConcurrentHashMap`; the JLA publish is repeated because it is
+    // idempotent and because a pre-body attempt can legitimately fail while the
+    // class loader is still coming up.
+    publish_real_system_props(ctx);
+    publish_shared_secrets(ctx);
+    publish_vm_saved_props(ctx);
+    Ok(result)
+}
+
+fn native_system_get_properties_jdk_only(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let props = system_properties_object(ctx)?;
+    // HARVEST BEFORE REFILL. `replace_real_map` clears the map and refills it
+    // from the VM store, so anything written straight through the receiver --
+    // `System.getProperties().setProperty(k, v)`, which is real JDK bytecode
+    // once `java/util/Properties` is retired -- has to be folded back into the
+    // store first or this call is what erases it.
+    crate::properties_sidetable::harvest_real_map(ctx, props);
+    // Re-publishes `java.lang.System.props` as a side effect, which is what
+    // makes the field correct after a `System.setProperties(p)` swapped the
+    // singleton, and what gives it a second chance if `initPhase1` ran too
+    // early to construct the backing map.
+    publish_real_system_props(ctx);
+    Ok(Some(Value::Object(Some(props))))
+}
+
 pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     register_essential_natives_with_shims(registry, app_shims::ShimSelection::ALL);
 }
@@ -10796,10 +11202,7 @@ pub fn register_essential_natives_with_shims(
             // 2026-08-29 -- see [`system_property_check_key`], which all four
             // entry points now share so they cannot drift apart again.
             let key = system_property_check_key(ctx, args)?;
-            match ctx
-                .get_system_property(&key)
-                .or_else(|| system_property_fallback(ctx, &key))
-            {
+            match system_property_read(ctx, &key) {
                 Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
                 None => Ok(Some(Value::Object(None))),
             }
@@ -10815,10 +11218,7 @@ pub fn register_essential_natives_with_shims(
             // default was the more misleading of the two, because it looks
             // exactly like a correctly-handled missing property.
             let key = system_property_check_key(ctx, args)?;
-            match ctx
-                .get_system_property(&key)
-                .or_else(|| system_property_fallback(ctx, &key))
-            {
+            match system_property_read(ctx, &key) {
                 Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
                 None => Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None)))),
             }
@@ -10854,6 +11254,10 @@ pub fn register_essential_natives_with_shims(
             // property as absent even though `System.getProperty("foo")` sees it.
             if let Some(props) = crate::lang_system::system_props_singleton(ctx.vm_identity()) {
                 crate::properties_sidetable::store_property_in_sidetable(ctx, props, &key, &val);
+                // And the REAL map, which is the store once the `Properties`
+                // natives are retired. Inert while the field is null, so
+                // `--real-jdk` is untouched.
+                crate::properties_sidetable::store_property_in_real_map(ctx, props, &key, &val);
             }
             match old {
                 Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
@@ -10877,6 +11281,7 @@ pub fn register_essential_natives_with_shims(
             // the matching comment in `setProperty` above (SC-web-method-spel RC-A).
             if let Some(props) = crate::lang_system::system_props_singleton(ctx.vm_identity()) {
                 crate::properties_sidetable::remove_property_from_sidetable(ctx, props, &key);
+                crate::properties_sidetable::remove_property_from_real_map(ctx, props, &key);
             }
             match result {
                 Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
@@ -10895,9 +11300,22 @@ pub fn register_essential_natives_with_shims(
         "setProperties",
         "(Ljava/util/Properties;)V",
         |ctx, args| {
+            // The side table FIRST, and the real map only when it is empty.
+            // Order matters both ways round: a VM-built `Properties` has a side
+            // table and may have no real map, and a `new Properties()` built by
+            // real `<init>` has a real map and no side table. Reading the
+            // wrong one silently installs an EMPTY property set, which is how
+            // `SystemRuntimeObjectSweep`'s `setProperties round trip` row read
+            // `null/null/true` under the Phase 3 retirement.
             let entries = match args.first() {
                 Some(Value::Object(Some(props))) => {
-                    crate::properties_sidetable::snapshot_sidetable(ctx, *props)
+                    let from_sidetable =
+                        crate::properties_sidetable::snapshot_sidetable(ctx, *props);
+                    if from_sidetable.is_empty() {
+                        crate::properties_sidetable::snapshot_real_map(ctx, *props)
+                    } else {
+                        from_sidetable
+                    }
                 }
                 _ => Vec::new(),
             };
@@ -11006,53 +11424,26 @@ pub fn register_essential_natives_with_shims(
     // — the 67 are in `properties_sidetable.rs` (32), `deprecated_util.rs`,
     // `deprecated_io_util.rs` and `wildfly_naming.rs`. The full table and the
     // rest of the cluster are on `register_properties_sidetable`.
+    //
+    // 2026-09-09 — THE CLUSTER'S FIRST MOVE, taken under `--jdk-only`. The note
+    // above asks for it in these words: *"make THIS return a real `Properties`
+    // — real `<init>`, real `map`"*. Strict mode now populates the real
+    // `java.util.concurrent.ConcurrentHashMap` in the real `map` field, which is
+    // what every JDK 25 `Properties` body reads.
+    //
+    // The branch is on the REGISTRY's mode and picks a BODY, not a second
+    // registration: §1.4's lever is registration, `NativeCallback` is a bare
+    // `fn` pointer that captures nothing, and `NativeContext` exposes no policy
+    // accessor — deliberately. Same shape as the `Runtime.loadLibrary0` arm in
+    // `lang_system.rs`. `--real-jdk` keeps the null `map` it has always had.
     registry.register(
         "java/lang/System",
         "getProperties",
         "()Ljava/util/Properties;",
-        |ctx, _args| {
-            // Return a lightweight synthetic Properties object.  The
-            // Properties.getProperty/getProperty(default) native overrides
-            // below intercept the common read paths and delegate to our
-            // VM's system property store — so individual lookups work
-            // without touching the inherited Hashtable slots.
-            //
-            // However, callers that *enumerate* (Properties.forEach,
-            // stringPropertyNames, size, entrySet) read from the
-            // side-table directly. SmallRye / Quarkus's
-            // `PropertiesConfigSource` iterates `System.getProperties()`
-            // to materialise its config map; if the side-table is empty,
-            // expressions like `${user.country:}` resolve to the empty
-            // default — producing values like `quarkus.locales=en-`.
-            // Pre-populate the side-table with the current system
-            // property snapshot so enumeration sees the live values.
-            // Identity: reuse the cached singleton so `System.getProperties()
-            // == System.getProperties()` holds — HotSpot returns the same
-            // `System.props` object every call (SC-env-classreading RC-A,
-            // StandardEnvironmentTests.getSystemProperties `isSameAs`). On the
-            // first call build the synthetic Properties and mark it as the
-            // system-properties view so writes through it (e.g.
-            // `System.getProperties().setProperty(...)`) propagate to the global
-            // store — regular `new Properties()` objects must NOT (they'd pollute
-            // system properties and cross-contaminate other Properties).
-            let props = match crate::lang_system::system_props_singleton(ctx.vm_identity()) {
-                Some(cached) => cached,
-                None => {
-                    let p = crate::try_alloc_concurrent_synthetic(ctx, "java/util/Properties", 16)?;
-                    crate::properties_sidetable::mark_system_props(ctx, p);
-                    crate::lang_system::set_system_props_singleton(ctx.vm_identity(), p)
-                }
-            };
-            // Resync the side-table to the current system-property snapshot on
-            // every call — whether the object is fresh or cached — so enumeration
-            // (forEach/stringPropertyNames/entrySet/size) and `getProperty` see
-            // the live values. A wholesale REPLACE (not additive store) is
-            // required for the cached singleton: it drops keys removed by
-            // `System.clearProperty(...)` between calls, matching HotSpot
-            // (additive merge would leave a cleared property visible).
-            let snapshot = ctx.list_system_properties();
-            crate::properties_sidetable::replace_sidetable(ctx, props, &snapshot);
-            Ok(Some(Value::Object(Some(props))))
+        if registry.compatibility_mode().is_jdk_only() {
+            native_system_get_properties_jdk_only
+        } else {
+            native_system_get_properties
         },
     );
     // Surefire bootstrap: Maven wraps system properties in
@@ -11660,7 +12051,11 @@ pub fn register_essential_natives_with_shims(
         "java/lang/System",
         "initPhase1",
         "()V",
-        lang_system::native_system_init_phase1,
+        if registry.compatibility_mode().is_jdk_only() {
+            native_system_init_phase1_jdk_only
+        } else {
+            lang_system::native_system_init_phase1
+        },
     );
 
     // --- java.lang.String (native methods + overrides) ---
@@ -12438,7 +12833,49 @@ pub fn register_essential_natives_with_shims(
     // This intentionally mirrors the synthetic-mode override at
     // `phases_late.rs::register_p59_module` so real-JDK and synthetic-jdk
     // boot paths see the same Module shape — see vm/tests/wave3_console_module.rs.
-    registry.register(
+    // REVIEWED `Intrinsic`, 2026-09-10, and the review is
+    // `apps/probes/ClassModuleSweep.java`.
+    //
+    // This is a §1.4 shadow by the letter and NOT one in substance, which is
+    // the case §1.4's reviewed-`Intrinsic` exception exists for.
+    // `Class.getModule()` is not `ACC_NATIVE` -- its body is `return module;`
+    // -- so a native in front of it shadows real bytecode and the contract's
+    // remedy is to yield. **That remedy cannot work here.**
+    // `java.lang.Class.module` is `private transient Module` and NO JAVA CODE
+    // WRITES IT: a real JVM populates it at class-definition time through
+    // `Module.defineModule0`. Yielding returns null, and a null Module is what
+    // 12 of the 108 remaining failures under
+    // `CRATONVM_ENFORCE_NATIVE_SHADOW=all` were -- a null `module`,
+    // `callerModule` or `thisModule` one or two frames later, through
+    // `ClassLoader.postDefineClass` -> `NamedPackage.<init>`.
+    //
+    // The tag was `Bridge` with `kind_stated: false` -- ambient, never chosen
+    // (see the module header on `NativeKind` being ambient). So this states a
+    // decision rather than overturning one.
+    //
+    // An `Intrinsic` claims SEMANTICS-PRESERVING, and that claim is earned
+    // rather than asserted. `ClassModuleSweep` is 32 rows against HotSpot
+    // 25.0.3+9 -- module names for `java.base`, a platform module, the unnamed
+    // module, primitives, arrays of both, nested/anonymous/lambda classes;
+    // Module identity WITHIN one VM, which the JDK depends on because `Module`
+    // does not override `equals`; and `isNamed`/`getName`/`getClassLoader`/
+    // `getDescriptor`/`isOpen`/`isExported`/`canRead`/`getLayer`.
+    //
+    //     31 of 32 rows byte-identical to HotSpot.
+    //
+    // The ONE deviation is recorded and NOT fixed here:
+    //
+    //     32 layer of unnamed is null    HotSpot true, this VM false
+    //
+    // `Module.getLayer()` on the UNNAMED module should be null and is not. That
+    // is a defect in `Module.getLayer`, not in `getModule`, and tagging this
+    // triple does not freeze it -- the sweep is checked in, so the row goes red
+    // the day it is fixed or the day this answer drifts.
+    //
+    // What this does NOT license: the rest of the `java/lang/Module` surface
+    // stays `Bridge`. The claim here is about ONE triple whose backing field no
+    // Java code can fill.
+    registry.register_with_kind(
         "java/lang/Class",
         "getModule",
         "()Ljava/lang/Module;",
@@ -12596,6 +13033,7 @@ pub fn register_essential_natives_with_shims(
             ctx.cache_module_mirror(module_name.as_deref(), m_obj);
             Ok(Some(Value::Object(Some(m_obj))))
         },
+        NativeKind::Intrinsic,
     );
 
     // `java.lang.Module` access checks — registry-backed exports/opens modeling.
@@ -13606,6 +14044,23 @@ pub fn register_essential_natives_with_shims(
         "()Ljava/security/ProtectionDomain;",
         |ctx, args| {
             let pd = try_alloc_concurrent_synthetic(ctx, "java/security/ProtectionDomain", 4)?;
+            // GC-safety: `pd` is allocated FIRST and written LAST, and almost
+            // everything between the two allocates — a `java.net.URL`, a
+            // `CodeSource`, several strings, and a nested
+            // `native_class_get_class_loader`. A moving young collection at any
+            // of those relocates `pd`, and this closure then populates and
+            // RETURNS the pre-move address.
+            //
+            // The interpreter's return-value barrier cannot save it:
+            // `safe_native_call` heals a stale return through
+            // `load_and_forward`, which reads the forwarding marker at the old
+            // address — and that marker is gone once the allocator has
+            // re-served the span, which is exactly the window this workload
+            // reads it in. MEASURED on BindableTests under
+            // `CRATONVM_DBG_GC_STRESS=262144`: `[deadref-nret]` named this
+            // native returning an address in the emptied semispace, reached
+            // from ByteBuddy's `trySelfResolve(Class)`.
+            let pd_pin = ctx.pin_native_root(pd);
             // Try to produce a real CodeSource with a URL pointing at the
             // classpath entry that holds this Class.
             let mut path_opt = if let Some(Value::Object(Some(mirror))) = args.first() {
@@ -13735,7 +14190,16 @@ pub fn register_essential_natives_with_shims(
                 .ok()
                 .flatten()
                 .unwrap_or(Value::Object(None));
-            lang_class::populate_protection_domain_fields(ctx, pd, codesource, classloader)?;
+            // Read `pd` back from its pin — the whole point of taking it. Every
+            // allocation above is behind us, and `populate_protection_domain_fields`
+            // must write through the LIVE address, not the one this closure
+            // started with.
+            let pd = ctx.read_native_pin(pd_pin, pd);
+            let populated =
+                lang_class::populate_protection_domain_fields(ctx, pd, codesource, classloader);
+            let pd = ctx.read_native_pin(pd_pin, pd);
+            ctx.unpin_native_roots(pd_pin);
+            populated?;
             Ok(Some(Value::Object(Some(pd))))
         },
     );

@@ -1390,7 +1390,49 @@ use cratonvm_types::compat::CompatibilityMode;
 /// the replay rather than about this change, and raising the baseline on the
 /// registry-identity evidence is not the same as waving it through.
 ///
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1646;
+/// # Re-frozen 2026-09-09: +251 rows, and the whole of it is ONE wave
+///
+/// `native-api`'s `RETIRED_SHADOW_PHASE3_TRIPLES` retires the
+/// `java/util/concurrent/ConcurrentHashMap` + `java/util/Properties` union as a
+/// §1.4 shadow wave. `NativeMethodRegistry::register` re-tags a retired triple
+/// `SyntheticStub`, and that re-tag is NOT gated on compatibility mode -- it
+/// fires wherever `effective_category()` is `Bridge` -- so a `--jdk-only`
+/// retirement moves this compatible-mode census. It changes the KIND and not
+/// the body: `SyntheticStub` is refused only by `allowed_in(JdkOnly)`, so the
+/// registry this gate censuses still dispatches every one of these natives.
+///
+/// The account this file demands, measured rather than attributed. Both halves
+/// are from `dump_synthetic_stubs` on this tree, once with the phase-3 arm of
+/// `triple_is_retired_shadow` disabled and once with it live:
+///
+/// ```text
+///   distinct SyntheticStub triples   1519 -> 1704   (+185)
+///   of the 185, on the two prefixes  185            (ALL of them)
+///   of the 185, anywhere else        0
+/// ```
+///
+/// 185 is the whole table. The gate counts REGISTRATIONS rather than distinct
+/// triples, so it moves by 251: the extra 66 are re-registrations of triples
+/// already in that 185, which the re-tag flips at every ordinal.
+///
+/// # The three constants were 3, 12 and 3 ABOVE the tree they claim to freeze
+///
+/// Found by taking the before-number instead of trusting the baseline as one.
+/// With the phase-3 arm disabled this tree observes 1643 / 1632 / 1632 against
+/// constants of 1646 / 1635 / 1644. The gate asserts `<=`, so a DECREASE passes
+/// silently and accumulated slack is invisible -- which is the failure mode the
+/// `SLACK: usize = 0` constant above exists to prevent and cannot, once the
+/// numbers have drifted apart for other reasons.
+///
+/// The `synthetic-jdk` arm's 12 is the interesting one. Its true count is
+/// IDENTICAL to `no-management`'s, so the feature adds no stub row at all and
+/// its constant was frozen against a tree that no longer exists. That is the
+/// arm-rot recorded for this configuration elsewhere: nothing in CI builds it,
+/// so nothing re-measures it. Re-freezing to the observed number is what
+/// removes the slack, and it is why this wave's delta reads +251 against the
+/// tree and +237/+248/+251 against the constants.
+///
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1894;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1419,7 +1461,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1646;
 /// unowned for three days before it had a constant at all.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1635;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1883;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1476,7 +1518,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1635;
 /// re-freeze ALL THREE — see the pointer on both siblings.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1644;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1883;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///

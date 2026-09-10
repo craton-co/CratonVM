@@ -5739,6 +5739,45 @@ impl Drop for G1Collector {
     }
 }
 
+/// `CRATONVM_GC_G1_MOVABLE_PINS=1` — let G1's pin set honour the
+/// movable/rewritable partition, as the generational path already does.
+/// **Default OFF.**
+///
+/// # Correct, wired, and still not worth a default
+///
+/// Two things that once made it inert are fixed. The whole-cycle
+/// `coverage_incomplete` gate is gone from this path (see the comment at
+/// `honour_movable` for why that is the generational collector's question, not
+/// G1's), and `publish_unrewritable_band_roots` now publishes the verifiable
+/// half of the band partition instead of computing it and dropping it.
+///
+/// What did not change is the yield, and that is the number this default rests
+/// on. On H2 `TestValueMemory` Type 3 the filter drops **1 pin out of 34**:
+///
+/// ```text
+/// [g1][MOVPIN] snapshot=34 kept=33 movable_claimed=2 unrew_veto=7
+/// ```
+///
+/// and an A/B on the row itself lands inside this host's noise (on 10975/9972,
+/// off 8961/13005). The reason is not this filter: 4794 of ~5200 JIT roots come
+/// from the A5 unregistered-frame SPAN sweep, which has no per-frame layout and
+/// so publishes neither half of the partition — nothing here can act on roots
+/// that never made a claim. See the H2 page for that measurement.
+///
+/// So it ships off, for the same reason it shipped off the first time: a live
+/// GC behaviour change bought for one pin in thirty-four is risk without
+/// return. It is kept, correct and one flag away, for whoever gives the
+/// unregistered-frame band a layout.
+fn g1_movable_pins_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_GC_G1_MOVABLE_PINS") {
+            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"),
+            Err(_) => false,
+        },
+    )
+}
+
 impl G1Collector {
     /// Bind this heap to its VM's compact-layout domain.
     pub fn set_layout_domain(&self, domain: u32) {
@@ -19482,10 +19521,99 @@ impl G1Collector {
         set
     }
 
+    /// The regions a live JIT frame forces out of the collection set.
+    ///
+    /// # The movable partition, which this used to ignore
+    ///
+    /// Not every conservative JIT root has to be pinned. A reference the shadow
+    /// stack published is PRECISE and REWRITABLE -- `shadow_stack.remap`
+    /// rewrites it after a move and the JIT's post-safepoint reload refreshes
+    /// the register from the (rewritten) frame slot -- so its object may be
+    /// evacuated like any other. `gc_quiescence` carries that partition, and
+    /// `gen_heap::collect_garbage_inner` has consulted it since the moving
+    /// young generation shipped:
+    ///
+    /// ```text
+    /// let movable = honour_movable
+    ///     && is_movable_jit_root(a)
+    ///     && !is_unrewritable_jit_root(a);
+    /// if is_y(a) && !movable { pin_base_of(a, &mut pinned); }
+    /// ```
+    ///
+    /// G1 applied NO such filter: every address in the snapshot pinned its
+    /// region. On a region-granular collector that is the expensive way to be
+    /// wrong -- a pinned region leaves the collection set WHOLESALE, so one
+    /// rewritable reference costs a whole megabyte at `-Xmx2g`. On H2's
+    /// `TestValueMemory` Type 3 it pinned 14 regions for 12474 KB from 38
+    /// addresses of which only 10 were actually unrewritable, and G1 read
+    /// ~11000 where the generational collector read 1149 and ZGC 1205 on the
+    /// same row.
+    ///
+    /// The three conjuncts are the generational path's, unchanged and for its
+    /// reasons: `honour_movable` is the whole-cycle proof that precise coverage
+    /// held, `is_movable_jit_root` is the per-address claim that a rewritable
+    /// channel names it, and `is_unrewritable_jit_root` is the VETO -- the pin
+    /// set is keyed by OBJECT, so one rewritable channel naming an address must
+    /// not license moving it out from under every other word that also holds
+    /// it, such as a compiled frame's callee-saved register image, which
+    /// `band_slot_is_verifiable` refuses to inspect and no channel rewrites.
+    ///
+    /// Gated OFF by default on `CRATONVM_GC_G1_MOVABLE_PINS` — see that function
+    /// for the measurement that says why.
     fn jit_pinned_region_set(&self) -> RegionSet {
+        // NOT gated on `moving_young_coverage_incomplete`, and the difference
+        // from the generational path is the whole point.
+        //
+        // That flag is a WHOLE-CYCLE proof, and the generational collector needs
+        // one because its question is "may I move the young generation at all"
+        // -- one unproven frame and the entire cycle must fall back to the
+        // non-moving sweep. G1's question is per-region, and the claim it rests
+        // on is per-ADDRESS: a movable publication says this object's every band
+        // sighting is either rewritten by `remap_one_jit_frame` or dead, and
+        // that is true or false about one object regardless of what some other
+        // frame could not prove about itself.
+        //
+        // Keeping the whole-cycle gate here was measured, and it made the filter
+        // inert: `coverage_incomplete=true` on the very pause this exists for,
+        // so `honour_movable=false` and all 38 pins survived a filter that had
+        // nothing wrong with it.
+        //
+        // The fail-closed direction is preserved by the PUBLISHER, not by this
+        // gate: `publish_unrewritable_band_roots` publishes movable only for
+        // words it can argue about, and vetoes the address outright when any
+        // unverifiable word also names it.
+        let honour_movable = g1_movable_pins_enabled();
         let mut set: RegionSet = if crate::gc_quiescence::is_active() {
-            crate::gc_quiescence::pinned_jit_roots_snapshot()
-                .into_iter()
+            let snap = crate::gc_quiescence::pinned_jit_roots_snapshot();
+            let (mut n_mov, mut n_unrew) = (0usize, 0usize);
+            let kept: Vec<usize> = snap
+                .iter()
+                .copied()
+                .filter(|&addr| {
+                    let claimed = crate::gc_quiescence::is_movable_jit_root(addr);
+                    let vetoed = crate::gc_quiescence::is_unrewritable_jit_root(addr);
+                    if claimed {
+                        n_mov += 1;
+                    }
+                    if vetoed {
+                        n_unrew += 1;
+                    }
+                    !(honour_movable && claimed && !vetoed)
+                })
+                .collect();
+            if gc_flags().g1_dbg_pins {
+                tracing::warn!(
+                    "[g1][MOVPIN] snapshot={} kept={} movable_claimed={} unrew_veto={}                      honour_movable={} coverage_incomplete={} movable_set={}",
+                    snap.len(),
+                    kept.len(),
+                    n_mov,
+                    n_unrew,
+                    honour_movable,
+                    crate::gc_quiescence::moving_young_coverage_incomplete(),
+                    crate::gc_quiescence::movable_jit_root_count(),
+                );
+            }
+            kept.into_iter()
                 .filter_map(|addr| self.lookup_region_for_addr(addr))
                 .collect()
         } else {

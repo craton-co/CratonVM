@@ -753,12 +753,58 @@ fn tls_soa_pool_clear() {
 /// `cap` is `effective_max_locals`, which is already clamped to at least the
 /// slots the arguments need, so the bound below is defensive rather than
 /// load-bearing — it preserves [`copy_args_to_locals`]'s clamp exactly.
+/// `CRATONVM_DBG_DEADREF_STORE`: report an argument that is already dead at the
+/// moment it is laid into a callee frame's locals.
+///
+/// This is the choke point the `set_local` guard cannot see. An invoke pops its
+/// arguments off the caller's operand stack into a Rust slice, and only then
+/// builds the callee frame — resolving the method, initialising its class, and
+/// carving the frame's buffers, any of which can run a moving young collection.
+/// The slice is not a GC root and is not remapped, so a collection there leaves
+/// every reference in it naming the pre-move address, and the frame is then
+/// built from those. Nothing downstream can attribute it: the value arrives in
+/// the callee's `local[n]` looking exactly like one the caller passed.
+///
+/// Cheap and off by default — a `OnceLock<bool>` load and a predicted
+/// not-taken branch per argument.
+#[inline]
+fn note_dead_arg(args: &[Value], site: &'static str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| cratonvm_types::flags().gc.dbg_deadref_store) {
+        return;
+    }
+    for (i, a) in args.iter().enumerate() {
+        let Value::Object(Some(o)) = a else { continue };
+        let Some(reason) =
+            cratonvm_gc::gen_heap::dead_young_ref_reason_global(o.as_ptr() as usize)
+        else {
+            continue;
+        };
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+            eprintln!(
+                "[deadref-arg] {reason} {site}: arg[{i}] = 0x{:x} is already dead as it is laid                  into the callee's locals — the argument slice was held across a collection.                  caller:
+{:?}",
+                o.as_ptr() as usize,
+                std::backtrace::Backtrace::force_capture(),
+            );
+        }
+    }
+}
+
+/// Public shim for [`note_dead_arg`], so the invoke paths can ask the same
+/// question at their own entry — see the call in `try_stackless_invoke`.
+pub(crate) fn note_dead_arg_pub(args: &[Value], site: &'static str) {
+    note_dead_arg(args, site);
+}
+
 fn push_args_to_locals(
     locals: &mut Vec<CompactValue>,
     kinds: &mut Vec<u8>,
     args: &[Value],
     cap: usize,
 ) {
+    note_dead_arg(args, "push_args_to_locals");
     for arg in args {
         if locals.len() >= cap {
             return;
@@ -782,6 +828,7 @@ fn push_args_to_locals(
 /// (deopt resume, frozen-frame rehydration). The frame-push path uses
 /// [`push_args_to_locals`] instead — see that function for why.
 fn copy_args_to_locals(locals: &mut [CompactValue], kinds: &mut [u8], args: &[Value]) {
+    note_dead_arg(args, "copy_args_to_locals");
     let mut slot = 0;
     for arg in args {
         if slot < locals.len() {
@@ -946,6 +993,30 @@ fn build_cached_compact_parts(
     kinds.clear();
     locals.reserve(n);
     kinds.reserve(n);
+    // The compact half of `note_dead_arg` — same choke point, same reason, but
+    // the values arrive already encoded so the check reads the pointer out of
+    // the `CompactValue` instead of a `Value`.
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| cratonvm_types::flags().gc.dbg_deadref_store) {
+            for (i, (cv, _)) in args.iter().enumerate() {
+                let Some(p) = cv.as_object_ptr() else { continue };
+                let Some(reason) = cratonvm_gc::gen_heap::dead_young_ref_reason_global(p as usize)
+                else {
+                    continue;
+                };
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                    eprintln!(
+                        "[deadref-arg] {reason} build_cached_compact_parts: arg[{i}] = 0x{p:x}                          is already dead as it is laid into {}'s locals — the argument slice was                          held across a collection. caller:
+{:?}",
+                        cached.method_name,
+                        std::backtrace::Backtrace::force_capture(),
+                    );
+                }
+            }
+        }
+    }
     for (cv, tag) in args {
         locals.push(*cv);
         match *tag {
@@ -1858,6 +1929,45 @@ impl Frame {
             // address the moment the allocator re-issues it, so a hit here is a
             // reference to memory the collector moved an object out of and
             // nothing has been allocated into since.
+            // `CRATONVM_DBG_DEADREF_STORE`: the arm the ledger below cannot
+            // reach.
+            //
+            // The ledger is exact only while the address is still un-reissued,
+            // and this workload's stale references are installed into frames
+            // AFTER the allocator has handed the address out again — so the
+            // ledger has forgotten it and the guard below prints nothing. The
+            // geometry predicate has no such window: a young address in the
+            // emptied semispace, or one in the active semispace whose header
+            // words are zero, names no live object whatever the ledger
+            // remembers.
+            //
+            // This is the store that matters, because a frame local is where a
+            // stale reference stops being a VM-internal value and becomes one
+            // bytecode can dispatch on.
+            {
+                static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *ON.get_or_init(|| cratonvm_types::flags().gc.dbg_deadref_store) {
+                    if let Value::Object(Some(o)) = value {
+                        if let Some(reason) =
+                            cratonvm_gc::gen_heap::dead_young_ref_reason_global(o.as_ptr() as usize)
+                        {
+                            static M: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            if M.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                                eprintln!(
+                                    "[deadref-local] {reason} storing 0x{:x} into {}.{}                                      local[{i}] pc={} — the value names no live object, so this                                      is where a dead reference becomes a Java-visible one.                                      caller:
+{:?}",
+                                    o.as_ptr() as usize,
+                                    self.class_name(),
+                                    self.method_name(),
+                                    self.pc,
+                                    std::backtrace::Backtrace::force_capture(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             if cratonvm_gc::gc_quiescence::vacated_frames_enabled() {
                 if let Value::Object(Some(o)) = value {
                     cratonvm_gc::gc_quiescence::check_stale_use(

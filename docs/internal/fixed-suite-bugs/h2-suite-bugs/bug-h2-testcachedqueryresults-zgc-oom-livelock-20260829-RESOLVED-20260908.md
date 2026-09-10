@@ -1590,7 +1590,7 @@ The reading this section was written under, kept because the argument it
 supports is still the one to re-test: that page established, with
 `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0` as the narrow switch (0/3), that
 relocation under LIVE COMPILED FRAMES was implicated, and linked it to
-`bug-h2-testrandommapops-small-heap-corruption-20260829.md`, "hunting an
+`docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md`, "hunting an
 unnamed root in a compiled frame for days".
 
 Enabling relocation under live JIT frames is precisely and only what this credit

@@ -1314,6 +1314,12 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             }
         }
 
+        // DBG: the PRE-collection half of the heap-stale verifier. Its whole
+        // point is to be paired with the post-GC call further down — see
+        // `verify_heap_object_fields_pre_gc`: without it a stale field cannot
+        // be dated, because the semispaces alternate and the post-GC pass
+        // reports the same field on every second cycle forever.
+        crate::memory::gc::verify_heap_object_fields_pre_gc(shared);
         // Truncation-checked: alive_count (usize) to u32; thread count realistically bounded
         let alive_count =
             u32::try_from(shared.threads.thread_registry.alive_count()).unwrap_or(u32::MAX);
