@@ -7499,6 +7499,72 @@ fn native_system_get_properties(ctx: &mut dyn NativeContext, _args: &[Value]) ->
 /// `properties_sidetable` native until those triples are retired, so the two
 /// stores must agree rather than one replace the other. They are written from
 /// ONE snapshot, on the same call, for that reason.
+/// The `SharedSecrets` access objects the real `initPhase1` publishes, and the
+/// image class that implements each.
+///
+/// `jdk.internal.access.SharedSecrets` is a box of `private static` fields, one
+/// per subsystem, each holding an object that lets `java.base` internals reach
+/// across package boundaries. The real JDK fills them during bootstrap --
+/// `System.setJavaLangAccess()` from `initPhase1`, the reflect one from
+/// `AccessibleObject`'s initialisation -- and every getter is
+/// `return theField;`.
+///
+/// This VM registers NATIVES for those getters, so the fields have never
+/// mattered. They start mattering the moment a getter is declined: the real
+/// accessor runs and returns null, and the null does not stay local, because
+/// real JDK classes capture the result into statics of their OWN during class
+/// initialisation. `sun.nio.cs.UTF_8.JLA` and
+/// `jdk.internal.constant.ConstantUtils.JLA` are two such copies.
+///
+/// # The entries are measured, not enumerated
+///
+/// `SharedSecrets` has around thirty of these fields. Only the ones a corpus
+/// vector actually reached are here, each with the vector that named it, so the
+/// list stays a record of what was needed rather than a guess at what might be.
+///
+/// # Every carrier is a REAL image class, and that is the whole trick
+///
+/// `java.lang.System$1` implements all 88 members of `JavaLangAccess` in
+/// bytecode; `java.lang.reflect.ReflectAccess` does the same for
+/// `JavaLangReflectAccess`. `try_alloc_concurrent_synthetic` resolves the real
+/// class id when the image has it, so what is published is a genuine instance
+/// and every method real code calls on it has a real body. There is nothing to
+/// implement here -- the objects already work, they were simply never handed
+/// to the field that the JDK reads them from.
+const SHARED_SECRETS_TO_PUBLISH: &[(&str, &str)] = &[
+    // `sun.nio.cs.UTF_8.JLA` -> `uncheckedEncodeASCII`, reached through
+    // `PrintStream.write`. Named by RJdkHello, RCollections, RJdkCollections,
+    // RJdkRecords and RImmutableFactoryTypes.
+    ("javaLangAccess", "java/lang/System$1"),
+    // `JavaLangReflectAccess.getExecutableSharedParameterTypes`, reached
+    // through the reflection machinery. Named by RJdkHello and RJdkRecords
+    // once the entry above stopped being their first failure.
+    ("javaLangReflectAccess", "java/lang/reflect/ReflectAccess"),
+];
+
+/// Publish the [`SHARED_SECRETS_TO_PUBLISH`] carriers, returning how many
+/// landed.
+///
+/// Idempotent, and silent on failure by design: this runs during `initPhase1`,
+/// before most of the Java world exists, and a carrier whose class cannot be
+/// allocated yet simply leaves its field as it was -- which is exactly the
+/// behaviour every one of these fields had before this function existed.
+fn publish_shared_secrets(ctx: &mut dyn NativeContext) -> usize {
+    let mut published = 0usize;
+    for (field, carrier) in SHARED_SECRETS_TO_PUBLISH {
+        let Ok(obj) = try_alloc_concurrent_synthetic(ctx, carrier, 1) else {
+            continue;
+        };
+        ctx.set_static_field_by_name(
+            "jdk/internal/access/SharedSecrets",
+            field,
+            Value::Object(Some(obj)),
+        );
+        published += 1;
+    }
+    published
+}
+
 /// Make the system `Properties` singleton real and publish it on
 /// `java.lang.System.props`, returning whether the field now holds it.
 ///
@@ -7549,6 +7615,7 @@ fn publish_real_system_props(ctx: &mut dyn NativeContext) -> bool {
     true
 }
 
+
 /// `System.initPhase1()V` under `--jdk-only`: the real body, plus the field it
 /// has always been documented to set.
 ///
@@ -7573,8 +7640,24 @@ fn native_system_init_phase1_jdk_only(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // BEFORE the body, and this ordering is measured rather than tidy.
+    // `native_system_init_phase1` installs charsets on the system streams,
+    // which initialises `java/nio/charset/Charset` and with it `sun.nio.cs.UTF_8`
+    // -- whose `<clinit>` CAPTURES `SharedSecrets.getJavaLangAccess()` into its
+    // own `JLA` static. Published after the body, the field is set and
+    // `UTF_8.JLA` still holds the null it captured on the way past.
+    //
+    // MEASURED: publishing after the body cleared
+    // `jdk.internal.constant.ConstantUtils.JLA` (initialised later) and left
+    // `sun.nio.cs.UTF_8.JLA` null, which is the same NPE one vector further on.
+    publish_shared_secrets(ctx);
     let result = lang_system::native_system_init_phase1(ctx, args)?;
+    // AFTER, for the two that need a working Java world. `publish_real_system_props`
+    // constructs a `ConcurrentHashMap`; the JLA publish is repeated because it is
+    // idempotent and because a pre-body attempt can legitimately fail while the
+    // class loader is still coming up.
     publish_real_system_props(ctx);
+    publish_shared_secrets(ctx);
     Ok(result)
 }
 

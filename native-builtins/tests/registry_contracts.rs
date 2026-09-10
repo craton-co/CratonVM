@@ -928,4 +928,21 @@ fn the_jdk_only_init_phase1_arm_publishes_the_system_props_field() {
         body[at..end].contains(PUBLISH),
         "{BODY} no longer calls {PUBLISH}, so java.lang.System.props goes back          to null and real System.getProperty bytecode NPEs on its first call."
     );
+
+    // The same arm publishes the OTHER static the real `initPhase1` sets, and
+    // it is checked here rather than in a test of its own because they share
+    // one body: a future edit that keeps the branch and drops one call would
+    // pass every other assertion in this file.
+    //
+    // `SharedSecrets.javaLangAccess` is the larger of the two by blast radius.
+    // Real JDK code captures it into statics of its own during class
+    // initialisation (`sun.nio.cs.UTF_8.JLA`,
+    // `jdk.internal.constant.ConstantUtils.JLA`), so a null propagates and then
+    // persists -- MEASURED as the single largest family of first failures under
+    // `CRATONVM_ENFORCE_NATIVE_SHADOW=all`, nine of sixteen sampled vectors.
+    const PUBLISH_JLA: &str = "publish_shared_secrets";
+    assert!(
+        body[at..end].contains(PUBLISH_JLA),
+        "{BODY} no longer calls {PUBLISH_JLA}. SharedSecrets.getJavaLangAccess()          is a shadow like any other; declined, the real accessor returns the          static, and nothing else sets it."
+    );
 }
