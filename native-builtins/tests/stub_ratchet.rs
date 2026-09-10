@@ -1466,7 +1466,19 @@ use cratonvm_types::compat::CompatibilityMode;
 ///
 /// `BASELINE_INTRINSICS` was READ in the same runs and did not move — it is a
 /// CEILING and would not have said so on its own.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1898;
+///
+/// **+13 on 2026-09-10, and NOT this lane's.** Lane 2 landed
+/// `RETIRED_SHADOW_L2_TRIPLES` (three `java/lang/Character` rows and ten
+/// `java/math/BigInteger` rows) in b88e4d9fb without re-freezing any of the
+/// three resolves, so this gate was RED on pristine `dev` from that merge. The
+/// L7 merge is where it was noticed and it is paid off here rather than left
+/// for whoever landed next: all three arms moved by exactly 13, which is the
+/// size of that table, and every row is the same CASE ONE relabel — a
+/// registration-time refusal re-tags an existing `Bridge`, it adds no
+/// `register(` call site and the total registration count is unmoved (13610
+/// no-management, 13978 management, both unchanged). Numbers pasted from each
+/// arm's own `stub-ratchet: const ...` line, not derived from one another.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1911;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1495,7 +1507,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1898;
 /// unowned for three days before it had a constant at all.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1887;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1900;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1552,7 +1564,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1887;
 /// re-freeze ALL THREE — see the pointer on both siblings.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1887;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1900;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
