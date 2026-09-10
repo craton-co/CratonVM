@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-537 tokens.
+538 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -532,6 +532,7 @@ export inherited from a parent shell.
 | `stw-native-ring` | `CRATONVM_DBG_STW_NATIVE_RING` |
 | `surefire-ipc-dbg` | `CRATONVM_SUREFIRE_IPC_DBG` |
 | `swchain` | `CRATONVM_DBG_SWCHAIN` |
+| `carrier` | `CRATONVM_DBG_CARRIER` |
 | `sweep-census` | `CRATONVM_DBG_SWEEP_CENSUS` |
 | `sweep-edges` | `CRATONVM_DBG_SWEEP_EDGES` |
 | `unreg-declined` | `CRATONVM_DBG_UNREG_DECLINED` |

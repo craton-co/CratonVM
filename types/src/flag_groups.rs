@@ -975,6 +975,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "stw-native-ring", on_key: Some("CRATONVM_DBG_STW_NATIVE_RING"), off_key: None, off_word: None, since: "2026-07-05" },
     E { group: Group::DBG, token: "surefire-ipc-dbg", on_key: Some("CRATONVM_SUREFIRE_IPC_DBG"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::DBG, token: "swchain", on_key: Some("CRATONVM_DBG_SWCHAIN"), off_key: None, off_word: None, since: "2026-08-20" },
+    // One line per starvation-watchdog sample: the carrier pool's queue depth,
+    // busy/live counts and dispatch counter, plus the per-state thread census.
+    // This is the reading that showed the pool running away from its base 32 to
+    // 233 on `VthreadGcStress` while `dispatch_count` sat frozen -- the shape a
+    // wall clock reports only as "the VM hung". Sampled on the watchdog's own
+    // interval, so it costs nothing when off and nothing hot when on.
+    E { group: Group::DBG, token: "carrier", on_key: Some("CRATONVM_DBG_CARRIER"), off_key: None, off_word: None, since: "2026-09-09" },
     E { group: Group::DBG, token: "sweep-census", on_key: Some("CRATONVM_DBG_SWEEP_CENSUS"), off_key: None, off_word: None, since: "2026-07-07" },
     E { group: Group::DBG, token: "sweep-edges", on_key: Some("CRATONVM_DBG_SWEEP_EDGES"), off_key: None, off_word: None, since: "2026-06-03" },
     E { group: Group::DBG, token: "unreg-declined", on_key: Some("CRATONVM_DBG_UNREG_DECLINED"), off_key: None, off_word: None, since: "2026-09-06" },
