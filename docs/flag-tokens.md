@@ -607,7 +607,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-422 tokens.
+423 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -746,6 +746,7 @@ export inherited from a parent shell.
 | `ir-reg-authoritative` | `CRATONVM_JIT_IR_REG_AUTHORITATIVE` |
 | `ir-gp-wide` | `CRATONVM_JIT_IR_GP_WIDE` |
 | `ir-epoch-guard-rip` | `CRATONVM_JIT_IR_EPOCH_GUARD_RIP` |
+| `code-near-globals` | `CRATONVM_JIT_CODE_NEAR_GLOBALS` |
 | `ir-speculate` | `CRATONVM_JIT_IR_SPECULATE` |
 | `band-skip` | `CRATONVM_JIT_BAND_SKIP` |
 | `ls-carry-relief` | `CRATONVM_JIT_LS_CARRY_RELIEF` |

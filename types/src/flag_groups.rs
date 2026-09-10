@@ -1415,6 +1415,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-reg-authoritative", on_key: Some("CRATONVM_JIT_IR_REG_AUTHORITATIVE"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
     E { group: Group::JIT, token: "ir-gp-wide", on_key: Some("CRATONVM_JIT_IR_GP_WIDE"), off_key: None, off_word: None, since: "2026-09-10" },
     E { group: Group::JIT, token: "ir-epoch-guard-rip", on_key: Some("CRATONVM_JIT_IR_EPOCH_GUARD_RIP"), off_key: None, off_word: Some("0"), since: "2026-09-10" },
+    E { group: Group::JIT, token: "code-near-globals", on_key: Some("CRATONVM_JIT_CODE_NEAR_GLOBALS"), off_key: None, off_word: None, since: "2026-09-10" },
     E { group: Group::JIT, token: "ir-speculate", on_key: Some("CRATONVM_JIT_IR_SPECULATE"), off_key: None, off_word: None, since: "2026-09-09" },
     // Diagnosis lever, value-taking: a comma-separated list of conservative
     // root-band CLASSES to skip (`operand-spill`,
