@@ -2862,6 +2862,25 @@ pub fn record_moved_history(pairs: &[(usize, usize, u32)]) {
     }
 }
 
+/// Did the collector ever move an object AWAY from `addr`, and where to?
+///
+/// The raw ledger read behind [`stale_use_verdict`], without that function's
+/// "and the space has since been re-issued under a different class" screen.
+/// Two very different defects produce a dangling reference and this is what
+/// separates them: `Some` means the referent MOVED and something failed to
+/// rewrite the reference; `None` means it was never relocated, so it was
+/// reclaimed while still referenced — or the reference was never right.
+///
+/// Requires `CRATONVM_DBG_VACATED_FRAMES`; `None` when the ledger is off, which
+/// a caller must not read as "was never moved".
+pub fn moved_away_to(addr: usize) -> Option<(usize, u32)> {
+    if !vacated_frames_enabled() || addr == 0 || addr % 8 != 0 {
+        return None;
+    }
+    let g = MOVED_HISTORY.read();
+    g.as_ref()?.get(&addr).copied()
+}
+
 /// Is `addr` a reference to an object the collector moved away, whose space has
 /// since been handed out to an object of a DIFFERENT class?
 ///

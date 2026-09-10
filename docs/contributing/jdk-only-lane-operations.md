@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | Permanent. This is process, not a work item; it does not retire when a campaign does. |
 | **Normative source** | [`../feature-designs/jdk-only-mode.md`](../feature-designs/jdk-only-mode.md) |
-| **Companions** | [`../jdk-only-migration.md`](../jdk-only-migration.md) · [`../jdk-only-native-review.md`](../jdk-only-native-review.md) · [`../known-issues/jdk-only/INDEX.md`](../known-issues/jdk-only/INDEX.md) · [`jdk-only-lanes/`](jdk-only-lanes/lane-0-integration-and-gates.md) |
+| **Companions** | [`../jdk-only-migration.md`](../jdk-only-migration.md) · [`../jdk-only-native-review.md`](../jdk-only-native-review.md) · [`../known-issues/jdk-only/INDEX.md`](../known-issues/jdk-only/INDEX.md) · [`jdk-only-lanes/`](../known-issues/jdk-only-lanes/lane-0-integration-and-gates.md) |
 
 **Why this page exists separately from any handoff.** The eight-lane campaign of
 2026-08-28/29 ran from `HANDOFF-20260828-SCOPE.md`, whose §3 and §5 were the
@@ -22,7 +22,7 @@ the rule, because that is the part that makes it stick.
 the same however many lanes run. What a parallel campaign needs *in addition* --
 who owns which class prefixes, who may edit the shared gate cells, the build
 queue, and the merge order -- is in
-[`jdk-only-lanes/lane-0-integration-and-gates.md`](jdk-only-lanes/lane-0-integration-and-gates.md),
+[`jdk-only-lanes/lane-0-integration-and-gates.md`](../known-issues/jdk-only-lanes/lane-0-integration-and-gates.md),
 which is the ownership authority for the nine-lane split of 2026-09-10. Read it
 before starting a lane; read this page for how to work inside one.
 

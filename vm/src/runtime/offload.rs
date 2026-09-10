@@ -6564,8 +6564,8 @@ pub(crate) mod input_cache {
     /// caller-saved registers on the hot path to fund a call taken
     /// essentially never. Instead it sets one byte here -- see
     /// `cratonvm_jit::gpu_barrier` for the eleven-instruction sequence --
-    /// and [`drain_compiled_writes`] does the eviction from Rust before
-    /// anything can READ the cache.
+    /// and [`drain_locked`] does the eviction from Rust before anything
+    /// can READ the cache.
     ///
     /// Indexed by the same `(addr >> 3) & 63` bucket [`addr_bit`] uses,
     /// so a dirty bucket names at most the entries that filter bit
@@ -6590,33 +6590,20 @@ pub(crate) mod input_cache {
         DIRTY.as_ptr() as usize
     }
 
-    /// Evict every entry a compiled array store marked dirty.
+    /// Evict every entry a compiled array store marked dirty, with the
+    /// cache mutex ALREADY HELD.
     ///
-    /// Called before every read of the cache, which is what makes the
-    /// deferral invisible: the window between a compiled store and this
-    /// drain contains no consultation of the cache, so no stale buffer
-    /// can be handed out inside it. Also called at the top of
-    /// [`remap_and_sweep`] -- there, before the table is re-keyed, while
-    /// its keys are still the addresses the compiled store bucketed.
+    /// **The only drain.** Every getter below calls it after taking the
+    /// lock and before the lookup, and [`remap_and_sweep`] calls it
+    /// before the re-key -- while the table's keys are still the
+    /// addresses the compiled store bucketed. That is what makes the
+    /// deferral invisible: the window between a compiled store and the
+    /// next drain contains no consultation of the cache, so no stale
+    /// buffer can be handed out inside it.
     ///
     /// Cheap when nothing is dirty, which is every call in a run whose
     /// compiled code never stored into a cached array: one pass over a
-    /// single cache line of bytes, no lock.
-    pub(crate) fn drain_compiled_writes() {
-        use std::sync::atomic::AtomicU8;
-        // Unlocked pre-filter only. Cheap when nothing is dirty, which
-        // is every call in a run whose compiled code never stored into a
-        // cached array. A false negative here is impossible: the barrier
-        // sets its byte before the store it guards is observable.
-        if !DIRTY.iter().any(|b: &AtomicU8| b.load(Ordering::Acquire) != 0) {
-            return;
-        }
-        let mut tables = map().lock();
-        drain_locked(&mut tables);
-    }
-
-    /// The read-clear-and-evict half of [`drain_compiled_writes`], with
-    /// the cache mutex ALREADY HELD.
+    /// single cache line of bytes.
     ///
     /// # Why the clear must happen under the lock
     ///
@@ -6637,11 +6624,13 @@ pub(crate) mod input_cache {
     /// Doing both under one hold makes the clear and the eviction atomic
     /// with respect to every other reader of the cache.
     ///
-    /// The getters compound it a second way, which is why they call THIS
-    /// rather than [`drain_compiled_writes`]: they used to drain (taking
-    /// and releasing the lock) and then re-acquire it for the lookup, so
-    /// even a correct drain left a gap a compiled store could land in.
-    /// One acquisition now covers drain-then-lookup.
+    /// The getters compounded it a second way, which is why this takes
+    /// the guard rather than the lock: they used to drain through a
+    /// wrapper that took and released the lock, then re-acquire it for
+    /// the lookup, so even a correct drain left a gap a compiled store
+    /// could land in. One acquisition now covers drain-then-lookup, and
+    /// the wrapper is gone -- it had no callers left once every one of
+    /// them needed the single hold.
     ///
     /// Measured on an RTX 2060: `GpuRuntimeStress` scenario 1 under
     /// `-XX:+UseGenerationalGC` failed 12/300 with the barrier armed and

@@ -154,7 +154,7 @@ is why it did not show up in the perf work that landed the intrinsic.
 * only `SIGSEGV` counted as BAD. The `NullPointerException` and the
   fragmentation `OutOfMemoryError` this workload also produces both PRE-DATE
   the range (see
-  `known-issues/h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`),
+  `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md`),
   and counting them would have bisected to the wrong defect. One commit in the
   range failed twice with `rc=1` and was still, correctly, scored GOOD.
 
@@ -191,7 +191,7 @@ that relocation moved without rewriting — a root the safepoint's oop map does
 not name.
 
 That is the same family as
-`known-issues/h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`,
+`docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md`,
 which has been hunting an unnamed root in a compiled frame for days and whose
 oracle reports `local_oop=0`. This is a fresh, cheap, 100%-reproducible
 instance of that shape — and unlike that page's witness, this one has a switch
@@ -558,7 +558,7 @@ That contradicts two things this page and its sibling rest on. This page says
 the failures pre-dating the bisect range are a `NullPointerException` and a
 fragmentation `OutOfMemoryError`; the blocker is neither, so a bisect scored the
 way this page describes would now score every commit BAD for the wrong reason.
-And `h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md` says `--Xmx
+And `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md` says `--Xmx
 1g` and `4g` are "clean over 1500 s each" -- at 1g this fails in 13-15 s. That
 page also calls its defect one with "no reproducer worth bisecting yet". It has
 one now, and it is 13 seconds long.

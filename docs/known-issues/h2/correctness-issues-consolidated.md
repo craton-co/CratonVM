@@ -46,6 +46,25 @@ the WARN as noise by reflex or assuming it caused the CCE without checking.
 and `CRATONVM_DBG_LAYOUT=1` on the same seed to get the class name behind
 `class_id=664`.
 
+> **CLOSED 2026-09-09.** That root-cause pass happened, on its own page, and
+> ended in a retirement. The `ClassCastException` recorded above never
+> reproduced in eleven runs across seven configurations and its seed passes on
+> CratonVM and on stock HotSpot 25 (see
+> `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testrandommapops-classcastexception-20260821-RETIRED-20260829.md`).
+> The heap-corruption row that page could not close —
+> `TestRandomMapOps` at `--Xmx 256m`, three faces, 9 failures in 9 runs — is
+> now **0 failures in 10 serial runs** at the same heap on a quiet host, with
+> `CRATONVM_ZGC_ASSUME_REWRITABLE=1` (relocation forced on under every
+> unproven compiled frame: 225 of 225 cycles compacting, 688 341 objects
+> moved) also passing, and the slide verifier, the root-remap audit and the
+> stale-frame-word audit all reading zero against seven-figure denominators.
+> Full record and controls:
+> `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md`.
+> There is also now a **passing** run of this workload at 256m —
+> `probes/MvStoreRandomOps.java`, which the census never had.
+>
+> **There are zero open correctness findings in this set.**
+
 ## Checked against the 2026-08-20/21 rerun — the first 20 classes, nothing new
 
 The 48-class fail/hang union was rerun locally (Windows, `dev` tip, fresh
@@ -72,7 +91,7 @@ Continued on the Azure host (`dev` tip, fresh release build,
 
 | class | result | verdict |
 |---|---|---|
-| `org.h2.test.store.TestRandomMapOps` | FAIL, 108s, `ClassCastException` | **new correctness finding — see above, not yet root-caused** |
+| `org.h2.test.store.TestRandomMapOps` | FAIL, 108s, `ClassCastException` | **root-caused and RETIRED 2026-09-09** — see the closure note above; the `ClassCastException` never reproduced and the heap-corruption row it led to is 0/10 with its forcing control also clean |
 | `org.h2.test.db.TestOpenClose` | FAIL, 2:04, `OutOfMemoryError` | **superseded 2026-08-29** — the OOM is gone with the ZGC fragmentation repairs; what remains is `Exception in thread "main" java/lang/Object` with no captured frames, split out to `bug-h2-testopenclose-throwable-is-java-lang-object-FIXED-20260830.md` |
 | `org.h2.test.store.TestMVStoreCachePerformance` | FAIL, 5:55, `OutOfMemoryError` | **superseded 2026-08-29** — no OOM and no arena failure at all now; what remains is a WRONG RECEIVER (`NoSuchMethodError` for `Page.isPersistent()` against a `Page$PageReference`), split out to `bug-h2-testmvstorecacheperformance-pagereference-receiver-20260829.md` |
 | `org.h2.test.store.TestMVStoreTool` | FAIL, 1:33, `OutOfMemoryError` | the ZGC fragmentation defect, four repairs on 2026-08-29 — see `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md` |

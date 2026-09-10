@@ -430,9 +430,8 @@ fn alloc_named_synthetic_singleton(
 /// is true only after the fix above -- every call site now copies the handle
 /// out and drops the guard before touching `ctx`. `servlet.rs` uses the same
 /// level for the same reason.
-fn synthetic_singleton_roots() -> &'static cratonvm_types::lock_order::OrderedPlMutex<
-    std::collections::HashMap<String, usize>,
-> {
+fn synthetic_singleton_roots(
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashMap<String, usize>> {
     static ROOTS: std::sync::OnceLock<
         cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashMap<String, usize>>,
     > = std::sync::OnceLock::new();
@@ -462,7 +461,10 @@ fn alloc_java_nio_access_singleton(
     // a native-builtins lock held across a re-entry into the VM, which is the
     // exact edge `lock_discipline_ratchet` exists to keep out of this crate.
     // Copy the handle out, drop the guard at the semicolon, then resolve.
-    let published = synthetic_singleton_roots().lock().get("java/nio/Buffer$2").copied();
+    let published = synthetic_singleton_roots()
+        .lock()
+        .get("java/nio/Buffer$2")
+        .copied();
     if let Some(existing) = published.and_then(|h| ctx.resolve_global_root(h)) {
         return Ok(existing);
     }
@@ -612,7 +614,15 @@ fn make_factory_callback(owner_class: &'static str) -> cratonvm_native_api::Nati
             }
         };
     }
-    gen_factory!(f_jla, "java/lang/System$1");
+    // NOT `gen_factory!` like its fourteen siblings: this is the one owner in
+    // the table whose class name is not the same on every JDK, so the carrier
+    // is resolved from the image at mint time rather than baked into the
+    // generated body. Everything else about the shape is identical.
+    fn f_jla(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+        let owner = resolve_jla_carrier(ctx);
+        let obj = alloc_singleton(ctx, owner)?;
+        Ok(Some(Value::Object(Some(obj))))
+    }
     gen_factory!(f_jlia, "java/lang/invoke/MethodHandleImpl$1");
     gen_factory!(f_jlra, "java/lang/ref/Reference$1");
     gen_factory!(f_jlrefa, "java/lang/reflect/ReflectAccess");
@@ -1726,255 +1736,379 @@ fn jla_add_uses(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     jla_call_module_impl(ctx, args, "implAddUses", "(Ljava/lang/Class;)V")
 }
 
+/// Every class that has carried `jdk.internal.access.JavaLangAccess` on a JDK
+/// this VM supports — **the `$N` index is not stable across releases.**
+///
+/// `owner_class`'s doc comment in `vm/src/runtime/shared_secrets.rs` warned
+/// that a `$N` index is "exactly the kind of thing that is right by luck", and
+/// verified all eleven pairings — on **25 only**. Re-run on two images
+/// (`javap -p '<Outer>$N' | sed -n 2p`, walking `$1..$8` and keeping whichever
+/// one names the interface):
+///
+/// ```text
+///                                 JDK 25.0.3+9        JDK 21.0.12.1+1
+///   JavaLangAccess                System$1  (89)      System$2  (87)   <-- MOVES
+///   JavaLangInvokeAccess          MethodHandleImpl$1  MethodHandleImpl$1
+///   JavaLangRefAccess             Reference$1         Reference$1
+///   JavaIOAccess                  Console$1           Console$1
+///   JavaIOFileDescriptorAccess    FileDescriptor$1    FileDescriptor$1
+///   JavaNetInetAddressAccess      InetAddress$1       InetAddress$1
+///   JavaNioAccess                 Buffer$2            Buffer$2
+///   JavaUtilZipFileAccess         ZipFile$1           ZipFile$1
+///   JavaUtilResourceBundleAccess  ResourceBundle$1    ResourceBundle$1
+///   JavaObjectInputStreamAccess   ABSENT              ABSENT
+/// ```
+///
+/// One of the ten moves, and it is this one. On 21, `System$1` is
+/// `implements java.security.PrivilegedAction<Object>` with two methods, so a
+/// carrier minted under that name answers no JLA call: the first strict-corpus
+/// run ever made against a 21 image raised
+/// `NoSuchMethodError: java.lang.System$1.parkVirtualThread(long)` and
+/// `...encodeASCII(char[],int,byte[],int,int)`.
+///
+/// **`System$2` does not exist on 25** (`javap` reports class not found), so
+/// registering the JLA natives under both names is a superset that is inert on
+/// 25 rather than a second live carrier. That is why registration may be
+/// static while only the *mint* has to resolve — see
+/// [`resolve_jla_carrier`], which asks the loaded class whether it is
+/// assignable to the interface instead of trusting either name.
+///
+/// Ordered most-recent-JDK first only so the common case probes once.
+pub(crate) const JLA_CARRIER_CANDIDATES: [&str; 2] = ["java/lang/System$1", "java/lang/System$2"];
+
+/// The interface whose implementor is the real carrier.
+pub(crate) const JLA_INTERFACE: &str = "jdk/internal/access/JavaLangAccess";
+
+/// Ask the running image which class actually carries `JavaLangAccess`,
+/// instead of trusting a `$N` index that moved between 21 and 25.
+///
+/// The question asked is assignability to the interface, not the name and not
+/// "does it declare a method we know" — a name is what was wrong here, and a
+/// method probe would pick `System$1` on 21 the moment the two classes happen
+/// to share a spelling.
+///
+/// Deliberately NOT memoised in a process global. The object it leads to
+/// already is (`alloc_singleton`), so the steady-state cost of re-asking is a
+/// resolved-class lookup plus one assignability test; a `OnceLock` here would
+/// instead pin the FIRST VM's answer for the life of the process, which in
+/// this crate's own test binaries means every later VM inherits it.
+///
+/// Falls back to the historical pin when neither candidate can be resolved, so
+/// a failure to load classes degrades to today's behaviour rather than to no
+/// carrier at all.
+fn resolve_jla_carrier(ctx: &mut dyn NativeContext) -> &'static str {
+    pick_jla_carrier(|cand| {
+        // Cheap arm first: if the class is already resolved, don't re-run
+        // `<clinit>` just to read its interface list.
+        let cid = match ctx.class_id_by_name(cand) {
+            Some(cid) => Some(cid),
+            None => ctx
+                .ensure_class_initialized(cand)
+                .ok()
+                .filter(|cid| *cid != cratonvm_types::ClassId::new(0)),
+        };
+        cid.and_then(|cid| ctx.class_assignable_to_name(cid, JLA_INTERFACE))
+    })
+}
+
+/// The RULE [`resolve_jla_carrier`] applies, with the image's answers passed in
+/// rather than asked for.
+///
+/// Split out so the decision can be tested without a JDK image. It has to be:
+/// the mock context this crate tests against inherits the trait default for
+/// `class_assignable_to_name`, which is a flat `None`, so a mock-based test of
+/// `resolve_jla_carrier` could only ever reach the fallback arm — it would pass
+/// identically against the pinned-`System$1` code this replaces.
+///
+/// `is_carrier` returns `None` for "the image could not say" (class absent, or
+/// a VM whose assignability door does not answer) and is NOT the same as
+/// `Some(false)`. Both fall through to the next candidate; the distinction is
+/// kept because a caller that turned `None` into a refusal is precisely the bug
+/// `class_assignable_to_name`'s own doc comment warns about.
+///
+/// The fallback is the historical pin rather than a panic or an empty name: an
+/// image that answers nothing then behaves exactly as it did before this
+/// function existed, which is a degradation and not a new failure mode.
+fn pick_jla_carrier(mut is_carrier: impl FnMut(&str) -> Option<bool>) -> &'static str {
+    for cand in JLA_CARRIER_CANDIDATES {
+        if is_carrier(cand) == Some(true) {
+            return cand;
+        }
+    }
+    JLA_CARRIER_CANDIDATES[0]
+}
+
 fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
-    let owner = "java/lang/System$1";
-    registry.register(
-        owner,
-        "currentCarrierThread",
-        "()Ljava/lang/Thread;",
-        jla_current_carrier_thread,
-    );
-    registry.register(
-        owner,
-        "currentThread0",
-        "()Ljava/lang/Thread;",
-        jla_current_carrier_thread,
-    );
-    registry.register(
-        owner,
-        "addReads",
-        "(Ljava/lang/Module;Ljava/lang/Module;)V",
-        jla_add_reads,
-    );
-    registry.register(
-        owner,
-        "addReadsAllUnnamed",
-        "(Ljava/lang/Module;)V",
-        jla_add_reads_all_unnamed,
-    );
-    registry.register(
-        owner,
-        "addExports",
-        "(Ljava/lang/Module;Ljava/lang/String;)V",
-        jla_add_exports,
-    );
-    registry.register(
-        owner,
-        "addExports",
-        "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V",
-        jla_add_exports,
-    );
-    registry.register(
-        owner,
-        "addExportsToAllUnnamed",
-        "(Ljava/lang/Module;Ljava/lang/String;)V",
-        jla_add_exports_all_unnamed,
-    );
-    registry.register(
-        owner,
-        "addOpens",
-        "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V",
-        jla_add_opens,
-    );
-    registry.register(
-        owner,
-        "addOpensToAllUnnamed",
-        "(Ljava/lang/Module;Ljava/lang/String;)V",
-        jla_add_opens_all_unnamed,
-    );
-    registry.register(
-        owner,
-        "addUses",
-        "(Ljava/lang/Module;Ljava/lang/Class;)V",
-        jla_add_uses,
-    );
-    registry.register(
-        owner,
-        "getReflectionFactory",
-        "()Ljdk/internal/reflect/ReflectionFactory;",
-        jla_get_reflection_factory,
-    );
-    registry.register(
-        owner,
-        "blockedOn",
-        "(Ljava/lang/Thread;Lsun/nio/ch/Interruptible;)V",
-        jla_blocked_on,
-    );
-    registry.register(
-        owner,
-        "blockedOn",
-        "(Lsun/nio/ch/Interruptible;)V",
-        jla_blocked_on,
-    );
-    registry.register(
-        owner,
-        "getCarrierThreadLocal",
-        "(Ljdk/internal/misc/CarrierThreadLocal;)Ljava/lang/Object;",
-        jla_get_carrier_thread_local,
-    );
-    registry.register(
-        owner,
-        "setCarrierThreadLocal",
-        "(Ljdk/internal/misc/CarrierThreadLocal;Ljava/lang/Object;)V",
-        jla_set_carrier_thread_local,
-    );
-    registry.register(
-        owner,
-        "removeCarrierThreadLocal",
-        "(Ljdk/internal/misc/CarrierThreadLocal;)V",
-        jla_remove_carrier_thread_local,
-    );
-    registry.register(
-        owner,
-        "isCarrierThreadLocalPresent",
-        "(Ljdk/internal/misc/CarrierThreadLocal;)Z",
-        jla_is_carrier_thread_local_present,
-    );
-    registry.register(
-        owner,
-        "setCause",
-        "(Ljava/lang/Throwable;Ljava/lang/Throwable;)V",
-        jla_set_cause,
-    );
-    registry.register(
-        owner,
-        "getEnumConstantsShared",
-        "(Ljava/lang/Class;)[Ljava/lang/Object;",
-        jla_get_enum_constants_shared,
-    );
-    // Erased-type variant: callers with `Class<? extends Enum<E>>` see
-    // the return type as `[Ljava/lang/Enum;` rather than `[Ljava/lang/Object;`.
-    registry.register(
-        owner,
-        "getEnumConstantsShared",
-        "(Ljava/lang/Class;)[Ljava/lang/Enum;",
-        jla_get_enum_constants_shared,
-    );
-    registry.register(
-        owner,
-        "newStringUtf8NoRepl",
-        "([BII)Ljava/lang/String;",
-        jla_new_string_utf8_no_repl,
-    );
-    registry.register(
-        owner,
-        "getBytesUtf8NoRepl",
-        "(Ljava/lang/String;)[B",
-        jla_get_bytes_utf8_no_repl,
-    );
-    // JDK 22 spells these `UTF8` (all-caps), not `Utf8`. The lowercase
-    // variants above were registered for an older method name; the real
-    // `jdk.internal.access.JavaLangAccess` declares `newStringUTF8NoRepl`
-    // / `getBytesUTF8NoRepl`. Elasticsearch's `Build.current()` version
-    // read path calls `newStringUTF8NoRepl` via `invokeinterface`, which
-    // raised `NoSuchMethodError` against `System$1`. Register the
-    // canonical casing too (keep both so any caller spelling resolves).
-    registry.register(
-        owner,
-        "newStringUTF8NoRepl",
-        "([BII)Ljava/lang/String;",
-        jla_new_string_utf8_no_repl,
-    );
-    registry.register(
-        owner,
-        "getBytesUTF8NoRepl",
-        "(Ljava/lang/String;)[B",
-        jla_get_bytes_utf8_no_repl,
-    );
-    // JDK 25 UnixPath encodes filesystem paths through JavaLangAccess with an
-    // explicit Charset argument. We currently support the UTF-8/ASCII paths
-    // WildFly uses and ignore the Charset object.
-    for name in ["getBytesNoRepl", "uncheckedGetBytesNoRepl"] {
+    // The carrier's `$N` index is not stable across JDKs, and registration has
+    // no VM context to ask the image with, so register on every name that has
+    // carried this interface. The extra name costs nothing where it is not the
+    // carrier: on 25 `java/lang/System$2` does not exist, so nothing can ever
+    // dispatch to it. The *mint* still has to pick correctly -- see
+    // `resolve_jla_carrier`.
+    //
+    // **The names are inline here and the body is NOT in a helper, both
+    // deliberately.** `native-builtins/tests/registrar_drift.rs` resolves a
+    // registration's class from source text: a literal, a `let`-bound literal
+    // in the same fn, or `for x in [ .. ]` over literals in the same fn. It
+    // does not follow a literal through a call into a parameter. Hoisting this
+    // body into `register_java_lang_access_on_carrier(registry, owner)` is the
+    // class-parameterised-registrar shape that
+    // `docs/known-issues/jdk-only/bug-two-drift-gates-are-red-on-pristine-dev-from-a-class-parameterised-registrar-20260822.md`
+    // records as still open, and it was measured doing the same damage here:
+    // `the_drift_baseline_has_no_stale_rows` reported the
+    // `System$1.defineClass` twin as "no longer drift[ing]" when only the
+    // scanner's view of it had gone. `JLA_CARRIER_CANDIDATES` stays the single
+    // source of truth for the MINT; this list is checked against it by
+    // `the_registrar_covers_every_carrier_candidate` below.
+    for owner in ["java/lang/System$1", "java/lang/System$2"] {
         registry.register(
             owner,
-            name,
-            "(Ljava/lang/String;Ljava/nio/charset/Charset;)[B",
+            "currentCarrierThread",
+            "()Ljava/lang/Thread;",
+            jla_current_carrier_thread,
+        );
+        registry.register(
+            owner,
+            "currentThread0",
+            "()Ljava/lang/Thread;",
+            jla_current_carrier_thread,
+        );
+        registry.register(
+            owner,
+            "addReads",
+            "(Ljava/lang/Module;Ljava/lang/Module;)V",
+            jla_add_reads,
+        );
+        registry.register(
+            owner,
+            "addReadsAllUnnamed",
+            "(Ljava/lang/Module;)V",
+            jla_add_reads_all_unnamed,
+        );
+        registry.register(
+            owner,
+            "addExports",
+            "(Ljava/lang/Module;Ljava/lang/String;)V",
+            jla_add_exports,
+        );
+        registry.register(
+            owner,
+            "addExports",
+            "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V",
+            jla_add_exports,
+        );
+        registry.register(
+            owner,
+            "addExportsToAllUnnamed",
+            "(Ljava/lang/Module;Ljava/lang/String;)V",
+            jla_add_exports_all_unnamed,
+        );
+        registry.register(
+            owner,
+            "addOpens",
+            "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V",
+            jla_add_opens,
+        );
+        registry.register(
+            owner,
+            "addOpensToAllUnnamed",
+            "(Ljava/lang/Module;Ljava/lang/String;)V",
+            jla_add_opens_all_unnamed,
+        );
+        registry.register(
+            owner,
+            "addUses",
+            "(Ljava/lang/Module;Ljava/lang/Class;)V",
+            jla_add_uses,
+        );
+        registry.register(
+            owner,
+            "getReflectionFactory",
+            "()Ljdk/internal/reflect/ReflectionFactory;",
+            jla_get_reflection_factory,
+        );
+        registry.register(
+            owner,
+            "blockedOn",
+            "(Ljava/lang/Thread;Lsun/nio/ch/Interruptible;)V",
+            jla_blocked_on,
+        );
+        registry.register(
+            owner,
+            "blockedOn",
+            "(Lsun/nio/ch/Interruptible;)V",
+            jla_blocked_on,
+        );
+        registry.register(
+            owner,
+            "getCarrierThreadLocal",
+            "(Ljdk/internal/misc/CarrierThreadLocal;)Ljava/lang/Object;",
+            jla_get_carrier_thread_local,
+        );
+        registry.register(
+            owner,
+            "setCarrierThreadLocal",
+            "(Ljdk/internal/misc/CarrierThreadLocal;Ljava/lang/Object;)V",
+            jla_set_carrier_thread_local,
+        );
+        registry.register(
+            owner,
+            "removeCarrierThreadLocal",
+            "(Ljdk/internal/misc/CarrierThreadLocal;)V",
+            jla_remove_carrier_thread_local,
+        );
+        registry.register(
+            owner,
+            "isCarrierThreadLocalPresent",
+            "(Ljdk/internal/misc/CarrierThreadLocal;)Z",
+            jla_is_carrier_thread_local_present,
+        );
+        registry.register(
+            owner,
+            "setCause",
+            "(Ljava/lang/Throwable;Ljava/lang/Throwable;)V",
+            jla_set_cause,
+        );
+        registry.register(
+            owner,
+            "getEnumConstantsShared",
+            "(Ljava/lang/Class;)[Ljava/lang/Object;",
+            jla_get_enum_constants_shared,
+        );
+        // Erased-type variant: callers with `Class<? extends Enum<E>>` see
+        // the return type as `[Ljava/lang/Enum;` rather than `[Ljava/lang/Object;`.
+        registry.register(
+            owner,
+            "getEnumConstantsShared",
+            "(Ljava/lang/Class;)[Ljava/lang/Enum;",
+            jla_get_enum_constants_shared,
+        );
+        registry.register(
+            owner,
+            "newStringUtf8NoRepl",
+            "([BII)Ljava/lang/String;",
+            jla_new_string_utf8_no_repl,
+        );
+        registry.register(
+            owner,
+            "getBytesUtf8NoRepl",
+            "(Ljava/lang/String;)[B",
             jla_get_bytes_utf8_no_repl,
         );
+        // JDK 22 spells these `UTF8` (all-caps), not `Utf8`. The lowercase
+        // variants above were registered for an older method name; the real
+        // `jdk.internal.access.JavaLangAccess` declares `newStringUTF8NoRepl`
+        // / `getBytesUTF8NoRepl`. Elasticsearch's `Build.current()` version
+        // read path calls `newStringUTF8NoRepl` via `invokeinterface`, which
+        // raised `NoSuchMethodError` against `System$1`. Register the
+        // canonical casing too (keep both so any caller spelling resolves).
+        registry.register(
+            owner,
+            "newStringUTF8NoRepl",
+            "([BII)Ljava/lang/String;",
+            jla_new_string_utf8_no_repl,
+        );
+        registry.register(
+            owner,
+            "getBytesUTF8NoRepl",
+            "(Ljava/lang/String;)[B",
+            jla_get_bytes_utf8_no_repl,
+        );
+        // JDK 25 UnixPath encodes filesystem paths through JavaLangAccess with an
+        // explicit Charset argument. We currently support the UTF-8/ASCII paths
+        // WildFly uses and ignore the Charset object.
+        for name in ["getBytesNoRepl", "uncheckedGetBytesNoRepl"] {
+            registry.register(
+                owner,
+                name,
+                "(Ljava/lang/String;Ljava/nio/charset/Charset;)[B",
+                jla_get_bytes_utf8_no_repl,
+            );
+        }
+        registry.register(
+            owner,
+            "newStackTraceElement",
+            "(Ljava/lang/StackWalker$StackFrame;)Ljava/lang/StackTraceElement;",
+            jla_new_stack_trace_element,
+        );
+        registry.register(
+            owner,
+            "getDeclaredPublicMethods",
+            "(Ljava/lang/Class;Ljava/lang/String;[Ljava/lang/Class;)Ljava/util/List;",
+            jla_get_declared_public_methods_list,
+        );
+        registry.register(
+            owner,
+            "getDeclaredPublicMethods",
+            "(Ljava/lang/Class;)[Ljava/lang/reflect/Method;",
+            jla_get_declared_public_methods,
+        );
+        registry.register(
+            owner,
+            "getMethodsOrNull",
+            "(Ljava/lang/Class;)[Ljava/lang/reflect/Method;",
+            jla_get_methods_or_null,
+        );
+        // BootLoader.<clinit> module bootstrap (see handler docs).
+        registry.register(
+            owner,
+            "defineUnnamedModule",
+            "(Ljava/lang/ClassLoader;)Ljava/lang/Module;",
+            jla_define_unnamed_module,
+        );
+        registry.register(
+            owner,
+            "addEnableNativeAccess",
+            "(Ljava/lang/Module;)Ljava/lang/Module;",
+            jla_add_enable_native_access,
+        );
+        registry.register(
+            owner,
+            "getConstantPool",
+            "(Ljava/lang/Class;)Ljdk/internal/reflect/ConstantPool;",
+            jla_get_constant_pool,
+        );
+        registry.register(
+            owner,
+            "start",
+            "(Ljava/lang/Thread;Ljdk/internal/vm/ThreadContainer;)V",
+            jla_start_in_container,
+        );
+        // `jdk.internal.reflect.ClassDefiner` (JUnit5/Arquillian serialization-
+        // constructor-accessor generation) — see `jla_define_class` doc comment.
+        registry.register(
+            owner,
+            "defineClass",
+            "(Ljava/lang/ClassLoader;Ljava/lang/String;[BLjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;",
+            jla_define_class,
+        );
+        registry.register(
+            owner,
+            "defineClass",
+            "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BLjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;",
+            jla_define_class_hidden,
+        );
+        // `jdk.internal.loader.BootLoader.loadClassOrNull` — see
+        // `jla_find_bootstrap_class_or_null` doc comment.
+        registry.register(
+            owner,
+            "findBootstrapClassOrNull",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            jla_find_bootstrap_class_or_null,
+        );
+        registry.register(
+            owner,
+            "findNative",
+            "(Ljava/lang/ClassLoader;Ljava/lang/String;)J",
+            jla_find_native,
+        );
+        registry.register(
+            owner,
+            "join",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;I)Ljava/lang/String;",
+            jla_join,
+        );
     }
-    registry.register(
-        owner,
-        "newStackTraceElement",
-        "(Ljava/lang/StackWalker$StackFrame;)Ljava/lang/StackTraceElement;",
-        jla_new_stack_trace_element,
-    );
-    registry.register(
-        owner,
-        "getDeclaredPublicMethods",
-        "(Ljava/lang/Class;Ljava/lang/String;[Ljava/lang/Class;)Ljava/util/List;",
-        jla_get_declared_public_methods_list,
-    );
-    registry.register(
-        owner,
-        "getDeclaredPublicMethods",
-        "(Ljava/lang/Class;)[Ljava/lang/reflect/Method;",
-        jla_get_declared_public_methods,
-    );
-    registry.register(
-        owner,
-        "getMethodsOrNull",
-        "(Ljava/lang/Class;)[Ljava/lang/reflect/Method;",
-        jla_get_methods_or_null,
-    );
-    // BootLoader.<clinit> module bootstrap (see handler docs).
-    registry.register(
-        owner,
-        "defineUnnamedModule",
-        "(Ljava/lang/ClassLoader;)Ljava/lang/Module;",
-        jla_define_unnamed_module,
-    );
-    registry.register(
-        owner,
-        "addEnableNativeAccess",
-        "(Ljava/lang/Module;)Ljava/lang/Module;",
-        jla_add_enable_native_access,
-    );
-    registry.register(
-        owner,
-        "getConstantPool",
-        "(Ljava/lang/Class;)Ljdk/internal/reflect/ConstantPool;",
-        jla_get_constant_pool,
-    );
-    registry.register(
-        owner,
-        "start",
-        "(Ljava/lang/Thread;Ljdk/internal/vm/ThreadContainer;)V",
-        jla_start_in_container,
-    );
-    // `jdk.internal.reflect.ClassDefiner` (JUnit5/Arquillian serialization-
-    // constructor-accessor generation) — see `jla_define_class` doc comment.
-    registry.register(
-        owner,
-        "defineClass",
-        "(Ljava/lang/ClassLoader;Ljava/lang/String;[BLjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;",
-        jla_define_class,
-    );
-    registry.register(
-        owner,
-        "defineClass",
-        "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BLjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;",
-        jla_define_class_hidden,
-    );
-    // `jdk.internal.loader.BootLoader.loadClassOrNull` — see
-    // `jla_find_bootstrap_class_or_null` doc comment.
-    registry.register(
-        owner,
-        "findBootstrapClassOrNull",
-        "(Ljava/lang/String;)Ljava/lang/Class;",
-        jla_find_bootstrap_class_or_null,
-    );
-    registry.register(
-        owner,
-        "findNative",
-        "(Ljava/lang/ClassLoader;Ljava/lang/String;)J",
-        jla_find_native,
-    );
-    registry.register(
-        owner,
-        "join",
-        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;I)Ljava/lang/String;",
-        jla_join,
-    );
     // Also register on the interface so direct invokeinterface
     // dispatch (when the receiver's concrete class lookup falls
     // back to the interface class) still hits these natives.
@@ -2968,18 +3102,14 @@ pub(crate) fn jdk_buffer_pools_in_hotspot_order(
     let mut failed = false;
     for i in 0..size {
         let list_now = ctx.read_native_pin(list_pin, list);
-        let bean = match ctx.invoke_virtual(
-            list_now,
-            "get",
-            "(I)Ljava/lang/Object;",
-            &[Value::Int(i)],
-        ) {
-            Ok(Some(Value::Object(Some(b)))) => b,
-            _ => {
-                failed = true;
-                break;
-            }
-        };
+        let bean =
+            match ctx.invoke_virtual(list_now, "get", "(I)Ljava/lang/Object;", &[Value::Int(i)]) {
+                Ok(Some(Value::Object(Some(b)))) => b,
+                _ => {
+                    failed = true;
+                    break;
+                }
+            };
         let bean_pin = ctx.pin_native_root(bean);
         let name = match ctx.invoke_virtual(bean, "getName", "()Ljava/lang/String;", &[]) {
             Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
@@ -3685,6 +3815,7 @@ mod tests {
         NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
         NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
     };
+    use std::collections::BTreeSet;
 
     #[test]
     fn all_factories_listed() {
@@ -4079,6 +4210,150 @@ mod tests {
                 r.find("jdk/internal/access/JavaLangAccess", name, desc)
                     .is_some(),
                 "JavaLangAccess.{name}{desc} not registered on interface fallback"
+            );
+        }
+    }
+
+    /// The two candidate names must actually differ, or every test below is
+    /// vacuous: a one-entry table returns its only entry from both the match
+    /// arm and the fallback, and nothing distinguishes them.
+    #[test]
+    fn the_candidate_table_holds_two_distinct_names() {
+        assert_eq!(JLA_CARRIER_CANDIDATES.len(), 2);
+        assert_ne!(JLA_CARRIER_CANDIDATES[0], JLA_CARRIER_CANDIDATES[1]);
+        assert!(JLA_CARRIER_CANDIDATES.contains(&"java/lang/System$1"));
+        assert!(JLA_CARRIER_CANDIDATES.contains(&"java/lang/System$2"));
+    }
+
+    /// The JDK 21 shape, which is the defect this whole change exists for:
+    /// `System$1` is a `PrivilegedAction` there and answers `false`, and the
+    /// carrier is the SECOND candidate.
+    #[test]
+    fn the_carrier_is_whichever_candidate_the_image_says_implements_the_interface() {
+        let mut asked: Vec<String> = Vec::new();
+        let picked = pick_jla_carrier(|cand| {
+            asked.push(cand.to_string());
+            Some(cand == "java/lang/System$2")
+        });
+        assert_eq!(picked, "java/lang/System$2");
+        assert_eq!(asked, ["java/lang/System$1", "java/lang/System$2"]);
+    }
+
+    /// The JDK 25 shape. This is the arm that keeps the test above honest: a
+    /// rule that simply preferred the last candidate would pass that one and
+    /// fail this one, and it is also the arm that shows a 25 image pays exactly
+    /// ONE lookup rather than probing a name that does not exist there.
+    #[test]
+    fn the_first_candidate_wins_when_the_image_says_it_is_the_carrier() {
+        let mut asked: Vec<String> = Vec::new();
+        let picked = pick_jla_carrier(|cand| {
+            asked.push(cand.to_string());
+            Some(cand == "java/lang/System$1")
+        });
+        assert_eq!(picked, "java/lang/System$1");
+        assert_eq!(
+            asked,
+            ["java/lang/System$1"],
+            "the walk kept probing after the carrier was identified"
+        );
+    }
+
+    /// An image that says no to everything, and an image that cannot say
+    /// anything, are different inputs and must both degrade to the historical
+    /// pin — not to a panic, and not to an empty owner that would mint the
+    /// singleton under no class at all.
+    #[test]
+    fn an_image_that_identifies_no_carrier_degrades_to_the_historical_pin() {
+        assert_eq!(pick_jla_carrier(|_| Some(false)), "java/lang/System$1");
+        assert_eq!(pick_jla_carrier(|_| None), "java/lang/System$1");
+    }
+
+    /// `None` is "could not say", not "no". A candidate that cannot be resolved
+    /// must not stop the walk before the one that can.
+    #[test]
+    fn an_unanswerable_candidate_does_not_shadow_the_answerable_one() {
+        let picked = pick_jla_carrier(|cand| {
+            if cand == "java/lang/System$1" {
+                None
+            } else {
+                Some(true)
+            }
+        });
+        assert_eq!(picked, "java/lang/System$2");
+    }
+
+    /// The registrar spells its two carrier names inline so the drift scanner
+    /// can resolve them (see the comment at that loop), which puts them out of
+    /// the compiler's reach as a copy of `JLA_CARRIER_CANDIDATES`. Tie them
+    /// together here: a name added to the const and not to that loop is a
+    /// carrier that would be minted and then answer none of the 39 JLA calls
+    /// registered on the other one.
+    #[test]
+    fn the_registrar_covers_every_carrier_candidate() {
+        let mut r = NativeMethodRegistry::new();
+        register_wp1_4_shared_secrets(&mut r);
+        for cand in JLA_CARRIER_CANDIDATES {
+            let n = r
+                .dump_registrations()
+                .into_iter()
+                .filter(|(cls, ..)| *cls == cand)
+                .count();
+            assert!(
+                n >= 30,
+                "carrier candidate {cand} carries only {n} registrations; the \
+                 inline list in register_java_lang_access has drifted from \
+                 JLA_CARRIER_CANDIDATES"
+            );
+        }
+    }
+
+    #[test]
+    fn every_jla_carrier_candidate_carries_the_same_registrations() {
+        // A JLA native registered on only one candidate name is a native that
+        // vanishes on the other image. That is exactly how
+        // `parkVirtualThread(long)` and `encodeASCII(char[],int,byte[],int,int)`
+        // came back as NoSuchMethodError the first time the strict corpus ran
+        // against a 21 image: on 21 the carrier is `System$2`, and every
+        // registration named `System$1`.
+        //
+        // This asserts the property rather than the spelling, so adding a JLA
+        // method to one name only is a red here instead of a defect found on
+        // whichever JDK CI does not run.
+        let mut r = NativeMethodRegistry::new();
+        register_wp1_4_shared_secrets(&mut r);
+
+        let per_candidate: Vec<(&str, BTreeSet<(String, String)>)> = JLA_CARRIER_CANDIDATES
+            .iter()
+            .map(|cand| {
+                let set = r
+                    .dump_registrations()
+                    .into_iter()
+                    .filter(|(cls, ..)| cls == cand)
+                    .map(|(_, name, desc, _)| (name.to_string(), desc.to_string()))
+                    .collect();
+                (*cand, set)
+            })
+            .collect();
+
+        // Control: two empty sets are equal, and would prove nothing. Measured
+        // 39 distinct (name, descriptor) pairs on 2026-09-09; the floor is set
+        // below that so a legitimate removal does not red, but a collapse to a
+        // handful (the registrar stopped running) still does.
+        assert!(
+            per_candidate[0].1.len() >= 30,
+            "expected the JLA registrar to cover the interface, got {} on {}",
+            per_candidate[0].1.len(),
+            per_candidate[0].0
+        );
+
+        let (base_name, base) = &per_candidate[0];
+        for (name, set) in &per_candidate[1..] {
+            let missing: Vec<_> = base.difference(set).collect();
+            let extra: Vec<_> = set.difference(base).collect();
+            assert!(
+                missing.is_empty() && extra.is_empty(),
+                "JLA registrations differ between {base_name} and {name}:\n  \
+                 missing from {name}: {missing:?}\n  only on {name}: {extra:?}"
             );
         }
     }

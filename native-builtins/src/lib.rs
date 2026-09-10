@@ -14083,6 +14083,23 @@ pub fn register_essential_natives_with_shims(
         "()Ljava/security/ProtectionDomain;",
         |ctx, args| {
             let pd = try_alloc_concurrent_synthetic(ctx, "java/security/ProtectionDomain", 4)?;
+            // GC-safety: `pd` is allocated FIRST and written LAST, and almost
+            // everything between the two allocates — a `java.net.URL`, a
+            // `CodeSource`, several strings, and a nested
+            // `native_class_get_class_loader`. A moving young collection at any
+            // of those relocates `pd`, and this closure then populates and
+            // RETURNS the pre-move address.
+            //
+            // The interpreter's return-value barrier cannot save it:
+            // `safe_native_call` heals a stale return through
+            // `load_and_forward`, which reads the forwarding marker at the old
+            // address — and that marker is gone once the allocator has
+            // re-served the span, which is exactly the window this workload
+            // reads it in. MEASURED on BindableTests under
+            // `CRATONVM_DBG_GC_STRESS=262144`: `[deadref-nret]` named this
+            // native returning an address in the emptied semispace, reached
+            // from ByteBuddy's `trySelfResolve(Class)`.
+            let pd_pin = ctx.pin_native_root(pd);
             // Try to produce a real CodeSource with a URL pointing at the
             // classpath entry that holds this Class.
             let mut path_opt = if let Some(Value::Object(Some(mirror))) = args.first() {
@@ -14212,7 +14229,16 @@ pub fn register_essential_natives_with_shims(
                 .ok()
                 .flatten()
                 .unwrap_or(Value::Object(None));
-            lang_class::populate_protection_domain_fields(ctx, pd, codesource, classloader)?;
+            // Read `pd` back from its pin — the whole point of taking it. Every
+            // allocation above is behind us, and `populate_protection_domain_fields`
+            // must write through the LIVE address, not the one this closure
+            // started with.
+            let pd = ctx.read_native_pin(pd_pin, pd);
+            let populated =
+                lang_class::populate_protection_domain_fields(ctx, pd, codesource, classloader);
+            let pd = ctx.read_native_pin(pd_pin, pd);
+            ctx.unpin_native_roots(pd_pin);
+            populated?;
             Ok(Some(Value::Object(Some(pd))))
         },
     );

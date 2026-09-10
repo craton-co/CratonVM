@@ -1568,6 +1568,31 @@ pub struct OopMapEntry {
     /// True only when the moving-young shadow-stack publication for this
     /// safepoint proved complete enough for relocation under live JIT frames.
     pub moving_young_coverage_complete: bool,
+    /// Which GPRs may hold a LIVE object reference at this safepoint, as a
+    /// bitmask over `x64::ALL_SPILL_GPRS` positions — the register-file half of
+    /// this map, and the one `frame_slot_offsets` never described.
+    ///
+    /// `None` is "no claim": the compiler could not prove the set, and a
+    /// consumer must fall back to scanning the whole blind-spill image. That is
+    /// the pre-2026-09-09 behaviour and it is the fail-open direction.
+    ///
+    /// `Some(mask)` says: **every register outside `mask` holds no live
+    /// reference here.** `emit_pre_safepoint_spill` writes the register file
+    /// into the frame's `reg_spill` region so a conservative scan can see it,
+    /// and that image is blind — it cannot tell a live oop from a dead
+    /// leftover, so every register's last value is retained. This mask is what
+    /// lets the scan skip the leftovers.
+    ///
+    /// Bit `i` corresponds to `ALL_SPILL_GPRS[i]`, which is also the slot
+    /// `emit_blind_reg_spill` writes it to (`reg_spill_lo + 8 * i`), so a
+    /// consumer holding a frame offset inverts it with
+    /// [`FrameLayout::spill_image_index`] and needs no register decoding.
+    ///
+    /// See `docs/known-issues/h2/testvaluememory-fails-under-g1-on-conservative-jit-roots-20260908.md`
+    /// for what the blind image costs when nothing narrows it: five conservative
+    /// words holding 2520 KB out of a G1 collection set, one of them an `r8`
+    /// leftover.
+    pub reg_oop_mask: Option<u16>,
     /// Exclusive `[rbp - off]` bound of the LIVE part of the frame at this
     /// safepoint: the operand-spill cursor (`next_spill_offset`) at the moment
     /// the safepoint was emitted. Slots at a larger offset are inside the
@@ -1596,7 +1621,7 @@ pub struct OopMapEntry {
     /// mask is the in-tree oracle that turns such a word into one of "the
     /// dataflow proves this local is a reference" (a real miss) or "the dataflow
     /// proves it is not" (dead storage). See
-    /// `bug-h2-testrandommapops-small-heap-corruption-20260829.md` §5.
+    /// `bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md` §5.
     ///
     /// x86-64 single-pass only. The IR tier allocates frame slots rather than
     /// homing locals at `8*(k+1)`, so it records `None` and the oracle stays
@@ -1669,6 +1694,7 @@ impl OopMapEntry {
             bytecode_pc: 0,
             frame_slot_offsets: Vec::new(),
             moving_young_coverage_complete: false,
+            reg_oop_mask: None,
             live_frame_hi: 0,
             local_oop_mask: None,
             num_locals: 0,
@@ -2591,6 +2617,21 @@ pub struct FrameLayout {
     /// Per-safepoint blind GPR spill (`emit_pre_safepoint_spill`).
     pub reg_spill_lo: i32,
     pub reg_spill_hi: i32,
+    /// Start of the OUTGOING area — the ABI shadow space plus the in-frame
+    /// stack-argument reserve — as an `[rbp - off]` offset, or `0` when the
+    /// producer does not distinguish it.
+    ///
+    /// `region_name` reports everything past `reg_spill_hi` as
+    /// `outgoing-args-or-deopt-regs`, which is two regions with different
+    /// contents: the frame-deopt `SavedRegisters` block (a register image the
+    /// deopt stub reads back) sits between the blind spill and the outgoing
+    /// area. A consumer that wants to stop scanning the outgoing reserve must
+    /// not thereby stop scanning `SavedRegisters`, so the boundary is published
+    /// rather than guessed.
+    ///
+    /// `0` means "not published" and must be read as "assume the whole region
+    /// is `SavedRegisters`" — the conservative direction.
+    pub outgoing_lo: i32,
     /// Total frame size (`SUB RSP, frame_size`); the band is `[rbp - size, rbp)`.
     pub frame_size: i32,
 }
@@ -2671,6 +2712,46 @@ impl FrameLayout {
         if arith {
             FRAMES_WITH_ARITH_SPAN.fetch_add(1, Relaxed);
         }
+    }
+
+    /// The `x64::ALL_SPILL_GPRS` index whose image `off` is, when `off` lands in
+    /// the per-safepoint blind spill.
+    ///
+    /// The inverse of `emit_blind_reg_spill`'s `reg_spill_lo + 8 * index`, and
+    /// the same index `OopMapEntry::reg_oop_mask` is a bitmask over -- so a
+    /// consumer with a frame offset and a map can answer "may this slot hold a
+    /// live oop" without decoding a register name.
+    pub fn spill_image_index(&self, off: i32) -> Option<u32> {
+        if self.reg_spill_hi <= self.reg_spill_lo
+            || off < self.reg_spill_lo
+            || off >= self.reg_spill_hi
+        {
+            return None;
+        }
+        // Cast: the span is 14 slots, so this is far inside u32.
+        Some(((off - self.reg_spill_lo) / 8) as u32)
+    }
+
+    /// Name the x86-64 GPR whose image `off` is, when `off` lands in the
+    /// per-safepoint blind spill (`safepoint-gpr-spill-image`).
+    ///
+    /// The spill is emitted as one store per entry of `x64::ALL_SPILL_GPRS`, in
+    /// table order, at `reg_spill_lo + 8 * index` (`emit_blind_reg_spill`), so
+    /// the index inverts exactly. Diagnostics only, and the table below must
+    /// stay in step with that constant -- a wrong name here misattributes a
+    /// retained object to the wrong register, which is worse than no name.
+    pub fn spill_image_register(&self, off: i32) -> Option<&'static str> {
+        const NAMES: [&str; 14] = [
+            "rax", "rcx", "rdx", "rbx", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13",
+            "r14", "r15",
+        ];
+        if self.reg_spill_hi <= self.reg_spill_lo || off < self.reg_spill_lo
+            || off >= self.reg_spill_hi
+        {
+            return None;
+        }
+        // Cast: the span is 14 slots, so the index is in range by construction.
+        NAMES.get(((off - self.reg_spill_lo) / 8) as usize).copied()
     }
 
     /// Name the region `off` falls in. Diagnostics only.
@@ -6606,6 +6687,31 @@ pub struct InlineSite {
     pub ldc_info: Vec<(usize, i64)>,
     /// Resolved ldc2_w constants: (callee_pc, i64_value).
     pub ldc2w_info: Vec<(usize, i64)>,
+    /// Callee PCs, among [`Self::ldc_info`] and [`Self::ldc2w_info`], whose
+    /// constant is a **float or double** rather than an int or a long.
+    ///
+    /// The two vectors above carry a bare `i64` because that is all the
+    /// single-pass emitter needs: it materialises the bits and the surrounding
+    /// bytecode decides how to read them. The IR builder cannot work that way —
+    /// it must choose a NODE, `Op::ConstF` typed `Float`/`Double` or `Op::Const`
+    /// typed `Int`/`Long`, at the moment it lowers the `ldc`, and it cannot
+    /// infer the width from the opcode (`ldc` is polymorphic) or from admission
+    /// (a method whose only FP is `ldc 1.5f` is admitted through the int
+    /// clause). Its own `ldc_info`/`ldc2w_info` maps are therefore
+    /// `(bits, is_fp)` pairs and always have been.
+    ///
+    /// That one missing bit was the whole of the `ir-splice-ldc` refusal: a
+    /// callee containing ANY `ldc` was refused for inlining by the optimizing
+    /// tier — not for a modelling reason, but because this struct dropped the
+    /// tag on the floor. Measured on a four-callee probe, `ldc` alone refused
+    /// two of the four (`x *= 0x9E3779B1`, `s * 1000003L` — a constant wider
+    /// than `sipush` is unremarkable in real code).
+    ///
+    /// A `Vec` rather than a third parallel `(pc, value, flag)` vector so the
+    /// two existing shapes and every consumer of them stay byte-identical; the
+    /// lists are per-callee and short, so membership is a linear scan over a
+    /// handful of entries at splice time only.
+    pub ldc_fp_pcs: Vec<usize>,
     /// Whether the callee needs VM context (heap pointer).
     pub needs_heap: bool,
     /// Class name of the inlined callee (for invalidation tracking).
@@ -6695,6 +6801,30 @@ pub struct InlineSite {
     /// `Deferred` target refuses the whole splice rather than leaving a row out
     /// — a missing row bails the METHOD, not the site.
     pub ir_new_info: Vec<(usize, u32, usize)>,
+    /// Resolved `checkcast` / `instanceof` sites in the callee body:
+    /// `(callee_pc, target_class_id, target_class_name, is_checkcast)`.
+    ///
+    /// Filled by `resolve_ir_inline_site` only, and an UNRESOLVED target
+    /// refuses the whole splice rather than leaving a row out -- the same
+    /// trade, and the same sentence, as [`Self::ir_new_info`]'s: a missing row
+    /// bails the METHOD, so admitting the body without one would cost the
+    /// CALLER its optimizing compile over a callee it merely wanted inlined.
+    ///
+    /// The builder's `0xc0`/`0xc1` arms look gentler than that -- a missing row
+    /// reaches `plant_uncommon_trap` rather than `ir_build_bail`. By default it
+    /// is not: `TrapCause::UnresolvedTypeCheck` is gated off
+    /// (`ir_unresolved_class_trap_enabled`), so the plant refuses and the arm
+    /// bails after all. With that gate ON the trap does fire, and inside a
+    /// splice it deopts to re-execute the invoke on every call. Refusing at
+    /// resolution is the answer that does not depend on which way that flag is
+    /// set.
+    ///
+    /// The NAME rides along rather than being re-derived downstream: it is read
+    /// out of the CALLEE's constant pool, which is the only pool that can
+    /// answer, and the same lookup that produced `target_class_id`. Interning
+    /// happens in `append_ir_inline_site` because that is where the
+    /// combined-buffer pc is known.
+    pub ir_typecheck_info: Vec<(usize, u32, String, bool)>,
 }
 
 /// How many levels of splice-inside-a-splice the OPTIMIZING tier's resolver
@@ -6847,6 +6977,33 @@ fn append_ir_inline_site(
     // to `ir_lower`, not to the builder, which is why it is not in
     // `IrInlineTables`.
     compact_fields_out: &mut HashMap<(usize, bool), (u32, bool, u8)>,
+    // The compiling method's value tier, for the spliced `getstatic` rows.
+    // `getstatic` is polymorphic and is listed by neither `is_category2_opcode`
+    // nor `is_float_opcode`, so a callee whose only wide or floating-point
+    // content is a static read reaches here inside a method admitted through
+    // the INT clause. The caller's own sites are gated on exactly this pair in
+    // `try_compile_inner`; a spliced site gated differently would put a `Long`
+    // node in a graph the long tier is switched off for.
+    ir_emit_long: bool,
+    ir_emit_fp: bool,
+    // Declaring classes of the spliced `getstatic` sites. Compiled code reads
+    // static storage directly, so every one of them is an ensure-init
+    // obligation this artifact owes before its first entry — the same
+    // obligation `ir_static_init_classes` records for the caller's own sites.
+    // Collected here rather than derived later because this is the only place
+    // that sees the callee's resolved rows.
+    static_init_classes_out: &mut Vec<u32>,
+    // `combined pc -> (callee entry, callee_needs_ctx)` for each surviving
+    // STATICALLY BOUND call in the spliced bodies. Goes to `ir_direct_calls`,
+    // which is what `ir_lower`'s `Op::Call` arm consults before falling
+    // through to the dispatch helper.
+    direct_call_sites: &mut Vec<(usize, (usize, bool))>,
+    // Set when a spliced body carries a `checkcast`. The artifact then owes
+    // `has_dispatch`, exactly as it does for one of the caller's own: a
+    // definitive refusal publishes its `ClassCastException` through the
+    // `JIT_THREAD` TLS, and the `!has_dispatch` fast entry never sets that TLS.
+    // An obligation, not an optimization -- see `ir_needs_dispatch_for_checkcast`.
+    spliced_checkcast_seen: &mut bool,
 ) -> bool {
     let code_len = site.callee_code_len;
     if code_len == 0 || site.callee_code.len() < code_len || code_len > *budget {
@@ -6916,6 +7073,95 @@ fn append_ir_inline_site(
     for &(cpc, class_id, num_fields) in &site.ir_new_info {
         tables.new_info.insert(base + cpc, (class_id, num_fields));
     }
+    // Constants, rebased with the type tag the builder needs. The resolver has
+    // already refused any `ldc` whose constant-pool entry is not an
+    // Integer/Float (or Long/Double for `ldc2_w`), so a pc present here is one
+    // of exactly those four kinds and `ldc_fp_pcs` splits them.
+    for &(cpc, val) in &site.ldc_info {
+        tables
+            .ldc_info
+            .insert(base + cpc, (val, site.ldc_fp_pcs.contains(&cpc)));
+    }
+    for &(cpc, val) in &site.ldc2w_info {
+        tables
+            .ldc2w_info
+            .insert(base + cpc, (val, site.ldc_fp_pcs.contains(&cpc)));
+    }
+    // Static reads, rebased. `InlineSite::static_field_info` has carried these
+    // resolved rows for the single-pass inliner all along; the optimizing tier
+    // refused the callee outright (`ir-splice-static-field`) because nothing
+    // put them where the builder's `0xb2` arm looks.
+    //
+    // Two guards, and neither is redundant with the resolver's:
+    //
+    // * The OPCODE is re-read from the relocated bytes. `static_field_info` is
+    //   a `getstatic`-and-`putstatic` list on the single-pass side, and the
+    //   builder has no `putstatic` arm at all — one such row reaching the map
+    //   would be a `getstatic` lowering planted at a store. The resolver
+    //   refuses a `putstatic`-bearing body, so this can only fire on a defect,
+    //   which is the case worth having a check for.
+    // * The VALUE TIER, exactly as `try_compile_inner` gates the caller's own
+    //   feed. A gated-off site cannot simply be omitted the way the caller's
+    //   is: omitting it there bails the method to single-pass, but omitting it
+    //   HERE bails the method after the splice has already been committed to.
+    //   Refusing the body instead rolls `combined` back and leaves the caller
+    //   compiling with one less inline.
+    if ir::ir_splice_getstatic_enabled() {
+        for &(cpc, class_id, field_index, type_tag, is_volatile) in &site.static_field_info {
+            if site.callee_code.get(cpc).copied() != Some(0xb2) {
+                return false;
+            }
+            let admitted_by_value_tier = match type_tag {
+                b'J' => ir_emit_long,
+                b'D' | b'F' => ir_emit_fp,
+                _ => true,
+            };
+            if !admitted_by_value_tier {
+                return false;
+            }
+            tables
+                .static_field_info
+                .insert(base + cpc, (class_id, field_index, type_tag, is_volatile));
+            static_init_classes_out.push(class_id);
+        }
+    } else if !site.static_field_info.is_empty() {
+        // The kill switch is set and the VM-side scanner mirror should already
+        // have refused this body. Refuse here too rather than splice a body
+        // whose statics have no rows: the two halves must not be able to
+        // disagree. See `ir::ir_splice_getstatic_enabled`.
+        return false;
+    }
+    // Type checks, rebased. The resolver has already refused the body unless
+    // every site's target class was loaded and named, so a row here is
+    // complete; interning is done at this point rather than there because this
+    // is where the combined-buffer pc is known, and because
+    // `intern_typecheck_target` is the jit crate's table.
+    //
+    // The interned `(ptr, len)` is process-lifetime and deliberately NOT owned
+    // by this compile -- see `intern_typecheck_class_name` on why the pair the
+    // type-check helpers memoize on must never be recycled for another class --
+    // so unlike the invoke rows these need no keep-alive entry on the artifact.
+    if ir::ir_splice_typecheck_enabled() {
+        for (cpc, class_id, name, is_checkcast) in &site.ir_typecheck_info {
+            let expected = if *is_checkcast { 0xc0 } else { 0xc1 };
+            if site.callee_code.get(*cpc).copied() != Some(expected) {
+                return false;
+            }
+            let (ptr, len) = intern_typecheck_target(name, Some(*class_id));
+            let row = (ptr as usize, len);
+            if *is_checkcast {
+                tables.checkcast_info.insert(base + *cpc, row);
+                *spliced_checkcast_seen = true;
+            } else {
+                tables.instanceof_info.insert(base + *cpc, row);
+            }
+        }
+    } else if !site.ir_typecheck_info.is_empty() {
+        // Kill switch set; the scanner mirror should already have refused.
+        // Refuse here too -- the halves must not be able to disagree. See
+        // `ir::ir_splice_typecheck_enabled`.
+        return false;
+    }
     // The resolver PROVED these bodies are no-ops, which is what
     // `object_init_pcs` means — elidable on any receiver, not only on a fresh
     // `Op::New`. `trivial_init_pcs` is the narrower set and would refuse the
@@ -6955,6 +7201,11 @@ fn append_ir_inline_site(
             budget,
             virtual_call_sites,
             compact_fields_out,
+            ir_emit_long,
+            ir_emit_fp,
+            static_init_classes_out,
+            direct_call_sites,
+            spliced_checkcast_seen,
         ) {
             return false;
         }
@@ -6988,18 +7239,113 @@ fn append_ir_inline_site(
         {
             virtual_call_sites.push((base + r.callee_pc, r.num_jit_args));
         }
+        // A STATICALLY BOUND surviving call gets the raw `CALL` the caller's
+        // own sites get.
+        //
+        // This row is what was missing, and its absence was not neutral. The
+        // resolver binds `direct_entry` for every `invokestatic` /
+        // `invokespecial` in a spliced body, and `intern_inline_invoke_targets`
+        // registers it in `direct_callee_entries` -- the KEEP-ALIVE list, which
+        // pins the callee artifact so a baked address cannot dangle. So the
+        // compile paid to pin a target for a direct call it then never emitted:
+        // `ir_direct_calls` was filled only from the CALLER's own scan loop, the
+        // lowerer's `self.direct_calls.get(&pc)` missed at every spliced pc, and
+        // the call fell through to `jit_invoke_dispatch` -- a blind NAME
+        // RESOLUTION, not a call.
+        //
+        // `resolve_inline_site_from` exempts IR mode from the single-pass side's
+        // "a spliced call must not be worse than the call it replaced" refusal,
+        // on the stated grounds that the IR tier's spliced call "is a call, not
+        // a resolution". That was the intent; it was not what the code did.
+        // Measured on `SpliceCallProbe`, whose spliced `mid` leaves behind a
+        // call to a `tableswitch`-bearing `pick` no resolver will splice:
+        // 53 ms running the single-pass body against ~455 ms running the
+        // optimizing one, checksums matching Temurin JDK 25 throughout. With
+        // the rows produced the optimizing body is at parity (~57 ms).
+        // Splicing a frame away while downgrading the calls inside it to
+        // resolutions is a net loss -- the same conclusion, and the same
+        // ~175 ns per resolution, the single-pass side measured in 2026-08.
+        //
+        // Virtual and interface kinds are NOT here: they select on the runtime
+        // receiver, the resolver offers them no direct bind, and the row above
+        // already routes them to the inline-cache cascade.
+        if ir_splice_direct_call_enabled() && ir_direct_calls_enabled() && r.direct_entry != 0 {
+            // The GPU gate the top-level planner applies, applied here for the
+            // same reason: a raw `CALL` to a kernel's entry bypasses
+            // `jit_invoke_dispatch`, and that helper is where the offload hook
+            // lives. Binding one directly would compile the caller and silently
+            // end offload. Unarmed, `keeps_dispatch_helper` is one relaxed bool.
+            let keeps_helper = site.invoke_targets.iter().any(|(pc, t)| {
+                *pc == r.callee_pc
+                    && crate::offload_hook::keeps_dispatch_helper(
+                        t.class_name.as_str(),
+                        t.method_name.as_str(),
+                        t.descriptor.as_str(),
+                    )
+            });
+            if !keeps_helper {
+                direct_call_sites
+                    .push((base + r.callee_pc, (r.direct_entry, r.direct_needs_context)));
+            }
+        }
     }
     true
+}
+
+/// May a surviving statically-bound call inside a SPLICED body be bound to the
+/// callee's entry with a raw `CALL`? **Default ON**;
+/// `CRATONVM_JIT_IR_SPLICE_DIRECT_CALL=0` restores the dispatch-helper
+/// fallback, which is what every such site got before 2026-09-09.
+///
+/// The off arm is not so much a safety net as the measurement's A arm: what it
+/// restores is `jit_invoke_dispatch`, which resolves the callee by NAME on
+/// every call. Keep it, because "did the splice make this slower?" has to stay
+/// a question one binary can answer.
+pub fn ir_splice_direct_call_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPLICE_DIRECT_CALL").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
 }
 
 /// Merge one top-level site's rows into the compile's plan. Split out so the
 /// roll-back path has something to NOT call.
 fn merge_ir_inline_tables(into: &mut ir::IrInlineTables, from: ir::IrInlineTables) {
-    into.sites.extend(from.sites);
-    into.field_info.extend(from.field_info);
-    into.invoke_info.extend(from.invoke_info);
-    into.new_info.extend(from.new_info);
-    into.object_init_pcs.extend(from.object_init_pcs);
+    // DESTRUCTURED, not field-by-field on `from`. A row added to
+    // `IrInlineTables` and forgotten here does not fail to compile — it
+    // silently reaches the builder empty, and the builder then bails the whole
+    // METHOD at the first spliced site that needed it, which reads from the
+    // outside exactly like a workload with no such site. That is not
+    // hypothetical: it is how the `ldc` rows behaved for their first hour of
+    // existence, with the scanner admitting the callee and the builder refusing
+    // it 65 bytes later. The pattern below makes the next such row a
+    // compile error.
+    let ir::IrInlineTables {
+        sites,
+        field_info,
+        invoke_info,
+        new_info,
+        object_init_pcs,
+        ldc_info,
+        ldc2w_info,
+        static_field_info,
+        checkcast_info,
+        instanceof_info,
+    } = from;
+    into.sites.extend(sites);
+    into.field_info.extend(field_info);
+    into.invoke_info.extend(invoke_info);
+    into.new_info.extend(new_info);
+    into.object_init_pcs.extend(object_init_pcs);
+    into.ldc_info.extend(ldc_info);
+    into.ldc2w_info.extend(ldc2w_info);
+    into.static_field_info.extend(static_field_info);
+    into.checkcast_info.extend(checkcast_info);
+    into.instanceof_info.extend(instanceof_info);
 }
 
 /// Turn a spliced body's resolver-side [`InlineInvokeTarget`]s into the
@@ -8128,6 +8474,7 @@ mod profile_guided_inlining_tests {
             static_field_info: Vec::new(),
             ldc_info: Vec::new(),
             ldc2w_info: Vec::new(),
+            ldc_fp_pcs: Vec::new(),
             needs_heap: false,
             class_name: class.to_string(),
             class_id: 0,
@@ -8138,6 +8485,7 @@ mod profile_guided_inlining_tests {
             resolved_invoke_infos: Vec::new(),
             nested_sites: Vec::new(),
             ir_new_info: Vec::new(),
+            ir_typecheck_info: Vec::new(),
         }
     }
 
@@ -8914,6 +9262,7 @@ mod inline_selection_tests {
                 .collect(),
             ldc_info: Vec::new(),
             ldc2w_info: Vec::new(),
+            ldc_fp_pcs: Vec::new(),
             needs_heap,
             class_name: "InlineCost".to_string(),
             class_id: 0,
@@ -8924,6 +9273,7 @@ mod inline_selection_tests {
             resolved_invoke_infos: Vec::new(),
             nested_sites: Vec::new(),
             ir_new_info: Vec::new(),
+            ir_typecheck_info: Vec::new(),
         }
     }
 
@@ -12888,7 +13238,7 @@ fn box_unbox_intrinsic_disabled() -> bool {
         // 1200 s cap, three to 400 s), **zero SIGSEGV**. What those runs end on
         // instead -- a `NullPointerException` at a later seed -- appears
         // identically with the family OFF, and is the pre-existing failure
-        // `known-issues/h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`
+        // `known-issues/h2/bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md`
         // records.
         //
         // `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` still forces it off and still
@@ -25343,6 +25693,13 @@ fn try_compile_inner(
                     let mut sub = ir::IrInlineTables::default();
                     let mut sub_vcalls: Vec<(usize, usize)> = Vec::new();
                     let mut sub_compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
+                    // Per-site, and merged only on success, for the same
+                    // reason `sub` itself is: a rolled-back body must not
+                    // leave this artifact owing a `<clinit>` for a class its
+                    // code never reads.
+                    let mut sub_static_init: Vec<u32> = Vec::new();
+                    let mut sub_direct_calls: Vec<(usize, (usize, bool))> = Vec::new();
+                    let mut sub_checkcast_seen = false;
                     let ok = append_ir_inline_site(
                         site,
                         pc,
@@ -25354,9 +25711,29 @@ fn try_compile_inner(
                         &mut budget,
                         &mut sub_vcalls,
                         &mut sub_compact,
+                        ir_emit_long,
+                        ir_emit_fp,
+                        &mut sub_static_init,
+                        &mut sub_direct_calls,
+                        &mut sub_checkcast_seen,
                     );
                     if ok {
                         merge_ir_inline_tables(&mut tables, sub);
+                        // A spliced `checkcast` obliges the artifact exactly as
+                        // one of the caller's own does. Merged only on success,
+                        // like every other row: a rolled-back body must not
+                        // leave the artifact carrying `has_dispatch` for a cast
+                        // its code does not contain.
+                        ir_needs_dispatch_for_checkcast |= sub_checkcast_seen;
+                        // The surviving statically-bound calls in the spliced
+                        // bodies, at their combined-buffer pcs. Merged only on
+                        // success, and keyed past `code_len`, so the spliced-pc
+                        // sweep below -- which drops the caller's own row at
+                        // every pc it spliced OVER -- cannot reach them.
+                        ir_direct_calls.extend(sub_direct_calls);
+                        // The ensure-init obligation the spliced statics add.
+                        // Sorted and deduped where the vector is consumed.
+                        ir_static_init_classes.append(&mut sub_static_init);
                         // Same gate the caller's own rows are behind, so
                         // the spliced bodies and the method around them cannot
                         // disagree about whether compact offsets are in play.
@@ -25450,6 +25827,36 @@ fn try_compile_inner(
         // report can separate "the front end refused this bytecode" (build
         // returned None, `nodes_built` stays unmeasured) from "the graph was
         // built and then rejected for size".
+        // The branches whose cold arm this compile may speculate away.
+        //
+        // Strictly stronger than `ir_branch_hints` above, and the
+        // difference is the whole point: a hint says which edge to lay
+        // out first and is free to be wrong, while this DELETES an arm
+        // and pays a deopt when it is wrong. So the test is exact —
+        // `not_taken == 0`, not "usually" — over a sample large enough
+        // that zero means something (`ir::MIN_OBSERVATIONS_TO_PRUNE`).
+        //
+        // Empty without a profile, which is every run that has not
+        // asked for one; `IrBuilder::prune_always_taken_branch` then
+        // never fires and the graph is byte-identical.
+        let ir_pruned_branches: std::collections::HashSet<usize> =
+            if ir::ir_speculate_enabled() {
+                profile
+                    .map(|prof| {
+                        prof.branches
+                            .iter()
+                            .filter(|(_, c)| {
+                                c.not_taken == 0
+                                    && c.taken >= ir::MIN_OBSERVATIONS_TO_PRUNE
+                            })
+                            .map(|(&pc, _)| pc)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                std::collections::HashSet::new()
+            };
+        builder.set_pruned_branches(ir_pruned_branches);
         note_jit_pipeline_stage(JIT_STAGE_BUILD);
         let metrics_build = metrics.phase(metrics::Phase::Build);
         // `code_len` stays the COMPILING method's length whichever buffer this

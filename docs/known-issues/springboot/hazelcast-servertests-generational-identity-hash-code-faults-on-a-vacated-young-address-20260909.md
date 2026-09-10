@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | OPEN, filed 2026-09-09 at dev tip `ccf731dd3`. Reproduced standalone. Not root-caused; the READER is named exactly, the producer is not. |
 | **Scope** | `module/spring-boot-hazelcast`, JIT on, real JDK 25, `--Xmx 2g`, **`--XX:UseGc Generational` only**. G1 and ZGC pass 20/20. HotSpot passes 20/20 in 33 s. |
-| **Rate** | **2 SIGSEGVs in 6** concurrent runs; 0 in 3 runs launched alone or in pairs. It is load-sensitive but a SIGSEGV is not a load artefact. |
+| **Rate** | **3 observed.** 2 SIGSEGVs in 6 concurrent runs, plus 1 in a six-arm mixed matrix at 52 s. 0 in 3 runs launched alone or in pairs. It is load-sensitive, but a SIGSEGV is not a load artefact. |
 | **Reproducer** | `org.springframework.boot.hazelcast.autoconfigure.HazelcastAutoConfigurationServerTests`, Linux x86-64, 128–375 s |
 | **Family** | The same "a stale reference reaches a reader after a moving young cycle" family as [`bindabletests-local-holds-an-interior-word-of-a-retired-tlab-filler-20260909.md`](bindabletests-local-holds-an-interior-word-of-a-retired-tlab-filler-20260909.md) and [`bindabletests-moving-young-leaves-a-frame-slot-unremapped-20260908.md`](bindabletests-moving-young-leaves-a-frame-slot-unremapped-20260908.md). Both of those have a **deterministic** reproducer under `CRATONVM_DBG_GC_STRESS`; this one does not, so **chase them, not this page.** |
 | **Supersedes** | the Generational rows of the retired [Hazelcast crash-or-hang page](../../internal/springboot/hazelcast-autoconfiguration-crash-hang-RETIRED-20260909.md). Every other row of that page was a timeout or a fixed defect. |
@@ -12,14 +12,15 @@
 ## The reader is `NativeContextImpl::identity_hash_code`, in both crashes
 
 Symbolised from the crash report's own `pc` and the `maps:` load base it
-prints (`addr2line -f -C -i`), on two independent runs:
+prints (`addr2line -f -C -i`), on three independent runs and two binaries:
 
-| run | `pc` | load base (`prev:` line) | file offset | symbol |
-|---|---|---|---|---|
-| `base2-Server-Generational` | `0x5c5895cc9f2b` | `0x5c5893cfb000` | `0x1fcef2b` | `NativeContextImpl::identity_hash_code` |
-| `rate1-2` | `0x5e9dd1878f2b` | `0x5e9dcf8aa000` | `0x1fcef2b` | `NativeContextImpl::identity_hash_code` |
+| run | binary | `pc` | load base (`prev:` line) | file offset | symbol |
+|---|---|---|---|---|---|
+| `base2-Server-Generational` | pre-fix | `0x5c5895cc9f2b` | `0x5c5893cfb000` | `0x1fcef2b` | `NativeContextImpl::identity_hash_code` |
+| `rate1-2` | pre-fix | `0x5e9dd1878f2b` | `0x5e9dcf8aa000` | `0x1fcef2b` | `NativeContextImpl::identity_hash_code` |
+| `fix2-Server-Generational` | post-fix | `0x62a22510b1bb` | `0x62a22313c000` | `0x1fcf1bb` | `NativeContextImpl::identity_hash_code` |
 
-Same byte of the same function. The crash handler's own operand decode agrees
+Same function every time, `rdx=0x4` and the fault at `rsi+8` on all three. The crash handler's own operand decode agrees
 it is a **read**, not a write:
 
 ```
@@ -76,10 +77,20 @@ in full. Do not read a green arm under either flag as a fix.
 
 `CRATONVM_DBG_VACATED_FRAMES=1` — the instrument whose crash-handler arm prints
 `VACATED REGISTER: rsi=0x… named an object a completed collection moved to
-0x…`, which is the single line that would close this — dilates this workload
-past the point where the crash window is reachable: six armed runs at a
-1500-second budget completed 3–9 Hazelcast member lifecycles each, against 16
-in 820 unarmed seconds, and none of them crashed.
+0x…`, which is the single line that would close this — **dilates this
+workload about ninefold, past the point where the crash window is reachable.**
+Measured in Hazelcast member lifecycles (`is STARTED`) rather than wall time, so
+what is reported is work done and not host load:
+
+| arms | budget | `CRATONVM_DBG_VACATED_FRAMES` | lifecycles reached | SIGSEGVs |
+|---|---|---|---:|---:|
+| 6 | 1200 s | off | 16 by 820 s, then PASS 20/20 | 2 of 6 |
+| 6 | 1500 s | **on** | 3 to 9 | 0 of 6 |
+| 6 | 3600 s | **on** | 7 to 9 | 0 of 6 |
+
+Twelve armed runs and 5.5 armed hours produced no crash and not one
+`VACATED REGISTER` line. Arming this instrument on this workload measures a
+different run.
 
 The two `BindableTests` pages reach the same family in **6–20 seconds** with
 `CRATONVM_DBG_GC_STRESS=262144`, deterministically, with the producer already
@@ -90,6 +101,13 @@ victim here is reached through a native's `identityHashCode`, not through an
 
 **Retire this page when either `BindableTests` page is fixed and this class
 runs 20/20 on Generational over six concurrent arms.**
+
+If someone does want to close it here rather than there, the measurement that
+would do it is a verdict cheap enough to stay armed: the vacated ledger
+consulted only AT THE FAULT, not fed by a recording side that runs all process
+long. `was_vacated_try` is already signal-safe and already called from
+`crash_handler.rs`; it is `vacated_frames_enabled()` gating the RECORD path
+that costs the ninefold above.
 
 ## Repro
 

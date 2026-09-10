@@ -2969,6 +2969,75 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             // through to a key CLDR does not define. The en constants stay as
             // the fallback for an image with no `jdk.localedata`.
             let (lang, country) = receiver_locale(ctx, args.first());
+            // An EMPTY language is always wrong here and was previously
+            // SILENT in the worst possible way: `cldr_format_data(ctx, "", "")`
+            // resolves to the ROOT bundle, which loads fine and carries a full
+            // 13-element `NumberElements` -- so the lookup SUCCEEDS, no
+            // fallback arm is taken, no warning fires, and every locale is
+            // formatted with root (English) number symbols. Neither the W7-80
+            // "no bundle" warning nor the "no NumberElements" one below can see
+            // it, because nothing is missing; the wrong LOCALE was asked for.
+            //
+            // This is the tell to check first when a locale asked for BY NAME
+            // still formats as English.
+            if lang.is_empty() {
+                // Two different faults produce an empty language here and they
+                // need different fixes, so name which one it was rather than
+                // guessing. The field SHAPE is identical on JDK 21 and 25
+                // (`private final java.util.Locale locale;`, same position,
+                // measured with javap), so a missing field means the receiver
+                // is not the real `LocaleResources` -- not that the JDK differs.
+                let field = match args.first() {
+                    Some(Value::Object(Some(this))) => {
+                        match ctx.get_field_by_name(*this, "locale") {
+                            Value::Object(Some(loc)) => {
+                                // The Locale is there. Ask it directly and
+                                // report the RAW shape of the answer, because
+                                // the three cases need different fixes and all
+                                // three read as an empty string upstream:
+                                //   * a real "" -- the Locale genuinely has no
+                                //     language;
+                                //   * Ok(None) -- the call returned VOID, which
+                                //     is what a REFUSED native hands back to a
+                                //     native caller, and is the tell that this
+                                //     dispatch route did not reach bytecode;
+                                //   * Err -- it threw.
+                                // Bytecode callers of Locale.getLanguage() are
+                                // known-correct in every mode (measured), so a
+                                // gap here is a DISPATCH-ROUTE difference, not a
+                                // broken accessor.
+                                match ctx.invoke_virtual(
+                                    loc,
+                                    "getLanguage",
+                                    "()Ljava/lang/String;",
+                                    &[],
+                                ) {
+                                    Ok(Some(Value::Object(Some(sref)))) => {
+                                        match ctx.read_string(sref) {
+                                            Some(v) if v.is_empty() => {
+                                                "getLanguage-returned-empty-string"
+                                            }
+                                            Some(_) => "getLanguage-OK-but-lang-empty-upstream",
+                                            None => "getLanguage-unreadable-string",
+                                        }
+                                    }
+                                    Ok(Some(Value::Object(None))) => "getLanguage-returned-null",
+                                    Ok(Some(_)) => "getLanguage-returned-non-reference",
+                                    Ok(None) => "getLanguage-returned-VOID-refused-native",
+                                    Err(_) => "getLanguage-threw",
+                                }
+                            }
+                            Value::Object(None) => "locale-field-null",
+                            _ => "locale-field-not-a-reference",
+                        }
+                    }
+                    _ => "no-receiver",
+                };
+                tracing::warn!(
+                    locale_field = field,
+                    "W7-80: LocaleResources receiver yielded no language, so number                      symbols resolve against the ROOT bundle and EVERY locale formats                      as English. Nothing is missing from the JDK image and this bridge                      is not the culprit -- the wrong LocaleResources was handed to it.                      `getLanguage-returned-empty-string` (the measured JDK 21                      --jdk-only case) means the receiver IS a real LocaleResources but                      for the ROOT locale: something upstream answered a non-root                      request with root resources, so look at adapter/resource                      SELECTION, not at this bridge or at the CLDR bundles.                      `getLanguage-returned-VOID-refused-native` would instead mean the                      call never reached bytecode."
+                );
+            }
             let cldr = cldr_format_data(ctx, &lang, &country)
                 .and_then(|t| cldr_number_strings(&t, "NumberElements"));
             let outer = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 3);
@@ -2983,13 +3052,36 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                     let refs: Vec<&str> = v.iter().map(String::as_str).collect();
                     make_string_array(ctx, &refs)
                 }
-                _ => make_string_array(
-                    ctx,
-                    &[
-                        ".", ",", ";", "%", "0", "#", "-", "E", "\u{2030}", "\u{221E}", "NaN", ".",
-                        ",",
-                    ],
-                ),
+                _ => {
+                    // Substituting en here is a SILENT wrong answer: the caller
+                    // gets a fully-formed 13-element array and formats every
+                    // locale as English with no error at all. That is how the
+                    // strict-mode `textformat` divergence stayed unexplained --
+                    // the W7-80 warning in `load_cldr_table` never fires for
+                    // it, because a locale that resolves to the ROOT bundle
+                    // LOADS fine and only its CONTENT is English.
+                    //
+                    // Say it here, where the substitution actually happens, and
+                    // name the locale that was asked for: an EMPTY language is
+                    // the tell that the receiver's `locale` field could not be
+                    // read at all, rather than that the image lacks the data.
+                    tracing::warn!(
+                        language = %lang,
+                        country = %country,
+                        "W7-80: no CLDR NumberElements for this locale; substituting \
+                         CratonVM's en number symbols, so every locale will format as \
+                         English. An EMPTY language here means the LocaleResources \
+                         receiver's locale could not be read, NOT that the JDK image \
+                         lacks the data."
+                    );
+                    make_string_array(
+                        ctx,
+                        &[
+                            ".", ",", ";", "%", "0", "#", "-", "E", "\u{2030}", "\u{221E}", "NaN",
+                            ".", ",",
+                        ],
+                    )
+                }
             };
             let outer_now = ctx.read_native_pin(outer_pin, outer);
             ctx.set_array_element(outer_now, 0, Value::Object(Some(elems)));

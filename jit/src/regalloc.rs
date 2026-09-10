@@ -3889,12 +3889,22 @@ pub mod xmm_roles {
     ///
     /// RBX and R12–R15, and every part of that choice is forced:
     ///
-    ///   * **Callee-saved on both ABIs.** `ir_lower` emits calls constantly —
-    ///     runtime helpers, inline-cache dispatch, JIT-to-JIT direct calls —
-    ///     and this wiring has no reload machinery, so a value's register must
-    ///     survive a call by the calling convention rather than by analysis.
-    ///     That rules out every caller-saved register, including the otherwise
-    ///     obvious System V candidates RSI/RDI.
+    ///   * **Callee-saved on the target ABI.** `ir_lower` emits calls
+    ///     constantly — runtime helpers, inline-cache dispatch, JIT-to-JIT
+    ///     direct calls — and this wiring has no reload machinery, so a
+    ///     value's register must survive a call by the calling convention
+    ///     rather than by analysis. That rules out every caller-saved
+    ///     register.
+    ///
+    ///     RSI/RDI are caller-saved on **System V** and callee-saved on
+    ///     **Win64**, so they are in the file on Windows and out of it
+    ///     elsewhere — the same platform split [`IR_PROLOGUE_SAVED`] already
+    ///     makes for XMM6/XMM7, and for the same reason. This constant said
+    ///     they were caller-saved unconditionally until 2026-09-10: a System V
+    ///     fact stated as an ABI-independent one, and it cost the optimizing
+    ///     tier two of the seven callee-saved registers the single-pass
+    ///     backend has been colouring locals into all along (`x64::LOCAL_REGS`
+    ///     is `[u8; 7]` on Windows and `[u8; 5]` elsewhere).
     ///   * **Untouched by this emitter.** The value tier is RAX/RCX/RDX, the
     ///     safepoint and shadow-stack scratch is R10/R11, and call arguments go
     ///     in `ENTRY_ABI_REGS`. None of those overlaps this set.
@@ -3914,14 +3924,32 @@ pub mod xmm_roles {
     /// structurally, by having no register a `Ref` could occupy; a GP file has
     /// to discharge it by refusing the type, which `plan_register_residency`
     /// does and which its own test pins.
+    /// Win64: RBX, R12–R15 **and RSI/RDI**, which this ABI makes
+    /// callee-saved. The two extra registers are appended rather than
+    /// interleaved so that a method whose peak live set fits in five is
+    /// allocated exactly as it was before they existed.
+    #[cfg(windows)]
+    pub const IR_GP_LINEAR_SCAN: [u8; 7] = [3, 12, 13, 14, 15, 6, 7];
+    /// System V: RSI/RDI are argument registers and caller-saved, so the file
+    /// is RBX and R12–R15 alone.
+    #[cfg(not(windows))]
     pub const IR_GP_LINEAR_SCAN: [u8; 5] = [3, 12, 13, 14, 15];
+
+    /// The first [`IR_GP_LINEAR_SCAN`] entries that were the file before the
+    /// Win64 widening — what `CRATONVM_JIT_IR_GP_WIDE=0` restores. Five on
+    /// every platform, which on System V is the whole file.
+    pub const IR_GP_LINEAR_SCAN_NARROW: usize = 5;
 
     /// The GP registers `ir_lower::emit_prologue` saves and every exit
     /// restores — all of [`IR_GP_LINEAR_SCAN`], because every one of them is
-    /// callee-saved on both ABIs and that is exactly why they were chosen.
+    /// callee-saved on the target ABI and that is exactly why they were
+    /// chosen.
     ///
-    /// Unlike the XMM list this is not platform-conditional: System V and Win64
-    /// agree that RBX and R12–R15 belong to the caller.
+    /// Platform-conditional only through [`IR_GP_LINEAR_SCAN`]: System V and
+    /// Win64 agree about RBX and R12–R15 and disagree about RSI/RDI.
+    /// `Lowerer::saved_gpr_regs` emits a save only for a register the
+    /// residency plan actually handed out, so a widened file that goes unused
+    /// costs frame bytes and no instructions.
     pub const IR_GP_PROLOGUE_SAVED: &[u8] = &IR_GP_LINEAR_SCAN;
 
     /// The first register claimed by two of the three authorities, if any.
@@ -4171,6 +4199,23 @@ pub struct MachineModel {
     /// Positions at which the collector may run and read the oop map. Sorted,
     /// deduplicated.
     pub safepoints: Vec<usize>,
+    /// May a reference hold a register across one of those positions?
+    ///
+    /// **`false` (the default) is the only setting that is safe on its own.**
+    /// The oop map names frame slots, so a collector can neither see nor
+    /// relocate a reference held in a register, and a value whose range covers
+    /// a safepoint is therefore refused a register outright.
+    ///
+    /// `true` says the CALLER discharges that obligation by other means, and
+    /// there is exactly one such caller: `ir_lower`, whose register file is a
+    /// write-through read cache over a frame slot the map does name. It keeps
+    /// the home word authoritative and invalidates the cached copy at every
+    /// point a collector could have run, so a reload after a collection reads
+    /// the slot the collector updated. See `ir_lower::invalidate_ref_residency`
+    /// — and note that it does NOT trust `safepoints` for that, because
+    /// `ir_op_is_safepoint` is a model of oop-map publication sites and
+    /// `ir_lower` also emits helper calls at ops that are not on that list.
+    pub refs_may_cross_safepoints: bool,
 }
 
 /// Work budget for the liveness fixed point, in `nodes × blocks` units.
@@ -5062,6 +5107,7 @@ impl MachineModel {
             clobbers,
             fixed: Vec::new(),
             safepoints,
+            refs_may_cross_safepoints: false,
         }
     }
 
@@ -5437,7 +5483,10 @@ pub fn allocate_linear_scan(
         if !live.converged || live.pinned[id] || live.class[id].is_none() {
             continue;
         }
-        if live.is_ref[id] && model.range_covers_safepoint(range) {
+        if live.is_ref[id]
+            && !model.refs_may_cross_safepoints
+            && model.range_covers_safepoint(range)
+        {
             continue;
         }
         if model
@@ -6204,7 +6253,13 @@ pub fn verify_allocation(
                     ),
                 ));
             }
+            // The same rule the candidate set applies, checked again over what
+            // was actually produced — and lifted by the same knob, so the
+            // verifier cannot be the thing that quietly forbids what the model
+            // permits. `MachineModel::refs_may_cross_safepoints` documents who
+            // may set it and what they owe for it.
             if live.is_ref.get(id).copied().unwrap_or(false)
+                && !model.refs_may_cross_safepoints
                 && model.range_covers_safepoint(seg.range)
             {
                 return Err(Bailout::with_context(
@@ -6723,6 +6778,7 @@ mod linear_scan_tests {
             clobbers: Vec::new(),
             fixed: Vec::new(),
             safepoints: Vec::new(),
+            refs_may_cross_safepoints: false,
         }
     }
 
@@ -6777,6 +6833,62 @@ mod linear_scan_tests {
             "[0, 8] and [8, 10] touch at 8, which counts as overlapping"
         );
         assert_eq!(live.peak_live, 2);
+        verify_allocation(&graph, &live, &model, &alloc).expect("verifies");
+    }
+
+    /// The default: a reference live across a safepoint gets no register,
+    /// because the oop map names frame slots and a collector could neither see
+    /// nor relocate one held in a register.
+    #[test]
+    fn a_reference_live_across_a_safepoint_gets_no_register_by_default() {
+        let mut f = Fixture::new(12);
+        let across = f.value(Op::Load(crate::ir::MemKind::Ref), IrType::Ref, 0, 8, &[3, 8]);
+        let prim = f.value(Op::Add, IrType::Int, 0, 8, &[3, 8]);
+        let (graph, live) = f.finish();
+        let mut model = bare_model(gp(4));
+        model.safepoints = vec![5];
+
+        let alloc = allocate_linear_scan(&graph, &live, &model).expect("allocates");
+        assert_eq!(
+            alloc.first_reg(across),
+            None,
+            "a reference crossing a safepoint took a register the oop map cannot name"
+        );
+        assert!(
+            alloc.first_reg(prim).is_some(),
+            "the primitive must be promoted, or the assertion above is vacuous"
+        );
+        verify_allocation(&graph, &live, &model, &alloc).expect("verifies");
+    }
+
+    /// `refs_may_cross_safepoints` lifts exactly that refusal and nothing else.
+    ///
+    /// The caller that sets it — `ir_lower`, whose file is a write-through read
+    /// cache over a slot the map DOES name — discharges the obligation by
+    /// invalidating the cached copy at every point a collector could have run.
+    /// See `ir_lower::invalidate_ref_residency`. This test's job is only to
+    /// pin that the knob is what decides it, so that turning it on cannot
+    /// become a silent property of some other change.
+    #[test]
+    fn refs_may_cross_safepoints_lifts_that_refusal_and_only_that_one() {
+        let mut f = Fixture::new(12);
+        let across = f.value(Op::Load(crate::ir::MemKind::Ref), IrType::Ref, 0, 8, &[3, 8]);
+        let pinned = f.home_bound(IrType::Ref, 0, 8, &[3, 8]);
+        let (graph, live) = f.finish();
+        let mut model = bare_model(gp(4));
+        model.safepoints = vec![5];
+        model.refs_may_cross_safepoints = true;
+
+        let alloc = allocate_linear_scan(&graph, &live, &model).expect("allocates");
+        assert!(
+            alloc.first_reg(across).is_some(),
+            "the knob is on, so the reference must be allocatable"
+        );
+        assert_eq!(
+            alloc.first_reg(pinned),
+            None,
+            "the knob lifts the SAFEPOINT refusal only — a home-bound value is              still refused for its own reason"
+        );
         verify_allocation(&graph, &live, &model, &alloc).expect("verifies");
     }
 

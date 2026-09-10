@@ -209,6 +209,6 @@ the search had no target.
 `bug-box-unbox-intrinsic-segv-under-relocation-20260902` (retired to
 `fixed-bugs/` 2026-09-05),
 `RMapGcStress` (`rc=139` in the 2026-09-03 suite run) and
-`h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`'s SEGV face.
+`docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md`'s SEGV face.
 One collector bug, four reporters.
 

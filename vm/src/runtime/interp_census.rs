@@ -352,6 +352,51 @@ pub fn report_at_exit() {
             "[c2-supersede] ir aastore sites lowered: {}",
             cratonvm_jit::ir_lower::ir_aastore_census(),
         );
+        // Block-exit shape. Read as a RATIO: `elided` alone cannot separate a
+        // layout that is working from a method whose blocks were already in
+        // source order, and until the elision existed every edge ended in an
+        // explicit `JMP` — so frequency-driven block layout could not pay,
+        // whatever it reordered.
+        let (ft_elided, ft_jmps) = cratonvm_jit::ir_lower::ir_fallthrough_census();
+        eprintln!(
+            "[c2-supersede] ir block exits: fell_through={ft_elided} jmp_emitted={ft_jmps}"
+        );
+        // Speculation. A zero with `CRATONVM_JIT_IR_SPECULATE=1` means no
+        // branch in this workload was one-sided over the sample — a fact about
+        // the program, not about the pass — and that is precisely what a bare
+        // "nothing happened" cannot tell you.
+        eprintln!(
+            "[c2-supersede] ir cold branch arms pruned: {}",
+            cratonvm_jit::ir::branch_prune_census(),
+        );
+        // Multi-return splicing. `bodies=0` is the DEFAULT reading — the
+        // feature is off. With `CRATONVM_JIT_IR_SPLICE_MULTI_RETURN=1` a zero
+        // means no admitted callee had a second reachable `return`, which is a
+        // fact about the workload rather than about the feature.
+        let (mr_bodies, mr_edges) = cratonvm_jit::ir::multi_return_splice_census();
+        eprintln!(
+            "[c2-supersede] ir multi-return spliced bodies: bodies={mr_bodies} return_edges={mr_edges}"
+        );
+        // Reference residency. `admitted=0` under
+        // `CRATONVM_JIT_IR_REF_RESIDENCY=1` means no reference in this workload
+        // was worth a register; `admitted>0 dropped=0` would mean the
+        // invalidation is not wired, which is the one reading that must never
+        // be silent — it is a stale-oop bug, not a missed optimization.
+        let (ref_admitted, ref_dropped) = cratonvm_jit::ir_lower::ir_ref_residency_census();
+        eprintln!(
+            "[c2-supersede] ir reference residency: admitted={ref_admitted} copies_dropped={ref_dropped}"
+        );
+        // Calls this tier lowered to `jit_invoke_dispatch` -- a name
+        // resolution per execution. `in_splice` is the row to act on: a splice
+        // exists to delete a frame, and a resolution costs far more than the
+        // frame it removed, so a non-zero here means the optimizing body is
+        // very likely SLOWER than the single-pass one for that method. It read
+        // non-zero for every spliced statically-bound call until 2026-09-09;
+        // see `c2-splice-getstatic-and-the-calls-it-left-behind-20260909.md`.
+        let (bd_own, bd_splice) = cratonvm_jit::ir_lower::ir_blind_dispatch_census();
+        eprintln!(
+            "[c2-supersede] ir blind dispatches: own_code={bd_own} in_splice={bd_splice}"
+        );
         let (held, spent, retired) = cratonvm_jit::deferred_new_retry_census();
         eprintln!(
             "[c2-supersede] deferred-new retries: held={held} spent={spent} retired={retired} re_offered={}",

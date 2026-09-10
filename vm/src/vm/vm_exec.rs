@@ -4291,6 +4291,51 @@ fn safe_native_call_impl(
                     );
                 }
                 *o = healed;
+                // `CRATONVM_DBG_DEADREF_STORE`: did the heal actually heal it?
+                //
+                // `load_and_forward` reads the forwarding marker at the old
+                // address, and the comment above is careful to say that marker
+                // "stays readable until the memory is actually reused". Once the
+                // allocator has re-served the span there is nothing left to
+                // read, and the heal silently returns the dead address it was
+                // given. That is not a rare corner under GC stress: it is the
+                // normal case, because a stale reference is only USED some
+                // cycles after it goes stale.
+                //
+                // So this is the boundary at which a native's stale return
+                // becomes the interpreter's problem, and it is the only place
+                // that can name the native. Everything downstream sees an
+                // ordinary operand-stack value.
+                {
+                    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    if *ON.get_or_init(|| cratonvm_types::flags().gc.dbg_deadref_store) {
+                        if let Some(reason) = cratonvm_gc::gen_heap::dead_young_ref_reason_global(
+                            o.as_ptr() as usize,
+                        ) {
+                            static N: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                                let callee = native_callee_name(callback);
+                                let java_site = thread
+                                    .frames
+                                    .last()
+                                    .map(|f| {
+                                        format!(
+                                            "{}.{}{}",
+                                            f.class_name(),
+                                            f.method_name(),
+                                            f.method_descriptor()
+                                        )
+                                    })
+                                    .unwrap_or_default();
+                                eprintln!(
+                                    "[deadref-nret] {reason} native {callee} (invoked from                                      {java_site}) returned 0x{:x}, which names no live object,                                      and `load_and_forward` could not heal it — the forwarding                                      marker is gone because the span was re-served. The defect                                      is in the native: it held a reference across an allocation.",
+                                    o.as_ptr() as usize,
+                                );
+                            }
+                        }
+                    }
+                }
             }
             if let Some(o) = value_as_validated_object_ref(shared, *v) {
                 thread.native_pending_return = Some(o);
@@ -12095,6 +12140,41 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                         "[blockgc] PIN-STALE tid={} 0x{:x}->0x{new:x} class={fwd_class} caller:\n{}",
                         self.thread.thread_id.0,
                         obj.as_ptr() as usize,
+                        std::backtrace::Backtrace::force_capture(),
+                    );
+                }
+            }
+        }
+        // `CRATONVM_DBG_DEADREF_STORE`: the same pin-time canary for the case
+        // the two sources above are blind to.
+        //
+        // `debug_forwarded_target` and `was_vacated` both answer "this object
+        // MOVED and here is where to". Neither can see a reference to memory
+        // that holds no object at all — an address the evacuator refused, or
+        // one whose semispace was emptied — because nothing was ever forwarded
+        // from it. That is the shape `alloc_unmod_wrapper` and `build_module`
+        // both hit on BindableTests: the caller handed down an `ObjectRef` it
+        // had held across an allocation, the collection declined to relocate
+        // it, and the pin faithfully preserved a dead address.
+        //
+        // Pinning is the right place to ask, because a pin is a promise that
+        // the value is live: if it is not live HERE, no later refresh can
+        // recover it, and the caller named in the backtrace is the defect.
+        if cratonvm_types::flags().gc.dbg_deadref_store {
+            if let Some(reason) = self
+                .shared
+                .mem
+                .heap
+                .dead_young_ref_reason(obj.as_ptr() as usize)
+            {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 12 {
+                    eprintln!(
+                        "[deadref-pin] #{n} {reason} pin_native_root(0x{:x}) on tid={} — the                          value names no live object, so this pin preserves a dead address                          rather than protecting a live one. caller:
+{:?}",
+                        obj.as_ptr() as usize,
+                        self.thread.thread_id.0,
                         std::backtrace::Backtrace::force_capture(),
                     );
                 }
@@ -25156,6 +25236,16 @@ fn invoke_on_class_shared_inner(
                                 | ("java/lang/System$1", "addOpens", "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V")
                                 | ("java/lang/System$1", "addOpensToAllUnnamed", "(Ljava/lang/Module;Ljava/lang/String;)V")
                                 | ("java/lang/System$1", "addUses", "(Ljava/lang/Module;Ljava/lang/Class;)V")
+                                // Same eight, on the name this carrier has
+                                // on JDK 21 (see JLA_CARRIER_CANDIDATES).
+                                | ("java/lang/System$2", "addReads", "(Ljava/lang/Module;Ljava/lang/Module;)V")
+                                | ("java/lang/System$2", "addReadsAllUnnamed", "(Ljava/lang/Module;)V")
+                                | ("java/lang/System$2", "addExports", "(Ljava/lang/Module;Ljava/lang/String;)V")
+                                | ("java/lang/System$2", "addExports", "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V")
+                                | ("java/lang/System$2", "addExportsToAllUnnamed", "(Ljava/lang/Module;Ljava/lang/String;)V")
+                                | ("java/lang/System$2", "addOpens", "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V")
+                                | ("java/lang/System$2", "addOpensToAllUnnamed", "(Ljava/lang/Module;Ljava/lang/String;)V")
+                                | ("java/lang/System$2", "addUses", "(Ljava/lang/Module;Ljava/lang/Class;)V")
                                 | ("jdk/jfr/internal/Type", "getKnownType", "(Ljava/lang/Class;)Ljdk/jfr/internal/Type;")
                                 | ("jdk/jfr/internal/util/Utils", "getValidType", "(Ljava/lang/Class;Ljava/lang/String;)Ljdk/jfr/internal/Type;")
                                 | ("jdk/jfr/internal/JDKEvents", "initialize", "()V")

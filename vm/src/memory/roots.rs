@@ -572,6 +572,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // `band_slot_is_verifiable` refuses to inspect, and the young sweep pins
     // those whatever the movable set says.
     cratonvm_gc::gc_quiescence::clear_unrewritable_jit_roots();
+    // The register-oop mask's oracle records what it EXCLUDED this pass, so it
+    // is reset on the same schedule as the sets above and checked against the
+    // finished root set below.
+    crate::jit::conservative_roots::clear_excluded_spill_words();
     // G1 pin-in-place: reset the conservative-JIT-root pin set too, so it
     // reflects only THIS collection's stack (republished by the JIT-frame scan
     // below, under G1). See that scan site and `G1Collector::young_collection`.
@@ -1592,8 +1596,42 @@ moving_young={moving_young} osr_fallback={moving_young_osr_fallback} incomplete=
             .iter()
             .map(|r| r.as_ptr() as usize)
             .collect();
+        // `CRATONVM_DBG_JIT_ROOTSCAN=1` — each DISTINCT address this pass is
+        // about to pin, with the two facts that decide whether it needs to be
+        // pinned at all. `scan_added=15 unrewritable=4` on the line below is a
+        // pair of totals over different domains (words, then objects) and the
+        // arithmetic between them is not available anywhere: 15 words dedupe to
+        // 5 addresses, and which of THOSE five are held only through rewritable
+        // storage is the whole of what a narrowed pin set could drop.
+        if dbg_jit_rootscan() {
+            let mut distinct: Vec<usize> = addrs.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            let mut line = String::new();
+            for a in &distinct {
+                line.push_str(&format!(
+                    " 0x{a:x}(unrew={},movable={})",
+                    cratonvm_gc::gc_quiescence::is_unrewritable_jit_root(*a) as u8,
+                    cratonvm_gc::gc_quiescence::is_movable_jit_root(*a) as u8,
+                ));
+            }
+            eprintln!(
+                "[jitpins] words={} distinct={} unrew_set={} movable_set={}{}",
+                addrs.len(),
+                distinct.len(),
+                cratonvm_gc::gc_quiescence::unrewritable_jit_root_count(),
+                cratonvm_gc::gc_quiescence::movable_jit_root_count(),
+                line,
+            );
+        }
         cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&addrs);
     }
+    // `CRATONVM_DBG_VERIFY_REG_OOP_MAPS=1` — every blind-spill word the
+    // register oop mask dropped, re-checked against the root set that was
+    // actually built. It has to run here rather than in the band scan: the
+    // question is whether anything ELSE names the object, and inside the scan
+    // the answer is still being assembled.
+    crate::jit::conservative_roots::verify_excluded_band_words(&roots, &shared.mem.heap);
     // 14a5. A5 CONSERVATIVE FRAME PASS — the second half of step 1, run here
     // because this is the first point in the pass at which the answer is known.
     //
@@ -1675,6 +1713,35 @@ moving_young={moving_young} osr_fallback={moving_young_osr_fallback} incomplete=
         // buckets above — read the growth between two lines.
         let (fc_no_slot, fc_misaligned, fc_no_map, fc_incomplete, fc_ok) =
             crate::jit::conservative_roots::frame_coverage_reason::snapshot();
+        // The register-oop mask, both sides. Emit-side causes are cumulative
+        // over compiles, consume-side over frame walks; read the growth.
+        let ro_e = cratonvm_jit::x64::reg_oop_mask_cause::snapshot();
+        let ro_u = crate::jit::conservative_roots::reg_oop_mask_census();
+        let ro_o = crate::jit::conservative_roots::reg_oop_mask_oracle();
+        // Which scan path ran, and what the band partition published. A pin
+        // census shows neither, and both decide whether a pin is arguable.
+        let bp = crate::jit::conservative_roots::band_path::snapshot();
+        eprintln!(
+            "[bandpath] bands={} fallback={} foreign_innermost={} a5_sweeps={}              a5_roots={} a5_frames={} published=(movable={} unrewritable={} \
+             remapped_not_pinned={})",
+            bp.0,
+            bp.1,
+            bp.2,
+            bp.3,
+            bp.4,
+            bp.5,
+            crate::jit::conservative_roots::movable_band_root_count(),
+            crate::jit::conservative_roots::unrewritable_band_root_count(),
+            crate::jit::conservative_roots::remapped_not_pinned_count(),
+        );
+        eprintln!(
+            "[regoop] emit=(disabled={} staged={} desync={} inexact={} windows={} inline={} \
+             dataflow={} PUBLISHED={}) use=(masked={} unmasked={} regwords={} \
+             deadspill={} outgoing={}) \
+             oracle=(words={} reachable={} UNREACHABLE={} walk_incomplete={})",
+            ro_e.0, ro_e.1, ro_e.2, ro_e.3, ro_e.4, ro_e.5, ro_e.6, ro_e.7,
+            ro_u.0, ro_u.1, ro_u.2, ro_u.3, ro_u.4, ro_o.0, ro_o.1, ro_o.2, ro_o.3,
+        );
         // Engagement counter for the cross-thread coverage handshake, printed
         // beside the verdict it produces so any claim about it carries the
         // number of cycles it actually decided.

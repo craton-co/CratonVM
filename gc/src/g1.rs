@@ -5739,6 +5739,45 @@ impl Drop for G1Collector {
     }
 }
 
+/// `CRATONVM_GC_G1_MOVABLE_PINS=1` — let G1's pin set honour the
+/// movable/rewritable partition, as the generational path already does.
+/// **Default OFF.**
+///
+/// # Correct, wired, and still not worth a default
+///
+/// Two things that once made it inert are fixed. The whole-cycle
+/// `coverage_incomplete` gate is gone from this path (see the comment at
+/// `honour_movable` for why that is the generational collector's question, not
+/// G1's), and `publish_unrewritable_band_roots` now publishes the verifiable
+/// half of the band partition instead of computing it and dropping it.
+///
+/// What did not change is the yield, and that is the number this default rests
+/// on. On H2 `TestValueMemory` Type 3 the filter drops **1 pin out of 34**:
+///
+/// ```text
+/// [g1][MOVPIN] snapshot=34 kept=33 movable_claimed=2 unrew_veto=7
+/// ```
+///
+/// and an A/B on the row itself lands inside this host's noise (on 10975/9972,
+/// off 8961/13005). The reason is not this filter: 4794 of ~5200 JIT roots come
+/// from the A5 unregistered-frame SPAN sweep, which has no per-frame layout and
+/// so publishes neither half of the partition — nothing here can act on roots
+/// that never made a claim. See the H2 page for that measurement.
+///
+/// So it ships off, for the same reason it shipped off the first time: a live
+/// GC behaviour change bought for one pin in thirty-four is risk without
+/// return. It is kept, correct and one flag away, for whoever gives the
+/// unregistered-frame band a layout.
+fn g1_movable_pins_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_GC_G1_MOVABLE_PINS") {
+            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"),
+            Err(_) => false,
+        },
+    )
+}
+
 impl G1Collector {
     /// Bind this heap to its VM's compact-layout domain.
     pub fn set_layout_domain(&self, domain: u32) {
@@ -7716,10 +7755,11 @@ impl G1Collector {
         let jit_pinned_regions = self.pinned_region_set_including_non_object_roots(&regions, roots);
         if gc_flags().g1_dbg_pins {
             eprintln!(
-                "[g1][PINS] young pause: jit_active={} pin_addrs={} pin_regions={:?}",
+                "[g1][PINS] young pause: jit_active={} pin_addrs={} pin_regions={:?} {}",
                 crate::gc_quiescence::is_active(),
                 crate::gc_quiescence::pinned_jit_root_count(),
                 jit_pinned_regions,
+                self.describe_pin_set(&regions, &jit_pinned_regions),
             );
         }
 
@@ -9261,10 +9301,12 @@ impl G1Collector {
         // exist.
         if gc_flags().g1_dbg_pins {
             eprintln!(
-                "[g1][PINS] young pause (parallel): jit_active={} pin_addrs={} pin_regions={:?}",
+                "[g1][PINS] young pause (parallel): jit_active={} pin_addrs={} \
+                 pin_regions={:?} {}",
                 crate::gc_quiescence::is_active(),
                 crate::gc_quiescence::pinned_jit_root_count(),
                 jit_pinned_regions,
+                self.describe_pin_set(&regions, &jit_pinned_regions),
             );
         }
         let cset: Vec<usize> = regions
@@ -19269,6 +19311,142 @@ impl G1Collector {
         detected && lever_on
     }
 
+    /// `CRATONVM_G1_DBG_PINS=1` — what each pinned region COSTS this pause, and
+    /// which pin vocabulary published it.
+    ///
+    /// `pin_regions={0, 11, 16}` (the line this extends) names the regions but
+    /// not the bill. A pin excludes a whole region from the collection set, so
+    /// the retention it buys is that region's OCCUPANCY, not the size of the
+    /// object the conservative word pointed at — and an investigation that
+    /// cannot see the occupancy cannot tell a pin that costs 40 bytes from one
+    /// that costs a megabyte. On
+    /// `docs/known-issues/h2/testvaluememory-fails-under-g1-on-conservative-jit-roots-20260908.md`
+    /// that distinction IS the defect: three pinned regions, and the two that
+    /// hold nothing the roots name are the whole of the 3224-vs-2228 gap.
+    ///
+    /// Provenance, because the three vocabularies have different repairs:
+    ///
+    /// * `jit` — an address in `gc_quiescence::pinned_jit_roots_snapshot()`, i.e.
+    ///   a conservative compiled-frame word. Narrowing this needs precise oop
+    ///   maps.
+    /// * `tlab` — a frozen peer's un-retired TLAB tail
+    ///   ([`Self::jit_tlab_skip_regions`]). Narrowing this needs the tail
+    ///   parseable, not the region excluded.
+    /// * `nonobj` — a root that failed [`Self::addr_is_followable_object`], pinned
+    ///   by [`Self::pinned_region_set_including_non_object_roots`].
+    ///
+    /// Diagnostic-only, and it recomputes the provenance rather than threading it
+    /// through the pin set: this runs once per pause behind a flag that is off,
+    /// and a `RegionSet` is a bitset with nowhere to put a label.
+    fn describe_pin_set(&self, regions: &[G1Region], pinned: &RegionSet) -> String {
+        let region_size = self.config.region_size.max(1);
+        // Provenance, by region, recomputed from the three publishers.
+        let mut jit: RegionSet = RegionSet::new();
+        if crate::gc_quiescence::is_active() {
+            for addr in crate::gc_quiescence::pinned_jit_roots_snapshot() {
+                if let Some(i) = self.lookup_region_for_addr(addr) {
+                    jit.insert(i);
+                }
+            }
+        }
+        let mut tlab: RegionSet = RegionSet::new();
+        for &(start, end) in self.jit_tlab_skip_regions.lock().iter() {
+            if let Some(i) = self.lookup_region_for_addr(start) {
+                tlab.insert(i);
+            }
+            if end > start {
+                if let Some(i) = self.lookup_region_for_addr(end - 1) {
+                    tlab.insert(i);
+                }
+            }
+        }
+        let mut nonobj: RegionSet = RegionSet::new();
+        // Per region: the PIN addresses that landed in it, not every root that
+        // did. Counting roots was the first version of this line and it is
+        // useless — region 0 reported `roots=5369` because the whole root set
+        // lives in Survivor, which says nothing about what pinned it. Five
+        // addresses decide this CSet; those five are the census.
+        let mut pin_hits: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
+        let mut pin_addrs: Vec<usize> = if crate::gc_quiescence::is_active() {
+            crate::gc_quiescence::pinned_jit_roots_snapshot()
+        } else {
+            Vec::new()
+        };
+        pin_addrs.sort_unstable();
+        pin_addrs.dedup();
+        for addr in pin_addrs {
+            let Some(idx) = self.lookup_region_for_addr(addr) else {
+                continue;
+            };
+            pin_hits.entry(idx).or_default().push(addr);
+            if !self.addr_is_followable_object(regions, addr, "pin-census") {
+                nonobj.insert(idx);
+            }
+        }
+
+        let mut out = String::new();
+        let mut pinned_bytes = 0usize;
+        for idx in pinned.iter() {
+            let Some(r) = regions.get(idx) else {
+                out.push_str(&format!(" [{idx}:no-such-region]"));
+                continue;
+            };
+            let occ = r.cursor();
+            pinned_bytes += occ;
+            let mut prov = String::new();
+            for (set, label) in [(&jit, "jit"), (&tlab, "tlab"), (&nonobj, "nonobj")] {
+                if set.contains(&idx) {
+                    if !prov.is_empty() {
+                        prov.push('+');
+                    }
+                    prov.push_str(label);
+                }
+            }
+            if prov.is_empty() {
+                // A pinned region no vocabulary claims is not a tidy-up item:
+                // the pin set and this census would then disagree about what
+                // pinned it, and the pin set is the one that decides the CSet.
+                prov.push_str("UNATTRIBUTED");
+            }
+            let empty: Vec<usize> = Vec::new();
+            let hits = pin_hits.get(&idx).unwrap_or(&empty);
+            // Each pin address with the size of the object it names, because
+            // that is the number the region's occupancy has to be read against:
+            // a 16-byte object holding a 997 KB region out of the CSet and a
+            // 976 KB object holding its own are the same line otherwise.
+            let mut named = String::new();
+            for addr in hits.iter().take(4) {
+                let (verdict, _) = self.classify_candidate_header(regions, *addr);
+                let base = r.data.as_ptr() as usize;
+                let size = if verdict == HeaderVerdict::Object {
+                    // SAFETY: `Object` is the verdict that both tag bytes decoded
+                    // and the shape is sane, which is what the sizer needs.
+                    crate::concurrent_mark::concurrent_mark_object_size(
+                        *addr as *const ObjectHeader,
+                    )
+                    .unwrap_or(0)
+                } else {
+                    0
+                };
+                named.push_str(&format!(
+                    " 0x{addr:x}(+0x{:x},{verdict:?},{size}B)",
+                    addr.wrapping_sub(base)
+                ));
+            }
+            out.push_str(&format!(
+                " [{idx}:{:?} occ={}K/{}K pins={} {}{}]",
+                r.region_type,
+                occ >> 10,
+                region_size >> 10,
+                hits.len(),
+                prov,
+                named,
+            ));
+        }
+        format!("pinned_bytes={}K{}", pinned_bytes >> 10, out)
+    }
+
     /// [`Self::jit_pinned_region_set`] PLUS every region holding a root that is
     /// not the start of a live object.
     ///
@@ -19343,10 +19521,99 @@ impl G1Collector {
         set
     }
 
+    /// The regions a live JIT frame forces out of the collection set.
+    ///
+    /// # The movable partition, which this used to ignore
+    ///
+    /// Not every conservative JIT root has to be pinned. A reference the shadow
+    /// stack published is PRECISE and REWRITABLE -- `shadow_stack.remap`
+    /// rewrites it after a move and the JIT's post-safepoint reload refreshes
+    /// the register from the (rewritten) frame slot -- so its object may be
+    /// evacuated like any other. `gc_quiescence` carries that partition, and
+    /// `gen_heap::collect_garbage_inner` has consulted it since the moving
+    /// young generation shipped:
+    ///
+    /// ```text
+    /// let movable = honour_movable
+    ///     && is_movable_jit_root(a)
+    ///     && !is_unrewritable_jit_root(a);
+    /// if is_y(a) && !movable { pin_base_of(a, &mut pinned); }
+    /// ```
+    ///
+    /// G1 applied NO such filter: every address in the snapshot pinned its
+    /// region. On a region-granular collector that is the expensive way to be
+    /// wrong -- a pinned region leaves the collection set WHOLESALE, so one
+    /// rewritable reference costs a whole megabyte at `-Xmx2g`. On H2's
+    /// `TestValueMemory` Type 3 it pinned 14 regions for 12474 KB from 38
+    /// addresses of which only 10 were actually unrewritable, and G1 read
+    /// ~11000 where the generational collector read 1149 and ZGC 1205 on the
+    /// same row.
+    ///
+    /// The three conjuncts are the generational path's, unchanged and for its
+    /// reasons: `honour_movable` is the whole-cycle proof that precise coverage
+    /// held, `is_movable_jit_root` is the per-address claim that a rewritable
+    /// channel names it, and `is_unrewritable_jit_root` is the VETO -- the pin
+    /// set is keyed by OBJECT, so one rewritable channel naming an address must
+    /// not license moving it out from under every other word that also holds
+    /// it, such as a compiled frame's callee-saved register image, which
+    /// `band_slot_is_verifiable` refuses to inspect and no channel rewrites.
+    ///
+    /// Gated OFF by default on `CRATONVM_GC_G1_MOVABLE_PINS` — see that function
+    /// for the measurement that says why.
     fn jit_pinned_region_set(&self) -> RegionSet {
+        // NOT gated on `moving_young_coverage_incomplete`, and the difference
+        // from the generational path is the whole point.
+        //
+        // That flag is a WHOLE-CYCLE proof, and the generational collector needs
+        // one because its question is "may I move the young generation at all"
+        // -- one unproven frame and the entire cycle must fall back to the
+        // non-moving sweep. G1's question is per-region, and the claim it rests
+        // on is per-ADDRESS: a movable publication says this object's every band
+        // sighting is either rewritten by `remap_one_jit_frame` or dead, and
+        // that is true or false about one object regardless of what some other
+        // frame could not prove about itself.
+        //
+        // Keeping the whole-cycle gate here was measured, and it made the filter
+        // inert: `coverage_incomplete=true` on the very pause this exists for,
+        // so `honour_movable=false` and all 38 pins survived a filter that had
+        // nothing wrong with it.
+        //
+        // The fail-closed direction is preserved by the PUBLISHER, not by this
+        // gate: `publish_unrewritable_band_roots` publishes movable only for
+        // words it can argue about, and vetoes the address outright when any
+        // unverifiable word also names it.
+        let honour_movable = g1_movable_pins_enabled();
         let mut set: RegionSet = if crate::gc_quiescence::is_active() {
-            crate::gc_quiescence::pinned_jit_roots_snapshot()
-                .into_iter()
+            let snap = crate::gc_quiescence::pinned_jit_roots_snapshot();
+            let (mut n_mov, mut n_unrew) = (0usize, 0usize);
+            let kept: Vec<usize> = snap
+                .iter()
+                .copied()
+                .filter(|&addr| {
+                    let claimed = crate::gc_quiescence::is_movable_jit_root(addr);
+                    let vetoed = crate::gc_quiescence::is_unrewritable_jit_root(addr);
+                    if claimed {
+                        n_mov += 1;
+                    }
+                    if vetoed {
+                        n_unrew += 1;
+                    }
+                    !(honour_movable && claimed && !vetoed)
+                })
+                .collect();
+            if gc_flags().g1_dbg_pins {
+                tracing::warn!(
+                    "[g1][MOVPIN] snapshot={} kept={} movable_claimed={} unrew_veto={}                      honour_movable={} coverage_incomplete={} movable_set={}",
+                    snap.len(),
+                    kept.len(),
+                    n_mov,
+                    n_unrew,
+                    honour_movable,
+                    crate::gc_quiescence::moving_young_coverage_incomplete(),
+                    crate::gc_quiescence::movable_jit_root_count(),
+                );
+            }
+            kept.into_iter()
                 .filter_map(|addr| self.lookup_region_for_addr(addr))
                 .collect()
         } else {

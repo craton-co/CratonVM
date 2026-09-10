@@ -10,7 +10,7 @@ moved to its own page.**
 |---|---|
 | the recorded `ClassCastException: String cannot be cast to Map$Entry` | **NOT REPRODUCED** — zero occurrences in eleven runs across seven configurations and ~2.5 h of runtime; the recorded seed passes on CratonVM *and* on stock HotSpot 25, so the operation sequence is not the lever |
 | `-XX:+UseG1GC`: `NoSuchMethodError: 'java.lang.Object[] java.lang.Object.toArray()'` | **FIXED 2026-08-24** — an unpinned receiver across a GC point in `collect_collection_elements_or_real`; measured by `CRATONVM_DBG_COLL_REFRESH`, 46 and 42 real moves absorbed per run, 3/3 clean past 500 s |
-| `--Xmx 256m`: a stale/corrupted reference with three faces | **MOVED** to `bug-h2-testrandommapops-small-heap-corruption-20260829.md` |
+| `--Xmx 256m`: a stale/corrupted reference with three faces | **MOVED** to `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md` |
 
 The third row is why this page stayed open, and it was never the defect the
 title names: a different site, a different face each time (`NPE "d" is null` at
@@ -96,7 +96,7 @@ Everything this page had on that row — the three faces, the base rate of about
 one failure in three runs of ~20 minutes, the reading of `2460030832` as a
 truncated pointer rather than a class id, why the segfault's Java frames are not
 a location, and why repro-and-dump is the wrong instrument at that rate — is now
-`docs/known-issues/h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`,
+`docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md`,
 unabridged.
 
 It moved because it was never this page's defect: a different site, a different
@@ -244,7 +244,7 @@ failure, so it is usable as a bisect target. The same command against
 - `docs/known-issues/h2/nonpassed-40-census-20260818.md` §1 — the methodology
   warning about over-reading that WARN shape, which this page's own history
   bears out.
-- `docs/known-issues/h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`
+- `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md`
   — the `--Xmx 256m` row this page could not close, moved out unabridged.
 - `fixed-suite-bugs/h2-suite-bugs/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
   — the ZGC relocation work whose binary the arms above were A/B'd against.

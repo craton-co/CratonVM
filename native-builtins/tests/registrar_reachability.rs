@@ -394,7 +394,7 @@ const FAMILY_DRIFT_EXPOSURE: &[(&str, usize)] = &[
     ("register_byte_array_output_stream", 0),
     ("register_cds_natives", 0),
     ("register_classfile_api_natives", 0),
-    ("register_classloader_natives", 84),
+    ("register_classloader_natives", 85),
     ("register_completable_future_natives", 3),
     ("register_concurrent_extras", 3),
     ("register_crypto_impl_natives", 2),

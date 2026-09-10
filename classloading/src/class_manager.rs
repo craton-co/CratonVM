@@ -16350,7 +16350,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // future back-pointer to a JLA-interior cache. This entry keeps the
         // synthetic fallback layout stable when the real JDK class file
         // can't be loaded.
-        "java/lang/System$1" => instance_fields(1),
+        "java/lang/System$1" | "java/lang/System$2" => instance_fields(1),
 
         // T19.H2: synthetic `ModuleLayer` fallback when the real JDK class
         // can't be resolved during boot (pre-init). Slot 0 = boot flag.

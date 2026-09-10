@@ -1076,6 +1076,29 @@ struct Compiler {
     /// `pending_live_frame_hi`, so a staging site that emits no map cannot leak
     /// its slots into a later safepoint's map.
     pending_staged_arg_oops: Vec<i32>,
+    /// The REGISTER homes of the reference arguments the pending call popped
+    /// off the simulated operand stack, as a bitmask over
+    /// [`crate::x64::licm::ALL_SPILL_GPRS`] positions.
+    ///
+    /// `pop_invoke_args` pops the argument entries, and from that moment the
+    /// simulated stack no longer mentions them -- but the machine registers
+    /// that held them are unchanged until something overwrites them, and the
+    /// `CALL` in between is a safepoint. `live_oop_register_mask` builds its
+    /// mask from the simulated stack and the live oop locals, so without this
+    /// field a reference sitting in, say, `r14` (a `StackSlot::CalleeSaved`
+    /// home) is in the blind spill image with its bit CLEAR, and the narrowed
+    /// scan walks past the only conservative sighting of a live object.
+    ///
+    /// The sibling `pending_staged_arg_oops` does not cover it: that field
+    /// names the FRAME slots the arguments were staged into, which answers "is
+    /// it findable somewhere" for the map, not "which register may still hold
+    /// it" for the register mask. The two are the same fact seen through the
+    /// two channels, and both are needed.
+    ///
+    /// Same lifecycle as `pending_staged_arg_oops`: set at the staging site,
+    /// taken by the next `emit_oop_map_for_safepoint`, so it cannot leak into a
+    /// later safepoint.
+    pending_call_oop_arg_regs: u16,
     /// A reference argument was staged somewhere this compiler cannot name in
     /// an oop map — the native-ABI outgoing-argument area
     /// (`emit_stack_arg_setup`), the direct-call service slots, or an inlined
@@ -1711,6 +1734,97 @@ fn sr_field_values(
         field_values.push(fv);
     }
     field_values
+}
+
+/// May a float/double JVM local live in an XMM register for the whole method?
+///
+/// **Win64 only, and that is a correctness rule rather than a tuning choice.**
+/// The x86-64 System V ABI makes every XMM register caller-saved, so a Java
+/// `float`/`double` local kept in XMM8..15 across an invoke is lost the moment
+/// the callee or a runtime helper touches a SIMD scratch register.
+/// `MonotonicLongValues.Builder.pack` exposed exactly that as a zeroed page
+/// average after its `invokespecial`, corrupting Lucene's document map.
+/// Windows x64 preserves XMM6..15 and this prologue saves the ones it hands
+/// out, so the allocation is kept there; System V locals must use their
+/// canonical frame homes until post-call XMM spill/reload exists.
+///
+/// # Why this is a function and not a `#[cfg]`
+///
+/// The gate sits inside [`Compiler::new`], between a caller's `RegAllocResult`
+/// and every consumer of it. Written as a `#[cfg]` it was unreachable from a
+/// System V test: `Compiler::new` overwrote `xmm_assignments` with all-`None`
+/// before any fixture could be built on top of it, so `xmm_for_local` answered
+/// `None` for every local and the fifteen emission sites that read it -- ten
+/// bytecode arms in `bytecode_walk`, the register-parameter load, the
+/// stack-parameter load and the zero-init in `frames` -- were dead code on
+/// Linux. A Linux-only test run could not have caught a defect in any of them,
+/// however loudly it failed on a developer's machine.
+///
+/// That is not hypothetical. The optimizing tier had the same shape in its own
+/// XMM file, and its OSR entry stub seeded home words while leaving the
+/// registers stale for exactly as long as nobody ran the suite on Windows --
+/// see `docs/internal/fixed-bugs/`, the spliced-merge page's "same defect in
+/// the other register file".
+///
+/// # [`XmmLocalHomesForce`] is EMISSION-ONLY
+///
+/// A test may force the homes on to inspect the BYTES this backend emits. It
+/// must never RUN that code on System V: the first paragraph is why the
+/// default is what it is, and a thread-local override does not change the ABI.
+fn xmm_local_homes_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(forced) = xmm_local_homes_forced() {
+            return forced;
+        }
+    }
+    cfg!(windows)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for [`xmm_local_homes_enabled`]. Thread-local, so
+    /// parallel tests cannot see each other's setting.
+    static XMM_LOCAL_HOMES_FORCE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn xmm_local_homes_forced() -> Option<bool> {
+    XMM_LOCAL_HOMES_FORCE.with(|c| c.get())
+}
+
+/// Test-only RAII override of [`xmm_local_homes_enabled`] on this thread.
+///
+/// **Emission-only** -- see that function.
+#[cfg(test)]
+pub(crate) struct XmmLocalHomesForce;
+
+#[cfg(test)]
+impl XmmLocalHomesForce {
+    /// Compile the way Win64 does: a float/double local takes an XMM home.
+    pub(crate) fn on() -> XmmLocalHomesForce {
+        XMM_LOCAL_HOMES_FORCE.with(|c| c.set(Some(true)));
+        XmmLocalHomesForce
+    }
+
+    /// Compile the way System V does: every float/double local uses its frame
+    /// home.
+    ///
+    /// The other half of an A/B, and not redundant on either platform: a test
+    /// that only forces ON cannot tell an emitter that honours the flag from
+    /// one that ignores it and was going to emit those bytes anyway.
+    pub(crate) fn off() -> XmmLocalHomesForce {
+        XMM_LOCAL_HOMES_FORCE.with(|c| c.set(Some(false)));
+        XmmLocalHomesForce
+    }
+}
+
+#[cfg(test)]
+impl Drop for XmmLocalHomesForce {
+    fn drop(&mut self) {
+        XMM_LOCAL_HOMES_FORCE.with(|c| c.set(None));
+    }
 }
 
 fn frame_value_for_slot(
@@ -2594,20 +2708,15 @@ impl Compiler {
             alloc_used_regs.sort_unstable();
             alloc_used_regs.dedup();
         }
-        // The x86-64 System V ABI (Linux/macOS) makes every XMM register
-        // caller-saved.  Keeping a Java float/double local in XMM8..15 across
-        // an invoke therefore loses it when the callee/helper uses SIMD
-        // scratch registers.  MonotonicLongValues.Builder.pack exposed this as
-        // a zeroed page average after its invokespecial, corrupting Lucene's
-        // document map.  Windows x64 preserves XMM6..15, so retain the local
-        // allocation there; System V locals must use their canonical frame
-        // homes until post-call XMM spill/reload exists.
-        #[cfg(windows)]
-        let (xmm_assignments, alloc_used_xmms) =
-            (alloc_result.xmm_assignments, alloc_result.used_xmm_regs);
-        #[cfg(not(windows))]
-        let (xmm_assignments, alloc_used_xmms) =
-            (vec![None; alloc_result.xmm_assignments.len()], Vec::new());
+        // Whether a float/double local may keep the XMM register the allocator
+        // gave it. `xmm_local_homes_enabled` carries the ABI argument, the
+        // Lucene incident that established it, and the test-only override that
+        // lets a System V host reach the other arm at all.
+        let (xmm_assignments, alloc_used_xmms) = if xmm_local_homes_enabled() {
+            (alloc_result.xmm_assignments, alloc_result.used_xmm_regs)
+        } else {
+            (vec![None; alloc_result.xmm_assignments.len()], Vec::new())
+        };
         let num_reg_locals = local_assignments.iter().filter(|a| a.is_some()).count()
             + xmm_assignments.iter().filter(|a| a.is_some()).count();
         let callee_saved_size = alloc_used_regs.len() as i32 * 8; // Cast: x86-64 immediate encoding
@@ -2862,6 +2971,7 @@ impl Compiler {
             stack_oop_marks: Vec::with_capacity(16),
             stack_oop_marks_exact: true,
             pending_staged_arg_oops: Vec::new(),
+            pending_call_oop_arg_regs: 0,
             pending_staged_args_unmapped: false,
             local_oop_windows: 0,
             local_oop_stride: 0,

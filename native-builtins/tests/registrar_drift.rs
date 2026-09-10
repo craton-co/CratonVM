@@ -251,57 +251,84 @@ const MAX_BLIND_SITES: usize = 1_000;
 /// forwarded verbatim. There is one body; last-write-wins picks between three
 /// pointers to it. See `jca/ssl_context_spi.rs` for why the guarded
 /// `SSLContext` surface is deliberately registered three times over.
+/// **Re-taken 2026-09-09, +1: `java/lang/System$2.defineClass(..ZILjava/lang/
+/// Object;)Ljava/lang/Class;`.** The `JavaLangAccess` carrier is `System$1` on
+/// JDK 25 and `System$2` on JDK 21, so both registrars that name the carrier
+/// now cover both names. That makes `System$2` carry the SAME twin `System$1`
+/// already carried, and this row is its exact mirror: synthetic-only
+/// `register_classloader_define_class` (`jla_system_define_class`) against
+/// shipping `register_java_lang_access` (`jla_define_class_hidden`).
+///
+/// **The gate's first question is answered NO, and that is not new.** The two
+/// bodies are different free functions, exactly as they are for the `System$1`
+/// row directly above — which has stood since 2026-08-17 without being
+/// collapsed. Whether one of them should survive is the same open question for
+/// both names; this change did not create it, does not answer it, and would
+/// have left it asymmetric (watched on one carrier, unwatched on the other) if
+/// this row were not added.
 /// **Re-taken 2026-09-10, +51 distinct / +54 pairs, and NONE of it is new
 /// drift.** The scanner was widened; these pairs were always there.
 ///
 /// This scan required the byte after `register` to be `(`, so
 /// `register_with_kind(class, name, descriptor, body, kind)` was skipped --
-/// the old code said so in a comment and treated it as noise alongside
-/// `registered_by`. It is not noise. **757 sites tree-wide** spell the call
-/// that way, and they are not a uniform sample of the registry: they are
-/// precisely the sites whose kind was ADJUDICATED. Converting
-/// `register` -> `register_with_kind` is the standard remedy for a contract
-/// 1.4 shadow, so every adjudication silently deleted the SHIPPING half of any
-/// drift pair the triple belonged to, and this gate reported the deletion as
-/// `STALE BASELINE -- recorded drift pair(s) no longer drift`. Good news,
-/// wearing a defect's clothes, once per adjudication.
+/// the old code said so in a comment and filed it with `registered_by` as
+/// noise. It is not noise. **757 sites tree-wide** spell the call that way, and
+/// they are not a uniform sample of the registry: they are precisely the sites
+/// whose kind was ADJUDICATED. Converting `register` -> `register_with_kind`
+/// is the standard remedy for a contract 1.4 shadow, so every adjudication
+/// silently deleted the SHIPPING half of any drift pair the triple belonged
+/// to, and this gate reported the deletion as `STALE BASELINE -- recorded
+/// drift pair(s) no longer drift`. Good news wearing a defect's clothes, once
+/// per adjudication.
 ///
-/// Found 2026-09-10 by tagging `java/lang/Class.getName` an `Intrinsic`. The
-/// gate went red claiming two pairs had stopped drifting; only ONE of them
-/// had, and not for the reason the message implied:
+/// **Same species as the six gates `d5ca22357` fixed on 2026-08-30** -- that
+/// commit counted 230 `register_with_kind(` sites in `native-builtins/src/lib
+/// .rs` alone against 1207 plain ones, and repaired four gates that read that
+/// file as text. This file was the one it did not reach, which is why the
+/// family was closed and this member of it stayed open for eleven more days.
+///
+/// Found by tagging `java/lang/Class.getName` an `Intrinsic`. The gate went red
+/// claiming two pairs had stopped drifting; only ONE of them had, and not for
+/// the reason the message implied:
 ///
 /// * `Class.getName` -- both registrations resolve to the SAME function,
-///   `lang_class::native_class_get_name` (`use lang_class::*` at
-///   `native-builtins/src/lib.rs:4785` makes the synthetic site's bare name
-///   the qualified one). One body, two pointers, exactly the `SSLContext
-///   .getProvider` case recorded below.
+///   `lang_class::native_class_get_name` (`use lang_class::*` in `lib.rs`
+///   makes the synthetic site's bare name the qualified one). One body, two
+///   pointers, exactly the `SSLContext.getProvider` case recorded below.
 /// * `Class.getModule` -- two DIFFERENT closures, `lib.rs` versus
 ///   `phases_late/reflect_invoke.rs`. Still two implementations, one per mode.
-///   It had been a recorded row here since before the tag; the tag hid it.
+///   It had been a recorded row here for weeks; the tag hid it.
+///
+/// **Read the BODIES before believing "no longer drifts".** The first fix
+/// attempted here moved both triples to `FIXED_NOT_DRIFTING` with a note
+/// claiming the kinds now agreed -- true of one and false of the other, and
+/// only the bodies separate them.
 ///
 /// So the fix is the scanner, not the baseline. Both triples are back in the
 /// table below where they always belonged, and the 54 pairs are what the blind
-/// spot had been covering. They are recorded rather than adjudicated because
+/// spot had been covering. They are RECORDED rather than adjudicated because
 /// each needs its own "do the two bodies agree?" answer, and several are not
 /// cosmetic -- `ClassLoader.defineClass0/1/2`, `Class.getSuperclass`,
 /// `Class.isInstance`, `Class.isAssignableFrom`,
-/// `ObjectStreamClass.hasStaticInitializer`. Routed to lanes L0, L3, L4 and L7
-/// by `docs/contributing/jdk-only-lanes/`.
+/// `ObjectStreamClass.hasStaticInitializer`, `Unsafe.defineClass0`. Routed to
+/// lanes L0, L4, L5 and L7 by `docs/known-issues/jdk-only-lanes/`.
 ///
 /// `registrar_reachability.rs`'s `FAMILY_DRIFT_EXPOSURE` was re-taken in the
 /// same commit, which is what its own panic prescribes when this file moved:
-/// six families rose (`register_classloader_natives` 81 -> 84,
+/// six families rose (`register_classloader_natives` 82 -> 85,
 /// `register_enterprise_final_natives` 118 -> 135,
 /// `register_java_lang_extras_natives` 27 -> 28, `register_phase69_natives`
 /// 8 -> 11, `register_serialization_natives` 2 -> 4,
-/// `register_unsafe_define_class` 1 -> 2). Both numbers here came from this
-/// gate's own paste-ready output, not from arithmetic.
-const BASELINE_TOTAL_DRIFT: usize = 1274;
+/// `register_unsafe_define_class` 1 -> 2). It cross-checks per family and
+/// caught the phantom independently before this note was written. Every number
+/// in both files came from the gates' own paste-ready output, never from
+/// arithmetic.
+const BASELINE_TOTAL_DRIFT: usize = 1275;
 
 /// `(synthetic-only pass, triple)` PAIRS in [`DRIFT_TRIPLES`] -- larger than
 /// [`BASELINE_TOTAL_DRIFT`] because one triple can be registered by several
 /// synthetic-only passes (`AtomicBoolean.get` has two).
-const BASELINE_TOTAL_PAIRS: usize = 1410;
+const BASELINE_TOTAL_PAIRS: usize = 1411;
 
 /// Two triples that pin BOTH answers.
 ///
@@ -948,6 +975,7 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/lang/ClassLoader", "defineClass1", "(Ljava/lang/ClassLoader;Ljava/lang/String;[BIILjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;"),
             ("java/lang/ClassLoader", "defineClass2", "(Ljava/lang/ClassLoader;Ljava/lang/String;Ljava/nio/ByteBuffer;IILjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;"),
             ("java/lang/System$1", "defineClass", "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BLjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;"),
+            ("java/lang/System$2", "defineClass", "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BLjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;"),
         ],
     ),
     (
@@ -4152,6 +4180,12 @@ fn build_analysis() -> Analysis {
             // this gate reported the erasure as "no longer drifts". Measured
             // 2026-09-10 on `Class.getModule`, whose two bodies (lib.rs closure
             // vs `phases_late/reflect_invoke.rs` closure) still differ.
+            //
+            // Same species as the six gates d5ca22357 fixed on 2026-08-30 --
+            // that commit counted 230 `register_with_kind(` sites in lib.rs
+            // alone against 1207 plain ones -- and this file was the one it
+            // did not reach.
+            //
             // The first three arguments are in the same positions, so
             // everything downstream is unchanged.
             if !(q < n && t[q] == b'(') && t[after..].starts_with(b"_with_kind") {

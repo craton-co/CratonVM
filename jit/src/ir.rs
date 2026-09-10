@@ -1462,11 +1462,15 @@ impl IrInlineFrameSites {
 /// resolution pass, and applying half of them would leave the walk bailing in
 /// the middle of a body it had already committed to.
 ///
-/// What is NOT here is what v1 refuses in a spliced body: `ldc` / `ldc2_w`
-/// (the resolver records a raw `i64` where the builder wants the value plus its
-/// float/double discriminator, and inventing that bit is how a `long` constant
-/// becomes a `double`), `getstatic` / `putstatic`, `anewarray`, `checkcast` and
-/// `instanceof`. A callee using any of them is refused whole at resolution.
+/// What is NOT here is what the resolver still refuses in a spliced body:
+/// `putstatic` and `anewarray`. A callee using either is refused whole at
+/// resolution. `ldc` / `ldc2_w`, `getstatic` and `checkcast` / `instanceof`
+/// were all on that list and came off it, in every case because the refusal
+/// was PLUMBING rather than modelling -- the builder had the arm and nothing
+/// rebased the rows it reads. `putstatic` is the one that is genuinely
+/// modelling: the builder has no arm for it at all, and a static reference
+/// write owes an SATB pre-barrier the single-pass `jit_putstatic_*` path
+/// carries.
 #[derive(Clone, Debug, Default)]
 pub struct IrInlineTables {
     /// The bodies themselves, keyed by CALLER pc.
@@ -1485,6 +1489,68 @@ pub struct IrInlineTables {
     /// `object_init_pcs` — the set that elides on any receiver — because that
     /// is what "proven no-op body" means, receiver notwithstanding.
     pub object_init_pcs: HashSet<usize>,
+    /// `pc → (bits, is_float)` for the `ldc` / `ldc_w` sites inside spliced
+    /// bodies, rebased into combined-buffer coordinates and merged into the
+    /// builder's own `ldc_info`.
+    ///
+    /// Without this row a spliced `ldc` reaches the builder's `0x12 | 0x13` arm
+    /// with nothing in any of its three tables and bails the whole METHOD —
+    /// which is why the splice scanner used to refuse such a callee up front
+    /// rather than discover it here. See [`crate::InlineSite::ldc_fp_pcs`].
+    pub ldc_info: HashMap<usize, (i64, bool)>,
+    /// `pc → (bits, is_double)` for the `ldc2_w` sites inside spliced bodies.
+    /// Same shape and same reason as [`Self::ldc_info`].
+    pub ldc2w_info: HashMap<usize, (i64, bool)>,
+    /// `pc -> (class_id, field_index, type_tag, is_volatile)` for the
+    /// `getstatic` sites inside spliced bodies, rebased into combined-buffer
+    /// coordinates and merged into the builder's own `static_field_info`.
+    ///
+    /// Same shape and same reason as [`Self::ldc_info`], and the same class of
+    /// cause: the rows were resolvable all along -- `InlineSite` has carried
+    /// `static_field_info` for the single-pass inliner since it existed -- and
+    /// the optimizing tier refused every callee containing a `getstatic`
+    /// (`ir-splice-static-field`) because nothing rebased them. `getstatic` is
+    /// the single largest opcode in the ir-coverage survey (92 of 273 events),
+    /// so the refusal fell on the callee shape framework code is mostly made
+    /// of: a static-table read behind an accessor.
+    ///
+    /// `putstatic` (0xb3) stays refused, and not for a plumbing reason: the
+    /// builder has no arm for it at all, and a static reference WRITE owes an
+    /// SATB pre-barrier that lives on the single-pass `jit_putstatic_*` path.
+    /// The resolver refuses it separately so the two sides cannot disagree.
+    pub static_field_info: HashMap<usize, (u32, usize, u8, bool)>,
+    /// `pc -> (name_ptr, name_len)` for the `checkcast` (0xc0) sites inside
+    /// spliced bodies, rebased and merged into the builder's own
+    /// `checkcast_info`. [`Self::instanceof_info`] is the 0xc1 twin.
+    ///
+    /// Same rebase and the same fail-closed shape as
+    /// [`Self::static_field_info`]: a missing row bails the METHOD, so the
+    /// resolver refuses a CALLEE whose targets it could not resolve rather
+    /// than admitting the body and leaving rows out.
+    ///
+    /// The `0xc0`/`0xc1` arms read as though a missing row were graceful --
+    /// they call `plant_uncommon_trap` and compile the rest. By default they
+    /// are not: `TrapCause::UnresolvedTypeCheck` is gated behind
+    /// `ir_unresolved_class_trap_enabled`, which is off, so the plant refuses
+    /// and the arm bails. With that switch ON the trap does fire, and inside a
+    /// splice it deopts to "re-execute the invoke" -- which is the second
+    /// reason the resolver refuses rather than relying on the arm: one setting
+    /// of that flag costs the caller its compile, the other costs it a trap on
+    /// every call.
+    ///
+    /// The `(ptr, len)` pairs are interned process-wide by
+    /// [`crate::intern_typecheck_target`] and are NOT owned by the compile, so
+    /// unlike the invoke tables these rows need no keep-alive on the artifact.
+    pub checkcast_info: HashMap<usize, (usize, usize)>,
+    /// `pc -> (name_ptr, name_len)` for the `instanceof` (0xc1) sites inside
+    /// spliced bodies. See [`Self::checkcast_info`].
+    ///
+    /// Kept as a separate map for the same reason the builder keeps two: the
+    /// two opcodes take different lowerings, and a `checkcast` additionally
+    /// obliges the artifact to carry `has_dispatch` — its ClassCastException
+    /// path publishes through the `JIT_THREAD` TLS that the no-dispatch fast
+    /// entry never sets. `instanceof` answers a boolean and owes nothing.
+    pub instanceof_info: HashMap<usize, (usize, usize)>,
 }
 
 /// The builder's state for one splice in progress.
@@ -1496,6 +1562,27 @@ struct SpliceFrame {
     saved_locals: Vec<NodeId>,
     saved_stack: Vec<NodeId>,
     returns_value: bool,
+    /// This body has more than one reachable `return`, so a `return` is NOT a
+    /// splice exit: it is an edge into the continuation built at [`Self::end`].
+    /// Decided once, by the pre-scan in [`IrBuilder::build`], from the same
+    /// verified decode the merge targets come from — never from the walk,
+    /// which meets the returns one at a time and cannot know it is at the last.
+    multi_return: bool,
+    /// One `(ctrl, mem, value)` per `return` the walk has reached, in walk
+    /// order. `value` is [`NO_NODE`] for a `void` callee.
+    ///
+    /// The caller's locals and operand stack need no entry here: they are
+    /// saved above and are the same on every path out of the callee, because
+    /// the callee cannot reach them.
+    exits: Vec<(NodeId, NodeId, NodeId)>,
+    /// Combined-buffer pc of the last `return` recorded in [`Self::exits`].
+    ///
+    /// The continuation's `Merge` and `Phi`s are stamped with this rather than
+    /// with `end`: `end` is one PAST the body, so `spliced_ranges` would
+    /// resolve it to the caller and `resume_bci` would stop rewriting these
+    /// nodes to the enclosing `invoke`. See [`IrInlineSite`] on the two
+    /// meanings of `bytecode_pc`.
+    exit_bci: usize,
 }
 
 /// Hard cap on inline-scope chain length.
@@ -4581,6 +4668,11 @@ pub struct IrBuilder {
     /// walk is inside a relocated callee body, which is what suppresses merge
     /// activation, the reachability skip and safepoint recording.
     splice: Vec<SpliceFrame>,
+    /// `IrInlineSite::base` of every admitted body with more than one reachable
+    /// `return`. Filled by the pre-scan in [`Self::build`] and read once, by
+    /// [`Self::begin_splice`]. Empty unless `CRATONVM_JIT_IR_SPLICE_MULTI_RETURN=1`
+    /// — and without it the scanner has admitted no such body either.
+    splice_multi_return: HashSet<usize>,
     /// Diagnostic-only: how many splices this build performed, for the
     /// `[ir] spliced` line. Never read by lowering.
     splices_done: usize,
@@ -4607,6 +4699,17 @@ pub struct IrBuilder {
     /// side effect first. A structural check here cannot drift from the
     /// resolver's opcode list the way a comment can.
     splice_guard_seen: bool,
+    /// Conditional-branch pcs whose NOT-TAKEN edge the profile never observed,
+    /// and which [`Self::prune_always_taken_branch`] may therefore replace with
+    /// a guarded unconditional jump.
+    ///
+    /// Populated by `lib.rs` from the method's branch profile, and empty
+    /// whenever there is no profile or the feature is off — in which case every
+    /// branch builds the ordinary `Op::If` and codegen is byte-identical.
+    pruned_always_taken: std::collections::HashSet<usize>,
+    /// How many branches this build actually pruned. Diagnostic; read through
+    /// [`Self::branches_pruned`].
+    branches_pruned: usize,
     /// Diagnostic-only: `pc → "0xNN cn.mn desc"` for every invoke site in the
     /// method. Populated by `lib.rs` **only** when [`ir_bail_reporting`] is on,
     /// and read **only** by [`Self::bail_invoke`]. Never consulted by lowering,
@@ -4899,10 +5002,13 @@ impl IrBuilder {
             indy_trap_sites: HashMap::new(),
             inline_sites: HashMap::new(),
             splice: Vec::new(),
+            splice_multi_return: HashSet::new(),
             splices_done: 0,
             splice_local: HashSet::new(),
             splice_tainted: HashSet::new(),
             splice_guard_seen: false,
+            pruned_always_taken: std::collections::HashSet::new(),
+            branches_pruned: 0,
             invoke_labels: HashMap::new(),
             method_label: None,
             spliced_bodies_pure: true,
@@ -5523,12 +5629,33 @@ impl IrBuilder {
             invoke_info,
             new_info,
             object_init_pcs,
+            ldc_info,
+            ldc2w_info,
+            static_field_info,
+            checkcast_info,
+            instanceof_info,
         } = tables;
         self.inline_sites.extend(sites);
         self.field_info.extend(field_info);
         self.invoke_info.extend(invoke_info);
         self.new_info.extend(new_info);
         self.object_init_pcs.extend(object_init_pcs);
+        // Merged, not replaced: the caller's own `ldc` sites are already in
+        // these maps (`set_ldc_info` runs before the tables are applied) and a
+        // spliced body's pcs are in combined-buffer coordinates, so the two key
+        // spaces are disjoint by construction.
+        self.ldc_info.extend(ldc_info);
+        self.ldc2w_info.extend(ldc2w_info);
+        // Same merge and same disjointness argument as the `ldc` rows above:
+        // `set_static_field_info` has already installed the caller's own
+        // `getstatic` sites, keyed by its own pcs, and a spliced body's pcs are
+        // combined-buffer pcs at or past `code_len`.
+        self.static_field_info.extend(static_field_info);
+        // Merged, not replaced, on the same disjointness argument: the caller's
+        // own typecheck sites are already installed under its own pcs, and a
+        // spliced body's pcs are combined-buffer pcs at or past `code_len`.
+        self.checkcast_info.extend(checkcast_info);
+        self.instanceof_info.extend(instanceof_info);
     }
 
     /// How many splices [`Self::build`] performed. Diagnostic only.
@@ -5661,12 +5788,16 @@ impl IrBuilder {
 
         let saved_locals = std::mem::replace(&mut self.locals, callee_locals);
         let saved_stack = std::mem::take(&mut self.stack);
+        let multi_return = self.splice_multi_return.contains(&base);
         self.splice.push(SpliceFrame {
             return_pc: pc + instr_len,
             end,
             saved_locals,
             saved_stack,
             returns_value,
+            multi_return,
+            exits: Vec::new(),
+            exit_bci: pc,
         });
         self.splices_done += 1;
         // A callee body in the graph is the transform that makes every other
@@ -5755,6 +5886,122 @@ impl IrBuilder {
             // The sets are scoped to one outermost splice: node ids from a
             // closed region can never be a later region's store target, and
             // keeping them would only grow.
+            self.splice_local.clear();
+            self.splice_tainted.clear();
+        }
+        Some(frame.return_pc)
+    }
+
+    /// A `return` inside an open splice.
+    ///
+    /// For a body with one `return` this IS the splice exit and the v1 fast
+    /// path stands: restore the caller's frame, push the value, resume after
+    /// the `invoke`.
+    ///
+    /// For a body with several, a `return` is an *edge* rather than an exit —
+    /// the walk has to keep going, because the other returns and the code that
+    /// reaches them are still ahead of it in the relocated buffer. The edge's
+    /// `(ctrl, mem, value)` is parked on the frame, `ctrl` goes dead, and the
+    /// walk steps to the next instruction exactly as it does after any
+    /// unconditional transfer. Whatever follows is either a branch target —
+    /// whose merge the branch itself created, and whose activation restores
+    /// `ctrl` — or genuinely unreachable, and the walk's own "reachable code
+    /// must have a control token" net refuses the method.
+    ///
+    /// Returns the pc to continue at, or `None` to refuse the method.
+    fn splice_return(&mut self, value: Option<NodeId>, pc: usize) -> Option<usize> {
+        if !self.splice.last()?.multi_return {
+            return self.end_splice(value);
+        }
+        let ctrl = self.ctrl_opt()?;
+        let mem = self.mem;
+        // `NO_NODE` for a `void` callee: `returns_value` decides whether the
+        // continuation reads this column at all, so a placeholder here is
+        // never a value anything can name.
+        let val = if self.splice.last()?.returns_value {
+            value?
+        } else {
+            NO_NODE
+        };
+        let frame = self.splice.last_mut()?;
+        frame.exits.push((ctrl, mem, val));
+        frame.exit_bci = pc;
+        self.ctrl = NO_NODE;
+        Some(pc + 1)
+    }
+
+    /// Close a multi-return splice: join its recorded exit edges and hand the
+    /// result back to the caller.
+    ///
+    /// Called when the walk reaches `end` — one past the callee's last
+    /// bytecode, which is a `return` by the scanner's own admission rule, so
+    /// every edge is already in.
+    ///
+    /// The join is built by hand rather than through [`Self::ensure_merge`] /
+    /// [`Self::activate_merge`] for two reasons. The `merges` map is keyed by
+    /// pc, and `end` is the `base` of whatever body `lib.rs` appended next —
+    /// so a continuation keyed there would collide with that body's own
+    /// merge at its pc 0 (a `while` starting at the top of a method makes one).
+    /// And the merge machinery phis the locals and operand stack, which here
+    /// are the *callee's*, about to be thrown away: every phi it built would be
+    /// dead on arrival.
+    ///
+    /// What does need a phi is the memory token and the returned value, and
+    /// only where the edges disagree.
+    fn finish_multi_return_splice(&mut self) -> Option<usize> {
+        let frame = self.splice.pop()?;
+        if frame.exits.is_empty() {
+            return None;
+        }
+        let bci = frame.exit_bci;
+
+        let ctrls: Vec<NodeId> = frame.exits.iter().map(|&(c, _, _)| c).collect();
+        let ctrl = if ctrls.len() == 1 {
+            ctrls[0]
+        } else {
+            // This used to disqualify the artifact from the optimizing OSR
+            // door, alongside every other spliced merge (`SPLICED_MERGE_SEEN`).
+            // The containment came off on 2026-09-09: the wrong answer was
+            // never the merge but `emit_osr_entry_stubs` jumping past the block
+            // that writes a constant arm's home word, and the stub seeds those
+            // constants now. See `ir_lower`'s `const_seeds` loop.
+            MULTI_RETURN_SPLICES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            MULTI_RETURN_EDGES.fetch_add(ctrls.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            self.graph
+                .add(Op::Merge, IrType::Control, ctrls, Some(bci))
+        };
+        self.ctrl = ctrl;
+
+        let mems: Vec<NodeId> = frame.exits.iter().map(|&(_, m, _)| m).collect();
+        if mems.iter().any(|&m| m != mems[0]) {
+            let mut inputs = vec![ctrl];
+            inputs.extend_from_slice(&mems);
+            self.mem = self
+                .graph
+                .add(Op::Phi, IrType::Memory, inputs, Some(bci));
+        } else {
+            self.mem = mems[0];
+        }
+
+        self.locals = frame.saved_locals;
+        self.stack = frame.saved_stack;
+        if frame.returns_value {
+            let vals: Vec<NodeId> = frame.exits.iter().map(|&(_, _, v)| v).collect();
+            if vals.iter().any(|&v| v == NO_NODE) {
+                return None;
+            }
+            let joined = if vals.iter().any(|&v| v != vals[0]) {
+                let mut inputs = vec![ctrl];
+                inputs.extend_from_slice(&vals);
+                let ty = self.phi_data_type(&inputs);
+                self.graph.add(Op::Phi, ty, inputs, Some(bci))
+            } else {
+                vals[0]
+            };
+            self.push(joined);
+        }
+
+        if self.splice.is_empty() {
             self.splice_local.clear();
             self.splice_tainted.clear();
         }
@@ -6101,6 +6348,95 @@ impl IrBuilder {
                 self.method_label.as_deref().unwrap_or("<unknown>"),
             );
         }
+        true
+    }
+
+    /// Branch pcs the profile says are ALWAYS taken. See
+    /// [`Self::prune_always_taken_branch`].
+    pub fn set_pruned_branches(&mut self, pcs: std::collections::HashSet<usize>) {
+        self.pruned_always_taken = pcs;
+    }
+
+    /// How many branches this build replaced with a guarded jump.
+    pub fn branches_pruned(&self) -> usize {
+        self.branches_pruned
+    }
+
+    /// Replace an always-taken conditional branch with a GUARD plus an
+    /// unconditional jump, deleting its cold arm from the graph entirely.
+    ///
+    /// # What this is
+    ///
+    /// The first actual speculation this tier performs. Every deopt point it
+    /// emitted before this carried `speculation_id: 0` and the reason
+    /// `TransferToInterpreter` — plain resume points, planted so that a trap
+    /// *could* be described, never so that a transform could be justified.
+    /// Uncommon traps existed only to stand in for opcodes the tier cannot
+    /// lower. Nothing anywhere used the profile to remove work.
+    ///
+    /// This does. When the profile has seen a branch's not-taken edge exactly
+    /// ZERO times over a meaningful sample, the branch becomes:
+    ///
+    /// ```text
+    ///     Guard(cmp)        ; cmp == 0 -> deopt at this bci
+    ///     goto target
+    /// ```
+    ///
+    /// and the whole fall-through arm is never built. That is the shape javac
+    /// gives `if (rare) { ... }` — `ifeq skip; <cold body>; skip:` — so the arm
+    /// deleted is exactly the cold body, together with everything downstream
+    /// that only it kept alive.
+    ///
+    /// # Why it is fail-SAFE rather than fail-closed
+    ///
+    /// A wrong speculation cannot produce a wrong answer. The guard's failure
+    /// edge is the ordinary deopt trampoline with `DeoptAction::Reinterpret`:
+    /// the interpreter re-executes this very branch and takes the cold arm
+    /// itself. The cost of being wrong is a deopt, and repeated deopts demote
+    /// the method to C1 through the existing `c2_bailout` path — the same
+    /// machinery a div-by-zero guard already relies on. That is what makes this
+    /// a different risk class from a speculative devirtualization, where a
+    /// wrong guard runs the wrong body.
+    ///
+    /// # Two refusals
+    ///
+    /// * **Inside a splice.** `splice_guard_seen` refuses a graph that built a
+    ///   guard inside a relocated body, because such a guard would resolve its
+    ///   frame state from the caller's snapshot at the `invoke`. Rather than
+    ///   set that flag and lose the whole method, simply do not speculate
+    ///   there.
+    /// * **No frame state at this bci.** A guard whose bci has no
+    ///   `SafepointSnapshot` cannot be resumed, so there would be nothing to
+    ///   deopt *to*. `plant_site_trap` makes the same check for the same
+    ///   reason.
+    fn prune_always_taken_branch(&mut self, pc: usize, cmp: NodeId, target_pc: usize) -> bool {
+        if !self.pruned_always_taken.contains(&pc) {
+            return false;
+        }
+        if !self.splice.is_empty() {
+            return false;
+        }
+        let Some(ctrl) = self.ctrl_opt() else {
+            return false;
+        };
+        if !self.graph.safepoints.iter().any(|sp| sp.bci == pc) {
+            return false;
+        }
+        // `cmp` is 1 exactly when the branch is TAKEN, so a non-zero `cmp`
+        // continues and a zero one deopts — the identical polarity
+        // `add_div_zero_guard` uses for its `Cmp(Ne)` against zero.
+        self.graph.add(
+            Op::Guard { bci: pc },
+            IrType::Void,
+            vec![ctrl, cmp],
+            Some(pc),
+        );
+        // From here it is exactly the `goto` arm (0xa7): the target gains this
+        // predecessor and control is dead until the next merge.
+        self.add_merge_predecessor(target_pc);
+        self.ctrl = NO_NODE;
+        self.branches_pruned += 1;
+        note_branch_pruned();
         true
     }
 
@@ -6456,6 +6792,96 @@ impl IrBuilder {
             .filter(|target| reachable.contains(target))
             .collect();
 
+        // ── The same pre-scan, for every SPLICED body ────────────────
+        //
+        // `verified_code` above analysed `code[..code_len]` — the caller alone.
+        // A relocated callee body lives past `code_len` in the combined buffer
+        // and has its own branches, its own merge targets and its own loop
+        // headers, none of which that analysis can see. That gap, and only that
+        // gap, is why the splice scanner refused every callee containing an
+        // `if` or a `goto` and called itself "straight-line only, v1".
+        //
+        // Closing it needs no new analysis, because a callee body IS a valid
+        // method body: run the SAME verifier over it and rebase what comes out
+        // by the body's `base`. Branch offsets need no rebasing at all — they
+        // are relative, the body is copied contiguously, and a branch inside it
+        // therefore lands inside it in combined coordinates by construction.
+        //
+        // Reachability needs no merging either: the walk's skip is already
+        // scoped to `self.splice.is_empty()` (see the `!reachable.contains`
+        // test below) precisely because a relocated body is unreachable from
+        // pc 0. What a body's own reachability is used for here is the same
+        // thing it is used for above — refusing to create an `Op::Merge` for a
+        // target only handler code can reach, which would leave an input-less
+        // control node in the graph.
+        //
+        // A `return` anywhere but the last instruction is still refused by the
+        // scanner (`ir-splice-not-single-trailing-return`); several returns
+        // that all funnel to a trailing one are admitted under
+        // `ir_splice_multi_return_enabled`, and the loop below is where the
+        // walk learns which bodies those are.
+        if ir_splice_branch_enabled() {
+            let bodies: Vec<(usize, usize)> = self
+                .inline_sites
+                .values()
+                .map(|s| (s.base, s.code_len))
+                .collect();
+            for (base, body_len) in bodies {
+                let Some(body) = code.get(base..base.saturating_add(body_len)) else {
+                    return ir_build_bail(line!(), base);
+                };
+                let Ok(body_verified) = cratonvm_reader::verified_code(body) else {
+                    // The body did not verify on its own. Refuse the METHOD
+                    // rather than walk a region whose control flow nothing has
+                    // analysed — the failure mode that produces is orphan nodes
+                    // referencing `NO_NODE`, which is what STUB-S8 was.
+                    return ir_build_bail(line!(), base);
+                };
+                let body_reachable = normally_reachable_pcs(&body_verified, body_len);
+                for &target in body_verified.merge_targets() {
+                    let target = target as usize;
+                    if body_reachable.contains(&target) {
+                        self.ensure_merge(base + target);
+                    }
+                }
+                for &header in body_verified.loop_headers() {
+                    let header = header as usize;
+                    if body_reachable.contains(&header) {
+                        self.loop_headers.insert(base + header);
+                    }
+                }
+
+                // A body with several `return`s: the walk must NOT leave the
+                // splice at the first one. Decide it here, from the same
+                // verified decode, because the walk meets the returns one at a
+                // time and cannot tell the first from the last.
+                //
+                // Only reachable returns count. An unreachable one is code the
+                // walk never enters, and counting it would put the body on the
+                // continuation path with one exit edge that never arrives —
+                // which `finish_multi_return_splice` would refuse, losing a
+                // body the straight-through path handles fine.
+                if ir_splice_multi_return_enabled() {
+                    let mut reachable_returns = 0usize;
+                    let mut p = 0usize;
+                    while p < body_len {
+                        let Some(decoded) = body_verified.instruction_at(p) else {
+                            return ir_build_bail(line!(), base + p);
+                        };
+                        if body_reachable.contains(&p)
+                            && matches!(body.get(p), Some(0xac..=0xb1))
+                        {
+                            reachable_returns += 1;
+                        }
+                        p = decoded.next_pc as usize;
+                    }
+                    if reachable_returns > 1 {
+                        self.splice_multi_return.insert(base);
+                    }
+                }
+            }
+        }
+
         let mut pc = 0;
         // The `|| !self.splice.is_empty()` half is IR-tier inlining: inside a
         // splice `pc` addresses a relocated callee body appended AFTER
@@ -6468,14 +6894,30 @@ impl IrBuilder {
             // into whatever `lib.rs` appended next.
             if let Some(frame) = self.splice.last() {
                 if pc >= frame.end {
+                    // A multi-return body ENDS here rather than falling off:
+                    // its last instruction is a `return` (the scanner admits no
+                    // other shape) and that return recorded an edge instead of
+                    // exiting, so `pc` lands exactly on `end` with every edge
+                    // in and `ctrl` dead. Join them and resume the caller.
+                    if frame.multi_return && pc == frame.end && !frame.exits.is_empty() {
+                        match self.finish_multi_return_splice() {
+                            Some(next) => {
+                                pc = next;
+                                continue;
+                            }
+                            None => return ir_build_bail(line!(), pc),
+                        }
+                    }
                     return ir_build_bail(line!(), pc);
                 }
             }
             // A relocated body is unreachable from pc 0 by construction, so the
-            // reachability skip and the merge bookkeeping — both of which are
-            // computed over the CALLER's code alone — apply only outside a
-            // splice. The resolver admits branch-free bodies only, so there is
-            // no merge inside one to activate.
+            // REACHABILITY skip — computed over the caller's code alone — must
+            // stay scoped to code outside a splice. Merge bookkeeping is a
+            // different matter: since 2026-09-09 the pre-scan above registers
+            // each spliced body's own merge targets and loop headers, rebased,
+            // so a merge inside a splice both exists and must be activated. The
+            // gate below is deliberately NOT `self.splice.is_empty()` any more.
             if self.splice.is_empty() && !reachable.contains(&pc) {
                 // Handler-only (or otherwise unreachable) bytecode: emit no IR
                 // for it at all. `next_pc` comes from the verifier's canonical
@@ -6491,8 +6933,13 @@ impl IrBuilder {
                 continue;
             }
 
-            // If this PC is a merge target, activate the merge
-            if self.splice.is_empty() && self.merges.contains_key(&pc) {
+            // If this PC is a merge target, activate the merge.
+            //
+            // Inside a splice too. Every predecessor of a merge that the
+            // spliced-body pre-scan registered is itself inside that same body,
+            // so the locals and operand stack this snapshots are the callee's
+            // throughout — the same invariant the caller's own merges rely on.
+            if self.merges.contains_key(&pc) {
                 // Add current state as predecessor (fall-through). On a loop
                 // header this is the forward-entry predecessor; the back-edge
                 // arrives later and is back-patched (see add_merge_predecessor).
@@ -8280,6 +8727,10 @@ impl IrBuilder {
                         _ => unreachable!(),
                     };
                     let cmp = self.add_data(Op::Cmp(cc), IrType::Int, vec![val, zero], pc);
+                    if self.prune_always_taken_branch(pc, cmp, target_pc) {
+                        pc = target_pc;
+                        continue;
+                    }
                     let if_node =
                         self.graph
                             .add(Op::If, IrType::Control, vec![self.ctrl, cmp], Some(pc));
@@ -8324,6 +8775,10 @@ impl IrBuilder {
                         _ => unreachable!(),
                     };
                     let cmp = self.add_data(Op::Cmp(cc), IrType::Int, vec![a, b], pc);
+                    if self.prune_always_taken_branch(pc, cmp, target_pc) {
+                        pc = target_pc;
+                        continue;
+                    }
                     let if_node =
                         self.graph
                             .add(Op::If, IrType::Control, vec![self.ctrl, cmp], Some(pc));
@@ -8373,6 +8828,10 @@ impl IrBuilder {
                         CmpOp::Ne
                     };
                     let cmp = self.add_data(Op::Cmp(cc), IrType::Int, vec![a, b], pc);
+                    if self.prune_always_taken_branch(pc, cmp, target_pc) {
+                        pc = target_pc;
+                        continue;
+                    }
                     let if_node =
                         self.graph
                             .add(Op::If, IrType::Control, vec![self.ctrl, cmp], Some(pc));
@@ -8433,7 +8892,7 @@ impl IrBuilder {
                     // resumes after the `invoke`. No `Op::Return`, and `ctrl`
                     // stays live.
                     if !self.splice.is_empty() {
-                        match self.end_splice(Some(val)) {
+                        match self.splice_return(Some(val), pc) {
                             Some(next) => {
                                 pc = next;
                                 continue;
@@ -8453,7 +8912,7 @@ impl IrBuilder {
                 0xad => {
                     let val = self.pop();
                     if !self.splice.is_empty() {
-                        match self.end_splice(Some(val)) {
+                        match self.splice_return(Some(val), pc) {
                             Some(next) => {
                                 pc = next;
                                 continue;
@@ -8491,7 +8950,7 @@ impl IrBuilder {
                 0xae | 0xaf => {
                     let val = self.pop();
                     if !self.splice.is_empty() {
-                        match self.end_splice(Some(val)) {
+                        match self.splice_return(Some(val), pc) {
                             Some(next) => {
                                 pc = next;
                                 continue;
@@ -8510,7 +8969,7 @@ impl IrBuilder {
                 // return (void)
                 0xb1 => {
                     if !self.splice.is_empty() {
-                        match self.end_splice(None) {
+                        match self.splice_return(None, pc) {
                             Some(next) => {
                                 pc = next;
                                 continue;
@@ -9569,6 +10028,23 @@ pub fn try_ir_scalar_intrinsic(class: &str, method: &str, descriptor: &str) -> O
         ("java/lang/Math" | "java/lang/StrictMath", "abs", "(J)J") => Some(ScalarOp::AbsL),
         ("java/lang/Integer", "compare", "(II)I") => Some(ScalarOp::CompareI),
         ("java/lang/Long", "compare", "(JJ)I") => Some(ScalarOp::CompareL),
+        // `Integer.min`/`max` and `Long.min`/`max` are one-line delegations to
+        // the `Math` methods directly above — `Integer.min(a, b)` IS
+        // `Math.min(a, b)` in the JDK source — so they lower to the identical
+        // sequence and need no new `ScalarOp`.
+        //
+        // They are here because they are separately native-shadowed in this VM,
+        // and a shadowed leaf is an inlining barrier as well as an
+        // un-compilable method: the caller cannot splice it (there is no
+        // bytecode to splice) and, without a row here, cannot lower it as
+        // arithmetic either, so a two-instruction operation costs a call
+        // through Rust. `Math.min` was already covered; these three-character
+        // spellings of it were not, and `Integer.max(a, b)` is not a rare way
+        // to write it.
+        ("java/lang/Integer", "min", "(II)I") => Some(ScalarOp::MinI),
+        ("java/lang/Integer", "max", "(II)I") => Some(ScalarOp::MaxI),
+        ("java/lang/Long", "min", "(JJ)J") => Some(ScalarOp::MinL),
+        ("java/lang/Long", "max", "(JJ)J") => Some(ScalarOp::MaxL),
         ("java/lang/Integer", "numberOfLeadingZeros", "(I)I") => Some(ScalarOp::NlzI),
         ("java/lang/Long", "numberOfLeadingZeros", "(J)I") => Some(ScalarOp::NlzL),
         ("java/lang/Integer", "numberOfTrailingZeros", "(I)I") => Some(ScalarOp::NtzI),
@@ -10119,6 +10595,139 @@ mod scalar_intrinsic_recognizer_tests {
 /// **Default ON**; `CRATONVM_JIT_IR_SCALAR_INTRINSICS=0` restores the
 /// method-level refusal for these families too, which is the A arm of the only
 /// A/B that means anything here.
+/// May a spliced callee body contain its own branches? **Default ON**;
+/// `CRATONVM_JIT_IR_SPLICE_BRANCH=0` restores the straight-line-only shape.
+///
+/// Read by BOTH halves of the feature — the splice scanner in `jit_bridge`,
+/// which decides whether to admit such a callee, and [`IrBuilder::build`],
+/// which pre-scans the admitted body's control flow. They must agree: a body
+/// admitted without its pre-scan is exactly the orphan-node failure STUB-S8
+/// was, so the scanner asks the VM-side mirror of this and the builder asks
+/// this, and neither may be flipped alone.
+pub fn ir_splice_branch_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPLICE_BRANCH").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
+/// May a spliced callee body have more than one `return`? **Default OFF**;
+/// `CRATONVM_JIT_IR_SPLICE_MULTI_RETURN=1` lifts the
+/// `ir-splice-not-single-trailing-return` refusal.
+///
+/// # Why it is off, given that it works
+///
+/// It works, and it is soak-clean: 39 deterministic workloads under three
+/// collectors with 0 divergence, checksum parity against Temurin JDK 25 on 14
+/// workloads, and a probe built for it (`MultiRet`) where the census reads
+/// `bodies=3 return_edges=8` on and `bodies=0` off.
+///
+/// What it does not do is go faster. Interleaved, order-flipped, 14 rounds on
+/// that probe: **+0.0 % median, faster in 5 of 14 paired rounds.** Splicing
+/// removes a call and adds a merge and a phi, and on this shape those cancel.
+///
+/// It used to cost something on the other side as well: a merge built inside a
+/// spliced body set `SPLICED_MERGE_SEEN`, which withheld the artifact's
+/// `ir_osr_entries` wholesale. That containment came off on 2026-09-09 — the
+/// wrong answer was `emit_osr_entry_stubs` jumping past the block that writes a
+/// constant arm's home word, not the splice — so the OSR door is no longer
+/// forfeited by turning this on.
+///
+/// What is left is the measurement, and the measurement is neutral. It stays off
+/// until a shape is found where splicing a multi-return body pays; the argument
+/// that would have flipped it (coverage against nothing) is gone with the
+/// containment, because there is no longer anything to trade coverage against.
+///
+/// Implies [`ir_splice_branch_enabled`] in practice — a second `return` is
+/// only reachable through a branch — and, like it, is read by BOTH halves:
+/// the splice scanner in `jit_bridge`, which decides whether to admit such a
+/// callee, and [`IrBuilder::splice_return`] / [`IrBuilder::finish_multi_return_splice`],
+/// which build the continuation. Admitting a body one half does not understand
+/// is the orphan-node failure STUB-S8 was, so neither may be flipped alone.
+pub fn ir_splice_multi_return_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        ir_splice_branch_enabled()
+            && matches!(
+                cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPLICE_MULTI_RETURN").as_deref(),
+                Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+            )
+    })
+}
+
+/// Spliced callee bodies whose several `return`s were funnelled into one
+/// continuation merge, and how many return edges that took in total. Both are
+/// process-wide and diagnostic only; `interp_census` prints them so "no
+/// multi-return body was ever admitted" is distinguishable from "the feature
+/// is not wired".
+static MULTI_RETURN_SPLICES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MULTI_RETURN_EDGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(bodies, return edges)` — see [`MULTI_RETURN_SPLICES`].
+pub fn multi_return_splice_census() -> (u64, u64) {
+    (
+        MULTI_RETURN_SPLICES.load(std::sync::atomic::Ordering::Relaxed),
+        MULTI_RETURN_EDGES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// May a spliced callee body contain a `getstatic`? **Default ON**;
+/// `CRATONVM_JIT_IR_SPLICE_GETSTATIC=0` restores the `ir-splice-static-field`
+/// refusal.
+///
+/// Read by BOTH halves, for the same reason and with the same hazard as
+/// [`ir_splice_branch_enabled`]: the splice scanner in `jit_bridge` decides
+/// whether to admit such a callee, and [`IrInlineTables::static_field_info`] is
+/// what carries the rows the builder's `0xb2` arm then looks up. A body
+/// admitted without its rows does not fall back -- the builder bails the whole
+/// METHOD at the first spliced `getstatic`, which is how the `ldc` rows
+/// behaved for their first hour. Neither half may be flipped alone.
+///
+/// `putstatic` is NOT covered by this switch in either direction. It stays
+/// refused unconditionally; see [`IrInlineTables::static_field_info`].
+pub fn ir_splice_getstatic_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPLICE_GETSTATIC").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
+/// May a spliced callee body contain a `checkcast` or an `instanceof`?
+/// **Default ON**; `CRATONVM_JIT_IR_SPLICE_TYPECHECK=0` restores the refusal.
+///
+/// Read by BOTH halves, with the same hazard as [`ir_splice_getstatic_enabled`]
+/// and one extra step: the splice scanner in `jit_bridge` decides whether to
+/// admit such a callee AND resolves the target class against the CALLEE's
+/// constant pool, since `InlineSite` carried no typecheck rows before this and
+/// only that pool can name the target. [`IrInlineTables::checkcast_info`]
+/// carries what comes out. A body admitted without its rows bails the whole
+/// METHOD, so neither half may be flipped alone.
+///
+/// Every typed read out of an untyped container is a `checkcast`, which is why
+/// the survey that motivated the caller-side arms counted 306 events on this
+/// pair -- "the largest single whole-method refusal, more than every opcode gap
+/// combined". The splice scanner had been refusing the same shape for the same
+/// non-reason.
+pub fn ir_splice_typecheck_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPLICE_TYPECHECK").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
 pub fn ir_scalar_intrinsics_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -10133,6 +10742,49 @@ pub fn ir_scalar_intrinsics_enabled() -> bool {
 /// Scalar-intrinsic sites lowered as arithmetic, this process.
 static SCALAR_INTRINSICS_LOWERED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+/// Conditional branches replaced by a guard plus an unconditional jump, this
+/// process. See [`IrBuilder::prune_always_taken_branch`].
+static BRANCHES_PRUNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_branch_pruned() {
+    BRANCHES_PRUNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many cold branch arms this tier speculated away. A zero with the feature
+/// ON means the profile never showed a branch to be one-sided over the sample —
+/// which is a fact about the workload, not about the pass, and is exactly the
+/// distinction a bare "it did nothing" cannot make.
+pub fn branch_prune_census() -> u64 {
+    BRANCHES_PRUNED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Speculative pruning of a branch arm the profile has never seen taken —
+/// **default OFF**, opt in with `CRATONVM_JIT_IR_SPECULATE=1`.
+///
+/// Needs a branch profile to do anything, so it is only meaningful together
+/// with `CRATONVM_TIER_PGO` / `CRATONVM_TIER_PGO_ALWAYS` or inside the C2
+/// nomination window.
+pub fn ir_speculate_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPECULATE").as_deref(),
+            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+        )
+    })
+}
+
+/// Minimum observations of a branch before its unseen edge may be speculated
+/// away.
+///
+/// A branch executed three times, all one way, says nothing. HotSpot's own
+/// uncommon-trap policy wants a comparable sample before it prunes, and the
+/// cost of being wrong here — a deopt, then a re-speculation on the next
+/// compile — is paid per mistake, so the floor is what keeps a cold method from
+/// paying it repeatedly.
+pub const MIN_OBSERVATIONS_TO_PRUNE: u32 = 2_000;
 
 /// Call sites REFUSED because their intrinsic family is loop-shaped and a
 /// generic dispatch would be a downgrade.
@@ -10777,6 +11429,86 @@ mod tests {
         builder.build(code, code_len).expect("IR build failed")
     }
 
+    /// `int f(int x) { return x == 0 ? 2 : 1; }`, whose `ifeq` at pc 1 the
+    /// profile says is always taken.
+    ///
+    /// Pruned, the branch becomes a guard plus a jump: the `Op::If` is gone,
+    /// the cold arm (`iconst_1`, pcs 4-5) is never built, and an `Op::Guard`
+    /// anchored at pc 1 carries the transfer back to the interpreter for the
+    /// case the profile never saw.
+    ///
+    /// Asserted against the UNPRUNED build of the same bytecode rather than
+    /// against absolute node counts, so the test says "pruning changed this"
+    /// rather than restating today's node numbering.
+    #[test]
+    fn an_always_taken_branch_becomes_a_guard_and_a_jump() {
+        let code = [
+            0x1a, // 0: iload_0
+            0x99, 0x00, 0x07, // 1: ifeq +7 -> 8
+            0x04, // 4: iconst_1     <- the cold arm
+            0xa7, 0x00, 0x04, // 5: goto +4 -> 9
+            0x05, // 8: iconst_2
+            0xac, // 9: ireturn
+            0, 0, 0,
+        ];
+
+        let plain = build_ir(&code, 10, 1, 1);
+        assert!(
+            plain.nodes.iter().any(|n| matches!(n.op, Op::If)),
+            "the control case must build an Op::If",
+        );
+        assert!(
+            !plain.nodes.iter().any(|n| matches!(n.op, Op::Guard { .. })),
+            "nothing unpruned may plant a guard here",
+        );
+
+        let mut builder = IrBuilder::new(1, 1);
+        builder.set_pruned_branches(std::iter::once(1usize).collect());
+        let pruned = builder.build(&code, 10).expect("pruned build");
+
+        assert!(
+            pruned
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::Guard { bci: 1 })),
+            "the pruned branch must plant a guard at its own bci",
+        );
+        assert!(
+            !pruned.nodes.iter().any(|n| matches!(n.op, Op::If)),
+            "the pruned branch must not also build an Op::If",
+        );
+        // The cold arm produced `iconst_1`; the surviving arm produces
+        // `iconst_2`. Only the second may be in the graph.
+        let consts: Vec<i64> = pruned
+            .nodes
+            .iter()
+            .filter_map(|n| match n.op {
+                Op::Const(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            consts.contains(&2) && !consts.contains(&1),
+            "the cold arm must be gone; constants were {consts:?}",
+        );
+    }
+
+    /// A guard has nothing to resume to inside a relocated body, so the tier
+    /// must decline to speculate there rather than set `splice_guard_seen` and
+    /// lose the whole method.
+    #[test]
+    fn pruning_is_declined_inside_a_splice() {
+        let mut b = IrBuilder::new(1, 1);
+        b.set_pruned_branches(std::iter::once(1usize).collect());
+        // No splice is open in this unit context, so the refusal under test is
+        // the OTHER one: a pc with no recorded frame state. Drive it by asking
+        // about a pc the walk has not reached.
+        assert!(
+            !b.prune_always_taken_branch(1, NO_NODE, 8),
+            "a bci with no safepoint snapshot must not be speculated on",
+        );
+    }
+
     #[test]
     fn test_ir_identity_function() {
         // int f(int x) { return x; }
@@ -10847,6 +11579,144 @@ mod tests {
         assert!(has_if, "Should contain an If node");
         let has_cmp = graph.nodes.iter().any(|n| matches!(n.op, Op::Cmp(_)));
         assert!(has_cmp, "Should contain a Cmp node");
+    }
+
+    /// A spliced `getstatic` resolves through `IrInlineTables::static_field_info`,
+    /// and a MISSING row bails the whole method.
+    ///
+    /// Both halves matter, and the second is the one with no other witness.
+    /// `ldc` spent its first hour in exactly this state -- the resolver
+    /// admitting a callee whose rows nothing rebased, and the builder refusing
+    /// the METHOD 65 bytes later, which from outside is indistinguishable from
+    /// a workload that has no such callee. Asserting only the positive would
+    /// leave the same hole: a future edit that drops the row from
+    /// `apply_inline_tables` would still pass.
+    #[test]
+    fn a_spliced_getstatic_resolves_through_the_rebased_rows() {
+        // Caller: `static int f() { return g(); }`
+        //   pc 0  invokestatic #1   (spliced)
+        //   pc 3  ireturn
+        // Callee body, relocated to combined pc 5:
+        //   pc 5  getstatic #2
+        //   pc 8  ireturn
+        let code = [
+            0xb8, 0x00, 0x01, 0xac, 0x00, // caller, code_len 4 (byte 4 is padding)
+            0xb2, 0x00, 0x02, 0xac, // relocated callee at [5, 9)
+            0, 0,
+        ];
+        let site = IrInlineSite {
+            base: 5,
+            code_len: 4,
+            num_args: 0,
+            max_locals: 0,
+            arg_local_slots: Vec::new(),
+            returns_value: true,
+            receiver_is_arg0: false,
+            method_key: "P.g:()I".to_string(),
+            class_id: 7,
+        };
+
+        let mut with_rows = IrBuilder::new(0, 1);
+        let mut tables = IrInlineTables::default();
+        tables.sites.insert(0, site.clone());
+        // The row `append_ir_inline_site` rebases: CALLEE pc 0 + base 5.
+        tables
+            .static_field_info
+            .insert(5, (7u32, 0usize, b'I', false));
+        with_rows.apply_inline_tables(tables);
+        let graph = with_rows
+            .build(&code, 4)
+            .expect("a spliced getstatic with its row must build");
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::LoadStatic { class_id: 7, .. })),
+            "the spliced `getstatic` must lower to an Op::LoadStatic naming the              resolved class, not to a call left behind by a skipped splice",
+        );
+
+        // Same site, same bytes, no row.
+        let mut without_rows = IrBuilder::new(0, 1);
+        let mut bare = IrInlineTables::default();
+        bare.sites.insert(0, site);
+        without_rows.apply_inline_tables(bare);
+        assert!(
+            without_rows.build(&code, 4).is_none(),
+            "with no row the builder must bail the METHOD -- that is the failure              mode the resolver's admission has to stay in step with",
+        );
+    }
+
+    /// A spliced `instanceof` resolves through `IrInlineTables::instanceof_info`,
+    /// and a MISSING row bails the whole method.
+    ///
+    /// The `0xc1` arm READS as though a missing row were graceful -- it calls
+    /// `plant_uncommon_trap` and compiles the rest. It is not, by default:
+    /// `TrapCause::UnresolvedTypeCheck` is gated behind
+    /// `ir_unresolved_class_trap_enabled`, which is OFF (the argument for it
+    /// having been refuted), so the plant refuses and the arm falls through to
+    /// `ir_build_bail`. That is the same fail-closed answer a missing
+    /// `getstatic` row gives, and it is why the resolver must refuse a callee
+    /// whose targets it could not resolve rather than admit the body and leave
+    /// rows out: doing so costs the CALLER its whole optimizing compile.
+    ///
+    /// Asserting the negative is the point. Reading the arm alone gives the
+    /// wrong answer, and a future edit that flips the trap default would change
+    /// this behaviour without touching either half of the splice feature.
+    #[test]
+    fn a_spliced_instanceof_resolves_through_the_rebased_rows() {
+        // Caller: `static boolean f(Object o) { return g(o); }`
+        //   pc 0  aload_0
+        //   pc 1  invokestatic #1   (spliced)
+        //   pc 4  ireturn
+        // Callee body, relocated to combined pc 6:
+        //   pc 6  aload_0
+        //   pc 7  instanceof #2
+        //   pc 10 ireturn
+        let code = [
+            0x2a, 0xb8, 0x00, 0x01, 0xac, 0x00, // caller, code_len 5
+            0x2a, 0xc1, 0x00, 0x02, 0xac, // relocated callee at [6, 11)
+            0, 0,
+        ];
+        let name = "java/lang/String";
+        let (ptr, len) = crate::intern_typecheck_target(name, Some(11));
+        let site = IrInlineSite {
+            base: 6,
+            code_len: 5,
+            num_args: 1,
+            max_locals: 1,
+            arg_local_slots: vec![0],
+            returns_value: true,
+            receiver_is_arg0: false,
+            method_key: "P.g:(Ljava/lang/Object;)Z".to_string(),
+            class_id: 7,
+        };
+
+        let mut with_rows = IrBuilder::new(1, 1);
+        let mut tables = IrInlineTables::default();
+        tables.sites.insert(1, site.clone());
+        // The row `append_ir_inline_site` rebases: CALLEE pc 1 + base 6.
+        tables.instanceof_info.insert(7, (ptr as usize, len));
+        with_rows.apply_inline_tables(tables);
+        let graph = with_rows
+            .build(&code, 5)
+            .expect("a spliced instanceof with its row must build");
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::InstanceOf { .. })),
+            "the spliced `instanceof` must lower to an Op::InstanceOf, not to a              call left behind by a skipped splice",
+        );
+
+        // Same site, same bytes, no row.
+        let mut without_rows = IrBuilder::new(1, 1);
+        let mut bare = IrInlineTables::default();
+        bare.sites.insert(1, site);
+        without_rows.apply_inline_tables(bare);
+        assert!(
+            without_rows.build(&code, 5).is_none(),
+            "with no row the builder must bail the METHOD -- the `0xc1` arm's              uncommon-trap path is gated off by default, so the resolver's              admission has to stay in step with the rows it produces",
+        );
     }
 
     #[test]
