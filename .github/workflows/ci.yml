@@ -1236,16 +1236,41 @@ jobs:
   #
   # ADVISORY (`continue-on-error: true`) ON PURPOSE. Two independent reasons:
   #
-  #  1. Wave 1 is measurement, not deletion (design §10). 157 synthetic-stub
-  #     natives are still registered on the default path, and the strict
-  #     class-loading refusals mean a `--jdk-only` run is *expected* to fail on
-  #     real workloads right now. The census is how that failure is measured.
+  #  1. Wave 1 is measurement, not deletion (design §10). Synthetic-stub natives
+  #     are still registered on the default path, and the strict class-loading
+  #     refusals mean a `--jdk-only` run is *expected* to fail on real workloads
+  #     right now. The census is how that failure is measured.
+  #     MEASURED 2026-09-10, because the figure that stood here (157) was prose
+  #     and prose does not get re-frozen: `registry-real.json` carries **1701
+  #     synthetic-stub rows over 1584 distinct triples**. Under `--jdk-only` the
+  #     final registry holds ZERO of them, so design §11's criterion 2 is met at
+  #     registration -- but 7 of those triples are still answered by an OLDER
+  #     registration rather than by bytecode, and refused is not retired. Take
+  #     any remaining-work figure from a dump:
+  #     `docs/known-issues/jdk-only/the-six-acceptance-criteria-measured-20260910.md`.
   #  2. The design's own acceptance criterion (§11) makes the zero-stub census
   #     blocking only once "the strict corpus shows no new HotSpot divergence" —
   #     i.e. once difftest/seeds-jdk-only is deterministic across both OS legs.
-  #     Promote this job by deleting `continue-on-error` at that point, together
-  #     with un-ignoring `strict_mode_refuses_nothing` in
-  #     `native-builtins/tests/stub_ratchet.rs`.
+  #
+  #     CORRECTED 2026-09-10. **That condition is now satisfied and it is NOT
+  #     sufficient**; the earlier wording ("promote this job by deleting
+  #     `continue-on-error` at that point, together with un-ignoring
+  #     `strict_mode_refuses_nothing`") read as an instruction to promote today,
+  #     and following it would enable a blocking gate whose own strong assertion
+  #     is still disabled. `21-linux` and `25-linux` reached ZERO divergent rows
+  #     on 2026-09-10 (`50b9c2482`), and the ratchet was proven to still fire
+  #     against the emptied files.
+  #
+  #     `native-builtins/tests/stub_ratchet.rs` governs, and it does not list
+  #     corpus determinism at all. `strict_mode_refuses_nothing` may be
+  #     un-ignored only after ALL THREE of: (a) the `SyntheticStub`
+  #     registrations are reclassified into real `Bridge`/`Intrinsic` or deleted
+  #     so real bytecode runs -- explicitly a separate wave with
+  #     subsystem-per-PR discipline, contract §8; (b) `BASELINE_SYNTHETIC_STUBS`
+  #     is driven to 0 in the SAME change, since the ratchet is slack-free and a
+  #     stale baseline would silently re-admit that many new stubs; (c) the test
+  #     is un-ignored so the zero is held. Promote this job as part of (c), not
+  #     before it.
   #
   # For the avoidance of doubt about the neighbouring jobs: the "Synthetic-stub
   # ratchet" step in `build-and-test` is BLOCKING today — it runs in a job that
