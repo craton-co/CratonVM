@@ -7,7 +7,7 @@ Prefixes: `java/util/concurrent/`, `jdk/internal/misc/`, `sun/misc/`,
 The smallest class count in the campaign and the highest concentration: 173 of
 405 rows are two classes. Read [`lane-0-integration-and-gates.md`](lane-0-integration-and-gates.md) §2-§6 first.
 Method, preconditions, landing protocol:
-[`../jdk-only-lane-operations.md`](../jdk-only-lane-operations.md).
+[`../jdk-only-lane-operations.md`](../../contributing/jdk-only-lane-operations.md).
 
 ---
 

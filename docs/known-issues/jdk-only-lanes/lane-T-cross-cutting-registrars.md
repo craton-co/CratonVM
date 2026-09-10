@@ -7,7 +7,7 @@ a class-name prefix.
 Read [`lane-0-integration-and-gates.md`](lane-0-integration-and-gates.md) §2-§6 first: the ownership table, the
 shared cells, the build queue, and the merge protocol. The method, the four
 retirement preconditions and the landing protocol are in
-[`../jdk-only-lane-operations.md`](../jdk-only-lane-operations.md).
+[`../jdk-only-lane-operations.md`](../../contributing/jdk-only-lane-operations.md).
 
 ---
 

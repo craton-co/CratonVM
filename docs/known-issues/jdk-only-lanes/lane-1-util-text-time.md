@@ -6,7 +6,7 @@ Prefixes: `java/util/` (excluding `java/util/concurrent/`, which is L5's),
 
 Read [`lane-0-integration-and-gates.md`](lane-0-integration-and-gates.md) §2-§6 first. The method, the four
 preconditions and the landing protocol are in
-[`../jdk-only-lane-operations.md`](../jdk-only-lane-operations.md).
+[`../jdk-only-lane-operations.md`](../../contributing/jdk-only-lane-operations.md).
 
 ---
 

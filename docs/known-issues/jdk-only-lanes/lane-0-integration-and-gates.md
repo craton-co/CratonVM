@@ -10,10 +10,10 @@ parallelised: **what the number is**.
 
 Authorities this page does not restate:
 
-- [`../jdk-only-lane-operations.md`](../jdk-only-lane-operations.md) — the method, the four
+- [`../jdk-only-lane-operations.md`](../../contributing/jdk-only-lane-operations.md) — the method, the four
   retirement preconditions (§7), the instrument traps (§4), and the **landing
   protocol (§5), which is the whole gate set and must not be shortened**.
-- [`../stub-ratchet.md`](../stub-ratchet.md) — why a ratchet constant is taken as a
+- [`../stub-ratchet.md`](../../contributing/stub-ratchet.md) — why a ratchet constant is taken as a
   before-number and never computed by arithmetic.
 
 ---
@@ -125,7 +125,7 @@ census, never with the scanner.
 | `scripts/baselines/jdk-only-kind-map-25-linux.tsv` — **rows** | the lane | keyed class+name+descriptor, disjoint by construction |
 | same file — the header note | **L0** | never edit |
 | `regression-suite/bridge-ratchet.sh` | **L0** | never edit |
-| [`../jdk-only-lane-operations.md`](../jdk-only-lane-operations.md) | **L0** | propose via your lane page |
+| [`../jdk-only-lane-operations.md`](../../contributing/jdk-only-lane-operations.md) | **L0** | propose via your lane page |
 | `apps/probes/L<N>*.java` | the lane | namespace your probes; `apps/` is gitignored, so `git add -f` |
 
 ### The skeleton commit makes the chain conflict-free

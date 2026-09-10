@@ -5,7 +5,7 @@ Prefixes: `java/lang/reflect/`, `jdk/internal/reflect/`, `sun/reflect/`,
 `java/lang/invoke/`.
 
 Read [`lane-0-integration-and-gates.md`](lane-0-integration-and-gates.md) §2-§6 first. Method, preconditions and
-landing protocol: [`../jdk-only-lane-operations.md`](../jdk-only-lane-operations.md).
+landing protocol: [`../jdk-only-lane-operations.md`](../../contributing/jdk-only-lane-operations.md).
 
 ---
 

@@ -5,7 +5,7 @@ Prefixes: `java/lang/` and `java/math/`, **minus** the prefixes L0, L3, L5 and
 L7 own (`Class*`, `Module*`, `reflect/`, `invoke/`, `Thread*`, `ClassLoader*`).
 
 Read [`lane-0-integration-and-gates.md`](lane-0-integration-and-gates.md) §2-§6 first. Method, preconditions and
-landing protocol: [`../jdk-only-lane-operations.md`](../jdk-only-lane-operations.md).
+landing protocol: [`../jdk-only-lane-operations.md`](../../contributing/jdk-only-lane-operations.md).
 
 ---
 
