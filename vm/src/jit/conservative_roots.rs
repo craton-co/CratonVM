@@ -9707,6 +9707,41 @@ static UNREWRITABLE_BAND_ROOTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Addresses published to the unrewritable-root veto since process start.
 ///
+/// Objects published MOVABLE from a verifiable band word this run.
+///
+/// The complement of [`unrewritable_band_root_count`], and the two are read
+/// together: a movable count of zero with a non-zero unrewritable count means
+/// every band word this workload holds is one nothing rewrites, which is a
+/// different situation from the partition never having been computed.
+static MOVABLE_BAND_ROOTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Diagnostic counterpart of [`unrewritable_band_root_count`].
+pub fn movable_band_root_count() -> usize {
+    MOVABLE_BAND_ROOTS.load(Ordering::Relaxed)
+}
+
+/// `CRATONVM_GC_MOVABLE_BAND_ROOTS=0` — stop publishing the verifiable half of
+/// the band partition as movable, i.e. go back to every conservative JIT root
+/// pinning its G1 region. **Default ON.**
+///
+/// The bisect lever for the publication in `publish_unrewritable_band_roots`.
+/// It is separate from `CRATONVM_GC_G1_MOVABLE_PINS` (the CONSUMER) because the
+/// two can fail differently: a wrong publication here is a movable claim for a
+/// word something still reads, while a wrong consumption there is a filter that
+/// ignores the veto. A stale-pointer report has to be attributable to one.
+fn gc_movable_band_roots_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_GC_MOVABLE_BAND_ROOTS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        },
+    )
+}
+
 /// Diagnostic only. A non-zero count means at least one compiled frame held a
 /// live object in a word `band_slot_is_verifiable` refuses to inspect — i.e.
 /// the pin below is doing work, not just costing a branch.
@@ -9794,6 +9829,43 @@ fn publish_unrewritable_band_roots(
             // the non-moving sweep, and a published one is rewritten by
             // `remap_one_jit_frame`, so it needs no pin and pinning it would
             // give back the drain this set exists to preserve.
+            //
+            // SAY SO. That sentence was true and unsaid: nothing published the
+            // verifiable half anywhere, so on G1 -- whose pin set was every
+            // conservative root without exception -- the word pinned its region
+            // regardless, and a REGION is a megabyte at `-Xmx2g`. Publishing
+            // the complement is what lets `jit_pinned_region_set` act on the
+            // partition this function already computes.
+            //
+            // The claim per word is the one above, in two cases. NAMED by the
+            // active map: `remap_one_jit_frame` rewrites the slot, so the
+            // object may move. NOT named, in a region the abstract interpreter
+            // MODELS: the word is DEAD -- `band_slot_is_verifiable_with_map`
+            // spends exactly that claim to excuse it from shadow publication,
+            // and its own measurement is the 74 unpublished words of
+            // `MVStore.closeStore` that were javac's out-of-scope copies. A
+            // dead word needs no rewrite.
+            //
+            // Fail-closed by construction: this publishes only what it can
+            // argue about. A foreign innermost frame has no layout and never
+            // reaches here, so its words stay pinned, and any address ALSO
+            // reaching an unverifiable word is vetoed by
+            // `add_unrewritable_jit_root` below -- the pin set is keyed by
+            // OBJECT, and the veto outranks every movable claim.
+            if gc_movable_band_roots_enabled() {
+                // SAFETY: aligned read inside this thread's own live compiled
+                // frame, bounded by the recorded frame size -- the same word
+                // `scan_one_frame` has already read.
+                let qword = unsafe { (addr as *const usize).read() };
+                let in_envelope = match envelope {
+                    Some((elo, ehi)) => qword >= elo && qword < ehi,
+                    None => true,
+                };
+                if in_envelope && heap.is_object_address(qword).is_some() {
+                    cratonvm_gc::gc_quiescence::add_movable_jit_root(qword);
+                    MOVABLE_BAND_ROOTS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             addr += 8;
             continue;
         }
