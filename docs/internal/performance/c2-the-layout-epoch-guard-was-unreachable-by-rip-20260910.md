@@ -166,7 +166,19 @@ the long form in both (`CRATONVM_JIT_IR_EPOCH_GUARD_RIP=0`, which a `.data`
 counter forces anyway, being out of disp32 reach by construction).
 `MultiFieldLoop`, `probe.reps=8000`:
 
-@@LOCATION_TABLE@@
+| run | floor | effect (`.data` vs heap) | |
+|---|---:|---:|---|
+| 1 | **0.7%** | **−0.6%** | UNMEASURABLE |
+| 2 | 1.3% | +1.5% | slower, barely clears |
+| 3 | 2.0% | +5.0% | slower |
+| 4 | 4.2% | −6.7% | floor above 3% — the machine |
+| 5 | 5.2% | +5.5% | floor above 3% — the machine |
+
+Five runs, no consistent sign, and the two whose floors are tightest read
+−0.6% and +1.5%. That is what "no mechanism for it to matter" looks like when
+you finally point an instrument at it. Run 3 is the outlier and is left in the
+table rather than dropped, because a discarded reading that is not written
+down gets re-taken.
 
 The argument was right, and it is now checkable rather than plausible.
 
@@ -360,7 +372,26 @@ with its four, and each copy's displacement was re-resolved against its own PC
 
 ### The number
 
-@@SP_TABLE@@
+`flag-ab.sh`, one binary, `CRATONVM_C2_SUPERSEDE=0` and
+`CRATONVM_JIT_CODE_NEAR_GLOBALS=1` in both arms, `MultiFieldLoop`,
+`probe.reps=8000`, 12 rounds. Six invocations across two hours of a host that
+other sessions kept between load 19 and load 55:
+
+| run | floor | effect | |
+|---|---:|---:|---|
+| 1 | **0.3%** | **−5.4%** | ON faster |
+| 2 | 1.4% | **−3.8%** | ON faster |
+| 3 | 1.6% | **−6.1%** | ON faster |
+| 4 | 1.7% | −1.3% | UNMEASURABLE |
+| 5 | 3.0% | −0.1% | floor at the bar |
+| 6 | 3.6% | −0.3% | floor above the bar |
+
+**Three readings clear the 3% bar with the same sign and −3.8% to −6.1%**, one
+clears it with a null, and two do not clear it at all. Called for what it is:
+the encoding is faster on this shape, somewhere in the low single digits, and
+this host was never quiet enough to say where in that range. The engagement
+above is the part that is exact — 104 bytes, eight sites, thirteen each — and
+the timing is the part that is a range.
 
 ## Two single-pass sites had no guard at all
 
@@ -402,7 +433,16 @@ exactly where it matters most.
 
 ### What it costs, because a correctness fix has a price
 
-@@GUARD_TABLE@@
+Same base and probe, and this is the arm that costs rather than pays:
+
+| run | floor | effect (guards ON vs removed) | |
+|---|---:|---:|---|
+| 1 | **1.4%** | **+14.8%** | ON slower |
+| 2 | **2.8%** | **+22.6%** | ON slower |
+| 3 | 3.6% | +8.9% | floor above the bar |
+| 4 | 12.1% | +5.6% | floor above the bar |
+
+Two clean readings, same sign, **+15% to +23%**.
 
 That is the bill for not reading a replaced layout at a stale offset, on a loop
 built to make it as large as it can be: four distinct fields, nothing else in
