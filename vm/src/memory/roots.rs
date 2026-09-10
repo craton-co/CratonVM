@@ -1718,6 +1718,17 @@ moving_young={moving_young} osr_fallback={moving_young_osr_fallback} incomplete=
         let ro_e = cratonvm_jit::x64::reg_oop_mask_cause::snapshot();
         let ro_u = crate::jit::conservative_roots::reg_oop_mask_census();
         let ro_o = crate::jit::conservative_roots::reg_oop_mask_oracle();
+        // Which scan path ran, and what the band partition published. A pin
+        // census shows neither, and both decide whether a pin is arguable.
+        let bp = crate::jit::conservative_roots::band_path::snapshot();
+        eprintln!(
+            "[bandpath] bands={} fallback={} foreign_innermost={}              published=(movable={} unrewritable={})",
+            bp.0,
+            bp.1,
+            bp.2,
+            crate::jit::conservative_roots::movable_band_root_count(),
+            crate::jit::conservative_roots::unrewritable_band_root_count(),
+        );
         eprintln!(
             "[regoop] emit=(disabled={} staged={} desync={} inexact={} windows={} inline={} \
              dataflow={} PUBLISHED={}) use=(masked={} unmasked={} regwords={} \

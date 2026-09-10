@@ -9001,7 +9001,20 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
     // and not yet stored anywhere tracked — see
     // `bug-g1-evacuates-live-jit-reference-20260819-FIXED.md`.
     if !frame_bands_enabled() || !scan_compiled_frame_bands(info, scanner_sp, heap, out) {
+        // The WHOLE-BAND fallback. It publishes NEITHER half of the
+        // movable/unrewritable partition -- it has no per-frame layout to
+        // compute one from -- so every object it finds pins its G1 region with
+        // no way to argue otherwise. It also covers `[scanner_sp, rbp_inner)`,
+        // the interpreter/native/Rust frames the compiled method called INTO,
+        // whose words nothing rewrites even in principle.
+        //
+        // Counted because the two paths are indistinguishable in a pin census
+        // and have opposite prospects: a band-path pin can be argued away, a
+        // fallback pin cannot.
+        band_path::FALLBACK.fetch_add(1, Ordering::Relaxed);
         scan_one_frame(scanner_sp, info.frame_base, heap, out);
+    } else {
+        band_path::BANDS.fetch_add(1, Ordering::Relaxed);
     }
     let _ = info.entry_ptr; // reserved for future PC-precise lookup
 }
@@ -9062,6 +9075,10 @@ fn scan_compiled_frame_bands(
         frames += 1;
         if innermost_is_foreign {
             innermost_is_foreign = false;
+            // Same blindness as the whole-band fallback, for one frame: no
+            // layout, so no partition, so every object here is an unarguable
+            // pin. See `band_path`.
+            band_path::FOREIGN_INNERMOST.fetch_add(1, Ordering::Relaxed);
             scan_one_frame(scanner_sp, rbp, heap, out);
         } else {
             let frame_size = cm.osr_frame_size;
@@ -9707,6 +9724,30 @@ static UNREWRITABLE_BAND_ROOTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Addresses published to the unrewritable-root veto since process start.
 ///
+/// Which JIT-root scan path each pass took.
+///
+/// `scan_compiled_frame_bands` walks each compiled frame's own
+/// `[rbp - frame_size, rbp)` WITH its layout, so it can split the band into the
+/// rewritable half and the half nothing rewrites. The fallback cannot: it has
+/// no layout, it sweeps `[scanner_sp, frame_base)` including the non-JIT frames
+/// the compiled code called into, and every object it finds is a pin with no
+/// argument available against it.
+///
+/// A pin census cannot tell the two apart, and their prospects are opposite,
+/// which is the whole reason to count them.
+pub mod band_path {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    pub static BANDS: AtomicUsize = AtomicUsize::new(0);
+    pub static FALLBACK: AtomicUsize = AtomicUsize::new(0);
+    pub static FOREIGN_INNERMOST: AtomicUsize = AtomicUsize::new(0);
+
+    /// `(bands, fallback, foreign_innermost)`.
+    pub fn snapshot() -> (usize, usize, usize) {
+        let g = |c: &AtomicUsize| c.load(Ordering::Relaxed);
+        (g(&BANDS), g(&FALLBACK), g(&FOREIGN_INNERMOST))
+    }
+}
+
 /// Objects published MOVABLE from a verifiable band word this run.
 ///
 /// The complement of [`unrewritable_band_root_count`], and the two are read
