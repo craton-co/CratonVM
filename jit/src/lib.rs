@@ -1568,6 +1568,31 @@ pub struct OopMapEntry {
     /// True only when the moving-young shadow-stack publication for this
     /// safepoint proved complete enough for relocation under live JIT frames.
     pub moving_young_coverage_complete: bool,
+    /// Which GPRs may hold a LIVE object reference at this safepoint, as a
+    /// bitmask over `x64::ALL_SPILL_GPRS` positions — the register-file half of
+    /// this map, and the one `frame_slot_offsets` never described.
+    ///
+    /// `None` is "no claim": the compiler could not prove the set, and a
+    /// consumer must fall back to scanning the whole blind-spill image. That is
+    /// the pre-2026-09-09 behaviour and it is the fail-open direction.
+    ///
+    /// `Some(mask)` says: **every register outside `mask` holds no live
+    /// reference here.** `emit_pre_safepoint_spill` writes the register file
+    /// into the frame's `reg_spill` region so a conservative scan can see it,
+    /// and that image is blind — it cannot tell a live oop from a dead
+    /// leftover, so every register's last value is retained. This mask is what
+    /// lets the scan skip the leftovers.
+    ///
+    /// Bit `i` corresponds to `ALL_SPILL_GPRS[i]`, which is also the slot
+    /// `emit_blind_reg_spill` writes it to (`reg_spill_lo + 8 * i`), so a
+    /// consumer holding a frame offset inverts it with
+    /// [`FrameLayout::spill_image_index`] and needs no register decoding.
+    ///
+    /// See `docs/known-issues/h2/testvaluememory-fails-under-g1-on-conservative-jit-roots-20260908.md`
+    /// for what the blind image costs when nothing narrows it: five conservative
+    /// words holding 2520 KB out of a G1 collection set, one of them an `r8`
+    /// leftover.
+    pub reg_oop_mask: Option<u16>,
     /// Exclusive `[rbp - off]` bound of the LIVE part of the frame at this
     /// safepoint: the operand-spill cursor (`next_spill_offset`) at the moment
     /// the safepoint was emitted. Slots at a larger offset are inside the
@@ -1669,6 +1694,7 @@ impl OopMapEntry {
             bytecode_pc: 0,
             frame_slot_offsets: Vec::new(),
             moving_young_coverage_complete: false,
+            reg_oop_mask: None,
             live_frame_hi: 0,
             local_oop_mask: None,
             num_locals: 0,
@@ -2591,6 +2617,21 @@ pub struct FrameLayout {
     /// Per-safepoint blind GPR spill (`emit_pre_safepoint_spill`).
     pub reg_spill_lo: i32,
     pub reg_spill_hi: i32,
+    /// Start of the OUTGOING area — the ABI shadow space plus the in-frame
+    /// stack-argument reserve — as an `[rbp - off]` offset, or `0` when the
+    /// producer does not distinguish it.
+    ///
+    /// `region_name` reports everything past `reg_spill_hi` as
+    /// `outgoing-args-or-deopt-regs`, which is two regions with different
+    /// contents: the frame-deopt `SavedRegisters` block (a register image the
+    /// deopt stub reads back) sits between the blind spill and the outgoing
+    /// area. A consumer that wants to stop scanning the outgoing reserve must
+    /// not thereby stop scanning `SavedRegisters`, so the boundary is published
+    /// rather than guessed.
+    ///
+    /// `0` means "not published" and must be read as "assume the whole region
+    /// is `SavedRegisters`" — the conservative direction.
+    pub outgoing_lo: i32,
     /// Total frame size (`SUB RSP, frame_size`); the band is `[rbp - size, rbp)`.
     pub frame_size: i32,
 }
@@ -2671,6 +2712,24 @@ impl FrameLayout {
         if arith {
             FRAMES_WITH_ARITH_SPAN.fetch_add(1, Relaxed);
         }
+    }
+
+    /// The `x64::ALL_SPILL_GPRS` index whose image `off` is, when `off` lands in
+    /// the per-safepoint blind spill.
+    ///
+    /// The inverse of `emit_blind_reg_spill`'s `reg_spill_lo + 8 * index`, and
+    /// the same index `OopMapEntry::reg_oop_mask` is a bitmask over -- so a
+    /// consumer with a frame offset and a map can answer "may this slot hold a
+    /// live oop" without decoding a register name.
+    pub fn spill_image_index(&self, off: i32) -> Option<u32> {
+        if self.reg_spill_hi <= self.reg_spill_lo
+            || off < self.reg_spill_lo
+            || off >= self.reg_spill_hi
+        {
+            return None;
+        }
+        // Cast: the span is 14 slots, so this is far inside u32.
+        Some(((off - self.reg_spill_lo) / 8) as u32)
     }
 
     /// Name the x86-64 GPR whose image `off` is, when `off` lands in the

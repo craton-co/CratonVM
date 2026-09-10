@@ -5931,6 +5931,9 @@ pub fn emit_machine_code_with_oop_maps(
             // rewrite. Claiming moving-young coverage here would be the exact
             // false claim `relocation_coverage_complete` exists to prevent.
             moving_young_coverage_complete: false,
+            // AArch64 publishes no blind GPR spill image, so there is no
+            // slot set for a mask to narrow. `None` is the honest answer.
+            reg_oop_mask: None,
             live_frame_hi: 0,
             local_oop_mask: None,
             num_locals: 0,
