@@ -1033,6 +1033,26 @@ struct Lowerer<'a> {
     /// when it started)`. At most one is ever live, because a carry is planned
     /// only between ADJACENT nodes.
     live_carry: Option<(NodeId, NodeId, u8, usize)>,
+    /// The DEFERRED carry: a value sitting in RCX for a consumer that is two
+    /// nodes away, not one.
+    ///
+    /// `(producer, consumer, intervening nodes still permitted)`.
+    ///
+    /// [`Self::live_carry`] is the adjacent carry and can be either register;
+    /// this is the second slot, and it is RCX-only by construction — the
+    /// consumer reads its first operand from RAX, which is where the ADJACENT
+    /// producer left it, so the only value that can still be in flight across
+    /// an arm is the second operand. The allowance is 1 and is spent by the
+    /// arm in between, whose op must satisfy [`op_preserves_rcx`]; running out
+    /// of it refuses the compile rather than reading a register something else
+    /// has since written.
+    deferred_rcx: Option<(NodeId, NodeId, u8)>,
+    /// Values `plan_carries` chose to carry in the DEFERRED slot, so
+    /// `store_rax` can tell the two apart at the home write.
+    carry_deferred: Vec<bool>,
+    /// Deferred carries planned, taken and read — engagement for the census.
+    carry_deferred_planned: usize,
+    carry_deferred_read: usize,
     /// ENGAGEMENT, and its fail-closed counterpart. A refusal is not a
     /// miscompile — the value's home is `home_dropped`, so the fallback read
     /// refuses the compile as well — but it means the contract this planned
@@ -1598,6 +1618,10 @@ impl<'a> Lowerer<'a> {
             homes_dropped_at_def: 0,
             carry_of: Vec::new(),
             live_carry: None,
+            deferred_rcx: None,
+            carry_deferred: Vec::new(),
+            carry_deferred_planned: 0,
+            carry_deferred_read: 0,
             carries_taken: 0,
             carries_read: 0,
             carries_refused: 0,
@@ -2398,6 +2422,26 @@ impl<'a> Lowerer<'a> {
                     // The value is in `dst`. That is the whole optimization:
                     // no store, no load, and for an RAX carry no instruction
                     // at all.
+                    return;
+                }
+            }
+        }
+        // The DEFERRED carry, read the same way and on the same three checks
+        // as the adjacent one, minus the `buf.pos()` proof — which is exactly
+        // what this slot cannot offer, since a whole arm was emitted in
+        // between. What stands in for it is `op_preserves_rcx`, checked when
+        // that arm was lowered (`lower_data_node_tracked`), plus the allowance
+        // running out if more than one arm ever gets between the two.
+        if let Some((prod, cons, _)) = self.deferred_rcx {
+            if prod == id {
+                if self.cur_def != Some(cons) {
+                    self.refuse_deferred("read outside its planned consumer");
+                } else if dst != RCX {
+                    self.refuse_deferred("read into a register other than RCX");
+                } else {
+                    self.deferred_rcx = None;
+                    self.carry_deferred_read += 1;
+                    self.carries_read += 1;
                     return;
                 }
             }
@@ -5200,7 +5244,16 @@ impl<'a> Lowerer<'a> {
             if reg != RAX {
                 self.emit_mov_reg_reg64(reg, RAX);
             }
-            self.live_carry = Some((id, cons, reg, self.buf.pos()));
+            if self.carry_deferred.get(id as usize).copied().unwrap_or(false) {
+                // The DEFERRED slot. `reg` is RCX by construction (the planner
+                // only defers a consumer's second operand), and the value has
+                // to survive exactly one arm before its consumer reads it.
+                debug_assert_eq!(reg, RCX, "a deferred carry is RCX-only");
+                self.deferred_rcx = Some((id, cons, 1));
+                self.carry_deferred_planned += 1;
+            } else {
+                self.live_carry = Some((id, cons, reg, self.buf.pos()));
+            }
             self.carries_taken += 1;
             if drop_store {
                 self.carry_stores_dropped += 1;
@@ -5229,6 +5282,22 @@ impl<'a> Lowerer<'a> {
     /// names it. The fallback is safe on its own terms too: a carried value's
     /// home is `home_dropped`, so any read that gets past here refuses in
     /// `slot_of_checked`.
+    /// Refuse the compile because the DEFERRED carry did not reach its
+    /// consumer the way it was planned to.
+    ///
+    /// The sibling of [`Self::refuse_carry`] and, like it, a coverage loss and
+    /// never a wrong answer: a deferred value's home is `home_dropped`, so any
+    /// read that gets past here refuses in `slot_of_checked`.
+    fn refuse_deferred(&mut self, why: &'static str) {
+        if let Some((prod, cons, _)) = self.deferred_rcx.take() {
+            self.carries_refused += 1;
+            self.latch_bailout(Bailout::with_context(
+                BailoutReason::UnallocatedValue { node: prod },
+                format!("n{prod}'s deferred carry to n{cons} did not hold: {why}"),
+            ));
+        }
+    }
+
     fn refuse_carry(&mut self, why: &'static str) {
         if let Some((prod, cons, _, _)) = self.live_carry.take() {
             self.carries_refused += 1;
@@ -7226,6 +7295,97 @@ impl<'a> Lowerer<'a> {
                 self.home_dropped[*id as usize] = true;
             }
         }
+        // ── The SECOND operand, one position further back ────────────────
+        //
+        // `ir_schedule::pair_single_use_operands` leaves a consumer's two
+        // single-use operands as `[input1, input0, cons]`. The loop above is
+        // strictly adjacent, so it sees `input0` and cannot see `input1` at
+        // all. This picks up that one extra position and only that one.
+        //
+        // `input1` is copied to RCX at its home store and has to survive
+        // `input0`'s arm. `op_preserves_rcx` is that promise and it is two ops
+        // long, because every binary arm loads its own second operand into RCX.
+        // The emitter re-checks it against what was actually LOWERED
+        // (`lower_data_node_tracked`) rather than trusting this plan.
+        //
+        // Everything else is the adjacent rule verbatim: one use, an `Int` or
+        // `Long`, a producer whose home store is one `store_rax`, a consumer
+        // that reads RAX then RCX, and no residency claim on the value.
+        if ir_carry_single_use_enabled() && ir_carry_second_operand_enabled() {
+            if self.carry_deferred.len() < n_nodes {
+                self.carry_deferred.resize(n_nodes, false);
+            }
+            for block in &self.schedule.blocks {
+                for w in 2..block.nodes.len() {
+                    let cons = block.nodes[w];
+                    let mid = block.nodes[w - 1];
+                    let prod = block.nodes[w - 2];
+                    // The middle node must already be carrying into THIS
+                    // consumer in RAX. That is what proves the three were put
+                    // together deliberately, rather than dependence order
+                    // happening to look the same.
+                    if carry_of.get(mid as usize).copied().flatten() != Some((RAX, cons)) {
+                        continue;
+                    }
+                    if carry_of.get(prod as usize).copied().flatten().is_some() {
+                        continue;
+                    }
+                    if use_count.get(prod as usize).copied().unwrap_or(0) != 1 {
+                        continue;
+                    }
+                    let (Some(pn), Some(cn), Some(mn)) = (
+                        self.graph.nodes.get(prod as usize),
+                        self.graph.nodes.get(cons as usize),
+                        self.graph.nodes.get(mid as usize),
+                    ) else {
+                        continue;
+                    };
+                    // RCX is the second operand's register, so this only ever
+                    // applies to a value read there.
+                    if cn.inputs.get(1) != Some(&prod) {
+                        continue;
+                    }
+                    if !matches!(pn.ty, IrType::Int | IrType::Long)
+                        || !matches!(cn.ty, IrType::Int | IrType::Long)
+                    {
+                        continue;
+                    }
+                    if !op_home_is_one_store_rax(&pn.op) || !op_reads_rax_then_rcx(&cn.op) {
+                        continue;
+                    }
+                    if !op_preserves_rcx(&mn.op) {
+                        continue;
+                    }
+                    if self.assigned_gpr(prod).is_some() {
+                        continue;
+                    }
+                    carry_of[prod as usize] = Some((RCX, cons));
+                    self.carry_deferred[prod as usize] = true;
+                    // The home STORE, on exactly the terms the adjacent case
+                    // uses.
+                    let consumer_traps = matches!(cn.op, Op::Div | Op::Rem);
+                    let named = deopt_named.get(prod as usize).copied().unwrap_or(true);
+                    if consumer_traps || (named && !graph_trap_free) {
+                        carry_named += 1;
+                    } else {
+                        if named {
+                            carry_unreachable += 1;
+                        }
+                        carry_droppable.push(prod);
+                    }
+                }
+            }
+        }
+        // A value whose home store is dropped has ONE readable location, so
+        // every other reader must refuse rather than take the word.
+        if !carry_droppable.is_empty() {
+            if self.home_dropped.len() < n_nodes {
+                self.home_dropped.resize(n_nodes, false);
+            }
+            for id in &carry_droppable {
+                self.home_dropped[*id as usize] = true;
+            }
+        }
         self.carry_skips = carry_skips;
         self.carry_named = carry_named;
         self.unreachable_homes += carry_unreachable;
@@ -7439,7 +7599,8 @@ impl<'a> Lowerer<'a> {
         // Found by flipping these switches on together: the probe this was
         // built on has a frame state naming every intermediate, so no carried
         // value's home was ever dropped there and the two mechanisms never met.
-        let started_carry = matches!(self.live_carry, Some((prod, _, _, _)) if prod == id);
+        let started_carry = matches!(self.live_carry, Some((prod, _, _, _)) if prod == id)
+            || matches!(self.deferred_rcx, Some((prod, _, _)) if prod == id);
         if self.home_dropped.get(id as usize).copied().unwrap_or(false)
             && !self.cur_def_published
             && !started_carry
@@ -7459,6 +7620,34 @@ impl<'a> Lowerer<'a> {
         if let Some((prod, _, _, _)) = self.live_carry {
             if prod != id {
                 self.refuse_carry("its consumer finished without reading it");
+            }
+        }
+        // The DEFERRED carry gets exactly one arm of grace, and that arm has to
+        // be one that leaves RCX alone. Both halves are checked here rather
+        // than trusted from the planner, because the planner reasons about the
+        // SCHEDULE and this reasons about what was actually lowered — and it is
+        // the second that the register image depends on.
+        //
+        // Three cases, in the order they occur: the producer that just started
+        // it, the one arm in between, and the consumer that was supposed to
+        // have read it.
+        if let Some((prod, cons, allowance)) = self.deferred_rcx {
+            if prod == id {
+                // Just started. Nothing to spend yet.
+            } else if id == cons {
+                // The consumer finished without taking it out of RCX.
+                self.refuse_deferred("its consumer finished without reading it");
+            } else if !self
+                .graph
+                .nodes
+                .get(id as usize)
+                .is_some_and(|n| op_preserves_rcx(&n.op))
+            {
+                self.refuse_deferred("an arm that can write RCX was lowered in between");
+            } else if allowance == 0 {
+                self.refuse_deferred("more than one arm came between it and its consumer");
+            } else {
+                self.deferred_rcx = Some((prod, cons, allowance - 1));
             }
         }
         self.cur_def = prev;
@@ -13507,6 +13696,24 @@ fn ir_carry_single_use_enabled() -> bool {
     }
 }
 
+/// `CRATONVM_JIT_IR_CARRY_2ND=0` — take only the adjacent carry, the shape that
+/// predates `ir_schedule::pair_single_use_operands`.
+///
+/// Default ON. This is the arm whose soundness rests on [`op_preserves_rcx`]
+/// rather than on adjacency, and a wrong entry there produces a plausible wrong
+/// integer rather than a fault — so it is the first flag to try when an
+/// optimizing-tier result is wrong rather than absent.
+fn ir_carry_second_operand_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CARRY_2ND").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
 /// Does lowering `op` read its first input into RAX, and its second (if it has
 /// one) into RCX, before emitting anything else?
 ///
@@ -13712,7 +13919,7 @@ pub fn ir_drop_unreachable_homes_enabled() -> bool {
 ///
 /// The claim is checked against the emission rather than trusted: see
 /// [`ir_drop_unreachable_homes_enabled`].
-fn op_cannot_deopt(op: &Op) -> bool {
+pub(crate) fn op_cannot_deopt(op: &Op) -> bool {
     matches!(
         op,
         Op::Start
@@ -13988,7 +14195,37 @@ pub fn ir_aastore_census() -> u64 {
     IR_AASTORE_LOWERED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-fn op_home_is_one_store_rax(op: &Op) -> bool {
+/// Does this op's lowering arm leave RCX untouched from entry to exit?
+///
+/// Asked of the ONE arm that runs between a deferred RCX carry's `MOV RCX, RAX`
+/// and the consumer that reads RCX — see `plan_carries`' second-operand pass
+/// and [`Lowerer::deferred_rcx`]. If the arm writes RCX, the consumer reads
+/// whatever the arm left there instead of its operand: a wrong answer, not a
+/// crash, and one no existing test would show.
+///
+/// **Two entries, and the shortness is the point.** Every BINARY arm loads its
+/// own second operand with `gp_load_value(RCX, node.inputs[1])`, so none of the
+/// `Add`/`Sub`/`And`/`Or`/`Xor` family can ever be here; `Op::Neg` writes RCX in
+/// its `IrType::Double` arm; the shift family puts the count in CL, which is
+/// RCX. What is left is the width conversions, whose arms are a load into RAX,
+/// one fixed instruction and a `store_rax`.
+///
+/// That still covers the shape this was built for — mixed `int`/`long`
+/// arithmetic, where an `I2L` widens one operand of a `long` expression — which
+/// is common enough in Java to be worth the machinery.
+///
+/// **Widening this list means reading the arm, not the op name.** The first
+/// attempt at it listed six ops that all write RCX, and both the unit suite and
+/// the `ir_vs_singlepass` differential suite passed with it in.
+/// `every_rcx_preserving_arm_leaves_rcx_alone` is what makes a wrong entry
+/// fail: it scans the claimed arms' source for any mention of RCX and pins the
+/// exact bytes they emit, because a raw `buf.emit(&[..])` can name RCX in a
+/// ModRM byte where no identifier scan would see it.
+pub(crate) fn op_preserves_rcx(op: &Op) -> bool {
+    matches!(op, Op::I2L | Op::L2I)
+}
+
+pub(crate) fn op_home_is_one_store_rax(op: &Op) -> bool {
     matches!(
         op,
         Op::Add
@@ -17061,13 +17298,15 @@ pub(crate) fn lower_inner_with_scopes(
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
         eprintln!(
             "[ir-ls] carries: planned={} taken={} read={} refused={} \
-             stores_dropped={} still_deopt_named={}",
+             stores_dropped={} still_deopt_named={} deferred={}/{}",
             lowerer.carry_of.iter().filter(|c| c.is_some()).count(),
             lowerer.carries_taken,
             lowerer.carries_read,
             lowerer.carries_refused,
             lowerer.carry_stores_dropped,
             lowerer.carry_named,
+            lowerer.carry_deferred_planned,
+            lowerer.carry_deferred_read,
         );
         let s = lowerer.carry_skips;
         eprintln!(
@@ -24908,6 +25147,120 @@ mod tests {").next().unwrap_or(src);
     /// A failure here is not cosmetic. It says the allowlist has drifted from
     /// the arms and `CRATONVM_JIT_IR_DROP_HOME` would emit a body that never
     /// writes a value it later reads.
+    /// Every op [`op_preserves_rcx`] claims must have an arm that cannot write
+    /// RCX — checked against the arm's SOURCE, not against the op's name.
+    ///
+    /// The reason this test exists is a concrete near-miss: the first version of
+    /// that allowlist claimed `Add`, `Sub`, `And`, `Or`, `Xor` and `Neg`, and
+    /// **all six write RCX** — the binary family through
+    /// `gp_load_value(RCX, node.inputs[1])`, `Neg` through the sign mask in its
+    /// `IrType::Double` arm. The full unit suite and the `ir_vs_singlepass`
+    /// differential suite both passed with it in, because a deferred carry that
+    /// is never honoured fails CLOSED (`slot_of_checked` refuses a dropped
+    /// home) rather than miscompiling. Nothing would have said so.
+    ///
+    /// Two checks, because either alone can be fooled:
+    ///
+    ///   * no `RCX` identifier anywhere in the arm — catches every helper call
+    ///     that names the register;
+    ///   * the arm's raw `buf.emit(&[..])` byte literals are exactly the ones
+    ///     recorded here — catches a ModRM byte that encodes RCX as a
+    ///     destination, which no identifier scan can see.
+    #[test]
+    fn every_rcx_preserving_arm_leaves_rcx_alone() {
+        let src = include_str!("ir_lower.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn lower_data_node(&mut self, id: NodeId) {")
+            .nth(1)
+            .expect("lower_data_node is in this file")
+            .split("\n    fn ")
+            .next()
+            .expect("the function ends");
+        let mut arms: Vec<(std::collections::BTreeSet<String>, String)> = Vec::new();
+        for line in body.lines() {
+            if line.starts_with("            | Op::") {
+                if let Some(last) = arms.last_mut() {
+                    collect_op_names(line, &mut last.0);
+                    continue;
+                }
+            }
+            if line.starts_with("            Op::") {
+                let mut names = std::collections::BTreeSet::new();
+                collect_op_names(line, &mut names);
+                arms.push((names, String::new()));
+                continue;
+            }
+            if let Some(last) = arms.last_mut() {
+                last.1.push_str(line);
+                last.1.push('\n');
+            }
+        }
+        assert!(
+            !arms.is_empty(),
+            "the arm scan found nothing — `lower_data_node`'s shape changed and \
+             this test would now pass vacuously"
+        );
+
+        let claimed_src = src
+            .split("pub(crate) fn op_preserves_rcx(op: &Op) -> bool {")
+            .nth(1)
+            .expect("op_preserves_rcx is in this file")
+            .split("\n}")
+            .next()
+            .expect("the function ends");
+        let mut claimed = std::collections::BTreeSet::new();
+        collect_op_names(claimed_src, &mut claimed);
+        assert!(
+            !claimed.is_empty(),
+            "the allowlist scan found nothing — `op_preserves_rcx` changed \
+             shape and this test would now pass vacuously"
+        );
+
+        // The bytes each claimed arm is allowed to emit, verified by hand
+        // against the Intel encoding. `48 63 C0` is MOVSXD RAX, EAX and
+        // `89 C0` is MOV EAX, EAX; neither names RCX in any field.
+        let permitted: &[(&str, &[&str])] = &[
+            ("I2L", &["0x48, 0x63, 0xC0"]),
+            ("L2I", &["0x89, 0xC0"]),
+        ];
+
+        for name in &claimed {
+            let arm = arms
+                .iter()
+                .find(|(names, _)| names.contains(name))
+                .unwrap_or_else(|| {
+                    panic!("`op_preserves_rcx` claims Op::{name}, which has no arm")
+                });
+            assert!(
+                !arm.1.contains("RCX"),
+                "Op::{name}'s arm names RCX, so it cannot carry a deferred \
+                 value across itself — `op_preserves_rcx` must not claim it"
+            );
+            let (_, expected) = permitted
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`op_preserves_rcx` claims Op::{name}, but this test has \
+                         no recorded byte list for it. Read the arm, verify by \
+                         hand that no emitted byte names RCX, and add it."
+                    )
+                });
+            for emitted in arm.1.match_indices("self.buf.emit(&[").map(|(i, _)| {
+                let rest = &arm.1[i + "self.buf.emit(&[".len()..];
+                rest.split(']').next().unwrap_or("").trim().to_string()
+            }) {
+                assert!(
+                    expected.iter().any(|e| *e == emitted),
+                    "Op::{name}'s arm emits `{emitted}`, which is not one of the \
+                     byte sequences this test verified. A raw encoding can name \
+                     RCX where the identifier scan cannot see it — re-verify the \
+                     arm and update the list."
+                );
+            }
+        }
+    }
+
     #[test]
     fn every_droppable_op_writes_its_home_once_through_store_rax() {
         let src = include_str!("ir_lower.rs").replace("\r\n", "\n");
