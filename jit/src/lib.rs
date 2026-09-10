@@ -7215,6 +7215,44 @@ fn append_ir_inline_site(
     // arenas by the same routine the single-pass path uses, so the `&'static
     // str` names and the baked `*const JitInvokeInfo` have identical lifetime
     // rules on both paths.
+    // A splice must not leave behind a call WORSE than the one it replaced.
+    //
+    // The single-pass resolver has always refused a splice on that rule; IR
+    // mode was exempted from it on the stated grounds that "the IR tier's
+    // spliced call is a call, not a resolution". That premise holds only while
+    // every surviving call can be lowered to something better than
+    // `jit_invoke_dispatch`, and there is one shape where it cannot:
+    //
+    //   * virtual / interface (kind 0, 2) get the MIC/PIC cascade, which needs
+    //     no plan-time binding -- it caches on the runtime receiver;
+    //   * statically bound (kind 1, 3) get a raw `CALL`, but ONLY if the
+    //     resolver produced a `direct_entry`. With none there is no cache to
+    //     fall back on, and the call lowers to a blind NAME RESOLUTION at
+    //     ~175 ns against a direct `CALL`'s ~4.
+    //
+    // Measured on `bench/SpliceCastProbe.java` (2026-09-10), which is where
+    // `c2-splice-checkcast-and-instanceof-20260909.md` recorded
+    // `ir blind dispatches: own_code=0 in_splice=1` and attributed it to a
+    // virtual `ArrayList.elementData` missing its cascade. It is not that. The
+    // site is `jdk/internal/util/Preconditions.checkIndex`, `invokestatic`, and
+    // it is there because `Objects.checkIndex(II)I` -- which IS compiled and
+    // `bg-direct-call BOUND` -- was spliced into `ArrayList.get`, and the call
+    // its body leaves behind is `native-shadow`, which the direct-bind path
+    // DECLINES. So the splice traded a bound direct call for a resolution: the
+    // exact trade this rule exists to refuse, arrived at through the exemption.
+    //
+    // Refuse before `intern_inline_invoke_targets`, so a site rejected here
+    // also registers no keep-alive entry for a callee this artifact will not
+    // call.
+    if ir_splice_refuse_unbindable_call_enabled()
+        && site.invoke_targets.iter().any(|(pc, t)| {
+            !nested_pcs.contains(pc)
+                && !matches!(t.invoke_kind, 0 | 2)
+                && t.direct_entry.is_none()
+        })
+    {
+        return false;
+    }
     intern_inline_invoke_targets(
         &mut site,
         owned_strings,
@@ -7301,6 +7339,26 @@ fn append_ir_inline_site(
 /// restores is `jit_invoke_dispatch`, which resolves the callee by NAME on
 /// every call. Keep it, because "did the splice make this slower?" has to stay
 /// a question one binary can answer.
+/// `CRATONVM_JIT_IR_SPLICE_REFUSE_UNBINDABLE=0` — splice a callee even when a
+/// statically-bound call in its body has no `direct_entry`, i.e. re-admit the
+/// trade where a splice replaces a bound `CALL` with a blind name resolution.
+///
+/// On by default: see the refusal in `append_ir_inline_site` for the measured
+/// case (`Objects.checkIndex` spliced into `ArrayList.get`, leaving the
+/// native-shadowed `Preconditions.checkIndex` unbindable). The off switch
+/// exists so the cost of the trade can be re-measured rather than argued.
+pub fn ir_splice_refuse_unbindable_call_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPLICE_REFUSE_UNBINDABLE")
+                .as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
 pub fn ir_splice_direct_call_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
