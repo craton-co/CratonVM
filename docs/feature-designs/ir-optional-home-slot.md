@@ -179,6 +179,30 @@ The 50-arm refactor this page proposed is still not built, and the census that
 refuted it still says why: `droppable=0`. What changed is that the reason is now
 `blocked_phi` rather than `blocked_deopt`, and the phi path has been taken.
 
+> **Corrected 2026-09-10 — and the correction is the whole point of writing a
+> census down.** The paragraph above stayed true only as long as the rule the
+> census used stayed the rule the emission used. It did not.
+> `ir-reg-authoritative`, `ir-drop-home` and `ir-drop-phi-home` widened
+> droppability to "named by no REACHABLE frame state", and the census kept
+> asking the 2026-09-04 question — "named by no safepoint at all, and not a
+> phi" — which on a bytecode graph is answered no by almost everything. So it
+> went on printing `droppable=0` while the same compile of `FieldLoop.sum`
+> dropped **three** homes and skipped **five** stores
+> (`[ir-ls] homes: dropped_values=3 stores_skipped=5`).
+>
+> The line is gone. What replaced it is `[ir-ls] homes kept:`, computed from
+> `home_dropped` itself with an accounting identity tying the two together, so
+> the next widening cannot leave it behind
+> (`ir_lower::Lowerer::census_home_blocks`). Read `dropped_values` for the
+> outcome and `homes kept:` for what is left and why.
+>
+> None of that revives the 50-arm refactor. It was refused because the
+> population was empty AND because a one-site fix existed; the one-site fixes
+> are what produced the three. What it does retire is the sentence that
+> `droppable=0` is evidence of anything today — including in
+> `internal/performance/c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md`,
+> which quoted it.
+
 See `JIT_OPTIMIZATION.md`, "the register image was built", for the engagement
 census, the SIGSEGV the executable test caught, and the measurement — which
 resolves nothing on this host.

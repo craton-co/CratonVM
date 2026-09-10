@@ -1,19 +1,30 @@
 # Wiring linear scan into `ir_lower`
 
 > **Status banner, 2026-09-10.** This file describes the FIRST increment, when
-> the path was XMM-only and default **off**. Both halves of that are now stale:
-> `CRATONVM_JIT_IR_LINEAR_SCAN` is **default ON**, there is a **GP** file as
-> well as an FP one (`regalloc::xmm_roles::IR_GP_LINEAR_SCAN`), and
-> `ir-drop-home` / `ir-deopt-regs` / `ir-reg-authoritative` have since made some
-> home stores droppable. Read `docs/config/flag-inventory.md` for what is
-> actually on.
+> the path was XMM-only and default **off**. Both halves of that are stale:
+> `CRATONVM_JIT_IR_LINEAR_SCAN` is **default ON** and declared, there is a
+> **GP** file as well as an FP one (`regalloc::xmm_roles::IR_GP_LINEAR_SCAN`),
+> and `ir-drop-home` / `ir-deopt-regs` / `ir-reg-authoritative` /
+> `ir-phi-copy-regs` / `ir-drop-phi-home` have since made some home stores
+> droppable. Read `docs/config/flag-inventory.md` for what is actually on.
+>
+> **Every stale sentence below now carries its correction inline**, dated, next
+> to what it used to say — the first increment's reasoning is worth reading and
+> its facts are not safe to quote. The one that mattered most is in *The
+> register file*: this file's "no reference can be register-resident, because
+> there is no GP register" argument is **gone**, and the property now rests on
+> `plan_register_residency` refusing `IrType::Ref`.
 >
 > What is NOT stale is this file's central claim, and it is the reason to keep
 > reading it: **write-through buys loads, not stores.** That ceiling was
 > re-measured from the other side on 2026-09-10 by widening the GP file to the
 > seven registers Win64 offers — residency rose, splits halved, and the code
-> got **4.6% slower**. See
-> `docs/internal/performance/c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md`.
+> got **4.6% slower**. Measured again from a third direction the same day: on
+> that loop the file is not merely un-widenable, it is a **net 1% cost at its
+> current width** (`CRATONVM_JIT_IR_LINEAR_SCAN` off vs on, one binary, 0.0%
+> floor). See
+> `docs/internal/performance/c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md`,
+> which is also where the loops it DOES pay on are named.
 
 `jit/src/regalloc.rs` has had a complete, self-verifying linear-scan register
 allocator (`allocate_linear_scan`, `verify_allocation`, `resolve_parallel_copy`)
@@ -29,14 +40,22 @@ important — what it still does not do.
 
 ## The one-paragraph version
 
-Behind `CRATONVM_JIT_IR_LINEAR_SCAN` (default **off**), `lower_inner_with_scopes`
-runs the linear-scan allocator over a four-register XMM file, verifies the
-result, cross-checks it against `plan_slots`' independently computed live
-ranges, and uses what survives as a **register read cache**: a value the
-allocation keeps in one register for its whole life is copied into that register
-at its definition, and its later reads become register moves instead of frame
-loads. Every value is still written to its frame slot exactly as before. The
-frame image is unchanged; only reads get cheaper.
+Behind `CRATONVM_JIT_IR_LINEAR_SCAN`, `lower_inner_with_scopes` runs the
+linear-scan allocator over an XMM file, verifies the result, cross-checks it
+against `plan_slots`' independently computed live ranges, and uses what
+survives as a **register read cache**: a value the allocation keeps in one
+register for its whole life is copied into that register at its definition, and
+its later reads become register moves instead of frame loads. Every value is
+still written to its frame slot exactly as before. The frame image is
+unchanged; only reads get cheaper.
+
+*As written on the day: four XMM registers, default off. Both moved. The file
+is XMM2–XMM7 (`regalloc::xmm_roles::IR_LINEAR_SCAN`, six) with a GP file
+beside it, the flag is **default ON** since 2026-09-02, and write-through is
+no longer universal — `ir-drop-home` and its relatives drop the home store for
+a value no reachable frame state names. What did not move is the sentence that
+matters: promoting a value the home store is still written for buys loads and
+not stores.*
 
 ---
 
@@ -58,19 +77,20 @@ compile with the position count, the peak live set, how many deopt pins were
 released, what the scan promoted, what survived the cross-checks, and what was
 demoted.
 
-### Enabling it
+### Turning it OFF
 
 ```
-CRATONVM_JIT_IR_LINEAR_SCAN=1
+CRATONVM_JIT_IR_LINEAR_SCAN=0
 ```
 
-**The flag is not declared yet.** `types/src/flag_groups.rs` owns the declared
-inventory and is outside this change. Until an entry is added there,
-`flags::runtime_var` falls through to a live `std::env` read: the environment
-variable works, but `-XX:` options and `flags::with_thread_overrides` do not
-reach it. The unit tests deliberately do not depend on either — they drive a
-`#[cfg(test)]` thread-local override (`LsForce`) — so declaring the flag later
-cannot silently turn them vacuous.
+**It is default ON since 2026-09-02**, so the interesting direction is the kill
+switch. **The flag is declared** — `types/src/flag_groups.rs` carries it as
+`jit/ir-linear-scan`, so `-XX:` options and `flags::with_thread_overrides`
+reach it as well as the environment variable. (As written, neither was true:
+the flag was opt-in and undeclared, and `flags::runtime_var` fell through to a
+live `std::env` read.) The unit tests deliberately depend on neither — they
+drive a `#[cfg(test)]` thread-local override (`LsForce`) — which is why
+declaring the flag did not silently turn them vacuous.
 
 ---
 
@@ -131,6 +151,28 @@ Three consequences, and they are the reason for the shape:
 3. **It buys loads, not stores.** The store side is still one per definition.
    That is the honest ceiling of this increment.
 
+> **Where consequences 1 and 3 stand, 2026-09-10.** Both were true of the
+> increment and neither is a standing property. `ir-deopt-regs` gave
+> `build_deopt_points` a register bank, `ir-phi-copy-regs` gave `emit_copy_op`
+> one, and `ir-drop-home` / `ir-drop-phi-home` then dropped the home store for
+> values those two can describe — so the frame image is **no longer** complete
+> at every instruction boundary, and the store side is **no longer** one per
+> definition for every value. `Lowerer::slot_of` is what holds the line: a read
+> of a dropped home REFUSES the compile rather than returning the stale word,
+> so an unconverted reader costs coverage and cannot cost correctness. The one
+> reader that reached a dropped home without asking produced a real miscompile
+> (`internal/fixed-bugs/jit-warm-groupdata-window-row-collapse-20260906-FIXED.md`).
+>
+> `emit_safepoint_map` is the one on the original list that genuinely has NOT
+> moved, and that is why `IrType::Ref` is still refused a register: the oop map
+> names frame slots only.
+>
+> Consequence 3's *sentence* survives all of that, which is why this file is
+> still worth reading — for any value whose home is still written, promoting it
+> buys loads and no stores. Widening the GP file to test that from the other
+> side made the code 4.6% slower:
+> `docs/internal/performance/c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md`.
+
 ---
 
 ## The register file, and why it is this small
@@ -149,8 +191,10 @@ every XMM is volatile — emitted in the prologue and restored at all three exit
 (`emit_epilogue`, `emit_call_exc_stub`, and `emit_deopt_stub`'s inlined
 teardown). It sits at `spill_cap_off`, inside the band
 `conservative_roots::band_slot_is_verifiable` already skips, so the reader side
-needed no edit. The GP half of the sentence still stands: writing R12 would
-still corrupt the Rust caller.
+needed no edit. The GP half of the sentence stood until 2026-09-02 — writing
+R12 would have corrupted the Rust caller — and `IR_GP_PROLOGUE_SAVED` is what
+retired it: the prologue now saves the GP file too, dynamically, for the
+registers a compile's residency plan actually handed out.
 
 What is available is the set that is **untouched by this emitter and either
 caller-saved or saved by this frame**:
@@ -177,15 +221,30 @@ it clobbers the caller-saved subset rather than the whole file, the same rule
 `MachineModel::for_graph` applies at a call, sound because the poll's slow path
 is an ordinary `extern "C"` function.
 
-**This keeps the wiring FP-only.** An `int` loop counter still gets nothing, and
-that is now a *safepoint* question rather than a prologue one: a GP file can
-hold references, so it has to discharge the oop-map obligation per site instead
-of structurally. See `docs/feature-designs/jit-machine-level-and-instruction-selection.md`,
-"Where the safepoint / oop-map obligation lives".
+**As written this kept the wiring FP-only.** An `int` loop counter got nothing,
+and that was already a *safepoint* question rather than a prologue one: a GP
+file can hold references, so it has to discharge the oop-map obligation per
+site instead of structurally. See
+`docs/feature-designs/jit-machine-level-and-instruction-selection.md`, "Where
+the safepoint / oop-map obligation lives".
 
-It also makes the GC question moot by construction, which is worth having on top
-of the argument below: `RegClass::of(IrType::Ref) == Gp`, and this file offers no
-GP register, so no reference can be register-resident at all.
+> **Superseded 2026-09-02.** The GP file landed:
+> `regalloc::xmm_roles::IR_GP_LINEAR_SCAN` — RBX and R12–R15; and on
+> 2026-09-10 RSI/RDI joined it on Win64, where that ABI makes them
+> callee-saved, behind `CRATONVM_JIT_IR_GP_WIDE` (default OFF, and off because
+> it measured **slower**, not because it is unsoaked). So the paragraph below is
+> the one part of this section a reader must not carry forward: the GC question
+> is **no longer moot by construction**, because `RegClass::of(IrType::Ref) ==
+> Gp` and there is now a GP file. It is discharged by TYPE instead —
+> `plan_register_residency` refuses `IrType::Ref`, and
+> `a_reference_is_never_register_resident` pins it. Whether the widening pays
+> is answered in
+> `docs/internal/performance/c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md`:
+> it does not, and the reason is the *"buys loads, not stores"* line below.
+
+It also made the GC question moot by construction, which was worth having on
+top of the argument below: `RegClass::of(IrType::Ref) == Gp`, and an XMM-only
+file offers no GP register, so no reference could be register-resident at all.
 
 ---
 
@@ -194,9 +253,14 @@ GP register, so no reference can be register-resident at all.
 The rule is unchanged from `docs/jit/linear-scan-regalloc.md`: **references stay
 in memory across every safepoint.** Here it holds three times over.
 
-1. **Structurally.** The file is XMM-only; references are `RegClass::Gp`. A
-   `Ref` cannot be promoted because there is no register for it. Tested by
-   `a_reference_is_never_register_resident`.
+1. ~~**Structurally.** The file is XMM-only; references are `RegClass::Gp`. A
+   `Ref` cannot be promoted because there is no register for it.~~ **No longer
+   true, 2026-09-02**: there is a GP file. The obligation is discharged by TYPE
+   instead — `plan_register_residency` refuses `IrType::Ref` outright. The test
+   name is unchanged (`a_reference_is_never_register_resident`) and so is the
+   property; only the reason it holds moved from "no such register exists" to
+   "the planner will not put one there". Legs 2 and 3 below never depended on
+   the file being XMM-only and are untouched.
 2. **By the allocator.** `allocate_linear_scan` refuses to promote a `Ref` whose
    range covers a safepoint, and `verify_allocation` re-checks it independently
    (proof 5).
@@ -287,7 +351,7 @@ the default.
 | `build_live_model`'s position count disagrees with the schedule | promote nothing |
 | `build_live_model`'s `wants_loc` disagrees with `plan_slots`' coloured set | promote nothing |
 | A value's allocation has more than one segment (a split / spill / reload) | that value is not promoted |
-| A value is not `Float`/`Double`, has no home colour, or is a phi | that value is not promoted |
+| A value is not `Float`/`Double`, has no home colour, or is a phi | that value is not promoted — **as written**; the bank now also takes `Int`/`Long`, and phis are admitted separately by `ir_phi_residency_enabled`. `IrType::Ref` is the one type still refused outright |
 | Two values share a register but `plan_slots` says their ranges overlap | **both** lose the register, counted as `demoted` |
 | A clobber falls inside a value's `plan_slots` range | that value loses the register, counted as `demoted` |
 
@@ -295,6 +359,13 @@ Declining is always safe: a value with no register keeps the frame slot the
 lowerer has always given it, and every read of it is the load it always was. A
 non-zero `demoted` count is a compiler bug worth chasing — two liveness models
 disagreeing — but it is not wrong code.
+
+**Declining is still always safe, and it is worth saying why that survived home
+dropping.** A home is dropped only for a value the plan promoted, so declining
+happens strictly before there is anything to drop: a declined value keeps its
+frame slot and every read of it is the load it always was. The order matters —
+`set_residency` installs the plan, and only then does the droppability pass run
+over it.
 
 ---
 
@@ -337,23 +408,30 @@ instructions nobody generated. Concretely:
   arm computes into RAX (`Op::ConstF`, FP `Op::Neg`, FP `Op::Param`) and reach
   their register through the home word.
 
-With the flag off — the default, and every compile today — both stay
-`NotMeasured`. That is the truth, not a gap: the lowerer allocates no registers,
-so there is no register↔memory transition to count, and a reported `0` would be
-indistinguishable from "an allocator ran and spilled nothing". Keeping those two
-distinguishable is the entire reason `Measured<T>` exists.
+With the flag off — as written, the default; since 2026-09-02, the kill switch
+— both stay `NotMeasured`. That is the truth, not a gap: the lowerer allocates
+no registers, so there is no register↔memory transition to count, and a
+reported `0` would be indistinguishable from "an allocator ran and spilled
+nothing". Keeping those two distinguishable is the entire reason `Measured<T>`
+exists.
 
 ---
 
 ## What is **not** done
 
-Listed so nobody reads a green test suite as a finished item.
+Listed so nobody reads a green test suite as a finished item. Written for the
+first increment; each item carries where it stands as of **2026-09-10**.
 
 1. **Not measured on a benchmark.** No CratonBench run, no before/after on an FP
    kernel. The claim here is "correct and enabled", not "faster". The report's
    15–45% estimate is for a *general* allocator; this one covers four XMM
    registers and no store elimination, and should be expected to deliver a small
    fraction of it.
+
+   **Since: measured, repeatedly, and the answer is the one this file
+   predicted.** The GP half was A/B'd on the tier-inversion loop and again with
+   the file widened; residency rose and the code did not get faster. See
+   `docs/internal/performance/c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md`.
 2. **Integer values get nothing.** The register file is FP-only. The blocker is
    **no longer the prologue**: `IR_LOWER_SAVED_XMMS` has landed, with
    the restore on all three exits (`emit_epilogue`, the inlined epilogue in
@@ -368,26 +446,53 @@ Listed so nobody reads a green test suite as a finished item.
    the home word before every safepoint the way `x64.rs` does
    (`SafepointPublishPlan::no_reference_in_registers`). That is the increment,
    and it is a bigger one than the save area was.
+
+   **Since: done, 2026-09-02** — `IR_GP_LINEAR_SCAN` and `IR_GP_PROLOGUE_SAVED`.
+   It took neither of the two shapes above. `IrType::Ref` is simply **refused**
+   by `plan_register_residency`, so there is no per-safepoint publish plan and
+   `OopMapEntry` is unchanged. Reference promotion is still not done and still
+   needs the register bank item 3 names.
 3. **Stores are not eliminated.** Write-through is what makes the safepoint,
    deopt and phi arguments hold without touching those paths. Dropping the home
    store means teaching `emit_safepoint_map`, `build_deopt_points` and
    `emit_phi_copies` to read a register — i.e. a register bank in the oop map
    and in the deopt frame reconstructor, which `vm/src/jit/conservative_roots.rs`
    does not have.
+
+   **Since: partly, and this is the item everything else waits on.**
+   `ir-deopt-regs` gave the deopt frame reconstructor a register bank,
+   `ir-phi-copy-regs` let the edge copies read one, and `ir-drop-home` /
+   `ir-drop-phi-home` / `ir-reg-authoritative` drop the home store for an `Int`
+   or `Long` that no REACHABLE frame state names. The **oop map** still has no
+   register bank, which is why `IrType::Ref` is still refused. What actually
+   got dropped on a given compile is `[ir-ls] homes: dropped_values=…`.
 4. **Splits and reloads are planned but not emitted.** Any value the allocator
    splits is demoted to memory. `Allocation::events` (`SpillKind::Load` /
-   `Store` / `Move` / `Remat`) is computed and discarded.
+   `Store` / `Move` / `Remat`) is computed and discarded. **Still true**; the
+   `split_or_spilled` skip cause in the census is what it costs.
 5. **Phi coalescing is not used.** `regalloc::phi_edge_copies` and
    `resolve_parallel_copy` already resolve a phi web as a parallel copy;
    `emit_phi_copies` still does its own frame-word copy through the scratch slot.
    Phis remain unpromotable here.
+
+   **Since: phis are promotable** (`ir_phi_residency_enabled`,
+   `ir_phi_copy_regs_enabled`), and `resolve_parallel_copy` is what
+   `emit_copy_op` drives. This is the item whose closing produced the one silent
+   miscompile in the area — a self-copy publishes nothing, so a phi whose home
+   had been dropped had no word left to reload from
+   (`internal/fixed-bugs/jit-warm-groupdata-window-row-collapse-20260906-FIXED.md`).
 6. **`Allocation::stack_slot` is unused.** The frame layout is still
    `plan_slots`'. The two are documented as interchangeable; that has not been
-   tested, and after `release_deopt_pins` they are deliberately not.
-7. **The flag is undeclared.** See *Enabling it*.
+   tested, and after `release_deopt_pins` they are deliberately not. **Still
+   true, and deliberately so** — see the contract note in *The deopt pins*.
+7. **The flag is undeclared.** See *Turning it OFF*. **Since: declared**, as
+   `jit/ir-linear-scan` in `types/src/flag_groups.rs`.
 8. **No differential run.** The wiring has not been run against the Spring, H2 or
    WildFly suites with the flag on. It is off by default precisely because that
-   evidence does not exist yet.
+   evidence does not exist yet. **Since: run, and the default moved on
+   2026-09-02** — the regression suite is green with the file on (88/88), and
+   the bugs it did surface are recorded as fixed rather than as reasons to turn
+   it back off.
 
 ---
 
