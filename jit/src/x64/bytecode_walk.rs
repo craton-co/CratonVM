@@ -4436,10 +4436,16 @@ impl Compiler {
                                     .copied()
                                     .collect();
                                 // RIP-relative displacements addressing a fixed
-                                // absolute target (the safepoint flag). Same
-                                // hazard as the helper rel32 above and the same
-                                // fix: verbatim bytes would address
-                                // `target + shift` from the copy.
+                                // absolute target: the safepoint flag, and
+                                // since 2026-09-10 the layout-replacement
+                                // epoch a getfield site guards on. Same hazard
+                                // as the helper rel32 above and the same fix:
+                                // verbatim bytes would address
+                                // `target + shift` from the copy. The two
+                                // carry DIFFERENT trailing-byte counts (the
+                                // poll's `imm8`, the guard's `imm32`), which
+                                // is why the trail is per entry and not a
+                                // constant here.
                                 let orig_rip_abs: Vec<(usize, usize)> = self
                                     .rip_abs_disp32_patches
                                     .iter()
@@ -5486,9 +5492,13 @@ impl Compiler {
                                                                                               // (NPE + i64::MIN sentinel) and flushes the scratch cache
                                                                                               // up-front because its slow path CALLs out.
                         let raw_mode = inline_getfield_enabled();
-                        if !raw_mode {
-                            self.flush_scratch_registers();
-                        }
+                        // Both modes flush since 2026-09-10: the
+                        // layout-replacement guard below clobbers R11 and RCX
+                        // on its fallback form, and its bail CALLs the checked
+                        // helper — so raw mode has a call on a path where it
+                        // never had one, and a stale scratch cache across it
+                        // would hand a later read a register the callee owns.
+                        self.flush_scratch_registers();
                         let trusted_have_key = !self.method_key.is_empty();
                         let trusted_marks_exact = self.stack_oop_marks_exact;
                         let trusted_top_is_oop =
@@ -5519,6 +5529,27 @@ impl Compiler {
                             );
                         }
                         let obj_slot = self.pop_stack();
+                        // The baked `cell_off` is a compile-time claim about
+                        // this class's compact layout, and the class manager
+                        // can REPLACE that layout at run time — the
+                        // synthetic-stub→real-bytecode upgrade. Every other
+                        // emitter that bakes one has guarded it since
+                        // 2026-09-04, whose commit named five such sites; this
+                        // one and the ungated compact reference `putfield`
+                        // below were not among them, and read at the OLD
+                        // offset for a REPLACED layout with nothing to stop
+                        // them. The allocation emitters' own comment calls
+                        // that "confirmed heap corruption".
+                        //
+                        // Emitted BEFORE the receiver load because the
+                        // fallback form clobbers R11 and RCX, exactly as
+                        // `objects.rs`'s three call sites do.
+                        let mut layout_bail: Vec<usize> = if jit_sp_field_layout_guard_enabled()
+                        {
+                            self.emit_layout_epoch_guard().into_iter().collect()
+                        } else {
+                            Vec::new()
+                        };
                         self.load_slot_to_reg(RAX, obj_slot);
                         let (mut slow_patches, null_patch) = if raw_mode {
                             // Null check: TEST RAX,RAX; JZ <null> (result 0).
@@ -5658,24 +5689,47 @@ impl Compiler {
                             }
                         }
                         let done_legacy_patch = self.emit_jmp_rel32_patch();
+                        // RAW mode emits no helper tail of its own, but the
+                        // layout-replacement bail above needs one: routing it
+                        // to the null path would answer 0, and routing it to
+                        // the legacy arm would read a compact object at the
+                        // uniform slot offset. So raw mode grows the tail too,
+                        // and jumps over it on the null path.
+                        let mut done_null_patch = None;
                         if let Some(null_patch) = null_patch {
                             // RAW mode null path: RAX := 0 (historical semantics).
                             self.patch_rel32_to_here(null_patch);
                             self.emit_xor_reg_self(RAX);
-                        } else {
+                            if !layout_bail.is_empty() {
+                                done_null_patch = Some(self.emit_jmp_rel32_patch());
+                            }
+                        }
+                        if null_patch.is_none() || !layout_bail.is_empty() {
                             // GUARDED slow path: null / unaligned / out-of-heap
                             // receiver → the checked helper, whose NPE +
                             // i64::MIN-sentinel semantics match the helper-only
-                            // arm below exactly.
+                            // arm below exactly. A replaced layout lands here
+                            // too, from either mode: the helper resolves the
+                            // CURRENT layout, which is the whole point of
+                            // refusing the baked offset.
                             for p in slow_patches {
                                 self.patch_rel32_to_here(p);
                             }
-                            // The implicit null check's recovery address is
-                            // THIS point. The slow path reloads the receiver
-                            // from its frame slot rather than reusing RAX, so
-                            // a fault recovered into here needs no register
-                            // repair — only the instruction pointer moves.
-                            self.bind_implicit_null_recovery();
+                            for p in layout_bail.drain(..) {
+                                self.patch_rel32_to_here(p);
+                            }
+                            if null_patch.is_none() {
+                                // The implicit null check's recovery address is
+                                // THIS point. The slow path reloads the receiver
+                                // from its frame slot rather than reusing RAX, so
+                                // a fault recovered into here needs no register
+                                // repair — only the instruction pointer moves.
+                                //
+                                // Raw mode tested null explicitly and has no
+                                // implicit check to recover, so it must not
+                                // claim this address as one.
+                                self.bind_implicit_null_recovery();
+                            }
                             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                             self.load_slot_to_reg(ARG_REGS[1], obj_slot);
                             self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag);
@@ -5684,6 +5738,9 @@ impl Compiler {
                             self.emit_post_invoke_exception_check(type_tag);
                         }
                         // join
+                        if let Some(p) = done_null_patch {
+                            self.patch_rel32_to_here(p);
+                        }
                         self.patch_rel32_to_here(done_compact_patch);
                         self.patch_rel32_to_here(done_legacy_patch);
                         self.push_from_rax();
@@ -6118,6 +6175,18 @@ impl Compiler {
                                 // (cell base, not +8) differ.
                                 let cell_off = (HEADER_SIZE + c_off as usize) as i32; // Cast: disp32
                                 let mut bail: Vec<usize> = Vec::new();
+                                // The baked `cell_off` is a compile-time claim
+                                // about a layout the class manager can REPLACE
+                                // at run time. `emit_gated_compact_ref_putfield`
+                                // — the arm that ran before this one and
+                                // declined — has guarded it since 2026-09-04;
+                                // this ungated fallback arm did not, and every
+                                // `bail` here already means "take the
+                                // compact-aware helper", so it is the same
+                                // vector and the same destination.
+                                if jit_sp_field_layout_guard_enabled() {
+                                    bail.extend(self.emit_layout_epoch_guard());
+                                }
                                 // F-08 — the G1 arm. Under G1 the guard
                                 // below rejects every receiver (empty
                                 // store-side table), so this whole inline path
@@ -6467,8 +6536,11 @@ impl Compiler {
                         // SAFETY: `invoke_info` owns every pointer it hands
                         // out for the life of this compile.
                         let info = unsafe { &*(ip as *const crate::JitInvokeInfo) };
+                        // `keeps_dispatch_helper`, not `is_kernel`: inlining is
+                        // one-way, and a registry miss can mean "could not have
+                        // known yet". See its AUDIT 2026-09-07 note.
                         info.invoke_kind == 3
-                            && crate::offload_hook::is_kernel(
+                            && crate::offload_hook::keeps_dispatch_helper(
                                 info.class_name,
                                 info.method_name,
                                 info.descriptor,

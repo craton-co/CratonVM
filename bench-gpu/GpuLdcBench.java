@@ -4,7 +4,7 @@
 // constant-pool load) rather than `sipush`/`bipush`.
 //
 // Exercises the ldc-constants feature: per
-// docs/known-issues/gpu-offload-followups-20260711.md item 6, `ldc`/`ldc_w`/
+// gpu-offload-followups-20260711.md item 6, `ldc`/`ldc_w`/
 // `ldc2_w` are currently rejected by the analyzer, so today this kernel is
 // INELIGIBLE (Rejected(Ldc) or similar) and always runs on CPU under both the
 // plain and --gpu builds — warm_ms should be identical between them. Once ldc

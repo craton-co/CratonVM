@@ -88,7 +88,7 @@ entries you saw — a *new* name in the output is the signal.
 | `jit` | x86-64 / AArch64 JIT compiler |
 | `jit-cuda` | Java bytecode -> PTX lowering for GPU offload |
 | `cuda-bridge` | Thin CUDA Driver API bridge for GPU offload |
-| `craton-gpu` | Build-time Java annotation sources (`@Parallel` etc.) for GPU offload |
+| `craton-gpu4j` | Build-time Java annotation sources (`@Parallel` etc.) for GPU offload, compiled from the gpu4j repo |
 | `classloading` | Class loading & bytecode verification |
 | `gc` | **ZGC is the default collector** since 2026-08-10 (`GcAlgorithm::Zgc` in `vm/src/config.rs`, behind the default-ON `zgc` feature in `gc/Cargo.toml`): `ZgcRealHeap` plus `zgc_concurrent.rs` and the twelve `src/zgc/` modules — colored pointers (`vaddr`), a load barrier (`barrier::z_load`), concurrent marking (`CRATONVM_ZGC_CONC_START`), compaction (`relocate`, kill switch `CRATONVM_ZGC_RELOCATE=0`) and an opt-in generational mode (`CRATONVM_ZGC_GENERATIONAL=1`). Generational (young/old; Cheney moving + non-moving sweep) stays available via `-XX:+UseGenerationalGC` and is the default in a `--no-default-features` build; G1 is opt-in via `-XX:+UseG1GC` (experimental) |
 | `jfr` | Java Flight Recorder |

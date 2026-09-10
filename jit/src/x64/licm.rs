@@ -2371,11 +2371,79 @@ pub(super) fn shadow_no_savebase() -> bool {
 ///
 /// Reaching for the out-of-reach fallback is NOT what this switch is for: that
 /// path is chosen per site by `emit_test_mem8_abs_imm8`'s own ±2GB test.
-pub(super) fn jit_rip_safepoint_poll_enabled() -> bool {
+///
+/// `pub(crate)` rather than `pub(super)` because BOTH x86-64 backends emit this
+/// poll and the switch has to mean the same thing to both. It reached only
+/// this one until 2026-09-10; `ir_lower.rs::emit_safepoint_poll` called its RIP
+/// emitter unconditionally, so on a real workload the switch moved **2 of 394**
+/// poll sites — everything hot is compiled by the optimizing tier, and the
+/// lever meant to price the two encodings against each other in one binary
+/// left 99.5% of them on the same arm. Whoever adds a third emitter of this
+/// poll owes it the same call.
+pub(crate) fn jit_rip_safepoint_poll_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_RIP_SAFEPOINT_POLL")
+            .and_then(|v| v.into_string().ok())
+            .is_none_or(|v| v != "0")
+    })
+}
+
+/// `CRATONVM_JIT_SP_EPOCH_GUARD_RIP=0` — emit this tier's layout-replacement
+/// epoch guard as `MOV R11, imm64 ; MOV ECX, [R11] ; CMP ECX, imm32` again
+/// instead of the one-instruction `CMP DWORD [rip+disp32], imm32`.
+///
+/// Default ON, and the single-pass twin of the optimizing tier's
+/// `CRATONVM_JIT_IR_EPOCH_GUARD_RIP`. Same counter, same comparison, same
+/// aligned 32-bit load — an ENCODING switch, not a behaviour one — so what it
+/// buys is a one-binary A/B of a shape that is two instructions and nine bytes
+/// shorter at every inline field access site.
+///
+/// The guard is emitted once per site and executed on every one of them, and
+/// this tier UNROLLS: a four-times-unrolled loop over a four-field body
+/// carries sixteen of them. That is also what made this the last tier to get
+/// the short form. The unroller copies body bytes verbatim, and a
+/// displacement that was right at the original site names `target + shift`
+/// from the copy — which is exactly what `rip_abs_disp32_patches` exists to
+/// re-resolve, the mechanism the safepoint poll above already rides. The
+/// guard's entry declares a trail of 4 for its `imm32` where the poll's
+/// declares 1 for its `imm8`; the trail is the whole difference.
+///
+/// Reaching for the out-of-reach fallback is NOT what this switch is for:
+/// that path is chosen per site by `emit_cmp_mem32_abs_imm32`'s own ±2GB test.
+/// `CRATONVM_JIT_SP_FIELD_LAYOUT_GUARD=0` — emit the single-pass inline
+/// compact `getfield` and the ungated compact reference `putfield` with **no**
+/// layout-replacement guard, the shape they had until 2026-09-10.
+///
+/// Default ON, and **off is UNSOUND**. It restores a baked compact body offset
+/// that survives a `register_class_layout` replacement, which is the hazard
+/// the allocation emitters' own comment calls "confirmed heap corruption" —
+/// this is not a safety valve, and nothing should run with it clear.
+///
+/// It exists because the guard has a price and the price has to be a number
+/// from one binary rather than an argument. Those two sites are the hottest
+/// field paths the single-pass tier has, and this tier UNROLLS, so a four-site
+/// body at 4x carries sixteen guards; "correctness costs something here" and
+/// "correctness costs 3% here" are different claims and only the second one
+/// can be checked. Same reasoning, and same shape, as
+/// `CRATONVM_JIT_IR_PHI_HOME_PUBLISH_GUARD`, which restores a miscompile for
+/// the same purpose.
+pub(super) fn jit_sp_field_layout_guard_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SP_FIELD_LAYOUT_GUARD")
+            .and_then(|v| v.into_string().ok())
+            .is_none_or(|v| v != "0")
+    })
+}
+
+pub(super) fn jit_sp_epoch_guard_rip_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SP_EPOCH_GUARD_RIP")
             .and_then(|v| v.into_string().ok())
             .is_none_or(|v| v != "0")
     })
@@ -2407,7 +2475,12 @@ pub(super) fn jit_fused_bounds_load_enabled() -> bool {
 /// `stw_requested` flag byte) at method entry and loop back-edges. Polling is
 /// enabled by default; `CRATONVM_JIT_SAFEPOINT_POLLS=0` is the diagnostic
 /// opt-out.
-pub(super) fn jit_safepoint_polls_enabled() -> bool {
+///
+/// `pub(crate)` for the same reason as
+/// [`jit_rip_safepoint_poll_enabled`]: the optimizing tier polls too, and used
+/// to parse this variable itself, once per emitted poll site rather than once
+/// per process.
+pub(crate) fn jit_safepoint_polls_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
@@ -2565,6 +2638,64 @@ pub(super) fn call_spill_elision_mode() -> u8 {
 /// position in `ALL_SPILL_GPRS` — so a skipped store leaves a stale slot, which
 /// the scanner re-validates through `heap.is_object_address` and which can
 /// therefore only over-retain, never under-report.
+/// Why [`crate::x64::Compiler::live_oop_register_mask`] abstained, by cause.
+///
+/// A mask that is always `None` and a mask that is always full look identical
+/// from the collector -- both leave the whole blind-spill image in the scan --
+/// so the emit side has to say which it is, per cause, or the narrowing cannot
+/// be debugged at all.
+pub mod reg_oop_mask_cause {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    pub static DISABLED: AtomicUsize = AtomicUsize::new(0);
+    pub static STAGED_ARGS_UNMAPPED: AtomicUsize = AtomicUsize::new(0);
+    pub static MARK_DESYNC: AtomicUsize = AtomicUsize::new(0);
+    pub static MARKS_INEXACT: AtomicUsize = AtomicUsize::new(0);
+    pub static LOCAL_WINDOWS: AtomicUsize = AtomicUsize::new(0);
+    pub static INLINE_SCOPE: AtomicUsize = AtomicUsize::new(0);
+    pub static LOCAL_DATAFLOW: AtomicUsize = AtomicUsize::new(0);
+    pub static PUBLISHED: AtomicUsize = AtomicUsize::new(0);
+
+    /// `(disabled, staged_args, mark_desync, marks_inexact, local_windows,
+    /// inline_scope, local_dataflow, published)`.
+    pub fn snapshot() -> (usize, usize, usize, usize, usize, usize, usize, usize) {
+        let g = |c: &AtomicUsize| c.load(Ordering::Relaxed);
+        (
+            g(&DISABLED),
+            g(&STAGED_ARGS_UNMAPPED),
+            g(&MARK_DESYNC),
+            g(&MARKS_INEXACT),
+            g(&LOCAL_WINDOWS),
+            g(&INLINE_SCOPE),
+            g(&LOCAL_DATAFLOW),
+            g(&PUBLISHED),
+        )
+    }
+}
+
+/// `CRATONVM_JIT_REG_OOP_MAPS=0` — stop publishing
+/// [`crate::OopMapEntry::reg_oop_mask`], so every consumer falls back to
+/// scanning the whole blind-spill image. **Default ON.**
+///
+/// The bisect lever for the register half of the oop maps. It is the emit-side
+/// switch; `CRATONVM_GC_REG_OOP_MAPS=0` is the consume-side one, and either
+/// alone restores the pre-2026-09-09 root set. Two switches because the map is
+/// baked into a `CompiledMethod` at compile time: flipping the emitter needs a
+/// fresh compile to take effect, flipping the consumer takes effect at the next
+/// collection, and an investigation wants both.
+pub(super) fn reg_oop_maps_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_REG_OOP_MAPS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        },
+    )
+}
+
 pub(super) fn narrow_safepoint_spill_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -2896,6 +3027,20 @@ pub(super) fn full_self_call_spill_requested() -> bool {
 pub(super) const ALL_SPILL_GPRS: [u8; 14] = [
     RAX, RCX, RDX, RBX, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15,
 ];
+
+/// `reg`'s bit in an [`ALL_SPILL_GPRS`]-indexed mask, or `0` when `reg` is not
+/// in that set (RSP/RBP, which never hold a Java reference).
+///
+/// The one place the `OopMapEntry::reg_oop_mask` bit order is computed, so a
+/// producer and a consumer cannot disagree about which bit is which register.
+#[inline]
+pub(super) fn spill_gpr_bit(reg: u8) -> u16 {
+    match ALL_SPILL_GPRS.iter().position(|&r| r == reg) {
+        // Cast: position < 14 < 16, so the shift is in range.
+        Some(i) => 1u16 << i,
+        None => 0,
+    }
+}
 
 /// The registers the inline-TLAB `new` fast path clobbers between the
 /// safepoint and its slow-path exits — and therefore the only ones whose

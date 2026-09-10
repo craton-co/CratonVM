@@ -161,6 +161,15 @@ impl Compiler {
             xmm_saved_hi,
             reg_spill_lo: self.reg_spill_base,
             reg_spill_hi: self.reg_spill_base + reg_spill_slots * 8,
+            // The outgoing area starts past the frame-deopt `SavedRegisters`
+            // block. `deopt_regs_base` is the block's SHALLOW end and it is 0
+            // when no block was reserved, so with deopt off this is exactly the
+            // end of the blind spill. See `FrameLayout::outgoing_lo`.
+            outgoing_lo: if self.deopt_regs_base != 0 {
+                self.deopt_regs_base
+            } else {
+                self.reg_spill_base + reg_spill_slots * 8
+            },
             frame_size: self.frame_size,
         }
     }

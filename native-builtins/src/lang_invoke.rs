@@ -6271,6 +6271,39 @@ const LK_SYNTHETIC_ALLOWED_MODES: usize = 1;
 /// `classloader::lk_modes_of`, which are private to that module. Collapsing
 /// the two needs a one-line `pub(crate)` on `classloader::lk_modes_of`; see
 /// the lane report.
+/// Pin the reference inside a `Value` across an allocation, if it has one.
+///
+/// Every `MethodHandles$Lookup` factory in this registrar has the same shape:
+/// resolve a class mirror, THEN allocate the Lookup, THEN store the mirror into
+/// its `lookupClass`. The allocation can complete a moving young collection and
+/// the mirror is a bare Rust local that nothing rewrites, so the store writes a
+/// PRE-GC address into a live object's reference slot.
+///
+/// `privateLookupIn` has had this fix since the day its own comment was
+/// written -- *"`alloc_concurrent_synthetic` can run a moving GC, after which
+/// the `target` ObjectRef the VM handed us in `args` is stale ... the old code
+/// wrote the pre-GC ref straight into `lookupClass`"* -- and `lookup()`,
+/// `publicLookup()` and `Lookup.in` sat three screens away without it. Reached
+/// through `MethodHandles.lookup()` from a `<clinit>`, the stale mirror is what
+/// `CRATONVM_DBG_STALE_OBJREF` catches and what SIGSEGVs once the evacuated
+/// arena is decommitted.
+fn lk_pin(ctx: &mut dyn NativeContext, v: Value) -> usize {
+    match v {
+        Value::Object(Some(o)) => ctx.pin_native_root(o),
+        _ => usize::MAX,
+    }
+}
+
+/// Read back what [`lk_pin`] pinned, at its post-collection address.
+fn lk_repin_read(ctx: &dyn NativeContext, pin: usize, v: Value) -> Value {
+    match v {
+        Value::Object(Some(o)) if pin != usize::MAX => {
+            Value::Object(Some(ctx.read_native_pin(pin, o)))
+        }
+        other => other,
+    }
+}
+
 fn lk_allowed_modes_slot(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<usize> {
     ctx.resolve_field_index_by_class_id(ctx.class_id_of_object(obj), "allowedModes")
 }
@@ -7038,11 +7071,18 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
             // Allocate with room for the real 3-field layout (lookupClass,
             // prevLookupClass, allowedModes) so the by-name `allowedModes`
             // write below actually lands.
+            // GC-safety: `caller_class` is resolved ABOVE and stored BELOW,
+            // with an allocation in between. See [`lk_pin`].
+            let caller_pin = lk_pin(ctx, caller_class);
             let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3)?;
+            let caller_class = lk_repin_read(ctx, caller_pin, caller_class);
             ctx.set_field_by_name(obj, "lookupClass", caller_class);
             ctx.set_field_by_name(obj, "prevLookupClass", Value::Object(None));
             // Slot-0 lookupClass fallback for the pure-synthetic layout.
             ctx.set_field(obj, 0, caller_class);
+            if caller_pin != usize::MAX {
+                ctx.unpin_native_roots(caller_pin);
+            }
             // FULL power, matching HotSpot's caller-sensitive lookup():
             // PUBLIC|PRIVATE|PROTECTED|PACKAGE|MODULE|ORIGINAL = 0x5F.
             lk_write_allowed_modes(ctx, obj, 0x5F);
@@ -7080,10 +7120,15 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
                 .ensure_class_initialized("java/lang/Object")
                 .unwrap_or(cratonvm_types::ClassId::new(0));
             let object_mirror = ctx.get_class_mirror(object_cid);
+            // GC-safety: same shape as `lookup()` above -- mirror resolved, then
+            // allocated, then stored. See [`lk_pin`].
+            let mirror_pin = ctx.pin_native_root(object_mirror);
             let obj =
                 try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3)?;
+            let object_mirror = ctx.read_native_pin(mirror_pin, object_mirror);
             ctx.set_field_by_name(obj, "lookupClass", Value::Object(Some(object_mirror)));
             ctx.set_field(obj, 0, Value::Object(Some(object_mirror)));
+            ctx.unpin_native_roots(mirror_pin);
             // JDK 9+ contract (verified against JDK 25 src.zip,
             // java.base/java/lang/invoke/MethodHandles.java):
             //
@@ -7282,10 +7327,18 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
                     target_is_public,
                 )
             };
+            // GC-safety: `target_class` came out of `args` and every read of
+            // it since has been of that SNAPSHOT, which the allocation below
+            // can leave pointing at a pre-GC address. See [`lk_pin`].
+            let target_pin = lk_pin(ctx, target_class);
             let lookup =
                 try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3)?;
+            let target_class = lk_repin_read(ctx, target_pin, target_class);
             ctx.set_field_by_name(lookup, "lookupClass", target_class);
             ctx.set_field(lookup, 0, target_class); // lookupClass = targetClass
+            if target_pin != usize::MAX {
+                ctx.unpin_native_roots(target_pin);
+            }
             lk_write_allowed_modes(ctx, lookup, modes);
             Ok(Some(Value::Object(Some(lookup))))
         },

@@ -145,6 +145,60 @@ fn system_property_check_key(
     Ok(key)
 }
 
+/// What `System.getProperty` answers, in precedence order.
+///
+/// Three sources, and the order is the whole content of this function:
+///
+///  1. the system `Properties` object's own real `map`, when it has one;
+///  2. the VM's system-property store;
+///  3. [`system_property_fallback`], the bootstrap defaults.
+///
+/// (1) is new with the Phase 3 `java/util/Properties` retirement and is the
+/// half a mirror cannot do. `System.setProperty` and `System.clearProperty`
+/// write BOTH stores, so those two never disagree. What has no mirror is real
+/// JDK bytecode reached through a reference the caller already holds --
+/// `System.getProperties().setProperty(k, v)` -- which writes the map and
+/// nothing else. Asking the map first is what makes that write visible here.
+///
+/// It cannot be the ONLY source: the map is refilled from the store by
+/// `System.getProperties()`, so between two such calls it legitimately lags a
+/// property the VM has set, and every miss has to fall through. The two orders
+/// are not interchangeable -- store-first would answer the STALE value for a
+/// key written through the receiver, which is the update half of the same
+/// defect and would have left `SystemRuntimeObjectSweep` row 39 green for the
+/// wrong reason (it adds a key rather than changing one).
+///
+/// # The residual, and why this order and not the other
+///
+/// A property written into the VM store by RUST -- `set_system_property` from
+/// somewhere in the VM, with no `System.setProperty` involved -- is masked here
+/// by an older value in the map, until the next `System.getProperties()` call
+/// refills it. The reverse order has a residual too, and a worse one: it masks
+/// every write through a held `Properties` reference, which is Java-visible.
+///
+/// The tie-break is not a guess about which is rarer. On a real JDK there is
+/// exactly one store and it IS the `Properties` object -- `System.getProperty`
+/// is literally `props.getProperty(key)`. This VM's own store is the shim, so
+/// when the two disagree the object is the one telling the truth about what
+/// Java did, and the store is the one that has to catch up. That is the same
+/// direction the whole §1.4 retirement campaign moves in.
+///
+/// Cost: one `invoke_virtual` per call, and only once a system `Properties`
+/// singleton exists with a filled `map`. MEASURED as affordable rather than
+/// assumed -- `System.getProperty`'s native carries `invocations: 0` in the
+/// probe-tree census, because the VM's own reads go through
+/// `NativeContext::get_system_property` in Rust and JDK callers go through
+/// `StaticProperty`'s cached statics. This is not a hot path.
+pub(crate) fn system_property_read(ctx: &mut dyn NativeContext, key: &str) -> Option<String> {
+    if let Some(props) = crate::lang_system::system_props_singleton(ctx.vm_identity()) {
+        if let Some(v) = crate::properties_sidetable::lookup_in_real_map(ctx, props, key) {
+            return Some(v);
+        }
+    }
+    ctx.get_system_property(key)
+        .or_else(|| system_property_fallback(ctx, key))
+}
+
 pub(crate) fn system_property_fallback(ctx: &dyn NativeContext, key: &str) -> Option<String> {
     // An explicit `System.setProperties(p)` REPLACES the property map, and a
     // key absent from the replacement is absent -- not a cue to fall back to a
@@ -4634,6 +4688,15 @@ pub mod logmanager;
 // `org.jboss.logmanager.ExtHandler.<clinit>` ClassCastException on
 // reflective cast.
 pub mod atomic_updater;
+// The Windows attach provider's two `listVirtualMachines()` natives.
+// `#![cfg(windows)]` inside the module, and gated again here, because the
+// LINUX class of the same name declares neither: a `Bridge` registered
+// against a method the runtime image does not have is what the bridge
+// ratchet exists to catch. See the module's own doc comment for the
+// `UnsatisfiedLinkError` this closes and for why only two of the four are
+// registered.
+#[cfg(windows)]
+pub mod attach_provider;
 // T19_H13_BIGINTEGER_INTRINSICS — `java.math.BigInteger.implSquareToLen` /
 // `shiftLeftImplWorker` / `shiftRightImplWorker` / `implMulAdd` / `mulAdd`
 // HotSpot-equivalent native overrides. KC16 boot path constructs a 2048-bit
@@ -6477,7 +6540,9 @@ fn native_jasper_jdtcompiler_accept_result(
             "()[Lorg/eclipse/jdt/core/compiler/CategorizedProblem;",
             &[],
         )? {
+            let errors_pin = ctx.pin_native_root(errors);
             for i in 0..ctx.array_length(problems) {
+                let errors = ctx.read_native_pin(errors_pin, errors);
                 let Value::Object(Some(problem)) = ctx.get_array_element(problems, i) else {
                     continue;
                 };
@@ -7356,6 +7421,358 @@ pub(crate) fn java_long_to_string_radix(val: i64, radix: i32) -> String {
         v /= radix as u64;
     }
     buf.into_iter().rev().collect()
+}
+
+/// The process-wide `System.getProperties()` receiver, allocated once.
+///
+/// Factored out of that native's body because there are now two bodies for it,
+/// one per compatibility mode, and the object's IDENTITY is the half that
+/// must not differ between them: HotSpot returns the same `System.props` object
+/// on every call, and `StandardEnvironmentTests.getSystemProperties` asserts
+/// `isSameAs`. A second copy of the singleton lookup is the shape that
+/// eventually grows a second cache.
+fn system_properties_object(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    match crate::lang_system::system_props_singleton(ctx.vm_identity()) {
+        Some(cached) => Ok(cached),
+        None => {
+            let p = crate::try_alloc_concurrent_synthetic(ctx, "java/util/Properties", 16)?;
+            crate::properties_sidetable::mark_system_props(ctx, p);
+            Ok(crate::lang_system::set_system_props_singleton(
+                ctx.vm_identity(),
+                p,
+            ))
+        }
+    }
+}
+
+/// `java.lang.System.getProperties()` — the `--real-jdk` body, unchanged.
+///
+/// Lifted out of a closure when the strict body below joined it, so the two
+/// are one registration with two bodies rather than two registrations of one
+/// triple: a duplicate `register` of this triple is a `shadowed_registrations`
+/// row, and `native-builtins/tests/duplicate_registration_gate.rs` freezes
+/// that population.
+fn native_system_get_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // Return a lightweight synthetic Properties object.  The
+    // Properties.getProperty/getProperty(default) native overrides
+    // below intercept the common read paths and delegate to our
+    // VM's system property store — so individual lookups work
+    // without touching the inherited Hashtable slots.
+    //
+    // However, callers that *enumerate* (Properties.forEach,
+    // stringPropertyNames, size, entrySet) read from the
+    // side-table directly. SmallRye / Quarkus's
+    // `PropertiesConfigSource` iterates `System.getProperties()`
+    // to materialise its config map; if the side-table is empty,
+    // expressions like `${user.country:}` resolve to the empty
+    // default — producing values like `quarkus.locales=en-`.
+    // Pre-populate the side-table with the current system
+    // property snapshot so enumeration sees the live values.
+    // Identity: reuse the cached singleton so `System.getProperties()
+    // == System.getProperties()` holds — HotSpot returns the same
+    // `System.props` object every call (SC-env-classreading RC-A,
+    // StandardEnvironmentTests.getSystemProperties `isSameAs`). On the
+    // first call build the synthetic Properties and mark it as the
+    // system-properties view so writes through it (e.g.
+    // `System.getProperties().setProperty(...)`) propagate to the global
+    // store — regular `new Properties()` objects must NOT (they'd pollute
+    // system properties and cross-contaminate other Properties).
+    let props = system_properties_object(ctx)?;
+    // Resync the side-table to the current system-property snapshot on
+    // every call — whether the object is fresh or cached — so enumeration
+    // (forEach/stringPropertyNames/entrySet/size) and `getProperty` see
+    // the live values. A wholesale REPLACE (not additive store) is
+    // required for the cached singleton: it drops keys removed by
+    // `System.clearProperty(...)` between calls, matching HotSpot
+    // (additive merge would leave a cleared property visible).
+    let snapshot = ctx.list_system_properties();
+    crate::properties_sidetable::replace_sidetable(ctx, props, &snapshot);
+    Ok(Some(Value::Object(Some(props))))
+}
+
+/// `java.lang.System.getProperties()` under `--jdk-only`: the same object,
+/// plus a real, populated `map`.
+///
+/// See [`crate::properties_sidetable::replace_real_map`] for the measurement
+/// and for what reads that field. The side-table store is kept as well as the
+/// real map, deliberately: strict mode still dispatches every
+/// `properties_sidetable` native until those triples are retired, so the two
+/// stores must agree rather than one replace the other. They are written from
+/// ONE snapshot, on the same call, for that reason.
+/// The `SharedSecrets` access objects the real `initPhase1` publishes, and the
+/// image class that implements each.
+///
+/// `jdk.internal.access.SharedSecrets` is a box of `private static` fields, one
+/// per subsystem, each holding an object that lets `java.base` internals reach
+/// across package boundaries. The real JDK fills them during bootstrap --
+/// `System.setJavaLangAccess()` from `initPhase1`, the reflect one from
+/// `AccessibleObject`'s initialisation -- and every getter is
+/// `return theField;`.
+///
+/// This VM registers NATIVES for those getters, so the fields have never
+/// mattered. They start mattering the moment a getter is declined: the real
+/// accessor runs and returns null, and the null does not stay local, because
+/// real JDK classes capture the result into statics of their OWN during class
+/// initialisation. `sun.nio.cs.UTF_8.JLA` and
+/// `jdk.internal.constant.ConstantUtils.JLA` are two such copies.
+///
+/// # The entries are measured, not enumerated
+///
+/// `SharedSecrets` has around thirty of these fields. Only the ones a corpus
+/// vector actually reached are here, each with the vector that named it, so the
+/// list stays a record of what was needed rather than a guess at what might be.
+///
+/// # Every carrier is a REAL image class, and that is the whole trick
+///
+/// `java.lang.System$1` implements all 88 members of `JavaLangAccess` in
+/// bytecode; `java.lang.reflect.ReflectAccess` does the same for
+/// `JavaLangReflectAccess`. `try_alloc_concurrent_synthetic` resolves the real
+/// class id when the image has it, so what is published is a genuine instance
+/// and every method real code calls on it has a real body. There is nothing to
+/// implement here -- the objects already work, they were simply never handed
+/// to the field that the JDK reads them from.
+const SHARED_SECRETS_TO_PUBLISH: &[(&str, &str)] = &[
+    // `sun.nio.cs.UTF_8.JLA` -> `uncheckedEncodeASCII`, reached through
+    // `PrintStream.write`. Named by RJdkHello, RCollections, RJdkCollections,
+    // RJdkRecords and RImmutableFactoryTypes.
+    ("javaLangAccess", "java/lang/System$1"),
+    // `JavaLangReflectAccess.getExecutableSharedParameterTypes`, reached
+    // through the reflection machinery. Named by RJdkHello and RJdkRecords
+    // once the entry above stopped being their first failure.
+    ("javaLangReflectAccess", "java/lang/reflect/ReflectAccess"),
+];
+
+/// Publish the [`SHARED_SECRETS_TO_PUBLISH`] carriers, returning how many
+/// landed.
+///
+/// Idempotent, and silent on failure by design: this runs during `initPhase1`,
+/// before most of the Java world exists, and a carrier whose class cannot be
+/// allocated yet simply leaves its field as it was -- which is exactly the
+/// behaviour every one of these fields had before this function existed.
+fn publish_shared_secrets(ctx: &mut dyn NativeContext) -> usize {
+    let mut published = 0usize;
+    for (field, carrier) in SHARED_SECRETS_TO_PUBLISH {
+        let Ok(obj) = try_alloc_concurrent_synthetic(ctx, carrier, 1) else {
+            continue;
+        };
+        ctx.set_static_field_by_name(
+            "jdk/internal/access/SharedSecrets",
+            field,
+            Value::Object(Some(obj)),
+        );
+        published += 1;
+    }
+    published
+}
+
+/// Fill `jdk.internal.misc.VM.savedProps`, which the real `initPhase1` sets
+/// through `VM.saveProperties(Map)`.
+///
+/// # Why it is not optional
+///
+/// `VM.getSavedProperty` is not a convenience wrapper; it THROWS when the map
+/// is absent:
+///
+/// ```java
+///     public static String getSavedProperty(String key) {
+///         if (savedProps == null)
+///             throw new IllegalStateException("Not yet initialized");
+/// ```
+///
+/// So a null here is not a null answer, it is an exception out of whatever
+/// `<clinit>` happened to ask first -- and the classes that ask are the ones
+/// every program needs:
+///
+/// ```text
+/// ExceptionInInitializerError, class jdk/internal/loader/ClassLoaders
+///   caused by IllegalStateException: Not yet initialized
+///     at jdk/internal/misc/VM.getSavedProperty(VM.java:211)
+///     at jdk/internal/loader/ClassLoaders.<clinit>(ClassLoaders.java:66)
+/// ```
+///
+/// MEASURED 2026-09-09 by classifying all 108 remaining failures of
+/// `CRATONVM_ENFORCE_NATIVE_SHADOW=all`: **11 of them are this field**, the
+/// largest single mechanical family left after the `SharedSecrets` wave.
+///
+/// # A real `HashMap`, filled through its own bytecode
+///
+/// `savedProps` is a `Map<String, String>` and real code calls `get` on it, so
+/// what goes in has to be a working map rather than a carrier. Built with
+/// `new_object_initialized` and filled with `invoke_virtual`, exactly as
+/// [`crate::properties_sidetable::replace_real_map`] fills the `Properties`
+/// backing map -- same GC discipline for the same reason: every `put` re-enters
+/// Java and is a collection point, so the receiver is pinned and re-read
+/// across the loop.
+///
+/// # Absent or complete, never half
+///
+/// The same invariant the rest of this cluster keeps. A partially filled
+/// `savedProps` would stop throwing and start answering `null` for keys it is
+/// missing, and `VM.getSavedProperty("java.home")` answering null is the shape
+/// of the 2026-07-14 `InternalError: null property: java.home` regression. On
+/// any failure the field is left exactly as it was.
+fn publish_vm_saved_props(ctx: &mut dyn NativeContext) -> bool {
+    let entries = ctx.list_system_properties();
+    if entries.is_empty() {
+        return false;
+    }
+    let created = ctx.new_object_initialized("java/util/HashMap", "()V", &[]);
+    let map = match created {
+        Ok(Some(Value::Object(Some(m)))) => m,
+        _ => return false,
+    };
+    let map_pin = ctx.pin_native_root(map);
+    let mut map_cur = ctx.read_native_pin(map_pin, map);
+    let mut written = 0usize;
+    let mut failed = false;
+    for (key, value) in &entries {
+        let k = ctx.create_string(key);
+        let k_pin = ctx.pin_native_root(k);
+        let v = ctx.create_string(value);
+        let k_cur = ctx.read_native_pin(k_pin, k);
+        map_cur = ctx.read_native_pin(map_pin, map_cur);
+        let put = ctx.invoke_virtual(
+            map_cur,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(k_cur)), Value::Object(Some(v))],
+        );
+        ctx.unpin_native_roots(k_pin);
+        match put {
+            Ok(_) => written += 1,
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+        map_cur = ctx.read_native_pin(map_pin, map_cur);
+    }
+    ctx.unpin_native_roots(map_pin);
+    if failed || written != entries.len() {
+        return false;
+    }
+    ctx.set_static_field_by_name(
+        "jdk/internal/misc/VM",
+        "savedProps",
+        Value::Object(Some(map_cur)),
+    );
+    true
+}
+
+/// Make the system `Properties` singleton real and publish it on
+/// `java.lang.System.props`, returning whether the field now holds it.
+///
+/// # Why the static field matters on its own
+///
+/// `System.getProperty` IS `props.getProperty(key)` in the real JDK
+/// (`System.java:744`). This VM answers that method from a native, so the field
+/// has never mattered and has never been set -- `native_system_init_phase1`'s
+/// own doc comment lists *"Sets up the system properties map (`System.props`)"*
+/// as step 1 of what the real `initPhase1` does, and the body does everything
+/// but that.
+///
+/// It stops being free the moment any real `System` bytecode runs. MEASURED
+/// 2026-09-09, `CRATONVM_ENFORCE_NATIVE_SHADOW=all` on the whole corpus:
+///
+/// ```text
+/// NullPointerException: Cannot invoke "java.util.Properties.getProperty(String)"
+///   because "java.lang.System.props" is null
+///     at java/lang/System.getProperty(System.java:744)
+///     at RJdkHello.systemStreams(RJdkHello.java:42)
+/// ```
+///
+/// That is the FIRST line of the FIRST vector. It is the same defect as the
+/// null `Properties.map` this cluster just closed, one level up, and the
+/// cluster-root comment on the `getProperties` registration said as much:
+/// making that native return a real `Properties` was *the cluster's first
+/// move*, not its last.
+///
+/// # It publishes a POPULATED receiver or nothing
+///
+/// `replace_real_map` keeps the invariant that the real `map` holds the whole
+/// snapshot or is ABSENT, and returns the count it wrote. Publishing a
+/// `Properties` whose `map` is null would trade one NPE for the same NPE a
+/// frame deeper; publishing one whose `map` is EMPTY would be worse still,
+/// because `getProperty` stops throwing and starts answering `null` -- the
+/// 2026-07-14 `InternalError: null property: java.home` regression, reached
+/// from a third direction. So a zero return leaves the field exactly as it was.
+fn publish_real_system_props(ctx: &mut dyn NativeContext) -> bool {
+    let Ok(props) = system_properties_object(ctx) else {
+        return false;
+    };
+    let snapshot = ctx.list_system_properties();
+    crate::properties_sidetable::replace_sidetable(ctx, props, &snapshot);
+    if crate::properties_sidetable::replace_real_map(ctx, props, &snapshot) == 0 {
+        return false;
+    }
+    ctx.set_static_field_by_name("java/lang/System", "props", Value::Object(Some(props)));
+    true
+}
+
+
+/// `System.initPhase1()V` under `--jdk-only`: the real body, plus the field it
+/// has always been documented to set.
+///
+/// A registration-time branch rather than a check inside the shared body, for
+/// the reason the `getProperties` pair gives: `NativeCallback` is a bare `fn`
+/// pointer that captures nothing and `NativeContext` exposes no policy
+/// accessor, deliberately.
+///
+/// `--real-jdk` keeps the unchanged body and keeps the null field. That is not
+/// timidity: the singleton only acquires a real `map` on the `--jdk-only` path,
+/// so stamping it in compatible mode would publish a `Properties` that real
+/// bytecode cannot read -- the NPE moved one frame, which is the shape this
+/// whole cluster keeps producing when a receiver is made half-real.
+///
+/// Failure is silent and safe by construction. `initPhase1` runs before most of
+/// the Java world exists; if the `ConcurrentHashMap` cannot be constructed yet,
+/// `publish_real_system_props` writes nothing and the field stays null, which is
+/// exactly today's behaviour. `native_system_get_properties_jdk_only` retries on
+/// every call, so the field is published at the latest on the first
+/// `System.getProperties()`.
+fn native_system_init_phase1_jdk_only(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // BEFORE the body, and this ordering is measured rather than tidy.
+    // `native_system_init_phase1` installs charsets on the system streams,
+    // which initialises `java/nio/charset/Charset` and with it `sun.nio.cs.UTF_8`
+    // -- whose `<clinit>` CAPTURES `SharedSecrets.getJavaLangAccess()` into its
+    // own `JLA` static. Published after the body, the field is set and
+    // `UTF_8.JLA` still holds the null it captured on the way past.
+    //
+    // MEASURED: publishing after the body cleared
+    // `jdk.internal.constant.ConstantUtils.JLA` (initialised later) and left
+    // `sun.nio.cs.UTF_8.JLA` null, which is the same NPE one vector further on.
+    publish_shared_secrets(ctx);
+    let result = lang_system::native_system_init_phase1(ctx, args)?;
+    // AFTER, for the two that need a working Java world. `publish_real_system_props`
+    // constructs a `ConcurrentHashMap`; the JLA publish is repeated because it is
+    // idempotent and because a pre-body attempt can legitimately fail while the
+    // class loader is still coming up.
+    publish_real_system_props(ctx);
+    publish_shared_secrets(ctx);
+    publish_vm_saved_props(ctx);
+    Ok(result)
+}
+
+fn native_system_get_properties_jdk_only(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let props = system_properties_object(ctx)?;
+    // HARVEST BEFORE REFILL. `replace_real_map` clears the map and refills it
+    // from the VM store, so anything written straight through the receiver --
+    // `System.getProperties().setProperty(k, v)`, which is real JDK bytecode
+    // once `java/util/Properties` is retired -- has to be folded back into the
+    // store first or this call is what erases it.
+    crate::properties_sidetable::harvest_real_map(ctx, props);
+    // Re-publishes `java.lang.System.props` as a side effect, which is what
+    // makes the field correct after a `System.setProperties(p)` swapped the
+    // singleton, and what gives it a second chance if `initPhase1` ran too
+    // early to construct the backing map.
+    publish_real_system_props(ctx);
+    Ok(Some(Value::Object(Some(props))))
 }
 
 pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
@@ -9944,7 +10361,15 @@ pub fn register_essential_natives_with_shims(
                     }
                 }
                 let mut read = 0usize;
+                // GC-safety: `buffered_input_stream_read_one` dispatches the
+                // delegate's `read()` -- real bytecode -- once per byte, and
+                // both the stream and the destination array are carried in
+                // from outside the loop.
+                let this_pin = ctx.pin_native_root(this);
+                let arr_pin = ctx.pin_native_root(arr);
                 for i in 0..limit {
+                    let this = ctx.read_native_pin(this_pin, this);
+                    let arr = ctx.read_native_pin(arr_pin, arr);
                     let b = buffered_input_stream_read_one(ctx, this)?;
                     if b < 0 {
                         break;
@@ -10777,10 +11202,7 @@ pub fn register_essential_natives_with_shims(
             // 2026-08-29 -- see [`system_property_check_key`], which all four
             // entry points now share so they cannot drift apart again.
             let key = system_property_check_key(ctx, args)?;
-            match ctx
-                .get_system_property(&key)
-                .or_else(|| system_property_fallback(ctx, &key))
-            {
+            match system_property_read(ctx, &key) {
                 Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
                 None => Ok(Some(Value::Object(None))),
             }
@@ -10796,10 +11218,7 @@ pub fn register_essential_natives_with_shims(
             // default was the more misleading of the two, because it looks
             // exactly like a correctly-handled missing property.
             let key = system_property_check_key(ctx, args)?;
-            match ctx
-                .get_system_property(&key)
-                .or_else(|| system_property_fallback(ctx, &key))
-            {
+            match system_property_read(ctx, &key) {
                 Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
                 None => Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None)))),
             }
@@ -10835,6 +11254,10 @@ pub fn register_essential_natives_with_shims(
             // property as absent even though `System.getProperty("foo")` sees it.
             if let Some(props) = crate::lang_system::system_props_singleton(ctx.vm_identity()) {
                 crate::properties_sidetable::store_property_in_sidetable(ctx, props, &key, &val);
+                // And the REAL map, which is the store once the `Properties`
+                // natives are retired. Inert while the field is null, so
+                // `--real-jdk` is untouched.
+                crate::properties_sidetable::store_property_in_real_map(ctx, props, &key, &val);
             }
             match old {
                 Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
@@ -10858,6 +11281,7 @@ pub fn register_essential_natives_with_shims(
             // the matching comment in `setProperty` above (SC-web-method-spel RC-A).
             if let Some(props) = crate::lang_system::system_props_singleton(ctx.vm_identity()) {
                 crate::properties_sidetable::remove_property_from_sidetable(ctx, props, &key);
+                crate::properties_sidetable::remove_property_from_real_map(ctx, props, &key);
             }
             match result {
                 Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
@@ -10876,9 +11300,22 @@ pub fn register_essential_natives_with_shims(
         "setProperties",
         "(Ljava/util/Properties;)V",
         |ctx, args| {
+            // The side table FIRST, and the real map only when it is empty.
+            // Order matters both ways round: a VM-built `Properties` has a side
+            // table and may have no real map, and a `new Properties()` built by
+            // real `<init>` has a real map and no side table. Reading the
+            // wrong one silently installs an EMPTY property set, which is how
+            // `SystemRuntimeObjectSweep`'s `setProperties round trip` row read
+            // `null/null/true` under the Phase 3 retirement.
             let entries = match args.first() {
                 Some(Value::Object(Some(props))) => {
-                    crate::properties_sidetable::snapshot_sidetable(ctx, *props)
+                    let from_sidetable =
+                        crate::properties_sidetable::snapshot_sidetable(ctx, *props);
+                    if from_sidetable.is_empty() {
+                        crate::properties_sidetable::snapshot_real_map(ctx, *props)
+                    } else {
+                        from_sidetable
+                    }
                 }
                 _ => Vec::new(),
             };
@@ -10987,53 +11424,26 @@ pub fn register_essential_natives_with_shims(
     // — the 67 are in `properties_sidetable.rs` (32), `deprecated_util.rs`,
     // `deprecated_io_util.rs` and `wildfly_naming.rs`. The full table and the
     // rest of the cluster are on `register_properties_sidetable`.
+    //
+    // 2026-09-09 — THE CLUSTER'S FIRST MOVE, taken under `--jdk-only`. The note
+    // above asks for it in these words: *"make THIS return a real `Properties`
+    // — real `<init>`, real `map`"*. Strict mode now populates the real
+    // `java.util.concurrent.ConcurrentHashMap` in the real `map` field, which is
+    // what every JDK 25 `Properties` body reads.
+    //
+    // The branch is on the REGISTRY's mode and picks a BODY, not a second
+    // registration: §1.4's lever is registration, `NativeCallback` is a bare
+    // `fn` pointer that captures nothing, and `NativeContext` exposes no policy
+    // accessor — deliberately. Same shape as the `Runtime.loadLibrary0` arm in
+    // `lang_system.rs`. `--real-jdk` keeps the null `map` it has always had.
     registry.register(
         "java/lang/System",
         "getProperties",
         "()Ljava/util/Properties;",
-        |ctx, _args| {
-            // Return a lightweight synthetic Properties object.  The
-            // Properties.getProperty/getProperty(default) native overrides
-            // below intercept the common read paths and delegate to our
-            // VM's system property store — so individual lookups work
-            // without touching the inherited Hashtable slots.
-            //
-            // However, callers that *enumerate* (Properties.forEach,
-            // stringPropertyNames, size, entrySet) read from the
-            // side-table directly. SmallRye / Quarkus's
-            // `PropertiesConfigSource` iterates `System.getProperties()`
-            // to materialise its config map; if the side-table is empty,
-            // expressions like `${user.country:}` resolve to the empty
-            // default — producing values like `quarkus.locales=en-`.
-            // Pre-populate the side-table with the current system
-            // property snapshot so enumeration sees the live values.
-            // Identity: reuse the cached singleton so `System.getProperties()
-            // == System.getProperties()` holds — HotSpot returns the same
-            // `System.props` object every call (SC-env-classreading RC-A,
-            // StandardEnvironmentTests.getSystemProperties `isSameAs`). On the
-            // first call build the synthetic Properties and mark it as the
-            // system-properties view so writes through it (e.g.
-            // `System.getProperties().setProperty(...)`) propagate to the global
-            // store — regular `new Properties()` objects must NOT (they'd pollute
-            // system properties and cross-contaminate other Properties).
-            let props = match crate::lang_system::system_props_singleton(ctx.vm_identity()) {
-                Some(cached) => cached,
-                None => {
-                    let p = crate::try_alloc_concurrent_synthetic(ctx, "java/util/Properties", 16)?;
-                    crate::properties_sidetable::mark_system_props(ctx, p);
-                    crate::lang_system::set_system_props_singleton(ctx.vm_identity(), p)
-                }
-            };
-            // Resync the side-table to the current system-property snapshot on
-            // every call — whether the object is fresh or cached — so enumeration
-            // (forEach/stringPropertyNames/entrySet/size) and `getProperty` see
-            // the live values. A wholesale REPLACE (not additive store) is
-            // required for the cached singleton: it drops keys removed by
-            // `System.clearProperty(...)` between calls, matching HotSpot
-            // (additive merge would leave a cleared property visible).
-            let snapshot = ctx.list_system_properties();
-            crate::properties_sidetable::replace_sidetable(ctx, props, &snapshot);
-            Ok(Some(Value::Object(Some(props))))
+        if registry.compatibility_mode().is_jdk_only() {
+            native_system_get_properties_jdk_only
+        } else {
+            native_system_get_properties
         },
     );
     // Surefire bootstrap: Maven wraps system properties in
@@ -11641,7 +12051,11 @@ pub fn register_essential_natives_with_shims(
         "java/lang/System",
         "initPhase1",
         "()V",
-        lang_system::native_system_init_phase1,
+        if registry.compatibility_mode().is_jdk_only() {
+            native_system_init_phase1_jdk_only
+        } else {
+            lang_system::native_system_init_phase1
+        },
     );
 
     // --- java.lang.String (native methods + overrides) ---
@@ -12419,7 +12833,49 @@ pub fn register_essential_natives_with_shims(
     // This intentionally mirrors the synthetic-mode override at
     // `phases_late.rs::register_p59_module` so real-JDK and synthetic-jdk
     // boot paths see the same Module shape — see vm/tests/wave3_console_module.rs.
-    registry.register(
+    // REVIEWED `Intrinsic`, 2026-09-10, and the review is
+    // `apps/probes/ClassModuleSweep.java`.
+    //
+    // This is a §1.4 shadow by the letter and NOT one in substance, which is
+    // the case §1.4's reviewed-`Intrinsic` exception exists for.
+    // `Class.getModule()` is not `ACC_NATIVE` -- its body is `return module;`
+    // -- so a native in front of it shadows real bytecode and the contract's
+    // remedy is to yield. **That remedy cannot work here.**
+    // `java.lang.Class.module` is `private transient Module` and NO JAVA CODE
+    // WRITES IT: a real JVM populates it at class-definition time through
+    // `Module.defineModule0`. Yielding returns null, and a null Module is what
+    // 12 of the 108 remaining failures under
+    // `CRATONVM_ENFORCE_NATIVE_SHADOW=all` were -- a null `module`,
+    // `callerModule` or `thisModule` one or two frames later, through
+    // `ClassLoader.postDefineClass` -> `NamedPackage.<init>`.
+    //
+    // The tag was `Bridge` with `kind_stated: false` -- ambient, never chosen
+    // (see the module header on `NativeKind` being ambient). So this states a
+    // decision rather than overturning one.
+    //
+    // An `Intrinsic` claims SEMANTICS-PRESERVING, and that claim is earned
+    // rather than asserted. `ClassModuleSweep` is 32 rows against HotSpot
+    // 25.0.3+9 -- module names for `java.base`, a platform module, the unnamed
+    // module, primitives, arrays of both, nested/anonymous/lambda classes;
+    // Module identity WITHIN one VM, which the JDK depends on because `Module`
+    // does not override `equals`; and `isNamed`/`getName`/`getClassLoader`/
+    // `getDescriptor`/`isOpen`/`isExported`/`canRead`/`getLayer`.
+    //
+    //     31 of 32 rows byte-identical to HotSpot.
+    //
+    // The ONE deviation is recorded and NOT fixed here:
+    //
+    //     32 layer of unnamed is null    HotSpot true, this VM false
+    //
+    // `Module.getLayer()` on the UNNAMED module should be null and is not. That
+    // is a defect in `Module.getLayer`, not in `getModule`, and tagging this
+    // triple does not freeze it -- the sweep is checked in, so the row goes red
+    // the day it is fixed or the day this answer drifts.
+    //
+    // What this does NOT license: the rest of the `java/lang/Module` surface
+    // stays `Bridge`. The claim here is about ONE triple whose backing field no
+    // Java code can fill.
+    registry.register_with_kind(
         "java/lang/Class",
         "getModule",
         "()Ljava/lang/Module;",
@@ -12577,6 +13033,7 @@ pub fn register_essential_natives_with_shims(
             ctx.cache_module_mirror(module_name.as_deref(), m_obj);
             Ok(Some(Value::Object(Some(m_obj))))
         },
+        NativeKind::Intrinsic,
     );
 
     // `java.lang.Module` access checks — registry-backed exports/opens modeling.
@@ -13587,6 +14044,23 @@ pub fn register_essential_natives_with_shims(
         "()Ljava/security/ProtectionDomain;",
         |ctx, args| {
             let pd = try_alloc_concurrent_synthetic(ctx, "java/security/ProtectionDomain", 4)?;
+            // GC-safety: `pd` is allocated FIRST and written LAST, and almost
+            // everything between the two allocates — a `java.net.URL`, a
+            // `CodeSource`, several strings, and a nested
+            // `native_class_get_class_loader`. A moving young collection at any
+            // of those relocates `pd`, and this closure then populates and
+            // RETURNS the pre-move address.
+            //
+            // The interpreter's return-value barrier cannot save it:
+            // `safe_native_call` heals a stale return through
+            // `load_and_forward`, which reads the forwarding marker at the old
+            // address — and that marker is gone once the allocator has
+            // re-served the span, which is exactly the window this workload
+            // reads it in. MEASURED on BindableTests under
+            // `CRATONVM_DBG_GC_STRESS=262144`: `[deadref-nret]` named this
+            // native returning an address in the emptied semispace, reached
+            // from ByteBuddy's `trySelfResolve(Class)`.
+            let pd_pin = ctx.pin_native_root(pd);
             // Try to produce a real CodeSource with a URL pointing at the
             // classpath entry that holds this Class.
             let mut path_opt = if let Some(Value::Object(Some(mirror))) = args.first() {
@@ -13716,7 +14190,16 @@ pub fn register_essential_natives_with_shims(
                 .ok()
                 .flatten()
                 .unwrap_or(Value::Object(None));
-            lang_class::populate_protection_domain_fields(ctx, pd, codesource, classloader)?;
+            // Read `pd` back from its pin — the whole point of taking it. Every
+            // allocation above is behind us, and `populate_protection_domain_fields`
+            // must write through the LIVE address, not the one this closure
+            // started with.
+            let pd = ctx.read_native_pin(pd_pin, pd);
+            let populated =
+                lang_class::populate_protection_domain_fields(ctx, pd, codesource, classloader);
+            let pd = ctx.read_native_pin(pd_pin, pd);
+            ctx.unpin_native_roots(pd_pin);
+            populated?;
             Ok(Some(Value::Object(Some(pd))))
         },
     );
@@ -15058,7 +15541,14 @@ pub fn register_essential_natives_with_shims(
             };
             let len = ctx.array_length(input_arr);
             let outer = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
+            // GC-safety: `build_stack_trace_element_array` allocates once per
+            // thread, and both the input array being read and the output array
+            // being written are carried across every turn.
+            let input_pin = ctx.pin_native_root(input_arr);
+            let outer_pin = ctx.pin_native_root(outer);
             for i in 0..len {
+                let input_arr = ctx.read_native_pin(input_pin, input_arr);
+                let outer = ctx.read_native_pin(outer_pin, outer);
                 let inner = match ctx.get_array_element(input_arr, i) {
                     Value::Object(Some(t)) => {
                         let trace = ctx.thread_stack_trace(t);
@@ -19284,6 +19774,12 @@ pub fn register_essential_natives_with_shims(
     t27_tls::register_t27_natives(registry);
     // WP5.2 — real PKCS12 + JKS parser via the `p12` crate + hand-rolled JKS.
     keystore::register_keystore_real(registry);
+    // `sun/tools/attach/AttachProviderImpl.tempPath` / `.volumeFlags` — the
+    // two natives `com.sun.tools.attach.VirtualMachine.list()` needs on
+    // Windows before it reaches the bytecode the Linux leg already runs.
+    // Windows-only: the Linux class declares neither method.
+    #[cfg(windows)]
+    attach_provider::register_attach_provider(registry);
     // WP5.3 — X509KeyManager + X509TrustManager with EKU-aware alias selection
     //         and RFC 5280 chain validation backed by rustls-native-certs.
     x509_manager::register_x509_manager_real(registry);
@@ -19616,13 +20112,13 @@ pub fn register_essential_natives_with_shims(
     // explicit assignments. Our native replaces the constructor outright,
     // so those initializers never run unless we do them by hand.
     fn ucp_init_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-        let this = match args.first() {
+        let mut this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
         let urls_val = args.get(1).copied().unwrap_or(Value::Object(None));
         // Construct path = new ArrayList<>(len)
-        let path = match ctx.new_object("java/util/ArrayList")? {
+        let mut path = match ctx.new_object("java/util/ArrayList")? {
             Some(Value::Object(Some(o))) => o,
             _ => return Ok(None),
         };
@@ -19633,7 +20129,7 @@ pub fn register_essential_natives_with_shims(
             &[Value::Object(Some(path))],
         )?;
         // Construct unopenedUrls = new ArrayDeque<>(len)
-        let unopened = match ctx.new_object("java/util/ArrayDeque")? {
+        let mut unopened = match ctx.new_object("java/util/ArrayDeque")? {
             Some(Value::Object(Some(o))) => o,
             _ => return Ok(None),
         };
@@ -19645,7 +20141,7 @@ pub fn register_essential_natives_with_shims(
         )?;
         // Construct loaders = new ArrayList<>() — required for getLoader(int)
         // which reads loaders.size() at URLClassPath.java:393.
-        let loaders = match ctx.new_object("java/util/ArrayList")? {
+        let mut loaders = match ctx.new_object("java/util/ArrayList")? {
             Some(Value::Object(Some(o))) => o,
             _ => return Ok(None),
         };
@@ -19657,7 +20153,7 @@ pub fn register_essential_natives_with_shims(
         )?;
         // Construct lmap = new HashMap<>() — guards getLoader(int)'s
         // `lmap.containsKey(...)` check at URLClassPath.java:402.
-        let lmap = match ctx.new_object("java/util/HashMap")? {
+        let mut lmap = match ctx.new_object("java/util/HashMap")? {
             Some(Value::Object(Some(o))) => o,
             _ => return Ok(None),
         };
@@ -19668,23 +20164,58 @@ pub fn register_essential_natives_with_shims(
             &[Value::Object(Some(lmap))],
         )?;
         // Iterate URLs (if non-null) and seed both collections.
+        //
+        // GC-safety: `ArrayList.add` and `ArrayDeque.add` are real bytecode and
+        // each can grow a backing array, so every reference this loop carries
+        // in -- both collections, the source array, and `this`, which is stored
+        // into below -- is a pre-GC address from the second turn on. `elem` is
+        // re-read from the (refreshed) array inside the turn, and the SECOND
+        // `add` needs it re-read again because the first one allocated.
         if let Value::Object(Some(arr)) = urls_val {
             let len = ctx.array_length(arr);
+            let this_pin = ctx.pin_native_root(this);
+            let path_pin = ctx.pin_native_root(path);
+            let unopened_pin = ctx.pin_native_root(unopened);
+            let loaders_pin = ctx.pin_native_root(loaders);
+            let lmap_pin = ctx.pin_native_root(lmap);
+            let arr_pin = ctx.pin_native_root(arr);
             for i in 0..len {
+                let arr = ctx.read_native_pin(arr_pin, arr);
                 let elem = ctx.get_array_element(arr, i);
+                let elem_pin = match elem {
+                    Value::Object(Some(o)) => ctx.pin_native_root(o),
+                    _ => usize::MAX,
+                };
+                let path = ctx.read_native_pin(path_pin, path);
                 ctx.invoke(
                     "java/util/ArrayList",
                     "add",
                     "(Ljava/lang/Object;)Z",
                     &[Value::Object(Some(path)), elem],
                 )?;
+                let elem = match (elem, elem_pin) {
+                    (Value::Object(Some(o)), p) if p != usize::MAX => {
+                        Value::Object(Some(ctx.read_native_pin(p, o)))
+                    }
+                    (other, _) => other,
+                };
+                let unopened = ctx.read_native_pin(unopened_pin, unopened);
                 ctx.invoke(
                     "java/util/ArrayDeque",
                     "add",
                     "(Ljava/lang/Object;)Z",
                     &[Value::Object(Some(unopened)), elem],
                 )?;
+                if elem_pin != usize::MAX {
+                    ctx.unpin_native_roots(elem_pin);
+                }
             }
+            this = ctx.read_native_pin(this_pin, this);
+            path = ctx.read_native_pin(path_pin, path);
+            unopened = ctx.read_native_pin(unopened_pin, unopened);
+            loaders = ctx.read_native_pin(loaders_pin, loaders);
+            lmap = ctx.read_native_pin(lmap_pin, lmap);
+            ctx.unpin_native_roots(this_pin);
         }
         ctx.set_field_by_name(this, "path", Value::Object(Some(path)));
         ctx.set_field_by_name(this, "unopenedUrls", Value::Object(Some(unopened)));
@@ -33203,11 +33734,26 @@ fn rl_with<R>(key: RlKey, f: impl FnOnce(&mut RlState) -> R) -> R {
 /// `enumset-synthetic-surface-drop-realmode-FIXED.md`).
 fn monitor_wait_release(
     ctx: &mut dyn NativeContext,
-    obj: ObjectRef,
+    obj: &mut ObjectRef,
     timeout_ms: Option<u64>,
 ) -> MethodCallResult {
-    let result = ctx.monitor_wait(obj, timeout_ms);
-    ctx.monitor_exit(obj);
+    // `monitor_wait` PARKS this thread, so a collection runs inside this call
+    // whenever one is due — the moving collector, or the non-moving young
+    // sweep's selective promotion. The exit below and every later iteration of
+    // the caller's retry loop must therefore use the POST-WAIT address:
+    // `MonitorTable::exit` opens with `header_of(obj)`, so a pre-wait address
+    // is an `EXCEPTION_ACCESS_VIOLATION` when the young slot was reclaimed and
+    // a permanently LEAKED monitor when it was merely moved — every later
+    // waiter on that object then blocks forever.
+    //
+    // The refreshed reference is written back through `obj` rather than
+    // returned, so a caller that keeps looping cannot forget to re-read it:
+    // every call site here is a `loop { ... monitor_wait_release(..)? }` retry.
+    let pin = ctx.pin_native_root(*obj);
+    let result = ctx.monitor_wait(*obj, timeout_ms);
+    *obj = ctx.read_native_pin(pin, *obj);
+    ctx.monitor_exit(*obj);
+    ctx.unpin_native_roots(pin);
     result
 }
 
@@ -33943,9 +34489,36 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/lang/String;Ljava/lang/String;)Ljdk/internal/util/ClassFileDumper;",
         |ctx, args| {
+            // PIN THE ARGUMENTS ACROSS THE ALLOCATION. `args` is a snapshot of
+            // the operand stack taken before this native was entered, and
+            // `try_alloc_concurrent_synthetic` can run a moving young
+            // collection -- after which the two `String`s in it name the
+            // addresses the collector moved them away from. Storing those into
+            // the dumper's fields puts a dead address inside a LIVE object,
+            // where no frame remap reaches it and the allocator re-serves it
+            // to something else. Same shape as `URL.openConnection`; see
+            // `docs/internal/springboot/bindabletests-moving-young-leaves-a-frame-slot-unremapped-20260908.md`.
+            let key = args.first().copied().unwrap_or(Value::Object(None));
+            let dir = args.get(1).copied().unwrap_or(Value::Object(None));
+            let p_key = match key {
+                Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+                _ => None,
+            };
+            let p_dir = match dir {
+                Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+                _ => None,
+            };
             let d = try_alloc_concurrent_synthetic(ctx, "jdk/internal/util/ClassFileDumper", 4)?;
-            ctx.set_field(d, 0, args.first().copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(d, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
+            let key = match p_key {
+                Some((h, o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+                None => key,
+            };
+            let dir = match p_dir {
+                Some((h, o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+                None => dir,
+            };
+            ctx.set_field(d, 0, key);
+            ctx.set_field(d, 1, dir);
             ctx.set_field(d, 2, Value::Int(0)); // disabled
             ctx.set_field(d, 3, Value::Object(None));
             Ok(Some(Value::Object(Some(d))))
@@ -33983,7 +34556,7 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
 
 // LinkedBlockingQueue: add element at tail, grow array if needed
 #[cfg(feature = "synthetic-jdk")]
-fn m18_lbq_add_internal(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Value) {
+fn m18_lbq_add_internal(ctx: &mut dyn NativeContext, mut this: ObjectRef, elem: Value) {
     let size = match ctx.get_field(this, 1) {
         Value::Int(n) => n as usize,
         _ => 0,
@@ -33995,12 +34568,39 @@ fn m18_lbq_add_internal(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Valu
     let cap = ctx.array_length(arr);
     if size >= cap {
         let new_cap = (cap * 2).max(16);
-        let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+    // GC: the grow path ALLOCATES, and everything it then touches is a Rust
+    // local holding a pre-allocation address — the old array it copies from,
+    // the element it stores, and the receiver it publishes into. Under a
+    // moving collector those go stale; under the Generational non-moving young
+    // sweep an object nothing else roots is ZEROED in place. Root them for the
+    // duration of the grow and re-read each one at its use. See
+    // `internal/fixed-bugs/native-arg-snapshot-stale-across-java-reentry-FIXED-20260906.md`.
+        let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+        let this_h = scope.root(this);
+        let arr_h = scope.root(arr);
+        let elem_h = match elem {
+            Value::Object(Some(o)) => Some(scope.root(o)),
+            _ => None,
+        };
+        let new_arr = scope.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+        let new_h = scope.root(new_arr);
         for i in 0..size {
-            ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, i));
+            let src = scope.get(&arr_h);
+            let v = scope.get_array_element(src, i);
+            let dst = scope.get(&new_h);
+            scope.set_array_element(dst, i, v);
         }
-        ctx.set_array_element(new_arr, size, elem);
-        ctx.set_field(this, 0, Value::Object(Some(new_arr)));
+        let elem_now = match &elem_h {
+            Some(h) => Value::Object(Some(scope.get(h))),
+            None => elem,
+        };
+        let dst = scope.get(&new_h);
+        scope.set_array_element(dst, size, elem_now);
+        let (recv, dst) = (scope.get(&this_h), scope.get(&new_h));
+        scope.set_field(recv, 0, Value::Object(Some(dst)));
+        // Carry the refreshed receiver out: the store below runs after the
+        // scope closes, and `this` named a pre-allocation address until now.
+        this = scope.get(&this_h);
     } else {
         ctx.set_array_element(arr, size, elem);
     }
@@ -34680,7 +35280,16 @@ fn cb_await_inner(
     // trip, break, or time out.
     cb_set(ctx, state, CB_H_COUNT, new_count);
     let arrival_index = (parties - new_count) as i32;
+    let this_pin = ctx.pin_native_root(this);
+    // `state` is the int[] holder every `cb_get`/`cb_set` below dereferences,
+    // and it crosses the same `monitor_wait` park as the receiver. Pinning
+    // only `this` kept it ALIVE (it hangs off `this`) but not CURRENT: after a
+    // relocating collection inside the wait, every state read in the next
+    // iteration went to the pre-wait array.
+    let state_pin = ctx.pin_native_root(state);
     loop {
+        let this = ctx.read_native_pin(this_pin, this);
+        let state = ctx.read_native_pin(state_pin, state);
         if cb_get(ctx, state, CB_H_BROKEN_GEN) == my_gen {
             ctx.monitor_exit(this);
             return Err(cb_throw(ctx, CB_BROKEN_BARRIER));
@@ -34711,6 +35320,10 @@ fn cb_await_inner(
         // error (interrupt) the monitor is still held — release it before
         // propagating so the unwind doesn't leak ownership.
         if let Err(e) = ctx.monitor_wait(this, Some(wait_ms)) {
+            // The wait PARKED before it failed, so a collection may have moved
+            // the receiver: exit on the post-wait address, not the pre-wait one
+            // (`MonitorTable::exit` dereferences it).
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.monitor_exit(this);
             return Err(e);
         }
@@ -38569,7 +39182,9 @@ pub(crate) fn interrupt_executor_workers_filtered(
     };
     let mut interrupted = 0;
     // Bound defensively; the worker set is tiny in practice.
+    let it_pin = ctx.pin_native_root(it);
     for _ in 0..4096 {
+        let it = ctx.read_native_pin(it_pin, it);
         match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
             Ok(Some(Value::Int(1))) => {}
             _ => break,
@@ -45889,9 +46504,29 @@ fn native_formatter_init_locale(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // GC: a reference held in a Rust local across an allocating or Java-re-entering
+    // call goes stale under a moving collector, and under the Generational
+    // non-moving young sweep an unrooted object is ZEROED in place. Pin and
+    // re-read. `safe_native_call_impl` truncates `native_pin_roots` when the native
+    // returns, so an unmatched pin costs nothing on an error path. See
+    // `internal/audits/wide-tranche-triage-20260907.md`.
+    // `create_string` allocates, so BOTH the receiver and the locale argument
+    // are pre-call addresses at the two stores below.
+    let this_pin = ctx.pin_native_root(this);
+    let locale_pin = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some((ctx.pin_native_root(*o), *o)),
+        _ => None,
+    };
     let empty = ctx.create_string("");
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, 0, Value::Object(Some(empty)));
-    ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
+    let locale = match locale_pin {
+        Some((p, o)) => Value::Object(Some(ctx.read_native_pin(p, o))),
+        None => args.get(1).copied().unwrap_or(Value::Object(None)),
+    };
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this, 1, locale);
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -46442,6 +47077,32 @@ fn pd_stream_gather(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     Ok(Some(Value::Object(Some(stream?))))
 }
 
+/// Pin every reference in a `Value` slice, returning one handle per element
+/// (`usize::MAX` for the non-reference ones).
+///
+/// The `pd_gather_*` bodies each run an arbitrary user lambda once per element,
+/// and the caller's slice is a bare Rust local: nothing rewrites it, so element
+/// `i` is a pre-GC address for every turn after the one that first allocated.
+fn pd_pin_elems(ctx: &mut dyn NativeContext, elems: &[Value]) -> Vec<usize> {
+    elems
+        .iter()
+        .map(|v| match v {
+            Value::Object(Some(o)) => ctx.pin_native_root(*o),
+            _ => usize::MAX,
+        })
+        .collect()
+}
+
+/// Read element `i` back through the handle [`pd_pin_elems`] took for it.
+fn pd_read_elem(ctx: &dyn NativeContext, pins: &[usize], i: usize, orig: Value) -> Value {
+    match (orig, pins.get(i).copied().unwrap_or(usize::MAX)) {
+        (Value::Object(Some(o)), pin) if pin != usize::MAX => {
+            Value::Object(Some(ctx.read_native_pin(pin, o)))
+        }
+        (other, _) => other,
+    }
+}
+
 fn pd_gather_fold(
     ctx: &mut dyn NativeContext,
     elems: &[Value],
@@ -46453,17 +47114,27 @@ fn pd_gather_fold(
     } else {
         Value::Object(None)
     };
+    // GC-safety: `state` is reassigned from each call's own return value, so it
+    // is current by construction -- the folder and the elements are not.
+    // `apply` is an arbitrary user lambda: it allocates, and both the receiver
+    // read once from `gatherer` and every element of the caller's slice are
+    // bare Rust locals from the second turn on.
     if let Value::Object(Some(folder)) = ctx.get_field(gatherer, 1) {
-        for elem in elems {
+        let folder_pin = ctx.pin_native_root(folder);
+        let elem_pins = pd_pin_elems(ctx, elems);
+        for (i, elem) in elems.iter().enumerate() {
+            let folder = ctx.read_native_pin(folder_pin, folder);
+            let elem = pd_read_elem(ctx, &elem_pins, i, *elem);
             state = ctx
                 .invoke_virtual(
                     folder,
                     "apply",
                     "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                    &[state, *elem],
+                    &[state, elem],
                 )?
                 .unwrap_or(Value::Object(None));
         }
+        ctx.unpin_native_roots(folder_pin);
     }
     Ok(vec![state])
 }
@@ -46480,18 +47151,34 @@ fn pd_gather_scan(
         Value::Object(None)
     };
     let mut result = Vec::with_capacity(elems.len());
+    // GC-safety: see `pd_gather_fold`. `result` additionally accumulates
+    // references across later allocations, so each is pinned as it is pushed
+    // and read back through its pin before the vector is returned.
     if let Value::Object(Some(scanner)) = ctx.get_field(gatherer, 1) {
-        for elem in elems {
+        let scanner_pin = ctx.pin_native_root(scanner);
+        let elem_pins = pd_pin_elems(ctx, elems);
+        let mut result_pins: Vec<usize> = Vec::with_capacity(elems.len());
+        for (i, elem) in elems.iter().enumerate() {
+            let scanner = ctx.read_native_pin(scanner_pin, scanner);
+            let elem = pd_read_elem(ctx, &elem_pins, i, *elem);
             state = ctx
                 .invoke_virtual(
                     scanner,
                     "apply",
                     "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                    &[state, *elem],
+                    &[state, elem],
                 )?
                 .unwrap_or(Value::Object(None));
+            result_pins.push(match state {
+                Value::Object(Some(o)) => ctx.pin_native_root(o),
+                _ => usize::MAX,
+            });
             result.push(state);
         }
+        for i in 0..result.len() {
+            result[i] = pd_read_elem(ctx, &result_pins, i, result[i]);
+        }
+        ctx.unpin_native_roots(scanner_pin);
     }
     Ok(result)
 }
@@ -46594,19 +47281,40 @@ fn pd_gather_custom(
     ctx.set_field(downstream, 0, Value::Object(Some(downstream_arr)));
     ctx.set_field(downstream, 1, Value::Int(0));
 
+    // GC-safety: unlike `pd_gather_fold`/`_scan`, `state` here is NOT
+    // reassigned -- the same reference is handed to every `integrate` call and
+    // then to the finisher. `integrate` is an arbitrary user lambda that
+    // allocates, so `state`, the freshly built `downstream` collector, the
+    // integrator itself and every element are all pre-GC addresses from the
+    // second turn on.
+    let state_pin = match state {
+        Value::Object(Some(o)) => ctx.pin_native_root(o),
+        _ => usize::MAX,
+    };
+    let downstream_pin = ctx.pin_native_root(downstream);
+    let mut state = state;
     if let Value::Object(Some(integrator)) = integrator_val {
-        for elem in elems {
+        let integrator_pin = ctx.pin_native_root(integrator);
+        let elem_pins = pd_pin_elems(ctx, elems);
+        for (i, elem) in elems.iter().enumerate() {
+            let integrator = ctx.read_native_pin(integrator_pin, integrator);
+            let elem = pd_read_elem(ctx, &elem_pins, i, *elem);
+            state = pd_read_elem(ctx, &[state_pin], 0, state);
+            let downstream = ctx.read_native_pin(downstream_pin, downstream);
             let cont = ctx.invoke_virtual(
                 integrator,
                 "integrate",
                 "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/stream/Gatherer$Downstream;)Z",
-                &[state, *elem, Value::Object(Some(downstream))],
+                &[state, elem, Value::Object(Some(downstream))],
             );
             if let Ok(Some(Value::Int(0))) = cont {
                 break;
             }
         }
+        ctx.unpin_native_roots(integrator_pin);
     }
+    let downstream = ctx.read_native_pin(downstream_pin, downstream);
+    let state = pd_read_elem(ctx, &[state_pin], 0, state);
 
     if let Value::Object(Some(finisher_ref)) = finisher {
         let _ = ctx.invoke_virtual(
@@ -46616,6 +47324,8 @@ fn pd_gather_custom(
             &[state, Value::Object(Some(downstream))],
         );
     }
+    let downstream = ctx.read_native_pin(downstream_pin, downstream);
+    ctx.unpin_native_roots(downstream_pin);
 
     // Read collected downstream values
     let ds_size = match ctx.get_field(downstream, 1) {

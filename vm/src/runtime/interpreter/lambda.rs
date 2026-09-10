@@ -2034,11 +2034,28 @@ pub(crate) fn lambda_site_bump_unresumable() {
     lambda_site_prof::SITE_UNRESUMABLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// `(resumed, unresumable)` — the direct arm's deopt outcome split.
+/// `(resumed, unresumable)` — the deopt outcome split for a lambda body.
 ///
 /// `unresumable` is the number of SAM calls whose compiled body trapped and was
 /// then re-executed from entry by the generic path, side effects and all. It is
 /// the metric a regression test asserts is zero.
+///
+/// **`resumed` counts two doors, not one.** The direct arm
+/// (`try_lambda_site_direct_call`) is the original, and since 2026-09-08 the
+/// compiled caller's dispatch helper (`try_resume_trapped_callee`) bumps it too
+/// when it claims a lambda body's frame through the metafactory's
+/// `impl_handle`. Both answer the same question — was a trapped lambda body's
+/// frame SPENT rather than dropped — and a split that reported only one of them
+/// would read as zero engagement on a run where the other door did all the
+/// work, which is precisely the shape
+/// `lambda-callee-deopt-is-orphaned-by-the-sam-name-check-20260908` had.
+///
+/// **`pub` for `vm/tests/`, and it has to be.** Its only readers are
+/// integration tests, which live in a separate crate: they see neither
+/// `pub(crate)` nor `#[cfg(test)]`. That makes this a permanent entry on the
+/// test-only-public-API ratchet, carried deliberately -- see the
+/// "third disposition" note in `vm/tests/no_test_only_public_api.rs` before
+/// trying to gate or delete it.
 pub fn lambda_site_deopt_outcomes() -> (u64, u64) {
     use std::sync::atomic::Ordering;
     (
@@ -3588,7 +3605,42 @@ pub(crate) fn try_lambda_dispatch(
                 maybe_gc(shared, thread);
                 return Ok(Some(Some(Value::Object(Some(arr)))));
             }
-            ensure_class_initialized_shared(shared, thread, class_id)?;
+            // GC-safety: `full_args` is a bare `Vec<Value>` — the proxy's
+            // captured fields plus the call arguments — and it is NOT a GC
+            // root. Everything from here to the `<init>` dispatch can run a
+            // moving young collection: `ensure_class_initialized_shared` runs
+            // the class's `<clinit>`, and `gc_alloc_object` allocates. A
+            // collection there relocates the captured objects and leaves every
+            // entry in this vector naming the pre-move address, which is then
+            // laid straight into `<init>`'s locals.
+            //
+            // MEASURED on BindableTests under `CRATONVM_DBG_GC_STRESS=262144`:
+            // `TestMethodTestDescriptor::new`, reached as a constructor
+            // reference, received `arg[4]` — the `enclosingInstanceTypes`
+            // `Supplier` — at the address a collection had moved it away from
+            // one cycle earlier, and every later `get()` on it dispatched
+            // through an all-zero header. The `new_obj` pin below already
+            // documents exactly this hazard for the receiver; the arguments
+            // needed the same protection and did not have it.
+            //
+            // `fa_base` is the group base, so one `truncate` releases the whole
+            // set — including `new_obj`'s pin — on every exit from here on.
+            let fa_base = thread.native_pin_roots.len();
+            let fa_handles: Vec<Option<usize>> = full_args
+                .iter()
+                .map(|v| match v {
+                    Value::Object(Some(o)) => {
+                        let h = thread.native_pin_roots.len();
+                        thread.native_pin_roots.push(*o);
+                        Some(h)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if let Err(e) = ensure_class_initialized_shared(shared, thread, class_id) {
+                thread.native_pin_roots.truncate(fa_base);
+                return Err(e);
+            }
             // Use `num_total_fields` (inherited + declared instance fields),
             // matching the `New` opcode. `c.fields.len()` is wrong here: it
             // counts this class's declared fields *including statics* while
@@ -3602,7 +3654,22 @@ pub(crate) fn try_lambda_dispatch(
                 .get_class(class_id)
                 .map(|c| c.num_total_fields)
                 .unwrap_or(0);
-            let new_obj = gc_alloc_object(shared, thread, class_id, num_fields)?;
+            let new_obj = match gc_alloc_object(shared, thread, class_id, num_fields) {
+                Ok(o) => o,
+                Err(e) => {
+                    thread.native_pin_roots.truncate(fa_base);
+                    return Err(e);
+                }
+            };
+            // Refresh the arguments from their pins — the read that makes the
+            // pinning above worth anything.
+            for (j, h) in fa_handles.iter().enumerate() {
+                if let Some(h) = *h {
+                    if let Some(cur) = thread.native_pin_roots.get(h).copied() {
+                        full_args[j] = Value::Object(Some(cur));
+                    }
+                }
+            }
             // Build <init> args: [new_obj, ...full_args]. The constructor body
             // can allocate and trigger a moving GC; the Java frame/locals are
             // remapped, but this Rust local `new_obj` is not. Pin the receiver
@@ -3629,7 +3696,9 @@ pub(crate) fn try_lambda_dispatch(
                 .get(new_obj_pin)
                 .copied()
                 .unwrap_or(new_obj);
-            thread.native_pin_roots.truncate(new_obj_pin);
+            // Releases `new_obj`'s pin and the argument pins together —
+            // `fa_base` is below `new_obj_pin`.
+            thread.native_pin_roots.truncate(fa_base);
             init_result?;
             Ok(Some(Some(Value::Object(Some(forwarded)))))
         }

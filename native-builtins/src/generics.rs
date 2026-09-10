@@ -586,7 +586,9 @@ pub fn type_sig_to_java(
                 // (e.g. Gradle `RepositoryHandler`). Resolving up the scope hands
                 // back the real `TypeVariableImpl`, matching HotSpot.
                 let mut scope = decl;
+                let scope_pin = ctx.pin_native_root(scope);
                 for _ in 0..16 {
+                    let mut scope = ctx.read_native_pin(scope_pin, scope);
                     if let Some(real) = resolve_declared_type_variable(ctx, scope, name) {
                         return Ok(real);
                     }

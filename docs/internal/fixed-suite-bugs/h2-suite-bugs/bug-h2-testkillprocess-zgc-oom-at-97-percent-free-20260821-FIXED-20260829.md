@@ -37,7 +37,8 @@
 > and keeps running, which is a different shape from every other class here
 > (those failed once and died), so something is catching and retrying and that
 > is not a collector question. It has its own page:
-> `bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829.md`.
+> `bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829-RESOLVED-20260908.md`
+> (retired 2026-09-08: 0 ref-array OOM and 0 SIGSEGV over 8 runs).
 >
 > **Everything below this box is the record of how the diagnosis got here**,
 > including three attributions this page had to withdraw. Read
@@ -2036,7 +2037,7 @@ it.
 | `TestMVStoreCachePerformance`: `NoSuchMethodError` for `Page.isPersistent()` against a `Page$PageReference` RECEIVER — **PASSES 1/1 on 2026-08-29** (`rc=0`, and the slide never ran, so the run does not exercise the path it would live on) | `bug-h2-testmvstorecacheperformance-pagereference-receiver-20260829.md` |
 | `-XX:+UseG1GC` fails `TestKillProcessWhileWriting` | `h2-testkillprocesswhilewriting-g1-oom-FIXED-20260902-VERIFIED-20260906.md` |
 | the same fragmentation symptom in Spring Framework and Hibernate, never censused | `../gc/zgc-arena-fragmentation-occurrences-to-reverify-20260829.md` |
-| `TestCachedQueryResults`: still a LIVELOCK, `oom=2990` in 900 s on the fixed tip against 18 048 in 1 500 s before — a 3.6× lower rate and the same outcome | `bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829.md` |
+| `TestCachedQueryResults`: still a LIVELOCK, `oom=2990` in 900 s on the fixed tip against 18 048 in 1 500 s before — a 3.6× lower rate and the same outcome | `bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829-RESOLVED-20260908.md` (RESOLVED 2026-09-08) |
 
 The last row is the one that matters most, and it is the reason this page
 retires with a caveat rather than a clean sweep: **`TestCachedQueryResults` is

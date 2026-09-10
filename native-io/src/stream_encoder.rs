@@ -570,12 +570,20 @@ fn write_bytes(
     }
     let to_encode = &combined[..encode_len];
 
+    // GC: `encode_for_stream` reads the stream's `encoder` and asks it for its
+    // malformed/unmappable actions through `invoke_virtual`, so it runs Java
+    // and can collect on a path that returns normally. `this` is then handed
+    // to `buffer_and_maybe_flush`.
     let name = name_of(ctx, this);
     let encode_name = effective_encode_name(ctx, this, &name);
+    let pin = ctx.pin_native_root(this);
     let bytes = encode_for_stream(ctx, this, &encode_name, to_encode)?;
     if bytes.is_empty() {
+        ctx.unpin_native_roots(pin);
         return Ok(());
     }
+    let this = ctx.read_native_pin(pin, this);
+    ctx.unpin_native_roots(pin);
     buffer_and_maybe_flush(ctx, this, &name, &bytes)?;
     Ok(())
 }
@@ -606,7 +614,12 @@ fn buffer_and_maybe_flush(
     // growing the buffer unboundedly — mirrors real StreamEncoder's overflow
     // handling, which never grows `bb` past `maxBufferCapacity`.
     if bytes.len() > MAX_BYTE_BUFFER_CAPACITY {
+        // GC: `flush_pending_buffer` reaches `write_through`, which allocates a
+        // byte array and calls `write` on the wrapped stream.
+        let pin = ctx.pin_native_root(this);
         flush_pending_buffer(ctx, this)?;
+        let this = ctx.read_native_pin(pin, this);
+        ctx.unpin_native_roots(pin);
         return write_through(ctx, this, bytes);
     }
 
@@ -669,7 +682,13 @@ fn write_through(
         Value::Object(Some(s)) => s,
         _ => return Ok(()),
     };
+    // GC: the byte array's allocation can move `os`, which is the receiver
+    // of the call below. Released on the way out — this runs once per buffered
+    // write.
+    let os_pin = ctx.pin_native_root(os);
     let buf = ctx.new_array(ArrayElementType::Byte, bytes.len());
+    let os = ctx.read_native_pin(os_pin, os);
+    ctx.unpin_native_roots(os_pin);
     // AUDIT 2026-05-17: bulk write via NativeContext intrinsic.
     ctx.write_byte_array_from(buf, 0, bytes);
     ctx.invoke_virtual(
@@ -768,7 +787,14 @@ fn native_se_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(o) => o,
         None => return Ok(None),
     };
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let this_pin = ctx.pin_native_root(this);
     ensure_open(ctx, this)?;
+    let this = ctx.read_native_pin(this_pin, this);
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let this_pin = ctx.pin_native_root(this);
     // Deliver any bytes still sitting in the pending buffer before flushing
     // the underlying stream, or `flush()` would be a no-op from the caller's
     // point of view (real `StreamEncoder.implFlush` does the same:
@@ -779,6 +805,7 @@ fn native_se_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // learn whether the encoded bytes reached the sink.
     // W7-57-close-flush-swallow-sweep.md
     flush_pending_buffer(ctx, this)?;
+    let this = ctx.read_native_pin(this_pin, this);
     if let Value::Object(Some(os)) = ctx.get_field_by_name(this, "out") {
         ctx.invoke_virtual(os, "flush", "()V", &[])?;
     }
@@ -793,6 +820,9 @@ fn native_se_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(o) => o,
         None => return Ok(None),
     };
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let this_pin = ctx.pin_native_root(this);
     if is_closed(ctx, this) {
         return Ok(None);
     }
@@ -801,6 +831,10 @@ fn native_se_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // the JDK's encoder.encode(.., endOfInput=true) + flush at close. Done
     // before the stream is flushed/closed so the bytes actually go out.
     flush_pending_surrogate(ctx, this)?;
+    let this = ctx.read_native_pin(this_pin, this);
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let this_pin = ctx.pin_native_root(this);
     // Deliver any bytes still sitting in the pending buffer — without this
     // the last partial batch (< buffer capacity) would be silently dropped
     // on close, matching real `StreamEncoder.implClose`'s final
@@ -818,6 +852,10 @@ fn native_se_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // (The `addSuppressed` link between the two is not reproduced; recorded as
     // a residual in that record.)
     flush_pending_buffer(ctx, this)?;
+    let this = ctx.read_native_pin(this_pin, this);
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let this_pin = ctx.pin_native_root(this);
     let (flushed, closed) = if let Value::Object(Some(os)) = ctx.get_field_by_name(this, "out") {
         let flushed = ctx.invoke_virtual(os, "flush", "()V", &[]).map(|_| ());
         // Attempted regardless, exactly as the `try`-with-resources does.
@@ -826,6 +864,7 @@ fn native_se_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     } else {
         (Ok(()), Ok(()))
     };
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this, "closed", Value::Int(1));
     ctx.set_field_by_name(this, "out", Value::Object(None));
     se_table().lock().unwrap().remove(&se_key(ctx, this));
@@ -857,7 +896,12 @@ fn flush_pending_surrogate(
     if bytes.is_empty() {
         return Ok(());
     }
+    // GC: same window as `write_through` — the byte array's allocation can
+    // move `os`, which is the receiver of the call below.
+    let os_pin = ctx.pin_native_root(os);
     let buf = ctx.new_array(ArrayElementType::Byte, bytes.len());
+    let os = ctx.read_native_pin(os_pin, os);
+    ctx.unpin_native_roots(os_pin);
     ctx.write_byte_array_from(buf, 0, &bytes);
     ctx.invoke_virtual(
         os,

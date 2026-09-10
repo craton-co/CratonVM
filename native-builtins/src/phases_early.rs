@@ -3319,7 +3319,14 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             };
             // Each entry is a 3-field object (key=0, value=1, next=2)
             let arr_len = ctx.array_length(entries);
+            // GC-safety: `accept` is an arbitrary user lambda -- it allocates --
+            // and both the consumer and the bucket array are carried across
+            // every turn.
+            let action_pin = ctx.pin_native_root(action);
+            let entries_pin = ctx.pin_native_root(entries);
             for i in 0..arr_len {
+                let action = ctx.read_native_pin(action_pin, action);
+                let entries = ctx.read_native_pin(entries_pin, entries);
                 if let Value::Object(Some(entry)) = ctx.get_array_element(entries, i) {
                     let key = ctx.get_field(entry, 0);
                     let val = ctx.get_field(entry, 1);
@@ -5393,7 +5400,9 @@ fn try_jdk_enum_set_of_elements(ctx: &mut dyn NativeContext, elems: &[Value]) ->
         Ok(Some(Value::Object(Some(s)))) => s,
         _ => return None,
     };
+    let set_pin = ctx.pin_native_root(set);
     for elem in elems {
+        let set = ctx.read_native_pin(set_pin, set);
         if let Value::Object(Some(_)) = *elem {
             if ctx
                 .invoke_virtual(set, "add", "(Ljava/lang/Object;)Z", &[*elem])
@@ -5982,7 +5991,9 @@ fn native_es_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         enum_set_elements(ctx, coll)
     };
     let mut modified = false;
+    let this_pin = ctx.pin_native_root(this);
     for elem in elems {
+        let this = ctx.read_native_pin(this_pin, this);
         if matches!(elem, Value::Object(Some(_))) {
             native_es_add(ctx, &[Value::Object(Some(this)), elem])?;
             modified = true;
@@ -7990,7 +8001,25 @@ fn exchanger_do_exchange(
     let deadline = timeout_ms
         .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms.max(0) as u64));
 
+    // GC: this loop BLOCKS in `monitor_wait`, and a blocked thread is exactly
+    // where a PEER thread's collection runs. Both the receiver and the value
+    // being exchanged are Rust locals that no collection rewrites, and the
+    // loop dereferences both on the next turn. That makes this the widest
+    // window in the tranche — every other site needs a collection to land in a
+    // short call, this one waits for one. Pin both and re-read at the top of
+    // each turn. See `internal/audits/wide-tranche-triage-20260907.md`.
+    let this_pin = ctx.pin_native_root(this);
+    let my_val_pin = match my_val {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
+
     loop {
+        let this = ctx.read_native_pin(this_pin, this);
+        let my_val = match my_val_pin {
+            Some((pin, obj)) => Value::Object(Some(ctx.read_native_pin(pin, obj))),
+            None => my_val,
+        };
         ctx.monitor_enter(this);
         let state = ctx.get_field(this, EXCH_FIELD_STATE).as_int().unwrap_or(0);
 
@@ -8010,6 +8039,11 @@ fn exchanger_do_exchange(
             // A previous exchange is still completing (the first thread has
             // not yet collected its reply) — wait for the reset, then retry.
             let wait_result = ctx.monitor_wait(this, Some(5));
+            // The wait PARKS, so the exit that pairs with it has to use the
+            // post-wait address: `MonitorTable::exit` dereferences the header,
+            // and a pre-wait address is a fault (reclaimed) or a permanently
+            // leaked monitor (merely moved).
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.monitor_exit(this);
             wait_result?;
             continue;
@@ -8021,7 +8055,14 @@ fn exchanger_do_exchange(
         ctx.monitor_exit(this);
 
         // Wait until a partner completes the exchange (state == 2).
+        //
+        // The re-read at the top of the OUTER loop does not reach here: this
+        // inner loop is where the thread actually parks, and it can spin for
+        // the whole timeout without the outer body running again. Re-read
+        // `this` on every inner turn too -- `monitor_wait` at the foot of the
+        // body is the widest collection window in this function.
         loop {
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.monitor_enter(this);
             let cur_state = ctx.get_field(this, EXCH_FIELD_STATE).as_int().unwrap_or(0);
             if cur_state == 2 {
@@ -8048,6 +8089,8 @@ fn exchanger_do_exchange(
                 }
             }
             let wait_result = ctx.monitor_wait(this, Some(5));
+            // Post-wait address, as in the state==2 branch above.
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.monitor_exit(this);
             wait_result?;
         }
@@ -8283,15 +8326,37 @@ pub(crate) fn register_phaser_natives(r: &mut NativeMethodRegistry) {
             // Not all parties arrived yet — record arrival and wait for phase to advance
             ph_set(ctx, this, PH_H_ARRIVALS, new_arrivals);
             let target_phase = phase + 1;
+            // `monitor_wait` PARKS, which is exactly where a peer thread's
+            // collection runs — and `this` is the holder array every `ph_get`
+            // and the `monitor_exit` below dereference. Pin it and re-read
+            // through the pin AFTER each wait; without that the loop kept
+            // reading (and released the monitor at) the pre-wait address.
+            //
+            // MERGE NOTE (2026-09-08): `origin/dev` fixed this site in the same
+            // hour with the re-read at the TOP of the loop instead. That closes
+            // the loop-carried half — turn N+1 no longer reads turn N's address
+            // — but not the within-turn half: the `monitor_exit` on the error
+            // path and the `ph_get` that follows the wait both still ran on the
+            // PRE-wait value, which is the address `MonitorTable::exit`
+            // dereferences. Resolved to this side because the park window ends
+            // at the wait, not at the top of the loop, and because
+            // `stale-receiver-audit.py`'s RULE 2 reports the other shape as a
+            // site.
+            let this_pin = ctx.pin_native_root(this);
+            let mut cur = this;
             // Bounded monitor-waits until the phase advances
             loop {
-                if let Err(e) = ctx.monitor_wait(this, Some(10)) {
-                    ctx.monitor_exit(this);
+                let wr = ctx.monitor_wait(cur, Some(10));
+                cur = ctx.read_native_pin(this_pin, cur);
+                if let Err(e) = wr {
+                    ctx.monitor_exit(cur);
+                    ctx.unpin_native_roots(this_pin);
                     return Err(e);
                 }
-                let current_phase = ph_get(ctx, this, PH_H_PHASE);
+                let current_phase = ph_get(ctx, cur, PH_H_PHASE);
                 if current_phase >= target_phase || current_phase < 0 {
-                    ctx.monitor_exit(this);
+                    ctx.monitor_exit(cur);
+                    ctx.unpin_native_roots(this_pin);
                     return Ok(Some(Value::Int(current_phase)));
                 }
             }
@@ -25271,7 +25336,9 @@ fn spl_prim_for_each_remaining(
         _ => 0,
     };
     let len = ctx.array_length(data);
+    let consumer_pin = ctx.pin_native_root(consumer);
     for i in cursor..len {
+        let consumer = ctx.read_native_pin(consumer_pin, consumer);
         let raw = ctx.get_array_element(data, i);
         let val = spl_prim_element_value(raw, prim);
         ctx.invoke_virtual(consumer, "accept", accept_desc, &[val])?;

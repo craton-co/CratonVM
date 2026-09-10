@@ -1479,14 +1479,33 @@ impl Compiler {
         // branch silently dropped it. Two dwords per `new` is the same price
         // that comment already judged negligible.
         self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32, 0);
-        self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32 + 4, 0);
+        // The HIGH dword is not zero: it carries `GC_FLAG_HEADER`, the bit that
+        // makes a published header distinguishable from zeroed arena space. A
+        // JIT-inline `new Object()` is `ClassId(0)`, `shape = 0` and (before
+        // this) `mark = 0` — sixteen zero bytes, which the young non-moving
+        // sweep cannot parse and therefore never reclaims. See
+        // `cratonvm_types::GC_FLAG_HEADER`.
+        //
+        // Folded into the existing store rather than added as a fifth
+        // instruction: `GC_FLAGS_BYTE_OFFSET` is `MARK_WORD_OFFSET + 7`, i.e.
+        // byte 3 of THIS dword, so the flag is just the immediate shifted by
+        // 24. `header_offset_contract_gc_flags_live_in_the_mark_words_top_byte`
+        // pins that relationship.
+        const HEADER_FLAG_IN_HIGH_DWORD: i32 = (cratonvm_types::GC_FLAG_HEADER as i32) << 24;
+        self.emit_mov_dword_mem_disp32_imm32(
+            R11,
+            cratonvm_types::MARK_WORD_OFFSET as i32 + 4,
+            HEADER_FLAG_IN_HIGH_DWORD,
+        );
 
-        // AFTER the mark-word zeroing, which would otherwise erase it.
+        // AFTER the mark-word zeroing, which would otherwise erase it. The
+        // whole-byte store carries `GC_FLAG_HEADER` too, for the same reason —
+        // it overwrites the byte the flag was just written into.
         if compact_flag_pending {
             self.emit_mov_byte_mem_disp32_imm8(
                 R11,
                 cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
-                cratonvm_types::GC_FLAG_COMPACT,
+                cratonvm_types::GC_FLAG_COMPACT | cratonvm_types::GC_FLAG_HEADER,
             );
         }
 
@@ -1504,10 +1523,11 @@ impl Compiler {
             // written inline above, the header is complete enough for
             // both the GC walker and the runtime; no helper call needed.
             //
-            // Class, kind/flags, and shape are explicitly published above.
-            // Body defaults, forwarding_ptr=null, and
-            // mark_word=MARK_NEUTRAL come from the refill zeroing invariant
-            // unless the conservative opt-out repeats those stores inline.
+            // Class, kind/flags, shape and the whole mark word are explicitly
+            // published above — the mark word unconditionally, and with
+            // `GC_FLAG_HEADER` set, so the span is parseable as an object by
+            // the collector's linear walk. Only the body defaults come from
+            // the refill zeroing invariant.
             //
             // RAX = obj_ptr — both arms converge with RAX holding the
             // freshly-allocated object pointer.
@@ -1680,23 +1700,48 @@ impl Compiler {
     ///
     /// So they guard on the process-wide replacement epoch instead — coarser,
     /// and affordable because only a REPLACEMENT bumps it, never a new class
-    /// registration. Four instructions; a mismatch permanently routes the site
+    /// registration. Two instructions; a mismatch permanently routes the site
     /// to the always-correct helper.
     ///
+    /// The compare is `CMP DWORD [rip+disp32], imm32` — see
+    /// [`Self::emit_cmp_mem32_abs_imm32`] — which is why "two" and not the
+    /// "four" this comment said until 2026-09-10.
+    ///
+    /// Whether that form is REACHABLE is not this emitter's decision. The
+    /// counter has to be within ±2GB of the buffer, which took moving it off
+    /// `.data` (Windows: ~140TB away as a `static`) and then, on System V,
+    /// moving the CODE — `jit::platform`'s `near_globals`, where
+    /// `mmap(NULL, …)` had been putting buffers ~130TB from the heap the
+    /// counter lives in. Where neither holds, the range check below declines
+    /// and the long form is emitted. See `LAYOUT_REPLACE_EPOCH` in
+    /// `cratonvm_types::field_layout`, and
+    /// `docs/internal/performance/c2-the-layout-epoch-guard-was-unreachable-by-rip-20260910.md`.
+    ///
+    /// Reach is best-effort, so the materialize-the-address form stays as the
+    /// fallback — and `CRATONVM_JIT_SP_EPOCH_GUARD_RIP=0` selects it
+    /// deliberately rather than waiting for an address space that produces it.
+    ///
     /// Returns `None` when the caller should emit no guard at all, which today
-    /// never happens — the epoch address is a `'static` and always available —
-    /// but keeps the shape honest if that ever changes.
+    /// never happens — the epoch address is always available — but keeps the
+    /// shape honest if that ever changes.
     pub(super) fn emit_layout_epoch_guard(&mut self) -> Option<usize> {
         let (addr, expected) = cratonvm_types::layout_replace_epoch_guard();
         if addr.is_null() {
             return None;
         }
-        self.emit_mov_imm64_full(R11, addr as i64);
-        self.emit_mov_r32_mem_disp32(RCX, R11, 0);
-        // CMP ECX, imm32.
-        self.buf.emit_byte(0x81);
-        self.buf.emit_byte(0xF9);
-        self.buf.emit(&(expected as i32).to_le_bytes());
+        if !jit_sp_epoch_guard_rip_enabled()
+            || !self.emit_cmp_mem32_abs_imm32(addr as usize, expected)
+        {
+            // Out of ±2GB RIP reach, or the encoding switch is off:
+            // materialize the address and read through it. This is the shape
+            // the guard had before 2026-09-10, kept verbatim as the fallback.
+            self.emit_mov_imm64_full(R11, addr as i64);
+            self.emit_mov_r32_mem_disp32(RCX, R11, 0);
+            // CMP ECX, imm32.
+            self.buf.emit_byte(0x81);
+            self.buf.emit_byte(0xF9);
+            self.buf.emit(&(expected as i32).to_le_bytes());
+        }
         Some(self.emit_jcc_rel32_patch(0x85)) // JNE -> helper
     }
 

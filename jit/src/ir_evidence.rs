@@ -20,13 +20,39 @@
 //!
 //! # What is recorded, and what it is NOT
 //!
-//! A bitset of transforms the optimizing tier applied to THIS compile. It is
-//! deliberately not a quality score and cannot be one: a compile-time predicate
-//! cannot know whether the emitted body is faster. What it can know is whether
-//! the tier did anything at all that the baseline tier has no equivalent for --
-//! and when the answer is no, the C2 body is a differently-emitted version of
-//! the same computation carrying this tier's weaker register model, which is
-//! the case there is no argument for publishing.
+//! A [`CompileRecord`]: a bitset of transforms the optimizing tier applied to
+//! THIS compile, plus the per-execution costs it introduced.
+//!
+//! The bitset was the whole record until 2026-09-10, on the argument that "a
+//! compile-time predicate cannot know whether the emitted body is faster". That
+//! is true of the body as a whole and it was doing more work than it can bear:
+//! a predicate cannot know the total, but it CAN know the price of the specific
+//! trades this tier makes, because those prices are measured.
+//!
+//! The gap was not hypothetical. Splicing `Objects.checkIndex` into
+//! `ArrayList.get` sets `Inlined`, which the list accepts. The call that splice
+//! left behind is native-shadowed, so it lowered to a name resolution -- ~175 ns
+//! on every execution against a direct `CALL`'s ~4 -- and the published body ran
+//! its probe in 897 ms against the single-pass body's 338. **The transform was
+//! the evidence that got a 3x regression published: the harmful change paid for
+//! its own admission.** (`c2-splice-checkcast-and-instanceof-20260909.md`.)
+//!
+//! So evidence is now NECESSARY BUT NOT SUFFICIENT. The list still answers "did
+//! this tier do something the baseline has no equivalent for"; the counts
+//! answer "and what did that cost", and a body whose net per-execution cost
+//! went up is refused however much it transformed. Refusing costs the
+//! single-pass body. Accepting a regression costs every execution of it, and
+//! nothing downstream measures that -- which is why the asymmetry is
+//! deliberate.
+//!
+//! What the price does NOT model: site execution frequency. A resolution on a
+//! cold branch is charged like one in a loop. That errs toward refusing, which
+//! is the safe direction here, and it is the first thing to fix if this is ever
+//! measured refusing bodies that were in fact better.
+//!
+//! When the transform list answers "no" the C2 body is a differently-emitted
+//! version of the same computation carrying this tier's weaker register model,
+//! which is the case there is no argument for publishing.
 //!
 //! The membership of [`is_worth_publishing`]'s list is a JUDGMENT, stated as
 //! one so it can be argued with. Two entries are firm:
@@ -120,6 +146,51 @@ impl Transform {
     ];
 }
 
+/// What one compile did, as both the transform bitset and the per-execution
+/// costs it introduced.
+///
+/// The bitset alone was the whole record until 2026-09-10, and the gap that
+/// closed is in [`is_worth_publishing`]: a bit says a transform HAPPENED, and a
+/// transform that happened can still have made the body slower. The counts
+/// below are the two sides of the one trade this tier is known to lose.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompileRecord {
+    /// Transforms applied, as [`Transform`] bit positions.
+    pub bits: u32,
+    /// Callee frames removed by splicing in this compile. Each saves roughly
+    /// one direct `CALL` per execution.
+    pub spliced_frames: u32,
+    /// Calls this body lowered to `jit_invoke_dispatch` -- a name resolution on
+    /// EVERY execution -- at sites that exist only because a callee body was
+    /// spliced in. `own_code` blind dispatches are deliberately not counted:
+    /// the method's own megamorphic or unbindable sites resolve by name in
+    /// either tier, so they are not something publishing this body causes.
+    pub blind_dispatches_in_splice: u32,
+}
+
+impl CompileRecord {
+    /// Estimated per-execution cost this compile ADDED, in nanoseconds.
+    /// Negative is an improvement.
+    ///
+    /// Both constants are measured and already load-bearing elsewhere in this
+    /// crate: a `jit_invoke_dispatch` resolves its callee by name at ~175 ns
+    /// against a direct `CALL`'s ~4 (see `ir_lower`'s blind-dispatch arm, and
+    /// `InlineInvokeTarget::direct_entry`, which states the same trade as
+    /// "removing a ~4 ns frame does not pay for a ~175 ns downgrade").
+    ///
+    /// The model weights every site equally, which is its main limitation: a
+    /// blind dispatch on a cold branch is charged the same as one in a loop.
+    /// It errs toward refusing, and the asymmetry is deliberate -- the refused
+    /// body is merely the single-pass one, while the accepted body is a
+    /// regression nothing downstream measures.
+    pub fn added_ns_per_execution(self) -> i64 {
+        const BLIND_DISPATCH_NS: i64 = 175;
+        const DIRECT_CALL_NS: i64 = 4;
+        i64::from(self.blind_dispatches_in_splice) * (BLIND_DISPATCH_NS - DIRECT_CALL_NS)
+            - i64::from(self.spliced_frames) * DIRECT_CALL_NS
+    }
+}
+
 thread_local! {
     /// A STACK of armed compiles, innermost last. Empty means nothing is armed.
     ///
@@ -134,14 +205,14 @@ thread_local! {
     /// compile and the outer one keeps its own bits. The `unjudged` counter is
     /// what found this; it is the reason the fail-open case is counted rather
     /// than silently accepted.
-    static STACK: std::cell::RefCell<Vec<u32>> = const {
+    static STACK: std::cell::RefCell<Vec<CompileRecord>> = const {
         std::cell::RefCell::new(Vec::new())
     };
 }
 
 /// Arm a new optimizing compile on this thread. Nests.
 pub fn begin_compile() {
-    STACK.with(|s| s.borrow_mut().push(0));
+    STACK.with(|s| s.borrow_mut().push(CompileRecord::default()));
 }
 
 /// Record that `t` was applied to the compile running on this thread.
@@ -154,8 +225,29 @@ pub fn begin_compile() {
 pub fn note(t: Transform) {
     STACK.with(|s| {
         if let Ok(mut v) = s.try_borrow_mut() {
-            if let Some(bits) = v.last_mut() {
-                *bits |= t.bit();
+            if let Some(rec) = v.last_mut() {
+                rec.bits |= t.bit();
+                if matches!(t, Transform::Inlined) {
+                    rec.spliced_frames = rec.spliced_frames.saturating_add(1);
+                }
+            }
+        }
+    });
+}
+
+/// Record that this compile lowered a call inside a SPLICED body to the blind
+/// dispatch helper. Ignored when nothing is armed, for `note`'s reason.
+///
+/// This is the cost side of the splice trade, and it is counted here rather
+/// than read from `ir_lower`'s process-wide census because the gate judges ONE
+/// compile and that census is cumulative across all of them.
+#[inline]
+pub fn note_blind_dispatch_in_splice() {
+    STACK.with(|s| {
+        if let Ok(mut v) = s.try_borrow_mut() {
+            if let Some(rec) = v.last_mut() {
+                rec.blind_dispatches_in_splice =
+                    rec.blind_dispatches_in_splice.saturating_add(1);
             }
         }
     });
@@ -164,7 +256,7 @@ pub fn note(t: Transform) {
 /// Pop the innermost armed compile. `None` means none was armed on this
 /// thread, which a caller must treat as "cannot judge" rather than as "did
 /// nothing".
-pub fn take() -> Option<u32> {
+pub fn take() -> Option<CompileRecord> {
     STACK.with(|s| s.borrow_mut().pop())
 }
 
@@ -189,7 +281,33 @@ pub fn describe(bits: u32) -> String {
 /// single-pass backend has both (`x64/loop_unroll_admission.rs` unrolls 4x,
 /// `x64/licm.rs` hoists), so their presence in a C2 body is not evidence the C2
 /// body is the better one.
-pub fn is_worth_publishing(bits: u32) -> bool {
+pub fn is_worth_publishing(rec: CompileRecord) -> bool {
+    // Evidence is NECESSARY but no longer SUFFICIENT (2026-09-10).
+    //
+    // The list below answers "did this tier do something the baseline has no
+    // equivalent for". It cannot answer "and did that make the body faster",
+    // and the difference is not hypothetical. `Objects.checkIndex` spliced into
+    // `ArrayList.get` set `Inlined`, which this list accepts; the call that
+    // splice left behind was native-shadowed, so it lowered to a name
+    // resolution, and the published body ran the probe in 897 ms against the
+    // single-pass body's 338. The transform was the evidence that got a 3x
+    // regression published -- the harmful change paid for its own admission.
+    // See `c2-splice-checkcast-and-instanceof-20260909.md`.
+    //
+    // So the trade is now priced, with the same measured constants the splice
+    // path already reasons in, and a body whose net per-execution cost went UP
+    // is refused however much it transformed. Refusing costs the single-pass
+    // body; accepting a regression costs every execution, and nothing
+    // downstream measures it.
+    if rec.added_ns_per_execution() > 0 {
+        return false;
+    }
+    is_worth_publishing_bits(rec.bits)
+}
+
+/// The transform-list half of the judgment, split out so it can be tested and
+/// argued with on its own. Callers want [`is_worth_publishing`].
+pub fn is_worth_publishing_bits(bits: u32) -> bool {
     const WORTH: u32 = Transform::ScalarReplacement.bit()
         | Transform::Inlined.bit()
         | Transform::GuardElided.bit()
@@ -281,7 +399,7 @@ static UNJUDGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// thread — ACCEPTS and counts `unjudged`, because a plumbing mistake must
 /// cost an unfiltered publish, never a silently disabled tier. A non-zero
 /// `unjudged` in the census is the signal that the recording is broken.
-pub fn accept(evidence: Option<u32>) -> bool {
+pub fn accept(evidence: Option<CompileRecord>) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     match accept_policy() {
         AcceptPolicy::Always => {
@@ -298,11 +416,24 @@ pub fn accept(evidence: Option<u32>) -> bool {
                 ACCEPTED.fetch_add(1, Relaxed);
                 true
             }
-            Some(bits) if is_worth_publishing(bits) => {
+            // Priced as a regression: refused whatever it transformed, and
+            // counted apart from the no-evidence refusals because the two mean
+            // opposite things about the tier. A no-evidence refusal says the
+            // tier did nothing; this one says it did something harmful.
+            Some(rec) if rec.added_ns_per_execution() > 0 => {
+                REFUSED_COST_REGRESSION.fetch_add(1, Relaxed);
+                REGRESSION_NS_REFUSED.fetch_add(
+                    u64::try_from(rec.added_ns_per_execution()).unwrap_or(0),
+                    Relaxed,
+                );
+                false
+            }
+            Some(rec) if is_worth_publishing(rec) => {
                 ACCEPTED.fetch_add(1, Relaxed);
                 true
             }
-            Some(bits) => {
+            Some(rec) => {
+                let bits = rec.bits;
                 REFUSED_NO_EVIDENCE.fetch_add(1, Relaxed);
                 // Split the refusals by whether the optimizer did ANYTHING.
                 // See `Transform::Simplified` for why this is the number the
@@ -316,6 +447,25 @@ pub fn accept(evidence: Option<u32>) -> bool {
             }
         },
     }
+}
+
+/// Bodies refused because their priced per-execution cost went UP, and the
+/// total nanoseconds-per-execution those refusals declined to publish.
+static REFUSED_COST_REGRESSION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static REGRESSION_NS_REFUSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(bodies refused as a cost regression, ns/execution they would have added)`.
+///
+/// A non-zero left-hand number is the gate doing the job the transform list
+/// alone could not: refusing a body that DID transform and was slower for it.
+pub fn cost_regression_census() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        REFUSED_COST_REGRESSION.load(Relaxed),
+        REGRESSION_NS_REFUSED.load(Relaxed),
+    )
 }
 
 static REFUSED_BUT_SIMPLIFIED: std::sync::atomic::AtomicU64 =
@@ -367,8 +517,8 @@ mod tests {
         begin_compile();
         assert_eq!(
             take(),
-            Some(0),
-            "an armed compile that did nothing reads as Some(0), not None",
+            Some(CompileRecord::default()),
+            "an armed compile that did nothing reads as an empty record, not None",
         );
     }
 
@@ -385,13 +535,13 @@ mod tests {
         note(Transform::GuardElided);
         let inner = take().expect("the inner compile is armed");
         assert_eq!(
-            describe(inner),
+            describe(inner.bits),
             "guard-elided",
             "the inner compile must see ONLY its own transforms",
         );
         let outer = take().expect("the outer compile must still be armed");
         assert_eq!(
-            describe(outer),
+            describe(outer.bits),
             "inlined",
             "the outer compile must keep its own bits across a nested one",
         );
@@ -404,9 +554,9 @@ mod tests {
         begin_compile();
         note(Transform::Inlined);
         note(Transform::GuardElided);
-        let bits = take().expect("armed");
-        assert!(is_worth_publishing(bits));
-        let d = describe(bits);
+        let rec = take().expect("armed");
+        assert!(is_worth_publishing(rec));
+        let d = describe(rec.bits);
         assert!(d.contains("inlined") && d.contains("guard-elided"), "{d}");
     }
 
@@ -419,12 +569,73 @@ mod tests {
         begin_compile();
         note(Transform::Unrolled);
         note(Transform::Licm);
-        let bits = take().expect("armed");
+        let rec = take().expect("armed");
         assert!(
-            !is_worth_publishing(bits),
+            !is_worth_publishing(rec),
             "the baseline tier unrolls 4x and hoists; doing the same is not a \
              reason to replace its body",
         );
+    }
+
+    /// THE REGRESSION THIS GATE MISSED. `Inlined` is on the evidence list, so
+    /// the bitset alone accepts this body -- and the body is slower, because
+    /// the splice left behind a call that resolves by name on every execution.
+    /// Measured shape: `Objects.checkIndex` spliced into `ArrayList.get`,
+    /// 897 ms against a single-pass 338 ms.
+    #[test]
+    fn a_transform_that_made_the_body_slower_is_refused() {
+        drain();
+        begin_compile();
+        note(Transform::Inlined);
+        note_blind_dispatch_in_splice();
+        let rec = take().expect("armed");
+        assert!(
+            is_worth_publishing_bits(rec.bits),
+            "the transform list alone still accepts it -- that is the bug",
+        );
+        assert!(
+            rec.added_ns_per_execution() > 0,
+            "one name resolution against one saved frame is a regression",
+        );
+        assert!(
+            !is_worth_publishing(rec),
+            "the priced judgment must refuse a body its own transform made slower",
+        );
+    }
+
+    /// The refusal is a PRICE, not a veto on the opcode: enough saved frames
+    /// pay for a resolution, and the gate must let that through rather than
+    /// treating any blind dispatch as fatal.
+    #[test]
+    fn enough_saved_frames_pay_for_a_resolution() {
+        drain();
+        begin_compile();
+        note(Transform::Inlined);
+        note_blind_dispatch_in_splice();
+        // 171 ns of regression against 4 ns a frame: 43 frames is the turn.
+        for _ in 0..50 {
+            note(Transform::Inlined);
+        }
+        let rec = take().expect("armed");
+        assert!(rec.added_ns_per_execution() <= 0, "{rec:?}");
+        assert!(is_worth_publishing(rec), "a paid-for trade is still publishable");
+    }
+
+    /// A blind dispatch in the method's OWN code is not this compile's doing --
+    /// an unbindable or megamorphic site resolves by name in either tier -- so
+    /// it must not be charged here. Only `note_blind_dispatch_in_splice` counts.
+    #[test]
+    fn only_the_splices_own_resolutions_are_charged() {
+        drain();
+        begin_compile();
+        note(Transform::Inlined);
+        let rec = take().expect("armed");
+        assert_eq!(rec.blind_dispatches_in_splice, 0);
+        assert!(
+            rec.added_ns_per_execution() < 0,
+            "a splice that left no resolution behind is a straight saving",
+        );
+        assert!(is_worth_publishing(rec));
     }
 
     /// A plumbing mistake must cost an unfiltered publish, not a disabled tier.

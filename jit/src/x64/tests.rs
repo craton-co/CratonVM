@@ -312,6 +312,175 @@ fn a_splice_does_not_rewind_the_cursor_under_a_buried_operand() {
     );
 }
 
+/// A reservation must not hand out a frame word that an OPEN inline scope's
+/// LOCALS still own.
+///
+/// # What this is about
+///
+/// A spliced callee's locals are reserved once, at its `callee_local_base`, and
+/// stay live until the wrapper pops the scope. They are NOT on the operand
+/// stack, so every "is this slot still owned?" scan in the compiler — the one
+/// in `pop_stack`'s reclaim arm, the one in `reset_spills`, the live-slot clamp
+/// in `try_emit_inline_body` — is blind to them. Any of the ~70 places that
+/// assign `next_spill_offset` can therefore leave the cursor pointing into an
+/// enclosing splice's locals, and the next reservation hands that word out to a
+/// second owner. The enclosing body then reads back whatever the new owner
+/// stored.
+///
+/// Measured on `CriteriaWindowFunctionTest` with `CRATONVM_DBG=jit-slot-overlap`
+/// before the floor: **151 of 304** overlap reports were against an ENCLOSING
+/// scope, i.e. one whose body continues after the inner call returns. Nearly
+/// all were `#1/3` — a middle scope in a three-deep splice — and in every
+/// sampled report the reservation range was EXACTLY the scope's locals range.
+/// With the floor: **0**, same binary, one switch, 11/11 both arms.
+///
+/// # Why the assertion is on the RESERVATION and not on a computed answer
+///
+/// The same reason its sibling above asserts on the cursor: the defect lives in
+/// the spill-slot simulation, and the descent that reaches an enclosing scope's
+/// locals needs a three-deep splice in an 11 KB bytebuddy body to occur
+/// naturally. What can be pinned here is the invariant itself — that a
+/// reservation never starts inside an open scope's locals, however the cursor
+/// got there — which is exactly what `reserve_spill_slots` now enforces.
+///
+/// The `A` arm is `CRATONVM_JIT_NO_INLINE_LOCALS_FLOOR=1`; it is not exercised
+/// here because the switch is a process-wide environment read and these tests
+/// run in parallel in one process.
+#[test]
+fn a_reservation_never_starts_inside_an_open_inline_scopes_locals() {
+    let alloc_result = crate::regalloc::RegAllocResult {
+        assignments: Vec::new(),
+        xmm_assignments: Vec::new(),
+        used_callee_saved: Vec::new(),
+        used_xmm_regs: Vec::new(),
+        block_live_in: Vec::new(),
+    };
+    let mut compiler = Compiler::new(
+        "inline-enclosing-locals-test".to_string(),
+        ExecutableBuffer::new(65536).expect("test executable buffer"),
+        0,
+        0,
+        64,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        alloc_result,
+        false,
+        test_helpers(),
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Vec::new(),
+    );
+
+    // THREE open scopes, the `#1/3` shape the census reports, because the
+    // floor is the maximum over the ENCLOSING ones only. Two scopes would leave
+    // a single enclosing scope and would pass just as well against a
+    // `last()`-style floor that ignores the outer one; three separates "max
+    // over the enclosing scopes" from "the scope just below the top".
+    let outer_base = compiler.next_spill_offset;
+    let outer = InlineOopScope {
+        local_base: outer_base,
+        num_locals: 3,
+        masks: Vec::new(),
+        reached: Vec::new(),
+        cur_pc: 0,
+    };
+    let middle_base = outer_base + 3 * 8;
+    let middle = InlineOopScope {
+        local_base: middle_base,
+        num_locals: 2,
+        masks: Vec::new(),
+        reached: Vec::new(),
+        cur_pc: 0,
+    };
+    // The top of the highest ENCLOSING scope: the floor.
+    let locals_top = middle_base + 2 * 8;
+    // The INNERMOST scope is the splice that is RETURNING. Its locals are dead
+    // at the `xreturn` that reclaims them, and the floor must NOT include them:
+    // a result pushed above them lands at the wrong operand depth, which is the
+    // ECJ `OperandStack.pop(OperandCategory)` miscompile that
+    // `a_spliced_callees_result_lands_at_the_callers_operand_depth` guards. The
+    // first cut of this floor included it and that test caught it.
+    let innermost = InlineOopScope {
+        local_base: locals_top,
+        num_locals: 4,
+        masks: Vec::new(),
+        reached: Vec::new(),
+        cur_pc: 0,
+    };
+    compiler.inline_oop_scopes.push(outer);
+    compiler.inline_oop_scopes.push(middle);
+    compiler.inline_oop_scopes.push(innermost);
+
+    assert_eq!(
+        compiler.open_inline_locals_floor(),
+        locals_top,
+        "the floor is the top of the highest ENCLOSING scope's locals - not the \
+         innermost's, whose locals are dead at the return that reclaims them"
+    );
+
+    // Any of the cursor-lowering paths, simulated directly: what matters is not
+    // which assignment did it (the first attempt at this fix guarded two of
+    // them and took 151 reports only to 125) but that the cursor can end up
+    // here at all.
+    compiler.next_spill_offset = outer_base;
+    assert!(
+        compiler.next_spill_offset < locals_top,
+        "the hazard requires the cursor BELOW the enclosing locals; with it \
+         above, this test would prove nothing"
+    );
+
+    let start = compiler
+        .reserve_spill_slots(1, SpillReason::Push)
+        .expect("the reservation must succeed");
+    assert!(
+        start >= locals_top,
+        "reservation was handed slot {start}, inside the locals of an open \
+         enclosing inline scope ({outer_base}..{locals_top}): that callee's \
+         body continues after the inner call returns and still reads the word"
+    );
+    assert!(
+        compiler.next_spill_offset > locals_top,
+        "the cursor must also come back ABOVE the enclosing locals, or the NEXT \
+         reservation walks straight back into them"
+    );
+
+    // A LONE open scope IS the innermost, so the floor is inert for it: a
+    // single splice must keep landing its result at the caller's operand depth.
+    compiler.inline_oop_scopes.truncate(1);
+    assert_eq!(
+        compiler.open_inline_locals_floor(),
+        i32::MIN,
+        "one open splice has no ENCLOSING scope, so nothing may be floored"
+    );
+
+    // And with nothing spliced at all the floor is inert - this must not cost a
+    // frame word in the methods that inline nothing, which is most of them.
+    compiler.inline_oop_scopes.clear();
+    assert_eq!(
+        compiler.open_inline_locals_floor(),
+        i32::MIN,
+        "no open scope must mean no floor"
+    );
+    let before = compiler.next_spill_offset;
+    let plain = compiler
+        .reserve_spill_slots(1, SpillReason::Push)
+        .expect("the reservation must succeed");
+    assert_eq!(
+        plain, before,
+        "with no splice open a reservation must start exactly at the cursor"
+    );
+}
+
 #[test]
 fn push_stack_refuses_to_cross_spill_limit() {
     let alloc_result = crate::regalloc::RegAllocResult {
@@ -4588,6 +4757,192 @@ fn test_getfield_guarded_inline_fast_and_fallback() {
     assert_eq!(result, 424242, "null receiver must route to the helper");
 }
 
+/// How many layout-replacement epoch guards a compiled body carries, counting
+/// BOTH encodings.
+///
+/// The guard is `CMP DWORD [rip+disp32], imm32` where the counter is in
+/// disp32 reach and `MOV R11, imm64` + `MOV ECX, [R11]` + `CMP ECX, imm32`
+/// where it is not, and which one a given run gets is a property of the
+/// process's address space — so a test that recognised only one of them would
+/// pass or fail by luck. Both are matched by RESOLVING to the epoch's address,
+/// which is also what makes this stronger than counting opcodes: a `81 3D`
+/// naming some other global is not a guard.
+fn layout_epoch_guards(compiled: &CompiledMethod) -> usize {
+    let (epoch, _) = cratonvm_types::layout_replace_epoch_guard();
+    let epoch = epoch as usize; // Cast: the address the guard must name
+    let code = compiled.code_bytes();
+    let base = code.as_ptr() as usize; // Cast: buffer base for RIP resolution
+    let mut n = 0usize;
+    for i in 0..code.len() {
+        // RIP form: 81 3D <disp32> <imm32>, measured from the END.
+        if i + 10 <= code.len() && code[i] == 0x81 && code[i + 1] == 0x3D {
+            let d = i32::from_le_bytes([code[i + 2], code[i + 3], code[i + 4], code[i + 5]]);
+            // Cast: sign-extend the disp32 for wrapping address arithmetic
+            if base.wrapping_add(i).wrapping_add(10).wrapping_add(d as isize as usize) == epoch {
+                n += 1;
+            }
+        }
+        // Fallback form: MOV R11, imm64 ; MOV ECX, [R11] ; CMP ECX, imm32.
+        //
+        // The load has two encodings and this backend emits the LONGER one:
+        // `emit_mov_r32_mem_disp32` goes through `Disp::encode_for_base`,
+        // which picks `mod=10` with an explicit zero disp32
+        // (`41 8B 8B 00000000`, 7 bytes) rather than the `mod=00` short form
+        // (`41 8B 0B`, 3). Measured, not assumed — and matching only the short
+        // one would make this test pass on a box where the counter is in RIP
+        // reach and fail on one where it is not, which is the single worst
+        // property a guard-census test could have.
+        if i + 2 <= code.len() && code[i] == 0x49 && code[i + 1] == 0xBB && i + 10 <= code.len() {
+            let mut imm = [0u8; 8];
+            imm.copy_from_slice(&code[i + 2..i + 10]);
+            if u64::from_le_bytes(imm) as usize == epoch {
+                let load = &code[i + 10..code.len().min(i + 17)];
+                let after = if load.starts_with(&[0x41, 0x8B, 0x8B, 0, 0, 0, 0]) {
+                    Some(i + 17)
+                } else if load.starts_with(&[0x41, 0x8B, 0x0B]) {
+                    Some(i + 13)
+                } else {
+                    None
+                };
+                if let Some(cmp_at) = after {
+                    if cmp_at + 2 <= code.len() && code[cmp_at..cmp_at + 2] == [0x81, 0xF9] {
+                        n += 1;
+                    }
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Every single-pass emitter that BAKES a compact body offset must guard it
+/// against a layout replacement — including the two the guard's own census
+/// missed.
+///
+/// `51aee440b` set out to guard "every baked compact cell offset" and listed
+/// five sites. The inline compact `getfield` — the hottest field path in the
+/// VM — and the UNGATED compact reference `putfield` were not among them, and
+/// went on baking `HEADER_SIZE + packed_body_offset` with nothing to stop them
+/// using it after `register_class_layout` replaced that layout. The allocation
+/// emitters' own comment for the same hazard is "confirmed heap corruption".
+///
+/// The failure mode this pins is a MISSING guard, not a broken one, so it is
+/// worth saying what it deliberately does not do: it does not bump the epoch.
+/// That the guard routes correctly when it fires is
+/// `a_replaced_layout_routes_the_gated_store_to_the_helper`'s job, in the
+/// optimizing tier, by execution; a second test bumping a process-wide counter
+/// would race every sibling that compiled an inline compact arm before it.
+#[test]
+fn every_single_pass_compact_field_site_guards_its_baked_offset() {
+    if !jit_sp_field_layout_guard_enabled() {
+        // This process asked for the unguarded shape, which is what that
+        // switch is for. Pricing a guard requires being able to turn it off.
+        return;
+    }
+    // ── the inline compact getfield ────────────────────────────────────
+    // int get(Obj this) { return this.x; }
+    let get_code: Vec<u8> = vec![
+        0x2a, // 0: aload_0
+        0xb4, 0x00, 0x01, // 1: getfield #1
+        0xac, // 4: ireturn
+        0, 0,
+    ];
+    let mut helpers = test_helpers();
+    // The guarded arm bakes this; a zero table sends the compact arm's
+    // admission test down the helper-only road and there would be nothing to
+    // guard.
+    static BOUNDS: [std::sync::atomic::AtomicUsize; 6] = [
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+    ];
+    helpers.read_bounds_addr = BOUNDS.as_ptr() as usize; // Cast: static address
+    set_pending_compact_field_info(vec![(1, 0, false)]);
+    let get = compile(
+        &get_code,
+        5,
+        1,
+        1,
+        false,
+        Vec::new(),
+        vec![(1usize, 0usize, b'I')],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(), // pic_slots — no PIC sites
+        Vec::new(), // ldc_info
+        Vec::new(), // ldc2w_info
+        HashMap::new(),
+        HashMap::new(),
+        &helpers,
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        None, // string_layout
+    )
+    .expect("a compact getfield must compile");
+    assert_eq!(
+        layout_epoch_guards(&get),
+        1,
+        "the inline compact getfield bakes a body offset and must guard it",
+    );
+
+    // ── the UNGATED compact reference putfield ─────────────────────────
+    // void set(Obj this, Object v) { this.f = v; }
+    //
+    // `test_helpers()` publishes no reference-store barrier plan, so
+    // `emit_gated_compact_ref_putfield` declines and this is the arm that
+    // runs — the one that had no guard.
+    let set_code: Vec<u8> = vec![
+        0x2a, // 0: aload_0
+        0x2b, // 1: aload_1
+        0xb5, 0x00, 0x01, // 2: putfield #1 (reference)
+        0xb1, // 5: return
+        0, 0,
+    ];
+    let mut set_helpers = test_helpers();
+    set_helpers.region_bounds_addr = BOUNDS.as_ptr() as usize; // Cast: static address
+    set_pending_compact_field_info(vec![(2, 0, true)]);
+    let set = compile(
+        &set_code,
+        6,
+        2,
+        2,
+        true, // needs_heap — the reference putfield helper takes it
+        Vec::new(),
+        vec![(2usize, 0usize, b'L')],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(), // pic_slots — no PIC sites
+        Vec::new(), // ldc_info
+        Vec::new(), // ldc2w_info
+        HashMap::new(),
+        HashMap::new(),
+        &set_helpers,
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        None, // string_layout
+    )
+    .expect("a compact reference putfield must compile");
+    assert_eq!(
+        layout_epoch_guards(&set),
+        1,
+        "the ungated inline compact reference putfield bakes a body offset \
+         and must guard it",
+    );
+}
+
 /// A REFERENCE field whose 16-byte cell does not hold a reference must not be
 /// read as one by the inline arm.
 ///
@@ -7361,6 +7716,103 @@ fn rip_relative_safepoint_poll_addresses_the_flag_byte() {
         resolved, flag_addr,
         "the RIP-relative displacement must land exactly on the flag byte"
     );
+}
+
+/// The layout-epoch guard's RIP-relative compare must name the counter, and
+/// must register the trail the unroll duplicator needs.
+///
+/// Two failures this catches, both silent:
+///
+/// * a displacement measured from the wrong reference point — `+ 6` instead of
+///   `+ 10`, forgetting the trailing `imm32` — compares a word four bytes from
+///   the epoch against the baked value. That is not a fault. It is a guard
+///   that answers about an unrelated global forever, which means an inline
+///   field access that keeps its baked offset across a layout REPLACEMENT:
+///   the "confirmed heap corruption" the allocation emitters' own guard
+///   comment names.
+/// * a `rip_abs_disp32_patches` entry whose trail is not 4. The unroller
+///   copies body bytes verbatim and re-resolves each entry against the copy's
+///   own PC; a trail that under-counts by 3 (the poll's 1, transcribed) makes
+///   every UNROLLED copy of the guard read three bytes off while the original
+///   stays correct — so the first iteration is right and the rest are not.
+#[test]
+fn rip_relative_epoch_guard_addresses_the_counter_and_declares_its_trail() {
+    static EPOCH: u32 = 0;
+
+    let alloc_result = crate::regalloc::RegAllocResult {
+        assignments: Vec::new(),
+        xmm_assignments: Vec::new(),
+        used_callee_saved: Vec::new(),
+        used_xmm_regs: Vec::new(),
+        block_live_in: Vec::new(),
+    };
+    let mut c = Compiler::new(
+        "rip-epoch-guard-test".to_string(),
+        ExecutableBuffer::new(4096).expect("test executable buffer"),
+        0,
+        0,
+        8,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        alloc_result,
+        false,
+        test_helpers(),
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Vec::new(),
+    );
+
+    let epoch_addr = &EPOCH as *const u32 as usize;
+    let start = c.buf.pos();
+    let patches_before = c.rip_abs_disp32_patches.len();
+    if !c.emit_cmp_mem32_abs_imm32(epoch_addr, 0x1234_5678) {
+        // The buffer landed more than 2GB from this test binary's data
+        // segment — which is exactly the shape a `static` counter has, and
+        // exactly why the epoch lives on the heap. The fallback is the
+        // materialize-the-address form.
+        assert_eq!(c.buf.pos(), start, "a refused encoding emits nothing");
+        assert_eq!(
+            c.rip_abs_disp32_patches.len(),
+            patches_before,
+            "a refused encoding registers no patch site either",
+        );
+        return;
+    }
+    let bytes: Vec<u8> = c.buf.as_slice()[start..c.buf.pos()].to_vec();
+    assert_eq!(bytes.len(), 10, "81 3D <disp32> <imm32>");
+    assert_eq!(&bytes[..2], &[0x81, 0x3D], "CMP r/m32, imm32 via [rip+d32]");
+    assert_eq!(
+        i32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]),
+        0x1234_5678,
+        "the baked epoch is the trailing imm32",
+    );
+
+    let disp = i32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
+    // RIP is the address of the NEXT instruction — past the imm32, not past
+    // the displacement. `+ 10`, not `+ 6`.
+    let insn_end = c.buf.as_ptr() as usize + start + 10;
+    let resolved = (insn_end as i64).wrapping_add(disp as i64) as usize;
+    assert_eq!(
+        resolved, epoch_addr,
+        "the RIP-relative displacement must land exactly on the epoch counter"
+    );
+
+    let (patch_off, trail) = *c
+        .rip_abs_disp32_patches
+        .last()
+        .expect("the guard registers its displacement for the unroll duplicator");
+    assert_eq!(patch_off, start + 2, "the disp32 follows the two opcode bytes");
+    assert_eq!(trail, 4, "the imm32 is part of the instruction the CPU measures from");
 }
 
 #[test]
@@ -11618,6 +12070,194 @@ fn p87_xmm_local_allocation_verified() {
     );
 }
 
+/// **The XMM-homed-local emitter, exercised on a System V host.**
+///
+/// The test above proves the ALLOCATOR hands a float/double local an XMM
+/// register. Nothing proved the EMITTER then does anything with it, on the
+/// platform that runs the suite: `Compiler::new` gates the allocation behind
+/// `xmm_local_homes_enabled`, which is Win64-only for the ABI reason stated
+/// there, so on Linux `xmm_for_local` answered `None` for every local and the
+/// fifteen sites that read it never ran.
+///
+/// This is the prologue's three of those, forced on and off over one fixture:
+///
+///   * a register-passed float/double parameter is moved GPR -> XMM, rather
+///     than stored to its frame home;
+///   * an XMM-mapped local past the parameter span is zeroed with `PXOR`,
+///     rather than by storing a zeroed GPR to its frame slot;
+///   * neither instruction is emitted when the homes are off.
+///
+/// **Bytes only, never executed.** Forcing the homes on does not change the
+/// ABI: code compiled this way would lose a local across any call on System V,
+/// which is the whole reason the default is what it is. This test inspects the
+/// buffer and calls nothing in it.
+#[test]
+fn an_xmm_homed_local_is_loaded_and_zeroed_by_the_prologue() {
+    // MOVQ xmm8, rax — 66 REX.W+R 0F 6E /r, ModRM 11 000 000.
+    const MOVQ_XMM8_RAX: [u8; 5] = [0x66, 0x4C, 0x0F, 0x6E, 0xC0];
+    // PXOR xmm9, xmm9 — 66 REX.R+B 0F EF /r, ModRM 11 001 001.
+    const PXOR_XMM9: [u8; 5] = [0x66, 0x45, 0x0F, 0xEF, 0xC9];
+
+    // Local 0 is the incoming parameter and is XMM-homed; local 2 is an
+    // XMM-homed local past the parameter span, so the prologue must zero it.
+    // XMM8/XMM9 rather than XMM2..7 because `regalloc` allocates single-pass
+    // local homes out of the high half — the same range the test above asserts.
+    let prologue_bytes = |homes: bool| -> Vec<u8> {
+        let _force = if homes {
+            XmmLocalHomesForce::on()
+        } else {
+            XmmLocalHomesForce::off()
+        };
+        let alloc_result = crate::regalloc::RegAllocResult {
+            assignments: vec![None; 4],
+            xmm_assignments: vec![Some(8), None, Some(9), None],
+            used_callee_saved: Vec::new(),
+            used_xmm_regs: vec![8, 9],
+            block_live_in: Vec::new(),
+        };
+        let mut compiler = Compiler::new(
+            "xmm-home-prologue-test".to_string(),
+            ExecutableBuffer::new(4096).expect("test executable buffer"),
+            4,
+            1,
+            8,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            alloc_result,
+            false,
+            test_helpers(),
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Vec::new(),
+        );
+        compiler.emit_prologue();
+        assert!(
+            !compiler.buf.overflowed(),
+            "the test buffer must hold the prologue",
+        );
+        compiler.buf.as_slice().to_vec()
+    };
+
+    let win = prologue_bytes(true);
+    let sysv = prologue_bytes(false);
+    let has = |b: &[u8], pat: &[u8; 5]| b.windows(5).any(|w| w == pat);
+
+    assert!(
+        has(&win, &MOVQ_XMM8_RAX),
+        "with XMM homes on, the parameter must be moved into XMM8 — this is \
+         `frames::emit_prologue`'s register-argument arm, and it is the arm \
+         that never runs on System V",
+    );
+    assert!(
+        has(&win, &PXOR_XMM9),
+        "with XMM homes on, an XMM-mapped local past the parameter span must \
+         be zeroed in its REGISTER; zeroing only its frame word would leave \
+         the register holding the previous frame's value",
+    );
+    assert!(
+        !has(&sysv, &MOVQ_XMM8_RAX) && !has(&sysv, &PXOR_XMM9),
+        "with XMM homes off, every float/double local uses its frame home and \
+         no XMM instruction belongs in the prologue at all",
+    );
+    assert_ne!(
+        win, sysv,
+        "the two arms emitted identical bytes, so the gate is being ignored \
+         and both assertions above are about the same compile",
+    );
+}
+
+/// **The ten bytecode arms, exercised on a System V host.**
+///
+/// The prologue test above covers `frames`' three sites. These are the other
+/// ten: every `dload`/`dstore`/`fload`/`fstore` and accumulator arm in
+/// `bytecode_walk` that reads `xmm_for_local`, reached the way production
+/// reaches them -- a whole compile through `driver::compile`, with the
+/// allocator choosing the homes rather than a fixture asserting them.
+///
+/// The assertion is an A/B rather than a byte pattern on purpose. Which
+/// instruction each arm picks is the emitter's business and changes with it;
+/// that the two arms of the gate produce DIFFERENT code, and that the forced-on
+/// one keeps the allocator's XMM registers out of the frame, is the property
+/// this is here to hold.
+///
+/// **Bytes only, never executed** -- see `XmmLocalHomesForce`.
+#[test]
+fn the_bytecode_arms_honour_an_xmm_home_the_allocator_gave() {
+    // static double f(int n) { double a = n; return a + a; }
+    //   0: iload_0  1: i2d  2: dstore_1  3: dload_1  4: dload_1  5: dadd
+    //   6: dreturn
+    // One store and two loads of local 1, which is what earns it a register.
+    let code = [0x1a, 0x87, 0x48, 0x27, 0x27, 0x63, 0xaf, 0, 0];
+    let code_len = 7;
+
+    // Precondition: the ALLOCATOR gives local 1 an XMM home on this fixture.
+    // Without it the two arms below are the same compile and the A/B proves
+    // nothing -- the failure mode this fixture is one edit away from.
+    let loops = detect_loops(&code, code_len);
+    let alloc = crate::regalloc::allocate_registers(&code, code_len, 3, 1, &loops);
+    assert!(
+        alloc.xmm_assignments.iter().any(|a| a.is_some()),
+        "the allocator gave this fixture no XMM home, so the gate below has \
+         nothing to gate: repair the fixture rather than believe the A/B",
+    );
+
+    let compiled = |homes: bool| -> Vec<u8> {
+        let _force = if homes {
+            XmmLocalHomesForce::on()
+        } else {
+            XmmLocalHomesForce::off()
+        };
+        let cm = crate::x64::driver::compile(
+            &code,
+            code_len,
+            1,
+            3,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            std::collections::HashMap::new(),
+            None,
+        )
+        .expect("the fixture compiles through the single-pass backend");
+        cm.code_bytes().to_vec()
+    };
+
+    let win = compiled(true);
+    let sysv = compiled(false);
+
+    assert_ne!(
+        win, sysv,
+        "the two arms of `xmm_local_homes_enabled` emitted identical code for \
+         a method whose double local the allocator put in an XMM register — \
+         the gate is being ignored, and every `xmm_for_local` arm in \
+         `bytecode_walk` is unreachable on this host",
+    );
+}
+
 // --- 87.2: FP Loop Optimization ---
 
 #[test]
@@ -13271,6 +13911,7 @@ fn make_inline_site(
         static_field_info: Vec::new(),
         ldc_info: Vec::new(),
         ldc2w_info: Vec::new(),
+        ldc_fp_pcs: Vec::new(),
         needs_heap: false,
         class_name: "Test".to_string(),
         class_id: 0,
@@ -13281,6 +13922,7 @@ fn make_inline_site(
         resolved_invoke_infos: Vec::new(),
         nested_sites: Vec::new(),
         ir_new_info: Vec::new(),
+        ir_typecheck_info: Vec::new(),
     }
 }
 

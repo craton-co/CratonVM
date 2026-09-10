@@ -1311,6 +1311,966 @@ static RETIRED_SHADOW_PHASE2_TRIPLES: &[(&str, &str, &str)] = &[
     ("sun/nio/ch/FileChannelImpl", "truncate", "(J)Ljava/nio/channels/FileChannel;"),
 ];
 
+/// The 2026-09-09 Phase 3 wave: `ConcurrentHashMap` and `Properties`, as ONE
+/// retirement, because neither class is retirable alone.
+///
+/// 185 triples over eight classes — the largest table here and the first whose
+/// unit is a PAIR of classes. A fourth table rather than rows merged into
+/// `RETIRED_SHADOW_PHASE2_TRIPLES` for the reason that one gives for existing:
+/// these were adjudicated by a different method, and the method is the part
+/// worth seeing at a glance. Phase 2's method — arm one class, read the probe
+/// tree — cannot reach this verdict, and §"the dial is the wrong instrument
+/// here" below is why.
+///
+/// # The reversal
+///
+/// `java/util/concurrent/ConcurrentHashMap` was adjudicated NOT retirable on
+/// 2026-08-30 on `MapViewsShadowSweep` dying at row 261 of 302. `Properties`
+/// was called LOAD-BEARING in the same sweep, with seven failing corpus
+/// vectors. Armed as a pair on the pre-merge control binary
+/// `a3855b8c7febaf7e`:
+///
+/// ```text
+///                         CHM alone                 CHM + java/util/Properties
+///   MapViewsShadowSweep   53 diffs, DIED 261/302    0 diffs, 302/302
+///   ChmShadowSweep        0 over 28 671 yields      0 over 28 654 yields
+/// ```
+///
+/// JDK 9 moved `Properties`' storage into a `ConcurrentHashMap` field named
+/// `map`. So the two classes are one object graph, and arming either half is a
+/// SPLIT STORE in one direction or the other: real `Properties` bytecode over a
+/// native CHM, or real CHM bytecode under a `Properties` whose state is in a
+/// Rust side table. Both halves real is the only configuration that is
+/// consistent, and it is not a scope the 2026-08-30 sweep ever ran — it armed
+/// 270 classes one at a time and then 236 at once, and a PAIR is neither.
+///
+/// # The precondition, and it is a code change
+///
+/// The object `System.getProperties()` returns is VM-built and its `map` was
+/// **permanently null**, so the first real `Properties` body to run against it
+/// threw. `native-builtins/src/properties_sidetable.rs`'s `replace_real_map`,
+/// called from the `--jdk-only` arm of the `java/lang/System.getProperties`
+/// registration, is what makes this wave possible at all. The whole defect and
+/// its measurement are in
+/// `docs/known-issues/jdk-only/the-system-properties-real-map-is-null-and-it-blocks-the-chm-retirement-20260909.md`.
+///
+/// # The dial is the wrong instrument here
+///
+/// `CRATONVM_ENFORCE_NATIVE_SHADOW` declines at nine dispatch doors, and a
+/// call that ORIGINATES IN A NATIVE is not one of them. `replace_real_map`
+/// fills the map with `ctx.invoke_virtual(chm, "put", ..)`; armed, those `put`s
+/// still reach the native and return `Ok`, so the map the real bytecode then
+/// reads is EMPTY and nothing reports a failure. On one binary, one function:
+///
+/// ```text
+///   scope = java/util/Properties           SysPropsRealMapProbe  10/10 vs HotSpot
+///   scope = ..ConcurrentHashMap,Properties                        6 of 10 FALSE
+/// ```
+///
+/// A registration REFUSED at `register` has no native to reach, so the same
+/// `invoke_virtual` runs the real bytecode. That is a fourth difference from a
+/// real retirement on top of the three that page's §6 lists, and it cuts both
+/// ways: an armed run understates breakage for any class the VM calls into
+/// from a native, and overstates it for a fix like this one. **So this wave was
+/// measured on a trial binary carrying this table and could not have been
+/// accepted on a dial arm.**
+///
+/// # Preconditions 3 and 4, and the 35 rows that are here for coherence
+///
+/// Every row owns its registry slot, has effective kind `Bridge`, and has image
+/// `Code` to yield to. 150 of the 185 were dispatched (`invocations > 0`) by
+/// the eight probes that back the measurement, read from those probes' own
+/// `--dump-native-registry --explain-jdk-only` runs, which is what precondition
+/// 4 asks for.
+///
+/// It was 122 of 185 until `apps/probes/ChmBulkSweep.java` was written for this
+/// wave. The 63 undispatched rows were CHM's bulk/parallel surface —
+/// `reduceKeysToLong`, `searchEntries`, `forEachEntry` and their siblings, plus
+/// most of `EntrySetView`/`EntryIterator` — and no probe in the tree called any
+/// of them, so retiring them would have been a change no instrument could see.
+/// That probe is 60 rows chosen so the EMPTY answer and the right answer print
+/// differently, and it is byte-identical to HotSpot on both sides of this
+/// retirement. Seven of them are Java SERIALIZATION, because
+/// `native_chm_write_object`'s own registration comment names that as the
+/// hazard -- the real bodies walk the `table` field this VM's segmented layout
+/// never populated -- and this wave retires both serialization hooks. Nothing
+/// else in the probe tree round-trips a `ConcurrentHashMap`.
+///
+/// 35 rows still have no dispatch of their own and are retired on a structural
+/// argument that has to be stated rather than assumed. `native_chm_put`
+/// populates this VM's segmented store; the real `table` field it never touches
+/// is what real CHM bytecode walks. Retire the writers, leave a native reader
+/// standing, and that reader answers from a store nothing fills any more — an
+/// EMPTY iteration, silently, which is strictly worse than an unmeasured
+/// retirement. The 2026-08-30 bisect says the same from the other side: arming
+/// `ConcurrentHashMap$` (the nested classes only) killed `ChmShadowSweep` at row
+/// 13 of 208 where arming the whole class left it byte-identical, so **partial
+/// is the configuration with evidence against it.** The instrument for the
+/// remaining 35 is the full corpus in the landing protocol, not the probes.
+///
+/// # How the wave takes effect, and the way it could have been INERT
+///
+/// The re-tag makes `register_inner` refuse the registration under `--jdk-only`
+/// without inserting it, so the force-native interception path
+/// (`vm/src/runtime/interpreter/native_override.rs`, which lists
+/// `ConcurrentHashMap`'s `put`/`get`/`size`/`computeIfAbsent`/... explicitly)
+/// resolves no id and declines rather than raising §1.3. That is the good
+/// outcome and it is not the only possible one: a refusal is a RETIREMENT only
+/// when nothing already owns the triple, and
+/// `JdkOnlyViolation::SyntheticNativeRegistered` carries a `survivor` for the
+/// case where an earlier registration keeps serving — strict mode then runs
+/// THAT native instead of the bytecode the policy asked for, and every probe
+/// reads clean because nothing changed.
+///
+/// 53 of these triples are registered more than once (ordinals up to 3 in the
+/// kind-map baseline), so the question is live. Measured on the trial binary,
+/// `--jdk-only-report` carries **251 `synthetic-native-registered` refusals on
+/// these two prefixes and ZERO of them has a survivor.** Check that column
+/// before reading any probe row on a future wave: a green probe tree and an
+/// inert retirement look identical from the outside.
+///
+/// One registration is EXCLUDED for want of a target:
+/// `ConcurrentHashMap.reduceEntries(JLjava/util/function/BiFunction;)Ljava/lang/Object;`
+/// reports `image_declaring_method.declared: false` — the real erasure returns
+/// `Ljava/util/Map$Entry;`, so the descriptor matches no method in the image.
+/// It can never be dispatched and retiring it would trade a dead shadow for an
+/// `UnsatisfiedLinkError` if anything ever did reach it.
+static RETIRED_SHADOW_PHASE3_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/util/Properties", "<init>", "()V"),
+    (
+        "java/util/Properties",
+        "<init>",
+        "(Ljava/util/Properties;)V",
+    ),
+    ("java/util/Properties", "clear", "()V"),
+    ("java/util/Properties", "clone", "()Ljava/lang/Object;"),
+    (
+        "java/util/Properties",
+        "compute",
+        "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Properties",
+        "computeIfAbsent",
+        "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Properties",
+        "computeIfPresent",
+        "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    ("java/util/Properties", "contains", "(Ljava/lang/Object;)Z"),
+    (
+        "java/util/Properties",
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/Properties",
+        "containsValue",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/Properties",
+        "elements",
+        "()Ljava/util/Enumeration;",
+    ),
+    ("java/util/Properties", "entrySet", "()Ljava/util/Set;"),
+    ("java/util/Properties", "equals", "(Ljava/lang/Object;)Z"),
+    (
+        "java/util/Properties",
+        "forEach",
+        "(Ljava/util/function/BiConsumer;)V",
+    ),
+    (
+        "java/util/Properties",
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Properties",
+        "getOrDefault",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Properties",
+        "getProperty",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+    ),
+    (
+        "java/util/Properties",
+        "getProperty",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+    ),
+    ("java/util/Properties", "hashCode", "()I"),
+    ("java/util/Properties", "isEmpty", "()Z"),
+    ("java/util/Properties", "keySet", "()Ljava/util/Set;"),
+    ("java/util/Properties", "keys", "()Ljava/util/Enumeration;"),
+    ("java/util/Properties", "load", "(Ljava/io/InputStream;)V"),
+    ("java/util/Properties", "load", "(Ljava/io/Reader;)V"),
+    (
+        "java/util/Properties",
+        "merge",
+        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Properties",
+        "propertyNames",
+        "()Ljava/util/Enumeration;",
+    ),
+    (
+        "java/util/Properties",
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    ("java/util/Properties", "putAll", "(Ljava/util/Map;)V"),
+    (
+        "java/util/Properties",
+        "putIfAbsent",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Properties",
+        "remove",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Properties",
+        "remove",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/Properties",
+        "replace",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Properties",
+        "replace",
+        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/Properties",
+        "replaceAll",
+        "(Ljava/util/function/BiFunction;)V",
+    ),
+    (
+        "java/util/Properties",
+        "save",
+        "(Ljava/io/OutputStream;Ljava/lang/String;)V",
+    ),
+    (
+        "java/util/Properties",
+        "setProperty",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;",
+    ),
+    ("java/util/Properties", "size", "()I"),
+    (
+        "java/util/Properties",
+        "store",
+        "(Ljava/io/OutputStream;Ljava/lang/String;)V",
+    ),
+    (
+        "java/util/Properties",
+        "store",
+        "(Ljava/io/Writer;Ljava/lang/String;)V",
+    ),
+    (
+        "java/util/Properties",
+        "stringPropertyNames",
+        "()Ljava/util/Set;",
+    ),
+    ("java/util/Properties", "toString", "()Ljava/lang/String;"),
+    ("java/util/Properties", "values", "()Ljava/util/Collection;"),
+    ("java/util/concurrent/ConcurrentHashMap", "<init>", "()V"),
+    ("java/util/concurrent/ConcurrentHashMap", "<init>", "(I)V"),
+    ("java/util/concurrent/ConcurrentHashMap", "<init>", "(IFI)V"),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "<init>",
+        "(Ljava/util/Map;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "addCount",
+        "(JI)V",
+    ),
+    ("java/util/concurrent/ConcurrentHashMap", "clear", "()V"),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "compute",
+        "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "computeIfAbsent",
+        "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "computeIfPresent",
+        "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "contains",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "containsValue",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "elements",
+        "()Ljava/util/Enumeration;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "entrySet",
+        "()Ljava/util/Set;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "forEach",
+        "(JLjava/util/function/BiConsumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "forEach",
+        "(JLjava/util/function/BiFunction;Ljava/util/function/Consumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "forEach",
+        "(Ljava/util/function/BiConsumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "forEachEntry",
+        "(JLjava/util/function/Consumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "forEachEntry",
+        "(JLjava/util/function/Function;Ljava/util/function/Consumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "forEachKey",
+        "(JLjava/util/function/Consumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "forEachKey",
+        "(JLjava/util/function/Function;Ljava/util/function/Consumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "forEachValue",
+        "(JLjava/util/function/Consumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "forEachValue",
+        "(JLjava/util/function/Function;Ljava/util/function/Consumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "getOrDefault",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    ("java/util/concurrent/ConcurrentHashMap", "hashCode", "()I"),
+    ("java/util/concurrent/ConcurrentHashMap", "isEmpty", "()Z"),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "keySet",
+        "()Ljava/util/Set;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "keySet",
+        "()Ljava/util/concurrent/ConcurrentHashMap$KeySetView;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "keySet",
+        "(Ljava/lang/Object;)Ljava/util/concurrent/ConcurrentHashMap$KeySetView;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "keys",
+        "()Ljava/util/Enumeration;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "mappingCount",
+        "()J",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "merge",
+        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "newKeySet",
+        "()Ljava/util/concurrent/ConcurrentHashMap$KeySetView;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "newKeySet",
+        "(I)Ljava/util/concurrent/ConcurrentHashMap$KeySetView;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "putAll",
+        "(Ljava/util/Map;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "putIfAbsent",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "readObject",
+        "(Ljava/io/ObjectInputStream;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduce",
+        "(JLjava/util/function/BiFunction;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceEntries",
+        "(JLjava/util/function/Function;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceEntriesToDouble",
+        "(JLjava/util/function/ToDoubleFunction;DLjava/util/function/DoubleBinaryOperator;)D",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceEntriesToInt",
+        "(JLjava/util/function/ToIntFunction;ILjava/util/function/IntBinaryOperator;)I",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceEntriesToLong",
+        "(JLjava/util/function/ToLongFunction;JLjava/util/function/LongBinaryOperator;)J",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceKeys",
+        "(JLjava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceKeys",
+        "(JLjava/util/function/Function;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceKeysToDouble",
+        "(JLjava/util/function/ToDoubleFunction;DLjava/util/function/DoubleBinaryOperator;)D",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceKeysToInt",
+        "(JLjava/util/function/ToIntFunction;ILjava/util/function/IntBinaryOperator;)I",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceKeysToLong",
+        "(JLjava/util/function/ToLongFunction;JLjava/util/function/LongBinaryOperator;)J",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceToDouble",
+        "(JLjava/util/function/ToDoubleBiFunction;DLjava/util/function/DoubleBinaryOperator;)D",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceToInt",
+        "(JLjava/util/function/ToIntBiFunction;ILjava/util/function/IntBinaryOperator;)I",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceToLong",
+        "(JLjava/util/function/ToLongBiFunction;JLjava/util/function/LongBinaryOperator;)J",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceValues",
+        "(JLjava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceValues",
+        "(JLjava/util/function/Function;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceValuesToDouble",
+        "(JLjava/util/function/ToDoubleFunction;DLjava/util/function/DoubleBinaryOperator;)D",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceValuesToInt",
+        "(JLjava/util/function/ToIntFunction;ILjava/util/function/IntBinaryOperator;)I",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceValuesToLong",
+        "(JLjava/util/function/ToLongFunction;JLjava/util/function/LongBinaryOperator;)J",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "remove",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "remove",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "replace",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "replace",
+        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "replaceAll",
+        "(Ljava/util/function/BiFunction;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "search",
+        "(JLjava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "searchEntries",
+        "(JLjava/util/function/Function;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "searchKeys",
+        "(JLjava/util/function/Function;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "searchValues",
+        "(JLjava/util/function/Function;)Ljava/lang/Object;",
+    ),
+    ("java/util/concurrent/ConcurrentHashMap", "size", "()I"),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "values",
+        "()Ljava/util/Collection;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "writeObject",
+        "(Ljava/io/ObjectOutputStream;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntryIterator",
+        "hasNext",
+        "()Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntryIterator",
+        "next",
+        "()Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntryIterator",
+        "remove",
+        "()V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "add",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "addAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "clear",
+        "()V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "contains",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "containsAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "hashCode",
+        "()I",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "isEmpty",
+        "()Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "iterator",
+        "()Ljava/util/Iterator;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "remove",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "removeAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "removeIf",
+        "(Ljava/util/function/Predicate;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "retainAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "size",
+        "()I",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "stream",
+        "()Ljava/util/stream/Stream;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "toArray",
+        "()[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeyIterator",
+        "hasMoreElements",
+        "()Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeyIterator",
+        "hasNext",
+        "()Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeyIterator",
+        "next",
+        "()Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeyIterator",
+        "nextElement",
+        "()Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeyIterator",
+        "remove",
+        "()V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "add",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "addAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "clear",
+        "()V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "contains",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "containsAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "getMap",
+        "()Ljava/util/concurrent/ConcurrentHashMap;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "getMappedValue",
+        "()Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "hashCode",
+        "()I",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "isEmpty",
+        "()Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "iterator",
+        "()Ljava/util/Iterator;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "remove",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "removeAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "removeIf",
+        "(Ljava/util/function/Predicate;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "retainAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "size",
+        "()I",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "stream",
+        "()Ljava/util/stream/Stream;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "toArray",
+        "()[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$MapEntry",
+        "setValue",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValueIterator",
+        "hasMoreElements",
+        "()Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValueIterator",
+        "hasNext",
+        "()Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValueIterator",
+        "next",
+        "()Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValueIterator",
+        "nextElement",
+        "()Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValueIterator",
+        "remove",
+        "()V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "clear",
+        "()V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "contains",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "isEmpty",
+        "()Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "iterator",
+        "()Ljava/util/Iterator;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "remove",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "removeIf",
+        "(Ljava/util/function/Predicate;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "size",
+        "()I",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "stream",
+        "()Ljava/util/stream/Stream;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "toArray",
+        "()[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+];
+
 /// Is this exact triple a retired §1.4 shadow?
 ///
 /// The class-name prefix test is a cheap discriminator: every entry is under
@@ -1337,6 +2297,7 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
     RETIRED_SHADOW_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(&key).is_ok()
+        || RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(&key).is_ok()
 }
 
 #[cfg(test)]
@@ -1391,6 +2352,14 @@ mod tests {
                 "{t:?} is in the phase-2 table and an earlier one"
             );
         }
+        for t in RETIRED_SHADOW_PHASE3_TRIPLES {
+            assert!(
+                RETIRED_SHADOW_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(t).is_err(),
+                "{t:?} is in the phase-3 table and an earlier one"
+            );
+        }
     }
 
     /// Sorted and binary-searched like both siblings, and for the same reason:
@@ -1409,6 +2378,22 @@ mod tests {
     fn every_phase2_entry_is_reachable() {
         for (c, m, d) in RETIRED_SHADOW_PHASE2_TRIPLES {
             assert!(triple_is_retired_shadow(c, m, d), "unreachable entry: {c}.{m}{d}");
+        }
+    }
+
+    /// The same guard for the phase-3 table, and it is 185 rows of it.
+    ///
+    /// `RETIRED_SHADOW_PREFIXES` already carried `java/util/`, so this wave
+    /// needed no prefix edit — which is exactly the situation where a missing
+    /// one would go unnoticed. Every entry is asked through the real predicate
+    /// rather than the table it lives in.
+    #[test]
+    fn every_phase3_entry_is_reachable() {
+        for (c, m, d) in RETIRED_SHADOW_PHASE3_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "unreachable entry: {c}.{m}{d}"
+            );
         }
     }
 
@@ -1856,11 +2841,6 @@ Ljava/nio/channels/FileChannel;"
             ("java/util/TreeSet", "add", "(Ljava/lang/Object;)Z"),
             ("java/util/ArrayDeque", "addLast", "(Ljava/lang/Object;)V"),
             (
-                "java/util/concurrent/ConcurrentHashMap",
-                "put",
-                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            ),
-            (
                 "java/util/Hashtable",
                 "put",
                 "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
@@ -1885,36 +2865,24 @@ Ljava/nio/channels/FileChannel;"
                 "copyOf",
                 "([Ljava/lang/Object;I)[Ljava/lang/Object;",
             ),
-            // 2026-08-30: the CHM VIEW surface, held for the Properties
-            // coupling in this test's doc comment. `keySet`/`values` hand out
-            // the object the view classes below then iterate, so the producer
-            // and the consumers have to be held together or the survivor is
-            // handed a receiver the retired half built.
-            (
-                "java/util/concurrent/ConcurrentHashMap",
-                "keySet",
-                "()Ljava/util/Set;",
-            ),
-            (
-                "java/util/concurrent/ConcurrentHashMap",
-                "values",
-                "()Ljava/util/Collection;",
-            ),
-            (
-                "java/util/concurrent/ConcurrentHashMap$KeyIterator",
-                "next",
-                "()Ljava/lang/Object;",
-            ),
-            (
-                "java/util/concurrent/ConcurrentHashMap$KeyIterator",
-                "hasNext",
-                "()Z",
-            ),
-            (
-                "java/util/concurrent/ConcurrentHashMap$ValueIterator",
-                "next",
-                "()Ljava/lang/Object;",
-            ),
+            // 2026-09-09: the CHM family — `put`, `keySet`, `values` and the
+            // key/value iterators — came OFF this list in the Phase 3 wave, and
+            // the reason they were on it is the reason they left together. The
+            // 2026-08-30 note held them as a set because "the producer and the
+            // consumers have to be held together or the survivor is handed a
+            // receiver the retired half built". That is the same coupling
+            // argument `RETIRED_SHADOW_PHASE3_TRIPLES` acts on, run to its end:
+            // the set that has to move together is the WHOLE class plus
+            // `java/util/Properties`, which owns the `map` field every
+            // `Properties` body reads. Holding any part of it is the split
+            // store the note was written to prevent.
+            //
+            // `java/util/Hashtable` above is NOT part of that move and stays
+            // held. `Properties extends Hashtable`, but JDK 9 moved the storage
+            // into `Properties.map` and `Properties` overrides the `Map`
+            // surface, so a dispatch door asking about the DECLARING class
+            // reaches `Properties` for every overridden method and never
+            // `Hashtable`.
         ] {
             assert!(
                 !triple_is_retired_shadow(c, m, d),
@@ -1998,26 +2966,102 @@ Ljava/nio/channels/FileChannel;"
         ));
     }
 
-    /// `Properties.getProperty` stays a `Bridge`, and the reason is a receiver
-    /// rather than the method.
+    /// `Properties.getProperty` is retired, and the condition it waited on is
+    /// the one this test used to enforce.
     ///
-    /// Not a restatement of the table's absence: this is the guard against a
-    /// later wave adding these two because "the real bytecode is String-keyed
-    /// JDK code and correct by construction" — which is TRUE, and still breaks
-    /// `System.getProperties().getProperty(...)`, because the object that call
-    /// runs on is built by a native that never initialises the real `map` field
-    /// JDK 25's `getProperty` reads. Retire them in the same change that makes
-    /// that receiver real, or not at all. Module docs carry the transcript.
+    /// This assertion is INVERTED from what it was between G60-1 and
+    /// 2026-09-09, and the inversion is the point. It held both overloads back
+    /// against a later wave adding them because "the real bytecode is
+    /// String-keyed JDK code and correct by construction" — which is true, and
+    /// still broke `System.getProperties().getProperty(..)`, because the object
+    /// that call runs on was built by a native that never initialised the real
+    /// `map` field JDK 25's `getProperty` reads. Its own words were: **retire
+    /// them in the same change that makes that receiver real, or not at all.**
+    ///
+    /// Phase 3 is that change. `native-builtins`'
+    /// `properties_sidetable::replace_real_map` fills the field from the
+    /// `--jdk-only` arm of the `java/lang/System.getProperties` registration.
+    ///
+    /// This crate cannot see that function — `native-builtins` depends on
+    /// `native-api` and not the other way round — so this test can only record
+    /// the condition, never check it. The check is
+    /// `the_jdk_only_get_properties_arm_fills_the_real_map` in
+    /// `native-builtins/tests/registry_contracts.rs`, which fails if the call
+    /// is removed while these rows stay in the table. A comment is not a
+    /// compile-time link; that test is the link.
     #[test]
-    fn properties_get_property_is_held_for_the_system_receiver() {
+    fn properties_get_property_is_retired_with_the_receiver_that_made_it_safe() {
         for d in [
             "(Ljava/lang/String;)Ljava/lang/String;",
             "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
         ] {
             assert!(
-                !triple_is_retired_shadow("java/util/Properties", "getProperty", d),
-                "retiring getProperty{d} NPEs System.getProperties(); see the module docs"
+                triple_is_retired_shadow("java/util/Properties", "getProperty", d),
+                "retired 2026-09-09 with the Phase 3 union: getProperty{d}"
             );
         }
+    }
+
+    /// The Phase 3 table obeys the same two invariants as its siblings.
+    ///
+    /// Sortedness is not cosmetic: [`triple_is_retired_shadow`] answers with a
+    /// binary search, so ONE out-of-order entry makes that entry answer `false`
+    /// — which reads as "not retired" and is invisible in any workload.
+    #[test]
+    fn the_phase3_table_is_sorted_and_unique() {
+        let mut sorted = RETIRED_SHADOW_PHASE3_TRIPLES.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.as_slice(),
+            RETIRED_SHADOW_PHASE3_TRIPLES,
+            "RETIRED_SHADOW_PHASE3_TRIPLES must be sorted and duplicate-free"
+        );
+    }
+
+    /// The wave is a PAIR of classes, and nothing else.
+    ///
+    /// The union is the whole finding — each class alone is a split store — so
+    /// a later edit that slips a third receiver into this table is making a
+    /// different, unmeasured claim. `java/util/Hashtable` is the specific one
+    /// to keep out: `Properties` extends it, and it stays a `Bridge`.
+    #[test]
+    fn the_phase3_wave_is_exactly_two_class_families() {
+        for (c, _, _) in RETIRED_SHADOW_PHASE3_TRIPLES {
+            assert!(
+                c.starts_with("java/util/concurrent/ConcurrentHashMap")
+                    || c.starts_with("java/util/Properties"),
+                "Phase 3 is the CHM/Properties union; {c} is a different wave"
+            );
+        }
+        assert!(!triple_is_retired_shadow(
+            "java/util/Hashtable",
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;"
+        ));
+    }
+
+    /// The dead registration stays out.
+    ///
+    /// `reduceEntries(JLjava/util/function/BiFunction;)` is registered with a
+    /// descriptor returning `Ljava/lang/Object;`; the real erasure returns
+    /// `Ljava/util/Map$Entry;`, so `image_declaring_method.declared` is `false`
+    /// and there is no `Code` to yield to. It is the one row on these two
+    /// prefixes that owns its slot, is a `Bridge`, and is still not retirable —
+    /// precondition 3, as a live example rather than a rule.
+    #[test]
+    fn the_phase3_wave_excludes_the_registration_with_no_image_target() {
+        assert!(!triple_is_retired_shadow(
+            "java/util/concurrent/ConcurrentHashMap",
+            "reduceEntries",
+            "(JLjava/util/function/BiFunction;)Ljava/lang/Object;"
+        ));
+        // The sibling overload DOES have an image target and is retired, so the
+        // exclusion above is about that descriptor and not about the name.
+        assert!(triple_is_retired_shadow(
+            "java/util/concurrent/ConcurrentHashMap",
+            "reduceEntries",
+            "(JLjava/util/function/Function;Ljava/util/function/BiFunction;)Ljava/lang/Object;"
+        ));
     }
 }

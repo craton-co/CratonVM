@@ -197,6 +197,27 @@ fn run_probe(bin: &Path, jdk: &Path, classes: &Path) -> (String, String) {
         // test can prove `throwAs` actually took the IR pipeline instead of
         // passing vacuously off the single-pass fallback.
         .env("CRATONVM_DBG", "ir-compiles")
+        // WITHOUT THIS THE TEST CANNOT PASS, and it could not from 2026-09-06
+        // (when `CRATONVM_C2_ACCEPT` defaulted to `evidence`) until 2026-09-08.
+        //
+        // `throwAs` is `checkcast; athrow` and nothing else. The C1→C2
+        // acceptance gate publishes an optimizing body only when it carries a
+        // transform the baseline lacks — `is_worth_publishing`: scalar
+        // replacement, inlining, an elided guard, a sunk allocation, a scalar
+        // intrinsic, or a simplified graph. A two-instruction unconditional
+        // throw earns NONE of those **by construction**, so the gate refused it
+        // (`[ir] acceptance …: REFUSED (evidence: none) -- keeping the
+        // single-pass body`) on every run, and the anti-vacuity assertion below
+        // fired every time. That assertion doing its job is the only reason
+        // anyone could tell: without it this file would have gone on reporting
+        // `ok` while measuring the single-pass backend, which has always been
+        // correct here.
+        //
+        // Pinning the policy is the right fix rather than widening the gate:
+        // this file is about the IR tier's `athrow` LOWERING, not about the
+        // gate's throughput judgment, and `ir_evidence::accept_policy`'s own
+        // doc nominates `=always` as the arm to take a claim against.
+        .env("CRATONVM_C2_ACCEPT", "always")
         .arg("-c")
         .arg(classes)
         .arg("IrAthrowDispatchProbe")

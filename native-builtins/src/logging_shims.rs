@@ -4291,7 +4291,11 @@ pub(crate) fn jul_log_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Int(size)) if size > 0 => size as usize,
         _ => return Ok(None),
     };
+    let handlers_pin = ctx.pin_native_root(handlers);
+    let record_pin = ctx.pin_native_root(record);
     for index in 0..size {
+        let handlers = ctx.read_native_pin(handlers_pin, handlers);
+        let record = ctx.read_native_pin(record_pin, record);
         let handler = match ctx.invoke_virtual(
             handlers,
             "get",

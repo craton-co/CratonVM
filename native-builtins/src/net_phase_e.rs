@@ -10643,6 +10643,29 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "()Ljava/net/URLConnection;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // PIN THE RECEIVER, and re-read it after every allocation below.
+            //
+            // `this` is a raw `ObjectRef` -- a bare address. Everything this
+            // native does afterwards can allocate (`create_string`,
+            // `new_object`, `try_alloc_concurrent_synthetic`) or run bytecode
+            // (`invoke_virtual`, `invoke_special`), and a moving young
+            // collection at any of those points relocates the URL and leaves
+            // `this` naming the address it moved away from.
+            //
+            // The write that matters is `set_field_by_name(conn, "url", this)`
+            // on the carrier below: it stores that dead address into a LIVE
+            // object's field, where no frame remap will ever reach it, and the
+            // allocator then re-serves the address to something else.
+            //
+            // Observed exactly that way on `BindableTests` under
+            // `CRATONVM_DBG_GC_STRESS=262144`:
+            // `ServiceLoader$LazyClassPathLookupIterator.parse` dispatching
+            // `openStream()` on a `java.util.Hashtable`, while the frame's own
+            // `local[1]` still held the correct, relocated `java.net.URL`. The
+            // stale address was in the `JarURLConnection.url` field written
+            // here. See
+            // `docs/internal/springboot/bindabletests-moving-young-leaves-a-frame-slot-unremapped-20260908.md`.
+            let p_this = ctx.pin_native_root(this);
             // Application-provided `URLStreamHandler` (e.g. ShrinkWrap
             // `archive:`): the real `URL.openConnection()` is
             // `handler.openConnection(this)`. Delegate so the app's own
@@ -10660,6 +10683,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             //   `jar:file:…!/…` URL returned by ClassLoader.getResource() —
             // returning an HttpURLConnection there throws ClassCastException,
             // which is swallowed and forces a wrong `../.` home fallback.
+            let this = ctx.read_native_pin(p_this, this);
             let ext = {
                 let s5 = read_field_string_or(ctx, this, 5, "");
                 // `s5.contains(':')` alone false-positives on a real-JDK
@@ -10675,9 +10699,11 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 let s = if field5_is_full_url(&s5) {
                     s5
                 } else {
+                    let this = ctx.read_native_pin(p_this, this);
                     match ctx.invoke_virtual(this, "toExternalForm", "()Ljava/lang/String;", &[]) {
                         Ok(Some(Value::Object(Some(o)))) => ctx.read_string(o).unwrap_or_default(),
                         _ => {
+                            let this = ctx.read_native_pin(p_this, this);
                             let s0 = read_field_string_or(ctx, this, 0, "");
                             if s0.contains(':') {
                                 s0
@@ -10730,7 +10756,9 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                     Some(Value::Object(Some(o))) => o,
                     _ => return Err(ioex("URL.openConnection: allocate File")),
                 };
+                let p_file = ctx.pin_native_root(file);
                 let path_string = ctx.create_string(&path);
+                let file = ctx.read_native_pin(p_file, file);
                 ctx.invoke_special(
                     "java/io/File",
                     "<init>",
@@ -10741,6 +10769,8 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                     Some(Value::Object(Some(o))) => o,
                     _ => return Err(ioex("URL.openConnection: allocate FileURLConnection")),
                 };
+                let this = ctx.read_native_pin(p_this, this);
+                let file = ctx.read_native_pin(p_file, file);
                 ctx.invoke_special(
                     "sun/net/www/protocol/file/FileURLConnection",
                     "<init>",
@@ -10751,6 +10781,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                         Value::Object(Some(file)),
                     ],
                 )?;
+                ctx.unpin_native_roots(p_this);
                 return Ok(Some(Value::Object(Some(conn))));
             }
             // `jrt:` (JEP 220 runtime image) URLs get their own carrier, exactly
@@ -10764,9 +10795,11 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // bytes (core.io.ModuleResourceTests.existingClassFileResource).
             if ext.starts_with("jrt:") {
                 let conn = try_alloc_concurrent_synthetic(ctx, JRT_URL_CONNECTION, 16)?;
+                let this = ctx.read_native_pin(p_this, this);
                 ctx.set_field(conn, HUC_URL, Value::Object(Some(this)));
                 ctx.set_field(conn, HUC_DO_INPUT, Value::Int(1));
                 ctx.set_field(conn, HUC_CONNECTED, Value::Int(0));
+                ctx.unpin_native_roots(p_this);
                 return Ok(Some(Value::Object(Some(conn))));
             }
             // For `jar:` URLs, retain the JarURLConnection carrier so callers
@@ -10806,6 +10839,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 "java/net/HttpURLConnection"
             };
             let conn = try_alloc_concurrent_synthetic(ctx, carrier, 16)?;
+            let p_conn = ctx.pin_native_root(conn);
             // BY NAME, NOT BY SLOT — and this is not a style preference.
             //
             // Both carriers selected above are REAL JDK classes with the
@@ -10842,10 +10876,12 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // itself ("never write synthetic slots (they alias real fields on
             // a real-JDK object)") and keeps its state in an identity-keyed
             // side table.
+            let this = ctx.read_native_pin(p_this, this);
             ctx.set_field_by_name(conn, "url", Value::Object(Some(this)));
             // Default request method "GET" so `huc_perform` doesn't trip
             // on a missing method when the http(s) path is exercised.
             let m = ctx.create_string("GET");
+            let conn = ctx.read_native_pin(p_conn, conn);
             ctx.set_field_by_name(conn, "method", Value::Object(Some(m)));
             ctx.set_field_by_name(conn, "doInput", Value::Int(1));
             ctx.set_field_by_name(conn, "connected", Value::Int(0));
@@ -10858,6 +10894,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // that inherited one-`getfield` body — and a fresh connection that
             // answers `false` is reporting a value the caller never chose.
             ctx.set_field_by_name(conn, "useCaches", Value::Int(1));
+            ctx.unpin_native_roots(p_this);
             Ok(Some(Value::Object(Some(conn))))
         },
     );
@@ -10896,18 +10933,24 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 return Err(ioex("JarURLConnection.getJarFileURL: malformed URL"));
             }
             let spec = ctx.create_string(&jar_part);
+            // Same rule as `URL.openConnection` above: `new_object` allocates,
+            // so `spec` has to be re-read from a pin before it is handed to
+            // the constructor, or the URL is built from a dead address.
+            let p_spec = ctx.pin_native_root(spec);
             // Construct via the regular `new URL(String)` path so the
             // returned object is a fully-initialised java.net.URL.
             let new_url = match ctx.new_object("java/net/URL")? {
                 Some(Value::Object(Some(o))) => o,
                 _ => return Err(ioex("JarURLConnection.getJarFileURL: alloc URL")),
             };
+            let spec = ctx.read_native_pin(p_spec, spec);
             ctx.invoke_special(
                 "java/net/URL",
                 "<init>",
                 "(Ljava/lang/String;)V",
                 &[Value::Object(Some(new_url)), Value::Object(Some(spec))],
             )?;
+            ctx.unpin_native_roots(p_spec);
             Ok(Some(Value::Object(Some(new_url))))
         },
     );
@@ -14772,9 +14815,16 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
                 pairs.push((name, value));
                 i += 2;
             }
+            // GC-safety: `re5_builder_append_header` allocates the header
+            // string it appends, so `this` is a pre-GC address from the second
+            // header on.
+            let this_pin = ctx.pin_native_root(this);
             for (name, value) in pairs {
+                let this = ctx.read_native_pin(this_pin, this);
                 re5_builder_append_header(ctx, this, &format!("{name}: {value}"));
             }
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -19563,7 +19613,11 @@ fn register_re9_nio_selector(r: &mut NativeMethodRegistry) {
         } else {
             let deadline = std::time::Instant::now() + Duration::from_millis(raw as u64);
             let mut total = 0i32;
+            // GC-safety: `selectNow` is real bytecode, dispatched on `this`
+            // every turn of a loop that spins until a deadline.
+            let this_pin = ctx.pin_native_root(this);
             while std::time::Instant::now() < deadline {
+                let this = ctx.read_native_pin(this_pin, this);
                 if let Ok(Some(Value::Int(n))) = ctx.invoke_virtual(this, "selectNow", "()I", &[]) {
                     if n > 0 {
                         total = n;

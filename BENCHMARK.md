@@ -59,21 +59,32 @@ file's own methodology section warns about. All seven phases come from **one
 binary in one window**, load 1.8–3.8 throughout, with the series aborted and
 retried if load left the band mid-run.
 
-| Benchmark                         | JDK 25 C2 | CratonVM  | Ratio     | CV (CratonVM) | was (2026-07) |
-|-----------------------------------|-----------|-----------|-----------|---------------|---------------|
-| Arithmetic (2B ops)               | 1,852 ms  | 3,601 ms  | 1.94x     | 0.6% | 2.44x |
-| Fibonacci(44)                     | 1,449 ms  | 5,059 ms‡ | 3.49x‡    | 0.6% | 2.79x |
-| Sieve (100K × 20,000)             | 2,333 ms† | 2,360 ms  | **1.01x** | 2.0% | 2.28x |
-| Matrix 1280×1280                  | 2,106 ms  | 2,094 ms  | **0.99x** | 0.2% | 2.93x |
-| HashMap (10M put/get, isolated)   | 983 ms    | 2,049 ms  | 2.08x     | 0.6% | **1.75x** |
-| String/Regex (100K, isolated)     | 50 ms     | 200 ms    | 4.00x     | 0.9% | **7.7x** |
-| Binary Trees (depth 18, isolated) | 176 ms    | 1,700 ms  | 9.66x     | 1.1% | 8.34x |
+| Benchmark                             | JDK 25 C2 | CratonVM   | Ratio     | CV (CratonVM) | was (2026-07) |
+|----------------------------------------|-----------|------------|-----------|---------------|---------------|
+| Arithmetic (2B ops)                   | 1,852 ms  | 3,601 ms   | 1.94x     | 0.6% | 2.44x |
+| Fibonacci(44)                         | 1,449 ms  | 5,059 ms‡  | 3.49x‡    | 0.6% | 2.79x |
+| Sieve (100K × 20,000)                 | 2,333 ms† | 2,360 ms   | **1.01x** | 2.0% | 2.28x |
+| Matrix 1280×1280                      | 2,106 ms  | 2,094 ms   | **0.99x** | 0.2% | 2.93x |
+| Binary Trees (depth 16, isolated)§    | 49 ms     | 259 ms     | 5.29x     | 8.3% | — |
+| Binary Trees (depth 18, isolated)§    | 183 ms    | 1,195 ms   | 6.53x     | 2.4% | 8.34x |
+| Binary Trees (depth 20, isolated)§    | 898 ms    | 6,649 ms   | 7.40x     | 1.0% | — |
+| HashMap (1M put/get, isolated)§       | 45 ms     | 553 ms     | 12.29x    | 2.4% | — |
+| HashMap (10M put/get, isolated)§      | 1,039 ms  | 5,499 ms   | 5.29x     | 0.4% | **1.75x** |
+| HashMap (100M put/get, isolated)§     | 11,455 ms | 120,465 ms | 10.52x    | 0.3% | — |
+| String/Regex (100K, isolated)§        | 54 ms     | 242 ms     | 4.48x     | 3.6% | **7.7x** |
+| String/Regex (1M, isolated)§          | 138 ms    | 2,320 ms   | 16.81x    | 1.3% | — |
+| String/Regex (10M, isolated)§         | 466 ms    | 23,359 ms  | 50.13x    | 0.4% | — |
 
 This replaces an older table whose rows were taken across four separate
 sessions on a host that has since been re-provisioned and three of which this
 document already flagged as unverified. Every row above comes from **one**
-interleaved series, so the rows are comparable to each other. CratonVM's
-run-to-run spread is under 1% on five of the seven rows.
+interleaved series per collector, so the rows are comparable to each other
+within a collector. CratonVM's run-to-run spread is under 1% on eight of the
+thirteen rows; the widest is Binary Trees depth 16 (8.3%, on a run so short
+— 259 ms median — that a couple of milliseconds of scheduling noise reads as
+a large percentage). The `was (2026-07)` column, where present, was measured
+under the Generational collector — see `§` below before comparing it to the
+Ratio column of a G1 row directly.
 
 **Two rows are at parity with HotSpot C2**: Matrix and Sieve. HashMap and
 Binary Trees sit above their `was (2026-07)` figures, but those earlier
@@ -119,6 +130,81 @@ The optimizing tier declines a method whose loops the single-pass backend
 would lower better, and what that backend can do and the IR tier cannot is
 enumerated in `jit/src/x64/single_pass_only.rs` rather than discovered one
 regression at a time.
+
+### § Growth across N: Binary Trees / HashMap / String-Regex under G1 (2026-09-10)
+
+Measured with a one-off sized harness (`CratonBenchSized`, one phase + one
+size per argv, not part of the checked-in `bench/` tree) so each of these
+three GC/allocation-heavy kernels could be run at three sizes in one
+interleaved series instead of the single proxy size the rest of this
+document uses. **CratonVM ran with `--XX:UseGc G1`; HotSpot needed no flag,
+since G1 has been its default collector since JDK 9.** This is a deliberate
+collector switch for these three rows only — the rest of this table, and the
+codebase default, is the Generational collector (see README.md Highlights).
+
+Azure host (`dev` @ `330773e1`, fat-LTO, sha256 `bc2bb8b0a044…`), CPU 7
+pinned via `taskset`, alternating CratonVM/HotSpot arms, 9 reps per
+size/kernel combination, no sample discarded, checksum-verified every rep.
+Load stayed at 2.1–2.3 for the entire series (quietest of any run in this
+document); memory headroom was 25GB+ available throughout, including the
+100M-entry HashMap run given `-Xmx24g`. **Zero checksum mismatches — every
+rep, every size, both VMs agree exactly.**
+
+| kernel | size | JDK 25 (G1, default) | CratonVM (G1) | ratio | CV (CratonVM) |
+|---|---|---:|---:|---:|---:|
+| Binary Trees | depth 16 | 49 ms | 259 ms | 5.29x | 8.3% |
+| Binary Trees | depth 18 | 183 ms | 1,195 ms | 6.53x | 2.4% |
+| Binary Trees | depth 20 | 898 ms | 6,649 ms | 7.40x | 1.0% |
+| HashMap | 1M put/get | 45 ms | 553 ms | 12.29x | 2.4% |
+| HashMap | 10M put/get | 1,039 ms | 5,499 ms | 5.29x | 0.4% |
+| HashMap | 100M put/get | 11,455 ms | 120,465 ms | 10.52x | 0.3% |
+| String/Regex | 100K | 54 ms | 242 ms | 4.48x | 3.6% |
+| String/Regex | 1M | 138 ms | 2,320 ms | 16.81x | 1.3% |
+| String/Regex | 10M | 466 ms | 23,359 ms | 50.13x | 0.4% |
+
+**Binary Trees and String/Regex compound with N; HashMap does not.** Binary
+Trees' ratio rises steadily as depth increases (5.29x → 6.53x → 7.40x, each
+step roughly quadrupling live-node count). String/Regex compounds far more
+sharply — the ratio nearly triples at each 10x step in N (4.48x → 16.81x →
+50.13x) — consistent with CratonVM's per-match `String` allocation
+(`Matcher.group(1)`) and `StringBuilder` growth paying an increasing GC tax
+as the retained string and match count both grow. HashMap's ratio is
+**non-monotonic** (12.29x → 5.29x → 10.52x): the 1M run completes in 553 ms,
+short enough that fixed per-process costs (JVM/VM bring-up, class loading)
+are still a real share of both columns, which is the more likely explanation
+than a genuine reversal of the scaling trend — this row would need a
+finer-grained sweep (e.g. 1M/3M/10M/30M/100M) to separate "small-N fixed
+overhead" from "true non-monotonic scaling" with confidence, which this
+series does not attempt to do.
+
+**G1 vs the Generational default, same binary, isolated same-day
+measurement** (CratonVM-only, no HotSpot column — this isolates the
+collector's own effect):
+
+| kernel | size | Generational | G1 | G1 effect |
+|---|---|---:|---:|---:|
+| Binary Trees | depth 16 | 1,978 ms | 259 ms | **7.6x faster** |
+| Binary Trees | depth 18 | 8,956 ms | 1,195 ms | **7.5x faster** |
+| Binary Trees | depth 20 | 49,361 ms | 6,649 ms | **7.4x faster** |
+| HashMap | 1M | 747 ms | 553 ms | 1.35x faster |
+| HashMap | 10M | 7,468 ms | 5,499 ms | 1.36x faster |
+| HashMap | 100M | 139,000 ms | 120,465 ms | 1.15x faster |
+| String/Regex | 100K | 343 ms | 242 ms | 1.42x faster |
+| String/Regex | 10M | 19,311 ms | 23,359 ms | **1.21x slower** |
+
+G1 is a **large, uneven** win, not a uniform one: it more than halves Binary
+Trees' wall time at every depth tested, helps HashMap and small String/Regex
+modestly, and measurably **regresses** String/Regex at 10M — the collector
+that helps most on one allocation-heavy kernel is the one that hurts on
+another. (The String/Regex 1M row is omitted from this delta table: the
+Generational-side sample for that size landed exactly as an unrelated
+session's build spiked host load to 8.4, so that specific comparison isn't
+trustworthy — see the raw sample data below.)
+
+Raw samples, manifest, and environment record for both series:
+`/data/cratonvm/regression-suite/perf/results/vs-hotspot-sized-g1-20260910T125919Z/`
+(G1) and `/data/cratonvm/regression-suite/perf/results/vs-hotspot-sized-20260910T121415Z/`
+(Generational) on the Azure benchmark host.
 
 ### Sieve was 6.50x yesterday
 
@@ -272,14 +358,35 @@ enforced budget.
 
 | Kernel (N = 2²⁴)                                    | HotSpot C2 | TornadoVM GPU | CratonVM GPU | vs HotSpot | vs TornadoVM |
 |-------------------------------------------------------|------------|---------------|--------------|------------|--------------|
-| Integer div-chain (48 divs/elem)                       | 2,146 ms   | 26 ms         | **11 ms**    | **195x**   | **2.4x**     |
-| Double div-chain (64 divs/elem)                        | 1,780 ms   | 128 ms        | **95 ms**    | **18.7x**  | **1.3x**     |
-| 128 multiply-adds/elem (data-dependent multiplier)     | 1,300 ms   | 27 ms         | **8 ms**     | **163x**   | **3.4x**     |
-| Dot-product reduction (int·int → long, x300/elem)      | 1,172 ms   | unimplemented | **2 ms**     | **586x**    | n/a          |
+| Integer div-chain (48 divs/elem)                       | 2,179 ms   | 27 ms         | **7 ms**     | **311x**   | **3.9x**     |
+| Double div-chain (64 divs/elem)                        | 1,784 ms   | 135 ms        | **82 ms**    | **21.8x**  | **1.6x**     |
+| 128 multiply-adds/elem (data-dependent multiplier)     | 1,298 ms   | 26 ms         | **7 ms**     | **185x**   | **3.7x**     |
+| Dot-product reduction (int·int → long, x300/elem)      | 1,168 ms   | unimplemented | **2 ms**     | **584x**   | n/a          |
 
-Re-verified 2026-09-05 on the same box (RTX 2060, TornadoVM 4.0.1 PTX,
-N = 2²⁴). The four non-ray-tracer rows still hold and TornadoVM's integer
-div-chain reproduced exactly at 26 ms. Two things that run did change:
+**Re-measured 2026-09-07**, and this table is now that measurement rather
+than an accumulation of three vintages. Quiet host (`bench-gpu/wait-for-quiet.sh`
+gated it), `target-gpu/release/cratonvm.exe`, HotSpot Adoptium 25.0.3.9,
+TornadoVM 4.0.1-jdk25-ptx, N = 2²⁴, best of 5, warm, full
+host→device→host. Reproduce with `bash bench-gpu/rerun-table-rows.sh`.
+
+Every arm of a row was run in the same session this time, including the CPU
+baselines — which had previously been carried over from an older idle-box run.
+They reproduced almost exactly (2,179 vs 2,146; 1,784 vs 1,780; 1,298 vs 1,300;
+1,168 vs 1,172), which is the check that the setup is sound: the ratios moved
+because CratonVM got faster, not because the baseline drifted.
+
+Three rows moved against the previous table, and the double div-chain row
+finally agrees with the note that has sat under it since 2026-09-05:
+
+- **int div-chain 11 ms → 7 ms**, and **128 multiply-adds 8 ms → 7 ms.**
+- **double div-chain 95 ms → 82 ms, TornadoVM 128 ms → 135 ms.** The note
+  below said "the row now measures 81 ms against TornadoVM's 135" and the table
+  above it still said 95/128. The table was stale; it is not any more.
+- **The 128-multiply-add row needed a different harness to measure at all** —
+  see the offload-gate defect recorded below.
+
+The pre-2026-09-07 notes follow, kept because they explain how rows got where
+they are:
 
 - The **dot-product row is now 2 ms**, not 12 — the warp-shuffle reduction
   (one `red.global.add` per warp rather than per thread) landed after the
@@ -302,13 +409,70 @@ present in this tree.
 
 Notes:
 
+- **FIXED 2026-09-07: a compiled caller silently stopped offloading a kernel in
+  another class.** `bench-gpu/GpuComputeWarm.java` has `main()` call
+  `GpuCompute.heavy` in a second class. Under `--gpu --print-gpu-decisions`
+  that method never appeared in the decision log at all — not
+  `Rejected(...)`, never asked — and the row read **2,611-2,934 ms on the
+  CPU** against 7 ms on the device. The same kernel declared beside `main()`
+  (`GpuComputeWarmSelf.java`) offloaded normally, which is what made it
+  look like an analyzer problem. It was not.
+
+  Root cause: the JIT has two one-way doors for a static call site — bind it
+  directly to the callee's entry (`jit/src/lib.rs`) and inline it
+  (`jit/src/x64/bytecode_walk.rs`). Both were gated on
+  `offload_hook::is_kernel`, a lookup in a registry that `offload_jit_gate`
+  fills as a side effect of scanning callers — and that scan cannot judge a
+  target whose declaring class is not loaded yet. A caller is scanned when it
+  is admitted to the JIT, which happens **before** it runs, so a callee in
+  another class has typically never been touched at that moment. `main` here
+  fills two 2²⁴ arrays first, so it is compiled at exactly the wrong time.
+  The site was bound directly, the dispatch helper the offload hook lives
+  behind was gone, and `try_compiled_offload`'s late registration (the
+  2026-09-06 fix for the same underlying limitation) had no site left to run
+  on.
+
+  The fix is one predicate. A registry **miss** means either "not a kernel" or
+  "could not have known yet", and these doors treated the two identically while
+  making a decision that is irreversible. `offload_hook::keeps_dispatch_helper`
+  now falls back on a miss to a descriptor-only test — `)V`/`)I`/`)J` with an
+  array parameter, mirroring `target_can_ever_dispatch` — which needs no class
+  loading and no locks. Keeping a helper is reversible and cheap; binding
+  directly is neither.
+
+  Verified: `GpuComputeWarm` went 2,934 ms → **6 ms**, and the census now
+  prints `registered late, by the compiled site: GpuCompute.heavy([I[I[I)V`.
+  Across five runs each on a quiet host the two harnesses are indistinguishable
+  (cross-class 5-6 ms, same-class 5-6 ms), which is the property that was
+  broken. `test_classes/gpu/GpuForwardRef.java` passes on both arms with equal
+  checksums. `GpuHookOverheadBench`'s `base_ns_per_call` — a loop calling an
+  **ineligible** target, which is what a broader predicate would have taxed —
+  reads 7.07 ns with `--gpu` against 7.58 ns without, so the CPU side pays
+  nothing; for scale, the old caller-refusal approach cost 407.9 ns there.
+
+  `bench-gpu/rerun-table-rows.sh` now measures this row with the cross-class
+  harness on purpose, and keeps the same-class one as a control arm. If the two
+  ever diverge again, that is what regressed.
+
 - The div-chain rows are the "GPU wins big" cases: division has no
   competitive CPU-vectorized form, so raw parallelism wins at every size
   tested (2²⁰–2²⁶; the ratios hold steady across sizes).
-- CratonVM's double-division checksum is **bit-exact** with HotSpot at
-  every size (`div.rn.f64` is IEEE-754 round-to-nearest, same as x86
-  `vdivpd`); TornadoVM's diverges slightly — its PTX backend doesn't
-  guarantee bit-exact division.
+- CratonVM's double-division **kernel output** is bit-exact with HotSpot
+  (`div.rn.f64` is IEEE-754 round-to-nearest, same as x86 `vdivpd`): the
+  2026-09-07 run prints identical `OUT0=45.40459327514974` and
+  `OUTN=7.2490508729547125` from both.
+
+  Its **harness checksum** does not match, and the distinction matters. The
+  checksum is a serial sum of 2²⁴ doubles in the benchmark's own epilogue;
+  floating-point addition is not associative, so summing in a different order
+  gives a different but equally correct total. CratonVM reads
+  `5.928010028745152E7` against HotSpot's `5.92801002867254E7` — a relative
+  difference of 1.2e-11, the size of a reassociated sum.
+
+  TornadoVM's `5.9583712290819384E7` is 5.1e-3 away, eight orders of magnitude
+  larger, and that one *is* a division difference: its PTX backend does not
+  guarantee bit-exact division. Do not read the two divergences as the same
+  kind of thing.
 - **Root-caused: TornadoVM's `unimplemented` is a standing gap in
   mixed-type reductions, not a version/driver issue.** `TornadoSnippetReflectionProvider
   .forBoxed` (what the whole stack trace bottoms out in) is an unconditional

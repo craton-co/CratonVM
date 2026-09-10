@@ -596,6 +596,19 @@ pub enum Op {
     /// Inputs are `[a]` for unary and `[a, b]` for binary; [`ScalarOp::arity`]
     /// is the single source of truth and `ir_verify` reads it.
     ScalarIntrinsic(ScalarOp),
+    /// An unboxing accessor lowered inline: null check, exact receiver class
+    /// guard, per-object compact/legacy layout branch, then the payload load.
+    /// Inputs `[ctrl, mem, obj]`; result `Long` or `Int`.
+    ///
+    /// Carries only the guard class id -- the byte offsets are re-derived at
+    /// lowering from `unbox_offsets`, the same resolver the single-pass backend
+    /// asks, so the two cannot disagree about where the field lives.
+    ///
+    /// A null receiver or a class mismatch DEOPTS rather than throwing here:
+    /// the interpreter re-runs the call and raises the NPE, or dispatches to
+    /// the override that made the guard fail. `AtomicLong` and friends are not
+    /// final, which is why the guard is not optional.
+    Unbox { op: UnboxOp, class_id: u32 },
 
     // ── Dead / removed ───────────────────────────────────────────────
     /// Placeholder for a removed node (inputs cleared, not referenced).
@@ -1252,6 +1265,191 @@ pub struct IrInlineSite {
     pub arg_local_slots: Vec<u32>,
     /// Whether the callee returns a value to push on the caller's stack.
     pub returns_value: bool,
+    /// Is argument 0 a RECEIVER — i.e. is the callee an instance method?
+    ///
+    /// JVMS §6.5 makes a null `objectref` an NPE AT THE INVOKE, before the
+    /// callee's first instruction. Splicing deletes that invoke, so unless the
+    /// builder puts a check back a null receiver simply flows into callee local
+    /// 0 and the body runs with `this == null` — measured on
+    /// `NullReceiverCachedProbe`: `warm-invokespecial=NO-THROW(3)`, the private
+    /// method's body returning its value for a receiver that was null. See
+    /// [`IrBuilder::begin_splice`], which is where the guard goes.
+    ///
+    /// Not derivable from `num_args` or `arg_local_slots`: a static callee's
+    /// argument 0 also lands in local 0.
+    pub receiver_is_arg0: bool,
+    /// The callee's `"class/Name.method:descriptor"` label — the same shape
+    /// [`crate::x64::InlineFrameLevel::label`] carries and the same one
+    /// `CompiledMethod::method_label` uses, so a consumer parses it with the
+    /// splitter `stackwalker::compiled_frame_entry` already has.
+    ///
+    /// Carried for ONE reason: a spliced body's frames are invisible to a stack
+    /// trace without it. Everything else on this struct describes how to RUN
+    /// the callee's bytecode; this pair describes whose bytecode it is, which
+    /// is what a trace needs and what nothing here recorded until 2026-09-08.
+    /// See [`IrInlineFrameSites`].
+    pub method_key: String,
+    /// `ClassId` of the class [`Self::method_key`] names, or `0` when the
+    /// resolver supplied none. Same contract as
+    /// [`crate::x64::InlineFrameLevel::class_id`]: a consumer that must answer
+    /// in `ClassId` expands the level without resolving a JIT label by name.
+    pub class_id: u32,
+}
+
+/// One level of an inline chain, in the arch-neutral form this module can
+/// speak. `ir_lower` converts these to [`crate::x64::InlineFrameLevel`] at the
+/// point it records a row; the split keeps `ir.rs` free of an x64 dependency
+/// while both sides agree on the field meanings exactly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IrInlineFrameLevel {
+    /// `"class/Name.method:descriptor"` of the spliced callee.
+    pub method_key: String,
+    /// Bytecode index inside that callee's OWN code — never a combined-buffer
+    /// pc, which is the whole point of the translation below.
+    pub bci: u32,
+    /// `ClassId` of the class `method_key` names, or `0`.
+    pub class_id: u32,
+}
+
+/// Resolves a COMBINED-BUFFER pc to the chain of spliced callees enclosing it,
+/// innermost first.
+///
+/// # Why this exists, and why the combined pc is the right key
+///
+/// The IR tier splices in the bytecode domain: `lib.rs` appends each admitted
+/// callee's body after the caller's code and the builder walks the result, so
+/// a program point inside a spliced body carries a pc PAST the caller's own
+/// `code_len` (see [`IrInlineSite`]). Every node the builder creates there is
+/// stamped with that combined pc, and it survives untouched into `ir_lower`.
+///
+/// That makes the combined pc an EXACT key, and exactness is what this needed.
+/// The obvious alternative — the bci a frame reports — cannot work: a spliced
+/// region is covered by the caller's snapshot at the `invoke` pc, so every
+/// level of a nested splice reports the SAME bci, and
+/// `x64::InlineFrameMap::from_rows` (correctly) poisons rows that disagree
+/// under one bci. Combined-pc ranges, by contrast, are disjoint by
+/// construction: `lib.rs` appends each body once, at its own `base`, so a pc
+/// names exactly one body and the nesting is recovered by following each
+/// site's CALLER pc outward.
+///
+/// # What it deliberately does not do
+///
+/// It answers `None` — not a guess — for a pc in no spliced range (the
+/// compiling method's own code, which is the physical frame and not an inlined
+/// level), for a malformed site table, and for a chain that would exceed
+/// [`MAX_INLINE_SCOPE_DEPTH`]. A missing chain costs a trace some frames; a
+/// wrong one names a method that never ran, which is the outcome this whole
+/// area refuses.
+#[derive(Clone, Debug, Default)]
+pub struct IrInlineFrameSites {
+    /// `(base, code_len, caller_pc, method_key, class_id)` per spliced body,
+    /// ascending by `base`. Ranges are disjoint, so a binary search on `base`
+    /// finds the only candidate.
+    bodies: Vec<(usize, usize, usize, String, u32)>,
+}
+
+impl IrInlineFrameSites {
+    /// Build from the builder's site table. `sites` is keyed by CALLER pc, in
+    /// combined coordinates, exactly as [`IrInlineTables::sites`] holds it.
+    pub fn from_sites(sites: &HashMap<usize, IrInlineSite>) -> Self {
+        let mut bodies: Vec<(usize, usize, usize, String, u32)> = sites
+            .iter()
+            .map(|(&caller_pc, s)| {
+                (
+                    s.base,
+                    s.code_len,
+                    caller_pc,
+                    s.method_key.clone(),
+                    s.class_id,
+                )
+            })
+            .collect();
+        bodies.sort_unstable_by_key(|&(base, _, _, _, _)| base);
+        Self { bodies }
+    }
+
+    /// `true` when nothing was spliced — the state of every compile that
+    /// inlines nothing, and the fast path every caller takes first.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.bodies.is_empty()
+    }
+
+    /// Index of the body whose range contains `pc`, or `None`.
+    fn body_at(&self, pc: usize) -> Option<usize> {
+        // The last body whose `base <= pc`; ranges are disjoint and ascending,
+        // so no earlier one can contain `pc`.
+        let i = match self.bodies.binary_search_by_key(&pc, |&(b, _, _, _, _)| b) {
+            Ok(i) => i,
+            Err(0) => return None,
+            Err(i) => i - 1,
+        };
+        let (base, code_len, ..) = self.bodies[i];
+        // `base + code_len` cannot overflow: both came from a buffer this
+        // process built, but saturate rather than assume it.
+        if pc < base.saturating_add(code_len) {
+            Some(i)
+        } else {
+            None
+        }
+    }
+
+    /// The chain of spliced callees enclosing `pc`, innermost first, or an
+    /// empty vector when `pc` is not inside any spliced body.
+    ///
+    /// Each level's `bci` is an index into THAT level's own code: for the
+    /// innermost it is `pc - base`, and for every level above it the offset of
+    /// the nested call inside its parent's body.
+    pub fn chain_at(&self, pc: usize) -> Vec<IrInlineFrameLevel> {
+        let mut out = Vec::new();
+        let mut at = pc;
+        while let Some(i) = self.body_at(at) {
+            let (base, _, caller_pc, ref key, class_id) = self.bodies[i];
+            // Cast: a bci inside a body this compile appended, so it is bounded
+            // by the combined buffer's length.
+            let Ok(bci) = u32::try_from(at - base) else {
+                return Vec::new();
+            };
+            out.push(IrInlineFrameLevel {
+                method_key: key.clone(),
+                bci,
+                class_id,
+            });
+            if out.len() > MAX_INLINE_SCOPE_DEPTH {
+                // A malformed table (a body whose caller pc lands back inside
+                // itself) would otherwise walk forever. Give up the chain
+                // whole rather than return a truncated one that reads as
+                // complete.
+                return Vec::new();
+            }
+            // Step out: the call that produced this level lives at the site's
+            // CALLER pc, which is either inside the enclosing spliced body or
+            // in the compiling method's own code — where the walk ends.
+            at = caller_pc;
+        }
+        out
+    }
+
+    /// The COMPILING method's own bci covering `pc`: the caller pc of the
+    /// outermost splice enclosing it, which is by construction an index into
+    /// that method's real bytecode.
+    ///
+    /// `None` when `pc` is in no spliced body — the caller already has the
+    /// method's own bci in that case and must not take one from here.
+    pub fn enclosing_bci_at(&self, pc: usize) -> Option<u32> {
+        let mut at = pc;
+        let mut guard = 0usize;
+        let mut found = None;
+        while let Some(i) = self.body_at(at) {
+            at = self.bodies[i].2;
+            found = Some(at);
+            guard += 1;
+            if guard > MAX_INLINE_SCOPE_DEPTH {
+                return None;
+            }
+        }
+        found.and_then(|b| u32::try_from(b).ok())
+    }
 }
 
 /// The pc-keyed rows a set of [`IrInlineSite`]s adds to the builder's existing
@@ -1264,11 +1462,15 @@ pub struct IrInlineSite {
 /// resolution pass, and applying half of them would leave the walk bailing in
 /// the middle of a body it had already committed to.
 ///
-/// What is NOT here is what v1 refuses in a spliced body: `ldc` / `ldc2_w`
-/// (the resolver records a raw `i64` where the builder wants the value plus its
-/// float/double discriminator, and inventing that bit is how a `long` constant
-/// becomes a `double`), `getstatic` / `putstatic`, `anewarray`, `checkcast` and
-/// `instanceof`. A callee using any of them is refused whole at resolution.
+/// What is NOT here is what the resolver still refuses in a spliced body:
+/// `putstatic` and `anewarray`. A callee using either is refused whole at
+/// resolution. `ldc` / `ldc2_w`, `getstatic` and `checkcast` / `instanceof`
+/// were all on that list and came off it, in every case because the refusal
+/// was PLUMBING rather than modelling -- the builder had the arm and nothing
+/// rebased the rows it reads. `putstatic` is the one that is genuinely
+/// modelling: the builder has no arm for it at all, and a static reference
+/// write owes an SATB pre-barrier the single-pass `jit_putstatic_*` path
+/// carries.
 #[derive(Clone, Debug, Default)]
 pub struct IrInlineTables {
     /// The bodies themselves, keyed by CALLER pc.
@@ -1287,6 +1489,68 @@ pub struct IrInlineTables {
     /// `object_init_pcs` — the set that elides on any receiver — because that
     /// is what "proven no-op body" means, receiver notwithstanding.
     pub object_init_pcs: HashSet<usize>,
+    /// `pc → (bits, is_float)` for the `ldc` / `ldc_w` sites inside spliced
+    /// bodies, rebased into combined-buffer coordinates and merged into the
+    /// builder's own `ldc_info`.
+    ///
+    /// Without this row a spliced `ldc` reaches the builder's `0x12 | 0x13` arm
+    /// with nothing in any of its three tables and bails the whole METHOD —
+    /// which is why the splice scanner used to refuse such a callee up front
+    /// rather than discover it here. See [`crate::InlineSite::ldc_fp_pcs`].
+    pub ldc_info: HashMap<usize, (i64, bool)>,
+    /// `pc → (bits, is_double)` for the `ldc2_w` sites inside spliced bodies.
+    /// Same shape and same reason as [`Self::ldc_info`].
+    pub ldc2w_info: HashMap<usize, (i64, bool)>,
+    /// `pc -> (class_id, field_index, type_tag, is_volatile)` for the
+    /// `getstatic` sites inside spliced bodies, rebased into combined-buffer
+    /// coordinates and merged into the builder's own `static_field_info`.
+    ///
+    /// Same shape and same reason as [`Self::ldc_info`], and the same class of
+    /// cause: the rows were resolvable all along -- `InlineSite` has carried
+    /// `static_field_info` for the single-pass inliner since it existed -- and
+    /// the optimizing tier refused every callee containing a `getstatic`
+    /// (`ir-splice-static-field`) because nothing rebased them. `getstatic` is
+    /// the single largest opcode in the ir-coverage survey (92 of 273 events),
+    /// so the refusal fell on the callee shape framework code is mostly made
+    /// of: a static-table read behind an accessor.
+    ///
+    /// `putstatic` (0xb3) stays refused, and not for a plumbing reason: the
+    /// builder has no arm for it at all, and a static reference WRITE owes an
+    /// SATB pre-barrier that lives on the single-pass `jit_putstatic_*` path.
+    /// The resolver refuses it separately so the two sides cannot disagree.
+    pub static_field_info: HashMap<usize, (u32, usize, u8, bool)>,
+    /// `pc -> (name_ptr, name_len)` for the `checkcast` (0xc0) sites inside
+    /// spliced bodies, rebased and merged into the builder's own
+    /// `checkcast_info`. [`Self::instanceof_info`] is the 0xc1 twin.
+    ///
+    /// Same rebase and the same fail-closed shape as
+    /// [`Self::static_field_info`]: a missing row bails the METHOD, so the
+    /// resolver refuses a CALLEE whose targets it could not resolve rather
+    /// than admitting the body and leaving rows out.
+    ///
+    /// The `0xc0`/`0xc1` arms read as though a missing row were graceful --
+    /// they call `plant_uncommon_trap` and compile the rest. By default they
+    /// are not: `TrapCause::UnresolvedTypeCheck` is gated behind
+    /// `ir_unresolved_class_trap_enabled`, which is off, so the plant refuses
+    /// and the arm bails. With that switch ON the trap does fire, and inside a
+    /// splice it deopts to "re-execute the invoke" -- which is the second
+    /// reason the resolver refuses rather than relying on the arm: one setting
+    /// of that flag costs the caller its compile, the other costs it a trap on
+    /// every call.
+    ///
+    /// The `(ptr, len)` pairs are interned process-wide by
+    /// [`crate::intern_typecheck_target`] and are NOT owned by the compile, so
+    /// unlike the invoke tables these rows need no keep-alive on the artifact.
+    pub checkcast_info: HashMap<usize, (usize, usize)>,
+    /// `pc -> (name_ptr, name_len)` for the `instanceof` (0xc1) sites inside
+    /// spliced bodies. See [`Self::checkcast_info`].
+    ///
+    /// Kept as a separate map for the same reason the builder keeps two: the
+    /// two opcodes take different lowerings, and a `checkcast` additionally
+    /// obliges the artifact to carry `has_dispatch` — its ClassCastException
+    /// path publishes through the `JIT_THREAD` TLS that the no-dispatch fast
+    /// entry never sets. `instanceof` answers a boolean and owes nothing.
+    pub instanceof_info: HashMap<usize, (usize, usize)>,
 }
 
 /// The builder's state for one splice in progress.
@@ -1298,6 +1562,27 @@ struct SpliceFrame {
     saved_locals: Vec<NodeId>,
     saved_stack: Vec<NodeId>,
     returns_value: bool,
+    /// This body has more than one reachable `return`, so a `return` is NOT a
+    /// splice exit: it is an edge into the continuation built at [`Self::end`].
+    /// Decided once, by the pre-scan in [`IrBuilder::build`], from the same
+    /// verified decode the merge targets come from — never from the walk,
+    /// which meets the returns one at a time and cannot know it is at the last.
+    multi_return: bool,
+    /// One `(ctrl, mem, value)` per `return` the walk has reached, in walk
+    /// order. `value` is [`NO_NODE`] for a `void` callee.
+    ///
+    /// The caller's locals and operand stack need no entry here: they are
+    /// saved above and are the same on every path out of the callee, because
+    /// the callee cannot reach them.
+    exits: Vec<(NodeId, NodeId, NodeId)>,
+    /// Combined-buffer pc of the last `return` recorded in [`Self::exits`].
+    ///
+    /// The continuation's `Merge` and `Phi`s are stamped with this rather than
+    /// with `end`: `end` is one PAST the body, so `spliced_ranges` would
+    /// resolve it to the caller and `resume_bci` would stop rewriting these
+    /// nodes to the enclosing `invoke`. See [`IrInlineSite`] on the two
+    /// meanings of `bytecode_pc`.
+    exit_bci: usize,
 }
 
 /// Hard cap on inline-scope chain length.
@@ -3140,6 +3425,19 @@ impl Op {
             Op::Throw => (3, MemAccess::Opaque), // [ctrl, mem, exc]
             Op::LambdaIntToDouble => (4, MemAccess::Opaque), // [ctrl, mem, lambda, index]
             Op::MonitorEnter => (3, MemAccess::MonitorEnter), // [ctrl, mem, obj]
+            // The guarded slot-0 accessors. `Opaque` -- the top of the lattice --
+            // rather than the `FieldRead`/`FieldWrite` pair the shape suggests:
+            // `access_location` reads a `(base, offset)` out of input slots 2
+            // and 3, and this node's slot 3 is a DELTA, not an offset (the
+            // offsets it uses are resolved from `class_id` at lowering and are
+            // carried by no edge at all). Three of the six are a `LOCK XADD` on
+            // a VOLATILE field, whose ordering is a full fence anyway, which is
+            // what `Opaque` already means here.
+            //
+            // Added 2026-09-08 with the `Atomic*` families. Before them the op
+            // had no entry at all, which was survivable for a pure load and is
+            // not for a read-modify-write.
+            Op::Unbox { .. } => (3, MemAccess::Opaque), // [ctrl, mem, receiver]
             Op::MonitorExit => (3, MemAccess::MonitorExit), // [ctrl, mem, obj]
             _ => return None,
         };
@@ -4351,6 +4649,7 @@ pub struct IrBuilder {
     /// planner handled on purpose would be indistinguishable from one it could
     /// not handle at all.
     scalar_intrinsics: HashMap<usize, ScalarOp>,
+    unbox_intrinsics: HashMap<usize, (UnboxOp, u32)>,
     /// `invokedynamic` sites this tier replaces with an uncommon trap, keyed by
     /// caller pc: `(operand-stack entries the call consumes, return type tag)`.
     ///
@@ -4369,6 +4668,11 @@ pub struct IrBuilder {
     /// walk is inside a relocated callee body, which is what suppresses merge
     /// activation, the reachability skip and safepoint recording.
     splice: Vec<SpliceFrame>,
+    /// `IrInlineSite::base` of every admitted body with more than one reachable
+    /// `return`. Filled by the pre-scan in [`Self::build`] and read once, by
+    /// [`Self::begin_splice`]. Empty unless `CRATONVM_JIT_IR_SPLICE_MULTI_RETURN=1`
+    /// — and without it the scanner has admitted no such body either.
+    splice_multi_return: HashSet<usize>,
     /// Diagnostic-only: how many splices this build performed, for the
     /// `[ir] spliced` line. Never read by lowering.
     splices_done: usize,
@@ -4395,6 +4699,17 @@ pub struct IrBuilder {
     /// side effect first. A structural check here cannot drift from the
     /// resolver's opcode list the way a comment can.
     splice_guard_seen: bool,
+    /// Conditional-branch pcs whose NOT-TAKEN edge the profile never observed,
+    /// and which [`Self::prune_always_taken_branch`] may therefore replace with
+    /// a guarded unconditional jump.
+    ///
+    /// Populated by `lib.rs` from the method's branch profile, and empty
+    /// whenever there is no profile or the feature is off — in which case every
+    /// branch builds the ordinary `Op::If` and codegen is byte-identical.
+    pruned_always_taken: std::collections::HashSet<usize>,
+    /// How many branches this build actually pruned. Diagnostic; read through
+    /// [`Self::branches_pruned`].
+    branches_pruned: usize,
     /// Diagnostic-only: `pc → "0xNN cn.mn desc"` for every invoke site in the
     /// method. Populated by `lib.rs` **only** when [`ir_bail_reporting`] is on,
     /// and read **only** by [`Self::bail_invoke`]. Never consulted by lowering,
@@ -4412,6 +4727,17 @@ pub struct IrBuilder {
     /// exactly the kind of inferred join this directory's rule 6 says not to
     /// trust. Same lifetime and same flag as `invoke_labels`.
     method_label: Option<Box<str>>,
+    /// Is every body this compile SPLICED IN free of side effects?
+    ///
+    /// The second half of the interpreter's replay question (see
+    /// `replay_from_entry_is_observably_equivalent`): a spliced artifact's
+    /// abandoned attempt also ran part of a RELOCATED callee body, which the
+    /// caller's own bytecode does not describe, so the prefix test alone
+    /// cannot clear it. `lib.rs` computes this while planning the splice, and
+    /// hands it over with [`Self::set_spliced_bodies_pure`]. Vacuously `true`
+    /// for a build that splices nothing — the default, and the value every
+    /// hand-built/test graph keeps.
+    spliced_bodies_pure: bool,
     pub tdigest_scalar_kernel: bool,
     /// inc 26/35: resolved `ldc2_w` (0x14) constant values (`pc → (bits, is_double)`).
     /// Set by [`Self::set_ldc2w_info`]; an `ldc2_w` pc not present bails to
@@ -4483,6 +4809,147 @@ pub struct IrBuilder {
     string_layout: Option<crate::StringFieldLayout>,
 }
 
+thread_local! {
+    /// IR site traps planted by the build currently running on this thread.
+    ///
+    /// Read back by `lib.rs` the moment `build()` returns, the same idiom
+    /// `reset_string_access_sites` uses -- `build(mut self, ..)` consumes the
+    /// builder, so a getter on it is not available afterwards.
+    static SITE_TRAPS_THIS_BUILD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn reset_site_traps_this_build() {
+    SITE_TRAPS_THIS_BUILD.with(|c| c.set(0));
+}
+
+/// How many IR site traps the build that just returned planted.
+pub fn site_traps_planted_this_build() -> usize {
+    SITE_TRAPS_THIS_BUILD.with(|c| c.get())
+}
+
+/// Methods whose IR body carries at least one planted site trap, by
+/// `compute_jit_key_hash(class, method, desc, ClassId::new(0))`.
+///
+/// The runtime consults this when a trapped callee resumes, to tell an IR SITE
+/// TRAP apart from genuinely unreachable code. The two want opposite actions:
+/// unreachable code should blacklist the method, whereas a site trap means only
+/// that the OPTIMIZING tier could not lower one call site -- the single-pass
+/// backend lowers `invokedynamic` and unresolved typechecks perfectly well, and
+/// blacklisting takes that body away too.
+fn trapped_methods() -> &'static std::sync::RwLock<rustc_hash::FxHashSet<u64>> {
+    static M: std::sync::OnceLock<std::sync::RwLock<rustc_hash::FxHashSet<u64>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::RwLock::new(rustc_hash::FxHashSet::default()))
+}
+
+/// Cap, for the same reason the refusal memo has one: a pathological program
+/// must not turn a diagnostic into unbounded retained memory.
+const MAX_TRAPPED_METHOD_MEMOS: usize = 8192;
+
+/// Set once any method is registered, so the common case -- a VM that has
+/// planted no site trap at all -- costs one relaxed load instead of a hash and
+/// a lock acquisition.
+///
+/// `try_resume_trapped_callee` runs on EVERY deopt resume, not only trapped
+/// ones, so the lookup it performs is on a path that has nothing to do with
+/// site traps for most workloads.
+static ANY_SITE_TRAP_REGISTERED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Has any method in this process been registered as carrying a site trap?
+///
+/// A `false` here is authoritative: the flag is set BEFORE the set insert, and
+/// only ever goes false -> true, so a reader that sees `false` cannot be racing
+/// a registration whose method it is about to be asked about -- the registering
+/// compile has not published its artifact yet.
+pub fn any_site_trap_registered() -> bool {
+    ANY_SITE_TRAP_REGISTERED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record that `hash`'s IR body carries a planted site trap.
+pub fn register_site_trap_method(hash: u64) {
+    ANY_SITE_TRAP_REGISTERED.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut set = trapped_methods().write().unwrap();
+    if set.len() < MAX_TRAPPED_METHOD_MEMOS {
+        set.insert(hash);
+    }
+}
+
+/// Does this method's compiled IR body carry a planted site trap?
+pub fn method_has_site_trap(hash: u64) -> bool {
+    trapped_methods().read().unwrap().contains(&hash)
+}
+
+/// Site traps actually TAKEN at runtime.
+///
+/// `ir_trap_census` counts what was planted; this is the other half the
+/// planting doc promised and did not have. A cause whose taken count is not
+/// ~0 has had its coldness argument refuted -- which is exactly what happened
+/// to the unresolved-class cause, and the number that says so.
+static SITE_TRAPS_TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count one site trap taken at runtime.
+pub fn note_site_trap_taken() {
+    SITE_TRAPS_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Methods whose site-trap policy has been applied, by memo hash.
+///
+/// A DEDICATED set, not the IR refusal memo. The first version of this reused
+/// `ir_evidence::method_already_refused` as the "already decided" flag, which
+/// is wrong because that memo has a SECOND writer: the acceptance gate marks a
+/// method refused whenever it discards an optimizing body. A method that got a
+/// trapping IR body, was later recompiled, and had THAT recompile refused by
+/// the gate would then look "already decided" the first time its old artifact
+/// trapped -- so the policy would never be applied, the artifact never evicted,
+/// and the trap would fire forever with nothing recorded.
+///
+/// Two writers, two meanings, two sets.
+fn site_trap_decided_methods() -> &'static std::sync::RwLock<rustc_hash::FxHashSet<u64>> {
+    static M: std::sync::OnceLock<std::sync::RwLock<rustc_hash::FxHashSet<u64>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::RwLock::new(rustc_hash::FxHashSet::default()))
+}
+
+/// Claim the site-trap policy decision for `hash`.
+///
+/// `true` exactly once per method: the caller that gets it must apply the
+/// policy, and every later trap on that method is a repeat. Insert-and-test
+/// under one write lock so two threads trapping the same method concurrently
+/// cannot both decide.
+pub fn claim_site_trap_decision(hash: u64) -> bool {
+    let mut set = site_trap_decided_methods().write().unwrap();
+    if set.len() >= MAX_TRAPPED_METHOD_MEMOS {
+        // Cap reached: decide every time rather than never. Re-deciding is a
+        // recompile request; NOT deciding leaves a trapping artifact installed.
+        return true;
+    }
+    set.insert(hash)
+}
+
+/// Site traps taken AFTER the policy for that method was already decided.
+///
+/// These cost an interpreter resume each and buy nothing: the method is already
+/// IR-banned and recompiled. A large number means a trapped site sits inside a
+/// long-running caller whose in-flight frame still holds a baked CALL to the
+/// old body -- see `try_resume_trapped_callee`.
+static SITE_TRAP_REPEATS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count one site trap taken after the decision was already made.
+pub fn note_site_trap_repeat() {
+    SITE_TRAP_REPEATS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Site traps that re-fired after their method's policy was already applied.
+pub fn site_trap_repeats() -> u64 {
+    SITE_TRAP_REPEATS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many planted site traps have actually fired.
+pub fn site_traps_taken() -> u64 {
+    SITE_TRAPS_TAKEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl IrBuilder {
     /// Create a new builder for a method with `num_params` parameter slots
     /// and `num_locals` total local variable slots.
@@ -4531,15 +4998,20 @@ impl IrBuilder {
             object_init_pcs: HashSet::new(),
             invoke_info: HashMap::new(),
             scalar_intrinsics: HashMap::new(),
+            unbox_intrinsics: HashMap::new(),
             indy_trap_sites: HashMap::new(),
             inline_sites: HashMap::new(),
             splice: Vec::new(),
+            splice_multi_return: HashSet::new(),
             splices_done: 0,
             splice_local: HashSet::new(),
             splice_tainted: HashSet::new(),
             splice_guard_seen: false,
+            pruned_always_taken: std::collections::HashSet::new(),
+            branches_pruned: 0,
             invoke_labels: HashMap::new(),
             method_label: None,
+            spliced_bodies_pure: true,
             tdigest_scalar_kernel: false,
             ldc2w_info: HashMap::new(),
             wide_field_long: false,
@@ -5030,6 +5502,10 @@ impl IrBuilder {
     /// Record the call sites the planner will lower as arithmetic. Keyed by
     /// caller pc, exactly like [`Self::set_invoke_info`], and deliberately a
     /// SEPARATE map: a site here has no `JitInvokeInfo` box and never will.
+    pub fn set_unbox_intrinsics(&mut self, sites: HashMap<usize, (UnboxOp, u32)>) {
+        self.unbox_intrinsics = sites;
+    }
+
     pub fn set_scalar_intrinsics(&mut self, sites: HashMap<usize, ScalarOp>) {
         self.scalar_intrinsics = sites;
     }
@@ -5046,6 +5522,61 @@ impl IrBuilder {
     /// abstract stack in reverse order, which is the same convention every
     /// binary arm in this builder uses; the receiver is never popped because
     /// every family in [`ScalarOp`] is declared `static`.
+    /// Emit an unboxing accessor inline. One input (the receiver), and the
+    /// node needs `ctrl` and `mem` because it can DEOPT and it reads the heap.
+    fn try_emit_unbox_intrinsic(&mut self, pc: usize) -> bool {
+        let Some(&(uop, class_id)) = self.unbox_intrinsics.get(&pc) else {
+            return false;
+        };
+        if self.ctrl_opt().is_none() {
+            return false;
+        }
+        // A guard needs a snapshot to resume from, exactly as `plant_uncommon_trap`
+        // does: without a safepoint at this bci the deopt would rebuild a frame
+        // from nothing. Refusing here leaves the site to the fallback path.
+        if !self.graph.safepoints.iter().any(|sp| sp.bci == pc) {
+            return false;
+        }
+        // The receiver is one abstract-stack entry and so is the one argument
+        // any of these takes (`getAndAdd(J)J` -- a category-2 value is ONE entry
+        // in this builder, see `static_call_shape`). A stack shallower than that
+        // means the planned site and the abstract state disagree; refuse rather
+        // than pop a depth nothing agreed on. Every refusal above and here
+        // returns before the first `pop`, so the caller's dispatch path finds
+        // the stack exactly as it left it.
+        if self.stack.len() < uop.arity() + 1 {
+            return false;
+        }
+        // Operands come off deepest-last: the delta is shallower, the receiver
+        // is deepest, so the delta pops first.
+        let delta = if uop.arity() == 1 {
+            Some(self.pop())
+        } else {
+            None
+        };
+        let obj = self.pop();
+        let mut inputs = vec![self.ctrl, self.mem, obj];
+        if let Some(d) = delta {
+            inputs.push(d);
+        }
+        let node = self.graph.add(
+            Op::Unbox { op: uop, class_id },
+            uop.result_type(),
+            inputs,
+            Some(pc),
+        );
+        // The node IS the new memory token as well as the result -- the
+        // convention `Op::Load` and the String expander use. Three of the six
+        // families WRITE the field with a `LOCK XADD`, so dropping this would
+        // let a later read of the same object float above the write. It is set
+        // for the pure loads too: the cost is ordering a load this tier could
+        // otherwise move, and the alternative is a rule with an exception in it.
+        self.mem = node;
+        self.push(node);
+        note_unbox_lowered();
+        true
+    }
+
     fn try_emit_scalar_intrinsic(&mut self, pc: usize) -> bool {
         let Some(&sop) = self.scalar_intrinsics.get(&pc) else {
             return false;
@@ -5098,12 +5629,33 @@ impl IrBuilder {
             invoke_info,
             new_info,
             object_init_pcs,
+            ldc_info,
+            ldc2w_info,
+            static_field_info,
+            checkcast_info,
+            instanceof_info,
         } = tables;
         self.inline_sites.extend(sites);
         self.field_info.extend(field_info);
         self.invoke_info.extend(invoke_info);
         self.new_info.extend(new_info);
         self.object_init_pcs.extend(object_init_pcs);
+        // Merged, not replaced: the caller's own `ldc` sites are already in
+        // these maps (`set_ldc_info` runs before the tables are applied) and a
+        // spliced body's pcs are in combined-buffer coordinates, so the two key
+        // spaces are disjoint by construction.
+        self.ldc_info.extend(ldc_info);
+        self.ldc2w_info.extend(ldc2w_info);
+        // Same merge and same disjointness argument as the `ldc` rows above:
+        // `set_static_field_info` has already installed the caller's own
+        // `getstatic` sites, keyed by its own pcs, and a spliced body's pcs are
+        // combined-buffer pcs at or past `code_len`.
+        self.static_field_info.extend(static_field_info);
+        // Merged, not replaced, on the same disjointness argument: the caller's
+        // own typecheck sites are already installed under its own pcs, and a
+        // spliced body's pcs are combined-buffer pcs at or past `code_len`.
+        self.checkcast_info.extend(checkcast_info);
+        self.instanceof_info.extend(instanceof_info);
     }
 
     /// How many splices [`Self::build`] performed. Diagnostic only.
@@ -5129,6 +5681,7 @@ impl IrBuilder {
         let num_args = site.num_args;
         let max_locals = site.max_locals;
         let returns_value = site.returns_value;
+        let receiver_is_arg0 = site.receiver_is_arg0;
         let arg_local_slots = site.arg_local_slots.clone();
 
         if self.splice.len() >= MAX_IR_SPLICE_DEPTH {
@@ -5151,14 +5704,100 @@ impl IrBuilder {
             callee_locals[slot] = *arg;
         }
 
+        // JVMS §6.5, put back where the deleted invoke used to enforce it.
+        //
+        // The splice replaces `invokespecial`/`invokevirtual` with the callee's
+        // own bytecode, and nothing in that bytecode is obliged to touch `this`
+        // — `private int small() { return 3; }` does not. So a null receiver ran
+        // the body and returned its value, with no exception anywhere:
+        // `warm-invokespecial=NO-THROW(3)` on `NullReceiverCachedProbe`, against
+        // HotSpot's NPE, and `NO-THROW(440)` for a callee too large for the
+        // single-pass inliner but not for this one. The single-pass backend's
+        // own direct-call arm has carried this check since `cd451facc`; this
+        // tier had it nowhere, so the fix that landed there was invisible on
+        // every method the optimizing tier claimed. See
+        // `docs/internal/retired/warm-invokespecial-on-a-null-receiver-runs-the-callee-again-FIXED-20260908.md`.
+        //
+        // An `Op::Guard` rather than a thrown NPE, which is HotSpot's answer
+        // too: the deopt reconstructs the frame for THIS bci and the
+        // interpreter re-executes the invoke, where the null-receiver guard in
+        // `execute_invokevirtual_cached` sends it to the slow path and the
+        // canonical NPE (message, JEP 358 action and all) is raised by the code
+        // that owns it. Re-executing is sound because the guard fires before a
+        // single byte of the callee has run.
+        //
+        // The snapshot the deopt resolves is the one the main walk pushed at
+        // the top of this bci, with the receiver and the arguments still on the
+        // operand stack — recorded before this function popped them. Absent it,
+        // `resolve_frame_state_for_bci` answers with an EMPTY frame rather than
+        // an error, which would park the interpreter at `pc` with no operands;
+        // so refuse the compile instead, exactly as `plant_uncommon_trap` does
+        // for the same reason.
+        // ...UNLESS THE RECEIVER CANNOT BE NULL, and this is not only a saved
+        // `TEST`/`JNZ`.
+        //
+        // `Op::Guard`'s reference inputs are `GlobalEscape` to escape analysis
+        // (`ir_op_to_ea_op` funnels `Op::Cmp` into `EaOp::Other`, whose arm
+        // republishes every reference operand), so a guard on the receiver of
+        // `new Vec3(…).add(…)` would take scalar replacement away from exactly
+        // the shape the IR inliner exists to enable -- the `per-voxel-allocation`
+        // case, where splicing the accessor chain is what lets the object die
+        // where it is used.
+        //
+        // `definitely_non_null` is `ir_check_elim`'s own predicate rather than a
+        // second copy of the list: a successful `Op::New`/`Op::NewArray` returns
+        // a non-null reference and a failed one returns the deopt sentinel and
+        // never reaches a use. Nothing is given up by skipping the guard for
+        // one -- the check could not fire.
+        let receiver_needs_null_check = receiver_is_arg0
+            && args.first().is_some_and(|&r| {
+                self.graph
+                    .nodes
+                    .get(r as usize)
+                    .is_none_or(|n| !crate::ir_check_elim::definitely_non_null(&n.op))
+            });
+        if receiver_needs_null_check {
+            let receiver = *args.first()?;
+            let ctrl = self.ctrl_opt()?;
+            if self.splice.is_empty() && !self.graph.safepoints.iter().any(|sp| sp.bci == pc) {
+                return None;
+            }
+            // A guard inside an OPEN splice resolves its frame state through
+            // `resume_bci` to the OUTERMOST invoke, so taking it re-executes
+            // that whole call — including any spliced prefix that already ran.
+            // `spliced_bodies_pure` is the property that makes that harmless
+            // and it is the same clause `trap_replay_is_safe` asks; when it does
+            // not hold, raise the fence that refuses the graph, exactly as
+            // `add_div_zero_guard` and `plant_uncommon_trap` do.
+            if !self.splice.is_empty() && !self.spliced_bodies_pure {
+                self.splice_guard_seen = true;
+            }
+            // `aconst_null`, not `iconst(0)`: `ir_lower`'s `Op::Cmp` selects a
+            // 64-bit CMP only when an operand is `Ref`-typed, and a 32-bit one
+            // would read a pointer whose low word is zero as null. The
+            // `ifnull` arm makes the same choice for the same reason.
+            let null = self.aconst_null();
+            let cond = self.add_data(Op::Cmp(CmpOp::Ne), IrType::Int, vec![receiver, null], pc);
+            self.graph.add(
+                Op::Guard { bci: pc },
+                IrType::Void,
+                vec![ctrl, cond],
+                Some(pc),
+            );
+        }
+
         let saved_locals = std::mem::replace(&mut self.locals, callee_locals);
         let saved_stack = std::mem::take(&mut self.stack);
+        let multi_return = self.splice_multi_return.contains(&base);
         self.splice.push(SpliceFrame {
             return_pc: pc + instr_len,
             end,
             saved_locals,
             saved_stack,
             returns_value,
+            multi_return,
+            exits: Vec::new(),
+            exit_bci: pc,
         });
         self.splices_done += 1;
         // A callee body in the graph is the transform that makes every other
@@ -5247,6 +5886,122 @@ impl IrBuilder {
             // The sets are scoped to one outermost splice: node ids from a
             // closed region can never be a later region's store target, and
             // keeping them would only grow.
+            self.splice_local.clear();
+            self.splice_tainted.clear();
+        }
+        Some(frame.return_pc)
+    }
+
+    /// A `return` inside an open splice.
+    ///
+    /// For a body with one `return` this IS the splice exit and the v1 fast
+    /// path stands: restore the caller's frame, push the value, resume after
+    /// the `invoke`.
+    ///
+    /// For a body with several, a `return` is an *edge* rather than an exit —
+    /// the walk has to keep going, because the other returns and the code that
+    /// reaches them are still ahead of it in the relocated buffer. The edge's
+    /// `(ctrl, mem, value)` is parked on the frame, `ctrl` goes dead, and the
+    /// walk steps to the next instruction exactly as it does after any
+    /// unconditional transfer. Whatever follows is either a branch target —
+    /// whose merge the branch itself created, and whose activation restores
+    /// `ctrl` — or genuinely unreachable, and the walk's own "reachable code
+    /// must have a control token" net refuses the method.
+    ///
+    /// Returns the pc to continue at, or `None` to refuse the method.
+    fn splice_return(&mut self, value: Option<NodeId>, pc: usize) -> Option<usize> {
+        if !self.splice.last()?.multi_return {
+            return self.end_splice(value);
+        }
+        let ctrl = self.ctrl_opt()?;
+        let mem = self.mem;
+        // `NO_NODE` for a `void` callee: `returns_value` decides whether the
+        // continuation reads this column at all, so a placeholder here is
+        // never a value anything can name.
+        let val = if self.splice.last()?.returns_value {
+            value?
+        } else {
+            NO_NODE
+        };
+        let frame = self.splice.last_mut()?;
+        frame.exits.push((ctrl, mem, val));
+        frame.exit_bci = pc;
+        self.ctrl = NO_NODE;
+        Some(pc + 1)
+    }
+
+    /// Close a multi-return splice: join its recorded exit edges and hand the
+    /// result back to the caller.
+    ///
+    /// Called when the walk reaches `end` — one past the callee's last
+    /// bytecode, which is a `return` by the scanner's own admission rule, so
+    /// every edge is already in.
+    ///
+    /// The join is built by hand rather than through [`Self::ensure_merge`] /
+    /// [`Self::activate_merge`] for two reasons. The `merges` map is keyed by
+    /// pc, and `end` is the `base` of whatever body `lib.rs` appended next —
+    /// so a continuation keyed there would collide with that body's own
+    /// merge at its pc 0 (a `while` starting at the top of a method makes one).
+    /// And the merge machinery phis the locals and operand stack, which here
+    /// are the *callee's*, about to be thrown away: every phi it built would be
+    /// dead on arrival.
+    ///
+    /// What does need a phi is the memory token and the returned value, and
+    /// only where the edges disagree.
+    fn finish_multi_return_splice(&mut self) -> Option<usize> {
+        let frame = self.splice.pop()?;
+        if frame.exits.is_empty() {
+            return None;
+        }
+        let bci = frame.exit_bci;
+
+        let ctrls: Vec<NodeId> = frame.exits.iter().map(|&(c, _, _)| c).collect();
+        let ctrl = if ctrls.len() == 1 {
+            ctrls[0]
+        } else {
+            // This used to disqualify the artifact from the optimizing OSR
+            // door, alongside every other spliced merge (`SPLICED_MERGE_SEEN`).
+            // The containment came off on 2026-09-09: the wrong answer was
+            // never the merge but `emit_osr_entry_stubs` jumping past the block
+            // that writes a constant arm's home word, and the stub seeds those
+            // constants now. See `ir_lower`'s `const_seeds` loop.
+            MULTI_RETURN_SPLICES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            MULTI_RETURN_EDGES.fetch_add(ctrls.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            self.graph
+                .add(Op::Merge, IrType::Control, ctrls, Some(bci))
+        };
+        self.ctrl = ctrl;
+
+        let mems: Vec<NodeId> = frame.exits.iter().map(|&(_, m, _)| m).collect();
+        if mems.iter().any(|&m| m != mems[0]) {
+            let mut inputs = vec![ctrl];
+            inputs.extend_from_slice(&mems);
+            self.mem = self
+                .graph
+                .add(Op::Phi, IrType::Memory, inputs, Some(bci));
+        } else {
+            self.mem = mems[0];
+        }
+
+        self.locals = frame.saved_locals;
+        self.stack = frame.saved_stack;
+        if frame.returns_value {
+            let vals: Vec<NodeId> = frame.exits.iter().map(|&(_, _, v)| v).collect();
+            if vals.iter().any(|&v| v == NO_NODE) {
+                return None;
+            }
+            let joined = if vals.iter().any(|&v| v != vals[0]) {
+                let mut inputs = vec![ctrl];
+                inputs.extend_from_slice(&vals);
+                let ty = self.phi_data_type(&inputs);
+                self.graph.add(Op::Phi, ty, inputs, Some(bci))
+            } else {
+                vals[0]
+            };
+            self.push(joined);
+        }
+
+        if self.splice.is_empty() {
             self.splice_local.clear();
             self.splice_tainted.clear();
         }
@@ -5438,10 +6193,59 @@ impl IrBuilder {
     /// [`ir_trap_census`] counts what was PLANTED by cause; the runtime side
     /// counts what is TAKEN. A cause whose taken count is not ~0 has had its
     /// coldness argument refuted, which is the falsifiable form of the claim.
-    fn plant_uncommon_trap(&mut self, pc: usize, cause: TrapCause) -> bool {
+    /// Tell the builder whether the bodies it is about to splice commit any
+    /// side effect. See [`Self::spliced_bodies_pure`]; called by `lib.rs`
+    /// alongside the combined buffer it hands to [`Self::build`].
+    pub fn set_spliced_bodies_pure(&mut self, pure: bool) {
+        self.spliced_bodies_pure = pure;
+    }
+
+    /// Would the interpreter accept a whole-method replay for a trap at `pc`?
+    ///
+    /// This is [`replay_from_entry_is_observably_equivalent`]'s rule, asked at
+    /// the producing end. It is deliberately the SAME three clauses in the
+    /// same order rather than a paraphrase, because the whole point is that a
+    /// trap this predicate admits is a trap the consumer will not refuse:
+    ///
+    ///  1. a body that commits nothing anywhere replays trivially;
+    ///  2. otherwise every spliced body must also commit nothing, since the
+    ///     caller's bytecode does not describe what a relocated body did;
+    ///  3. and then only `code[..pc]` can have committed anything, because
+    ///     every deopt point this VM emits is `REEXECUTE` — the bytecode AT
+    ///     the trap had not completed and nothing after it ran.
+    ///
+    /// `code` may be the COMBINED buffer (method body, then the spliced
+    /// bodies appended after it), so `code_len` — the original method's own
+    /// length — is what bounds clause 1. A trap inside a spliced region never
+    /// reaches this point: `plant_uncommon_trap` raises `splice_guard_seen`
+    /// for one, which refuses the graph outright.
+    fn trap_replay_is_safe(&self, code: &[u8], code_len: usize, pc: usize) -> bool {
+        let body_len = code_len.min(code.len());
+        if !crate::bytecode_commits_side_effect(code, body_len) {
+            return true;
+        }
+        if !self.spliced_bodies_pure {
+            return false;
+        }
+        if pc > body_len {
+            return false;
+        }
+        !crate::bytecode_commits_side_effect(code, pc)
+    }
+
+    fn plant_uncommon_trap(
+        &mut self,
+        code: &[u8],
+        code_len: usize,
+        pc: usize,
+        cause: TrapCause,
+    ) -> bool {
         if !ir_site_trap_enabled() {
             return false;
         }
+        // Counted at the END, on the success path only -- see the increment
+        // just before `true` is returned. A refused plant must not make the
+        // runtime think this method carries a trap.
         // The unresolved-class causes are opt-in and off by default; see
         // `ir_unresolved_class_trap_enabled` for the argument that was refuted.
         if matches!(
@@ -5449,6 +6253,57 @@ impl IrBuilder {
             TrapCause::UnresolvedTypeCheck | TrapCause::UnresolvedNew
         ) && !ir_unresolved_class_trap_enabled()
         {
+            return false;
+        }
+
+        // A trap this tier CANNOT BE RESUMED FROM is not a slow path, it is a
+        // guaranteed `InternalError`. `x64::driver` sets
+        // `can_deopt_resume = !deopt_points.is_empty() && !has_elided_monitor`
+        // for the single-pass backend, but this backend only ever sets it on
+        // the scalar-replacement path (`sr_map.is_some()`, i.e.
+        // `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL`) -- so on a
+        // production artifact an optimizing-tier deopt has exactly ONE
+        // fallback: the interpreter's whole-method replay from entry. That
+        // replay is refused, fatally, whenever the bytecode before the trap
+        // already committed something a re-run would duplicate.
+        //
+        // The doc comment above claims parity with the single-pass backend's
+        // indy trade. That backend takes the same trade AND carries the safety
+        // valve this one was missing: `bytecode_walk`'s 0xba arm bails the
+        // whole compile (`mark_codegen_unencodable("unresumable-indy-trap")`)
+        // when the snapshot it just built is not resumable. Copying the trade
+        // without the valve is what made `com/sun/tools/javac/code/
+        // Scope$ScopeImpl.remove` -- `Assert.check(...)` at bci 12, an
+        // `invokedynamic` at bci 21 -- die on its FIRST compiled call with
+        // `precise deoptimization unavailable ... refusing side-effecting
+        // replay`, which javac reports as a compile that failed with zero
+        // diagnostics. That is the whole 19-class Spring `TestCompiler`/AOT
+        // cluster and the `--nojit`-clears-it finding above it.
+        //
+        // Asked with the CONSUMER's own predicate
+        // (`replay_from_entry_is_observably_equivalent` in
+        // vm/src/runtime/interpreter/deopt_resume.rs) so the two ends cannot
+        // drift: whole body pure, else the prefix before the trap pure and
+        // every spliced body pure.
+        // AFTER the default-off unresolved-class gate, deliberately. Both
+        // arms return `false` and the compile bails identically either way,
+        // so the order is not a behaviour question -- it is a COUNTING one.
+        // Above the gate, every `checkcast`/`instanceof`/`new` site was
+        // charged to this refusal even though `ir_unresolved_class_trap_enabled`
+        // was going to decline it regardless: on one javac workload that was
+        // 77 of 126 rows, i.e. the census read the guard as three times more
+        // expensive than it is. A refusal counted here now means exactly
+        // "this site would have been a trap but for the resumability rule",
+        // which is the only reading that makes the census a price tag.
+        if ir_trap_replay_guard_enabled() && !self.trap_replay_is_safe(code, code_len, pc) {
+            if ir_bail_reporting() {
+                eprintln!(
+                    "[ir] site TRAP REFUSED at bytecode pc {pc} ({}) in {} --                      the code before it commits a side effect and this tier                      publishes no resumable deopt, so the trap would be a hard                      InternalError; declining the optimizing tier instead",
+                    cause.as_str(),
+                    self.method_label.as_deref().unwrap_or("<unknown>"),
+                );
+            }
+            note_trap_refused(cause);
             return false;
         }
         let Some(ctrl) = self.ctrl_opt() else {
@@ -5485,6 +6340,7 @@ impl IrBuilder {
             Some(pc),
         );
         note_trap_planted(cause);
+        SITE_TRAPS_THIS_BUILD.with(|c| c.set(c.get() + 1));
         if ir_bail_reporting() {
             eprintln!(
                 "[ir] site TRAP planted at bytecode pc {pc} ({}) in {} -- the rest of the method still compiles",
@@ -5492,6 +6348,95 @@ impl IrBuilder {
                 self.method_label.as_deref().unwrap_or("<unknown>"),
             );
         }
+        true
+    }
+
+    /// Branch pcs the profile says are ALWAYS taken. See
+    /// [`Self::prune_always_taken_branch`].
+    pub fn set_pruned_branches(&mut self, pcs: std::collections::HashSet<usize>) {
+        self.pruned_always_taken = pcs;
+    }
+
+    /// How many branches this build replaced with a guarded jump.
+    pub fn branches_pruned(&self) -> usize {
+        self.branches_pruned
+    }
+
+    /// Replace an always-taken conditional branch with a GUARD plus an
+    /// unconditional jump, deleting its cold arm from the graph entirely.
+    ///
+    /// # What this is
+    ///
+    /// The first actual speculation this tier performs. Every deopt point it
+    /// emitted before this carried `speculation_id: 0` and the reason
+    /// `TransferToInterpreter` — plain resume points, planted so that a trap
+    /// *could* be described, never so that a transform could be justified.
+    /// Uncommon traps existed only to stand in for opcodes the tier cannot
+    /// lower. Nothing anywhere used the profile to remove work.
+    ///
+    /// This does. When the profile has seen a branch's not-taken edge exactly
+    /// ZERO times over a meaningful sample, the branch becomes:
+    ///
+    /// ```text
+    ///     Guard(cmp)        ; cmp == 0 -> deopt at this bci
+    ///     goto target
+    /// ```
+    ///
+    /// and the whole fall-through arm is never built. That is the shape javac
+    /// gives `if (rare) { ... }` — `ifeq skip; <cold body>; skip:` — so the arm
+    /// deleted is exactly the cold body, together with everything downstream
+    /// that only it kept alive.
+    ///
+    /// # Why it is fail-SAFE rather than fail-closed
+    ///
+    /// A wrong speculation cannot produce a wrong answer. The guard's failure
+    /// edge is the ordinary deopt trampoline with `DeoptAction::Reinterpret`:
+    /// the interpreter re-executes this very branch and takes the cold arm
+    /// itself. The cost of being wrong is a deopt, and repeated deopts demote
+    /// the method to C1 through the existing `c2_bailout` path — the same
+    /// machinery a div-by-zero guard already relies on. That is what makes this
+    /// a different risk class from a speculative devirtualization, where a
+    /// wrong guard runs the wrong body.
+    ///
+    /// # Two refusals
+    ///
+    /// * **Inside a splice.** `splice_guard_seen` refuses a graph that built a
+    ///   guard inside a relocated body, because such a guard would resolve its
+    ///   frame state from the caller's snapshot at the `invoke`. Rather than
+    ///   set that flag and lose the whole method, simply do not speculate
+    ///   there.
+    /// * **No frame state at this bci.** A guard whose bci has no
+    ///   `SafepointSnapshot` cannot be resumed, so there would be nothing to
+    ///   deopt *to*. `plant_site_trap` makes the same check for the same
+    ///   reason.
+    fn prune_always_taken_branch(&mut self, pc: usize, cmp: NodeId, target_pc: usize) -> bool {
+        if !self.pruned_always_taken.contains(&pc) {
+            return false;
+        }
+        if !self.splice.is_empty() {
+            return false;
+        }
+        let Some(ctrl) = self.ctrl_opt() else {
+            return false;
+        };
+        if !self.graph.safepoints.iter().any(|sp| sp.bci == pc) {
+            return false;
+        }
+        // `cmp` is 1 exactly when the branch is TAKEN, so a non-zero `cmp`
+        // continues and a zero one deopts — the identical polarity
+        // `add_div_zero_guard` uses for its `Cmp(Ne)` against zero.
+        self.graph.add(
+            Op::Guard { bci: pc },
+            IrType::Void,
+            vec![ctrl, cmp],
+            Some(pc),
+        );
+        // From here it is exactly the `goto` arm (0xa7): the target gains this
+        // predecessor and control is dead until the next merge.
+        self.add_merge_predecessor(target_pc);
+        self.ctrl = NO_NODE;
+        self.branches_pruned += 1;
+        note_branch_pruned();
         true
     }
 
@@ -5796,6 +6741,7 @@ impl IrBuilder {
         // returns, to install the compact-field rows the String-access
         // expansion's two loads need. See `string_access_site_pcs`.
         reset_string_access_sites();
+        reset_site_traps_this_build();
         // Consume the verifier's canonical decode/CFG contract instead of
         // maintaining a second opcode-length scanner in the compiler.
         let verified = cratonvm_reader::verified_code(code.get(..code_len)?).ok()?;
@@ -5846,6 +6792,96 @@ impl IrBuilder {
             .filter(|target| reachable.contains(target))
             .collect();
 
+        // ── The same pre-scan, for every SPLICED body ────────────────
+        //
+        // `verified_code` above analysed `code[..code_len]` — the caller alone.
+        // A relocated callee body lives past `code_len` in the combined buffer
+        // and has its own branches, its own merge targets and its own loop
+        // headers, none of which that analysis can see. That gap, and only that
+        // gap, is why the splice scanner refused every callee containing an
+        // `if` or a `goto` and called itself "straight-line only, v1".
+        //
+        // Closing it needs no new analysis, because a callee body IS a valid
+        // method body: run the SAME verifier over it and rebase what comes out
+        // by the body's `base`. Branch offsets need no rebasing at all — they
+        // are relative, the body is copied contiguously, and a branch inside it
+        // therefore lands inside it in combined coordinates by construction.
+        //
+        // Reachability needs no merging either: the walk's skip is already
+        // scoped to `self.splice.is_empty()` (see the `!reachable.contains`
+        // test below) precisely because a relocated body is unreachable from
+        // pc 0. What a body's own reachability is used for here is the same
+        // thing it is used for above — refusing to create an `Op::Merge` for a
+        // target only handler code can reach, which would leave an input-less
+        // control node in the graph.
+        //
+        // A `return` anywhere but the last instruction is still refused by the
+        // scanner (`ir-splice-not-single-trailing-return`); several returns
+        // that all funnel to a trailing one are admitted under
+        // `ir_splice_multi_return_enabled`, and the loop below is where the
+        // walk learns which bodies those are.
+        if ir_splice_branch_enabled() {
+            let bodies: Vec<(usize, usize)> = self
+                .inline_sites
+                .values()
+                .map(|s| (s.base, s.code_len))
+                .collect();
+            for (base, body_len) in bodies {
+                let Some(body) = code.get(base..base.saturating_add(body_len)) else {
+                    return ir_build_bail(line!(), base);
+                };
+                let Ok(body_verified) = cratonvm_reader::verified_code(body) else {
+                    // The body did not verify on its own. Refuse the METHOD
+                    // rather than walk a region whose control flow nothing has
+                    // analysed — the failure mode that produces is orphan nodes
+                    // referencing `NO_NODE`, which is what STUB-S8 was.
+                    return ir_build_bail(line!(), base);
+                };
+                let body_reachable = normally_reachable_pcs(&body_verified, body_len);
+                for &target in body_verified.merge_targets() {
+                    let target = target as usize;
+                    if body_reachable.contains(&target) {
+                        self.ensure_merge(base + target);
+                    }
+                }
+                for &header in body_verified.loop_headers() {
+                    let header = header as usize;
+                    if body_reachable.contains(&header) {
+                        self.loop_headers.insert(base + header);
+                    }
+                }
+
+                // A body with several `return`s: the walk must NOT leave the
+                // splice at the first one. Decide it here, from the same
+                // verified decode, because the walk meets the returns one at a
+                // time and cannot tell the first from the last.
+                //
+                // Only reachable returns count. An unreachable one is code the
+                // walk never enters, and counting it would put the body on the
+                // continuation path with one exit edge that never arrives —
+                // which `finish_multi_return_splice` would refuse, losing a
+                // body the straight-through path handles fine.
+                if ir_splice_multi_return_enabled() {
+                    let mut reachable_returns = 0usize;
+                    let mut p = 0usize;
+                    while p < body_len {
+                        let Some(decoded) = body_verified.instruction_at(p) else {
+                            return ir_build_bail(line!(), base + p);
+                        };
+                        if body_reachable.contains(&p)
+                            && matches!(body.get(p), Some(0xac..=0xb1))
+                        {
+                            reachable_returns += 1;
+                        }
+                        p = decoded.next_pc as usize;
+                    }
+                    if reachable_returns > 1 {
+                        self.splice_multi_return.insert(base);
+                    }
+                }
+            }
+        }
+
         let mut pc = 0;
         // The `|| !self.splice.is_empty()` half is IR-tier inlining: inside a
         // splice `pc` addresses a relocated callee body appended AFTER
@@ -5858,14 +6894,30 @@ impl IrBuilder {
             // into whatever `lib.rs` appended next.
             if let Some(frame) = self.splice.last() {
                 if pc >= frame.end {
+                    // A multi-return body ENDS here rather than falling off:
+                    // its last instruction is a `return` (the scanner admits no
+                    // other shape) and that return recorded an edge instead of
+                    // exiting, so `pc` lands exactly on `end` with every edge
+                    // in and `ctrl` dead. Join them and resume the caller.
+                    if frame.multi_return && pc == frame.end && !frame.exits.is_empty() {
+                        match self.finish_multi_return_splice() {
+                            Some(next) => {
+                                pc = next;
+                                continue;
+                            }
+                            None => return ir_build_bail(line!(), pc),
+                        }
+                    }
                     return ir_build_bail(line!(), pc);
                 }
             }
             // A relocated body is unreachable from pc 0 by construction, so the
-            // reachability skip and the merge bookkeeping — both of which are
-            // computed over the CALLER's code alone — apply only outside a
-            // splice. The resolver admits branch-free bodies only, so there is
-            // no merge inside one to activate.
+            // REACHABILITY skip — computed over the caller's code alone — must
+            // stay scoped to code outside a splice. Merge bookkeeping is a
+            // different matter: since 2026-09-09 the pre-scan above registers
+            // each spliced body's own merge targets and loop headers, rebased,
+            // so a merge inside a splice both exists and must be activated. The
+            // gate below is deliberately NOT `self.splice.is_empty()` any more.
             if self.splice.is_empty() && !reachable.contains(&pc) {
                 // Handler-only (or otherwise unreachable) bytecode: emit no IR
                 // for it at all. `next_pc` comes from the verifier's canonical
@@ -5881,8 +6933,13 @@ impl IrBuilder {
                 continue;
             }
 
-            // If this PC is a merge target, activate the merge
-            if self.splice.is_empty() && self.merges.contains_key(&pc) {
+            // If this PC is a merge target, activate the merge.
+            //
+            // Inside a splice too. Every predecessor of a merge that the
+            // spliced-body pre-scan registered is itself inside that same body,
+            // so the locals and operand stack this snapshots are the callee's
+            // throughout — the same invariant the caller's own merges rely on.
+            if self.merges.contains_key(&pc) {
                 // Add current state as predecessor (fall-through). On a loop
                 // header this is the forward-entry predecessor; the back-edge
                 // arrives later and is back-patched (see add_merge_predecessor).
@@ -6854,7 +7911,12 @@ impl IrBuilder {
                         // the abstract stack keeps the depth the verifier
                         // proved, and the code that reads it is unreachable.
                         None => {
-                            if !self.plant_uncommon_trap(pc, TrapCause::UnresolvedTypeCheck) {
+                            if !self.plant_uncommon_trap(
+                                code,
+                                code_len,
+                                pc,
+                                TrapCause::UnresolvedTypeCheck,
+                            ) {
                                 return ir_build_bail(line!(), pc);
                             }
                             let _obj = self.pop();
@@ -6888,7 +7950,12 @@ impl IrBuilder {
                         // Same argument as the `checkcast` arm above: an
                         // unloaded class has been reached by nothing.
                         None => {
-                            if !self.plant_uncommon_trap(pc, TrapCause::UnresolvedTypeCheck) {
+                            if !self.plant_uncommon_trap(
+                                code,
+                                code_len,
+                                pc,
+                                TrapCause::UnresolvedTypeCheck,
+                            ) {
                                 return ir_build_bail(line!(), pc);
                             }
                             let _obj = self.pop();
@@ -7139,7 +8206,12 @@ impl IrBuilder {
                         // this story: it stops the retry sweep re-resolving a
                         // site that traps perfectly well.
                         None => {
-                            if !self.plant_uncommon_trap(pc, TrapCause::UnresolvedNew) {
+                            if !self.plant_uncommon_trap(
+                                code,
+                                code_len,
+                                pc,
+                                TrapCause::UnresolvedNew,
+                            ) {
                                 return ir_build_bail(line!(), pc);
                             }
                             let null = self.aconst_null();
@@ -7414,6 +8486,14 @@ impl IrBuilder {
                         pc += 3;
                         continue;
                     }
+                    // An unboxing accessor: emit the guarded field load inline
+                    // and skip the call. Same contract as the scalar families
+                    // above -- the planner builds no `invoke_info` row for a
+                    // site it registered here.
+                    if self.try_emit_unbox_intrinsic(pc) {
+                        pc += 3;
+                        continue;
+                    }
                     let (info_ptr, num_args, ret_type) = match self.invoke_info.get(&pc) {
                         Some(&t) => t,
                         None => return self.bail_invoke(line!(), pc),
@@ -7494,7 +8574,7 @@ impl IrBuilder {
                     let Some(&(arg_entries, ret_tag)) = self.indy_trap_sites.get(&pc) else {
                         return ir_build_bail(line!(), pc);
                     };
-                    if !self.plant_uncommon_trap(pc, TrapCause::Indy) {
+                    if !self.plant_uncommon_trap(code, code_len, pc, TrapCause::Indy) {
                         return ir_build_bail(line!(), pc);
                     }
                     for _ in 0..arg_entries {
@@ -7647,6 +8727,10 @@ impl IrBuilder {
                         _ => unreachable!(),
                     };
                     let cmp = self.add_data(Op::Cmp(cc), IrType::Int, vec![val, zero], pc);
+                    if self.prune_always_taken_branch(pc, cmp, target_pc) {
+                        pc = target_pc;
+                        continue;
+                    }
                     let if_node =
                         self.graph
                             .add(Op::If, IrType::Control, vec![self.ctrl, cmp], Some(pc));
@@ -7691,6 +8775,10 @@ impl IrBuilder {
                         _ => unreachable!(),
                     };
                     let cmp = self.add_data(Op::Cmp(cc), IrType::Int, vec![a, b], pc);
+                    if self.prune_always_taken_branch(pc, cmp, target_pc) {
+                        pc = target_pc;
+                        continue;
+                    }
                     let if_node =
                         self.graph
                             .add(Op::If, IrType::Control, vec![self.ctrl, cmp], Some(pc));
@@ -7740,6 +8828,10 @@ impl IrBuilder {
                         CmpOp::Ne
                     };
                     let cmp = self.add_data(Op::Cmp(cc), IrType::Int, vec![a, b], pc);
+                    if self.prune_always_taken_branch(pc, cmp, target_pc) {
+                        pc = target_pc;
+                        continue;
+                    }
                     let if_node =
                         self.graph
                             .add(Op::If, IrType::Control, vec![self.ctrl, cmp], Some(pc));
@@ -7800,7 +8892,7 @@ impl IrBuilder {
                     // resumes after the `invoke`. No `Op::Return`, and `ctrl`
                     // stays live.
                     if !self.splice.is_empty() {
-                        match self.end_splice(Some(val)) {
+                        match self.splice_return(Some(val), pc) {
                             Some(next) => {
                                 pc = next;
                                 continue;
@@ -7820,7 +8912,7 @@ impl IrBuilder {
                 0xad => {
                     let val = self.pop();
                     if !self.splice.is_empty() {
-                        match self.end_splice(Some(val)) {
+                        match self.splice_return(Some(val), pc) {
                             Some(next) => {
                                 pc = next;
                                 continue;
@@ -7858,7 +8950,7 @@ impl IrBuilder {
                 0xae | 0xaf => {
                     let val = self.pop();
                     if !self.splice.is_empty() {
-                        match self.end_splice(Some(val)) {
+                        match self.splice_return(Some(val), pc) {
                             Some(next) => {
                                 pc = next;
                                 continue;
@@ -7877,7 +8969,7 @@ impl IrBuilder {
                 // return (void)
                 0xb1 => {
                     if !self.splice.is_empty() {
-                        match self.end_splice(None) {
+                        match self.splice_return(None, pc) {
                             Some(next) => {
                                 pc = next;
                                 continue;
@@ -8568,6 +9660,22 @@ pub enum ScalarOp {
     RotateRightI,
     /// `Long.rotateRight(long, int)`.
     RotateRightL,
+
+    // -- Floating-point sign mask, 2026-09-07 ------------------------
+    //
+    // `Math.abs(float)` / `Math.abs(double)` clear the sign bit, which is one
+    // AND against a mask -- no branch, no memory, and no NaN special case:
+    // clearing the sign of a NaN yields a NaN, which is what the JLS requires.
+    // It also gets `abs(-0.0) == +0.0` right for free, where a comparison-based
+    // sequence (`x < 0 ? -x : x`) returns -0.0 and is WRONG.
+    //
+    // These are the first FP members of this enum. They do NOT go through
+    // `gp_load_value`/`store_rax` like every variant above; see
+    // `ScalarOp::is_fp` and the guard at the top of the lowering arm.
+    /// `Math.abs(float)`.
+    AbsF,
+    /// `Math.abs(double)`.
+    AbsD,
 }
 
 impl ScalarOp {
@@ -8586,9 +9694,23 @@ impl ScalarOp {
             | ScalarOp::LowestOneBitI
             | ScalarOp::LowestOneBitL
             | ScalarOp::HighestOneBitI
-            | ScalarOp::HighestOneBitL => 1,
+            | ScalarOp::HighestOneBitL
+            | ScalarOp::AbsF
+            | ScalarOp::AbsD => 1,
             _ => 2,
         }
+    }
+
+    /// Does this family operate in XMM registers rather than general-purpose
+    /// ones?
+    ///
+    /// The lowering arm loads `inputs[0]` into RAX before it dispatches, which
+    /// is wrong for an FP family; this is the predicate that guards it. Kept as
+    /// its own question rather than derived from `result_type`, because
+    /// `Long.numberOfLeadingZeros` already proves operand width and result
+    /// width are independent here.
+    pub fn is_fp(self) -> bool {
+        matches!(self, ScalarOp::AbsF | ScalarOp::AbsD)
     }
 
     /// The type of data input `idx`.
@@ -8608,6 +9730,8 @@ impl ScalarOp {
             {
                 IrType::Int
             }
+            ScalarOp::AbsF => IrType::Float,
+            ScalarOp::AbsD => IrType::Double,
             _ if self.operands_are_long() => IrType::Long,
             _ => IrType::Int,
         }
@@ -8624,6 +9748,8 @@ impl ScalarOp {
             | ScalarOp::HighestOneBitL
             | ScalarOp::RotateLeftL
             | ScalarOp::RotateRightL => IrType::Long,
+            ScalarOp::AbsF => IrType::Float,
+            ScalarOp::AbsD => IrType::Double,
             // `Integer.compare`, `Long.compare` and BOTH widths of
             // `numberOfLeading/TrailingZeros` return `int` --
             // `Long.numberOfLeadingZeros` takes a `long` and answers an `int`,
@@ -8678,6 +9804,8 @@ impl ScalarOp {
             ScalarOp::RotateLeftL => "Long.rotateLeft(JI)",
             ScalarOp::RotateRightI => "Integer.rotateRight(II)",
             ScalarOp::RotateRightL => "Long.rotateRight(JI)",
+            ScalarOp::AbsF => "Math.abs(F)",
+            ScalarOp::AbsD => "Math.abs(D)",
         }
     }
 }
@@ -8693,6 +9821,200 @@ impl ScalarOp {
 /// `StrictMath` is accepted alongside `Math` for `min`/`max`/`abs` only: those
 /// three are specified identically in both classes (JLS 15.20, `StrictMath`'s
 /// own javadoc delegates), unlike the transcendentals, which are not.
+/// The unboxing accessors, as a GUARDED FIELD LOAD rather than a refusal.
+///
+/// `ScalarOp` covers call-site intrinsics that are pure register arithmetic.
+/// These are not: they read a field, and the byte offset of that field depends
+/// on how the INSTANCE was allocated -- a compact instance stores the payload
+/// at a registered body offset, a legacy one inside its 16-byte `Value` cell,
+/// and both shapes exist at once because different allocators build different
+/// cells. That per-object branch is why this family sat on the refusal list
+/// while the arithmetic ones were lowered.
+///
+/// The node carries only the guard class id. The offsets are re-derived at
+/// LOWERING time from that id, through the very same `AtomicLongFieldLayout` /
+/// `AtomicIntFieldLayout` the single-pass emitter uses, so the two backends
+/// cannot drift into disagreeing about where the field is -- which, for a raw
+/// load, is the difference between a value and a wild read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UnboxOp {
+    /// `java/lang/Long.longValue()J` -- 8-byte payload.
+    LongValue,
+    /// `java/lang/Integer.intValue()I` -- 4-byte payload.
+    IntValue,
+
+    // -- The `Atomic*` accessors, 2026-09-08 ----------------------------
+    //
+    // Same node, same three guards, same per-object layout branch: these are
+    // the SAME shape as the two above -- a guarded field access at slot 0 of a
+    // receiver whose class id the planner resolved -- differing only in the
+    // instruction at the bottom and, for one of them, an argument.
+    //
+    // They joined `UnboxOp` rather than arriving as a second op with a second
+    // recognizer and a second planner clause, which is what a first cut of this
+    // work did (`claude/unboxing-atomic-ir-nodes-d7aff4`). Two recognizers both
+    // claiming `Long.longValue` is one recognizer plus dead code that still
+    // compiles and still has passing tests -- the failure this file has a
+    // standing rule about.
+    //
+    // The name is now a little narrow for its contents. It is kept because
+    // every reference to it is, and because "the guarded slot-0 accessor
+    // families" has no shorter spelling.
+    /// `AtomicLong.get()J` -- a VOLATILE 8-byte load. An aligned 8-byte `MOV`
+    /// is atomic on x86-64 and loads are not reordered with older loads under
+    /// TSO, so the acquire is owed nothing: the same plain `MOV`
+    /// [`Self::LongValue`] emits is the correct encoding.
+    AtomicLongGet,
+    /// `AtomicInteger.incrementAndGet()I` -- `LOCK XADD` of `+1`, returning the
+    /// POST-add value.
+    AtomicIntIncrementAndGet,
+    /// `AtomicInteger.decrementAndGet()I` -- `LOCK XADD` of `-1`, POST-add.
+    AtomicIntDecrementAndGet,
+    /// `AtomicLong.getAndAdd(J)J` -- `LOCK XADD` of a runtime delta, returning
+    /// the PRE-add value, which is what `XADD` leaves in its source register
+    /// with no fixup at all.
+    AtomicLongGetAndAdd,
+}
+
+impl UnboxOp {
+    pub fn result_type(self) -> IrType {
+        if self.is_wide() {
+            IrType::Long
+        } else {
+            IrType::Int
+        }
+    }
+
+    /// True when the field access is 64-bit (`REX.W`) rather than 32-bit.
+    pub fn is_wide(self) -> bool {
+        matches!(
+            self,
+            UnboxOp::LongValue | UnboxOp::AtomicLongGet | UnboxOp::AtomicLongGetAndAdd
+        )
+    }
+
+    /// True for the families that only READ the field -- a `MOV`, with no
+    /// `LOCK` prefix and no delta register.
+    pub fn is_load(self) -> bool {
+        matches!(
+            self,
+            UnboxOp::LongValue | UnboxOp::IntValue | UnboxOp::AtomicLongGet
+        )
+    }
+
+    /// How many DATA inputs the node takes past `[ctrl, mem, receiver]`.
+    /// `ir_verify` reads this rather than carrying a second copy of the table.
+    pub fn arity(self) -> usize {
+        match self {
+            UnboxOp::AtomicLongGetAndAdd => 1,
+            _ => 0,
+        }
+    }
+
+    /// The `LOCK XADD` delta when it is a compile-time immediate, or `None`
+    /// when the family has no delta (the loads) or takes it as an argument.
+    ///
+    /// `+1`/`-1` are the only immediates here.
+    pub fn delta_imm(self) -> Option<i32> {
+        match self {
+            UnboxOp::AtomicIntIncrementAndGet => Some(1),
+            UnboxOp::AtomicIntDecrementAndGet => Some(-1),
+            _ => None,
+        }
+    }
+
+    /// True when the result is the POST-add value, so the delta must be added
+    /// back after the `XADD` (which leaves the PRE-add value in its source).
+    pub fn returns_post_add(self) -> bool {
+        matches!(
+            self,
+            UnboxOp::AtomicIntIncrementAndGet | UnboxOp::AtomicIntDecrementAndGet
+        )
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnboxOp::LongValue => "java/lang/Long.longValue",
+            UnboxOp::IntValue => "java/lang/Integer.intValue",
+            UnboxOp::AtomicLongGet => "java/util/concurrent/atomic/AtomicLong.get",
+            UnboxOp::AtomicIntIncrementAndGet => {
+                "java/util/concurrent/atomic/AtomicInteger.incrementAndGet"
+            }
+            UnboxOp::AtomicIntDecrementAndGet => {
+                "java/util/concurrent/atomic/AtomicInteger.decrementAndGet"
+            }
+            UnboxOp::AtomicLongGetAndAdd => "java/util/concurrent/atomic/AtomicLong.getAndAdd",
+        }
+    }
+}
+
+/// Recognise an unboxing call site the optimizing tier can lower.
+///
+/// `class_id` is the receiver guard, resolved from the constant pool by the
+/// caller. Id 0 means "unresolved", and the layout resolvers refuse it -- a
+/// site with no class id must decline, because the emitter has nothing to
+/// derive an offset from.
+pub fn try_ir_unbox_intrinsic(
+    class: &str,
+    method: &str,
+    descriptor: &str,
+    class_id: u32,
+) -> Option<UnboxOp> {
+    if !ir_scalar_intrinsics_enabled() || class_id == 0 {
+        return None;
+    }
+    let op = match (class, method, descriptor) {
+        ("java/lang/Long", "longValue", "()J") => UnboxOp::LongValue,
+        ("java/lang/Integer", "intValue", "()I") => UnboxOp::IntValue,
+        ("java/util/concurrent/atomic/AtomicLong", "get", "()J") => UnboxOp::AtomicLongGet,
+        ("java/util/concurrent/atomic/AtomicInteger", "incrementAndGet", "()I") => {
+            UnboxOp::AtomicIntIncrementAndGet
+        }
+        ("java/util/concurrent/atomic/AtomicInteger", "decrementAndGet", "()I") => {
+            UnboxOp::AtomicIntDecrementAndGet
+        }
+        ("java/util/concurrent/atomic/AtomicLong", "getAndAdd", "(J)J") => {
+            UnboxOp::AtomicLongGetAndAdd
+        }
+        _ => return None,
+    };
+    // Ask the layout NOW as well as at lowering: a class whose `value` field is
+    // not an 8/4-byte scalar at a resolvable offset must be refused at the
+    // planner, not discovered by the emitter after the method was admitted.
+    unbox_offsets(op, class_id)?;
+    Some(op)
+}
+
+/// `(compact, legacy)` byte offsets of the payload, from the SAME resolver the
+/// single-pass backend uses. The single source of truth for both backends.
+pub fn unbox_offsets(op: UnboxOp, class_id: u32) -> Option<(i32, i32)> {
+    // The WIDTH decides which resolver applies, and it is read off the family
+    // rather than off the class name: `AtomicLong` and `AtomicInteger` differ by
+    // exactly this, and pointing the 64-bit form at a 4-byte payload is a wrong
+    // VALUE that no test of the 32-bit form would catch. Both constructors
+    // carry the width check too -- they refuse unless slot 0's compact storage
+    // is exactly 8 / 4 bytes -- so a layout the access could not address never
+    // reaches codegen.
+    if op.is_wide() {
+        crate::AtomicLongFieldLayout::new(0, class_id)
+            .map(|l| (l.value_compact_offset, l.value_legacy_offset))
+    } else {
+        crate::AtomicIntFieldLayout::new(0, class_id)
+            .map(|l| (l.value_compact_offset, l.value_legacy_offset))
+    }
+}
+
+/// Unbox sites the optimizing tier LOWERED, for the engagement census.
+static UNBOX_LOWERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn note_unbox_lowered() {
+    UNBOX_LOWERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn unbox_lowered() -> u64 {
+    UNBOX_LOWERED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn try_ir_scalar_intrinsic(class: &str, method: &str, descriptor: &str) -> Option<ScalarOp> {
     if !ir_scalar_intrinsics_enabled() {
         return None;
@@ -8706,6 +10028,23 @@ pub fn try_ir_scalar_intrinsic(class: &str, method: &str, descriptor: &str) -> O
         ("java/lang/Math" | "java/lang/StrictMath", "abs", "(J)J") => Some(ScalarOp::AbsL),
         ("java/lang/Integer", "compare", "(II)I") => Some(ScalarOp::CompareI),
         ("java/lang/Long", "compare", "(JJ)I") => Some(ScalarOp::CompareL),
+        // `Integer.min`/`max` and `Long.min`/`max` are one-line delegations to
+        // the `Math` methods directly above — `Integer.min(a, b)` IS
+        // `Math.min(a, b)` in the JDK source — so they lower to the identical
+        // sequence and need no new `ScalarOp`.
+        //
+        // They are here because they are separately native-shadowed in this VM,
+        // and a shadowed leaf is an inlining barrier as well as an
+        // un-compilable method: the caller cannot splice it (there is no
+        // bytecode to splice) and, without a row here, cannot lower it as
+        // arithmetic either, so a two-instruction operation costs a call
+        // through Rust. `Math.min` was already covered; these three-character
+        // spellings of it were not, and `Integer.max(a, b)` is not a rare way
+        // to write it.
+        ("java/lang/Integer", "min", "(II)I") => Some(ScalarOp::MinI),
+        ("java/lang/Integer", "max", "(II)I") => Some(ScalarOp::MaxI),
+        ("java/lang/Long", "min", "(JJ)J") => Some(ScalarOp::MinL),
+        ("java/lang/Long", "max", "(JJ)J") => Some(ScalarOp::MaxL),
         ("java/lang/Integer", "numberOfLeadingZeros", "(I)I") => Some(ScalarOp::NlzI),
         ("java/lang/Long", "numberOfLeadingZeros", "(J)I") => Some(ScalarOp::NlzL),
         ("java/lang/Integer", "numberOfTrailingZeros", "(I)I") => Some(ScalarOp::NtzI),
@@ -8720,6 +10059,8 @@ pub fn try_ir_scalar_intrinsic(class: &str, method: &str, descriptor: &str) -> O
         ("java/lang/Long", "rotateLeft", "(JI)J") => Some(ScalarOp::RotateLeftL),
         ("java/lang/Integer", "rotateRight", "(II)I") => Some(ScalarOp::RotateRightI),
         ("java/lang/Long", "rotateRight", "(JI)J") => Some(ScalarOp::RotateRightL),
+        ("java/lang/Math", "abs", "(F)F") => Some(ScalarOp::AbsF),
+        ("java/lang/Math", "abs", "(D)D") => Some(ScalarOp::AbsD),
         _ => None,
     }
 }
@@ -8728,6 +10069,438 @@ pub fn try_ir_scalar_intrinsic(class: &str, method: &str, descriptor: &str) -> O
 mod scalar_intrinsic_recognizer_tests {
     use super::*;
 
+    /// The site-trap registry is what lets the runtime tell an IR SITE TRAP
+    /// apart from genuinely unreachable code, and the two want OPPOSITE
+    /// actions: unreachable code should blacklist the method, a site trap must
+    /// not -- `MakeNotCompilable` is consulted by `compile_gate` itself, so it
+    /// takes away the single-pass body too, and single-pass lowers the very
+    /// opcodes the trap was planted for.
+    ///
+    /// Measured before the split existed: `MVStore.getMapId` on H2 trapped
+    /// once and lost its body on every tier.
+    #[test]
+    fn a_registered_site_trap_method_is_distinguishable_from_unreachable_code() {
+        // The registry is PROCESS-GLOBAL and this binary runs thousands of
+        // tests, some of which compile real fixtures and register real methods;
+        // the memo key is a hash, so an unlucky collision is possible too. So
+        // this asserts the DISCRIMINATION -- registering one method changes
+        // that method's answer and nothing else's -- rather than asserting the
+        // registry starts empty, which is not this test's to control. A first
+        // draft asserted the precondition and failed in whichever of the two
+        // feature configurations happened to run a colliding fixture first.
+        let h =
+            crate::ir_method_memo_hash("cratonvm/test/SiteTrapRegistryProbe", "trapping", "()V");
+        let other =
+            crate::ir_method_memo_hash("cratonvm/test/SiteTrapRegistryProbe", "untrapped", "()V");
+        assert_ne!(h, other, "distinct methods must not share a memo key");
+        let other_before = method_has_site_trap(other);
+        register_site_trap_method(h);
+        assert!(
+            method_has_site_trap(h),
+            "a registered method must be recognisable -- this is what stops the              runtime blacklisting it on every tier",
+        );
+        assert_eq!(
+            method_has_site_trap(other),
+            other_before,
+            "registering one method must not implicate another: the runtime              uses this answer to choose between recompiling and blacklisting",
+        );
+    }
+
+    /// An uncommon trap is only a slow path if the interpreter can get back
+    /// to the bytecode. This tier publishes no resumable deopt on a production
+    /// artifact, so the ONLY fallback is the whole-method replay from entry —
+    /// and the interpreter refuses that, fatally, once the prefix before the
+    /// trap has committed something the replay would duplicate.
+    ///
+    /// This is the `com/sun/tools/javac/code/Scope$ScopeImpl.remove` shape,
+    /// spelled in bytecode: `Assert.check(...)` (an `invokestatic`) at bci 5,
+    /// then the `invokedynamic` the tier cannot lower at bci 8. Planting there
+    /// is what made every in-process javac compile under Spring's
+    /// `TestCompiler` die with `InternalError: precise deoptimization
+    /// unavailable ... refusing side-effecting replay` — a compile that failed
+    /// with zero diagnostics.
+    #[test]
+    fn a_trap_after_a_side_effect_is_refused() {
+        let builder = IrBuilder::new(1, 1);
+        // 0: aload_0, 1: aload_0, 2..4: invokestatic #1, 5..7: getstatic #2,
+        // 8..12: invokedynamic #3
+        let code = [
+            0x2a, 0x2a, 0xb8, 0x00, 0x01, 0xb2, 0x00, 0x02, 0xba, 0x00, 0x03, 0x00, 0x00,
+        ];
+        assert!(
+            !builder.trap_replay_is_safe(&code, code.len(), 8),
+            "an invokestatic at bci 2 is a committed side effect, so a replay             from entry would duplicate it and the interpreter refuses — the trap             at bci 8 must not be planted",
+        );
+    }
+
+    /// The other half of the same rule, and the reason it is a PREFIX test and
+    /// not "does this body commit anything anywhere". A trap reached before
+    /// the method has done anything replays harmlessly: the locals are rebuilt
+    /// from the same arguments and nothing outside the frame was written. The
+    /// side effect AFTER the trap never ran — every deopt point this VM emits
+    /// is `REEXECUTE`, so the bytecode at the trap had not completed.
+    ///
+    /// Refusing this shape too would cost the optimizing tier every method
+    /// that opens with a lambda, for a hazard it does not have.
+    #[test]
+    fn a_trap_before_any_side_effect_is_admitted() {
+        let builder = IrBuilder::new(1, 1);
+        // 0: aload_0, 1..5: invokedynamic #1, 6..8: invokestatic #2 (AFTER)
+        let code = [0x2a, 0xba, 0x00, 0x01, 0x00, 0x00, 0xb8, 0x00, 0x02];
+        assert!(
+            builder.trap_replay_is_safe(&code, code.len(), 1),
+            "nothing before bci 1 commits anything, and the invokestatic at bci             6 never ran — this replay is observably the abandoned attempt",
+        );
+    }
+
+    /// Clause 2 of the consumer's rule, which the prefix test cannot see: a
+    /// spliced artifact's abandoned attempt also ran part of a RELOCATED
+    /// callee body, and the caller's own bytecode does not describe it. The
+    /// interpreter reads the same one number off the artifact
+    /// (`spliced_bodies_side_effect_free`), so the producer has to ask it too.
+    #[test]
+    fn an_impure_splice_refuses_a_trap_a_pure_prefix_would_admit() {
+        let code = [0x2a, 0xba, 0x00, 0x01, 0x00, 0x00, 0xb8, 0x00, 0x02];
+        let mut builder = IrBuilder::new(1, 1);
+        builder.set_spliced_bodies_pure(false);
+        assert!(
+            !builder.trap_replay_is_safe(&code, code.len(), 1),
+            "the prefix is pure but a spliced body is not, and the replay             would re-run that body's side effects",
+        );
+        // Same bytes, same bci, only the splice answer differs — so this pair
+        // isolates the clause rather than merely exercising it.
+        let mut pure = IrBuilder::new(1, 1);
+        pure.set_spliced_bodies_pure(true);
+        assert!(pure.trap_replay_is_safe(&code, code.len(), 1));
+    }
+
+    /// A body that commits nothing ANYWHERE needs no reasoning about where the
+    /// attempt stopped — clause 1, and the one clause that answers `true` even
+    /// for a trap late in the method. It also has to hold with an impure
+    /// splice recorded, because the consumer asks it first, before it looks at
+    /// the splice answer at all; a producer that ordered the clauses the other
+    /// way would refuse traps the interpreter would have accepted.
+    ///
+    /// The body here traps on an unresolved `checkcast`, not an
+    /// `invokedynamic`, and that is the point — see
+    /// [`clause_one_can_never_fire_for_an_invokedynamic_body`].
+    #[test]
+    fn a_body_that_commits_nothing_admits_a_trap_anywhere() {
+        let mut builder = IrBuilder::new(1, 1);
+        builder.set_spliced_bodies_pure(false);
+        // 0: aload_0, 1..3: checkcast #1, 4: areturn
+        let code = [0x2a, 0xc0, 0x00, 0x01, 0xb0];
+        assert!(
+            builder.trap_replay_is_safe(&code, code.len(), 1),
+            "no store, no call, no monitor action anywhere in this body",
+        );
+    }
+
+    /// `invokedynamic` is `0xba`, and `opcode_commits_side_effect` commits the
+    /// whole `0xb6..=0xba` invoke range — so a body containing one can never
+    /// satisfy clause 1, no matter how pure the rest of it is. Every indy trap
+    /// is therefore decided by the PREFIX clause alone.
+    ///
+    /// This is worth a test of its own because it is the difference between
+    /// the rule as stated and the rule as it runs, and the first version of
+    /// the clause-1 test above got it wrong: it used an indy body, asserted
+    /// clause 1, and failed. Left as an assertion so that widening or
+    /// narrowing `opcode_commits_side_effect` says so here instead of quietly
+    /// changing which methods the optimizing tier will trap in.
+    #[test]
+    fn clause_one_can_never_fire_for_an_invokedynamic_body() {
+        // 0: aload_0, 1: pop, 2..6: invokedynamic #1, 7: return — nothing but
+        // the indy itself could commit anything.
+        let code = [0x2a, 0x57, 0xba, 0x00, 0x01, 0x00, 0x00, 0xb1];
+        assert!(
+            crate::bytecode_commits_side_effect(&code, code.len()),
+            "the indy opcode is itself in the side-effect set",
+        );
+        let mut impure = IrBuilder::new(1, 1);
+        impure.set_spliced_bodies_pure(false);
+        assert!(
+            !impure.trap_replay_is_safe(&code, code.len(), 2),
+            "clause 1 cannot rescue it, so the impure splice decides",
+        );
+        let mut pure = IrBuilder::new(1, 1);
+        pure.set_spliced_bodies_pure(true);
+        assert!(
+            pure.trap_replay_is_safe(&code, code.len(), 2),
+            "with the splice clause satisfied the PREFIX is what admits it",
+        );
+    }
+
+    /// `code` may be the COMBINED buffer — the method body, then the spliced
+    /// bodies appended after it — while `code_len` is the method's own length.
+    /// Clause 1 has to be bounded by `code_len`, or a side effect in a
+    /// relocated callee would make the whole-body test read "impure" for a
+    /// method that is pure, and the trap would be refused for the wrong
+    /// reason. The prefix clause then still answers correctly.
+    #[test]
+    fn the_whole_body_clause_stops_at_the_methods_own_length() {
+        let builder = IrBuilder::new(1, 1);
+        // Method body is the first 8 bytes (pure); bytes 8.. are a relocated
+        // callee that stores to a static.
+        let code = [
+            0x2a, 0x57, 0xba, 0x00, 0x01, 0x00, 0x00, 0xb1, // method (len 8)
+            0x2a, 0xb3, 0x00, 0x04, 0xb1, // spliced callee: putstatic
+        ];
+        assert!(
+            builder.trap_replay_is_safe(&code, 8, 2),
+            "the relocated tail is not this method's body and must not decide             clause 1",
+        );
+    }
+
+    /// The site-trap decision must be claimable exactly ONCE, and must not be
+    /// confused with the IR refusal memo.
+    ///
+    /// The first version read `ir_evidence::method_already_refused` as the
+    /// "already decided" flag. That memo has a second writer -- the acceptance
+    /// gate marks a method refused whenever it discards an optimizing body --
+    /// so a method that got a trapping IR body, was recompiled, and had THAT
+    /// recompile refused would look already-decided on its FIRST trap. The
+    /// policy would never be applied and the trapping artifact never evicted:
+    /// a trap firing forever with nothing recorded. Two writers, two meanings,
+    /// two sets.
+    #[test]
+    fn the_site_trap_decision_is_claimable_exactly_once_and_is_not_the_refusal_memo() {
+        let h = crate::ir_method_memo_hash(
+            "cratonvm/test/SiteTrapDecisionProbe",
+            "claimed",
+            "()V",
+        );
+        assert!(claim_site_trap_decision(h), "the first claim must succeed");
+        assert!(
+            !claim_site_trap_decision(h),
+            "a second claim must fail -- otherwise every trap re-applies the              policy and the per-method deopt count escalates to blacklisting",
+        );
+
+        // The refusal memo must NOT be able to pre-empt a decision.
+        let g = crate::ir_method_memo_hash(
+            "cratonvm/test/SiteTrapDecisionProbe",
+            "gate_refused_first",
+            "()V",
+        );
+        crate::ir_evidence::note_method_refused(g);
+        assert!(
+            crate::ir_evidence::method_already_refused(g),
+            "precondition: the gate has marked this method IR-refused",
+        );
+        assert!(
+            claim_site_trap_decision(g),
+            "a gate refusal must not consume the site-trap decision: the first              trap still has to evict the trapping artifact",
+        );
+    }
+
+    /// The unbox recognizer must decline an UNRESOLVED receiver class.
+    ///
+    /// `class_id == 0` means the constant pool did not resolve the receiver.
+    /// The lowering derives its byte offsets from that id, so a site admitted
+    /// without one would have the emitter loading from an offset nobody
+    /// vouched for -- which for a raw field load is a wild read, not a wrong
+    /// answer. This is the same refusal `box_unbox_intrinsic_shape` makes for
+    /// the single-pass backend, and the two must agree.
+    #[test]
+    fn the_unbox_recognizer_declines_an_unresolved_receiver_class() {
+        assert!(
+            try_ir_unbox_intrinsic("java/lang/Long", "longValue", "()J", 0).is_none(),
+            "class_id 0 is 'unresolved' and must never be admitted",
+        );
+        assert!(
+            try_ir_unbox_intrinsic("java/lang/Integer", "intValue", "()I", 0).is_none(),
+        );
+    }
+
+    /// Only the two triples, and only with their exact descriptors. A
+    /// near-miss must fall through to the ordinary path rather than be lowered
+    /// as a field load of something else.
+    #[test]
+    fn the_unbox_recognizer_matches_only_its_declared_triples() {
+        for (c, n, d) in [
+            ("java/lang/Long", "intValue", "()I"),
+            ("java/lang/Integer", "longValue", "()J"),
+            ("java/lang/Long", "longValue", "()I"),
+            ("java/lang/Double", "doubleValue", "()D"),
+            ("java/lang/Short", "shortValue", "()S"),
+            // The BOXING half: `valueOf` allocates or reads a cache, and has no
+            // receiver whose slot 0 could be read.
+            ("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;"),
+            ("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;"),
+            // Right name, wrong owner: `Number.longValue` is abstract and its
+            // receiver may be any subclass, so slot 0 means nothing.
+            ("java/lang/Number", "longValue", "()J"),
+            // Real `Atomic*` methods this family deliberately does NOT claim.
+            // `compareAndSet` is a `LOCK CMPXCHG` whose operand placement
+            // differs in a way that compiles fine while comparing the object
+            // pointer against the field; the `getAnd*`/`addAndGet` spellings are
+            // absent because the H2 census does not name them, and a family
+            // added without a site to exercise it is one whose first real
+            // receiver is a user's.
+            ("java/util/concurrent/atomic/AtomicLong", "compareAndSet", "(JJ)Z"),
+            ("java/util/concurrent/atomic/AtomicLong", "getAndIncrement", "()J"),
+            ("java/util/concurrent/atomic/AtomicLong", "addAndGet", "(J)J"),
+            ("java/util/concurrent/atomic/AtomicInteger", "get", "()I"),
+            ("java/util/concurrent/atomic/AtomicInteger", "getAndAdd", "(I)I"),
+            // Right owner and name, wrong descriptor.
+            ("java/util/concurrent/atomic/AtomicLong", "getAndAdd", "(I)I"),
+        ] {
+            assert!(
+                try_ir_unbox_intrinsic(c, n, d, 7).is_none(),
+                "{c}.{n}{d} must not be recognised as an unbox site",
+            );
+        }
+    }
+
+    /// The triple each declared family must be recognised from, as an
+    /// EXHAUSTIVE match: a new `UnboxOp` variant is a COMPILE ERROR here until
+    /// its signature is declared.
+    ///
+    /// A `match` rather than a hand-written table, because the failure this
+    /// catches is a family added to the enum and its lowering but forgotten in
+    /// the recognizer -- which reads, from the outside, exactly like a workload
+    /// that has no such call site, and which a table only catches if someone
+    /// remembers to add a row.
+    #[cfg(test)]
+    fn unbox_triple_for(op: UnboxOp) -> (&'static str, &'static str, &'static str) {
+        match op {
+            UnboxOp::LongValue => ("java/lang/Long", "longValue", "()J"),
+            UnboxOp::IntValue => ("java/lang/Integer", "intValue", "()I"),
+            UnboxOp::AtomicLongGet => {
+                ("java/util/concurrent/atomic/AtomicLong", "get", "()J")
+            }
+            UnboxOp::AtomicIntIncrementAndGet => (
+                "java/util/concurrent/atomic/AtomicInteger",
+                "incrementAndGet",
+                "()I",
+            ),
+            UnboxOp::AtomicIntDecrementAndGet => (
+                "java/util/concurrent/atomic/AtomicInteger",
+                "decrementAndGet",
+                "()I",
+            ),
+            UnboxOp::AtomicLongGetAndAdd => {
+                ("java/util/concurrent/atomic/AtomicLong", "getAndAdd", "(J)J")
+            }
+        }
+    }
+
+    #[cfg(test)]
+    const ALL_UNBOX_OPS: [UnboxOp; 6] = [
+        UnboxOp::LongValue,
+        UnboxOp::IntValue,
+        UnboxOp::AtomicLongGet,
+        UnboxOp::AtomicIntIncrementAndGet,
+        UnboxOp::AtomicIntDecrementAndGet,
+        UnboxOp::AtomicLongGetAndAdd,
+    ];
+
+    #[test]
+    fn every_declared_unbox_family_is_recognised() {
+        for op in ALL_UNBOX_OPS {
+            let (c, m, d) = unbox_triple_for(op);
+            assert_eq!(
+                try_ir_unbox_intrinsic(c, m, d, 7),
+                Some(op),
+                "{c}.{m}{d} is declared as an unbox family and was not recognised",
+            );
+        }
+    }
+
+    /// The width and delta plans, checked against each family's DESCRIPTOR
+    /// rather than against the tables under test.
+    ///
+    /// A wrong answer in either is a wrong VALUE, not a slow one: an `IntValue`
+    /// mistyped wide reads four bytes of the next field into the answer, and a
+    /// `getAndAdd` that claimed `returns_post_add` would add the delta twice.
+    #[test]
+    fn unbox_width_and_delta_plans_match_each_descriptor() {
+        for op in ALL_UNBOX_OPS {
+            let (_, m, d) = unbox_triple_for(op);
+            let wide = d.ends_with(")J");
+            assert_eq!(op.is_wide(), wide, "{}", op.as_str());
+            assert_eq!(
+                op.result_type(),
+                if wide { IrType::Long } else { IrType::Int },
+                "{}",
+                op.as_str(),
+            );
+            assert_eq!(
+                op.arity(),
+                usize::from(!d.starts_with("()")),
+                "{} disagrees with its descriptor about the argument count",
+                op.as_str(),
+            );
+            // Exactly one delta source: an immediate, an argument, or neither.
+            assert!(
+                !(op.arity() == 1 && op.delta_imm().is_some()),
+                "{} claims both an immediate and an argument delta",
+                op.as_str(),
+            );
+            assert_eq!(
+                op.is_load(),
+                op.arity() == 0 && op.delta_imm().is_none(),
+                "{} disagrees about whether it has a delta at all",
+                op.as_str(),
+            );
+            // `XADD` leaves the PRE-add value in its source, so only the
+            // `*AndGet` spellings owe the fixup -- and `getAndAdd`, whose name
+            // also ends in "AndGet" if read carelessly, must not.
+            assert_eq!(
+                op.returns_post_add(),
+                m.ends_with("AndGet") && !m.starts_with("getAnd"),
+                "{}",
+                op.as_str(),
+            );
+        }
+    }
+
+    /// `unbox_offsets` is the SINGLE source of truth for both backends. If this
+    /// ever stopped agreeing with `AtomicLongFieldLayout`/`AtomicIntFieldLayout`
+    /// the optimizing tier and the single-pass tier would read different halves
+    /// of the same object.
+    #[test]
+    fn unbox_offsets_come_from_the_same_resolver_the_single_pass_backend_uses() {
+        const CID: u32 = 42;
+        // Every family, driven off the same list the recognizer test uses, so a
+        // new one cannot be added with its width silently pointed at the wrong
+        // resolver.
+        for op in ALL_UNBOX_OPS {
+            let want = if op.is_wide() {
+                crate::AtomicLongFieldLayout::new(0, CID)
+                    .map(|l| (l.value_compact_offset, l.value_legacy_offset))
+            } else {
+                crate::AtomicIntFieldLayout::new(0, CID)
+                    .map(|l| (l.value_compact_offset, l.value_legacy_offset))
+            };
+            assert_eq!(unbox_offsets(op, CID), want, "{}", op.as_str());
+        }
+    }
+
+    /// The per-build counter is what carries "this build planted a trap" back
+    /// to `lib.rs`, because `build(mut self, ..)` consumes the builder. It must
+    /// start at zero for every build or one trapping method would register
+    /// every method compiled after it on the same thread.
+    #[test]
+    fn the_per_build_trap_count_starts_at_zero() {
+        reset_site_traps_this_build();
+        assert_eq!(site_traps_planted_this_build(), 0);
+        SITE_TRAPS_THIS_BUILD.with(|c| c.set(3));
+        assert_eq!(site_traps_planted_this_build(), 3);
+        reset_site_traps_this_build();
+        assert_eq!(
+            site_traps_planted_this_build(),
+            0,
+            "a stale count would register a method that planted nothing",
+        );
+    }
+
+    // RESTORED 2026-09-07. The site-trap tests above were inserted between
+    // this test's doc comment and its `fn`, which orphaned the comment onto
+    // the first of them and left this function with NO `#[test]` attribute —
+    // so the one check that a `ScalarOp` family cannot be added without its
+    // recognizer signature had silently stopped running, and
+    // `cargo clippy --workspace --all-targets -- -D warnings` was red on
+    // `duplicated attribute` for everyone.
     /// Every family the recognizer claims must actually be recognised.
     ///
     /// A table rather than a spot check, because the failure this catches is a
@@ -8736,30 +10509,83 @@ mod scalar_intrinsic_recognizer_tests {
     /// call site.
     #[test]
     fn every_declared_family_is_recognised() {
-        let cases: &[(&str, &str, &str, ScalarOp)] = &[
-            ("java/lang/Math", "min", "(II)I", ScalarOp::MinI),
-            ("java/lang/Math", "max", "(II)I", ScalarOp::MaxI),
-            ("java/lang/Long", "compare", "(JJ)I", ScalarOp::CompareL),
-            ("java/lang/Integer", "numberOfLeadingZeros", "(I)I", ScalarOp::NlzI),
-            ("java/lang/Long", "numberOfLeadingZeros", "(J)I", ScalarOp::NlzL),
-            ("java/lang/Integer", "numberOfTrailingZeros", "(I)I", ScalarOp::NtzI),
-            ("java/lang/Long", "numberOfTrailingZeros", "(J)I", ScalarOp::NtzL),
-            ("java/lang/Integer", "reverseBytes", "(I)I", ScalarOp::ReverseBytesI),
-            ("java/lang/Long", "reverseBytes", "(J)J", ScalarOp::ReverseBytesL),
-            ("java/lang/Integer", "lowestOneBit", "(I)I", ScalarOp::LowestOneBitI),
-            ("java/lang/Long", "lowestOneBit", "(J)J", ScalarOp::LowestOneBitL),
-            ("java/lang/Integer", "highestOneBit", "(I)I", ScalarOp::HighestOneBitI),
-            ("java/lang/Long", "highestOneBit", "(J)J", ScalarOp::HighestOneBitL),
-            ("java/lang/Integer", "rotateLeft", "(II)I", ScalarOp::RotateLeftI),
-            ("java/lang/Long", "rotateLeft", "(JI)J", ScalarOp::RotateLeftL),
-            ("java/lang/Integer", "rotateRight", "(II)I", ScalarOp::RotateRightI),
-            ("java/lang/Long", "rotateRight", "(JI)J", ScalarOp::RotateRightL),
+        // Driven off an EXHAUSTIVE match rather than a hand-kept list. The
+        // previous version was a list of tuples, which could not catch the one
+        // failure this test exists for: a family added to the enum and to the
+        // lowering but missing from the recognizer reads, from outside,
+        // exactly like a workload with no such call site -- the census simply
+        // does not count it. With the match below, adding a variant without
+        // declaring its signature is a COMPILE error.
+        fn declared_signature(sop: ScalarOp) -> (&'static str, &'static str, &'static str) {
+            match sop {
+                ScalarOp::MinI => ("java/lang/Math", "min", "(II)I"),
+                ScalarOp::MaxI => ("java/lang/Math", "max", "(II)I"),
+                ScalarOp::MinL => ("java/lang/Math", "min", "(JJ)J"),
+                ScalarOp::MaxL => ("java/lang/Math", "max", "(JJ)J"),
+                ScalarOp::AbsI => ("java/lang/Math", "abs", "(I)I"),
+                ScalarOp::AbsL => ("java/lang/Math", "abs", "(J)J"),
+                ScalarOp::CompareI => ("java/lang/Integer", "compare", "(II)I"),
+                ScalarOp::CompareL => ("java/lang/Long", "compare", "(JJ)I"),
+                ScalarOp::NlzI => ("java/lang/Integer", "numberOfLeadingZeros", "(I)I"),
+                ScalarOp::NlzL => ("java/lang/Long", "numberOfLeadingZeros", "(J)I"),
+                ScalarOp::NtzI => ("java/lang/Integer", "numberOfTrailingZeros", "(I)I"),
+                ScalarOp::NtzL => ("java/lang/Long", "numberOfTrailingZeros", "(J)I"),
+                ScalarOp::ReverseBytesI => ("java/lang/Integer", "reverseBytes", "(I)I"),
+                ScalarOp::ReverseBytesL => ("java/lang/Long", "reverseBytes", "(J)J"),
+                ScalarOp::LowestOneBitI => ("java/lang/Integer", "lowestOneBit", "(I)I"),
+                ScalarOp::LowestOneBitL => ("java/lang/Long", "lowestOneBit", "(J)J"),
+                ScalarOp::HighestOneBitI => ("java/lang/Integer", "highestOneBit", "(I)I"),
+                ScalarOp::HighestOneBitL => ("java/lang/Long", "highestOneBit", "(J)J"),
+                ScalarOp::RotateLeftI => ("java/lang/Integer", "rotateLeft", "(II)I"),
+                ScalarOp::RotateLeftL => ("java/lang/Long", "rotateLeft", "(JI)J"),
+                ScalarOp::RotateRightI => ("java/lang/Integer", "rotateRight", "(II)I"),
+                ScalarOp::RotateRightL => ("java/lang/Long", "rotateRight", "(JI)J"),
+                ScalarOp::AbsF => ("java/lang/Math", "abs", "(F)F"),
+                ScalarOp::AbsD => ("java/lang/Math", "abs", "(D)D"),
+            }
+        }
+        const ALL: &[ScalarOp] = &[
+            ScalarOp::MinI,
+            ScalarOp::MaxI,
+            ScalarOp::MinL,
+            ScalarOp::MaxL,
+            ScalarOp::AbsI,
+            ScalarOp::AbsL,
+            ScalarOp::CompareI,
+            ScalarOp::CompareL,
+            ScalarOp::NlzI,
+            ScalarOp::NlzL,
+            ScalarOp::NtzI,
+            ScalarOp::NtzL,
+            ScalarOp::ReverseBytesI,
+            ScalarOp::ReverseBytesL,
+            ScalarOp::LowestOneBitI,
+            ScalarOp::LowestOneBitL,
+            ScalarOp::HighestOneBitI,
+            ScalarOp::HighestOneBitL,
+            ScalarOp::RotateLeftI,
+            ScalarOp::RotateLeftL,
+            ScalarOp::RotateRightI,
+            ScalarOp::RotateRightL,
+            ScalarOp::AbsF,
+            ScalarOp::AbsD,
         ];
-        for &(c, m, d, want) in cases {
+        for &sop in ALL {
+            let (c, m, d) = declared_signature(sop);
             assert_eq!(
                 try_ir_scalar_intrinsic(c, m, d),
-                Some(want),
+                Some(sop),
                 "{c}.{m}{d} is declared as a scalar-intrinsic family and was not recognised",
+            );
+            // And the shapes the lowering relies on must agree with the
+            // descriptor: a mistyped input is joined against a real stack entry
+            // at the next merge, which is a wrong-code bug rather than a missed
+            // optimization.
+            assert!(sop.arity() >= 1 && sop.arity() <= 2, "{c}.{m}{d} arity");
+            assert_eq!(
+                sop.is_fp(),
+                matches!(sop, ScalarOp::AbsF | ScalarOp::AbsD),
+                "{c}.{m}{d}: is_fp must name exactly the XMM families, because                  the lowering arm loads inputs[0] into RAX unless it says so",
             );
         }
     }
@@ -8769,6 +10595,139 @@ mod scalar_intrinsic_recognizer_tests {
 /// **Default ON**; `CRATONVM_JIT_IR_SCALAR_INTRINSICS=0` restores the
 /// method-level refusal for these families too, which is the A arm of the only
 /// A/B that means anything here.
+/// May a spliced callee body contain its own branches? **Default ON**;
+/// `CRATONVM_JIT_IR_SPLICE_BRANCH=0` restores the straight-line-only shape.
+///
+/// Read by BOTH halves of the feature — the splice scanner in `jit_bridge`,
+/// which decides whether to admit such a callee, and [`IrBuilder::build`],
+/// which pre-scans the admitted body's control flow. They must agree: a body
+/// admitted without its pre-scan is exactly the orphan-node failure STUB-S8
+/// was, so the scanner asks the VM-side mirror of this and the builder asks
+/// this, and neither may be flipped alone.
+pub fn ir_splice_branch_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPLICE_BRANCH").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
+/// May a spliced callee body have more than one `return`? **Default OFF**;
+/// `CRATONVM_JIT_IR_SPLICE_MULTI_RETURN=1` lifts the
+/// `ir-splice-not-single-trailing-return` refusal.
+///
+/// # Why it is off, given that it works
+///
+/// It works, and it is soak-clean: 39 deterministic workloads under three
+/// collectors with 0 divergence, checksum parity against Temurin JDK 25 on 14
+/// workloads, and a probe built for it (`MultiRet`) where the census reads
+/// `bodies=3 return_edges=8` on and `bodies=0` off.
+///
+/// What it does not do is go faster. Interleaved, order-flipped, 14 rounds on
+/// that probe: **+0.0 % median, faster in 5 of 14 paired rounds.** Splicing
+/// removes a call and adds a merge and a phi, and on this shape those cancel.
+///
+/// It used to cost something on the other side as well: a merge built inside a
+/// spliced body set `SPLICED_MERGE_SEEN`, which withheld the artifact's
+/// `ir_osr_entries` wholesale. That containment came off on 2026-09-09 — the
+/// wrong answer was `emit_osr_entry_stubs` jumping past the block that writes a
+/// constant arm's home word, not the splice — so the OSR door is no longer
+/// forfeited by turning this on.
+///
+/// What is left is the measurement, and the measurement is neutral. It stays off
+/// until a shape is found where splicing a multi-return body pays; the argument
+/// that would have flipped it (coverage against nothing) is gone with the
+/// containment, because there is no longer anything to trade coverage against.
+///
+/// Implies [`ir_splice_branch_enabled`] in practice — a second `return` is
+/// only reachable through a branch — and, like it, is read by BOTH halves:
+/// the splice scanner in `jit_bridge`, which decides whether to admit such a
+/// callee, and [`IrBuilder::splice_return`] / [`IrBuilder::finish_multi_return_splice`],
+/// which build the continuation. Admitting a body one half does not understand
+/// is the orphan-node failure STUB-S8 was, so neither may be flipped alone.
+pub fn ir_splice_multi_return_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        ir_splice_branch_enabled()
+            && matches!(
+                cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPLICE_MULTI_RETURN").as_deref(),
+                Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+            )
+    })
+}
+
+/// Spliced callee bodies whose several `return`s were funnelled into one
+/// continuation merge, and how many return edges that took in total. Both are
+/// process-wide and diagnostic only; `interp_census` prints them so "no
+/// multi-return body was ever admitted" is distinguishable from "the feature
+/// is not wired".
+static MULTI_RETURN_SPLICES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MULTI_RETURN_EDGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(bodies, return edges)` — see [`MULTI_RETURN_SPLICES`].
+pub fn multi_return_splice_census() -> (u64, u64) {
+    (
+        MULTI_RETURN_SPLICES.load(std::sync::atomic::Ordering::Relaxed),
+        MULTI_RETURN_EDGES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// May a spliced callee body contain a `getstatic`? **Default ON**;
+/// `CRATONVM_JIT_IR_SPLICE_GETSTATIC=0` restores the `ir-splice-static-field`
+/// refusal.
+///
+/// Read by BOTH halves, for the same reason and with the same hazard as
+/// [`ir_splice_branch_enabled`]: the splice scanner in `jit_bridge` decides
+/// whether to admit such a callee, and [`IrInlineTables::static_field_info`] is
+/// what carries the rows the builder's `0xb2` arm then looks up. A body
+/// admitted without its rows does not fall back -- the builder bails the whole
+/// METHOD at the first spliced `getstatic`, which is how the `ldc` rows
+/// behaved for their first hour. Neither half may be flipped alone.
+///
+/// `putstatic` is NOT covered by this switch in either direction. It stays
+/// refused unconditionally; see [`IrInlineTables::static_field_info`].
+pub fn ir_splice_getstatic_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPLICE_GETSTATIC").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
+/// May a spliced callee body contain a `checkcast` or an `instanceof`?
+/// **Default ON**; `CRATONVM_JIT_IR_SPLICE_TYPECHECK=0` restores the refusal.
+///
+/// Read by BOTH halves, with the same hazard as [`ir_splice_getstatic_enabled`]
+/// and one extra step: the splice scanner in `jit_bridge` decides whether to
+/// admit such a callee AND resolves the target class against the CALLEE's
+/// constant pool, since `InlineSite` carried no typecheck rows before this and
+/// only that pool can name the target. [`IrInlineTables::checkcast_info`]
+/// carries what comes out. A body admitted without its rows bails the whole
+/// METHOD, so neither half may be flipped alone.
+///
+/// Every typed read out of an untyped container is a `checkcast`, which is why
+/// the survey that motivated the caller-side arms counted 306 events on this
+/// pair -- "the largest single whole-method refusal, more than every opcode gap
+/// combined". The splice scanner had been refusing the same shape for the same
+/// non-reason.
+pub fn ir_splice_typecheck_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPLICE_TYPECHECK").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
 pub fn ir_scalar_intrinsics_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -8783,6 +10742,49 @@ pub fn ir_scalar_intrinsics_enabled() -> bool {
 /// Scalar-intrinsic sites lowered as arithmetic, this process.
 static SCALAR_INTRINSICS_LOWERED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+/// Conditional branches replaced by a guard plus an unconditional jump, this
+/// process. See [`IrBuilder::prune_always_taken_branch`].
+static BRANCHES_PRUNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_branch_pruned() {
+    BRANCHES_PRUNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many cold branch arms this tier speculated away. A zero with the feature
+/// ON means the profile never showed a branch to be one-sided over the sample —
+/// which is a fact about the workload, not about the pass, and is exactly the
+/// distinction a bare "it did nothing" cannot make.
+pub fn branch_prune_census() -> u64 {
+    BRANCHES_PRUNED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Speculative pruning of a branch arm the profile has never seen taken —
+/// **default OFF**, opt in with `CRATONVM_JIT_IR_SPECULATE=1`.
+///
+/// Needs a branch profile to do anything, so it is only meaningful together
+/// with `CRATONVM_TIER_PGO` / `CRATONVM_TIER_PGO_ALWAYS` or inside the C2
+/// nomination window.
+pub fn ir_speculate_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPECULATE").as_deref(),
+            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+        )
+    })
+}
+
+/// Minimum observations of a branch before its unseen edge may be speculated
+/// away.
+///
+/// A branch executed three times, all one way, says nothing. HotSpot's own
+/// uncommon-trap policy wants a comparable sample before it prunes, and the
+/// cost of being wrong here — a deopt, then a re-speculation on the next
+/// compile — is paid per mistake, so the floor is what keeps a cold method from
+/// paying it repeatedly.
+pub const MIN_OBSERVATIONS_TO_PRUNE: u32 = 2_000;
 
 /// Call sites REFUSED because their intrinsic family is loop-shaped and a
 /// generic dispatch would be a downgrade.
@@ -8854,8 +10856,67 @@ static TRAPS_PLANTED: [std::sync::atomic::AtomicU64; TrapCause::COUNT] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Traps REFUSED because the trap would not have been resumable, by cause.
+///
+/// A planted count on its own cannot tell "this workload has no such site"
+/// from "every such site was declined": both read as a low number of hard
+/// failures, and only one of them means the guard is doing anything. This row
+/// is what makes the refusal falsifiable — and it is the price tag of
+/// `ir_trap_replay_guard_enabled`, since every refusal here is one optimizing
+/// body given back to the single-pass tier.
+static TRAPS_REFUSED_UNRESUMABLE: [std::sync::atomic::AtomicU64; TrapCause::COUNT] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
 fn note_trap_planted(cause: TrapCause) {
     TRAPS_PLANTED[cause.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn note_trap_refused(cause: TrapCause) {
+    TRAPS_REFUSED_UNRESUMABLE[cause.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(cause, refused)` for every trap cause — the companion row to
+/// [`ir_trap_census`]. See [`TRAPS_REFUSED_UNRESUMABLE`].
+pub fn ir_trap_refusal_census() -> [(&'static str, u64); TrapCause::COUNT] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [
+        (
+            TrapCause::Indy.as_str(),
+            TRAPS_REFUSED_UNRESUMABLE[0].load(Relaxed),
+        ),
+        (
+            TrapCause::UnresolvedTypeCheck.as_str(),
+            TRAPS_REFUSED_UNRESUMABLE[1].load(Relaxed),
+        ),
+        (
+            TrapCause::UnresolvedNew.as_str(),
+            TRAPS_REFUSED_UNRESUMABLE[2].load(Relaxed),
+        ),
+    ]
+}
+
+/// Must an uncommon trap be resumable before it may be planted? **Default
+/// ON**; `CRATONVM_JIT_IR_TRAP_REPLAY_GUARD=0` is the kill switch and restores
+/// the pre-2026-09-07 behaviour (plant regardless, and let the interpreter's
+/// deopt sink raise `InternalError` when it cannot replay).
+///
+/// The guard exists because this backend publishes no resumable deopt on a
+/// production artifact — see [`IrBuilder::plant_uncommon_trap`] for the full
+/// argument and the javac shape that proved it. The kill switch is here so the
+/// cost of the refusal (optimizing bodies handed back to the single-pass tier)
+/// can be measured as an A/B in one binary rather than argued about.
+pub fn ir_trap_replay_guard_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_TRAP_REPLAY_GUARD").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
 }
 
 /// `(cause, planted)` for every trap cause, always all three rows.
@@ -8886,6 +10947,25 @@ pub fn ir_trap_census() -> [(&'static str, u64); TrapCause::COUNT] {
 /// an `invokedynamic`, 34 for a `checkcast`/`instanceof` on an unloaded class,
 /// and 13 for a `new` of one -- 100 methods, none of which had anything wrong
 /// with the code the optimizing tier would actually have run.
+///
+/// THIS WAS BRIEFLY FLIPPED OFF ON 2026-09-07 AND THE FLIP WAS WRONG. Thirty
+/// hibernate-reactive classes then read `ok=182 failed=7` with traps on against
+/// `ok=241 failed=0` with them off, and 36 `InternalError: ... refusing
+/// side-effecting replay` -- so the trap looked like the defect. It was only the
+/// TRIGGER. The cause was a deopt SINK that aborted on a trapped frame its
+/// sibling sink resumed, fixed the same day by another session
+/// (`CRATONVM_JIT_DEOPT_SINK_RESUME`, default ON). Re-measured on a binary
+/// carrying that fix:
+///
+/// ```text
+///   site traps ON  + sink fix    ok=239  failed=0  InternalError=0
+///   site traps OFF + sink fix    ok=241  failed=0  InternalError=0
+/// ```
+///
+/// Zero errors either way, so there is nothing here to switch off. The lesson
+/// kept is about the measurement, not the flag: an A/B with ONE lever proves
+/// that lever is on the path to the failure, and says nothing about whether it
+/// is the defect. A trigger and a cause both answer to a kill switch.
 pub fn ir_site_trap_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -8899,6 +10979,18 @@ pub fn ir_site_trap_enabled() -> bool {
 
 /// May an UNRESOLVED-CLASS site (`checkcast`, `instanceof`, `new`) become a
 /// trap? **Default OFF**; `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP=1` opts in.
+///
+/// The reason it is off CHANGED on 2026-09-07 and the old reason is retracted.
+/// It read "200,000 deopts on `UnresolvedTrapProbe`, every call, permanently
+/// not-compilable", and every one of those numbers was a broken deopt sink
+/// measured through this switch (see `ir_site_trap_enabled`). On a binary with
+/// `CRATONVM_JIT_DEOPT_SINK_RESUME` in it, 30 hibernate-reactive classes with
+/// this switch ON read `ok=241 failed=0` with **112 traps taken and zero**
+/// `refusing side-effecting replay` -- identical to the default arm.
+///
+/// It stays off because turning it on was always a THROUGHPUT argument (+13
+/// accepted bodies, +11 lowered on H2) and that has never been measured. Not
+/// because it is harmful.
 ///
 /// # Why this is separate from the indy trap, and why it ships off
 ///
@@ -9337,6 +11429,86 @@ mod tests {
         builder.build(code, code_len).expect("IR build failed")
     }
 
+    /// `int f(int x) { return x == 0 ? 2 : 1; }`, whose `ifeq` at pc 1 the
+    /// profile says is always taken.
+    ///
+    /// Pruned, the branch becomes a guard plus a jump: the `Op::If` is gone,
+    /// the cold arm (`iconst_1`, pcs 4-5) is never built, and an `Op::Guard`
+    /// anchored at pc 1 carries the transfer back to the interpreter for the
+    /// case the profile never saw.
+    ///
+    /// Asserted against the UNPRUNED build of the same bytecode rather than
+    /// against absolute node counts, so the test says "pruning changed this"
+    /// rather than restating today's node numbering.
+    #[test]
+    fn an_always_taken_branch_becomes_a_guard_and_a_jump() {
+        let code = [
+            0x1a, // 0: iload_0
+            0x99, 0x00, 0x07, // 1: ifeq +7 -> 8
+            0x04, // 4: iconst_1     <- the cold arm
+            0xa7, 0x00, 0x04, // 5: goto +4 -> 9
+            0x05, // 8: iconst_2
+            0xac, // 9: ireturn
+            0, 0, 0,
+        ];
+
+        let plain = build_ir(&code, 10, 1, 1);
+        assert!(
+            plain.nodes.iter().any(|n| matches!(n.op, Op::If)),
+            "the control case must build an Op::If",
+        );
+        assert!(
+            !plain.nodes.iter().any(|n| matches!(n.op, Op::Guard { .. })),
+            "nothing unpruned may plant a guard here",
+        );
+
+        let mut builder = IrBuilder::new(1, 1);
+        builder.set_pruned_branches(std::iter::once(1usize).collect());
+        let pruned = builder.build(&code, 10).expect("pruned build");
+
+        assert!(
+            pruned
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::Guard { bci: 1 })),
+            "the pruned branch must plant a guard at its own bci",
+        );
+        assert!(
+            !pruned.nodes.iter().any(|n| matches!(n.op, Op::If)),
+            "the pruned branch must not also build an Op::If",
+        );
+        // The cold arm produced `iconst_1`; the surviving arm produces
+        // `iconst_2`. Only the second may be in the graph.
+        let consts: Vec<i64> = pruned
+            .nodes
+            .iter()
+            .filter_map(|n| match n.op {
+                Op::Const(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            consts.contains(&2) && !consts.contains(&1),
+            "the cold arm must be gone; constants were {consts:?}",
+        );
+    }
+
+    /// A guard has nothing to resume to inside a relocated body, so the tier
+    /// must decline to speculate there rather than set `splice_guard_seen` and
+    /// lose the whole method.
+    #[test]
+    fn pruning_is_declined_inside_a_splice() {
+        let mut b = IrBuilder::new(1, 1);
+        b.set_pruned_branches(std::iter::once(1usize).collect());
+        // No splice is open in this unit context, so the refusal under test is
+        // the OTHER one: a pc with no recorded frame state. Drive it by asking
+        // about a pc the walk has not reached.
+        assert!(
+            !b.prune_always_taken_branch(1, NO_NODE, 8),
+            "a bci with no safepoint snapshot must not be speculated on",
+        );
+    }
+
     #[test]
     fn test_ir_identity_function() {
         // int f(int x) { return x; }
@@ -9407,6 +11579,144 @@ mod tests {
         assert!(has_if, "Should contain an If node");
         let has_cmp = graph.nodes.iter().any(|n| matches!(n.op, Op::Cmp(_)));
         assert!(has_cmp, "Should contain a Cmp node");
+    }
+
+    /// A spliced `getstatic` resolves through `IrInlineTables::static_field_info`,
+    /// and a MISSING row bails the whole method.
+    ///
+    /// Both halves matter, and the second is the one with no other witness.
+    /// `ldc` spent its first hour in exactly this state -- the resolver
+    /// admitting a callee whose rows nothing rebased, and the builder refusing
+    /// the METHOD 65 bytes later, which from outside is indistinguishable from
+    /// a workload that has no such callee. Asserting only the positive would
+    /// leave the same hole: a future edit that drops the row from
+    /// `apply_inline_tables` would still pass.
+    #[test]
+    fn a_spliced_getstatic_resolves_through_the_rebased_rows() {
+        // Caller: `static int f() { return g(); }`
+        //   pc 0  invokestatic #1   (spliced)
+        //   pc 3  ireturn
+        // Callee body, relocated to combined pc 5:
+        //   pc 5  getstatic #2
+        //   pc 8  ireturn
+        let code = [
+            0xb8, 0x00, 0x01, 0xac, 0x00, // caller, code_len 4 (byte 4 is padding)
+            0xb2, 0x00, 0x02, 0xac, // relocated callee at [5, 9)
+            0, 0,
+        ];
+        let site = IrInlineSite {
+            base: 5,
+            code_len: 4,
+            num_args: 0,
+            max_locals: 0,
+            arg_local_slots: Vec::new(),
+            returns_value: true,
+            receiver_is_arg0: false,
+            method_key: "P.g:()I".to_string(),
+            class_id: 7,
+        };
+
+        let mut with_rows = IrBuilder::new(0, 1);
+        let mut tables = IrInlineTables::default();
+        tables.sites.insert(0, site.clone());
+        // The row `append_ir_inline_site` rebases: CALLEE pc 0 + base 5.
+        tables
+            .static_field_info
+            .insert(5, (7u32, 0usize, b'I', false));
+        with_rows.apply_inline_tables(tables);
+        let graph = with_rows
+            .build(&code, 4)
+            .expect("a spliced getstatic with its row must build");
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::LoadStatic { class_id: 7, .. })),
+            "the spliced `getstatic` must lower to an Op::LoadStatic naming the              resolved class, not to a call left behind by a skipped splice",
+        );
+
+        // Same site, same bytes, no row.
+        let mut without_rows = IrBuilder::new(0, 1);
+        let mut bare = IrInlineTables::default();
+        bare.sites.insert(0, site);
+        without_rows.apply_inline_tables(bare);
+        assert!(
+            without_rows.build(&code, 4).is_none(),
+            "with no row the builder must bail the METHOD -- that is the failure              mode the resolver's admission has to stay in step with",
+        );
+    }
+
+    /// A spliced `instanceof` resolves through `IrInlineTables::instanceof_info`,
+    /// and a MISSING row bails the whole method.
+    ///
+    /// The `0xc1` arm READS as though a missing row were graceful -- it calls
+    /// `plant_uncommon_trap` and compiles the rest. It is not, by default:
+    /// `TrapCause::UnresolvedTypeCheck` is gated behind
+    /// `ir_unresolved_class_trap_enabled`, which is OFF (the argument for it
+    /// having been refuted), so the plant refuses and the arm falls through to
+    /// `ir_build_bail`. That is the same fail-closed answer a missing
+    /// `getstatic` row gives, and it is why the resolver must refuse a callee
+    /// whose targets it could not resolve rather than admit the body and leave
+    /// rows out: doing so costs the CALLER its whole optimizing compile.
+    ///
+    /// Asserting the negative is the point. Reading the arm alone gives the
+    /// wrong answer, and a future edit that flips the trap default would change
+    /// this behaviour without touching either half of the splice feature.
+    #[test]
+    fn a_spliced_instanceof_resolves_through_the_rebased_rows() {
+        // Caller: `static boolean f(Object o) { return g(o); }`
+        //   pc 0  aload_0
+        //   pc 1  invokestatic #1   (spliced)
+        //   pc 4  ireturn
+        // Callee body, relocated to combined pc 6:
+        //   pc 6  aload_0
+        //   pc 7  instanceof #2
+        //   pc 10 ireturn
+        let code = [
+            0x2a, 0xb8, 0x00, 0x01, 0xac, 0x00, // caller, code_len 5
+            0x2a, 0xc1, 0x00, 0x02, 0xac, // relocated callee at [6, 11)
+            0, 0,
+        ];
+        let name = "java/lang/String";
+        let (ptr, len) = crate::intern_typecheck_target(name, Some(11));
+        let site = IrInlineSite {
+            base: 6,
+            code_len: 5,
+            num_args: 1,
+            max_locals: 1,
+            arg_local_slots: vec![0],
+            returns_value: true,
+            receiver_is_arg0: false,
+            method_key: "P.g:(Ljava/lang/Object;)Z".to_string(),
+            class_id: 7,
+        };
+
+        let mut with_rows = IrBuilder::new(1, 1);
+        let mut tables = IrInlineTables::default();
+        tables.sites.insert(1, site.clone());
+        // The row `append_ir_inline_site` rebases: CALLEE pc 1 + base 6.
+        tables.instanceof_info.insert(7, (ptr as usize, len));
+        with_rows.apply_inline_tables(tables);
+        let graph = with_rows
+            .build(&code, 5)
+            .expect("a spliced instanceof with its row must build");
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::InstanceOf { .. })),
+            "the spliced `instanceof` must lower to an Op::InstanceOf, not to a              call left behind by a skipped splice",
+        );
+
+        // Same site, same bytes, no row.
+        let mut without_rows = IrBuilder::new(1, 1);
+        let mut bare = IrInlineTables::default();
+        bare.sites.insert(1, site);
+        without_rows.apply_inline_tables(bare);
+        assert!(
+            without_rows.build(&code, 5).is_none(),
+            "with no row the builder must bail the METHOD -- the `0xc1` arm's              uncommon-trap path is gated off by default, so the resolver's              admission has to stay in step with the rows it produces",
+        );
     }
 
     #[test]
@@ -11240,6 +13550,132 @@ mod tests {
         );
         assert_eq!(graph.verify_use_lists(), Ok(()));
         assert_eq!(graph.use_counts(), scanned_use_counts(&graph));
+    }
+
+    // ── IR-tier inline FRAME sites (stack traces) ────────────────────
+    //
+    // The probe these are modelled on is `probes/StackTraceAfterOsr.java`:
+    // `probe()` calls `outer(1)`, which calls `mid`, which calls `leaf`. The
+    // IR tier splices `outer` and then `mid` into `probe`'s combined buffer,
+    // and before 2026-09-08 both contributed no stack frame at all.
+
+    /// `probe` has real code `[0, code_len)`; `outer` is spliced at caller pc
+    /// 42 and `mid` is spliced at a caller pc INSIDE `outer`'s body.
+    fn probe_shaped_sites() -> HashMap<usize, IrInlineSite> {
+        fn site(base: usize, code_len: usize, key: &str, class_id: u32) -> IrInlineSite {
+            IrInlineSite {
+                base,
+                code_len,
+                num_args: 1,
+                max_locals: 1,
+                arg_local_slots: vec![0],
+                returns_value: true,
+                receiver_is_arg0: false,
+                method_key: key.to_string(),
+                class_id,
+            }
+        }
+        let mut m = HashMap::new();
+        // `outer` spliced at probe's pc 42, body at [100, 107).
+        m.insert(42, site(100, 7, "P.outer:(I)I", 7));
+        // `mid` spliced at combined pc 101 — one byte into `outer`'s body —
+        // with its own body at [200, 207).
+        m.insert(101, site(200, 7, "P.mid:(I)I", 7));
+        m
+    }
+
+    /// Nothing spliced ⇒ no chain anywhere, and the fast path reports empty.
+    #[test]
+    fn inline_frame_sites_empty_answers_nothing() {
+        let sites = IrInlineFrameSites::default();
+        assert!(sites.is_empty());
+        assert!(sites.chain_at(0).is_empty());
+        assert!(sites.chain_at(9999).is_empty());
+        assert_eq!(sites.enclosing_bci_at(42), None);
+    }
+
+    /// A pc in the COMPILING method's own code is not an inlined level. It is
+    /// the physical frame, which reports itself; answering a chain for it would
+    /// name a callee that is not on the stack.
+    #[test]
+    fn inline_frame_sites_refuse_the_compiling_methods_own_code() {
+        let sites = IrInlineFrameSites::from_sites(&probe_shaped_sites());
+        assert!(!sites.is_empty());
+        assert!(sites.chain_at(0).is_empty());
+        assert!(sites.chain_at(42).is_empty());
+        assert_eq!(sites.enclosing_bci_at(42), None);
+    }
+
+    /// One level deep: a pc inside `outer`'s body names `outer` alone, at
+    /// `outer`'s OWN bci — never the combined-buffer pc.
+    #[test]
+    fn inline_frame_sites_one_level() {
+        let sites = IrInlineFrameSites::from_sites(&probe_shaped_sites());
+        let chain = sites.chain_at(103);
+        assert_eq!(chain.len(), 1, "one spliced body encloses pc 103");
+        assert_eq!(chain[0].method_key, "P.outer:(I)I");
+        assert_eq!(chain[0].bci, 3, "103 - base 100");
+        assert_eq!(chain[0].class_id, 7);
+        // The compiling method's own bci covering it is the splice's caller pc.
+        assert_eq!(sites.enclosing_bci_at(103), Some(42));
+    }
+
+    /// Two levels: a pc inside `mid` reports `mid` THEN `outer`, innermost
+    /// first, each with a bci in its own code. This is the exact shape that
+    /// printed `len=3` instead of `len=5` on `StackTraceAfterOsr`.
+    #[test]
+    fn inline_frame_sites_nested_chain_is_innermost_first() {
+        let sites = IrInlineFrameSites::from_sites(&probe_shaped_sites());
+        let chain = sites.chain_at(204);
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].method_key, "P.mid:(I)I");
+        assert_eq!(chain[0].bci, 4, "204 - base 200, inside mid");
+        assert_eq!(chain[1].method_key, "P.outer:(I)I");
+        assert_eq!(
+            chain[1].bci, 1,
+            "mid's caller pc 101 - outer's base 100: where outer calls mid"
+        );
+        // Still the OUTERMOST splice's caller pc — an index into probe's own
+        // bytecode, which is the only bci a row may legally carry.
+        assert_eq!(sites.enclosing_bci_at(204), Some(42));
+    }
+
+    /// A pc in the gap between two bodies belongs to neither. Ranges are
+    /// half-open, so `base + code_len` is already outside.
+    #[test]
+    fn inline_frame_sites_ranges_are_half_open() {
+        let sites = IrInlineFrameSites::from_sites(&probe_shaped_sites());
+        assert!(!sites.chain_at(106).is_empty(), "last byte of outer's body");
+        assert!(sites.chain_at(107).is_empty(), "one past it");
+        assert!(sites.chain_at(150).is_empty(), "the gap before mid's body");
+    }
+
+    /// A malformed table whose site sits inside its OWN body would walk
+    /// forever. The chain is given up WHOLE rather than truncated: a truncated
+    /// chain reads as complete and names a caller that is not there.
+    #[test]
+    fn inline_frame_sites_refuse_a_cyclic_table() {
+        let mut m = HashMap::new();
+        m.insert(
+            105, // caller pc inside the body this very site installs
+            IrInlineSite {
+                base: 100,
+                code_len: 20,
+                num_args: 0,
+                max_locals: 1,
+                arg_local_slots: vec![],
+                returns_value: false,
+                receiver_is_arg0: false,
+                method_key: "P.loop:()V".to_string(),
+                class_id: 1,
+            },
+        );
+        let sites = IrInlineFrameSites::from_sites(&m);
+        assert!(
+            sites.chain_at(110).is_empty(),
+            "a cycle must yield NO chain, not a truncated one"
+        );
+        assert_eq!(sites.enclosing_bci_at(110), None);
     }
 
     // ── Inline scopes ────────────────────────────────────────────────

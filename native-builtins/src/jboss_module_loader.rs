@@ -1126,6 +1126,17 @@ pub(crate) fn native_loader_load_module(
     args: &[Value],
 ) -> MethodCallResult {
     // args[0] = this (LocalModuleLoader), args[1] = String name
+    //
+    // GC: the `_` arm below ALLOCATES and does not return, so `args` — the
+    // snapshot `safe_native_call_impl` took before this native was entered —
+    // names pre-call addresses from there on. `this` was already pinned for
+    // the `extract_receiver_roots` window; the NAME argument was not, and it
+    // is read out of `args` after that allocation. Pin it at entry, before
+    // anything can collect. See `internal/audits/wide-tranche-triage-20260907.md`.
+    let name_pin = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some((ctx.pin_native_root(*o), *o)),
+        _ => None,
+    };
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => build_local_module_loader(ctx)?,
@@ -1138,7 +1149,10 @@ pub(crate) fn native_loader_load_module(
     // wildfly-parallel-boot-stale-objectref-residual.md).
     let this_pin = ctx.pin_native_root(this);
     let name_obj = match args.get(1) {
-        Some(Value::Object(Some(s))) => *s,
+        Some(Value::Object(Some(s))) => match name_pin {
+            Some((pin, obj)) => ctx.read_native_pin(pin, obj),
+            None => *s,
+        },
         Some(Value::Object(None)) => {
             return Err(RuntimeError::NullPointerException {
                 message: Some("LocalModuleLoader.loadModule: name must not be null".to_string()),
@@ -3716,6 +3730,20 @@ fn native_loader_load_module_by_identifier(
             .into());
         }
     };
+    // GC: a reference held in a Rust local across an allocating or Java-re-entering
+    // call goes stale under a moving collector, and under the Generational
+    // non-moving young sweep an unrooted object is ZEROED in place. Pin and
+    // re-read. `safe_native_call_impl` truncates `native_pin_roots` when the native
+    // returns, so an unmatched pin costs nothing on an error path. See
+    // `internal/audits/wide-tranche-triage-20260907.md`.
+    // `ctx.invoke` runs `getName()` bytecode and `create_string` below
+    // allocates, so `args[0]` — the loader this forwards to the sibling
+    // native — names a pre-call address by the time the new argument vector
+    // is built.
+    let arg0_pin = match args.first() {
+        Some(Value::Object(Some(o))) => Some((ctx.pin_native_root(*o), *o)),
+        _ => None,
+    };
     // ModuleIdentifier has `String getName()` — call it.
     let name_val = ctx.invoke(
         "org/jboss/modules/ModuleIdentifier",
@@ -3734,7 +3762,11 @@ fn native_loader_load_module_by_identifier(
         .into());
     }
     let name_str = ctx.create_string(&name);
-    let new_args: Vec<Value> = vec![args[0], Value::Object(Some(name_str))];
+    let arg0 = match arg0_pin {
+        Some((p, o)) => Value::Object(Some(ctx.read_native_pin(p, o))),
+        None => args[0],
+    };
+    let new_args: Vec<Value> = vec![arg0, Value::Object(Some(name_str))];
     native_loader_load_module(ctx, &new_args)
 }
 

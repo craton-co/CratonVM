@@ -471,6 +471,44 @@ impl Tlab {
             return None;
         }
         let ptr = aligned as *mut u8;
+        if watch_covers(ptr as usize, new_cursor) {
+            watch_note(format_args!(
+                "TLAB BUMP handed it out: ptr=0x{:x} size={size} tlab=[0x{:x},0x{:x}) cursor was 0x{cursor:x}",
+                ptr as usize,
+                self.start as usize,
+                self.end as usize,
+            ));
+        }
+        // TRIPWIRE (`CRATONVM_DBG_DEADREF_STORE`): is this TLAB bumping over
+        // memory that is not free?
+        //
+        // A chunk is zeroed when it is carved and the cursor only moves
+        // forward, so every byte this bump is about to hand out is zero — in a
+        // correct run. A non-zero word here is the one shape the two tripwires
+        // in `install_tail_filler` and `refill_tlab` cannot see, because both
+        // of those look at the moment the span is HANDED OUT and this looks at
+        // the moment it is USED: a TLAB that keeps bumping after its chunk has
+        // been retired and filled, or re-served to someone else, passes both of
+        // them and fails this one. `0xF111E700` as the value names the filler
+        // directly.
+        if cratonvm_types::flags().gc.dbg_deadref_store {
+            // SAFETY: `[ptr, ptr+footprint)` is inside `[cursor, end)`, memory
+            // this TLAB owns and that is mapped.
+            let w = unsafe { std::ptr::read_unaligned(ptr as *const u32) };
+            if w != 0 {
+                static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 8 {
+                    eprintln!(
+                        "[tlab-audit] BUMP-OVER-OCCUPIED #{n}: TLAB alloc at 0x{:x}                          (size={size} align={align}) is handing out memory whose first word is                          0x{w:x}, not zero. start=0x{:x} cursor=0x{:x} end=0x{:x}. The chunk                          this TLAB is bumping through is not free.",
+                        ptr as usize,
+                        self.start as usize,
+                        cursor,
+                        self.end as usize,
+                    );
+                }
+            }
+        }
         init(ptr);
         // Commit last: a cross-thread root scan may publish the remaining
         // `[cursor, end)` tail while this thread is suspended in JIT code.
@@ -692,6 +730,68 @@ impl Tlab {
 
         let tail = end_addr - aligned;
         use crate::heap::{ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE};
+        // TRIPWIRE: is there already an object AT the cursor?
+        //
+        // A TLAB's memory is zeroed when the chunk is carved (`refill_tlab`),
+        // and the cursor only ever moves forward over what this thread
+        // allocated. So the bytes at `cursor` are zero unless the cursor is
+        // WRONG — pointing at or before an object that was already handed out.
+        // Filling from there buries live objects under one synthetic `int[]`:
+        // the next collection's object-start walk strides over them, their
+        // addresses stop being object starts, and every reference to them is
+        // refused by the evacuator and left dangling.
+        //
+        // That is exactly how `0x200868400d8` — a live lambda capture 261 336
+        // bytes inside a 261 792-byte filler — reached `invokevirtual` as an
+        // all-zero header on BindableTests (2026-09-09). O(1), always on: one
+        // load of a word this function is about to overwrite anyway, and the
+        // silence of a correct run costs a predicted-not-taken branch.
+        //
+        // SAFETY: `aligned` is inside `[cursor, end)`, which this TLAB owns and
+        // which is mapped until the arena is reset.
+        if watch_covers(aligned, end_addr) {
+            watch_note(format_args!(
+                "TAIL FILLER buried it: filler=[0x{aligned:x},0x{end_addr:x}) tlab=[0x{:x},0x{end_addr:x}) consumed={}",
+                self.start as usize,
+                aligned.saturating_sub(self.start as usize),
+            ));
+        }
+        let mut occupant = unsafe { std::ptr::read_unaligned(aligned as *const u32) };
+        // Same widening as the refill tripwire, and for the same reason: the
+        // O(1) word above catches a cursor that sits exactly ON an object, but
+        // not a filler span that swallows objects further along. The tail of a
+        // TLAB is untouched memory, so any non-zero word inside it is live data
+        // this filler is about to hide from every object-start walk.
+        if occupant == 0 && cratonvm_types::flags().gc.dbg_deadref_store {
+            // SAFETY: `[aligned, end_addr)` is this TLAB's own tail, mapped and
+            // 8-aligned at both ends.
+            let words = (end_addr - aligned) / 8;
+            for i in 0..words {
+                let w = unsafe { std::ptr::read_unaligned((aligned as *const u64).add(i)) };
+                if w != 0 {
+                    occupant = w as u32;
+                    break;
+                }
+            }
+        }
+        if occupant != 0 {
+            FILLER_OVER_OBJECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 8 || n.is_power_of_two() {
+                tracing::error!(
+                    target: "cratonvm::gc::guard",
+                    cursor = format!("{aligned:#x}"),
+                    start = format!("{:#x}", self.start as usize),
+                    end = format!("{end_addr:#x}"),
+                    consumed = aligned.saturating_sub(self.start as usize),
+                    tail,
+                    occupant_class_id = occupant,
+                    occurrence = n + 1,
+                    "[tlab-audit] install_tail_filler is about to stamp a filler over an                      ALREADY-ALLOCATED object: the word at the TLAB cursor is a live class id,                      not the zero this chunk was carved with. Everything from here to the TLAB                      end is about to become one synthetic int[], so the next object-start walk                      will stride over it and the evacuator will refuse every reference into it.",
+                );
+            }
+        }
         if tail < HEADER_SIZE {
             // Bug-D fix (2026-06-12): a sub-`HEADER_SIZE` tail cannot hold a
             // walkable `int[]` filler, and ZEROING it (the old behaviour) is
@@ -888,6 +988,65 @@ pub fn max_tlab_size() -> usize {
 /// "synthetic VM" class-id range (the same kind of reserved sentinel as
 /// `AUTOBOX_CLASS_ID`, now `u32::MAX`) so it cannot collide with a
 /// classloader-issued id.
+/// `CRATONVM_DBG_WATCH_ADDR=<hex>`: one young-heap address to narrate.
+///
+/// The refusal census can say an address is not an object start on the cycle it
+/// fails, and nothing in the tree could say how it got that way — every
+/// candidate mechanism (a double-issued chunk, a filler over live data, a
+/// bump past a retired cursor) had to be tested by its own tripwire, and all of
+/// them can be silent while the address is still wrong.
+///
+/// The addresses this workload fails on repeat exactly across runs, because a
+/// semispace is reset and re-served from the same base every cycle. That makes
+/// one absolute address a usable handle: arm it, and the allocator, the
+/// retire path and the object-start walk each say what they did to it, in
+/// order, with the collection number.
+fn watch_addr() -> usize {
+    static A: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *A.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_WATCH_ADDR")
+            .ok()
+            .and_then(|v| {
+                usize::from_str_radix(v.trim().trim_start_matches("0x").trim_start_matches("0X"), 16)
+                    .ok()
+            })
+            .unwrap_or(0)
+    })
+}
+
+/// Does `[lo, hi)` cover the watched address? `false` when unarmed.
+pub fn watch_covers(lo: usize, hi: usize) -> bool {
+    let w = watch_addr();
+    w != 0 && w >= lo && w < hi
+}
+
+/// The watched address, or 0.
+pub fn watched() -> usize {
+    watch_addr()
+}
+
+/// The collection count, published by the generational heap each cycle so the
+/// TLAB paths — which hold no heap handle — can date their own reports.
+pub static WATCH_COLLECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Emit one line of the watched address's life story.
+pub fn watch_note(what: std::fmt::Arguments<'_>) {
+    eprintln!(
+        "[watch 0x{:x}] collection={} {what}",
+        watch_addr(),
+        WATCH_COLLECTION.load(std::sync::atomic::Ordering::Relaxed),
+    );
+}
+
+/// Times [`Tlab::install_tail_filler`] found a live object at the cursor it was/// Times [`Tlab::install_tail_filler`] found a live object at the cursor it was
+/// about to fill from. See the tripwire there; a non-zero count is a
+/// use-after-free in waiting, not a diagnostic curiosity.
+pub static FILLER_OVER_OBJECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Times a TLAB refill handed out a chunk that already held an object. See the
+/// tripwire in `GenerationalHeap::refill_tlab`.
+pub static REFILL_OVER_OBJECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub const TLAB_FILLER_CLASS_ID: cratonvm_types::ClassId = cratonvm_types::ClassId::new(0xF111_E700);
 
 /// Bug-D fix (2026-06-12) — synthetic class id stamped into a
@@ -1074,7 +1233,13 @@ impl TlabPressureTracker {
         let next = if grow && !shrink {
             current.saturating_mul(2).min(MAX_TLAB_SIZE)
         } else if shrink && !grow {
-            (current / 2).max(MIN_TLAB_SIZE)
+            // `current` is only guaranteed to be a multiple of 8 (it can be
+            // seeded from a truncated, arena-nearly-full grant — see
+            // `refill_tlab`), not a multiple of 16+, so halving it can drop
+            // below the 8-byte alignment `Tlab::new` requires of the final
+            // refill size. Re-mask after the divide so every value this
+            // heuristic ever produces stays 8-aligned.
+            ((current / 2) & !7).max(MIN_TLAB_SIZE)
         } else {
             current
         };
@@ -1265,6 +1430,33 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         let next = t.next_refill_size();
         assert_eq!(next, 32 * 1024);
+    }
+
+    /// Regression: `next_refill_size`'s shrink branch used to compute
+    /// `current / 2` without re-masking to 8-byte alignment. `current`
+    /// (`last_refill_size`) can be seeded from a truncated `refill_tlab`
+    /// grant (see `gen_heap.rs` / `g1.rs` — the arena/region need only
+    /// guarantee multiples of 8, not 16+), so a value like 16392
+    /// (multiple of 8, not of 16) halves to 8196 — still inside
+    /// `[MIN_TLAB_SIZE, MAX_TLAB_SIZE]` so the final clamp doesn't catch
+    /// it, but not 8-aligned. That poisoned "requested size" would flow
+    /// straight into `Tlab::new`, tripping its `end`-pointer alignment
+    /// contract. Every value this heuristic can ever produce must stay
+    /// 8-aligned regardless of what `last_refill_size` was seeded with.
+    #[test]
+    fn pressure_tracker_shrink_stays_8_aligned_even_from_odd_seed() {
+        let mut t = TlabPressureTracker::new();
+        // 16392 = 16384 + 8: a multiple of 8, deliberately not of 16.
+        t.begin_refill(16392);
+        t.record_allocation(64);
+        t.record_allocation(64);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let next = t.next_refill_size();
+        assert_eq!(
+            next % 8,
+            0,
+            "next_refill_size must stay 8-aligned, got {next}"
+        );
     }
 
     #[test]

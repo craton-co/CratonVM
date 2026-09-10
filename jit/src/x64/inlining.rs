@@ -45,6 +45,43 @@ fn inline_live_slot_clamp_disabled() -> bool {
     cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_LIVE_SLOT_CLAMP").is_some()
 }
 
+/// How many reservations the open-inline-locals floor MOVED — i.e. how many
+/// would have handed out a word an enclosing spliced callee's locals still own.
+///
+/// A SECOND counter rather than a second use of [`INLINE_LIVE_SLOT_CLAMPS`],
+/// because the two guard different things: that one protects the caller's
+/// OPERAND stack from a rewound cursor, this one protects a spliced callee's
+/// LOCALS from every path that lowers the cursor. A single number could not say
+/// which a result should be credited to — and this defect exists in the first
+/// place because a single number (308 overlap reports) could not say which half
+/// of it was the hazard.
+static INLINE_LOCALS_FLOOR_BUMPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(super) fn note_inline_locals_floor() {
+    INLINE_LOCALS_FLOOR_BUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Engagement count for the open-inline-locals floor. Printed by
+/// `jit-method-stats` beside [`inline_live_slot_clamps`]. Zero means the guard
+/// never engaged on this run, which is what any report crediting it has to say.
+pub fn inline_locals_floor_bumps() -> u64 {
+    INLINE_LOCALS_FLOOR_BUMPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `CRATONVM_JIT_NO_INLINE_LOCALS_FLOOR=1` — measurement-only escape hatch
+/// restoring the pre-fix reservation start, so the fix can be A/B'd in ONE
+/// binary.
+///
+/// Separate from `CRATONVM_JIT_NO_INLINE_LIVE_SLOT_CLAMP` on purpose: that
+/// switch removes the operand-stack clamp, whose absence is a known miscompile
+/// (bc-java `LEATest`), so an A/B through it would price two changes at once
+/// and one of them is not this one. Turning THIS one off reinstates a store
+/// onto a live enclosing local; it is not a supported configuration.
+pub(super) fn inline_locals_floor_disabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_LOCALS_FLOOR").is_some()
+}
+
 // ---------------------------------------------------------------------------
 // The spliced direct call's oop map, keyed at the RETURN ADDRESS
 // ---------------------------------------------------------------------------
@@ -870,7 +907,7 @@ impl InlineFrameMap {
     ///
     /// `code_len` is the artifact's final code length; a row past it describes
     /// bytes that are not in the artifact and is dropped.
-    fn from_rows(rows: Vec<InlineFrameRow>, code_len: usize) -> Self {
+    pub(crate) fn from_rows(rows: Vec<InlineFrameRow>, code_len: usize) -> Self {
         // Rewind backstop. Rows are appended in emission order, so their
         // offsets are strictly increasing UNLESS the buffer was rewound
         // between two of them. When it was, every row at or above the new
