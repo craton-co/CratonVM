@@ -266,13 +266,25 @@ finite.
 **What landed.** `regalloc::xmm_roles::IR_GP_LINEAR_SCAN` = RBX, R12–R15 — a
 general-purpose file beside the XMM one, on the same write-through contract.
 
-Every part of the register choice is forced. They are callee-saved on **both**
-ABIs, which this wiring needs because it has no reload machinery: a value's
-register must survive a call by the calling convention rather than by analysis,
-and that rules out even the otherwise-obvious System V candidates RSI/RDI. They
-are untouched by this emitter's own tiers. The prologue saves them and every
-exit restores them (`IR_GP_PROLOGUE_SAVED`), on the same footing as the XMM save
-area and just as dynamically — a method that promotes nothing emits no save.
+Every part of the register choice is forced. They must be **callee-saved on the
+target ABI**, which this wiring needs because it has no reload machinery: a
+value's register must survive a call by the calling convention rather than by
+analysis, and that rules out every caller-saved register. They are untouched by
+this emitter's own tiers. The prologue saves them and every exit restores them
+(`IR_GP_PROLOGUE_SAVED`), on the same footing as the XMM save area and just as
+dynamically — a method that promotes nothing emits no save.
+
+> **Corrected 2026-09-10.** This paragraph used to read "callee-saved on
+> **both** ABIs […] and that rules out even the otherwise-obvious System V
+> candidates RSI/RDI" — a System V fact stated as an ABI-independent one.
+> **Win64 makes RSI and RDI callee-saved**, and the single-pass backend has
+> been colouring locals into them all along (`x64::LOCAL_REGS` is `[u8; 7]` on
+> Windows and `[u8; 5]` elsewhere). The IR file now widens to seven there
+> behind `CRATONVM_JIT_IR_GP_WIDE`, which is **default OFF because it was
+> measured slower**, not because it is unsoaked:
+> `docs/internal/performance/c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md`.
+> The reason it is slower is the next paragraph but one — write-through means a
+> wider file buys publishes, not fewer stores.
 
 **The safepoint obligation is discharged by type, not by structure.** A GC root
 walk reads a frame it did not stop, through RBP, and `OopMapEntry` names frame
@@ -972,7 +984,8 @@ downgrade that gate was shut for.
 2. **Every compiled call still republishes RBP and pushes/reloads the shadow
    stack.** Those buy precise roots, not nothing, and removing them is a GC
    trade rather than a codegen one.
-3. **Nothing compares a C2 body against the C1 body it replaces.** The
+3. **Nothing compares a C2 body against the C1 body it replaces.**
+   *(Partly closed 2026-09-10 — see the note at the end of this item.)* The
    policy question is unchanged and deliberately still open — the obvious
    static metrics both misjudge the good cases, since a bigger body is usually
    inlining or unrolling and more call sites can be a callee's own calls after
@@ -981,6 +994,30 @@ downgrade that gate was shut for.
    also does is remove the causes that made a C2 body worse — the tier now has
    an inline TLAB bump, gated inline reference stores, and a register file.
    **What that instrument then said is below.**
+   **2026-09-10, what is now closed of item 3.** The acceptance gate no longer
+   judges only by *what the tier did*. `ir_evidence::CompileRecord` carries the
+   per-execution cost a compile introduced beside its transform bitset, and
+   `is_worth_publishing` refuses a body whose priced cost went UP however much
+   it transformed. Evidence is now necessary, not sufficient.
+
+   The prices are the two this crate already reasons in — a blind
+   `jit_invoke_dispatch` resolves by name at ~175 ns against a direct `CALL`'s
+   ~4 — and the trade they settle is splicing: a spliced frame saves a call, a
+   call the splice strands without a bindable target costs a resolution on every
+   execution. What is NOT modelled is site execution frequency, so a resolution
+   on a cold branch is charged like one in a loop; that errs toward refusing,
+   which is the safe direction, and it is the first thing to fix if the gate is
+   ever measured refusing better bodies.
+
+   This is still not a general C1-vs-C2 comparison. It prices one specific trade
+   because that trade has measured constants; the rest of item 3 stands.
+   `[c2-supersede] refused as a cost regression: bodies=N est_ns_per_execution_declined=M`
+   is the reading. It came out of a case where a transform's presence was the
+   evidence that published a 3x regression — `Objects.checkIndex` spliced into
+   `ArrayList.get` set `Inlined`, the stranded call was native-shadowed, and the
+   published body ran its probe in 897 ms against the single-pass 338. See
+   `internal/performance/c2-splice-checkcast-and-instanceof-20260909.md`.
+
 4. **`Node` is still 48 bytes against HotSpot's 24.** Unchanged, structural,
    and a GC item: see
    `known-issues/perf/perf-bintrees-9x-gap-characterised.md`.
@@ -1358,6 +1395,14 @@ loop reproduces cleanly: both control pairs agree (3.5% and 1.4%) while the
 groups differ by 65%, and the medians are separated by far more than either
 spread.
 
+**Re-measured 2026-09-10: still there, at 1.594x.** The table above is a
+2026-09-03 snapshot and seven register flags went default-ON after it, so the
+number was retaken rather than carried forward — `probes/FieldLoop.java` `sum`,
+`tools/tier-ab/tier-ab.sh`, 503 ms baseline against 812 ms optimizing over a
+2.6% floor. The register work that landed in between did not close it, and
+widening the GP file does not either. See
+`docs/internal/performance/c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md`.
+
 Two things it is **not**. The optimizing tier emits *less* code for that method
 (1,030 bytes against 1,579), so it is not bloat; and `getfield helper calls`
 is 0 at runtime in both arms, so it is not an out-of-line call per iteration.
@@ -1729,6 +1774,18 @@ actually gave a register to, how many could lose their home word:
 [ir-ls] home: droppable=0 blocked_deopt=1 blocked_phi=2 safepoints=16
 ```
 
+> **The census in that code block no longer exists, 2026-09-10.** It kept
+> asking the question it was written for — "promoted, named by no safepoint at
+> all, and not a phi" — while `ir-reg-authoritative`, `ir-drop-home` and
+> `ir-drop-phi-home` widened the rule the emission uses to "named by no
+> REACHABLE frame state". By 2026-09-10 it printed `droppable=0` on a compile
+> of `FieldLoop.sum` that dropped **three** homes and skipped five stores. It
+> is replaced by `[ir-ls] homes: dropped_values=` (the outcome) and
+> `[ir-ls] homes kept: switch/deopt/type/op` (the per-cause remainder), the
+> second computed from `home_dropped` itself under an accounting identity so
+> it cannot fall behind again. Read the block below as the 2026-09-04 record
+> it is.
+
 **Zero of three**, on the loop this whole section is about. The design's safety
 argument — that `pinned` covers every deopt-named value, so a promoted value is
 named by no frame state — is true in `regalloc.rs` and false where it is used:
@@ -1798,7 +1855,8 @@ tested, so deopt metadata CAN name a register — but the IR tier's
 `emit_deopt_stub` passes only `rbp` to `ir_deopt_entry` and reserves no
 `SavedRegisters` region, so nothing would fill one. Dropping the home of a
 deopt-named value needs that region reserved and the callee-saved file spilled
-into it first. `blocked_deopt` is the counter that says what that would buy.
+into it first. `blocked_deopt` is the counter that says what that would buy
+(retired 2026-09-10; `[ir-ls] homes kept: deopt=` is its successor).
 
 #### The register image was built, and the home is gone for the values it covers
 
@@ -2349,7 +2407,8 @@ safepoint[16] bci=23 locals=[3, 12, -, 13, 14] stack=[23]
 `graph.safepoints` records the **full operand stack at every bci**, so an
 intermediate is named by a frame state from its definition until its consumer
 pops it. That is the same wall the residency file hit — its `blocked_deopt`
-census — reached from a different direction.
+census, today `[ir-ls] homes kept: deopt=` — reached from a different
+direction.
 
 And it is worth reading beside what the door reports for this very method:
 `sentinel_free=true`, which is `deopt_stub_patches.is_empty() &&
@@ -2738,8 +2797,9 @@ been losing its inline cache at the tier-up boundary.
 The stores this section kept naming as the residual were home writes for values
 pinned by frame states. `graph.safepoints` records the **full operand stack at
 every bci**, so an intermediate is deopt-named from its definition until its
-consumer pops it — which is what `plan_register_residency`'s `blocked_deopt` and
-the carry's `still_deopt_named` refuse on. Meanwhile the OSR door reports
+consumer pops it — which is what the home census's `deopt` cause (then
+`plan_register_residency`'s `blocked_deopt`) and the carry's
+`still_deopt_named` refuse on. Meanwhile the OSR door reports
 `sentinel_free=true` for the same method: it emits **no deopt stub and no
 call-exception stub**, so nothing inside it can transfer to the interpreter.
 Thirty-three frame states, not one reachable, all of them pinning intermediates
