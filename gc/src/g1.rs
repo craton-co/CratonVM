@@ -5743,30 +5743,31 @@ impl Drop for G1Collector {
 /// movable/rewritable partition, as the generational path already does.
 /// **Default OFF.**
 ///
-/// # Why this ships off
+/// # Correct, wired, and still not worth a default
 ///
-/// The filter is right and it is inert, and the second half is why it is not
-/// on. Measured on H2 `TestValueMemory` Type 3, the pause that pins 14 regions
-/// for 12474 KB:
+/// Two things that once made it inert are fixed. The whole-cycle
+/// `coverage_incomplete` gate is gone from this path (see the comment at
+/// `honour_movable` for why that is the generational collector's question, not
+/// G1's), and `publish_unrewritable_band_roots` now publishes the verifiable
+/// half of the band partition instead of computing it and dropping it.
+///
+/// What did not change is the yield, and that is the number this default rests
+/// on. On H2 `TestValueMemory` Type 3 the filter drops **1 pin out of 34**:
 ///
 /// ```text
-/// [g1][MOVPIN] snapshot=38 kept=38 movable_claimed=2 unrew_veto=9
-///              honour_movable=false coverage_incomplete=true movable_set=2
+/// [g1][MOVPIN] snapshot=34 kept=33 movable_claimed=2 unrew_veto=7
 /// ```
 ///
-/// Two independent reasons nothing is filtered. `coverage_incomplete=true`
-/// disables the whole-cycle proof, so `honour_movable` is false outright; and
-/// even with it forced on, only 2 of the 38 addresses are CLAIMED movable,
-/// because `add_movable_jit_root` is reached only from the shadow-stack scan
-/// and only when that scan is not publishing pinned. The other 36 are precise
-/// oop-map roots, which `remap_active_jit_frames` does rewrite but which
-/// nothing publishes to the movable set.
+/// and an A/B on the row itself lands inside this host's noise (on 10975/9972,
+/// off 8961/13005). The reason is not this filter: 4794 of ~5200 JIT roots come
+/// from the A5 unregistered-frame SPAN sweep, which has no per-frame layout and
+/// so publishes neither half of the partition — nothing here can act on roots
+/// that never made a claim. See the H2 page for that measurement.
 ///
-/// So the ceiling of this filter today is 2 pins out of 38, and turning it on
-/// by default would be a live GC behaviour change bought for nothing. It is
-/// kept, and kept off, because the shortfall is in what feeds the partition
-/// rather than in the partition: whoever teaches the precise map roots to
-/// publish themselves movable will want this already here and already correct.
+/// So it ships off, for the same reason it shipped off the first time: a live
+/// GC behaviour change bought for one pin in thirty-four is risk without
+/// return. It is kept, correct and one flag away, for whoever gives the
+/// unregistered-frame band a layout.
 fn g1_movable_pins_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(
@@ -19560,8 +19561,28 @@ impl G1Collector {
     /// Gated OFF by default on `CRATONVM_GC_G1_MOVABLE_PINS` — see that function
     /// for the measurement that says why.
     fn jit_pinned_region_set(&self) -> RegionSet {
-        let honour_movable = g1_movable_pins_enabled()
-            && !crate::gc_quiescence::moving_young_coverage_incomplete();
+        // NOT gated on `moving_young_coverage_incomplete`, and the difference
+        // from the generational path is the whole point.
+        //
+        // That flag is a WHOLE-CYCLE proof, and the generational collector needs
+        // one because its question is "may I move the young generation at all"
+        // -- one unproven frame and the entire cycle must fall back to the
+        // non-moving sweep. G1's question is per-region, and the claim it rests
+        // on is per-ADDRESS: a movable publication says this object's every band
+        // sighting is either rewritten by `remap_one_jit_frame` or dead, and
+        // that is true or false about one object regardless of what some other
+        // frame could not prove about itself.
+        //
+        // Keeping the whole-cycle gate here was measured, and it made the filter
+        // inert: `coverage_incomplete=true` on the very pause this exists for,
+        // so `honour_movable=false` and all 38 pins survived a filter that had
+        // nothing wrong with it.
+        //
+        // The fail-closed direction is preserved by the PUBLISHER, not by this
+        // gate: `publish_unrewritable_band_roots` publishes movable only for
+        // words it can argue about, and vetoes the address outright when any
+        // unverifiable word also names it.
+        let honour_movable = g1_movable_pins_enabled();
         let mut set: RegionSet = if crate::gc_quiescence::is_active() {
             let snap = crate::gc_quiescence::pinned_jit_roots_snapshot();
             let (mut n_mov, mut n_unrew) = (0usize, 0usize);

@@ -516,6 +516,12 @@ pub const INVENTORY: &[E] = &[
     // G1's pin set honouring the movable/rewritable partition the
     // generational path has always honoured.
     E { group: Group::GC, token: "g1-movable-pins", on_key: Some("CRATONVM_GC_G1_MOVABLE_PINS"), off_key: None, off_word: None, since: "2026-09-09" },
+    // The producer half: publishing the verifiable band partition as movable.
+    E { group: Group::GC, token: "movable-band-roots", on_key: Some("CRATONVM_GC_MOVABLE_BAND_ROOTS"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // UNSAFE pricing lever for the A5 unregistered-frame span sweep.
+    E { group: Group::JIT, token: "a5-mark-span", on_key: Some("CRATONVM_JIT_A5_MARK_SPAN"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // Recover frames from the A5 band instead of sweeping it as a raw span.
+    E { group: Group::JIT, token: "a5-frame-scan", on_key: Some("CRATONVM_JIT_A5_FRAME_SCAN"), off_key: None, off_word: None, since: "2026-09-09" },
     E { group: Group::DBG, token: "peer-reg-pairing", on_key: Some("CRATONVM_DBG_PEER_REG_PAIRING"), off_key: None, off_word: None, since: "2026-09-06" },
     // Coverage oracle for the slot list `static-root-slots` builds: after the
     // fast path has patched the recorded slots, re-walk every static the slow
@@ -1371,6 +1377,12 @@ pub const INVENTORY: &[E] = &[
     // resolver had bound and keep-alive-registered the entry all along; nothing
     // put it where the lowerer looks.
     E { group: Group::JIT, token: "ir-splice-direct-call", on_key: Some("CRATONVM_JIT_IR_SPLICE_DIRECT_CALL"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    // Splice a callee whose body carries a `checkcast` or an `instanceof`.
+    // `IrBuilder` has had both arms since cov-05; the splice scanner refused
+    // the shape because nothing resolved the callee's targets or rebased the
+    // rows. An unresolved target refuses the CALLEE rather than being dropped,
+    // because a missing row bails the whole method.
+    E { group: Group::JIT, token: "ir-splice-typecheck", on_key: Some("CRATONVM_JIT_IR_SPLICE_TYPECHECK"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
     E { group: Group::JIT, token: "ir-splice-getstatic", on_key: Some("CRATONVM_JIT_IR_SPLICE_GETSTATIC"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
     // R1. Memoize the ACCEPTED optimizing OSR artifact, not only the refusals.
     // Without it one run recompiled the same method 502 times.
@@ -1382,6 +1394,7 @@ pub const INVENTORY: &[E] = &[
     // to state -- removing the key is the way back.
     E { group: Group::JIT, token: "ir-deopt-points-at-traps", on_key: Some("CRATONVM_JIT_IR_DEOPT_POINTS_AT_TRAPS"), off_key: None, off_word: None, since: "2026-09-09" },
     E { group: Group::JIT, token: "ir-reg-authoritative", on_key: Some("CRATONVM_JIT_IR_REG_AUTHORITATIVE"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
+    E { group: Group::JIT, token: "ir-gp-wide", on_key: Some("CRATONVM_JIT_IR_GP_WIDE"), off_key: None, off_word: None, since: "2026-09-10" },
     E { group: Group::JIT, token: "ir-speculate", on_key: Some("CRATONVM_JIT_IR_SPECULATE"), off_key: None, off_word: None, since: "2026-09-09" },
     // Diagnosis lever, value-taking: a comma-separated list of conservative
     // root-band CLASSES to skip (`operand-spill`,

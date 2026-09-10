@@ -3889,12 +3889,22 @@ pub mod xmm_roles {
     ///
     /// RBX and R12–R15, and every part of that choice is forced:
     ///
-    ///   * **Callee-saved on both ABIs.** `ir_lower` emits calls constantly —
-    ///     runtime helpers, inline-cache dispatch, JIT-to-JIT direct calls —
-    ///     and this wiring has no reload machinery, so a value's register must
-    ///     survive a call by the calling convention rather than by analysis.
-    ///     That rules out every caller-saved register, including the otherwise
-    ///     obvious System V candidates RSI/RDI.
+    ///   * **Callee-saved on the target ABI.** `ir_lower` emits calls
+    ///     constantly — runtime helpers, inline-cache dispatch, JIT-to-JIT
+    ///     direct calls — and this wiring has no reload machinery, so a
+    ///     value's register must survive a call by the calling convention
+    ///     rather than by analysis. That rules out every caller-saved
+    ///     register.
+    ///
+    ///     RSI/RDI are caller-saved on **System V** and callee-saved on
+    ///     **Win64**, so they are in the file on Windows and out of it
+    ///     elsewhere — the same platform split [`IR_PROLOGUE_SAVED`] already
+    ///     makes for XMM6/XMM7, and for the same reason. This constant said
+    ///     they were caller-saved unconditionally until 2026-09-10: a System V
+    ///     fact stated as an ABI-independent one, and it cost the optimizing
+    ///     tier two of the seven callee-saved registers the single-pass
+    ///     backend has been colouring locals into all along (`x64::LOCAL_REGS`
+    ///     is `[u8; 7]` on Windows and `[u8; 5]` elsewhere).
     ///   * **Untouched by this emitter.** The value tier is RAX/RCX/RDX, the
     ///     safepoint and shadow-stack scratch is R10/R11, and call arguments go
     ///     in `ENTRY_ABI_REGS`. None of those overlaps this set.
@@ -3914,14 +3924,32 @@ pub mod xmm_roles {
     /// structurally, by having no register a `Ref` could occupy; a GP file has
     /// to discharge it by refusing the type, which `plan_register_residency`
     /// does and which its own test pins.
+    /// Win64: RBX, R12–R15 **and RSI/RDI**, which this ABI makes
+    /// callee-saved. The two extra registers are appended rather than
+    /// interleaved so that a method whose peak live set fits in five is
+    /// allocated exactly as it was before they existed.
+    #[cfg(windows)]
+    pub const IR_GP_LINEAR_SCAN: [u8; 7] = [3, 12, 13, 14, 15, 6, 7];
+    /// System V: RSI/RDI are argument registers and caller-saved, so the file
+    /// is RBX and R12–R15 alone.
+    #[cfg(not(windows))]
     pub const IR_GP_LINEAR_SCAN: [u8; 5] = [3, 12, 13, 14, 15];
+
+    /// The first [`IR_GP_LINEAR_SCAN`] entries that were the file before the
+    /// Win64 widening — what `CRATONVM_JIT_IR_GP_WIDE=0` restores. Five on
+    /// every platform, which on System V is the whole file.
+    pub const IR_GP_LINEAR_SCAN_NARROW: usize = 5;
 
     /// The GP registers `ir_lower::emit_prologue` saves and every exit
     /// restores — all of [`IR_GP_LINEAR_SCAN`], because every one of them is
-    /// callee-saved on both ABIs and that is exactly why they were chosen.
+    /// callee-saved on the target ABI and that is exactly why they were
+    /// chosen.
     ///
-    /// Unlike the XMM list this is not platform-conditional: System V and Win64
-    /// agree that RBX and R12–R15 belong to the caller.
+    /// Platform-conditional only through [`IR_GP_LINEAR_SCAN`]: System V and
+    /// Win64 agree about RBX and R12–R15 and disagree about RSI/RDI.
+    /// `Lowerer::saved_gpr_regs` emits a save only for a register the
+    /// residency plan actually handed out, so a widened file that goes unused
+    /// costs frame bytes and no instructions.
     pub const IR_GP_PROLOGUE_SAVED: &[u8] = &IR_GP_LINEAR_SCAN;
 
     /// The first register claimed by two of the three authorities, if any.

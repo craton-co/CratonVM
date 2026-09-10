@@ -251,12 +251,27 @@ const MAX_BLIND_SITES: usize = 1_000;
 /// forwarded verbatim. There is one body; last-write-wins picks between three
 /// pointers to it. See `jca/ssl_context_spi.rs` for why the guarded
 /// `SSLContext` surface is deliberately registered three times over.
-const BASELINE_TOTAL_DRIFT: usize = 1223;
+/// **Re-taken 2026-09-09, +1: `java/lang/System$2.defineClass(..ZILjava/lang/
+/// Object;)Ljava/lang/Class;`.** The `JavaLangAccess` carrier is `System$1` on
+/// JDK 25 and `System$2` on JDK 21, so both registrars that name the carrier
+/// now cover both names. That makes `System$2` carry the SAME twin `System$1`
+/// already carried, and this row is its exact mirror: synthetic-only
+/// `register_classloader_define_class` (`jla_system_define_class`) against
+/// shipping `register_java_lang_access` (`jla_define_class_hidden`).
+///
+/// **The gate's first question is answered NO, and that is not new.** The two
+/// bodies are different free functions, exactly as they are for the `System$1`
+/// row directly above — which has stood since 2026-08-17 without being
+/// collapsed. Whether one of them should survive is the same open question for
+/// both names; this change did not create it, does not answer it, and would
+/// have left it asymmetric (watched on one carrier, unwatched on the other) if
+/// this row were not added.
+const BASELINE_TOTAL_DRIFT: usize = 1224;
 
 /// `(synthetic-only pass, triple)` PAIRS in [`DRIFT_TRIPLES`] -- larger than
 /// [`BASELINE_TOTAL_DRIFT`] because one triple can be registered by several
 /// synthetic-only passes (`AtomicBoolean.get` has two).
-const BASELINE_TOTAL_PAIRS: usize = 1356;
+const BASELINE_TOTAL_PAIRS: usize = 1357;
 
 /// Two triples that pin BOTH answers.
 ///
@@ -900,6 +915,7 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
         "register_classloader_define_class",
         &[
             ("java/lang/System$1", "defineClass", "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BLjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;"),
+            ("java/lang/System$2", "defineClass", "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BLjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;"),
         ],
     ),
     (

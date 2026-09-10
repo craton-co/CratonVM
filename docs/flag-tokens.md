@@ -606,10 +606,12 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-415 tokens.
+419 tokens.
 
 | Token | Expands to |
 | --- | --- |
+| `a5-mark-span` | `CRATONVM_JIT_A5_MARK_SPAN` |
+| `a5-frame-scan` | `CRATONVM_JIT_A5_FRAME_SCAN` |
 | `aaload-licm` | `CRATONVM_DISABLE_AALOAD_LICM` |
 | `gpu-approx-math` | `CRATONVM_GPU_APPROX_MATH` |
 | `gpu-dispatch-memo` | `CRATONVM_GPU_DISPATCH_MEMO` |
@@ -734,11 +736,13 @@ export inherited from a parent shell.
 | `ir-splice-ldc` | `CRATONVM_JIT_IR_SPLICE_LDC` |
 | `ir-splice-branch` | `CRATONVM_JIT_IR_SPLICE_BRANCH` |
 | `ir-splice-direct-call` | `CRATONVM_JIT_IR_SPLICE_DIRECT_CALL` |
+| `ir-splice-typecheck` | `CRATONVM_JIT_IR_SPLICE_TYPECHECK` |
 | `ir-splice-getstatic` | `CRATONVM_JIT_IR_SPLICE_GETSTATIC` |
 | `osr-optimizing-cache` | `CRATONVM_JIT_OSR_OPTIMIZING_CACHE` |
 | `ir-fallthrough` | `CRATONVM_JIT_IR_FALLTHROUGH` |
 | `ir-deopt-points-at-traps` | `CRATONVM_JIT_IR_DEOPT_POINTS_AT_TRAPS` |
 | `ir-reg-authoritative` | `CRATONVM_JIT_IR_REG_AUTHORITATIVE` |
+| `ir-gp-wide` | `CRATONVM_JIT_IR_GP_WIDE` |
 | `ir-speculate` | `CRATONVM_JIT_IR_SPECULATE` |
 | `band-skip` | `CRATONVM_JIT_BAND_SKIP` |
 | `ls-carry-relief` | `CRATONVM_JIT_LS_CARRY_RELIEF` |
@@ -1028,7 +1032,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-177 tokens.
+178 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1044,6 +1048,7 @@ export inherited from a parent shell.
 | `dead-spill-roots` | `CRATONVM_GC_DEAD_SPILL_ROOTS` |
 | `outgoing-arg-roots` | `CRATONVM_GC_OUTGOING_ARG_ROOTS` |
 | `g1-movable-pins` | `CRATONVM_GC_G1_MOVABLE_PINS` |
+| `movable-band-roots` | `CRATONVM_GC_MOVABLE_BAND_ROOTS` |
 | `moving-young-band-skip-in-map` | `CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP` |
 | `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
 | `gpu-min-work-giveup` | `CRATONVM_GPU_MIN_WORK_GIVEUP` |

@@ -1,6 +1,48 @@
 # The first JDK 21 strict-corpus run: `JavaLangAccess` is pinned to `java.lang.System$1`, which on 21 is a `PrivilegedAction`
 
-**Status: OPEN — MEASURED 2026-09-08.** Windows 11, Temurin `21.0.12.1+1`
+**Status: FIXED 2026-09-09 — all four defects this page found are closed.**
+
+| # | defect | closed by |
+|---|---|---|
+| 1 | `JavaLangAccess` pinned to `System$1` — `parkVirtualThread` | the carrier is resolved from the image, 2026-09-09 |
+| 2 | the same pin — `encodeASCII` | same change |
+| 3 | `serialization` round-trip returns the wrong class | `jdk-21-serialization-round-trip-returns-the-wrong-class-FIXED-20260909.md` |
+| 4 | `textformat` separators are US-style for every locale | `jdk-21-strict-mode-answers-a-non-root-locale-with-root-resources-FIXED-20260909.md` |
+
+**Measured on the jdk-21 Linux strict corpus after the carrier fix:** 8 of the
+10 baselined `21-linux` rows report NO LONGER DIVERGING, including every
+`NoSuchMethodError` row and all three `JdkOnlyCensusLoadProbe/strict` rows. The
+two that remain are `JdkOnlyPlatformProbe/{real,strict}/vthreads`, and they are
+**one cell** — `handoffs=64` on HotSpot against `handoffs=57` on both CratonVM
+arms, every other field on the line identical. That cell is the load-fragile
+counter §7 of
+[`phase-2-adjudicated-the-corpus-cannot-decide-a-retirement-20260830.md`](phase-2-adjudicated-the-corpus-cannot-decide-a-retirement-20260830.md)
+measured at 64 on eight of eight runs on BOTH VMs on an idle host, and ruled
+unusable as an oracle. The host these runs were taken on had a load average of
+3.7. **It is not a carrier residual and it is not a JDK 21 story** — the same
+cell is what the `25-linux` and `25-windows` keys' vthreads rows are.
+
+**This page stays at this path** rather than moving to `docs/internal/retired/`
+like the two pages named in the table above. `scripts/baselines/jdk-only-strict-corpus-21-windows.txt`
+points here by path, that file is generated and never hand-edited, and it cannot
+be re-minted: the Windows key needs a Windows host carrying a JDK 21 image, and
+the machine this repo builds on has only JDK 25. Its 16 rows therefore still
+need this page to explain them.
+
+**As of 2026-09-10 all 16 are stale, not 7.** Six serialization rows and one
+textformat row closed on 2026-09-09; eight carrier rows closed with the fix
+above; and the two vthreads rows stopped being a divergence when the probe was
+changed to report the handoff SHAPE instead of a load-fragile count
+(`50b9c2482`). Every row in that file now reads GONE, which PASSES, so the
+Windows 21 leg gates nothing today -- it is a ratchet with no teeth rather than
+a wrong one. **This is a prediction for the rows, not a measurement**: no
+Windows JDK 21 image exists on any machine this repo builds on, so nobody has
+run the corpus against one since 2026-09-08. Whoever next has that image should
+re-mint the key and expect zero rows; if it is not zero, that difference is a
+finding and this paragraph is where it starts.
+
+**The 2026-09-08 measurement below is unchanged**, and is the record the fixes
+were made against: Windows 11, Temurin `21.0.12.1+1`
 (downloaded for this run; this host had only JDK 25), release binary built from
 `dev` @ `6502772c4`. Three arms: HotSpot 21 control, `--real-jdk`, `--jdk-only`.
 
@@ -162,29 +204,18 @@ was silently absent.
   obvious shape and is exactly the kind of thing that needs its own lane — the
   literal is load-bearing in a registrar, a factory, a classloader path and
   that bridge's own contract tests.
-> **SUPERSEDED 2026-09-09 -- `21-linux` is minted and gating.** Run on an
-> azure Linux host against Temurin 21.0.12+8 with a release binary built from
-> `origin/dev` @ 5487287dc. All four matrix legs now adjudicate; none refuses.
->
-> The Linux key carries **16 sections, the same count as `21-windows` but not
-> the same set**: Linux does not diverge on `textformat` (that row is locale
-> data, and the Windows measurement was taken on a host whose default locale is
-> ru_RU -- see the #4 note above), and Linux carries a `real/vthreads` row
-> Windows does not.
->
-> **It was not accepted from one mint, and the first two attempts would have
-> been a gate that went red at random.** The vthreads section is an
-> intermittent race, and because the baseline records section IDENTITY, a
-> baseline minted from a run that saw the smaller set reads the larger set as
-> NEW. Attempt 1 minted 15 sections, passed one gate run and failed the next.
-> The accepted baseline is the MAXIMAL observed set -- every later run is then
-> a subset, and GONE always passes -- and it was held to ten consecutive
-> passing gate runs before acceptance, with the paired ratchet then re-run
-> against it (remove one row -> rc=5 naming that row; restore -> rc=0).
->
-> Two of the four defects on this page are therefore now frozen on BOTH
-> platforms rather than one.
-
+  > **SUPERSEDED 2026-09-09 — that lane ran, and the shape guessed here is the
+  > shape that landed.** `JLA_CARRIER_CANDIDATES` lists both names that have
+  > carried the interface; `resolve_jla_carrier` asks the loaded class whether
+  > it is assignable to `jdk/internal/access/JavaLangAccess` and mints the
+  > singleton under whichever answers yes. The four static sites (registrar,
+  > `defineClass`, the `force_native_over_real_jdk_bytecode` list, the
+  > synthetic-stub layout table, and the strict-mode allowlist in `vm_exec.rs`)
+  > take BOTH names instead: `System$2` does not exist on 25 and `System$1` is
+  > not the carrier on 21, so registering under both is a superset that is
+  > inert on the image where it does not apply, and only the MINT has to
+  > choose. What this page could not have said, and the run did: the repair is
+  > worth 8 of the 10 rows in the `21-linux` key.
 > **SUPERSEDED 2026-09-09 -- `21-linux` is minted and gating.** Run on an
 > azure Linux host against Temurin 21.0.12+8 with a release binary built from
 > `origin/dev` @ 5487287dc. All four matrix legs now adjudicate; none refuses.
