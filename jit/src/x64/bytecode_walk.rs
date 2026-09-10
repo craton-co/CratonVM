@@ -4436,10 +4436,16 @@ impl Compiler {
                                     .copied()
                                     .collect();
                                 // RIP-relative displacements addressing a fixed
-                                // absolute target (the safepoint flag). Same
-                                // hazard as the helper rel32 above and the same
-                                // fix: verbatim bytes would address
-                                // `target + shift` from the copy.
+                                // absolute target: the safepoint flag, and
+                                // since 2026-09-10 the layout-replacement
+                                // epoch a getfield site guards on. Same hazard
+                                // as the helper rel32 above and the same fix:
+                                // verbatim bytes would address
+                                // `target + shift` from the copy. The two
+                                // carry DIFFERENT trailing-byte counts (the
+                                // poll's `imm8`, the guard's `imm32`), which
+                                // is why the trail is per entry and not a
+                                // constant here.
                                 let orig_rip_abs: Vec<(usize, usize)> = self
                                     .rip_abs_disp32_patches
                                     .iter()

@@ -308,7 +308,8 @@ static LAYOUT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// overwhelming majority of real programs, keeps every inline arm.
 ///
 /// Coarse and correct beats precise and absent.
-/// **On the heap, deliberately, and not in this image's `.data`.**
+/// **In an OS page of its own, deliberately, and not in this image's `.data`
+/// nor on the Rust heap.**
 ///
 /// A JIT site guards on this counter by baking its ADDRESS, and the cheapest
 /// encoding for that is `CMP dword [rip+disp32], imm32` — one 10-byte
@@ -319,20 +320,35 @@ static LAYOUT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// box: the counter sat at `0x7FF6BDFB9AF4` as a static while the optimizing
 /// tier's buffer was at `0x1B430060000`, so every guard took the long form.
 ///
-/// A leaked `Box` is allocated from the same heap the VM's own structures come
-/// from, which is where `stw_requested_flag_addr` already lives — and that
-/// flag's poll DOES encode as `TEST BYTE [rip+disp32], 0xFF`. Same heap, same
-/// region, same reach.
+/// So it moved off `.data`. It first moved to a leaked `Box`, on the argument
+/// that the Rust heap "is where the VM's own structures come from" and is
+/// therefore where the code cache's neighbours are. **That argument was wrong,
+/// and it was wrong for a reason worth stating: what matters is not being on
+/// "the heap" but coming from the same ALLOCATOR the code cache does.** The
+/// code cache is a bare `mmap(NULL, …)` / `VirtualAlloc(NULL, …)`
+/// (`jit/src/platform.rs`), which the kernel places in the process's mapping
+/// band. Rust's global allocator is mimalloc, which reserves its own arenas
+/// somewhere else entirely — measured on Linux: the leaked `Box` landed at
+/// `0x2001E750420` while the optimizing tier's buffer was at
+/// `0x7DE4D7F9E000`, **123.9TB apart**, and every guard took the long form on
+/// that platform exactly as it had from `.data`.
 ///
-/// This is best-effort and not a guarantee: nothing promises an allocator puts
-/// two allocations within 2GB of each other, so
-/// `ir_lower::emit_layout_epoch_guard` range-checks the displacement and keeps
-/// the materialize-the-address form as its fallback. Moving the counter here
-/// makes the short form REACHABLE; it does not make it certain.
+/// A page from the same primitive lands in the same band. That is what
+/// [`alloc_epoch_page`] does, and it is the difference between a counter that
+/// is reachable on one platform by luck and one that is reachable because it
+/// was placed by the allocator whose neighbours it needs.
+///
+/// This is still best-effort and not a guarantee: nothing promises two
+/// mappings from the same band land within 2GB, so
+/// `ir_lower::emit_layout_epoch_guard` and `x64::objects`' twin range-check
+/// the displacement and keep the materialize-the-address form as their
+/// fallback. Placing the counter here makes the short form REACHABLE; it does
+/// not make it certain.
 ///
 /// The address must also be STABLE for the life of the process, because JIT
-/// code bakes it. `Box::leak` gives exactly that, and `LazyLock` makes the
-/// allocation happen once, before any compile can observe it.
+/// code bakes it. A page that is never unmapped gives exactly that, and
+/// `LazyLock` makes the allocation happen once, before any compile can observe
+/// it.
 ///
 /// `CRATONVM_JIT_LAYOUT_EPOCH_STATIC=1` puts it back in `.data`
 /// ([`LAYOUT_REPLACE_EPOCH_IMAGE`]) — the arm that makes the move itself
@@ -340,11 +356,119 @@ static LAYOUT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 static LAYOUT_REPLACE_EPOCH: LazyLock<&'static std::sync::atomic::AtomicU32> =
     LazyLock::new(|| {
         if layout_epoch_static_enabled() {
-            &LAYOUT_REPLACE_EPOCH_IMAGE
-        } else {
-            Box::leak(Box::new(std::sync::atomic::AtomicU32::new(0)))
+            return &LAYOUT_REPLACE_EPOCH_IMAGE;
         }
+        // A failed page allocation is not a reason to fail a VM start: the
+        // long-form guard reads any address correctly, so fall back to the
+        // leaked `Box` this used to be and lose only the encoding.
+        alloc_epoch_page().unwrap_or_else(|| {
+            Box::leak(Box::new(std::sync::atomic::AtomicU32::new(0)))
+        })
     });
+
+/// One zeroed, never-unmapped page from the OS, holding the epoch counter.
+///
+/// The page comes from the SAME primitive `jit/src/platform.rs` uses for a
+/// code buffer — `VirtualAlloc(NULL, …)` on Windows, `mmap(NULL, …)`
+/// elsewhere — because that, and not "the heap", is what puts it in disp32
+/// reach of the code that reads it. See [`LAYOUT_REPLACE_EPOCH`].
+///
+/// A whole page for four bytes is the point, not waste: sharing a Rust
+/// allocation would put the counter back in mimalloc's arena, and sharing a
+/// cache line with an unrelated hot word would false-share against a counter
+/// every guarded field access reads.
+///
+/// `None` on failure, and the caller falls back — the guard is correct at any
+/// address, only longer.
+fn alloc_epoch_page() -> Option<&'static std::sync::atomic::AtomicU32> {
+    // A page's worth. Every target here has 4KiB pages or a multiple of them,
+    // and both allocators round up anyway.
+    const PAGE: usize = 4096;
+
+    #[cfg(target_os = "windows")]
+    let raw: *mut u8 = {
+        const MEM_COMMIT: u32 = 0x1000;
+        const MEM_RESERVE: u32 = 0x2000;
+        const PAGE_READWRITE: u32 = 0x04;
+        extern "system" {
+            fn VirtualAlloc(
+                lpAddress: *mut u8,
+                dwSize: usize,
+                flAllocationType: u32,
+                flProtect: u32,
+            ) -> *mut u8;
+        }
+        // SAFETY: a null base asks the OS to choose the address; the size is a
+        // constant page and the flags are the documented commit-and-reserve
+        // pair. The mapping is never freed, so the pointer stays valid for the
+        // life of the process — which is the contract JIT code baking it needs.
+        unsafe { VirtualAlloc(std::ptr::null_mut(), PAGE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) }
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let raw: *mut u8 = {
+        const PROT_READ: i32 = 1;
+        const PROT_WRITE: i32 = 2;
+        const MAP_PRIVATE: i32 = 0x02;
+        // MAP_ANONYMOUS is 0x20 on Linux and 0x1000 on the BSDs/macOS. Getting
+        // it wrong does not fail loudly — the call just returns an error and
+        // this function reports `None` — but the fallback is a silently longer
+        // guard, so name both rather than assume Linux.
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))]
+        const MAP_ANONYMOUS: i32 = 0x1000;
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly")))]
+        const MAP_ANONYMOUS: i32 = 0x20;
+        const MAP_FAILED: *mut u8 = !0 as *mut u8;
+        extern "C" {
+            fn mmap(
+                addr: *mut u8,
+                len: usize,
+                prot: i32,
+                flags: i32,
+                fd: i32,
+                offset: i64,
+            ) -> *mut u8;
+        }
+        // SAFETY: a null hint asks the kernel to choose the address; the size
+        // is a constant page, the fd is the -1 an anonymous mapping requires,
+        // and the mapping is never unmapped — so the pointer stays valid for
+        // the life of the process.
+        let p = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                PAGE,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if p == MAP_FAILED {
+            std::ptr::null_mut()
+        } else {
+            p
+        }
+    };
+
+    if raw.is_null() {
+        return None;
+    }
+    // Both allocators hand back page-aligned memory, so this is already
+    // 4-aligned; assert it rather than assume, because an unaligned counter
+    // would make the guard's single 32-bit read non-atomic and the failure
+    // would be a rare wrong answer rather than a fault.
+    debug_assert_eq!(raw as usize % 4, 0, "an OS page is 4-byte aligned");
+    let cell = raw.cast::<std::sync::atomic::AtomicU32>();
+    // SAFETY: `cell` points at the start of a fresh, writable, page-aligned
+    // mapping of 4096 bytes, which is larger than and aligned for `AtomicU32`.
+    // Both allocators hand back zeroed pages, so this write is a formality
+    // that gives the location an initialized value of the right type rather
+    // than relying on the zero fill to also be a valid `AtomicU32`.
+    unsafe {
+        cell.write(std::sync::atomic::AtomicU32::new(0));
+        Some(&*cell)
+    }
+}
 
 /// The `.data` counter [`LAYOUT_REPLACE_EPOCH`] used to be, kept for one
 /// purpose: making the MOVE to the heap A/B-able inside one binary.
@@ -1785,15 +1909,17 @@ mod tests {
 
     static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// The replacement epoch a JIT site bakes must be the HEAP cell, not the
-    /// one in this image's `.data`.
+    /// The replacement epoch a JIT site bakes must be the OS PAGE, not the
+    /// cell in this image's `.data` and not a Rust allocation.
     ///
     /// That is the whole reason `CMP dword [rip+disp32], imm32` is reachable
-    /// at all: as a `static` the counter sat ~140TB from the code buffer and
-    /// the short encoding was unreachable by construction, on every compile.
-    /// A refactor that "simplifies" the `LazyLock` back into a plain `static`
-    /// would not fail any behaviour test — every guard would silently return
-    /// to three instructions and nineteen bytes — so the default arm is pinned
+    /// at all: as a `static` the counter sat ~140TB from the code buffer, and
+    /// as a leaked `Box` it sat 123.9TB away on Linux — mimalloc's arena is
+    /// not the band the code cache's `mmap` lands in. Both times the short
+    /// encoding was unreachable by construction, on every compile. A refactor
+    /// that "simplifies" this back to a `static`, or back to a `Box`, would
+    /// not fail any behaviour test — every guard would silently return to
+    /// three instructions and nineteen bytes — so the default arm is pinned
     /// here.
     ///
     /// Only the default is pinned: `CRATONVM_JIT_LAYOUT_EPOCH_STATIC=1`
@@ -1801,7 +1927,7 @@ mod tests {
     /// `LazyLock` before any test could flip it, so that arm belongs to a
     /// separate process and not to an assertion here.
     #[test]
-    fn the_baked_epoch_address_is_the_heap_cell_by_default() {
+    fn the_baked_epoch_address_is_an_os_page_by_default() {
         if layout_epoch_static_enabled() {
             return; // this process asked for the image cell.
         }
@@ -1810,11 +1936,16 @@ mod tests {
         assert_ne!(
             addr,
             &LAYOUT_REPLACE_EPOCH_IMAGE as *const std::sync::atomic::AtomicU32 as *const u32,
-            "the guarded counter must be the leaked heap cell, not the `.data` one",
+            "the guarded counter must be the page cell, not the `.data` one",
         );
-        // JIT code reads it as one aligned 32-bit load; nothing else makes
-        // that as atomic as the `MOV ECX` it replaced.
-        assert_eq!(addr as usize % 4, 0, "the counter is 4-byte aligned");
+        // Page-aligned, which a Rust allocation of four bytes would not be —
+        // this is what says the cell came from the OS and not from the
+        // allocator whose arena is 124TB from the code cache.
+        assert_eq!(
+            addr as usize % 4096,
+            0,
+            "the counter is its own OS page, so its address is page-aligned",
+        );
         // And it is STABLE, because compiled code bakes it.
         let (again, _) = layout_replace_epoch_guard();
         assert_eq!(addr, again, "the baked address may not move under a compile");
