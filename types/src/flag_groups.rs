@@ -2084,6 +2084,13 @@ pub const INVENTORY: &[E] = &[
     // setting it restores the pre-fix behaviour exactly, SIGSEGV included.
     E { group: Group::JIT, token: "xt-no-safe-peer-read", on_key: Some("CRATONVM_XT_NO_SAFE_PEER_READ"), off_key: None, off_word: None, since: "2026-09-08" },
     E { group: Group::JIT, token: "xt-jit-root-scan", on_key: Some("CRATONVM_XT_JIT_ROOT_SCAN"), off_key: None, off_word: None, since: "2026-06-23" },
+    // Verification-only, and expensive on purpose: re-walks the WHOLE system
+    // thread table on every take-over pass to prove the process-local roster
+    // `take_over_pass` uses did not miss a thread that was in compiled code.
+    // Kept off the `xt-jit-root-scan` debug token deliberately — that walk is
+    // the ~83 ms/pass cost the roster removed, so bundling the two would make
+    // the scan impossible to observe without reintroducing what it fixed.
+    E { group: Group::JIT, token: "xt-root-scan-audit", on_key: Some("CRATONVM_XT_ROOT_SCAN_AUDIT"), off_key: None, off_word: None, since: "2026-09-10" },
     // Value token, milliseconds: `CRATONVM_JIT=xt-peer-deadline-ms=50`. Unset
     // means the built-in 20 ms, and `0` is rejected by the parser's own filter,
     // so there is no off state to spell.

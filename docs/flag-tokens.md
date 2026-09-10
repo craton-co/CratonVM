@@ -604,7 +604,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-415 tokens.
+416 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1003,6 +1003,7 @@ export inherited from a parent shell.
 | `xt-helper-window-scan` | `CRATONVM_XT_HELPER_WINDOW_SCAN` |
 | `xt-no-safe-peer-read` | `CRATONVM_XT_NO_SAFE_PEER_READ` |
 | `xt-jit-root-scan` | `CRATONVM_XT_JIT_ROOT_SCAN` |
+| `xt-root-scan-audit` | `CRATONVM_XT_ROOT_SCAN_AUDIT` |
 | `xt-peer-deadline-ms` | `CRATONVM_XT_PEER_DEADLINE_MS` |
 | `xt-peer-total-ms` | `CRATONVM_XT_PEER_TOTAL_MS` |
 | `direct-call-arg-maps` | `CRATONVM_JIT_DIRECT_CALL_ARG_MAPS` |

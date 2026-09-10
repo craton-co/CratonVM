@@ -469,10 +469,20 @@ pub(super) fn stw_take_over_and_wait(
         let should_scan =
             stw_takeover_should_scan(rounds, crate::jit::conservative_roots::any_thread_in_jit());
         let newly = if should_scan {
+            // Re-read the roster every round rather than snapshotting it once
+            // before the loop: this loop exists precisely because "a peer can
+            // enter JIT after the previous takeover pass", and such a peer may
+            // also have REGISTERED after it. A stale roster would leave that
+            // newcomer unfrozen and unscanned for the rest of the collection —
+            // the coverage hole `take_over_pass`'s obligation rules out. The
+            // read is a registry lock and a small Vec; the walk it replaced
+            // cost ~83ms a pass (see `take_over_pass`).
+            let (_, live_tids) = shared.threads.thread_registry.alive_count_and_os_tids();
             xt::take_over_pass(
                 &mut taken,
                 &|a| shared.mem.heap.is_object_address(a),
                 xt_roots,
+                &live_tids,
             )
         } else {
             0
