@@ -218,18 +218,27 @@ bytecode could have produced.
 
 ### Retirement: blocked on the armed arm, and why
 
-**Both halves of this lane were independently fatal under the dial.**
+**Both halves of this lane aborted the VM under the dial, at different rows —
+and it is ONE defect, not two.**
 
-- Core reflection armed (`java/lang/reflect/,jdk/internal/reflect/,sun/reflect/`)
-  aborted the VM at row 126, `Lookup.unreflect`, on an unguarded descriptor
-  slice in `vm/src/runtime/interpreter/invoke.rs`. **Fixed** — a malformed
-  descriptor must not be able to take the VM down; see the commit.
-- `java/lang/invoke/` armed alone aborts at row 166, `MethodHandle.bindTo`.
-  Not yet diagnosed. §4 predicted this half would be VM-coupled and it is.
+```text
+reflect/ armed   dies row 126  Lookup.unreflect     invoke.rs:2845
+invoke/  armed   dies row 166  MethodHandle.bindTo  invoke.rs:2845
+```
 
-So arm the two halves **separately**. Arming the whole prefix set lets the
-invoke failure swamp core reflection's rows, and the first run of it scored
-`delta=-58`, which reads as a spectacular improvement and was an artefact.
+Same line, same message: `start byte index 1 is out of bounds for string of
+length 0` — the unguarded tail slice in `split_method_descriptor_ref`. Both
+halves reach it with an empty descriptor by different routes. **Fixed** in the
+preceding commit; a malformed descriptor must not be able to take the VM down.
+
+This was very nearly written up as two independent blockers, on the strength of
+two different failing rows in two different packages. Two crashes at two call
+sites is not two bugs until you have read the panic site of each — and here the
+second stderr capture cost one command and removed a whole line of enquiry.
+
+Arming the two halves separately is still the right method while the counts are
+being taken, because the first whole-prefix run scored `delta=-58` — which
+reads as a spectacular improvement and was the artefact described below.
 
 ### Three instrument defects found and fixed, all of which produced a wrong number
 
