@@ -1,14 +1,22 @@
-# The optimizing tier's frame traffic is one carry slot, not a scheduling order
+# The optimizing tier's frame traffic is one carry slot, not a scheduling order — FIXED 2026-09-10
 
 **2026-09-10.** A counted loop whose entire live state is two `long`s and an
-`int` spends **55 of 161 instructions** on `[rbp-*]` traffic, and two of its
-three intermediate stores are never read back. The obvious next lever —
-scheduling a single-use operand next to the consumer that reads it, so the
-existing carry can take it — was built, engaged, and **measured a wash**. It is
-not in the tree, and this file is why.
+`int` spent **55 of 161 instructions** on `[rbp-*]` traffic, and two of its
+three intermediate stores were never read back.
+
+The obvious lever — scheduling a single-use operand next to the consumer that
+reads it, so the existing carry can take it — was built, engaged, and **measured
+a wash** (§4). It is a wash by construction: the emitter held ONE carry, so
+pairing could only move the carry between operands, never add one.
+
+The fix was therefore in the emitter and not the scheduler: a second carry slot,
+with its own soundness proof, so a consumer can take both its operands in
+registers (§6). **1.090x on the kernel, ranges non-overlapping.** The scheduling
+pass ships with it because the two slots need the order it produces — but on its
+own it does nothing, which is why §4 is still in this page rather than deleted.
 
 Sibling of `c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md`,
-and the same shape of answer: the thing that looks like the constraint is not.
+and the same shape of answer: the thing that looked like the constraint was not.
 
 ## 1. The traffic, from the emitted bytes
 
@@ -80,7 +88,7 @@ That was built, with three tests (node-set preservation, definitions before
 uses, no sinking past a trapping node). 2339 jit unit tests and the 145
 `ir_vs_singlepass` differential tests passed with it default-ON.
 
-## 4. Measured, and rejected
+## 4. Measured, and rejected on its own
 
 Same release binary, `CRATONVM_JIT_IR_PAIR_OPERANDS` as the A/B:
 
@@ -120,21 +128,79 @@ home whose carry is never honoured — which fails closed (a dropped home refuse
 the read and bails the compile) rather than miscompiling, but the full jit suite
 and the differential suite both pass with it in.
 
-## 6. What to do instead
+## 6. FIXED — the emitter grew a second slot, and it is worth 1.090x
 
-The `single_use=16` skip is the number to attack, and the two routes are:
+Route 1 below was taken. `Lowerer::deferred_rcx` is a second carry slot holding
+`(producer, consumer, allowance)`; the adjacent `live_carry` is unchanged. It is
+RCX-only by construction, because the consumer reads operand 0 from RAX — where
+the adjacent producer left it — so the only value that can still be in flight
+across an arm is operand 1.
 
-1. **A second carry slot in the emitter**, plus a per-op audit of which arms
-   leave RCX alone — read from the arms, the way
-   `every_droppable_op_writes_its_home_once_through_store_rax` reads them, not
-   from the op names. The scheduling half is then a ~150-line pass of the shape
-   described in §3, which is cheap once the emitter can use it.
-2. **Promote single-use values into caller-saved scratch registers.** They
-   cannot repay a callee-saved register's prologue save, which is why residency
-   declines them — but a caller-saved register has no save to repay. Larger
-   blast radius: it changes register pressure and interacts with every existing
-   residency invariant.
+The adjacent carry proves itself with `pos == buf.pos()`: nothing was emitted
+since the producer left the value there. A deferred carry cannot say that, and
+what stands in for it is [`op_preserves_rcx`], re-checked in
+`lower_data_node_tracked` against what was actually LOWERED rather than trusted
+from the plan. The allowance is 1, spent by the arm in between; running out
+refuses the compile.
 
-Neither should be started from one kernel. `PollReach.hotLoop` is a single loop
-with one binary consumer of two single-use operands; the census wants running
-across the probe set before either route is priced.
+`op_preserves_rcx` is two ops — `I2L` and `L2I` — for the reasons in §5.
+`every_rcx_preserving_arm_leaves_rcx_alone` is what keeps it honest: it scans
+each claimed arm's source for any `RCX` identifier AND pins the exact
+`buf.emit(&[..])` byte literals, because a raw ModRM can name RCX where no
+identifier scan would see it. Adding `Op::Add` to the list makes it fail.
+
+`ir_schedule::pair_single_use_operands` supplies the `[input1, input0, cons]`
+order the two slots need. On its own it is inert — see §4, which is why it is
+not a separate change.
+
+### Measured
+
+`probes`-style kernel `s += i ^ (s >>> 3)`, release binary, one flag
+(`CRATONVM_JIT_IR_CARRY_2ND`), arms interleaved ABBA x3, 6 samples each, best-of-7
+inner rounds per sample:
+
+| arm | median ns/iter | min | max | spread |
+|---|---:|---:|---:|---:|
+| `=0` | 1.0399 | 1.0345 | 1.0937 | 5.7% |
+| **`=1`** | **0.9537** | 0.9115 | 0.9745 | 6.9% |
+
+**1.090x**, and the ranges do not overlap — every `on` sample beats every `off`
+sample. Checksums identical across arms and against HotSpot
+(`791133517366464198`). HotSpot on the same source and host is 0.777 ns/iter, so
+the gap on this kernel goes from 1.34x to **1.23x**.
+
+Emitted code, same method:
+
+| arm | bytes | instrs | `[rbp]` ops | carries | deferred |
+|---|---:|---:|---:|---|---|
+| `=0` | 777 | 161 | 55 | planned=2 taken=2 dropped=2 | 0/0 |
+| `=1` | 766 | 160 | 53 | planned=3 taken=3 dropped=3 | **1/1** |
+
+`refused=0`. The two `[rbp]` operations removed are exactly the `[rbp-78h]`
+store and its reload two instructions later — the store-to-load forwarding pair
+`docs/JIT_OPTIMIZATION.md` traced this tier's residual to.
+
+Green: 2340 jit unit tests, 145 `ir_vs_singlepass` differential tests, 2641 vm
+unit tests.
+
+## 7. What is still open
+
+`deferred=1/1` on this kernel: the mechanism fires once, because it needs the
+consumer's FIRST operand to come from a width conversion. That covers mixed
+`int`/`long` arithmetic and nothing else.
+
+What is left of the `single_use=16` skip is the bigger half:
+
+* **Promote single-use values into caller-saved scratch registers.** They cannot
+  repay a callee-saved register's prologue save, which is why residency declines
+  them — but a caller-saved register has no save to repay. This subsumes carries
+  entirely rather than extending them. Larger blast radius: it changes register
+  pressure and interacts with every existing residency invariant.
+* **Widen `op_preserves_rcx` by making the arms deserve it.** Every binary arm
+  loads its operand 1 into RCX. An arm that took a caller-supplied scratch
+  register instead would be eligible, and that is a mechanical change to ~50
+  arms rather than a design question.
+
+Neither should be started from one kernel. The census wants running across the
+probe set first — `deferred=N/M` is now the line that says how often the shape
+occurs in real code.
