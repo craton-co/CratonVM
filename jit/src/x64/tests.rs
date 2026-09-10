@@ -4757,6 +4757,167 @@ fn test_getfield_guarded_inline_fast_and_fallback() {
     assert_eq!(result, 424242, "null receiver must route to the helper");
 }
 
+/// How many layout-replacement epoch guards a compiled body carries, counting
+/// BOTH encodings.
+///
+/// The guard is `CMP DWORD [rip+disp32], imm32` where the counter is in
+/// disp32 reach and `MOV R11, imm64` + `MOV ECX, [R11]` + `CMP ECX, imm32`
+/// where it is not, and which one a given run gets is a property of the
+/// process's address space — so a test that recognised only one of them would
+/// pass or fail by luck. Both are matched by RESOLVING to the epoch's address,
+/// which is also what makes this stronger than counting opcodes: a `81 3D`
+/// naming some other global is not a guard.
+fn layout_epoch_guards(compiled: &CompiledMethod) -> usize {
+    let (epoch, _) = cratonvm_types::layout_replace_epoch_guard();
+    let epoch = epoch as usize; // Cast: the address the guard must name
+    let code = compiled.code_bytes();
+    let base = code.as_ptr() as usize; // Cast: buffer base for RIP resolution
+    let mut n = 0usize;
+    for i in 0..code.len() {
+        // RIP form: 81 3D <disp32> <imm32>, measured from the END.
+        if i + 10 <= code.len() && code[i] == 0x81 && code[i + 1] == 0x3D {
+            let d = i32::from_le_bytes([code[i + 2], code[i + 3], code[i + 4], code[i + 5]]);
+            // Cast: sign-extend the disp32 for wrapping address arithmetic
+            if base.wrapping_add(i).wrapping_add(10).wrapping_add(d as isize as usize) == epoch {
+                n += 1;
+            }
+        }
+        // Fallback form: MOV R11, imm64 ; MOV ECX, [R11] ; CMP ECX, imm32.
+        if i + 19 <= code.len() && code[i] == 0x49 && code[i + 1] == 0xBB {
+            let mut imm = [0u8; 8];
+            imm.copy_from_slice(&code[i + 2..i + 10]);
+            if u64::from_le_bytes(imm) as usize == epoch
+                && code[i + 10..i + 13] == [0x41, 0x8B, 0x0B]
+                && code[i + 13..i + 15] == [0x81, 0xF9]
+            {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Every single-pass emitter that BAKES a compact body offset must guard it
+/// against a layout replacement — including the two the guard's own census
+/// missed.
+///
+/// `51aee440b` set out to guard "every baked compact cell offset" and listed
+/// five sites. The inline compact `getfield` — the hottest field path in the
+/// VM — and the UNGATED compact reference `putfield` were not among them, and
+/// went on baking `HEADER_SIZE + packed_body_offset` with nothing to stop them
+/// using it after `register_class_layout` replaced that layout. The allocation
+/// emitters' own comment for the same hazard is "confirmed heap corruption".
+///
+/// The failure mode this pins is a MISSING guard, not a broken one, so it is
+/// worth saying what it deliberately does not do: it does not bump the epoch.
+/// That the guard routes correctly when it fires is
+/// `a_replaced_layout_routes_the_gated_store_to_the_helper`'s job, in the
+/// optimizing tier, by execution; a second test bumping a process-wide counter
+/// would race every sibling that compiled an inline compact arm before it.
+#[test]
+fn every_single_pass_compact_field_site_guards_its_baked_offset() {
+    // ── the inline compact getfield ────────────────────────────────────
+    // int get(Obj this) { return this.x; }
+    let get_code: Vec<u8> = vec![
+        0x2a, // 0: aload_0
+        0xb4, 0x00, 0x01, // 1: getfield #1
+        0xac, // 4: ireturn
+        0, 0,
+    ];
+    let mut helpers = test_helpers();
+    // The guarded arm bakes this; a zero table sends the compact arm's
+    // admission test down the helper-only road and there would be nothing to
+    // guard.
+    static BOUNDS: [std::sync::atomic::AtomicUsize; 6] = [
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+    ];
+    helpers.read_bounds_addr = BOUNDS.as_ptr() as usize; // Cast: static address
+    set_pending_compact_field_info(vec![(1, 0, false)]);
+    let get = compile(
+        &get_code,
+        5,
+        1,
+        1,
+        false,
+        Vec::new(),
+        vec![(1usize, 0usize, b'I')],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(), // pic_slots — no PIC sites
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+        &helpers,
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        None, // string_layout
+    )
+    .expect("a compact getfield must compile");
+    assert_eq!(
+        layout_epoch_guards(&get),
+        1,
+        "the inline compact getfield bakes a body offset and must guard it",
+    );
+
+    // ── the UNGATED compact reference putfield ─────────────────────────
+    // void set(Obj this, Object v) { this.f = v; }
+    //
+    // `test_helpers()` publishes no reference-store barrier plan, so
+    // `emit_gated_compact_ref_putfield` declines and this is the arm that
+    // runs — the one that had no guard.
+    let set_code: Vec<u8> = vec![
+        0x2a, // 0: aload_0
+        0x2b, // 1: aload_1
+        0xb5, 0x00, 0x01, // 2: putfield #1 (reference)
+        0xb1, // 5: return
+        0, 0,
+    ];
+    let mut set_helpers = test_helpers();
+    set_helpers.region_bounds_addr = BOUNDS.as_ptr() as usize; // Cast: static address
+    set_pending_compact_field_info(vec![(2, 0, true)]);
+    let set = compile(
+        &set_code,
+        6,
+        2,
+        2,
+        true, // needs_heap — the reference putfield helper takes it
+        Vec::new(),
+        vec![(2usize, 0usize, b'L')],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(), // pic_slots — no PIC sites
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+        &set_helpers,
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        None, // string_layout
+    )
+    .expect("a compact reference putfield must compile");
+    assert_eq!(
+        layout_epoch_guards(&set),
+        1,
+        "the ungated inline compact reference putfield bakes a body offset \
+         and must guard it",
+    );
+}
+
 /// A REFERENCE field whose 16-byte cell does not hold a reference must not be
 /// read as one by the inline arm.
 ///
