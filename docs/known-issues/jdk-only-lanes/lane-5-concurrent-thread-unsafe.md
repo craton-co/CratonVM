@@ -96,9 +96,20 @@ Related traps in this area:
 
 ## 4. `ForkJoin*` (44 rows) — one known real gap lives here
 
-`RJdkForkJoin` fails with `AssertionError: CountedCompleter leaves: 128`. That
-is one of the 41 `AssertionError`s in the corpus and it is **a genuine
-behavioural difference, not a null field** — L7's triage routed it here.
+`RJdkForkJoin` **no longer fails** (2026-09-10). It was routed here by L7's
+triage as `AssertionError: CountedCompleter leaves: 128`, "a genuine
+behavioural difference, not a null field" — and L7's final pass re-ran the
+classification on a binary with the loader blocker fixed and
+`Class.getName` tagged, and the vector PASSES on the
+`CRATONVM_ENFORCE_NATIVE_SHADOW=all` arm. It is one of the seventeen the wave
+flipped, with zero new failures.
+
+**Do not open this as a lead without re-running it first.** The re-measured
+routing table is in the
+[`the-builtin-classloader-could-not-link-and-getname-was-never-tagged-20260910`](../jdk-only/the-builtin-classloader-could-not-link-and-getname-was-never-tagged-20260910.md) record, and the reason
+this row moved without anybody touching `ForkJoinTask` is the reason that
+record exists: a first-failure count cannot score a fix in a chain, and it
+cannot score a leftover in one either.
 
 Treat it as this lane's first correctness target rather than a retirement:
 `CountedCompleter`'s pending-count protocol is the kind of thing a hand-written

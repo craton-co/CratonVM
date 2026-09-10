@@ -1432,7 +1432,41 @@ use cratonvm_types::compat::CompatibilityMode;
 /// removes the slack, and it is why this wave's delta reads +251 against the
 /// tree and +237/+248/+251 against the constants.
 ///
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1894;
+/// **RE-FROZEN 2026-09-10: 1883 -> 1887 (default), 1894 -> 1898 (management).
+/// CASE ONE, a RELABEL, and all four rows are the good direction**: they moved
+/// OUT of a kind that runs a native and INTO the kind `--jdk-only` refuses, so
+/// the strict arm now runs the JDK's own parallel-capable bookkeeping where it
+/// used to run a native that answered a constant `true`.
+///
+/// The message this assert prints tells you to classify with the SECOND column,
+/// so: total registrations did NOT move. The source delta is **zero new
+/// `register(` call sites** — this wave adds two triples to
+/// `RETIRED_SHADOW_L7_TRIPLES` and edits no registrar. The +4 is therefore
+/// accounted for entirely by
+///
+/// ```text
+/// java/lang/ClassLoader.registerAsParallelCapable ()Z   Bridge -> SyntheticStub   (x3 registrations)
+/// java/security/SecureClassLoader.<clinit>        ()V   Bridge -> SyntheticStub
+/// ```
+///
+/// **Three of the four are ONE triple.** `registerAsParallelCapable` is
+/// registered three times (`classloader_real.rs`, `classloader.rs`,
+/// `deprecated_internal.rs`) and the retag in `NativeMethodRegistry::register`
+/// is keyed by TRIPLE, so all three move together. That is not an accident of
+/// this wave, it is why the fix had to be a table entry rather than an edit to
+/// the site that owns the slot: a refusal that leaves a survivor retires
+/// nothing. MEASURED with `--jdk-only-report`: **4 refusals, 0 survivors.**
+///
+/// Why the relabel is right rather than tolerated: `BuiltinClassLoader.<clinit>`
+/// is `if (!ClassLoader.registerAsParallelCapable()) throw new InternalError(..)`,
+/// and it threw, because the native answered `true` without ever entering
+/// `SecureClassLoader` in `ParallelLoaders.loaderTypes`. See
+/// `RETIRED_SHADOW_L7_TRIPLES` in `native-api/src/retired_shadow.rs` for the
+/// three-arm probe that isolated the link.
+///
+/// `BASELINE_INTRINSICS` was READ in the same runs and did not move — it is a
+/// CEILING and would not have said so on its own.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1898;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1461,7 +1495,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1894;
 /// unowned for three days before it had a constant at all.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1883;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1887;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1518,7 +1552,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1883;
 /// re-freeze ALL THREE — see the pointer on both siblings.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1883;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1887;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///

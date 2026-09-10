@@ -116,9 +116,20 @@ already produced two false conclusions:
   fallback is root-only on JDK 21 but **not** on 25. Split a composite call into
   its sub-questions before concluding anything about locale data.
 
-The CLDR provider failures in the corpus are in this lane's territory but may be
-gated behind L7's `BuiltinClassLoader` link failure — check with L7 before
-pricing them.
+The CLDR provider failures in the corpus are in this lane's territory, and the
+L7 gate on them is **lifted as of 2026-09-10**: `jdk/internal/loader/BuiltinClassLoader`
+links, and `Class.getName` is a reviewed `Intrinsic` (it was recorded as tagged
+a day earlier and was not — see the
+[`the-builtin-classloader-could-not-link-and-getname-was-never-tagged-20260910`](../jdk-only/the-builtin-classloader-could-not-link-and-getname-was-never-tagged-20260910.md) record §2).
+
+**Re-price them; do not read the pre-2026-09-10 failure text.** One CLDR symptom
+in particular is now yours to own rather than to wait on:
+`System.out.printf` -> `java.util.Formatter` -> `DecimalFormatSymbols.getInstance`
+-> `LocaleProviderAdapter.forType` throws
+`ServiceConfigurationError: Locale provider adapter "CLDR" cannot be instantiated`
+under `CRATONVM_ENFORCE_NATIVE_SHADOW=all`. That is not a loader failure; it
+takes out every armed vector and every armed PROBE that formats a string, so it
+is worth pricing before the retirement rows.
 
 ## 7. The increment loop
 
