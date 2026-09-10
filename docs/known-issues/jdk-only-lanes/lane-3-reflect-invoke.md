@@ -214,13 +214,29 @@ defect is closed by the retirement rather than blocking it.
 `IllegalArgumentException: L3ReflectInvokeSurface$Iface referenced from a
 method is not visible from class loader`. Re-price after L7.
 
-**Nine `MethodHandles` combinators are broken:** `zero` (`InternalError: Failed
-to link speciesData to speciesCode`), `empty` and `countedLoop`
+**Nine `MethodHandles` combinators answer wrongly:** `zero` (`InternalError:
+Failed to link speciesData to speciesCode`), `empty` and `countedLoop`
 (`NoClassDefFoundError: java/lang/invoke/BoundMethodHandle`), `arrayLength` and
 `arrayConstructor` (`IllegalArgumentException: not an array: class [I` — they
 refuse a genuine array class), `spreadInvoker`/`exactInvoker`/`invoker`
 (return **null** instead of the value), `throwException` (`NPE: cannot invoke
 MethodTypeForm.basicType() because this.form is null`).
+
+**Reconcile these against
+[`../jdk-only/W7-19-methodhandles-compatible-residuals.md`](../jdk-only/W7-19-methodhandles-compatible-residuals.md)
+before filing any of them as new.** That page is the live home for
+`MethodHandle` residuals and already carries the adjacent hazards — notably
+that `MethodHandles.empty`/`zero` allocate **17** slots while
+`lang_invoke::alloc_method_handle` and `classloader::alloc_method_handle`
+allocate 21 with *different field orders*, so a bare field read is
+out-of-bounds on three of the four populations. Two of the rows above are
+`empty` and `zero`. Lane 3's contribution is the measurement against a
+current binary and a probe row per combinator; the diagnosis belongs on W7-19.
+
+This is the second time in this lane that a row which looked like a fresh
+defect was an area someone had already mapped. The access-control rows below
+were the first. **One grep of `docs/known-issues/` per finding**, before the
+write-up and not after.
 
 The rest are shape: `MethodHandle.toString` and `Lookup.toString` drop their
 type/lookup-class, `NPE` messages are `null` where HotSpot is helpful, and
