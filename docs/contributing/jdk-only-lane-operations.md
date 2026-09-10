@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | Permanent. This is process, not a work item; it does not retire when a campaign does. |
 | **Normative source** | [`../feature-designs/jdk-only-mode.md`](../feature-designs/jdk-only-mode.md) |
-| **Companions** | [`../jdk-only-migration.md`](../jdk-only-migration.md) · [`../jdk-only-native-review.md`](../jdk-only-native-review.md) · [`../known-issues/jdk-only/INDEX.md`](../known-issues/jdk-only/INDEX.md) |
+| **Companions** | [`../jdk-only-migration.md`](../jdk-only-migration.md) · [`../jdk-only-native-review.md`](../jdk-only-native-review.md) · [`../known-issues/jdk-only/INDEX.md`](../known-issues/jdk-only/INDEX.md) · [`jdk-only-lanes/`](jdk-only-lanes/lane-0-integration-and-gates.md) |
 
 **Why this page exists separately from any handoff.** The eight-lane campaign of
 2026-08-28/29 ran from `HANDOFF-20260828-SCOPE.md`, whose §3 and §5 were the
@@ -17,6 +17,14 @@ Everything below is durable.
 
 Each rule here was learned by getting it wrong once. The cost is recorded with
 the rule, because that is the part that makes it stick.
+
+**Running more than one lane at a time.** The rules below are per-lane and stay
+the same however many lanes run. What a parallel campaign needs *in addition* --
+who owns which class prefixes, who may edit the shared gate cells, the build
+queue, and the merge order -- is in
+[`jdk-only-lanes/lane-0-integration-and-gates.md`](jdk-only-lanes/lane-0-integration-and-gates.md),
+which is the ownership authority for the nine-lane split of 2026-09-10. Read it
+before starting a lane; read this page for how to work inside one.
 
 ---
 
@@ -372,3 +380,78 @@ dispatched was retired — and nothing moved, because the probe exercises
 Convert a dial result into a table entry only via a registry dump **from a run
 of the very probe whose improvement you are citing**, then rebuild and
 re-measure on two binaries.
+
+### After the build: prove the retirement is not INERT before reading a probe
+
+The four preconditions above decide whether to retire. This is the first thing
+to check once you have, and it is not any of them: **a refusal is a retirement
+only when nothing already owns the triple.**
+
+`NativeMethodRegistry::register_inner` refuses a `SyntheticStub` under
+`--jdk-only` without inserting it, which is what lets the real bytecode run. But
+`JdkOnlyViolation::SyntheticNativeRegistered` carries a `survivor`, and when it
+is non-null an EARLIER registration of the same triple is still in the slot and
+still serving — so strict mode runs that older native instead of the bytecode
+the policy asked for, every probe reads exactly as it did before, and the wave
+is a no-op that looks like a clean result. Re-registration is common: 53 of the
+185 triples in the 2026-09-09 CHM/`Properties` wave are registered more than
+once.
+
+```text
+python - <<'PY' report.json      # --jdk-only-report from any run of your probe
+import json, sys
+pre = ("java/util/concurrent/ConcurrentHashMap", "java/util/Properties")
+v = json.load(open(sys.argv[1], encoding="utf-8"))["violations"]
+ours = [r for r in v if r["kind"] == "synthetic-native-registered"
+        and r["class"].startswith(pre)]
+print(len(ours), "refusals,", sum(1 for r in ours if r["survivor"]), "with a survivor")
+PY
+```
+
+Zero survivors is the answer you need. Anything else means the table entry is
+inert for that triple and the registration that supersedes it has to be found
+and dealt with first.
+
+### A probe whose noise floor exceeds the effect cannot score a retirement
+
+The 2026-09-09 wave moved two probes of 115. One was
+`SystemRuntimeObjectSweep`, +4, and it was a real defect. The other was
+`VtHandoffProbe`, −4, and it was NOTHING: its rows are thread counts (`polls
+that received a value |96|` against `|76|`, `threads joined |510|` against
+`|512|`) and both arms are wrong against HotSpot in the same way on every run.
+
+A negative delta is the shape of the result you want, which is exactly why it is
+the one to distrust. Before recording an improvement, read the ROWS that moved
+and ask whether the probe could have produced that delta with no change at all —
+`measure a flaky vector's noise floor before explaining it` applies to the good
+news too.
+
+**Two named offenders, with the evidence, so the next lane does not re-derive
+it.** `VtHandoffProbe` and `JdkOnlyPlatformProbe` both count virtual-thread
+handoffs, and both counts are nondeterministic on this VM. Six successive
+whole-tree A/Bs across the 2026-09-09/10 waves scored `JdkOnlyPlatformProbe` at
+delta `0, -2, 0, 0, +2, +2` — it oscillates in BOTH directions — and the row is
+one line of one probe.
+
+**The proof that no binary attribution is possible.** `cratonvm-p8.exe`
+differed from HotSpot on this row when it was the TRIAL arm of one A/B, and was
+byte-identical to HotSpot when the very next A/B used it as the CONTROL. One
+binary, one probe, opposite verdicts. That is the noise floor, measured, and it
+is wider than any delta this campaign has claimed from this probe.
+
+**And it is two fields, not one** — a correction to the earlier note here,
+which named `handoffs` alone:
+
+```text
+HotSpot   ... handoffs=64  allJoined=true  ...
+observed  ... handoffs=50 / 60 / 63 / 64   allJoined=true / false
+```
+
+They drift independently, so a run can match on `handoffs` and differ on
+`allJoined` — which is exactly what the 2026-09-10 `+2` was. A lane that
+chases only the handoff count is looking at the wrong half of the line about as
+often as the right one. `diff` scores the whole line either way, so the delta
+is `2` whichever field moved, and the delta alone cannot tell you which.
+
+A delta from either probe is a coin flip until someone fixes both counts.
+Neither is a reason to hold a retirement, and neither is a win to claim.
