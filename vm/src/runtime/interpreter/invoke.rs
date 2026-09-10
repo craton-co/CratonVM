@@ -2811,6 +2811,29 @@ pub fn descriptor_return_ref(descriptor: &str) -> &str {
 
 pub fn split_method_descriptor_ref(descriptor: &str) -> (Vec<&str>, &str) {
     let bytes = descriptor.as_bytes();
+    // A descriptor that does not open with `(` is MALFORMED, and this function
+    // used to PANIC on it rather than reject it: `i` starts at 1 to skip the
+    // `(`, the two loops are bounded by `bytes.len()`, but the tail slice
+    // `&descriptor[i..]` is not -- so an EMPTY descriptor reached
+    // `&""[1..]` and panicked with "start byte index 1 is out of bounds for
+    // string of length 0".
+    //
+    // That panic crosses the native boundary. Measured 2026-09-10: with
+    // `CRATONVM_ENFORCE_NATIVE_SHADOW` armed on core reflection,
+    // `MethodHandles.Lookup.unreflect(Method)` arrives here with an empty
+    // descriptor; the panic is logged as a "Native method panic caught" and
+    // then aborts the VM with `internal error`, which killed lane 3's
+    // instrument at row 126 of 245 and made the whole arm unscorable. A
+    // malformed descriptor must not be able to take the VM down.
+    //
+    // `descriptor_return_ref` directly above already states the house rule for
+    // this input -- it "returns `""` for a descriptor with no `')'`
+    // (malformed), which every consumer already treats as not-`V`, not-a-match"
+    // -- so the hardening existed and had been applied to one of the two
+    // neighbouring parsers. This is the other one.
+    if bytes.first() != Some(&b'(') {
+        return (Vec::new(), "");
+    }
     // Pre-size from the `(...)` span: one token is at least one byte, and no
     // real descriptor holds more than a handful. Without this the per-call Vec
     // reallocated through `RawVec::grow_one` on the lambda path.
