@@ -4,18 +4,10 @@
 # Never hand-edited: every line is a (probe, arm, section) that a real
 # three-arm run measured as diverging from the HotSpot control.
 #
-# note: the JDK 21 serialization defect is FIXED (JDK 21 installs a run-time-generated GeneratedSerializationConstructorAccessorN, which the VM now delegates to instead of recognising only the JDK 25 DirectConstructorHandleAccessor), so the six JdkOnlyBreadthProbe serialization rows no longer diverge and the ratchet is re-tightened from 16 rows to 10. Accepted ONLY from a mint that captured the MAXIMAL set: the vthreads section is an intermittent race that showed 9 or 10 rows across a 4-run sweep on this host, and a baseline minted from a 9-row run reads the 10th row as NEW and sends the leg red at random. The remaining rows are the JavaLangAccess carrier defect and are NOT accepted behaviour.
+# note: FIXED and re-tightened 10 rows -> 2 on 2026-09-09. The JavaLangAccess carrier is now resolved from the running image instead of being pinned to the literal java/lang/System$1, which is the carrier on JDK 25 but on JDK 21 is a PrivilegedAction (System$2 is the carrier there). The eight rows that were NoSuchMethodError on parkVirtualThread and encodeASCII therefore no longer diverge. The two that remain are the vthreads sections handoffs= cell and NOTHING else on that line, in BOTH modes and on BOTH images: HotSpot 64 vs CratonVM 57 on the 21 image, 64 vs 62 and 56 on the 25 image. That counter is load-fragile on both VMs, not a CratonVM property: section 7 of docs/known-issues/jdk-only/phase-2-adjudicated-the-corpus-cannot-decide-a-retirement-20260830.md measured 64 on eight of eight runs on BOTH VMs on an idle host and ruled the row unusable as an oracle, and this host was at load average 3.7. Accepted from a MAXIMAL set, unlike the first 21-linux mint which took three attempts: six consecutive runs observed exactly these two rows and no others, and the paired ratchet was then re-run against the tightened file (remove one row -> rc=5 naming it; restore -> rc=0).
 #
 # The gate fails when this set GROWS. A line that stops diverging is
 # reported and passes, so a fix is never blocked by the gate that
 # measured it — re-freeze afterwards to keep the ratchet tight.
-JdkOnlyCensusLoadProbe/strict/CENSUSLOAD
-JdkOnlyCensusLoadProbe/strict/SECTION-FAILED:io
-JdkOnlyCensusLoadProbe/strict/io
 JdkOnlyPlatformProbe/real/vthreads
-JdkOnlyPlatformProbe/strict/Exception
-JdkOnlyPlatformProbe/strict/PLATFORM
-JdkOnlyPlatformProbe/strict/SECTION-FAILED:vthreads
-JdkOnlyPlatformProbe/strict/at
-JdkOnlyPlatformProbe/strict/java.lang.NoSuchMethodError:
 JdkOnlyPlatformProbe/strict/vthreads

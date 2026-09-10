@@ -4725,12 +4725,34 @@ pub fn register_classloader_define_class(r: &mut NativeMethodRegistry) {
         cl_define_class0,
     );
 
-    r.register(
-        "java/lang/System$1",
-        "defineClass",
-        "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BLjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;",
-        jla_system_define_class,
-    );
+    // `defineClass` is a JavaLangAccess method, and that interface's carrier
+    // class is not spelled the same on every JDK -- see
+    // `shared_secrets_bridge::JLA_CARRIER_CANDIDATES`. Register on each
+    // candidate; the ones that are not the carrier on this image have no class
+    // for anything to dispatch through.
+    //
+    // **Spelled inline rather than looped over that const, deliberately.**
+    // `native-builtins/tests/registrar_drift.rs` scans this file as TEXT: its
+    // `parse_loops` accepts `for x in [ .. ]` over literal elements and skips
+    // any `for` whose `in` is not followed by `[`. Written as
+    // `for carrier in JLA_CARRIER_CANDIDATES` this registration becomes
+    // invisible to it -- measured, on 2026-09-09: total drift pairs 1356 ->
+    // 1355 and `the_drift_baseline_has_no_stale_rows` reporting this very call
+    // as "no longer drift[ing] ... registered by: <not registered anywhere
+    // this scan can see>". The registration had not stopped happening; the
+    // gate had stopped seeing it, and taking the regenerated baseline would
+    // have retired a live row on a parser's blind spot.
+    //
+    // `jla_define_class_is_registered_on_every_carrier_candidate` below keeps
+    // this list and that const from drifting apart, since the compiler cannot.
+    for carrier in ["java/lang/System$1", "java/lang/System$2"] {
+        r.register(
+            carrier,
+            "defineClass",
+            "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BLjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;",
+            jla_system_define_class,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5143,7 +5165,8 @@ pub(crate) fn first_resource_url(
     ctx: &mut dyn NativeContext,
     resource_name: &str,
 ) -> Option<String> {
-    if get_resource_first_hit_enabled() && ctx.resource_name_supports_incremental_scan(resource_name)
+    if get_resource_first_hit_enabled()
+        && ctx.resource_name_supports_incremental_scan(resource_name)
     {
         return ctx
             .next_resource_url(resource_name, 0, 0)
@@ -8073,10 +8096,8 @@ pub(crate) fn package_class_files_visible_to_loader(
     // built-in chain) keeps the historical global probe, unchanged.
     let namespace = loader_namespace_id(ctx, loader);
     if namespace >= cratonvm_types::ClassLoaderId::NATIVE_FIRST_USER_DEFINED {
-        return ctx.any_loaded_class_in_package_for_loader(
-            &package_name.replace('.', "/"),
-            namespace,
-        );
+        return ctx
+            .any_loaded_class_in_package_for_loader(&package_name.replace('.', "/"), namespace);
     }
     !ctx.find_all_resource_urls(class_glob).is_empty()
 }
@@ -11560,6 +11581,31 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod classloader_tests {
     use super::*;
+
+    /// The two names in `register_classloader_define_class` are written out
+    /// instead of looped over `JLA_CARRIER_CANDIDATES` so the drift scanner can
+    /// read them (see the comment there). Nothing in the language ties the two
+    /// lists together, so tie them here: a candidate added to the const and not
+    /// to that call site is a carrier on which `defineClass` silently is not
+    /// registered, which on the image where it IS the carrier is a
+    /// `NoSuchMethodError` from `BootLoader` during boot.
+    #[test]
+    fn jla_define_class_is_registered_on_every_carrier_candidate() {
+        const DESC: &str = "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BLjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;";
+        let mut r = NativeMethodRegistry::new();
+        register_classloader_define_class(&mut r);
+        let rows = r.dump_registrations();
+        for cand in crate::shared_secrets_bridge::JLA_CARRIER_CANDIDATES {
+            assert!(
+                rows.iter().any(|(cls, name, desc, _)| *cls == cand
+                    && *name == "defineClass"
+                    && *desc == DESC),
+                "no defineClass registration for carrier candidate {cand}; \
+                 the inline list in register_classloader_define_class has \
+                 drifted from JLA_CARRIER_CANDIDATES"
+            );
+        }
+    }
     use crate::test_utils::MockNativeContext;
     #[allow(unused_imports)]
     use cratonvm_native_api::{
