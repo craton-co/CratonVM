@@ -5193,6 +5193,41 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
 
     // RD.6: submit(Runnable, T) — bind the given result.
     let submit_rt_closure = |ctx: &mut dyn NativeContext, args: &[Value]| -> MethodCallResult {
+        // BUG-CCE-0716, and this overload was the one it MISSED. Its two
+        // siblings -- `native_es_submit_runnable` and
+        // `native_es_submit_callable` -- both delegate a genuinely-real
+        // receiver to `AbstractExecutorService`'s own bytecode; this one ran
+        // the task inline on the CALLING thread and handed back an
+        // already-completed future, so a real `ThreadPoolExecutor` never saw
+        // the task at all.
+        //
+        // The tell is the pool's own accounting, and `apps/probes/L5TpeCount.java`
+        // reads it per submission shape on a 2-worker pool given 3 tasks and
+        // then shut down and joined -- at which point every count is
+        // determined:
+        //
+        //   shape                 HotSpot            CratonVM (before)
+        //   execute               completed=3        completed=3
+        //   submit(Callable)      completed=3        completed=3
+        //   submit(Runnable)      completed=3        completed=3
+        //   submit(Runnable, T)   completed=3        completed=0   <-- here
+        //   invokeAll             completed=3        completed=3
+        //   invokeAny             completed=1        completed=0   <-- and here
+        //
+        // A count is the mild half of it: the task also ran on the wrong
+        // THREAD, which is the difference a start-gate `CountDownLatch`
+        // deadlocks on (see `spawn_runnable_on_real_thread`'s note on the
+        // eager-inline policy this is the last of).
+        if let Some(Value::Object(Some(this))) = args.first() {
+            if crate::executor_is_real(ctx, *this) {
+                return ctx.invoke_special_bytecode_only(
+                    "java/util/concurrent/AbstractExecutorService",
+                    "submit",
+                    "(Ljava/lang/Runnable;Ljava/lang/Object;)Ljava/util/concurrent/Future;",
+                    args,
+                );
+            }
+        }
         if let Some(Value::Object(Some(runnable))) = args.get(1) {
             ctx.invoke_virtual(*runnable, "run", "()V", &[])?;
         }
@@ -5260,6 +5295,21 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(c))) => *c,
             _ => return Ok(Some(Value::Object(None))),
         };
+        // Same omission as `submit_rt_closure` above, and the same remedy: a
+        // genuinely-real executor runs `AbstractExecutorService.invokeAny`,
+        // so the task is submitted to the pool rather than called inline on
+        // the caller. `L5TpeCount` reads `completed=0` against HotSpot's `1`
+        // without this.
+        if let Some(Value::Object(Some(this))) = args.first() {
+            if crate::executor_is_real(ctx, *this) {
+                return ctx.invoke_special_bytecode_only(
+                    "java/util/concurrent/AbstractExecutorService",
+                    "invokeAny",
+                    "(Ljava/util/Collection;)Ljava/lang/Object;",
+                    args,
+                );
+            }
+        }
         let iter_val = ctx.invoke_virtual(coll, "iterator", "()Ljava/util/Iterator;", &[])?;
         let mut last_err: Option<cratonvm_types::error::MethodCallFailed> = None;
         if let Some(Value::Object(Some(iter))) = iter_val {
