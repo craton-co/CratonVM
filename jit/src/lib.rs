@@ -26594,7 +26594,7 @@ fn try_compile_inner(
                                     cached.class_name,
                                     cached.method_name,
                                     cached.method_descriptor,
-                                    ir_evidence::describe(evidence.unwrap_or(0)),
+                                    ir_evidence::describe(evidence.map_or(0, |r| r.bits)),
                                 );
                             }
                             ir_evidence::note_method_refused(ir_method_hash);

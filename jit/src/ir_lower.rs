@@ -13799,6 +13799,12 @@ static IR_BLIND_DISPATCH: [std::sync::atomic::AtomicU64; 2] = [
 
 fn note_ir_blind_dispatch(in_splice: bool) {
     IR_BLIND_DISPATCH[usize::from(in_splice)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Also charge it to THIS compile, so the acceptance gate can price the
+    // splice trade for the body in front of it. The census above is cumulative
+    // across every compile in the process and cannot answer that question.
+    if in_splice {
+        crate::ir_evidence::note_blind_dispatch_in_splice();
+    }
 }
 
 /// `(in the method's own code, inside a spliced body)`. See
