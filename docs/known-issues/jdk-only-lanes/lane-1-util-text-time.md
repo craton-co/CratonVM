@@ -477,6 +477,46 @@ The `+52` is the retirement: a `Bridge` re-tagged `SyntheticStub` is what
 makes `--jdk-only` drop it. 50 of the 52 are wave 3's 21 and wave 4's 29; the
 other two are the same triples counted again under a second feature arm.
 
+### The gate set, on the MERGED tree
+
+`origin/dev` gained lane 5's `RETIRED_SHADOW_L5_TRIPLES` and a re-frozen
+`stub_ratchet` between this branch's acceptance and its merge, so the gate set
+was run after the merge, not before. The merge is textual and clean, and the
+thing to check after it is not that it compiled but that **all nine tables and
+all nine chain arms are still there** — a patch authored on a stale base has
+`git apply`'d clean over this very file once and silently deleted a sibling
+lane's 311-line table. They are, and both of this branch's tables now carry a
+disjointness check against lane 5's by name.
+
+```text
+  cratonvm-native-api          --lib      378 passed, 0 failed
+  cratonvm-native-collections  --lib      144 passed, 0 failed
+  cratonvm-types                          607 + 30 passed, 0 failed
+  cratonvm-native-builtins     --tests   4238 passed, 0 failed  (lib)
+                                         + 45 across the integration binaries
+    EXCEPT stub_ratchet::synthetic_stub_count_does_not_regress — RED BY
+    DESIGN, and the only red in the set.
+```
+
+`registrar_drift::the_drift_baseline_has_no_stale_rows` and the
+`flag_inventory` rows, both red for this lane on 2026-09-10 and both traced
+then to other lanes, are **green on this tree**. They were fixed where they
+belonged.
+
+**The ratchet is re-frozen from the line the test prints, never hand-derived**
+— that is the file's own rule, and the 1038 it once froze on was six above
+anything any run produced:
+
+```text
+  stub-ratchet [no-management]: 2380 SyntheticStub registrations out of 13610
+  stub-ratchet: const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2380;
+```
+
+`2328 -> 2380` is `+52`, and it is the same `+52` the jdk-only census reports
+for `synthetic-native-registered` — two instruments, one number, which is the
+check neither can make alone. The rise IS the retirement: a `Bridge` re-tagged
+`SyntheticStub` is exactly what makes `--jdk-only` drop it.
+
 ## 4. The finding this lane would most like the next lane to have: a retired PRODUCER makes a zero-invocation CONSUMER reachable
 
 Precondition 4 asks for `invocations > 0` per triple in your own instrument's
