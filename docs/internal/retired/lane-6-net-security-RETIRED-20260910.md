@@ -184,13 +184,64 @@ Two traps it walked into and out of, both already on the operations page:
   constructor or a class-initialiser path can differ. A dial result is a lead
   in both directions, never a verdict.
 
-`RSslLiveSession` was in the failing set and is **not** one of the six: it
-passes under every armed scope including none, and the operations page already
-documents it as load-sensitive — its own client loop discards the reply it
-asserts on when three TLS records arrive in one read. It failed in an arm run
-concurrently with a 125-probe A/B and a five-configuration `cargo test`.
+`RSslLiveSession` was in the trial arm's failing set and is **not** one of the
+six. What is measured about it here, and all that is measured: it passed 11 of
+11 runs on the control binary during the bisect — with nothing armed and with
+each of ten scopes armed — and it failed once, in an arm that ran concurrently
+with a 125-probe A/B and a five-configuration `cargo test`. It is a live TLS
+handshake vector, and the operations page §6 records an unnamed TLS vector
+whose client loop discards the reply it asserts on when three records arrive in
+one read under load. That may or may not be this one; **this page does not
+claim it is**, and the honest statement is that `RSslLiveSession` is not
+reproducible as a consequence of this wave. `RNetIfaceScope` looked the same
+and is not the same: it reproduces alone, on the trial binary, every time.
 
-### 2.3 The four preconditions, and what each removed
+### 2.3 The dial is wrong in BOTH directions, and this wave measured both
+
+The narrowed 54-row set was pre-checked by arming its four scopes on the
+control binary and running the whole `--jdk-only` corpus. It came back **130 of
+132**, with two failures the first table never had:
+
+```text
+  RJdkBridge1        AssertionError: URL.toURI().getPath() must carry the lone
+                     surrogate at 2, got charAt(2)=fffd in: /a<fffd>b
+  RJdkX509Intercept  NoSuchMethodError: java.lang.String.getRFC2253Name()
+                       at javax/security/auth/x500/X500Principal.getName(X500Principal.java:318)
+```
+
+Both look like exactly the species §2.1 is about, and the second is almost
+persuasive: this VM stores a **String** in `X500Principal`'s single declared
+slot, `transient X500Name thisX500Name` (`native-builtins/src/jca/x500.rs`
+documents the repurposing), so JDK bytecode that calls
+`thisX500Name.getRFC2253Name()` on it is a `NoSuchMethodError` waiting to
+happen.
+
+**Neither is real.** Both vectors pass on the BUILT binary that carries those
+very rows — the 124-row trial binary contains all 29 `URI` rows and all 10
+`X500Principal` rows, and `RJdkBridge1` and `RJdkX509Intercept` are not in its
+six failures. Run directly, one vector at a time, on the control binary and on
+that trial binary, all four runs are clean.
+
+The reason is the one the operations page gives and this lane has now hit three
+times: **the dial DECLINES at dispatch and arms a PREFIX; `retired_shadow.rs`
+re-tags at REGISTRATION and is per-TRIPLE.** Arming `javax/security/auth/x500/`
+declines every dispatch on the package, including on principals the VM minted
+itself with a String in that slot and including the one `X500Principal`
+registration the table does not carry. The table refuses 10 named
+registrations, and instances built through the retired constructor get a real
+`X500Name`.
+
+So this lane measured the dial wrong in both directions within one wave:
+
+* **optimistic** — `java/net/URL`, `DatagramSocket` and the `Inet*` family
+  scored clean on every probe under the dial and broke six corpus vectors when
+  built (§2.1);
+* **pessimistic** — `java/net/URI` and `X500Principal` broke two corpus vectors
+  under the dial and are clean when built.
+
+A dial result is a lead. The verdict is a built binary.
+
+### 2.4 The four preconditions, and what each removed
 
 Applied per triple against a dump from a run of **the very probes whose
 improvement is cited above** — never against a corpus census, which is a
@@ -206,7 +257,7 @@ the corpus had dispatched and the probe never touched.)
   the corpus tolerates it                 -70 §2.1
 ```
 
-### 2.4 The refusals are not inert
+### 2.5 The refusals are not inert
 
 A refusal is a retirement **only when nothing already owns the triple**.
 `NativeMethodRegistry::register_inner` refuses a `SyntheticStub` under
