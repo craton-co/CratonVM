@@ -481,6 +481,142 @@ fn a_reservation_never_starts_inside_an_open_inline_scopes_locals() {
     );
 }
 
+/// A reservation that fits ENTIRELY UNDER an open enclosing scope's locals is
+/// left where it is.
+///
+/// This is the other half of
+/// `a_reservation_never_starts_inside_an_open_inline_scopes_locals`, and the
+/// two together are the whole contract: the floor moves a reservation that
+/// would TOUCH an enclosing splice's locals, and only that one.
+///
+/// The first cut of the floor could not tell them apart. It compared the
+/// cursor against the TOP of the highest enclosing scope's locals -- a
+/// one-sided test -- so it also displaced reservations sitting below those
+/// locals, which own nothing and overlap nothing.
+///
+/// That displacement was a miscompile. Measured 2026-09-10 on
+/// `scala.runtime.Statics.anyHash(Long)`: ONE floor bump in the whole run,
+/// overlapping NO scope, and the compiled body then answered a per-run
+/// constant for every argument -- 299,498 wrong hashes in 300,000 calls, 9 runs
+/// in 10, against 0 in 10 with `CRATONVM_JIT_NO_INLINE_LOCALS_FLOOR=1`. Its
+/// page:
+/// `known-issues/springboot/kafka-scala-statics-anyhash-jit-miscompile-20260910.md`.
+///
+/// So this test asserts a NON-movement, which is the thing a guard's own test
+/// usually cannot see. Without it, restoring the one-sided rule -- which is a
+/// strictly more conservative-LOOKING change, and the obvious "fix" for any
+/// future overlap report -- passes every other test in this file.
+#[test]
+fn a_reservation_that_fits_under_an_open_scopes_locals_is_not_moved() {
+    let alloc_result = crate::regalloc::RegAllocResult {
+        assignments: Vec::new(),
+        xmm_assignments: Vec::new(),
+        used_callee_saved: Vec::new(),
+        used_xmm_regs: Vec::new(),
+        block_live_in: Vec::new(),
+    };
+    let mut compiler = Compiler::new(
+        "inline-locals-range-test".to_string(),
+        ExecutableBuffer::new(65536).expect("test executable buffer"),
+        0,
+        0,
+        64,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        alloc_result,
+        false,
+        test_helpers(),
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Vec::new(),
+    );
+
+    // Two scopes, so exactly one is ENCLOSING and the floor is its top. Its
+    // locals start four words above the cursor, leaving a gap that a small
+    // reservation fits inside without touching them.
+    let cursor = compiler.next_spill_offset;
+    let enclosing_base = cursor + 4 * 8;
+    let enclosing_top = enclosing_base + 2 * 8;
+    compiler.inline_oop_scopes.push(InlineOopScope {
+        local_base: enclosing_base,
+        num_locals: 2,
+        masks: Vec::new(),
+        reached: Vec::new(),
+        cur_pc: 0,
+    });
+    compiler.inline_oop_scopes.push(InlineOopScope {
+        local_base: enclosing_top,
+        num_locals: 3,
+        masks: Vec::new(),
+        reached: Vec::new(),
+        cur_pc: 0,
+    });
+
+    // The premise: the one-sided rule WOULD move this reservation. Without
+    // this the test would pass against either rule and prove nothing.
+    assert_eq!(
+        compiler.open_inline_locals_floor(),
+        enclosing_top,
+        "the floor is the top of the enclosing scope's locals"
+    );
+    assert!(
+        cursor < enclosing_top,
+        "the cursor must be below the one-sided floor, or this test is vacuous"
+    );
+
+    // One word at the cursor: [cursor, cursor + 8) against locals
+    // [enclosing_base, enclosing_top) -- four words apart, no intersection.
+    assert_eq!(
+        compiler.inline_locals_clear_of_range(cursor, 1),
+        cursor,
+        "a reservation that touches no enclosing scope's locals must not move"
+    );
+    let start = compiler
+        .reserve_spill_slots(1, SpillReason::Push)
+        .expect("the reservation must succeed");
+    assert_eq!(
+        start, cursor,
+        "the reservation was displaced past locals it does not overlap; that \
+         is the one-sided rule, and it miscompiled Statics.anyHash"
+    );
+
+    // And the range rule still moves one that DOES reach them: four words from
+    // the cursor is exactly `enclosing_base`, so a five-word reservation from
+    // the cursor covers the enclosing scope's first local.
+    assert_eq!(
+        compiler.inline_locals_clear_of_range(cursor, 5),
+        enclosing_top,
+        "a reservation whose RANGE reaches the enclosing locals must clear \
+         them entirely, not merely start above their base"
+    );
+
+    // A zero-word reservation occupies nothing, so it intersects nothing.
+    assert_eq!(
+        compiler.inline_locals_clear_of_range(cursor, 0),
+        cursor,
+        "a zero-word reservation owns no word and must not be moved"
+    );
+
+    // A lone open splice IS the innermost, so nothing is enclosing and the
+    // range rule is inert for it -- the same exemption the one-sided floor has.
+    compiler.inline_oop_scopes.truncate(1);
+    assert_eq!(
+        compiler.inline_locals_clear_of_range(cursor, 5),
+        cursor,
+        "one open splice has no ENCLOSING scope, so nothing may be moved"
+    );
+}
+
 #[test]
 fn push_stack_refuses_to_cross_spill_limit() {
     let alloc_result = crate::regalloc::RegAllocResult {
@@ -4778,7 +4914,12 @@ fn layout_epoch_guards(compiled: &CompiledMethod) -> usize {
         if i + 10 <= code.len() && code[i] == 0x81 && code[i + 1] == 0x3D {
             let d = i32::from_le_bytes([code[i + 2], code[i + 3], code[i + 4], code[i + 5]]);
             // Cast: sign-extend the disp32 for wrapping address arithmetic
-            if base.wrapping_add(i).wrapping_add(10).wrapping_add(d as isize as usize) == epoch {
+            if base
+                .wrapping_add(i)
+                .wrapping_add(10)
+                .wrapping_add(d as isize as usize)
+                == epoch
+            {
                 n += 1;
             }
         }
@@ -5347,7 +5488,10 @@ fn the_g1_barrier_table_is_read_by_content_not_by_address() {
     TABLE[0].store(0x4000_0000, Ordering::Release);
     assert!(!g1_barrier_table_live(addr), "no mask");
     TABLE[2].store(!(0x100000usize - 1), Ordering::Release);
-    assert!(g1_barrier_table_live(addr), "a fully published table is live");
+    assert!(
+        g1_barrier_table_live(addr),
+        "a fully published table is live"
+    );
 
     // `G1Collector::drop` clears the length first.
     TABLE[1].store(0, Ordering::Release);
@@ -5431,10 +5575,10 @@ fn the_inline_g1_barrier_filter_separates_the_four_cases_when_executed() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
-                // dev added `array_len_hoist_info` as argument 13 while this branch
+        // dev added `array_len_hoist_info` as argument 13 while this branch
         // was open; these tests hoist no array length.
         Vec::new(),
-alloc_result,
+        alloc_result,
         false,
         helpers,
         0,
@@ -5465,7 +5609,10 @@ alloc_result,
     compiler.emit_xor_reg_self(RAX);
     compiler.emit_ret();
 
-    assert!(!compiler.buf.overflowed(), "the test buffer must hold the snippet");
+    assert!(
+        !compiler.buf.overflowed(),
+        "the test buffer must hold the snippet"
+    );
     // W^X: `ExecutableBuffer::new` maps RW, and the compile driver flips the
     // page to RX when it finalises a method. This snippet bypasses the driver,
     // so it has to do the flip itself or the first instruction faults.
@@ -5595,10 +5742,10 @@ fn the_inline_g1_barrier_needs_the_flag_the_table_and_the_helper() {
             Vec::new(),
             Vec::new(),
             Vec::new(),
-                        // dev added `array_len_hoist_info` as argument 13 while this branch
+            // dev added `array_len_hoist_info` as argument 13 while this branch
             // was open; these tests hoist no array length.
             Vec::new(),
-alloc_result,
+            alloc_result,
             false,
             helpers,
             0,
@@ -5736,10 +5883,10 @@ fn the_generational_inline_card_mark_stays_disabled_under_f08() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
-                // dev added `array_len_hoist_info` as argument 13 while this branch
+        // dev added `array_len_hoist_info` as argument 13 while this branch
         // was open; these tests hoist no array length.
         Vec::new(),
-alloc_result,
+        alloc_result,
         false,
         helpers,
         0,
@@ -7535,7 +7682,11 @@ fn find_array_len_hoists_matches_the_canonical_counted_loop() {
     ];
     let code_len = code.len();
     let loops = detect_loops(&code, code_len);
-    assert_eq!(loops[0], (12, 34), "back edge 34 -> header 12, got {loops:?}");
+    assert_eq!(
+        loops[0],
+        (12, 34),
+        "back edge 34 -> header 12, got {loops:?}"
+    );
 
     let hoists = find_array_len_hoists(&code, code_len, &loops);
     assert_eq!(hoists.len(), 1, "one invariant arraylength, got {hoists:?}");
@@ -7811,8 +7962,15 @@ fn rip_relative_epoch_guard_addresses_the_counter_and_declares_its_trail() {
         .rip_abs_disp32_patches
         .last()
         .expect("the guard registers its displacement for the unroll duplicator");
-    assert_eq!(patch_off, start + 2, "the disp32 follows the two opcode bytes");
-    assert_eq!(trail, 4, "the imm32 is part of the instruction the CPU measures from");
+    assert_eq!(
+        patch_off,
+        start + 2,
+        "the disp32 follows the two opcode bytes"
+    );
+    assert_eq!(
+        trail, 4,
+        "the imm32 is part of the instruction the CPU measures from"
+    );
 }
 
 #[test]
