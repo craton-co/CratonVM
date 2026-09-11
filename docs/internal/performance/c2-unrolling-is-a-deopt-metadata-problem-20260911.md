@@ -213,6 +213,24 @@ audit.
 > [`c2-per-copy-deopt-frames-20260911.md`](c2-per-copy-deopt-frames-20260911.md).
 > **§4's zeros are unchanged** — this is the prerequisite, not the prize.
 
+> **AND THE PRIZE WAS THEN BUILT, same day**, behind
+> `CRATONVM_JIT_IR_PARTIAL_UNROLL` (default OFF). §3's shape, with one
+> departure: each copy's failing test branches **back to the header** instead of
+> to a new exit merge, so there are no exit phis and no post-loop rewrite at all.
+>
+> It is correct and it is **not faster** — 0.98 against a ±8% spread — and the
+> reason is not this page's subject at all: `sink_pure_nodes` moves a pure node
+> only when the loop depth strictly decreases, every copy is at the header's own
+> depth, so all `factor` copies are computed above the first test and the
+> carried values spill. The rolled loop has no memory operand in it; the
+> unrolled one has 69 of 180.
+>
+> Two wrong-code defects it was the first code to reach — an `If`'s successors
+> ordered by node id, and an OSR entry at a bci two blocks claimed — are fixed
+> and pinned.
+>
+> [`c2-the-partial-unroller-20260911.md`](c2-the-partial-unroller-20260911.md).
+
 ## 6. What was landed
 
 The census, the typed refusals it needed, and this page. Specifically:

@@ -5142,3 +5142,37 @@ change, not this one.
 
 Full write-up in
 [`internal/performance/c2-per-copy-deopt-frames-20260911.md`](internal/performance/c2-per-copy-deopt-frames-20260911.md).
+
+### FOLLOW-UP: the partial unroller was written (`CRATONVM_JIT_IR_PARTIAL_UNROLL`, default OFF)
+
+**2026-09-11, same day.** It keeps the loop test in every copy — so no
+trip-count arithmetic and no speculation — and sends each copy's failing test
+**back to the header** rather than to a new exit merge, which is what keeps the
+transform closed under the loop and leaves every post-loop use and safepoint
+slot untouched.
+
+It is **correct and it is not faster**: 9 alternating pairs on
+`bench/C2PartialUnrollProbe.java` read 356 ms rolled against 362 ms unrolled at
+factor 4 — a ratio of 0.98 against a ±8% spread — with checksums matching
+Temurin 25 on trip counts both divisible and not divisible by the factor. The
+per-iteration instruction count *does* fall, 20 to 16.25. It buys nothing
+because the rolled loop keeps `a` and `i` in `rbx`/`r15` with **no memory
+operand in its loop at all** and the unrolled one spills every carried value:
+`sink_pure_nodes` moves a node only when the loop depth strictly DECREASES, and
+every copy of an unrolled body sits at the header's own depth, so all four are
+computed above the first test and eight intermediates contend for a
+five-register file.
+
+The sentence at 1437 and item 1 at 1484 both need a caveat now. The optimizing
+tier *can* unroll; unrolling is not by itself what the baseline's 4x buys. The
+baseline also colours its locals into callee-saved registers, and that is the
+half this tier is still missing.
+
+Two wrong-code defects were found on the way, both in shared code, both live
+before this transform and reachable by anything that clones a control node: an
+`If`'s successors were ordered by **node id** rather than by projection index,
+and an OSR entry resolved a bci **two blocks claimed**. Both are fixed and
+pinned by tests.
+
+Full write-up, including why the obvious schedule-late fix is not landed, in
+[`internal/performance/c2-the-partial-unroller-20260911.md`](internal/performance/c2-the-partial-unroller-20260911.md).
