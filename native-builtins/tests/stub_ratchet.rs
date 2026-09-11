@@ -1432,6 +1432,21 @@ use cratonvm_types::compat::CompatibilityMode;
 /// removes the slack, and it is why this wave's delta reads +251 against the
 /// tree and +237/+248/+251 against the constants.
 ///
+/// # Re-frozen 2026-09-11 (the THIRD merge): 2622 -> 2709, +87 for the fourth time
+///
+/// Measured on the union again rather than carried forward:
+///
+/// ```text
+///   dev alone            2611 / 2622 / 2611
+///   union                2698 / 2709 / 2698   totals 13609 / 13977 / 13644
+///   this branch           +87 /  +87 /  +87   totals -3 (as isolated by the
+///                                             substitution on the block below)
+/// ```
+///
+/// Four measurements across three dev merges and 229 commits, and the delta
+/// has been +87 stubs and -3 total every time. A number that survives that
+/// much churn underneath it is measuring the change rather than the tree.
+///
 /// # Re-frozen 2026-09-11 (the SECOND merge): 2620 -> 2707, isolated by substitution
 ///
 /// Dev moved 91 more commits between this branch's verification and its push,
@@ -1876,7 +1891,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// `2620 + 2` was NOT assumed — each arm was run again and this is its printed
 /// line. That is the treadmill the note above names: on a branch this busy the
 /// constant is re-measured per merge, never added up.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2622;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2709;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2114,7 +2129,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2622;
 /// `2609 + 2` was NOT assumed — each arm was run again and this is its printed
 /// line. That is the treadmill the note above names: on a branch this busy the
 /// constant is re-measured per merge, never added up.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2611;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2698;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2274,7 +2289,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2611;
 /// `2609 + 2` was NOT assumed — each arm was run again and this is its printed
 /// line. That is the treadmill the note above names: on a branch this busy the
 /// constant is re-measured per merge, never added up.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2611;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2698;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -2334,7 +2349,7 @@ const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2611;
 /// was the only trace a real defect left in this gate, and staleness meant
 /// nobody could have read it. The `synthetic-jdk` arm has no constant here and
 /// measured 13645 on the same tree.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13975;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13977;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
@@ -2347,7 +2362,7 @@ const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13975;
 /// dev's staleness rather than either wave's — the localisation is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13607;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13609;
 
 /// The `--features synthetic-jdk` total, which had no constant at all.
 ///
@@ -2373,7 +2388,7 @@ const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13607;
 /// and 13645 on that tree against 13658 on this one is exactly the drift a
 /// sentence cannot track.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13642;
+const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13644;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;
