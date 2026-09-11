@@ -46,7 +46,7 @@ would invent a number neither took. What they retire, exactly:
                                                       $Name, JarEntry, Manifest,
                                                       java/text/Normalizer
   wave 5  RETIRED_SHADOW_L1_ZI_TRIPLES    2 triples   sun/util/calendar/ZoneInfoFile
-                                                      -- WRITTEN, NOT ACCEPTED
+                                                      -- ACCEPTED, see below
 ```
 
 ### Wave 5 — the acceptance
@@ -88,11 +88,94 @@ cannot adjudicate this at all: *"on CratonVM it is 64 on an idle host and
 55-58 on a loaded one"* — its author measured the row as load-sensitive on
 this VM, and this host is never idle.
 
-**Wave 5 is not landed on the strength of its own table.** Its two rows are
+#### The corpus, and a red arm that is not this wave's
+
+```text
+                              control          trial
+  jdk-only-strict-probes      FAIL             FAIL
+  regression-suite SUITE=all  133 / 133        133 / 133
+  regression-suite SUITE=core  93 /  93         93 /  93
+```
+
+**Arm 1 fails on `origin/dev` UNTOUCHED**, and the same three probes diverge
+in both arms (`JdkOnlyPlatformProbe`, `ChmKeySetGrowth`, `ChmShadowSweep`).
+Every "new divergence" is a line of this shape:
+
+```text
+  +2026-09-11T21:26:32.831065Z  WARN cas_diag: T19_H6_CAS_DIAG cas_long FAIL #3
+     class=java/util/concurrent/ConcurrentHashMap$CounterCell
+```
+
+— a timestamped CAS-retry DIAGNOSTIC being compared as if it were program
+output. It carries a wall clock, so it can never match a frozen baseline, and
+it only appears when a CAS actually contends. **That arm cannot stay green
+under load regardless of what any lane does**, and it is worth someone's
+attention as a harness defect rather than a VM one.
+
+**The count of those lines nearly cost this wave a false regression, and the
+interleaving is what saved it.** Taken sequentially — three control runs, then
+two trial runs — the two arms did not overlap at all:
+
+```text
+  base  (sequential)  11  9 14  8          range 8-16 combined with the corpus run
+  trial (sequential)  15 15 15
+```
+
+and there was a MECHANISM ready to explain it, which is the dangerous part:
+`try_delegate_real_collection` now runs real bytecode for `size`/`isEmpty` on
+carrier receivers, `ConcurrentHashMap$EntrySetView` is a `SET_VIEW_CARRIERS`
+entry, and the diagnostics name `ConcurrentHashMap$CounterCell`. A `size()`
+that used to answer 0 and now answers correctly makes downstream code do work
+it was skipping — more counter updates, more CAS retries, more lines. The
+story fits. It is also wrong. Six INTERLEAVED pairs:
+
+```text
+  BASE : 12 12 12 15 16 12     range 12-16
+  TRIAL: 10 15 16 16 15 12     range 10-16
+```
+
+Fully overlapping; the CONTROL reaches 16 and the TRIAL goes down to 10. The
+sequential split was the clock, not the binary. **A plausible mechanism is not
+evidence, and on this host a sequential A/B is not a measurement** — the same
+lesson the probe tree's one mover taught two hours earlier, in a different
+instrument.
+
+#### The ratchet
+
+Each arm RUN, none copied from a sibling and none computed as `n + 2`:
+
+```text
+  BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT   2547 -> 2549
+  BASELINE_SYNTHETIC_STUBS_MANAGEMENT      2558 -> 2560
+  BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK   2547 -> 2549
+```
+
+`+2` on every arm, and the account the assertion demands is two rows —
+`ZoneInfoFile.getZoneInfo` and `getZoneInfo0`, the whole of
+`RETIRED_SHADOW_L1_ZI_TRIPLES`. The table's own length and the ratchet are two
+instruments reporting one number.
+
+#### The unit gates
+
+```text
+  native-api --lib                                 400 passed, 0 failed
+  native-collections --lib                         147 passed, 0 failed
+  native-builtins --test stub_ratchet               12 passed, 0 failed
+  native-builtins --test duplicate_registration_gate 7 passed, 0 failed
+  rustfmt --check hunks inside this branch's lines:  0
+```
+
+**Wave 5 IS landed, and its table with it.** The paragraph below was written
+before the acceptance ran and is kept because the reasoning still stands: the
+3,792 engagements bought the table a place in the queue, not a landing. What
+landed it is the trial binary.
+
+**Wave 5 was not landed on the strength of its own table.** Its two rows are
 the one non-vacuous `+0` in item 6's bisection (3,792 door engagements), and
-an armed `+0` is what a LEAKED dial row looks like too — so the table is
-queued behind a trial binary, not counted here. What wave 5 DID land is four
-things that needed no retirement:
+an armed `+0` is what a LEAKED dial row looks like too — so the 3,792 bought
+the table a queue place and nothing more. The trial binary above is what
+landed it. Beside the table, wave 5 landed four things that needed no
+retirement at all:
 
 ```text
   1  try_delegate_real_collection now runs the receiver's own bytecode when
