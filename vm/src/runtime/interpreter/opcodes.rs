@@ -4345,6 +4345,68 @@ pub(super) fn op_getstatic(
     Ok(())
 }
 
+/// What the RECEIVER of a watched field access actually is, at the moment of
+/// the access.
+///
+/// The ledger used to print only the receiver's ADDRESS, and that is not
+/// enough to answer the one question a "the constructor stored it but the
+/// reader sees null" log is opened to answer: is this the same object the
+/// constructor wrote to, moved, or a DIFFERENT object now living at that
+/// address? The address alone cannot tell those apart — a young semispace is
+/// re-served from the same base every cycle and the old gen allocates out of a
+/// free list, so one address names many objects over a run.
+///
+/// So: the receiver's own class (not the field's declaring class, which is
+/// already printed and is a static property of the bytecode), its `num_slots`,
+/// its `gc_flags` (`0x…` — the compact bit lives there), and whether the heap
+/// still recognises the address as an object start at all.
+fn watch_receiver_note(shared: &SharedVm, obj_ref: ObjectRef, field_index: usize) -> String {
+    let recognised = shared
+        .mem
+        .heap
+        .is_object_address(obj_ref.as_ptr() as usize)
+        .is_some();
+    let header = shared.mem.heap.get_header(obj_ref);
+    let recv_cid = header.class_id.as_u32();
+    let recv_name = cratonvm_gc::gc::resolve_class_info(recv_cid)
+        .map(|(n, _)| n)
+        .unwrap_or_else(|| "<unresolved>".to_string());
+    // The BYTE ADDRESS of this field's storage, which is what a write-watch
+    // (`CRATONVM_DBG_WATCH_CELL`) has to be aimed at. It is not derivable from
+    // the object address and the field index by the reader: a compact object
+    // packs its fields at per-class offsets, so the legacy
+    // `base + HEADER_SIZE + index * SLOT_SIZE` formula names the wrong cell for
+    // exactly the objects this ledger is usually opened on.
+    let slot_addr = if cratonvm_types::is_compact_object(header) {
+        cratonvm_types::with_class_layout(recv_cid, header.num_slots(), |layout| {
+            layout.field_offset(field_index)
+        })
+        .flatten()
+        .map(|off| obj_ref.as_ptr() as usize + cratonvm_types::HEADER_SIZE + off as usize)
+    } else {
+        Some(
+            obj_ref.as_ptr() as usize
+                + cratonvm_types::HEADER_SIZE
+                + field_index * cratonvm_types::SLOT_SIZE,
+        )
+    };
+    format!(
+        "recv_class={recv_name} recv_class_id={recv_cid} recv_num_slots={} \
+         recv_gc_flags=0x{:x} recv_kind={} object_start={recognised} slot_addr={}",
+        header.num_slots(),
+        header.gc_flags(),
+        cratonvm_gc::heap::ObjectHeader::kind_tag(
+            header
+                .mark_word
+                .load(std::sync::atomic::Ordering::Relaxed)
+        ),
+        match slot_addr {
+            Some(a) => format!("0x{a:x}"),
+            None => "<no-layout>".to_string(),
+        },
+    )
+}
+
 /// Cold half of `op_putfield`: the diagnostics behind `crate::runtime::env_cache::dbg_field_watch()`,
 /// moved out of the handler body verbatim (2026-09-02) so the unarmed
 /// path keeps one gate load and none of the code. Takes the handler
@@ -4386,9 +4448,10 @@ fn diag_getfield_watch(
             } else {
                 shared.mem.heap.get_field(obj_ref, field.field_index)
             };
+            let recv = watch_receiver_note(shared, obj_ref, field.field_index);
             let fr = &thread.frames[frame_idx];
             eprintln!(
-                        "[GETFIELD-WATCH] obj={:p} decl_class={} field={:?} field_index={} value={:?} in {}.{} pc={} thread={}",
+                        "[GETFIELD-WATCH] obj={:p} decl_class={} field={:?} field_index={} value={:?} {recv} in {}.{} pc={} thread={}",
                         obj_ref.as_ptr(),
                         decl_name,
                         field_name,
@@ -4659,9 +4722,10 @@ fn diag_putfield_watch(
             decl_name,
             field_name.as_deref().unwrap_or("?")
         )) {
+            let recv = watch_receiver_note(shared, obj_ref, field.field_index);
             let fr = &thread.frames[frame_idx];
             eprintln!(
-                        "[PUTFIELD-WATCH] obj={:p} decl_class={} field={:?} field_index={} old={:?} new={:?} in {}.{} pc={} thread={}",
+                        "[PUTFIELD-WATCH] obj={:p} decl_class={} field={:?} field_index={} old={:?} new={:?} {recv} in {}.{} pc={} thread={}",
                         obj_ref.as_ptr(),
                         decl_name,
                         field_name,

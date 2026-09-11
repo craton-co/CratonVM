@@ -606,7 +606,8 @@ impl ZTlab {
         let config = config.normalized();
         let batch = config.registry_batch;
         Self {
-            inner: Tlab::empty(),
+            // Heap-internal staging — see `TlabAccounting`.
+            inner: Tlab::empty_heap_staging(),
             page: None,
             chunk: None,
             chunk_size: 0,
@@ -939,7 +940,8 @@ impl ZTlab {
                 // every recycled page. `addr` and `want` are both multiples of
                 // the 8-byte object grid, so `addr + want` is 8-aligned, which
                 // is what `Tlab::new`'s tail-filler contract requires.
-                self.inner = unsafe { Tlab::new(addr as *mut u8, want) };
+                // `new_heap_staging`, not `new`: see `TlabAccounting`.
+                self.inner = unsafe { Tlab::new_heap_staging(addr as *mut u8, want) };
                 self.chunk = Some((addr, addr + want));
                 self.chunk_size = want;
                 self.waste_limit = want / self.config.refill_waste_fraction;

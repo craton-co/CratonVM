@@ -126,7 +126,10 @@ pub(crate) struct ZArenaTlab {
 impl ZArenaTlab {
     pub(crate) fn new() -> Self {
         Self {
-            inner: Tlab::empty(),
+            // Heap-internal staging: the bytes this buffer hands out are
+            // counted again by the VM's `note_external_allocation` on the
+            // allocating Java thread's own TLAB. See `TlabAccounting`.
+            inner: Tlab::empty_heap_staging(),
             chunk: None,
             stats: ZTlabStats::default(),
             tail_returned_bytes: 0,
@@ -750,15 +753,23 @@ impl ZgcRealHeap {
         // write is one header, and "walkable" is the state the rest of the tree
         // assumes of arena bytes below the cursor.
         //
-        // `retire_taking_tail`, not `retire`: the plain retire consults the
-        // process-wide tail sinks (`crate::tlab::TlabTailSink`), and THIS heap
-        // is one of them. Letting it run would free the tail into the arena
-        // twice -- once through the sink and once on the line below.
+        // `retire_with_filler_taking_tail`, not `retire`: the plain retire
+        // consults the process-wide tail sinks (`crate::tlab::TlabTailSink`),
+        // and THIS heap is one of them. Letting it run would free the tail into
+        // the arena twice -- once through the sink and once on the line below.
+        //
+        // And not the open-coded `install_tail_filler(); retire_taking_tail();`
+        // this used to be: the filler sets `cursor = end` by design, so the
+        // retire that followed read `consumed_bytes()` as the WHOLE chunk and
+        // charged the unused tail as allocated -- the same defect
+        // `Tlab::retire`'s body documents having fixed, reintroduced here by
+        // splitting the two steps apart. The combined entry point reads the
+        // consumed span before the filler runs.
         // SAFETY: the chunk is live arena memory this thread owns alone.
-        unsafe {
-            tlab.inner.install_tail_filler(crate::tlab::TLAB_FILLER_CLASS_ID);
-        }
-        let _ = tlab.inner.retire_taking_tail();
+        let _ = unsafe {
+            tlab.inner
+                .retire_with_filler_taking_tail(crate::tlab::TLAB_FILLER_CLASS_ID)
+        };
         tlab.stats.retires += 1;
         debug_assert!(tlab.inner.reserved_tail().is_none());
         let Some((tail_start, tail_end)) = tail else {
@@ -819,7 +830,9 @@ impl ZgcRealHeap {
         // owned exclusively by this thread until retire; it is zeroed by the
         // carve; `want` is a multiple of `ZGC_TLAB_ALIGN`, which is what
         // `Tlab::new`'s tail-filler contract requires of `ptr + want`.
-        tlab.inner = unsafe { Tlab::new(ptr, want) };
+        // `new_heap_staging`, not `new`: see `TlabAccounting`. The whole
+        // `inner` is replaced here, so the mode has to be re-stated.
+        tlab.inner = unsafe { Tlab::new_heap_staging(ptr, want) };
         tlab.chunk = Some((ptr as usize, ptr as usize + want));
         tlab.stats.refills += 1;
         tlab.stats.refill_bytes += want as u64;

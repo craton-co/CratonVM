@@ -2723,15 +2723,19 @@ static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
 /// Retiring these three means removing the dead `math_bignum.rs` registrations
 /// first, which changes nothing in compatible mode because they own no slot.
 ///
-/// **`remainder`, `mod`, `gcd`, `and`, `or`, `xor` — the JIT drops the
-/// message.** These do reach bytecode, and interpreted they are HotSpot-exact.
-/// Once the real body is JIT-compiled the `NullPointerException` arrives with
-/// no message at all. It is not a `BigInteger` fact — `apps/probes/L2JitNpeProbe.java`
-/// asks five null-deref shapes cold and hot with no JDK class involved and
-/// every one of them loses its message when hot. See
-/// `docs/known-issues/jit/the-helpful-npe-message-is-lost-in-compiled-code-20260910.md`.
-/// Retiring them today would trade a correct message for none on exactly the
-/// rows a caller reads when something has already gone wrong.
+/// **`remainder`, `mod`, `gcd`, `and`, `or`, `xor` — the JIT DROPPED the
+/// message; blocker cleared 2026-09-11.** These do reach bytecode, and
+/// interpreted they are HotSpot-exact. Once the real body was JIT-compiled the
+/// `NullPointerException` arrived with no message at all. It was not a
+/// `BigInteger` fact — `probes/L2JitNpeProbe.java` asks six null-deref shapes
+/// cold and hot with no JDK class involved and every one of them lost its
+/// message when hot. Fixed and retired as
+/// `docs/internal/fixed-bugs/the-helpful-npe-message-is-lost-in-compiled-code-FIXED-20260911.md`,
+/// pinned by `vm/tests/jit_npe_message_hot_equals_cold.rs`.
+///
+/// They are STILL HELD, and not by this reason: the rule below is structural —
+/// every reference-argument row — and lifting it needs the `BigIntegerSweep`
+/// measurement with the JIT on that put it there, which is lane 2's to take.
 ///
 /// ## ...and the held set is every REFERENCE-argument row, not a list of six
 ///
