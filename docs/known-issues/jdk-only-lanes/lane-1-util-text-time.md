@@ -30,7 +30,7 @@ preconditions and the landing protocol are in
 | HELD — `Locale` + `sun/util/locale/` + `sun/util/resources/` + `Currency` | 35 | 3 probes worse, one truncates 125 → 8; bisected §10 item 6 |
 | HELD — the interface and abstract receivers | 28 | §6 — they are NOT dead, and no per-class trial was run |
 | HELD — `HashSet` / `LinkedHashSet` remainder | 13 | lane T holds `register_hashset_natives` |
-| PART RETIRED — `java/text/` | 12 | **wave 4**: everything but `BreakIterator` (the whole of the `+16`) and `DateFormat` (vacuous) — §3 |
+| PART RETIRED — `java/text/` | 12 | **wave 4**: `Normalizer` only. `BreakIterator` is the whole `+16`, `DateFormat` is vacuous, `ParseException` repairs nothing and its two moving rows are `Throwable`'s — §3 |
 | HELD — `ResourceBundle` + `$Control` | 12 | **armed-clean over 51 probes, red on the trial binary** — §8 |
 | EXCLUDED — no dispatch any probe can produce | 9 | §5 |
 | | **959** | |
@@ -42,9 +42,8 @@ would invent a number neither took. What they retire, exactly:
 
 ```text
   wave 3  RETIRED_SHADOW_L1_HM_TRIPLES   21 triples   java/util/HashMap
-  wave 4  RETIRED_SHADOW_L1_JT_TRIPLES   41 triples   java/util/jar/Attributes,
+  wave 4  RETIRED_SHADOW_L1_JT_TRIPLES   29 triples   java/util/jar/Attributes,
                                                       $Name, JarEntry, Manifest,
-                                                      java/text/ParseException,
                                                       java/text/Normalizer
 ```
 

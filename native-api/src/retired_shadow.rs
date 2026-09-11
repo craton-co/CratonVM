@@ -3520,11 +3520,11 @@ mod tests {
         }
     }
 
-    /// The twelve rows wave 4 repairs, by the triple that repairs
+    /// The nine rows wave 4 repairs, by the triple that repairs
     /// each. A later edit that drops one of these fails here rather than in a
     /// probe nobody runs.
     #[test]
-    fn the_twelve_jar_text_defect_rows_this_wave_repairs_are_retired() {
+    fn the_nine_jar_text_defect_rows_this_wave_repairs_are_retired() {
         for (c, m, d) in [
             (
                 "java/util/jar/Attributes",
