@@ -429,61 +429,103 @@ agrees: arming `java/util/concurrent/CopyOnWrite` empties the set out —
 
 ## 6. The acceptance measurement
 
-Three binaries, all from this branch, so the arithmetic is about the change and
-not about a revision:
+**Two binaries from ONE revision, differing in ONE file.** Both are
+`--release --features management` at `33e6d6759` on the merged tree; the control
+has `origin/dev`'s `retired_shadow.rs` substituted in and nothing else changed,
+so the difference between them is this lane's table and the two source fixes are
+in BOTH. That is the shape a retirement's A/B has to have — binary vs binary,
+not dial vs dial, and not one binary from each of two revisions.
 
 ```text
-  a   the Unsafe atomicity fix, no table
-  b   + the executor fix, + 81 table rows
-  c   + 19 more table rows (the delegating Unsafe atomics/fences, three VM rows)
+  cratonvm-l5ctl   cd1592380cbc   dev's table
+  cratonvm-l5d     75524176ae18   this branch's 98
 ```
 
-**The refusal census first, because a wave can be a no-op that looks clean.**
-A table entry retires a triple only when nothing already owns it —
-`JdkOnlyViolation::SyntheticNativeRegistered` carries a `survivor`, and a
-non-null one means an earlier registration is still serving and every probe
-reads exactly as it did before. On binary c:
+**First, that the retirement is not INERT**, because a wave that refuses nothing
+produces a clean A/B for the wrong reason. `--jdk-only-report` carries a
+`refusals` object, and one probe (`L5ExecutorSweep`) run once on each binary
+reads:
 
 ```text
-  105 refusals, 0 with a survivor
+                                   l5ctl   l5d
+  interpreter_bytecode_preferred     117     138   (+21)
+  interpreter_shadow_unenforced      141     105   (-36)
 ```
 
-105 rather than 100 because five triples are registered more than once
-(`CopyOnWriteArrayList` 19 refusals for 16 rows, `ThreadPoolExecutor` 16 for
-15, `jdk/internal/misc/Unsafe` 17 for 16).
+Twenty-one dispatches move from a native to the JDK's own bytecode and
+thirty-six shadow observations stop being raised, in a single probe. The table
+is live.
 
-**Whole probe tree, a against c, arms concurrent, 123 probes:**
+**Whole probe tree, control against trial, arms concurrent, 123 probes:**
 
 ```text
-  worse   0
-  better  5   L5ExecutorSweep -4, L5TpeCount -4, NullArgMsgProbe -2
-              L4FilesSweep -307   <- an instrument artefact, see below
-              VtHandoffProbe -4   <- the known-flaky row, not claimed
+  measured           123
+  worse                1   VtHandoffProbe +10  <- the flaky row; discharged below
+  better               2   L5ExecutorSweep -2, NullArgMsgProbe -2
+  line-count moved     0
 ```
 
-**Corpus, binary c:**
+`line-count moved 0` is the load-bearing one: no probe produced a different
+NUMBER of rows on the two binaries, so nothing crashed earlier, truncated, or
+silently stopped. Every `L4FilesSweep`-shaped instrument artefact from the
+earlier waves shows up in that column first, and this run has none.
+
+**The one worse row is the control's flakiness, and it is measured rather than
+waved away.** `VtHandoffProbe`, twelve runs interleaved between the two binaries
+against the same HotSpot capture:
+
+```text
+  l5ctl   10, 0, 0, 10, 10, 14
+  l5d     10, 10, 14, 10, 10, --
+```
+
+Both arms span 0 to 14 on an unchanged binary, and 16 rows every time. The A/B
+caught the control on one of its zero runs. §7 already priced this probe from
+the phase-2 batteries; this is the same number from a different instrument, and
+it is bigger than the effect anybody could claim from it.
+
+**Corpus, the trial binary, all three arms:**
 
 ```text
   CRATONVM_ARGS=--jdk-only    132 passed, 0 failed
   SUITE=all                   132 passed, 0 failed
-  SUITE=core                   91 passed, 1 failed  (RSocketChannelInterrupt)
+  SUITE=core                   92 passed, 0 failed
 ```
 
-**That one failure is the host, and it is attributed rather than assumed.**
-`SUITE=core` run three more times on the CONTROL binary and three more on the
-trial:
+`SUITE=core` is 92/92 here. It read 91/92 earlier in the session and that was
+attributed to the host at the time — six runs, three per arm, with the CONTROL
+supplying the only failure. This run agrees with the attribution rather than
+resting on it.
+
+**The gate set, and which reds are `dev`'s:**
 
 ```text
-  control  91/92 (failed: RBlockingQueue)   92/92   92/92
-  trial    92/92                            92/92   92/92
+  cratonvm-types                        607/0, and doc_numeric_claims 3/4
+  native-builtins --lib   (x3, alone)   4237 / 0 each time
+  native-builtins registrar_drift       6/1
+  native-api --lib                      367 / 0
 ```
 
-The trial is 92/92 three times out of three, and the run that failed is the
-CONTROL's, on a different vector. `RSocketChannelInterrupt` is a
-socket-plus-interrupt vector and `RBlockingQueue` a concurrency one; which arm
-fails moves with the host's load, not with the binary. **Host load flips
-pass/fail, not only timings** — and the cheap tell, before any of these six
-runs, was that the control failed at all.
+Two of those are red and neither is this branch's, each checked against a
+pristine `origin/dev` worktree rather than assumed:
+
+  * `doc_numeric_claims::flag_inventory_surface_counts_are_current` — the
+    hand-written flag count in `docs/config/flag-inventory.md` says 1,382 and the
+    tree has 1,387. Identical failure, identical numbers, on pristine dev.
+  * `registrar_drift::the_drift_baseline_has_no_stale_rows` — `register_p59_module`
+    and `java/lang/Class.getModule()`. Identical on pristine dev, under both
+    `--lib` and `--tests`.
+
+**And one red that was neither dev's nor this branch's: 43 failures that the
+host invented.** The first `--tests` pass reported 4194 passed / 43 failed in the
+default arm, all in `jboss_module_loader::t19_h15_*`, while the SAME `--lib`
+passed under `--features management` and `--features synthetic-jdk` in the same
+sweep. A deterministic break does not pick one feature arm. That run was
+concurrent with a 50-minute release build; run alone the same target is **4237
+passed / 0 failed, three times out of three**, which is pristine dev's number
+exactly. A failure that does not reproduce alone is a claim about the host, and
+the cheap tell was that two of the three arms disagreed with the first.
+
 
 ### The instrument lesson: two arms of a filesystem probe collide
 
@@ -511,11 +553,34 @@ sequentially and say so, not to sequentialise the battery.
 The tell was there without the re-runs: `rc=1` on BOTH arms. A row where the
 control also failed is not a row about the trial.
 
+### The instrument lesson: a corpus arm that runs nothing exits clean
+
+The first attempt at the three arms above produced this, in four seconds:
+
+```text
+  ### jdk-only
+  ### SUITE=all
+  ### SUITE=core
+  CORPUSDONE
+```
+
+Three headers, no suite lines, exit 0. `regression-suite/run.sh` needs `JDK=`
+as well as `CV=`, and without it stops at `ERROR: javac not found` — which the
+`grep -E 'REGRESSION SUITE|COUNTS'` filter discarded, leaving a transcript that
+looks like three arms with nothing to say rather than three arms that never ran.
+
+The general form is already in this tree twice (`difftest` skipping every seed
+with no `javac`; `REQUIRE_E2E` guarding the binary and not the run), and the
+remedy is the same each time: **put the error pattern in the filter**, and read
+the CLOCK. Three corpus arms cannot finish in four seconds.
+
 ## 7. The two probes the lane page named, and their noise floor
 
 The lane page said `JdkOnlyPlatformProbe` and `VtHandoffProbe` are unusable and
 that a delta from either is a coin flip. This session produced the cleanest
-evidence of that yet, without meaning to.
+evidence of that yet, without meaning to — and then produced it a second time
+from a different instrument, in §6's twelve interleaved `VtHandoffProbe` runs,
+where the CONTROL binary spans 0 to 14 on six runs of unchanged code.
 
 A whole-tree battery prints the dial's `yielded/reached` beside every row. In
 three of the arms above, both probes moved **while the dial was never asked** —
@@ -596,3 +661,15 @@ produce.
    memory-address family, because the dial arms a class and the table is per
    triple, and the class-wide arm is where `L4BridgeSweep` goes from 499 rows
    to zero.
+5. **The two `ScheduledThreadPoolExecutor` rows, if and only if real-JDK mode
+   is measured.** §4a took them out because the re-tag disarms
+   `keep_real_scheduled_executor_bridge` and this lane measured `--jdk-only`
+   only. They are not permanently unretirable — they are unretirable *by the
+   table*. Retiring them means establishing, in REAL-JDK mode, that Spring's
+   `ThreadPoolTaskScheduler` anonymous subclass still constructs without the
+   bridge, and then deleting the keep arm and the table entry together. That is
+   a Spring-corpus measurement, not a probe-tree one, so it belongs to whoever
+   owns that corpus rather than to this lane.
+   `registry::tests::real_layout_bridge_keeps_are_not_retired_shadows` will go
+   red the moment someone adds the rows without the other half, which is the
+   point of it.
