@@ -1,14 +1,27 @@
-# A phi copy staged in RAX, and the pairing census that said where to look
+# Three lines of one loop's instruction budget: a phi copy, a branch, and the census that redirected both
 
-**2026-09-11.** Every phi edge copy in the optimizing tier was staged through
-RAX and then published into the phi's own register — `mov rax, r15` /
-`mov r12, rax` — so a loop paid **one instruction per loop-carried value per
-iteration** to move a value that was already in a register.
+**2026-09-11.** The tiering inversion on a field-read loop is **1.208x** on this
+host. Counted per ITERATION rather than per body, the optimizing tier spends 26
+instructions where the single-pass tier spends 20 — and three of the six are
+avoidable for reasons that have nothing to do with registers or with memory
+traffic, which is where every previous attempt looked.
 
-Staging in the destination's register instead is worth **1.05x to 1.12x** on
-`probes/FieldLoop.java` `sum` across three invocations that agree on the sign,
-and takes the tiering inversion on that shape from **1.208x to ~1.11x** on this
-host. `CRATONVM_JIT_IR_PHI_COPY_DIRECT=0` is the kill switch.
+Two of the three are fixed here, and the third is named:
+
+| | worth | measured |
+|---|---|---|
+| **§5** phi edge copies staged through RAX rather than the phi's own register | 2 instructions/iteration | **−4.8% to −10.5%**, four invocations |
+| **§9** the loop's exit branch went the wrong way round | 1 instruction + 1 taken branch/iteration | **UNMEASURABLE**, reported as such |
+| **§4** no unrolling, and an explicit receiver null check | 3 + ~1 instructions/iteration | unbuilt |
+
+Together the two fixes take the inversion from **1.208x to ~1.11x** on this
+shape. `CRATONVM_JIT_IR_PHI_COPY_DIRECT=0` and
+`CRATONVM_JIT_IR_BRANCH_LAYOUT_POLARITY=0` are the kill switches.
+
+**And the census that redirected the work**, because neither change was the one
+the previous page said to make: the pairing census §1 asks for says operand
+POSITION is **3.8%** of the pass's windows, not the 82% that page's own
+denominator reported.
 
 Sibling of
 [`c2-one-carry-slot-is-the-frame-traffic-ceiling-FIXED-20260910.md`](c2-one-carry-slot-is-the-frame-traffic-ceiling-FIXED-20260910.md)
@@ -224,7 +237,7 @@ frame the same number of times per iteration**, so "the optimizing tier
 round-trips its values through memory" is not what separates them on this
 shape, which is the same conclusion §3 reaches from the other direction.
 
-## 5. The change
+## 5. The first change: a phi copy reads into its own register
 
 `Lowerer::emit_copy_op` had three steps per phi copy:
 
@@ -389,27 +402,173 @@ shell version does not face, recorded because each cost a run:
   culture, because a decimal comma is a trap for whoever pastes it into a
   markdown file.
 
-## 9. What is still owed
+## 9. The budget's next line: the loop branched the wrong way
 
-1. **A real application.** Every number here is a probe. The change is
-   per-loop-carried-value-per-iteration and should show up wherever the
-   optimizing tier compiles a counted loop, which is exactly the claim a
-   workload measurement would test.
-2. **The two larger items the budget in §4 names**, in order of size: the
-   optimizing tier does not unroll (~1.12x on this shape, on record), and its
-   receiver null check is explicit where the single-pass tier's is implicit
-   (`CRATONVM_JIT_IR_THIS_NONNULL`, built, default OFF, and measured *slower* —
-   which is still the most suspicious result in `JIT_OPTIMIZATION.md`).
-3. **A per-op breakdown of `producer_arm`** — 16.2% of all pairing windows and
-   the only row the pass can act on. `Op::Load` is the conspicuous exclusion and
-   the one whose reason is textual rather than semantic; whether it is 10 of
-   those 5,560 or 4,000 of them is one more counter and nobody has it.
-4. **The census on a real application.** §1's probe-set totals are 188 probes,
-   which is a corpus of kernels. Whether `multi_use` stays at 78% on Spring or
-   H2 — where the loops are shorter and the straight-line code longer — is a
-   different question and the totals cannot answer it.
+§4 counts four TAKEN branches per iteration against the single-pass tier's one.
+One of the four was free, and it is the same kind of defect as §5's: a default
+that nobody had looked at since the thing it defaulted to arrived.
 
-## 10. Reproducing
+### The shape
+
+```asm
+25d: cmp  ebx,r14d
+260: jl   +5        ; to the loop body -- TAKEN every iteration
+266: jmp  exit      ;   ...skipping this
+26b: <loop body continues>
+```
+
+A conditional branch over an unconditional one, to reach the block physically
+underneath. The loop body was already the next block the scheduler had laid
+out.
+
+### The cause: a fallback that is inverted for every javac counted loop
+
+The fused-branch arm picks which edge FALLS THROUGH from `branch_hints`:
+
+```rust
+let favor_false = node.bytecode_pc
+    .and_then(|pc| self.branch_hints.get(&pc).copied()) == Some(false);
+```
+
+`branch_hints` is populated only under `CRATONVM_TIER_PGO`. **On a default run
+it is empty**, so `favor_false` is false and the arm always made the `true`
+edge the near one.
+
+For a counted loop that is exactly backwards, and the reason is already written
+down one section of `JIT_OPTIMIZATION.md` away, in the range-BCE closeout:
+**javac puts the loop body on the FALSE edge.** `for (i = 0; i < n; i++)`
+compiles to `if_icmpge exit`; the builder preserves that polarity; so `Proj(0)`
+— this arm's `true_block` — is the loop EXIT. The near edge was the exit, the
+exit was not the next block, and the arm therefore emitted a `JMP rel32` for it
+*and* left the hot edge on the taken side of the conditional.
+
+`ir_fallthrough_enabled`'s elision — default-ON since 2026-09-09, and built
+precisely to stop a block exit spending five bytes on a jump to the next
+instruction — could not reach it, because the arm had already decided the wrong
+edge was near.
+
+### The fix, and why it is a tie-break rather than an override
+
+`CRATONVM_JIT_IR_BRANCH_LAYOUT_POLARITY` (default ON): with no hint, the
+fall-through edge is whichever successor the block LAYOUT put next.
+`layout_hot_paths` is default-ON, needs no profile (`static_branch_probs`
+derives its probabilities from loop structure alone), and emission order is
+block index order — so `block_idx + 1` *is* the layout's decision, and it is
+the same test `emit_jmp_to_block_or_fall_through` reads. At most one successor
+can be next, so there is never a choice between two layout facts.
+
+```asm
+260: jge  exit      ; not taken on the hot path
+266: <loop body continues>
+```
+
+**−5 bytes, −1 instruction, −1 taken branch per iteration**, and the loop's exit
+test becomes a forward not-taken branch, which is also what static prediction
+assumes.
+
+**It does not override a hint that exists, and a test caught it trying.** The
+first version preferred the layout unconditionally and turned
+`step4_ir_lower_consumes_branch_bias_hint` red. That test is a shipped
+contract, and the interaction it exposed is real: `ScheduleOptions::branch_counts`
+exists and is documented as taking the same per-bci profile, but
+`production_schedule_options()` leaves it **empty** — so the profile reaches
+codegen's branch polarity and never reaches the block layout at all. Where the
+two disagree, the profile is evidence about frequency and `block_idx + 1` is a
+heuristic's guess, so the profile wins. The cost of deferring is one
+`JMP rel32` and no extra taken branch.
+
+(That gap — the layout cannot see the profile the lowerer can — is a residual,
+and it is listed in §10.)
+
+### Measured: it engages, it is smaller, and it measures NOTHING
+
+| | |
+|---|---|
+| `FieldLoop.sum` body | 1059 B → **1054 B** |
+| hot-path instructions per iteration | 24 → **23** |
+| hot-path TAKEN branches per iteration | 4 → **3** |
+| branches taking the layout polarity, `CratonBenchC2` | **41** |
+| branches taking it, `FieldLoop` / `MultiFieldLoop` | 1 / 1 |
+
+| workload | floor | effect | verdict |
+|---|---:|---:|---|
+| `FieldLoop.sum`, user CPU, 2.6 s samples | 0.6% | +0.6% | **UNMEASURABLE** |
+| `CratonBenchC2` total, wall, interleaved ×6 | 4.8% | −2.5% | **UNMEASURABLE** |
+
+Checksums identical in every run of both (`CratonBenchC2`'s three phases across
+24 runs).
+
+**So there is no throughput evidence for this change, and that is the result,
+not an omission.** What there is: it never emits more instructions or more taken
+branches than the shape it replaces (near-is-next is weakly better in both, and
+strictly better when the near edge would otherwise need a `JMP`); it defers to
+the profile where one exists; and it repairs a default that was wrong for the
+commonest loop shape in Java. Those are the reasons it ships ON, and
+`=0` is there because nobody has shown it pays.
+
+### A harness finding worth more than the number
+
+The first `FieldLoop` run reported **+1.3% against a "0.0%" floor** — the
+tightest floor this apparatus has ever printed, and meaningless. Windows
+accounts CPU in ~15.625 ms scheduler ticks, the samples were 0.586 s, so **one
+tick was 2.7% of a sample** and both medians had merely landed on the same tick.
+Re-run at six times the work per sample it became +0.6% against a 0.6% floor:
+UNMEASURABLE, the correct answer.
+
+A floor below one tick is not a floor; it is two numbers that were never
+distinguishable. `cpu-ab.ps1` now prints the tick as a percentage of the median
+beside the floor and refuses a verdict inside it:
+
+```text
+noise floor (A vs C)      :    0.6%
+one CPU tick (15.6 ms)    :    0.6%  of the median sample
+VERDICT: UNMEASURABLE -- the effect (0.6%) is inside ONE CPU TICK (0.6%),
+         whatever the floor says. Raise the work per sample.
+```
+
+This sits beside §5.2 of the GP-register page as the second way a clean floor
+misleads: that one is drift BETWEEN invocations, this one is resolution WITHIN
+one. Both make a tight floor read as permission to stop.
+
+## 10. What is still owed
+
+1. **A real application.** Every throughput number here is a probe.
+   `CratonBenchC2` was run for §9 and its floor (4.8%) made it useless as an
+   instrument; four of `CratonBench`'s seven kernels are not served by this
+   tier at all, so an A/B there compares a binary with itself. netty and
+   hibernate are where the IR-inlining soak measured 8% and 15–26%, and those
+   are the arms that would price either change on their own terms.
+2. **The third line of §4's budget, in order of size.** The optimizing tier
+   does not unroll — three instructions per iteration it pays every time and
+   the single-pass tier pays once per four, priced at about 1.12x on this shape
+   in `JIT_OPTIMIZATION.md`. Then the receiver null check, which is explicit
+   here and implicit there; `CRATONVM_JIT_IR_THIS_NONNULL` is built, default
+   OFF, and measured ~20% SLOWER, which that document flags as the most
+   suspicious result on it.
+3. **The two remaining TAKEN branches per iteration are intra-block cold code**,
+   and neither is reachable by the block layout. `emit_inline_compact_getfield`
+   emits its legacy-layout arm INLINE and jumps the hot path over it
+   (`jmp` at `0x1fc`); `emit_safepoint_poll` does the same with its slow path
+   (`je` at `0x26d`). `layout_hot_paths` moves BLOCKS, and neither of these is
+   a block — they are forward patches inside one. Sinking emitter-local cold
+   paths out of line is the change that would reach them, and it is a bigger
+   one than either fix on this page.
+4. **The block layout cannot see the profile the lowerer can.**
+   `ScheduleOptions::branch_counts` exists and is documented as taking the same
+   per-bci bias `ir_lower::branch_hints` takes, and
+   `production_schedule_options()` leaves it empty. So a profiled branch informs
+   the polarity of one `Jcc` and never informs which block is placed next —
+   which is why §9 has to make the profile outrank the layout rather than
+   letting them agree. Populating it is small and nobody has.
+5. **A per-op breakdown of `producer_arm`** — 16.2% of all pairing windows and
+   the only row that pass can act on. `Op::Load` is the conspicuous exclusion
+   and the one whose reason is textual rather than semantic: its three lowering
+   paths are mutually exclusive and each ends in one `store_rax` with RAX
+   holding the result, but the mechanical test counts `self.store_rax(slot);`
+   textually and sees three. Whether that is 10 of the 5,560 or 4,000 of them is
+   one more counter.
+
+## 11. Reproducing
 
 ```bash
 cargo build --release -p cratonvm-cli
@@ -424,13 +583,20 @@ CRATONVM_JIT=force-c2 CRATONVM_DBG_IR_LINEAR_SCAN=1 \
 CRATONVM_JIT=force-c2 CRATONVM_DBG=jitc \
   ./target/release/cratonvm -cp /tmp/pc FieldLoop 2>&1 | grep 'operand pairing'
 
-# section 5 — the emitted code, both arms from one binary
-for F in 1 0; do
-  CRATONVM_JIT_IR_PHI_COPY_DIRECT=$F CRATONVM_JIT=force-c2 \
-  CRATONVM_DBG=jit-disasm CRATONVM_DBG_JIT_DISASM=FieldLoop.sum \
-    ./target/release/cratonvm -cp /tmp/pc -Dprobe.reps=9000 -Dprobe.n=300 FieldLoop 2>&1 \
-    | grep -m1 'full/ir FieldLoop.sum'
+# sections 5 and 9 — the emitted code, both arms of either flag, one binary
+for FLAG in CRATONVM_JIT_IR_PHI_COPY_DIRECT CRATONVM_JIT_IR_BRANCH_LAYOUT_POLARITY; do
+  for F in 1 0; do
+    env "$FLAG=$F" CRATONVM_JIT=force-c2 \
+    CRATONVM_DBG=jit-disasm CRATONVM_DBG_JIT_DISASM=FieldLoop.sum \
+      ./target/release/cratonvm -cp /tmp/pc -Dprobe.reps=9000 -Dprobe.n=300 FieldLoop 2>&1 \
+      | grep -m1 'full/ir FieldLoop.sum'
+  done
 done
+
+# section 9 — engagement on a workload rather than a kernel
+CRATONVM_JIT=force-c2 CRATONVM_DBG=jitc \
+  ./target/release/cratonvm -Xmx4g -cp bench-classes CratonBenchC2 2>&1 \
+  | grep 'branch polarity from layout'
 ```
 
 ```powershell
@@ -450,15 +616,20 @@ quoted beside its effect. A floor above ~3% means the run is describing the
 machine — and §5.2 of the GP-register page is why that is a necessary condition
 and not a sufficient one.
 
-## 11. Green
+## 12. Green
 
-* 2356 `cratonvm-jit` unit tests, 145 `ir_vs_singlepass` differential tests,
+* 2357 `cratonvm-jit` unit tests, 145 `ir_vs_singlepass` differential tests,
   2641 `cratonvm-vm` unit tests, 607 `cratonvm-types`.
 * **Regression suite 92/92** against HotSpot (`CV=... JDK=... regression-suite/run.sh`).
 * The flag surface gates the pre-push hook runs — `flag_declaration_guard`,
   `flag_surface`, `flag_docs_generated` — with `docs/flag-tokens.md` and
   `docs/config/flag-inventory.md` regenerated from `INVENTORY` by
   `tools/flag-census/render-*.sh`.
+* **§9's branch change is the broadest thing on this page** — it moves every
+  fused two-way branch in every optimizing-tier body, not just a loop's — so
+  the 92-vector HotSpot differential is the gate that matters for it, and it is
+  the reason `step4_ir_lower_consumes_branch_bias_hint` turning red was worth
+  stopping for rather than working around.
 * **Checksums identical in both arms** on `CratonBench` (all seven phases:
   `5000000003999999995`, `701408733`, `9592`, `173943680`,
   `1549999915000000`, `5000050000`, `68332206`) and on `CratonBenchC2` (all
