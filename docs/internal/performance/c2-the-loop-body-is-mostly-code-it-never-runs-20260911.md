@@ -1,7 +1,7 @@
 # The optimizing tier's loop body is mostly code it never runs
 
 **Status:** one default flipped, one wrong answer fixed, two switches left OFF
-because they measured as nothing.
+because they measured as nothing. §7 adds the `sumWide` arm §6 left open.
 **Shape:** `probes/FieldLoop.java` `sum` — `for (i…) a += this.fx;`
 **Predecessor:** `c2-the-phi-copy-staging-register-20260911.md`, whose §4 asked
 the question this answers.
@@ -315,10 +315,8 @@ the signal to stop and clean the host, not to report the number.
   `docs/JIT_OPTIMIZATION.md` has been corrected: it was the best lead anyone had
   on the residual inversion, and there is no longer an effect for it to be a
   lead on.
-* **`sumWide` is unmeasured.** `probes/FieldLoop.java`'s four-accumulator arm
-  exists to separate a latency bottleneck from extra work, and every number here
-  is from `sum`. The memory-edge hoist should help it more (four reads become
-  one), which is exactly why it should be checked rather than assumed.
+* ~~`sumWide` is unmeasured.~~ **Measured — see §7.** It helps more there, not
+  less, and the reason is not the one this bullet guessed.
 * **The speculation permission is narrow on purpose** (§3a): receiver, or
   `definitely_non_null`, or already anchored at the header. A loop whose bound
   is provably positive, or a base proven non-null by a dominating check, is
@@ -327,3 +325,59 @@ the signal to stop and clean the host, not to report the number.
 * **Nothing aligns a loop header**, and there is no nop/pad emitter in this
   backend at all. Worth less than it looked like before §5, for the same reason
   as the first bullet.
+
+---
+
+## 7. `sumWide`, which §6 said should be checked rather than assumed
+
+`probes/FieldLoop.java`'s other arm: the same loop with four INDEPENDENT
+accumulators, all reading the same field. The probe's own comment says it is not
+a second benchmark — the ratio between the two arms separates a latency
+bottleneck (which independent work overlaps) from extra work (which does not).
+
+Same apparatus as §5, `-Dprobe.wide=true`, nine rounds, checksum `4800600000`
+on all 108 runs.
+
+| | baseline | optimizing | ratio | floor |
+|---|---:|---:|---:|---:|
+| memory edge OFF | 1480 ms | 1418 ms | 0.964x | 1.2% |
+| memory edge ON | 1454 ms | **649 ms** | **0.445x** | 0.9% |
+
+The flag against itself on the optimizing tier: 1436 ms → 674 ms, **0.472x**,
+floor 1.3% — a *larger* win than `sum`'s 0.589x.
+
+### Two things this corrects
+
+**§6 guessed the mechanism wrong, and so did the guess that replaced it.** The
+bullet said "four reads become one". Reading the bytecode — four `getfield #7`
+sites at bci 21, 28, 36 and 44, same field, same receiver — the obvious
+correction was that GVN and the receiver-guard CSE would have collapsed them to
+one load long before LICM looked, making the win *smaller*. Both were wrong, and
+the disassembly says so plainly:
+
+| `sumWide` loop, header to back edge | instructions | field-read sequences inside |
+|---|---:|---:|
+| memory edge OFF | 145 | **4** |
+| memory edge ON | **69** | **0** |
+
+Nothing collapsed them. Each site kept its own epoch guard, null test, compact
+test, read and jump, and all four ran every iteration. The accurate sentence is
+*four read sequences become zero inside the loop*, and it is worth more than one
+because there were four of them to remove.
+
+**There was no inversion on this shape to begin with.** With the memory edge off
+the optimizing tier is already 0.964x here — 3.6% against a 1.2% floor — where
+`sum` is 1.120x. So the tiering inversion is narrower than "the optimizing tier
+is slower": it is a property of a loop whose *entire* body is one guarded read,
+where the per-iteration overhead has nothing to hide behind. Widen the body with
+independent work and it disappears on its own.
+
+### What this opens
+
+The four reads are hoisted, but they are still **four**: the pre-header holds
+four complete read sequences where one would do. GVN does not dedup them even
+once they share a control anchor and a memory state, which it should be able to
+after the memory edge moves. Once per call rather than once per iteration, so it
+is worth little on a 20,000-iteration loop and proportionally more the shorter
+the loop — and "identical loads in the same block do not GVN" is a fact about
+the pass worth knowing whatever it is worth here.
