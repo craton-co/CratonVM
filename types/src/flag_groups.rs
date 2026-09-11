@@ -1281,7 +1281,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "inline-putfield", on_key: None, off_key: Some("CRATONVM_NO_JIT_INLINE_PUTFIELD"), off_word: None, since: "2026-07-24" },
     E { group: Group::JIT, token: "inline-self-guard", on_key: Some("CRATONVM_JIT_INLINE_SELF_GUARD"), off_key: None, off_word: None, since: "2026-07-10" },
     E { group: Group::JIT, token: "inline-tlab-new", on_key: None, off_key: Some("CRATONVM_NO_JIT_INLINE_TLAB_NEW"), off_word: None, since: "2026-07-24" },
+    E { group: Group::JIT, token: "inline-tlab-newarray", on_key: None, off_key: Some("CRATONVM_NO_JIT_INLINE_TLAB_NEWARRAY"), off_word: None, since: "2026-09-11" },
     E { group: Group::JIT, token: "intrinsics", on_key: None, off_key: Some("CRATONVM_DISABLE_INTRINSICS"), off_word: None, since: "2026-05-22" },
+    E { group: Group::JIT, token: "sb-intrinsics", on_key: None, off_key: Some("CRATONVM_NO_JIT_SB_INTRINSICS"), off_word: None, since: "2026-09-11" },
+    E { group: Group::JIT, token: "staged-arg-slot", on_key: None, off_key: Some("CRATONVM_NO_JIT_STAGED_ARG_SLOT"), off_word: None, since: "2026-09-11" },
     E { group: Group::JIT, token: "ir-branchy", on_key: None, off_key: Some("CRATONVM_NO_IR_BRANCHY"), off_word: None, since: "2026-06-18" },
     E { group: Group::JIT, token: "ir-call", on_key: Some("CRATONVM_JIT_IR_CALL"), off_key: None, off_word: None, since: "2026-06-20" },
     E { group: Group::JIT, token: "ir-call-special", on_key: Some("CRATONVM_JIT_IR_CALL_SPECIAL"), off_key: None, off_word: None, since: "2026-06-21" },
@@ -2667,6 +2670,7 @@ pub const INVENTORY: &[E] = &[
     // so `CRATONVM_LOADER=enforce-native-shadow` could not reach it and no test
     // could arrange it.
     E { group: Group::LOADER, token: "enforce-native-shadow", on_key: Some("CRATONVM_ENFORCE_NATIVE_SHADOW"), off_key: None, off_word: None, since: "2026-08-06" },
+    E { group: Group::LOADER, token: "unretire-native-shadow", on_key: Some("CRATONVM_UNRETIRE_NATIVE_SHADOW"), off_key: None, off_word: None, since: "2026-09-11" },
     // Default ON. `-cf-delegating-yield` keeps the pure-delegation
     // `CompletableFuture` natives in front of the real JDK bytecode, so the
     // yield can be A/B'd on one binary. See

@@ -13653,6 +13653,13 @@ pub fn register_essential_natives_with_shims(
     // shadow census by construction. That is a real cost — the row leaves the
     // population the dial can ask about — and it is earned here by the numbers
     // above, not by "yielding breaks it".
+    //
+    // One distinction from the superseded L0 copy of this comment, kept because
+    // it is the §1.5 boundary and it is easy to lose: `initClassName` sits
+    // directly above and stays `Bridge` DELIBERATELY. That one IS `ACC_NATIVE`
+    // in the image, so §1.5 governs it and `Bridge` is the correct tag; this
+    // row is ordinary bytecode, which is why it needed §1.4's reviewed
+    // exception instead. The two rows look interchangeable and are not.
     registry.register_with_kind(
         "java/lang/Class",
         "getName",
