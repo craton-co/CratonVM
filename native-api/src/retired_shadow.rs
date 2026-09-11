@@ -2380,6 +2380,8 @@ static RETIRED_SHADOW_PHASE3_TRIPLES: &[(&str, &str, &str)] = &[
 static RETIRED_SHADOW_L7_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/lang/ClassLoader", "registerAsParallelCapable", "()Z"),
     ("java/security/SecureClassLoader", "<clinit>", "()V"),
+];
+
 /// Lane 5 — `java/util/concurrent/`, `Thread`, `Unsafe`, retired 2026-09-10.
 ///
 /// `docs/internal/retired/lane-5-concurrent-thread-unsafe-RETIRED-20260910.md`
@@ -3384,6 +3386,14 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // `the_tables_const_lists_every_table_the_predicate_consults` exists to
     // catch, and it is what caught it.
     RETIRED_SHADOW_L1_TRIPLES,
+    // And here by the 2026-09-11 merge of lane 7, for exactly the reason the
+    // note above gives — same shape, second occurrence in two days. Lane 7's
+    // table and this const were also written on branches that never saw each
+    // other, `git merge` resolved both files, and the omission was again
+    // invisible to every per-table test. Two in two days says the failure mode
+    // is structural: a new table is added at the bottom of a list in one file
+    // and consulted in another, and nothing textual connects them.
+    RETIRED_SHADOW_L7_TRIPLES,
 ];
 
 #[cfg(test)]
