@@ -613,7 +613,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-440 tokens.
+443 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -707,7 +707,10 @@ export inherited from a parent shell.
 | `inline-putfield` | `CRATONVM_NO_JIT_INLINE_PUTFIELD` |
 | `inline-self-guard` | `CRATONVM_JIT_INLINE_SELF_GUARD` |
 | `inline-tlab-new` | `CRATONVM_NO_JIT_INLINE_TLAB_NEW` |
+| `inline-tlab-newarray` | `CRATONVM_NO_JIT_INLINE_TLAB_NEWARRAY` |
 | `intrinsics` | `CRATONVM_DISABLE_INTRINSICS` |
+| `sb-intrinsics` | `CRATONVM_NO_JIT_SB_INTRINSICS` |
+| `staged-arg-slot` | `CRATONVM_NO_JIT_STAGED_ARG_SLOT` |
 | `ir-branchy` | `CRATONVM_NO_IR_BRANCHY` |
 | `ir-call` | `CRATONVM_JIT_IR_CALL` |
 | `ir-call-special` | `CRATONVM_JIT_IR_CALL_SPECIAL` |

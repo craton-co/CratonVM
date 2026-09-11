@@ -27727,6 +27727,20 @@ fn invoke_on_class_shared_inner(
                                 // unsurfaced jdk.localedata bundle and otherwise
                                 // returns null → appendPattern(null) NPE.
                                 || method_name == "getJavaTimeDateTimePattern"))
+                        // BREAKITER, the real data (2026-09-11): the two
+                        // readers `BreakIteratorProviderImpl.getBreakInstance`
+                        // needs, answered from the image's own
+                        // `BreakIteratorInfo` bundle class and
+                        // `*BreakIteratorData` binary rather than null. This is
+                        // the gate the BREAKITER arm above is waiting on: once
+                        // the real chain builds a `sun.text.RuleBasedBreakIterator`,
+                        // `java/text/BreakIterator`'s 17 registrations can be
+                        // retired instead of pinned (lane 1 §10 item 5).
+                        || (class_name == "sun/util/locale/provider/LocaleResources"
+                            && matches!(
+                                method_name,
+                                "getBreakIteratorInfo" | "getBreakIteratorResources"
+                            ))
                         // java.time text names: `CalendarDataUtility.retrieve
                         // JavaTimeFieldValueName(s)` back `DateTimeTextProvider`'s
                         // `EEE`/`MMM`/`a`/`G` lookups. Same locale-data gap as

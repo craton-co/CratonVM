@@ -1863,7 +1863,20 @@ use cratonvm_types::compat::CompatibilityMode;
 /// side: on a branch this busy the constant is re-measured per merge, never
 /// added up. Totals stay 13623 / 13991 / 13658, so lane 6's 17 are
 /// relabellings too.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2707;
+///
+/// **Re-frozen again 2026-09-11 on the lane 1 wave 5 merge: 2620 -> 2622.**
+/// `+2`, and the account the assertion demands is two rows —
+/// `sun/util/calendar/ZoneInfoFile.getZoneInfo` and `getZoneInfo0`, the whole
+/// of `RETIRED_SHADOW_L1_ZI_TRIPLES`. The table's own length and this ratchet
+/// are two instruments reporting one number.
+///
+/// RE-MEASURED on the merged tree rather than carried across it. This branch
+/// had measured `2560` against dev's earlier `2558`; dev then re-froze to
+/// `2620` for lanes L0/L3/L6 while this wave was in its corpus runs, and
+/// `2620 + 2` was NOT assumed — each arm was run again and this is its printed
+/// line. That is the treadmill the note above names: on a branch this busy the
+/// constant is re-measured per merge, never added up.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2622;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2088,7 +2101,20 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2707;
 /// side: on a branch this busy the constant is re-measured per merge, never
 /// added up. Totals stay 13623 / 13991 / 13658, so lane 6's 17 are
 /// relabellings too.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2696;
+///
+/// **Re-frozen again 2026-09-11 on the lane 1 wave 5 merge: 2609 -> 2611.**
+/// `+2`, and the account the assertion demands is two rows —
+/// `sun/util/calendar/ZoneInfoFile.getZoneInfo` and `getZoneInfo0`, the whole
+/// of `RETIRED_SHADOW_L1_ZI_TRIPLES`. The table's own length and this ratchet
+/// are two instruments reporting one number.
+///
+/// RE-MEASURED on the merged tree rather than carried across it. This branch
+/// had measured `2549` against dev's earlier `2547`; dev then re-froze to
+/// `2609` for lanes L0/L3/L6 while this wave was in its corpus runs, and
+/// `2609 + 2` was NOT assumed — each arm was run again and this is its printed
+/// line. That is the treadmill the note above names: on a branch this busy the
+/// constant is re-measured per merge, never added up.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2611;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2235,7 +2261,20 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2696;
 /// side: on a branch this busy the constant is re-measured per merge, never
 /// added up. Totals stay 13623 / 13991 / 13658, so lane 6's 17 are
 /// relabellings too.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2696;
+///
+/// **Re-frozen again 2026-09-11 on the lane 1 wave 5 merge: 2609 -> 2611.**
+/// `+2`, and the account the assertion demands is two rows —
+/// `sun/util/calendar/ZoneInfoFile.getZoneInfo` and `getZoneInfo0`, the whole
+/// of `RETIRED_SHADOW_L1_ZI_TRIPLES`. The table's own length and this ratchet
+/// are two instruments reporting one number.
+///
+/// RE-MEASURED on the merged tree rather than carried across it. This branch
+/// had measured `2549` against dev's earlier `2547`; dev then re-froze to
+/// `2609` for lanes L0/L3/L6 while this wave was in its corpus runs, and
+/// `2609 + 2` was NOT assumed — each arm was run again and this is its printed
+/// line. That is the treadmill the note above names: on a branch this busy the
+/// constant is re-measured per merge, never added up.
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2611;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///

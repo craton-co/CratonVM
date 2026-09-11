@@ -1284,6 +1284,14 @@ const RETIRED_SHADOW_PREFIXES: &[&str] = &[
     // same tables answers `true` for exactly the two `java/time/` rows this
     // wave adds and `false` for everything else, as before.
     "java/time/",
+    // 2026-09-11, L1 wave 5. NARROW, the way lane 7's two are and for the same
+    // reason: `sun/util/` is a large tree whose locale-provider half this lane
+    // has measured as NOT retirable (see `RETIRED_SHADOW_L1_ZI_TRIPLES`'s doc
+    // comment for the five `reached == 0` rows), and admitting the package
+    // would put every one of them one binary search from a future table.
+    // `the_zone_info_file_prefix_retires_only_the_two_measured_rows` is the
+    // guard.
+    "sun/util/calendar/ZoneInfoFile",
     // 2026-09-11, lane L3 adds NO prefix of its own, and that is the merge
     // resolution rather than an omission. This branch carried
     // `java/lang/invoke/` and `java/lang/reflect/` for
@@ -4263,6 +4271,79 @@ static RETIRED_SHADOW_L1_JT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Lane 1, wave 5 — `sun/util/calendar/ZoneInfoFile`, the one row of the
+/// Date/TimeZone/Locale family that a bisection left standing.
+///
+/// ## Why two rows and not the forty
+///
+/// §10 item 6 of the lane page holds `Date`/`TimeZone`/`sun/util/calendar/`
+/// (40) and `Locale` + providers (35) together, and the reason they were held
+/// together was that nobody had asked them separately. Armed one class at a
+/// time on `LocaleDateTzShadowSweep` (base 2 diffs), 2026-09-11:
+///
+/// ```text
+///   java/util/Locale                       +117 WORSE  rc 1   reached=58
+///   sun/util/calendar/ZoneInfo               +4 WORSE         reached=5723
+///   java/util/TimeZone                       +2 WORSE         reached=53
+///   java/util/Currency                       +2 WORSE         reached=4
+///   sun/util/calendar/ZoneInfoFile           +0 same          reached=3792
+///   java/util/Date                           +0 same          reached=0   VACUOUS
+///   sun/util/locale/provider/CalendarDataUtility      +0      reached=0   VACUOUS
+///   sun/util/locale/provider/JRELocaleProviderAdapter +0      reached=0   VACUOUS
+///   sun/util/locale/provider/LocaleResources          +0      reached=0   VACUOUS
+///   sun/util/resources/Bundles                        +0      reached=0   VACUOUS
+///   sun/util/resources/LocaleData                     +0      reached=0   VACUOUS
+/// ```
+///
+/// Six of the seven `+0` rows are §7's vacuity trap wearing a green coat: the
+/// probe never asks those classes anything, so `reached == 0` and the row says
+/// NOTHING. `ZoneInfoFile` is the one `+0` that means something — 3,792 door
+/// engagements and no diff — and it is the only row here.
+///
+/// **A green dial arm is a candidate, not a verdict, and so is a red one.**
+/// This wave's own sibling finding is that `java/util/HashMap` sat held for two
+/// page revisions on nine rows a trial binary reads as zero
+/// (`RETIRED_SHADOW_L1_HM_TRIPLES`), and the converse — an armed arm that
+/// agrees with base is exactly what a LEAKED dial row also looks like. So the
+/// 3,792 buys this table a place in the queue, not a landing: the acceptance is
+/// a trial binary against the whole probe tree, per the four preconditions in
+/// the ops page §7.
+///
+/// ## What the two rows are
+///
+/// Both are registered in `native-builtins/src/lib.rs` and both answer with
+/// `alloc_synth_timezone` — a `sun/util/calendar/ZoneInfo` this VM builds from
+/// its own tzdb parse, with `ID`/`rawOffset`/`dstSavings` populated. The real
+/// bytecode reads `tzdb.dat` out of the image instead. They are a pair on
+/// purpose: `getZoneInfo` is the public entry point, `getZoneInfo0` the private
+/// one it delegates to, and retiring one without the other would leave a
+/// synthesised object being handed to real bytecode or the reverse — the
+/// half-retirement shape wave 3 measured on `HashMap`'s iterators.
+///
+/// ## What is NOT here, and why the prefix is narrow
+///
+/// `sun/util/locale/provider/` and `sun/util/resources/` are the five vacuous
+/// rows above, and they are all one blocker: `LocaleResources` answers `null`
+/// for the class-based bundle families (`getBreakIteratorInfo`,
+/// `getDateTimePattern`), which is what makes `java/text/BreakIterator`'s
+/// yield throw `AbstractMethodError` and what BUG-15 in
+/// `vm/src/vm/vm_exec.rs` pins a native over. That is one engineering front
+/// under four of the lane's remaining items, and it is §10's, not this table's.
+/// Admitting `sun/util/` as a prefix would put all of it one binary search from
+/// a future table for no gain today, so the prefix names this class alone.
+static RETIRED_SHADOW_L1_ZI_TRIPLES: &[(&str, &str, &str)] = &[
+    (
+        "sun/util/calendar/ZoneInfoFile",
+        "getZoneInfo",
+        "(Ljava/lang/String;)Lsun/util/calendar/ZoneInfo;",
+    ),
+    (
+        "sun/util/calendar/ZoneInfoFile",
+        "getZoneInfo0",
+        "(Ljava/lang/String;)Lsun/util/calendar/ZoneInfo;",
+    ),
+];
+
 /// Lane 4 wave 1, 2026-09-11: 140 rows over 10 classes of `java/io/` and
 /// `java/nio/`.
 ///
@@ -5152,6 +5233,11 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // list, so a table missing from it is a table the predicate does not
     // consult.
     RETIRED_SHADOW_L5R_TRIPLES,
+    // 2026-09-11, L1 wave 5. Added HERE and nowhere else, which under the loop
+    // above is the whole registration -- there is no chain arm to forget any
+    // more. See `RETIRED_SHADOW_L1_ZI_TRIPLES` for why two rows and not forty,
+    // and why the table is written but not yet accepted.
+    RETIRED_SHADOW_L1_ZI_TRIPLES,
 ];
 
 #[cfg(test)]
@@ -5272,6 +5358,99 @@ mod tests {
                  sorted and unique: {:?} does not precede {:?}",
                 w[0],
                 w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn every_zone_info_file_entry_is_reachable_through_the_predicate() {
+        for (c, m, d) in RETIRED_SHADOW_L1_ZI_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is in lane 1 wave 5's table but answers false —                  the prefix list does not admit it, so the entry is inert and                  silent."
+            );
+        }
+    }
+
+    // NO per-table sortedness or disjointness test for wave 5, deliberately.
+    //
+    // `the_every_table_is_sorted_and_unique` and
+    // `no_triple_is_claimed_by_two_tables` walk `RETIRED_SHADOW_TABLES`, so a
+    // new table is covered by being in the const — the same thing that makes
+    // it consulted. A hand-written sibling list is the shape those two exist
+    // to replace: this wave was written with one, and it named nine tables
+    // and omitted lane 4's, which landed between the writing and the merge.
+    // Adding L4 to it would have fixed today and rotted again on the next
+    // lane.
+
+    /// The narrow prefix admits ONE class, and the table under it retires the
+    /// two rows the bisection measured — not the family, and not the package.
+    ///
+    /// The six classes named here all read `+0` on the same armed sweep as
+    /// `ZoneInfoFile` did, and every one of them read `reached == 0` with it:
+    /// the probe never asked them anything, so their green is §7's vacuity
+    /// trap and says nothing at all. They are spelled out rather than left
+    /// implicit because a future wave reading "+0" off that table without the
+    /// engagement column beside it would admit all six.
+    #[test]
+    fn the_zone_info_file_prefix_retires_only_the_two_measured_rows() {
+        assert_eq!(
+            RETIRED_SHADOW_L1_ZI_TRIPLES.len(),
+            2,
+            "wave 5 is `getZoneInfo` and `getZoneInfo0`. A third row needs its              own trial binary, not this table."
+        );
+        for c in [
+            "java/util/Date",
+            "sun/util/locale/provider/CalendarDataUtility",
+            "sun/util/locale/provider/JRELocaleProviderAdapter",
+            "sun/util/locale/provider/LocaleResources",
+            "sun/util/resources/Bundles",
+            "sun/util/resources/LocaleData",
+        ] {
+            for t in RETIRED_SHADOW_TABLES.iter() {
+                assert!(
+                    !t.iter().any(|(tc, _, _)| *tc == c),
+                    "{c} read `+0` with `reached == 0` on the 2026-09-11 sweep,                      which is a VACUOUS green and not a measurement. It cannot                      be retired on that row."
+                );
+            }
+        }
+    }
+
+    /// Lane 1's four tables are all in `RETIRED_SHADOW_TABLES`, which since
+    /// the 2026-09-11 loop rewrite is the ONLY thing that retires them.
+    ///
+    /// `triple_is_retired_shadow` used to be a chain of `||` arms and this
+    /// const a second, hand-maintained list of the same tables; a table in the
+    /// chain and not the const was consulted but invisible to the gates driven
+    /// off the const. Three lanes shipped that drift in two days — lane 1's
+    /// first table, lane 7's, and then lane 1's waves 3 and 4 — and the guard
+    /// on it compared two COUNTS, so it reported `10 == 8` without ever saying
+    /// which two were missing.
+    ///
+    /// The loop removed the second list, which removes the drift. It also
+    /// raised the stakes of the remaining omission: a table absent from the
+    /// const is now not consulted AT ALL, so forgetting it silently
+    /// UN-RETIRES a whole wave rather than merely under-covering it. That is a
+    /// better failure — it is a behaviour change a probe can see — but it is
+    /// still worth a test that names the table rather than counting.
+    #[test]
+    fn lane_ones_four_tables_are_all_in_the_tables_const() {
+        for (t, name) in [
+            (RETIRED_SHADOW_L1_TRIPLES, "RETIRED_SHADOW_L1_TRIPLES"),
+            (RETIRED_SHADOW_L1_HM_TRIPLES, "RETIRED_SHADOW_L1_HM_TRIPLES"),
+            (RETIRED_SHADOW_L1_JT_TRIPLES, "RETIRED_SHADOW_L1_JT_TRIPLES"),
+            (RETIRED_SHADOW_L1_ZI_TRIPLES, "RETIRED_SHADOW_L1_ZI_TRIPLES"),
+        ] {
+            // Compared BY VALUE, not by pointer. `RETIRED_SHADOW_TABLES` is a
+            // `const`, so each use site materialises its own array and
+            // `ptr::eq` on the slices inside it is not guaranteed to hold
+            // (measured 2026-09-11: it does not, for an entry that IS in the
+            // list). Two tables can only compare equal if they carry identical
+            // rows, and `no_triple_is_claimed_by_two_tables` already forbids
+            // that for every non-empty pair.
+            assert!(
+                RETIRED_SHADOW_TABLES.iter().any(|listed| *listed == t),
+                "{name} is consulted by `triple_is_retired_shadow` but is not in                  `RETIRED_SHADOW_TABLES`, so it is never asked whether it                  disarms a real-JDK keep arm."
             );
         }
     }
