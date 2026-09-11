@@ -3106,18 +3106,8 @@ static RETIRED_SHADOW_L1_HM_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/util/HashMap", "clear", "()V"),
     (
         "java/util/HashMap",
-        "compute",
-        "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
-    ),
-    (
-        "java/util/HashMap",
         "computeIfAbsent",
         "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;",
-    ),
-    (
-        "java/util/HashMap",
-        "computeIfPresent",
-        "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
     ),
     (
         "java/util/HashMap",
@@ -3129,8 +3119,6 @@ static RETIRED_SHADOW_L1_HM_TRIPLES: &[(&str, &str, &str)] = &[
         "containsValue",
         "(Ljava/lang/Object;)Z",
     ),
-    ("java/util/HashMap", "entrySet", "()Ljava/util/Set;"),
-    ("java/util/HashMap", "equals", "(Ljava/lang/Object;)Z"),
     (
         "java/util/HashMap",
         "forEach",
@@ -3146,14 +3134,7 @@ static RETIRED_SHADOW_L1_HM_TRIPLES: &[(&str, &str, &str)] = &[
         "getOrDefault",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
     ),
-    ("java/util/HashMap", "hashCode", "()I"),
     ("java/util/HashMap", "isEmpty", "()Z"),
-    ("java/util/HashMap", "keySet", "()Ljava/util/Set;"),
-    (
-        "java/util/HashMap",
-        "merge",
-        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
-    ),
     (
         "java/util/HashMap",
         "put",
@@ -3164,11 +3145,6 @@ static RETIRED_SHADOW_L1_HM_TRIPLES: &[(&str, &str, &str)] = &[
         "java/util/HashMap",
         "putIfAbsent",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-    ),
-    (
-        "java/util/HashMap",
-        "readObject",
-        "(Ljava/io/ObjectInputStream;)V",
     ),
     (
         "java/util/HashMap",
@@ -3190,277 +3166,8 @@ static RETIRED_SHADOW_L1_HM_TRIPLES: &[(&str, &str, &str)] = &[
         "replace",
         "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Z",
     ),
-    (
-        "java/util/HashMap",
-        "replaceAll",
-        "(Ljava/util/function/BiFunction;)V",
-    ),
     ("java/util/HashMap", "size", "()I"),
     ("java/util/HashMap", "toString", "()Ljava/lang/String;"),
-    ("java/util/HashMap", "values", "()Ljava/util/Collection;"),
-    (
-        "java/util/HashMap",
-        "writeObject",
-        "(Ljava/io/ObjectOutputStream;)V",
-    ),
-    ("java/util/HashMap$EntryIterator", "hasNext", "()Z"),
-    (
-        "java/util/HashMap$EntryIterator",
-        "next",
-        "()Ljava/lang/Object;",
-    ),
-    ("java/util/HashMap$EntryIterator", "remove", "()V"),
-    (
-        "java/util/HashMap$EntrySet",
-        "add",
-        "(Ljava/lang/Object;)Z",
-    ),
-    (
-        "java/util/HashMap$EntrySet",
-        "addAll",
-        "(Ljava/util/Collection;)Z",
-    ),
-    ("java/util/HashMap$EntrySet", "clear", "()V"),
-    (
-        "java/util/HashMap$EntrySet",
-        "contains",
-        "(Ljava/lang/Object;)Z",
-    ),
-    (
-        "java/util/HashMap$EntrySet",
-        "containsAll",
-        "(Ljava/util/Collection;)Z",
-    ),
-    (
-        "java/util/HashMap$EntrySet",
-        "equals",
-        "(Ljava/lang/Object;)Z",
-    ),
-    (
-        "java/util/HashMap$EntrySet",
-        "forEach",
-        "(Ljava/util/function/Consumer;)V",
-    ),
-    ("java/util/HashMap$EntrySet", "hashCode", "()I"),
-    ("java/util/HashMap$EntrySet", "isEmpty", "()Z"),
-    (
-        "java/util/HashMap$EntrySet",
-        "iterator",
-        "()Ljava/util/Iterator;",
-    ),
-    (
-        "java/util/HashMap$EntrySet",
-        "remove",
-        "(Ljava/lang/Object;)Z",
-    ),
-    (
-        "java/util/HashMap$EntrySet",
-        "removeAll",
-        "(Ljava/util/Collection;)Z",
-    ),
-    (
-        "java/util/HashMap$EntrySet",
-        "removeIf",
-        "(Ljava/util/function/Predicate;)Z",
-    ),
-    (
-        "java/util/HashMap$EntrySet",
-        "retainAll",
-        "(Ljava/util/Collection;)Z",
-    ),
-    ("java/util/HashMap$EntrySet", "size", "()I"),
-    (
-        "java/util/HashMap$EntrySet",
-        "spliterator",
-        "()Ljava/util/Spliterator;",
-    ),
-    (
-        "java/util/HashMap$EntrySet",
-        "stream",
-        "()Ljava/util/stream/Stream;",
-    ),
-    (
-        "java/util/HashMap$EntrySet",
-        "toArray",
-        "()[Ljava/lang/Object;",
-    ),
-    (
-        "java/util/HashMap$EntrySet",
-        "toArray",
-        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
-    ),
-    (
-        "java/util/HashMap$EntrySet",
-        "toArray",
-        "([Ljava/lang/Object;)[Ljava/lang/Object;",
-    ),
-    (
-        "java/util/HashMap$EntrySet",
-        "toString",
-        "()Ljava/lang/String;",
-    ),
-    ("java/util/HashMap$KeyIterator", "hasNext", "()Z"),
-    (
-        "java/util/HashMap$KeyIterator",
-        "next",
-        "()Ljava/lang/Object;",
-    ),
-    ("java/util/HashMap$KeyIterator", "remove", "()V"),
-    ("java/util/HashMap$KeySet", "add", "(Ljava/lang/Object;)Z"),
-    (
-        "java/util/HashMap$KeySet",
-        "addAll",
-        "(Ljava/util/Collection;)Z",
-    ),
-    ("java/util/HashMap$KeySet", "clear", "()V"),
-    (
-        "java/util/HashMap$KeySet",
-        "contains",
-        "(Ljava/lang/Object;)Z",
-    ),
-    (
-        "java/util/HashMap$KeySet",
-        "containsAll",
-        "(Ljava/util/Collection;)Z",
-    ),
-    (
-        "java/util/HashMap$KeySet",
-        "equals",
-        "(Ljava/lang/Object;)Z",
-    ),
-    (
-        "java/util/HashMap$KeySet",
-        "forEach",
-        "(Ljava/util/function/Consumer;)V",
-    ),
-    ("java/util/HashMap$KeySet", "hashCode", "()I"),
-    ("java/util/HashMap$KeySet", "isEmpty", "()Z"),
-    (
-        "java/util/HashMap$KeySet",
-        "iterator",
-        "()Ljava/util/Iterator;",
-    ),
-    (
-        "java/util/HashMap$KeySet",
-        "remove",
-        "(Ljava/lang/Object;)Z",
-    ),
-    (
-        "java/util/HashMap$KeySet",
-        "removeAll",
-        "(Ljava/util/Collection;)Z",
-    ),
-    (
-        "java/util/HashMap$KeySet",
-        "removeIf",
-        "(Ljava/util/function/Predicate;)Z",
-    ),
-    (
-        "java/util/HashMap$KeySet",
-        "retainAll",
-        "(Ljava/util/Collection;)Z",
-    ),
-    ("java/util/HashMap$KeySet", "size", "()I"),
-    (
-        "java/util/HashMap$KeySet",
-        "spliterator",
-        "()Ljava/util/Spliterator;",
-    ),
-    (
-        "java/util/HashMap$KeySet",
-        "stream",
-        "()Ljava/util/stream/Stream;",
-    ),
-    (
-        "java/util/HashMap$KeySet",
-        "toArray",
-        "()[Ljava/lang/Object;",
-    ),
-    (
-        "java/util/HashMap$KeySet",
-        "toArray",
-        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
-    ),
-    (
-        "java/util/HashMap$KeySet",
-        "toArray",
-        "([Ljava/lang/Object;)[Ljava/lang/Object;",
-    ),
-    (
-        "java/util/HashMap$KeySet",
-        "toString",
-        "()Ljava/lang/String;",
-    ),
-    (
-        "java/util/HashMap$Node",
-        "setValue",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-    ),
-    ("java/util/HashMap$ValueIterator", "hasNext", "()Z"),
-    (
-        "java/util/HashMap$ValueIterator",
-        "next",
-        "()Ljava/lang/Object;",
-    ),
-    ("java/util/HashMap$ValueIterator", "remove", "()V"),
-    ("java/util/HashMap$Values", "clear", "()V"),
-    (
-        "java/util/HashMap$Values",
-        "contains",
-        "(Ljava/lang/Object;)Z",
-    ),
-    (
-        "java/util/HashMap$Values",
-        "forEach",
-        "(Ljava/util/function/Consumer;)V",
-    ),
-    ("java/util/HashMap$Values", "isEmpty", "()Z"),
-    (
-        "java/util/HashMap$Values",
-        "iterator",
-        "()Ljava/util/Iterator;",
-    ),
-    (
-        "java/util/HashMap$Values",
-        "remove",
-        "(Ljava/lang/Object;)Z",
-    ),
-    (
-        "java/util/HashMap$Values",
-        "removeIf",
-        "(Ljava/util/function/Predicate;)Z",
-    ),
-    ("java/util/HashMap$Values", "size", "()I"),
-    (
-        "java/util/HashMap$Values",
-        "spliterator",
-        "()Ljava/util/Spliterator;",
-    ),
-    (
-        "java/util/HashMap$Values",
-        "stream",
-        "()Ljava/util/stream/Stream;",
-    ),
-    (
-        "java/util/HashMap$Values",
-        "toArray",
-        "()[Ljava/lang/Object;",
-    ),
-    (
-        "java/util/HashMap$Values",
-        "toArray",
-        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
-    ),
-    (
-        "java/util/HashMap$Values",
-        "toArray",
-        "([Ljava/lang/Object;)[Ljava/lang/Object;",
-    ),
-    (
-        "java/util/HashMap$Values",
-        "toString",
-        "()Ljava/lang/String;",
-    ),
 ];
 
 /// Is this exact triple a retired §1.4 shadow?
@@ -3607,19 +3314,54 @@ mod tests {
         }
     }
 
-    /// The nine rows the wave exists to repair, named so a later edit that
-    /// drops one of them from the table fails here rather than in a probe.
+    /// What wave 3 measured and then REFUSED, with the failure each refusal
+    /// is holding back.
     ///
-    /// All nine are the `entrySet()` → `toArray` route and its two copy
-    /// constructors. They are the ONLY rows of `apps/probes/
-    /// L1MapFamilySweep.java`'s 142 that the dial-armed binary got wrong, and
-    /// three of them — `toArray()`, `new ArrayList<>(entrySet())` and
-    /// `new HashSet<>(entrySet())` — are SILENT wrong answers rather than
-    /// throws.
+    /// The first trial binary retired all 98 and the probe tree read **12
+    /// worse, 1 better**. Two causes, both of them a family boundary this
+    /// table cannot cross alone:
+    ///
+    /// * **the three iterator carriers.** `key_itr_carrier_for` mints
+    ///   `java/util/HashMap$KeyIterator` for EVERY receiver that is not
+    ///   LinkedHashMap-shaped — including `java/util/HashSet`'s and
+    ///   `java/util/Hashtable`'s views, whose producers are lane T's and the
+    ///   Hashtable family's. Retire the carrier's natives and the live
+    ///   producer keeps minting it, so real `HashMap$HashIterator.nextNode`
+    ///   runs on an object no bytecode built:
+    ///   `NullPointerException: Cannot read field "modCount" because
+    ///   "this.this$0" is null`, which killed `MethodRefDoorProbe` on its
+    ///   HashSet row and truncated four more probes behind it. The cluster
+    ///   note on `register_set_view_carrier_natives` predicted exactly this;
+    ///   wave 3 is its first measurement.
+    /// * **the three view classes and the three accessors that produce
+    ///   them.** They are one unit with the iterators: retire
+    ///   `HashMap.entrySet()` and real bytecode mints a real
+    ///   `HashMap$EntrySet`, whose surviving natives then find no backing —
+    ///   the very defect §3's wave-3 trace is about, moved one class along.
+    /// * **eight methods `java/util/LinkedHashMap` inherits.** LinkedHashMap
+    ///   is a `HashMap` SUBCLASS and registers its own native for 33 of these
+    ///   methods but NOT for these eight, so retiring them routes a
+    ///   LinkedHashMap receiver into real `HashMap` bytecode over a table its
+    ///   entries are not in — they are in `lhm_overlay()`.
+    ///   `LinkedSequencedShadowSweep` read `{b=22, c=33, a=2}` -> `{a=2}`.
+    ///
+    /// This test is the record. Deleting a row from it means claiming the
+    /// blocker is gone, which is a measurement, not an edit.
     #[test]
-    fn the_entry_set_to_array_route_is_retired() {
+    fn wave_three_refused_the_iterators_the_views_and_lhm_s_inherited_eight() {
         for (c, m, d) in [
+            // the iterator carriers — shared with HashSet and Hashtable
+            ("java/util/HashMap$KeyIterator", "next", "()Ljava/lang/Object;"),
+            ("java/util/HashMap$ValueIterator", "next", "()Ljava/lang/Object;"),
+            (
+                "java/util/HashMap$EntryIterator",
+                "next",
+                "()Ljava/lang/Object;",
+            ),
+            // the view classes and the accessors that produce them
             ("java/util/HashMap", "entrySet", "()Ljava/util/Set;"),
+            ("java/util/HashMap", "keySet", "()Ljava/util/Set;"),
+            ("java/util/HashMap", "values", "()Ljava/util/Collection;"),
             (
                 "java/util/HashMap$EntrySet",
                 "toArray",
@@ -3627,28 +3369,53 @@ mod tests {
             ),
             (
                 "java/util/HashMap$EntrySet",
-                "toArray",
-                "([Ljava/lang/Object;)[Ljava/lang/Object;",
-            ),
-            (
-                "java/util/HashMap$EntrySet",
-                "toArray",
-                "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
-            ),
-            ("java/util/HashMap$EntrySet", "size", "()I"),
-            (
-                "java/util/HashMap$EntrySet",
                 "iterator",
                 "()Ljava/util/Iterator;",
             ),
+            ("java/util/HashMap$KeySet", "iterator", "()Ljava/util/Iterator;"),
+            ("java/util/HashMap$Values", "iterator", "()Ljava/util/Iterator;"),
+            (
+                "java/util/HashMap$Node",
+                "setValue",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            // the eight LinkedHashMap inherits
+            (
+                "java/util/HashMap",
+                "merge",
+                "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+            ),
+            (
+                "java/util/HashMap",
+                "compute",
+                "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+            ),
+            (
+                "java/util/HashMap",
+                "computeIfPresent",
+                "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+            ),
+            (
+                "java/util/HashMap",
+                "replaceAll",
+                "(Ljava/util/function/BiFunction;)V",
+            ),
+            ("java/util/HashMap", "equals", "(Ljava/lang/Object;)Z"),
+            ("java/util/HashMap", "hashCode", "()I"),
+            (
+                "java/util/HashMap",
+                "readObject",
+                "(Ljava/io/ObjectInputStream;)V",
+            ),
+            (
+                "java/util/HashMap",
+                "writeObject",
+                "(Ljava/io/ObjectOutputStream;)V",
+            ),
         ] {
             assert!(
-                triple_is_retired_shadow(c, m, d),
-                "{c}.{m}{d} is not retired. The whole route has to go \
-                 together: `native_al_to_array` on `AbstractCollection` asks \
-                 the receiver's own `size()` from INSIDE a native, and a \
-                 surviving `size` native answers that question with its \
-                 sentinel instead of the real body's 3."
+                !triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is retired, and wave 3 measured that retiring it                  makes the probe tree WORSE. See this test's doc comment for                  which of the three blockers it belongs to."
             );
         }
     }

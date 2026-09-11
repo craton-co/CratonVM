@@ -20,10 +20,10 @@ preconditions and the landing protocol are in
 
 | disposition | rows | what decided it |
 |---|---:|---|
-| **RETIRED** — `RETIRED_SHADOW_L1_TRIPLES` | **329** | two waves, §3 |
+| **RETIRED** — `RETIRED_SHADOW_L1_TRIPLES` | **329** | waves 1 and 2, §3 |
+| **RETIRED** — `RETIRED_SHADOW_L1_HM_TRIPLES` | **98** | wave 3, `HashMap` + views, §3 |
 | HELD — `TreeMap`/`TreeSet` | 157 | state is `tm_array_table()`, a Rust side table; 9 probes worse armed |
 | HELD — `LinkedHashMap` + its four views + iterators | 102 | state is `lhm_overlay()`, a Rust side table; 11 probes worse |
-| HELD — `HashMap` + views + iterators + `$Node` | 98 | state IS real (`table` holds real `HashMap$Node`s); 9 probes still worse |
 | HELD — `Hashtable` + views + `$Entry` | 79 | 4 probes worse |
 | HELD — `java/util/jar/` | 45 | **a vacuous green**: 0 worse over 44 probes until one reached it, then +28 |
 | HELD — `Date` / `TimeZone` / `sun/util/calendar/` | 40 | 5 probes worse |
@@ -35,9 +35,21 @@ preconditions and the landing protocol are in
 | EXCLUDED — no dispatch any probe can produce | 9 | §5 |
 | | **959** | |
 
-`RETIRED_SHADOW_L1_TRIPLES` in `native-api/src/retired_shadow.rs` carries the
-329 with the numbers per family; the tests beside it pin every HELD verdict, so
-changing one means changing a test.
+`RETIRED_SHADOW_L1_TRIPLES` and `RETIRED_SHADOW_L1_HM_TRIPLES` in
+`native-api/src/retired_shadow.rs` carry the 427 with the numbers per family;
+the tests beside them pin every HELD verdict, so changing one means changing a
+test.
+
+**Wave 3 changed what a RED dial arm means, and that is the lane's most
+transferable result.** `java/util/HashMap` sat in the HELD column for two
+revisions of this page on the strength of nine probe rows that moved when the
+dial was armed on it. Those nine rows were a DIAL ARTEFACT: the native that
+answered them is registered on `java/util/AbstractCollection`, and the question
+it falls back on is asked from inside a native, where there is no dispatch door
+to decline at. The trial binary — which removes the registration rather than
+declining at a door — is **0 diffs on all 142 rows**. §3's wave 3 has the
+trace. The ops page already says an armed sweep is a candidate and not a
+verdict when it is green; it is not a verdict when it is red either.
 
 ## 2. How to re-take the 959, because the headline number will rot
 
@@ -67,7 +79,7 @@ Two things about that subtraction, both of which cost a re-measure here:
   retiring the encounter-order surface while lane T's `add`/`remove`/`iterator`
   stay native is a split store in the one direction the class cannot survive.
 
-## 3. What was retired, and the two waves that did it
+## 3. What was retired, and the three waves that did it
 
 Both waves ran the same loop: arm one prefix at a time with
 `CRATONVM_ENFORCE_NATIVE_SHADOW` against a fixed probe subset, keep the
@@ -180,6 +192,130 @@ last to know:
 retired ArrayList five depended on it, and this wave retires the dependents and
 the dependency together. That is the only configuration that is not a split
 store.
+
+
+### Wave 3 — `java/util/HashMap` and its views, and the red that was not real
+
+Waves 1 and 2 used the dial to nominate and a trial binary to decide. Wave 3 is
+the case where those two disagreed, and the trial binary was right.
+
+**What the dial said.** Armed on `java/util/HashMap`,
+`apps/probes/L1MapFamilySweep.java` — 142 rows, written for this wave — moved
+nine of them. All nine are the same route:
+
+```text
+  ES.toArray        [3]Object[a=1, b=2, c=3]  ->  [0]Object[]
+  ES.toArrayObj     [3]Object                 ->  [0]Object
+  ES.toArrayEntry   [3]Map$Entry              ->  [0]Map$Entry
+  ES.toArrayString  ArrayStoreException       ->  [0]String
+  ES.toArrayGen     [3]Object                 ->  [0]Object
+  ES.intoArrayList  3                         ->  0
+  ES.intoHashSet    3                         ->  0
+  X.resize.100      100/9900/100/100          ->  100/9900/100/0
+  X.collision.chain 12/12/12                  ->  12/0/12
+```
+
+Everything else was exact: `size()`, the entry ITERATOR, `forEach`, `stream`,
+`spliterator`, both other views, serialization, comodification, `Node.setValue`
+through a detached entry, a 100-entry resize and a 12-way collision chain.
+
+**The row that told us which route answers.** `ES.toArrayString` is
+`entrySet().toArray(new String[0])`. Real `AbstractCollection.toArray(T[])`
+`aastore`s each element, so for three `Map.Entry`s and a `String[]` it MUST
+throw `ArrayStoreException` — and it cannot throw for an empty walk. A quiet
+`String[0]` therefore says a native answered and believed the view was empty.
+`CRATONVM_DBG_TOARRAY` names it and `CRATONVM_HS_ITR_DBG` corroborates:
+
+```text
+  [DBG_TOARRAY] native_al_to_array (0-arg) HIT nargs=1
+  [DBG_TOARRAY] al_or_collection_elements recv=java/util/HashMap$EntrySet
+                heuristic_len=0 nulls=0 suspect=false
+  WARN zgc real: field index OOB index=1 num_slots=1 op="get"   (x10)
+  [DBG_TOARRAY] new_ref_array(Object[],len=0) from frame=Mini.main
+```
+
+The chain, end to end:
+
+1. the dial's prefix `java/util/HashMap` also covers `$EntrySet`, so
+   `entrySet()` yields and hands back the image's OWN `HashMap$EntrySet`.
+   `apps/probes/L1EntrySetRouteProbe.java` checks that it really is the JDK's
+   object and not a look-alike: `this$0` is the map, `m.entrySet() ==
+   m.entrySet()`, and the map's own `entrySet` field is populated — all three
+   byte-identical to HotSpot;
+2. that object has ONE slot, and `hs_map_slot` puts a view carrier's backing at
+   `class_num_total_fields` — slot 1 — because the VM's own mint site allocates
+   the carrier WIDER than the class declares. On the image's own object that
+   slot is off the end, which is the ten `zgc` warnings, and `hs_backing_map`
+   is empty;
+3. `toArray` on it resolves up to `java/util/AbstractCollection`, which is not
+   armed, so `native_al_to_array` fires;
+4. its documented fallback for a layout it does not model is "ask the
+   receiver's own `size()`, and walk the real `iterator()` only if it is
+   non-zero". **That question is asked from inside a native, where there is no
+   dispatch door.** So it reaches `native_hs_size` on `HashMap$EntrySet`, which
+   finds no backing and tries `try_delegate_real_collection` — whose
+   `invoke_special` re-finds the SAME native, trips its own re-entrancy guard
+   and returns the sentinel. `real_size == 0`, no walk, `[0]`.
+
+Java-level `entrySet().size()` answers 3 the whole time, because THAT call
+passes a door. The two answers to one question, four frames apart, are the
+whole defect.
+
+**What the trial binary says.** Retirement does not decline at a door; it
+removes the registration, so step 4's question reaches real bytecode.
+Control `cratonvm-l1hm-base-20260911` (`1d9c00029`, untouched), trial
+`cratonvm-l1hm-trial1-20260911` (the same tree plus this table):
+
+```text
+  L1MapFamilySweep  142 rows   control 0 diffs   DIAL-ARMED 9   trial 0
+  L1MapFieldProbe              control 5 diffs                  trial 1
+  L1EntrySetRouteProbe         control 1 diff                   trial 1
+```
+
+The four `L1MapFieldProbe` rows the wave repairs are unarmed defects the
+control has and HotSpot does not: `new HashMap<>()` plus three puts leaves
+`threshold = 0` where HotSpot has 12, `new HashMap<>(64)` leaves
+`threshold = 64` where HotSpot has 48, and the copy constructor and
+`new HashMap<>(Map.of(..))` leave `table = [16]java.lang.Object` — an UNTYPED
+array where HotSpot has a typed `HashMap$Node[]` — with `loadFactor = 0.0`.
+
+The two rows that remain are both other people's families and are named here so
+nobody re-derives them:
+
+- `F.hashSet.backing.fields` — `new HashSet<>(List.of("a","b","c"))` gives its
+  backing map `threshold = 16` where HotSpot has 12. That is
+  `java/util/HashSet`'s own constructor, which lane T holds
+  (`register_hashset_natives`), and it is §10's HashSet item;
+- `D.treeMap.map.keySetField` — `new TreeMap<>(m)` leaves the map's `keySet`
+  field populated where HotSpot leaves it null, in BOTH arms. §10 item 1.
+
+**Precondition 4 is measured, not waived.** Three earlier probe runs reached 29
+of the 98 triples. `apps/probes/L1MapFamilySweep.java` reaches the rest through
+ordinary Java: every constructor including the three that throw, every
+default-method override on all three views, both iterator `remove()`
+contracts, `Node.setValue` through a detached entry, a serialization
+round-trip, comodification on each view, a resize and a collision chain.
+
+**One provably-inert repair went in beside the table.** `hs_backing_map` now
+bounds the slot against the OBJECT (`object_num_fields`) rather than the class.
+The heap already answered a default for an out-of-range slot, so no caller's
+answer changes; what stops is the VM reading a cell that is not the object's,
+ten times per call, and saying so. It is the same shape as
+`has_byte_array_stream_layout` one family over: ask the slot count before
+probing the layout.
+
+**One defect is NAMED AND NOT FIXED, on purpose.**
+`try_delegate_real_collection` in `native-collections/src/lib.rs` opens with
+*"`invoke_special` does an exact per-class native lookup (which finds nothing
+for these real classes)"*. That premise is false for every
+`SET_VIEW_CARRIERS` entry, because CratonVM registers natives under the real
+JDK class NAME — so the helper re-finds itself, trips its guard and returns the
+sentinel it exists to avoid. `invoke_special_bytecode_only` is the API for
+exactly this and the fix is one line. It is not in this wave because this wave
+measured 0 diffs WITHOUT it, and changing a helper that every collection
+size/isEmpty native calls is a separate blast radius that deserves its own
+control and its own trial. It is §10's own item now, with the trace above as
+its evidence.
 
 ## 4. The finding this lane would most like the next lane to have: a retired PRODUCER makes a zero-invocation CONSUMER reachable
 
@@ -345,7 +481,7 @@ Fixed in `normalizer_reject_nulls`, called from **both** registrars —
 `phases_late/text_intl.rs` serves synthetic mode, and a duplicate pair that
 sits half-fixed is exactly what `owns_slot` exists to catch.
 
-## 10. What is left, as six VM changes rather than more measurement
+## 10. What is left, as seven VM changes rather than more measurement
 
 Every remaining HELD family has a named blocker. In rough order of rows:
 
@@ -356,63 +492,53 @@ Every remaining HELD family has a named blocker. In rough order of rows:
    build the real node graph, make it the authority, then retire. Retiring
    first hands real bytecode an empty map.
 2. **`LinkedHashMap` + views (102).** `lhm_overlay()`, same shape, same remedy.
-3. **`HashMap` + views (98) — the blocker is now ONE METHOD, measured.**
-   `apps/probes/L1MapFieldProbe.java` reads, reflectively and under
-   `--add-opens=java.base/java.util=ALL-UNNAMED`, the five fields real
-   `HashMap$HashIterator` reads, on five receivers built five different ways.
-   Armed on `java/util/HashMap` alone, against HotSpot 25.0.4+7:
-
-   ```text
-                        table                  size mod thr  load
-     HotSpot   A put    [16]HashMap$Node        3    3   12  0.75
-     armed     A put    [16]HashMap$Node        3    3   12  0.75   <- exact
-     HotSpot   C copy   [4]HashMap$Node         3    3    3  0.75
-     armed     C copy   [4]HashMap$Node         3    3    3  0.75   <- exact
-   ```
-
-   **Every field matches, on every receiver.** So the 2026-09-10 reading —
-   "state IS real but nine probes move" — resolves: the object model is not the
-   problem and `modCount`/`threshold`/`loadFactor` are not the answer. What is
-   left is one observable:
-
-   ```text
-     armed:  keySet.size 3   values.size 3   entrySet.size 3
-             keySet walk [a,b,c]   entry walk [a=1,b=2,c=3]   values walk ok
-             keySet().toArray()  3      values().toArray()  3
-             entrySet().toArray() 0                          <- the blocker
-   ```
-
-   The entry ITERATOR works and the entry SIZE is right, so real
-   `AbstractCollection.toArray()` should answer 3 and answers 0. Arming
-   `AbstractCollection`, `AbstractSet`, `AbstractMap`, `Set`, `Collection` and
-   `Map` alongside changes nothing, so it is not one of those registrations
-   declining at a door — which, by the §8 argument, points at a native reached
-   from inside a native. `toArray` is registered on 34 classes and the
-   DISPATCH ROUTE decides the answer; that is where to look next, and the
-   probe row to watch is `A.ctor+put.views eToArray`.
-
-   **And the control is worse than the trial on three of these rows**, which
-   is worth landing on its own account: unarmed, `new HashMap<>()` + three
-   puts leaves `threshold = 0` where HotSpot has 12, `new HashMap<>(64)`
-   leaves `threshold = 64` where HotSpot has 48, and **the copy constructor
-   and `new HashMap<>(Map.of(..))` leave `table = [16]java.lang.Object` — an
-   UNTYPED array where HotSpot has `[4]`/`[2] java.util.HashMap$Node` — with
-   `loadFactor = 0.0`.** Retiring the family fixes all five.
-
-   `Hashtable` (79) is NOT the same answer: its fields already match HotSpot
-   unarmed, and its views survive arming (`G.hashtable.views` is byte-identical
-   in all three columns). Its four moving probes are a separate question.
+3. **`Hashtable` + views + `$Entry` (79).** Four probes worse armed, and
+   NOT the same answer as `HashMap` was: its fields already match HotSpot
+   unarmed and its views survive arming byte-identically
+   (`L1EntrySetRouteProbe`'s `C.hashtable.*` rows are clean in all three
+   columns). Its own question, unbisected.
 4. **`java/util/jar/` (45)** and **`java/text/` (12)**: both red only under
    `L1TailSweep`; neither has been bisected to a method. Start by splitting the
-   scope — `JarFile` alone, `Manifest`/`Attributes` alone.
+   scope — `JarFile` alone, `Manifest`/`Attributes` alone —
+   `/data/l1hm/bisect.sh`'s shape is the loop, and after wave 3 the rule for
+   reading it is "a red arm is a candidate, not a verdict" (see below).
 5. **`Date`/`TimeZone`/`sun/util/calendar/` (40)** and **`Locale` + providers
    (35)**: read §6 of the previous revision of this page, preserved as the
    locale-provider trap below, before pricing either.
 6. **`HashSet`/`LinkedHashSet` (13 + lane T's 42)**: blocked on lane T
-   releasing `register_hashset_natives`. Nothing for L1 to do until then.
+   releasing `register_hashset_natives`. Nothing for L1 to do until then —
+   except that wave 3 left it one measured row to start from:
+   `new HashSet<>(List.of("a","b","c"))` gives its backing map
+   `threshold = 16` where HotSpot has 12 (`L1MapFieldProbe`'s
+   `F.hashSet.backing.fields`). HotSpot's `HashSet(Collection)` sizes the map
+   at `max((int)(c.size()/.75f)+1, 16)` and lets `HashMap` derive the
+   threshold from it; this VM writes the capacity into the threshold.
 7. **`ResourceBundle` (12)**: §8. Blocked on the same locale-provider
    lookup as item 5's `Locale`, and it is the cheapest probe into it —
    `TimeZone.getDisplayName` is one call and the answer is one string.
+
+### And one that is not a family at all
+
+`try_delegate_real_collection` in `native-collections/src/lib.rs` is the
+helper every collection `size`/`isEmpty` native calls when it finds no
+synthetic backing, and its opening premise —
+
+> `invoke_special` does an *exact* per-class native lookup (which finds
+> nothing for these real classes)
+
+— is FALSE for every `SET_VIEW_CARRIERS` entry, because this VM registers
+natives under the real JDK class NAME. So on a real `HashMap$EntrySet` the
+helper re-finds the very native that called it, trips its own re-entrancy
+guard, and returns the sentinel it exists to avoid: `size()` answers 0 for a
+three-entry map, four frames below a `size()` that answers 3.
+
+`invoke_special_bytecode_only` is the API for precisely this case — its own
+doc says "for a native that IS ITSELF the native registered for
+(class, method, descriptor)" — and the fix is one line. Wave 3 did not take
+it, because wave 3 measured 0 diffs without it and this helper sits under
+every collection in the VM; it wants its own control, its own trial and its
+own corpus run. §3's wave-3 trace is the evidence, and a comment in the
+source is not a compile-time link to the premise it depends on.
 
 ### The locale-provider trap, unchanged and still true
 
@@ -443,6 +569,24 @@ Every remaining HELD family has a named blocker. In rough order of rows:
   exception message**, so a probe must print the message, not the outcome.
 - `java/util/Hashtable` is still **held** on purpose, and the held-family test
   says so. Amend that test rather than deleting the entry.
+- **An armed dial arm that goes RED is a candidate, not a verdict — the same
+  way a green one is not.** The ops page's rule was written for vacuous
+  greens; wave 3 is the mirror image. `java/util/HashMap` was held for two
+  revisions of this page on nine rows the dial moved and the trial binary does
+  not. The dial declines at nine DISPATCH DOORS; retirement removes the
+  REGISTRATION. Those differ wherever the deciding call starts inside a
+  native, and a family whose natives call each other is exactly where they
+  differ most.
+- **When a native asks its receiver a question, that question has no door.**
+  It is §8's rule stated from the other end, and it is the reason a fallback
+  path can answer 0 while the same call from Java answers 3. If an armed arm
+  is red and the rows all funnel through one VM-internal question, ask what
+  answers that question before believing the red.
+- **A typed destination is a free route discriminator.**
+  `coll.toArray(new String[0])` on a collection of non-Strings throws
+  `ArrayStoreException` from real bytecode and cannot throw from a native that
+  believes the collection is empty. One row separated "the view is empty" from
+  "the walk is empty" after two revisions of not knowing.
 
 ## 12. Done
 
