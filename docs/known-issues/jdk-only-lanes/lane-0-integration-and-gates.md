@@ -705,6 +705,44 @@ Nothing in the local gate set sees this. It is a shell gate over a census, so
 `cargo test` is green on a tree that fails CI — which is why every other lane's
 wave left an `amended:` note in that baseline's header and this one did not.
 
+### The root cause, MEASURED: this gate cannot run on Windows
+
+Running it here, `CV=p19 JAVA_HOME=<jdk25> sh regression-suite/bridge-ratchet.sh`:
+
+```text
+SCRIPT RC=2
+REFUSED: no kind-map baseline for 25/windows
+         (looked for scripts/baselines/jdk-only-kind-map-25-windows.tsv)
+REFUSING: no committed baseline for 25/windows        <- compatible leg
+REFUSING: no committed baseline for 25/windows/jdk-only  <- strict leg
+BRIDGE-RATCHET: REFUSED (this is not a pass)
+```
+
+**Both legs refuse, exit 2, and only `-25-linux` is committed.** The key is
+`<jdk-feature>/<os>` by design — `image_declaring_method` is a statement about
+one runtime image and the registrars are platform-conditional — so this is
+correct behaviour, not a bug in the gate.
+
+But the consequence is structural and it reframes §7.4 entirely:
+
+* **No lane can verify a kind-map amendment locally.** `run.sh`'s own note says
+  the suite is usually run from Git Bash on Windows, and that is where this
+  campaign's work happens. So protocol step 7's "Kind-map rows" has been done
+  **by hand, unverified, by every lane** — including this one. The gate only
+  ever adjudicates on `ubuntu-latest` in CI.
+* **So lane 1's 50 rows are not that lane being careless.** They are the
+  predictable output of a gate that refuses on the platform the work is done
+  on, and a protocol step that asks for an edit the author cannot check. Any
+  future wave will do the same thing for the same reason.
+* **At least one existing amendment is already wrong**, and the file says so
+  itself: L3's retired rows read `synthetic-stub 0 1` and L0's read
+  `synthetic-stub 1 1`. Those cannot both follow from one deterministic retag.
+  Two hand-derivations, two answers, neither checkable here.
+
+That last point is the one to act on before adding a third style. The
+per-registration diff is what CI adjudicates, so a wrong `kind_stated` in a
+committed amendment fires the gate exactly like a missing row.
+
 **The repair is a measurement, and deliberately not done by hand here.** The
 two existing amendment styles in that file DISAGREE on the middle column —
 L3's retired rows read `synthetic-stub 0 1`, L0's read `synthetic-stub 1 1` —
@@ -713,9 +751,11 @@ of them. With two precedents in conflict, deriving 50 rows from either would be
 a guess wearing a measurement's clothes, in the one file whose doctrine is that
 re-freezing without reading the diff defeats the gate. So:
 
-1. run the census gate on `p20` — it PRINTS the changed rows with their actual
-   new values (`mode: compatible`, the generated `BridgeRatchetCensusProbe`,
-   not the corpus);
+1. run the census gate on `p20` **on Linux** — it PRINTS the changed rows with
+   their actual new values (`mode: compatible`, the generated
+   `BridgeRatchetCensusProbe`, not the corpus). It cannot be run on this
+   worktree's host at all; see the measurement above. CI's `ubuntu-latest` leg
+   or one of the Azure hosts is the only place this number exists;
 2. paste those values, with an `amended:` note naming lane 1's waves as the
    cause and this merge as the repair;
 3. re-run to green.
