@@ -513,18 +513,56 @@ should do.
 
 ## 8. What this leaves for the next lane
 
-1. **The TLS/JCA contract question (557 rows).** Is a first-class rustls
-   implementation a §1.4 shadow? If it is not, those rows leave the goal
-   population and the campaign denominator changes. That is L0's call.
-2. **The defects §1 lists inside the blocked set** are fixable in the natives
-   today, without waiting for that answer. In rough order of severity:
-   `Cipher` WRAP/UNWRAP does not round-trip; `GCMParameterSpec` tag lengths are
-   ignored and not validated; `AES/CTR/NoPadding` resolves to no provider;
+Ordered by what unblocks the most rows per unit of work, with the exact remedy
+where this wave found it. The first three are each a KEEP that a specific,
+nameable change would turn back into a candidate.
+
+1. **`java/net/URL` (16 rows) — give the carrier a `handler`, or stop minting
+   it.** Every JDK method on `URL` is one line through `this.handler`, and this
+   VM mints `URL` objects in `native-builtins/src/classloader.rs` without
+   running the constructor that sets it. Either mint through the real
+   constructor, or populate `handler` at the mint sites. Three corpus vectors
+   are the test: `RJdkServices`, `RServiceLoaderDoubleSource`,
+   `RJdkDefineClass`.
+2. **`java/net/InetAddress` + `Inet4Address` + `Inet6Address` (18 rows) —
+   implement `java/net/Inet6AddressImpl.lookupAllHostAddr`.** That single
+   `ACC_NATIVE` method is what the JDK's `getByName` bytecode calls, and its
+   absence is the whole blocker. `RJdkNet` and `RNetIfaceScope` are the test.
+3. **`java/net/DatagramSocket` + `MulticastSocket` (36 rows) — implement
+   `sun/nio/ch/DatagramChannelImpl.receive0`.** Same shape, one level further
+   down the NIO stack, and it is **L4's** prefix rather than this lane's, so
+   the two lanes have to agree before either moves. `RJdkNet` is the test.
+4. **The TLS/JCA contract question (557 rows).** Is a first-class rustls
+   implementation a §1.4 shadow at all? If it is not, those rows leave the goal
+   population and the campaign denominator changes. That is L0's call, not a
+   lane's, and nothing here should be retired until it is answered.
+5. **The defects §1 lists inside that blocked set are fixable in the natives
+   today**, without waiting for the answer to (4). In rough order of severity:
+   `Cipher` WRAP/UNWRAP does not round-trip (it produces neither the JDK's
+   ciphertext nor the original key); `GCMParameterSpec` tag lengths are ignored
+   and not validated; `AES/CTR/NoPadding` resolves to no provider;
    `SSLSocket.getEnableSessionCreation` raises `AbstractMethodError`;
    `SSLParameters.setApplicationProtocols` accepts null and empty elements.
-3. **The 30 connection-state rows** need either a loopback HTTP fixture in the
-   probe tree or a corpus vector that asserts them.
-4. **`java/net/URLClassLoader` (12 rows) should move to L7** by amending
-   lane-0 §2's ownership table.
-5. **The four `MalformedURLException`/`UnknownHostException` rows** unblock the
+   Each has a row in `L6JcaSweep` or `L6TlsParamSweep` that goes green when it
+   is fixed.
+6. **The 30 connection-state rows** (`HttpURLConnection`/`URLConnection`
+   `getInputStream`, `getResponseCode`, `getHeaderField(s)`,
+   `getContentLength`) need either a loopback HTTP fixture in the probe tree or
+   a corpus vector that asserts them. `L6HttpLogicSweep` keeps 18 differing
+   rows after this wave and they are mostly this family: asked for
+   `getContentLength()` on a subclass that overrides every header accessor,
+   CratonVM attempts a real transport where HotSpot answers from the fixture.
+7. **`java/net/URLClassLoader` (12 rows) should move to L7** by amending
+   lane-0 §2's ownership table: it is the loader story wearing a `java/net/`
+   prefix.
+8. **The four `MalformedURLException`/`UnknownHostException` rows** unblock the
    moment lane T releases the throwable registrar.
+
+### And one thing to carry into every lane, not just this one
+
+**Precondition 3 is checked one frame too high.** "The image method carries
+`Code`" was true for all 124 rows and false about six of them, because what
+that code CALLS was not satisfiable in this VM: a field only a real
+constructor writes, or an `ACC_NATIVE` method nobody implemented. Until the
+funnel can answer the deeper question, the corpus is the check that catches it
+— and the probe tree, at 125 probes and a two-binary A/B, demonstrably cannot.
