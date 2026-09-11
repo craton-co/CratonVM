@@ -511,6 +511,25 @@ native while the loader hierarchy does not link changes which failure you see
 without changing whether it fails*. The hierarchy links now; what the rows still
 lack is an instrument that reaches them. Naming that is the result.
 
+**UPDATE 2026-09-11: the instrument exists, and three of the 19 are now
+dispatched — one of them wrongly.** `apps/probes/L7LoaderInternalsSweep.java`
+drives the loader internals through public API only, and
+[`the-platform-loader-answers-from-the-application-class-path-20260911`](the-platform-loader-answers-from-the-application-class-path-20260911.md)
+records what it found: the three built-in-loader `getResourceAsStream`
+registrations of this table's last row are reached, and on the PLATFORM loader
+that native answers from the application class path, where HotSpot answers
+`null`. The probe's own row 07 is the oracle — `getResource` on the same loader
+for the same name answers `null` correctly, and the JDK defines
+`getResourceAsStream` in terms of `getResource`, so the two cannot disagree.
+
+That record also repeats this one's central finding independently: no value of
+`CRATONVM_ENFORCE_NATIVE_SHADOW`, `all` included, changes the row, because the
+rows are bucket B and there is no `Code` on the receiver class to yield to.
+
+The remaining 16 stay classified. The instrument reaches them; what it has not
+yet produced for them is a DIFFERENCE, which is a different thing and a better
+problem to have.
+
 ## 7. Measured
 
 One binary per arm on azure vm1, JDK 25.0.4+7. The control is the same worktree

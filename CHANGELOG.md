@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 2026-09-11 The BindableTests residual was a stale RECEIVER, and the whole probe family only ever screened values
+
+`docs/known-issues/springboot/bindabletests-assertj-objects-field-null-under-gc-stress-20260909.md`
+is retired into
+`docs/internal/springboot/bindabletests-assertj-objects-receiver-stale-across-clinit-20260911.md`.
+
+`Assertions.assertThat(Comparable)` and `assertThat(String)` are CratonVM
+natives: `native_assertj_lightweight_comparable_assert` builds the assertion
+object field by field instead of running `AbstractAssert.<init>`. The store into
+`objects` reused an `assertion` handle read BEFORE the call that runs
+`org/assertj/core/internal/Objects.<clinit>`, so on the first comparable
+assertion in a process — the only call where that `<clinit>` is still pending —
+the `<clinit>`'s allocations moved the assertion and the store landed in a copy
+nothing would read again. The surviving object kept `objects == null`, and
+`BindableTests`'
+`whenTypeCouldUseJavaBeanOrValueObjectJavaBeanBindingCanBeSpecified` failed an
+AssertJ `NullPointerException` at every `CRATONVM_DBG_GC_STRESS <= 262144`.
+Every store in that native now re-reads the pin; three more `ObjectRef`s carried
+across an allocation in the same file are fixed with it.
+
+Why it survived the sweep that fixed ten siblings on 2026-09-09, in two layers.
+Every arm of `CRATONVM_DBG_DEADREF_STORE` screens the VALUE being stored, and
+the value here (`Objects.INSTANCE`, in old gen) was live throughout —
+**`[deadref-recv]`** is the new receiver-side arm of the same switch, pinned by
+a unit test. And this store never reached the heap at all:
+`NativeContext::set_field_by_name` resolves the field against the class of
+whatever is AT the address it is handed and **drops the store silently** when it
+does not resolve, one level above `set_field`, where no heap probe can see it.
+**`[field-by-name-dropped]`** is that arm — counted always, with a non-zero
+total printed at exit, and named per distinct `(class, field)` under the same
+switch. On the unfixed binary it prints
+`recv_class=java/lang/Object recv_class_id=0 field="objects"` with
+`native_assertj_lightweight_comparable_assert` in the backtrace. The dedup is
+load-bearing: the same run drops 2 710 stores, ~2 700 of them one benign shape.
+
+Three instrument gaps closed alongside it. The compact reference store was the
+one heap write primitive with no `cell_watch_check`, so
+`CRATONVM_DBG_WATCH_CELL` answered "nobody wrote it" for a compact object's
+reference field. `[GETFIELD-WATCH]`/`[PUTFIELD-WATCH]` printed the receiver's
+address and nothing else, which cannot tell "the same object, moved" from "a
+different object at a recycled address"; they now print its class, `num_slots`,
+`gc_flags`, whether the heap still calls it an object start, and the field's
+layout-aware byte address. And **`CRATONVM_DBG_OBJ_WATCH=<class-substring>`** is
+new: it follows an OBJECT rather than an address — one `[OBJWATCH]` line per
+evacuation with the source body words, plus one per `set_field` with the Rust
+caller — which is what an address watch cannot do when a semispace is re-served
+from the same base every cycle.
+
+`BindableTests` 27/27 at 65 536, 131 072, 262 144, 262 144 `--nojit`, 393 216,
+524 288 and unset; every `[deadref-*]`, `[tlab-audit]`, `[heap-stale]` and
+`[RESID-DIAG]` counter zero and 42 589 `[rset-verify]` reports with `missing=0`
+on the 262 144 run.
+
+
 ### 2026-09-11 The loop control: a folded immediate, and `LEA` for the increment
 
 The residue `c2-a-fused-compare-can-read-its-operands-where-they-are-20260910.md`

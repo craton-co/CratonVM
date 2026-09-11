@@ -1120,20 +1120,49 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
             let term_node = &graph.nodes[term as usize];
             match &term_node.op {
                 Op::If => {
-                    // Find Proj(0) and Proj(1) successors
+                    // The Proj(0) and Proj(1) successors, pushed in PROJECTION
+                    // order.
+                    //
+                    // `ir_lower` names `successors[0]` the TRUE block and
+                    // `successors[1]` the false one, so this order is not a
+                    // presentation detail: it decides which way every
+                    // conditional branch this backend emits goes.
+                    //
+                    // This scan used to push in node-ID order and rely on the
+                    // two agreeing, which they do for every graph `IrBuilder`
+                    // produces — its `if_icmp*` arms add `Proj(0)` and then
+                    // `Proj(1)`, so the lower id is always the true edge. That
+                    // is a property of one producer, not of the IR, and the
+                    // first transform to CLONE an `If` broke it: the partial
+                    // unroller adds each copy's continue-edge projection first
+                    // (it is the one the next copy hangs off), and in a javac
+                    // `if_icmpge` loop that is `Proj(1)`. Every intermediate
+                    // test then branched to the edge meant for its opposite,
+                    // the early exits were never taken, and the loop ran
+                    // `n + factor - 1` iterations — `sum(1)` returned 6.
+                    //
+                    // Sorting by the projection's own index makes the invariant
+                    // a property of this code rather than of node-allocation
+                    // order. It is a no-op on every graph the builder makes.
+                    let mut succs: Vec<(u8, usize)> = Vec::new();
                     for (id, node) in graph.nodes.iter().enumerate() {
-                        if let Op::Proj(_n) = &node.op {
-                            if !node.inputs.is_empty() && node.inputs[0] == term {
-                                let succ_block = node_to_block[id];
-                                if succ_block != usize::MAX {
-                                    if !blocks[block_idx].successors.contains(&succ_block) {
-                                        blocks[block_idx].successors.push(succ_block);
-                                    }
-                                    if !blocks[succ_block].predecessors.contains(&block_idx) {
-                                        blocks[succ_block].predecessors.push(block_idx);
-                                    }
-                                }
-                            }
+                        let Op::Proj(which) = &node.op else { continue };
+                        if node.inputs.first().copied() != Some(term) {
+                            continue;
+                        }
+                        let succ_block = node_to_block[id];
+                        if succ_block == usize::MAX {
+                            continue;
+                        }
+                        succs.push((*which, succ_block));
+                    }
+                    succs.sort_by_key(|&(which, _)| which);
+                    for (_which, succ_block) in succs {
+                        if !blocks[block_idx].successors.contains(&succ_block) {
+                            blocks[block_idx].successors.push(succ_block);
+                        }
+                        if !blocks[succ_block].predecessors.contains(&block_idx) {
+                            blocks[succ_block].predecessors.push(block_idx);
                         }
                     }
                 }
@@ -3061,6 +3090,65 @@ mod tests {
     // ── Memory-effect ordering ───────────────────────────────────────────
 
     use crate::ir::{MemKind, NodeId as Id};
+
+    /// An `If`'s successors come out in PROJECTION order, whatever order the
+    /// projections were added in.
+    ///
+    /// `ir_lower` names `successors[0]` the true block and `successors[1]` the
+    /// false one, so this ordering decides which way every conditional branch
+    /// the backend emits goes. It held for free as long as `IrBuilder` was the
+    /// only producer — its `if_icmp*` arms add `Proj(0)` and then `Proj(1)`, so
+    /// the lower node id was always the true edge, and this scan pushed in node
+    /// id order.
+    ///
+    /// The first transform to CLONE an `If` broke that. The partial unroller
+    /// adds each copy's continue-edge projection first, because that is the one
+    /// the next copy hangs off, and in a javac `if_icmpge` loop the continue
+    /// edge is `Proj(1)`. Every intermediate test then branched to the edge
+    /// meant for its opposite: the early exits were never taken and the loop
+    /// ran `n + factor - 1` iterations, so `sum(1)` returned 6.
+    ///
+    /// This graph is built the way the unroller builds one — `Proj(1)` first —
+    /// so it fails against a node-id-ordered scan and passes against an
+    /// index-ordered one. A fixture built in the conventional order cannot tell
+    /// the two apart, which is why this one is deliberately backwards.
+    #[test]
+    fn an_ifs_successors_are_ordered_by_projection_not_by_node_id() {
+        let mut g = bare_graph();
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let entry = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let cond = g.add(Op::Param(0), IrType::Int, vec![], None);
+        let if_node = g.add(Op::If, IrType::Control, vec![entry, cond], Some(0));
+        // Backwards on purpose: the FALSE edge gets the lower node id.
+        let false_edge = g.add(Op::Proj(1), IrType::Control, vec![if_node], Some(0));
+        let true_edge = g.add(Op::Proj(0), IrType::Control, vec![if_node], Some(0));
+        let a = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let b = g.add(Op::Const(2), IrType::Int, vec![], None);
+        let merge = g.add(
+            Op::Merge,
+            IrType::Control,
+            vec![true_edge, false_edge],
+            Some(1),
+        );
+        let phi = g.add(Op::Phi, IrType::Int, vec![merge, a, b], Some(1));
+        let ret = g.add(Op::Return, IrType::Void, vec![merge, phi], Some(2));
+        g.entry = start;
+        g.exit = ret;
+
+        let schedule = schedule(&g);
+        let if_block = schedule.node_to_block[if_node as usize];
+        let succ = &schedule.blocks[if_block].successors;
+        assert_eq!(succ.len(), 2, "an `If` has exactly two successors");
+        assert_eq!(
+            schedule.blocks[succ[0]].ctrl, true_edge,
+            "successors[0] must be the Proj(0) block — `ir_lower` branches on it \
+             as the TRUE edge",
+        );
+        assert_eq!(
+            schedule.blocks[succ[1]].ctrl, false_edge,
+            "successors[1] must be the Proj(1) block",
+        );
+    }
 
     fn bare_graph() -> Graph {
         Graph {
