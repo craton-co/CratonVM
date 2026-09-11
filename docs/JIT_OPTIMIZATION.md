@@ -4887,3 +4887,292 @@ log (86 lines); on, zero. Suite 92/92, 2,285 jit tests green.
 inside this host's noise floor, and today's two withdrawn results are the reason
 that is left as a measurement someone takes on a quiet host rather than a figure
 asserted here.
+
+---
+
+## 2026-09-11 — a phi copy staged in RAX, and a census that redirected the work
+
+Two things landed, and the second is the reason the first was findable.
+
+### The census: operand POSITION is 3.8%, not 82%
+
+`c2-one-carry-slot-is-the-frame-traffic-ceiling-FIXED-20260910.md` closed by
+naming `ir_schedule::pair_single_use_operands` as the next lever, on the
+strength of the deferred carry declining **82%** of its candidate windows for
+`operand_position`, and asking for a census of that pass because *"which of
+those four dominates is not yet counted"*.
+
+Built (`ir_schedule::PairCensus` — one counter per `continue`, under a
+`debug_assert`ed accounting identity so a new reason cannot read low) and run
+over 188 probes, **34,289 windows**:
+
+| cause | share |
+|---|---:|
+| producer is multi-use | **78.3%** |
+| producer's arm not certified by `op_home_is_one_store_rax` | **16.2%** |
+| the four POSITION buckets, together | **3.8%** |
+| paired | 1.7% |
+
+The two figures have different denominators and both are right — the carry's
+82% is over windows where a consumer already takes its first operand in RAX,
+the pass's is over every `(consumer, operand)` pair — but only the second says
+what the PASS could act on. **94.5% of the operands it sees were never
+eligible**, and no scheduling change reaches them. The carry page now carries
+the correction beside its prediction.
+
+Where it points instead: `producer_arm`, and inside it `Op::Load`. A
+`getfield`'s three lowering paths are mutually exclusive and each ends in one
+`store_rax` with RAX holding the result, but the mechanical test counts
+`self.store_rax(slot);` textually and sees three, so the op is excluded from a
+certification it appears to satisfy. Unowned, and the per-op breakdown that
+would size it is one more counter.
+
+### The change: `CRATONVM_JIT_IR_PHI_COPY_DIRECT`, default ON
+
+Every phi edge copy staged through RAX and then published into the phi's own
+register. On a loop back edge that is `mov rax,r15` / `mov r12,rax` for a
+resident source and `mov rax,[slot]` / `mov rbx,rax` for one still in its
+word — **one instruction per loop-carried value per iteration**, to move a
+value that is already in a register or already in the word.
+
+`emit_copy_op` now reads straight into the phi's register when it has one, so
+the publish disappears. It is the same program: the write to that register
+moves earlier inside ONE `CopyOp`, crossing only that copy's own store, so
+`resolve_parallel_copy`'s cross-op invariant is untouched.
+
+`FieldLoop.sum`'s back edge goes from four instructions to two, its loop body
+from 26 to 24, and its body from 1071 to 1059 bytes. Measured
+(`tools/tier-ab/cpu-ab.ps1`, four invocations, all outside their own floors and
+agreeing on the sign, the last re-taken after merging `dev`):
+**−4.8% / −7.0% / −7.3% / −10.5%**, i.e. about **1.08x** on
+that shape, and the tiering inversion there goes **1.208x → 1.11x** on this
+host. `FieldLoop.sumWide`, which folds twice as many copies, is
+**UNMEASURABLE** — four times the arithmetic per iteration, so the same two
+instructions are a quarter of the share.
+
+**A restriction worth copying, not just recording.** The first version also
+staged when the phi's home store survived, and wrote that home from the staged
+register. Replacing that store with `panic!()` left the **entire**
+`cratonvm-jit` suite green — 2356 unit tests and 145 differential tests — so
+the branch was shipping unexercised; and forcing it to run still could not
+catch storing the WRONG register, because nothing reads a resident phi's home
+word back. The change was narrowed to the home-dropped case (where the store
+does not exist at all) rather than the test weakened, and
+`a_phi_copy_that_keeps_its_home_is_byte_identical` pins the exclusion by
+demanding byte equality. One instruction given up on a path nothing reaches,
+in exchange for every remaining path being one the suite can fail.
+
+### And a third witness that the register file is not the constraint
+
+`c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md` argued from
+census counters that widening the GP file does not pay. The disassembly now
+shows what the two extra Win64 registers actually buy: with
+`CRATONVM_JIT_IR_GP_WIDE=1` the induction variable's home store AND its reload
+on the back edge disappear entirely — `lea r15d,[rbx+1]`, no frame traffic —
+which is exactly the store-to-load-forwarding pair this document traced the
+tier's residual 1.36x to. It still measures **+0.4% against a 0.8% floor**.
+
+So that chain is not this loop's critical path, whatever its latency is in
+isolation, and the next person reaching for "the loop-carried value round-trips
+through the frame" has a measurement to answer first.
+
+Full write-up, including the per-iteration instruction budget that says where
+the remaining gap is — **20 instructions against 26**, with the two survivors
+being that this tier does not unroll (so it pays the safepoint poll and the back
+edge every iteration rather than every fourth) and that its receiver null check
+is explicit where the single-pass tier's is implicit — in
+[`internal/performance/c2-the-phi-copy-staging-register-20260911.md`](internal/performance/c2-the-phi-copy-staging-register-20260911.md).
+
+### The same budget's next line: the loop branched the wrong way
+
+`FieldLoop.sum` takes **four** branches per iteration at this tier against the
+single-pass tier's one, and one of the four was free:
+
+```asm
+25d: cmp ebx,r14d
+260: jl  +5        ; to the loop body -- TAKEN every iteration
+266: jmp exit      ;   ...skipping this
+26b: <loop body>
+```
+
+The fused-branch arm picks its fall-through edge from `branch_hints`, which is
+empty without `CRATONVM_TIER_PGO`. The fallback that left behind — *the `true`
+edge is the near one* — is inverted for every javac counted loop, and for a
+reason this document already records in the range-BCE closeout: **javac puts the
+loop body on the FALSE edge**, because `for (i = 0; i < n; i++)` compiles to
+`if_icmpge exit`. So the near edge was the loop EXIT, the exit was not the next
+block, and `ir_fallthrough_enabled`'s `JMP rel32` elision — default-ON since
+2026-09-09 and built for exactly this — could never reach it.
+
+`CRATONVM_JIT_IR_BRANCH_LAYOUT_POLARITY` (default ON) takes the fall-through
+edge from the block LAYOUT when there is no hint: `layout_hot_paths` is
+default-ON, needs no profile, and `block_idx + 1` is its decision. The sequence
+becomes one not-taken `jge exit`: **−5 bytes, −1 instruction, −1 taken branch
+per iteration**, and 41 branches take it on `CratonBenchC2`.
+
+**It measures nothing** — UNMEASURABLE on `FieldLoop` (+0.6% against a 0.6%
+floor) and on `CratonBenchC2` (−2.5% against a 4.8% floor), checksums identical
+throughout. It ships ON because it is weakly better in both instructions and
+taken branches and strictly better whenever the near edge would otherwise need a
+`JMP`, not because anything here shows it pays.
+
+**It does not override a profile hint, and a test caught it trying.**
+`step4_ir_lower_consumes_branch_bias_hint` went red on the first version. The
+interaction it exposed is a real gap: `ScheduleOptions::branch_counts` is
+documented as taking the same per-bci bias the lowerer takes, and
+`production_schedule_options()` leaves it **empty** — so a profile informs the
+polarity of one `Jcc` and never informs which block is placed next. Populating
+it is small, and nobody has.
+
+**And a harness finding worth more than the number.** The first run reported
++1.3% against a **0.0%** floor — the tightest this apparatus has printed, and
+meaningless: Windows accounts CPU in ~15.625 ms ticks, the samples were 0.586 s,
+so one tick was 2.7% of a sample and both medians had merely landed on the same
+one. `cpu-ab.ps1` now prints the tick as a percentage of the median and refuses
+a verdict inside it. That is the second way a clean floor misleads — the first
+being drift between invocations (§5.2 of the GP-register page) — and both make a
+tight floor read as permission to stop.
+
+### CORRECTION: "the optimizing tier does not unroll" — true, and not for the reason implied
+
+This document has said since 2026-09-03 that the optimizing tier does not
+unroll, priced it at about 1.12x on a counted loop, and listed it as the
+largest remaining item in that tier's per-iteration budget. All three stand.
+What does not stand is the conclusion anyone would draw from them — that an
+unroller needs writing.
+
+**`ir_optimize::unroll` exists, is default-ON, and recognises a javac counted
+loop exactly.** Driven against a real bytecode-built `for (i = 0; i < 5; i++)
+a += i;` it reports `trip=5 init=0 stride=1` and then declines, silently, on the
+`body_named_by_safepoint` refusal — whose escape hatch is gated on
+`CRATONVM_JIT_IR_DROP_UNREACHABLE_HOMES`, **default OFF**. With that flag set,
+the same loop unrolls. The flag's own sibling
+(`CRATONVM_JIT_IR_REG_AUTHORITATIVE`) rests on the identical prediction, was
+soaked and flipped ON on 2026-09-09, and says so in its doc comment; the flag it
+names was never revisited.
+
+**And that would not reach the loops that matter.** `ir_optimize::UnrollCensus`
+— one counter per `continue`, under a closing identity — says every counted loop
+in both benchmark suites has a RUNTIME bound, which full unrolling can never
+serve:
+
+| | CratonBenchC2 | CratonBench |
+|---|---:|---:|
+| loops found (merges − not_single_backedge) | 13 | 6 |
+| of which runtime-bounded | **6** | **4** |
+| `safepoint_named` | 0 | 0 |
+| unrolled | **0** | **0** |
+
+So the thing to build is a PARTIAL unroller, in the single-pass tier's own shape
+(keep the test in every copy, amortise only the poll and the back edge — no
+trip-count arithmetic, so none of the overflow hazard the range-BCE closeout
+records). It was designed and deliberately **not built**, because both of the
+gates under which it could be written without touching deopt metadata measure
+**zero**:
+
+| gate | asks | CratonBenchC2 | CratonBench | `FieldLoop` |
+|---|---|---:|---:|---:|
+| whole method trap-free | `graph_cannot_deopt` | 0 of 6 | 0 of 4 | 0 of 1 |
+| **cloned nodes all pure** | the real obligation | **0 of 6** | **0 of 4** | **0 of 1** |
+
+The second is zero for the same reason these loops are worth unrolling:
+`FieldLoop.sum`'s body IS a field read, and `Op::Load` is not pure.
+
+**What unrolling actually needs is one thing, and it is the same for both
+unrollers: a deopt point addressable per COPY rather than per bci.**
+`DeoptimizationPoint` already carries `(native_offset, bci, frame_state)` and
+two points may share a bci — the representation is fine. Two things collapse
+them: `bci_native` keeps the EARLIEST offset per bci, so only copy 0 is
+anchored, and `find_deopt_point` is an exact-offset binary search returning
+`None` for the rest; and `graph.safepoints` has one snapshot per bci naming the
+original nodes, so a later copy has no frame describing its own values. That is
+a bounded change to three named places, and it is the prerequisite for every
+version of this feature.
+
+Full write-up, including the census, the refusal taxonomy and the partial-unroll
+design that was not built, in
+[`internal/performance/c2-unrolling-is-a-deopt-metadata-problem-20260911.md`](internal/performance/c2-unrolling-is-a-deopt-metadata-problem-20260911.md).
+
+### FOLLOW-UP: the per-copy deopt frame, built (`CRATONVM_JIT_IR_PER_COPY_FRAMES`, default OFF)
+
+The "bounded change to three named places" above is done, and it is off by
+default because it is deopt metadata: the failure mode is a right-looking wrong
+answer, not a crash.
+
+* **`Node::frame_snapshot: Option<u32>`** — the per-copy identity, on the node.
+  `None` on everything the builder makes, so the by-bci scan is unchanged for
+  every compile that does not unroll. `Graph::set_node_frame_snapshot` refuses a
+  snapshot whose bci is not the node's own.
+* **`ir_optimize::install_copy_frames`** — one substituted snapshot per
+  iteration; iteration 0 rewrites its own in place so `bci_native`'s anchor and
+  the frame at it keep describing the same code.
+* **`Lowerer::snapshot_native` / `resolve_frame_state_for_site`** — the anchor
+  and the frame taken from the copy rather than from the bci.
+
+Two places the design note did not name turned out to matter. **GVN's identity**
+now includes `frame_snapshot`: two copies of a body compute the same value at
+different program points, and merging them hands one copy's code the other's
+frame. And **`ir_verify`'s duplicate-bci rule**, which existed because of this
+exact collapse, is now *"a duplicated bci is a violation unless every snapshot at
+it is claimed by a node"* — an unclaimed duplicate is still the bug, and is what
+a half-finished copy looks like.
+
+**One thing the end-to-end run taught that is not about unrolling.** The probe
+that exercises a deopt out of copy 3 still crashed on a default run, and the
+reason was `ir_evidence::accept`: it priced the unrolled C2 body as not worth
+publishing and handed the method back to the single-pass tier. The C2 body was
+never running. `CRATONVM_C2_ACCEPT=always` installs it, and then all three
+shapes match HotSpot exactly (20 000 `NullPointerException`s out of a cloned
+body, each resuming in the copy that trapped). Worth remembering generally: with
+an acceptance gate between a transform and its execution, "the checksum matched"
+can be a statement about code that never ran.
+
+**It wins nothing measurable yet, and that is expected.** The census above says
+every counted loop in both suites has a runtime bound, so `per_copy_frames`
+(a new sub-count of `unrolled`) is zero there. What it buys is that the sentence
+the previous page ended on is no longer owed: the partial unroller can now be
+written against a frame mechanism instead of around one.
+
+One cost is worth knowing before it is discovered: **safepoint slots are DCE
+roots**, so per-copy frames keep every iteration's intermediates alive to
+describe them. On the `for (i = 0; i < 5; i++) a += i;` fixture the loop folds to
+`Const(10)` and five `Const` nodes survive anyway, materialised purely for the
+frames. The narrower fix (root only snapshots that can be consulted) is a DCE
+change, not this one.
+
+Full write-up in
+[`internal/performance/c2-per-copy-deopt-frames-20260911.md`](internal/performance/c2-per-copy-deopt-frames-20260911.md).
+
+### FOLLOW-UP: the partial unroller was written (`CRATONVM_JIT_IR_PARTIAL_UNROLL`, default OFF)
+
+**2026-09-11, same day.** It keeps the loop test in every copy — so no
+trip-count arithmetic and no speculation — and sends each copy's failing test
+**back to the header** rather than to a new exit merge, which is what keeps the
+transform closed under the loop and leaves every post-loop use and safepoint
+slot untouched.
+
+It is **correct and it is not faster**: 9 alternating pairs on
+`bench/C2PartialUnrollProbe.java` read 356 ms rolled against 362 ms unrolled at
+factor 4 — a ratio of 0.98 against a ±8% spread — with checksums matching
+Temurin 25 on trip counts both divisible and not divisible by the factor. The
+per-iteration instruction count *does* fall, 20 to 16.25. It buys nothing
+because the rolled loop keeps `a` and `i` in `rbx`/`r15` with **no memory
+operand in its loop at all** and the unrolled one spills every carried value:
+`sink_pure_nodes` moves a node only when the loop depth strictly DECREASES, and
+every copy of an unrolled body sits at the header's own depth, so all four are
+computed above the first test and eight intermediates contend for a
+five-register file.
+
+The sentence at 1437 and item 1 at 1484 both need a caveat now. The optimizing
+tier *can* unroll; unrolling is not by itself what the baseline's 4x buys. The
+baseline also colours its locals into callee-saved registers, and that is the
+half this tier is still missing.
+
+Two wrong-code defects were found on the way, both in shared code, both live
+before this transform and reachable by anything that clones a control node: an
+`If`'s successors were ordered by **node id** rather than by projection index,
+and an OSR entry resolved a bci **two blocks claimed**. Both are fixed and
+pinned by tests.
+
+Full write-up, including why the obvious schedule-late fix is not landed, in
+[`internal/performance/c2-the-partial-unroller-20260911.md`](internal/performance/c2-the-partial-unroller-20260911.md).

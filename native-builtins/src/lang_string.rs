@@ -1427,6 +1427,15 @@ pub(crate) fn format_double(v: f64) -> String {
 /// model describes the 4-slot real one must not be indexed past its end. Every
 /// caller then falls back to the historical index heuristic, so behaviour under
 /// the mock and under the synthetic layout is unchanged.
+///
+/// **Memoised per class.** `resolve_field_index_by_class_id` takes a
+/// class-manager READ LOCK and walks the hierarchy comparing field NAMES, and
+/// `sb_view` + `sb_set_count` between them ask for one twice on every single
+/// `append`. A name→slot answer is a property of the CLASS, not of the
+/// receiver, so [`SB_SLOT_MEMO`] caches it keyed by `ClassId` and the hot path
+/// pays one `class_id_of_object` and an array scan instead. Measured on the
+/// `String/Regex` row's builder loop, `resolve_field_index_by_class_id` +
+/// `set_field_by_name` + the `memcmp` they drive were 5.3% of the phase.
 fn sb_field_slot(
     ctx: &dyn NativeContext,
     this: cratonvm_types::ObjectRef,
@@ -1441,12 +1450,87 @@ fn sb_field_slot(
     if fields <= 2 {
         return None;
     }
-    let slot = ctx.resolve_field_index_by_class_id(ctx.class_id_of_object(this), name)?;
+    let class_id = ctx.class_id_of_object(this);
+    let slot = sb_class_slot(ctx, class_id, name)?;
     if slot < fields {
         Some(slot)
     } else {
         None
     }
+}
+
+/// One memoised `(class, field name) -> slot` answer.
+///
+/// `slot` is `None` for a name the class does not declare at all — the
+/// NEGATIVE answer is worth caching too, because `sb_set_count`'s
+/// `toStringCache` probe misses on every `StringBuilder` ever appended to and
+/// a miss is the most expensive lookup there is: it walks the whole hierarchy
+/// before concluding.
+///
+/// Keyed by `ClassId`, which makes the answer permanent: a `ClassId` names one
+/// loaded class in one loader, and JVMTI `RedefineClasses` is forbidden from
+/// changing a class's field layout, so a name that resolved to slot `k` under
+/// this class resolves to slot `k` for the rest of the run. (The
+/// `java.util.regex` fast path next door caches the same kind of answer in a
+/// process-global `OnceLock` keyed only by class NAME; this is the stricter
+/// key, not a looser one.)
+#[derive(Clone, Copy)]
+struct SbSlotMemoEntry {
+    class_id: cratonvm_types::ClassId,
+    /// Index into [`SB_MEMO_NAMES`].
+    name: u8,
+    slot: Option<u32>,
+}
+
+/// The field names this file resolves on a hot path. Anything not listed here
+/// goes straight to the class model, uncached — the memo is a fixed-size array
+/// scan, so it stays fast only while it stays small.
+const SB_MEMO_NAMES: [&str; 3] = ["count", "coder", "toStringCache"];
+
+thread_local! {
+    /// Direct-mapped `(ClassId, name) -> slot` memo.
+    ///
+    /// Sized for the receivers this path actually sees: `StringBuilder` and
+    /// `StringBuffer`, three names each. Thread-local so it needs no lock of
+    /// its own — the thing it exists to avoid IS a lock.
+    static SB_SLOT_MEMO: std::cell::RefCell<Vec<SbSlotMemoEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// [`sb_field_slot`]'s class-model half, memoised. See [`SbSlotMemoEntry`].
+fn sb_class_slot(
+    ctx: &dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+    name: &str,
+) -> Option<usize> {
+    let Some(name_idx) = SB_MEMO_NAMES.iter().position(|&n| n == name) else {
+        return ctx.resolve_field_index_by_class_id(class_id, name);
+    };
+    let name_idx = name_idx as u8;
+    let hit = SB_SLOT_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .find(|e| e.class_id == class_id && e.name == name_idx)
+            .map(|e| e.slot)
+    });
+    if let Some(slot) = hit {
+        return slot.map(|s| s as usize);
+    }
+    let slot = ctx.resolve_field_index_by_class_id(class_id, name);
+    SB_SLOT_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        // A runaway memo would turn the scan into the cost it removes. Real
+        // programs load two builder classes; a pathological one that somehow
+        // produced more just stops being memoised past the cap.
+        if memo.len() < 32 {
+            memo.push(SbSlotMemoEntry {
+                class_id,
+                name: name_idx,
+                slot: slot.map(|s| s as u32),
+            });
+        }
+    });
+    slot
 }
 
 /// The builder's UTF-16 content, whatever layout its `value` slot holds.
@@ -1554,20 +1638,43 @@ pub(crate) struct SbView {
     pub(crate) count: usize,
     /// Characters — `value.length >> coder`, which is `capacity()`.
     pub(crate) capacity: usize,
+    /// The receiver's class, and where THIS image puts `count` in it —
+    /// resolved once while building the view so the write side does not have
+    /// to resolve it a second time. `None` for the synthetic 2-slot layout and
+    /// for a receiver whose class model cannot answer, which is exactly when
+    /// [`sb_set_count`] falls back to its historical index heuristic.
+    pub(crate) count_slot: Option<(cratonvm_types::ClassId, usize)>,
 }
 
-/// The builder's `count` field, wherever this image puts it. Split out of
-/// [`sb_state`] so [`sb_view`] can read it without also re-deriving the payload.
-fn sb_raw_count(ctx: &dyn NativeContext, this: cratonvm_types::ObjectRef) -> i32 {
-    let at = |slot: usize| match ctx.get_field(this, slot) {
+/// Where `count` lives for THIS receiver, with the class it was resolved
+/// against.
+///
+/// The class id is handed back so the write side can reuse it for its own
+/// (memoised) `toStringCache` lookup instead of asking the heap for the
+/// receiver's class a second time.
+fn sb_count_slot(
+    ctx: &dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+) -> Option<(cratonvm_types::ClassId, usize)> {
+    let fields = ctx.object_num_fields(this);
+    if fields <= 2 {
+        return None;
+    }
+    let class_id = ctx.class_id_of_object(this);
+    let slot = sb_class_slot(ctx, class_id, "count")?;
+    if slot < fields {
+        Some((class_id, slot))
+    } else {
+        None
+    }
+}
+
+/// No class model (the mock) — the historical index heuristic, unchanged.
+fn sb_raw_count_heuristic(ctx: &dyn NativeContext, this: cratonvm_types::ObjectRef) -> i32 {
+    let slot = if ctx.object_num_fields(this) >= 3 { 2 } else { 1 };
+    match ctx.get_field(this, slot) {
         Value::Int(v) => v,
         _ => 0,
-    };
-    match sb_field_slot(ctx, this, "count") {
-        Some(slot) => at(slot),
-        // No class model (the mock) — the historical heuristic, unchanged.
-        None if ctx.object_num_fields(this) >= 3 => at(2),
-        None => at(1),
     }
 }
 
@@ -1589,12 +1696,15 @@ fn sb_raw_count(ctx: &dyn NativeContext, this: cratonvm_types::ObjectRef) -> i32
 /// that (`classloading/src/class_manager.rs`, `instance_fields(2)`).
 pub(crate) fn sb_view(ctx: &dyn NativeContext, this: cratonvm_types::ObjectRef) -> SbView {
     use cratonvm_types::ArrayElementType;
+    // One `array_shape` where this used to ask `object_is_array`,
+    // `array_length` and `heap_element_type_of` about the same payload — three
+    // validated heap round-trips, each re-walking the same header, on every
+    // `append`.
     let (buf, raw_len, elem) = match ctx.get_field(this, 0) {
-        Value::Object(Some(a)) if ctx.object_is_array(a) => (
-            Some(a),
-            ctx.array_length(a),
-            Some(ctx.heap_element_type_of(a)),
-        ),
+        Value::Object(Some(a)) => match ctx.array_shape(a) {
+            Some((elem, len)) => (Some(a), len, Some(elem)),
+            None => (None, 0, None),
+        },
         _ => (None, 0, None),
     };
     // `coder` is read at slot 1 FIRST, and only resolved by name when that read
@@ -1639,7 +1749,15 @@ pub(crate) fn sb_view(ctx: &dyn NativeContext, this: cratonvm_types::ObjectRef) 
         }
     };
     let capacity = if utf16 { raw_len / 2 } else { raw_len };
-    let count = (sb_raw_count(ctx, this).max(0) as usize).min(capacity);
+    let count_slot = sb_count_slot(ctx, this);
+    let raw_count = match count_slot {
+        Some((_, slot)) => match ctx.get_field(this, slot) {
+            Value::Int(v) => v,
+            _ => 0,
+        },
+        None => sb_raw_count_heuristic(ctx, this),
+    };
+    let count = (raw_count.max(0) as usize).min(capacity);
     SbView {
         layout,
         buf,
@@ -1647,6 +1765,7 @@ pub(crate) fn sb_view(ctx: &dyn NativeContext, this: cratonvm_types::ObjectRef) 
         utf16,
         count,
         capacity,
+        count_slot,
     }
 }
 
@@ -1980,7 +2099,7 @@ pub(crate) fn sb_append_units(
         };
         if let (true, Some(buf)) = (representable, v.buf) {
             sb_put_units_at(ctx, buf, v.count, units, v.layout, v.utf16);
-            sb_set_count(ctx, this, (v.count + units.len()) as i32);
+            sb_set_count_resolved(ctx, this, (v.count + units.len()) as i32, v.count_slot);
             return this;
         }
     }
@@ -2186,10 +2305,26 @@ pub(crate) fn sb_state(
 /// to resolve names against), and the extra by-name write is a no-op when no
 /// such field exists.
 fn sb_set_count(ctx: &mut dyn NativeContext, this: cratonvm_types::ObjectRef, count: i32) {
+    let resolved = sb_count_slot(&*ctx, this);
+    sb_set_count_resolved(ctx, this, count, resolved);
+}
+
+/// [`sb_set_count`] with the `count` slot already resolved.
+///
+/// The append path builds an [`SbView`] immediately before the write and that
+/// view already knows where `count` is, so re-resolving it here was a second
+/// `object_num_fields` + `class_id_of_object` + memo probe per append for an
+/// answer we were holding.
+fn sb_set_count_resolved(
+    ctx: &mut dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+    count: i32,
+    resolved: Option<(cratonvm_types::ClassId, usize)>,
+) {
     // Ask the class model where `count` is, exactly as `sb_state` now does —
     // the two must not disagree, and for two years they did. See
     // `sb_field_slot` for the three layouts and the measurement.
-    if let Some(slot) = sb_field_slot(ctx, this, "count") {
+    if let Some((class_id, slot)) = resolved {
         // The payload these natives maintain is a `char[]`, and
         // `native_sb_get_coder` reports LATIN1 for it, so keep the real
         // `coder` field agreeing with that answer. Resolve it by name too:
@@ -2224,12 +2359,25 @@ fn sb_set_count(ctx: &mut dyn NativeContext, this: cratonvm_types::ObjectRef, co
         // sb.toString()` answered the STALE "abc" for exactly those six and
         // the right "7abc" for the other thirty.
         //
-        // The guard is `count_slot + 1 < num_fields` — "this receiver has state
-        // after `count`", which is true of `StringBuffer` on every image and
-        // false of `StringBuilder` on every image — so the hot builder path
-        // pays one integer comparison and never a second name resolution.
-        if slot + 1 < ctx.object_num_fields(this) {
-            ctx.set_field_by_name(this, "toStringCache", Value::Object(None));
+        // The guard used to be `count_slot + 1 < num_fields` — "this receiver
+        // has state after `count`" — followed by an UNCONDITIONAL by-name
+        // write. That is a whole-hierarchy name walk on every append of every
+        // builder whose layout happens to satisfy the count heuristic, and for
+        // a `StringBuilder` the walk can only ever MISS, because that class
+        // declares no `toStringCache` at all. A miss is also the most
+        // expensive shape of that lookup: it compares every field name in the
+        // hierarchy before concluding.
+        //
+        // Ask the class directly instead, through the same memo the `count`
+        // and `coder` lookups use, so the negative answer is computed once per
+        // class and the write is skipped outright from then on. This is also
+        // strictly closer to what `StringBuffer` specifies: it clears the
+        // cache whenever the receiver DECLARES one, rather than whenever a
+        // field-count heuristic happens to hold.
+        if let Some(cache_slot) = sb_class_slot(&*ctx, class_id, "toStringCache") {
+            if cache_slot < ctx.object_num_fields(this) {
+                ctx.set_field(this, cache_slot, Value::Object(None));
+            }
         }
         return;
     }
@@ -2288,8 +2436,61 @@ pub(crate) fn sb_append_str(
     this: cratonvm_types::ObjectRef,
     text: &str,
 ) -> cratonvm_types::ObjectRef {
+    // `encode_utf16().collect()` is a heap allocation on EVERY append, and the
+    // hottest appends there are — `append(int)`, `append(long)`,
+    // `append(char)`, `append(boolean)` — render at most twenty characters and
+    // so never need one. Encode short text into the stack instead and keep the
+    // `Vec` for the long tail.
+    //
+    // A UTF-16 encoding is never LONGER in units than the UTF-8 is in bytes
+    // (1-, 2- and 3-byte scalars are one unit each, 4-byte scalars two), so
+    // `text.len() <= SB_STACK_UNITS` is a sound bound on the unit count and
+    // the buffer cannot overflow.
+    if text.len() <= SB_STACK_UNITS {
+        let mut buf = [0u16; SB_STACK_UNITS];
+        let mut units = 0usize;
+        for unit in text.encode_utf16() {
+            buf[units] = unit;
+            units += 1;
+        }
+        return sb_append_chars(ctx, this, &buf[..units]);
+    }
     let chars: Vec<u16> = text.encode_utf16().collect();
     sb_append_chars(ctx, this, &chars)
+}
+
+/// Longest text [`sb_append_str`] encodes without touching the allocator.
+const SB_STACK_UNITS: usize = 64;
+
+/// The widest `i64` rendering: nineteen digits plus a sign.
+const SB_DIGITS: usize = 20;
+
+/// `value` rendered into a caller-owned stack buffer — what `Integer.toString`
+/// / `Long.toString` produce, without the `String` that `i64::to_string`
+/// allocates and frees for every single `append`.
+///
+/// The `String/Regex` benchmark row makes two builder appends per loop
+/// iteration, one of them an `append(int)`, so this is one malloc/free pair per
+/// element of the input.
+fn sb_render_signed(value: i64, buf: &mut [u8; SB_DIGITS]) -> &str {
+    // `-i64::MIN` overflows, so accumulate the magnitude unsigned.
+    let mut magnitude = value.unsigned_abs();
+    let mut at = buf.len();
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (magnitude % 10) as u8;
+        magnitude /= 10;
+        if magnitude == 0 {
+            break;
+        }
+    }
+    if value < 0 {
+        at -= 1;
+        buf[at] = b'-';
+    }
+    // Every byte written above is ASCII, so this cannot fail; the fallback
+    // keeps the function total rather than panicking on an impossible state.
+    core::str::from_utf8(&buf[at..]).unwrap_or("0")
 }
 
 /// The `NullPointerException` a real `AbstractStringBuilder` body raises when it
@@ -2489,7 +2690,8 @@ pub(crate) fn native_sb_append_int(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let this = sb_append_str(ctx, this, &val.to_string());
+    let mut digits = [0u8; SB_DIGITS];
+    let this = sb_append_str(ctx, this, sb_render_signed(i64::from(val), &mut digits));
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -2797,7 +2999,8 @@ pub(crate) fn native_sb_append_long(
         Some(Value::Int(i)) => *i as i64,
         _ => 0,
     };
-    let this = sb_append_str(ctx, this, &val.to_string());
+    let mut digits = [0u8; SB_DIGITS];
+    let this = sb_append_str(ctx, this, sb_render_signed(val, &mut digits));
     Ok(Some(Value::Object(Some(this))))
 }
 

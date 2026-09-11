@@ -111,9 +111,13 @@ reached only through those paths, and it is otherwise untested territory.
 
 - **L0** owns `java/lang/Class`. Most reflection entry points route through it;
   if a failure resolves to a `Class` row, hand it to L0 rather than tagging it.
-- **L7** owns the loader and its bootstrap failures. `setAccessible` and module
-  access answers depend on module state that L7 may still be repairing —
-  re-price after any L7 landing.
+- **L7** owned the loader and its bootstrap failures, and **has landed and
+  retired** (2026-09-10): the builtin loader hierarchy links, and the null
+  `java.lang.Module` family was already closed by L0's `Class.getModule` tag.
+  So the module state `setAccessible` depends on is no longer moving under you —
+  re-price once against the
+  [`the-builtin-classloader-could-not-link-and-getname-was-never-tagged-20260910`](../jdk-only/the-builtin-classloader-could-not-link-and-getname-was-never-tagged-20260910.md) record, then treat it as
+  stable. Anything whose remedy is a `Class` row is L0's.
 - **Lane T** owns the two throwable classes in your prefix.
 
 ## 7. The increment loop

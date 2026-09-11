@@ -1233,6 +1233,25 @@ const RETIRED_SHADOW_PREFIXES: &[&str] = &[
     // see `RETIRED_SHADOW_PHASE2_TRIPLES`. A prefix admits a package to the
     // binary search; the table decides what is retired, and it retires one row.
     "sun/nio/ch/",
+    // 2026-09-10, the `--jdk-only` loader-and-bootstrap lane. The measurement
+    // is in
+    // `docs/known-issues/jdk-only/the-builtin-classloader-could-not-link-and-getname-was-never-tagged-20260910.md`;
+    // the lane's own page retired with it.
+    // Two NARROW prefixes, for the reason the `sun/nio/ch/` note above gives: a
+    // prefix only admits a class to the binary search, and
+    // `RETIRED_SHADOW_L7_TRIPLES` retires exactly two rows under them. In
+    // particular `java/security/SecureClassLoader` is spelled out rather than
+    // `java/security/`, which is lane 6's whole prefix set and is NOT admitted
+    // here. `the_l7_prefixes_retire_only_the_two_measured_rows` is the guard.
+    //
+    // Lane 2's `java/lang/` above arrived in the SAME merge and subsumes
+    // `java/lang/ClassLoader` entirely. The entry stays anyway: it is what
+    // makes lane 7's two rows reachable on their own terms, and deleting it
+    // would silently hand that reachability to a prefix another lane owns and
+    // could re-narrow. A duplicate prefix costs one `starts_with` on a path
+    // that has already matched.
+    "java/lang/ClassLoader",
+    "java/security/SecureClassLoader",
     // 2026-09-10, lane 5 (`java/util/concurrent/`, `jdk/internal/misc/`,
     // `sun/misc/`, `java/lang/Thread*`, `jdk/internal/vm/`). `java/util/`
     // above already admits `java/util/concurrent/`; these four are the rest of
@@ -2487,16 +2506,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
     ),
-    (
-        "java/io/EOFException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/io/EOFException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
     ("java/io/EOFException", "toString", "()Ljava/lang/String;"),
     ("java/io/FileNotFoundException", "<init>", "()V"),
     (
@@ -2547,16 +2556,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/io/FileNotFoundException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/io/FileNotFoundException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/io/FileNotFoundException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -2600,16 +2599,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/io/IOException",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/io/IOException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/io/IOException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     ("java/io/IOException", "toString", "()Ljava/lang/String;"),
     ("java/io/NotSerializableException", "<init>", "()V"),
@@ -2658,16 +2647,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/io/NotSerializableException",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/io/NotSerializableException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/io/NotSerializableException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     (
         "java/io/NotSerializableException",
@@ -2727,16 +2706,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/io/UncheckedIOException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/io/UncheckedIOException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/io/UncheckedIOException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -2793,16 +2762,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/io/UnsupportedEncodingException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/io/UnsupportedEncodingException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/io/UnsupportedEncodingException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -2855,16 +2814,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/lang/AbstractMethodError",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/AbstractMethodError",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/lang/AbstractMethodError",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -2914,16 +2863,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/lang/ArithmeticException",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/lang/ArithmeticException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/ArithmeticException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     (
         "java/lang/ArithmeticException",
@@ -2981,16 +2920,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/lang/ArrayIndexOutOfBoundsException",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/lang/ArrayIndexOutOfBoundsException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/ArrayIndexOutOfBoundsException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     (
         "java/lang/ArrayIndexOutOfBoundsException",
@@ -3057,16 +2986,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/lang/AssertionError",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/AssertionError",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/lang/AssertionError",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -3116,16 +3035,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/lang/ClassCastException",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/lang/ClassCastException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/ClassCastException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     (
         "java/lang/ClassCastException",
@@ -3186,16 +3095,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/lang/ClassNotFoundException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/ClassNotFoundException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/lang/ClassNotFoundException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -3252,16 +3151,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/lang/CloneNotSupportedException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/CloneNotSupportedException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/lang/CloneNotSupportedException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -3306,16 +3195,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
     ),
-    (
-        "java/lang/Error",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/Error",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
     ("java/lang/Error", "toString", "()Ljava/lang/String;"),
     ("java/lang/Exception", "<init>", "()V"),
     ("java/lang/Exception", "<init>", "(Ljava/lang/String;)V"),
@@ -3357,16 +3236,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/lang/Exception",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/lang/Exception",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/Exception",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     ("java/lang/Exception", "toString", "()Ljava/lang/String;"),
     ("java/lang/ExceptionInInitializerError", "<init>", "()V"),
@@ -3427,16 +3296,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/lang/ExceptionInInitializerError",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/ExceptionInInitializerError",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/lang/ExceptionInInitializerError",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -3489,16 +3348,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/lang/IllegalAccessError",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/IllegalAccessError",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/lang/IllegalAccessError",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -3548,16 +3397,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/lang/IllegalAccessException",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/lang/IllegalAccessException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/IllegalAccessException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     (
         "java/lang/IllegalAccessException",
@@ -3627,16 +3466,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/lang/IllegalArgumentException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/IllegalArgumentException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/lang/IllegalArgumentException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -3699,16 +3528,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/lang/IllegalStateException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/IllegalStateException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/lang/IllegalStateException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -3762,16 +3581,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/lang/IncompatibleClassChangeError",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/lang/IncompatibleClassChangeError",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/IncompatibleClassChangeError",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     (
         "java/lang/IncompatibleClassChangeError",
@@ -3833,16 +3642,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/lang/IndexOutOfBoundsException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/IndexOutOfBoundsException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/lang/IndexOutOfBoundsException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -3892,16 +3691,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/lang/InstantiationException",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/lang/InstantiationException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/InstantiationException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     (
         "java/lang/InstantiationException",
@@ -3963,16 +3752,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/lang/InternalError",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/InternalError",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/lang/InternalError",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -4022,16 +3801,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/lang/InterruptedException",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/lang/InterruptedException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/InterruptedException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     (
         "java/lang/InterruptedException",
@@ -4086,16 +3855,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
     ),
-    (
-        "java/lang/LinkageError",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/LinkageError",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
     ("java/lang/LinkageError", "toString", "()Ljava/lang/String;"),
     (
         "java/lang/MatchException",
@@ -4142,16 +3901,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/lang/MatchException",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/lang/MatchException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/MatchException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     (
         "java/lang/MatchException",
@@ -4211,16 +3960,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/lang/NegativeArraySizeException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/NegativeArraySizeException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/lang/NegativeArraySizeException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -4270,16 +4009,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/lang/NoClassDefFoundError",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/lang/NoClassDefFoundError",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/NoClassDefFoundError",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     (
         "java/lang/NoClassDefFoundError",
@@ -4335,16 +4064,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/lang/NoSuchFieldError",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/NoSuchFieldError",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/lang/NoSuchFieldError",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -4394,16 +4113,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/lang/NoSuchFieldException",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/lang/NoSuchFieldException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/NoSuchFieldException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     (
         "java/lang/NoSuchFieldException",
@@ -4459,16 +4168,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/lang/NoSuchMethodError",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/NoSuchMethodError",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/lang/NoSuchMethodError",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -4518,16 +4217,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/lang/NoSuchMethodException",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/lang/NoSuchMethodException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/NoSuchMethodException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     (
         "java/lang/NoSuchMethodException",
@@ -4583,16 +4272,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/lang/NullPointerException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/NullPointerException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/lang/NullPointerException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -4645,16 +4324,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/lang/NumberFormatException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/NumberFormatException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/lang/NumberFormatException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -4704,16 +4373,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/lang/OutOfMemoryError",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/lang/OutOfMemoryError",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/OutOfMemoryError",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     (
         "java/lang/OutOfMemoryError",
@@ -4783,16 +4442,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/lang/ReflectiveOperationException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/ReflectiveOperationException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/lang/ReflectiveOperationException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -4852,16 +4501,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/lang/RuntimeException",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/lang/RuntimeException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/RuntimeException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     (
         "java/lang/RuntimeException",
@@ -4927,16 +4566,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/lang/SecurityException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/SecurityException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/lang/SecurityException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -4986,16 +4615,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/lang/StackOverflowError",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/lang/StackOverflowError",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/StackOverflowError",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     (
         "java/lang/StackOverflowError",
@@ -5060,16 +4679,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/lang/StringIndexOutOfBoundsException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/StringIndexOutOfBoundsException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/lang/StringIndexOutOfBoundsException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -5113,16 +4722,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/lang/Throwable",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/lang/Throwable",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/Throwable",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     ("java/lang/Throwable", "toString", "()Ljava/lang/String;"),
     (
@@ -5177,16 +4776,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/lang/TypeNotPresentException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/TypeNotPresentException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/lang/TypeNotPresentException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -5236,16 +4825,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/lang/UnsatisfiedLinkError",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/lang/UnsatisfiedLinkError",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/UnsatisfiedLinkError",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     (
         "java/lang/UnsatisfiedLinkError",
@@ -5315,16 +4894,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/lang/UnsupportedOperationException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/UnsupportedOperationException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/lang/UnsupportedOperationException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -5370,16 +4939,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/lang/VerifyError",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/lang/VerifyError",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/VerifyError",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     ("java/lang/VerifyError", "toString", "()Ljava/lang/String;"),
     (
@@ -5439,16 +4998,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/lang/reflect/InaccessibleObjectException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/reflect/InaccessibleObjectException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/lang/reflect/InaccessibleObjectException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -5504,11 +5053,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/lang/reflect/InvocationTargetException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/lang/reflect/InvocationTargetException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -5558,16 +5102,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/net/MalformedURLException",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/net/MalformedURLException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/net/MalformedURLException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     (
         "java/net/MalformedURLException",
@@ -5623,16 +5157,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/net/UnknownHostException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/net/UnknownHostException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/net/UnknownHostException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -5676,16 +5200,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/text/ParseException",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/text/ParseException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/text/ParseException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     (
         "java/text/ParseException",
@@ -5755,16 +5269,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/util/ConcurrentModificationException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/util/ConcurrentModificationException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/util/ConcurrentModificationException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -5813,16 +5317,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/util/FormatterClosedException",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/util/FormatterClosedException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/util/FormatterClosedException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     (
         "java/util/FormatterClosedException",
@@ -5878,16 +5372,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/util/InputMismatchException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/util/InputMismatchException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/util/InputMismatchException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -5940,16 +5424,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/util/MissingResourceException",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/util/MissingResourceException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/util/MissingResourceException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     (
         "java/util/MissingResourceException",
@@ -6015,16 +5489,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/util/NoSuchElementException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/util/NoSuchElementException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/util/NoSuchElementException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -6085,16 +5549,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/util/concurrent/BrokenBarrierException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/util/concurrent/BrokenBarrierException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/util/concurrent/BrokenBarrierException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -6152,16 +5606,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/util/concurrent/CancellationException",
         "printStackTrace",
         "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/util/concurrent/CancellationException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/util/concurrent/CancellationException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
     ),
     (
         "java/util/concurrent/CancellationException",
@@ -6231,16 +5675,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/util/concurrent/CompletionException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/util/concurrent/CompletionException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/util/concurrent/CompletionException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -6307,16 +5741,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/util/concurrent/ExecutionException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/util/concurrent/ExecutionException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/util/concurrent/ExecutionException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -6387,16 +5811,6 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/util/concurrent/RejectedExecutionException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/util/concurrent/RejectedExecutionException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/util/concurrent/RejectedExecutionException",
         "toString",
         "()Ljava/lang/String;",
     ),
@@ -6453,19 +5867,67 @@ static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     (
         "java/util/concurrent/TimeoutException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/util/concurrent/TimeoutException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/util/concurrent/TimeoutException",
         "toString",
         "()Ljava/lang/String;",
     ),
+];
+
+/// Lane 7's wave, 2026-09-10: the two triples that stop
+/// `jdk/internal/loader/BuiltinClassLoader` from linking under `--jdk-only`.
+///
+/// # The measurement
+///
+/// `BuiltinClassLoader.<clinit>` is, in JDK 25 bytecode,
+/// `if (!ClassLoader.registerAsParallelCapable()) throw new InternalError(...)`,
+/// and it threw. `CRATONVM_DBG_CLINIT_FAIL=1` named the class and the exception
+/// (the `NoClassDefFoundError` every consumer sees names only the consumer);
+/// `apps/probes/L7ParallelCapableProbe.java` then named the broken link, with
+/// no reflection and therefore no `--add-opens` requirement:
+///
+/// ```text
+///                                            HotSpot  armed  unarmed
+///   Direct       extends ClassLoader          true     true   true
+///   UnderSecure  extends SecureClassLoader    true     FALSE  true
+///   UnderUrl     extends URLClassLoader       true     FALSE  true
+/// ```
+///
+/// `ParallelLoaders.register(c)` answers `loaderTypes.contains(c.getSuperclass())`,
+/// so `BuiltinClassLoader` — whose superclass is `SecureClassLoader` — can only
+/// register once `SecureClassLoader` has. It never did, and the two
+/// registrations below are jointly why:
+///
+///  * `ClassLoader.registerAsParallelCapable()Z` was a native returning a
+///    constant `Int(1)`. It never touched the real `ParallelLoaders.loaderTypes`
+///    set, so every caller was told `true` while the SET stayed empty of
+///    everything the JDK believed it had registered.
+///  * `java/security/SecureClassLoader.<clinit>()V` was a **no-op native**
+///    (S111r9, a `--real-jdk` Spring-Boot-launcher workaround). It runs during
+///    the built-in loader allocation chain, i.e. from inside a native, where the
+///    dispatch dial cannot see it — so no arm of
+///    `CRATONVM_ENFORCE_NATIVE_SHADOW` could ever have yielded this row. Only a
+///    registration-time refusal reaches it, which is what this table is.
+///
+/// That combination is the corrupt MIXTURE `scripts/jdk-only-blast-radius.sh`
+/// caveat 4 describes rather than a partial retirement: half the chain kept the
+/// native's fictional answer and half read the real set.
+///
+/// # Why retirement rather than a faithful native
+///
+/// The native's own comment said a faithful implementation was "not
+/// implementable ... `NativeContext` exposes no caller-class / stack-walk
+/// accessor". `NativeContext::frame_class_ids` has existed since the
+/// `latestUserDefinedLoader` work, so that sentence is stale — but a native
+/// mirroring `ParallelLoaders` would still have to keep a second copy of a JDK
+/// set in step with the JDK's own, and §1.4's remedy for a shadow over concrete
+/// bytecode is to yield to it. Both rows are bucket A (the image method
+/// declares `Code`), so yielding has somewhere to go.
+///
+/// `Compatible` is untouched — a `SyntheticStub` registers and dispatches
+/// normally there — which is what keeps the S111r9 workaround intact for the
+/// `--real-jdk` fat-jar launchers it was written for.
+static RETIRED_SHADOW_L7_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/lang/ClassLoader", "registerAsParallelCapable", "()Z"),
+    ("java/security/SecureClassLoader", "<clinit>", "()V"),
 ];
 
 /// Lane 5 — `java/util/concurrent/`, `Thread`, `Unsafe`, retired 2026-09-10.
@@ -6809,15 +6271,19 @@ static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
 /// Retiring these three means removing the dead `math_bignum.rs` registrations
 /// first, which changes nothing in compatible mode because they own no slot.
 ///
-/// **`remainder`, `mod`, `gcd`, `and`, `or`, `xor` — the JIT drops the
-/// message.** These do reach bytecode, and interpreted they are HotSpot-exact.
-/// Once the real body is JIT-compiled the `NullPointerException` arrives with
-/// no message at all. It is not a `BigInteger` fact — `apps/probes/L2JitNpeProbe.java`
-/// asks five null-deref shapes cold and hot with no JDK class involved and
-/// every one of them loses its message when hot. See
-/// `docs/known-issues/jit/the-helpful-npe-message-is-lost-in-compiled-code-20260910.md`.
-/// Retiring them today would trade a correct message for none on exactly the
-/// rows a caller reads when something has already gone wrong.
+/// **`remainder`, `mod`, `gcd`, `and`, `or`, `xor` — the JIT DROPPED the
+/// message; blocker cleared 2026-09-11.** These do reach bytecode, and
+/// interpreted they are HotSpot-exact. Once the real body was JIT-compiled the
+/// `NullPointerException` arrived with no message at all. It was not a
+/// `BigInteger` fact — `probes/L2JitNpeProbe.java` asks six null-deref shapes
+/// cold and hot with no JDK class involved and every one of them lost its
+/// message when hot. Fixed and retired as
+/// `docs/internal/fixed-bugs/the-helpful-npe-message-is-lost-in-compiled-code-FIXED-20260911.md`,
+/// pinned by `vm/tests/jit_npe_message_hot_equals_cold.rs`.
+///
+/// They are STILL HELD, and not by this reason: the rule below is structural —
+/// every reference-argument row — and lifting it needs the `BigIntegerSweep`
+/// measurement with the JIT on that put it there, which is lane 2's to take.
 ///
 /// ## ...and the held set is every REFERENCE-argument row, not a list of six
 ///
@@ -7409,6 +6875,392 @@ static RETIRED_SHADOW_L1_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/util/zip/ZipFile", "stream", "()Ljava/util/stream/Stream;"),
 ];
 
+/// Lane 1 wave 3 — `java/util/HashMap` and its six view/iterator classes, the
+/// 98 §1.4 shadows the census calls bucket A or B.
+///
+/// ## Why this family was HELD until now, and what the hold turned out to be
+///
+/// The 2026-09-10 reading was "the state IS real but nine probes move", and
+/// the 2026-09-11 reading narrowed it to ONE observable:
+/// `hashMap.entrySet().toArray()` answered a zero-length array where HotSpot
+/// answers three, while `size()`, the entry ITERATOR, `forEach`, `stream`,
+/// `spliterator` and both other views were already exact. `keySet().toArray()`
+/// and `values().toArray()` were exact too, which is what made it look like a
+/// defect in the entry view specifically.
+///
+/// It is not. `apps/probes/L1EntrySetRouteProbe.java` asks the one question
+/// that separates the two routes that can produce that array — what happens
+/// to a TYPED destination:
+///
+/// ```text
+///   HotSpot            entrySet().toArray(new String[0])  ArrayStoreException
+///   dial-armed         entrySet().toArray(new String[0])  [0]java.lang.String
+/// ```
+///
+/// Real `AbstractCollection.toArray(T[])` `aastore`s each element and so MUST
+/// throw for three `Map.Entry`s and a `String[]`; it cannot throw for an empty
+/// walk. A quiet `String[0]` therefore means a NATIVE answered and believed the
+/// view was empty. `CRATONVM_DBG_TOARRAY` names it:
+///
+/// ```text
+///   [DBG_TOARRAY] native_al_to_array (0-arg) HIT nargs=1
+///   [DBG_TOARRAY] al_or_collection_elements recv=java/util/HashMap$EntrySet
+///                 heuristic_len=0 nulls=0 suspect=false
+///   WARN zgc real: field index OOB index=1 num_slots=1 op="get"   (x10)
+/// ```
+///
+/// and the chain is:
+///
+/// 1. the dial's prefix `java/util/HashMap` also covers `$EntrySet`, so
+///    `entrySet()` yields and hands back the image's own `HashMap$EntrySet` —
+///    `this$0` set, identity stable, the map's own `entrySet` field populated,
+///    all three verified against HotSpot;
+/// 2. that object has ONE slot, and `hs_map_slot` puts a view carrier's
+///    backing at `class_num_total_fields` — slot 1 — so every read is out of
+///    bounds and `hs_backing_map` is empty (the ten `zgc` warnings are that
+///    read);
+/// 3. `toArray` on it resolves up to `java/util/AbstractCollection`, which is
+///    NOT armed, so `native_al_to_array` fires;
+/// 4. its documented fallback for an unmodelled layout is "ask the receiver's
+///    own `size()`, and walk the real `iterator()` if it is non-zero" — and
+///    that question is asked from INSIDE a native, where no dispatch door
+///    exists. So it reaches `native_hs_size` on `HashMap$EntrySet`, which finds
+///    no backing, tries `try_delegate_real_collection`, and that helper's
+///    `invoke_special` re-finds the SAME native, trips its own re-entrancy
+///    guard and returns the sentinel. `real_size == 0`, no walk, `[0]`.
+///
+/// **So the dial's nine red rows were a dial artefact, and the ops page's rule
+/// cuts both ways: an armed sweep is not a verdict when it is GREEN, and it is
+/// not a verdict when it is RED either.** Retirement does not decline at a
+/// door — it removes the registration, so step 4's question reaches real
+/// bytecode and answers 3. Measured, not argued: the trial binary takes
+/// `apps/probes/L1MapFamilySweep.java` from 9 diffs to 0.
+///
+/// Arming `AbstractCollection`, `AbstractSet`, `AbstractMap`, `Set`,
+/// `Collection` and `Map` alongside changes nothing, and now there is a reason
+/// rather than a shrug: the door that would have to decline is not on the
+/// `toArray` call at all, it is on the `size()` call the native makes, and that
+/// call has no door.
+///
+/// ## What the family is
+///
+/// 98 triples over seven classes, every one bucket A or B:
+///
+/// ```text
+///   java/util/HashMap                 A 30   B 3
+///   java/util/HashMap$EntrySet        A  7   B 14
+///   java/util/HashMap$KeySet          A  9   B 12
+///   java/util/HashMap$Values          A  8   B  6
+///   java/util/HashMap$EntryIterator   A  1   B  2
+///   java/util/HashMap$KeyIterator     A  1   B  2
+///   java/util/HashMap$ValueIterator   A  1   B  2
+///   java/util/HashMap$Node            A  1
+/// ```
+///
+/// They move as a SET and cannot move any other way. `hs_map_slot` puts a view
+/// carrier's backing past the class's declared fields, `key_itr_carrier_for`
+/// mints `HashMap$KeyIterator` for the view's cursor, and `map_state` reads the
+/// map's own bucket array — retire the map and keep the views and the views
+/// read a backing nothing fills; retire the views and keep the map and the
+/// map's own `keySet()` native mints a carrier whose natives are gone.
+///
+/// ## Precondition 4 is measured, not waived
+///
+/// Three earlier probe runs reached 29 of the 98. `apps/probes/
+/// L1MapFamilySweep.java` — 142 rows, written for this wave — reaches the rest
+/// through ordinary Java: every constructor, every default-method override,
+/// both iterator `remove()` contracts, `Node.setValue` through a detached
+/// entry, serialization round-trip, comodification, a 100-entry resize and a
+/// 12-way hash collision chain.
+///
+/// ## What retiring it REPAIRS
+///
+/// The nine rows above are §1.4 defects that yielding fixes, and three of them
+/// are silent wrong answers rather than throws — `entrySet().toArray()`,
+/// `new ArrayList<>(entrySet())` and `new HashSet<>(entrySet())` all read
+/// EMPTY for a three-entry map on the armed binary. The unarmed binary is also
+/// worse than HotSpot on five reflective rows this wave fixes (see
+/// `apps/probes/L1MapFieldProbe.java`): `new HashMap<>()` + three puts leaves
+/// `threshold = 0` where HotSpot has 12, `new HashMap<>(64)` leaves
+/// `threshold = 64` where HotSpot has 48, and the copy constructor and
+/// `new HashMap<>(Map.of(..))` leave `table = [16]java.lang.Object` — an
+/// UNTYPED array where HotSpot has a typed `HashMap$Node[]` — with
+/// `loadFactor = 0.0`.
+///
+/// `java/util/LinkedHashMap` is NOT in this table even though it is a
+/// `HashMap` subclass: its entries live in `lhm_overlay()`, a Rust side table
+/// the real bodies cannot read, and that is §10 item 2's own change.
+/// `java/util/Hashtable` is not here either — its fields already match HotSpot
+/// unarmed and its four moving probes are a separate question.
+static RETIRED_SHADOW_L1_HM_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/util/HashMap", "<init>", "()V"),
+    ("java/util/HashMap", "<init>", "(I)V"),
+    ("java/util/HashMap", "<init>", "(IF)V"),
+    ("java/util/HashMap", "<init>", "(Ljava/util/Map;)V"),
+    ("java/util/HashMap", "clear", "()V"),
+    (
+        "java/util/HashMap",
+        "computeIfAbsent",
+        "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;",
+    ),
+    ("java/util/HashMap", "containsKey", "(Ljava/lang/Object;)Z"),
+    (
+        "java/util/HashMap",
+        "containsValue",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/HashMap",
+        "forEach",
+        "(Ljava/util/function/BiConsumer;)V",
+    ),
+    (
+        "java/util/HashMap",
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/HashMap",
+        "getOrDefault",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    ("java/util/HashMap", "isEmpty", "()Z"),
+    (
+        "java/util/HashMap",
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    ("java/util/HashMap", "putAll", "(Ljava/util/Map;)V"),
+    (
+        "java/util/HashMap",
+        "putIfAbsent",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/HashMap",
+        "remove",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/HashMap",
+        "remove",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/HashMap",
+        "replace",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/HashMap",
+        "replace",
+        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Z",
+    ),
+    ("java/util/HashMap", "size", "()I"),
+    ("java/util/HashMap", "toString", "()Ljava/lang/String;"),
+];
+
+/// Lane 1 wave 4 — the 29 `java/util/jar/` and `java/text/` rows that a dial
+/// BISECTION cleared, once the whole-prefix red was traced to one class each.
+///
+/// ## §7's two vacuous greens were also two unbisected reds
+///
+/// The 2026-09-10 revision of the lane page held both families because
+/// `apps/probes/L1TailSweep.java` turned each prefix red — jar `+28`, text
+/// `+11` — after a 44-probe subset had called both `0 worse` with the dial
+/// never engaging. That was the right call and it stopped there: "neither has
+/// been bisected to a method".
+///
+/// Bisected on 2026-09-11 against `cratonvm-l1hm-base-20260911`, one class at
+/// a time, scored on `L1TailSweep` (base 13 diffs), with the dial's own
+/// engagement printed beside each row so a vacuous arm cannot pass as a green:
+///
+/// ```text
+///   java/util/jar/                 +34 WORSE   reached=146
+///     java/util/jar/JarFile        +34 WORSE   reached=4    <- the whole red
+///     java/util/jar/JarEntry        +0 same    reached=16
+///     java/util/jar/Manifest        +0 same    reached=23
+///     java/util/jar/Attributes      +0 same    reached=156
+///     java/util/jar/Attributes$Name +0 same    reached=127
+///   java/text/                     +16 WORSE   reached=4
+///     java/text/BreakIterator      +16 WORSE   reached=4    <- the whole red
+///     java/text/ParseException      +0 same    reached=1
+///     java/text/Normalizer          +0 same    reached=10
+///     java/text/DateFormat          +0 same    reached=0    <- VACUOUS
+/// ```
+///
+/// Each family's red is ONE class, and `java/util/jar/JarFile` is the same
+/// class wave 2 already had to retire three defect rows out of. Those two
+/// stay `Bridge` and keep their prefixes off this table; `DateFormat`'s single
+/// registration is excluded for the reason §7 exists — its green said nothing.
+///
+/// ## What yielding REPAIRS: nine of thirteen rows, measured
+///
+/// `apps/probes/L1JarTextSweep.java` (87 rows, written for this wave) is
+/// thirteen rows out from HotSpot 25.0.4+7 on the control. Armed on this
+/// table's five classes together — 1,119 door engagements, so not a vacuous
+/// arm — it is **four**: nine repaired, none made worse. Every one of the
+/// thirteen is a §1.4 defect, the native answering where the image's own
+/// body throws or throwing where it answers:
+///
+/// ```text
+///   A.getValue.nullName    HotSpot NullPointerException   control null
+///   A.put.rejectsString    HotSpot ClassCastException     control null
+///   N.ctor.empty           HotSpot IllegalArgumentException  control ""
+///   N.ctor.null            HotSpot NullPointerException   control null
+///   N.ctor.illegalChar     HotSpot IllegalArgumentException  control "bad name"
+///   N.ctor.tooLong         HotSpot IllegalArgumentException  control 71
+///   M.ctorStream.garbage   HotSpot 0                      control IOException
+///   M.ctorStream.null      HotSpot NPE "this.in is null"  control NPE, own text
+///   M.ctorCopy.null        HotSpot NullPointerException   control 0
+///   E.ctorName.null        HotSpot NullPointerException   control null
+///   E.attributesFromJar    HotSpot "section-value"        control null
+///   P.printStackTrace.writer / .stream   two more, same shape
+/// ```
+///
+/// `Attributes$Name`'s constructor is the sharpest of them: the image
+/// validates the header name (non-empty, ≤ 70 characters, `[0-9A-Za-z_-]`
+/// only) and this VM validated nothing at all, so `new Attributes.Name("bad
+/// name")` produced a Name that can never appear in a real manifest.
+/// `E.attributesFromJar` is the only one that is a wrong VALUE rather than a
+/// missing throw: a jar's per-entry manifest section was invisible.
+///
+/// The four that remain are not this table's to fix, and saying which is the
+/// point of measuring them:
+///
+/// * `E.attributesFromJar` — `java/util/jar/JarFile`'s, which stays `Bridge`;
+/// * `M.ctorStream.null` — the NPE is raised at the right place with the
+///   right type and the message lacks its `because "this.in" is null`
+///   clause, which is the helpful-NPE-message gap and not a jar defect;
+/// * the two `P.printStackTrace` rows — see below.
+///
+/// ## `java/text/ParseException` was in this table and came out
+///
+/// It is the wave's own refusal, on its own measurement. Armed alone it is
+/// `+0` — it repairs nothing — and two of its rows trade one wrong answer
+/// for another:
+///
+/// ```text
+///   e.setStackTrace(new StackTraceElement[0]); e.printStackTrace(w)
+///     HotSpot   java.text.ParseException: bad
+///     control   (wrong, one way)
+///     armed     java.text.ParseException: bad
+///                 at java.text.ParseException.<init>(ParseException.java:64)
+///                 at ... six more frames
+/// ```
+///
+/// Thirteen of its fourteen registrations are `java/lang/Throwable`'s
+/// inherited surface, so what the yield exposes is that this VM's `Throwable`
+/// model does not read back a `stackTrace` array that BYTECODE wrote — a
+/// `Throwable` defect that a `java/text/` retirement merely made visible.
+/// `printStackTrace` is called by too much real code to change its output for
+/// no repair, so the class stays and the finding is written down instead.
+///
+/// ## Why these five and not the prefix
+///
+/// `java/util/jar/JarFile` is the family's producer and it stays; that is not
+/// a half-retirement of the kind wave 3 hit, because `JarEntry`, `Manifest`
+/// and `Attributes` are VALUES a `JarFile` hands out rather than carriers the
+/// VM mints under a borrowed class name. The discriminator is whether a
+/// SURVIVING native can be handed an object real bytecode built: for wave 3's
+/// `HashMap$KeyIterator` it could, and did; here the natives that survive are
+/// `JarFile`'s own and they are handed `JarFile`s.
+static RETIRED_SHADOW_L1_JT_TRIPLES: &[(&str, &str, &str)] = &[
+    (
+        "java/text/Normalizer",
+        "isNormalized",
+        "(Ljava/lang/CharSequence;Ljava/text/Normalizer$Form;)Z",
+    ),
+    (
+        "java/text/Normalizer",
+        "normalize",
+        "(Ljava/lang/CharSequence;Ljava/text/Normalizer$Form;)Ljava/lang/String;",
+    ),
+    ("java/util/jar/Attributes", "<init>", "()V"),
+    ("java/util/jar/Attributes", "<init>", "(I)V"),
+    (
+        "java/util/jar/Attributes",
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+    ),
+    ("java/util/jar/Attributes", "entrySet", "()Ljava/util/Set;"),
+    (
+        "java/util/jar/Attributes",
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/jar/Attributes",
+        "getValue",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+    ),
+    (
+        "java/util/jar/Attributes",
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/jar/Attributes",
+        "putValue",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+    ),
+    ("java/util/jar/Attributes", "size", "()I"),
+    (
+        "java/util/jar/Attributes$Name",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/util/jar/Attributes$Name",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+    ),
+    ("java/util/jar/Attributes$Name", "hashCode", "()I"),
+    (
+        "java/util/jar/Attributes$Name",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/util/jar/JarEntry", "<init>", "(Ljava/lang/String;)V"),
+    (
+        "java/util/jar/JarEntry",
+        "getComment",
+        "()Ljava/lang/String;",
+    ),
+    ("java/util/jar/JarEntry", "getCompressedSize", "()J"),
+    ("java/util/jar/JarEntry", "getMethod", "()I"),
+    ("java/util/jar/JarEntry", "getName", "()Ljava/lang/String;"),
+    ("java/util/jar/JarEntry", "getSize", "()J"),
+    ("java/util/jar/JarEntry", "isDirectory", "()Z"),
+    ("java/util/jar/Manifest", "<init>", "()V"),
+    (
+        "java/util/jar/Manifest",
+        "<init>",
+        "(Ljava/io/InputStream;)V",
+    ),
+    (
+        "java/util/jar/Manifest",
+        "<init>",
+        "(Ljava/io/InputStream;Ljava/lang/String;)V",
+    ),
+    (
+        "java/util/jar/Manifest",
+        "<init>",
+        "(Ljava/util/jar/JarVerifier;Ljava/io/InputStream;Ljava/lang/String;)V",
+    ),
+    (
+        "java/util/jar/Manifest",
+        "<init>",
+        "(Ljava/util/jar/Manifest;)V",
+    ),
+    ("java/util/jar/Manifest", "getEntries", "()Ljava/util/Map;"),
+    (
+        "java/util/jar/Manifest",
+        "getMainAttributes",
+        "()Ljava/util/jar/Attributes;",
+    ),
+];
+
 /// Is this exact triple a retired §1.4 shadow?
 ///
 /// The class-name prefix test is a cheap discriminator: every entry is under
@@ -7437,9 +7289,12 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
         || RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_L2_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(&key).is_ok()
+        || RETIRED_SHADOW_L7_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_L5_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_LT_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_L1_TRIPLES.binary_search(&key).is_ok()
+        || RETIRED_SHADOW_L1_HM_TRIPLES.binary_search(&key).is_ok()
+        || RETIRED_SHADOW_L1_JT_TRIPLES.binary_search(&key).is_ok()
 }
 
 /// Every retired-shadow table, in one slice, so a gate can walk the whole
@@ -7480,6 +7335,22 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // predicate that consults them every time a lane lands, and only this
     // guard closes the gap.
     RETIRED_SHADOW_LT_TRIPLES,
+    // And here by the 2026-09-11 merge of lane 7, for exactly the reason the
+    // note above gives — same shape, second occurrence in two days. Lane 7's
+    // table and this const were also written on branches that never saw each
+    // other, `git merge` resolved both files, and the omission was again
+    // invisible to every per-table test. Two in two days says the failure mode
+    // is structural: a new table is added at the bottom of a list in one file
+    // and consulted in another, and nothing textual connects them.
+    RETIRED_SHADOW_L7_TRIPLES,
+    // Third occurrence: the same 93-commit merge that added lane 7's table
+    // above also carried lane 1's waves 3 and 4 (`java/util/HashMap`'s own
+    // map surface, and `java/util/jar`/`java/text/Normalizer`), each its own
+    // table added on a branch that never saw this const either. Three
+    // landings in two days, not a coincidence -- see the note on
+    // `RETIRED_SHADOW_LT_TRIPLES` above.
+    RETIRED_SHADOW_L1_HM_TRIPLES,
+    RETIRED_SHADOW_L1_JT_TRIPLES,
 ];
 
 #[cfg(test)]
@@ -7520,6 +7391,408 @@ mod tests {
             "`triple_is_retired_shadow` consults {consulted} tables but `RETIRED_SHADOW_TABLES` lists {}. Add the new table to the const — see its doc comment for what is skipped otherwise.",
             RETIRED_SHADOW_TABLES.len()
         );
+    }
+
+    #[test]
+    fn the_l1_jar_text_table_is_disjoint_from_every_other_table() {
+        for key in RETIRED_SHADOW_L1_JT_TRIPLES {
+            for (other, name) in [
+                (RETIRED_SHADOW_TRIPLES, "RETIRED_SHADOW_TRIPLES"),
+                (
+                    RETIRED_SHADOW_STATELESS_TRIPLES,
+                    "RETIRED_SHADOW_STATELESS_TRIPLES",
+                ),
+                (
+                    RETIRED_SHADOW_PHASE2_TRIPLES,
+                    "RETIRED_SHADOW_PHASE2_TRIPLES",
+                ),
+                (RETIRED_SHADOW_L2_TRIPLES, "RETIRED_SHADOW_L2_TRIPLES"),
+                (
+                    RETIRED_SHADOW_PHASE3_TRIPLES,
+                    "RETIRED_SHADOW_PHASE3_TRIPLES",
+                ),
+                (RETIRED_SHADOW_L5_TRIPLES, "RETIRED_SHADOW_L5_TRIPLES"),
+                (RETIRED_SHADOW_L1_TRIPLES, "RETIRED_SHADOW_L1_TRIPLES"),
+                (RETIRED_SHADOW_L1_HM_TRIPLES, "RETIRED_SHADOW_L1_HM_TRIPLES"),
+            ] {
+                assert!(
+                    other.binary_search(key).is_err(),
+                    "{key:?} is in both lane 1 wave 4's table and {name}."
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_l1_jar_text_table_is_sorted_and_unique() {
+        for w in RETIRED_SHADOW_L1_JT_TRIPLES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "lane 1 wave 4's table is binary-searched, so it must be \
+                 sorted and unique: {:?} does not precede {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn every_l1_jar_text_entry_is_reachable_through_the_predicate() {
+        for (c, m, d) in RETIRED_SHADOW_L1_JT_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is in lane 1 wave 4's table but answers false — \
+                 the prefix list does not admit it, so the entry is inert and \
+                 silent."
+            );
+        }
+    }
+
+    /// Wave 4 is six classes, and the two that carry each family's red are
+    /// NOT among them.
+    ///
+    /// `java/util/jar/JarFile` is the whole of `java/util/jar/`'s `+34` and
+    /// `java/text/BreakIterator` is the whole of `java/text/`'s `+16`;
+    /// `java/text/DateFormat`'s one registration is excluded because its
+    /// green was VACUOUS (`reached == 0`), which is §7's trap and not a
+    /// result. Adding any of the three back means re-running the bisection,
+    /// not editing this list.
+    #[test]
+    fn wave_four_is_six_classes_and_refuses_jarfile_breakiterator_dateformat() {
+        for (c, _, _) in RETIRED_SHADOW_L1_JT_TRIPLES {
+            assert!(
+                matches!(
+                    *c,
+                    "java/util/jar/JarEntry"
+                        | "java/util/jar/Manifest"
+                        | "java/util/jar/Attributes"
+                        | "java/util/jar/Attributes$Name"
+                        | "java/text/Normalizer"
+                ),
+                "{c} is in wave 4's table and is not one of the six classes \
+                 the 2026-09-11 bisection cleared."
+            );
+        }
+        for (c, m, d) in [
+            (
+                "java/util/jar/JarFile",
+                "getManifest",
+                "()Ljava/util/jar/Manifest;",
+            ),
+            (
+                "java/util/jar/JarFile",
+                "getJarEntry",
+                "(Ljava/lang/String;)Ljava/util/jar/JarEntry;",
+            ),
+            ("java/text/BreakIterator", "next", "()I"),
+            (
+                "java/text/DateFormat",
+                "getInstance",
+                "()Ljava/text/DateFormat;",
+            ),
+            // `java/text/ParseException` was IN wave 4's table and came out
+            // on its own measurement. Armed alone on
+            // `apps/probes/L1JarTextSweep.java` it is `+0` — it repairs
+            // nothing — and two of its rows trade one wrong answer for
+            // another: `e.setStackTrace(new StackTraceElement[0]);
+            // e.printStackTrace(w)` prints one header line on HotSpot and
+            // the FULL seven-frame trace when the class yields, because this
+            // VM's `Throwable` model does not read back a `stackTrace` array
+            // that bytecode wrote. Thirteen of its fourteen triples are
+            // `Throwable`'s inherited surface, so the defect is `Throwable`'s
+            // and not `java/text/`'s; retiring a Throwable SUBCLASS is how it
+            // becomes visible. `printStackTrace` is too widely called to
+            // change its output for no repair.
+            (
+                "java/text/ParseException",
+                "printStackTrace",
+                "(Ljava/io/PrintWriter;)V",
+            ),
+            (
+                "java/text/ParseException",
+                "setStackTrace",
+                "([Ljava/lang/StackTraceElement;)V",
+            ),
+        ] {
+            assert!(
+                !triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is retired. `JarFile` and `BreakIterator` each \
+                 carry their family's whole regression and `DateFormat`'s arm \
+                 was vacuous — none of the three has a measurement behind it."
+            );
+        }
+    }
+
+    /// The nine rows wave 4 repairs, by the triple that repairs
+    /// each. A later edit that drops one of these fails here rather than in a
+    /// probe nobody runs.
+    #[test]
+    fn the_nine_jar_text_defect_rows_this_wave_repairs_are_retired() {
+        for (c, m, d) in [
+            (
+                "java/util/jar/Attributes",
+                "getValue",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+            ),
+            (
+                "java/util/jar/Attributes",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            (
+                "java/util/jar/Attributes$Name",
+                "<init>",
+                "(Ljava/lang/String;)V",
+            ),
+            (
+                "java/util/jar/Manifest",
+                "<init>",
+                "(Ljava/io/InputStream;)V",
+            ),
+            (
+                "java/util/jar/Manifest",
+                "<init>",
+                "(Ljava/util/jar/Manifest;)V",
+            ),
+            ("java/util/jar/JarEntry", "<init>", "(Ljava/lang/String;)V"),
+            // `JarEntry.getAttributes` is deliberately NOT here.
+            // `L1JarTextSweep`'s `E.attributesFromJar` row is a real control
+            // defect — a jar's per-entry manifest section reads `null` where
+            // HotSpot reads `section-value` — but the class declares no
+            // native for it, so nothing in THIS table can repair it. It
+            // belongs to whatever fills a `JarEntry` in on the way out of
+            // `java/util/jar/JarFile`, which stays `Bridge`. Twelve of the
+            // thirteen are this wave's; the thirteenth is §10 item 5's.
+        ] {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is not retired, and `apps/probes/\
+                 L1JarTextSweep.java` measured the control answering where \
+                 the image's own body throws."
+            );
+        }
+    }
+
+    #[test]
+    fn the_l1_hashmap_table_is_sorted_and_unique() {
+        for w in RETIRED_SHADOW_L1_HM_TRIPLES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "lane 1 wave 3's table is binary-searched, so it must be \
+                 sorted and unique: {:?} does not precede {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn every_l1_hashmap_entry_is_reachable_through_the_predicate() {
+        for (c, m, d) in RETIRED_SHADOW_L1_HM_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is in lane 1 wave 3's table but answers false — \
+                 the prefix list does not admit it, so the entry is inert and \
+                 silent."
+            );
+        }
+    }
+
+    #[test]
+    fn the_l1_hashmap_table_is_disjoint_from_every_other_table() {
+        for key in RETIRED_SHADOW_L1_HM_TRIPLES {
+            for (other, name) in [
+                (RETIRED_SHADOW_TRIPLES, "RETIRED_SHADOW_TRIPLES"),
+                (
+                    RETIRED_SHADOW_STATELESS_TRIPLES,
+                    "RETIRED_SHADOW_STATELESS_TRIPLES",
+                ),
+                (
+                    RETIRED_SHADOW_PHASE2_TRIPLES,
+                    "RETIRED_SHADOW_PHASE2_TRIPLES",
+                ),
+                (RETIRED_SHADOW_L2_TRIPLES, "RETIRED_SHADOW_L2_TRIPLES"),
+                (
+                    RETIRED_SHADOW_PHASE3_TRIPLES,
+                    "RETIRED_SHADOW_PHASE3_TRIPLES",
+                ),
+                (RETIRED_SHADOW_L1_TRIPLES, "RETIRED_SHADOW_L1_TRIPLES"),
+                // Lane 5 landed on `origin/dev` between this wave's
+                // acceptance and its merge. Named here rather than
+                // assumed: a patch authored on a stale base has once
+                // `git apply`'d clean over this same file and silently
+                // deleted a sibling lane's 311-line table, so every
+                // table in the chain is checked against every other
+                // BY NAME.
+                (RETIRED_SHADOW_L5_TRIPLES, "RETIRED_SHADOW_L5_TRIPLES"),
+            ] {
+                assert!(
+                    other.binary_search(key).is_err(),
+                    "{key:?} is in both lane 1 wave 3's table and {name}. Two \
+                     tables claiming one triple means two measurements claim \
+                     it, and only one of them can be the record."
+                );
+            }
+        }
+    }
+
+    /// Wave 3 is `java/util/HashMap` and its OWN view and iterator classes,
+    /// and nothing that merely looks like them.
+    ///
+    /// `java/util/LinkedHashMap` is a `HashMap` SUBCLASS and its views are
+    /// named `LinkedKeySet`/`LinkedEntrySet`, so a prefix-shaped edit to this
+    /// table would swallow it — and it must not, because its entries live in
+    /// `lhm_overlay()`, a side table the real bodies cannot read. Retiring it
+    /// on this table's coat-tails would hand real bytecode an empty map. Same
+    /// argument for `Hashtable`, whose views the JDK wraps in a
+    /// `Collections$Synchronized*`.
+    #[test]
+    fn the_l1_hashmap_table_is_the_hashmap_family_and_only_it() {
+        for (c, _, _) in RETIRED_SHADOW_L1_HM_TRIPLES {
+            assert!(
+                *c == "java/util/HashMap" || c.starts_with("java/util/HashMap$"),
+                "{c} is in wave 3's table but is not `java/util/HashMap` or \
+                 one of its nested classes. The wave is one family and its \
+                 acceptance measured that family."
+            );
+        }
+        for (c, m, d) in [
+            (
+                "java/util/LinkedHashMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            (
+                "java/util/LinkedHashMap$LinkedEntrySet",
+                "iterator",
+                "()Ljava/util/Iterator;",
+            ),
+            ("java/util/LinkedHashMap$LinkedKeySet", "size", "()I"),
+            (
+                "java/util/Hashtable",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            (
+                "java/util/Hashtable$EntrySet",
+                "iterator",
+                "()Ljava/util/Iterator;",
+            ),
+        ] {
+            assert!(
+                !triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is retired, and wave 3 did not measure it. \
+                 `LinkedHashMap` keeps its entries in `lhm_overlay()` and \
+                 `Hashtable` was measured separately; both are §10's own \
+                 changes, not this table's."
+            );
+        }
+    }
+
+    /// What wave 3 measured and then REFUSED, with the failure each refusal
+    /// is holding back.
+    ///
+    /// The first trial binary retired all 98 and the probe tree read **12
+    /// worse, 1 better**. Two causes, both of them a family boundary this
+    /// table cannot cross alone:
+    ///
+    /// * **the three iterator carriers.** `key_itr_carrier_for` mints
+    ///   `java/util/HashMap$KeyIterator` for EVERY receiver that is not
+    ///   LinkedHashMap-shaped — including `java/util/HashSet`'s and
+    ///   `java/util/Hashtable`'s views, whose producers are lane T's and the
+    ///   Hashtable family's. Retire the carrier's natives and the live
+    ///   producer keeps minting it, so real `HashMap$HashIterator.nextNode`
+    ///   runs on an object no bytecode built:
+    ///   `NullPointerException: Cannot read field "modCount" because
+    ///   "this.this$0" is null`, which killed `MethodRefDoorProbe` on its
+    ///   HashSet row and truncated four more probes behind it. The cluster
+    ///   note on `register_set_view_carrier_natives` predicted exactly this;
+    ///   wave 3 is its first measurement.
+    /// * **the three view classes and the three accessors that produce
+    ///   them.** They are one unit with the iterators: retire
+    ///   `HashMap.entrySet()` and real bytecode mints a real
+    ///   `HashMap$EntrySet`, whose surviving natives then find no backing —
+    ///   the very defect §3's wave-3 trace is about, moved one class along.
+    /// * **eight methods `java/util/LinkedHashMap` inherits.** LinkedHashMap
+    ///   is a `HashMap` SUBCLASS and registers its own native for 33 of these
+    ///   methods but NOT for these eight, so retiring them routes a
+    ///   LinkedHashMap receiver into real `HashMap` bytecode over a table its
+    ///   entries are not in — they are in `lhm_overlay()`.
+    ///   `LinkedSequencedShadowSweep` read `{b=22, c=33, a=2}` -> `{a=2}`.
+    ///
+    /// This test is the record. Deleting a row from it means claiming the
+    /// blocker is gone, which is a measurement, not an edit.
+    #[test]
+    fn wave_three_refused_the_iterators_the_views_and_lhm_s_inherited_eight() {
+        for (c, m, d) in [
+            // the iterator carriers — shared with HashSet and Hashtable
+            ("java/util/HashMap$KeyIterator", "next", "()Ljava/lang/Object;"),
+            ("java/util/HashMap$ValueIterator", "next", "()Ljava/lang/Object;"),
+            (
+                "java/util/HashMap$EntryIterator",
+                "next",
+                "()Ljava/lang/Object;",
+            ),
+            // the view classes and the accessors that produce them
+            ("java/util/HashMap", "entrySet", "()Ljava/util/Set;"),
+            ("java/util/HashMap", "keySet", "()Ljava/util/Set;"),
+            ("java/util/HashMap", "values", "()Ljava/util/Collection;"),
+            (
+                "java/util/HashMap$EntrySet",
+                "toArray",
+                "()[Ljava/lang/Object;",
+            ),
+            (
+                "java/util/HashMap$EntrySet",
+                "iterator",
+                "()Ljava/util/Iterator;",
+            ),
+            ("java/util/HashMap$KeySet", "iterator", "()Ljava/util/Iterator;"),
+            ("java/util/HashMap$Values", "iterator", "()Ljava/util/Iterator;"),
+            (
+                "java/util/HashMap$Node",
+                "setValue",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            // the eight LinkedHashMap inherits
+            (
+                "java/util/HashMap",
+                "merge",
+                "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+            ),
+            (
+                "java/util/HashMap",
+                "compute",
+                "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+            ),
+            (
+                "java/util/HashMap",
+                "computeIfPresent",
+                "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+            ),
+            (
+                "java/util/HashMap",
+                "replaceAll",
+                "(Ljava/util/function/BiFunction;)V",
+            ),
+            ("java/util/HashMap", "equals", "(Ljava/lang/Object;)Z"),
+            ("java/util/HashMap", "hashCode", "()I"),
+            (
+                "java/util/HashMap",
+                "readObject",
+                "(Ljava/io/ObjectInputStream;)V",
+            ),
+            (
+                "java/util/HashMap",
+                "writeObject",
+                "(Ljava/io/ObjectOutputStream;)V",
+            ),
+        ] {
+            assert!(
+                !triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is retired, and wave 3 measured that retiring it                  makes the probe tree WORSE. See this test's doc comment for                  which of the three blockers it belongs to."
+            );
+        }
     }
 
     #[test]
@@ -7776,6 +8049,21 @@ mod tests {
         }
     }
 
+    /// Sorted, unique and binary-searched like every sibling, and for the same
+    /// reason: an out-of-order entry makes the predicate answer `false` for a
+    /// row that is present, which reads as "not retired" and is invisible.
+    #[test]
+    fn the_l7_table_is_sorted_and_unique() {
+        for w in RETIRED_SHADOW_L7_TRIPLES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "out of order or duplicated: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
     /// Sorted and duplicate-free, for the reason every sibling table is: the
     /// predicate binary-searches it, so an out-of-order entry answers `false`
     /// for a row that is present -- which reads as "not retired" and is
@@ -7788,6 +8076,19 @@ mod tests {
                 "out of order or duplicated: {:?} then {:?}",
                 w[0],
                 w[1]
+            );
+        }
+    }
+
+    /// An entry outside every prefix in [`RETIRED_SHADOW_PREFIXES`] answers
+    /// `false`, which reads as "not retired" and retires nothing. This wave
+    /// ADDED two prefixes, which is exactly the edit that is easy to forget.
+    #[test]
+    fn every_l7_entry_is_reachable() {
+        for (c, m, d) in RETIRED_SHADOW_L7_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "unreachable entry: {c}.{m}{d}"
             );
         }
     }
@@ -7808,6 +8109,26 @@ mod tests {
         }
     }
 
+    /// No lane-7 triple may be claimed by another wave. This asks about EVERY
+    /// other table, including the two (L1, L5) that landed on `dev` after this
+    /// test was written -- a disjointness test that names a fixed list of
+    /// siblings stops being a disjointness test the day a sibling is added.
+    #[test]
+    fn the_l7_table_is_disjoint_from_the_earlier_ones() {
+        for t in RETIRED_SHADOW_L7_TRIPLES {
+            assert!(
+                RETIRED_SHADOW_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_L1_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_L2_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_L5_TRIPLES.binary_search(t).is_err(),
+                "{t:?} is in the lane-7 table and an earlier one"
+            );
+        }
+    }
+
     /// No triple may be claimed by two waves. Harmless to the predicate, which
     /// ORs; NOT harmless to the record, because two waves would each report
     /// having retired it and the next reader cannot tell which measurement
@@ -7823,6 +8144,79 @@ mod tests {
                 "{t:?} is in the L5 table and an earlier one"
             );
         }
+    }
+
+    /// The two prefixes lane 7 added are a licence for exactly two rows.
+    ///
+    /// `java/lang/ClassLoader` is a PREFIX, so it also admits
+    /// `java/lang/ClassLoader$ParallelLoaders` and `java/lang/ClassLoaderHelper`
+    /// to one extra binary search each, and `java/security/SecureClassLoader`
+    /// admits that class whole. None of their other triples is retired, and this
+    /// test is what says so — the guard
+    /// `the_phase2_wave_retires_only_the_triple_it_measured` provides for
+    /// `sun/nio/ch/`.
+    #[test]
+    fn the_l7_prefixes_retire_only_the_two_measured_rows() {
+        for (c, m, d) in [
+            (
+                "java/lang/ClassLoader",
+                "getUnnamedModule",
+                "()Ljava/lang/Module;",
+            ),
+            (
+                "java/lang/ClassLoader",
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+            ),
+            (
+                "java/lang/ClassLoader",
+                "getParent",
+                "()Ljava/lang/ClassLoader;",
+            ),
+            ("java/lang/ClassLoader", "<init>", "(Ljava/lang/ClassLoader;)V"),
+            (
+                "java/lang/ClassLoader",
+                "getSystemClassLoader",
+                "()Ljava/lang/ClassLoader;",
+            ),
+            (
+                "java/lang/ClassLoaderHelper",
+                "mapAlternativeName",
+                "(Ljava/io/File;)Ljava/io/File;",
+            ),
+            (
+                "java/security/SecureClassLoader",
+                "getPermissions",
+                "(Ljava/security/CodeSource;)Ljava/security/PermissionCollection;",
+            ),
+        ] {
+            assert!(
+                !triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} was retired by a prefix, not by a measurement"
+            );
+        }
+    }
+
+    /// Both lane-7 rows are retired AS A PAIR, and the pair is the fix.
+    ///
+    /// Retiring only `SecureClassLoader.<clinit>` would run its real bytecode
+    /// into the constant-`true` native and register nothing; retiring only
+    /// `registerAsParallelCapable` would leave the `<clinit>` a no-op, so
+    /// nothing would call it. Either half alone leaves
+    /// `BuiltinClassLoader.<clinit>` throwing `InternalError` — the same "all
+    /// four or none" shape as the `LogRecord` source pair above.
+    #[test]
+    fn the_l7_pair_is_retired_together() {
+        assert!(triple_is_retired_shadow(
+            "java/lang/ClassLoader",
+            "registerAsParallelCapable",
+            "()Z"
+        ));
+        assert!(triple_is_retired_shadow(
+            "java/security/SecureClassLoader",
+            "<clinit>",
+            "()V"
+        ));
     }
 
     /// The four prefixes lane 5 added are an EARLY-OUT, not a licence.
@@ -8319,11 +8713,16 @@ Ljava/nio/channels/FileChannel;"
                 "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
             ),
             ("java/util/LinkedHashSet", "add", "(Ljava/lang/Object;)Z"),
-            (
-                "java/util/HashMap",
-                "put",
-                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            ),
+            // 2026-09-11, L1 wave 3: `java/util/HashMap` and its six view and
+            // iterator classes came OFF this list, all 98 triples together.
+            // The hold was one observable — `entrySet().toArray()` reading
+            // EMPTY under the dial — and it was a DIAL ARTEFACT: the native
+            // that answers is `native_al_to_array` on `AbstractCollection`,
+            // and the `size()` question it falls back on is asked from inside
+            // a native, where there is no dispatch door to decline at.
+            // Retirement removes the registration instead of declining at a
+            // door, so that question reaches real bytecode. See
+            // `RETIRED_SHADOW_L1_HM_TRIPLES` for the trace and the numbers.
             ("java/util/HashSet", "iterator", "()Ljava/util/Iterator;"),
             // 2026-09-10, L1 wave 1: `java/util/LinkedList` came OFF this
             // list, for the same correction. `ll_set` publishes `first`,
@@ -8662,16 +9061,39 @@ Ljava/nio/channels/FileChannel;"
                 "getJarEntry",
                 "(Ljava/lang/String;)Ljava/util/jar/JarEntry;",
             ),
-            ("java/util/jar/Manifest", "getMainAttributes", "()Ljava/util/jar/Attributes;"),
+            // 2026-09-11, L1 wave 4: `java/util/jar/Manifest` came OFF this
+            // list and `java/util/jar/JarFile` took its place. The vacuous
+            // green was real and so was the red that replaced it — but the
+            // red is ONE CLASS. Armed alone on `L1TailSweep` (base 13
+            // diffs): `JarFile` +34, `JarEntry` +0 (reached 16), `Manifest`
+            // +0 (reached 23), `Attributes` +0 (reached 156),
+            // `Attributes$Name` +0 (reached 127).
+            (
+                "java/util/jar/JarFile",
+                "getManifest",
+                "()Ljava/util/jar/Manifest;",
+            ),
             (
                 "java/text/BreakIterator",
                 "getWordInstance",
                 "(Ljava/util/Locale;)Ljava/text/BreakIterator;",
             ),
+            // 2026-09-11, L1 wave 4: `java/text/Normalizer` came OFF this
+            // list and `java/text/BreakIterator` took its place, on the same
+            // bisection. `java/text/` armed whole is +16 on `L1TailSweep`
+            // and `BreakIterator` armed alone is the same +16;
+            // `ParseException` and `Normalizer` are +0 with the dial
+            // engaged (reached 1 and 10), and `DateFormat` is +0 with
+            // `reached == 0`, which is §7's trap and stays out.
+            //
+            // Retiring `Normalizer` is what §9 said it could not do: with
+            // `java/text/` held, the null-argument contract had to live in
+            // `normalizer_reject_nulls` inside the native. It can now be the
+            // image's own body again, in `--jdk-only`.
             (
-                "java/text/Normalizer",
-                "normalize",
-                "(Ljava/lang/CharSequence;Ljava/text/Normalizer$Form;)Ljava/lang/String;",
+                "java/text/BreakIterator",
+                "next",
+                "()I",
             ),
             // NOT a vacuous green — this one was clean over 51 probes with
             // the dial armed and turned red only on the trial binary, because
@@ -8826,13 +9248,18 @@ Ljava/nio/channels/FileChannel;"
                 "put",
                 "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
             ),
-            // 9 probes worse, two truncate — even though `table` IS a real
-            // `HashMap$Node[]` in the receiver's own field. Whatever is
-            // missing here is not the bucket array.
+            // 2026-09-11, L1 wave 3: `java/util/HashMap.put` came OFF this
+            // list. "9 probes worse, two truncate" was true of the DIAL and
+            // false of the change: a trial binary that retires the map
+            // surface is 0 diffs on all 142 rows of
+            // `apps/probes/L1MapFamilySweep.java`. What the dial could not
+            // see, and what still holds 77 of the family's 98, is on the
+            // row below — see `RETIRED_SHADOW_L1_HM_TRIPLES` and
+            // `wave_three_refused_the_iterators_the_views_and_lhm_s_inherited_eight`.
             (
-                "java/util/HashMap",
-                "put",
-                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                "java/util/HashMap$KeySet",
+                "iterator",
+                "()Ljava/util/Iterator;",
             ),
             // 4 probes worse.
             (

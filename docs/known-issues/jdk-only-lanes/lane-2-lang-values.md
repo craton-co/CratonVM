@@ -174,13 +174,20 @@ answer you need` earned its place here. Retiring these three means removing the
 dead `math_bignum.rs` registrations first, which changes nothing in compatible
 mode because they own no slot.
 
-**`remainder`, `mod`, `gcd`, `and`, `or`, `xor` — the JIT drops the message.**
-These do reach bytecode and interpreted they are HotSpot-exact. Once the body is
-JIT-compiled the `NullPointerException` arrives with no message at all. It is not
-a `BigInteger` fact: `apps/probes/L2JitNpeProbe.java` asks five null-deref shapes
-cold and hot with no JDK class involved, and every one loses its message when
-hot. Filed as
-[`../jit/the-helpful-npe-message-is-lost-in-compiled-code-20260910.md`](../jit/the-helpful-npe-message-is-lost-in-compiled-code-20260910.md).
+**`remainder`, `mod`, `gcd`, `and`, `or`, `xor` — the JIT dropped the message.
+BLOCKER CLEARED 2026-09-11; the retirement is still this lane's to make.**
+These do reach bytecode and interpreted they are HotSpot-exact. Once the body
+was JIT-compiled the `NullPointerException` arrived with no message at all. It
+was not a `BigInteger` fact: `probes/L2JitNpeProbe.java` asks six null-deref
+shapes cold and hot with no JDK class involved, and every one lost its message
+when hot. Fixed and retired as
+[`../../internal/fixed-bugs/the-helpful-npe-message-is-lost-in-compiled-code-FIXED-20260911.md`](../../internal/fixed-bugs/the-helpful-npe-message-is-lost-in-compiled-code-FIXED-20260911.md),
+pinned by `vm/tests/jit_npe_message_hot_equals_cold.rs`.
+
+Clearing the blocker is not the same as retiring the rows. The hold below is
+STRUCTURAL — every reference-argument row, not a list of six — and a lane that
+wants to lift it owes the same `BigIntegerSweep` measurement with the JIT on
+that put it there.
 ### The held set is a RULE, because the affected rows move between runs
 
 The six above are what regressed on the 24-triple binary. Rebuilt with those six

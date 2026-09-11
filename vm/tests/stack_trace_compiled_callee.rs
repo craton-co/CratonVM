@@ -3,12 +3,19 @@
 
 //! An exception raised BY compiled code must not lose the frames that raised it.
 //!
-//! Sibling of `stack_trace_across_tiers.rs`, and it covers the half that one
-//! deliberately cannot: there the throw is an implicit NPE whose *callees were
-//! spliced*, so every frame the trace needs is still described by one artifact.
-//! Here the callee is padded past `MAX_INLINE_BYTECODE_SIZE` (325) so it is
-//! compiled and **called**, and its activation is a real compiled frame of its
-//! own — the one an implicit NPE unwinds before the throwable is built.
+//! Sibling of `stack_trace_across_tiers.rs`. That file's subject is the
+//! INLINE-FRAME MAP — the callees an artifact spliced, which push nothing and
+//! must still appear — plus the OSR pc refresh. This file's subject is the
+//! SNAPSHOT: here the callee is padded past `MAX_INLINE_BYTECODE_SIZE` (325) so
+//! it is compiled and **called**, and its activation is a real compiled frame of
+//! its own — the one an implicit NPE unwinds before the throwable is built.
+//!
+//! The two overlap since 2026-09-11, and deliberately: the sibling's throw site
+//! is now refused for splicing too (`probes/StackTraceAfterOsr.java`'s `MARK`),
+//! so its third row needs the map for `mid`/`outer` AND the snapshot for
+//! `leaf`. Neither file subsumes the other — this one is the only place a
+//! compiled callee's activation is the WHOLE of what the snapshot has to
+//! recover.
 //!
 //! Drives the checked-in probe `probes/StackTraceCompiledCallee.java`.
 //!

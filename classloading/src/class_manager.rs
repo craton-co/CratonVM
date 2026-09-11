@@ -13213,17 +13213,42 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         "sun/reflect/generics/reflectiveObjects/GenericArrayTypeImpl" => {
             vec![named_field("genericComponentType", "Ljava/lang/reflect/Type;")]
         }
-        // Collections: ArrayList/Vector/Stack/CopyOnWriteArrayList = 2 fields (data, size)
+        // Collections: ArrayList/Vector/Stack/CopyOnWriteArrayList = 2 fields
+        // (data, size) -- `AL_FIELD_DATA`, `AL_FIELD_SIZE`, `AL_NUM_FIELDS = 2`
+        // in `native-collections`. This said 2 and reserved 4 until 2026-09-11;
+        // see the HashMap arm below for why that mattered and what the extra
+        // slots cost.
         "java/util/ArrayList"
         | "java/util/Vector"
         | "java/util/Stack"
-        | "java/util/concurrent/CopyOnWriteArrayList" => instance_fields(4),
+        | "java/util/concurrent/CopyOnWriteArrayList" => instance_fields(2),
         // HashMap/HashSet/ConcurrentHashMap = 3 fields (buckets, size, capacity)
+        // -- `MAP_FIELD_BUCKETS/SIZE/CAPACITY`, `HS_FIELD_MAP`,
+        // `CHM_FIELD_SEGMENTS` and its mask, all in `native-collections`. No
+        // native indexes a slot above 2 on any of these receivers.
+        //
+        // This said 3 and reserved 16 until 2026-09-11. The floor is applied in
+        // REAL-JDK mode too, as `max(declared, floor)`, and
+        // `build_compact_layout` fills the padding with 8-byte reference slots
+        // -- so an empty `java.util.HashMap` occupied 36 slots and 304 bytes
+        // against HotSpot's 48, with `table` already null and nothing allocated
+        // on the side to explain it. A `HashSet` cost 576. Bringing the two
+        // drifted floors down to what the natives actually index took HashMap to
+        // 64 bytes and ArrayList from 96 to 32, and 7% off the Hibernate HQL
+        // parse that found it.
+        //
+        // VALIDATED, because lowering a floor fails SILENTLY (an out-of-range
+        // `set_field` is dropped, not raised): 300 Hibernate ORM classes
+        // byte-for-byte identical, `regression-suite` 92/92, and
+        // `probes/CollectionSlotFloor.java` -- written for this -- passing in
+        // real-JDK mode and producing an IDENTICAL failure set to the unchanged
+        // build in synthetic-JDK mode, where the stub really is the layout.
+        // Raising a floor here is free; lowering one needs that evidence again.
         "java/util/HashMap"
         | "java/util/HashSet"
         | "java/util/EnumMap"
         | "java/util/Hashtable"
-        | "java/util/concurrent/ConcurrentHashMap" => instance_fields(16),
+        | "java/util/concurrent/ConcurrentHashMap" => instance_fields(3),
         // `ConcurrentHashMap$KeySetView` — the JDK's own two fields, named, so
         // `resolve_field_index_by_class_id` finds the same slots in synthetic
         // mode that it finds against the real class (`CollectionView.map` and

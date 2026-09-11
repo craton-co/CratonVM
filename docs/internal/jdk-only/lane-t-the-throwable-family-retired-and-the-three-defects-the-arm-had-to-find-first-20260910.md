@@ -251,9 +251,14 @@ always been right.
 
 ---
 
-## 2. The retirement: 906 triples, class-scoped
+## 2. The retirement: 906 triples, class-scoped — now 783, see §8
 
 `native-api/src/retired_shadow.rs::RETIRED_SHADOW_LT_TRIPLES`.
+
+**This section describes the table as first measured, 2026-09-10.** §8 pulls
+123 of these 906 rows back the next day, on evidence from a SIBLING lane's
+test rather than this one's own corpus — read this section for the shape of
+the retirement, and §8 for what changed.
 
 **The scope is the class set, not the registrar**, and that is deliberate: the
 dial is keyed on the RECEIVER's class, so a registrar-scoped table would retire
@@ -724,3 +729,57 @@ constant-pool resolution needs a class compiled against a class that is then
 deleted, which the suite's single-shot `javac` cannot express, and the loader
 NPEs are reached only through internal states. They are covered by
 construction, not by measurement, and that distinction is the honest one.
+
+## 8. 123 rows pulled back, 2026-09-11 — a sibling lane's test found what this
+one's own corpus could not
+
+A 93-commit merge of `origin/dev` brought lane 1's waves 3 and 4 alongside
+this branch's KS-5/KS-6 work (see the keystore known-issues page). Wave 4's
+own test, `wave_four_is_six_classes_and_refuses_jarfile_breakiterator_
+dateformat`, asserts that two triples must NOT be retired by ANY table:
+
+```text
+("java/text/ParseException", "printStackTrace", "(Ljava/io/PrintWriter;)V")
+("java/text/ParseException", "setStackTrace",   "([Ljava/lang/StackTraceElement;)V")
+```
+
+Its own comment states why, and the reasoning does not stop at
+`ParseException`: **"13 of its 14 triples are Throwable's inherited surface,
+so the defect is Throwable's and not `java/text/`'s"** — armed alone on a
+probe that does `e.setStackTrace(new StackTraceElement[0]);
+e.printStackTrace(w)`, HotSpot prints one header line and this VM prints the
+full internal trace, because this VM's `Throwable` model does not read back a
+`stackTrace` array bytecode wrote through `setStackTrace`. That is a defect
+BELOW the shadow/bytecode boundary this whole campaign turns on: yielding to
+real bytecode does not fix it, because the real bytecode's `printStackTrace`
+reads the VM's own internal stack-trace state, which `setStackTrace` never
+updated correctly in the first place.
+
+`RETIRED_SHADOW_LT_TRIPLES` retired both triples for **all 62**
+`THROWABLE_FAMILY_CLASSES`, not just `ParseException` — the table is
+class-scoped (§2), so the same exposure sits on every sibling. Pulled back
+for all 62 rather than left active on the 61 the wave-4 author's own test
+does not name: **123 rows removed** (62 × `printStackTrace(PrintWriter)`, 61
+× `setStackTrace` — `InvocationTargetException` never had a `setStackTrace`
+row to begin with). `RETIRED_SHADOW_LT_TRIPLES` is now **783 triples**, not
+906; §2 is left as first measured and this section is the update.
+
+**This was not caught by lane T's own corpus** — `SUITE=all` scored 134/134
+on `cratonvm-lt6.exe` through `cratonvm-lt8.exe`, all three including this
+exact regression, because no vector in the corpus happens to call
+`setStackTrace` immediately before `printStackTrace` on a throwable. The
+defect was live on every binary this lane shipped before this merge, and the
+only reason it surfaced now is that a sibling lane's author reasoned about
+the SAME 906-row table from the outside and wrote a test naming the two
+triples specifically — worth recording as a gap in this lane's own
+instrumentation, not only as a fix. No probe in this repo currently exercises
+`setStackTrace` immediately before `printStackTrace`; closing that gap
+(a `RThrowableSetStackTraceThenPrint` vector, or similar) is left for
+whichever lane next touches the `Throwable` family, since fixing the
+underlying VM-side stack-trace model is out of scope for a registrar lane.
+
+Both class-guard tests still pass after the carve-out
+(`no_non_throwable_sibling_is_retired_by_lane_t`,
+`the_lane_t_table_is_disjoint_from_every_sibling`), confirming the removal
+touched only these two triples and created no new overlap with any sibling
+table.

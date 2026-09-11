@@ -525,9 +525,14 @@ retire it, either of them enough:
    the short guard needs no placement strategy at all. The 12% above is what
    that route is worth, and it is the better answer to this whole page.
 
-Until one of those lands, `CRATONVM_JIT_CODE_NEAR_GLOBALS=1` is a supported and
-now well-measured opt-in — worth 12% on a four-site field loop and 2% on a
-one-site one — and not a default.
+Until one of those lands, `CRATONVM_JIT_CODE_NEAR_GLOBALS=1` is a supported
+opt-in and not a default.
+
+> **The "well-measured" part did not survive the next build.** The 12% and the
+> 2% quoted here were withdrawn on 2026-09-11 — the same experiment reads
+> **+5.6%** on the next binary, against a 0.9% floor. See *What this retires*
+> under *Route 4, built*. Route 2 in the list above is now moot as well: Route
+> 4 landed, and it gets the encoding without this flag.
 
 ## The single-pass tier had the same guard and not the same encoding
 
@@ -739,11 +744,165 @@ not a patch:
    been forced and fail closed, and that latch is the part that wants a test
    rather than a comment.
 
-The prize is worth the care, and *The differential run was owed* now prices it:
-**12% on the four-site loop and 2% on the one-site one**, which is what this
-route would deliver with no flag, no placement strategy, and without standing
-down the cell that keeps the safepoint poll short. It is the better answer to
-this whole page, and the reason the flag it is named for stays an opt-in.
+The prize is worth the care, and *The differential run was owed* prices it at
+**12% on the four-site loop and 2% on the one-site one** — which this route
+would deliver with no flag, no placement strategy, and without standing down
+the cell that keeps the safepoint poll short.
+
+> **Both of those numbers are wrong, and building the route is what proved it.**
+> See *Route 4, built* below: the 12% does not survive a rebuild, and the
+> one-site figure is off by more than an order of magnitude in the other
+> direction. The architectural case above stands unchanged; the price tag on it
+> did not.
+
+## Route 4, built — 2026-09-11
+
+Landed as `CRATONVM_JIT_EPOCH_CELL` (default ON, `=0` is the kill switch).
+`Vm::new`'s first statement takes a cell from
+`platform::alloc_code_adjacent_cell` and hands it to
+`field_layout::install_layout_epoch_cell`, which **fails closed** once the
+counter has been read, bumped or baked even once — the hazard #2 above names, turned into a `Mutex`-guarded state machine rather than a comment. The
+install is a `bool` and the choice is latched at a fixed point in boot rather
+than by whoever reads the counter first, so a call site that drifts later
+cannot silently cost the encoding.
+
+The dependency inversion needed no hook: `vm` depends on both crates, so it
+does the allocating and `types` only accepts a pointer. Composition with
+`CRATONVM_JIT_CODE_NEAR_GLOBALS` needed no check either —
+`alloc_code_adjacent_cell` already returns `None` while that flag is set, so
+the install simply never happens and "exactly one strategy owns placement"
+survives by where the cell comes from.
+
+### It engages, with no placement strategy at all
+
+`MultiFieldLoop.sumGuarded`, Ubuntu 24.04, **no `CODE_NEAR_GLOBALS`**:
+
+| arm | body | short guards | long guards | short polls | body bytes |
+|---|---|---:|---:|---:|---:|
+| `EPOCH_CELL=0` | `full/ir` | 0 | 4 | 2 | 1841 |
+| `EPOCH_CELL=1` | `full/ir` | **4** | 0 | 2 | **1805** |
+| `EPOCH_CELL=0` | `osr/sp` | 0 | 8 | 2 | 2511 |
+| `EPOCH_CELL=1` | `osr/sp` | **8** | 0 | 2 | **2407** |
+
+36 = 4 x 9 and 104 = 8 x 13 — the same savings `CODE_NEAR_GLOBALS=1` buys, with
+the code left exactly where `mmap` put it. Both arms' code buffers are
+page-aligned at identical relative offsets (`0x…957000/955000/953000` against
+`0x…b4f000/b4d000/b4b000`), because the cell is allocated in **both** arms and
+only the install differs — so the arms do not differ in their `mmap` sequence,
+which an earlier version of this experiment would have got wrong.
+
+`CRATONVM_DBG_EPOCH_CELL=1` is the witness:
+
+```text
+[epoch-cell] origin=CodeAdjacent addr=0x759d494f7000     # default
+[epoch-cell] origin=Heap        addr=0x20000260100       # CRATONVM_JIT_EPOCH_CELL=0
+```
+
+### The one-site loop: −30%
+
+`flag-ab.sh`, one binary, 24 rounds, `probe.reps=8000`,
+`CRATONVM_JIT_FORCE_C2=1` in both arms:
+
+| shape | invocation | A | C | B | floor | effect |
+|---|---|---:|---:|---:|---:|---:|
+| `FieldLoop` | 1 | 606.0 | 618.5 | **421.5** | **2.0%** | **−31.2%** |
+| `FieldLoop` | 2 | 626.5 | 655.5 | **457.0** | 4.5% | **−28.7%** |
+
+Both were taken at load averages of **612 and 57** on 8 cores — which is the
+first thing to say about them. An effect that survives a host in that state,
+with a 2.0% control floor, is not a scheduling artifact; §5.2's warning is
+about a few percent, and this is thirty.
+
+Decomposed, same probe and sample size:
+
+| what varies | invocations | effect |
+|---|---|---|
+| **encoding only** (counter isolated in both arms) | 2 | **−28.1%** (floor 13.6%), **−28.8%** (9.4%) |
+| **location only** (long form forced in both arms) | 2 | −6.3% (2.8%), −0.4% (9.9%) |
+
+So it is the **encoding**, not the counter's new address. The cache-line
+isolation the cell also buys is worth a few percent at most.
+
+**And thirty percent is out of all proportion to what changed**, which is the
+part to be honest about rather than to explain away. Counted off the
+disassembly, `FieldLoop.sum`'s hot loop goes from **80 instructions and 432
+bytes to 78 and 423** — the guard's `MOV R11, imm64` / `MOV ECX, [R11]` /
+`CMP ECX, 0` collapsing into one `CMP dword [rip+disp32], 0`. Two instructions
+in eighty is 2.5%. Something about those two — a three-deep dependency chain
+per iteration whose head is a 10-byte immediate load, and the R11/ECX clobber
+it forces on every other value in the loop — costs ten times its instruction
+count here. **This page does not know which, and says so.**
+
+### The four-site loop: +5%, and that is the part that should worry a reader
+
+Same binary, same flag, 12 rounds, `probe.reps=8000`. **Eleven invocations**,
+of which nine clear the 3% bar, spread over two hours of a host that went from
+load 6 to load 27 and back:
+
+| invocation | floor | effect | | invocation | floor | effect |
+|---|---:|---:|---|---|---:|---:|
+| 1 | 0.8% | **+2.8%** | | 6 | 2.8% | −1.2% |
+| 2 | 1.0% | **+5.6%** | | 7 | *7.4%* | *(+14.7%)* |
+| 3 | 1.2% | **+5.2%** | | 8 | 2.7% | **+5.9%** |
+| 4 | 1.7% | **+6.4%** | | 9 | 2.0% | −1.1% |
+| 5 | 1.4% | −0.0% | | 10 | 1.6% | **+8.2%** |
+| | | | | 11 | *11.0%* | *(+5.2%)* |
+
+Nine usable readings: **+2.8, +5.6, +5.2, +6.4, 0.0, −1.2, +5.9, −1.1, +8.2**.
+Median **+5.2%**, six of nine at or above +2.8%, none negative by more than a
+point. So on `MultiFieldLoop` the short encoding **costs something like four
+percent**, while removing 8 instructions and 36 bytes from a 150-instruction,
+853-byte loop.
+
+**The first four of those were taken inside one twenty-minute window and agreed
+to within four points, and that agreement meant less than it looked.** Readings
+5, 6 and 9 — floors of 1.4%, 2.8% and 2.0%, as clean as 1 through 4 — say
+nothing at all. A tight cluster is a property of the window it was taken in.
+Only the nine together support a number, and the number they support has a
+spread wider than most of the effects this page has argued about.
+
+One site −30%, four sites +4%, from the same change on the same binary. The
+sign of this encoding's effect is a property of the loop it lands in, and
+neither direction is small enough to call noise.
+
+### What this retires: the 12% in *The differential run was owed*
+
+The same `CODE_NEAR_GLOBALS` experiment that read **−11.4% to −12.3% across
+four invocations** on the previous binary reads **+5.6% (floor 0.9%)** on this
+one, with the flag verified engaged (code at `0x1fffc800000`, 16 short guards,
+body 1841 → 1805). Nothing in the experiment changed. The binary did — `dev`
+moved, and the generated body with it, by ten bytes.
+
+**That is a harder lesson than §5.2's and it belongs beside it.** §5.2 says a
+control arm bounds drift *within* an invocation and not between invocations.
+This says: four invocations agreeing to within a percentage point bound nothing
+*across a rebuild*, when the effect under test is one that changes the size and
+alignment of the loop being measured. Such a change cannot be A/B'd without
+also perturbing code layout — the guards are *in* the loop — so layout is a
+confound no amount of repetition removes.
+
+The honest statement of what this encoding is worth is therefore: **large,
+shape-dependent, signed either way, and not a number this apparatus can pin.**
+The 12% is withdrawn. `CODE_NEAR_GLOBALS` keeps its default OFF and now has a
+second reason: Route 4 gets the same encoding with none of its costs.
+
+### Why it ships default ON anyway
+
+Not because of the −30%, which the four-site +4% is enough to disqualify as a
+headline.
+
+`CRATONVM_JIT_IR_EPOCH_GUARD_RIP` has been default ON since 2026-09-10, and on
+Windows the counter has always been in reach, so **the short form is already
+what Windows emits at every site**. Linux emitted the long one for one reason:
+the counter was in an allocator the code could not reach. Route 4 removes that
+reason. It is a platform-consistency change, not a new code shape, and the
+measurement above is the same measurement Windows has been living with — where
+it read −14.5% on the four-site loop that reads +4% here.
+
+Shipping it OFF would mean keeping Linux on a fallback encoding that exists for
+a reachability problem that no longer exists, on the strength of one synthetic
+four-site probe whose own readings disagree by nine points. `CRATONVM_JIT_EPOCH_CELL=0` is there for anyone who measures
+otherwise on their own shape.
 
 ## Reproducing
 
@@ -765,7 +924,8 @@ bash tools/tier-ab/flag-ab.sh -Exe "$PWD/target/release/cratonvm" \
     -Base "CRATONVM_JIT_FORCE_C2=1" -Rounds 14 -D probe.reps=8000
 
 # the placement flag itself, four-site then one-site. ONLY on an idle host:
-# see "The same measurement on a busy host says nothing, fifteen times".
+# see "The same measurement on a busy host says nothing, fifteen times" --
+# and read "What this retires" before believing any number this produces.
 uptime   # load average under ~4 on 8 cores, or the answer is the machine
 for c in "MultiFieldLoop 12 8000" "FieldLoop 14 25000"; do
   set -- $c

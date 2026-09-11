@@ -304,31 +304,30 @@ fn run_arm(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .unwrap_or_else(|e| panic!("[{TAG}] {arm}: could not spawn cratonvm: {e}"));
     // Generous: an arm that never tiers up runs the whole probe interpreted,
     // and a loaded host makes that slower still. A timeout here is an
     // environment report, not a verdict on the trace.
-    let timeout = Duration::from_secs(600);
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if start.elapsed() > timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("[{TAG}] {arm}: probe timed out after {timeout:?}");
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => panic!("[{TAG}] {arm}: wait failed: {e}"),
-        }
-    }
-    let out = child
-        .wait_with_output()
-        .expect("collect probe output after exit");
+    //
+    // DRAINED, and that is load-bearing rather than tidy. Every arm here sets
+    // `CRATONVM_DBG_JITC=1`, a pipe holds tens of KiB, and the shape this
+    // replaced -- poll `try_wait`, then `wait_with_output` -- reads neither pipe
+    // until the child has exited. A child that writes more than the buffer
+    // blocks in `write` and can never exit, so the parent polls out its whole
+    // cap and reports a hang that is not one. It had not bitten this file only
+    // because this probe's JIT log is currently small enough, which is a
+    // property of the diagnostics someone else owns. See `wait_draining`.
+    let timed = common::wait_draining(child, Duration::from_secs(600));
+    let out = timed.output;
+    assert!(
+        !timed.timed_out,
+        "[{TAG}] {arm}: the probe did not finish within the cap. What it managed to \
+         say:\nstdout:\n{}\nstderr tail:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        tail(&String::from_utf8_lossy(&out.stderr))
+    );
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),

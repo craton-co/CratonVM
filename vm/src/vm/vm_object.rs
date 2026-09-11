@@ -69,21 +69,32 @@ const CODER_UTF16: i32 = 1;
 /// - Legacy (pre-JDK 9 / synthetic): `char[] value` (field 0) + `int hash`
 ///   (field 1).
 pub fn create_java_string(shared: &SharedVm, text: &str) -> ObjectRef {
+    create_java_string_reporting(shared, text).0
+}
+
+/// [`create_java_string`], also saying whether this call ALLOCATED.
+///
+/// An intern hit returns an existing object and allocates nothing, so a caller
+/// that charges an allocation counter (`NativeContextImpl::create_string`)
+/// needs to tell the two apart. Reported from inside rather than by probing the
+/// pool a second time from outside: the probe would double the read-lock
+/// acquisition on the hit path, which is the hot one.
+pub fn create_java_string_reporting(shared: &SharedVm, text: &str) -> (ObjectRef, bool) {
     // Fast path: check pool
     if let Some(&obj) = shared.mem.string_pool.read().get(text) {
-        return obj;
+        return (obj, false);
     }
 
     // Slow path: create new string object
     let mut pool = shared.mem.string_pool.write();
     // Double-check after acquiring write lock
     if let Some(&obj) = pool.get(text) {
-        return obj;
+        return (obj, false);
     }
 
     let str_obj = alloc_java_string_object(shared, text);
     pool.insert(text.to_string(), str_obj);
-    str_obj
+    (str_obj, true)
 }
 
 /// Fallible, pooled twin of [`create_java_string`]: returns `None` instead of

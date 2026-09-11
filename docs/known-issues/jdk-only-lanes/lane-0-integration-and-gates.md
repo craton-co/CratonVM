@@ -81,7 +81,7 @@ Sets are disjoint; the totals below reconcile to 5,549 exactly.
 | **L4** | `java/io/`, `java/nio/`, `sun/nio/`, `jdk/internal/foreign` | 1,110 | 131 | 615 |
 | **L5** | `java/util/concurrent/`, `jdk/internal/misc/`, `sun/misc/`, `java/lang/Thread*`, `jdk/internal/vm/` | 405 | 23 | 345 |
 | **L6** | `java/net/`, `sun/net/`, `javax/net/`, `java/security/`, `sun/security/`, `javax/crypto/`, `javax/security/`, `jdk/net/` | 819 | 90 | 663 |
-| **L7** | `java/lang/ClassLoader*`, `jdk/internal/loader/` **+ the bootstrap failure triage** | 20 | 6 | 18 |
+| **L7** | `java/lang/ClassLoader*`, `jdk/internal/loader/`, **`java/security/SecureClassLoader`** (claimed 2026-09-10, one `<clinit>` row, from L6) **+ the bootstrap failure triage** | 20 | 6 | 18 |
 | — | **UNOWNED, frozen** | 316 | 83 | 291 |
 | | **TOTAL** | **5,549** | **631** | **3,395** |
 
@@ -245,10 +245,26 @@ Two are already resolved and are the pattern the other lanes should copy:
 - **`Class.getName` → reviewed `Intrinsic`.** Yielding returns the **internal
   form** (`java/lang/Object`), which is worse than null because nothing throws;
   it propagates into every JDK name comparison and is why `ServiceLoader`
-  reports *"module java.base does not declare `uses`"*. Reviewed with
-  `apps/probes/ClassNameSweep.java`: **0 diffs of 24 unarmed, 24 of 24 when
-  yielded, and 2 of 24 after the tag** — one tag repaired 22 rows, because the
-  JDK derives `getTypeName`/`getCanonicalName`/`getSimpleName` from `getName`.
+  reports *"module java.base does not declare `uses`"*.
+
+  **This bullet described a tag that had not landed, and said so in the past
+  tense for a day.** Measured 2026-09-10: the registration was still
+  `bridge`/`kind_stated:false` in `--dump-native-registry`, the kind-map row
+  still read `bridge 0 1`, and `apps/probes/ClassNameSweep.java` existed in no
+  commit — `git log --all -S ClassNameSweep` finds only the commit that wrote
+  this bullet. It landed that day, reviewed with a sweep of **85** rows (not
+  24): **0 rows differ unarmed, 9 differ armed before the tag and 1 after**, and
+  the nine include `Class.forName(X.class.getName())` throwing
+  `ClassNotFoundException` for every reference type. One tag repairs eight of
+  them, because the JDK derives
+  `getTypeName`/`getCanonicalName`/`getSimpleName`/`toString` from `getName`.
+  The ninth is a `Class.forName` defect on a NESTED application class and is
+  recorded, not frozen — the sweep is checked in.
+
+  Two things this cost, worth keeping: a prose claim of "already resolved" is
+  not a measurement, and the armed/unarmed split alone would have missed it —
+  rows reached through a method reference kept the native and answered
+  correctly, so a probe that asked one dispatch route called the family clean.
 
 ### The §1.4 reviewed-`Intrinsic` protocol, which every lane will need
 

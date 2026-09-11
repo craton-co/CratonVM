@@ -2459,6 +2459,50 @@ fn matcher_realjdk_capture_layout_valid(
         && groups_len >= java_capture_count.saturating_mul(2)
 }
 
+thread_local! {
+    /// Scratch for one `find()`'s `groups[]` image, so the bulk commit costs
+    /// no allocation per call.
+    static MATCHER_REAL_SLOT_SCRATCH: std::cell::RefCell<Vec<i32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Commit `slots` into `groups[0..slots.len()]`.
+///
+/// One bulk write where the element-at-a-time loop this replaced made two
+/// validated native-boundary crossings per capture group. The per-element
+/// fallback is kept for a heap that declines the bulk path — the unit-test
+/// mocks do, and `write_int_array_from`'s own contract is "best effort".
+fn matcher_realjdk_write_slots(ctx: &mut dyn NativeContext, groups: ObjectRef, slots: &[i32]) {
+    if slots.is_empty() {
+        return;
+    }
+    if ctx.write_int_array_from(groups, 0, slots) {
+        return;
+    }
+    for (i, &v) in slots.iter().enumerate() {
+        ctx.set_array_element(groups, i, Value::Int(v));
+    }
+}
+
+/// Set every slot of `groups[]` to `-1`, the "no match here" sentinel real
+/// `Matcher` uses. See [`matcher_realjdk_write_slots`] for the bulk contract.
+fn matcher_realjdk_clear_slots(ctx: &mut dyn NativeContext, groups: ObjectRef) {
+    let len = ctx.array_length(groups) & !1;
+    if len == 0 {
+        return;
+    }
+    MATCHER_REAL_SLOT_SCRATCH.with(|scratch| {
+        let mut slots = scratch.borrow_mut();
+        slots.clear();
+        slots.resize(len, -1);
+        if !ctx.write_int_array_from(groups, 0, &slots[..]) {
+            for i in 0..len {
+                ctx.set_array_element(groups, i, Value::Int(-1));
+            }
+        }
+    });
+}
+
 fn matcher_realjdk_capture_layout_ok(
     ctx: &mut dyn NativeContext,
     capture_count: usize,
@@ -2729,24 +2773,38 @@ fn matcher_realjdk_search(
     // `groups_obj` has enough capacity, so every write below is in bounds.
     let mut whole_start = -1i32;
     let mut whole_end = -1i32;
-    let capture_count = re.visit_capture_ranges_at(region_slice, search_from_byte, |i, range| {
-        let (s, e) = match range {
-            Some((start, end)) => {
-                let abs_start_byte = region_from_byte + start;
-                let abs_end_byte = region_from_byte + end;
-                (
-                    byte_to_utf16[abs_start_byte] as i32,
-                    byte_to_utf16[abs_end_byte] as i32,
-                )
+    // Collect the slot values first and commit them with ONE bulk
+    // `write_int_array_from`, instead of two validated `set_array_element`
+    // round-trips per capture group. Every one of those crosses the native
+    // boundary and re-validates the receiver; `while (m.find())` makes the
+    // whole set of them per iteration, so for the two-slot `(\d+)` shape the
+    // bulk write replaces four crossings with one.
+    let capture_count = MATCHER_REAL_SLOT_SCRATCH.with(|scratch| {
+        let mut slots = scratch.borrow_mut();
+        slots.clear();
+        let count = re.visit_capture_ranges_at(region_slice, search_from_byte, |i, range| {
+            let (s, e) = match range {
+                Some((start, end)) => {
+                    let abs_start_byte = region_from_byte + start;
+                    let abs_end_byte = region_from_byte + end;
+                    (
+                        byte_to_utf16[abs_start_byte] as i32,
+                        byte_to_utf16[abs_end_byte] as i32,
+                    )
+                }
+                None => (-1, -1),
+            };
+            if i == 0 {
+                whole_start = s;
+                whole_end = e;
             }
-            None => (-1, -1),
-        };
-        if i == 0 {
-            whole_start = s;
-            whole_end = e;
+            slots.push(s);
+            slots.push(e);
+        });
+        if count.is_some() {
+            matcher_realjdk_write_slots(ctx, groups_obj, &slots[..]);
         }
-        ctx.set_array_element(groups_obj, 2 * i, Value::Int(s));
-        ctx.set_array_element(groups_obj, 2 * i + 1, Value::Int(e));
+        count
     });
     let matched = match capture_count {
         Some(_) => {
@@ -2784,10 +2842,7 @@ fn matcher_realjdk_search(
             true
         }
         None => {
-            for i in 0..(ctx.array_length(groups_obj) / 2) {
-                ctx.set_array_element(groups_obj, 2 * i, Value::Int(-1));
-                ctx.set_array_element(groups_obj, 2 * i + 1, Value::Int(-1));
-            }
+            matcher_realjdk_clear_slots(ctx, groups_obj);
             ctx.set_field(this, idx.first, Value::Int(-1));
             // Best-effort: a failed search plausibly means the engine
             // examined input through the region end. See module banner.
@@ -2963,10 +3018,7 @@ pub(crate) fn native_matcher_find_realjdk(
         // Real `find()`'s own early-return branch: clear `groups[]` only,
         // leave `first`/`last`/`modCount`/`hitEnd` untouched — replicated
         // exactly (not a bug we're "fixing").
-        for i in 0..(ctx.array_length(groups_obj) / 2) {
-            ctx.set_array_element(groups_obj, 2 * i, Value::Int(-1));
-            ctx.set_array_element(groups_obj, 2 * i + 1, Value::Int(-1));
-        }
+        matcher_realjdk_clear_slots(ctx, groups_obj);
         return Ok(Some(Value::Int(0)));
     }
 

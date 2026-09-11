@@ -277,7 +277,10 @@ fn class_id_memo() -> &'static RwLock<FxHashMap<u64, u32>> {
 /// growing a second FNV helper; the two memos are separate maps, so the domains
 /// cannot collide with each other, and a collision WITHIN this map is caught by
 /// the same name re-check that catches a redefinition.
-fn find_class_id_by_name_memoized(class_store: &ClassStore, name: &str) -> Option<ClassId> {
+pub(crate) fn find_class_id_by_name_memoized(
+    class_store: &ClassStore,
+    name: &str,
+) -> Option<ClassId> {
     let key = signature_hash(name, "");
 
     let memoized = class_id_memo().read().get(&key).copied();
@@ -1451,14 +1454,80 @@ pub fn append_snapshotted_compiled_frames(
     // returns them. Getting this backwards is not a subtle failure: it prints
     // the throw site as the outermost frame, which reads as a plausible trace
     // of a completely different call.
-    trace.reserve(snapshot.len());
+    let mut fresh: Vec<StackTraceEntry> = Vec::with_capacity(snapshot.len());
     for f in snapshot {
         // An inlined callee is deeper than the artifact that inlined it, so it
         // is pushed after it — the same direction as the live splice, for the
         // same reason.
-        push_compiled_frames(&mut trace, class_store, f);
+        push_compiled_frames(&mut fresh, class_store, f);
     }
+    let overlap = trailing_overlap(&trace, &fresh);
+    trace.reserve(fresh.len() - overlap);
+    trace.extend(fresh.into_iter().skip(overlap));
     trace
+}
+
+/// How many entries at the FRONT of `fresh` the tail of `trace` already holds.
+///
+/// # Why this is needed at all
+///
+/// [`append_snapshotted_compiled_frames`]'s premise is that the compiled frames
+/// have already unwound by the time the throwable is constructed — the whole
+/// reason the snapshot exists. One door breaks that premise:
+/// `jit::helpers::materialize_implicit_signal` builds the throwable INSIDE the
+/// JIT helper, with every compiled frame still on the stack, so
+/// `fillInStackTrace` has already walked and spliced them. Appending the
+/// snapshot unfiltered then prints them twice:
+///
+/// ```text
+/// as PRINTED, i.e. innermost first -- this function's own lists are the
+/// reverse of that:
+/// HotSpot                       [leaf:25 mid:26 outer:27 probe:42 main:66]
+/// unfiltered snapshot splice    [leaf:25 mid:26 outer:27 probe:42
+///                                        mid:26 outer:27 probe:42 main:66]
+/// ```
+///
+/// measured on a `synchronized` throw-site variant of
+/// `probes/StackTraceAfterOsr.java`, where the `synchronized` is doing nothing
+/// but routing the raise through that door.
+///
+/// # Why the OVERLAP and not a membership test
+///
+/// Both lists describe ONE stack, outermost-first, and `fresh` is the inner
+/// end of it. So the only correct merge is the longest prefix of `fresh` that
+/// is a suffix of `trace` — which is also what makes genuine recursion safe: a
+/// method that really does appear twice appears twice in BOTH lists, and the
+/// maximal overlap lines them up instead of deleting a real frame. A membership
+/// test ("is this method already in the trace?") would delete one.
+///
+/// Zero overlap — every shape where the frames HAD unwound — appends
+/// everything, which is byte-for-byte what this function did before.
+///
+/// Entries are compared on `(class_name, method_name, byte_code_index)`: the
+/// identity of a program point. The line number is derived from the bci and the
+/// source file from the class, so neither adds information, and `class_id` /
+/// `method_index` are `None` on a name-only entry and would make two readings of
+/// one frame compare unequal.
+fn trailing_overlap(trace: &[StackTraceEntry], fresh: &[StackTraceEntry]) -> usize {
+    let max = trace.len().min(fresh.len());
+    for n in (1..=max).rev() {
+        let tail = &trace[trace.len() - n..];
+        if tail
+            .iter()
+            .zip(&fresh[..n])
+            .all(|(a, b)| same_program_point(a, b))
+        {
+            return n;
+        }
+    }
+    0
+}
+
+/// Do two entries name the same program point? See [`trailing_overlap`].
+fn same_program_point(a: &StackTraceEntry, b: &StackTraceEntry) -> bool {
+    a.class_name == b.class_name
+        && a.method_name == b.method_name
+        && a.byte_code_index == b.byte_code_index
 }
 
 /// Re-point an already-built entry at `bci`, re-resolving its line.
@@ -1829,6 +1898,85 @@ mod tests {
             method_index: Some(method_index),
             ..entry_for(class_id, method, bci)
         }
+    }
+
+    /// One entry naming a program point, for the overlap tests.
+    fn point(class: &str, method: &str, bci: i32) -> StackTraceEntry {
+        StackTraceEntry {
+            class_name: Arc::from(class),
+            method_name: Arc::from(method),
+            source_file: None,
+            line_number: LINE_NUMBER_UNKNOWN,
+            byte_code_index: bci,
+            class_id: None,
+            method_index: None,
+        }
+    }
+
+    /// The shape that motivated [`trailing_overlap`]: the throwable was built
+    /// while the compiled frames were still live, so the capture already spliced
+    /// them and the snapshot repeats all but the innermost.
+    #[test]
+    fn a_snapshot_that_repeats_the_captured_tail_is_appended_only_once() {
+        let trace = vec![
+            point("P", "main", 66),
+            point("P", "probe", 42),
+            point("P", "outer", 27),
+            point("P", "mid", 26),
+        ];
+        let fresh = vec![
+            point("P", "probe", 42),
+            point("P", "outer", 27),
+            point("P", "mid", 26),
+            point("P", "leaf", 25),
+        ];
+        assert_eq!(trailing_overlap(&trace, &fresh), 3);
+    }
+
+    /// The ORDINARY shape — the frames had unwound, so nothing repeats and
+    /// everything is appended. This is the arm that must stay byte-for-byte
+    /// what it was.
+    #[test]
+    fn a_snapshot_of_frames_that_already_unwound_overlaps_nothing() {
+        let trace = vec![point("P", "msg", 1), point("P", "pair", 48)];
+        let fresh = vec![point("P", "probe", 42), point("P", "leaf", 25)];
+        assert_eq!(trailing_overlap(&trace, &fresh), 0);
+    }
+
+    /// Genuine recursion appears twice in BOTH lists, and the MAXIMAL overlap
+    /// is what lines them up. A membership test would delete a real frame here.
+    #[test]
+    fn genuine_recursion_keeps_every_copy() {
+        let trace = vec![
+            point("P", "main", 3),
+            point("P", "rec", 7),
+            point("P", "rec", 7),
+        ];
+        let fresh = vec![
+            point("P", "rec", 7),
+            point("P", "rec", 7),
+            point("P", "leaf", 1),
+        ];
+        // Two `rec` frames are shared; the third entry of `fresh` is new.
+        assert_eq!(trailing_overlap(&trace, &fresh), 2);
+    }
+
+    /// A frame that matches by NAME but stands at a different bci is a
+    /// different program point and must not be folded away.
+    #[test]
+    fn a_different_bci_is_a_different_program_point() {
+        let trace = vec![point("P", "main", 3), point("P", "rec", 7)];
+        let fresh = vec![point("P", "rec", 9), point("P", "leaf", 1)];
+        assert_eq!(trailing_overlap(&trace, &fresh), 0);
+    }
+
+    /// An empty snapshot, and an empty trace, both overlap nothing rather than
+    /// dividing by zero on the way there.
+    #[test]
+    fn an_empty_side_overlaps_nothing() {
+        let some = vec![point("P", "m", 0)];
+        assert_eq!(trailing_overlap(&some, &[]), 0);
+        assert_eq!(trailing_overlap(&[], &some), 0);
     }
 
     // -- memoized find_method ------------------------------------------

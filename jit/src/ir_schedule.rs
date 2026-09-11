@@ -611,6 +611,9 @@ pub struct Schedule {
     pub freq: BlockFrequencies,
     /// What the frequency-driven layout did, or why it did nothing.
     pub layout: LayoutReport,
+    /// Why each single-use operand did or did not end up beside its consumer.
+    /// See [`PairCensus`]; empty when `pair_single_use_operands` is off.
+    pub pairing: PairCensus,
 }
 
 impl Schedule {
@@ -665,6 +668,142 @@ fn use_counts(graph: &Graph) -> Vec<u32> {
         }
     }
     out
+}
+
+/// Why each `(consumer, operand)` pair did or did not end up adjacent.
+///
+/// # Why this exists
+///
+/// `c2-one-carry-slot-is-the-frame-traffic-ceiling-FIXED-20260910.md` §10 closed
+/// on a number it could not explain: **82% of the carry's candidate windows are
+/// declined for `operand_position`** — the node two positions back is not the
+/// consumer's second operand, so the `[input1, input0, cons]` triple both carry
+/// slots need was never formed. [`pair_single_use_operands`] is the pass that
+/// would form it, it declines for five enumerated reasons, and *"which of those
+/// dominates is not yet counted — the pairing pass has no census, and that is
+/// the next thing to build, not the next thing to fix."*
+///
+/// This is that census. One counter per `continue`, so the five reasons are
+/// five numbers rather than one silence.
+///
+/// # The denominator is the honest one
+///
+/// [`Self::candidates`] counts `(consumer, operand)` pairs where the operand is
+/// a real, distinct node — every pair the pass could conceivably act on, and
+/// nothing else. The sibling census learned this the hard way: its first cut
+/// reported every three consecutive scheduled nodes as the denominator, which
+/// made the dominant cause "not a candidate" and said nothing.
+///
+/// # The identity
+///
+/// `paired + multi_use + no_node + producer_arm + other_block + after_consumer
+/// + already_adjacent + deopt_between == candidates`, checked by
+/// [`Self::closes`] and asserted in debug builds at the call site. A reason
+/// added to the pass and not to the census fails that assertion rather than
+/// quietly reading low — the failure mode
+/// `c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md` §10.1
+/// records, where a census that computed its own answer drifted to zero while
+/// the emission it described did three things.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PairCensus {
+    /// `(consumer, operand)` pairs examined. The denominator.
+    pub candidates: usize,
+    /// Moved to sit immediately before the consumer.
+    pub paired: usize,
+    /// The operand is read by more than one node, so sinking it past a reader
+    /// would be a semantic change rather than a scheduling one.
+    pub multi_use: usize,
+    /// No node behind the operand's id. Structural; expected to be zero.
+    pub no_node: usize,
+    /// The operand's op is not one `ir_lower::op_home_is_one_store_rax`
+    /// certifies, so the carry would refuse it even if it were adjacent.
+    pub producer_arm: usize,
+    /// The operand is scheduled in a different block from its consumer.
+    pub other_block: usize,
+    /// The operand is scheduled AFTER its consumer in this block. A consumer
+    /// that is itself a phi reads across a back edge, so this is not a bug.
+    pub after_consumer: usize,
+    /// Already immediately before the consumer — the pass has nothing to do and
+    /// the carry already sees the shape.
+    pub already_adjacent: usize,
+    /// A node a deopt can arrive at sits between the two positions, so sinking
+    /// the definition past it would leave a frame slot nothing had written.
+    pub deopt_between: usize,
+}
+
+impl PairCensus {
+    /// Does every candidate fall into exactly one bucket?
+    pub fn closes(&self) -> bool {
+        self.paired
+            + self.multi_use
+            + self.no_node
+            + self.producer_arm
+            + self.other_block
+            + self.after_consumer
+            + self.already_adjacent
+            + self.deopt_between
+            == self.candidates
+    }
+
+    /// Add this method's counts to the process-wide totals.
+    fn publish(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        debug_assert!(
+            self.closes(),
+            "a `continue` in pair_single_use_operands has no counter: {self:?}"
+        );
+        let fields = [
+            self.candidates,
+            self.paired,
+            self.multi_use,
+            self.no_node,
+            self.producer_arm,
+            self.other_block,
+            self.after_consumer,
+            self.already_adjacent,
+            self.deopt_between,
+        ];
+        for (slot, v) in IR_PAIR_CENSUS.iter().zip(fields) {
+            slot.fetch_add(v as u64, Relaxed);
+        }
+    }
+}
+
+/// Process-wide pairing totals, in [`PairCensus`] field order.
+///
+/// Unconditional and cheap — nine relaxed adds per scheduled method. A census
+/// you have to switch on is one nobody has for the run they already did, which
+/// is the same reason `IR_CARRY_DEFERRED` is unconditional.
+static IR_PAIR_CENSUS: [std::sync::atomic::AtomicU64; 9] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// The process-wide pairing census since process start.
+pub fn ir_pair_census() -> PairCensus {
+    use std::sync::atomic::Ordering::Relaxed;
+    let v: Vec<usize> = IR_PAIR_CENSUS
+        .iter()
+        .map(|a| a.load(Relaxed) as usize)
+        .collect();
+    PairCensus {
+        candidates: v[0],
+        paired: v[1],
+        multi_use: v[2],
+        no_node: v[3],
+        producer_arm: v[4],
+        other_block: v[5],
+        after_consumer: v[6],
+        already_adjacent: v[7],
+        deopt_between: v[8],
+    }
 }
 
 /// `CRATONVM_JIT_IR_PAIR_OPERANDS=0` — schedule single-use operands in plain
@@ -738,7 +877,12 @@ fn pair_operands_enabled() -> bool {
 ///     refuse anyway buys nothing and widens the blast radius for no reason.
 ///
 /// Returns how many operands moved.
-fn pair_single_use_operands(graph: &Graph, uses: &[u32], nodes: &mut Vec<NodeId>) -> usize {
+fn pair_single_use_operands(
+    graph: &Graph,
+    uses: &[u32],
+    nodes: &mut Vec<NodeId>,
+    census: &mut PairCensus,
+) -> usize {
     let mut moved = 0usize;
     // Descending, so sinking an operand cannot disturb a consumer this loop has
     // yet to visit: everything it moves lands below the current index.
@@ -759,25 +903,41 @@ fn pair_single_use_operands(graph: &Graph, uses: &[u32], nodes: &mut Vec<NodeId>
             if prod == NO_NODE || prod == cons {
                 continue;
             }
+            // Denominator: a real operand of a real consumer, both of which
+            // exist. Everything counted below is a subset of this.
+            census.candidates += 1;
             if uses.get(prod as usize).copied().unwrap_or(0) != 1 {
+                census.multi_use += 1;
                 continue;
             }
             let Some(pn) = graph.nodes.get(prod as usize) else {
+                census.no_node += 1;
                 continue;
             };
             if !crate::ir_lower::op_home_is_one_store_rax(&pn.op) {
+                census.producer_arm += 1;
                 continue;
             }
             // Re-read both positions: a previous sink in this same iteration
             // has already shifted the consumer down by one.
             let Some(ci_now) = nodes.iter().position(|&n| n == cons) else {
+                census.other_block += 1;
                 continue;
             };
             let Some(pi) = nodes.iter().position(|&n| n == prod) else {
+                // The producer is scheduled in a DIFFERENT block. Sinking
+                // across a block boundary is a different transform with a
+                // different proof obligation, and this pass does not attempt
+                // it.
+                census.other_block += 1;
                 continue;
             };
-            if pi >= ci_now || pi + 1 == ci_now {
-                // Not ahead of the consumer in this block, or already adjacent.
+            if pi >= ci_now {
+                census.after_consumer += 1;
+                continue;
+            }
+            if pi + 1 == ci_now {
+                census.already_adjacent += 1;
                 continue;
             }
             // The crossing condition: everything in between must be a node no
@@ -788,6 +948,7 @@ fn pair_single_use_operands(graph: &Graph, uses: &[u32], nodes: &mut Vec<NodeId>
                     .get(mid as usize)
                     .is_some_and(|m| crate::ir_lower::op_cannot_deopt(&m.op))
             }) {
+                census.deopt_between += 1;
                 continue;
             }
             let id = nodes.remove(pi);
@@ -795,6 +956,7 @@ fn pair_single_use_operands(graph: &Graph, uses: &[u32], nodes: &mut Vec<NodeId>
             // removal was below it, so the consumer now sits at `ci_now - 1`
             // and the operand belongs immediately before it.
             nodes.insert(ci_now - 1, id);
+            census.paired += 1;
             moved += 1;
         }
     }
@@ -958,20 +1120,49 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
             let term_node = &graph.nodes[term as usize];
             match &term_node.op {
                 Op::If => {
-                    // Find Proj(0) and Proj(1) successors
+                    // The Proj(0) and Proj(1) successors, pushed in PROJECTION
+                    // order.
+                    //
+                    // `ir_lower` names `successors[0]` the TRUE block and
+                    // `successors[1]` the false one, so this order is not a
+                    // presentation detail: it decides which way every
+                    // conditional branch this backend emits goes.
+                    //
+                    // This scan used to push in node-ID order and rely on the
+                    // two agreeing, which they do for every graph `IrBuilder`
+                    // produces — its `if_icmp*` arms add `Proj(0)` and then
+                    // `Proj(1)`, so the lower id is always the true edge. That
+                    // is a property of one producer, not of the IR, and the
+                    // first transform to CLONE an `If` broke it: the partial
+                    // unroller adds each copy's continue-edge projection first
+                    // (it is the one the next copy hangs off), and in a javac
+                    // `if_icmpge` loop that is `Proj(1)`. Every intermediate
+                    // test then branched to the edge meant for its opposite,
+                    // the early exits were never taken, and the loop ran
+                    // `n + factor - 1` iterations — `sum(1)` returned 6.
+                    //
+                    // Sorting by the projection's own index makes the invariant
+                    // a property of this code rather than of node-allocation
+                    // order. It is a no-op on every graph the builder makes.
+                    let mut succs: Vec<(u8, usize)> = Vec::new();
                     for (id, node) in graph.nodes.iter().enumerate() {
-                        if let Op::Proj(_n) = &node.op {
-                            if !node.inputs.is_empty() && node.inputs[0] == term {
-                                let succ_block = node_to_block[id];
-                                if succ_block != usize::MAX {
-                                    if !blocks[block_idx].successors.contains(&succ_block) {
-                                        blocks[block_idx].successors.push(succ_block);
-                                    }
-                                    if !blocks[succ_block].predecessors.contains(&block_idx) {
-                                        blocks[succ_block].predecessors.push(block_idx);
-                                    }
-                                }
-                            }
+                        let Op::Proj(which) = &node.op else { continue };
+                        if node.inputs.first().copied() != Some(term) {
+                            continue;
+                        }
+                        let succ_block = node_to_block[id];
+                        if succ_block == usize::MAX {
+                            continue;
+                        }
+                        succs.push((*which, succ_block));
+                    }
+                    succs.sort_by_key(|&(which, _)| which);
+                    for (_which, succ_block) in succs {
+                        if !blocks[block_idx].successors.contains(&succ_block) {
+                            blocks[block_idx].successors.push(succ_block);
+                        }
+                        if !blocks[succ_block].predecessors.contains(&block_idx) {
+                            blocks[succ_block].predecessors.push(block_idx);
                         }
                     }
                 }
@@ -1063,11 +1254,13 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
     // Step 5b: put a consumer's single-use operands next to it, so `ir_lower`
     // can carry them in registers instead of round-tripping them through the
     // frame. See `pair_single_use_operands`.
+    let mut pairing = PairCensus::default();
     if opts.pair_single_use_operands {
         let uses = use_counts(graph);
         for block in &mut blocks {
-            pair_single_use_operands(graph, &uses, &mut block.nodes);
+            pair_single_use_operands(graph, &uses, &mut block.nodes, &mut pairing);
         }
+        pairing.publish();
     }
 
     // Step 6: Estimate how often each block runs, then (optionally) lay the
@@ -1160,6 +1353,7 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
         dom,
         freq,
         layout,
+        pairing,
     }
 }
 
@@ -2896,6 +3090,65 @@ mod tests {
     // ── Memory-effect ordering ───────────────────────────────────────────
 
     use crate::ir::{MemKind, NodeId as Id};
+
+    /// An `If`'s successors come out in PROJECTION order, whatever order the
+    /// projections were added in.
+    ///
+    /// `ir_lower` names `successors[0]` the true block and `successors[1]` the
+    /// false one, so this ordering decides which way every conditional branch
+    /// the backend emits goes. It held for free as long as `IrBuilder` was the
+    /// only producer — its `if_icmp*` arms add `Proj(0)` and then `Proj(1)`, so
+    /// the lower node id was always the true edge, and this scan pushed in node
+    /// id order.
+    ///
+    /// The first transform to CLONE an `If` broke that. The partial unroller
+    /// adds each copy's continue-edge projection first, because that is the one
+    /// the next copy hangs off, and in a javac `if_icmpge` loop the continue
+    /// edge is `Proj(1)`. Every intermediate test then branched to the edge
+    /// meant for its opposite: the early exits were never taken and the loop
+    /// ran `n + factor - 1` iterations, so `sum(1)` returned 6.
+    ///
+    /// This graph is built the way the unroller builds one — `Proj(1)` first —
+    /// so it fails against a node-id-ordered scan and passes against an
+    /// index-ordered one. A fixture built in the conventional order cannot tell
+    /// the two apart, which is why this one is deliberately backwards.
+    #[test]
+    fn an_ifs_successors_are_ordered_by_projection_not_by_node_id() {
+        let mut g = bare_graph();
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let entry = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let cond = g.add(Op::Param(0), IrType::Int, vec![], None);
+        let if_node = g.add(Op::If, IrType::Control, vec![entry, cond], Some(0));
+        // Backwards on purpose: the FALSE edge gets the lower node id.
+        let false_edge = g.add(Op::Proj(1), IrType::Control, vec![if_node], Some(0));
+        let true_edge = g.add(Op::Proj(0), IrType::Control, vec![if_node], Some(0));
+        let a = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let b = g.add(Op::Const(2), IrType::Int, vec![], None);
+        let merge = g.add(
+            Op::Merge,
+            IrType::Control,
+            vec![true_edge, false_edge],
+            Some(1),
+        );
+        let phi = g.add(Op::Phi, IrType::Int, vec![merge, a, b], Some(1));
+        let ret = g.add(Op::Return, IrType::Void, vec![merge, phi], Some(2));
+        g.entry = start;
+        g.exit = ret;
+
+        let schedule = schedule(&g);
+        let if_block = schedule.node_to_block[if_node as usize];
+        let succ = &schedule.blocks[if_block].successors;
+        assert_eq!(succ.len(), 2, "an `If` has exactly two successors");
+        assert_eq!(
+            schedule.blocks[succ[0]].ctrl, true_edge,
+            "successors[0] must be the Proj(0) block — `ir_lower` branches on it \
+             as the TRUE edge",
+        );
+        assert_eq!(
+            schedule.blocks[succ[1]].ctrl, false_edge,
+            "successors[1] must be the Proj(1) block",
+        );
+    }
 
     fn bare_graph() -> Graph {
         Graph {
