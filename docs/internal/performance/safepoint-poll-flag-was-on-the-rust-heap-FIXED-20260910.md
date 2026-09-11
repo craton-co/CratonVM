@@ -138,16 +138,19 @@ exists for. `probes/MultiFieldLoop.java`, `CRATONVM_JIT_FORCE_C2=1`,
 ```
 
 The flag byte is **36 KiB** from the code buffer that reads it — a cell out of
-`alloc_code_adjacent_cell`'s own chunk, exactly as designed. Across the whole
-dump, **10 poll sites take `test byte [rel …]` and 0 take the R11 form**, in
-both bodies and in both arms of the placement flag:
+`alloc_code_adjacent_cell`'s own chunk, exactly as designed. Counted per body,
+by resolving each site rather than by grepping the dump — **every poll site in
+every body takes `test byte [rel …]` and none takes the R11 form**, in both
+arms of the placement flag:
 
 | body | arm | `test byte [rel …]` | `mov r11` + `test byte [r11]` |
 |---|---|---:|---:|
-| `full/ir` | default | **2** | 0 |
-| `osr/sp` | default | **2** | 0 |
-| `full/ir` | `CODE_NEAR_GLOBALS=1` | **2** | 0 |
-| `osr/sp` | `CODE_NEAR_GLOBALS=1` | **2** | 0 |
+| `sumGuarded` `full/ir` | default | **2** | 0 |
+| `sumGuarded` `osr/sp` | default | **2** | 0 |
+| `main` `osr/sp` | default | **3** | 0 |
+| `sumGuarded` `full/ir` | `CODE_NEAR_GLOBALS=1` | **2** | 0 |
+| `sumGuarded` `osr/sp` | `CODE_NEAR_GLOBALS=1` | **2** | 0 |
+| `main` `osr/sp` | `CODE_NEAR_GLOBALS=1` | **3** | 0 |
 
 So the answer to the question this page asked is *in reach*, and the Windows
 table above — which could not show an encoding change because that host was

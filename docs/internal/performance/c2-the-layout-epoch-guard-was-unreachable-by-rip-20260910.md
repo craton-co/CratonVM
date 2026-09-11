@@ -272,12 +272,12 @@ change gives the safepoint flag a cell out of the code cache's own allocator, so
 on Linux the poll is in `disp32` reach **without** this flag. The OFF arm is
 therefore no longer the arm above:
 
-| arm | body | `81 3D` guards | `F6 05` polls | `mov r11` polls | body bytes |
-|---|---|---:|---:|---:|---:|
-| `CODE_NEAR_GLOBALS=0` | `full/ir` | 0 | **2** | 0 | **1851** |
-| `CODE_NEAR_GLOBALS=1` | `full/ir` | **4** | **2** | 0 | 1815 |
-| `CODE_NEAR_GLOBALS=0` | `osr/sp` | 0 | **2** | 0 | **2511** |
-| `CODE_NEAR_GLOBALS=1` | `osr/sp` | **8** | **2** | 0 | 2407 |
+| arm | body | short guards | long guards | `F6 05` polls | `mov r11` polls | body bytes |
+|---|---|---:|---:|---:|---:|---:|
+| `CODE_NEAR_GLOBALS=0` | `full/ir` | 0 | 4 | **2** | 0 | **1851** |
+| `CODE_NEAR_GLOBALS=1` | `full/ir` | **4** | 0 | **2** | 0 | 1815 |
+| `CODE_NEAR_GLOBALS=0` | `osr/sp` | 0 | 8 | **2** | 0 | **2511** |
+| `CODE_NEAR_GLOBALS=1` | `osr/sp` | **8** | 0 | **2** | 0 | 2407 |
 
 The arithmetic reconciles exactly with the tables above and below, which is the
 check that this is the same mechanism and not a second one:
@@ -479,9 +479,9 @@ fails in both arms at reps 1 and 3), and neither reproduces in the same
 direction twice. **On 3066 classes across two suites there is no failure this
 flag causes.**
 
-Green alongside it, on the branch that carries this section:
-`cargo test -p cratonvm-jit` **2615/2615**, `cargo test -p cratonvm-types`
-**637/637**, and the fast regression suite **92/92 in both arms** — run as a
+Green alongside it: `cargo test -p cratonvm-jit -p cratonvm-types`
+**3267 passed, 0 failed** on the merged tree (2615 and 637 on the branch before
+it took `dev`), and the fast regression suite **92/92 in both arms** — run as a
 pair rather than only with the flag on, so the row is a comparison and not a
 single green tick.
 
@@ -499,11 +499,13 @@ one strategy may own placement"), and it was free when the alternative was a
 cell nobody had. It is not free now:
 
 * flag OFF — the safepoint flag gets a cell **36 KiB** from the code buffer
-  that polls it, by construction, on any host. Measured above: 10 poll sites,
-  10 short.
+  that polls it, by construction, on any host. Measured above: every poll site
+  in the dump is `test byte [rel …]` and none is the R11 form, 2 per body in
+  both the `full/ir` and the `osr/sp` body.
 * flag ON, ladder hits — the flag goes back on the VM heap and is short
   **because it happens to be ~500 MB from the anchor** in the same mimalloc
-  band. Measured on this host: also 10 of 10, so nothing is lost *here*.
+  band. Measured on this host: also 2 short and 0 long per body, so nothing is
+  lost *here*.
 * flag ON, ladder **misses** — `near_globals` retires after eight
   `mmap`/`munmap` pairs, the code buffer lands 130 TB away, and the cell
   allocator has already declined for the whole process. **Every guard and
