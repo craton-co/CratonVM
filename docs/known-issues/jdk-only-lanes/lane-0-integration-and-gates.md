@@ -666,6 +666,65 @@ So if this gate reddens after your tag:
 `--test` targets by hand hid both, which is how the `getModule` adjudication
 shipped with this gate already red.
 
+## 7.4 Lane 1's waves 3 and 4 will fire a BLOCKING CI gate, 2026-09-11
+
+Found while merging `origin/dev`, by checking each lane's table against the
+kind-map baseline rather than by reading the diff.
+
+```text
+table                      rows   in kind map   of those synthetic-stub
+L1_HM (wave 3)               21            21                        0   STALE
+L1_JT (wave 4)               29            29                        0   STALE
+L7                            2             2                        2   ok
+L0                           19            19                       19   ok
+L3                           24            24                       24   ok
+```
+
+The two counts match `dev`'s own commit subjects — *"narrow to the 21 the
+measurement allows"* and *"wave 4 is 29 triples over five classes"* — so this
+is 50 triples, not an artefact of my parser.
+
+**It is a real staleness, not a mask.** Before concluding, I checked the 50 are
+actually retired at runtime: all of them are covered by `RETIRED_SHADOW_PREFIXES`
+(`java/util/` and `java/text/`), so none is the silent
+outside-every-prefix case where a table entry answers "not retired" and the
+kind map is right to still say `bridge`.
+
+**Why this is blocking and not housekeeping.** `regression-suite/bridge-ratchet.sh`
+runs from `.github/workflows/ci.yml` on `ubuntu-latest`, in the BLOCKING job,
+and its own header says that placement is deliberate: left in the advisory
+`jdk-only` job, "a new unadjudicated `Bridge` printed an error and failed
+nothing, which is the decorative-guard shape the lane exists to avoid."
+`scripts/jdk-only-kind-map.py` exits **1** on *"a registration changed kind"* —
+per registration, in EITHER direction. It is not a `<=` count ratchet, so the
+usual "a retirement only lowers the number" reasoning does not apply: 50
+registrations moving `bridge` -> `synthetic-stub` is 50 changed kinds and the
+gate fires.
+
+Nothing in the local gate set sees this. It is a shell gate over a census, so
+`cargo test` is green on a tree that fails CI — which is why every other lane's
+wave left an `amended:` note in that baseline's header and this one did not.
+
+**The repair is a measurement, and deliberately not done by hand here.** The
+two existing amendment styles in that file DISAGREE on the middle column —
+L3's retired rows read `synthetic-stub 0 1`, L0's read `synthetic-stub 1 1` —
+and the header's own claim (retag implies `kind_stated` true) matches only one
+of them. With two precedents in conflict, deriving 50 rows from either would be
+a guess wearing a measurement's clothes, in the one file whose doctrine is that
+re-freezing without reading the diff defeats the gate. So:
+
+1. run the census gate on `p20` — it PRINTS the changed rows with their actual
+   new values (`mode: compatible`, the generated `BridgeRatchetCensusProbe`,
+   not the corpus);
+2. paste those values, with an `amended:` note naming lane 1's waves as the
+   cause and this merge as the repair;
+3. re-run to green.
+
+Recorded as lane 0's because this lane owns the shared gates, and noted as a
+REPAIR of the baseline rather than a re-adjudication of lane 1's triples —
+their verdicts are theirs, and nothing here revisits whether the 50 should
+have been retired.
+
 ## 8. The 54 newly-visible drift pairs, routed
 
 Widening the scanner surfaced 54 `(pass, triple)` pairs where one triple has
