@@ -437,6 +437,49 @@ above the tree with every arm green. Set each baseline to `1`, run, and read the
 failure's own paste-ready line. Arithmetic on the old constant is not a
 measurement.
 
+### When the arm fails and nothing says WHICH row: the census attributes it
+
+Added 2026-09-11 after lane L0 used it to go from an empty table back to 19
+retirements in an afternoon. The situation it is for: `OK -> BAD == 0` holds on
+your probe, the corpus arm still loses vectors, and a bisection over the table
+is one build per hypothesis at ~65 minutes each.
+
+The per-vector census answers a **weaker** question for free, and the weaker
+question is usually enough — *which of my table's triples does this failing
+vector dispatch at all?* A registration a vector never consults cannot be the
+row that broke it.
+
+```bash
+env CRATONVM_ARGS=--jdk-only CV=<CONTROL binary, table EMPTY>     ONLY="RFailing1 RFailing2 RFailing3"     KEEP_JDK_ONLY_REPORTS=$SP/rep bash regression-suite/run.sh
+```
+
+Each kept `<Vector>.json` holds one-line-JSON `native-shadows-bytecode` rows
+with `class`/`method`/`descriptor`. Intersect with your table: the **union over
+the failing vectors** is what you withdraw, and the complement is untouched by
+every vector that failed.
+
+Four things that make it sound rather than suggestive, and each is a way to get
+it wrong:
+
+* **Run it on the CONTROL binary.** With the table in, your retired rows are
+  refused and never appear in the census at all — you would measure an empty
+  intersection and conclude everything is safe.
+* **Check the run's own `saturation:` line.** `none` means the counts are
+  totals. Anything else makes them floors, and a floor cannot support "this
+  vector never dispatches that triple".
+* **Close over the whole corpus, not just the vectors you ran.** Pair the
+  attribution with an arm that already PASSED with those rows in the table.
+  L0's round-1 arm scored 127 passed / 5 failed with the 19 among its 38 rows,
+  so those 127 are measured rather than assumed; 127 exonerated + 5 attributed
+  away = all 132.
+* **It over-collects on purpose.** It names every row that *could* be
+  responsible, never the one that *is*. Withdraw them "as touched, not as
+  convicted", and pin them out with a test so a later wave has to do the
+  bisection instead of re-adding one by hand.
+
+And it does not replace the arm: "not dispatched in these five" is not "not
+dispatched anywhere". The wave still gets the three arms on its own binary.
+
 ### After the build: prove the retirement is not INERT before reading a probe
 
 The four preconditions above decide whether to retire. This is the first thing
