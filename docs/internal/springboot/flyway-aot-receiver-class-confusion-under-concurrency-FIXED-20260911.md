@@ -143,6 +143,10 @@ suggestive of a single run's behaviour — which is exactly how this row absorbe
 two sessions — and the census is the same statement without the sampling:
 750-odd freed mirrors per run, every run, versus zero.
 
+The rest of the module is unchanged. All nine `*Tests` classes of
+`module/spring-boot-flyway`, both binaries alternating on the same host: 91
+tests, `0 tests failed` on every class on both arms.
+
 **Class unloading is unaffected**, which is the thing this fix could plausibly
 have broken. `vm/tests/resources/class_loader_unload/LoaderUnloadProbe` on the
 default collector:
