@@ -3817,17 +3817,21 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
         return false;
     }
     let key = (class_name, method_name, descriptor);
-    RETIRED_SHADOW_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_L2_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_L7_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_L5_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_L1_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_L1_HM_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_L1_JT_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_L1_ZI_TRIPLES.binary_search(&key).is_ok()
+    // Driven off `RETIRED_SHADOW_TABLES` rather than one `||` arm per table.
+    // `any` short-circuits exactly as the chain did and each table is still
+    // binary-searched, so this is the same work in the same order of magnitude
+    // — what changes is that a table which is not in the const is not
+    // consulted, instead of being consulted while the const says otherwise.
+    // Both lane 1 and lane 7 shipped a table missing from that const; the
+    // arrangement below cannot reproduce it.
+    //
+    // The const's order differs from the chain's it replaces. That is
+    // immaterial and `no_triple_is_claimed_by_two_tables` is why: no triple is
+    // in two tables, so no input can reach a second table that would answer
+    // differently, and which table answers first is unobservable.
+    RETIRED_SHADOW_TABLES
+        .iter()
+        .any(|table| table.binary_search(&key).is_ok())
 }
 
 /// Every retired-shadow table, in one slice, so a gate can walk the whole
@@ -3868,16 +3872,22 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // is structural: a new table is added at the bottom of a list in one file
     // and consulted in another, and nothing textual connects them.
     RETIRED_SHADOW_L7_TRIPLES,
-    // 2026-09-11, L1 waves 3, 4 and 5. THE SAME OMISSION A THIRD AND FOURTH
-    // TIME, and this time it was lane 1 omitting lane 1's own tables: waves 3
-    // and 4 added two chain arms above and did not add them here, so
-    // `the_tables_const_lists_every_table_the_predicate_consults` has been RED
-    // on `dev` since that merge. The note on `RETIRED_SHADOW_L1_TRIPLES` above
-    // called the failure mode structural after two occurrences; four says it
-    // plainly. The two lines below are the repair, `RETIRED_SHADOW_L1_ZI_TRIPLES`
-    // is this wave's, and none of the three was caught by any per-table test.
+    // Lane 1's HashMap and java.time waves, added to the const by the 2026-09-11
+    // L7 merge and NOT by lane 1 -- the third and fourth occurrence of this
+    // exact drift in two days, after lane 1's first table and lane 7's.
+    //
+    // They arrived as two more `||` arms in the predicate with no entry here,
+    // which under the old chain meant "consulted, but invisible to every gate
+    // driven off this const". Under the loop the predicate reads this list, so
+    // the same omission would have UN-RETIRED both waves instead of merely
+    // under-covering them -- a louder failure, and the reason the loop is worth
+    // having: the two lists cannot disagree, because there is only one.
     RETIRED_SHADOW_L1_HM_TRIPLES,
     RETIRED_SHADOW_L1_JT_TRIPLES,
+    // 2026-09-11, L1 wave 5. Added HERE and nowhere else, which under the loop
+    // above is the whole registration -- there is no chain arm to forget any
+    // more. See `RETIRED_SHADOW_L1_ZI_TRIPLES` for why two rows and not forty,
+    // and why the table is written but not yet accepted.
     RETIRED_SHADOW_L1_ZI_TRIPLES,
 ];
 
@@ -3900,24 +3910,37 @@ mod tests {
     /// the tables or consults one without a `binary_search`, and either is a
     /// change to this file that should be reading this comment.
     #[test]
-    fn the_tables_const_lists_every_table_the_predicate_consults() {
+    fn the_predicate_names_no_table_directly() {
+        // The inverse of the test this replaces, and the reason it can be an
+        // inverse: `triple_is_retired_shadow` now iterates
+        // `RETIRED_SHADOW_TABLES`, so "the const lists every table the
+        // predicate consults" is true by construction and no longer needs
+        // asserting. What DOES need asserting is that nobody reintroduces a
+        // hand-written arm beside the loop — one `|| RETIRED_SHADOW_LX_TRIPLES
+        // .binary_search(..)` would consult a table the const does not list,
+        // and every gate driven off the const would quietly stop covering it.
         let src = include_str!("retired_shadow.rs");
         let body = src
             .split("pub fn triple_is_retired_shadow(")
             .nth(1)
             .expect("the predicate is in this file");
-        let body = body.split("
-}
-").next().expect("the predicate has a body");
-        let consulted = body
-            .matches("RETIRED_SHADOW_")
-            .count()
-            .saturating_sub(body.matches("RETIRED_SHADOW_PREFIXES").count());
+        let body = body.split("\n}\n").next().expect("the predicate has a body");
+        let total = body.matches("RETIRED_SHADOW_").count();
+        let allowed = body.matches("RETIRED_SHADOW_PREFIXES").count()
+            + body.matches("RETIRED_SHADOW_TABLES").count();
         assert_eq!(
-            consulted,
-            RETIRED_SHADOW_TABLES.len(),
-            "`triple_is_retired_shadow` consults {consulted} tables but `RETIRED_SHADOW_TABLES` lists {}. Add the new table to the const — see its doc comment for what is skipped otherwise.",
-            RETIRED_SHADOW_TABLES.len()
+            total, allowed,
+            "`triple_is_retired_shadow` names a retired-shadow table directly. \
+             It must reach every table through `RETIRED_SHADOW_TABLES`, which \
+             is what makes the const the single place a new table is \
+             registered — and what makes every gate driven off the const cover \
+             it. Delete the hand-written arm and add the table to the const."
+        );
+        assert!(
+            body.contains("RETIRED_SHADOW_TABLES"),
+            "`triple_is_retired_shadow` no longer consults \
+             `RETIRED_SHADOW_TABLES` at all — it would answer `false` for every \
+             retired triple, silently un-retiring the whole population."
         );
     }
 
@@ -4051,14 +4074,23 @@ mod tests {
         }
     }
 
-    /// Every table the predicate consults is asked the real-JDK keep-arm
-    /// question, and waves 3 and 4 were not.
+    /// Lane 1's four tables are all in `RETIRED_SHADOW_TABLES`, which since
+    /// the 2026-09-11 loop rewrite is the ONLY thing that retires them.
     ///
-    /// `the_tables_const_lists_every_table_the_predicate_consults` compares a
-    /// COUNT, so it says two tables are missing without saying which. This
-    /// names them, because the two that went missing were this lane's own and
-    /// the count test had already been red on `dev` for a day before anyone
-    /// read which.
+    /// `triple_is_retired_shadow` used to be a chain of `||` arms and this
+    /// const a second, hand-maintained list of the same tables; a table in the
+    /// chain and not the const was consulted but invisible to the gates driven
+    /// off the const. Three lanes shipped that drift in two days — lane 1's
+    /// first table, lane 7's, and then lane 1's waves 3 and 4 — and the guard
+    /// on it compared two COUNTS, so it reported `10 == 8` without ever saying
+    /// which two were missing.
+    ///
+    /// The loop removed the second list, which removes the drift. It also
+    /// raised the stakes of the remaining omission: a table absent from the
+    /// const is now not consulted AT ALL, so forgetting it silently
+    /// UN-RETIRES a whole wave rather than merely under-covering it. That is a
+    /// better failure — it is a behaviour change a probe can see — but it is
+    /// still worth a test that names the table rather than counting.
     #[test]
     fn lane_ones_four_tables_are_all_in_the_tables_const() {
         for (t, name) in [
@@ -4070,9 +4102,10 @@ mod tests {
             // Compared BY VALUE, not by pointer. `RETIRED_SHADOW_TABLES` is a
             // `const`, so each use site materialises its own array and
             // `ptr::eq` on the slices inside it is not guaranteed to hold
-            // (measured: it does not). Two tables can only compare equal if
-            // they carry identical rows, and the disjointness tests above
-            // already forbid that for every non-empty pair.
+            // (measured 2026-09-11: it does not, for an entry that IS in the
+            // list). Two tables can only compare equal if they carry identical
+            // rows, and `no_triple_is_claimed_by_two_tables` already forbids
+            // that for every non-empty pair.
             assert!(
                 RETIRED_SHADOW_TABLES.iter().any(|listed| *listed == t),
                 "{name} is consulted by `triple_is_retired_shadow` but is not in                  `RETIRED_SHADOW_TABLES`, so it is never asked whether it                  disarms a real-JDK keep arm."
@@ -4690,6 +4723,97 @@ mod tests {
                 triple_is_retired_shadow(c, m, d),
                 "unreachable entry: {c}.{m}{d}"
             );
+        }
+    }
+
+    /// **The N-way disjointness test**, over [`RETIRED_SHADOW_TABLES`] rather
+    /// than over a list of sibling names typed out by hand.
+    ///
+    /// `docs/known-issues/jdk-only-lanes/lane-0-integration-and-gates.md` §4
+    /// specifies one of these and assigns it to L0, in the skeleton commit that
+    /// was to land before any lane started. That commit never landed — lane 1
+    /// says so in `RETIRED_SHADOW_TABLES`' own comment — so each lane wrote its
+    /// own instead, and on 2026-09-11 they had drifted into covering different
+    /// and partial sets:
+    ///
+    /// ```text
+    ///   L1  no disjointness test at all
+    ///   L2  STATELESS, PHASE2
+    ///   L5  STATELESS, PHASE2, PHASE3
+    ///   L7  STATELESS, PHASE2, PHASE3, L1, L2, L5
+    /// ```
+    ///
+    /// So L1's rows were checked against nothing, and L2xL5, L2xL7, L2xPHASE3
+    /// and L5xL1 were checked by neither side. A per-lane test cannot close
+    /// this: it names its siblings at the moment it is written, and the next
+    /// lane to land is not on the list.
+    ///
+    /// A collision is harmless to the predicate, which ORs, and NOT harmless to
+    /// the record — two waves each report having retired the row and the next
+    /// reader cannot tell which measurement backs the decision. This walks
+    /// every table against every other, so a new table is covered by being in
+    /// the const, which is the same thing that makes it consulted.
+    #[test]
+    fn no_triple_is_claimed_by_two_tables() {
+        use std::collections::BTreeMap;
+        let mut first: BTreeMap<(&str, &str, &str), usize> = BTreeMap::new();
+        let mut collisions = Vec::new();
+        for (i, table) in RETIRED_SHADOW_TABLES.iter().enumerate() {
+            for t in table.iter() {
+                if let Some(prev) = first.insert(*t, i) {
+                    collisions.push((*t, prev, i));
+                }
+            }
+        }
+        assert!(
+            collisions.is_empty(),
+            "{} triple(s) are claimed by two tables of `RETIRED_SHADOW_TABLES`. \
+             Each is retired twice, so two waves each report having retired it \
+             and neither measurement is identifiable as the one behind the \
+             decision. Delete the later claim, keeping the row in the table \
+             whose page measured it: {:?}",
+            collisions.len(),
+            collisions
+        );
+    }
+
+    /// Sorted and unique for EVERY table, for the same reason each lane asserts
+    /// it of its own: the predicate binary-searches, so an out-of-order entry
+    /// answers `false` for a row that is present and retires nothing, silently.
+    /// Driven off the const so a new table cannot arrive unchecked.
+    #[test]
+    fn every_table_is_sorted_and_unique() {
+        for (i, table) in RETIRED_SHADOW_TABLES.iter().enumerate() {
+            for w in table.windows(2) {
+                assert!(
+                    w[0] < w[1],
+                    "table {i} of `RETIRED_SHADOW_TABLES` is out of order or \
+                     has a duplicate: {:?} then {:?}",
+                    w[0],
+                    w[1]
+                );
+            }
+        }
+    }
+
+    /// Every row of every table answers `true` through the REAL predicate.
+    ///
+    /// Per-lane versions of this exist and each covers its own table; this one
+    /// covers the tables nobody wrote one for. A row outside every
+    /// [`RETIRED_SHADOW_PREFIXES`] entry answers `false`, which reads as "not
+    /// retired" and is invisible in a workload — a missing prefix is the one
+    /// edit that silently un-retires a whole wave.
+    #[test]
+    fn every_row_of_every_table_is_reachable() {
+        for (i, table) in RETIRED_SHADOW_TABLES.iter().enumerate() {
+            for (c, m, d) in table.iter() {
+                assert!(
+                    triple_is_retired_shadow(c, m, d),
+                    "table {i}: {c}.{m}{d} is in a retired-shadow table and the \
+                     predicate says it is not retired — almost always a missing \
+                     `RETIRED_SHADOW_PREFIXES` entry"
+                );
+            }
         }
     }
 

@@ -62,18 +62,28 @@ things that needed no retirement:
      VM never did                                    (§10 item 7's one row)
   3  LocaleResources.getBreakIteratorInfo / getBreakIteratorResources answer
      from the image instead of null                  (§10 items 5, 6, 8)
-  4  RETIRED_SHADOW_TABLES lists waves 3 and 4, which it did not
+  4  a guard that NAMES a table missing from RETIRED_SHADOW_TABLES
 ```
 
-Item 4 is a red gate on `dev`, caused by this lane's own wave-3/4 merge:
-`triple_is_retired_shadow` consults ten tables and `RETIRED_SHADOW_TABLES`
-listed eight, so `the_tables_const_lists_every_table_the_predicate_consults`
-asserts `10 == 8`. Verified by reading `origin/dev` at `059eabf7e`, not
-inferred. The const's own doc comment predicted this shape twice already, in
-the notes it carries for the wave-2 and lane-7 merges; this is the third and
-fourth occurrence and the first where the omitting lane was the owning one.
-`lane_ones_four_tables_are_all_in_the_tables_const` now names the missing
-table instead of only counting.
+Item 4 started as a red-gate fix and was overtaken mid-session, which is worth
+recording as it happened. `triple_is_retired_shadow` consulted ten tables and
+`RETIRED_SHADOW_TABLES` listed eight, so
+`the_tables_const_lists_every_table_the_predicate_consults` asserted `10 == 8`
+and `cargo test -p cratonvm-native-api --lib` was **red on `dev`** — caused by
+this lane's own wave-3/4 merge, and verified by reading `origin/dev` at
+`059eabf7e` rather than inferred from a branch. The const's doc comment
+already carried notes for the same drift at the wave-2 and lane-7 merges;
+that made it the third and fourth occurrence, and the first where the
+omitting lane was the owning one.
+
+**A sibling fixed it better while this branch was being written**, at
+`edc6653d3`: the predicate is now a loop over `RETIRED_SHADOW_TABLES`, so
+there is no second list to drift from. The count guard is gone with it. What
+this wave keeps is the part the loop does not cover —
+`lane_ones_four_tables_are_all_in_the_tables_const`, which NAMES a missing
+table. The omission is rarer now and louder: under the loop, a table absent
+from the const is not consulted at all, so forgetting one silently
+**un-retires a whole wave** rather than merely under-covering it.
 
 All three tables live in `native-api/src/retired_shadow.rs` with the numbers
 per family, and the tests beside them pin every HELD verdict — including the
