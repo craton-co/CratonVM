@@ -147,11 +147,14 @@ submission being claimed by both the submitter's help path and a worker.
 
 The primitives underneath are not the cause, and that is measured rather than
 assumed. `apps/probes/L5CasRace.java` is exact on every row after the fix, and
-a targeted sweep of the fields and array slots the real `WorkQueue` uses —
-`objectFieldOffset` on five adjacent `int` fields, `putIntOpaque` /
-`getIntOpaque` / `putIntRelease` / `getIntAcquire` / `getAndBitwiseOrInt` on
-each, `putReferenceRelease` / `getReferenceAcquire` at four array indices,
-mixed with plain bytecode reads and writes — is byte-identical to HotSpot.
+`apps/probes/L5UnsafeAccess.java` asks the exact surface a `WorkQueue` runs on
+— five adjacent `int` fields through `putIntOpaque` / `getIntOpaque` /
+`putIntRelease` / `getIntAcquire`, `getAndBitwiseOrInt` (which is what
+`ForkJoinTask.setDone` uses), `putReferenceRelease` / `getReferenceAcquire` at
+four array indices and on a reference field, the slot claim itself, and every
+one of them mixed with plain bytecode reads and writes so that two address
+spaces would show up as a disagreement. **11 rows, byte-identical to
+HotSpot.**
 
 **So `ForkJoinPool` is held, and it holds `ForkJoinTask`, `RecursiveTask` and
 `RecursiveAction` with it.** That is 51 more rows, and it is one unit rather
@@ -438,6 +441,7 @@ summaries above.
 | `L5CowSweep` | 67 | `CopyOnWriteArrayList`/`Set` snapshot isolation, refusals, `addIfAbsent` |
 | `L5ExecutorSweep` | 104 | the executor and task-status surface, written to DISPATCH rows nothing calls |
 | `L5TpeCount` | 6 | does the POOL see the task, per submission shape |
+| `L5UnsafeAccess` | 11 | the exact `Unsafe` surface a `WorkQueue` runs on (needs `--add-exports`) |
 | `l5run.sh` | — | the runner for the two `--add-exports` probes the battery correctly excludes |
 
 `L5ExecutorSweep` is the one worth copying. 84 rows in this lane's *clean*
