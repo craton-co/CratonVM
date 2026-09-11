@@ -114,14 +114,18 @@ assertion in the corpus that counts SIDE EFFECTS instead of reducing values.
 
 `apps/probes/L5CountedCompleter.java` is that question asked three ways, and
 the fix is scored on it with the real `ForkJoinPool` bytecode running
-(`CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/concurrent/ForkJoinPool,java/util/concurrent/ForkJoinTask`),
-eight runs each:
+(`CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/concurrent/ForkJoinPool,java/util/concurrent/ForkJoinTask`):
 
 ```text
   ccTree depth=6, 64 leaves expected
-    before   64, 64, 76, 64, 100, 91, 128, 96
-    after    64, 64, 64, 64,  64, 64, 121, 64
+    before, 8 runs   64, 64, 76, 64, 100, 91, 128, 96
+    after,  6 runs   64, 121, 64, 64, 64, 64
 ```
+
+The same arm on the WHOLE `java/util/concurrent/` prefix, before the fix, read
+70, 128, 81, 109, 114, 127, 128, 128 — so "sometimes correct" was already the
+shape, and eight runs is the minimum that shows it. **Three passes would have
+called this fixed.**
 
 **Not fixed, improved** — and §3 says what the residue is.
 
@@ -299,7 +303,8 @@ Java over a 4-byte CAS:
 ```
 
 Over a slot index, `offset & ~3` names a **different field**. The same applies
-to the eight `get*Unaligned` / `put*Unaligned` rows, which decompose a byte
+to the sixteen `get*Unaligned` / `put*Unaligned` rows (each of the eight names
+is registered at two descriptors), which decompose a byte
 range a slot index does not have.
 
 **The lane page asked for this at all four byte positions, and here it is.**
