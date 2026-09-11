@@ -1478,7 +1478,23 @@ use cratonvm_types::compat::CompatibilityMode;
 /// `register(` call site and the total registration count is unmoved (13610
 /// no-management, 13978 management, both unchanged). Numbers pasted from each
 /// arm's own `stub-ratchet: const ...` line, not derived from one another.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1911;
+///
+/// **+331 on 2026-09-11, and NOT this lane's either.** Lane 1's wave 2
+/// (`RETIRED_SHADOW_L1_TRIPLES`, 329 `java/util` rows) plus the two
+/// `java/time/` rows it added under the same prefix edit landed in b779085e0
+/// without re-freezing any of the three resolves, so this gate arrived at the
+/// L7 merge red for the second time in two days -- see the +13 note above for
+/// lane 2's. Same shape, same CASE ONE: a registration-time refusal re-tags an
+/// existing `Bridge`, adds no `register(` call site, and the total registration
+/// count is unmoved in every arm (13610 no-management, 13978 management, 13645
+/// synthetic-jdk). Each number below is pasted from its own arm's
+/// `stub-ratchet: const ...` line.
+///
+/// Two lanes in two days is a pattern, not an accident: a wave that adds rows
+/// to a `RETIRED_SHADOW_*` table moves this ceiling by exactly the number of
+/// those rows that were registered, and nothing in the retirement itself makes
+/// that visible until somebody runs this gate.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2242;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1507,7 +1523,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1911;
 /// unowned for three days before it had a constant at all.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1900;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2231;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1564,7 +1580,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1900;
 /// re-freeze ALL THREE — see the pointer on both siblings.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1900;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2231;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
