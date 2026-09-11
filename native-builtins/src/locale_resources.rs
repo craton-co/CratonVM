@@ -453,6 +453,58 @@ fn populate_calendar_data_en_body(ctx: &mut dyn NativeContext, map: ObjectRef) {
     ctx.unpin_native_roots(map_pin);
 }
 
+/// Copy the JDK image's OWN `CalendarData` rows into the synthetic bundle,
+/// returning whether anything was read.
+///
+/// `firstDayOfWeek` / `minimalDaysInFirstWeek` are NOT per-locale integers in
+/// CLDR. They are one region-keyed TABLE shared by every locale --
+/// `"1: AG AS BD ... US ...;2: 001 AD ... DE ...;6: MV;7: AE AF ..."` -- which
+/// `CLDRCalendarDataProviderImpl` parses and then selects from by the locale's
+/// COUNTRY. `populate_calendar_data_en` writes a bare `"1"` in its place, and a
+/// bare `"1"` is not a region table: the real provider finds no region in it,
+/// answers 0, and `CalendarDataUtility`'s "not in 1..7" guard substitutes its
+/// own default of 1. Every locale then reports Sunday / 1 minimal day, and
+/// `en-US` looks healthy only because 1/1 happens to be the right answer for
+/// the US -- which is what made the defect survive its own control.
+///
+/// This reads the real bundle class out of the image by the same mechanism
+/// `cldr_collation_rule` uses for `CollationData`, so the region table arrives
+/// intact rather than being re-derived from a curated table in this file (which
+/// would be one more copy of CLDR to keep in step with the image). Returning
+/// false leaves the caller on that curated fallback, which is still the right
+/// answer for an image that has no `sun/util/resources/cldr/CalendarData.class`
+/// at all.
+fn populate_calendar_data_from_cldr(
+    ctx: &mut dyn NativeContext,
+    map_pin: usize,
+    map: ObjectRef,
+    lang: &str,
+    country: &str,
+) -> bool {
+    let Some(table) = load_cldr_table(ctx, "sun.util.resources.cldr.CalendarData", lang, country)
+    else {
+        return false;
+    };
+    // GC: `put_str`/`put_arr` re-read `map` through `map_pin` on every call, so
+    // the raw `map` handed in here may already be a pre-move address -- the
+    // same contract the `CollationData` arm below relies on.
+    let mut wrote = false;
+    for (key, value) in table.iter() {
+        match value {
+            CldrValue::Str(s) => {
+                crate::phases_late::text_intl::put_str(ctx, map_pin, map, key, s);
+                wrote = true;
+            }
+            CldrValue::Arr(items) => {
+                let refs: Vec<&str> = items.iter().map(String::as_str).collect();
+                crate::phases_late::text_intl::put_arr(ctx, map_pin, map, key, &refs);
+                wrote = true;
+            }
+        }
+    }
+    wrote
+}
+
 fn populate_currency_names_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     // cceres5: every put below allocates; one entry pin, read per call.
     let map_pin = ctx.pin_native_root(map);
@@ -1280,8 +1332,13 @@ fn build_bundle(
         } else if bundle_name.starts_with("sun.util.resources.CalendarData")
             || bundle_name.starts_with("sun.util.resources.cldr.CalendarData")
         {
-            let mut map_now = ctx.read_native_pin(map_pin, map);
-            populate_calendar_data_en(ctx, &mut map_now);
+            // The image's own CalendarData FIRST. Its week rules are a
+            // region-keyed table that the curated fallback cannot express --
+            // see `populate_calendar_data_from_cldr`.
+            if !populate_calendar_data_from_cldr(ctx, map_pin, map, lang, country) {
+                let mut map_now = ctx.read_native_pin(map_pin, map);
+                populate_calendar_data_en(ctx, &mut map_now);
+            }
         } else if bundle_name.starts_with("sun.util.resources.CurrencyNames")
             || bundle_name.starts_with("sun.util.resources.cldr.CurrencyNames")
         {
