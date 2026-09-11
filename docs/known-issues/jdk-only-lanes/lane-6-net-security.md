@@ -28,7 +28,7 @@ Two large single-lane registrars concentrate the work:
 latter is **cross-lane with the frozen/unowned set**, so check lane T and L0 §2
 before touching it.
 
-## 2. Read this first: much of this lane is blocked behind L7
+## 2. Read this first: the L7 block is LIFTED (2026-09-10)
 
 Security and networking reach the JDK through **service loading**, and service
 loading is currently broken in a way no retirement in this lane can fix:
@@ -37,21 +37,25 @@ loading is currently broken in a way no retirement in this lane can fix:
   algorithms through `ServiceLoader`.
 - `ServiceLoader.checkCaller` was failing with *"module java.base does not
   declare `uses`"* because `Class.getName()` answered the internal slash form
-  when the native yielded. **That is fixed** — L0 tagged `getName` a reviewed
-  `Intrinsic`, taking `ClassNameSweep` from 24 diffs of 24 to 2. Re-confirm on
-  your tree.
-- What remains is L7's: `jdk/internal/loader/BuiltinClassLoader` **fails to
-  link**, which blocks ten corpus vectors and every path that needs the builtin
-  loader hierarchy. No field publish reaches it.
+  when the native yielded. This page said that was fixed by an L0 `Intrinsic`
+  tag. **The tag had not landed** — the registration was still an ambient
+  `Bridge` on `dev`, and "re-confirm on your tree" was the right instruction for
+  the wrong reason. It landed on 2026-09-10 with the review the protocol asks
+  for: `apps/probes/ClassNameSweep.java`, 85 rows — **0 rows differ unarmed, 9
+  differ armed before the tag, 1 after.**
+- `jdk/internal/loader/BuiltinClassLoader` **now links**. It was never a null
+  field: two natives disagreed about `ParallelLoaders.loaderTypes` and the
+  `<clinit>` threw `InternalError`. Both are retired.
+- Both are in the [`the-builtin-classloader-could-not-link-and-getname-was-never-tagged-20260910`](../jdk-only/the-builtin-classloader-could-not-link-and-getname-was-never-tagged-20260910.md) record.
 - A separate recorded finding: **`loadInstalled()` answered 0 for every
   service** and was bypassed *without throwing*, because every module was in the
   app loader's catalog and the probe asked a different lookup than the code
   used.
 
-**So price your provider/algorithm rows against L7's progress, not against
-today's failures.** Start with the rows that do not route through service
-loading — `URI`, `InetAddress`, `DatagramSocket` — and re-price the rest after
-each L7 landing.
+**So re-price your provider/algorithm rows now: the failures this page was
+written against are two landings out of date.** Starting with the rows that do
+not route through service loading — `URI`, `InetAddress`, `DatagramSocket` — is
+still good advice, but it is no longer a way of waiting for L7.
 
 ## 3. Two vectors in the corpus are yours right now
 

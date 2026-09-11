@@ -541,10 +541,15 @@ one. Both make a tight floor read as permission to stop.
 2. **The third line of §4's budget, in order of size.** The optimizing tier
    does not unroll — three instructions per iteration it pays every time and
    the single-pass tier pays once per four, priced at about 1.12x on this shape
-   in `JIT_OPTIMIZATION.md`. Then the receiver null check, which is explicit
-   here and implicit there; `CRATONVM_JIT_IR_THIS_NONNULL` is built, default
-   OFF, and measured ~20% SLOWER, which that document flags as the most
-   suspicious result on it.
+   in `JIT_OPTIMIZATION.md`. **Taken, and it is not a codegen gap**: the
+   unroller exists and recognises this loop; what blocks it is that a cloned
+   body has several copies of each bci and `build_deopt_points` can anchor only
+   one point per bci. Both gates under which a partial unroller could dodge that
+   measure ZERO on every corpus available. See
+   [`c2-unrolling-is-a-deopt-metadata-problem-20260911.md`](c2-unrolling-is-a-deopt-metadata-problem-20260911.md).
+   Then the receiver null check, which is explicit here and implicit there;
+   `CRATONVM_JIT_IR_THIS_NONNULL` is built, default OFF, and measured ~20%
+   SLOWER, which that document flags as the most suspicious result on it.
 3. **The two remaining TAKEN branches per iteration are intra-block cold code**,
    and neither is reachable by the block layout. `emit_inline_compact_getfield`
    emits its legacy-layout arm INLINE and jumps the hot path over it
