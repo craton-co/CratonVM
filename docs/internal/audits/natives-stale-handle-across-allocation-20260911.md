@@ -136,9 +136,38 @@ stops detecting fails the job instead of reporting zero.
   27/27 at `CRATONVM_DBG_GC_STRESS` 65536, 131072, 262144, 262144 `--nojit`,
   393216, 524288 and default — the matrix the predecessor page established, on
   the tree with all 20 fixes.
-* Probe vector (`CRATONVM_DBG_DEADREF_STORE=1 CRATONVM_GC_VERIFY_RSET=1`,
-  262144, `--nojit`): every `[deadref-*]` arm zero, including the three newly
-  wired receiver arms.
+* A/B on the 15-class spring-boot smoke batch, same host, same runner, the
+  binary before this sweep (`mrg1`) against the binary after it (`arr1`):
+
+  | | default GC | `CRATONVM_DBG_GC_STRESS=262144` |
+  |---|---|---|
+  | before | 15 PASS | 9 PASS · 1 FAIL · 5 CRASH |
+  | after | 15 PASS | 9 PASS · 1 FAIL · 5 CRASH |
+
+  Identical, class for class, including WHICH six fail. No regression, and no
+  claim that the sweep fixed any of them.
+
+## The six the A/B exposes, which are the next unit
+
+That stress column is the useful part of the A/B. Six of fifteen ordinary
+spring-boot classes do not survive `CRATONVM_DBG_GC_STRESS=262144` on either
+binary, and they are reproducible in under thirty seconds each — which is
+better evidence than anything the static screen can produce:
+
+| class | symptom |
+|---|---|
+| `BannerTests` | `NullPointerException: Proxy$Dispatch.invokeProxy: proxy InvocationHandler is null` — a proxy's handler field reads null |
+| `ApplicationEnvironmentTests` | CRASH |
+| `ApplicationInfoPropertySourceTests` | CRASH |
+| `ApplicationPropertiesTests` | CRASH |
+| `ResourceBannerTests` | CRASH |
+| `ShutdownEndpointTests` | CRASH |
+
+`BannerTests`' shape is this species' signature: a field that is null when the
+object it belongs to was built while something else was allocating. Whether all
+six are this family is exactly what the next unit has to establish rather than
+assume — and with a reproducer per class, `[deadref-recv]`'s three new arms are
+finally being pointed at a workload that fails.
 
 The honest limit, restated from the predecessor page because it did not change:
 these fixes are not each demonstrated by a failing test. The species produces a
