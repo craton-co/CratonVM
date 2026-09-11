@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-545 tokens.
+546 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -334,6 +334,7 @@ export inherited from a parent shell.
 | `jit-unmap` | `CRATONVM_DBG_JIT_UNMAP` |
 | `intrinsic` | `CRATONVM_DBG_INTRINSIC` |
 | `jitc` | `CRATONVM_DBG_JITC` |
+| `jitnpe` | `CRATONVM_DBG_JITNPE` |
 | `jlm` | `CRATONVM_DBG_JLM` |
 | `jul` | `CRATONVM_DBG_JUL` |
 | `kcbool` | `CRATONVM_DBG_KCBOOL` |

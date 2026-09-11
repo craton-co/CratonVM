@@ -703,6 +703,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "jit-unmap", on_key: Some("CRATONVM_DBG_JIT_UNMAP"), off_key: None, off_word: None, since: "2026-07-28" },
     E { group: Group::DBG, token: "intrinsic", on_key: Some("CRATONVM_DBG_INTRINSIC"), off_key: None, off_word: None, since: "2026-08-13" },
     E { group: Group::DBG, token: "jitc", on_key: Some("CRATONVM_DBG_JITC"), off_key: None, off_word: None, since: "2026-05-21" },
+    E { group: Group::DBG, token: "jitnpe", on_key: Some("CRATONVM_DBG_JITNPE"), off_key: None, off_word: None, since: "2026-09-11" },
     E { group: Group::DBG, token: "jlm", on_key: Some("CRATONVM_DBG_JLM"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::DBG, token: "jul", on_key: Some("CRATONVM_DBG_JUL"), off_key: None, off_word: None, since: "2026-07-27" },
     E { group: Group::DBG, token: "kcbool", on_key: Some("CRATONVM_DBG_KCBOOL"), off_key: None, off_word: None, since: "2026-05-21" },

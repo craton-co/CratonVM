@@ -954,6 +954,15 @@ struct Lowerer<'a> {
     /// `CompiledMethod::inline_frame_map`. Empty ⇒ the artifact carries the
     /// same empty map it always did.
     inline_frame_rows: Vec<crate::x64::InlineFrameRow>,
+    /// NPE trap sites this lowering described, becoming
+    /// `CompiledMethod::npe_trap_map`. Empty ⇒ the artifact carries the same
+    /// empty map every optimizing-tier body carried before 2026-09-11, and a
+    /// null receiver in it raises an UNMESSAGED `NullPointerException` exactly
+    /// as it did then. See [`Self::record_npe_trap_site`].
+    npe_trap_sites: Vec<(u32, crate::x64::NpeTrapSite)>,
+    /// Monotonic id for [`Self::npe_trap_sites`]. Per-ARTIFACT, like the
+    /// single-pass backend's — `NpeTrapMap::get` searches one map.
+    npe_trap_next_id: u32,
 
     // ── Linear-scan register read cache ──────────────────────────────
     //
@@ -1667,6 +1676,8 @@ impl<'a> Lowerer<'a> {
             inline_scopes,
             inline_frame_sites,
             inline_frame_rows: Vec::new(),
+            npe_trap_sites: Vec::new(),
+            npe_trap_next_id: 0,
             cur_node_pc: None,
             // Off by default; `lower_inner_with_scopes` installs a plan when
             // `CRATONVM_JIT_IR_LINEAR_SCAN` is on. Empty vectors, not
@@ -5261,8 +5272,16 @@ impl<'a> Lowerer<'a> {
         // declared `[C`, read back as `Int(1)`, and the `arraylength` that
         // followed faulted at `addr=0x5`.
         let base_is_proven_oop = self.graph.nodes[base as usize].ty == IrType::Ref;
-        let arg2 =
-            cratonvm_jit_api::getfield_index_arg(field_index as u32, ref_node, base_is_proven_oop);
+        // The NPE trap-site key, so a null receiver reaching the helper can
+        // carry JEP 358's message out: the helper has the receiver (null) and
+        // the slot index, and neither names the field or the bci.
+        let npe_site = self.record_npe_trap_site(pc);
+        let arg2 = cratonvm_jit_api::getfield_index_arg(
+            field_index as u32,
+            ref_node,
+            base_is_proven_oop,
+            npe_site,
+        );
         self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
         self.gp_load_value(CALL_ARG_REGS[1], base);
         self.emit_mov_reg_imm64(CALL_ARG_REGS[2], arg2);
@@ -7070,6 +7089,70 @@ impl<'a> Lowerer<'a> {
                 })
                 .collect(),
         });
+    }
+
+    /// Describe one NPE trap site and return its key, or `0` for "not
+    /// described" — which every caller passes straight through to the helper
+    /// argument, where zero means the historical unmessaged NPE.
+    ///
+    /// This is [`crate::x64::inlining::record_npe_trap_site`]'s optimizing-tier
+    /// twin, and it answers the same two questions from this backend's own
+    /// data: the ENCLOSING method's bci for the program point
+    /// (`IrInlineFrameSites::enclosing_bci_at`, or `node_pc` itself when the
+    /// point is not inside a spliced body), and the callees spliced there
+    /// (`chain_at`, innermost first).
+    ///
+    /// Both halves respect the same kill switches the single-pass twin does, so
+    /// `CRATONVM_JIT_NO_NPE_TRAP_LINES=1` and
+    /// `CRATONVM_JIT_NO_INLINE_FRAME_MAP=1` revert this tier and that one
+    /// together rather than leaving one of them describing sites the walk will
+    /// not read.
+    fn record_npe_trap_site(&mut self, node_pc: usize) -> u32 {
+        if !crate::x64::npe_trap_lines_enabled() || !crate::x64::inline_frame_map_enabled() {
+            return 0;
+        }
+        // The compiling method's own bci. Inside a splice that is the outermost
+        // caller pc; outside one the node's pc already IS it.
+        let own_pc = match u32::try_from(node_pc) {
+            Ok(v) => v,
+            Err(_) => return 0,
+        };
+        let bci = if self.inline_frame_sites.is_empty() {
+            own_pc
+        } else {
+            // `None` means the point is not inside any spliced body, so the
+            // node's own pc already IS the compiling method's bci.
+            self.inline_frame_sites
+                .enclosing_bci_at(node_pc)
+                .unwrap_or(own_pc)
+        };
+        // JVMS 4.9.1: `Code.code_length` is below 65536. A bci at or above it
+        // is not a bytecode index and describing a site with one would hand the
+        // consumer a confidently wrong opcode. The SAME constant the
+        // single-pass twin screens against, not a second copy of the bound.
+        if bci as usize >= crate::x64::INLINE_FRAME_MAX_BCI {
+            return 0;
+        }
+        let chain: Vec<crate::x64::InlineFrameLevel> = self
+            .inline_frame_sites
+            .chain_at(node_pc)
+            .into_iter()
+            .map(|l| crate::x64::InlineFrameLevel {
+                label: l.method_key,
+                bci: l.bci,
+                class_id: l.class_id,
+            })
+            .collect();
+        self.npe_trap_next_id = self.npe_trap_next_id.wrapping_add(1);
+        let id = self.npe_trap_next_id;
+        // The key rides in 24 bits of one helper argument; a compile with more
+        // sites than that describes no more of them.
+        if id >= (1 << 24) {
+            return 0;
+        }
+        self.npe_trap_sites
+            .push((id, crate::x64::NpeTrapSite { bci, chain }));
+        id
     }
 
     fn emit_call_return_check(&mut self, slot: i32, ty: IrType) {
@@ -9381,6 +9464,11 @@ impl<'a> Lowerer<'a> {
                 }
                 if self.getfield != 0 {
                     crate::metrics::note_getfield_arm(5);
+                    // See the inline-compact arm: `0` when this node carries no
+                    // bytecode pc, which is also the "not described" key.
+                    let npe_site = node
+                        .bytecode_pc
+                        .map_or(0, |pc| self.record_npe_trap_site(pc));
                     self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
                     self.gp_load_value(CALL_ARG_REGS[1], base);
                     // Reference loads must carry `GETFIELD_EXPECT_REFERENCE` at
@@ -9389,10 +9477,12 @@ impl<'a> Lowerer<'a> {
                     // here.
                     self.emit_mov_reg_imm64(
                         CALL_ARG_REGS[2],
+                        // The trap-site key — see the sibling arm above.
                         cratonvm_jit_api::getfield_index_arg(
                             field_index as u32,
                             node.ty == IrType::Ref,
                             false,
+                            npe_site,
                         ),
                     );
                     self.emit_mov_reg_imm64(RAX, self.getfield as u64);
@@ -18375,6 +18465,7 @@ pub(crate) fn lower_inner_with_scopes(
     let oop_maps = std::mem::take(&mut lowerer.oop_maps);
     let sp_id_bcis = std::mem::take(&mut lowerer.sp_id_bcis);
     let inline_frame_rows = std::mem::take(&mut lowerer.inline_frame_rows);
+    let npe_trap_sites = std::mem::take(&mut lowerer.npe_trap_sites);
     let locals_size = lowerer.locals_size;
     let first_spill = lowerer.first_spill;
     let spill_cap_off = lowerer.spill_cap_off;
@@ -18726,6 +18817,10 @@ pub(crate) fn lower_inner_with_scopes(
     // when `compiled_frame_inline_chain` returned on its `is_empty()` guard and
     // IR-tier inlining contributed no frames at all.
     cm.inline_frame_map = crate::x64::InlineFrameMap::from_rows(inline_frame_rows, cm.code_len());
+    // No `code_len` screen, for the reason the single-pass twin states at its
+    // own publication site: the keys are monotonic ids rather than code
+    // offsets, so a row nothing carries a key for is simply unreachable.
+    cm.npe_trap_map = crate::x64::NpeTrapMap::from_rows(npe_trap_sites);
     cm.safepoint_bci_table = {
         let mut t = sp_id_bcis;
         t.sort_unstable_by_key(|(id, _)| *id);
@@ -20362,8 +20457,8 @@ mod tests {").next().unwrap_or(src);
         // computed from the thing under test is not an expectation.
         const EXPECT_REF: u64 = cratonvm_jit_api::GETFIELD_EXPECT_REFERENCE;
         const PROVEN: u64 = cratonvm_jit_api::GETFIELD_RECEIVER_PROVEN_OOP;
-        let proven = (5u64 | EXPECT_REF | PROVEN).to_le_bytes();
-        let unproven = (5u64 | EXPECT_REF).to_le_bytes();
+        let proven = 5u64 | EXPECT_REF | PROVEN;
+        let unproven = 5u64 | EXPECT_REF;
         //
         // Accepting either means this pins "the emitted code flags the load",
         // not "every arm flags it" — measured: patching `ref_node` out of the
@@ -20372,7 +20467,8 @@ mod tests {").next().unwrap_or(src);
         // in both backends through `getfield_index_arg`, plus the control that
         // disables that encoder and turns this red.
         assert!(
-            contains_seq(cm.code_bytes(), &proven) || contains_seq(cm.code_bytes(), &unproven),
+            contains_getfield_arg(cm.code_bytes(), proven)
+                || contains_getfield_arg(cm.code_bytes(), unproven),
             "no getfield argument in the emitted code carries \
              GETFIELD_EXPECT_REFERENCE, so the helper will hand this \
              dereferencing arm whatever primitive the slot happens to hold"
@@ -20391,7 +20487,8 @@ mod tests {").next().unwrap_or(src);
         let schedule = ir_schedule::schedule(&graph);
         let cm = lower(&graph, &schedule, 1, 1, &helpers).expect("must compile");
         assert!(
-            !contains_seq(cm.code_bytes(), &proven) && !contains_seq(cm.code_bytes(), &unproven),
+            !contains_getfield_arg(cm.code_bytes(), proven)
+                && !contains_getfield_arg(cm.code_bytes(), unproven),
             "an int field must not claim GETFIELD_EXPECT_REFERENCE"
         );
     }
@@ -20406,6 +20503,23 @@ mod tests {").next().unwrap_or(src);
         let graph = builder.build(code, code_len).expect("IR build");
         let schedule = ir_schedule::schedule(&graph);
         lower(&graph, &schedule, num_params, num_locals, &no_helpers()).expect("lower")
+    }
+
+    /// Does the emitted code bake a `jit_getfield` third argument equal to
+    /// `want`, ignoring the NPE trap-SITE key?
+    ///
+    /// A byte-sequence search used to be enough, and stopped being enough when
+    /// the argument grew a third passenger: the key is a per-compile monotonic
+    /// id, so the eight bytes differ from `want` by a value no expectation can
+    /// name without becoming a copy of the emitter. Masking ONE documented
+    /// field off keeps the property this test was written for -- the
+    /// expectation is built from constants, never from `getfield_index_arg` --
+    /// while letting the passenger through.
+    fn contains_getfield_arg(hay: &[u8], want: u64) -> bool {
+        hay.windows(8).any(|w| {
+            let v = u64::from_le_bytes(w.try_into().expect("an 8-byte window"));
+            v & !cratonvm_jit_api::GETFIELD_NPE_SITE_MASK == want
+        })
     }
 
     /// True iff `needle` appears as a contiguous subsequence of `hay`.
