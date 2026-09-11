@@ -9691,6 +9691,16 @@ pub struct StringFieldLayout {
     /// dispatch for any other CharSequence (`StringBuilder`, …). For a
     /// `java/lang/String` site (final, monomorphic) no guard is emitted.
     pub string_class_id: u32,
+    /// The `java/lang/StringBuilder` half, when that class is loaded and has a
+    /// resolvable `count`/`value`/`coder` shape.
+    ///
+    /// Carried HERE rather than threaded as a second resolver because this
+    /// struct already reaches all three compile doors, and a second parameter
+    /// would have to be added at every one of them — the drift `compile_gate`'s
+    /// module doc describes, where each door grows its own hand-copied subset
+    /// of what the others pass. `None` leaves every StringBuilder site on
+    /// ordinary native dispatch, which is where they all were before this.
+    pub builder: Option<StringBuilderFieldLayout>,
 }
 
 /// Where `java.util.concurrent.atomic.AtomicInteger.value` lives, for the
@@ -9940,7 +9950,181 @@ impl StringFieldLayout {
             coder_legacy_offset: coder_field_index.map_or(0, |idx| legacy(idx, false)),
             coder_compact_is_byte,
             string_class_id,
+            builder: None,
         }
+    }
+
+    /// Attach the `java/lang/StringBuilder` half of the layout.
+    ///
+    /// A setter rather than a fifth parameter to [`Self::new`] because every
+    /// existing caller — the resolver, the name probe, and six tests — wants
+    /// the String half alone, and the builder half is legitimately absent
+    /// (`StringBuilder` not loaded yet, or not the JDK-9+ shape). `None`
+    /// leaves every StringBuilder site on ordinary native dispatch, which is
+    /// what happened before this existed.
+    pub fn with_builder(mut self, builder: Option<StringBuilderFieldLayout>) -> Self {
+        self.builder = builder;
+        self
+    }
+}
+
+/// `java/lang/StringBuilder`'s `count` / `value` / `coder` addresses, for the
+/// StringBuilder call-site intrinsics.
+///
+/// # Why this exists
+///
+/// Measured on this tree, one `StringBuilder` native costs what the JIT→native
+/// boundary costs and then some: `System.identityHashCode` — the same shape,
+/// one object argument, a trivial body — is 120 ns/op, `StringBuilder.length()`
+/// is 194 ns and `StringBuilder.append(char)` is 349 ns. Against that,
+/// `String.length()` is **2 ns**, because it is one of these intrinsics and
+/// never leaves compiled code. The machinery for making a native cost 2 ns
+/// instead of 349 already existed; `StringBuilder` was not on it.
+///
+/// # The shape, and the three fields
+///
+/// `AbstractStringBuilder` declares `value` (`byte[]`), `coder` (`byte`) and
+/// `count` (`int`); `StringBuilder` adds none of its own. The representation is
+/// `String`'s, with `count` characters used of `value.length >> coder`
+/// available — which is why this carries the same compact/legacy offset pair
+/// per field that [`StringFieldLayout`] does, for the same reason (a class with
+/// a registered `CompactLayout` may still have LEGACY-laid-out instances, so
+/// every access dispatches per object on the `GC_FLAG_COMPACT` header bit).
+///
+/// # The guard is the class id, and it is exact
+///
+/// `java/lang/StringBuilder` is `final`, so a site whose receiver's header
+/// class id equals `class_id` is that class and no other. The guard is what
+/// keeps `StringBuffer` — whose `append` is `synchronized` and whose
+/// `toStringCache` must be invalidated on every mutation — off these paths
+/// entirely. Neither obligation is emitted here, and neither has to be,
+/// because a `StringBuffer` receiver fails the class-id compare and takes the
+/// ordinary native call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StringBuilderFieldLayout {
+    /// Byte offset of `count`'s 4-byte payload in a COMPACT instance.
+    pub count_compact_offset: i32,
+    /// Byte offset of `count`'s 4-byte payload in a LEGACY instance.
+    pub count_legacy_offset: i32,
+    /// Byte offset of `value`'s reference payload in a COMPACT instance.
+    pub value_compact_offset: i32,
+    /// Byte offset of `value`'s 8-byte reference payload in a LEGACY instance.
+    pub value_legacy_offset: i32,
+    /// Whether `value`'s COMPACT slot is a 4-byte **narrow** oop. Same meaning,
+    /// and the same hazard, as [`StringFieldLayout::value_compact_is_narrow`].
+    pub value_compact_is_narrow: bool,
+    /// Byte offset of `coder`'s payload in a COMPACT instance.
+    pub coder_compact_offset: i32,
+    /// Byte offset of `coder`'s 4-byte payload in a LEGACY instance.
+    pub coder_legacy_offset: i32,
+    /// Whether `coder`'s COMPACT slot is one byte wide rather than four.
+    pub coder_compact_is_byte: bool,
+    /// `ObjectHeader` class id of `java/lang/StringBuilder`, the receiver
+    /// guard. Never 0: [`Self::new`] refuses that, because an unguarded decode
+    /// of an arbitrary receiver is exactly the hazard the guard exists for.
+    pub class_id: u32,
+}
+
+impl StringBuilderFieldLayout {
+    /// Build a layout from the three raw field indices, precomputing the
+    /// COMPACT and LEGACY payload addresses the same way
+    /// [`StringFieldLayout::new`] does — see that function for why each field
+    /// needs two, and for the 2026-07-26 defect that came of deriving one from
+    /// the other.
+    ///
+    /// Returns `None` when the class id is 0 (no guard is possible) or when
+    /// `count`'s compact storage is not exactly 4 bytes: the emitted code
+    /// reads and writes `count` as a 32-bit `int`, so a narrower or wider
+    /// storage width would touch the wrong bytes. Both refusals leave the call
+    /// on native dispatch.
+    pub fn new(
+        count_field_index: usize,
+        value_field_index: usize,
+        coder_field_index: usize,
+        class_id: u32,
+    ) -> Option<Self> {
+        if class_id == 0 {
+            return None;
+        }
+        // The family's opt-out, and it is HERE rather than at the emission
+        // site on purpose: refusing the layout refuses registration too, so
+        // the two cannot disagree about whether a site is an intrinsic — the
+        // disagreement that dropped every method containing one to the
+        // interpreter the first time this landed. `CRATONVM_NO_JIT_SB_INTRINSICS=1`
+        // therefore gives an A/B whose two arms are one binary.
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_SB_INTRINSICS").is_some() {
+            return None;
+        }
+        let legacy = |idx: usize, is_ref: bool| -> i32 {
+            let cell = (cratonvm_types::HEADER_SIZE + idx * cratonvm_types::SLOT_SIZE) as i32;
+            cell + if is_ref {
+                cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET as i32
+            } else {
+                cratonvm_types::FIELD_CELL_PAYLOAD32_OFFSET as i32
+            }
+        };
+        // `(address, storage width)`. The fallback — compact fields globally
+        // off, or no `CompactLayout` registered for this class — reuses the
+        // legacy address and reports width 8, exactly as the String twin does:
+        // neither condition can produce an instance carrying
+        // `GC_FLAG_COMPACT`, so the compact arm is unreachable, and pointing
+        // it at the legacy address keeps it harmless rather than wild if that
+        // invariant ever slips.
+        let compact = |idx: usize, is_ref: bool| -> (i32, u32) {
+            if cratonvm_types::compact_ref_fields_enabled() {
+                if let Some((body_off, storage)) =
+                    cratonvm_types::compact_field_storage(class_id, idx)
+                {
+                    return (
+                        (cratonvm_types::HEADER_SIZE + body_off) as i32,
+                        storage.size_runtime(),
+                    );
+                }
+            }
+            (legacy(idx, is_ref), 8)
+        };
+
+        let (count_compact_offset, count_width) = compact(count_field_index, false);
+        // The fallback reports 8 and means "legacy address", which IS four
+        // bytes of payload; a REGISTERED width that is not 4 is the refusal.
+        if cratonvm_types::compact_ref_fields_enabled()
+            && cratonvm_types::compact_field_storage(class_id, count_field_index).is_some()
+            && count_width != 4
+        {
+            return None;
+        }
+        let (value_compact_offset, value_width) = compact(value_field_index, true);
+        let (coder_compact_offset, coder_width) = compact(coder_field_index, false);
+        // A NARROW `value` oop would need the decode
+        // `emit_load_string_value_ptr` does for the String family; the
+        // StringBuilder codegen loads the reference with a plain 8-byte `MOV`
+        // and refuses rather than half-decode it — the exact shape of hole 1
+        // in `gc/src/compressed_oops.rs`, where an unconditional 64-bit load
+        // took four bytes of narrow oop plus four bytes of the adjacent field
+        // and dereferenced the result.
+        //
+        // Refused HERE, in the constructor, and not at the emission site: the
+        // registration path and the codegen both go through this layout, so a
+        // refusal either side of it alone would register an intrinsic the
+        // emitter then could not emit — which fails the whole compile and
+        // drops the method to the interpreter. Narrow oops are default-off on
+        // this tree, so today this costs nothing.
+        if value_width == cratonvm_types::narrow_oop::NARROW_REF_SIZE as u32 {
+            return None;
+        }
+
+        Some(Self {
+            count_compact_offset,
+            count_legacy_offset: legacy(count_field_index, false),
+            value_compact_offset,
+            value_legacy_offset: legacy(value_field_index, true),
+            value_compact_is_narrow: value_width
+                == cratonvm_types::narrow_oop::NARROW_REF_SIZE as u32,
+            coder_compact_offset,
+            coder_legacy_offset: legacy(coder_field_index, false),
+            coder_compact_is_byte: coder_width == 1,
+            class_id,
+        })
     }
 }
 
@@ -10359,6 +10543,23 @@ pub enum JitIntrinsic {
     StringCharAt,   // charAt(I)C
     StringHashCode, // hashCode()I
     // ===== INTRINSIC REGION END: STRING_ACCESS =====
+
+    // ===== INTRINSIC REGION BEGIN: STRINGBUILDER_ACCESS =====
+    // java.lang.StringBuilder, behind a `StringBuilderFieldLayout` and an
+    // exact `[recv+0] == StringBuilder` class-id guard. See that struct for
+    // the measurement (`length()` 194 ns, `append(char)` 349 ns, against 2 ns
+    // for the already-intrinsified `String.length()`), and for why the guard
+    // is what keeps `StringBuffer`'s `synchronized` + `toStringCache`
+    // obligations off these paths.
+    //
+    // `append(char)` is the only MUTATING call-site intrinsic in this file,
+    // and its slow edges go to the ordinary native call rather than to an
+    // uncommon trap. A full payload is not an uncommon event — it is what
+    // every growing builder does O(log n) times — and a deopt there would
+    // re-run the whole method in the interpreter each time it grew.
+    StringBuilderLength,     // length()I
+    StringBuilderAppendChar, // append(C)Ljava/lang/StringBuilder;
+    // ===== INTRINSIC REGION END: STRINGBUILDER_ACCESS =====
 
     // ===== INTRINSIC REGION BEGIN: STRING_SEARCH =====
     // java.lang.String search/compare intrinsics (Phase 3b). `equals` is
@@ -13851,6 +14052,144 @@ pub fn receiver_profile_rejects_guard(
     u64::from(hits) * 100 < u64::from(total) * u64::from(MIN_GUARDED_RECEIVER_PCT)
 }
 
+/// Does this String-intrinsic entry DECLINE into an ordinary native dispatch
+/// rather than into an uncommon trap?
+///
+/// True for the `java/lang/StringBuilder` members and false for every
+/// String/CharSequence one, and both halves of that answer are load-bearing at
+/// every compile door:
+///
+/// * **It needs a `JitInvokeInfo`.** A site the resolver registers as an
+///   intrinsic never reaches the generic `invoke_info.push` — every such arm
+///   `continue`s above it — so a declining intrinsic must register one of its
+///   own, exactly as the FFM region does. Without it the emitter cannot emit
+///   the decline edge, refuses the site, and the refusal fails the whole
+///   method: measured at 404 696 interpreted dispatches against 8 695, with
+///   `StringBuilder.append(char)` at 1 091 ns against 309 ns, because every
+///   method containing one dropped to the interpreter.
+/// * **The receiver de-spec screen does not apply to it.** That screen exists
+///   because a `CharSequence` site's class-id guard DEOPTS on a miss, so a bci
+///   the profile says is rarely a `String` must not get one. A guard whose miss
+///   is a predicted branch and a call has nothing to protect against — and a
+///   `StringBuilder` guard cannot miss anyway, the class being final.
+///
+/// Asked by BOTH doors rather than hand-copied into each, because the record of
+/// this area is that a door grows its own subset and the two drift — see
+/// `compile_gate`'s module doc, and the fact that the method-entry door was
+/// fixed first here and the OSR door still failed every method.
+pub fn string_intrinsic_declines_to_a_call(entry: usize) -> bool {
+    entry == JitIntrinsic::StringBuilderLength.as_entry()
+        || entry == JitIntrinsic::StringBuilderAppendChar.as_entry()
+}
+
+#[cfg(test)]
+mod string_builder_intrinsic_registration {
+    use super::*;
+
+    fn builder_layout() -> StringFieldLayout {
+        StringFieldLayout::new(0, Some(1), 2, 7)
+            .with_builder(StringBuilderFieldLayout::new(0, 1, 2, 9))
+    }
+
+    /// EVERY entry the resolver can hand back for a `java/lang/StringBuilder`
+    /// site must be one `string_intrinsic_declines_to_a_call` claims.
+    ///
+    /// The two are asked at different places — the resolver at registration,
+    /// the predicate by both doors to decide whether to mint a
+    /// `JitInvokeInfo` — and a member added to one and not the other
+    /// registers an intrinsic whose decline edge has no dispatch to decline
+    /// into. The emitter then refuses the site, and that refusal fails the
+    /// whole method, which is a silent drop to the interpreter rather than a
+    /// visible error.
+    #[test]
+    fn every_string_builder_entry_is_one_that_declines_to_a_call() {
+        let layout = Some(builder_layout());
+        let mut seen = 0;
+        for (name, descriptor) in [
+            ("length", "()I"),
+            ("append", "(C)Ljava/lang/StringBuilder;"),
+        ] {
+            let hit =
+                try_resolve_string_intrinsic("java/lang/StringBuilder", name, descriptor, layout);
+            let (entry, _, _, guard) = hit.unwrap_or_else(|| {
+                panic!("the resolver must answer for StringBuilder.{name}{descriptor}")
+            });
+            assert!(
+                string_intrinsic_declines_to_a_call(entry),
+                "StringBuilder.{name}{descriptor} registers an entry the doors will not                  mint a JitInvokeInfo for"
+            );
+            assert_ne!(
+                guard, 0,
+                "a StringBuilder site must carry its class-id guard: without it the inline                  decode would run against a StringBuffer receiver, whose append is                  synchronized and whose toStringCache must be invalidated"
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, 2);
+    }
+
+    /// A String / CharSequence member must NOT claim to decline into a call:
+    /// every one of its edges is an uncommon trap, and minting a
+    /// `JitInvokeInfo` for it would be dead weight on every String site in the
+    /// program.
+    #[test]
+    fn the_string_members_still_decline_into_a_trap() {
+        let layout = Some(builder_layout());
+        for (class, name, descriptor) in [
+            ("java/lang/String", "length", "()I"),
+            ("java/lang/String", "charAt", "(I)C"),
+            ("java/lang/CharSequence", "length", "()I"),
+        ] {
+            if let Some((entry, _, _, _)) =
+                try_resolve_string_intrinsic(class, name, descriptor, layout)
+            {
+                assert!(
+                    !string_intrinsic_declines_to_a_call(entry),
+                    "{class}.{name}{descriptor} is trap-declining and must not be listed"
+                );
+            }
+        }
+    }
+
+    /// A layout with no builder half leaves every StringBuilder site alone.
+    #[test]
+    fn without_a_builder_layout_no_string_builder_site_is_claimed() {
+        let layout = Some(StringFieldLayout::new(0, Some(1), 2, 7));
+        assert!(try_resolve_string_intrinsic(
+            "java/lang/StringBuilder",
+            "append",
+            "(C)Ljava/lang/StringBuilder;",
+            layout
+        )
+        .is_none());
+    }
+
+    /// `StringBuffer` is never claimed, whatever the layout says. Its `append`
+    /// is `synchronized` and it carries a `toStringCache` that every mutation
+    /// must invalidate; the inline path emits neither.
+    #[test]
+    fn string_buffer_is_never_claimed() {
+        let layout = Some(builder_layout());
+        for (name, descriptor) in [
+            ("length", "()I"),
+            ("append", "(C)Ljava/lang/StringBuffer;"),
+            ("append", "(C)Ljava/lang/StringBuilder;"),
+        ] {
+            assert!(
+                try_resolve_string_intrinsic("java/lang/StringBuffer", name, descriptor, layout)
+                    .is_none(),
+                "StringBuffer.{name}{descriptor} must stay on native dispatch"
+            );
+        }
+    }
+
+    /// A zero class id is refused by the layout constructor: an unguarded
+    /// decode of an arbitrary receiver is the hazard the guard exists for.
+    #[test]
+    fn a_layout_without_a_class_id_is_refused() {
+        assert!(StringBuilderFieldLayout::new(0, 1, 2, 0).is_none());
+    }
+}
+
 pub fn try_resolve_string_intrinsic(
     class: &str,
     name: &str,
@@ -13881,6 +14220,32 @@ pub fn try_resolve_string_intrinsic(
     // narrow slots at 4 bytes as well). The gate still defaults off; see
     // `gc/src/compressed_oops.rs` for why, which is no longer "a known
     // wrong-width slot access on this backend".
+    // ===== INTRINSIC REGION BEGIN: STRINGBUILDER_ACCESS =====
+    // Answered before the String/CharSequence screen below, because a
+    // `java/lang/StringBuilder` site is neither and would be refused by it.
+    //
+    // The guard is ALWAYS the StringBuilder class id, never 0: `StringBuilder`
+    // is final, so the compare is exact, and it is what keeps a `StringBuffer`
+    // receiver — `synchronized` methods, a `toStringCache` to invalidate — off
+    // a path that emits neither obligation. `StringBuilderFieldLayout::new`
+    // refuses a zero class id, so a layout that exists has a usable guard.
+    if class == "java/lang/StringBuilder" {
+        if let Some(b) = string_layout.and_then(|l| l.builder) {
+            let hit: Option<(JitIntrinsic, usize, u8)> = match (name, descriptor) {
+                ("length", "()I") => Some((JitIntrinsic::StringBuilderLength, 0, b'I')),
+                ("append", "(C)Ljava/lang/StringBuilder;") => {
+                    Some((JitIntrinsic::StringBuilderAppendChar, 1, b'L'))
+                }
+                _ => None,
+            };
+            if let Some((intrinsic, num_params, ret)) = hit {
+                return Some((intrinsic.as_entry(), num_params, ret, b.class_id));
+            }
+        }
+        return None;
+    }
+    // ===== INTRINSIC REGION END: STRINGBUILDER_ACCESS =====
+
     let is_string = class == "java/lang/String";
     let is_charseq = class == "java/lang/CharSequence";
     if !is_string && !is_charseq {
@@ -20431,6 +20796,7 @@ const STRING_INTRINSIC_NAME_PROBE: StringFieldLayout = StringFieldLayout {
     // the caller then rejects every guarded site anyway. Never an object's
     // real class id, and never compared against one.
     string_class_id: 1,
+    builder: None,
 };
 
 /// Does the OPTIMIZING tier's own String-access expander handle this exact
@@ -29052,8 +29418,19 @@ fn try_compile_inner(
                 // `HttpHeaderValidationUtil.validateValidHeaderValue` is that
                 // site (`CharSequence.length()` at bci 1, reached only with
                 // `AsciiString` and an anonymous `CharSequence`).
-                .filter(|&(_, _, _, guard_class_id)| {
+                .filter(|&(entry, _, _, guard_class_id)| {
                     if guard_class_id == 0 || !receiver_despec_enabled() {
+                        return true;
+                    }
+                    // The StringBuilder family carries a non-zero guard and is
+                    // NOT what this filter is about. Its guard miss is a CALL
+                    // to the ordinary dispatch, not a deopt — so a receiver
+                    // that keeps missing costs a predicted branch, never a
+                    // deopt-per-call or a whole-method blacklist, and there is
+                    // nothing here for a receiver profile to protect against.
+                    // (It also cannot miss in practice: `StringBuilder` is
+                    // final, so the site's declared class IS the guard.)
+                    if string_intrinsic_declines_to_a_call(entry) {
                         return true;
                     }
                     // Positive evidence admits the guard outright; the de-spec
@@ -29105,6 +29482,47 @@ fn try_compile_inner(
                     !(by_profile || by_despec)
                 }) {
                     needs_heap = true;
+                    // The StringBuilder family is registered with its OWN
+                    // `JitInvokeInfo` for this same pc, for the reason the FFM
+                    // region above gives: its emitted fast path DECLINES — a
+                    // UTF16 payload, a full one, a character above LATIN1 — and
+                    // the decline edge runs this exact native dispatch. Without
+                    // it the pc has no dispatch metadata at all, because a site
+                    // the resolver registers as an intrinsic never reaches the
+                    // generic `invoke_info.push` below (this arm `continue`s
+                    // above it). That is not a hypothetical: it is what this
+                    // arm did on its first run, and the emitter's
+                    // `sb-intrinsic-unemittable` refusal dropped every method
+                    // containing a `StringBuilder.append(char)` to the
+                    // interpreter — 404 696 interpreted dispatches against
+                    // 8 695 before, and `append(char)` 309 ns -> 1 091 ns.
+                    //
+                    // The String/CharSequence members need none of this: every
+                    // one of their edges is a deopt, which needs no dispatch
+                    // metadata.
+                    if string_intrinsic_declines_to_a_call(entry) {
+                        let class_box: Box<str> = class_name.clone().into_boxed_str();
+                        let method_box: Box<str> = method_name.clone().into_boxed_str();
+                        let desc_box: Box<str> = descriptor.clone().into_boxed_str();
+                        let class_ref = &*class_box as *const str;
+                        let method_ref = &*method_box as *const str;
+                        let desc_ref = &*desc_box as *const str;
+                        owned_strings.push(class_box);
+                        owned_strings.push(method_box);
+                        owned_strings.push(desc_box);
+                        let info = Box::new(JitInvokeInfo {
+                            class_name: unsafe { &*class_ref },
+                            method_name: unsafe { &*method_ref },
+                            descriptor: unsafe { &*desc_ref },
+                            num_jit_args,
+                            return_type: ret_type,
+                            invoke_kind,
+                            declaring_class_id: cached.declaring_class_id.as_u32(),
+                        });
+                        let info_ptr: *const JitInvokeInfo = &*info;
+                        owned_invoke_infos.push(info);
+                        invoke_info.push((pc, info_ptr));
+                    }
                     direct_calls.push((
                         pc,
                         JitDirectCall {
@@ -40298,7 +40716,29 @@ mod layout_constant_inventory {
         // counted here anyway because a use that CANNOT be wrong today is
         // still a use that a later edit can make wrong, which is the
         // premise of counting every occurrence rather than every hazard.
-        ("lib.rs", [8, 1, 4, 1, 0, 0, 2, 2]),
+        //
+        // 2026-09-11: `StringBuilderFieldLayout::new` (the
+        // STRINGBUILDER_ACCESS region) adds the same two-offsets-per-field
+        // pair the three layouts above it add, and it carries its own copy of
+        // both closures, so it moves every constant those two spell:
+        // `HEADER_SIZE` 8 -> 10 (the `legacy()` header-plus-cell address and
+        // the `compact()` header-plus-body one), `SLOT_SIZE` 4 -> 5 (the
+        // legacy cell index), and BOTH payload biases 2 -> 3 — `value` is a
+        // reference and so biases by payload64, while `count` and `coder` are
+        // int-category and bias by payload32. The layout names no array
+        // constant: `value.length` is read in the emitter, not here.
+        //
+        // Value-safety at a shrunk header, which is what this inventory
+        // exists to make someone check: every address this layout produces is
+        // emitted as the disp32 of a `MOV` (`48 8B 90` / `44 8B 80` /
+        // `44 0F B6 88`) or of the `MOV [RAX+disp32], R8D` count store —
+        // ModRM mod=10, a full signed 32-bit displacement — so none of them
+        // shares the disp8 backwards-addressing hazard the `ir_lower.rs`
+        // array sites have, and a smaller `HEADER_SIZE` simply makes every
+        // number smaller. The codegen picks between the compact and legacy
+        // address per OBJECT on the `GC_FLAG_COMPACT` header bit, so a shrink
+        // must move BOTH or the legacy arm writes `count` into the wrong cell.
+        ("lib.rs", [10, 1, 5, 1, 0, 0, 3, 3]),
         // ir_lower.rs: the `use` list, the three compile-time invariants
         // restated at the top of that file, two disp32 field-address
         // computations, two disp8 float array element accesses, and the disp8
@@ -40391,7 +40831,26 @@ mod layout_constant_inventory {
         // listed two files. The gap was found the honest way, by adding a
         // legacy emission site there on 2026-09-02 and having to record it by
         // hand in `header-shrink.md` because nothing counted it.
-        ("objects.rs", [8, 0, 3, 0, 2, 0, 2, 2]),
+        //
+        // 2026-09-11: `emit_inline_tlab_newarray` and
+        // `emit_sb_append_char_body` add the file's first ARRAY constants.
+        // `ARRAY_LENGTH_OFFSET` 0 -> 3: the disp8 screen at the top of the
+        // array allocator, its `MOV [R11+ARRAY_LENGTH_OFFSET], ECX` shape
+        // store, and the `MOV R9D, [RDX+ARRAY_LENGTH_OFFSET]` capacity load in
+        // the append body. `MARK_WORD_OFFSET` 2 -> 5: the same screen, plus
+        // the array header's two mark-word halves.
+        //
+        // Value-safety at a shrunk header, which is what this inventory exists
+        // to make someone check: all five are disp8 sites, which is the
+        // hazardous form — so the allocator SCREENS for it, refusing to emit
+        // (and keeping the helper) when `MARK_WORD_OFFSET + 4`,
+        // `ARRAY_LENGTH_OFFSET` or `ARRAY_DATA_OFFSET` exceeds 127. A GROWN
+        // header therefore costs coverage rather than addressing backwards,
+        // and a shrunk one only makes the displacements smaller. The append
+        // body's two are reached only through that same allocator's screen
+        // being satisfiable, and both address a live `byte[]` whose header the
+        // same constants describe.
+        ("objects.rs", [8, 3, 3, 0, 5, 0, 2, 2]),
     ];
 
     fn source(file: &str) -> &'static str {

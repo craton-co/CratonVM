@@ -3086,16 +3086,30 @@ impl<'a> Lowerer<'a> {
     ///
     /// The only read path into `node_slot`. There is no longer a value that
     /// means "unallocated": an absent location is an `Err`, never `0`.
+    #[track_caller]
     fn slot_of_checked(&self, id: NodeId) -> CompileResult<i32> {
         // A home nobody wrote is not a location. Refusing here fails the
         // compile and drops the method to the single-pass backend — a coverage
         // loss, never a wrong answer — and `home_read_refusals` names the site
         // that wanted converting. See `home_dropped`.
+        //
+        // "Names the site" was a COUNT until an `Op::NewArray` length read sent
+        // `StringRegexOnly.run` to the single-pass backend and the only way to
+        // find which of the ~45 emission sites had asked was to rebuild with a
+        // backtrace. `#[track_caller]` costs nothing on the success path — the
+        // caller's `Location` is a compile-time constant threaded in a register
+        // — and turns the refusal into the file:line of the reader that wants
+        // converting to `gp_load_value`. Both façades below forward it.
         if self.home_dropped.get(id as usize).copied().unwrap_or(false) {
             self.home_read_refusals.set(self.home_read_refusals.get() + 1);
+            let site = core::panic::Location::caller();
             return Err(Bailout::with_context(
                 BailoutReason::UnallocatedValue { node: id },
-                format!("n{id}'s home word is never written; read it from its register"),
+                format!(
+                    "n{id}'s home word is never written; read it from its register                      (read at {}:{})",
+                    site.file(),
+                    site.line(),
+                ),
             ));
         }
         match self.node_slot.get(id as usize).copied().flatten() {
@@ -3122,6 +3136,7 @@ impl<'a> Lowerer<'a> {
     /// destination and to sequentialise the edge's parallel copy, and it hands
     /// that offset to `emit_copy_op`, which decides per copy whether to store
     /// through it. Nothing here reads the word.
+    #[track_caller]
     fn slot_of_unwritten(&self, id: NodeId) -> i32 {
         match self.node_slot.get(id as usize).copied().flatten() {
             Some(off) => off.get() as i32,
@@ -3129,6 +3144,7 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    #[track_caller]
     fn slot_of(&self, id: NodeId) -> i32 {
         match self.slot_of_checked(id) {
             Ok(offset) => offset,
@@ -6960,7 +6976,43 @@ impl<'a> Lowerer<'a> {
         for p in slow_patches {
             self.patch_rel32_to_here(p);
         }
-        let arg_offsets: Vec<i32> = (0..num_args).map(|i| self.slot_of(inputs[2 + i])).collect();
+        // Where the stub loads each argument from.
+        //
+        // A value the register allocator kept wholly in a register has NO home
+        // word (`home_dropped`), and `slot_of` refuses to name one rather than
+        // emit a read of whatever the last tenant of that frame word left
+        // there. That refusal failed the whole compile — this site is on the
+        // megamorphic edge of EVERY virtual call the optimizing tier lowers, so
+        // one register-resident argument anywhere in a method dropped that
+        // method to the single-pass backend. `StringRegexOnly.run` is one such
+        // method, and the refusal is what kept the `String/Regex` row's hot
+        // method out of the optimizing tier entirely.
+        //
+        // The staging block written immediately below already holds every
+        // argument, and it is written with `gp_load_value`, which reads a
+        // register-resident value FROM its register. So a homeless argument has
+        // a perfectly good frame address to name: its staging slot. Nothing new
+        // is emitted for it, and the stores land before the stub runs (the
+        // stub's own emission follows them).
+        //
+        // Only the homeless case is redirected. An argument with a real home
+        // keeps naming it, so a megamorphic site's generated code is unchanged
+        // for every shape that compiled before this.
+        let arg_offsets: Vec<i32> = (0..num_args)
+            .map(|i| {
+                let arg = inputs[2 + i];
+                if self.home_dropped.get(arg as usize).copied().unwrap_or(false)
+                    && staged_arg_slot_enabled()
+                {
+                    // Cast: an argument index is bounded by the callee's
+                    // parameter count, so `i * 8` cannot overflow an x86-64
+                    // displacement — the same cast the staging stores make.
+                    self.args_stage_top_off - (i as i32) * 8
+                } else {
+                    self.slot_of(arg)
+                }
+            })
+            .collect();
         // Populate the staging block for the stub's own callee-deopt service.
         // This is the megamorphic region — reached only after the MIC and all
         // four PIC entries missed — so the copy costs nothing on a
@@ -19095,6 +19147,21 @@ fn ir_receiver_guard_cse_enabled() -> bool {
 /// second stated reason is a perf trade (a promoted allocation lowering through
 /// the stub buys a more optimized body at the price of a cheaper allocation)
 /// that is still unpriced.
+/// Let a megamorphic call site name a homeless argument's STAGING slot.
+///
+/// Default-ON. Opt out with `CRATONVM_NO_JIT_STAGED_ARG_SLOT=1`, which
+/// restores the `slot_of` read — and with it the `unallocated_value` bail that
+/// dropped any method with a register-resident argument at a megamorphic site
+/// to the single-pass backend. A bisection lever, not a tuning knob: what it
+/// restores is the refusal, so the before and after are two runs of one binary.
+fn staged_arg_slot_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_STAGED_ARG_SLOT").is_none()
+    })
+}
+
 fn ir_inline_tlab_enabled() -> bool {
     // 2026-09-02, the eight-finding pass: BACK TO OPT-IN, with a repro.
     //
