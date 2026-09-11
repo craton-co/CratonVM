@@ -5515,6 +5515,13 @@ fn try_delegate_real_collection(
     // stub), and `invoke_special`'s native-first lookup is the safer answer —
     // that is the input the original premise was written about, and its
     // behaviour is unchanged here.
+    //
+    // `class_declares_method` EXCLUDES compiler-generated bridges, which is
+    // the behaviour this wants rather than an accident to work around: a
+    // bridge is javac's forwarding stub, not the receiver's own body, so
+    // running it "bytecode-only" would forward to a supertype method the
+    // native-first lookup should have had a say about. Declared-and-not-a-
+    // bridge is exactly "this class provides its own implementation".
     let declares_own = ctx.class_declares_method(ctx.class_id_of_object(this), method, descriptor);
     let r = if declares_own {
         ctx.invoke_special_bytecode_only(&cls, method, descriptor, &[Value::Object(Some(this))])

@@ -592,6 +592,16 @@ fn cldr_cache() -> &'static cratonvm_types::lock_order::OrderedMutex<
 /// `CRATONVM_DBG_CATALINA=1`, six calls, all the JRE name. HotSpot's answer is
 /// the oracle and HotSpot answers from CLDR, so both names resolve to the CLDR
 /// classes rather than to `jdk.localedata`'s older JRE-package copies.
+fn cldr_packages(base_name: &str) -> Option<(&'static str, &'static str)> {
+    if base_name.starts_with("sun.text.resources.") {
+        Some(("sun/text/resources/cldr", "sun/text/resources/cldr/ext"))
+    } else if base_name.starts_with("sun.util.resources.") {
+        Some(("sun/util/resources/cldr", "sun/util/resources/cldr/ext"))
+    } else {
+        None
+    }
+}
+
 /// The bundle families that genuinely live OUTSIDE the `cldr` packages.
 ///
 /// [`cldr_packages`] maps EVERY `sun.text.resources.*` base name onto the CLDR
@@ -620,16 +630,6 @@ fn non_cldr_packages(simple: &str) -> Option<(&'static str, &'static str)> {
     match simple {
         "BreakIteratorInfo" => Some(("sun/text/resources", "sun/text/resources/ext")),
         _ => None,
-    }
-}
-
-fn cldr_packages(base_name: &str) -> Option<(&'static str, &'static str)> {
-    if base_name.starts_with("sun.text.resources.") {
-        Some(("sun/text/resources/cldr", "sun/text/resources/cldr/ext"))
-    } else if base_name.starts_with("sun.util.resources.") {
-        Some(("sun/util/resources/cldr", "sun/util/resources/cldr/ext"))
-    } else {
-        None
     }
 }
 
@@ -788,11 +788,17 @@ fn load_cldr_table(
     let table: Option<CldrTable> = if loaded_any {
         Some(std::sync::Arc::new(merged))
     } else {
-        // Warn only for the families CLDR is expected to answer. The other
-        // `sun.*.resources.*` base names (`BreakIteratorInfo`, `CollationData`,
-        // …) legitimately have no `cldr` package at all, and a warning on those
-        // would be crying wolf — which is how a real fallback notice gets
-        // filtered out of a log.
+        // Warn only for the families that are expected to answer. The other
+        // `sun.*.resources.*` base names (`CollationData`, …) legitimately have
+        // no `cldr` package at all, and a warning on those would be crying
+        // wolf — which is how a real fallback notice gets filtered out of a
+        // log.
+        //
+        // `BreakIteratorInfo` USED to be the first example in that sentence and
+        // is now in the list below instead, because `non_cldr_packages` routes
+        // it to the packages the image actually has. The sentence was right
+        // about the old behaviour and would now suppress the warning for the
+        // one family whose miss means the probe is broken.
         // `BreakIteratorInfo` is in the list because its ROOT bundle is in
         // `java.base`: unlike the `cldr` families, a jlinked image that dropped
         // `jdk.localedata` still has it, so a total miss is not the ordinary
