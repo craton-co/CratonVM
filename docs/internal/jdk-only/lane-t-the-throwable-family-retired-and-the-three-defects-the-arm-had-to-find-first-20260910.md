@@ -676,4 +676,51 @@ by the shadow that was already written to model it, not by the retirement.
 
 ### 7.3 What it measured
 
-MEASUREMENTS PENDING — filled from the acceptance run.
+Acceptance binary `cratonvm-lt6.exe`: the merged tree, LT-4, and KS-1.
+Control `cratonvm-lt4.exe`: this lane's wave without either.
+
+```text
+   RLoaderExceptionShape          default      --jdk-only
+     control (lt4)                AssertionError  AssertionError
+     trial   (lt6)                PASS 23         PASS 23
+     HotSpot                      PASS 23
+
+   64 promoted probes, lt4 -> lt6, against a HotSpot oracle
+     --jdk-only                   0 of 64 differ   ctrl 5 / trial 5
+     default                      0 of 64 differ   ctrl 5 / trial 5
+
+   SUITE=all, 134 vectors, TIMEOUT=900
+     --jdk-only                   134 / 134
+     default                      134 / 134
+
+   jdk-only-refusal-survivors.sh  5 rows, matches baseline (3,007 refusals)
+   jdk-only-census.sh             rc=0
+   stub_ratchet x3 feature arms   green after the lane-2 re-freeze
+   jdk_only_registry              green
+   jdk_only_class_origin          green
+   jdk_only_dispatch              green
+   cratonvm-types                 green after three doc numbers
+```
+
+The `ctrl 5 / trial 5` is the whole probe result rather than a summary of it:
+both arms diff from HotSpot by exactly five lines, which are
+`FfmCarrierProbe`'s pre-existing five, and the totals are equal, so nothing
+moved in either direction. That is taken with `diff -a`. The script this lane
+inherited used a bare `diff`, which prints ONE "Binary files differ" line for a
+single NUL byte and scores it as ZERO through `grep -c '^[<>]'` — so a
+crashing arm reads as perfect. Re-running the earlier wave's own numbers under
+`-a` reproduced them, which is the only reason they still stand.
+
+**134, not 133**, because `RLoaderExceptionShape` joins the corpus in this
+wave. The control fails it by construction; that is what a vector is for.
+
+### 7.4 What the vector does NOT cover
+
+It exercises the 21 `ClassNotFoundException` sites. The other ten — six
+`NullPointerException`, three `NoClassDefFoundError`, one
+`ModuleNotFoundException` — take the same funnel and the same constructor
+call, but no portable probe reaches them: a `NoClassDefFoundError` from
+constant-pool resolution needs a class compiled against a class that is then
+deleted, which the suite's single-shot `javac` cannot express, and the loader
+NPEs are reached only through internal states. They are covered by
+construction, not by measurement, and that distinction is the honest one.
