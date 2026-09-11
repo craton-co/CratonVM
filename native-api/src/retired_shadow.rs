@@ -1244,7 +1244,14 @@ const RETIRED_SHADOW_PREFIXES: &[&str] = &[
     // those classes appear in any table. `java/lang/ref/` is still absent, so
     // the belt-and-braces guard in `a_prefix_alone_retires_nothing` is intact.
     "java/lang/Class",
-    "java/lang/Module",
+    // `java/lang/Module` was here and is GONE: the wave withdrew all nine
+    // `java/lang/Module` triples after the corpus arm, so the prefix covered
+    // nothing. A prefix with no table entry behind it keeps every test green
+    // while removing the second guard `a_prefix_alone_retires_nothing`
+    // provides, which is the trap this module's own §4 warns about -- so the
+    // prefix leaves with its rows. `java/lang/module/` (lowercase, a DIFFERENT
+    // prefix that predates this wave) still covers the four
+    // `ModuleDescriptor$Version` triples.
 ];
 
 /// The 2026-08-30 Phase 2 wave: ONE triple, and the size is the finding.
@@ -1590,6 +1597,39 @@ static RETIRED_SHADOW_L3_TRIPLES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// # 54 became 38 became 29, in two corpus rounds
+///
+/// **Round 2.** With the first 16 withdrawn the arm went 97 -> **127 of 132**,
+/// and the five survivors were all mine: `RClassUnloadSweep`,
+/// `RClassUnloadSweepGen`, `RLoaderIdentity`, `RJdkModule`,
+/// `RServiceLoaderDoubleSource`. Through the harness, control 5/0 against
+/// current 0/5.
+///
+/// All nine `java/lang/Module` triples are withdrawn, and the reason is the
+/// SAME default-value trap a third time. The probe validated
+/// `Module.getName`, `getDescriptor`, `canRead` and `getClassLoader` only at
+/// their default answers -- an UNNAMED module's name (`null`), an unnamed
+/// module's descriptor (`null`), `canRead` in its TRUE direction, and
+/// "java.base's loader is null". **A retirement answering `null`/`true` for
+/// everything satisfies all four**, so all four read as agreements. The corpus
+/// asserts the other side of each, and eight discriminating rows added
+/// afterwards found `Module.getClassLoader` answering `false` for a
+/// PLATFORM-loaded module where HotSpot and the control binary both say
+/// `true`.
+///
+/// Seven of those eight new rows PASS, so `getName`, `getDescriptor`,
+/// `canRead` and `getPackages` are not individually disproven -- they are
+/// withdrawn as a family because the wave that admitted them cannot be trusted
+/// per triple, and a later wave can re-earn them one at a time with a
+/// discriminating row each. That is cheaper than shipping a third round.
+///
+/// **A methodological note on the A/B that nearly went wrong.** Run directly
+/// with `-cp regression-suite/build`, four of the five vectors failed on the
+/// CONTROL binary too and read as "not mine". They need a `--module-path` that
+/// `run.sh` supplies. Re-run through the harness, control scored 5/0. **An
+/// invocation that is not the harness's own is not a control** -- it would
+/// have dismissed four real regressions.
+///
 /// # 54 became 38: the DIAL is not a faithful simulator of a RETIREMENT
 ///
 /// **This table shipped 16 triples the corpus disproved, and the reason is
@@ -1753,35 +1793,6 @@ static RETIRED_SHADOW_L0_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/lang/Class", "isEnum", "()Z"),
     ("java/lang/Class", "isInterface", "()Z"),
     ("java/lang/Class", "isPrimitive", "()Z"),
-    (
-        "java/lang/Module",
-        "addExports",
-        "(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;",
-    ),
-    (
-        "java/lang/Module",
-        "addOpens",
-        "(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;",
-    ),
-    (
-        "java/lang/Module",
-        "addUses",
-        "(Ljava/lang/Class;)Ljava/lang/Module;",
-    ),
-    ("java/lang/Module", "canRead", "(Ljava/lang/Module;)Z"),
-    ("java/lang/Module", "canUse", "(Ljava/lang/Class;)Z"),
-    (
-        "java/lang/Module",
-        "getClassLoader",
-        "()Ljava/lang/ClassLoader;",
-    ),
-    (
-        "java/lang/Module",
-        "getDescriptor",
-        "()Ljava/lang/module/ModuleDescriptor;",
-    ),
-    ("java/lang/Module", "getName", "()Ljava/lang/String;"),
-    ("java/lang/Module", "getPackages", "()Ljava/util/Set;"),
     (
         "java/lang/module/ModuleDescriptor$Version",
         "equals",

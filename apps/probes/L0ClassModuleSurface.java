@@ -469,6 +469,35 @@ public class L0ClassModuleSurface {
         t("Version parse invalid", () -> ModuleDescriptor.Version.parse(""));
         t("Version with qualifier", () -> ModuleDescriptor.Version.parse("1.0-ea+42").toString());
 
+        // ===== DISCRIMINATING ROWS, added 2026-09-10 after the corpus arm =====
+        // The rows above validated `Module.getName`, `getDescriptor`,
+        // `canRead` and `getClassLoader` ONLY at their default answers -- an
+        // UNNAMED module's name (null), an unnamed module's descriptor (null),
+        // `canRead` in its TRUE direction, and "java.base's loader is null".
+        // A retirement that answers null or true for everything satisfies all
+        // four, so all four read as agreements. The corpus disagreed:
+        // RJdkModule and RLoaderIdentity assert the other side of each.
+        t("D Module getName NAMED", () -> Object.class.getModule().getName());
+        t("D Module getDescriptor NAMED non-null", () ->
+                Object.class.getModule().getDescriptor() != null);
+        t("D Module getDescriptor NAMED name", () -> {
+            ModuleDescriptor d = Object.class.getModule().getDescriptor();
+            return d == null ? "null" : d.name();
+        });
+        t("D Module canRead FALSE direction", () ->
+                Object.class.getModule().canRead(
+                        L0ClassModuleSurface.class.getModule()));
+        t("D Module getClassLoader app NON-null", () ->
+                L0ClassModuleSurface.class.getModule().getClassLoader() != null);
+        t("D Module getClassLoader platform NON-null", () -> {
+            Class<?> c = Class.forName("java.sql.Connection");
+            return c.getModule().getClassLoader() != null;
+        });
+        t("D Module getPackages NAMED has java.lang", () ->
+                Object.class.getModule().getPackages().contains("java.lang"));
+        t("D Module getName unnamed is still null", () ->
+                String.valueOf(L0ClassModuleSurface.class.getModule().getName()));
+
         System.out.println("DONE L0ClassModuleSurface rows=" + rows);
     }
 }

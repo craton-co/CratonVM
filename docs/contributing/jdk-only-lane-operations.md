@@ -381,6 +381,62 @@ Convert a dial result into a table entry only via a registry dump **from a run
 of the very probe whose improvement you are citing**, then rebuild and
 re-measure on two binaries.
 
+### What skipping the two-binary step actually cost, 2026-09-10
+
+The paragraph above already said "rebuild and re-measure on two binaries", and
+lane L0 shipped a 54-triple table without doing it. The `--jdk-only` arm came
+back **97 of 132** where the four previous binaries had scored 132/0. Two
+withdrawal rounds later the table is **29**. Nothing reached `dev`, and the only
+instrument that caught it was the arm.
+
+Three things that round taught, none of which is on this page yet.
+
+**1. Read the dial's `leaked` counter before citing a dial arm at all.** The
+armed run prints it:
+
+```text
+[DIAL_DOOR_CENSUS] armed=true reached=3680 yielded=3593 leaked=87
+```
+
+87 dispatches reached the dial and were **not** yielded. A leaked row reports
+the NATIVE's answer while reading, in a three-arm diff, as "the bytecode is fine
+here". `Class.isArray` was one: the armed arm printed `true/false`, matching
+HotSpot exactly, and the real retirement answers `false/false`. **`leaked > 0`
+means some rows in that arm are not evidence, and the arm does not say which.**
+
+**2. An agreement at the value a blanket yield returns anyway is not
+evidence.** This trap fired three times in one session and it is the single
+biggest source of wrong table entries:
+
+```text
+Module.getName        probed on an UNNAMED module -> null   yield returns null
+Module.getDescriptor  probed on an UNNAMED module -> null   yield returns null
+Module.canRead        probed only in its TRUE direction     yield returns true
+Module.getClassLoader probed as "java.base's is null"       yield returns null
+```
+
+All four read as clean agreements. A retirement answering `null`/`true` for
+everything satisfies every one of them, and `Module.getClassLoader` does
+exactly that — it answers `null` for a PLATFORM-loaded module, which is what
+`RLoaderIdentity` asserts and what cost five vectors in the second round.
+**Before banking an agreement, ask what the yield returns for the whole family
+and whether this row's correct answer differs from it.** If it does not, the row
+is untested; write the discriminating row (a NAMED module, the FALSE direction,
+a non-null loader) or hold the triple.
+
+**3. An invocation that is not the harness's own is not a control.** Run
+directly with `-cp regression-suite/build`, four of the five second-round
+failures failed on the CONTROL binary too and read as "not mine" — they need a
+`--module-path` that `run.sh` supplies. Re-run through the harness with
+`ONLY="..."`, the control scored 5/0 and all five were mine. Always A/B with
+`ONLY=` through `run.sh`, never with a hand-written classpath.
+
+**And re-freeze a withdrawal from a forced failure.** `stub_ratchet`'s
+assertion is `<=`, so removing entries passes silently: the constants sat 16
+above the tree with every arm green. Set each baseline to `1`, run, and read the
+failure's own paste-ready line. Arithmetic on the old constant is not a
+measurement.
+
 ### After the build: prove the retirement is not INERT before reading a probe
 
 The four preconditions above decide whether to retire. This is the first thing
