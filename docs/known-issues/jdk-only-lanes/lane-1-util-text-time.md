@@ -740,5 +740,21 @@ source is not a compile-time link to the premise it depends on.
 
 For this lane: every bucket-A/B row in the prefix set is retired, or classified
 with the measurement that refused it and the blocker named. That is §1, and it
-is complete. What remains is the seven VM changes in §10 — each one a piece of
+is complete. What remains is the eight VM changes in §10 — each one a piece of
 engineering with a stated acceptance test, not an open question.
+
+Waves 3 and 4 moved three families out of "held, reason unknown" and into
+"held, blocker named and located", which is the only kind of hold worth
+keeping:
+
+```text
+  HashMap's 77    the iterator carriers are shared with HashSet and Hashtable
+                  (key_itr_carrier_for), and LinkedHashMap inherits eight
+                  methods whose entries live in lhm_overlay()
+  JarFile         new JarFile(f) itself NPEs under the yield
+  BreakIterator   AbstractMethodError — the locale provider hands back no
+                  concrete RuleBasedBreakIterator, the SAME lookup that makes
+                  item 6's five provider rows vacuous
+```
+
+None of those is "9 probes move". Each names a function and a file.
