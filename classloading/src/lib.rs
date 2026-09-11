@@ -84,6 +84,7 @@ pub use class_manager::ImageMethodVerdict;
 // because that is where the descriptor knowledge lives.
 pub use class_manager::array_descriptor_element_class;
 pub use class_manager::synthetic_stub_instance_field_count;
+pub use class_manager::synthetic_stub_total_field_count;
 // The fabricated slot MODEL itself, not just its size. `shadow_layout` diffs it
 // against the real layout; a build-time gate over the `*_FIELD_*` constants —
 // the follow-up `jdk-only-object-layout-audit.md` §"A gate worth adding"

@@ -89,6 +89,13 @@ pub mod socket_input_stream_read;
 /// accessors for it and a map with two owners drifts —
 /// W7-72-ssc-socket-and-filechannel.md.
 pub mod synthetic_file_channel;
+/// Turn named rows of the retirement tables back OFF at runtime, so
+/// bisecting a wave costs a run instead of a ~25-minute build. A
+/// DIAGNOSTIC: unset -- every shipping configuration -- it is inert, and
+/// `the_default_is_inert_across_every_retired_row` asserts that against the
+/// whole table rather than a sample. Sibling of [`retired_shadow`], whose
+/// tables it reads and never writes.
+pub mod unretire;
 pub mod vm_scoped;
 
 /// Lightweight `NativeContext` mock available to tests and to other

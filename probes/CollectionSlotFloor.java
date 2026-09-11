@@ -27,7 +27,7 @@ import java.util.*;
  * clean. Compare the SET of mismatches against that baseline rather than
  * expecting a bare pass in synthetic mode.
  *
- * See docs/known-issues/perf/jdk-collection-classes-are-padded-to-a-synthetic-stub-floor-20260911.md
+ * See docs/internal/fixed-bugs/jdk-collection-classes-are-padded-to-a-synthetic-stub-floor-FIXED-20260911.md
  */
 public class CollectionSlotFloor {
     static int failures = 0;
@@ -62,6 +62,16 @@ public class CollectionSlotFloor {
         StringBuilder sb = new StringBuilder();
         for (Map.Entry<String, Integer> e : ordered.entrySet()) sb.append(e.getValue()).append(',');
         check("LinkedHashMap insertion order", "0,1,2,3,4,5,6,7,8,9,10,11,", sb.toString());
+
+        // The EMPTY read path, for the sorted families.
+        //
+        // Every section above fills its collection first, so none of them ever
+        // reads one that has no backing array. `TreeMap`/`TreeSet` install
+        // theirs on the first insert (`native_tm_put` / `native_ts_add`), which
+        // makes "never written" a state the readers have to handle rather than
+        // a state they happen never to see -- and a reader that assumes an
+        // array reads a fresh map as a crash or as garbage, not as empty.
+        emptySortedReads();
 
         // EnumMap / EnumSet have their own floors.
         EnumMap<Day, String> em = new EnumMap<>(Day.class);
@@ -160,6 +170,112 @@ public class CollectionSlotFloor {
         check(name + " toArray length", "39", String.valueOf(c.toArray().length));
         c.clear();
         check(name + " after clear", "true", String.valueOf(c.isEmpty()));
+    }
+
+    /// Reads against a sorted collection that has never been written.
+    static void emptySortedReads() {
+        TreeMap<String, String> tm = new TreeMap<>();
+        check("empty TreeMap size", "0", String.valueOf(tm.size()));
+        check("empty TreeMap isEmpty", "true", String.valueOf(tm.isEmpty()));
+        check("empty TreeMap get", "null", String.valueOf(tm.get("k")));
+        check("empty TreeMap containsKey", "false", String.valueOf(tm.containsKey("k")));
+        check("empty TreeMap remove", "null", String.valueOf(tm.remove("k")));
+        check("empty TreeMap keySet", "0", String.valueOf(tm.keySet().size()));
+        check("empty TreeMap entrySet", "0", String.valueOf(tm.entrySet().size()));
+        check("empty TreeMap values", "0", String.valueOf(tm.values().size()));
+        check("empty TreeMap iterator", "false",
+                String.valueOf(tm.entrySet().iterator().hasNext()));
+        check("empty TreeMap toString", "{}", tm.toString());
+        check("empty TreeMap equals empty", "true",
+                String.valueOf(tm.equals(new TreeMap<String, String>())));
+        try {
+            tm.firstKey();
+            check("empty TreeMap firstKey throws", "NoSuchElementException", "no throw");
+        } catch (NoSuchElementException e) {
+            check("empty TreeMap firstKey throws", "NoSuchElementException",
+                    "NoSuchElementException");
+        }
+        tm.clear();
+        check("empty TreeMap clear then put/get", "v", put1(tm));
+
+        TreeMap<String, String> cmp = new TreeMap<>(Comparator.reverseOrder());
+        check("empty TreeMap(cmp) size", "0", String.valueOf(cmp.size()));
+        check("empty TreeMap(cmp) get", "null", String.valueOf(cmp.get("k")));
+        cmp.put("a", "1");
+        cmp.put("b", "2");
+        check("empty TreeMap(cmp) keeps comparator", "b", cmp.firstKey());
+
+        TreeSet<String> ts = new TreeSet<>();
+        check("empty TreeSet size", "0", String.valueOf(ts.size()));
+        check("empty TreeSet isEmpty", "true", String.valueOf(ts.isEmpty()));
+        check("empty TreeSet contains", "false", String.valueOf(ts.contains("e")));
+        check("empty TreeSet remove", "false", String.valueOf(ts.remove("e")));
+        check("empty TreeSet iterator", "false", String.valueOf(ts.iterator().hasNext()));
+        check("empty TreeSet toString", "[]", ts.toString());
+        check("empty TreeSet toArray length", "0", String.valueOf(ts.toArray().length));
+        check("empty TreeSet equals empty", "true",
+                String.valueOf(ts.equals(new TreeSet<String>())));
+        try {
+            ts.first();
+            check("empty TreeSet first throws", "NoSuchElementException", "no throw");
+        } catch (NoSuchElementException e) {
+            check("empty TreeSet first throws", "NoSuchElementException",
+                    "NoSuchElementException");
+        }
+        ts.clear();
+        ts.add("z");
+        ts.add("a");
+        check("empty TreeSet clear then add", "a", ts.first());
+
+        TreeSet<String> tsc = new TreeSet<>(Comparator.reverseOrder());
+        check("empty TreeSet(cmp) size", "0", String.valueOf(tsc.size()));
+        tsc.add("a");
+        tsc.add("b");
+        check("empty TreeSet(cmp) keeps comparator", "b", tsc.first());
+
+        // The NAVIGABLE readers, which derive a view from the backing store
+        // rather than reading an element out of it -- the ones most likely to
+        // assume the store exists.
+        TreeMap<String, String> nav = new TreeMap<>();
+        check("empty TreeMap firstEntry", "null", String.valueOf(nav.firstEntry()));
+        check("empty TreeMap lastEntry", "null", String.valueOf(nav.lastEntry()));
+        check("empty TreeMap ceilingKey", "null", String.valueOf(nav.ceilingKey("k")));
+        check("empty TreeMap floorKey", "null", String.valueOf(nav.floorKey("k")));
+        check("empty TreeMap higherKey", "null", String.valueOf(nav.higherKey("k")));
+        check("empty TreeMap lowerKey", "null", String.valueOf(nav.lowerKey("k")));
+        check("empty TreeMap pollFirstEntry", "null", String.valueOf(nav.pollFirstEntry()));
+        check("empty TreeMap headMap", "0", String.valueOf(nav.headMap("m").size()));
+        check("empty TreeMap tailMap", "0", String.valueOf(nav.tailMap("m").size()));
+        check("empty TreeMap subMap", "0", String.valueOf(nav.subMap("a", "z").size()));
+        check("empty TreeMap descendingMap", "0", String.valueOf(nav.descendingMap().size()));
+        check("empty TreeMap descendingKeySet", "0",
+                String.valueOf(nav.descendingKeySet().size()));
+        check("empty TreeMap copy ctor", "0",
+                String.valueOf(new TreeMap<String, String>(nav).size()));
+        check("empty TreeMap putAll of empty", "0", putAllEmpty(nav));
+
+        TreeSet<String> nts = new TreeSet<>();
+        check("empty TreeSet pollFirst", "null", String.valueOf(nts.pollFirst()));
+        check("empty TreeSet pollLast", "null", String.valueOf(nts.pollLast()));
+        check("empty TreeSet ceiling", "null", String.valueOf(nts.ceiling("k")));
+        check("empty TreeSet floor", "null", String.valueOf(nts.floor("k")));
+        check("empty TreeSet headSet", "0", String.valueOf(nts.headSet("m").size()));
+        check("empty TreeSet tailSet", "0", String.valueOf(nts.tailSet("m").size()));
+        check("empty TreeSet subSet", "0", String.valueOf(nts.subSet("a", "z").size()));
+        check("empty TreeSet descendingSet", "0", String.valueOf(nts.descendingSet().size()));
+        check("empty TreeSet copy ctor", "0", String.valueOf(new TreeSet<String>(nts).size()));
+        check("empty TreeSet addAll of empty", "false",
+                String.valueOf(nts.addAll(new TreeSet<String>())));
+    }
+
+    static String putAllEmpty(TreeMap<String, String> m) {
+        m.putAll(new TreeMap<String, String>());
+        return String.valueOf(m.size());
+    }
+
+    static String put1(TreeMap<String, String> m) {
+        m.put("k", "v");
+        return String.valueOf(m.get("k"));
     }
 
     static void check(String what, String expected, String actual) {

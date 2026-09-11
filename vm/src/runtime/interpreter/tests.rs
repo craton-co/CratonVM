@@ -3961,6 +3961,38 @@ fn split_descriptor_arrays() {
     assert_eq!(r, "[I");
 }
 
+/// The four tests above all pass a WELL-FORMED descriptor, which is why a
+/// panic on the malformed one survived: `split_method_descriptor_ref` skipped
+/// the `(` by starting its cursor at 1 and then sliced the tail unguarded, so
+/// an empty descriptor panicked instead of being rejected. It reached that
+/// state from `Lookup.unreflect` on a VM whose core-reflection natives were
+/// yielding, and took the VM down with it (`internal error: native method
+/// panic`) rather than returning a value any caller could handle.
+///
+/// A parser reachable from a native must be total over its input type.
+#[test]
+fn split_descriptor_rejects_malformed_without_panicking() {
+    // The exact input that aborted the VM.
+    let (p, r) = split_method_descriptor("");
+    assert!(p.is_empty(), "no parameters from an empty descriptor");
+    assert_eq!(r, "", "empty return token, matching descriptor_return_ref");
+
+    // Anything not opening with `(` is the same class of input.
+    for d in ["V", "I)V", "Ljava/lang/String;", ")", "["] {
+        let (p, r) = split_method_descriptor(d);
+        assert!(
+            p.is_empty(),
+            "{d:?} does not open with '(' and must yield no parameters"
+        );
+        assert_eq!(r, "", "{d:?} must yield an empty return token");
+    }
+
+    // A well-formed descriptor is untouched by the guard.
+    let (p, r) = split_method_descriptor("(I)V");
+    assert_eq!(p, vec!["I"]);
+    assert_eq!(r, "V");
+}
+
 #[test]
 fn is_primitive_desc_covers_all_8_primitives() {
     for t in &["I", "J", "F", "D", "B", "S", "Z", "C"] {

@@ -328,6 +328,25 @@ const MAX_BLIND_SITES: usize = 1_000;
 /// **These 51 rows are debt this gate could not see, not debt this change
 /// created.** They are recorded rather than fixed, which is what every other
 /// row in this table is: "Every row is a debt, not a permission."
+///
+/// **Found twice, independently, on the same day** -- this branch (lane L0)
+/// and `claude/gate-baselines-refresh-20260911` both widened this scan on
+/// 2026-09-10/11 and both landed on +51/+54. The counts of blind sites differ
+/// by scope, not by disagreement: 745-747 in the five scanned crates, 757
+/// tree-wide.
+///
+/// One thing worth adding to the account above, because it explains the
+/// *rate*: the blind set is not a uniform sample of the registry. Converting
+/// `register` -> `register_with_kind` is this campaign's standard remedy for a
+/// contract-1.4 shadow, so the sites spelled that way are precisely the ones
+/// whose kind was ADJUDICATED. Every adjudication therefore removed the
+/// shipping half of any drift pair its triple belonged to, and this gate
+/// reported the removal as `STALE BASELINE -- recorded drift pair(s) no longer
+/// drift`. Good news wearing a defect's clothes, once per adjudication --
+/// which is the same species as the six gates `d5ca22357` repaired on
+/// 2026-08-30, counting 230 `register_with_kind(` sites in
+/// `native-builtins/src/lib.rs` alone against 1207 plain ones. This file was
+/// the one that commit did not reach.
 const BASELINE_TOTAL_DRIFT: usize = 1275;
 
 /// `(synthetic-only pass, triple)` PAIRS in [`DRIFT_TRIPLES`] -- larger than
@@ -4190,6 +4209,11 @@ fn build_analysis() -> Analysis {
             // … p59 has its own"). A resolver blind spot reads exactly like a
             // fix, which is the failure mode this file's vacuity control exists
             // for and which a per-site skip like this one walks straight past.
+            // Two lanes widened this scan independently on the same day and
+            // agreed on the pair count; the site counts differ by scope only
+            // (745-747 in the five scanned crates, 757 tree-wide). The
+            // addendum on the baseline's doc comment has why the blind set is
+            // not a uniform sample of the registry.
             let after = if t[after..].starts_with(b"_with_kind") {
                 after + 10
             } else {

@@ -843,7 +843,17 @@ fn dlbf_register_bean_definition(
 fn empty_hashmap(ctx: &mut dyn NativeContext) -> MethodCallResult {
     let map = match ctx.new_object("java/util/HashMap").ok().flatten() {
         Some(Value::Object(Some(o))) => o,
-        _ => crate::try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 8)?,
+        // Width asked for: the table's own count for this class. This
+        // allocation writes NO slot -- it is a fallback that hands the
+        // object straight to the real `<init>` (or to a field) -- so any
+        // width the class can actually be is correct, and
+        // `alloc_concurrent_synthetic` takes `max(n, real)` anyway. It
+        // used to ask for a generous round number, which the T9C gate
+        // reads as a SHAPE the natives index and scores the table short
+        // against. The only way to satisfy that reading is to widen the
+        // table, and a widened floor pads the real class past its
+        // declared width -- which costs it the compact layout entirely.
+        _ => crate::try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?,
     };
     // GC-safety: the `<init>` invocation below can itself allocate; pin
     // `map` and re-read the forwarded reference before returning it.
@@ -1086,7 +1096,8 @@ fn cache_get_mapped(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => {
             // Return empty set
-            let s = crate::try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 8)?;
+            // See the `empty_hashmap` note: a fallback that writes no slot.
+            let s = crate::try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?;
             return Ok(Some(Value::Object(Some(s))));
         }
     };
@@ -1099,7 +1110,7 @@ fn cache_get_mapped(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // data was null OR we just installed an empty one — return empty Set.
     let s = match ctx.new_object("java/util/HashSet").ok().flatten() {
         Some(Value::Object(Some(o))) => o,
-        _ => crate::try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 8)?,
+        _ => crate::try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?,
     };
     // GC-safety: the `<init>` invocation below can itself allocate; pin
     // `s` and re-read the forwarded reference before returning it.

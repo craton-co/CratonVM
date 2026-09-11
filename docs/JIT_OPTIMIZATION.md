@@ -1762,6 +1762,30 @@ inversion**, and it is why the switch is kept rather than the change reverted:
 it is the smallest known perturbation that moves this loop by 20%, which makes
 it the cheapest handle on whatever the real cause is.
 
+**2026-09-11 — RETIRED: the anomaly no longer reproduces.** Re-measured on the
+current tree with `tools/tier-ab/flag-ab.sh` (7 rounds, interleaved, same-config
+control, checksum `1200150000` on every run), `CRATONVM_JIT_IR_THIS_NONNULL` on
+`probes/FieldLoop.java` `sum` is **0.981x — UNMEASURABLE inside a 4.6% floor**.
+It is not 20% slower; it is not measurably anything. Whatever arrangement
+produced the 1.78/1.93-against-1.49/1.61 medians is gone, most likely with the
+phi-copy change in
+`docs/internal/performance/c2-the-phi-copy-staging-register-20260911.md` §5.
+
+So this paragraph's standing recommendation — keep the switch because it is the
+cheapest handle on the residual inversion — no longer holds: there is no longer
+an effect for it to be a handle on. Keep the switch on its own merits (it is
+correct and it elides real checks), not as a lead.
+
+The layout theory it invited was tested and did not survive either.
+`docs/internal/performance/c2-the-loop-body-is-mostly-code-it-never-runs-20260911.md`
+counts this loop at **412 bytes spanned, ~122 executed**, the rest cold code
+emitted inline; `CRATONVM_JIT_IR_POLL_OUTLINE` removes the largest of those
+blocks (229 bytes) and one taken branch per iteration, and it measures
+**0.999x — UNMEASURABLE**. A well-predicted branch over cold bytes costs
+approximately nothing, because fetch follows the predicted target rather than
+the linear address. What actually moved this loop was removing WORK: see the
+same document's §3.
+
 One structural asymmetry is worth naming as a candidate: the receiver
 null-check elision described above — the `this` seed and
 `CRATONVM_JIT_RECEIVER_NULL_ELIM` — is **single-pass only**. Both arms it
