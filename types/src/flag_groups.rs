@@ -617,6 +617,10 @@ pub const INVENTORY: &[E] = &[
     // decision. That flag is a HINT to `mmap`, so "set" and "engaged" are
     // different facts and only this line separates them.
     E { group: Group::DBG, token: "code-near-globals", on_key: Some("CRATONVM_DBG_CODE_NEAR_GLOBALS"), off_key: None, off_word: None, since: "2026-09-10" },
+    // Which cell the layout-epoch counter ended up in, and its address. The
+    // witness for `jit/epoch-cell`, whose install FAILS CLOSED and would
+    // otherwise do so silently.
+    E { group: Group::DBG, token: "epoch-cell", on_key: Some("CRATONVM_DBG_EPOCH_CELL"), off_key: None, off_word: None, since: "2026-09-11" },
     E { group: Group::DBG, token: "ir-compiles", on_key: Some("CRATONVM_DBG_IR_COMPILES"), off_key: None, off_word: None, since: "2026-07-31" },
     // The trace half of `jit/ir-linear-scan`; same token name in the group that
     // owns tracing, exactly like `ir-long` and `xt-jit-root-scan` below.
@@ -1359,6 +1363,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-phi-residency", on_key: Some("CRATONVM_JIT_IR_PHI_RESIDENCY"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "ir-phi-copy-regs", on_key: Some("CRATONVM_JIT_IR_PHI_COPY_REGS"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "ir-phi-copy-direct", on_key: Some("CRATONVM_JIT_IR_PHI_COPY_DIRECT"), off_key: None, off_word: Some("0"), since: "2026-09-11" },
+    E { group: Group::JIT, token: "ir-branch-layout-polarity", on_key: Some("CRATONVM_JIT_IR_BRANCH_LAYOUT_POLARITY"), off_key: None, off_word: Some("0"), since: "2026-09-11" },
     E { group: Group::JIT, token: "ir-phi-home-publish-guard", on_key: Some("CRATONVM_JIT_IR_PHI_HOME_PUBLISH_GUARD"), off_key: None, off_word: Some("0"), since: "2026-09-07" },
     E { group: Group::JIT, token: "ir-phi-edge-interfere", on_key: Some("CRATONVM_JIT_IR_PHI_EDGE_INTERFERE"), off_key: None, off_word: Some("0"), since: "2026-09-06" },
     E { group: Group::JIT, token: "ir-skip-republish", on_key: Some("CRATONVM_JIT_IR_SKIP_REPUBLISH"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
@@ -1434,6 +1439,11 @@ pub const INVENTORY: &[E] = &[
     // shipped with. Must not be combined with `code-near-globals`, whose
     // placement anchor is this counter.
     E { group: Group::JIT, token: "layout-epoch-static", on_key: Some("CRATONVM_JIT_LAYOUT_EPOCH_STATIC"), off_key: None, off_word: None, since: "2026-09-10" },
+    // Default ON: the layout-epoch counter takes a cell from the JIT code
+    // cache's own allocator, so the short guard encoding is in reach by
+    // construction. `=0` puts it back on the Rust heap, which is the arm the
+    // 2026-09-11 A/B was taken against.
+    E { group: Group::JIT, token: "epoch-cell", on_key: Some("CRATONVM_JIT_EPOCH_CELL"), off_key: None, off_word: Some("0"), since: "2026-09-11" },
     E { group: Group::JIT, token: "code-near-globals", on_key: Some("CRATONVM_JIT_CODE_NEAR_GLOBALS"), off_key: None, off_word: None, since: "2026-09-10" },
     E { group: Group::JIT, token: "ir-speculate", on_key: Some("CRATONVM_JIT_IR_SPECULATE"), off_key: None, off_word: None, since: "2026-09-09" },
     // Diagnosis lever, value-taking: a comma-separated list of conservative
@@ -1665,6 +1675,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-list-sched", on_key: Some("CRATONVM_JIT_IR_LIST_SCHED"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "ir-carry-rcx-folded", on_key: Some("CRATONVM_JIT_IR_CARRY_RCX_FOLDED"), off_key: None, off_word: Some("0"), since: "2026-09-10" },
     E { group: Group::JIT, token: "ir-unroll-unreachable-frames", on_key: Some("CRATONVM_JIT_IR_UNROLL_UNREACHABLE_FRAMES"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::JIT, token: "ir-per-copy-frames", on_key: Some("CRATONVM_JIT_IR_PER_COPY_FRAMES"), off_key: None, off_word: None, since: "2026-09-11" },
     E { group: Group::JIT, token: "c2-accept", on_key: Some("CRATONVM_C2_ACCEPT"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "c2-accept-memo", on_key: Some("CRATONVM_C2_ACCEPT_MEMO"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "ir-unresolved-class-trap", on_key: Some("CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP"), off_key: None, off_word: None, since: "2026-09-06" },

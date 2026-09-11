@@ -479,7 +479,7 @@ accepted={accepted} total={ms}ms",
     }
 
     // The per-SITE half of the same question, and the reason it once took a
-    // sampled-backtrace build to answer: `MEMBERSHIP_WALK_BY_SITE` has counted
+    // sampled-backtrace build to answer: the per-thread walk tallies have counted
     // every JIT-helper membership walk since it was added, and
     // `membership_walks_by_site()` -- its only reader -- had NO CALLER at all.
     // A write-only counter is a diagnosis nobody can read; the census's own doc

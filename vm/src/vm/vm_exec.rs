@@ -2175,7 +2175,17 @@ pub fn coerce_value_for_return(value: Value, ret_type: u8) -> Value {
 /// the method descriptor's return type.
 #[inline]
 pub fn coerce_native_return(value: Option<Value>, descriptor: &str) -> Option<Value> {
-    let ret = crate::jit::return_type(descriptor);
+    coerce_native_return_typed(value, crate::jit::return_type(descriptor))
+}
+
+/// [`coerce_native_return`] for a caller that already holds the descriptor's
+/// return tag.
+///
+/// `crate::jit::return_type` is a byte-at-a-time scan for `)`, and the compiled
+/// native dispatch path runs it on every call for a descriptor it has already
+/// decoded once (see `jit::helpers::JitArgShape`). Same answer, no scan.
+#[inline]
+pub fn coerce_native_return_typed(value: Option<Value>, ret: u8) -> Option<Value> {
     if ret == b'V' {
         return value;
     }
@@ -3464,7 +3474,9 @@ pub(crate) fn safe_native_call_leaf(
     // Copy nothing unless the barrier has something to rewrite — see the same
     // shape, and the measurement behind it, in `safe_native_call_impl`.
     const INLINE_NATIVE_ARGS: usize = crate::jit::helpers::INLINE_JIT_NATIVE_ARGS;
-    let mut inline_forwarded = [Value::Object(None); INLINE_NATIVE_ARGS];
+    // Declared, not initialised — see the same shape, and the measurement, in
+    // `safe_native_call_impl`.
+    let mut inline_forwarded: [Value; INLINE_NATIVE_ARGS];
     let mut heap_forwarded: Vec<Value>;
     let mut moved = None;
     for (index, value) in args.iter().enumerate() {
@@ -3480,6 +3492,7 @@ pub(crate) fn safe_native_call_leaf(
         None => args,
         Some(first_moved) => {
             let buf: &mut [Value] = if args.len() <= INLINE_NATIVE_ARGS {
+                inline_forwarded = [Value::Object(None); INLINE_NATIVE_ARGS];
                 inline_forwarded[..args.len()].copy_from_slice(args);
                 &mut inline_forwarded[..args.len()]
             } else {
@@ -3828,12 +3841,27 @@ fn safe_native_call_impl(
     // whether or not one is used, measured at 7.3 ns for the two scratch arrays
     // together in `native_funnel_profile` (`vm_exec.rs`), against a ~23 ns
     // one-argument funnel.
-    let mut inline_forwarded = [Value::Object(None); INLINE_NATIVE_ARGS];
+    // DECLARED, not initialised. The comment above prices the eight-`Value`
+    // fill at 7.3 ns for the pair and says it is paid "whether or not one is
+    // used" — and the ordinary case is that none is, because an argument that
+    // forwards to itself needs no scratch at all. Definite-assignment lets the
+    // fill move into the arm that actually reads it, so the common path stores
+    // nothing. Measured at 2.7-3.8 ns for the remaining array on
+    // `native_funnel_profile`'s scratch rung, against a ~26 ns funnel.
+    let mut inline_forwarded: [Value; INLINE_NATIVE_ARGS];
     let mut heap_forwarded: Vec<Value>;
     let mut moved = None;
     for (index, value) in args.iter().enumerate() {
         if let Value::Object(Some(obj)) = value {
-            let forwarded = shared.mem.heap.load_and_forward(*obj);
+            // The caller already walked these pointers when it validated them;
+            // `load_and_forward` would walk each one again. See
+            // `VmHeap::load_and_forward_validated` for the contract, and
+            // `safe_native_call_prevalidated_objects` for who establishes it.
+            let forwarded = if prevalidated_objects {
+                shared.mem.heap.load_and_forward_validated(*obj)
+            } else {
+                shared.mem.heap.load_and_forward(*obj)
+            };
             if forwarded.as_ptr() != obj.as_ptr() {
                 moved = Some(index);
                 break;
@@ -3847,6 +3875,7 @@ fn safe_native_call_impl(
         // its own forwarding target.
         Some(first_moved) => {
             let forwarded_args: &mut [Value] = if args.len() <= INLINE_NATIVE_ARGS {
+                inline_forwarded = [Value::Object(None); INLINE_NATIVE_ARGS];
                 inline_forwarded[..args.len()].copy_from_slice(args);
                 &mut inline_forwarded[..args.len()]
             } else {
@@ -13845,6 +13874,30 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
 
     fn heap_element_type_of(&self, obj: ObjectRef) -> ArrayElementType {
         self.shared.mem.heap.element_type_of(obj)
+    }
+
+    /// One membership walk and one forwarding barrier for all three answers.
+    ///
+    /// `object_is_array` + `heap_element_type_of` + `array_length` repeat both
+    /// per call, and `array_length`'s walk alone was measurable on the
+    /// `String/Regex` row: `is_object_address` is 5% of its builder phase, and
+    /// `sb_view` asks all three of these questions about the same payload
+    /// array on every `append`. The KINDOF-SENTINEL guard comes first for the
+    /// reason `array_length` documents — an invalid `obj` must not reach
+    /// `load_and_forward`, whose first read dereferences it unconditionally.
+    fn array_shape(&self, obj: ObjectRef) -> Option<(ArrayElementType, usize)> {
+        self.shared
+            .mem
+            .heap
+            .is_object_address(obj.as_ptr() as usize)?;
+        let obj = self.shared.mem.heap.load_and_forward_validated(obj);
+        if self.shared.mem.heap.kind_of_validated(obj) != ObjectKind::Array {
+            return None;
+        }
+        Some((
+            self.shared.mem.heap.element_type_of_validated(obj),
+            self.shared.mem.heap.array_length(obj),
+        ))
     }
 
     fn create_string(&mut self, text: &str) -> ObjectRef {

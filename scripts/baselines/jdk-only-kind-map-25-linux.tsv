@@ -35,6 +35,32 @@
 #   of them are the rows above. The other two -- Formatter.formatMessage and
 #   its neighbour -- are untouched here and still read `intrinsic 0 1` where
 #   the tree now produces `bridge`.
+# amended: 2026-09-10, the `--jdk-only` loader-and-bootstrap lane. FIVE rows
+#   edited by hand, not re-measured, on the same convention as the two blocks
+#   above: the value of each is DERIVED from a deterministic rule in
+#   NativeMethodRegistry::register, not guessed.
+#
+#   java/lang/ClassLoader registerAsParallelCapable ()Z  ordinals 0, 1 and 2
+#   java/security/SecureClassLoader <clinit> ()V         ordinal 0
+#     bridge -> synthetic-stub, kind_stated 0 -> 1. Both triples are now in
+#     RETIRED_SHADOW_L7_TRIPLES; the retag fires on an effective category of
+#     Bridge and sets SyntheticStub with kind_stated true, so the value is
+#     forced rather than chosen. ALL THREE ordinals of the registerAsParallelCapable
+#     triple move, because the table is keyed by TRIPLE and every registration
+#     of it is re-tagged -- which is also why the fix could not have been made
+#     by editing the one site that owns the slot.
+#
+#   java/lang/Class getName ()Ljava/lang/String;         ordinal 0
+#     bridge -> intrinsic, kind_stated 0 -> 1. A reviewed Intrinsic under
+#     contract 1.4's exception: yielding reads java.lang.Class.name, which this
+#     VM overlays with the INTERNAL class name, so the real bytecode answers
+#     "java/lang/Object". Reviewed with apps/probes/ClassNameSweep.java, 85 rows:
+#     0 diffs unarmed, 18 armed.
+#
+#     THIS ROW WAS RECORDED AS ALREADY TAGGED and was not. lane 0's page said so
+#     from 2026-09-09; the registration was still bridge/kind_stated:false and
+#     this file still read `bridge 0 1`. The two disagreeing was the visible
+#     trace, exactly as the LogRecord block above records for its own case.
 # amended: 2026-08-12, W7-62-ratchets-and-dead-code.md. TWELVE more rows edited
 #   by hand, not re-measured, on the same convention as the block above: the
 #   value of each is DERIVED from a deterministic rule in
@@ -2005,7 +2031,7 @@ java/lang/Class	getMethod	(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/refle
 java/lang/Class	getMethods	()[Ljava/lang/reflect/Method;	0	bridge	0	1
 java/lang/Class	getModifiers	()I	0	bridge	0	1
 java/lang/Class	getModule	()Ljava/lang/Module;	0	intrinsic	1	1
-java/lang/Class	getName	()Ljava/lang/String;	0	bridge	0	1
+java/lang/Class	getName	()Ljava/lang/String;	0	intrinsic	1	1
 java/lang/Class	getNestHost0	()Ljava/lang/Class;	0	bridge	1	1
 java/lang/Class	getNestMembers0	()[Ljava/lang/Class;	0	bridge	1	1
 java/lang/Class	getPackage	()Ljava/lang/Package;	0	bridge	0	1
@@ -2109,9 +2135,9 @@ java/lang/ClassLoader	getSystemResources	(Ljava/lang/String;)Ljava/util/Enumerat
 java/lang/ClassLoader	getUnnamedModule	()Ljava/lang/Module;	0	bridge	0	1
 java/lang/ClassLoader	loadClass	(Ljava/lang/String;)Ljava/lang/Class;	0	bridge	0	1
 java/lang/ClassLoader	loadClass	(Ljava/lang/String;Z)Ljava/lang/Class;	0	bridge	0	1
-java/lang/ClassLoader	registerAsParallelCapable	()Z	0	bridge	0	1
-java/lang/ClassLoader	registerAsParallelCapable	()Z	1	bridge	0	1
-java/lang/ClassLoader	registerAsParallelCapable	()Z	2	bridge	0	1
+java/lang/ClassLoader	registerAsParallelCapable	()Z	0	synthetic-stub	1	1
+java/lang/ClassLoader	registerAsParallelCapable	()Z	1	synthetic-stub	1	1
+java/lang/ClassLoader	registerAsParallelCapable	()Z	2	synthetic-stub	1	1
 java/lang/ClassLoader	registerNatives	()V	0	bridge	1	1
 java/lang/ClassLoader	retrieveDirectives	()Ljava/lang/AssertionStatusDirectives;	0	bridge	1	1
 java/lang/ClassLoader	setDefaultAssertionStatus	(Z)V	0	bridge	0	1
@@ -5938,7 +5964,7 @@ java/security/Provider$ServiceKey	<clinit>	()V	0	bridge	0	1
 java/security/PublicKey	getAlgorithm	()Ljava/lang/String;	0	bridge	0	1
 java/security/PublicKey	getEncoded	()[B	0	bridge	0	1
 java/security/PublicKey	getFormat	()Ljava/lang/String;	0	bridge	0	1
-java/security/SecureClassLoader	<clinit>	()V	0	bridge	0	1
+java/security/SecureClassLoader	<clinit>	()V	0	synthetic-stub	1	1
 java/security/SecureRandom	<init>	()V	0	intrinsic	0	1
 java/security/SecureRandom	<init>	()V	1	intrinsic	0	1
 java/security/SecureRandom	<init>	([B)V	0	intrinsic	0	1

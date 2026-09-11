@@ -203,17 +203,42 @@ if ($a.Count -eq 0 -or $c.Count -eq 0 -or $b.Count -eq 0) {
 $mid = ($ma + $mc) / 2.0
 $floor = [math]::Abs($ma - $mc) / $mid * 100.0
 $effect = ($mb - $mid) / $mid * 100.0
+# ── The resolution trap, which a clean floor makes WORSE ──────────────
+#
+# Windows accounts CPU time in scheduler ticks of ~15.625 ms, so one tick is a
+# fixed number of MILLISECONDS and a fixed PERCENTAGE only once you fix the
+# sample size. At a 0.59 s median one tick is 2.7% -- and two medians landing on
+# the same tick then report a noise floor of 0.0%, which reads as the tightest
+# measurement the apparatus has ever produced and is in fact the coarsest.
+#
+# That happened, on this script, on 2026-09-11: a +1.3% effect against a '0.0%'
+# floor, which re-run at six times the work per sample became +0.6% against
+# 0.6% -- UNMEASURABLE, the correct answer. A floor BELOW one tick is not a
+# floor; it is two numbers that were never distinguishable.
+#
+# So the tick is quoted next to the floor and the verdict is suppressed when
+# the effect is inside it. `cpu-ab.sh`'s header says 'aim for seconds' for the
+# same reason and leaves it to the reader; this says the number.
+$TICK_MS = 15.625
+$tick_pct = ($TICK_MS / 1000.0) / $mid * 100.0
 'noise floor (A vs C)      : {0,6:F1}%' -f $floor | Write-Host
+'one CPU tick (15.6 ms)    : {0,6:F1}%  of the median sample' -f $tick_pct | Write-Host
 'effect  (B vs mean(A,C))  : {0,6:F1}%   ratio {1:F3}x' -f $effect, ($mb / $mid) | Write-Host
 
-if ([math]::Abs($effect) -le $floor) {
-    Write-Host 'VERDICT: UNMEASURABLE -- the effect is inside the noise floor.'
+$resolution = [math]::Max($floor, $tick_pct)
+if ([math]::Abs($effect) -le $resolution) {
+    if ($tick_pct -gt $floor) {
+        'VERDICT: UNMEASURABLE -- the effect ({0:F1}%) is inside ONE CPU TICK ({1:F1}%), whatever the floor says. Raise the work per sample.' -f [math]::Abs($effect), $tick_pct | Write-Host
+    }
+    else {
+        Write-Host 'VERDICT: UNMEASURABLE -- the effect is inside the noise floor.'
+    }
 }
 elseif ($effect -lt 0) {
-    'VERDICT: B IS FASTER -- {0:F1}% below the floor of {1:F1}%' -f [math]::Abs($effect), $floor | Write-Host
+    'VERDICT: B IS FASTER -- {0:F1}%, above a resolution of {1:F1}%' -f [math]::Abs($effect), $resolution | Write-Host
 }
 else {
-    'VERDICT: B IS SLOWER -- {0:F1}% above the floor of {1:F1}%' -f $effect, $floor | Write-Host
+    'VERDICT: B IS SLOWER -- {0:F1}%, above a resolution of {1:F1}%' -f $effect, $resolution | Write-Host
 }
 
 # A within-invocation floor bounds the drift INSIDE this invocation and says
