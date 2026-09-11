@@ -413,6 +413,32 @@ pub fn report_at_exit() {
             crate::runtime::interpreter::jit_bridge::deferred_new_reoffered(),
         );
     }
+    // The DEFERRED carry -- a consumer taking BOTH of its single-use operands
+    // in registers rather than one.
+    //
+    // OUTSIDE the supersede block on purpose. Everything above it is gated on
+    // a C1 body having been superseded, and most workloads that compile
+    // hundreds of methods never supersede one: the first run of this census
+    // over the probe set reported `planned=0` from 54 processes that had
+    // compiled thousands of methods between them, which is an instrument
+    // armed where nobody reads it rather than a fact about the code.
+    //
+    // Read against its denominator. `taken` alone says how often the shape
+    // was TAKEN and nothing about how often it was there, and
+    // `c2-one-carry-slot-is-the-frame-traffic-ceiling-FIXED-20260910.md`
+    // closed on exactly that distinction. `candidates` is every consumer
+    // already taking its first
+    // operand in RAX -- the shape the second slot exists for.
+    // `declined_mid_writes_rcx` is the share of those refused because the arm
+    // in between can write RCX, and `foldable` is the part of THAT which
+    // `CRATONVM_JIT_IR_CARRY_RCX_FOLDED` converts.
+    if crate::runtime::env_cache::dbg_jitc() {
+        let (dc, dt, dm, df) = cratonvm_jit::ir_lower::ir_carry_deferred_census();
+        eprintln!(
+            "[c2-supersede] ir deferred carries: candidates={dc} taken={dt} \
+             declined_mid_writes_rcx={dm} (foldable={df})"
+        );
+    }
     if direct_binds_enabled() {
         eprintln!(
             "[direct-binds] Integer.intValue: sites_bound={} served={} declined_to_dispatch={}",

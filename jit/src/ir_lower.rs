@@ -1053,6 +1053,33 @@ struct Lowerer<'a> {
     /// Deferred carries planned, taken and read — engagement for the census.
     carry_deferred_planned: usize,
     carry_deferred_read: usize,
+    /// Why a `[input1, input0, cons]` triple was NOT deferred, per cause:
+    /// [0 no-RAX-carry-on-the-middle, 1 producer-already-carrying,
+    ///  2 producer-multi-use, 3 producer-type-or-arm, 4 producer-resident,
+    ///  5 operand-position, 6 consumer, 7 middle-arm-can-write-RCX].
+    ///
+    /// A bare `deferred=N/M` says how often the shape was TAKEN and nothing
+    /// about how often it was there, and that is the distinction
+    /// `c2-one-carry-slot-is-the-frame-traffic-ceiling-FIXED-20260910.md`
+    /// closed on — so the causes are split finely enough to name the next
+    /// increment rather than merely to record that there was one.
+    ///
+    /// Cause 0 is every other triple of scheduled nodes and is not a candidate;
+    /// [`Self::deferred_candidates`] is the denominator the rest divide into.
+    /// `deferred_mid_foldable` splits cause 7: how many of those middle arms
+    /// fold their own second operand into an immediate and so never reach
+    /// `gp_load_value(RCX, ..)` at all.
+    deferred_skips: [usize; 8],
+    deferred_mid_foldable: usize,
+    /// Windows in which the consumer already takes its FIRST operand in RAX —
+    /// the shape the second slot exists for, and the only honest denominator
+    /// for the causes above.
+    deferred_candidates: usize,
+    /// Writes to RCX this lowering has emitted, through every route in this
+    /// file that reaches the register. Snapshotted around each node so a
+    /// deferred carry's survival is OBSERVED rather than predicted — see
+    /// [`Self::note_rcx_written`].
+    rcx_writes: usize,
     /// Fused compares that read both operands where they already were.
     cmp_in_place: usize,
     /// Fused compares that read the second operand straight out of its frame
@@ -1640,6 +1667,10 @@ impl<'a> Lowerer<'a> {
             carry_deferred: Vec::new(),
             carry_deferred_planned: 0,
             carry_deferred_read: 0,
+            deferred_skips: [0; 8],
+            deferred_mid_foldable: 0,
+            deferred_candidates: 0,
+            rcx_writes: 0,
             cmp_in_place: 0,
             cmp_in_place_frame: 0,
             cmp_imm: 0,
@@ -2357,6 +2388,89 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Does lowering THIS NODE leave RCX exactly as it found it?
+    ///
+    /// [`op_preserves_rcx`] asked of the op, widened by the one fact an op
+    /// cannot express: a binary arm reaches RCX only through the REGISTER form
+    /// of its second operand, and an operand that folds into an immediate never
+    /// takes that branch. The three fold helpers (`emit_alu_acc_imm`,
+    /// `emit_imul_imm`, `emit_shift_imm`) all decide on `alu_imm32(id)`, so
+    /// asking that here is asking the arm's own question rather than a proxy
+    /// for it — and `every_folded_arm_reaches_rcx_only_in_its_register_form`
+    /// is what holds the two together.
+    ///
+    /// `alu_imm32` already answers `None` when `ir_alu_imm_enabled()` is off,
+    /// so the two flags cannot disagree: with folding off nothing here is
+    /// eligible and this collapses back to `op_preserves_rcx`.
+    ///
+    /// A prediction, and treated as one: `lower_data_node_tracked` compares
+    /// `rcx_writes` across the node and refuses the compile if the arm wrote
+    /// RCX anyway.
+    fn node_preserves_rcx(&self, id: NodeId) -> bool {
+        let Some(node) = self.graph.nodes.get(id as usize) else {
+            return false;
+        };
+        if op_preserves_rcx(&node.op) {
+            return true;
+        }
+        if !ir_carry_rcx_folded_enabled() {
+            return false;
+        }
+        // The FP forms of these ops go through `fp_load_value` into XMM0/XMM1
+        // and never reach the arm this reasons about.
+        if !matches!(node.ty, IrType::Int | IrType::Long) {
+            return false;
+        }
+        if !matches!(
+            node.op,
+            Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::And
+                | Op::Or
+                | Op::Xor
+                | Op::Shl
+                | Op::Shr
+                | Op::UShr
+        ) {
+            return false;
+        }
+        node.inputs
+            .get(1)
+            .is_some_and(|&b| self.alu_imm32(b).is_some())
+    }
+
+    /// Would `node_preserves_rcx` admit `id` if the folded widening were on?
+    ///
+    /// Census only, and deliberately independent of both flags: a run with
+    /// `CRATONVM_JIT_IR_CARRY_RCX_FOLDED=0` still reports how many triples the
+    /// widening would have converted, which is the number that prices it
+    /// WITHOUT a second run.
+    fn mid_would_fold(&self, id: NodeId) -> bool {
+        let Some(node) = self.graph.nodes.get(id as usize) else {
+            return false;
+        };
+        matches!(node.ty, IrType::Int | IrType::Long)
+            && matches!(
+                node.op,
+                Op::Add
+                    | Op::Sub
+                    | Op::Mul
+                    | Op::And
+                    | Op::Or
+                    | Op::Xor
+                    | Op::Shl
+                    | Op::Shr
+                    | Op::UShr
+            )
+            && node.inputs.get(1).is_some_and(|&b| {
+                matches!(
+                    self.graph.nodes.get(b as usize).map(|c| &c.op),
+                    Some(Op::Const(v)) if i32::try_from(*v).is_ok()
+                )
+            })
+    }
+
     /// `<op> EAX/RAX, imm32` in the one-byte accumulator form, if `id` is a
     /// constant. Answers whether it emitted, so the caller skips its
     /// register-to-register form.
@@ -2470,6 +2584,12 @@ impl<'a> Lowerer<'a> {
                 }
             }
         }
+        // Past both carry slots, so this read is not the one either was
+        // planned for. If it names RCX it is about to overwrite whatever a
+        // deferred carry left there.
+        if dst == RCX {
+            self.note_rcx_written();
+        }
         // 2026-09-02: a constant is an IMMEDIATE, not a frame word. The
         // `Op::Const` arm still writes its home (a deopt frame may name it,
         // and some sites still read slots directly), but no reader of a
@@ -2523,6 +2643,17 @@ impl<'a> Lowerer<'a> {
     /// `MOV dst, src` — 64-bit register to register, for any pair including the
     /// extended registers the GP file is made of.
     fn emit_mov_reg_reg64(&mut self, dst: u8, src: u8) {
+        if dst == RCX {
+            self.note_rcx_written();
+        }
+        self.emit_mov_reg_reg64_raw(dst, src);
+    }
+
+    /// [`Self::emit_mov_reg_reg64`] without the RCX bookkeeping, for the ONE
+    /// site that writes RCX on purpose while a deferred carry is being
+    /// INSTALLED: `store_rax` moving the carried value out of RAX. Every other
+    /// caller wants the counter to move.
+    fn emit_mov_reg_reg64_raw(&mut self, dst: u8, src: u8) {
         if dst == src {
             return;
         }
@@ -5449,6 +5580,7 @@ impl<'a> Lowerer<'a> {
 
     /// MOV RCX, [RBP - offset]
     fn load_to_rcx(&mut self, offset: i32) {
+        self.note_rcx_written();
         let mut bytes = FrameAccess::new();
         enc_frame_load(RCX, offset, &mut bytes);
         self.buf.emit(bytes.as_slice());
@@ -5473,8 +5605,11 @@ impl<'a> Lowerer<'a> {
         if let Some((id, reg, cons)) = carry {
             // RAX already holds it — that is what the store was about to
             // write. RCX costs one register move and still removes a load.
+            // `_raw`, because this write to RCX is the carry being INSTALLED:
+            // counting it would make the producer's own node look as if it had
+            // clobbered the value it just placed.
             if reg != RAX {
-                self.emit_mov_reg_reg64(reg, RAX);
+                self.emit_mov_reg_reg64_raw(reg, RAX);
             }
             if self.carry_deferred.get(id as usize).copied().unwrap_or(false) {
                 // The DEFERRED slot. `reg` is RCX by construction (the planner
@@ -5537,6 +5672,27 @@ impl<'a> Lowerer<'a> {
                 BailoutReason::UnallocatedValue { node: prod },
                 format!("n{prod}'s carry to n{cons} did not hold: {why}"),
             ));
+        }
+    }
+
+    /// Count a write to RCX, and kill a deferred carry it has just destroyed.
+    ///
+    /// The OBSERVATION half of the deferred carry's proof. `op_preserves_rcx`
+    /// and [`Self::node_preserves_rcx`] are audits of SOURCE, so they can be
+    /// wrong in the one direction that matters — claiming an arm leaves RCX
+    /// alone when it does not. Every route by which this file reaches RCX
+    /// (`gp_load_value`, `load_to_rcx`, `emit_mov_reg_reg64` and the two
+    /// immediate forms) calls this first, so a wrong audit costs the METHOD, at
+    /// the node that did it, and never a wrong answer at run time.
+    ///
+    /// The counter is what `lower_data_node_tracked` compares across a node:
+    /// "did this arm write RCX" is then a fact about the emission rather than a
+    /// prediction about the op, which is what lets the audit widen past the two
+    /// ops whose arms mention no RCX at all.
+    fn note_rcx_written(&mut self) {
+        self.rcx_writes += 1;
+        if self.deferred_rcx.is_some() {
+            self.refuse_deferred("RCX was written before its consumer read it");
         }
     }
 
@@ -5628,6 +5784,9 @@ impl<'a> Lowerer<'a> {
 
     /// MOV reg, imm64 (REX.W [+ REX.B for r8–r15]).
     fn emit_mov_reg_imm64(&mut self, reg: u8, val: u64) {
+        if reg == RCX {
+            self.note_rcx_written();
+        }
         let rex = 0x48 | if reg >= 8 { 0x01 } else { 0 }; // REX.W (+REX.B)
         self.buf.emit_byte(rex);
         self.buf.emit_byte(0xB8 + (reg & 7));
@@ -7543,6 +7702,9 @@ impl<'a> Lowerer<'a> {
         // Everything else is the adjacent rule verbatim: one use, an `Int` or
         // `Long`, a producer whose home store is one `store_rax`, a consumer
         // that reads RAX then RCX, and no residency claim on the value.
+        let mut deferred_skips = [0usize; 8];
+        let mut deferred_mid_foldable = 0usize;
+        let mut deferred_candidates = 0usize;
         if ir_carry_single_use_enabled() && ir_carry_second_operand_enabled() {
             if self.carry_deferred.len() < n_nodes {
                 self.carry_deferred.resize(n_nodes, false);
@@ -7557,38 +7719,66 @@ impl<'a> Lowerer<'a> {
                     // together deliberately, rather than dependence order
                     // happening to look the same.
                     if carry_of.get(mid as usize).copied().flatten() != Some((RAX, cons)) {
+                        deferred_skips[0] += 1;
                         continue;
                     }
-                    if carry_of.get(prod as usize).copied().flatten().is_some() {
-                        continue;
-                    }
-                    if use_count.get(prod as usize).copied().unwrap_or(0) != 1 {
-                        continue;
-                    }
-                    let (Some(pn), Some(cn), Some(mn)) = (
+                    // From here the window IS the shape the second slot exists
+                    // for — a consumer already taking its first operand in RAX
+                    // — so everything below is a CANDIDATE declined, and the
+                    // causes are split finely enough to be acted on. Above it is
+                    // every other triple of scheduled nodes, which is a
+                    // denominator no decision depends on.
+                    deferred_candidates += 1;
+                    let (Some(pn), Some(cn)) = (
                         self.graph.nodes.get(prod as usize),
                         self.graph.nodes.get(cons as usize),
-                        self.graph.nodes.get(mid as usize),
                     ) else {
                         continue;
                     };
                     // RCX is the second operand's register, so this only ever
-                    // applies to a value read there.
+                    // applies to a value read there. When the node two back is
+                    // not that operand, the operand is somewhere the pairing
+                    // pass could not bring it — another block, a phi, a
+                    // parameter, or behind a node it may not cross.
                     if cn.inputs.get(1) != Some(&prod) {
+                        deferred_skips[5] += 1;
+                        continue;
+                    }
+                    if carry_of.get(prod as usize).copied().flatten().is_some() {
+                        deferred_skips[1] += 1;
+                        continue;
+                    }
+                    if use_count.get(prod as usize).copied().unwrap_or(0) != 1 {
+                        deferred_skips[2] += 1;
                         continue;
                     }
                     if !matches!(pn.ty, IrType::Int | IrType::Long)
-                        || !matches!(cn.ty, IrType::Int | IrType::Long)
+                        || !op_home_is_one_store_rax(&pn.op)
                     {
-                        continue;
-                    }
-                    if !op_home_is_one_store_rax(&pn.op) || !op_reads_rax_then_rcx(&cn.op) {
-                        continue;
-                    }
-                    if !op_preserves_rcx(&mn.op) {
+                        deferred_skips[3] += 1;
                         continue;
                     }
                     if self.assigned_gpr(prod).is_some() {
+                        deferred_skips[4] += 1;
+                        continue;
+                    }
+                    if !matches!(cn.ty, IrType::Int | IrType::Long)
+                        || !op_reads_rax_then_rcx(&cn.op)
+                    {
+                        deferred_skips[6] += 1;
+                        continue;
+                    }
+                    // The one arm in between has to leave RCX alone. Asked of
+                    // the NODE, not the op: a binary arm reaches RCX only
+                    // through the register form of its own second operand, and
+                    // a folded operand never takes that branch.
+                    if !self.node_preserves_rcx(mid) {
+                        deferred_skips[7] += 1;
+                        // …and how many of those are the folded shape, so a run
+                        // with the widening switched OFF still prices it.
+                        if self.mid_would_fold(mid) {
+                            deferred_mid_foldable += 1;
+                        }
                         continue;
                     }
                     carry_of[prod as usize] = Some((RCX, cons));
@@ -7618,6 +7808,9 @@ impl<'a> Lowerer<'a> {
                 self.home_dropped[*id as usize] = true;
             }
         }
+        self.deferred_skips = deferred_skips;
+        self.deferred_mid_foldable = deferred_mid_foldable;
+        self.deferred_candidates = deferred_candidates;
         self.carry_skips = carry_skips;
         self.carry_named = carry_named;
         self.unreachable_homes += carry_unreachable;
@@ -7717,6 +7910,9 @@ impl<'a> Lowerer<'a> {
     /// bits: `mov r32, imm32` (zero-extends) for 0..=u32::MAX, `mov r64,
     /// simm32` for the rest of the i32 range, `mov r64, imm64` otherwise.
     fn emit_mov_reg_imm_smart(&mut self, reg: u8, val: i64) {
+        if reg == RCX {
+            self.note_rcx_written();
+        }
         if (0..=i64::from(u32::MAX)).contains(&val) {
             if reg >= 8 {
                 self.buf.emit_byte(0x41); // REX.B
@@ -7820,6 +8016,7 @@ impl<'a> Lowerer<'a> {
         let prev_published = self.cur_def_published;
         self.cur_def = Some(id);
         self.cur_def_published = false;
+        let rcx_writes_before = self.rcx_writes;
         self.lower_data_node(id);
         // A CARRIED value satisfies its dropped home the other way: it is left
         // in RAX or RCX for its one consumer rather than published into a
@@ -7869,12 +8066,13 @@ impl<'a> Lowerer<'a> {
             } else if id == cons {
                 // The consumer finished without taking it out of RCX.
                 self.refuse_deferred("its consumer finished without reading it");
-            } else if !self
-                .graph
-                .nodes
-                .get(id as usize)
-                .is_some_and(|n| op_preserves_rcx(&n.op))
-            {
+            } else if self.rcx_writes != rcx_writes_before {
+                // OBSERVED, not predicted. `note_rcx_written` has normally
+                // refused already; this is the same fact asked of the node as a
+                // whole, and it is what lets `node_preserves_rcx` widen past
+                // the two ops whose arms mention no RCX at all.
+                self.refuse_deferred("the arm in between wrote RCX");
+            } else if !self.node_preserves_rcx(id) {
                 self.refuse_deferred("an arm that can write RCX was lowered in between");
             } else if allowance == 0 {
                 self.refuse_deferred("more than one arm came between it and its consumer");
@@ -14012,6 +14210,34 @@ fn ir_carry_second_operand_enabled() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_IR_CARRY_RCX_FOLDED=0` — restrict a deferred carry's crossing
+/// to the ops [`op_preserves_rcx`] names, ignoring the folded-operand widening
+/// [`Lowerer::node_preserves_rcx`] adds.
+///
+/// Default ON since 2026-09-10. `op_preserves_rcx` is two ops, and its own doc
+/// gives the reason: *every* binary arm loads its second operand with
+/// `gp_load_value(RCX, node.inputs[1])`. That is true of the arm, and false of
+/// the arm on the path it takes when that operand is a CONSTANT — every one of
+/// them opens `if !self.emit_alu_acc_imm(node.inputs[1], ..)` (or the `imul` /
+/// shift form), and the folded branch never reaches the RCX read at all. The
+/// three fold helpers share one predicate, `alu_imm32(id).is_some()`, so the
+/// planner can ask the arm's own question rather than a weaker one.
+///
+/// That is a NODE-level fact, not an op-level one, which is why it cannot live
+/// in `op_preserves_rcx`. `x + 1`, `x & 0xFF`, `x >>> 3` and `x * 31` are the
+/// commonest producers in Java arithmetic, and before this every one of them
+/// disqualified whatever was scheduled behind it.
+fn ir_carry_rcx_folded_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CARRY_RCX_FOLDED").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
 /// `CRATONVM_JIT_IR_ADD_LEA=0` — lower `x + k` and `x - k` through the
 /// accumulator, the shape that predates 2026-09-10.
 ///
@@ -14032,6 +14258,64 @@ fn ir_add_lea_enabled() -> bool {
             Ok("0") | Ok("false") | Ok("off")
         )
     })
+}
+
+/// The ops whose arms reach RCX ONLY through the register form of their second
+/// operand, so that folding that operand into an immediate leaves RCX
+/// untouched.
+///
+/// Membership is a claim about arm SHAPE and nothing else: one
+/// `gp_load_value(RAX, node.inputs[0])`, then a single
+/// `if !self.emit_<fold>(node.inputs[1], ..) { self.gp_load_value(RCX,
+/// node.inputs[1]); .. }`, then `store_rax`.
+/// `every_folded_arm_reaches_rcx_only_in_its_register_form` checks that, and
+/// checks the fold helpers' shared predicate too — the tie between "the
+/// planner thinks this folds" and "the arm took the folded branch".
+///
+/// The FP-typed forms of these ops take an entirely different path
+/// (`fp_load_value` into XMM0/XMM1), so `node_preserves_rcx` restricts to
+/// `Int`/`Long`.
+const RCX_FREE_WHEN_FOLDED: &[&str] = &[
+    "Add", "Sub", "Mul", "And", "Or", "Xor", "Shl", "Shr", "UShr",
+];
+
+/// Deferred carries, process-wide: `(candidate windows, taken, declined because
+/// the arm in between can write RCX, of which that arm folds its own second
+/// operand)`.
+///
+/// A CANDIDATE is a consumer already taking its first operand in RAX, which is
+/// the only honest denominator: the shape the second slot exists for.
+///
+/// A per-compile census answers "did it fire on THIS method", which is the
+/// question a kernel asks. Retiring
+/// `c2-one-carry-slot-is-the-frame-traffic-ceiling-FIXED-20260910.md` needed
+/// the other one — how often the shape occurs across a probe set — and that
+/// is a total over every method a run compiles, not a line per method to be
+/// summed by eye.
+static IR_CARRY_DEFERRED: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// `(candidates, taken, mid_writes_rcx, of_which_foldable)` since process start.
+pub fn ir_carry_deferred_census() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        IR_CARRY_DEFERRED[0].load(Relaxed),
+        IR_CARRY_DEFERRED[1].load(Relaxed),
+        IR_CARRY_DEFERRED[2].load(Relaxed),
+        IR_CARRY_DEFERRED[3].load(Relaxed),
+    )
+}
+
+fn note_deferred_census(candidates: usize, taken: usize, mid_rcx: usize, foldable: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    IR_CARRY_DEFERRED[0].fetch_add(candidates as u64, Relaxed);
+    IR_CARRY_DEFERRED[1].fetch_add(taken as u64, Relaxed);
+    IR_CARRY_DEFERRED[2].fetch_add(mid_rcx as u64, Relaxed);
+    IR_CARRY_DEFERRED[3].fetch_add(foldable as u64, Relaxed);
 }
 
 /// `CRATONVM_JIT_IR_CMP_IN_PLACE=0` — load both operands of a fused compare into
@@ -17833,6 +18117,16 @@ pub(crate) fn lower_inner_with_scopes(
     {
         let _ = lowerer.census_home_blocks();
     }
+    // Unconditional, and cheap: four relaxed adds per compiled method. The
+    // per-method lines below are behind a diagnostic flag; this total is what a
+    // probe-set census reads, and a census you have to switch on is one nobody
+    // has for the run they already did.
+    note_deferred_census(
+        lowerer.deferred_candidates,
+        lowerer.carry_deferred_planned,
+        lowerer.deferred_skips[7],
+        lowerer.deferred_mid_foldable,
+    );
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
         eprintln!(
             "[ir-ls] carries: planned={} taken={} read={} refused={} \
@@ -17856,6 +18150,18 @@ pub(crate) fn lower_inner_with_scopes(
             "[ir-ls] carry skips: multi_use={} wrong_type={} producer_arm={} \
              already_resident={} consumer_arm={} operand_position={}",
             s[0], s[1], s[2], s[3], s[4], s[5],
+        );
+        let d = lowerer.deferred_skips;
+        eprintln!(
+            "[ir-ls] deferred candidates={} taken={} | declined: \
+             prod_carrying={} prod_multi_use={} prod_type_or_arm={} \
+             prod_resident={} operand_position={} consumer={} \
+             mid_writes_rcx={} (of which foldable={}) | non_candidate_windows={}",
+            lowerer.deferred_candidates,
+            lowerer.carry_deferred_planned,
+            d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+            lowerer.deferred_mid_foldable,
+            d[0],
         );
         eprintln!(
             "[ir-ls] alu immediates folded: {} add_lea={}+{}",
@@ -25967,6 +26273,336 @@ mod tests {").next().unwrap_or(src);
                      arm and update the list."
                 );
             }
+        }
+    }
+
+    /// [`RCX_FREE_WHEN_FOLDED`] claims of nine binary arms that their ONLY
+    /// route to RCX is the REGISTER form of their own second operand — so an
+    /// operand folded to an immediate leaves RCX untouched and the arm can
+    /// carry a deferred value across itself.
+    ///
+    /// `op_preserves_rcx` could not express that: it is a claim about a NODE
+    /// (does *this* second operand fold?) rather than about an op. What makes
+    /// it safe is that the claim is checkable in the source three ways, and
+    /// this test does all three:
+    ///
+    /// 1. **The fold helpers decide on exactly the predicate the planner
+    ///    asks.** `emit_alu_acc_imm`, `emit_imul_imm` and `emit_shift_imm` all
+    ///    open `let Some(imm) = self.alu_imm32(id) else { return false; };`,
+    ///    which is what ties `node_preserves_rcx`'s question to the branch the
+    ///    arm actually takes. If one of them grew a second reason to decline,
+    ///    the planner could predict a fold the arm does not perform.
+    /// 2. **Every mention of RCX in the arm is inside that fold's `else`
+    ///    branch**, and there is exactly one such branch per arm.
+    /// 3. **Nothing outside it can reach RCX by another route** — no raw
+    ///    `buf.emit`, and only calls from a closed list, of which the sole
+    ///    register-bearing one is `gp_load_value(RAX, node.inputs[0])`.
+    ///
+    /// A failure here says the widening has drifted from the arms. The
+    /// emitter's `rcx_writes` comparison in `lower_data_node_tracked` is the
+    /// net under it — the compile is refused rather than wrong — but a refusal
+    /// is a silent perf cliff, so this is where it should be caught.
+    /// The two lists that have to agree: `RCX_FREE_WHEN_FOLDED`, which the
+    /// audit above checks against the arms, and the `matches!` inside
+    /// `Lowerer::node_preserves_rcx`, which is what the planner actually asks.
+    ///
+    /// They are separate because one is strings for a source scan and the other
+    /// is `Op` patterns for a match, and nothing in the language ties them
+    /// together. A name in the planner's list but not the audit's is an arm
+    /// claimed by NOTHING -- the widening would cross it on a promise no test
+    /// has read. A name in the audit's but not the planner's is only a missed
+    /// optimization, and it fails here too, because a list that is checked and
+    /// unused reads exactly like one that is checked and used.
+    #[test]
+    fn the_planner_and_the_audit_name_the_same_folded_ops() {
+        let src = include_str!("ir_lower.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn node_preserves_rcx(&self, id: NodeId) -> bool {")
+            .nth(1)
+            .expect("node_preserves_rcx is in this file")
+            .split("\n    }")
+            .next()
+            .expect("the function ends");
+        let mut planner = std::collections::BTreeSet::new();
+        collect_op_names(body, &mut planner);
+        // `op_preserves_rcx` is consulted first and contributes no names of its
+        // own here; the only `Op::` patterns in this body are the folded list
+        // and the `IrType` guard, which `collect_op_names` does not match.
+        let audited: std::collections::BTreeSet<String> = super::RCX_FREE_WHEN_FOLDED
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(
+            planner, audited,
+            "`node_preserves_rcx` and `RCX_FREE_WHEN_FOLDED` name different ops. \
+             The first decides what a deferred carry may cross; the second is \
+             what `every_folded_arm_reaches_rcx_only_in_its_register_form` \
+             checks against the arms. A name in the first and not the second is \
+             an arm crossed on a promise no test has read.",
+        );
+        assert!(
+            !planner.is_empty(),
+            "the planner scan found nothing - `node_preserves_rcx` changed \
+             shape and this test would now pass vacuously"
+        );
+    }
+
+    #[test]
+    fn every_folded_arm_reaches_rcx_only_in_its_register_form() {
+        let src = include_str!("ir_lower.rs").replace("\r\n", "\n");
+
+        // (1) The three fold helpers share one predicate with the planner.
+        for helper in ["emit_alu_acc_imm", "emit_imul_imm", "emit_shift_imm"] {
+            let f = src
+                .split(&format!("fn {helper}(&mut self,"))
+                .nth(1)
+                .unwrap_or_else(|| panic!("{helper} is in this file"))
+                .split("\n    fn ")
+                .next()
+                .expect("the function ends");
+            assert!(
+                f.starts_with(" id: NodeId,"),
+                "{helper}'s first parameter is no longer the operand node — \
+                 `node_preserves_rcx` passes `node.inputs[1]` to it",
+            );
+            assert!(
+                f.contains("let Some(imm) = self.alu_imm32(id) else {"),
+                "{helper} no longer declines exactly on `alu_imm32` — \
+                 `node_preserves_rcx` would then predict folds the arm does \
+                 not perform, and a deferred carry would cross an arm that \
+                 does reach `gp_load_value(RCX, ..)`",
+            );
+        }
+
+        let body = src
+            .split("fn lower_data_node(&mut self, id: NodeId) {")
+            .nth(1)
+            .expect("lower_data_node is in this file")
+            .split("\n    fn ")
+            .next()
+            .expect("the function ends");
+        let mut arms: Vec<(std::collections::BTreeSet<String>, Vec<String>)> = Vec::new();
+        for line in body.lines() {
+            if line.starts_with("            | Op::") {
+                if let Some(last) = arms.last_mut() {
+                    collect_op_names(line, &mut last.0);
+                    continue;
+                }
+            }
+            if line.starts_with("            Op::") {
+                let mut names = std::collections::BTreeSet::new();
+                collect_op_names(line, &mut names);
+                arms.push((names, Vec::new()));
+                continue;
+            }
+            if let Some(last) = arms.last_mut() {
+                last.1.push(line.to_string());
+            }
+        }
+        assert!(
+            !arms.is_empty(),
+            "the arm scan found nothing — `lower_data_node`'s shape changed \
+             and this test would now pass vacuously"
+        );
+
+        const GUARDS: &[&str] = &[
+            "if !self.emit_alu_acc_imm(node.inputs[1],",
+            "if !self.emit_imul_imm(node.inputs[1],",
+            "if !self.emit_shift_imm(node.inputs[1],",
+        ];
+        // Everything an admitted arm may call OUTSIDE the fold's else branch.
+        // `gp_load_value` is the only one that names a register, and the check
+        // below pins which one.
+        const OUTSIDE_CALLS: &[&str] = &[
+            "alloc_slot",
+            "gp_load_value",
+            "store_rax",
+            // The FP path of `Add`/`Sub`/`Mul`, which `node_preserves_rcx`
+            // never admits (it requires `IrType::Int | IrType::Long`) and
+            // which reaches XMM0/XMM1, never RCX.
+            "fp_load_value",
+            "fp_binop",
+            "fp_store_value",
+            // 2026-09-11: `Op::Add`'s arm grew an `LEA` form. It emits into
+            // `assigned_gpr(id)` or `resident_gpr(x)` or RAX, reads
+            // `carry_names` / `carry_at_store` without writing, and otherwise
+            // only stores and counts. None of those can be RCX, and that is
+            // asserted below rather than left to this comment.
+            "emit_add_lea",
+        ];
+        // The claim `emit_add_lea` rests on, checked here rather than argued:
+        // the residency file the arms write into names neither carry register.
+        // If it ever did, an `LEA` into a promoted value would land in RCX and
+        // a deferred carry crossing that arm would read it.
+        for r in crate::regalloc::xmm_roles::IR_GP_LINEAR_SCAN {
+            assert_ne!(r, RAX, "the GP file names RAX; no arm may publish there");
+            assert_ne!(r, RCX, "the GP file names RCX, which a deferred carry holds");
+        }
+
+        for name in super::RCX_FREE_WHEN_FOLDED {
+            let arm = arms
+                .iter()
+                .find(|(names, _)| names.contains(*name))
+                .unwrap_or_else(|| {
+                    panic!("`RCX_FREE_WHEN_FOLDED` claims Op::{name}, which has no arm")
+                });
+            let mut inside = false;
+            let mut depth = 0i32;
+            let mut guards = 0;
+            let mut outside: Vec<&str> = Vec::new();
+            let mut guarded: Vec<&str> = Vec::new();
+            for line in &arm.1 {
+                let t = line.trim();
+                if !inside && GUARDS.iter().any(|g| t.starts_with(g)) {
+                    inside = true;
+                    guards += 1;
+                    depth = line.matches('{').count() as i32 - line.matches('}').count() as i32;
+                    continue;
+                }
+                if inside {
+                    depth += line.matches('{').count() as i32;
+                    depth -= line.matches('}').count() as i32;
+                    guarded.push(line);
+                    if depth <= 0 {
+                        inside = false;
+                    }
+                    continue;
+                }
+                outside.push(line);
+            }
+            assert_eq!(
+                guards, 1,
+                "Op::{name}'s arm has {guards} fold guards on `node.inputs[1]`, \
+                 not one — `node_preserves_rcx` reasons about exactly one",
+            );
+            assert!(
+                guarded.iter().any(|l| l.contains("RCX")),
+                "Op::{name}'s fold guard has no RCX branch at all, so this arm \
+                 is not the shape `RCX_FREE_WHEN_FOLDED` describes and the test \
+                 would pass vacuously",
+            );
+            let outside_text = outside.join("\n");
+            assert!(
+                !outside_text.contains("RCX"),
+                "Op::{name}'s arm names RCX outside its folded operand's `else` \
+                 branch, so folding that operand does not make the arm \
+                 RCX-free — `RCX_FREE_WHEN_FOLDED` must not claim it",
+            );
+            assert!(
+                !outside_text.contains("self.buf.emit("),
+                "Op::{name}'s arm emits raw bytes outside its fold guard. A \
+                 ModRM byte can name RCX where the identifier scan cannot see \
+                 it — re-verify the arm before claiming it",
+            );
+            for call in outside_text.match_indices("self.").map(|(i, _)| {
+                let rest = &outside_text[i + "self.".len()..];
+                rest.split('(').next().unwrap_or("").trim().to_string()
+            }) {
+                assert!(
+                    OUTSIDE_CALLS.contains(&call.as_str()),
+                    "Op::{name}'s arm calls `self.{call}` outside its fold \
+                     guard, which this test has not verified to leave RCX \
+                     alone. Read it, then add it to OUTSIDE_CALLS or drop the \
+                     op from `RCX_FREE_WHEN_FOLDED`",
+                );
+            }
+            let reads: Vec<&str> = outside
+                .iter()
+                .map(|l| l.trim())
+                .filter(|l| l.starts_with("self.gp_load_value("))
+                .collect();
+            assert_eq!(
+                reads,
+                vec!["self.gp_load_value(RAX, node.inputs[0]);"],
+                "Op::{name}'s arm reads something other than its first operand \
+                 into RAX outside the fold guard",
+            );
+        }
+    }
+
+    /// The deferred carry EXECUTES correctly when it fires, with a folded
+    /// binary arm in between — the case `op_preserves_rcx` alone cannot admit.
+    ///
+    /// The source audits above prove the arms cannot write RCX. This proves the
+    /// other half, which no audit can: that a body in which one operand reached
+    /// its consumer through RCX across another arm computes the same integers
+    /// as one in which it went through the frame. Both schedules are lowered
+    /// from the same graph and both are called, so a divergence is attributable
+    /// to the pairing and to nothing else.
+    ///
+    /// `(a + 1) ^ (b * 3)` is the smallest shape that needs the widening:
+    /// dependence order puts the `Add` before the `Mul`, pairing sinks it to
+    /// `[Mul, Add, Xor]`, and the arm the `Mul`'s value has to survive is the
+    /// `Add` — which reaches RCX only through the register form of `+ 1`, and
+    /// `+ 1` folds.
+    #[test]
+    fn a_folded_middle_arm_carries_both_operands_and_still_computes_the_answer() {
+        // iload_0, iconst_1, iadd, iload_1, iconst_3, imul, ixor, ireturn
+        let code = [0x1a, 0x04, 0x60, 0x1b, 0x06, 0x68, 0x82, 0xac, 0, 0];
+        let mut graph = IrBuilder::new(2, 2).build(&code, 8).expect("IR build");
+        ir_optimize::optimize(&mut graph);
+
+        let plain = ir_schedule::schedule_with_options(
+            &graph,
+            &ir_schedule::ScheduleOptions {
+                pair_single_use_operands: false,
+                ..Default::default()
+            },
+        );
+        let paired = ir_schedule::schedule_with_options(
+            &graph,
+            &ir_schedule::ScheduleOptions {
+                pair_single_use_operands: true,
+                ..Default::default()
+            },
+        );
+
+        let before = super::ir_carry_deferred_census();
+        let paired_cm = lower(&graph, &paired, 2, 2, &no_helpers()).expect("the paired body lowers");
+        let after = super::ir_carry_deferred_census();
+        let plain_cm = lower(&graph, &plain, 2, 2, &no_helpers()).expect("the plain body lowers");
+
+        // Engagement, when the switches that reach it are on. A kill switch is
+        // a legitimate way to run the suite, so the correctness half below
+        // still runs either way — but a silent zero here with everything on
+        // would mean this test proves nothing at all.
+        if super::ir_carry_single_use_enabled()
+            && super::ir_carry_second_operand_enabled()
+            && super::ir_carry_rcx_folded_enabled()
+        {
+            assert!(
+                after.0 > before.0,
+                "the deferred carry never fired on the shape it exists for — \
+                 planned went {} -> {}",
+                before.0,
+                after.0,
+            );
+            assert_eq!(
+                after.1 - before.1,
+                after.0 - before.0,
+                "every deferred carry planned must be READ; an unread one is a \
+                 refused compile, not an optimization",
+            );
+        }
+
+        // `ireturn` defines the low 32 bits of RAX and nothing above them, so
+        // that is what is compared — and the two bodies are compared to each
+        // other, which is the assertion that attributes any divergence to the
+        // pairing rather than to this test's arithmetic.
+        for (a, b) in [(3i32, 4i32), (-1, 5), (0, 0), (7, -9), (i32::MAX, 2)] {
+            let want = a.wrapping_add(1) ^ b.wrapping_mul(3);
+            let args = [i64::from(a), i64::from(b)];
+            let got_paired = unsafe { paired_cm.try_call(&args) }.expect("the paired body runs");
+            let got_plain = unsafe { plain_cm.try_call(&args) }.expect("the plain body runs");
+            assert_eq!(
+                got_paired, got_plain,
+                "the two schedules disagree for ({a}, {b})",
+            );
+            assert_eq!(
+                got_paired as u32 as i32,
+                want,
+                "paired body wrong for ({a}, {b})",
+            );
         }
     }
 
