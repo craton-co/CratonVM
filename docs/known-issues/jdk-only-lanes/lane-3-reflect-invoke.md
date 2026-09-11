@@ -478,6 +478,39 @@ The six rejections, each by a rule rather than a judgement:
   `Method.isVarArgs`, `Field.trySetAccessible`. Wave 2 gave them a
   non-default row where it could, but at least one attributed row still has
   `false` as the oracle, so the family's blanket answer still passes it.
+
+  **WRONG, corrected 2026-09-11 from the same run's output: three of these four
+  clear.** The criterion in that sentence is not the one this wave set out. The
+  deferral asks for ONE row where the oracle is not the default and the VM
+  agrees; it does not ask that every attributed row be non-default, which
+  almost nothing would satisfy. Re-read off `w2p18`, all three arms:
+
+  ```text
+  row  61  M isVarArgs                    hs |true|  base |true|  armed |true|
+  row  64  M isDefault iface              hs |true|  base |true|  armed |true|
+  row 256  W2 F isEnumConstant TRUE       hs |true|  base |true|  armed |true|
+  row 260  W2 F trySetAccessible FALSE    hs |false| base |true|
+  ```
+
+  `true` is not the blanket answer for a `()Z` yield, so the first three agree
+  at a non-default value and their deferral reason is discharged — by the
+  ORACLE and BASE arms, which need no dial at all. Only
+  `Field.trySetAccessible` fails, and for the stronger reason below: it is a
+  real BAD, not a default-bound unknown.
+
+  **Two rows of the three were never attributed to their triple, and the cause
+  is the trap the last bullet of this section names.** `l3w2map.tsv` is 16 of
+  16 `W2 ` tags, so wave 1's `M isVarArgs` (probe line 400) and `M isDefault
+  iface` (line 403) drive `Method.isVarArgs()Z` and `Method.isDefault()Z` under
+  a wave-1 tag and the tag-keyed map could not see them. I wrote that warning
+  in this section and then shipped the verdict it warns about. **A mapping
+  keyed on a tag needs a completeness check against the TRIPLE, not against its
+  own key set** — the map being internally consistent is exactly what made it
+  look finished.
+
+  `Field.isEnumConstant` is the one that was mapped and still misjudged, so the
+  map is not the whole cause: the criterion itself was wrong. Both defects had
+  to be present for the verdict to come out as it did.
 * **`BAD -> BAD` — 2.** `Field.trySetAccessible` answers `true` where HotSpot
   answers `false` for a JDK-internal field — **a real access-control defect,
   not a retirement candidate.** `Constructor.setAccessible` differs only in the
@@ -578,18 +611,34 @@ The six candidates from §8b, with descriptors, sorted as the table wants them:
 java/lang/reflect/Constructor  getExceptionTypes  ()[Ljava/lang/Class;
 java/lang/reflect/Constructor  isSynthetic        ()Z
 java/lang/reflect/Constructor  isVarArgs          ()Z
+java/lang/reflect/Field        isEnumConstant     ()Z    <- added by 8b's correction
 java/lang/reflect/Field        isSynthetic        ()Z
 java/lang/reflect/Method       isBridge           ()Z
+java/lang/reflect/Method       isDefault          ()Z    <- added by 8b's correction
 java/lang/reflect/Method       isSynthetic        ()Z
+java/lang/reflect/Method       isVarArgs          ()Z    <- added by 8b's correction
 ```
 
-None is in `RETIRED_SHADOW_L3_TRIPLES` today, so wave 3 takes it **24 -> 30**.
-All six read `bridge` with `kind_stated 0` in the kind map, and
+**Nine, not six.** The three marked rows were rejected by wave 2 as
+"still default-bound" and are not: §8b's correction reads their non-default
+agreement straight off the same run. They cost no new measurement, which is
+the point — the data was already on disk and the verdict was the thing that
+was wrong.
+
+That also settles the twelve deferrals exactly: **9 candidates + 3 rejections**
+(`Field.trySetAccessible`, a real BAD; `Constructor.setAccessible`, frame-only
+and secondary HELD; `Field.setBoolean`, secondary HELD). The earlier "6 and 6"
+double-counted `trySetAccessible` and `setAccessible` across two rejection
+categories each.
+
+None is in `RETIRED_SHADOW_L3_TRIPLES` today, so wave 3 takes it **24 -> 33**.
+All nine read `bridge` with `kind_stated 0` in the kind map, and
 `Method.getExceptionTypes` beside them already reads `synthetic-stub` — the
 sibling a previous wave retired, which is why `Constructor`'s is the candidate
 and `Method`'s is not.
 
-**Of the four preconditions, two are discharged and two are not:**
+**Of the four preconditions, two are discharged and two are not** (the same
+for all nine):
 
 | # | precondition | state |
 |---|---|---|
@@ -612,17 +661,20 @@ earlier wave.
 
 Both are single-launch checks (seconds), and they gate a build, not a decision.
 The mechanical edit is written and checked for control bytes; it applies the
-six in sorted position and writes LF. Sequence, exploiting the fact that lane
+nine in sorted position and writes LF. Sequence, exploiting the fact that lane
 0's verification binary is this wave's control:
 
-1. `p20` — the merged tree, **without** the six. Lane 0's §7.3 binary, and this
+1. `p20` — the merged tree, **without** the nine. Lane 0's §7.3 binary, and this
    wave's control. Run the dump on it for preconditions 3 and 4.
-2. apply the six, `p21` — the retired arm.
+2. apply the nine, `p21` — the retired arm.
 3. A/B `p20` vs `p21`: probe tree, then the three corpus arms.
 
 A dial arm cannot substitute for step 3 here and §8b says why: with
-`leaked=126` every one of these six is an `armed == base` row, which is exactly
-the shape a leak produces.
+`leaked=126` every one of these nine is an `armed == base` row, which is
+exactly the shape a leak produces. Note this cuts both ways for the three just
+added — their non-default agreement discharges the DEFERRAL, which is an
+oracle-and-base question, and says nothing about whether the bytecode is
+right, which is step 3's question.
 
 ## 9. Done
 
