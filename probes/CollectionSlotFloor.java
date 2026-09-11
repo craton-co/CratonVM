@@ -72,6 +72,7 @@ public class CollectionSlotFloor {
         // a state they happen never to see -- and a reader that assumes an
         // array reads a fresh map as a crash or as garbage, not as empty.
         emptySortedReads();
+        emptyConcurrentReads();
 
         // EnumMap / EnumSet have their own floors.
         EnumMap<Day, String> em = new EnumMap<>(Day.class);
@@ -276,6 +277,81 @@ public class CollectionSlotFloor {
     static String put1(TreeMap<String, String> m) {
         m.put("k", "v");
         return String.valueOf(m.get("k"));
+    }
+
+    /// Reads and inserting operations against a `ConcurrentHashMap` whose
+    /// segments have never been allocated.
+    ///
+    /// Its default constructor installs them on the first INSERT
+    /// (`chm_segment_for_mut`) rather than eagerly, so "no segments yet" is a
+    /// state every reader has to handle and every inserting entry point has to
+    /// resolve. The read-only paths must report an empty map; the inserting
+    /// ones -- put, putIfAbsent, merge, compute, computeIfAbsent, replace --
+    /// must each install the segments themselves, and a path that reached its
+    /// insert through the read-only lookup would silently store NOTHING and
+    /// report success.
+    static void emptyConcurrentReads() {
+        java.util.concurrent.ConcurrentHashMap<String, String> m =
+                new java.util.concurrent.ConcurrentHashMap<>();
+        check("empty CHM size", "0", String.valueOf(m.size()));
+        check("empty CHM isEmpty", "true", String.valueOf(m.isEmpty()));
+        check("empty CHM get", "null", String.valueOf(m.get("k")));
+        check("empty CHM containsKey", "false", String.valueOf(m.containsKey("k")));
+        check("empty CHM containsValue", "false", String.valueOf(m.containsValue("v")));
+        check("empty CHM remove", "null", String.valueOf(m.remove("k")));
+        check("empty CHM keySet", "0", String.valueOf(m.keySet().size()));
+        check("empty CHM values", "0", String.valueOf(m.values().size()));
+        check("empty CHM entrySet", "0", String.valueOf(m.entrySet().size()));
+        check("empty CHM iterator", "false",
+                String.valueOf(m.entrySet().iterator().hasNext()));
+        check("empty CHM toString", "{}", m.toString());
+        check("empty CHM getOrDefault", "d", m.getOrDefault("k", "d"));
+        check("empty CHM replace is null", "null", String.valueOf(m.replace("k", "v")));
+
+        // Each inserting door, on its OWN never-written map.
+        java.util.concurrent.ConcurrentHashMap<String, String> a =
+                new java.util.concurrent.ConcurrentHashMap<>();
+        a.put("k", "v");
+        check("empty CHM put then get", "v", a.get("k"));
+        check("empty CHM put then size", "1", String.valueOf(a.size()));
+
+        java.util.concurrent.ConcurrentHashMap<String, String> b =
+                new java.util.concurrent.ConcurrentHashMap<>();
+        check("empty CHM putIfAbsent returns null", "null",
+                String.valueOf(b.putIfAbsent("k", "v")));
+        check("empty CHM putIfAbsent stored", "v", b.get("k"));
+
+        java.util.concurrent.ConcurrentHashMap<String, String> c =
+                new java.util.concurrent.ConcurrentHashMap<>();
+        check("empty CHM computeIfAbsent", "v", c.computeIfAbsent("k", x -> "v"));
+        check("empty CHM computeIfAbsent stored", "v", c.get("k"));
+        check("empty CHM computeIfAbsent size", "1", String.valueOf(c.size()));
+
+        java.util.concurrent.ConcurrentHashMap<String, String> d =
+                new java.util.concurrent.ConcurrentHashMap<>();
+        check("empty CHM merge", "v", d.merge("k", "v", (x, y) -> x + y));
+        check("empty CHM merge stored", "v", d.get("k"));
+
+        java.util.concurrent.ConcurrentHashMap<String, String> e =
+                new java.util.concurrent.ConcurrentHashMap<>();
+        check("empty CHM compute", "v", e.compute("k", (x, y) -> "v"));
+        check("empty CHM compute stored", "v", e.get("k"));
+
+        java.util.concurrent.ConcurrentHashMap<String, String> f =
+                new java.util.concurrent.ConcurrentHashMap<>();
+        f.putAll(java.util.Map.of("k", "v"));
+        check("empty CHM putAll stored", "v", f.get("k"));
+
+        // Growth past the first table, on a map that started with none.
+        java.util.concurrent.ConcurrentHashMap<String, String> g =
+                new java.util.concurrent.ConcurrentHashMap<>();
+        for (int i = 0; i < 64; i++) {
+            g.put("g" + i, "v" + i);
+        }
+        check("empty CHM grown size", "64", String.valueOf(g.size()));
+        check("empty CHM grown get first", "v0", g.get("g0"));
+        check("empty CHM grown get last", "v63", g.get("g63"));
+        check("empty CHM grown keySet", "64", String.valueOf(g.keySet().size()));
     }
 
     static void check(String what, String expected, String actual) {

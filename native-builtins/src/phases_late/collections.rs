@@ -80,21 +80,37 @@ pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/util/Set;",
         |ctx, args| {
             let elem = args[0];
-            // Pin across the set/array allocs below — a moving young GC there
-            // would relocate them (native stale-local family).
+            // Built through the REAL `HashSet.<init>` and `add`, not by writing
+            // raw slots. The three slots this used to write (bucket array,
+            // size, capacity) are the MAP layout, on a class whose one real
+            // field is `map` (`Ljava/util/HashMap;`) -- so a reader resolving
+            // `map` by name, which is what `hs_map_slot` and any surviving JDK
+            // bytecode both do, found an `Object[]` where a map belongs. It is
+            // the same shape `publish_map_table` records fixing on the map
+            // side, and it also wrote the element straight into bucket 0 with
+            // no hashing, so the set was only findable by an implementation
+            // that agreed to look there.
+            //
+            // It also pinned the class's synthetic slot floor at 3 against one
+            // real field, which pads `java/util/HashSet` (and `LinkedHashSet`,
+            // which declares none of its own) out of the compact layout.
+            //
+            // Pin across every allocating call -- `<init>` allocates the
+            // backing map and `add` allocates a node; a moving young GC in
+            // either relocates both the set and the element.
             let elem_pin = pinned_object_value(ctx, elem);
-            let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?;
+            let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1)?;
             let set_pin = ctx.pin_native_root(set);
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+            let _ = ctx.invoke(
+                "java/util/HashSet",
+                "<init>",
+                "()V",
+                &[Value::Object(Some(set))],
+            );
             let set = ctx.read_native_pin(set_pin, set);
             let elem = read_pinned_object_value(ctx, elem_pin, elem);
-            ctx.set_field(set, 0, Value::Object(Some(arr)));
-            ctx.set_field(set, 1, Value::Int(0));
-            ctx.set_field(set, 2, Value::Int(16));
-            // Just store element — we'll use the standard HashSet native_set_add internally
-            // But we can't call it directly here. Just allocate and put manually:
-            ctx.set_array_element(arr, 0, elem);
-            ctx.set_field(set, 1, Value::Int(1));
+            let _ = ctx.invoke_virtual(set, "add", "(Ljava/lang/Object;)Z", &[elem]);
+            let set = ctx.read_native_pin(set_pin, set);
             ctx.unpin_native_roots(elem_pin.map(|(h, _)| h).unwrap_or(set_pin));
             Ok(Some(Value::Object(Some(set))))
         },
@@ -809,10 +825,27 @@ pub(crate) fn register_p63_weak_hash_map(r: &mut NativeMethodRegistry) {
     });
     r.register(whm, "keySet", "()Ljava/util/Set;", |ctx, _args| {
         // Return empty HashSet stub
-        let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?;
-        ctx.set_field(set, 0, Value::Object(None));
-        ctx.set_field(set, 1, Value::Int(0));
-        ctx.set_field(set, 2, Value::Int(16));
+        // Built through the REAL `HashSet.<init>`, not by writing raw slots.
+        // The three slots this used to write (bucket array, size, capacity)
+        // are the MAP layout, on a class whose one real field is `map`
+        // (`Ljava/util/HashMap;`) -- so a reader resolving `map` by name, which
+        // is what `hs_map_slot` and any surviving JDK bytecode both do, found
+        // an `Object[]` where a map belongs. It is the same shape
+        // `publish_map_table` records fixing on the map side.
+        //
+        // It also pinned the class's synthetic slot floor at 3 against one
+        // real field, which pads `java/util/HashSet` (and `LinkedHashSet`,
+        // which declares none of its own) out of the compact layout entirely.
+        let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1)?;
+        let set_pin = ctx.pin_native_root(set);
+        let _ = ctx.invoke(
+            "java/util/HashSet",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(set))],
+        );
+        let set = ctx.read_native_pin(set_pin, set);
+        ctx.unpin_native_roots(set_pin);
         Ok(Some(Value::Object(Some(set))))
     });
     r.register(whm, "values", "()Ljava/util/Collection;", |ctx, _args| {
