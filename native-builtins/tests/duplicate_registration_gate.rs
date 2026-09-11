@@ -769,3 +769,33 @@ fn the_jarfile_constructor_has_two_producers_and_this_says_which_wins() {
         rendered.join("\n")
     );
 }
+
+// TEMPORARY (wave 6, 2026-09-11): the census this wave's retirement tables are
+// transcribed FROM. Deleted in the same wave that reads it — a table is only
+// as good as the dump it came from, and a dump that stays becomes a second
+// place to keep in step. Run with `--nocapture`.
+#[test]
+fn w6_print_candidate_triples() {
+    let mut registry = NativeMethodRegistry::new();
+    vm_init_real_jdk_boot_path(&mut registry);
+    let dump = registry.dump_registrations();
+    for prefix in [
+        "java/text/BreakIterator",
+        "java/util/Date",
+        "java/util/TimeZone",
+        "sun/util/calendar/",
+        "sun/util/resources/",
+        "sun/util/locale/provider/",
+    ] {
+        let mut rows: Vec<String> = dump
+            .iter()
+            .filter(|(c, _, _, _)| *c == prefix || c.starts_with(prefix))
+            .map(|(c, m, d, k)| format!("    (\"{c}\", \"{m}\", \"{d}\"),  // {}", k.as_str()))
+            .collect();
+        rows.sort();
+        println!("W6TRIPLES prefix={prefix} count={}", rows.len());
+        for r in &rows {
+            println!("W6ROW {r}");
+        }
+    }
+}
