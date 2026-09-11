@@ -5032,3 +5032,63 @@ one. `cpu-ab.ps1` now prints the tick as a percentage of the median and refuses
 a verdict inside it. That is the second way a clean floor misleads — the first
 being drift between invocations (§5.2 of the GP-register page) — and both make a
 tight floor read as permission to stop.
+
+### CORRECTION: "the optimizing tier does not unroll" — true, and not for the reason implied
+
+This document has said since 2026-09-03 that the optimizing tier does not
+unroll, priced it at about 1.12x on a counted loop, and listed it as the
+largest remaining item in that tier's per-iteration budget. All three stand.
+What does not stand is the conclusion anyone would draw from them — that an
+unroller needs writing.
+
+**`ir_optimize::unroll` exists, is default-ON, and recognises a javac counted
+loop exactly.** Driven against a real bytecode-built `for (i = 0; i < 5; i++)
+a += i;` it reports `trip=5 init=0 stride=1` and then declines, silently, on the
+`body_named_by_safepoint` refusal — whose escape hatch is gated on
+`CRATONVM_JIT_IR_DROP_UNREACHABLE_HOMES`, **default OFF**. With that flag set,
+the same loop unrolls. The flag's own sibling
+(`CRATONVM_JIT_IR_REG_AUTHORITATIVE`) rests on the identical prediction, was
+soaked and flipped ON on 2026-09-09, and says so in its doc comment; the flag it
+names was never revisited.
+
+**And that would not reach the loops that matter.** `ir_optimize::UnrollCensus`
+— one counter per `continue`, under a closing identity — says every counted loop
+in both benchmark suites has a RUNTIME bound, which full unrolling can never
+serve:
+
+| | CratonBenchC2 | CratonBench |
+|---|---:|---:|
+| loops found (merges − not_single_backedge) | 13 | 6 |
+| of which runtime-bounded | **6** | **4** |
+| `safepoint_named` | 0 | 0 |
+| unrolled | **0** | **0** |
+
+So the thing to build is a PARTIAL unroller, in the single-pass tier's own shape
+(keep the test in every copy, amortise only the poll and the back edge — no
+trip-count arithmetic, so none of the overflow hazard the range-BCE closeout
+records). It was designed and deliberately **not built**, because both of the
+gates under which it could be written without touching deopt metadata measure
+**zero**:
+
+| gate | asks | CratonBenchC2 | CratonBench | `FieldLoop` |
+|---|---|---:|---:|---:|
+| whole method trap-free | `graph_cannot_deopt` | 0 of 6 | 0 of 4 | 0 of 1 |
+| **cloned nodes all pure** | the real obligation | **0 of 6** | **0 of 4** | **0 of 1** |
+
+The second is zero for the same reason these loops are worth unrolling:
+`FieldLoop.sum`'s body IS a field read, and `Op::Load` is not pure.
+
+**What unrolling actually needs is one thing, and it is the same for both
+unrollers: a deopt point addressable per COPY rather than per bci.**
+`DeoptimizationPoint` already carries `(native_offset, bci, frame_state)` and
+two points may share a bci — the representation is fine. Two things collapse
+them: `bci_native` keeps the EARLIEST offset per bci, so only copy 0 is
+anchored, and `find_deopt_point` is an exact-offset binary search returning
+`None` for the rest; and `graph.safepoints` has one snapshot per bci naming the
+original nodes, so a later copy has no frame describing its own values. That is
+a bounded change to three named places, and it is the prerequisite for every
+version of this feature.
+
+Full write-up, including the census, the refusal taxonomy and the partial-unroll
+design that was not built, in
+[`internal/performance/c2-unrolling-is-a-deopt-metadata-problem-20260911.md`](internal/performance/c2-unrolling-is-a-deopt-metadata-problem-20260911.md).
