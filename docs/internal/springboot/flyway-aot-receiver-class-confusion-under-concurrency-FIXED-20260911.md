@@ -113,31 +113,35 @@ fix touches the compiler.
 
 ## Verification
 
-Paired bursts, every arm in EVERY round, on Azure Linux (`20.80.105.49`),
-`dev`@`8f166641` and the same tree plus this change. Both binaries run side by
-side in the same round, so host load cannot be the arm. Two independent bursts,
-40 runs per arm each, 8 processes concurrent:
+Paired bursts, every arm in EVERY round, on Azure Linux (`20.80.105.49`). Both
+binaries run side by side in the same round, so host load cannot be the arm.
+Three independent bursts, 8 processes concurrent; the third is the merged tree
+that shipped:
 
-| burst | arm | failed / runs |
-|---|---|---:|
-| A | before, forcing | 3 / 40 |
-| | **after, forcing** | **0 / 40** |
-| | before, natural | 1 / 40 |
-| | **after, natural** | **0 / 40** |
-| B | before, forcing | 4 / 40 |
-| | **after, forcing** | **0 / 40** |
-| | before, natural | 1 / 40 |
-| | **after, natural** | **0 / 40** |
+| burst | base | arm | failed / runs |
+|---|---|---|---:|
+| A, 20 rounds | `dev`@`8f166641` | before, forcing | 3 / 40 |
+| | | **after, forcing** | **0 / 40** |
+| | | before, natural | 1 / 40 |
+| | | **after, natural** | **0 / 40** |
+| B, 20 rounds | `dev`@`8f166641` | before, forcing | 4 / 40 |
+| | | **after, forcing** | **0 / 40** |
+| | | before, natural | 1 / 40 |
+| | | **after, natural** | **0 / 40** |
+| C, 10 rounds | `dev`@`bf8f2c0c` | before, forcing | 5 / 20 |
+| | | **after, forcing** | **0 / 20** |
+| | | before, natural | 0 / 20 |
+| | | **after, natural** | **0 / 20** |
 
-Pooled: **9 failures / 160 runs before, 0 / 160 after** (one-sided Fisher
-p ~ 0.002). The signatures on the `before` arms are this page's own:
-`String.isAssignableFrom(Class)`, `LinkedHashMap$Entry.isPrimitive()`, and six
-`AnnotatedElement.getDeclaredAnnotations() has no Code attribute`.
+Pooled: **14 failures / 200 runs before, 0 / 200 after** (one-sided Fisher
+p ~ 5e-5). The signatures on the `before` arms are this page's own:
+`String.isAssignableFrom(Class)`, five `LinkedHashMap$Entry.isPrimitive()`, and
+seven `AnnotatedElement.getDeclaredAnnotations() has no Code attribute`.
 
-Read the census above first, though. At this rate a burst can only ever be
-suggestive — which is exactly how this row absorbed two sessions — and the
-census is the same statement without the sampling: 750-odd freed mirrors per
-run, every run, versus zero.
+Read the census above first, though. At a 5-25 % rate a burst can only ever be
+suggestive of a single run's behaviour — which is exactly how this row absorbed
+two sessions — and the census is the same statement without the sampling:
+750-odd freed mirrors per run, every run, versus zero.
 
 **Class unloading is unaffected**, which is the thing this fix could plausibly
 have broken. `vm/tests/resources/class_loader_unload/LoaderUnloadProbe` on the
