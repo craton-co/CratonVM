@@ -248,6 +248,10 @@ pub use inlining::{
     inline_miss_edge_poison_counts, npe_trap_lines_enabled, InlineFrameLevel, InlineFrameMap,
     InlineFrameRow, NpeTrapMap, NpeTrapSite,
 };
+/// The JVMS 4.9.1 bci bound, re-exported for `ir_lower`'s twin of
+/// `record_npe_trap_site`: the optimizing tier screens against the same bound
+/// and a second copy of it would be a second place to fix.
+pub(crate) use inlining::INLINE_FRAME_MAX_BCI;
 mod arith;
 mod arrays;
 mod deopt_stubs;

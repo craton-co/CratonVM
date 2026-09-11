@@ -1762,6 +1762,30 @@ inversion**, and it is why the switch is kept rather than the change reverted:
 it is the smallest known perturbation that moves this loop by 20%, which makes
 it the cheapest handle on whatever the real cause is.
 
+**2026-09-11 — RETIRED: the anomaly no longer reproduces.** Re-measured on the
+current tree with `tools/tier-ab/flag-ab.sh` (7 rounds, interleaved, same-config
+control, checksum `1200150000` on every run), `CRATONVM_JIT_IR_THIS_NONNULL` on
+`probes/FieldLoop.java` `sum` is **0.981x — UNMEASURABLE inside a 4.6% floor**.
+It is not 20% slower; it is not measurably anything. Whatever arrangement
+produced the 1.78/1.93-against-1.49/1.61 medians is gone, most likely with the
+phi-copy change in
+`docs/internal/performance/c2-the-phi-copy-staging-register-20260911.md` §5.
+
+So this paragraph's standing recommendation — keep the switch because it is the
+cheapest handle on the residual inversion — no longer holds: there is no longer
+an effect for it to be a handle on. Keep the switch on its own merits (it is
+correct and it elides real checks), not as a lead.
+
+The layout theory it invited was tested and did not survive either.
+`docs/internal/performance/c2-the-loop-body-is-mostly-code-it-never-runs-20260911.md`
+counts this loop at **412 bytes spanned, ~122 executed**, the rest cold code
+emitted inline; `CRATONVM_JIT_IR_POLL_OUTLINE` removes the largest of those
+blocks (229 bytes) and one taken branch per iteration, and it measures
+**0.999x — UNMEASURABLE**. A well-predicted branch over cold bytes costs
+approximately nothing, because fetch follows the predicted target rather than
+the linear address. What actually moved this loop was removing WORK: see the
+same document's §3.
+
 One structural asymmetry is worth naming as a candidate: the receiver
 null-check elision described above — the `this` seed and
 `CRATONVM_JIT_RECEIVER_NULL_ELIM` — is **single-pass only**. Both arms it
@@ -5142,3 +5166,37 @@ change, not this one.
 
 Full write-up in
 [`internal/performance/c2-per-copy-deopt-frames-20260911.md`](internal/performance/c2-per-copy-deopt-frames-20260911.md).
+
+### FOLLOW-UP: the partial unroller was written (`CRATONVM_JIT_IR_PARTIAL_UNROLL`, default OFF)
+
+**2026-09-11, same day.** It keeps the loop test in every copy — so no
+trip-count arithmetic and no speculation — and sends each copy's failing test
+**back to the header** rather than to a new exit merge, which is what keeps the
+transform closed under the loop and leaves every post-loop use and safepoint
+slot untouched.
+
+It is **correct and it is not faster**: 9 alternating pairs on
+`bench/C2PartialUnrollProbe.java` read 356 ms rolled against 362 ms unrolled at
+factor 4 — a ratio of 0.98 against a ±8% spread — with checksums matching
+Temurin 25 on trip counts both divisible and not divisible by the factor. The
+per-iteration instruction count *does* fall, 20 to 16.25. It buys nothing
+because the rolled loop keeps `a` and `i` in `rbx`/`r15` with **no memory
+operand in its loop at all** and the unrolled one spills every carried value:
+`sink_pure_nodes` moves a node only when the loop depth strictly DECREASES, and
+every copy of an unrolled body sits at the header's own depth, so all four are
+computed above the first test and eight intermediates contend for a
+five-register file.
+
+The sentence at 1437 and item 1 at 1484 both need a caveat now. The optimizing
+tier *can* unroll; unrolling is not by itself what the baseline's 4x buys. The
+baseline also colours its locals into callee-saved registers, and that is the
+half this tier is still missing.
+
+Two wrong-code defects were found on the way, both in shared code, both live
+before this transform and reachable by anything that clones a control node: an
+`If`'s successors were ordered by **node id** rather than by projection index,
+and an OSR entry resolved a bci **two blocks claimed**. Both are fixed and
+pinned by tests.
+
+Full write-up, including why the obvious schedule-late fix is not landed, in
+[`internal/performance/c2-the-partial-unroller-20260911.md`](internal/performance/c2-the-partial-unroller-20260911.md).

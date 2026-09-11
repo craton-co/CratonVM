@@ -4069,12 +4069,20 @@ pub(crate) fn build_json_tree_node_depth(
         // Object node
         let pairs = parse_json_object(trimmed);
         let count = pairs.len();
-        let node = alloc_json_node(ctx, 1)?;
-        let children = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
-        let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
+        // The node and its two arrays survive a string and a whole recursive
+        // subtree per pair — many allocations each — so they are held in the
+        // scope and re-read at every store.
+        let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+        let node_obj = alloc_json_node(&mut *scope, 1)?;
+        let node_h = scope.root(node_obj);
+        let children_obj = scope.new_array(cratonvm_types::ArrayElementType::Reference, count);
+        let children_h = scope.root(children_obj);
+        let keys_obj = scope.new_array(cratonvm_types::ArrayElementType::Reference, count);
+        let keys_h = scope.root(keys_obj);
         for (i, (key, val_str)) in pairs.iter().enumerate() {
-            let key_obj = ctx.create_string(key);
-            ctx.set_array_element(keys, i, Value::Object(Some(key_obj)));
+            let key_obj = scope.create_string(key);
+            let keys = scope.get(&keys_h);
+            scope.set_array_element(keys, i, Value::Object(Some(key_obj)));
             let child_json = if val_str.starts_with('{') || val_str.starts_with('[') {
                 val_str.clone()
             } else if val_str == "true"
@@ -4086,12 +4094,16 @@ pub(crate) fn build_json_tree_node_depth(
             } else {
                 format!("\"{}\"", json_escape(val_str))
             };
-            let child = build_json_tree_node_depth(ctx, &child_json, depth + 1);
-            ctx.set_array_element(children, i, Value::Object(Some(child?)));
+            let child = build_json_tree_node_depth(&mut *scope, &child_json, depth + 1)?;
+            let children = scope.get(&children_h);
+            scope.set_array_element(children, i, Value::Object(Some(child)));
         }
-        ctx.set_field(node, 4, Value::Object(Some(children)));
-        ctx.set_field(node, 5, Value::Object(Some(keys)));
-        ctx.set_field(node, 6, Value::Int(count as i32));
+        let node = scope.get(&node_h);
+        let children = scope.get(&children_h);
+        let keys = scope.get(&keys_h);
+        scope.set_field(node, 4, Value::Object(Some(children)));
+        scope.set_field(node, 5, Value::Object(Some(keys)));
+        scope.set_field(node, 6, Value::Int(count as i32));
         Ok(node)
     } else if trimmed.starts_with('[') {
         // Array node
@@ -4119,8 +4131,11 @@ pub(crate) fn build_json_tree_node_depth(
             elements.push(val);
         }
         let count = elements.len();
-        let node = alloc_json_node(ctx, 2)?;
-        let children = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
+        let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+        let node_obj = alloc_json_node(&mut *scope, 2)?;
+        let node_h = scope.root(node_obj);
+        let children_obj = scope.new_array(cratonvm_types::ArrayElementType::Reference, count);
+        let children_h = scope.root(children_obj);
         for (idx, elem) in elements.iter().enumerate() {
             let child_json = if elem.starts_with('{') || elem.starts_with('[') {
                 elem.clone()
@@ -4133,42 +4148,57 @@ pub(crate) fn build_json_tree_node_depth(
             } else {
                 format!("\"{}\"", json_escape(elem))
             };
-            let child = build_json_tree_node_depth(ctx, &child_json, depth + 1);
-            ctx.set_array_element(children, idx, Value::Object(Some(child?)));
+            let child = build_json_tree_node_depth(&mut *scope, &child_json, depth + 1)?;
+            let children = scope.get(&children_h);
+            scope.set_array_element(children, idx, Value::Object(Some(child)));
         }
-        ctx.set_field(node, 4, Value::Object(Some(children)));
-        ctx.set_field(node, 6, Value::Int(count as i32));
+        let node = scope.get(&node_h);
+        let children = scope.get(&children_h);
+        scope.set_field(node, 4, Value::Object(Some(children)));
+        scope.set_field(node, 6, Value::Int(count as i32));
         Ok(node)
     } else if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
         // String node
         let inner_str = json_unescape(&trimmed[1..trimmed.len() - 1]);
-        let node = alloc_json_node(ctx, 3)?;
-        let s = ctx.create_string(&inner_str);
-        ctx.set_field(node, 1, Value::Object(Some(s)));
+        let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+        let node_obj = alloc_json_node(&mut *scope, 3)?;
+        let node_h = scope.root(node_obj);
+        let s = scope.create_string(&inner_str);
+        let node = scope.get(&node_h);
+        scope.set_field(node, 1, Value::Object(Some(s)));
         Ok(node)
     } else if trimmed == "true" || trimmed == "false" {
         let node = alloc_json_node(ctx, 5)?;
         ctx.set_field(node, 3, Value::Int(if trimmed == "true" { 1 } else { 0 }));
         Ok(node)
     } else if let Ok(n) = trimmed.parse::<i64>() {
-        let node = alloc_json_node(ctx, 4)?;
-        ctx.set_field(node, 2, Value::Long(n));
-        ctx.set_field(node, 7, Value::Double(n as f64));
-        let s = ctx.create_string(trimmed);
-        ctx.set_field(node, 1, Value::Object(Some(s)));
+        let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+        let node_obj = alloc_json_node(&mut *scope, 4)?;
+        let node_h = scope.root(node_obj);
+        scope.set_field(node_obj, 2, Value::Long(n));
+        scope.set_field(node_obj, 7, Value::Double(n as f64));
+        let s = scope.create_string(trimmed);
+        let node = scope.get(&node_h);
+        scope.set_field(node, 1, Value::Object(Some(s)));
         Ok(node)
     } else if let Ok(f) = trimmed.parse::<f64>() {
-        let node = alloc_json_node(ctx, 4)?;
-        ctx.set_field(node, 2, Value::Long(f as i64)); // truncated for asInt()/asLong()
-        ctx.set_field(node, 7, Value::Double(f)); // full precision for asDouble()
-        let s = ctx.create_string(trimmed);
-        ctx.set_field(node, 1, Value::Object(Some(s)));
+        let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+        let node_obj = alloc_json_node(&mut *scope, 4)?;
+        let node_h = scope.root(node_obj);
+        scope.set_field(node_obj, 2, Value::Long(f as i64)); // truncated for asInt()/asLong()
+        scope.set_field(node_obj, 7, Value::Double(f)); // full precision for asDouble()
+        let s = scope.create_string(trimmed);
+        let node = scope.get(&node_h);
+        scope.set_field(node, 1, Value::Object(Some(s)));
         Ok(node)
     } else {
         // Bare string (unquoted) — treat as string
-        let node = alloc_json_node(ctx, 3)?;
-        let s = ctx.create_string(trimmed);
-        ctx.set_field(node, 1, Value::Object(Some(s)));
+        let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+        let node_obj = alloc_json_node(&mut *scope, 3)?;
+        let node_h = scope.root(node_obj);
+        let s = scope.create_string(trimmed);
+        let node = scope.get(&node_h);
+        scope.set_field(node, 1, Value::Object(Some(s)));
         Ok(node)
     }
 }

@@ -1207,6 +1207,14 @@ static RETIRED_SHADOW_STATELESS_TRIPLES: &[(&str, &str, &str)] = &[
 /// `every_entry_is_reachable_through_the_predicate` and its sibling exist to
 /// catch.
 const RETIRED_SHADOW_PREFIXES: &[&str] = &[
+    // 2026-09-11, lane 4 wave 1. The two wide prefixes of the largest lane:
+    // 1,398 bucket-A/B shadows over 142 classes sit under them. Same rule as
+    // every prefix above -- this admits those packages to one extra binary
+    // search each, and `RETIRED_SHADOW_L4_TRIPLES` decides what is retired. It
+    // retires 140 rows over 10 classes; `jdk/internal/foreign` is deliberately
+    // NOT admitted, because nothing under it came through the funnel.
+    "java/io/",
+    "java/nio/",
     "java/lang/module/",
     "java/text/",
     "java/util/",
@@ -2723,15 +2731,19 @@ static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
 /// Retiring these three means removing the dead `math_bignum.rs` registrations
 /// first, which changes nothing in compatible mode because they own no slot.
 ///
-/// **`remainder`, `mod`, `gcd`, `and`, `or`, `xor` — the JIT drops the
-/// message.** These do reach bytecode, and interpreted they are HotSpot-exact.
-/// Once the real body is JIT-compiled the `NullPointerException` arrives with
-/// no message at all. It is not a `BigInteger` fact — `apps/probes/L2JitNpeProbe.java`
-/// asks five null-deref shapes cold and hot with no JDK class involved and
-/// every one of them loses its message when hot. See
-/// `docs/known-issues/jit/the-helpful-npe-message-is-lost-in-compiled-code-20260910.md`.
-/// Retiring them today would trade a correct message for none on exactly the
-/// rows a caller reads when something has already gone wrong.
+/// **`remainder`, `mod`, `gcd`, `and`, `or`, `xor` — the JIT DROPPED the
+/// message; blocker cleared 2026-09-11.** These do reach bytecode, and
+/// interpreted they are HotSpot-exact. Once the real body was JIT-compiled the
+/// `NullPointerException` arrived with no message at all. It was not a
+/// `BigInteger` fact — `probes/L2JitNpeProbe.java` asks six null-deref shapes
+/// cold and hot with no JDK class involved and every one of them lost its
+/// message when hot. Fixed and retired as
+/// `docs/internal/fixed-bugs/the-helpful-npe-message-is-lost-in-compiled-code-FIXED-20260911.md`,
+/// pinned by `vm/tests/jit_npe_message_hot_equals_cold.rs`.
+///
+/// They are STILL HELD, and not by this reason: the rule below is structural —
+/// every reference-argument row — and lifting it needs the `BigIntegerSweep`
+/// measurement with the JIT on that put it there, which is lane 2's to take.
 ///
 /// ## ...and the held set is every REFERENCE-argument row, not a list of six
 ///
@@ -3818,6 +3830,442 @@ static RETIRED_SHADOW_L1_JT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Lane 4 wave 1, 2026-09-11: 140 rows over 10 classes of `java/io/` and
+/// `java/nio/`.
+///
+/// A SEVENTH table rather than rows merged into a sibling, for the reason the
+/// second and third give for existing: these were adjudicated by a different
+/// METHOD, and the method is the part worth seeing at a glance.
+///
+/// # The method: a per-family dial sweep, then the SAME families armed together
+///
+/// `apps/probes/l4famsweep.sh` arms `CRATONVM_ENFORCE_NATIVE_SHADOW` on one
+/// receiver family at a time and diffs thirteen lane-4 probes against a real
+/// HotSpot 25 on the same host. On 2026-09-10, with the `FileInputStream.skip`
+/// residual fixed, sixteen of its eighteen families scored **0**:
+///
+/// ```text
+///   java/io/PrintStream  File  FileInputStream  FileOutputStream
+///   java/io/ByteArrayInputStream  ByteArrayOutputStream  DataInputStream
+///   java/io/DataOutputStream  BufferedReader  BufferedWriter
+///   java/io/FilterOutputStream   java/nio/ByteBuffer   java/nio/CharBuffer
+///   java/nio/file/spi/FileSystemProvider   java/nio/file/attribute/
+///   java/nio/channels/FileChannel                                    DIFF 0
+///   java/nio/file/Files                                              DIFF 4
+///   java/nio/file/Path                                             DIFF 100
+/// ```
+///
+/// **Sixteen per-family greens are not one green for the wave.** Phase 2 armed
+/// 270 classes one at a time, called 236 retire-safe, and arming those 236
+/// together failed 54 of 118 corpus vectors. So the families were re-armed as
+/// ONE scope, which is what a wave actually does, and measured against an
+/// unarmed control on the same binary:
+///
+/// ```text
+///   control (dial off)                 0 diffs over 4416 rows, 0 short
+///   the 13 wave-1 families armed       0 diffs over 4416 rows, 0 short
+///   ... plus java/io/PrintStream       0 diffs over 4416 rows, 0 short
+/// ```
+///
+/// # The dial was ASKED, and this is the number that says so
+///
+/// A zero from an instrument that never ran reads exactly like a zero from one
+/// that did. Under the wave-1 scope the dial's own counters report **180 268
+/// dispatches reached and 176 112 YIELDED** across the thirteen probes -- that
+/// many native calls declined and served by real JDK bytecode instead, for
+/// 4 416 rows that stayed byte-identical to HotSpot. `L4TypedBufferSweep`
+/// alone yields 27 849 times and moves no row.
+///
+/// # The funnel
+///
+/// Step 1 of the lane's increment loop, unioned over the whole instrument
+/// rather than one probe: a registry dump per probe (13 dumps, schema 5,
+/// `--explain-jdk-only` so the image columns are populated), and a row is a
+/// candidate only if it **owns its slot**, is kind `Bridge`, its image
+/// declaring method carries `Code` (bucket A or B), and it was **invoked at
+/// least once** in one of those runs.
+///
+/// ```text
+///   bucket C / D / E / F (no bytecode to yield to)      867  not candidates
+///   not a Bridge                                         17
+///   invocations 0 in all 13 runs                        820  unmeasured, not safe
+///   outside a DIFF-0 family                             226  Files, Path, sun/nio/ch, …
+///   CANDIDATES                                          191
+///   backed out by the BUILD (see below)                  -51
+///   RETIRED                                             140
+/// ```
+///
+/// `invocations 0` is the largest exclusion and it is deliberately NOT read as
+/// "unreachable": schema 5's `invocations_complete` bit exists because the
+/// column is a lower bound. Those 820 rows are unmeasured by this instrument,
+/// which is a reason not to retire them here, not a verdict about them.
+///
+/// # What the build found that the dial could not, and why the dial cannot
+///
+/// The screen above said 0 for all thirteen probes with the wave armed. Built,
+/// the same thirteen probes moved **eight rows in strict mode** — and none in
+/// compatible mode, which is the half that identifies the mechanism:
+///
+/// ```text
+///   L4TailSweep2        3 rows   Files.createLink -> UnsupportedOperationException
+///   L4TypedBufferSweep  3 rows   CharBuffer subSequence/toString, wrong WINDOW
+///   TailFamilySweep     2 rows   the same two, through the asCharBuffer view
+///
+/// (`diff` counts both sides, so that is 16 differing LINES. The count that
+/// matters is eight rows, in two families.)
+/// ```
+///
+/// **The dial is not a faithful model of a retirement, and this is the shape of
+/// the gap.** The dial declines a native at DISPATCH, and its decline is
+/// conditional: when the receiver's own class has no concrete body to yield to
+/// (`dispatch_has_code == false`) it answers no and the native runs anyway —
+/// that is the `declined_no_bytecode` column, 4 156 of 180 268 here. A
+/// retirement has no such fallback: the registration is simply not there, and
+/// the call lands wherever real dispatch takes it. Every row the dial scored 0
+/// on *because it declined to decline* is therefore unmeasured by it.
+///
+/// `java/nio/file/spi/FileSystemProvider` is exactly that row. This VM hands
+/// out a fabricated provider stamped with the ABSTRACT class, so `createLink`
+/// has no concrete body, so the dial ran the native and read 0. Retired, the
+/// call reaches the abstract declaration and answers
+/// `UnsupportedOperationException` for all three rows — the
+/// fabricate-an-abstract-class trade, arrived at from the registration side.
+/// All four of its rows are out.
+///
+/// `java/nio/CharBuffer` is the second, and it is §4's named failure mode
+/// rather than a throw: `subSequence(1,3)` answered `cd` where HotSpot answers
+/// `bc`, and `toString()` after `position(2)` answered the empty string. The
+/// real `CharBuffer` bodies derive their window from `position()`/`limit()`,
+/// and this VM's carrier does not keep those where the real accessors read
+/// them, so retiring the accessors hands the real bodies the wrong window. It
+/// produces correct-LOOKING output with the wrong characters, which is the one
+/// outcome the lane page says to design the probe for. All seventeen of its
+/// rows are out. `java/nio/ByteBuffer`'s thirty-four stay: the same accessors,
+/// the same probe, zero rows moved — so this is a CharBuffer carrier defect and
+/// not a buffer-wide one.
+///
+/// The four `ByteBufferAsCharBuffer{B,L,RB,RL}.order()` rows stay too. They were
+/// suspected with CharBuffer and cleared by the re-measurement: `order()` is a
+/// constant, and with CharBuffer's accessors restored those views are at 0.
+///
+/// # The corpus found three more, and the probe tree could not have
+///
+/// The thirteen probes scored 0 in BOTH modes on the built binary -- 4 416 rows,
+/// binary against binary. The `--jdk-only` corpus went **132/132 -> 129/132**,
+/// reproducibly, on the same binary:
+///
+/// ```text
+///   RFileTimes       every timestamp reads 1970-01-01T00:00:00Z
+///   RJdkSecurity     a property-named truststore IGNORED: 122 anchors for 1,
+///                    and a certificate HotSpot REJECTS is ACCEPTED
+///   RSslLiveSession  fails at client.responseCode = 200
+/// ```
+///
+/// `RFileTimes` has one cause and it is the SETTER, not the getter:
+/// `Files.setLastModifiedTime` reads `FileTime.toMillis()` off a fabricated
+/// carrier, gets 0, and stamps the file at the epoch -- so all four read-back
+/// rows follow from one write. Dial-armed attribution names
+/// `java/nio/file/attribute/` for it and `java/io/ByteArrayInputStream` for
+/// `RSslLiveSession`; `java/io/File` armed alone is clean, so `File.lastModified`
+/// reading 1970 was a symptom of the same write and not a second defect.
+///
+/// `RJdkSecurity` reproduces under NO single family and not under all thirteen
+/// armed together -- the dial's blind spot described above, and the dial was
+/// never going to name it. What did was an eight-line probe,
+/// `apps/probes/L4AbsPath.java`, printing path SHAPES rather than paths:
+///
+/// ```text
+///   temp.getPath          abs=true len=32 slashes=2      (correct)
+///   temp.isAbsolute       false                          (HotSpot: true)
+///   temp.getAbsolutePath  abs=true len=45 slashes=5      (the cwd, prepended)
+/// ```
+///
+/// Every `java.io.File` this VM builds kept its path in slot 0 and wrote
+/// nothing else, so real `File` bytecode read `prefixLength = 0` and called
+/// every path relative. Fixed in the commit before this table, in
+/// [`crate::file_layout`], at all six producing call sites across two crates.
+/// **That fix is why the six `prefixLength`-dependent `File` rows below --
+/// `isAbsolute`, `getAbsolutePath`, `getAbsoluteFile`, `getCanonicalPath`,
+/// `getCanonicalFile`, `toURI` -- are retired here rather than carved out.**
+///
+/// Five fabricated carriers in this lane have now been found with their real
+/// fields empty: `Path`, `CharBuffer`, `FileTime`, `FileSystemProvider` and
+/// `File`. The carrier is the blocker, not the retirement.
+///
+/// The whole `--jdk-only` corpus, armed on the trimmed scope, is back at its
+/// unarmed baseline. **That screen belongs before the build, not after it**, and
+/// its absence is what cost this wave five of its seven builds.
+///
+/// # What is held back, and why
+///
+///  * **`java/io/PrintStream`.** It scores 0 armed, alone
+///    and in the wave, and it is still not here: `System.out` and `System.err`
+///    are how every lane reads its probes, so a regression there reads as all
+///    nine lanes failing at once. The lane page requires it in its own wave
+///    with its own commit naming the blast radius. The measurement above is
+///    that wave's evidence, taken early.
+///  * **The five families the builds backed out (51 rows).**
+///    `java/nio/CharBuffer` (17) and `java/nio/file/spi/FileSystemProvider` (4)
+///    from the probe tree; `java/nio/file/attribute/` (12) and
+///    `java/io/ByteArrayInputStream` (9) from the corpus, attributed by dial
+///    sweep; and the file-handle group (9) — `java/io/FileOutputStream`,
+///    `FileCleanable`, `FileDescriptor` and the abstract-receiver
+///    `java/nio/channels/FileChannel` — as an un-attributed GROUP, because
+///    `RJdkSecurity` reproduces under no dial scope at all. Every one of them is
+///    blocked on a CARRIER defect rather than on the retirement: a fabricated
+///    receiver whose real fields this VM never writes.
+///  * **`java/nio/file/Files` (DIFF 4) and `java/nio/file/Path` (DIFF 100).**
+///    Above the floor, so not candidates. `Path`'s 100 are one defect: the
+///    carrier is stamped with the INTERFACE, so `toString()` lands on
+///    `Object.toString()`. See `crate::path_layout`.
+///  * **`sun/nio/ch/`.** The 2026-08-19 package verdict stands; this wave does
+///    not try to beat it.
+///  * **`native-io/src/concrete_receiver.rs:185`**, a cross-lane registrar of
+///    191 rows over 21 classes that lane T owns whole. The funnel filters it by
+///    call site and it removed NOTHING here -- its classes are `sun/nio/ch`,
+///    already outside the wave -- so the filter is a guard for later waves
+///    rather than a thing that fired.
+///  * **`jdk/internal/foreign`.** Nothing under it reached the candidate set,
+///    so its prefix is not admitted either.
+///
+/// The wave's only FFM-adjacent rows went out with CharBuffer:
+/// `session()Ljdk/internal/foreign/MemorySessionImpl;` and `checkSession()V`
+/// were on that class. Nothing retired here touches
+/// `jdk/internal/foreign`, whose carrier is this VM's own allocation shape
+/// rather than the JDK's
+/// (`docs/known-issues/jdk-only/the-ffm-carrier-is-the-vms-own-allocation-shape-20260829.md`).
+///
+/// Measured on **linux/x86_64 against JDK 25**. `java/io/File`'s separators,
+/// absolute-path rules and permission methods differ by OS, and the two shell
+/// gates in this campaign are keyed `25/linux` and refuse on Windows, so that
+/// is the platform this table is measured on and the only one.
+static RETIRED_SHADOW_L4_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/io/ByteArrayOutputStream", "<init>", "()V"),
+    ("java/io/ByteArrayOutputStream", "<init>", "(I)V"),
+    ("java/io/ByteArrayOutputStream", "close", "()V"),
+    ("java/io/ByteArrayOutputStream", "flush", "()V"),
+    ("java/io/ByteArrayOutputStream", "reset", "()V"),
+    ("java/io/ByteArrayOutputStream", "size", "()I"),
+    ("java/io/ByteArrayOutputStream", "toByteArray", "()[B"),
+    (
+        "java/io/ByteArrayOutputStream",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/io/ByteArrayOutputStream",
+        "toString",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+    ),
+    (
+        "java/io/ByteArrayOutputStream",
+        "toString",
+        "(Ljava/nio/charset/Charset;)Ljava/lang/String;",
+    ),
+    ("java/io/ByteArrayOutputStream", "write", "(I)V"),
+    ("java/io/ByteArrayOutputStream", "write", "([B)V"),
+    ("java/io/ByteArrayOutputStream", "write", "([BII)V"),
+    ("java/io/DataInputStream", "available", "()I"),
+    ("java/io/DataInputStream", "close", "()V"),
+    ("java/io/DataInputStream", "read", "()I"),
+    ("java/io/DataInputStream", "read", "([BII)I"),
+    ("java/io/DataInputStream", "readBoolean", "()Z"),
+    ("java/io/DataInputStream", "readByte", "()B"),
+    ("java/io/DataInputStream", "readChar", "()C"),
+    ("java/io/DataInputStream", "readDouble", "()D"),
+    ("java/io/DataInputStream", "readFloat", "()F"),
+    ("java/io/DataInputStream", "readFully", "([B)V"),
+    ("java/io/DataInputStream", "readFully", "([BII)V"),
+    ("java/io/DataInputStream", "readInt", "()I"),
+    ("java/io/DataInputStream", "readLong", "()J"),
+    ("java/io/DataInputStream", "readShort", "()S"),
+    ("java/io/DataInputStream", "readUTF", "()Ljava/lang/String;"),
+    ("java/io/DataInputStream", "readUnsignedByte", "()I"),
+    ("java/io/DataInputStream", "readUnsignedShort", "()I"),
+    ("java/io/DataInputStream", "skipBytes", "(I)I"),
+    (
+        "java/io/DataOutputStream",
+        "<init>",
+        "(Ljava/io/OutputStream;)V",
+    ),
+    ("java/io/DataOutputStream", "close", "()V"),
+    ("java/io/DataOutputStream", "flush", "()V"),
+    ("java/io/DataOutputStream", "size", "()I"),
+    ("java/io/DataOutputStream", "write", "(I)V"),
+    ("java/io/DataOutputStream", "write", "([BII)V"),
+    ("java/io/DataOutputStream", "writeBoolean", "(Z)V"),
+    ("java/io/DataOutputStream", "writeByte", "(I)V"),
+    ("java/io/DataOutputStream", "writeChar", "(I)V"),
+    ("java/io/DataOutputStream", "writeDouble", "(D)V"),
+    ("java/io/DataOutputStream", "writeFloat", "(F)V"),
+    ("java/io/DataOutputStream", "writeInt", "(I)V"),
+    ("java/io/DataOutputStream", "writeLong", "(J)V"),
+    ("java/io/DataOutputStream", "writeShort", "(I)V"),
+    (
+        "java/io/DataOutputStream",
+        "writeUTF",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/io/File",
+        "<init>",
+        "(Ljava/io/File;Ljava/lang/String;)V",
+    ),
+    ("java/io/File", "<init>", "(Ljava/lang/String;)V"),
+    (
+        "java/io/File",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+    ),
+    ("java/io/File", "<init>", "(Ljava/net/URI;)V"),
+    ("java/io/File", "canExecute", "()Z"),
+    ("java/io/File", "canRead", "()Z"),
+    ("java/io/File", "canWrite", "()Z"),
+    ("java/io/File", "compareTo", "(Ljava/io/File;)I"),
+    ("java/io/File", "createNewFile", "()Z"),
+    (
+        "java/io/File",
+        "createTempFile",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/io/File;)Ljava/io/File;",
+    ),
+    ("java/io/File", "delete", "()Z"),
+    ("java/io/File", "equals", "(Ljava/lang/Object;)Z"),
+    ("java/io/File", "exists", "()Z"),
+    ("java/io/File", "getAbsoluteFile", "()Ljava/io/File;"),
+    ("java/io/File", "getAbsolutePath", "()Ljava/lang/String;"),
+    ("java/io/File", "getCanonicalFile", "()Ljava/io/File;"),
+    ("java/io/File", "getCanonicalPath", "()Ljava/lang/String;"),
+    ("java/io/File", "getFreeSpace", "()J"),
+    ("java/io/File", "getName", "()Ljava/lang/String;"),
+    ("java/io/File", "getParent", "()Ljava/lang/String;"),
+    ("java/io/File", "getParentFile", "()Ljava/io/File;"),
+    ("java/io/File", "getPath", "()Ljava/lang/String;"),
+    ("java/io/File", "getTotalSpace", "()J"),
+    ("java/io/File", "getUsableSpace", "()J"),
+    ("java/io/File", "hashCode", "()I"),
+    ("java/io/File", "isAbsolute", "()Z"),
+    ("java/io/File", "isDirectory", "()Z"),
+    ("java/io/File", "isFile", "()Z"),
+    ("java/io/File", "isHidden", "()Z"),
+    ("java/io/File", "lastModified", "()J"),
+    ("java/io/File", "length", "()J"),
+    ("java/io/File", "list", "()[Ljava/lang/String;"),
+    (
+        "java/io/File",
+        "list",
+        "(Ljava/io/FilenameFilter;)[Ljava/lang/String;",
+    ),
+    ("java/io/File", "listFiles", "()[Ljava/io/File;"),
+    (
+        "java/io/File",
+        "listFiles",
+        "(Ljava/io/FileFilter;)[Ljava/io/File;",
+    ),
+    (
+        "java/io/File",
+        "listFiles",
+        "(Ljava/io/FilenameFilter;)[Ljava/io/File;",
+    ),
+    ("java/io/File", "listRoots", "()[Ljava/io/File;"),
+    ("java/io/File", "mkdir", "()Z"),
+    ("java/io/File", "mkdirs", "()Z"),
+    ("java/io/File", "renameTo", "(Ljava/io/File;)Z"),
+    ("java/io/File", "setExecutable", "(Z)Z"),
+    ("java/io/File", "setExecutable", "(ZZ)Z"),
+    ("java/io/File", "setLastModified", "(J)Z"),
+    ("java/io/File", "setReadOnly", "()Z"),
+    ("java/io/File", "setReadable", "(Z)Z"),
+    ("java/io/File", "setReadable", "(ZZ)Z"),
+    ("java/io/File", "setWritable", "(Z)Z"),
+    ("java/io/File", "setWritable", "(ZZ)Z"),
+    ("java/io/File", "toPath", "()Ljava/nio/file/Path;"),
+    ("java/io/File", "toString", "()Ljava/lang/String;"),
+    ("java/io/File", "toURI", "()Ljava/net/URI;"),
+    ("java/io/FilterOutputStream", "close", "()V"),
+    ("java/io/FilterOutputStream", "flush", "()V"),
+    ("java/io/FilterOutputStream", "write", "(I)V"),
+    ("java/io/FilterOutputStream", "write", "([B)V"),
+    ("java/io/FilterOutputStream", "write", "([BII)V"),
+    (
+        "java/nio/ByteBuffer",
+        "allocate",
+        "(I)Ljava/nio/ByteBuffer;",
+    ),
+    (
+        "java/nio/ByteBuffer",
+        "allocateDirect",
+        "(I)Ljava/nio/ByteBuffer;",
+    ),
+    ("java/nio/ByteBuffer", "array", "()[B"),
+    ("java/nio/ByteBuffer", "arrayOffset", "()I"),
+    ("java/nio/ByteBuffer", "capacity", "()I"),
+    ("java/nio/ByteBuffer", "clear", "()Ljava/nio/Buffer;"),
+    ("java/nio/ByteBuffer", "clear", "()Ljava/nio/ByteBuffer;"),
+    (
+        "java/nio/ByteBuffer",
+        "compareTo",
+        "(Ljava/nio/ByteBuffer;)I",
+    ),
+    ("java/nio/ByteBuffer", "equals", "(Ljava/lang/Object;)Z"),
+    ("java/nio/ByteBuffer", "flip", "()Ljava/nio/Buffer;"),
+    ("java/nio/ByteBuffer", "flip", "()Ljava/nio/ByteBuffer;"),
+    ("java/nio/ByteBuffer", "get", "([B)Ljava/nio/ByteBuffer;"),
+    ("java/nio/ByteBuffer", "hasArray", "()Z"),
+    ("java/nio/ByteBuffer", "hasRemaining", "()Z"),
+    ("java/nio/ByteBuffer", "hashCode", "()I"),
+    ("java/nio/ByteBuffer", "limit", "()I"),
+    ("java/nio/ByteBuffer", "limit", "(I)Ljava/nio/Buffer;"),
+    ("java/nio/ByteBuffer", "limit", "(I)Ljava/nio/ByteBuffer;"),
+    ("java/nio/ByteBuffer", "mark", "()Ljava/nio/Buffer;"),
+    ("java/nio/ByteBuffer", "mark", "()Ljava/nio/ByteBuffer;"),
+    ("java/nio/ByteBuffer", "order", "()Ljava/nio/ByteOrder;"),
+    (
+        "java/nio/ByteBuffer",
+        "order",
+        "(Ljava/nio/ByteOrder;)Ljava/nio/ByteBuffer;",
+    ),
+    ("java/nio/ByteBuffer", "position", "()I"),
+    ("java/nio/ByteBuffer", "position", "(I)Ljava/nio/Buffer;"),
+    (
+        "java/nio/ByteBuffer",
+        "position",
+        "(I)Ljava/nio/ByteBuffer;",
+    ),
+    (
+        "java/nio/ByteBuffer",
+        "put",
+        "(Ljava/nio/ByteBuffer;)Ljava/nio/ByteBuffer;",
+    ),
+    ("java/nio/ByteBuffer", "put", "([B)Ljava/nio/ByteBuffer;"),
+    ("java/nio/ByteBuffer", "put", "([BII)Ljava/nio/ByteBuffer;"),
+    ("java/nio/ByteBuffer", "remaining", "()I"),
+    ("java/nio/ByteBuffer", "reset", "()Ljava/nio/Buffer;"),
+    ("java/nio/ByteBuffer", "rewind", "()Ljava/nio/Buffer;"),
+    ("java/nio/ByteBuffer", "rewind", "()Ljava/nio/ByteBuffer;"),
+    ("java/nio/ByteBuffer", "wrap", "([B)Ljava/nio/ByteBuffer;"),
+    ("java/nio/ByteBuffer", "wrap", "([BII)Ljava/nio/ByteBuffer;"),
+    (
+        "java/nio/ByteBufferAsCharBufferB",
+        "order",
+        "()Ljava/nio/ByteOrder;",
+    ),
+    (
+        "java/nio/ByteBufferAsCharBufferL",
+        "order",
+        "()Ljava/nio/ByteOrder;",
+    ),
+    (
+        "java/nio/ByteBufferAsCharBufferRB",
+        "order",
+        "()Ljava/nio/ByteOrder;",
+    ),
+    (
+        "java/nio/ByteBufferAsCharBufferRL",
+        "order",
+        "()Ljava/nio/ByteOrder;",
+    ),
+];
+
 /// Is this exact triple a retired §1.4 shadow?
 ///
 /// The class-name prefix test is a cheap discriminator: every entry is under
@@ -3841,16 +4289,21 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
         return false;
     }
     let key = (class_name, method_name, descriptor);
-    RETIRED_SHADOW_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_L2_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_L7_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_L5_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_L1_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_L1_HM_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_L1_JT_TRIPLES.binary_search(&key).is_ok()
+    // Driven off `RETIRED_SHADOW_TABLES` rather than one `||` arm per table.
+    // `any` short-circuits exactly as the chain did and each table is still
+    // binary-searched, so this is the same work in the same order of magnitude
+    // — what changes is that a table which is not in the const is not
+    // consulted, instead of being consulted while the const says otherwise.
+    // Both lane 1 and lane 7 shipped a table missing from that const; the
+    // arrangement below cannot reproduce it.
+    //
+    // The const's order differs from the chain's it replaces. That is
+    // immaterial and `no_triple_is_claimed_by_two_tables` is why: no triple is
+    // in two tables, so no input can reach a second table that would answer
+    // differently, and which table answers first is unobservable.
+    RETIRED_SHADOW_TABLES
+        .iter()
+        .any(|table| table.binary_search(&key).is_ok())
 }
 
 /// Every retired-shadow table, in one slice, so a gate can walk the whole
@@ -3900,11 +4353,50 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // is structural: a new table is added at the bottom of a list in one file
     // and consulted in another, and nothing textual connects them.
     RETIRED_SHADOW_L7_TRIPLES,
+    RETIRED_SHADOW_L4_TRIPLES,
+    // Lane 1's HashMap and java.time waves, added to the const by the 2026-09-11
+    // L7 merge and NOT by lane 1 -- the third and fourth occurrence of this
+    // exact drift in two days, after lane 1's first table and lane 7's.
+    //
+    // They arrived as two more `||` arms in the predicate with no entry here,
+    // which under the old chain meant "consulted, but invisible to every gate
+    // driven off this const". Under the loop the predicate reads this list, so
+    // the same omission would have UN-RETIRED both waves instead of merely
+    // under-covering them -- a louder failure, and the reason the loop is worth
+    // having: the two lists cannot disagree, because there is only one.
+    RETIRED_SHADOW_L1_HM_TRIPLES,
+    RETIRED_SHADOW_L1_JT_TRIPLES,
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_l4_table_is_sorted_and_unique() {
+        for w in RETIRED_SHADOW_L4_TRIPLES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "lane 4's table is binary-searched, so it must be sorted and                  unique: {:?} does not precede {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn every_lane_4_entry_is_reachable_through_the_predicate() {
+        // A table entry under a prefix `triple_is_retired_shadow` rejects
+        // answers `false`, which reads as "not retired" and is INVISIBLE --
+        // the failure mode `every_entry_is_reachable_through_the_predicate`
+        // exists for. Lane 4 needed two new prefixes to be reachable at all.
+        for (c, m, d) in RETIRED_SHADOW_L4_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is in the lane 4 table and the predicate cannot see it"
+            );
+        }
+    }
 
     /// [`RETIRED_SHADOW_TABLES`] must list every table the predicate consults.
     ///
@@ -3921,24 +4413,37 @@ mod tests {
     /// the tables or consults one without a `binary_search`, and either is a
     /// change to this file that should be reading this comment.
     #[test]
-    fn the_tables_const_lists_every_table_the_predicate_consults() {
+    fn the_predicate_names_no_table_directly() {
+        // The inverse of the test this replaces, and the reason it can be an
+        // inverse: `triple_is_retired_shadow` now iterates
+        // `RETIRED_SHADOW_TABLES`, so "the const lists every table the
+        // predicate consults" is true by construction and no longer needs
+        // asserting. What DOES need asserting is that nobody reintroduces a
+        // hand-written arm beside the loop — one `|| RETIRED_SHADOW_LX_TRIPLES
+        // .binary_search(..)` would consult a table the const does not list,
+        // and every gate driven off the const would quietly stop covering it.
         let src = include_str!("retired_shadow.rs");
         let body = src
             .split("pub fn triple_is_retired_shadow(")
             .nth(1)
             .expect("the predicate is in this file");
-        let body = body.split("
-}
-").next().expect("the predicate has a body");
-        let consulted = body
-            .matches("RETIRED_SHADOW_")
-            .count()
-            .saturating_sub(body.matches("RETIRED_SHADOW_PREFIXES").count());
+        let body = body.split("\n}\n").next().expect("the predicate has a body");
+        let total = body.matches("RETIRED_SHADOW_").count();
+        let allowed = body.matches("RETIRED_SHADOW_PREFIXES").count()
+            + body.matches("RETIRED_SHADOW_TABLES").count();
         assert_eq!(
-            consulted,
-            RETIRED_SHADOW_TABLES.len(),
-            "`triple_is_retired_shadow` consults {consulted} tables but `RETIRED_SHADOW_TABLES` lists {}. Add the new table to the const — see its doc comment for what is skipped otherwise.",
-            RETIRED_SHADOW_TABLES.len()
+            total, allowed,
+            "`triple_is_retired_shadow` names a retired-shadow table directly. \
+             It must reach every table through `RETIRED_SHADOW_TABLES`, which \
+             is what makes the const the single place a new table is \
+             registered — and what makes every gate driven off the const cover \
+             it. Delete the hand-written arm and add the table to the const."
+        );
+        assert!(
+            body.contains("RETIRED_SHADOW_TABLES"),
+            "`triple_is_retired_shadow` no longer consults \
+             `RETIRED_SHADOW_TABLES` at all — it would answer `false` for every \
+             retired triple, silently un-retiring the whole population."
         );
     }
 
@@ -4688,6 +5193,97 @@ mod tests {
                 triple_is_retired_shadow(c, m, d),
                 "unreachable entry: {c}.{m}{d}"
             );
+        }
+    }
+
+    /// **The N-way disjointness test**, over [`RETIRED_SHADOW_TABLES`] rather
+    /// than over a list of sibling names typed out by hand.
+    ///
+    /// `docs/known-issues/jdk-only-lanes/lane-0-integration-and-gates.md` §4
+    /// specifies one of these and assigns it to L0, in the skeleton commit that
+    /// was to land before any lane started. That commit never landed — lane 1
+    /// says so in `RETIRED_SHADOW_TABLES`' own comment — so each lane wrote its
+    /// own instead, and on 2026-09-11 they had drifted into covering different
+    /// and partial sets:
+    ///
+    /// ```text
+    ///   L1  no disjointness test at all
+    ///   L2  STATELESS, PHASE2
+    ///   L5  STATELESS, PHASE2, PHASE3
+    ///   L7  STATELESS, PHASE2, PHASE3, L1, L2, L5
+    /// ```
+    ///
+    /// So L1's rows were checked against nothing, and L2xL5, L2xL7, L2xPHASE3
+    /// and L5xL1 were checked by neither side. A per-lane test cannot close
+    /// this: it names its siblings at the moment it is written, and the next
+    /// lane to land is not on the list.
+    ///
+    /// A collision is harmless to the predicate, which ORs, and NOT harmless to
+    /// the record — two waves each report having retired the row and the next
+    /// reader cannot tell which measurement backs the decision. This walks
+    /// every table against every other, so a new table is covered by being in
+    /// the const, which is the same thing that makes it consulted.
+    #[test]
+    fn no_triple_is_claimed_by_two_tables() {
+        use std::collections::BTreeMap;
+        let mut first: BTreeMap<(&str, &str, &str), usize> = BTreeMap::new();
+        let mut collisions = Vec::new();
+        for (i, table) in RETIRED_SHADOW_TABLES.iter().enumerate() {
+            for t in table.iter() {
+                if let Some(prev) = first.insert(*t, i) {
+                    collisions.push((*t, prev, i));
+                }
+            }
+        }
+        assert!(
+            collisions.is_empty(),
+            "{} triple(s) are claimed by two tables of `RETIRED_SHADOW_TABLES`. \
+             Each is retired twice, so two waves each report having retired it \
+             and neither measurement is identifiable as the one behind the \
+             decision. Delete the later claim, keeping the row in the table \
+             whose page measured it: {:?}",
+            collisions.len(),
+            collisions
+        );
+    }
+
+    /// Sorted and unique for EVERY table, for the same reason each lane asserts
+    /// it of its own: the predicate binary-searches, so an out-of-order entry
+    /// answers `false` for a row that is present and retires nothing, silently.
+    /// Driven off the const so a new table cannot arrive unchecked.
+    #[test]
+    fn every_table_is_sorted_and_unique() {
+        for (i, table) in RETIRED_SHADOW_TABLES.iter().enumerate() {
+            for w in table.windows(2) {
+                assert!(
+                    w[0] < w[1],
+                    "table {i} of `RETIRED_SHADOW_TABLES` is out of order or \
+                     has a duplicate: {:?} then {:?}",
+                    w[0],
+                    w[1]
+                );
+            }
+        }
+    }
+
+    /// Every row of every table answers `true` through the REAL predicate.
+    ///
+    /// Per-lane versions of this exist and each covers its own table; this one
+    /// covers the tables nobody wrote one for. A row outside every
+    /// [`RETIRED_SHADOW_PREFIXES`] entry answers `false`, which reads as "not
+    /// retired" and is invisible in a workload — a missing prefix is the one
+    /// edit that silently un-retires a whole wave.
+    #[test]
+    fn every_row_of_every_table_is_reachable() {
+        for (i, table) in RETIRED_SHADOW_TABLES.iter().enumerate() {
+            for (c, m, d) in table.iter() {
+                assert!(
+                    triple_is_retired_shadow(c, m, d),
+                    "table {i}: {c}.{m}{d} is in a retired-shadow table and the \
+                     predicate says it is not retired — almost always a missing \
+                     `RETIRED_SHADOW_PREFIXES` entry"
+                );
+            }
         }
     }
 

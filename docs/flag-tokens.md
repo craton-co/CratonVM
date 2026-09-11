@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-545 tokens.
+547 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -334,6 +334,7 @@ export inherited from a parent shell.
 | `jit-unmap` | `CRATONVM_DBG_JIT_UNMAP` |
 | `intrinsic` | `CRATONVM_DBG_INTRINSIC` |
 | `jitc` | `CRATONVM_DBG_JITC` |
+| `jitnpe` | `CRATONVM_DBG_JITNPE` |
 | `jlm` | `CRATONVM_DBG_JLM` |
 | `jul` | `CRATONVM_DBG_JUL` |
 | `kcbool` | `CRATONVM_DBG_KCBOOL` |
@@ -423,6 +424,7 @@ export inherited from a parent shell.
 | `null-native` | `CRATONVM_DBG_NULL_NATIVE` |
 | `nullthis` | `CRATONVM_DBG_NULLTHIS` |
 | `obj-equals` | `CRATONVM_DBG_OBJ_EQUALS` |
+| `obj-watch` | `CRATONVM_DBG_OBJ_WATCH` |
 | `objects` | `CRATONVM_DBG_OBJECTS` |
 | `objkey` | `CRATONVM_DBG_OBJKEY` |
 | `obsreg` | `CRATONVM_DBG_OBSREG` |
@@ -611,7 +613,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-435 tokens.
+440 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -820,7 +822,12 @@ export inherited from a parent shell.
 | `ir-list-sched` | `CRATONVM_JIT_IR_LIST_SCHED` |
 | `ir-carry-rcx-folded` | `CRATONVM_JIT_IR_CARRY_RCX_FOLDED` |
 | `ir-unroll-unreachable-frames` | `CRATONVM_JIT_IR_UNROLL_UNREACHABLE_FRAMES` |
+| `ir-licm-mem-edge` | `CRATONVM_JIT_IR_LICM_MEM_EDGE` |
+| `ir-licm-before-unroll` | `CRATONVM_JIT_IR_LICM_BEFORE_UNROLL` |
+| `ir-poll-outline` | `CRATONVM_JIT_IR_POLL_OUTLINE` |
 | `ir-per-copy-frames` | `CRATONVM_JIT_IR_PER_COPY_FRAMES` |
+| `ir-partial-unroll` | `CRATONVM_JIT_IR_PARTIAL_UNROLL` |
+| `ir-partial-unroll-factor` | `CRATONVM_JIT_IR_PARTIAL_UNROLL_FACTOR` |
 | `c2-accept` | `CRATONVM_C2_ACCEPT` |
 | `c2-accept-memo` | `CRATONVM_C2_ACCEPT_MEMO` |
 | `ir-unresolved-class-trap` | `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` |

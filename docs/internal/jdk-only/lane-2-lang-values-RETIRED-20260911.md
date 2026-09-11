@@ -119,10 +119,18 @@ reach bytecode — it wakes the dead loser, which returns **null** for a null
 argument where the real body throws. 3 of 27 refusals carried a survivor. The
 probe rows moved, so the wave *looked* measurable and retired nothing.
 
-**The rest — the JIT drops the helpful NPE message.** Interpreted they are
-HotSpot-exact; once the body is JIT-compiled the `NullPointerException` arrives
-with no message at all. Filed as
-[`../../known-issues/jit/the-helpful-npe-message-is-lost-in-compiled-code-20260910.md`](../../known-issues/jit/the-helpful-npe-message-is-lost-in-compiled-code-20260910.md).
+**The rest — the JIT dropped the helpful NPE message. BLOCKER CLEARED
+2026-09-11, and the rows still do not move.** Interpreted they were
+HotSpot-exact; once the body was JIT-compiled the `NullPointerException` arrived
+with no message at all. Fixed by `0d013f359` and retired as
+[`../fixed-bugs/the-helpful-npe-message-is-lost-in-compiled-code-FIXED-20260911.md`](../fixed-bugs/the-helpful-npe-message-is-lost-in-compiled-code-FIXED-20260911.md),
+pinned by `vm/tests/jit_npe_message_hot_equals_cold.rs`.
+
+Clearing the blocker is not the same as retiring the rows, and the JIT lane said
+so in this page before it moved: **the hold is STRUCTURAL** — every
+reference-argument row, not the six that happened to regress — so lifting it owes
+the same `BigIntegerSweep` measurement with the JIT on that put it there. This
+lane did not re-take it, so the 14 rows stay held and the tally in §5 stands.
 
 **Which rows show it moves between runs**, so the hold is structural rather than
 copied out of one diff: six rows regressed on the 24-triple binary, and
@@ -265,9 +273,12 @@ where retiring is a defect.
 
 ## 6. What this lane hands on
 
-- **The JIT drops JEP 358's helpful NPE message** in compiled code. Blocks 14
-  `BigInteger` rows here and every reference-argument retirement anywhere.
-  `apps/probes/L2JitNpeProbe.java` is the acceptance test.
+- ~~**The JIT drops JEP 358's helpful NPE message** in compiled code.~~ FIXED
+  2026-09-11 by `0d013f359` (`probes/L2JitNpeProbe.java`, now six shapes, and
+  `vm/tests/jit_npe_message_hot_equals_cold.rs`). The 14 `BigInteger` rows it
+  blocked are still held: the rule is "no reference parameter", which was
+  derived from rows MOVING between runs, and nobody has re-measured with the
+  defect gone. That re-measurement is the whole of what is left here.
 - **Five `java/util/logging` triples are INERT.** The full refusal report on the
   final binary reads 2029 refusals, 7 rows / 5 distinct triples with a survivor,
   all `java/util/logging`, none in lane 2 — an older `phases_early.rs` intrinsic

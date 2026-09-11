@@ -3364,10 +3364,15 @@ pub(crate) fn register_p65_priority_blocking_queue(r: &mut NativeMethodRegistry)
             Some(Value::Int(v)) => (*v).max(1) as usize,
             _ => 11,
         };
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
-        ctx.set_field(this, 0, Value::Object(Some(arr)));
-        ctx.set_field(this, 1, Value::Int(0));
-        ctx.set_field(this, 2, Value::Object(None));
+        // The receiver was read from the caller's frame before this
+        // allocation, so its address has to be taken again after it.
+        let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+        let this_h = scope.root(this);
+        let arr = scope.new_array(cratonvm_types::ArrayElementType::Reference, cap);
+        let this = scope.get(&this_h);
+        scope.set_field(this, 0, Value::Object(Some(arr)));
+        scope.set_field(this, 1, Value::Int(0));
+        scope.set_field(this, 2, Value::Object(None));
         Ok(None)
     });
     // put = offer (non-blocking semantics in our model)
@@ -3437,9 +3442,14 @@ pub(crate) fn register_p65_priority_blocking_queue(r: &mut NativeMethodRegistry)
                 return Ok(Some(Value::Object(Some(empty))));
             }
         };
-        let result = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
+        // `arr` came out of the heap before this allocation: re-read it.
+        let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+        let arr_h = scope.root(arr);
+        let result = scope.new_array(cratonvm_types::ArrayElementType::Reference, size);
+        let arr = scope.get(&arr_h);
         for i in 0..size {
-            ctx.set_array_element(result, i, ctx.get_array_element(arr, i));
+            let v = scope.get_array_element(arr, i);
+            scope.set_array_element(result, i, v);
         }
         Ok(Some(Value::Object(Some(result))))
     });

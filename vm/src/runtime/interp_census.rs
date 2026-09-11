@@ -371,6 +371,14 @@ pub fn report_at_exit() {
         eprintln!(
             "[c2-supersede] ir block exits: fell_through={ft_elided} jmp_emitted={ft_jmps}"
         );
+        // Safepoint polls, by shape. The inline shape branches over its own
+        // slow path on the FAST path, so a hot loop pays a taken jump and
+        // carries ~230 bytes it never enters; `CRATONVM_JIT_IR_POLL_OUTLINE`
+        // moves the block after the body and inverts the test.
+        let (poll_out, poll_inline) = cratonvm_jit::ir_lower::ir_poll_census();
+        eprintln!(
+            "[c2-supersede] ir safepoint polls: outlined={poll_out} inline={poll_inline}"
+        );
         // Speculation. A zero with `CRATONVM_JIT_IR_SPECULATE=1` means no
         // branch in this workload was one-sided over the sample — a fact about
         // the program, not about the pass — and that is precisely what a bare
@@ -447,20 +455,31 @@ pub fn report_at_exit() {
         // Loop unrolling. OUTSIDE the supersede gate, and read as a
         // DISTRIBUTION rather than a total: `unrolled=0` is the expected
         // reading and says nothing on its own, while `runtime_bound` sizes the
-        // partial unroller that does not exist and `safepoint_named` sizes what
-        // the existing one refuses on a default run.
+        // PARTIAL unroller's population and `safepoint_named` sizes what the
+        // full one refuses on a default run.
+        //
+        // `runtime_bound` is a SHAPE count and deliberately not a term of the
+        // closing identity; `runtime_bound_refused` is its terminal counterpart,
+        // and the two are EQUAL until the partial unroller is armed. Read
+        // `partially_unrolled` against the gap between them: it is how many of
+        // the loops the partial unroller took responsibility for it actually
+        // transformed, and the rest went to one of the shared refusals on this
+        // same line.
         let uc = cratonvm_jit::ir_optimize::ir_unroll_census();
         eprintln!(
             "[c2-supersede] ir unroll: merges={} (loops = merges - not_single_backedge) unrolled={} \
-             (of which per_copy_frames={}) | declined: \
-             runtime_bound={} (of which trap_free={} pure_body={}) safepoint_named={} \
+             (of which per_copy_frames={}) partially_unrolled={} | declined: \
+             runtime_bound={} (of which refused_outright={} trap_free={} pure_body={}) \
+             safepoint_named={} \
              frame_uncopyable={} side_effect={} not_counted={} control_shape={} \
              body_unclonable={} trip_over_cap={} escapes_or_pinned={} \
              not_single_backedge={}",
             uc.headers,
             uc.unrolled,
             uc.per_copy_frames,
+            uc.partially_unrolled,
             uc.runtime_bound,
+            uc.runtime_bound_refused,
             uc.runtime_bound_trap_free,
             uc.runtime_bound_pure_body,
             uc.safepoint_named,
