@@ -3485,7 +3485,7 @@ mod tests {
     }
 
     #[test]
-    fn the_l2_table_is_disjoint_from_the_other_three() {
+    fn the_l2_table_is_disjoint_from_every_other_table() {
         for key in RETIRED_SHADOW_L2_TRIPLES {
             for (other, name) in [
                 (RETIRED_SHADOW_TRIPLES, "RETIRED_SHADOW_TRIPLES"),
@@ -3497,6 +3497,12 @@ mod tests {
                     RETIRED_SHADOW_PHASE2_TRIPLES,
                     "RETIRED_SHADOW_PHASE2_TRIPLES",
                 ),
+                (
+                    RETIRED_SHADOW_PHASE3_TRIPLES,
+                    "RETIRED_SHADOW_PHASE3_TRIPLES",
+                ),
+                (RETIRED_SHADOW_L1_TRIPLES, "RETIRED_SHADOW_L1_TRIPLES"),
+                (RETIRED_SHADOW_L5_TRIPLES, "RETIRED_SHADOW_L5_TRIPLES"),
             ] {
                 assert!(
                     other.binary_search(key).is_err(),
