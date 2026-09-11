@@ -253,7 +253,7 @@ was silently absent.
   a stack trace. Full measurement, and an UNRESOLVED conflict with the
   `--real-jdk` cell recorded above (Linux shows the fallback in BOTH modes,
   Windows recorded `--real-jdk` correct):
-  ../serviceloader-loadinstalled-finds-nothing-so-every-platform-loader-service-is-empty-20260909.md
+  ../../internal/retired/serviceloader-loadinstalled-finds-nothing-so-every-platform-loader-service-is-empty-FIXED-20260909.md
   **CORRECTED the same day:** the cause is NOT `jdk.localedata` failing to
   load — that module is present and its data is intact. It is
   `ServiceLoader.loadInstalled` returning NOTHING for every service (the

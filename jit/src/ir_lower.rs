@@ -1080,6 +1080,24 @@ struct Lowerer<'a> {
     /// deferred carry's survival is OBSERVED rather than predicted — see
     /// [`Self::note_rcx_written`].
     rcx_writes: usize,
+    /// Fused compares that read both operands where they already were.
+    cmp_in_place: usize,
+    /// Fused compares that read the second operand straight out of its frame
+    /// slot instead of loading it into RCX first.
+    cmp_in_place_frame: usize,
+    /// Fused compares against a CONSTANT second operand, by where the first
+    /// operand was read from: its register, and its frame slot.
+    ///
+    /// `i < 100` is the shape, and it is the most common comparison in Java.
+    /// Both forms fold the constant into the instruction instead of
+    /// materialising it in RCX first.
+    cmp_imm: usize,
+    cmp_imm_frame: usize,
+    /// `x + k` / `x - k` emitted as one `LEA` into the result's own register
+    /// instead of load-accumulate-publish, and — the common case — as one
+    /// `LEA` into the accumulator instead of a `MOV` and an `ADD`.
+    add_lea: usize,
+    add_lea_acc: usize,
     /// ENGAGEMENT, and its fail-closed counterpart. A refusal is not a
     /// miscompile — the value's home is `home_dropped`, so the fallback read
     /// refuses the compile as well — but it means the contract this planned
@@ -1653,6 +1671,12 @@ impl<'a> Lowerer<'a> {
             deferred_mid_foldable: 0,
             deferred_candidates: 0,
             rcx_writes: 0,
+            cmp_in_place: 0,
+            cmp_in_place_frame: 0,
+            cmp_imm: 0,
+            cmp_imm_frame: 0,
+            add_lea: 0,
+            add_lea_acc: 0,
             carries_taken: 0,
             carries_read: 0,
             carries_refused: 0,
@@ -2636,6 +2660,214 @@ impl<'a> Lowerer<'a> {
         let rex = 0x48u8 | (((src >= 8) as u8) << 2) | ((dst >= 8) as u8);
         self.buf
             .emit(&[rex, 0x89, 0xC0 | ((src & 7) << 3) | (dst & 7)]);
+    }
+
+    /// `CMP a, b` — register to register, any pair, 64-bit when `wide`.
+    ///
+    /// `39 /r` is `CMP r/m, r`, so the FIRST operand goes in the ModRM `r/m`
+    /// field and the second in `reg` — the opposite nesting from the mnemonic,
+    /// and the reason this is a named helper rather than three inline literals.
+    /// The flags it sets are `a - b`, which is the order `CmpCond::x64_cc`
+    /// expects.
+    ///
+    /// The 32-bit form emits REX only when it has to name an extended register,
+    /// so a comparison of two low registers stays two bytes exactly as
+    /// `CMP EAX, ECX` did.
+    fn emit_cmp_reg_reg(&mut self, a: u8, b: u8, wide: bool) {
+        let (bytes, len) = cmp_reg_reg_bytes(a, b, wide);
+        self.buf.emit(&bytes[..len]);
+    }
+
+    /// `CMP a, [RBP - offset]` — 64-bit when `wide`.
+    ///
+    /// `3B /r` is `CMP r, r/m`, the mirror of the `39 /r` above: here the FIRST
+    /// operand is the `reg` field and the second comes from memory, which is
+    /// the direction needed to compare a resident value against one still in
+    /// its frame slot. Flags are `a - [slot]`, the same order
+    /// `CmpCond::x64_cc` expects.
+    ///
+    /// The 32-bit form reads four bytes where the `MOV` it replaces read eight.
+    /// That is the same comparison: the slot holds a sign-extended `int` in its
+    /// low word, and the `CMP EAX, ECX` this replaces only ever looked at those
+    /// four bytes either.
+    fn emit_cmp_reg_frame(&mut self, a: u8, offset: i32, wide: bool) {
+        let rex = if wide { 0x48u8 } else { 0x40u8 } | (((a >= 8) as u8) << 2);
+        if rex != 0x40 {
+            self.buf.emit_byte(rex);
+        }
+        self.buf.emit_byte(0x3B);
+        self.emit_rbp_modrm_disp(a, offset);
+    }
+
+    /// `CMP a, imm` — register against a folded constant, 64-bit when `wide`.
+    fn emit_cmp_reg_imm(&mut self, a: u8, imm: i32, wide: bool) {
+        let (bytes, len) = cmp_reg_imm_bytes(a, imm, wide);
+        self.buf.emit(&bytes[..len]);
+    }
+
+    /// `CMP [RBP - offset], imm` — a value still in its slot against a folded
+    /// constant, 64-bit when `wide`. Three instructions become one, and the
+    /// one names no register at all.
+    fn emit_cmp_frame_imm(&mut self, offset: i32, imm: i32, wide: bool) {
+        let (bytes, len) = cmp_frame_imm_bytes(offset, imm, wide);
+        self.buf.emit(&bytes[..len]);
+    }
+
+    /// Which in-place form a fused compare of `a` against `b` can take, if any.
+    ///
+    /// Ordered by how much each saves, and the immediate forms come first
+    /// because they need the least: a constant folds into the instruction, so
+    /// only the FIRST operand needs a place to be read from, and a first
+    /// operand that lost its register is served as well as one that kept it.
+    ///
+    /// `alu_imm32` is the gate on the constant rather than a local
+    /// `Op::Const` match, deliberately. It declines a constant too wide for
+    /// `i32` — which every immediate form here sign-extends, so such a
+    /// constant has no immediate encoding at all — and it is OFF under a MIR
+    /// mode, where a tiled node is emitted by the selector and a fold here
+    /// would make the byte-equality lane compare two different programs.
+    ///
+    /// `slot_of_checked` rather than `slot_of`: a dropped home declines the
+    /// frame forms instead of latching a bailout on a path that has a
+    /// perfectly good fallback.
+    fn pick_cmp_form(&self, a: NodeId, b: NodeId) -> Option<CmpForm> {
+        if let Some(imm) = self.alu_imm32(b) {
+            return match self.resident_gpr(a) {
+                Some(ra) => Some(CmpForm::RegImm(ra, imm)),
+                None => self
+                    .slot_of_checked(a)
+                    .ok()
+                    .map(|off| CmpForm::FrameImm(off, imm)),
+            };
+        }
+        // Both remaining forms need the first operand in a register: there is
+        // no `CMP mem, mem`, and loading `a` to compare it against a slot
+        // would spend the instruction this exists to remove.
+        let ra = self.resident_gpr(a)?;
+        match self.resident_gpr(b) {
+            Some(rb) => Some(CmpForm::RegReg(ra, rb)),
+            None => self
+                .slot_of_checked(b)
+                .ok()
+                .map(|off| CmpForm::RegFrame(ra, off)),
+        }
+    }
+
+    /// `x + k` (or `x - k`) as a `LEA`, when `k` is a constant and `x` is
+    /// resident. Answers WHERE it left the result, so the caller knows how
+    /// much of its accumulator sequence still has to run.
+    ///
+    /// What it replaces, from `CmpImm.wide` with `i` in RBX:
+    ///
+    /// ```asm
+    /// mov rax,rbx        ; i -> RAX
+    /// add eax,1
+    /// ```
+    ///
+    /// Two instructions to add one to a value that was already in a register.
+    /// `LEA` is the only three-operand integer instruction on this machine, so
+    /// it is the only way to read a source and write a destination that is not
+    /// the source without routing through the accumulator — and `x + 1` in a
+    /// counted loop is exactly that shape.
+    ///
+    /// **Two forms, and the weaker one is the common case.** Which applies
+    /// turns on whether the result got a register of its own:
+    ///
+    /// * it did — [`AddForm::Done`], `lea r14d,[rbx+1]` writes that register
+    ///   directly and the arm owes nothing further;
+    /// * it did not — [`AddForm::InRax`], `lea eax,[rbx+1]` writes the
+    ///   accumulator and [`Self::store_rax`] finishes exactly as it would
+    ///   have. One instruction out of two, and nothing else about the arm
+    ///   changes.
+    ///
+    /// The second form is the one a loop-carried increment actually takes, and
+    /// it is why this is not written as a single all-or-nothing fold. Measured
+    /// on `CmpImm.wide`: `def_publishes=0` against `phi copies:
+    /// reg_publishes=10` — the loop-carried values are published by the phi
+    /// copies on the back edge, so `i + 1` itself writes a home word and is
+    /// given no register. A first version that required one engaged **nowhere**
+    /// on that probe.
+    ///
+    /// Unlike the fused compare this DEFINES a value, so the direct form owes
+    /// everything a definition owes:
+    ///
+    /// * neither operand may be a value a carry is holding, which has to be
+    ///   read through `gp_load_value` or the carry strands — and when `x` IS
+    ///   carried in RAX the accumulator path is already one instruction, so
+    ///   declining costs nothing;
+    /// * the result must not itself be PLANNED as a carry: `store_rax` hands a
+    ///   carried value to its consumer out of RAX, and the direct form never
+    ///   puts it there. The accumulator form needs no such guard — it falls
+    ///   into `store_rax` with RAX loaded, which is the contract that path
+    ///   already has;
+    /// * and when the home word survives (`home_dropped` is false — a deopt
+    ///   frame names it, say) it is still written, from the destination
+    ///   register, which by then holds exactly what RAX would have.
+    ///
+    /// The 32-bit form zero-extends into the destination, which is what `ADD
+    /// EAX, imm` did and what the 64-bit home store then writes, so the frame
+    /// image is byte-identical either way.
+    fn emit_add_lea(&mut self, id: NodeId, slot: i32, sub: bool, wide: bool) -> AddForm {
+        if !ir_add_lea_enabled() {
+            return AddForm::No;
+        }
+        let node = &self.graph.nodes[id as usize];
+        let (x, k) = (node.inputs[0], node.inputs[1]);
+        // Only the SECOND operand is tried as the constant. `Op::Add` is
+        // commutative and nothing canonicalises it, so `1 + i` is left to the
+        // accumulator path — a missed fold, never a wrong one, and javac does
+        // not emit that order for a counted loop.
+        let Some(imm) = self.alu_imm32(k) else {
+            return AddForm::No;
+        };
+        // `x - k` is `x + (-k)`, except at `i32::MIN`, whose negation is not an
+        // `i32` at all. One constant in the language, and it declines here
+        // rather than wrapping into a silent `+ MIN`.
+        let Some(disp) = (if sub { imm.checked_neg() } else { Some(imm) }) else {
+            return AddForm::No;
+        };
+        if self.carry_names(x) || self.carry_names(k) {
+            return AddForm::No;
+        }
+        let Some(base) = self.resident_gpr(x) else {
+            return AddForm::No;
+        };
+        // The direct form, when the result has a register to be written into
+        // and nothing has claimed RAX as the route to its consumer.
+        if let Some(dst) = self.assigned_gpr(id) {
+            if self.carry_at_store(slot).is_none() {
+                let (bytes, len) = lea_reg_base_disp_bytes(dst, base, disp, wide);
+                self.buf.emit(&bytes[..len]);
+                self.mark_gp_reg_live(id);
+                self.reg_publishes_at_def += 1;
+                self.cur_def_published = true;
+                if self.home_dropped.get(id as usize).copied().unwrap_or(false) {
+                    self.homes_dropped_at_def += 1;
+                    self.home_stores_dropped += 1;
+                } else {
+                    self.store_abi_reg(dst, slot);
+                }
+                self.add_lea += 1;
+                return AddForm::Done;
+            }
+        }
+        let (bytes, len) = lea_reg_base_disp_bytes(RAX, base, disp, wide);
+        self.buf.emit(&bytes[..len]);
+        self.add_lea_acc += 1;
+        AddForm::InRax
+    }
+
+    /// Is `id` a value some carry is holding in RAX or RCX right now?
+    ///
+    /// A carried value must be read through `gp_load_value`, which is what
+    /// takes it out of the slot; a site that reads it any other way would leave
+    /// the carry stranded and refuse the compile. `plan_carries` already
+    /// declines to carry anything the residency file assigned a register, so a
+    /// resident value is never carried — this is the belt to that braces,
+    /// because the failure is silent at the point it is made.
+    fn carry_names(&self, id: NodeId) -> bool {
+        matches!(self.live_carry, Some((prod, _, _, _)) if prod == id)
+            || matches!(self.deferred_rcx, Some((prod, _, _)) if prod == id)
     }
 
     /// Latch a structured bailout raised from an infallible legacy accessor.
@@ -7915,18 +8147,27 @@ impl<'a> Lowerer<'a> {
                     self.fp_binop(0x58, XMM0, XMM1, is_d);
                     self.fp_store_value(id, slot, XMM0, is_d);
                 } else {
-                    self.gp_load_value(RAX, node.inputs[0]);
-                    if !self.emit_alu_acc_imm(node.inputs[1], 0x05, node.ty != IrType::Int) {
-                        self.gp_load_value(RCX, node.inputs[1]);
-                        if node.ty == IrType::Int {
-                            // ADD EAX, ECX
-                            self.buf.emit(&[0x01, 0xC8]);
-                        } else {
-                            // ADD RAX, RCX
-                            self.buf.emit(&[0x48, 0x01, 0xC8]);
+                    let form = self.emit_add_lea(id, slot, false, node.ty != IrType::Int);
+                    if matches!(form, AddForm::No) {
+                        self.gp_load_value(RAX, node.inputs[0]);
+                        if !self.emit_alu_acc_imm(node.inputs[1], 0x05, node.ty != IrType::Int) {
+                            self.gp_load_value(RCX, node.inputs[1]);
+                            if node.ty == IrType::Int {
+                                // ADD EAX, ECX
+                                self.buf.emit(&[0x01, 0xC8]);
+                            } else {
+                                // ADD RAX, RCX
+                                self.buf.emit(&[0x48, 0x01, 0xC8]);
+                            }
                         }
                     }
-                    self.store_rax(slot);
+                    // `Done` settled the home inside the helper, having
+                    // published the register itself; the other two leave the
+                    // value in RAX for this one store, exactly as the single
+                    // path used to.
+                    if !matches!(form, AddForm::Done) {
+                        self.store_rax(slot);
+                    }
                 }
             }
             Op::Sub => {
@@ -7939,18 +8180,23 @@ impl<'a> Lowerer<'a> {
                     self.fp_binop(0x5C, XMM0, XMM1, is_d);
                     self.fp_store_value(id, slot, XMM0, is_d);
                 } else {
-                    self.gp_load_value(RAX, node.inputs[0]);
-                    if !self.emit_alu_acc_imm(node.inputs[1], 0x2D, node.ty != IrType::Int) {
-                        self.gp_load_value(RCX, node.inputs[1]);
-                        if node.ty == IrType::Int {
-                            // SUB EAX, ECX
-                            self.buf.emit(&[0x29, 0xC8]);
-                        } else {
-                            // SUB RAX, RCX
-                            self.buf.emit(&[0x48, 0x29, 0xC8]);
+                    let form = self.emit_add_lea(id, slot, true, node.ty != IrType::Int);
+                    if matches!(form, AddForm::No) {
+                        self.gp_load_value(RAX, node.inputs[0]);
+                        if !self.emit_alu_acc_imm(node.inputs[1], 0x2D, node.ty != IrType::Int) {
+                            self.gp_load_value(RCX, node.inputs[1]);
+                            if node.ty == IrType::Int {
+                                // SUB EAX, ECX
+                                self.buf.emit(&[0x29, 0xC8]);
+                            } else {
+                                // SUB RAX, RCX
+                                self.buf.emit(&[0x48, 0x29, 0xC8]);
+                            }
                         }
                     }
-                    self.store_rax(slot);
+                    if !matches!(form, AddForm::Done) {
+                        self.store_rax(slot);
+                    }
                 }
             }
             Op::Mul => {
@@ -10307,12 +10553,64 @@ impl<'a> Lowerer<'a> {
                                 let ref_cmp =
                                     matches!(self.graph.nodes[a as usize].ty, IrType::Ref)
                                         || matches!(self.graph.nodes[b as usize].ty, IrType::Ref);
-                                self.gp_load_value(RAX, a);
-                                self.gp_load_value(RCX, b);
-                                if ref_cmp {
-                                    self.buf.emit(&[0x48, 0x39, 0xC8]); // CMP RAX, RCX
+                                // Both already in registers: compare them
+                                // there. A fused compare is the one arm that
+                                // may do this without owing anything else — it
+                                // defines no value, writes no home and
+                                // publishes no register, so the only thing that
+                                // outlives it is the flags, and those are the
+                                // same either way.
+                                //
+                                // Nothing downstream may assume RAX holds `a`:
+                                // the non-fused path below overwrites AL with
+                                // `SETcc` on the phi-copy layout, so no reader
+                                // could ever have relied on it.
+                                // Four in-place forms — see `pick_cmp_form`
+                                // for which one wins and why. Neither operand
+                                // may be a value some carry is holding: that
+                                // has to be read through `gp_load_value` or
+                                // the carry strands.
+                                //
+                                // `b` in a frame slot is the common case, not
+                                // the fallback: `peak_live` routinely exceeds
+                                // the five-register file, and a loop bound is
+                                // exactly the long-lived value that loses.
+                                // `b` a CONSTANT is commoner still — `i < 100`
+                                // is the shape of most Java loops.
+                                let form = if ir_cmp_in_place_enabled()
+                                    && !self.carry_names(a)
+                                    && !self.carry_names(b)
+                                {
+                                    self.pick_cmp_form(a, b)
                                 } else {
-                                    self.buf.emit(&[0x39, 0xC8]); // CMP EAX, ECX
+                                    None
+                                };
+                                match form {
+                                    Some(CmpForm::RegReg(ra, rb)) => {
+                                        self.emit_cmp_reg_reg(ra, rb, ref_cmp);
+                                        self.cmp_in_place += 1;
+                                    }
+                                    Some(CmpForm::RegFrame(ra, off)) => {
+                                        self.emit_cmp_reg_frame(ra, off, ref_cmp);
+                                        self.cmp_in_place_frame += 1;
+                                    }
+                                    Some(CmpForm::RegImm(ra, imm)) => {
+                                        self.emit_cmp_reg_imm(ra, imm, ref_cmp);
+                                        self.cmp_imm += 1;
+                                    }
+                                    Some(CmpForm::FrameImm(off, imm)) => {
+                                        self.emit_cmp_frame_imm(off, imm, ref_cmp);
+                                        self.cmp_imm_frame += 1;
+                                    }
+                                    None => {
+                                        self.gp_load_value(RAX, a);
+                                        self.gp_load_value(RCX, b);
+                                        if ref_cmp {
+                                            self.buf.emit(&[0x48, 0x39, 0xC8]); // CMP RAX, RCX
+                                        } else {
+                                            self.buf.emit(&[0x39, 0xC8]); // CMP EAX, ECX
+                                        }
+                                    }
                                 }
                                 Some(cc.x64_cc())
                             }
@@ -13940,6 +14238,28 @@ fn ir_carry_rcx_folded_enabled() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_IR_ADD_LEA=0` — lower `x + k` and `x - k` through the
+/// accumulator, the shape that predates 2026-09-10.
+///
+/// Default ON. `LEA` is the only three-operand integer instruction on x86-64,
+/// and an increment whose source and destination are both register-resident is
+/// exactly the case that needs one: without it the value makes a round trip
+/// through RAX it has no other reason to make.
+///
+/// The kill switch and the A/B. See [`Lowerer::emit_add_lea`] for what it
+/// replaces and for the obligations a DEFINING arm has that a fused compare
+/// does not.
+fn ir_add_lea_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_ADD_LEA").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
 /// The ops whose arms reach RCX ONLY through the register form of their second
 /// operand, so that folding that operand into an immediate leaves RCX
 /// untouched.
@@ -13996,6 +14316,26 @@ fn note_deferred_census(candidates: usize, taken: usize, mid_rcx: usize, foldabl
     IR_CARRY_DEFERRED[1].fetch_add(taken as u64, Relaxed);
     IR_CARRY_DEFERRED[2].fetch_add(mid_rcx as u64, Relaxed);
     IR_CARRY_DEFERRED[3].fetch_add(foldable as u64, Relaxed);
+}
+
+/// `CRATONVM_JIT_IR_CMP_IN_PLACE=0` — load both operands of a fused compare into
+/// RAX and RCX before comparing them, the shape that predates 2026-09-10.
+///
+/// Default ON. A fused compare is the one arm that can read its operands
+/// wherever they already are without any further obligation: it produces no
+/// value, writes no home, publishes no register and leaves only flags. When
+/// both operands are register-resident the two `MOV`s ahead of it are pure
+/// overhead, and on a counted loop they are two of the seventeen instructions
+/// in the body.
+fn ir_cmp_in_place_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CMP_IN_PLACE").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
 }
 
 /// Does lowering `op` read its first input into RAX, and its second (if it has
@@ -14505,6 +14845,204 @@ pub fn ir_aastore_census() -> u64 {
 /// fail: it scans the claimed arms' source for any mention of RCX and pins the
 /// exact bytes they emit, because a raw `buf.emit(&[..])` can name RCX in a
 /// ModRM byte where no identifier scan would see it.
+/// The bytes of `CMP a, b` — 64-bit when `wide` — and how many of them.
+///
+/// A free function so the encoding can be tested against known-good vectors
+/// without standing up a `Lowerer`. It is worth testing: a ModRM field swapped
+/// here compares two registers that both exist, so the result is a plausible
+/// wrong branch rather than a fault.
+///
+/// `39 /r` is `CMP r/m, r`, so the FIRST operand lands in `r/m` and the second
+/// in `reg` — the opposite nesting from the mnemonic. REX.R extends the `reg`
+/// field (the second operand) and REX.B the `r/m` field (the first).
+fn cmp_reg_reg_bytes(a: u8, b: u8, wide: bool) -> ([u8; 3], usize) {
+    let rex = if wide { 0x48u8 } else { 0x40u8 } | (((b >= 8) as u8) << 2) | ((a >= 8) as u8);
+    let modrm = 0xC0 | ((b & 7) << 3) | (a & 7);
+    if rex == 0x40 {
+        // No extended register and no width prefix — two bytes, exactly the
+        // `CMP EAX, ECX` this replaced.
+        ([0x39, modrm, 0], 2)
+    } else {
+        ([rex, 0x39, modrm], 3)
+    }
+}
+
+/// The bytes of `CMP a, imm` — 64-bit when `wide` — and how many of them.
+///
+/// Group 1 `/7`, the same `ModRM.reg`-as-opcode-extension column `ADD`/`SUB`
+/// live in: `83 /7 ib` sign-extends an `imm8`, `81 /7 id` an `imm32`. The
+/// short form is not a nicety — a Java counted loop compares against a small
+/// literal, so `imm8` is the case, and the long form is what catches the rest.
+///
+/// Both SIGN-EXTEND to the operand width, which is why [`Lowerer::alu_imm32`]
+/// declines a constant that does not fit `i32`: such a constant cannot be
+/// written as an immediate at all, and the register form is not a fallback but
+/// the only correct encoding.
+///
+/// A free function for the same reason `cmp_reg_reg_bytes` is one: the failure
+/// mode of a wrong `/digit` is another real instruction. `/7` is CMP; `/0` is
+/// ADD and `/5` is SUB, both of which WRITE the register and would corrupt a
+/// loop counter rather than fault.
+fn cmp_reg_imm_bytes(a: u8, imm: i32, wide: bool) -> ([u8; 7], usize) {
+    // REX.B extends the r/m field, which is where the single operand goes.
+    // There is no `reg` operand here — `/7` occupies that field — so REX.R is
+    // never set.
+    let rex = if wide { 0x48u8 } else { 0x40u8 } | u8::from(a >= 8);
+    let modrm = 0xF8 | (a & 7); // mod=11, /7, r/m=a
+    let mut out = [0u8; 7];
+    let mut n = 0;
+    if rex != 0x40 {
+        out[n] = rex;
+        n += 1;
+    }
+    match i8::try_from(imm) {
+        Ok(b) => {
+            out[n] = 0x83;
+            out[n + 1] = modrm;
+            // Cast: `i8` to its two's-complement byte, which is what the
+            // sign-extending `ib` field wants.
+            out[n + 2] = b as u8;
+            n += 3;
+        }
+        Err(_) => {
+            out[n] = 0x81;
+            out[n + 1] = modrm;
+            out[n + 2..n + 6].copy_from_slice(&imm.to_le_bytes());
+            n += 6;
+        }
+    }
+    (out, n)
+}
+
+/// The bytes of `CMP [RBP - offset], imm` — 64-bit when `wide`.
+///
+/// The same `/7` column as [`cmp_reg_imm_bytes`] with a memory `r/m`, and the
+/// displacement chosen exactly as [`Lowerer::emit_rbp_modrm_disp`] chooses it
+/// so the two cannot drift.
+///
+/// The 32-bit form reads four bytes of the slot where the `MOV` it replaces
+/// read eight — the same comparison, since the `CMP EAX, ECX` it replaces only
+/// ever looked at those four either.
+fn cmp_frame_imm_bytes(offset: i32, imm: i32, wide: bool) -> ([u8; 11], usize) {
+    let mut out = [0u8; 11];
+    let mut n = 0;
+    if wide {
+        out[n] = 0x48; // REX.W. RBP needs no REX.B, and `/7` leaves no `reg`.
+        n += 1;
+    }
+    let short = i8::try_from(imm);
+    out[n] = if short.is_ok() { 0x83 } else { 0x81 };
+    n += 1;
+    let neg = -offset;
+    if let Ok(d) = i8::try_from(neg) {
+        // mod=01, reg=/7, r/m=RBP(101), disp8; and the cast is the
+        // two's-complement byte of a displacement that fits `i8`.
+        out[n] = 0x7D;
+        out[n + 1] = d as u8;
+        n += 2;
+    } else {
+        out[n] = 0xBD; // mod=10, reg=/7, r/m=RBP(101), disp32
+        out[n + 1..n + 5].copy_from_slice(&neg.to_le_bytes());
+        n += 5;
+    }
+    match short {
+        Ok(b) => {
+            // Cast: as above.
+            out[n] = b as u8;
+            n += 1;
+        }
+        Err(_) => {
+            out[n..n + 4].copy_from_slice(&imm.to_le_bytes());
+            n += 4;
+        }
+    }
+    (out, n)
+}
+
+/// The bytes of `LEA dst, [base + disp]` — 64-bit when `wide` — and how many.
+///
+/// `8D /r`. The point of using it for `x + constant` is that it READS its
+/// operands and WRITES a third register without going through an accumulator:
+/// `mov rax,rbx; add eax,1; mov r14,rax` becomes `lea r14d,[rbx+1]`. It also
+/// leaves the flags alone, which the `ADD` it replaces does not — nothing here
+/// depends on that, but it is one fewer thing between an arm and a fused
+/// compare.
+///
+/// Two encoding traps, and both are silent rather than faulting:
+///
+/// * a base whose low three bits are `100` (RSP, **R12**) means "SIB follows"
+///   in the `r/m` field, so it needs a `24` SIB byte naming itself with no
+///   index. R12 is in this backend's GP file, so this is a live case, not a
+///   theoretical one.
+/// * a base whose low three bits are `101` (RBP, **R13**) has no `mod=00`
+///   form — that encoding means RIP-relative. This always emits a
+///   displacement, `disp8` of zero if that is what it takes, which sidesteps
+///   it for every base at the cost of one byte in the `+0` case.
+fn lea_reg_base_disp_bytes(dst: u8, base: u8, disp: i32, wide: bool) -> ([u8; 8], usize) {
+    // REX.R extends the destination (the `reg` field), REX.B the base (`r/m`,
+    // or the SIB base when there is one) — the opposite assignment from
+    // `cmp_reg_imm_bytes`, where the sole operand is the `r/m`.
+    let rex = if wide { 0x48u8 } else { 0x40u8 } | (u8::from(dst >= 8) << 2) | u8::from(base >= 8);
+    let mut out = [0u8; 8];
+    let mut n = 0;
+    if rex != 0x40 {
+        out[n] = rex;
+        n += 1;
+    }
+    out[n] = 0x8D;
+    n += 1;
+    let short = i8::try_from(disp);
+    let md = if short.is_ok() { 0x40u8 } else { 0x80u8 };
+    out[n] = md | ((dst & 7) << 3) | (base & 7);
+    n += 1;
+    if base & 7 == 4 {
+        out[n] = 0x24; // SIB: scale=0, index=none(100), base=r/m
+        n += 1;
+    }
+    match short {
+        Ok(d) => {
+            // Cast: two's-complement byte of a displacement that fits `i8`.
+            out[n] = d as u8;
+            n += 1;
+        }
+        Err(_) => {
+            out[n..n + 4].copy_from_slice(&disp.to_le_bytes());
+            n += 4;
+        }
+    }
+    (out, n)
+}
+
+/// Where an `x + k` / `x - k` arm left its result, and therefore what the arm
+/// still owes. See [`Lowerer::emit_add_lea`].
+enum AddForm {
+    /// A `LEA` wrote the result's own register and settled its home word. The
+    /// arm is finished.
+    Done,
+    /// A `LEA` left the result in RAX, exactly as `mov rax,x; add eax,k` would
+    /// have. The arm's `store_rax` runs unchanged.
+    InRax,
+    /// Nothing emitted — the accumulator sequence stands.
+    No,
+}
+
+/// Where a fused compare reads its two operands.
+///
+/// Named rather than a nest of `Option`/`Result` because there are four forms
+/// now and the reader of the arm should not have to decode which `Err` means
+/// "frame slot". Each variant is one instruction; the fallback the arm keeps
+/// for `None` is three.
+enum CmpForm {
+    /// Both operands already in registers: `cmp ebx, r12d`.
+    RegReg(u8, u8),
+    /// First resident, second still in its slot: `cmp ebx, [rbp-60h]`.
+    RegFrame(u8, i32),
+    /// First resident, second a constant: `cmp ebx, 100`.
+    RegImm(u8, i32),
+    /// First in its slot, second a constant: `cmp [rbp-60h], 100`.
+    FrameImm(i32, i32),
+}
+
 pub(crate) fn op_preserves_rcx(op: &Op) -> bool {
     matches!(op, Op::I2L | Op::L2I)
 }
@@ -17592,7 +18130,8 @@ pub(crate) fn lower_inner_with_scopes(
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
         eprintln!(
             "[ir-ls] carries: planned={} taken={} read={} refused={} \
-             stores_dropped={} still_deopt_named={} deferred={}/{}",
+             stores_dropped={} still_deopt_named={} deferred={}/{} cmp_in_place={}+{} \
+             cmp_imm={}+{}",
             lowerer.carry_of.iter().filter(|c| c.is_some()).count(),
             lowerer.carries_taken,
             lowerer.carries_read,
@@ -17601,6 +18140,10 @@ pub(crate) fn lower_inner_with_scopes(
             lowerer.carry_named,
             lowerer.carry_deferred_planned,
             lowerer.carry_deferred_read,
+            lowerer.cmp_in_place,
+            lowerer.cmp_in_place_frame,
+            lowerer.cmp_imm,
+            lowerer.cmp_imm_frame,
         );
         let s = lowerer.carry_skips;
         eprintln!(
@@ -17620,7 +18163,10 @@ pub(crate) fn lower_inner_with_scopes(
             lowerer.deferred_mid_foldable,
             d[0],
         );
-        eprintln!("[ir-ls] alu immediates folded: {}", lowerer.alu_imms_folded);
+        eprintln!(
+            "[ir-ls] alu immediates folded: {} add_lea={}+{}",
+            lowerer.alu_imms_folded, lowerer.add_lea, lowerer.add_lea_acc,
+        );
         eprintln!(
             "[ir-ls] carried homes dropped: {}",
             lowerer.carried_homes_dropped,
@@ -25472,6 +26018,169 @@ mod tests {").next().unwrap_or(src);
     ///   * the arm's raw `buf.emit(&[..])` byte literals are exactly the ones
     ///     recorded here — catches a ModRM byte that encodes RCX as a
     ///     destination, which no identifier scan can see.
+    /// `cmp_reg_reg_bytes` against hand-checked encodings.
+    ///
+    /// A swapped ModRM field here compares two registers that both exist, so
+    /// the failure is a plausible wrong branch and not a fault — which is why
+    /// the vectors are written out rather than derived by the same arithmetic
+    /// the function uses.
+    ///
+    /// The first two are the sequences this replaced, so a regression that
+    /// changes the low-register case shows up as a byte difference.
+    #[test]
+    fn cmp_reg_reg_encodes_the_known_forms() {
+        // CMP EAX, ECX — the exact two bytes the fused compare emitted before.
+        assert_eq!(cmp_reg_reg_bytes(RAX, RCX, false), ([0x39, 0xC8, 0], 2));
+        // CMP RAX, RCX — and the exact three of the ref/64-bit form.
+        assert_eq!(cmp_reg_reg_bytes(RAX, RCX, true), ([0x48, 0x39, 0xC8], 3));
+        // CMP EBX, R12D — REX.R extends the SECOND operand into r8..r15.
+        assert_eq!(cmp_reg_reg_bytes(3, 12, false), ([0x44, 0x39, 0xE3], 3));
+        // CMP R13, RBX — REX.B extends the FIRST operand.
+        assert_eq!(cmp_reg_reg_bytes(13, 3, true), ([0x49, 0x39, 0xDD], 3));
+        // Both extended, 64-bit: REX.W|REX.R|REX.B.
+        assert_eq!(cmp_reg_reg_bytes(14, 15, true), ([0x4D, 0x39, 0xFE], 3));
+    }
+
+    /// The operand ORDER must survive the r/m-versus-reg inversion: `CMP a, b`
+    /// sets the flags of `a - b`, which is what `CmpCond::x64_cc` reads.
+    ///
+    /// Stated as a distinct test because the encoding one above would still
+    /// pass if both the function and its vectors were transposed together.
+    /// `CMP EAX, ECX` is `39 C8` in every reference; `CMP ECX, EAX` is `39 C1`.
+    #[test]
+    fn cmp_reg_reg_puts_the_first_operand_in_rm() {
+        assert_eq!(cmp_reg_reg_bytes(RAX, RCX, false), ([0x39, 0xC8, 0], 2));
+        assert_eq!(cmp_reg_reg_bytes(RCX, RAX, false), ([0x39, 0xC1, 0], 2));
+    }
+
+    /// `cmp_reg_imm_bytes` against hand-checked encodings.
+    ///
+    /// The `/digit` is the whole risk and it is a silent one: `/7` is CMP, but
+    /// `/0` in the same two opcodes is ADD and `/5` is SUB, and both of those
+    /// WRITE the register. A transposed digit would not fault — it would
+    /// increment the loop counter under the comparison.
+    #[test]
+    fn cmp_reg_imm_encodes_the_known_forms() {
+        // CMP EBX, 100 — the `i < 100` this exists for. `83 /7 ib`.
+        assert_eq!(
+            &cmp_reg_imm_bytes(3, 100, false).0[..3],
+            &[0x83, 0xFB, 0x64]
+        );
+        // CMP EAX, 0 — the low-register, zero-constant corner still uses the
+        // short form and emits no REX.
+        assert_eq!(
+            &cmp_reg_imm_bytes(RAX, 0, false).0[..3],
+            &[0x83, 0xF8, 0x00]
+        );
+        // CMP RBX, 100 — REX.W only.
+        assert_eq!(
+            &cmp_reg_imm_bytes(3, 100, true).0[..4],
+            &[0x48, 0x83, 0xFB, 0x64]
+        );
+        // CMP R12D, 100 — REX.B extends the r/m field, which is where the sole
+        // operand lives. REX.R is never set here: `/7` occupies `reg`.
+        assert_eq!(
+            &cmp_reg_imm_bytes(12, 100, false).0[..4],
+            &[0x41, 0x83, 0xFC, 0x64]
+        );
+        // CMP EAX, 4096 — too wide for `imm8`, so `81 /7 id`, six bytes.
+        assert_eq!(
+            cmp_reg_imm_bytes(RAX, 4096, false),
+            ([0x81, 0xF8, 0x00, 0x10, 0x00, 0x00, 0x00], 6)
+        );
+        // -128 is the last `imm8`; -129 is not. The boundary is worth pinning
+        // because an off-by-one there emits a six-byte instruction where a
+        // three-byte one was correct, which no test of behaviour would catch.
+        assert_eq!(cmp_reg_imm_bytes(RAX, -128, false).1, 3);
+        assert_eq!(cmp_reg_imm_bytes(RAX, -129, false).1, 6);
+    }
+
+    /// `cmp_frame_imm_bytes` against hand-checked encodings — the form that
+    /// names no register at all.
+    #[test]
+    fn cmp_frame_imm_encodes_the_known_forms() {
+        // CMP DWORD [RBP-60h], 100. mod=01, /7, r/m=RBP, disp8 = -0x60.
+        assert_eq!(
+            &cmp_frame_imm_bytes(0x60, 100, false).0[..4],
+            &[0x83, 0x7D, 0xA0, 0x64]
+        );
+        // CMP QWORD [RBP-60h], 100 — REX.W, and nothing else changes.
+        assert_eq!(
+            &cmp_frame_imm_bytes(0x60, 100, true).0[..5],
+            &[0x48, 0x83, 0x7D, 0xA0, 0x64]
+        );
+        // A slot past the disp8 reach takes mod=10 and a disp32.
+        assert_eq!(
+            &cmp_frame_imm_bytes(0x200, 1, false).0[..7],
+            &[0x83, 0xBD, 0x00, 0xFE, 0xFF, 0xFF, 0x01]
+        );
+        // Both fields long: disp32 and imm32, eleven bytes with REX.W.
+        assert_eq!(cmp_frame_imm_bytes(0x200, 4096, true).1, 11);
+    }
+
+    /// `lea_reg_base_disp_bytes` against hand-checked encodings.
+    ///
+    /// Two encodings here are wrong in ways that do not fault, which is why
+    /// they are written out rather than derived: an R12 base without its SIB
+    /// byte reads `[disp]` through a different addressing form, and an R13
+    /// base with `mod=00` is RIP-relative.
+    #[test]
+    fn lea_base_disp_encodes_the_known_forms() {
+        // LEA R14D, [RBX+1] — the `i + 1` this exists for.
+        assert_eq!(
+            &lea_reg_base_disp_bytes(14, 3, 1, false).0[..4],
+            &[0x44, 0x8D, 0x73, 0x01]
+        );
+        // LEA R14, [RBX+1] — the `long` form, REX.W added.
+        assert_eq!(
+            &lea_reg_base_disp_bytes(14, 3, 1, true).0[..4],
+            &[0x4C, 0x8D, 0x73, 0x01]
+        );
+        // LEA EAX, [RBX-1] — `x - k` arrives here as a negative displacement.
+        assert_eq!(
+            &lea_reg_base_disp_bytes(RAX, 3, -1, false).0[..3],
+            &[0x8D, 0x43, 0xFF]
+        );
+        // LEA EBX, [R12+1] — base r/m 100 means "SIB follows", so one must.
+        assert_eq!(
+            &lea_reg_base_disp_bytes(3, 12, 1, false).0[..5],
+            &[0x41, 0x8D, 0x5C, 0x24, 0x01]
+        );
+        // LEA EBX, [R13+0] — r/m 101 has no mod=00 form, so the zero
+        // displacement is emitted rather than elided.
+        assert_eq!(
+            &lea_reg_base_disp_bytes(3, 13, 0, false).0[..4],
+            &[0x41, 0x8D, 0x5D, 0x00]
+        );
+        // A displacement past `imm8` takes mod=10 and four bytes.
+        assert_eq!(lea_reg_base_disp_bytes(RAX, 3, 4096, false).1, 6);
+        assert_eq!(lea_reg_base_disp_bytes(RAX, 3, 127, false).1, 3);
+        assert_eq!(lea_reg_base_disp_bytes(RAX, 3, 128, false).1, 6);
+    }
+
+    /// `LEA` must not be transposed: the destination is the `reg` field and the
+    /// base is `r/m`, the OPPOSITE assignment from `cmp_reg_imm_bytes`, where
+    /// the sole operand is the `r/m` and `reg` is an opcode extension.
+    ///
+    /// Stated separately because the vectors above would all still pass if the
+    /// function and its expectations were transposed together.
+    #[test]
+    fn lea_puts_the_destination_in_reg_and_the_base_in_rm() {
+        // LEA EAX, [RCX+0] is `8D 41 00`; LEA ECX, [RAX+0] is `8D 48 00`.
+        assert_eq!(
+            &lea_reg_base_disp_bytes(RAX, RCX, 0, false).0[..3],
+            &[0x8D, 0x41, 0x00]
+        );
+        assert_eq!(
+            &lea_reg_base_disp_bytes(RCX, RAX, 0, false).0[..3],
+            &[0x8D, 0x48, 0x00]
+        );
+        // And the REX bits follow the same split: extending the DESTINATION
+        // sets REX.R (0x44), extending the BASE sets REX.B (0x41).
+        assert_eq!(lea_reg_base_disp_bytes(14, 3, 0, false).0[0], 0x44);
+        assert_eq!(lea_reg_base_disp_bytes(3, 14, 0, false).0[0], 0x41);
+    }
+
     #[test]
     fn every_rcx_preserving_arm_leaves_rcx_alone() {
         let src = include_str!("ir_lower.rs").replace("\r\n", "\n");
@@ -25714,7 +26423,21 @@ mod tests {").next().unwrap_or(src);
             "fp_load_value",
             "fp_binop",
             "fp_store_value",
+            // 2026-09-11: `Op::Add`'s arm grew an `LEA` form. It emits into
+            // `assigned_gpr(id)` or `resident_gpr(x)` or RAX, reads
+            // `carry_names` / `carry_at_store` without writing, and otherwise
+            // only stores and counts. None of those can be RCX, and that is
+            // asserted below rather than left to this comment.
+            "emit_add_lea",
         ];
+        // The claim `emit_add_lea` rests on, checked here rather than argued:
+        // the residency file the arms write into names neither carry register.
+        // If it ever did, an `LEA` into a promoted value would land in RCX and
+        // a deferred carry crossing that arm would read it.
+        for r in crate::regalloc::xmm_roles::IR_GP_LINEAR_SCAN {
+            assert_ne!(r, RAX, "the GP file names RAX; no arm may publish there");
+            assert_ne!(r, RCX, "the GP file names RCX, which a deferred carry holds");
+        }
 
         for name in super::RCX_FREE_WHEN_FOLDED {
             let arm = arms
@@ -25951,6 +26674,21 @@ mod tests {").next().unwrap_or(src);
                 "Op::{name}'s arm writes its home through `store_rax` {stores} times, \
                  not once — `op_home_is_one_store_rax` must not claim it"
             );
+            // `emit_add_lea` is the one helper in a claimed arm that can reach
+            // a home word WITHOUT that `store_rax` — its `AddForm::Done` path
+            // writes the home itself, having published the register itself.
+            // The scan above cannot see that, so the exception is named here
+            // and proved in `the_lea_add_form_publishes_what_it_does_not_store`.
+            // A NEW arm reaching for the helper has to come past this line.
+            if arm.1.contains("self.emit_add_lea(") {
+                assert!(
+                    name == "Add" || name == "Sub",
+                    "Op::{name}'s arm calls `emit_add_lea`, whose `AddForm::Done` path \
+                     writes a home word that `publish_def_at_store` never sees. Only \
+                     Add and Sub are certified for that by \
+                     `the_lea_add_form_publishes_what_it_does_not_store`"
+                );
+            }
             for forbidden in ["gp_store_value(", "emit_store_frame_imm32("] {
                 assert!(
                     !arm.1.contains(forbidden),
@@ -25960,6 +26698,84 @@ mod tests {").next().unwrap_or(src);
                 );
             }
         }
+    }
+
+    /// `emit_add_lea`'s direct form is the one home-writing path in a claimed
+    /// arm that does NOT go through `store_rax`, so the property
+    /// `publish_def_at_store` would have provided has to be proved of it
+    /// separately — against its SOURCE, for the same reason the test above
+    /// reads source: nothing in the type system says a register was published.
+    ///
+    /// The property: on the path that can SKIP the home store
+    /// (`home_dropped`), the value must already exist in its own register and
+    /// the arm must have said so. Both halves matter —
+    /// `lower_data_node_tracked` refuses the compile when a dropped home meets
+    /// `cur_def_published == false`, so a missing flag is a coverage loss; a
+    /// missing `mark_gp_reg_live` is worse, because the value would then be
+    /// unreadable from a register nothing recorded it in.
+    ///
+    /// A failure here says the direct form drifted and
+    /// `CRATONVM_JIT_IR_DROP_HOME` would emit a body that never writes a value
+    /// it later reads — the same failure the store-once test exists to prevent,
+    /// through the door that test now lets through.
+    #[test]
+    fn the_lea_add_form_publishes_what_it_does_not_store() {
+        let src = include_str!("ir_lower.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn emit_add_lea(&mut self, id: NodeId, slot: i32, sub: bool, wide: bool)")
+            .nth(1)
+            .expect("emit_add_lea is in this file")
+            .split("\n    fn ")
+            .next()
+            .expect("the function ends");
+        // The direct form: from the `assigned_gpr` gate to the `AddForm::Done`
+        // it returns. Everything after that is the accumulator form, which
+        // owes nothing because its caller's `store_rax` owes everything.
+        let direct = body
+            .split("if let Some(dst) = self.assigned_gpr(id) {")
+            .nth(1)
+            .expect("the direct form gates on an assigned register")
+            .split("AddForm::Done")
+            .next()
+            .expect("the direct form returns AddForm::Done");
+        for required in [
+            "self.mark_gp_reg_live(id);",
+            "self.cur_def_published = true;",
+            "self.store_abi_reg(dst, slot);",
+        ] {
+            assert!(
+                direct.contains(required),
+                "`emit_add_lea`'s direct form no longer contains `{required}` — it \
+                 skips the home store on the `home_dropped` path, so it must \
+                 publish the register and say that it did"
+            );
+        }
+        // The publish must PRECEDE the branch that decides whether to store, so
+        // there is no ordering in which a dropped home is skipped by a value
+        // that was never published.
+        let publish = direct
+            .find("self.mark_gp_reg_live(id);")
+            .expect("checked above");
+        let decide = direct.find("home_dropped").expect("the drop test is here");
+        assert!(
+            publish < decide,
+            "`emit_add_lea` decides whether to skip the home store before it \
+             publishes the register"
+        );
+        // And the accumulator form must NOT publish: its value is in RAX, and
+        // `store_rax` is what publishes and stores it.
+        let acc = body
+            .split("return AddForm::Done;")
+            .nth(1)
+            .expect("the direct form returns")
+            .split("AddForm::InRax")
+            .next()
+            .expect("the accumulator form returns");
+        assert!(
+            !acc.contains("mark_gp_reg_live"),
+            "`emit_add_lea`'s accumulator form publishes a register, which \
+             `store_rax` is about to publish again from RAX"
+        );
     }
 
     /// Every op the mechanical scan finds eligible for a dropped home is

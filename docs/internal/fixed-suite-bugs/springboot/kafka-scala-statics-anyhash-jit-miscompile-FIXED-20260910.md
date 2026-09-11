@@ -1,6 +1,22 @@
 # `scala.runtime.Statics.anyHash(Long)` answers garbage once JIT-compiled
 
-**Status: OPEN, 2026-09-10.** A JIT miscompile with a 20-line reproducer that
+**Status: FIXED 2026-09-10**, the same day it was filed. The cause was the
+open-inline-locals floor moving reservations that overlapped nothing; the fix,
+the measurement and the regression test are on its own page,
+[`../../fixed-bugs/inline-locals-floor-moved-reservations-that-overlapped-nothing-FIXED-20260910.md`](../../fixed-bugs/inline-locals-floor-moved-reservations-that-overlapped-nothing-FIXED-20260910.md).
+
+After the fix: the reproducer is `bad=0` in 10 runs of 10, and
+`KafkaAutoConfigurationIntegrationTests` is 3 tests / 0 failed in 3 runs of 3.
+`inline_locals_floor_bumps` on the reproducer went 1 -> 0, which is the whole
+defect: one gratuitous bump, 299,498 wrong answers.
+
+Everything below is the investigation as it stood when the page was filed, kept
+because the localisation is what found the bug and the dead end is worth not
+walking twice.
+
+---
+
+A JIT miscompile with a 20-line reproducer that
 needs no Kafka, no Spring and no broker. It is the reason
 `org.springframework.boot.kafka.autoconfigure.KafkaAutoConfigurationIntegrationTests`
 is a CratonVM-only Spring Boot failure; the same defect is reachable from any
@@ -164,7 +180,21 @@ nothing outside Scala code. It is a diagnostic lever, not a shipping fix.
 
 `--nojit` also passes (2/2) and is not an option for the suite.
 
-## Next step for whoever picks this up
+## What the next step turned out to be
+
+The section below is what the page proposed, and it aimed at the right family
+and the wrong member: it asked whether the INNERMOST-scope exclusion was
+letting a reservation land on a live callee local. It was not. The floor was
+moving a reservation that landed on NOTHING -- `[56, 64)` while the enclosing
+scope's locals ran `[88, ...)`, twenty-four bytes of clearance -- because the
+rule compared only the reservation's START against the top of those locals.
+
+The lever that answered was `CRATONVM_JIT_NO_INLINE_LOCALS_FLOOR=1`: 10 clean
+runs against 9 catastrophic in 10, interleaved, one binary. The
+`jit-slot-overlap` census then said the bump overlapped no scope at all, which
+is what turned "the floor is involved" into "the floor is wrong".
+
+## Next step for whoever picks this up (superseded)
 
 The compiled body is available — `CRATONVM_DBG=jit-disasm` with
 `CRATONVM_DBG_JIT_DISASM=scala/runtime/Statics.anyHashNumber` dumps 9,240 bytes
