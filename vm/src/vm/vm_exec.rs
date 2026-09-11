@@ -6283,6 +6283,108 @@ pub struct NativeContextImpl<'a> {
 }
 
 impl NativeContextImpl<'_> {
+    /// Charge a native-side allocation that did NOT come out of the calling
+    /// thread's TLAB to the two allocation counters.
+    ///
+    /// # Why this exists
+    ///
+    /// `getThreadAllocatedBytes` / `getTotalThreadAllocatedBytes` are fed from
+    /// exactly two places (see `cratonvm_gc::tlab`): the TLAB cursor, and
+    /// `note_external_allocation` for everything that bypassed the TLAB. The
+    /// interpreter's own slow paths (`alloc_object_shared`, `gc_alloc_array`)
+    /// have always called the second. The NATIVE allocation funnels did not,
+    /// on any of their non-TLAB arms -- and every collection, string, box and
+    /// reflective object in this VM is built through them.
+    ///
+    /// The hole was invisible while the counter had a larger over-count on top
+    /// of it, and it is not small. MEASURED, `Integer.valueOf(100000 + i)` a
+    /// million times: 24.0 bytes per object retained on the heap, and **0.0**
+    /// reported by BOTH counters on Generational and ZGC, against a correct
+    /// 24.0 on G1 -- not because G1 counted better, but because G1 is the one
+    /// backend with neither a native old-gen batch pool nor a disabled-by-
+    /// default TLAB refill, so its native allocations happened to land on the
+    /// one arm that was already counted. On the Hibernate HQL parse this
+    /// record is about, the difference between the two is 72 MB against 191 MB
+    /// for byte-identical bytecode.
+    ///
+    /// An under-count is the dangerous direction: it is what makes a byte
+    /// budget pass vacuously. `HqlParserMemoryUsageTest` asserts one.
+    ///
+    /// Sized from the ALLOCATED OBJECT's own header, not from the slot count
+    /// the caller asked for. The two differ: `alloc_object` clamps a native
+    /// caller's slot count up to the class's real field count, and the heap
+    /// rounds the result, so charging the request over-reported a boxed
+    /// `Integer` at 32 bytes where its header says 24. Reading the header back
+    /// is one load and cannot drift from what was actually laid down.
+    #[inline]
+    fn note_native_object_alloc(&mut self, obj: ObjectRef) {
+        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
+        let slots = self.shared.mem.heap.get_header(obj).num_slots() as usize;
+        self.thread
+            .tlab
+            .note_external_allocation(HEADER_SIZE + slots.saturating_mul(SLOT_SIZE));
+    }
+
+    /// [`Self::note_native_object_alloc`] for an array. The data area is sized
+    /// by the same `array_data_size` the allocator used, so the charge is the
+    /// footprint and not the element count.
+    #[inline]
+    fn note_native_array_alloc(&mut self, array: ObjectRef) {
+        self.thread
+            .tlab
+            .note_external_allocation(self.native_array_footprint(array));
+    }
+
+    /// Footprint of an allocated array, read back from the heap: header plus
+    /// the `array_data_size` of its own length and element type. Shares the
+    /// sizing rule with the allocator rather than restating it.
+    ///
+    /// Read straight off the header rather than through `array_length` /
+    /// `element_type_of`. Those two are the defensive accessors: they run
+    /// `is_object_address` first, which on ZGC is a registry lookup, and this
+    /// runs on every native array allocation -- every collection resize in the
+    /// process. The defence buys nothing here, because the only callers pass an
+    /// array this method's own allocator returned microseconds earlier.
+    #[inline]
+    fn native_array_footprint(&self, array: ObjectRef) -> usize {
+        use cratonvm_gc::heap::HEADER_SIZE;
+        let header = self.shared.mem.heap.get_header(array);
+        if header.kind() != ObjectKind::Array {
+            // Not an array: charge nothing. Reachable only through the String
+            // helper, whose field 0 is an array on every real layout but is a
+            // duck-typed read -- and inventing a header's worth of allocation
+            // for a String that turned out not to have a backing array would be
+            // a bias in the over-reporting direction, which is the one this
+            // whole record exists to remove.
+            return 0;
+        }
+        let len = header.array_length() as usize;
+        let data = cratonvm_types::array_data_size(len, header.element_type()).unwrap_or(0);
+        HEADER_SIZE.saturating_add(data)
+    }
+
+    /// [`Self::note_native_object_alloc`] for a freshly built `java/lang/String`,
+    /// charging BOTH the String object and its backing array.
+    ///
+    /// Sized by reading the object back rather than from the source text: the
+    /// String's slot count and its backing array's element type (LATIN1 `byte[]`
+    /// against UTF16, or a legacy `char[]`) are layout decisions made inside
+    /// `alloc_java_string_object`, and re-deriving them here would be a second
+    /// copy of that logic to keep in step.
+    ///
+    /// The caller decides WHETHER to call this, because the pooled constructor
+    /// returns an existing object on an intern hit and that allocates nothing.
+    fn note_native_string_alloc(&mut self, s: ObjectRef) {
+        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
+        let slots = self.shared.mem.heap.get_header(s).num_slots() as usize;
+        let mut bytes = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
+        if let Value::Object(Some(backing)) = self.shared.mem.heap.get_field(s, 0) {
+            // `native_array_footprint` screens the kind off the header itself.
+            bytes = bytes.saturating_add(self.native_array_footprint(backing));
+        }
+        self.thread.tlab.note_external_allocation(bytes);
+    }
+
     /// Terminal object allocation for [`NativeContext::alloc_object`], with the
     /// heap-exhaustion unwind applied (see `crate::runtime::native_oom`).
     ///
@@ -11996,6 +12098,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 }))
             })?;
         crate::runtime::interpreter::init_primitive_fields(self.shared, obj_ref, class_id);
+        self.note_native_object_alloc(obj_ref);
         Ok(Some(Value::Object(Some(obj_ref))))
     }
 
@@ -12037,6 +12140,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                     ))
                 })?;
             crate::runtime::interpreter::init_primitive_fields(self.shared, obj_ref, class_id);
+            self.note_native_object_alloc(obj_ref);
 
             // Keep the new object and constructor object arguments rooted until
             // the Java `<init>` frame owns them in scanned locals.
@@ -13107,6 +13211,9 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 .native_array_gc_requested
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        // Straight to the heap, never through the TLAB -- so the counters only
+        // learn about it here. See `note_native_object_alloc`.
+        self.note_native_array_alloc(array);
         array
     }
 
@@ -13145,6 +13252,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 .native_array_gc_requested
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        self.note_native_array_alloc(array);
         array
     }
 
@@ -13153,10 +13261,15 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // young→old-gen spill path reports `None` on true exhaustion instead of
         // aborting, so native callers (e.g. `ArrayList(int)`) can raise a
         // catchable OutOfMemoryError matching HotSpot.
-        self.shared
-            .mem
-            .heap
-            .try_alloc_array_full(class_id, ArrayElementType::Reference, length)
+        let array = self.shared.mem.heap.try_alloc_array_full(
+            class_id,
+            ArrayElementType::Reference,
+            length,
+        );
+        if let Some(a) = array {
+            self.note_native_array_alloc(a);
+        }
+        array
     }
 
     fn try_new_array(
@@ -13166,10 +13279,15 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     ) -> Option<ObjectRef> {
         // Fallible sibling of `new_array` (primitive arrays) — see
         // `try_new_ref_array`.
-        self.shared
-            .mem
-            .heap
-            .try_alloc_array_full(ClassId::new(0), element_type, length)
+        let array =
+            self.shared
+                .mem
+                .heap
+                .try_alloc_array_full(ClassId::new(0), element_type, length);
+        if let Some(a) = array {
+            self.note_native_array_alloc(a);
+        }
+        array
     }
 
     fn reclaim_before_alloc_retry(&mut self) -> bool {
@@ -13901,11 +14019,20 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     }
 
     fn create_string(&mut self, text: &str) -> ObjectRef {
-        super::create_java_string(self.shared, text)
+        // Pooled: an intern HIT returns an existing object and allocates
+        // nothing, and only a miss is charged. The constructor reports which
+        // happened, so the hit path does not pay a second pool lock.
+        let (s, allocated) = super::create_java_string_reporting(self.shared, text);
+        if allocated {
+            self.note_native_string_alloc(s);
+        }
+        s
     }
 
     fn create_string_uninterned(&mut self, text: &str) -> ObjectRef {
-        super::create_java_string_uninterned(self.shared, text)
+        let s = super::create_java_string_uninterned(self.shared, text);
+        self.note_native_string_alloc(s);
+        s
     }
 
     fn create_string_uninterned_gc_safe(&mut self, text: &str) -> ObjectRef {
@@ -13933,7 +14060,10 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             crate::runtime::interpreter::maybe_gc(self.shared, self.thread);
         }
-        super::create_java_string_uninterned_gc_safe_threaded(self.shared, self.thread, text)
+        let s =
+            super::create_java_string_uninterned_gc_safe_threaded(self.shared, self.thread, text);
+        self.note_native_string_alloc(s);
+        s
     }
 
     fn get_ascii_case_string_cached(
@@ -14030,7 +14160,9 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     }
 
     fn create_string_from_units(&mut self, units: &[u16]) -> ObjectRef {
-        super::create_java_string_from_units(self.shared, units)
+        let s = super::create_java_string_from_units(self.shared, units);
+        self.note_native_string_alloc(s);
+        s
     }
 
     fn read_string(&self, obj: ObjectRef) -> Option<String> {
@@ -14183,7 +14315,9 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 let cached = self.shared.classes.anon_class_cache[num_fields]
                     .load(std::sync::atomic::Ordering::Relaxed);
                 if cached != 0 {
-                    return self.heap_alloc_object(ClassId::new(cached), num_fields);
+                    let obj = self.heap_alloc_object(ClassId::new(cached), num_fields);
+                    self.note_native_object_alloc(obj);
+                    return obj;
                 }
             }
             let name = format!("cratonvm/synthetic/AnonymousObject${num_fields}");
@@ -14412,6 +14546,11 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 if self.thread.native_alloc_pool.is_empty() {
                     self.thread.native_alloc_pool_layout = None;
                 }
+                // Charged as each object is HANDED OUT, not when the batch of
+                // 2048 was carved: the batch is a lock-amortisation device, and
+                // charging it up front would report 2048 objects' worth of
+                // allocation to whichever caller happened to trip the refill.
+                self.note_native_object_alloc(obj);
                 return obj;
             }
             self.thread.native_alloc_pool_layout = None;
@@ -14475,10 +14614,18 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 } else {
                     Some((class_id, slots))
                 };
+                // Only the object handed out here; the rest are charged as the
+                // pool arm above pops them.
+                self.note_native_object_alloc(obj);
                 return obj;
             }
         }
-        self.heap_alloc_object(class_id, slots)
+        // The TLAB arm above is NOT charged here -- its bytes are the TLAB
+        // cursor's advance, which both counters already read. Every other arm
+        // of this method bypassed the TLAB and has to say so.
+        let obj = self.heap_alloc_object(class_id, slots);
+        self.note_native_object_alloc(obj);
+        obj
     }
 
     fn object_num_fields(&self, obj: ObjectRef) -> usize {
@@ -14503,9 +14650,19 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // peer's in-flight cursor may not be read while its owner runs, so the
         // under-count is bounded by one TLAB per running thread — and the value
         // stays monotonic, which the occupancy gauge this replaced was not.
+        //
+        // `consumed_bytes()` — the LIVE SPAN — not `thread_allocated_bytes()`,
+        // which is that span PLUS this thread's whole running total. That total
+        // is already inside `process_allocated_bytes()`: every retire and every
+        // `note_external_allocation` credits both. Adding it again made this
+        // counter report exactly 2x of the truth on Generational and G1 (and
+        // 3x under ZGC, whose heap-staging TLAB layer was crediting the global
+        // a second time — see `TlabAccounting`). Hibernate's
+        // `HqlParserMemoryUsageTest` reads this counter and budgets 256 MiB
+        // against it, so the doubling alone turned a passing parse into a FAIL.
         Some(
             cratonvm_gc::tlab::process_allocated_bytes()
-                .saturating_add(self.thread.tlab.thread_allocated_bytes()),
+                .saturating_add(self.thread.tlab.consumed_bytes() as u64),
         )
     }
 
