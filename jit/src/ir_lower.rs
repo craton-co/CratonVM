@@ -1059,10 +1059,10 @@ struct Lowerer<'a> {
     ///  5 operand-position, 6 consumer, 7 middle-arm-can-write-RCX].
     ///
     /// A bare `deferred=N/M` says how often the shape was TAKEN and nothing
-    /// about how often it was there — the distinction
-    /// `c2-one-carry-slot-is-the-frame-traffic-ceiling` closed on — so the
-    /// causes are split finely enough to name the next increment rather than
-    /// merely to record that there was one.
+    /// about how often it was there, and that is the distinction
+    /// `c2-one-carry-slot-is-the-frame-traffic-ceiling-FIXED-20260910.md`
+    /// closed on — so the causes are split finely enough to name the next
+    /// increment rather than merely to record that there was one.
     ///
     /// Cause 0 is every other triple of scheduled nodes and is not a candidate;
     /// [`Self::deferred_candidates`] is the denominator the rest divide into.
@@ -13968,9 +13968,10 @@ const RCX_FREE_WHEN_FOLDED: &[&str] = &[
 ///
 /// A per-compile census answers "did it fire on THIS method", which is the
 /// question a kernel asks. Retiring
-/// `c2-one-carry-slot-is-the-frame-traffic-ceiling` needed the other one — how
-/// often the shape occurs across a probe set — and that is a total over every
-/// method a run compiles, not a line per method to be summed by eye.
+/// `c2-one-carry-slot-is-the-frame-traffic-ceiling-FIXED-20260910.md` needed
+/// the other one — how often the shape occurs across a probe set — and that
+/// is a total over every method a run compiles, not a line per method to be
+/// summed by eye.
 static IR_CARRY_DEFERRED: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),

@@ -7,7 +7,7 @@
  * induction variable and a `UShr` of the accumulator. That is the smallest
  * shape in which the single-use carry can want BOTH of a consumer's operands
  * at once, which is what
- * `docs/internal/performance/c2-one-carry-slot-is-the-frame-traffic-ceiling-20260910.md`
+ * `c2-one-carry-slot-is-the-frame-traffic-ceiling-FIXED-20260910.md`
  * measures. Nothing in the body allocates, calls, loads or can trap, so the
  * disassembly is the arithmetic and the frame traffic and nothing else.
  *

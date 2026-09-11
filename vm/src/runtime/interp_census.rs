@@ -425,8 +425,9 @@ pub fn report_at_exit() {
     //
     // Read against its denominator. `taken` alone says how often the shape
     // was TAKEN and nothing about how often it was there, and
-    // `c2-one-carry-slot-is-the-frame-traffic-ceiling` closed on exactly that
-    // distinction. `candidates` is every consumer already taking its first
+    // `c2-one-carry-slot-is-the-frame-traffic-ceiling-FIXED-20260910.md`
+    // closed on exactly that distinction. `candidates` is every consumer
+    // already taking its first
     // operand in RAX -- the shape the second slot exists for.
     // `declined_mid_writes_rcx` is the share of those refused because the arm
     // in between can write RCX, and `foldable` is the part of THAT which

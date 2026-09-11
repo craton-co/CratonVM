@@ -1658,6 +1658,18 @@ the same slot two instructions apart —
 — with the accumulator itself crossing the back edge through the frame, so
 every iteration waits on the previous one's store.
 
+**That pair has since been removed for one shape, and the removal is where this
+tier's remaining frame traffic was finally counted.** A second carry slot lets a
+consumer take BOTH of its single-use operands in registers instead of one, which
+deletes exactly the store-and-reload above; widening the rule that says which
+arm a carried value may cross — from an OP-level allowlist to the NODE-level
+question the arm actually asks — took the probe set from 1 such carry to 11 and
+is worth 1.009x against a 0.1% floor on a kernel that has the shape. The census
+that made possible is the part to read before reaching for this paragraph again:
+**82% of the candidate sites fail on operand POSITION**, not on anything the
+emitter decides. Full write-up in
+`c2-one-carry-slot-is-the-frame-traffic-ceiling-FIXED-20260910.md`.
+
 The exact stall could not be named: this host is a VM without PMU passthrough
 (`perf stat` reports `<not supported>` for cycles and instructions), so
 store-forwarding latency is the likely mechanism rather than the measured one.
