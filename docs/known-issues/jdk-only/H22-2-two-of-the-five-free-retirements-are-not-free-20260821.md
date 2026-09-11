@@ -197,10 +197,37 @@ application exception in the VM today. The 105-vector corpus checks neither,
 which is why two lanes reached this from opposite directions before anything
 went red.
 
-Not fixed here: lane L3 found it while measuring reflection retirements, the
-fix is in `capture_throwable_trace` (`lang_misc.rs`) and belongs with N2's
-owner, and a change to stack-trace capture wants the whole gate set and the
-arms behind it rather than a ride on a reflection wave.
+Not fixed here: lane L3 found it while measuring reflection retirements, it
+belongs with N2's owner, and a change to stack-trace capture wants the whole
+gate set and the arms behind it rather than a ride on a reflection wave.
+
+**Correction, 2026-09-11: the fix is NOT in `lang_misc.rs`, and attempting it
+there produces a worse defect than the one it fixes.** This paragraph and N2
+both said `capture_throwable_trace`; that function only *holds* the Vec. Two
+facts, read off the trait and the impl:
+
+* `NativeContext::capture_throwable_stack_trace` **stores** the trace as a side
+  effect (`vm_exec.rs:17020` — `store_throwable_stack_trace(throwable,
+  trace.clone())`, then returns the clone). The trait exposes exactly one
+  capture, one reader (`get_stack_trace`) and **no store**, so nothing on the
+  native side can put a trimmed trace back. Trimming the local Vec in
+  `capture_throwable_trace_body` changes only the `depth` field it writes; the
+  frames `getStackTrace()` materialises still come from the untrimmed store.
+* Captured traces are **outermost-first** — this file's own `STTRACE_DBG_TOP`
+  comment says so, and says an unlabelled "top=" is how one investigation was
+  sent to `TaskThread.run`. So the frames to drop are at the **end** of the
+  Vec, while `depth` sizes the array from the **start**. A `depth -= k` written
+  against the natural reading of "skip the constructor frames" drops the real
+  throw site and keeps the `<init>` frames — the exact inversion of the fix,
+  and it would pass any test that only asserts a shortened trace.
+
+So the skip has to happen where the frames are captured and stored: either in
+`capture_current_stack_trace`/`capture_throwable_stack_trace`
+(`vm/src/vm/vm_exec.rs`) or behind a new trait method that accepts a trimmed
+trace (`native-api/src/registry.rs:4305`). Note for whoever schedules it:
+`vm_exec.rs` took 33 commits in the seven days to 2026-09-11 and is the hottest
+file in the tree, which is a scheduling constraint on this fix, not a reason to
+retarget it at the cold file next door.
 
 **So the price of the largest zero-cost cell in `H14-3` is one missing frame
 skip in `capture_throwable_trace`.** Fix that and 906 registrations over 62
@@ -278,9 +305,12 @@ price; **they have the same scope question open** and nobody has answered it.
   remains measured-free is `HexFormat` (24, landed) and, at the *dial* level
   only, `ArrayDeque` (31) and `Optional` (20) — neither re-priced on its full
   class list.
-* **N2 — fix the frame skip in `capture_throwable_trace`** (`lang_misc.rs`), so
-  that a trace captured from inside `Throwable.<init>`/`fillInStackTrace(I)`
-  drops the constructor frames. Then re-run arm 6. If it comes back at 4
+* **N2 — fix the frame skip at the capture site** (`vm_exec.rs`'s
+  `capture_throwable_stack_trace`, or a new trait method that accepts a trimmed
+  trace), so that a trace captured from inside
+  `Throwable.<init>`/`fillInStackTrace(I)` drops the constructor frames. **Not
+  in `lang_misc.rs`** — see the 2026-09-11 correction in §3b for why that
+  produces the inverted fix. Then re-run arm 6. If it comes back at 4
   differing lines (the `setStackTrace(null)` pair), **906 registrations over 62
   classes become retirable in one commit** and it is the largest single item in
   the population. The arm is one env var and 20 seconds; the fix is the work.
