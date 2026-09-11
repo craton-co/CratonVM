@@ -161,6 +161,42 @@ fn conditional_loader_metadata(shared: &SharedVm) -> bool {
     }
 }
 
+/// May this class mirror be left OUT of the unconditional root set?
+///
+/// The deferral exists so a user-defined loader's classes can be unloaded: a
+/// mirror dropped here is reached instead through `mirror_pin` propagation,
+/// which marks every mirror a LIVE loader defined. All three inputs are
+/// necessary and the third one is the whole point:
+///
+/// * `is_user_defined` — the permanent `ClassLoaderId::UserDefined`
+///   classification. A built-in-loader class is never deferred (see
+///   `conditional_loader_metadata`'s caller for why the mutable
+///   `defining_loader_for` must not be used for THIS half).
+/// * `deferrable` — [`cratonvm_gc::VmHeap::mirror_pin_deferrable`]: will a
+///   marker that runs this cycle actually follow the propagation?
+/// * `named_by_mirror_pin` — **does the propagation have a row for this
+///   mirror at all?** `mirror_pin` is populated by
+///   `vm_object::get_or_create_class_mirror` only when
+///   `classloader::defining_loader_for` had a recorded pairing at the moment
+///   the mirror was minted, so a `UserDefined` class can perfectly well have
+///   no row. Without this input the first two said "defer" for such a class
+///   and NOTHING rooted it: the collector freed a `java.lang.Class` live
+///   bytecode was still using, the allocator re-served the address, and the
+///   next read through it — a `Class`-typed field, the `ldc` constant record,
+///   the mirror cache itself — returned an unrelated object.
+///
+/// Steps 2, 3 and 13 of [`collect_roots`] never had this hole: each RECORDS
+/// the metadata pin itself and only then skips the root, so it cannot skip a
+/// root it did not replace. This is the same rule for step 6.
+#[inline]
+fn mirror_deferral_is_covered(
+    is_user_defined: bool,
+    deferrable: bool,
+    named_by_mirror_pin: bool,
+) -> bool {
+    is_user_defined && deferrable && named_by_mirror_pin
+}
+
 /// Per-thread roots that live in `JvmThread` FIELDS rather than on any frame,
 /// and are therefore invisible to the frame walk both peer-publish paths are
 /// built around.
@@ -944,6 +980,46 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
         if conditional_metadata {
             let cm = shared.classes.class_manager.read();
+            // WHICH MIRRORS DOES THE REPLACEMENT EDGE ACTUALLY NAME?
+            //
+            // The deferral below drops a mirror from the root set on the
+            // promise that `mirror_pin` propagation will reach it from its
+            // defining loader. The two halves were keyed off DIFFERENT facts
+            // and could therefore disagree:
+            //
+            //   * this loop defers on `ClassLoaderId::UserDefined`, the
+            //     permanent classification set when the class is registered;
+            //   * `mirror_pin` is populated by `get_or_create_class_mirror`
+            //     only when `classloader::defining_loader_for` has a recorded
+            //     pairing for that class at the moment the mirror is minted.
+            //
+            // A class that is `UserDefined` but has no recorded pairing is
+            // deferred to a propagation with no row for it, so NOTHING roots
+            // it: the collector frees a `java.lang.Class` that live bytecode
+            // is still using, the allocator re-serves the address, and every
+            // holder -- a `Class`-typed field, the `ldc` constant record, the
+            // mirror cache itself -- then reads an unrelated object.
+            // MEASURED on `module/spring-boot-flyway …
+            // ResourceProviderCustomizerBeanRegistrationAotProcessorTests`
+            // with `CRATONVM_DBG=mirrorpin`: 5 `add_mirror_pin` rows against
+            // 752 distinct mirrors reconciled `is_marked=false`, the cache
+            // dropping from 1842 entries to 1092 in one cycle, and
+            // `NoSuchMethodError: 'boolean
+            // java.lang.String.isAssignableFrom(java.lang.Class)'` out the
+            // other end.
+            //
+            // Steps 2, 3 and 13 never had this hole: each RECORDS the
+            // metadata pin itself and only then `continue`s, so it can never
+            // skip a root it did not replace. This is that same rule, and the
+            // module doc of `cratonvm_types::mirror_pin` already states the
+            // invariant it restores -- "built-in/bootstrap classes' mirrors
+            // are unconditionally rooted directly ... so they never need this
+            // propagation" -- which is only true of a mirror the registry
+            // actually names.
+            let pinned_mirrors: rustc_hash::FxHashSet<usize> =
+                cratonvm_types::mirror_pin::all_pinned_mirrors()
+                    .into_iter()
+                    .collect();
             for (&class_id, obj_ref) in class_mirrors.iter() {
                 let is_user_defined = cm.get_class(class_id).is_some_and(|c| {
                     matches!(
@@ -979,13 +1055,22 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
                         .get_class(class_id)
                         .map(|c| c.name.to_string())
                         .unwrap_or_default();
+                    let pinned = pinned_mirrors.contains(&(obj_ref.as_ptr() as usize));
                     eprintln!(
-                        "[DBG_MIRRORPIN] roots: user class={name:?} mirror={:#x} deferrable={deferrable} => {}",
+                        "[DBG_MIRRORPIN] roots: user class={name:?} mirror={:#x} deferrable={deferrable} pinned={pinned} => {}",
                         obj_ref.as_ptr() as usize,
-                        if deferrable { "DEFERRED" } else { "ROOTED" }
+                        if mirror_deferral_is_covered(is_user_defined, deferrable, pinned) {
+                            "DEFERRED"
+                        } else {
+                            "ROOTED"
+                        }
                     );
                 }
-                if is_user_defined && deferrable {
+                if mirror_deferral_is_covered(
+                    is_user_defined,
+                    deferrable,
+                    pinned_mirrors.contains(&(obj_ref.as_ptr() as usize)),
+                ) {
                     continue;
                 }
                 roots.push(*obj_ref);
@@ -2236,6 +2321,40 @@ mod tests {
              outlives its critical section holds the array and its whole \
              transitive closure for the life of the process"
         );
+    }
+
+    /// **THE THIRD INPUT IS THE ONE THAT MATTERS.**
+    ///
+    /// A `UserDefined` class whose mirror `mirror_pin` does not name has no
+    /// replacement root, so deferring it roots it NOWHERE. That is the shape
+    /// measured on `module/spring-boot-flyway …
+    /// ResourceProviderCustomizerBeanRegistrationAotProcessorTests`
+    /// (`CRATONVM_DBG=mirrorpin`): 5 `add_mirror_pin` rows against 752
+    /// distinct mirrors reconciled `is_marked=false`, and
+    /// `NoSuchMethodError: 'boolean
+    /// java.lang.String.isAssignableFrom(java.lang.Class)'` out the far end.
+    #[test]
+    fn a_user_defined_mirror_with_no_mirror_pin_row_is_not_deferred() {
+        assert!(
+            !mirror_deferral_is_covered(true, true, false),
+            "a mirror the propagation does not name must stay in the root set;              deferring it frees a `java.lang.Class` that is still in use"
+        );
+    }
+
+    /// The deferral still happens when the propagation really can reach it —
+    /// this is what keeps `class_loader_unload_regression` green.
+    #[test]
+    fn a_user_defined_mirror_the_propagation_names_is_still_deferred() {
+        assert!(mirror_deferral_is_covered(true, true, true));
+    }
+
+    /// Both other inputs stay load-bearing: a built-in-loader class is rooted
+    /// outright, and so is any mirror on a cycle whose marker will not follow
+    /// the side tables.
+    #[test]
+    fn a_builtin_mirror_and_an_unfollowed_cycle_are_both_rooted() {
+        assert!(!mirror_deferral_is_covered(false, true, true));
+        assert!(!mirror_deferral_is_covered(true, false, true));
     }
 
     #[test]
