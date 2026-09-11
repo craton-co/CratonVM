@@ -192,6 +192,41 @@ assuming it did.
 
 ---
 
+### 4.4 Bisecting a wave costs RUNS, not builds
+
+`CRATONVM_UNRETIRE_NATIVE_SHADOW` turns named rows of the retirement tables back
+off at runtime. Unset — every shipping configuration and every CI arm — it is
+inert, and `the_default_is_inert_across_every_retired_row` asserts that against
+every row of every table rather than a sample.
+
+```text
+  CRATONVM_UNRETIRE_NATIVE_SHADOW=all
+  CRATONVM_UNRETIRE_NATIVE_SHADOW=java/io/
+  CRATONVM_UNRETIRE_NATIVE_SHADOW=java/io/File
+  CRATONVM_UNRETIRE_NATIVE_SHADOW=java/io/File.isAbsolute()Z
+```
+
+Comma-separated; `all`, a package prefix (trailing `/`), a class, a
+class+method, or an exact triple. Also reachable as
+`CRATONVM_LOADER=unretire-native-shadow=...`.
+
+**It is not the dial, and the difference is the point.**
+`CRATONVM_ENFORCE_NATIVE_SHADOW` declines a native at DISPATCH and its decline
+is CONDITIONAL — with no concrete body on the receiver it runs the native
+anyway (`declined_no_bytecode`). This edits the TABLE, so what it turns off is
+off unconditionally. That is why the dial can only bound a wave (§4.2) while
+this can bisect one.
+
+**Read the arm report before believing a green run.** Each rule is resolved
+against the tables before any dispatch and its row count printed; a rule
+matching zero rows is called out by name. A mistyped rule that silently matched
+nothing would exonerate a triple it never tested — a false negative
+manufactured by the instrument, which is the trap §4 exists to list.
+
+It un-retires and cannot re-retire, so the worst it can do is restore the
+pre-wave behaviour. It is a diagnostic: **no acceptance run may set it**, and a
+measurement taken with it armed is not one of the numbers §5 asks for.
+
 ## 5. Landing protocol
 
 ```bash

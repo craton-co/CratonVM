@@ -1736,36 +1736,26 @@ use cratonvm_types::compat::CompatibilityMode;
 /// appear in the arm-OFF dump -- so retiring them changes their strict-mode
 /// admission and not their kind.
 ///
-/// # Re-frozen 2026-09-11 on the L4 merge: 2592 / 2603 / 2592
-///
-/// The two accounts above were measured on trees that had not seen each
-/// other: this branch's 2429/2440/2429 carried L0+L3 but not lane 4, and
-/// dev's 2547/2558/2547 carried lane 4's 163 but not L0's 19 or L3's 24.
-/// Neither describes this tree and their difference is not their sum, so
-/// this arm was re-measured from a forced failure on the merged tree.
+/// # Re-frozen 2026-09-11 on the L6 merge: 2609 / 2620 / 2609
 ///
 /// ```text
-/// dev (lane 4's 163)                       2547 / 2558 / 2547
-/// + this branch's L0 (21) and L3 (24)        +45 in every arm
-/// = this merged tree                       2592 / 2603 / 2592   (measured)
+/// dev (lane 6's +17)                     2564 / 2575 / 2564
+/// + this branch's L0 (21) and L3 (24)      +45 in every arm
+/// = this merged tree                     2609 / 2620 / 2609   measured
 ///
-/// and from the other side, as a check:
-/// this branch pre-merge                    2429 / 2440 / 2429
-/// + lane 4's wave                          +163 in every arm
+/// and from the other side:
+/// this branch pre-merge                  2592 / 2603 / 2592
+/// + lane 6's wave                         +17 in every arm
 /// = the same three numbers
 /// ```
 ///
-/// **Both decompositions land on the measured value**, which is the strongest
-/// form this account takes: two independent halves summing to the third, in
-/// two directions, on three arms. The `+45` has now reproduced on four
-/// different trees.
-///
-/// Totals stay **13623 / 13991 / 13658**, unchanged from before this merge, so
-/// lane 4's 163 are case (b) as well -- existing fakes relabelled, not new
-/// registrations. A retirement table re-tags `Bridge` -> `SyntheticStub` in
-/// `NativeMethodRegistry::register` before insertion; it moves the KIND and
-/// never the count.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2603;
+/// Both decompositions land on the measured value. The `+45` has now
+/// reproduced on FIVE trees, and lane 6's log (`re-freeze at +17, the third
+/// measurement on the third base`) records the same treadmill from the other
+/// side: on a branch this busy the constant is re-measured per merge, never
+/// added up. Totals stay 13623 / 13991 / 13658, so lane 6's 17 are
+/// relabellings too.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2620;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1971,36 +1961,26 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2603;
 /// **Re-frozen 2026-09-11, 2384 -> 2547**, with the other two; the account is
 /// on [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]. +163, all of it lane 4 wave 1:
 /// the arm-OFF measurement lands on 2384 exactly.
-/// # Re-frozen 2026-09-11 on the L4 merge: 2592 / 2603 / 2592
-///
-/// The two accounts above were measured on trees that had not seen each
-/// other: this branch's 2429/2440/2429 carried L0+L3 but not lane 4, and
-/// dev's 2547/2558/2547 carried lane 4's 163 but not L0's 19 or L3's 24.
-/// Neither describes this tree and their difference is not their sum, so
-/// this arm was re-measured from a forced failure on the merged tree.
+/// # Re-frozen 2026-09-11 on the L6 merge: 2609 / 2620 / 2609
 ///
 /// ```text
-/// dev (lane 4's 163)                       2547 / 2558 / 2547
-/// + this branch's L0 (21) and L3 (24)        +45 in every arm
-/// = this merged tree                       2592 / 2603 / 2592   (measured)
+/// dev (lane 6's +17)                     2564 / 2575 / 2564
+/// + this branch's L0 (21) and L3 (24)      +45 in every arm
+/// = this merged tree                     2609 / 2620 / 2609   measured
 ///
-/// and from the other side, as a check:
-/// this branch pre-merge                    2429 / 2440 / 2429
-/// + lane 4's wave                          +163 in every arm
+/// and from the other side:
+/// this branch pre-merge                  2592 / 2603 / 2592
+/// + lane 6's wave                         +17 in every arm
 /// = the same three numbers
 /// ```
 ///
-/// **Both decompositions land on the measured value**, which is the strongest
-/// form this account takes: two independent halves summing to the third, in
-/// two directions, on three arms. The `+45` has now reproduced on four
-/// different trees.
-///
-/// Totals stay **13623 / 13991 / 13658**, unchanged from before this merge, so
-/// lane 4's 163 are case (b) as well -- existing fakes relabelled, not new
-/// registrations. A retirement table re-tags `Bridge` -> `SyntheticStub` in
-/// `NativeMethodRegistry::register` before insertion; it moves the KIND and
-/// never the count.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2592;
+/// Both decompositions land on the measured value. The `+45` has now
+/// reproduced on FIVE trees, and lane 6's log (`re-freeze at +17, the third
+/// measurement on the third base`) records the same treadmill from the other
+/// side: on a branch this busy the constant is re-measured per merge, never
+/// added up. Totals stay 13623 / 13991 / 13658, so lane 6's 17 are
+/// relabellings too.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2609;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2128,36 +2108,26 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2592;
 /// its sibling -- it lands on the same number again, which is a measurement
 /// each time and not a rule. The account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-/// # Re-frozen 2026-09-11 on the L4 merge: 2592 / 2603 / 2592
-///
-/// The two accounts above were measured on trees that had not seen each
-/// other: this branch's 2429/2440/2429 carried L0+L3 but not lane 4, and
-/// dev's 2547/2558/2547 carried lane 4's 163 but not L0's 19 or L3's 24.
-/// Neither describes this tree and their difference is not their sum, so
-/// this arm was re-measured from a forced failure on the merged tree.
+/// # Re-frozen 2026-09-11 on the L6 merge: 2609 / 2620 / 2609
 ///
 /// ```text
-/// dev (lane 4's 163)                       2547 / 2558 / 2547
-/// + this branch's L0 (21) and L3 (24)        +45 in every arm
-/// = this merged tree                       2592 / 2603 / 2592   (measured)
+/// dev (lane 6's +17)                     2564 / 2575 / 2564
+/// + this branch's L0 (21) and L3 (24)      +45 in every arm
+/// = this merged tree                     2609 / 2620 / 2609   measured
 ///
-/// and from the other side, as a check:
-/// this branch pre-merge                    2429 / 2440 / 2429
-/// + lane 4's wave                          +163 in every arm
+/// and from the other side:
+/// this branch pre-merge                  2592 / 2603 / 2592
+/// + lane 6's wave                         +17 in every arm
 /// = the same three numbers
 /// ```
 ///
-/// **Both decompositions land on the measured value**, which is the strongest
-/// form this account takes: two independent halves summing to the third, in
-/// two directions, on three arms. The `+45` has now reproduced on four
-/// different trees.
-///
-/// Totals stay **13623 / 13991 / 13658**, unchanged from before this merge, so
-/// lane 4's 163 are case (b) as well -- existing fakes relabelled, not new
-/// registrations. A retirement table re-tags `Bridge` -> `SyntheticStub` in
-/// `NativeMethodRegistry::register` before insertion; it moves the KIND and
-/// never the count.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2592;
+/// Both decompositions land on the measured value. The `+45` has now
+/// reproduced on FIVE trees, and lane 6's log (`re-freeze at +17, the third
+/// measurement on the third base`) records the same treadmill from the other
+/// side: on a branch this busy the constant is re-measured per merge, never
+/// added up. Totals stay 13623 / 13991 / 13658, so lane 6's 17 are
+/// relabellings too.
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2609;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///

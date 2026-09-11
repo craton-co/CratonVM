@@ -1282,7 +1282,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_LOADER`
 
-17 tokens.
+18 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1290,6 +1290,7 @@ export inherited from a parent shell.
 | `ann-proxy-latch` | `CRATONVM_LOADER_NO_ANN_PROXY_LATCH` |
 | `allow-jsr-ret` | `CRATONVM_ALLOW_JSR_RET` |
 | `enforce-native-shadow` | `CRATONVM_ENFORCE_NATIVE_SHADOW` |
+| `unretire-native-shadow` | `CRATONVM_UNRETIRE_NATIVE_SHADOW` |
 | `cf-delegating-yield` | `CRATONVM_CF_DELEGATING_YIELD` |
 | `aware-resolution` | `CRATONVM_LOADER_AWARE_RESOLUTION` |
 | `boot-module-registry` | `CRATONVM_BOOT_MODULE_REGISTRY` |
