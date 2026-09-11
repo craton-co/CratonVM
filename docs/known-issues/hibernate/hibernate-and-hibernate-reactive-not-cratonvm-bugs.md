@@ -35,7 +35,8 @@ artifacts that reproduce identically under real HotSpot.
 Verified on Azure Linux (`20.80.105.49`, JDK 25 Temurin), branch
 `test/azure-recheck-fails-20260817` off `dev`, cross-checked on Windows the same
 day. Full detail in
-[hibernate-orm-hql-parser-memory-overhead-20260817.md](hibernate-orm-hql-parser-memory-overhead.md).
+[`hibernate-orm-hql-parser-memory-overhead-RETIRED-20260911.md`](../../internal/retired/hibernate-orm-hql-parser-memory-overhead-RETIRED-20260911.md)
+(retired 2026-09-11; it corrects the allocation figures in this table).
 
 | Class | CratonVM | Real HotSpot | Verdict |
 |---|---|---|---|
@@ -53,24 +54,31 @@ CratonVM-specific:
 Same shape as the 2026-08-17 figures (41.9 s / 5.4 s), so nothing about it has
 drifted. This remains the one entry on this page that is a real CratonVM
 characteristic rather than a host artifact, and it stays open —
-[hibernate-orm-hql-parser-memory-overhead-20260817.md](hibernate-orm-hql-parser-memory-overhead.md)
-is the detail.
+[`hibernate-orm-hql-parser-memory-overhead-RETIRED-20260911.md`](../../internal/retired/hibernate-orm-hql-parser-memory-overhead-RETIRED-20260911.md)
+is the detail, and corrects the allocation figures quoted here.
 | `annotations.uniqueconstraint.UniqueConstraintBatchingTest` | PASS | PASS | No longer reproduces |
 | `query.hql.FunctionTests` | PASS (124/118/6skip) | PASS (124/118/6skip) | Host locale — see below |
 | `query.hql.StandardFunctionTests` | PASS (44/44) | PASS (44/44) | Host locale — see below |
 
 `HqlParserMemoryUsageTest` (regression test for upstream `HHH-19240`) asserts a
-single cold HQL parse allocates under 256 MiB. A standalone probe replicating
-Hibernate's `StandardHqlTranslator.parseHql()` exactly shows ANTLR's SLL
-prediction mode succeeds on **both** VMs — no fallback to the expensive LL
-parse on either, ruling out a dispatch/exception-handling divergence. CratonVM
-allocates ~1.8–1.9x more heap garbage than HotSpot for that one cold parse, on
-both Windows and Azure Linux; warm repeats are cheap on both VMs, so it is not
-a leak. This is a real, reproducible, platform-independent interpreter
-allocation-volume gap (likely ANTLR's SLL ATN-configuration/DFA-state
-construction), not a wrong answer and not a measurement artifact — CratonVM
-has no allocation-site profiler yet to pin down the exact multiplier's source,
-so root-causing it further is left open.
+single cold HQL parse allocates under 256 MiB. ANTLR's SLL prediction mode
+succeeds on **both** VMs -- no fallback to the expensive LL parse on either, so
+this is not a dispatch or exception-handling divergence -- and warm repeats are
+cheap on both, so it is not a leak.
+
+**The multiplier this paragraph used to quote was wrong, and so was every later
+revision of it.** Corrected 2026-09-11: the counter this test asserts against
+(`getTotalThreadAllocatedBytes`) was over-reporting by 2-3x for two reasons and
+under-reporting the entire native allocation surface for a third. Fixed and
+verified against retained heap, and the collection-class padding it exposed was
+narrowed too. The parse is **1.35x** HotSpot on Generational and G1 (336,746 KB
+against 248,666 KB) and 1.85x on ZGC. The largest single driver left is
+reference width -- `CRATONVM_COMPRESSED_OOPS=1` takes it to 263,799 KB, 0.6%
+over the budget, where the old record had measured that same knob at 9% of the
+gap on the broken counter. The class remains a FAIL.
+
+Full detail, and what became of every claim the old page made, in
+[`hibernate-orm-hql-parser-memory-overhead-RETIRED-20260911.md`](../../internal/retired/hibernate-orm-hql-parser-memory-overhead-RETIRED-20260911.md).
 
 The other three classes were flagged earlier this session on Windows as FAILs
 that also reproduced under real HotSpot there. Rechecked here on a second,

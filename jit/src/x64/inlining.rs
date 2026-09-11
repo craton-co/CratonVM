@@ -460,7 +460,12 @@ fn restamp_outcome(
 /// of the synthetic pcs this backend stamps (`ENTRY_POLL_BC_PC`,
 /// `SP_ID_UNSET_BC_PC`), both of which are far above it and are rejected by
 /// the same one test.
-const INLINE_FRAME_MAX_BCI: usize = 65_536;
+///
+/// `pub(crate)` since 2026-09-11: `ir_lower::record_npe_trap_site` is the
+/// optimizing tier's twin of [`record_npe_trap_site`] and screens its bci
+/// against the same bound. A second copy of the constant there would be a
+/// second place to fix when the bound is re-derived.
+pub(crate) const INLINE_FRAME_MAX_BCI: usize = 65_536;
 
 // ---------------------------------------------------------------------------
 // The guarded-virtual MISS EDGE, and why it has to poison its own bci
@@ -719,6 +724,25 @@ impl NpeTrapMap {
             .binary_search_by_key(&key, |(id, _)| *id)
             .ok()
             .map(|i| &self.sites[i].1)
+    }
+
+    /// Build a map from rows a backend collected itself.
+    ///
+    /// The single-pass backend records through the thread-local session
+    /// ([`record_npe_trap_site`] / [`finish_npe_trap_recording`]) because its
+    /// emitter is reached from a dozen places that would otherwise all have to
+    /// be handed a table. The OPTIMIZING backend lowers one graph in one
+    /// function and already carries its sibling table (`inline_frame_rows`) as
+    /// a plain field, so it collects these the same way and hands them over
+    /// here. Two producers, one consumer, and the ids are per-ARTIFACT either
+    /// way — `get` binary-searches within one map and never across two.
+    ///
+    /// Sorted here rather than trusted: a lowerer that pushed out of order
+    /// would otherwise turn every lookup into a silent miss or, worse, a hit on
+    /// a neighbouring site.
+    pub fn from_rows(mut sites: Vec<(u32, NpeTrapSite)>) -> Self {
+        sites.sort_unstable_by_key(|(id, _)| *id);
+        NpeTrapMap { sites }
     }
 }
 
@@ -2864,7 +2888,7 @@ impl Compiler {
                         let obj_slot = self.pop_stack();
                         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                         self.load_slot_to_reg(ARG_REGS[1], obj_slot);
-                        self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag);
+                        self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag, cpc);
                         crate::metrics::note_getfield_arm(0);
                         self.emit_call_absolute(self.helpers.getfield);
                         // The checked helper returns the `i64::MIN` deopt/NPE

@@ -559,6 +559,172 @@ fn compile_bytes(code: &[u8], code_len: usize) -> Option<CompiledMethod> {
     )
 }
 
+/// `walk(N o) { int a = 0; for (int i = 0; i < 5; i++) { a += o.v; o = o.next; }
+/// return a; }` — one `int` parameter slot holding a reference, three locals,
+/// and the shape the implicit-null test below needs: a receiver that is
+/// REASSIGNED in the body, so no dataflow can prove it non-null and both
+/// `getfield`s take the implicit check.
+fn shape_pointer_walk_loop() -> Vec<u8> {
+    vec![
+        0x03, 0x3c, // 0: iconst_0; istore_1          a = 0
+        0x03, 0x3d, // 2: iconst_0; istore_2          i = 0
+        0x1c, 0x08, 0xa2, 0x00, 0x15, // 4: iload_2; iconst_5; if_icmpge 27
+        0x1b, 0x2a, 0xb4, 0x00, 0x07, 0x60, 0x3c, // 9: a += o.v
+        0x2a, 0xb4, 0x00, 0x0d, 0x4b, // 16: o = o.next
+        0x84, 0x02, 0x01, // 21: iinc 2, 1
+        0xa7, 0xff, 0xec, // 24: goto 4               <- back edge
+        0x1b, 0xac, // 27: iload_1; ireturn
+    ]
+}
+
+/// How many native offsets inside `cm` are registered implicit-null faulting
+/// PCs?
+///
+/// Asked by RANGE rather than by a `implicit_null::counts()` delta on purpose:
+/// the table is process-global and the test harness runs tests concurrently, so
+/// a delta counts whatever a sibling test compiled at the same moment. A range
+/// scan of this artifact's own code answers only about this artifact.
+fn implicit_null_sites_in(cm: &CompiledMethod) -> usize {
+    let base = cm.entry as usize;
+    let len = cm.code_bytes().len();
+    (0..len)
+        .filter(|&off| crate::implicit_null::recover(base + off, 0).is_some())
+        .count()
+}
+
+/// Every COPY of an implicitly-null-checked dereference is registered, not just
+/// copy 0.
+///
+/// # The defect
+///
+/// A `getfield` whose receiver cannot be proved non-null emits **no test**: the
+/// dereference is allowed to fault and `implicit_null::recover` translates the
+/// SIGSEGV into a `NullPointerException` by looking the faulting PC up in a
+/// table. The native unroller duplicates the body's MACHINE CODE, so each copy
+/// contains that dereference at a different PC — and it shifted every other
+/// patch vector (`forward_patches`, `bounds_check_stubs`,
+/// `exception_check_stubs`, `null_check_store_stubs`, `self_call_patches`,
+/// `deopt_stubs`, `jump_table_patches`, `oop_maps`, the IC slots) while this one
+/// stayed behind, because it post-dates the Task #60 sweep that built the list.
+///
+/// The consequence is not a slow path or a missed optimisation. A null receiver
+/// in copy 0 threw `NullPointerException`; the same receiver one iteration later
+/// was an `EXCEPTION_ACCESS_VIOLATION` reading `0x0F`, i.e. the process died.
+/// Measured on the fixture above over a THREE-element list: correct under
+/// `CRATONVM_DISABLE_UNROLL=1`, fatal without it, with byte-identical loop
+/// bodies in the two artifacts.
+///
+/// # Why the two arms
+///
+/// The unrolled count alone proves nothing — it would be satisfied by a build
+/// that registered eight sites for two dereferences. The rolled arm pins what
+/// one copy costs, and `4 *` is the unroll factor
+/// `plan_native_unroll` admits for this 20-byte body (`extra_copies = 3`).
+#[test]
+fn every_unrolled_copy_of_an_implicit_null_check_is_registered() {
+    if !crate::implicit_null::enabled() {
+        // The kill switch is a legitimate way to run the suite; with it set
+        // nothing registers and both arms are 0, which would pass vacuously.
+        return;
+    }
+    let code = shape_pointer_walk_loop();
+    // pc -> (field index, type tag): 11 is `v` (int), 17 is `next` (ref).
+    let field_info = vec![(11usize, 0usize, b'I'), (17usize, 1usize, b'L')];
+    // pc -> (packed byte offset, is_ref). The compact layout is what puts the
+    // arm that takes the implicit check in play at all: its `GC_FLAGS` read at
+    // `[RAX + 15]` is the dereference the fault lands on.
+    let compact_field_info = vec![(11usize, 0u32, false), (17usize, 8u32, true)];
+    // The guarded (default) inline-getfield mode needs a read-bounds helper
+    // address to be present. Never called: this test compiles and reads
+    // metadata, it does not execute the artifact.
+    let mut helpers = JitRuntimeHelpers::default();
+    helpers.read_bounds_addr = 0x1000;
+
+    // Through `compile_with_param_slots`, not the legacy `compile()` wrapper:
+    // that one passes an EMPTY `method_key`, and `receiver_is_trusted_oop` —
+    // the condition the implicit-null arm sits behind — requires a non-empty
+    // one. A fixture compiled the legacy way registers nothing at all, which
+    // would make both arms of this test read zero.
+    let compile_walk = |disable_unroll: bool| -> CompiledMethod {
+        cratonvm_types::flags::with_thread_overrides(
+            &[(
+                "CRATONVM_DISABLE_UNROLL",
+                if disable_unroll { Some("1") } else { None },
+            )],
+            || {
+                compile_with_param_slots(
+                    &crate::compile_gate::CompileAdmission::for_backend_test(),
+                    &code,
+                    29,
+                    1,     // num_params: (N o)
+                    3,     // max_locals: o, a, i
+                    false, // needs_heap
+                    Vec::new(),
+                    field_info.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Default::default(), // ldc_fp_pcs
+                    HashMap::new(),
+                    HashMap::new(),
+                    &helpers,
+                    std::collections::HashSet::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    None,
+                    &[0],
+                    1,
+                    1, // param_oop_mask: local 0 is a reference parameter
+                    compact_field_info.clone(),
+                    "UT3.walk:(LUT3$N;)I",
+                    Vec::new(),
+                    None,
+                )
+                .expect("the pointer-walk fixture compiles")
+            },
+        )
+    };
+
+    let rolled = compile_walk(true);
+    let rolled_sites = implicit_null_sites_in(&rolled);
+    // ONE, not two. The body has two `getfield`s on `o`, and the second is
+    // correctly elided: the first dereference proves local 0 non-null on its
+    // fall-through, and `o` is not reassigned until after it. The reassignment
+    // (`astore_0`) then clears the fact, so the NEXT iteration's first
+    // `getfield` is unproven again -- which is exactly why this fixture has an
+    // implicit site inside a loop body at all.
+    assert_eq!(
+        rolled_sites, 1,
+        "expected one implicit-null site in the un-unrolled body; found \
+         {rolled_sites}. Either the receiver stopped taking the implicit check \
+         or the dataflow changed which dereferences are proven -- and the \
+         unrolled assertion below then means nothing.",
+    );
+
+    let unrolled = compile_walk(false);
+    let unrolled_sites = implicit_null_sites_in(&unrolled);
+    assert_eq!(
+        unrolled_sites,
+        4 * rolled_sites,
+        "the body was duplicated into 4 copies but {unrolled_sites} faulting \
+         PCs are registered instead of {}. An unregistered copy does not \
+         throw NullPointerException on a null receiver -- it takes the \
+         process down.",
+        4 * rolled_sites,
+    );
+}
+
 #[test]
 fn the_rewriter_is_off_by_default_and_armed_per_thread() {
     assert!(

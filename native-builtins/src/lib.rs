@@ -7710,6 +7710,42 @@ fn publish_real_system_props(ctx: &mut dyn NativeContext) -> bool {
 }
 
 
+/// Publish `java.lang.ClassLoader.scl` — the system class loader static.
+///
+/// The fourth member of the published-static cluster
+/// (`System.props`, `SharedSecrets.javaLangAccess`, `VM.savedProps`), and it
+/// arrived the same way all three did: a native answered for a field nothing
+/// had ever read, and then real bytecode read it.
+///
+/// The real `System.initPhase3()` calls `ClassLoader.initSystemClassLoader()`,
+/// which assigns `ClassLoader.scl`. This VM has no `initPhase3` body in
+/// real-JDK mode, and `scl` is stamped only as the LAST step of
+/// `classloader::get_or_create_app_loader` — which is lazy. So the real
+/// `ClassLoader.getSystemClassLoader()` bytecode, which is
+/// `switch (VM.initLevel()) { ... } return scl;`, read a null whenever it ran
+/// before the first native that needed an app loader.
+///
+/// That was invisible while `jdk/internal/loader/BuiltinClassLoader` could not
+/// link, because the vectors that would have reached it died earlier. It became
+/// visible in the same wave that fixed the link:
+/// `apps/probes/L7UnnamedModuleSweep.java` rows 1 and 3-6 went from matching
+/// HotSpot to `NullPointerException ... because "<local0>" is null`, under
+/// `CRATONVM_ENFORCE_NATIVE_SHADOW=all` only. **A fix that unblocks a chain
+/// exposes the next link, and the next link is a field this VM never filled.**
+///
+/// Eager, and that is the whole point — the lane's own rule is that a published
+/// static must beat its reader. Nothing here decides the VALUE; the stamp lives
+/// where it always has, at the end of `get_or_create_app_loader`, so there is
+/// exactly one writer and forcing it early cannot make the two disagree.
+///
+/// Failure is silent and safe by construction, exactly as
+/// `publish_real_system_props` is: if the loader chain cannot be built this
+/// early the field stays null, which is today's behaviour, and the lazy path
+/// still stamps it at the first native that needs an app loader.
+fn publish_system_class_loader(ctx: &mut dyn NativeContext) {
+    let _ = crate::classloader::get_or_create_app_loader(ctx);
+}
+
 /// `System.initPhase1()V` under `--jdk-only`: the real body, plus the field it
 /// has always been documented to set.
 ///
@@ -7753,6 +7789,11 @@ fn native_system_init_phase1_jdk_only(
     publish_real_system_props(ctx);
     publish_shared_secrets(ctx);
     publish_vm_saved_props(ctx);
+    // LAST, and after the three above rather than before: building the app
+    // loader runs `alloc_classloader` -> `ProtectionDomain` / `ConcurrentHashMap`
+    // allocation and a `create_string`, so it needs the Java world the body and
+    // the props publish have just finished bringing up.
+    publish_system_class_loader(ctx);
     Ok(result)
 }
 
@@ -13552,11 +13593,72 @@ pub fn register_essential_natives_with_shims(
     );
     // getName() is a Java method that caches via initClassName(). Override with
     // native since JDK's Class field layout differs from our mirror layout.
-    registry.register(
+    //
+    // REVIEWED `Intrinsic`, 2026-09-10 — §1.4's remedy for this row makes it
+    // WORSE, which is the case the contract's exception exists for.
+    //
+    // `getName` is not `ACC_NATIVE`, so by the letter it is a §1.4 shadow over
+    // real bytecode. That bytecode is
+    //
+    //     String name = this.name;  return name != null ? name : initClassName();
+    //
+    // and `java.lang.Class.name` in this VM is an OVERLAY: the mirror allocator
+    // (`vm/src/vm/vm_object.rs`, the `slots.name` store) writes the VM's
+    // INTERNAL name there, and `lang_class::mirror_class_name_strict` and its
+    // callers read it back in that form deliberately — that strict reader is
+    // the fix for ByteBuddy's hierarchy walker, which the reverse map's Object
+    // aliasing broke. So yielding hands every caller `java/lang/Object`.
+    //
+    // Worse than a null, because nothing throws. MEASURED with
+    // `apps/probes/ClassNameSweep.java`, 85 rows, one binary, three arms:
+    //
+    // ```text
+    //                                                  rows differing, of 85
+    //   HotSpot vs --jdk-only unarmed                     0
+    //   HotSpot vs CRATONVM_ENFORCE_NATIVE_SHADOW=all     9   <- before this tag
+    //   HotSpot vs the same arm, after the tag            1
+    // ```
+    //
+    // and the nine are not cosmetic: `Class.forName(X.class.getName())` throws
+    // `ClassNotFoundException` for every reference type, `Class.toString()`
+    // renders `class java/lang/Object`, and the invariant a binary name never
+    // contains `/` fails. It is why `ServiceLoader.checkCaller` reported
+    // *"module java.base does not declare `uses`"*.
+    //
+    // Those rows are also the reason a dial arm alone could not have found
+    // this: rows reached through a METHOD REFERENCE (`c::getName`) kept the
+    // native and answered correctly, while the same call written inline in a
+    // lambda body yielded and answered `java/lang/Object`. Rows 1-5 of the
+    // sweep — `getName`/`getTypeName`/`getCanonicalName`/`getSimpleName`/
+    // `getPackageName` on `Object`, all method references — MATCH under the
+    // dial. One tag removes the split by making the row exempt at every door.
+    //
+    // The one row the tag does not repair is recorded, not frozen:
+    // `Class.forName(Nested.class.getName())` still throws
+    // `ClassNotFoundException` under the dial while the same round-trip works
+    // for `java.lang.Object` and `String[]`. That is a `Class.forName` defect
+    // on a nested application class — `getName` now returns the name HotSpot
+    // returns — and the sweep is checked in, so it goes red the day it is
+    // fixed or the day this answer drifts.
+    //
+    // TAGGING THIS ROW TURNED `registrar_drift.rs` RED, and the red was the
+    // gate's, not the tag's: its enclosing-fn sweep required the byte after
+    // `register` to be `(`, so `register_with_kind(` was invisible to it and
+    // every tagged triple's SHIPPING registration vanished from the scan. The
+    // same run named `java/lang/Class.getModule`, tagged the day before — that
+    // gate had been red on `dev` since. Both are fixed there, not worked
+    // around here.
+    //
+    // An `Intrinsic` is exempt at every dispatch door and exempt from the
+    // shadow census by construction. That is a real cost — the row leaves the
+    // population the dial can ask about — and it is earned here by the numbers
+    // above, not by "yielding breaks it".
+    registry.register_with_kind(
         "java/lang/Class",
         "getName",
         "()Ljava/lang/String;",
         lang_class::native_class_get_name,
+        NativeKind::Intrinsic,
     );
     registry.register(
         "java/lang/Class",

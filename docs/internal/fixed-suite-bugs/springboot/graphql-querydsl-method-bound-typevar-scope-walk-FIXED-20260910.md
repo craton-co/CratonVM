@@ -156,4 +156,4 @@ unrelated and are filed separately:
 * `module/spring-boot-kafka … KafkaAutoConfigurationIntegrationTests` —
   `internal/fixed-suite-bugs/springboot/kafka-scala-statics-anyhash-jit-miscompile-FIXED-20260910.md`
 * `module/spring-boot-flyway … ResourceProviderCustomizerBeanRegistrationAotProcessorTests` —
-  `known-issues/springboot/flyway-aot-receiver-class-confusion-under-concurrency-20260910.md`
+  `internal/springboot/flyway-aot-receiver-class-confusion-under-concurrency-FIXED-20260911.md`

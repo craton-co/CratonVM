@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-544 tokens.
+546 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -278,6 +278,7 @@ export inherited from a parent shell.
 | `ir-call` | `CRATONVM_DBG_IR_CALL` |
 | `ir-bufsize` | `CRATONVM_DBG_IR_BUFSIZE` |
 | `code-near-globals` | `CRATONVM_DBG_CODE_NEAR_GLOBALS` |
+| `epoch-cell` | `CRATONVM_DBG_EPOCH_CELL` |
 | `ir-compiles` | `CRATONVM_DBG_IR_COMPILES` |
 | `ir-isel` | `CRATONVM_DBG_IR_ISEL` |
 | `ir-linear-scan` | `CRATONVM_DBG_IR_LINEAR_SCAN` |
@@ -333,6 +334,7 @@ export inherited from a parent shell.
 | `jit-unmap` | `CRATONVM_DBG_JIT_UNMAP` |
 | `intrinsic` | `CRATONVM_DBG_INTRINSIC` |
 | `jitc` | `CRATONVM_DBG_JITC` |
+| `jitnpe` | `CRATONVM_DBG_JITNPE` |
 | `jlm` | `CRATONVM_DBG_JLM` |
 | `jul` | `CRATONVM_DBG_JUL` |
 | `kcbool` | `CRATONVM_DBG_KCBOOL` |
@@ -610,7 +612,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-431 tokens.
+437 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -732,6 +734,8 @@ export inherited from a parent shell.
 | `ir-const-imm` | `CRATONVM_JIT_IR_CONST_IMM` |
 | `ir-phi-residency` | `CRATONVM_JIT_IR_PHI_RESIDENCY` |
 | `ir-phi-copy-regs` | `CRATONVM_JIT_IR_PHI_COPY_REGS` |
+| `ir-phi-copy-direct` | `CRATONVM_JIT_IR_PHI_COPY_DIRECT` |
+| `ir-branch-layout-polarity` | `CRATONVM_JIT_IR_BRANCH_LAYOUT_POLARITY` |
 | `ir-phi-home-publish-guard` | `CRATONVM_JIT_IR_PHI_HOME_PUBLISH_GUARD` |
 | `ir-phi-edge-interfere` | `CRATONVM_JIT_IR_PHI_EDGE_INTERFERE` |
 | `ir-skip-republish` | `CRATONVM_JIT_IR_SKIP_REPUBLISH` |
@@ -752,6 +756,7 @@ export inherited from a parent shell.
 | `sp-epoch-guard-rip` | `CRATONVM_JIT_SP_EPOCH_GUARD_RIP` |
 | `sp-field-layout-guard` | `CRATONVM_JIT_SP_FIELD_LAYOUT_GUARD` |
 | `layout-epoch-static` | `CRATONVM_JIT_LAYOUT_EPOCH_STATIC` |
+| `epoch-cell` | `CRATONVM_JIT_EPOCH_CELL` |
 | `code-near-globals` | `CRATONVM_JIT_CODE_NEAR_GLOBALS` |
 | `ir-speculate` | `CRATONVM_JIT_IR_SPECULATE` |
 | `band-skip` | `CRATONVM_JIT_BAND_SKIP` |
@@ -816,6 +821,9 @@ export inherited from a parent shell.
 | `ir-list-sched` | `CRATONVM_JIT_IR_LIST_SCHED` |
 | `ir-carry-rcx-folded` | `CRATONVM_JIT_IR_CARRY_RCX_FOLDED` |
 | `ir-unroll-unreachable-frames` | `CRATONVM_JIT_IR_UNROLL_UNREACHABLE_FRAMES` |
+| `ir-per-copy-frames` | `CRATONVM_JIT_IR_PER_COPY_FRAMES` |
+| `ir-partial-unroll` | `CRATONVM_JIT_IR_PARTIAL_UNROLL` |
+| `ir-partial-unroll-factor` | `CRATONVM_JIT_IR_PARTIAL_UNROLL_FACTOR` |
 | `c2-accept` | `CRATONVM_C2_ACCEPT` |
 | `c2-accept-memo` | `CRATONVM_C2_ACCEPT_MEMO` |
 | `ir-unresolved-class-trap` | `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` |
