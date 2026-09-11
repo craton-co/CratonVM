@@ -464,15 +464,31 @@ summaries above.
 | `L5UnsafeAccess` | 11 | the exact `Unsafe` surface a `WorkQueue` runs on (needs `--add-exports`) |
 | `l5run.sh` | — | the runner for the two `--add-exports` probes the battery correctly excludes |
 
-`L5ExecutorSweep` is the one worth copying. 84 rows in this lane's *clean*
-classes had `invocations: 0` in every probe run and in all 132 corpus reports —
-not wrong, just never called. A row nothing calls cannot be retired, and, as
-`L5TpeCount` then showed, cannot be known to be right either. Writing the
-caller moved 60 of those 84 into the table and found a live defect on the way.
+`L5ExecutorSweep` is the one worth copying. **84 rows in this lane's *clean*
+classes had `invocations: 0` in every probe run and in all 132 corpus
+reports** — not wrong, just never called. A row nothing calls cannot be
+retired, and, as `L5TpeCount` then showed, cannot be known to be right either.
 
-The remaining 24 are the four dead `AbstractExecutorService` rows and the
-twenty `ScopedMemoryAccess` aligned accessors — both cases where the probe
-would have to construct a receiver shape the image does not otherwise produce.
+Writing the caller is what moved them:
+
+```text
+  class                         dispatched before -> after
+  TimeUnit                          3 -> 9
+  ThreadPoolExecutor                6 -> 15
+  CompletableFuture                 4 -> 11
+  PriorityBlockingQueue             3 -> 9
+  ScheduledThreadPoolExecutor       0 -> 2
+  Thread$State                      0 -> 2
+```
+
+Thirty-two rows, all of them in the table, and one live defect found on the
+way. Twenty-six more of the 84 are the `ForkJoinTask`/`RecursiveTask`/
+`RecursiveAction` rows — the probe reaches those too, and §3 holds them for a
+different reason. The last twenty-six are the four dead
+`AbstractExecutorService` rows and twenty-two `ScopedMemoryAccess` aligned
+accessors; eight of those twenty-two are in the table under the twin rule, and
+the other fourteen would need a receiver shape the image does not otherwise
+produce.
 
 ## 9. What the next wave should do, in order
 
@@ -484,10 +500,15 @@ would have to construct a receiver shape the image does not otherwise produce.
    reaches. Until one exists, that count is not evidence of anything.
 3. **Delete the four `AbstractExecutorService` registrations** — dead weight,
    not a shadow, and not a retirement.
-4. **`jdk/internal/misc/Unsafe`, per triple rather than per class.** The
-   class-wide arm is destructive, but the destruction is concentrated in the
-   memory-address family; the delegating wrappers (`getAndAddInt`,
-   `weakCompareAndSet*`, the `Acquire`/`Release` variants) reach the same
-   `ACC_NATIVE` primitives through the same offsets and are the obvious first
-   subset. That needs a build per iteration, because the dial arms a class and
-   the table is per triple.
+4. **The rest of `jdk/internal/misc/Unsafe`, per triple rather than per class.**
+   Sixteen delegating atomics and fences are already retired (§4); the rule
+   that admitted them — delegates to an `ACC_NATIVE` primitive at the SAME
+   offset — admits more rows that no instrument here dispatches:
+   `compareAndExchange{Int,Long,Reference}{Acquire,Release}`,
+   `weakCompareAndSet*{Acquire,Release,Plain}`, `getIntAcquire`,
+   `getIntOpaque`, `getLongAcquire`, `getReferenceOpaque`, `putIntRelease`,
+   `putLongRelease`. Each needs a dispatch first, which means a probe, not a
+   build. What DOES need a build per iteration is anything in the
+   memory-address family, because the dial arms a class and the table is per
+   triple, and the class-wide arm is where `L4BridgeSweep` goes from 499 rows
+   to zero.
