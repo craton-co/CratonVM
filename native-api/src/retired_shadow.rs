@@ -3490,6 +3490,13 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // `the_tables_const_lists_every_table_the_predicate_consults` exists to
     // catch, and it is what caught it.
     RETIRED_SHADOW_L1_TRIPLES,
+    // ...and lane 6's, added by the same mechanism one merge later, for the
+    // same reason: this const and the L6 table were written on branches that
+    // never saw each other. Two waves in a row means the guard is not a
+    // one-off — a lane adding a table adds a predicate arm in one hunk and
+    // must add a row here in another, and `git merge` cannot know they belong
+    // together.
+    RETIRED_SHADOW_L6_TRIPLES,
 ];
 
 #[cfg(test)]

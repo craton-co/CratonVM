@@ -1528,7 +1528,35 @@ use cratonvm_types::compat::CompatibilityMode;
 /// worth only as much as its last refresh, and this is the first time one of
 /// them would have had something to say.
 ///
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2339;
+
+/// # Re-frozen 2026-09-11 by lane L6: +17, and the account is three numbers
+///
+/// `RETIRED_SHADOW_L6_TRIPLES` retires 15 triples, and re-tagging a `Bridge`
+/// to `SyntheticStub` is what raises this count — case (b) in the failure
+/// message above, a fake being labelled honestly so `--jdk-only` drops it and
+/// the JDK's own bytecode runs.
+///
+/// The substitution experiment, on the merged tree, with the control pinned to
+/// the merge's own second parent rather than to the moving `origin/dev` ref:
+///
+/// ```text
+///   CTRL  (retired_shadow.rs from HEAD^2)   all three arms GREEN
+///   TRIAL (this branch)                     2345 / 2356 / 2345
+///   baseline before                         2328 / 2339 / 2328
+/// ```
+///
+/// **CTRL green is the load-bearing half.** It says the whole +17 is this
+/// lane's and none of it is drift the lane is absorbing — the mistake this
+/// file's own header records three of, at 3/3/12.
+///
+/// **+17 for 15 triples, and the 2 are not an error.** The unit of this count
+/// is a REGISTRATION, not a triple, and two of the fifteen are registered
+/// twice: the same `(class, name, descriptor)` reaches
+/// `NativeMethodRegistry::register` from two sites, and each registration is
+/// re-tagged separately. The `--jdk-only-report` census for these prefixes
+/// reports **15 distinct triples refused, 0 with a survivor**, which is the
+/// same population counted the other way.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2356;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1561,7 +1589,35 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2339;
 /// owns, +327 is lane 1's wave 2 and +101 is this branch; the decomposition
 /// and the three measurements behind the classification are all on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2328;
+
+/// # Re-frozen 2026-09-11 by lane L6: +17, and the account is three numbers
+///
+/// `RETIRED_SHADOW_L6_TRIPLES` retires 15 triples, and re-tagging a `Bridge`
+/// to `SyntheticStub` is what raises this count — case (b) in the failure
+/// message above, a fake being labelled honestly so `--jdk-only` drops it and
+/// the JDK's own bytecode runs.
+///
+/// The substitution experiment, on the merged tree, with the control pinned to
+/// the merge's own second parent rather than to the moving `origin/dev` ref:
+///
+/// ```text
+///   CTRL  (retired_shadow.rs from HEAD^2)   all three arms GREEN
+///   TRIAL (this branch)                     2345 / 2356 / 2345
+///   baseline before                         2328 / 2339 / 2328
+/// ```
+///
+/// **CTRL green is the load-bearing half.** It says the whole +17 is this
+/// lane's and none of it is drift the lane is absorbing — the mistake this
+/// file's own header records three of, at 3/3/12.
+///
+/// **+17 for 15 triples, and the 2 are not an error.** The unit of this count
+/// is a REGISTRATION, not a triple, and two of the fifteen are registered
+/// twice: the same `(class, name, descriptor)` reaches
+/// `NativeMethodRegistry::register` from two sites, and each registration is
+/// re-tagged separately. The `--jdk-only-report` census for these prefixes
+/// reports **15 distinct triples refused, 0 with a survivor**, which is the
+/// same population counted the other way.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2345;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1623,7 +1679,35 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2328;
 /// [`BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT`] again, as it has every time, and
 /// that is still a measurement each time rather than a rule. The account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2328;
+
+/// # Re-frozen 2026-09-11 by lane L6: +17, and the account is three numbers
+///
+/// `RETIRED_SHADOW_L6_TRIPLES` retires 15 triples, and re-tagging a `Bridge`
+/// to `SyntheticStub` is what raises this count — case (b) in the failure
+/// message above, a fake being labelled honestly so `--jdk-only` drops it and
+/// the JDK's own bytecode runs.
+///
+/// The substitution experiment, on the merged tree, with the control pinned to
+/// the merge's own second parent rather than to the moving `origin/dev` ref:
+///
+/// ```text
+///   CTRL  (retired_shadow.rs from HEAD^2)   all three arms GREEN
+///   TRIAL (this branch)                     2345 / 2356 / 2345
+///   baseline before                         2328 / 2339 / 2328
+/// ```
+///
+/// **CTRL green is the load-bearing half.** It says the whole +17 is this
+/// lane's and none of it is drift the lane is absorbing — the mistake this
+/// file's own header records three of, at 3/3/12.
+///
+/// **+17 for 15 triples, and the 2 are not an error.** The unit of this count
+/// is a REGISTRATION, not a triple, and two of the fifteen are registered
+/// twice: the same `(class, name, descriptor)` reaches
+/// `NativeMethodRegistry::register` from two sites, and each registration is
+/// re-tagged separately. The `--jdk-only-report` census for these prefixes
+/// reports **15 distinct triples refused, 0 with a survivor**, which is the
+/// same population counted the other way.
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2345;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
