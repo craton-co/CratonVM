@@ -3166,7 +3166,7 @@ static RETIRED_SHADOW_L1_HM_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/util/HashMap", "toString", "()Ljava/lang/String;"),
 ];
 
-/// Lane 1 wave 4 — the `java/util/jar/` and `java/text/` rows that a dial
+/// Lane 1 wave 4 — the 29 `java/util/jar/` and `java/text/` rows that a dial
 /// BISECTION cleared, once the whole-prefix red was traced to one class each.
 ///
 /// ## §7's two vacuous greens were also two unbisected reds
@@ -3200,12 +3200,14 @@ static RETIRED_SHADOW_L1_HM_TRIPLES: &[(&str, &str, &str)] = &[
 /// stay `Bridge` and keep their prefixes off this table; `DateFormat`'s single
 /// registration is excluded for the reason §7 exists — its green said nothing.
 ///
-/// ## What yielding REPAIRS: thirteen rows, measured
+/// ## What yielding REPAIRS: nine of thirteen rows, measured
 ///
 /// `apps/probes/L1JarTextSweep.java` (87 rows, written for this wave) is
-/// byte-identical to HotSpot 25.0.4+7 on the trial binary and thirteen rows
-/// out on the control. Every one of them is a §1.4 defect — the native
-/// answers where the image's own body throws, or throws where it answers:
+/// thirteen rows out from HotSpot 25.0.4+7 on the control. Armed on this
+/// table's five classes together — 1,119 door engagements, so not a vacuous
+/// arm — it is **four**: nine repaired, none made worse. Every one of the
+/// thirteen is a §1.4 defect, the native answering where the image's own
+/// body throws or throwing where it answers:
 ///
 /// ```text
 ///   A.getValue.nullName    HotSpot NullPointerException   control null
@@ -3229,7 +3231,38 @@ static RETIRED_SHADOW_L1_HM_TRIPLES: &[(&str, &str, &str)] = &[
 /// `E.attributesFromJar` is the only one that is a wrong VALUE rather than a
 /// missing throw: a jar's per-entry manifest section was invisible.
 ///
-/// ## Why these six and not the prefix
+/// The four that remain are not this table's to fix, and saying which is the
+/// point of measuring them:
+///
+/// * `E.attributesFromJar` — `java/util/jar/JarFile`'s, which stays `Bridge`;
+/// * `M.ctorStream.null` — the NPE is raised at the right place with the
+///   right type and the message lacks its `because "this.in" is null`
+///   clause, which is the helpful-NPE-message gap and not a jar defect;
+/// * the two `P.printStackTrace` rows — see below.
+///
+/// ## `java/text/ParseException` was in this table and came out
+///
+/// It is the wave's own refusal, on its own measurement. Armed alone it is
+/// `+0` — it repairs nothing — and two of its rows trade one wrong answer
+/// for another:
+///
+/// ```text
+///   e.setStackTrace(new StackTraceElement[0]); e.printStackTrace(w)
+///     HotSpot   java.text.ParseException: bad
+///     control   (wrong, one way)
+///     armed     java.text.ParseException: bad
+///                 at java.text.ParseException.<init>(ParseException.java:64)
+///                 at ... six more frames
+/// ```
+///
+/// Thirteen of its fourteen registrations are `java/lang/Throwable`'s
+/// inherited surface, so what the yield exposes is that this VM's `Throwable`
+/// model does not read back a `stackTrace` array that BYTECODE wrote — a
+/// `Throwable` defect that a `java/text/` retirement merely made visible.
+/// `printStackTrace` is called by too much real code to change its output for
+/// no repair, so the class stays and the finding is written down instead.
+///
+/// ## Why these five and not the prefix
 ///
 /// `java/util/jar/JarFile` is the family's producer and it stays; that is not
 /// a half-retirement of the kind wave 3 hit, because `JarEntry`, `Manifest`
@@ -3249,62 +3282,6 @@ static RETIRED_SHADOW_L1_JT_TRIPLES: &[(&str, &str, &str)] = &[
         "normalize",
         "(Ljava/lang/CharSequence;Ljava/text/Normalizer$Form;)Ljava/lang/String;",
     ),
-    (
-        "java/text/ParseException",
-        "addSuppressed",
-        "(Ljava/lang/Throwable;)V",
-    ),
-    (
-        "java/text/ParseException",
-        "getCause",
-        "()Ljava/lang/Throwable;",
-    ),
-    (
-        "java/text/ParseException",
-        "getLocalizedMessage",
-        "()Ljava/lang/String;",
-    ),
-    (
-        "java/text/ParseException",
-        "getMessage",
-        "()Ljava/lang/String;",
-    ),
-    (
-        "java/text/ParseException",
-        "getStackTrace",
-        "()[Ljava/lang/StackTraceElement;",
-    ),
-    (
-        "java/text/ParseException",
-        "getSuppressed",
-        "()[Ljava/lang/Throwable;",
-    ),
-    (
-        "java/text/ParseException",
-        "initCause",
-        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
-    ),
-    ("java/text/ParseException", "printStackTrace", "()V"),
-    (
-        "java/text/ParseException",
-        "printStackTrace",
-        "(Ljava/io/PrintStream;)V",
-    ),
-    (
-        "java/text/ParseException",
-        "printStackTrace",
-        "(Ljava/io/PrintWriter;)V",
-    ),
-    (
-        "java/text/ParseException",
-        "setStackTrace",
-        "([Ljava/lang/StackTraceElement;)V",
-    ),
-    (
-        "java/text/ParseException",
-        "toString",
-        "()Ljava/lang/String;",
-    ),
     ("java/util/jar/Attributes", "<init>", "()V"),
     ("java/util/jar/Attributes", "<init>", "(I)V"),
     (
@@ -3312,7 +3289,11 @@ static RETIRED_SHADOW_L1_JT_TRIPLES: &[(&str, &str, &str)] = &[
         "containsKey",
         "(Ljava/lang/Object;)Z",
     ),
-    ("java/util/jar/Attributes", "entrySet", "()Ljava/util/Set;"),
+    (
+        "java/util/jar/Attributes",
+        "entrySet",
+        "()Ljava/util/Set;",
+    ),
     (
         "java/util/jar/Attributes",
         "get",
@@ -3350,7 +3331,11 @@ static RETIRED_SHADOW_L1_JT_TRIPLES: &[(&str, &str, &str)] = &[
         "toString",
         "()Ljava/lang/String;",
     ),
-    ("java/util/jar/JarEntry", "<init>", "(Ljava/lang/String;)V"),
+    (
+        "java/util/jar/JarEntry",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
     (
         "java/util/jar/JarEntry",
         "getComment",
@@ -3358,7 +3343,11 @@ static RETIRED_SHADOW_L1_JT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     ("java/util/jar/JarEntry", "getCompressedSize", "()J"),
     ("java/util/jar/JarEntry", "getMethod", "()I"),
-    ("java/util/jar/JarEntry", "getName", "()Ljava/lang/String;"),
+    (
+        "java/util/jar/JarEntry",
+        "getName",
+        "()Ljava/lang/String;",
+    ),
     ("java/util/jar/JarEntry", "getSize", "()J"),
     ("java/util/jar/JarEntry", "isDirectory", "()Z"),
     ("java/util/jar/Manifest", "<init>", "()V"),
@@ -3382,7 +3371,11 @@ static RETIRED_SHADOW_L1_JT_TRIPLES: &[(&str, &str, &str)] = &[
         "<init>",
         "(Ljava/util/jar/Manifest;)V",
     ),
-    ("java/util/jar/Manifest", "getEntries", "()Ljava/util/Map;"),
+    (
+        "java/util/jar/Manifest",
+        "getEntries",
+        "()Ljava/util/Map;",
+    ),
     (
         "java/util/jar/Manifest",
         "getMainAttributes",
@@ -3471,7 +3464,6 @@ mod tests {
                         | "java/util/jar/Manifest"
                         | "java/util/jar/Attributes"
                         | "java/util/jar/Attributes$Name"
-                        | "java/text/ParseException"
                         | "java/text/Normalizer"
                 ),
                 "{c} is in wave 4's table and is not one of the six classes \
@@ -3494,6 +3486,29 @@ mod tests {
                 "java/text/DateFormat",
                 "getInstance",
                 "()Ljava/text/DateFormat;",
+            ),
+            // `java/text/ParseException` was IN wave 4's table and came out
+            // on its own measurement. Armed alone on
+            // `apps/probes/L1JarTextSweep.java` it is `+0` — it repairs
+            // nothing — and two of its rows trade one wrong answer for
+            // another: `e.setStackTrace(new StackTraceElement[0]);
+            // e.printStackTrace(w)` prints one header line on HotSpot and
+            // the FULL seven-frame trace when the class yields, because this
+            // VM's `Throwable` model does not read back a `stackTrace` array
+            // that bytecode wrote. Thirteen of its fourteen triples are
+            // `Throwable`'s inherited surface, so the defect is `Throwable`'s
+            // and not `java/text/`'s; retiring a Throwable SUBCLASS is how it
+            // becomes visible. `printStackTrace` is too widely called to
+            // change its output for no repair.
+            (
+                "java/text/ParseException",
+                "printStackTrace",
+                "(Ljava/io/PrintWriter;)V",
+            ),
+            (
+                "java/text/ParseException",
+                "setStackTrace",
+                "([Ljava/lang/StackTraceElement;)V",
             ),
         ] {
             assert!(
