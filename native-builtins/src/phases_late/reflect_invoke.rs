@@ -2930,17 +2930,37 @@ pub(crate) fn build_string_set(
     ctx: &mut dyn NativeContext,
     items: Vec<String>,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    use cratonvm_types::ArrayElementType;
-    let len = items.len();
-    let arr = ctx.new_array(ArrayElementType::Reference, len);
-    for (i, s) in items.iter().enumerate() {
+    // Through the real `HashSet.<init>` and `add`, not by writing raw slots.
+    // The three this used to write are the MAP layout (bucket array, size,
+    // capacity) on a class whose one real field is `map`
+    // (`Ljava/util/HashMap;`), and the elements went into the array in
+    // INSERTION order rather than into hash buckets -- so the set was
+    // findable only by an implementation that agreed to look there. Every
+    // call allocates (the strings, the `<init>` backing map, each `add`'s
+    // node), so the set is pinned across the loop.
+    let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1)?;
+    let set_pin = ctx.pin_native_root(set);
+    let _ = ctx.invoke(
+        "java/util/HashSet",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(set))],
+    );
+    for s in items.iter() {
         let js = ctx.create_string(s);
-        ctx.set_array_element(arr, i, Value::Object(Some(js)));
+        let js_pin = ctx.pin_native_root(js);
+        let set_now = ctx.read_native_pin(set_pin, set);
+        let js = ctx.read_native_pin(js_pin, js);
+        let _ = ctx.invoke_virtual(
+            set_now,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(js))],
+        );
+        ctx.unpin_native_roots(js_pin);
     }
-    let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?;
-    ctx.set_field(set, 0, Value::Object(Some(arr)));
-    ctx.set_field(set, 1, Value::Int(len as i32));
-    ctx.set_field(set, 2, Value::Int(16)); // initial capacity marker
+    let set = ctx.read_native_pin(set_pin, set);
+    ctx.unpin_native_roots(set_pin);
     Ok(set)
 }
 

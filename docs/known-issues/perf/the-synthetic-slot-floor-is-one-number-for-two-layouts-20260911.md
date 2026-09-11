@@ -121,9 +121,39 @@ in both modes — `native_hs_init` allocates a proper backing map and
 fallback. Fixed in the same change as the `ConcurrentHashMap` work; it does NOT
 by itself let the floor move, for the §2 reason.
 
-Still map-shaped, and worth the same treatment: `phases_late/text_intl.rs`,
-`phases_late/reflect_invoke.rs::build_string_set`, and the real-mode arm of
-`wildfly_security.rs` is already correct and can be the model.
+`phases_late/text_intl.rs` (`ResourceBundle.keySet`) and
+`phases_late/reflect_invoke.rs::build_string_set` went the same way in that
+change -- five factories in total.
+
+**Six remain, and they are what still pins `HashSet`'s floor.** Each builds an
+array-backed set by writing raw absolute slots on a real receiver, so the screen
+in §3 does not clear the class until they are converted:
+
+```text
+  native-builtins/src/jmx.rs:7042                        slots 0,1
+  native-builtins/src/phases_late/net_channels.rs:623    slots 0,1  (Selector.selectedKeys)
+  native-builtins/src/phases_late/net_channels.rs:642    slots 0,1  (Selector.keys)
+  native-builtins/src/phases_late/reflect_invoke.rs:3342 slots 0,1,2
+  native-builtins/src/util_time.rs:4922                  slots 0,1  (available zone ids)
+  native-builtins/src/servlet.rs:8929                    slots 0,1
+```
+
+The tool for all six already exists and does not need writing:
+`native-builtins/src/lib.rs::build_real_layout_string_hashset` builds the real
+single-`map` shape by NAME, sizing the object with
+`(s_map + 1).max(class_num_total_fields)`, and falls back to the legacy
+two-field synthetic layout only when the real one cannot be resolved -- i.e. it
+is already mode-aware. `wildfly_security.rs::count_carrying_hash_set` is the
+model call site.
+
+**Two floor sites, and both are real-mode-only.** That is what makes the §3 fix
+surgical rather than dangerous: `class_manager.rs` applies the floor at ~6296
+(`define_class_with_options`) and ~10589 (the stub-upgrade path), and BOTH run
+only when a class is defined from real class-file bytes. A fabricated stub gets
+its fields straight from `synthetic_stub_fields` at ~9776 and never consults
+either. So an allowlist that skips the floor for a screened class changes
+synthetic-JDK mode by nothing at all, and the arm that has to be re-run is the
+real-JDK one plus a verdict-neutrality check.
 
 ## 5. Repro
 
