@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Retired. Every bucket-A/B row in the lane's prefix set is retired, classified, or blocked with the blocker named and measured. |
+| **Status** | Retired 2026-09-10. A RESIDUAL wave on 2026-09-11 took four of §10's five items: see §3a (a correction to this page's own §3) and §9a. Table count is now 98 + 48. |
 | **Was** | `docs/known-issues/jdk-only-lanes/lane-5-concurrent-thread-unsafe.md` |
 | **Table** | [`RETIRED_SHADOW_L5_TRIPLES`](../../../native-api/src/retired_shadow.rs) |
 | **Ownership authority** | [`lane-0-integration-and-gates.md`](../../known-issues/jdk-only-lanes/lane-0-integration-and-gates.md) |
@@ -170,6 +170,62 @@ task classes alone, `apps/probes/L5ExecutorSweep.java` hangs at
 `ForkJoinPool.submit(...).get()` and `ForkJoinShadowSweep` at
 `invokeAll(t1, t2)` — 178 rows before the arm, 92 after, and the missing tail
 is what `diff` reports as 86 differing rows.
+
+## 3a. CORRECTION, 2026-09-11: the double is a RACE, and it is not in shipped mode
+
+§3 above says the doubling is "deterministic rather than racy" and reads it as
+the JDK's own `WorkQueue` being claimed by both the submitter's help path and a
+worker. **Both halves of that are wrong**, and the correction matters because
+§9 put 70 rows behind it.
+
+`apps/probes/L5FjDouble.java` scores twenty submission shapes — three task
+classes × five routes, plus the commonPool and two `execute(Runnable)` rows —
+and records, at every body entry, the THREAD, the nesting DEPTH and the order.
+That separates the three defects `computes=2` can mean: two threads, a nested
+re-entry, or two sequential routes. Five runs of each configuration on one
+binary at `dev`:
+
+```text
+  run   dial on ForkJoinPool   dial on pool + 3 task classes   unarmed
+   1            3                          8                      0
+   2            2                          4                      0
+   3            3                          5                      0
+   4            2                          6                      0
+   5            2                          2                      0
+```
+
+Three things follow, and none of them is in §3:
+
+  * **Unarmed `--jdk-only` never doubles.** 0 of 20 rows, five runs out of five.
+    Whatever this is, it is not in shipped behaviour — §3's four rows were taken
+    with the dial ARMED on `ForkJoinPool`, which its own code block says and the
+    prose then drops.
+  * **It is a race.** The count varies run to run and so does the identity of
+    the rows: one `pool-only` run doubled `{RecursiveTask execute+join,
+    RecursiveAction execute+join, CountedCompleter execute+join, RecursiveTask
+    submit+get, RecursiveAction submit+get, RecursiveAction execute+get,
+    commonPool invoke}` and another doubled two of those and nothing else. A
+    row that doubles is not a property of the shape.
+  * **Arming the task classes with the pool makes it WORSE, not better.** §3's
+    remedy — "it is one unit rather than four decisions" — predicts that arming
+    the pool and the three task classes together fixes it. Measured, that arm
+    doubles 2 to 8 rows where the pool alone doubles 2 to 3. The "one unit"
+    reading is not supported by the only experiment that tests it.
+
+Every doubling row reads `threads=2 maxDepth=1 CONCURRENT-two-threads`, so the
+mechanism is two threads rather than re-entrancy — and the reason is one this
+lane can name. `fjp_state` (the side table these natives complete tasks in) and
+the JDK's own write-once `status` word are TWO sources of truth for "is this
+task done", and **nothing claims a task before its body runs**: `FjpEntry` has
+`done`, `cancelled`, `result` and `thrown`, and `done` is set only after
+`compute()` returns. Refuse the pool's natives and the caller's inline path and
+a real worker both read "not done" and both run the body.
+
+So the 70 rows stay held, with a better-stated blocker: **not "the external
+submission is claimed twice" but "the two halves of this pool disagree about
+completion, and the side table has no claim state."** Adding one — or moving
+the pool and task surface onto a single model — is the work, and it is a design
+change rather than a missing registration.
 
 ## 4. What was retired: 98 rows over 10 classes
 
@@ -668,7 +724,75 @@ accessors; eight of those twenty-two are in the table under the twin rule, and
 the other fourteen would need a receiver shape the image does not otherwise
 produce.
 
-## 9. What the next wave should do, in order
+## 9a. What the residual wave actually did, 2026-09-11
+
+§9's list was written the day before and four of its five items were taken the
+next day. What each turned into, because three of them turned into something
+other than what the item predicted:
+
+| §9 item | outcome |
+|---|---|
+| 1. `ForkJoinPool`'s external submission | **re-characterised, not fixed.** §3a: a race, absent from shipped mode, and the "one unit" remedy measured worse. One real inconsistency behind it WAS fixed — see below. The 70 rows stay held. |
+| 2. a `sun.misc.Unsafe` workload | **done, and it unblocked 48 rows.** See below. |
+| 3. delete the four `AbstractExecutorService` registrations | **done.** |
+| 4. the rest of `jdk/internal/misc/Unsafe` | untouched; still needs a dispatch per triple. |
+| 5. the two `ScheduledThreadPoolExecutor` rows | untouched; still needs a real-JDK Spring measurement. |
+
+**`ForkJoinPool.execute` had an override entry and no native.**
+`is_forkjoin_native_override` has listed BOTH `execute` descriptors for a long
+time; nothing registered either, and `keep_real_forkjoinpool_bridge` listed
+neither. That is precisely the failure the paragraph above that keep-list warns
+about — *"the two lists must agree entry-for-entry; a name present in only one
+of them is silently inert"* — sitting in the file that says it. So
+`pool.execute(task)` ran the concrete JDK bytecode into a real `WorkQueue`
+while `join()` read the side table. `execute(ForkJoinTask)V` is now registered
+on its sibling `submit`'s policy and on the keep-list.
+`execute(Runnable)V` stays off both ON PURPOSE: a `Runnable` gives the caller
+no task to join, so nothing can double, and real bytecode puts it on a real
+worker — closer to HotSpot than this pool's borrow-the-caller model.
+
+**`sun.misc.Unsafe`: 48 rows retired, and the blocker was a missing
+instrument.** §5 held all 82 with "precondition 1 fails by measurement" — 121
+probes reported the dial vacuous on that scope. §9.2 said what that was worth:
+*until a workload exists, the count is not evidence of anything.*
+`apps/probes/L5SunMiscUnsafe.java` is the workload, and it changed the verdict:
+
+```text
+  1. the dial was asked              y/r = 76/76 on the workload
+  2. whole probe tree no worse       134 measured: 0 toward, 1 away and that
+                                     row is y/r=0/0 VACUOUS with a line count
+                                     that moved -- not the dial
+  3. the image target carries Code   outcome=bytecode-won on all 48
+  4. a per-triple dispatch observed  48 distinct triples, one row each
+```
+
+The probe is **byte-identical armed and unarmed**, 36 rows. A wave that refuses
+48 natives and changes no answer is the definition of a shadow.
+
+It also settles a fact the page assumed the other way: **`sun.misc.Unsafe` is
+fully functional on JDK 25.** Every accessor and volatile twin, all three
+`compareAndSwap*`, `getAndAdd`/`getAndSet`, the static-field pair,
+`allocateMemory`/`setMemory`/`freeMemory`, `allocateInstance`,
+`getLoadAverage`, `park`/`unpark` and `throwException` answer on both VMs.
+Terminal deprecation says nothing about whether a method works today, and the
+one row where the VMs disagree is `getUnsafe` — which JDK 25 does not declare
+at all.
+
+Three of the 82 are **deletions rather than retirements**: `getUnsafe`,
+`ensureClassInitialized` and `shouldBeInitialized` answer
+`NoSuchMethodException` on HotSpot 25, so nothing can dispatch them on a
+supported image. Thirty-one more were simply not reached by this workload and
+stay out, because precondition 4 is per-triple however obvious a sibling looks.
+Widening the probe takes them, and that is a probe edit rather than a build.
+
+**The instrument lesson.** §5's blocker for this class was true and useless at
+the same time: "no probe reaches it" is a statement about the probe tree, not
+about the rows. The battery agrees — of 134 probes, `L5SunMiscUnsafe` is the
+ONLY one that asks this dial, and the other 133 still read `VACUOUS`. A
+vacuous scope is a request for a workload, not a verdict, and this page said so
+itself before anybody acted on it.
+
+## 10. What the next wave should do, in order (as written 2026-09-10; see §9a for what happened)
 
 1. **`ForkJoinPool`'s external submission.** §3 localises it to the submitter's
    help path racing a worker, with the `Unsafe` primitives underneath proven
