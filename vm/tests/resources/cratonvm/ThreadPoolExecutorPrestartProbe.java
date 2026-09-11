@@ -13,6 +13,19 @@ import java.util.concurrent.atomic.AtomicInteger;
  * platform Thread through its factory, and immediately prestarts its only core
  * worker. A fresh Thread must always be startable: any IllegalThreadStateException
  * is a VM regression in Thread construction/state publication.</p>
+ *
+ * <h2>Why it prints progress</h2>
+ *
+ * <p>The harness guarded this with a 120 s deadline. Measured 2026-09-11 on an
+ * 8-core host with a debug binary and 2000 iterations: <b>147 s real, 28 s
+ * user</b>, printing {@code PRESTART_OK iterations=2000 workers=2000}. Every
+ * assertion in the probe passed and the clock was what failed -- and 28 s of
+ * user time against 147 s of wall clock says the host was busy, not that the
+ * VM was slow. A deadline cannot tell those apart.</p>
+ *
+ * <p>So the probe reports its own progress and the harness fails when
+ * {@code remaining=} stops falling rather than when a clock runs out. See
+ * {@code common::Progress} in {@code vm/tests/common/mod.rs}.</p>
  */
 public final class ThreadPoolExecutorPrestartProbe {
     private static final int DEFAULT_ITERATIONS = 10_000;
@@ -42,6 +55,8 @@ public final class ThreadPoolExecutorPrestartProbe {
         final AtomicInteger created = new AtomicInteger();
         int started = 0;
 
+        final int heartbeatEvery = Math.max(1, iterations / 40);
+
         for (int i = 0; i < iterations; i++) {
             final ThreadFactory factory = runnable ->
                     new TomcatStyleTaskThread(
@@ -59,6 +74,10 @@ public final class ThreadPoolExecutorPrestartProbe {
                 if (!executor.awaitTermination(30, TimeUnit.SECONDS)) {
                     throw new AssertionError("worker did not terminate at iteration " + i);
                 }
+            }
+            if ((i + 1) % heartbeatEvery == 0) {
+                System.out.println("progress remaining=" + (iterations - (i + 1))
+                        + " started=" + started);
             }
         }
 
