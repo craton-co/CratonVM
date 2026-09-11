@@ -3315,6 +3315,93 @@ struct NativeDiagState {
 /// Cheap and confined: this is the native boundary, not the interpreter's
 /// `putfield`, and the barrier short-circuits on anything that is not a moved
 /// object.
+/// Stores `NativeContext::set_field_by_name` DROPPED because the receiver's
+/// class does not declare the named field.
+static FIELD_BY_NAME_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many `set_field_by_name` calls named a field their receiver does not
+/// have. Always counted; see [`note_field_by_name_dropped`] for what a non-zero
+/// value does and does not mean.
+pub fn field_by_name_dropped_count() -> u64 {
+    FIELD_BY_NAME_DROPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The silent arm of `set_field_by_name`, made audible under
+/// `CRATONVM_DBG_DEADREF_STORE`.
+///
+/// # Why this is where a stale receiver actually surfaces
+///
+/// `set_field_by_name` resolves the field against the class of whatever object
+/// is AT the address it is handed. A native that kept a receiver across an
+/// allocation hands it a vacated address — and a young semispace is re-served
+/// from the same base every cycle, so that address is usually occupied by some
+/// unrelated object by the time the store runs. The field name then does not
+/// resolve, and the store disappears **before** it reaches the heap: no
+/// `set_field`, so no `[deadref-store]`, no `[deadref-recv]`, no
+/// `[CELLWATCH]`, no `[PUTFIELD-WATCH]`. Nothing in the VM said anything.
+///
+/// That is exactly how `native_assertj_lightweight_comparable_assert`'s
+/// `objects` store vanished (see
+/// `docs/internal/springboot/bindabletests-assertj-objects-receiver-stale-across-clinit-20260911.md`),
+/// and it is why the heap-side screens could not have found it however many
+/// arms they grew.
+///
+/// # Why it is counted always and printed only under the flag
+///
+/// A miss is not always a defect: several natives set a field that only some
+/// subclasses declare (`strings` and `failures` on the AssertJ assertions are
+/// the local example), so an unconditional warning would be noise — MEASURED, a
+/// single `BindableTests` run drops 2 710 stores and ~2 700 of them are one
+/// benign shape, `StringBuilder.toStringCache`. The COUNT is free and makes
+/// "did this happen at all" answerable; the line with its backtrace is behind
+/// the same switch as the rest of the stale-reference family, because that is
+/// when someone is asking this question, and it is deduped by
+/// `(receiver class, field name)` so that population cannot crowd out the one
+/// row a reader opened the log for.
+#[cold]
+#[inline(never)]
+fn note_field_by_name_dropped(
+    class_id: ClassId,
+    class_name: &str,
+    field_name: &str,
+    obj: ObjectRef,
+    value: Value,
+) {
+    FIELD_BY_NAME_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !cratonvm_types::flags().gc.dbg_deadref_store {
+        return;
+    }
+    // DEDUPE BY SHAPE, not by occurrence count. A plain "first N" cap is worse
+    // than useless here and was measured to be: a BindableTests run drops 2 710
+    // stores, ~2 700 of them one benign shape (`StringBuilder.toStringCache`),
+    // so a 32-line cap spends every line on the noise and never reaches the
+    // one that matters. One line per distinct `(receiver class, field name)`
+    // turns the same population into a handful of rows, and a stale receiver is
+    // a shape nothing else in the run produces.
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(u32, String)>>> =
+        std::sync::Mutex::new(None);
+    let mut guard = match SEEN.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let seen = guard.get_or_insert_with(std::collections::HashSet::new);
+    if seen.len() >= 256 || !seen.insert((class_id.as_u32(), field_name.to_string())) {
+        return;
+    }
+    let n = seen.len() - 1;
+    drop(guard);
+    eprintln!(
+        "[field-by-name-dropped] #{n} obj=0x{:x} recv_class={class_name} \
+         recv_class_id={} field={field_name:?} value={value:?} — the receiver's class does not \
+         declare this field, so the store was DROPPED. Either the caller named a field only some \
+         subclasses have, or the receiver is a stale address now occupied by a different object.\n{:?}",
+        obj.as_ptr() as usize,
+        class_id.as_u32(),
+        std::backtrace::Backtrace::force_capture(),
+    );
+}
+
 #[inline]
 fn forward_boundary_value(heap: &crate::memory::VmHeap, value: Value) -> Value {
     match value {
@@ -9080,7 +9167,7 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         // "what class is this" read lands here, so a victim that reaches
         // neither of the other two is still named. `ClassId::new(0)` on a hit
         // is what a reclaimed header already reads as.
-        if deadrecv_check(&self.shared, obj, "class_id_of_object") {
+        if deadrecv_check(&self.shared, self.thread, obj, "class_id_of_object") {
             return ClassId::new(0);
         }
         self.shared.mem.heap.class_id_of(obj)
@@ -12773,7 +12860,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // victims instead of dying at the first. That makes the flag
         // behaviour-changing -- a 0 identity hash is otherwise impossible, see
         // the C28 note below -- which is why it is opt-in and named DBG.
-        if deadrecv_check(&self.shared, obj, "identity_hash_code") {
+        if deadrecv_check(&self.shared, self.thread, obj, "identity_hash_code") {
             return 0;
         }
         // C28: identityHashCode must NEVER return 0. JDK's
@@ -13163,6 +13250,13 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             drop(cm);
             self.shared.mem.heap.set_field(obj, index, value);
             // write_barrier fires automatically inside set_field
+        } else {
+            let class_name = cm
+                .get_class(class_id)
+                .map(|c| c.name.to_string())
+                .unwrap_or_else(|| "<unresolved>".to_string());
+            drop(cm);
+            note_field_by_name_dropped(class_id, &class_name, field_name, obj, value);
         }
     }
 
@@ -13441,7 +13535,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // Generational `--nojit` reclaim: 1 crash in 3 faults in
         // `get_array_element_unboxing` rather than in `identity_hash_code`.
         // Asked before `load_and_forward`, which dereferences.
-        if deadrecv_check(&self.shared, obj, "get_array_element") {
+        if deadrecv_check(&self.shared, self.thread, obj, "get_array_element") {
             return Value::Object(None);
         }
         let obj = self.shared.mem.heap.load_and_forward(obj);
@@ -19546,10 +19640,14 @@ pub(super) fn convert_element_value(
 // Env-gated and `#[cold]`: the enabled path takes a global `Mutex` and formats
 // a `String` per call, so it is a diagnosis tool, not something to leave on.
 #[cold]
-/// `CRATONVM_DBG_DEADRECV`: at `identity_hash_code`, ask the reclamation rings
-/// whether the receiver is an address this process already freed, BEFORE the
-/// first dereference, and report it through `reclaim_guard` instead of
-/// faulting on it.
+/// `CRATONVM_DBG_DEADRECV`: at `identity_hash_code`, ask whether the receiver is
+/// an address this process already freed, BEFORE the first dereference, and
+/// report it through `reclaim_guard` instead of faulting on it.
+///
+/// Two sources, because no single one covers both collectors: the reclamation
+/// RINGS for the non-moving reclamations that feed them, and the published
+/// young GEOMETRY for a moving young cycle, which feeds no ring at all. See
+/// `deadrecv_check` for why the second arm exists and what it costs.
 ///
 /// Opt-in and behaviour-changing: a hit returns 0, which `identity_hash_code`
 /// otherwise never does (C28). That is deliberate, so one run names many
@@ -19562,14 +19660,19 @@ fn dbg_deadrecv() -> bool {
 /// `CRATONVM_DBG_DEADRECV`'s shared body: is `obj` an address this process has
 /// already reclaimed, asked BEFORE anything dereferences it?
 ///
-/// Both lookups are keyed on the ADDRESS and read only the always-on
-/// reclamation rings, so they answer whether or not the page is still mapped —
-/// which is the whole point, because this defect's face is a fault on the read
-/// that every other consumer performs first.
+/// Every lookup is keyed on the ADDRESS and dereferences nothing, so they answer
+/// whether or not the page is still mapped — which is the whole point, because
+/// this defect's face is a fault on the read that every other consumer performs
+/// first.
 ///
 /// `true` means reported; the caller returns a benign value rather than
 /// walking into the fault, so one run names MANY victims.
-pub(crate) fn deadrecv_check(shared: &SharedVm, obj: ObjectRef, site: &'static str) -> bool {
+pub(crate) fn deadrecv_check(
+    shared: &SharedVm,
+    thread: &JvmThread,
+    obj: ObjectRef,
+    site: &'static str,
+) -> bool {
     if !dbg_deadrecv() {
         return false;
     }
@@ -19618,16 +19721,94 @@ pub(crate) fn deadrecv_check(shared: &SharedVm, obj: ObjectRef, site: &'static s
     if cratonvm_gc::gen_heap::old_freed_lookup_covering(addr).is_some()
         || cratonvm_gc::gen_heap::young_freed_lookup(addr).is_some()
     {
-        crate::memory::reclaim_guard::report_reclaimed_receiver_forced(
-            shared,
-            addr,
-            site,
-            "java/lang/Object",
-            0,
+        report_deadrecv(shared, thread, addr, site);
+        return true;
+    }
+    // THE MOVING-YOUNG ARM, and without it this probe is silent on the one
+    // collector it was written for.
+    //
+    // Both rings above are fed by a NON-MOVING reclamation: `old_freed_*` by
+    // the old-gen sweep and mark-compact, `young_freed_*` by
+    // `sweep_young_non_moving`'s `record_young_span_freed`. A MOVING young
+    // cycle writes to neither — it evacuates the semispace and
+    // `uncommit_evacuated_young` hands the span back to the OS — so on
+    // `--XX:UseGc Generational` with moving cycles in the history, the rings
+    // answer nothing about exactly the addresses that fault. That is the
+    // Hazelcast `ServerTests` face: the crash handler names the span
+    // (`site=unbumped-middle`, `and NOT re-committed since`) and this guard,
+    // asked about the same address one instruction earlier, said "live".
+    //
+    // The question is address-keyed and dereferences NOTHING, which is what
+    // lets it answer on a released granule: `is_object_address` screened above
+    // through the commit bitmap and the arena's object-start bitmap, and
+    // `young_geometry_span` is four relaxed loads and two range compares. A
+    // live young reference always names an object start, so "inside the young
+    // geometry and no object starts there" names no live object.
+    //
+    // Cheap enough to stay armed, which is the property the page asked for:
+    // the `CRATONVM_DBG_VACATED_FRAMES` ledger that answers the same question
+    // exactly costs a RECORD path running all process long and dilates this
+    // workload about ninefold, past the window the crash needs.
+    if let Some(span) = cratonvm_gc::gen_heap::young_geometry_span(addr) {
+        tracing::error!(
+            target: "cratonvm::gc::guard",
+            obj = format!("{addr:#x}"),
+            site = site,
+            semispace = span,
+            "receiver names a YOUNG address at which no object starts: a moving young cycle evacuated this span and nothing rewrote the reference. INACTIVE-SEMISPACE is the arena the last flip emptied; ACTIVE-SEMISPACE means the span was re-served, but not to an object base.",
         );
+        report_deadrecv(shared, thread, addr, site);
         return true;
     }
     false
+}
+
+/// The shared report for both [`deadrecv_check`] arms: the reclaim guard's
+/// verdict, then the Java stack that handed the dead receiver in.
+///
+/// The guard answers WHAT the address is and proves no live heap object holds it
+/// — which leaves "a frame local, a register, or a native side table", and says
+/// nothing about WHICH. The Java stack is the cheapest thing that narrows that:
+/// the receiver was on some frame's operand stack one bytecode ago, so the
+/// innermost frames bound where it came from.
+fn report_deadrecv(shared: &SharedVm, thread: &JvmThread, addr: usize, site: &'static str) {
+    crate::memory::reclaim_guard::report_reclaimed_receiver_forced(
+        shared,
+        addr,
+        site,
+        "java/lang/Object",
+        0,
+    );
+    tracing::error!(
+        target: "cratonvm::gc::guard",
+        obj = format!("{addr:#x}"),
+        site = site,
+        java_frames = %deadrecv_java_frames(thread),
+        "…and THIS is the Java stack that handed the dead receiver in. The innermost frame is the call site; the producer is the native, or the reference copy, that put this address on its operand stack.",
+    );
+}
+
+/// Innermost Java frames, for [`report_deadrecv`].
+///
+/// Bounded at eight: this is an error path, and a full Hazelcast stack is
+/// hundreds deep with nothing in the tail the top does not already say.
+fn deadrecv_java_frames(thread: &JvmThread) -> String {
+    thread
+        .frames
+        .iter()
+        .rev()
+        .take(8)
+        .map(|f| {
+            format!(
+                "{}.{}{} pc={}",
+                f.class_name(),
+                f.method_name(),
+                f.method_descriptor(),
+                f.pc
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" <- ")
 }
 
 pub fn dbg_dispatch_tally(site: &str, class_name: &str, method_name: &str, descriptor: &str) {

@@ -7661,29 +7661,45 @@ pub(crate) fn native_string_lines(ctx: &mut dyn NativeContext, args: &[Value]) -
             lines.push(tail);
         }
     }
-    // Create Stream of strings
-    let elements: Vec<Value> = lines
+    // Create Stream of strings.
+    //
+    // Each `create_string_uninterned` can collect, so the strings made earlier
+    // in this loop move while the later ones are being made: collecting their
+    // raw addresses hands the array a list of pre-move copies, and
+    // `String.lines()` yields garbage elements with nothing reported. Root them
+    // and read each back at its store.
+    let mut scope = NativeHandleScope::new(ctx);
+    let element_handles: Vec<_> = lines
         .iter()
         .map(|line| {
-            let str_obj = ctx.create_string_uninterned(line);
-            Value::Object(Some(str_obj))
+            let str_obj = scope.create_string_uninterned(line);
+            scope.root(str_obj)
         })
         .collect();
     // Use the Stream pattern from collections
-    let stream_class_id = match ctx.ensure_class_initialized("java/util/stream/Stream") {
+    let stream_class_id = match scope.ensure_class_initialized("java/util/stream/Stream") {
         Ok(id) => id,
         // Fallible since 2026-08-10 (JDK-only wave 2, step 3): a 1-field
         // instance of the `java.util.stream.Stream` INTERFACE is a synthetic
         // stream stand-in, which is precisely what a strict run must not get in
         // place of `java.base`'s own pipeline.
-        Err(_) => crate::util_concurrent_ext::refused_class(ctx, "java/util/stream/Stream", 1)?,
+        Err(_) => crate::util_concurrent_ext::refused_class(
+            &mut *scope,
+            "java/util/stream/Stream",
+            1,
+        )?,
     };
-    let stream = ctx.alloc_object(stream_class_id, 1);
-    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), elements.len());
-    for (i, val) in elements.iter().enumerate() {
-        ctx.set_array_element(arr, i, *val);
+    let stream_obj = scope.alloc_object(stream_class_id, 1);
+    // The backing array is allocated after the stream, so the stream's address
+    // is only valid again once that allocation is behind us.
+    let stream_h = scope.root(stream_obj);
+    let arr = scope.new_ref_array(cratonvm_types::ClassId::new(0), element_handles.len());
+    for (i, h) in element_handles.iter().enumerate() {
+        let element = scope.get(h);
+        scope.set_array_element(arr, i, Value::Object(Some(element)));
     }
-    ctx.set_field(stream, 0, Value::Object(Some(arr)));
+    let stream = scope.get(&stream_h);
+    scope.set_field(stream, 0, Value::Object(Some(arr)));
     Ok(Some(Value::Object(Some(stream))))
 }
 

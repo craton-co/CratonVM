@@ -843,6 +843,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "null-native", on_key: Some("CRATONVM_DBG_NULL_NATIVE"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::DBG, token: "nullthis", on_key: Some("CRATONVM_DBG_NULLTHIS"), off_key: None, off_word: None, since: "2026-06-11" },
     E { group: Group::DBG, token: "obj-equals", on_key: Some("CRATONVM_DBG_OBJ_EQUALS"), off_key: None, off_word: None, since: "2026-05-23" },
+    E { group: Group::DBG, token: "obj-watch", on_key: Some("CRATONVM_DBG_OBJ_WATCH"), off_key: None, off_word: None, since: "2026-09-11" },
     E { group: Group::DBG, token: "objects", on_key: Some("CRATONVM_DBG_OBJECTS"), off_key: None, off_word: None, since: "2026-06-14" },
     E { group: Group::DBG, token: "objkey", on_key: Some("CRATONVM_DBG_OBJKEY"), off_key: None, off_word: None, since: "2026-08-01" },
     E { group: Group::DBG, token: "obsreg", on_key: Some("CRATONVM_DBG_OBSREG"), off_key: None, off_word: None, since: "2026-07-22" },

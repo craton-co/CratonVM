@@ -3157,11 +3157,17 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
-        let vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
-        ctx.set_field(this, 0, Value::Object(Some(keys)));
-        ctx.set_field(this, 1, Value::Object(Some(vals)));
-        ctx.set_field(this, 2, Value::Int(0));
+        // `this` and the first array both predate the second allocation.
+        let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+        let this_h = scope.root(this);
+        let keys_obj = scope.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+        let keys_h = scope.root(keys_obj);
+        let vals = scope.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+        let this = scope.get(&this_h);
+        let keys = scope.get(&keys_h);
+        scope.set_field(this, 0, Value::Object(Some(keys)));
+        scope.set_field(this, 1, Value::Object(Some(vals)));
+        scope.set_field(this, 2, Value::Int(0));
         Ok(None)
     });
 
@@ -3175,24 +3181,47 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let key = args.get(1).copied().unwrap_or(Value::Object(None));
-            let val = args.get(2).copied().unwrap_or(Value::Object(None));
-            ctx.monitor_enter(this);
-            let size = match ctx.get_field(this, 2) {
+            // `compareTo` below runs arbitrary Java on every probe of the
+            // search loop, and the grow arm allocates twice. The receiver, both
+            // arrays and both arguments cross all of that, so the whole body
+            // works through the scope and re-reads each address after anything
+            // that can collect.
+            let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+            let this_h = scope.root(this);
+            let key_h = match args.get(1) {
+                Some(Value::Object(Some(o))) => Some(scope.root(*o)),
+                _ => None,
+            };
+            let val_h = match args.get(2) {
+                Some(Value::Object(Some(o))) => Some(scope.root(*o)),
+                _ => None,
+            };
+            let key_plain = args.get(1).copied().unwrap_or(Value::Object(None));
+            let val_plain = args.get(2).copied().unwrap_or(Value::Object(None));
+            let key = |scope: &cratonvm_native_api::NativeHandleScope| match &key_h {
+                Some(h) => Value::Object(Some(scope.get(h))),
+                None => key_plain,
+            };
+            let val = |scope: &cratonvm_native_api::NativeHandleScope| match &val_h {
+                Some(h) => Value::Object(Some(scope.get(h))),
+                None => val_plain,
+            };
+            scope.monitor_enter(this);
+            let size = match scope.get_field(this, 2) {
                 Value::Int(n) => n as usize,
                 _ => 0,
             };
-            let keys_arr = match ctx.get_field(this, 0) {
-                Value::Object(Some(a)) => a,
+            let keys_src_h = match scope.get_field(this, 0) {
+                Value::Object(Some(a)) => scope.root(a),
                 _ => {
-                    ctx.monitor_exit(this);
+                    scope.monitor_exit(this);
                     return Ok(Some(Value::Object(None)));
                 }
             };
-            let vals_arr = match ctx.get_field(this, 1) {
-                Value::Object(Some(a)) => a,
+            let vals_src_h = match scope.get_field(this, 1) {
+                Value::Object(Some(a)) => scope.root(a),
                 _ => {
-                    ctx.monitor_exit(this);
+                    scope.monitor_exit(this);
                     return Ok(Some(Value::Object(None)));
                 }
             };
@@ -3200,16 +3229,21 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
             // Find insertion point via linear scan (compareTo)
             let mut pos = size;
             for i in 0..size {
-                let existing_key = ctx.get_array_element(keys_arr, i);
+                let keys_arr = scope.get(&keys_src_h);
+                let existing_key = scope.get_array_element(keys_arr, i);
                 if let Value::Object(Some(ek)) = existing_key {
+                    let probe = key(&scope);
                     if let Ok(Some(Value::Int(cmp))) =
-                        ctx.invoke_virtual(ek, "compareTo", "(Ljava/lang/Object;)I", &[key])
+                        scope.invoke_virtual(ek, "compareTo", "(Ljava/lang/Object;)I", &[probe])
                     {
                         if cmp == 0 {
                             // Key exists — replace value
-                            let old = ctx.get_array_element(vals_arr, i);
-                            ctx.set_array_element(vals_arr, i, val);
-                            ctx.monitor_exit(this);
+                            let vals_arr = scope.get(&vals_src_h);
+                            let old = scope.get_array_element(vals_arr, i);
+                            let v = val(&scope);
+                            scope.set_array_element(vals_arr, i, v);
+                            let this = scope.get(&this_h);
+                            scope.monitor_exit(this);
                             return Ok(Some(old));
                         } else if cmp > 0 {
                             pos = i;
@@ -3220,38 +3254,58 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
             }
 
             // Grow if needed
-            let cap = ctx.array_length(keys_arr);
+            let keys_arr = scope.get(&keys_src_h);
+            let cap = scope.array_length(keys_arr);
             if size >= cap {
                 let new_cap = cap * 2;
-                let new_keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
-                let new_vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+                let new_keys_obj =
+                    scope.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+                let new_keys_h = scope.root(new_keys_obj);
+                let new_vals = scope.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+                let new_keys = scope.get(&new_keys_h);
+                let keys_arr = scope.get(&keys_src_h);
+                let vals_arr = scope.get(&vals_src_h);
+                let this = scope.get(&this_h);
+                let key = key(&scope);
+                let val = val(&scope);
                 for i in 0..size {
-                    ctx.set_array_element(new_keys, i, ctx.get_array_element(keys_arr, i));
-                    ctx.set_array_element(new_vals, i, ctx.get_array_element(vals_arr, i));
+                    let k = scope.get_array_element(keys_arr, i);
+                    scope.set_array_element(new_keys, i, k);
+                    let v = scope.get_array_element(vals_arr, i);
+                    scope.set_array_element(new_vals, i, v);
                 }
-                ctx.set_field(this, 0, Value::Object(Some(new_keys)));
-                ctx.set_field(this, 1, Value::Object(Some(new_vals)));
+                scope.set_field(this, 0, Value::Object(Some(new_keys)));
+                scope.set_field(this, 1, Value::Object(Some(new_vals)));
                 // Re-fetch after resize
                 let keys_arr = new_keys;
                 let vals_arr = new_vals;
                 // Shift right from pos
                 for i in (pos..size).rev() {
-                    ctx.set_array_element(keys_arr, i + 1, ctx.get_array_element(keys_arr, i));
-                    ctx.set_array_element(vals_arr, i + 1, ctx.get_array_element(vals_arr, i));
+                    let k = scope.get_array_element(keys_arr, i);
+                    scope.set_array_element(keys_arr, i + 1, k);
+                    let v = scope.get_array_element(vals_arr, i);
+                    scope.set_array_element(vals_arr, i + 1, v);
                 }
-                ctx.set_array_element(keys_arr, pos, key);
-                ctx.set_array_element(vals_arr, pos, val);
+                scope.set_array_element(keys_arr, pos, key);
+                scope.set_array_element(vals_arr, pos, val);
             } else {
                 // Shift right from pos
+                let keys_arr = scope.get(&keys_src_h);
+                let vals_arr = scope.get(&vals_src_h);
                 for i in (pos..size).rev() {
-                    ctx.set_array_element(keys_arr, i + 1, ctx.get_array_element(keys_arr, i));
-                    ctx.set_array_element(vals_arr, i + 1, ctx.get_array_element(vals_arr, i));
+                    let k = scope.get_array_element(keys_arr, i);
+                    scope.set_array_element(keys_arr, i + 1, k);
+                    let v = scope.get_array_element(vals_arr, i);
+                    scope.set_array_element(vals_arr, i + 1, v);
                 }
-                ctx.set_array_element(keys_arr, pos, key);
-                ctx.set_array_element(vals_arr, pos, val);
+                let k = key(&scope);
+                let v = val(&scope);
+                scope.set_array_element(keys_arr, pos, k);
+                scope.set_array_element(vals_arr, pos, v);
             }
-            ctx.set_field(this, 2, Value::Int((size + 1) as i32));
-            ctx.monitor_exit(this);
+            let this = scope.get(&this_h);
+            scope.set_field(this, 2, Value::Int((size + 1) as i32));
+            scope.monitor_exit(this);
             Ok(Some(Value::Object(None)))
         },
     );
