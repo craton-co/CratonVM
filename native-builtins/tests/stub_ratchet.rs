@@ -1481,7 +1481,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// the defect this file's header describes, where two such ratchets disagreed
 /// by 364 registrations for weeks. Here it is a units difference, not a
 /// measurement error -- but only enumerating the added set showed which.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2262;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2283;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1597,7 +1597,29 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2262;
 /// and L2 waves arriving) and DOWN relative to `dev` (2328 -> 2251, its drift
 /// corrected). Both directions in one re-freeze, which is why the account
 /// matters more than the number.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2251;
+/// # Re-frozen again 2026-09-11: lane L0 wave 2, +21 in all three arms
+///
+/// ```text
+/// stubs   2251 -> 2272   2262 -> 2283   2272 (synthetic-jdk, was 2251)
+/// totals  13623          13991          13658
+/// ```
+///
+/// Case ONE of the three classified above -- **existing fakes relabelled** --
+/// and it is attributed row for row rather than argued:
+///
+/// * `RETIRED_SHADOW_L0_TRIPLES` gained **19 triples**, and the kind map
+///   needed **21 lines** flipped `bridge` -> `synthetic-stub`, because
+///   `ModuleDescriptor$Version.equals` and `.hashCode` are each registered at
+///   two ordinals. Same units difference as this lane's own 54-vs-56.
+/// * `dump_synthetic_stubs` on this tree lists all 19 as `SyntheticStub`.
+/// * The delta is +21 in every configuration, which is what a table-driven
+///   relabel looks like: a retirement table re-tags `Bridge` ->
+///   `SyntheticStub` before insertion, so it moves the KIND and never the
+///   count of registrations.
+///
+/// Three readings of one change, agreeing. That is the standard the +101 drift
+/// on `dev` failed, and the reason it went unnoticed for as long as it did.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2272;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1654,7 +1676,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2251;
 /// re-freeze ALL THREE — see the pointer on both siblings.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2251;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2272;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -1704,17 +1726,37 @@ const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2251;
 /// `cratonvm/internal/ArrayListViewItr` rows), and the other three accumulated
 /// across merges nobody had to re-freeze for. An ungated constant used to
 /// classify a gated one is worth only as much as its last refresh.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13879;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13991;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
 /// for the reason given on [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].**
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13511;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13623;
+
+/// The `--features synthetic-jdk` total, which had no constant at all.
+///
+/// **Found 2026-09-11 while re-freezing for lane L0's wave 2.** The three
+/// baselines, [`MEASURED_CONFIG`] and [`BASELINE_CONST`] all branch three
+/// ways; [`MEASURED_TOTAL_REGISTRATIONS`] branched TWO, so the synthetic-jdk
+/// arm classified its own failure against the no-management total. Measured
+/// side by side, that arm carries **13658** against no-management's **13623**
+/// — a 35-registration gap, which is larger than a typical stub delta. So the
+/// second column could report a clean relabel (total flat, stubs up) as "new
+/// fakes were registered, do not re-freeze", which is the one conclusion in
+/// the three-case table that stops work.
+///
+/// The gap is the point: `synthetic-jdk` compiles registrars neither other arm
+/// does, so a shared total was never going to be right for it. It read as
+/// right because nothing asserts on it and only a failure prints it.
+#[allow(dead_code)]
+const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13658;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;
-#[cfg(not(feature = "management"))]
+#[cfg(all(not(feature = "management"), feature = "synthetic-jdk"))]
+const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK;
+#[cfg(all(not(feature = "management"), not(feature = "synthetic-jdk")))]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT;
 
 // Both constants are compiled in both configurations on purpose: a reader

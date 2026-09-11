@@ -1703,13 +1703,144 @@ static RETIRED_SHADOW_L3_TRIPLES: &[(&str, &str, &str)] = &[
 /// `OK -> BAD == 0` before the corpus arm, not after. If a dial arm is used at
 /// all, read its `leaked` counter first: `leaked > 0` means some rows in that
 /// arm never yielded and cannot be cited.
+///
+/// ## Wave 2: the 19 the failing vectors never consult
+///
+/// The 54 were withdrawn as a block for one reason -- `OK -> BAD == 0` held on
+/// the probe and the corpus still lost five vectors, and nothing said WHICH of
+/// the 29 remaining rows did it. Bisecting 29 triples is a build per
+/// hypothesis, 65 minutes each.
+///
+/// The per-vector census answers a weaker question for free: **which of the 29
+/// does this vector dispatch at all?** A registration a vector never consults
+/// cannot be the row that broke it. Measured on `p16` (L0 empty, so all 29
+/// natives present and counted), the five vectors passing 5/0, all five
+/// reports written, `saturation: none`:
+///
+/// ```text
+/// RClassUnloadSweep           5 of 29        union = 10 triples
+/// RClassUnloadSweepGen        5 of 29        desiredAssertionStatus, forName x3,
+/// RJdkModule                  8 of 29        getConstructor, getDeclaredConstructor,
+/// RLoaderIdentity             6 of 29        getMethod, getPackageName,
+/// RServiceLoaderDoubleSource  6 of 29        isInterface, isPrimitive
+/// ```
+///
+/// All ten are class-loading or member-lookup plumbing, which is what a
+/// class-unload sweep and a two-source `ServiceLoader` lean on and what a
+/// 129-row probe over `java.lang.Class` does not reach. The **19** below are
+/// touched by none of the five.
+///
+/// ## Why that covers the corpus and not just five vectors
+///
+/// The round-1 arm -- binary `p14`, **38 rows**, the 19 among them -- scored
+/// **127 passed, 5 failed**. So the 19 are not a hypothesis about those 127:
+/// they were retired *during* that run and those 127 vectors passed anyway.
+/// The five that did not pass are the five attributed above, and none of them
+/// consults a row in the 19. `19 subset 29 subset 38`, so the two later
+/// withdrawals only removed rows from around them. The halves close over 132:
+///
+/// ```text
+/// 127 vectors   passed WITH these 19 retired            measured, p14
+///   5 vectors   failed, and dispatch none of the 19     measured, p16 census
+/// ```
+///
+/// That is why this wave is 19 and not a bisection: the bisection would
+/// identify which of the 10 is guilty, which is a question about re-adding
+/// them, not about shipping these.
+///
+/// What it does NOT cover, and what the arm on this binary is for: the table
+/// now ships alongside L1's, L2's and L3's, and individually-safe retirements
+/// can interact -- Phase 2's 236 dial-safe classes armed together broke 54 of
+/// 118 vectors. Every number above was measured with L0 alone.
 static RETIRED_SHADOW_L0_TRIPLES: &[(&str, &str, &str)] = &[
-    // EMPTIED 2026-09-10. See this table's doc comment: two corpus
-    // rounds withdrew 25 of 54 and the arm still failed four vectors,
-    // and lane L0's retirement cannot be attributed per triple without
-    // a build per hypothesis. The measurement stands and is recorded;
-    // the TABLE does not ship until a wave can name which triples the
-    // corpus accepts. Lane L3's table is unaffected and stays.
+    // WAVE 2, 2026-09-11. The 54-row wave was withdrawn whole because no
+    // instrument named the row; these 19 are the 29 that survived two
+    // probe rounds, minus the 10 that the five failing corpus vectors
+    // actually dispatch. Attribution is in the lane page's 7.2 and the
+    // 10 are pinned out by `the_l0_attributed_triples_are_not_retired`.
+    (
+        "java/lang/Class",
+        "asSubclass",
+        "(Ljava/lang/Class;)Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/Class",
+        "cast",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/lang/Class",
+        "getConstructors",
+        "()[Ljava/lang/reflect/Constructor;",
+    ),
+    (
+        "java/lang/Class",
+        "getDeclaredConstructors",
+        "()[Ljava/lang/reflect/Constructor;",
+    ),
+    (
+        "java/lang/Class",
+        "getDeclaredMethod",
+        "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
+    ),
+    (
+        "java/lang/Class",
+        "getDeclaredMethods",
+        "()[Ljava/lang/reflect/Method;",
+    ),
+    (
+        "java/lang/Class",
+        "getEnclosingClass",
+        "()Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/Class",
+        "getEnclosingConstructor",
+        "()Ljava/lang/reflect/Constructor;",
+    ),
+    (
+        "java/lang/Class",
+        "getEnclosingMethod",
+        "()Ljava/lang/reflect/Method;",
+    ),
+    (
+        "java/lang/Class",
+        "getEnumConstants",
+        "()[Ljava/lang/Object;",
+    ),
+    (
+        "java/lang/Class",
+        "getMethods",
+        "()[Ljava/lang/reflect/Method;",
+    ),
+    ("java/lang/Class", "getSigners", "()[Ljava/lang/Object;"),
+    (
+        "java/lang/Class",
+        "getTypeParameters",
+        "()[Ljava/lang/reflect/TypeVariable;",
+    ),
+    ("java/lang/Class", "isAnnotation", "()Z"),
+    ("java/lang/Class", "isEnum", "()Z"),
+    (
+        "java/lang/module/ModuleDescriptor$Version",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/lang/module/ModuleDescriptor$Version",
+        "hashCode",
+        "()I",
+    ),
+    (
+        "java/lang/module/ModuleDescriptor$Version",
+        "parse",
+        "(Ljava/lang/String;)Ljava/lang/module/ModuleDescriptor$Version;",
+    ),
+    (
+        "java/lang/module/ModuleDescriptor$Version",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
 ];
 
 /// The 2026-09-09 Phase 3 wave: `ConcurrentHashMap` and `Properties`, as ONE
@@ -3818,15 +3949,14 @@ Ljava/nio/channels/FileChannel;"
     /// Binary-searched like every sibling, so ordering is correctness.
     #[test]
     fn the_l0_table_is_sorted_and_unique() {
-        // The table is EMPTY, and this assertion is why the test still earns
-        // its place: `windows(2)` over an empty slice iterates zero times, so
-        // without this line the test would pass while checking nothing, which
-        // is the failure mode this module's own §4 warns about for
-        // placeholder tables. When a later wave refills L0, delete this line
-        // and the loop below becomes real again.
-        assert!(
-            RETIRED_SHADOW_L0_TRIPLES.is_empty(),
-            "L0's table has entries again -- drop the is_empty assertion here              and in every_l0_entry_is_reachable, and re-read the table's doc              comment on what the corpus rejected"
+        // Refilled by wave 2, so `windows(2)` is real again and the
+        // emptiness assertion that stood guard over the placeholder is
+        // gone. 19 entries, so an out-of-order pair is reachable by this
+        // loop rather than hypothetical.
+        assert_eq!(
+            RETIRED_SHADOW_L0_TRIPLES.len(),
+            19,
+            "wave 2 landed 19; the lane page's 7.2 carries the same count"
         );
         for w in RETIRED_SHADOW_L0_TRIPLES.windows(2) {
             assert!(
@@ -3847,6 +3977,62 @@ Ljava/nio/channels/FileChannel;"
             assert!(
                 triple_is_retired_shadow(c, m, d),
                 "unreachable entry: {c}.{m}{d}"
+            );
+        }
+    }
+
+    /// The 10 triples the corpus rejected and §7.2 attributed by dispatch.
+    ///
+    /// Each is consulted by at least one of `RClassUnloadSweep`,
+    /// `RClassUnloadSweepGen`, `RJdkModule`, `RLoaderIdentity` or
+    /// `RServiceLoaderDoubleSource`, every one of which failed with the 29-row
+    /// table in and passed 5/0 on the control binary run concurrently through
+    /// the same harness. They are withdrawn **as touched, not as convicted** --
+    /// attribution by dispatch over-collects on purpose -- so re-adding one is
+    /// legitimate, on a bisection that names it. It just cannot happen by
+    /// hand, silently, which is what this test buys.
+    #[test]
+    fn the_l0_attributed_triples_are_not_retired() {
+        const ATTRIBUTED: &[(&str, &str, &str)] = &[
+            ("java/lang/Class", "desiredAssertionStatus", "()Z"),
+            (
+                "java/lang/Class",
+                "forName",
+                "(Ljava/lang/Module;Ljava/lang/String;)Ljava/lang/Class;",
+            ),
+            (
+                "java/lang/Class",
+                "forName",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+            ),
+            (
+                "java/lang/Class",
+                "forName",
+                "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;",
+            ),
+            (
+                "java/lang/Class",
+                "getConstructor",
+                "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
+            ),
+            (
+                "java/lang/Class",
+                "getDeclaredConstructor",
+                "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
+            ),
+            (
+                "java/lang/Class",
+                "getMethod",
+                "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
+            ),
+            ("java/lang/Class", "getPackageName", "()Ljava/lang/String;"),
+            ("java/lang/Class", "isInterface", "()Z"),
+            ("java/lang/Class", "isPrimitive", "()Z"),
+        ];
+        for (c, m, d) in ATTRIBUTED {
+            assert!(
+                !triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} was attributed to a failing vector; see 7.2"
             );
         }
     }

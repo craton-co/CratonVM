@@ -255,13 +255,13 @@ A release build is **17-50 minutes** and the host is shared. Rules:
 `module/ModuleDescriptor$Version` (5), `ModuleLayer` (4), `Class$Atomic` (3),
 `ClassValue` (2), `Class$ReflectionData` (1).
 
-**The account closes exactly: 23 held + 54 measured-then-withdrawn + 27
-undispatched = 104.** The middle column is the 2026-09-10 correction and
-the rest of this section is written as it was measured, in order: the wave
-landed 54, the corpus rejected them, and what survives is the measurement
-and an attribution. **`RETIRED_SHADOW_L0_TRIPLES` ships empty**, and
-`the_l0_table_is_sorted_and_unique` asserts that rather than leaving it to
-be noticed.
+**The account closes exactly: 19 retired + 23 held + 35 withdrawn + 27
+undispatched = 104.** The last two columns are the 2026-09-10/11 correction,
+and the rest of this section is written as it was measured, in order: the wave
+landed 54, the corpus rejected them, the table went empty, and wave 2 landed
+back the 19 that the census could attribute away from every failing vector.
+`RETIRED_SHADOW_L0_TRIPLES.len() == 19` is asserted, so the count and this
+paragraph cannot drift apart the way §7's held set did.
 The two reviewed `Intrinsic`s sit outside that sum -- adjudicating a kind
 removes a triple from the `Bridge` population, so they are no longer shadows to
 count.
@@ -380,15 +380,38 @@ plumbing that a class-unload sweep and a two-source `ServiceLoader` lean on
 directly, which is the sort of coupling a 129-row probe on `java.lang.Class`
 does not reach.
 
-The remaining **19 are touched by none of the five** and are this lane's next
-candidate set, recorded here so the next wave starts from evidence rather than
-from the 54. Two caveats belong with them, not in a later commit:
+The remaining **19 are touched by none of the five**, and between the two
+halves that closes over the whole corpus rather than over five vectors:
 
-* "Not dispatched in these five" is not "not dispatched anywhere". The 19 still
-  need the full corpus arm, on their own binary, before they are a table.
+```text
+127 vectors   passed WITH these 19 retired            measured — p14, round 1
+  5 vectors   failed, and dispatch none of the 19     measured — p16 census
+```
+
+The round-1 arm (`p14`, **38 rows**, the 19 among them) scored 127/5, so the 19
+are not a hypothesis about those 127 — they were retired during that run and it
+passed them anyway. `19 ⊂ 29 ⊂ 38`, so the later withdrawals only ever removed
+rows from around them. Bisecting the 10 would say which one is guilty, and that
+is a question about re-adding them, not about shipping these.
+
+That provenance is worth one sentence, because it nearly went in wrong. The
+round-2 log was read as `p15`'s on its timestamp, and it cannot be: it contains
+four completed arms ten minutes after `p15` finished linking. Four arms take
+two hours. **Date a corpus log by what it could physically have run, not by its
+mtime** — the arm scripts of that era piped through `tail`, which cut the
+`== RUN … rev=` header that would have said so outright.
+
+Two things this is not:
+
+* It is not an argument about the *combination*. The table now ships beside
+  L1's, L2's and L3's, and individually-safe retirements can interact — Phase 2
+  armed 236 dial-safe classes together and broke 54 of 118 vectors. Every
+  number above was measured with L0 alone, so the wave still gets the three
+  arms on its own binary.
 * The 10 are withdrawn *as touched*, not as convicted. Attribution by dispatch
-  over-collects by design: it names every row that could be responsible, and
-  bisection is what would name the one that is.
+  over-collects by design: it names every row that could be responsible.
+  `the_l0_attributed_triples_are_not_retired` pins them out, so re-adding one
+  takes the bisection rather than a steady hand.
 
 ### Held: 23 triples, each with the row that held it
 
