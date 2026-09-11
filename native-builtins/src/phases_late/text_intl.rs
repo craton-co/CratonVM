@@ -2493,6 +2493,146 @@ pub(crate) const BI_CHARACTER: i32 = 2;
 
 pub(crate) const BI_LINE: i32 = 3;
 
+/// True when the receiver is this VM's FABRICATED `java/text/BreakIterator`
+/// carrier, and not a real subclass instance.
+///
+/// `java.text.BreakIterator` is ABSTRACT, so no real instance can carry that
+/// exact class name — only [`bi_alloc_kind`]'s fabrication does, and the
+/// three-field layout below belongs to it alone. The discriminator is
+/// therefore exact rather than a heuristic about widths.
+///
+/// # Why anything needs to ask
+///
+/// Of the seventeen registrations on `java/text/BreakIterator`, exactly TWO
+/// name a method that is CONCRETE on the abstract class — `setText(String)`
+/// and `preceding(int)` (`javap -p` on the JDK 25 image: everything else this
+/// registrar claims is `abstract`). A dispatch door asks the registry about
+/// the DECLARING class of the resolved method, so for the abstract ones a real
+/// `sun.text.RuleBasedBreakIterator` receiver resolves to its own body and the
+/// natives never see it. For those two, the declaring class IS
+/// `java.text.BreakIterator`, so the natives claimed every BreakIterator in
+/// the VM — including the real ones the provider chain builds.
+///
+/// MEASURED 2026-09-11 with `apps/probes/L1BreakIterRealProbe`, whose `P.*`
+/// rows reach `BreakIteratorProviderImpl` without going through the pinned
+/// static factories. The chain already worked: `P.wordClass` answered
+/// `sun.text.RuleBasedBreakIterator` and `P.wordClass.th`
+/// `sun.text.DictionaryBasedBreakIterator`, so wave 5's two `LocaleResources`
+/// readers find the bundle, find the blob, and the constructor validates the
+/// rule data. And then every walk over that correct iterator answered `[0]`,
+/// because `setText(String)` had written the text into slot 0 of an object
+/// whose slot 0 is `charCategoryTable`, and the real `first()`/`next()` ran
+/// against a `text` field nobody had set. The same one cause took
+/// `GraphemeBreakIterator` — pure JDK code that reads no bundle at all — to
+/// `NullPointerException: "this.boundaries" is null`.
+///
+/// One hijacked setter, three symptoms, and none of them in the family the
+/// symptoms pointed at.
+fn bi_is_fabricated_carrier(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(this))
+        .as_deref()
+        == Some("java/text/BreakIterator")
+}
+
+/// `BreakIterator.setText(String)`'s REAL body, for a receiver this VM did not
+/// fabricate: `setText(new StringCharacterIterator(newText))`.
+///
+/// Read out of `javap -c java.text.BreakIterator` rather than from memory —
+/// the whole method is those two steps, and `setText(CharacterIterator)` is
+/// abstract, so the virtual call lands on the receiver's own implementation
+/// and no native can claim it.
+fn bi_delegate_set_text(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    text: Value,
+) -> MethodCallResult {
+    let s = match text {
+        Value::Object(Some(s)) => s,
+        // A null argument is `new StringCharacterIterator(null)` on HotSpot,
+        // i.e. a NullPointerException out of the constructor — so throw one
+        // here rather than inventing a quieter answer.
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("BreakIterator.setText: text is null".to_string()),
+            }
+            .into())
+        }
+    };
+    // GC-SAFETY: `new_object_initialized` runs `<init>` and can move the heap,
+    // and `this` is a bare Rust local the collector cannot see.
+    let this_pin = ctx.pin_native_root(this);
+    let built = ctx.new_object_initialized(
+        "java/text/StringCharacterIterator",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(s))],
+    );
+    let this = ctx.read_native_pin(this_pin, this);
+    let built = match built {
+        Ok(b) => b,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
+    let r = match built {
+        Some(Value::Object(Some(it))) => ctx.invoke_virtual(
+            this,
+            "setText",
+            "(Ljava/text/CharacterIterator;)V",
+            &[Value::Object(Some(it))],
+        ),
+        // No `StringCharacterIterator` in this image is the synthetic-JDK
+        // shape; leaving the receiver untouched is what happened before this
+        // delegation existed.
+        _ => Ok(None),
+    };
+    ctx.unpin_native_roots(this_pin);
+    r?;
+    Ok(None)
+}
+
+/// `BreakIterator.preceding(int)`'s REAL body, for a receiver this VM did not
+/// fabricate.
+///
+/// ```text
+///   int pos = following(offset);
+///   while (pos >= offset && pos != DONE) pos = previous();
+///   return pos;
+/// ```
+///
+/// `javap -c`, not paraphrase. Both calls are virtual and both targets are
+/// abstract on `BreakIterator`, so they land on the real implementation. The
+/// loop has no iteration guard for the same reason the JDK's has none: it
+/// terminates on `previous()` reaching `DONE`, and an implementation where it
+/// does not is one that hangs on HotSpot too.
+fn bi_delegate_preceding(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    offset: i32,
+) -> MethodCallResult {
+    const DONE: i32 = -1;
+    let this_pin = ctx.pin_native_root(this);
+    // One exit path for the pin: compute into a Result and release once.
+    let out = (|| -> Result<i32, MethodCallFailed> {
+        let this_now = ctx.read_native_pin(this_pin, this);
+        let mut pos = match ctx.invoke_virtual(this_now, "following", "(I)I", &[Value::Int(offset)])?
+        {
+            Some(Value::Int(p)) => p,
+            _ => DONE,
+        };
+        while pos >= offset && pos != DONE {
+            let this_now = ctx.read_native_pin(this_pin, this);
+            pos = match ctx.invoke_virtual(this_now, "previous", "()I", &[])? {
+                Some(Value::Int(p)) => p,
+                _ => DONE,
+            };
+        }
+        Ok(pos)
+    })();
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(Value::Int(out?)))
+}
+
 pub(crate) fn bi_alloc_kind(
     ctx: &mut dyn NativeContext,
     kind: i32,
@@ -2900,9 +3040,17 @@ pub(crate) fn register_p66_break_iterator(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Locale;)Ljava/text/BreakIterator;",
         |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_LINE)?)))),
     );
+    // CONCRETE on the abstract class, so this native claims EVERY
+    // BreakIterator in the VM and not just the fabricated carrier — see
+    // `bi_is_fabricated_carrier` for the measurement and the three symptoms
+    // that came of it. A real subclass gets the real two-line body.
     r.register(bi, "setText", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+        let text = args.get(1).copied().unwrap_or(Value::Object(None));
+        if !bi_is_fabricated_carrier(ctx, this) {
+            return bi_delegate_set_text(ctx, this, text);
+        }
+        ctx.set_field(this, 0, text);
         ctx.set_field(this, 1, Value::Int(0));
         Ok(None)
     });
@@ -2968,8 +3116,15 @@ pub(crate) fn register_p66_break_iterator(r: &mut NativeMethodRegistry) {
             None => Ok(Some(Value::Int(-1))),
         }
     });
+    // The OTHER concrete one. Same hijack, same remedy: a real subclass gets
+    // `BreakIterator.preceding`'s own loop over its own `following`/
+    // `previous`, both of which are abstract and therefore unclaimable.
     r.register(bi, "preceding", "(I)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if !bi_is_fabricated_carrier(ctx, this) {
+            let offset = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+            return bi_delegate_preceding(ctx, this, offset);
+        }
         let offset = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as usize;
         let text = match ctx.get_field(this, 0) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
