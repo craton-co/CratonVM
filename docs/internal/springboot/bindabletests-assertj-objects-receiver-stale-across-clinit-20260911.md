@@ -244,6 +244,15 @@ handle taken before an allocation. The audit also stopped at one file;
 `test_frameworks.rs` was never in it, and it contained the residual plus three
 more.
 
+**Acted on, same day:** [the sweep this argument implies](../audits/natives-stale-handle-across-allocation-20260911.md)
+screened every native crate for a handle reused after an allocation, fixed
+twenty more — seventeen of them ARRAY receivers, which is a shape this page did
+not anticipate — and left the remaining population baselined behind
+`scripts/stale-handle-across-alloc-audit.py`. `[deadref-recv]` grew the arms it
+was missing (`set_array_element`, `get_array_element`, `get_field`) at the same
+time, so the instrument this page introduced now covers the form the species
+actually takes.
+
 The generalisation: **a pin is not a fact about a variable, it is a fact about a
 read.** `pin_native_root` roots the object; only `read_native_pin` produces an
 address that is valid NOW. Any `ObjectRef` that outlives a call is a stale
