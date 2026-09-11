@@ -126,3 +126,188 @@ reviewed `Intrinsic` with its probe, or blocked with the blocker named — with
 the `sun/nio/ch` package verdict either upheld or beaten per-triple with the
 measurement recorded, and every buffer/FFM retirement backed by a probe that
 reads data back rather than checking a return code.
+
+
+---
+
+## 9. Progress
+
+### Wave 1 — 2026-09-11, 140 rows over 10 classes of `java/io/` and `java/nio/`
+
+`RETIRED_SHADOW_L4_TRIPLES` in `native-api/src/retired_shadow.rs`, whose doc
+comment carries the method and the arithmetic. §9.1 is the ledger §8 asks for;
+§9.2, §9.3 and §9.4 are the three findings that change how the next wave should
+be run, and they cost this wave five of its seven builds.
+
+The classes: `java/io/File` (51), `java/io/DataInputStream` (18),
+`java/io/DataOutputStream` (15), `java/io/ByteArrayOutputStream` (13),
+`java/io/FilterOutputStream` (5), `java/nio/ByteBuffer` (34), and the four
+`java/nio/ByteBufferAsCharBuffer{B,L,RB,RL}.order()` views.
+
+### 9.1 The ledger — every bucket-A/B row in the prefix set, with a disposition
+
+Over the **union of thirteen probe dumps**, not one run: §1's table is a
+single-dump census and undercounts a class whose rows only one workload reaches.
+
+| disposition | rows |
+|---|---:|
+| `RETIRED` — wave 1 | **140** |
+| blocked: no probe in this tree invokes it | 479 |
+| blocked: `sun/nio/ch/` package verdict, 2026-08-19 | 308 |
+| blocked: outside a dial-floor family | 131 |
+| blocked: lane T owns `concrete_receiver.rs:185` | 49 |
+| blocked: `java/nio/file/Files`, armed 4, above the floor | 39 |
+| deferred: `java/io/PrintStream`, its own wave (§5) | 30 |
+| **backed out by a build** (five families, §9.2) | **51** |
+| blocked: `Path` carrier is stamped with the interface | 11 |
+| reviewed `Intrinsic` | 10 |
+| **total** | **1 254** |
+
+**"No probe invokes it" is the largest bucket and it is not a verdict about
+those rows.** `invocations` is a lower bound — schema 5 carries an
+`invocations_complete` bit to say so — and 479 rows being unmeasured by this
+instrument is a statement about the instrument. Over half are one shape:
+`jdk/internal/foreign/layout/ValueLayouts$Of*Impl`, eight classes at ~16 rows
+each, which a single FFM layout probe would move into the funnel in one pass.
+That is the cheapest next wave in the lane.
+
+### 9.2 The dial is not a model of a retirement
+
+The dial declines a native at DISPATCH, and the decline is **conditional**: when
+the receiver's own class has no concrete body to yield to it answers no and the
+native runs anyway — `declined_no_bytecode`, 4 156 of 180 268 on this wave's
+scope. A retirement has no such fallback. **Every row the dial scored 0 on
+*because it declined to decline* is unmeasured by it.**
+
+So a per-family sweep at DIFF 0, and the same families re-armed together as one
+scope at 0 diffs over 4 416 rows with 176 112 real yields, still lost two
+families on the first build: `java/nio/file/spi/FileSystemProvider` (the VM's
+provider is fabricated onto the ABSTRACT class, so `createLink` has no body, so
+the dial ran the native — retired, the call reaches the abstract declaration and
+throws) and `java/nio/CharBuffer` (`subSequence(1,3)` answered `cd` for `bc`;
+the real bodies take their window from `position()`/`limit()`, which this VM's
+carrier does not keep where the real accessors read them).
+
+`java/nio/ByteBuffer`'s 34 rows — same accessors, same probe — moved nothing.
+CharBuffer is a carrier defect, not a buffer-wide one.
+
+**Use the dial to BOUND a wave. Never to certify one.**
+
+### 9.3 Screen against the CORPUS, not only the probe tree
+
+The 13 probes scored 0 in **both modes** on the built binary. The `--jdk-only`
+corpus went **132/132 → 129/132**, reproducibly, on that same binary:
+
+```text
+  RFileTimes       every timestamp reads 1970-01-01T00:00:00Z
+  RJdkSecurity     a property-named truststore IGNORED: 122 anchors for 1,
+                   and a certificate HotSpot REJECTS is ACCEPTED
+  RSslLiveSession  fails at client.responseCode = 200
+```
+
+`RJdkSecurity` is the one to read twice. It is not a crash and not a diff in a
+probe — it is a **silently widened trust set**, which is precisely the failure
+mode §4 says this lane owns, and no happy-path probe would ever have seen it.
+
+`RFileTimes` has one cause, and it is the SETTER: `Files.setLastModifiedTime`
+reads `FileTime.toMillis()` off a fabricated carrier, gets 0, and stamps the
+file at the epoch — so all four read-back rows follow from one write. Dial-armed
+attribution names `java/nio/file/attribute/` for it and
+`java/io/ByteArrayInputStream` for `RSslLiveSession`.
+
+**And the screen that WOULD have caught all three is build-free:** arm the dial
+on the whole wave scope and run `regression-suite/run.sh` with
+`CRATONVM_ARGS=--jdk-only`, against its own unarmed run on the same binary.
+~20 minutes, versus a ~26-minute build plus a ~40-minute verification. On the
+trimmed scope it reads:
+
+```text
+  unarmed control                  132 passed, 0 failed
+  armed on the wave-1 scope        132 passed, 0 failed
+```
+
+Phase 2 already had this as its fourth precondition. §7 step 6 lists the corpus
+*after* the build; it belongs in step 2 as well.
+
+### 9.4 `RJdkSecurity` was a carrier defect, and it is fixed
+
+`RJdkSecurity` reproduced under **no** dial scope, single or combined — §9.2's
+blind spot exactly. What found it was not the dial and not the 13 probes but an
+eight-line probe, `apps/probes/L4AbsPath.java`, printing path SHAPES:
+
+```text
+  temp.getPath          abs=true len=32 slashes=2      (correct)
+  temp.isAbsolute       false                          (HotSpot: true)
+  temp.getAbsolutePath  abs=true len=45 slashes=5      (the cwd, prepended)
+```
+
+Every `java.io.File` this VM builds kept its path in **slot 0** and wrote
+nothing else. Self-consistent for exactly as long as this VM's own natives are
+the only readers — §1.4's whole story — and over the moment real `File` bytecode
+runs: `UnixFileSystem.resolve` reads `prefixLength`, never written and therefore
+`0`, and calls every path relative. `javax.net.ssl.trustStore` then named a path
+that no longer resolved, the JDK fell back to `cacerts` without throwing, and
+the vector's one expected trust anchor became 122.
+
+Fixed in the commit before this wave: `native-api/src/file_layout.rs`, the
+shared carrier rule, applied at all **six** producing call sites across
+`native-io` and `native-builtins`. Additive — slot 0 keeps the String, so the
+twenty-two `read_file_path` readers are untouched. With it, the corpus is back
+at 132/132 and the six `prefixLength`-dependent `File` rows (`isAbsolute`,
+`getAbsolutePath`, `getAbsoluteFile`, `getCanonicalPath`, `getCanonicalFile`,
+`toURI`) are retired in this table rather than carved out of it.
+
+**Two lessons, and the second is the expensive one.** A fabricated carrier is a
+STAMP and CONTENTS, and this lane keeps finding the contents empty — `Path`,
+`CharBuffer`, `FileTime`, `FileSystemProvider` and now `File`, five for five.
+And the first fix for this one measured *inert*: it was written into
+`native-io`'s three `File` constructors, which are themselves retired by this
+very table and so never run. The `File` under test came from `createTempFile`'s
+producer in `native-builtins`. **A carrier rule belongs in `native-api`, beside
+`path_layout` and `appended_slots`, and every producer has to be found first.**
+
+**The instrument that would have attributed it in one run still does not
+exist:** a runtime exclusion switch on the retirement table, so a per-triple
+bisection costs a run instead of a build. It needs a declared `CRATONVM_*` flag,
+which pulls in the flag-census fixture and the inventory counts — a change of
+its own, not something to bury in a retirement wave. It remains the
+highest-leverage thing anyone could build for the remaining eight lanes.
+
+### 9.5 What the residual work before it was
+
+Wave 1 rests on three defects fixed on 2026-09-10 (`6f507bb48..44f28fe64`),
+because the dial could not read a clean floor until they were:
+
+* `FileInputStream.skip` was not an `lseek`, and `isRegularFile0` — the
+  predicate deciding whether `skip0` runs at all — answered **false for every
+  file**, having read an instance native's `args[1]` as its first argument. That
+  is why two earlier, correct `skip0` bodies measured inert and were reverted;
+* a synthetic `java.nio.file.Path` wrote its string to slot 0 and its filesystem
+  to slot 1 on a two-slot object, where `UnixPath` is
+  `fs(0) path(1) stringValue(2) hash(3) offsets(4)`. Now resolved by name
+  against the implementation class, once per process, in
+  `native-api/src/path_layout.rs`;
+* a `ByteBuffer` view's read-only flag was read from the wrong carrier.
+
+### 9.6 What is left
+
+* **`java/io/PrintStream` (30).** Measured clean in the wave-1 dial screen and
+  deliberately not in the table; §5 requires its own wave and its own commit.
+  Read §9.2 and §9.3 before trusting that screen — and screen it against the
+  corpus, where `System.out` actually lives.
+* **479 rows no probe in this tree reaches.** `ValueLayouts$Of*Impl` is the
+  cheapest half.
+* **The five backed-out families (51).** All five are blocked on the same thing:
+  a fabricated carrier whose real fields this VM never writes. §9.4 is what
+  fixing one looks like, and it is the unlock — not retrying the retirement.
+* **`java/nio/file/Path` (11) and, behind it, `FileSystemProvider`.** One defect
+  and a measured order: the Path carrier is stamped with the INTERFACE, so
+  `toString()` lands on `Object.toString()` and no `instanceof UnixPath` in the
+  JDK's own `java.nio.file` code can succeed. Minting a concrete provider while
+  that is true dies in `UnixPath.toUnixPath`'s `instanceof` (`L4FilesSweep`
+  0 → 172). **Path first**, and it needs `concrete_receiver::alloc_concrete`
+  *and* `mirror_class_registrations` together, plus every
+  `class_name == "java/nio/file/Path"` test in `vm/` and `native-collections`.
+* **`sun/nio/ch/` (308).** Package verdict upheld, not beaten.
+* **`jdk/internal/foreign`.** Untouched; its prefix is not admitted, because
+  nothing under it reached the candidate set.

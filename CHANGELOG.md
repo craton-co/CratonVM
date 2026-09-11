@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 2026-09-11 The receiver species is mostly ARRAYS: 20 more fixed, and a screen so the population cannot grow quietly
+
+The BindableTests residual fixed earlier today was one native holding a
+receiver across a `<clinit>`. Screening the same shape across every native
+crate says it is neither rare nor mostly about `set_field`: the commonest form
+is building a Java array and filling it, which holds the ARRAY's address across
+every element's allocation.
+
+Twenty of those are fixed, each by rooting the reference in a
+`NativeHandleScope` and reading it back after the allocation —
+`Throwable.getStackTrace()` and `Thread.getStackTrace()` (array, element,
+three strings and a class mirror per frame), `fill_stack_trace_element`,
+`System.getenv()`, `Properties.setProperty`'s growth path, `String.lines()`,
+`ConcurrentSkipListMap.put` (its `compareTo` runs Java on every probe of the
+search loop), the JSON tree builder, both StAX readers,
+`Locale.getAvailableLocales`, `InetAddress.getAllByName`, `Module.getModules`,
+`ChoiceFormat`, `BigInteger(int, byte[])`, `ClassLoader.getResources`,
+`PriorityBlockingQueue`, JNDI `list`, the charset map, `ServiceName`,
+`MBeanServer.unregisterMBean` and `XnioWorker.getIoThreads`.
+
+Two screens close behind them:
+
+* `[deadref-recv]` now covers `set_array_element`, `get_array_element` and
+  `get_field`, not just `set_field` — the array store is where this species
+  lives, and a READ through a vacated receiver silently answers whatever the
+  pre-move copy held.
+* `scripts/stale-handle-across-alloc-audit.py` is the static half, a sibling of
+  `stale-receiver-audit.py` (which screens a callee shape and structurally
+  cannot see a body that reuses its own local). Baseline: 283 sites in 202
+  functions — a ratchet, not a target, since a match is not a defect. It scans
+  each closure of a `register_*` function as its own body (without that, 290 of
+  an apparent 573 sites were an allocation in one closure paired with a use in
+  another), and it ships with a selftest that fails if a hazard token stops
+  matching, because a dead token looks exactly like a clean tree.
+
+`docs/internal/audits/natives-stale-handle-across-allocation-20260911.md` has
+the site table, the triage rules and the honest limits.
+
+
 ### 2026-09-11 The BindableTests residual was a stale RECEIVER, and the whole probe family only ever screened values
 
 `docs/known-issues/springboot/bindabletests-assertj-objects-field-null-under-gc-stress-20260909.md`

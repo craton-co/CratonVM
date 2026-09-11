@@ -301,13 +301,18 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "toFile", "()Ljava/io/File;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let file = try_alloc_concurrent_synthetic(ctx, "java/io/File", 1)?;
+        // WIDTH and the two extra writes: `cratonvm_native_api::file_layout`.
+        // A one-slot File takes the path and silently keeps `prefixLength = 0`,
+        // which is what made real `File` bytecode call every path relative.
+        let w = cratonvm_native_api::file_layout::alloc_width(ctx);
+        let file = try_alloc_concurrent_synthetic(ctx, "java/io/File", w)?;
         // Pin across the create_string below — a moving young GC there would
         // relocate the fresh File (native stale-local family).
         let file_pin = ctx.pin_native_root(file);
         let s = ctx.create_string(&p);
         let file = ctx.read_native_pin(file_pin, file);
         ctx.set_field(file, 0, Value::Object(Some(s)));
+        cratonvm_native_api::file_layout::write(ctx, file, s, &p);
         ctx.unpin_native_roots(file_pin);
         Ok(Some(Value::Object(Some(file))))
     });
@@ -7635,13 +7640,18 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "toFile", "()Ljava/io/File;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let file = try_alloc_concurrent_synthetic(ctx, "java/io/File", 1)?;
+        // WIDTH and the two extra writes: `cratonvm_native_api::file_layout`.
+        // A one-slot File takes the path and silently keeps `prefixLength = 0`,
+        // which is what made real `File` bytecode call every path relative.
+        let w = cratonvm_native_api::file_layout::alloc_width(ctx);
+        let file = try_alloc_concurrent_synthetic(ctx, "java/io/File", w)?;
         // Pin across the create_string below — a moving young GC there would
         // relocate the fresh File (native stale-local family).
         let file_pin = ctx.pin_native_root(file);
         let s = ctx.create_string(&p);
         let file = ctx.read_native_pin(file_pin, file);
         ctx.set_field(file, 0, Value::Object(Some(s)));
+        cratonvm_native_api::file_layout::write(ctx, file, s, &p);
         ctx.unpin_native_roots(file_pin);
         Ok(Some(Value::Object(Some(file))))
     });
@@ -16800,13 +16810,16 @@ pub(crate) fn file_alloc_units(
     ctx: &mut dyn NativeContext,
     path: &[u16],
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/io/File", 1)?;
+    let w = cratonvm_native_api::file_layout::alloc_width(ctx);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/io/File", w)?;
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh File (native stale-local family).
     let obj_pin = ctx.pin_native_root(obj);
     let s = ctx.create_string_from_units(path);
     let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_field(obj, 0, Value::Object(Some(s)));
+    let text = String::from_utf16_lossy(path);
+    cratonvm_native_api::file_layout::write(ctx, obj, s, &text);
     ctx.unpin_native_roots(obj_pin);
     Ok(obj)
 }
@@ -16892,13 +16905,15 @@ pub(crate) fn file_alloc(
     ctx: &mut dyn NativeContext,
     path: &str,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/io/File", 1)?;
+    let w = cratonvm_native_api::file_layout::alloc_width(ctx);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/io/File", w)?;
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh File (native stale-local family).
     let obj_pin = ctx.pin_native_root(obj);
     let s = ctx.create_string(path);
     let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_field(obj, 0, Value::Object(Some(s)));
+    cratonvm_native_api::file_layout::write(ctx, obj, s, path);
     ctx.unpin_native_roots(obj_pin);
     Ok(obj)
 }

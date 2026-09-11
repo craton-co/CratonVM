@@ -109,13 +109,14 @@ Rough size distribution, largest first, so newcomers know where the mass
 actually is:
 
 Measured 2026-09-09 with the command above, one directory at a time;
-`native-api` re-measured 2026-09-11 at **41,715**. It has now moved twice for
-the same reason: lane L1's retirement table took it from 37k to 38,923 on
-2026-09-10, and the six-lane merge of 2026-09-11 (L0's 19 and L3's 24 rows,
-plus L1's waves 3-4 and L7's table arriving from `dev`) took it past the 5%
-tolerance to 41,715. The retirement tables in `retired_shadow.rs` are the
-single largest source of growth in this crate, and each is a row per retired
-triple plus the account that justifies it.
+`native-api` re-measured 2026-09-11 at **42429**, on the merge of lane 4's
+table with this branch's L0 and L3. It has moved three times in two days and
+always for one reason: every retirement table lives in `retired_shadow.rs`,
+one row per retired triple plus the account justifying it. L1's wave took it
+from 37k to 38,923; L0+L3+L1's waves 3-4+L7 took it to 41,715; lane 4 and
+`file_layout.rs` bring it here. **The 5% tolerance on the row below is roughly
+two waves wide**, so expect to re-measure it about every second wave rather
+than treating a red here as a surprise.
 
 | Crate | LoC | Crate | LoC |
 |-------|----:|-------|----:|

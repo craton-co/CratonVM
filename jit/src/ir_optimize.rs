@@ -56,6 +56,32 @@ pub fn optimize(graph: &mut Graph) {
     // constants; re-runs the cleanup so the unrolled straight-line code folds
     // (the concrete induction values collapse the per-iteration computation)
     // and the retired loop nodes are reclaimed.
+    //
+    // ── Pass ORDER: unroll, then LICM — unless the order is flipped ────
+    //
+    // The unroller refuses a loop whose body holds an invariant `Op::Load`
+    // still anchored to the header or the back edge (`escapes_or_pinned`): the
+    // load is not in the clone set, so cloning the body would leave it naming a
+    // control node the transform killed. LICM is the pass that re-anchors
+    // exactly those loads to the pre-header — and it runs *after* the
+    // unroller, so the unroller never sees the re-anchored form.
+    //
+    // That ordering is why `probes/FieldLoop.java`'s `sum` — `a += this.fx`,
+    // the one loop the tiering inversion is actually measured on — refuses.
+    // `this.fx` is loop-invariant, so its load is pinned to the header and the
+    // partial unroller never reaches the shape whose per-iteration budget
+    // (`docs/internal/performance/c2-the-phi-copy-staging-register-20260911.md`
+    // §4) prices unrolling at three of the six instructions separating the
+    // tiers.
+    //
+    // `CRATONVM_JIT_IR_LICM_BEFORE_UNROLL=1` runs LICM first instead. Default
+    // OFF: both passes are default-ON, so flipping their order also changes
+    // which loops the *full* unroller takes, and that is a default-config
+    // behaviour change that has to earn its place on evidence.
+    let licm_first = licm_before_unroll_enabled();
+    if licm_first {
+        run_licm_pass(graph);
+    }
     if unroll_enabled() && unroll(graph) {
         crate::ir_evidence::note(crate::ir_evidence::Transform::Unrolled);
         for _ in 0..8 {
@@ -70,21 +96,97 @@ pub fn optimize(graph: &mut Graph) {
             }
         }
     }
-    // SCEV-driven loop-invariant code motion. Default-**ON**;
-    // `CRATONVM_JIT_LICM=0` turns it off (`licm_enabled` is `map_or(true, ..)`).
-    // Same correction, same date, same reason as the unroll comment above: it
-    // is why the single-pass `aaload`/FP hoists are not on the veto list in
-    // `x64/single_pass_only.rs`. Runs once *after* the fixed-point cleanup so it sees already-folded /
-    // GVN'd invariant expressions, then a final lightweight cleanup re-runs
-    // GVN + DCE to dedup any anchor edges it rewrote.
+    if !licm_first {
+        run_licm_pass(graph);
+    }
+    if graph.live_count() < nodes_before {
+        crate::ir_evidence::note(crate::ir_evidence::Transform::Simplified);
+    }
+}
+
+/// SCEV-driven loop-invariant code motion, plus the cleanup that follows it.
+///
+/// Default-**ON**; `CRATONVM_JIT_LICM=0` turns it off (`licm_enabled` is
+/// `map_or(true, ..)`). It is why the single-pass `aaload`/FP hoists are not on
+/// the veto list in `x64/single_pass_only.rs`. Runs after the fixed-point
+/// cleanup so it sees already-folded / GVN'd invariant expressions, then a
+/// lightweight cleanup re-runs GVN + DCE to dedup any anchor edges it rewrote.
+///
+/// Extracted from [`optimize`] so the pass can be called from *either* side of
+/// the unroller without its body being written twice — see
+/// [`licm_before_unroll_enabled`].
+fn run_licm_pass(graph: &mut Graph) {
     if licm_enabled() && licm(graph) {
         crate::ir_evidence::note(crate::ir_evidence::Transform::Licm);
         gvn(graph);
         eliminate_dead_nodes(graph);
     }
-    if graph.live_count() < nodes_before {
-        crate::ir_evidence::note(crate::ir_evidence::Transform::Simplified);
+}
+
+/// Is `base` non-null on entry to the method, so that a load of it hoisted
+/// above the loop test cannot invent a `NullPointerException`?
+///
+/// Two sources, both already believed elsewhere in this crate: the receiver
+/// parameter (`Graph::receiver_param` is a parameter INDEX, so the node is
+/// whichever `Op::Param` carries it — reading it as a node id would seed an
+/// arbitrary node non-null), and the ops `ir_check_elim::definitely_non_null`
+/// answers for. Anything else is `false`; this is a permission, not an
+/// analysis.
+fn base_non_null_on_entry(graph: &Graph, base: NodeId) -> bool {
+    if base == NO_NODE || base as usize >= graph.nodes.len() {
+        return false;
     }
+    match graph.receiver_param {
+        Some(recv) => matches!(graph.nodes[base as usize].op, Op::Param(p) if p == recv),
+        None => false,
+    }
+}
+
+/// A hoisted invariant load has its MEMORY edge moved to the loop-entry memory
+/// state as well as its control edge — which is what actually gets it scheduled
+/// outside the loop. **Default ON** since 2026-09-11;
+/// `CRATONVM_JIT_IR_LICM_MEM_EDGE=0` is the kill switch.
+///
+/// Without it the hoist is cosmetic: `ir_schedule::find_best_block` puts a data
+/// node in the deepest block dominated by all of its input blocks, so a load
+/// still naming the header's memory phi is scheduled back into the loop LICM
+/// just moved it out of. See the hoist site in [`licm`], and
+/// `docs/internal/performance/c2-the-loop-body-is-mostly-code-it-never-runs-20260911.md`.
+///
+/// Flipped ON against the bar this tree uses for a default: on
+/// `probes/FieldLoop.java` `sum` the optimizing tier goes from 1.12x SLOWER
+/// than the single-pass tier to **0.68x**, measured interleaved with a
+/// same-config control; CratonBench's seven checksums are byte-identical in
+/// every arm; and the whole `cratonvm-jit` suite — 2,373 unit tests and the 145
+/// `ir_vs_singlepass` differential cases — passes gate-ON exactly as gate-OFF.
+///
+/// Read LIVE on every call rather than cached in a `OnceLock`, for the reason
+/// `ir_per_copy_frames_enabled` spells out: a cached read makes one arm of an
+/// in-process A/B untestable, because whichever arm runs first fixes the answer
+/// for the whole process.
+fn licm_mem_edge_enabled() -> bool {
+    !matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_LICM_MEM_EDGE").as_deref(),
+        Ok("0") | Ok("false") | Ok("off") | Ok("no")
+    )
+}
+
+/// `true` when `CRATONVM_JIT_IR_LICM_BEFORE_UNROLL` is set: LICM runs *before*
+/// the unroller instead of after it, so the unroller sees invariant loads
+/// already re-anchored to the pre-header rather than pinned to the header.
+///
+/// Default OFF — see the pass-order comment in [`optimize`] for what the
+/// order costs and why flipping it is a measurement rather than a cleanup.
+///
+/// Read LIVE on every call rather than cached in a `OnceLock`, for the reason
+/// `ir_per_copy_frames_enabled` spells out: a cached read makes the ON arm of
+/// an in-process A/B untestable, because whichever arm runs first fixes the
+/// answer for the whole process and both arms then emit identical code.
+fn licm_before_unroll_enabled() -> bool {
+    matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_LICM_BEFORE_UNROLL").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
 }
 
 /// `true` (default) when the SCEV-driven loop-invariant code-motion pass runs.
@@ -1905,8 +2007,104 @@ fn licm(graph: &mut Graph) -> bool {
             // (already established) makes it loop-entry schedulable.
             if inputs.len() >= 3 {
                 // Full form: repoint ctrl (slot 0) to the pre-header control.
-                if graph.nodes[load as usize].inputs[0] != preheader {
+                //
+                // Slot 1 is the MEMORY edge, and until 2026-09-11 this arm left
+                // it alone — which made the hoist cosmetic. `ir_schedule`'s
+                // `find_best_block` places a data node in the DEEPEST block
+                // dominated by every one of its input blocks, and a body load's
+                // memory input is the header's memory phi, whose block IS the
+                // header. So the load was re-anchored to the pre-header in the
+                // graph and scheduled straight back into the loop in the code.
+                //
+                // Measured on `probes/FieldLoop.java`'s `sum` — the loop the
+                // tiering inversion is quoted on — `CRATONVM_DBG_LICM=1` printed
+                // `hoisted 1 invariant load(s) to loop pre-header(s)` while the
+                // emitted body still ran the whole `getfield` sequence every
+                // iteration: epoch guard, null test, compact test, the read and
+                // the jump over the legacy arm, nine of its ~24 hot-path
+                // instructions. A hoist nothing observes is not a hoist.
+                //
+                // The read-hoist arm above has always moved BOTH edges, with
+                // this same `loop_entry_memory`. This is that rewrite, in the
+                // arm that reaches the loops the other one declines (it fires
+                // only for a loop `licm_read_hoist_enabled` singles out — one
+                // that only its own reads and guards disqualify — and
+                // `FieldLoop.sum` has no disqualifying barrier at all, so it
+                // never went near it).
+                //
+                // `CRATONVM_JIT_IR_LICM_MEM_EDGE=1` turns it on. Default OFF:
+                // LICM is default-ON, so this changes where a load lands in
+                // every method that hoists one.
+                //
+                // ── Speculation: the pre-header runs when the body does not ──
+                //
+                // A hoist to the pre-header is SPECULATIVE. The pre-header runs
+                // on every entry and the body does not, so a load that reaches
+                // the pre-header executes for a loop that iterates zero times.
+                // A `getfield` carries its own null check, so speculating one
+                // speculates the `NullPointerException` with it.
+                //
+                // That is not hypothetical. `probes/ZeroTripHoist.java` is
+                // `static int walk(N o, int n) { int a = 0; for (int i = 0;
+                // i < n; i++) a += o.v; return a; }`, and `walk(null, 0)` came
+                // back as a thrown NPE where HotSpot returns 0 — on the
+                // optimizing tier, from THIS arm: it survives
+                // `CRATONVM_JIT_NO_LICM_READ_HOIST=1` and vanishes under
+                // `CRATONVM_JIT_LICM=0`. A wrong answer, not a crash — and it
+                // reproduced under `CRATONVM_C2_SUPERSEDE=0` too, which stops
+                // the optimizing body from SUPERSEDING and not from being
+                // compiled.
+                //
+                // So the hoist asks whether it may speculate, and three answers
+                // are accepted:
+                //
+                //   * the load is anchored at the HEADER itself — the header
+                //     runs whenever the loop is reached, zero trips included,
+                //     so the pre-header is not earlier in any execution;
+                //   * the base is the RECEIVER, which the JVM guarantees
+                //     non-null at the call site and SSA gives no other
+                //     definition — the fact `ir_check_elim` already seeds;
+                //   * `definitely_non_null` already answers for the base (a
+                //     fresh allocation, a materialized constant).
+                //
+                // This is a permission, not an analysis: anything else refuses,
+                // and a refusal costs an optimization rather than an answer. It
+                // is deliberately NOT behind `CRATONVM_JIT_IR_LICM_MEM_EDGE` —
+                // the control-edge move below is the one that was already
+                // wrong, and it is default-ON.
+                let hoist_is_safe = inputs[0] == region
+                    || base_non_null_on_entry(graph, base)
+                    || crate::ir_check_elim::definitely_non_null(&graph.nodes[base as usize].op);
+                if !hoist_is_safe {
+                    if dbg {
+                        eprintln!(
+                            "[DBG_LICM] load {load}: NOT hoisted — base {base} may be null at \
+                             the pre-header and the body may not run"
+                        );
+                    }
+                    continue;
+                }
+                let new_mem = if licm_mem_edge_enabled() {
+                    if is_loop_invariant(graph, inputs[1], region, &body) {
+                        inputs[1]
+                    } else {
+                        loop_entry_memory(graph, region, entry_pred).unwrap_or(NO_NODE)
+                    }
+                } else {
+                    NO_NODE
+                };
+                let move_mem = new_mem != NO_NODE && new_mem != inputs[1];
+                if graph.nodes[load as usize].inputs[0] != preheader || move_mem {
                     graph.nodes[load as usize].inputs[0] = preheader;
+                    if move_mem {
+                        graph.nodes[load as usize].inputs[1] = new_mem;
+                        if dbg {
+                            eprintln!(
+                                "[DBG_LICM] load {load}: mem {} -> {new_mem} (the edge that                                  decides the block)",
+                                inputs[1]
+                            );
+                        }
+                    }
                     changed = true;
                     hoisted += 1;
                 }
@@ -7281,6 +7479,234 @@ mod per_copy_frames_tests {
             crate::ir_verify::VerifyOptions::structural(),
         )
         .expect("a partially unrolled loop with loads must verify");
+    }
+
+    /// An invariant load whose base may be null is NOT hoisted out of a loop
+    /// that may not run.
+    ///
+    /// # The wrong answer this pins
+    ///
+    /// `probes/ZeroTripHoist.java` is `static int walk(N o, int n) { int a = 0;
+    /// for (int i = 0; i < n; i++) a += o.v; return a; }`. `walk(null, 0)`
+    /// returns 0 — the body never runs, so `o` is never dereferenced. Hoisting
+    /// the read to the pre-header makes it run anyway, and the `getfield`'s own
+    /// null check comes with it, so the method throws where it should return.
+    /// Measured against Temurin 25 before the fix: HotSpot `0`, CratonVM's
+    /// optimizing tier a thrown `NullPointerException`.
+    ///
+    /// # Why both arms
+    ///
+    /// The fix is a PERMISSION, not a refusal to hoist at all — hoisting is the
+    /// point of the pass, and a guard that turned it off everywhere would pass
+    /// a one-armed test while destroying the optimization. So the same graph is
+    /// run twice, differing only in whether the base is the receiver:
+    ///
+    /// * a STATIC method's first parameter can be null — refused, the load's
+    ///   control edge does not move;
+    /// * the same parameter as a RECEIVER is non-null by the JVM's own
+    ///   guarantee — hoisted, and the edge does move.
+    ///
+    /// One arm alone cannot tell "safe" from "switched off".
+    #[test]
+    fn an_invariant_load_of_a_maybe_null_base_is_not_hoisted_out_of_a_maybe_empty_loop() {
+        let code = [
+            0x03u8, 0x3D, // iconst_0; istore_2           a = 0
+            0x03, 0x3E, // iconst_0; istore_3             i = 0
+            0x1D, 0x1B, 0xA2, 0x00, 0x10, // iload_3; iload_1; if_icmpge 22
+            0x1C, 0x2A, 0xB4, 0x00, 0x07, 0x60, 0x3D, // a += o.v
+            0x84, 0x03, 0x01, // iinc 3, 1
+            0xA7, 0xFF, 0xF1, // goto 4
+            0x1C, 0xAC, // iload_2; ireturn
+        ];
+        let mut info: std::collections::HashMap<usize, (usize, u8)> =
+            std::collections::HashMap::new();
+        info.insert(11, (0, b'I'));
+
+        // Returns (load id, control edge before licm, control edge after).
+        let anchor_move = |receiver: Option<u16>| -> (NodeId, NodeId, NodeId) {
+            let mut builder = IrBuilder::new(2, 4);
+            builder.set_field_info(info.clone());
+            let mut g = builder.build(&code, 24).expect("IR build");
+            g.receiver_param = receiver;
+            // The cleanup `optimize` runs before LICM, so the pass sees the
+            // same graph it would in production — but LICM is called directly,
+            // because what is under test is one pass's decision and `optimize`
+            // would fold the evidence away.
+            for _ in 0..8 {
+                let before = g.live_count();
+                fold_constants(&mut g);
+                algebraic_simplify(&mut g);
+                gvn(&mut g);
+                eliminate_dead_nodes(&mut g);
+                if g.live_count() == before {
+                    break;
+                }
+            }
+            // Normalize the single-input merges FIRST. `licm` does this
+            // itself, and it renumbers a load's control anchor without moving
+            // it — which would make the before/after comparison below read a
+            // hoist that never happened.
+            collapse_trivial_merges(&mut g);
+            let load = g
+                .nodes
+                .iter()
+                .position(|n| matches!(n.op, Op::Load(_)))
+                .expect("the fixture must contain the field read") as NodeId;
+            let before = g.nodes[load as usize].inputs[0];
+            licm(&mut g);
+            (load, before, g.nodes[load as usize].inputs[0])
+        };
+
+        let (load, was, now) = anchor_move(None);
+        assert_eq!(
+            was, now,
+            "n{load} is a read of a STATIC method's parameter, which may be \
+             null, in a loop that may run zero times — hoisting it invents an \
+             NPE (probes/ZeroTripHoist.java)",
+        );
+
+        let (load, was, now) = anchor_move(Some(0));
+        assert_ne!(
+            was, now,
+            "n{load} is a read of the RECEIVER, which the JVM guarantees \
+             non-null, so the hoist is safe and must still happen — a guard \
+             that refuses this one is not a safety condition, it is LICM \
+             switched off",
+        );
+    }
+
+    /// LICM before the unroller, with the memory edge moved, makes the copies
+    /// of an unrolled body SHARE one invariant read instead of cloning it.
+    ///
+    /// # What each half does, and why neither is enough alone
+    ///
+    /// `CRATONVM_JIT_IR_LICM_BEFORE_UNROLL` moves the pass. On its own it
+    /// changes nothing here: the unroller builds its clone set by DATA
+    /// dependence, so a read the accumulator consumes is cloned per copy
+    /// whatever its control anchor says. Measured, not assumed — the flag alone
+    /// leaves this fixture with two reads.
+    ///
+    /// `CRATONVM_JIT_IR_LICM_MEM_EDGE` moves the hoisted load's MEMORY input to
+    /// the loop-entry state. That is what makes the copies identical
+    /// expressions, so the trailing GVN folds them to one; without it each
+    /// clone still names the header's memory phi and they stay distinct.
+    ///
+    /// Together they are the pair, which is why this test sets both from one
+    /// switch: the arms are `neither` and `both`.
+    ///
+    /// # The load count is the load-bearing assertion
+    ///
+    /// The `If` count only says the loop unrolled, and it unrolls in BOTH arms
+    /// — asserted, so a future change that stops unrolling this shape fails
+    /// here rather than quietly making the contrast vacuous. The LOAD count is
+    /// the claim: two reads become one.
+    ///
+    /// `walk` is `static int walk(N o, int n) { int a = 0; for (int i = 0;
+    /// i < n; i++) { a += o.v; } return a; }` — `o` is never reassigned, which
+    /// is what makes the read invariant.
+    #[test]
+    fn licm_before_unroll_with_the_memory_edge_shares_one_read_across_copies() {
+        let code = [
+            0x03u8, 0x3D, // iconst_0; istore_2           a = 0
+            0x03, 0x3E, // iconst_0; istore_3             i = 0
+            0x1D, 0x1B, 0xA2, 0x00, 0x10, // iload_3; iload_1; if_icmpge 22
+            0x1C, 0x2A, 0xB4, 0x00, 0x07, 0x60, 0x3D, // a += o.v
+            0x84, 0x03, 0x01, // iinc 3, 1
+            0xA7, 0xFF, 0xF1, // goto 4
+            0x1C, 0xAC, // iload_2; ireturn
+        ];
+        // pc 11 is `v` (int). The only field this fixture reads.
+        let mut info: std::collections::HashMap<usize, (usize, u8)> =
+            std::collections::HashMap::new();
+        info.insert(11, (0, b'I'));
+
+        let build = |licm_first: Option<&'static str>| {
+            cratonvm_types::flags::with_thread_overrides(
+                &[
+                    ("CRATONVM_JIT_IR_PER_COPY_FRAMES", Some("1")),
+                    ("CRATONVM_JIT_IR_PARTIAL_UNROLL", Some("1")),
+                    ("CRATONVM_JIT_IR_PARTIAL_UNROLL_FACTOR", Some("2")),
+                    ("CRATONVM_JIT_IR_LICM_BEFORE_UNROLL", licm_first),
+                    // The memory edge is default-ON, so the "neither" arm has
+                    // to turn it OFF explicitly — leaving it unset would run
+                    // both arms with it on and make the contrast vacuous.
+                    ("CRATONVM_JIT_IR_LICM_MEM_EDGE", Some(licm_first.unwrap_or("0"))),
+                ],
+                || {
+                    let mut builder = IrBuilder::new(2, 4);
+                    builder.set_field_info(info.clone());
+                    let mut g = builder.build(&code, 24).expect("IR build");
+                    // Parameter 0 is the RECEIVER. Without this the base is a
+                    // parameter that may be null, LICM refuses to speculate the
+                    // read past a loop that may not run (see
+                    // `an_invariant_load_of_a_maybe_null_base_is_not_hoisted_
+                    // out_of_a_maybe_empty_loop`), and there is no hoist for
+                    // either arm to share. `probes/FieldLoop.java`'s `sum`,
+                    // which this fixture stands in for, reads `this.fx`.
+                    g.receiver_param = Some(0);
+                    optimize(&mut g);
+                    g
+                },
+            )
+        };
+        let live_ifs = |g: &Graph| g.nodes.iter().filter(|n| n.op == Op::If).count();
+        let live_loads = |g: &Graph| {
+            g.nodes
+                .iter()
+                .filter(|n| n.op != Op::Dead && matches!(n.op, Op::Load(_)))
+                .count()
+        };
+
+        // Default order: the unroller runs first and CLONES the read, because
+        // nothing has re-anchored it yet. The loop unrolls either way — what
+        // the order decides is how many reads the unrolled body contains.
+        let rolled = build(None);
+        assert_eq!(
+            live_ifs(&rolled),
+            2,
+            "factor 2 keeps one test per copy in BOTH arms; if this arm does \
+             not unroll, the contrast below is not the one being measured",
+        );
+        assert_eq!(
+            live_loads(&rolled),
+            2,
+            "the default order clones the invariant read once per copy",
+        );
+
+        // LICM first: the read is re-anchored to the pre-header before the
+        // unroller looks, so it is outside the body that gets cloned and ONE
+        // read serves every copy.
+        let unrolled = build(Some("1"));
+        assert_eq!(live_ifs(&unrolled), 2, "factor 2 keeps one test per copy");
+        assert_eq!(
+            live_loads(&unrolled),
+            1,
+            "the hoisted read is shared by every copy; two would mean the body \
+             was cloned without LICM having run first",
+        );
+
+        for (id, node) in unrolled.nodes.iter().enumerate() {
+            if node.op == Op::Dead {
+                continue;
+            }
+            for (k, &inp) in node.inputs.iter().enumerate() {
+                if inp == NO_NODE {
+                    continue;
+                }
+                assert_ne!(
+                    unrolled.nodes[inp as usize].op,
+                    Op::Dead,
+                    "n{id}:{:?} input[{k}] = n{inp} names a node the unroll killed",
+                    node.op,
+                );
+            }
+        }
+        crate::ir_verify::verify_graph(
+            &unrolled,
+            "licm-before-partial-unroll",
+            crate::ir_verify::VerifyOptions::structural(),
+        )
+        .expect("a partially unrolled invariant-read loop must verify");
     }
 
     /// With the flag off, a runtime-bound loop is left exactly as it was.

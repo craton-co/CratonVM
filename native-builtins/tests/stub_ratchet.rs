@@ -1679,7 +1679,93 @@ use cratonvm_types::compat::CompatibilityMode;
 /// that. Totals are **13623 / 13991 / 13658**, the same three numbers this
 /// branch measured BEFORE this merge, so `dev`'s 44 commits added no
 /// registrations to this tree at all.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2440;
+///
+/// ## Re-frozen 2026-09-11 (third today): +163, and ALL of it is lane 4 wave 1
+///
+/// `native-api`'s `RETIRED_SHADOW_L4_TRIPLES` retires 140 triples over ten
+/// classes of `java/io/` and `java/nio/` -- the same mechanism as the lane-1,
+/// lane-5 and lane-7 entries above, and the same reason it moves a
+/// COMPATIBLE-mode census: `NativeMethodRegistry::register` re-tags a retired
+/// triple `SyntheticStub` wherever `effective_category()` is `Bridge`, and that
+/// re-tag is not gated on mode. The body is untouched; only
+/// `allowed_in(JdkOnly)` reads the new kind.
+///
+/// Measured with the paired ratchet on the merged tree -- the same tree scored
+/// twice, once with the L4 arm of `triple_is_retired_shadow` short-circuited
+/// and once live:
+///
+/// ```text
+///                              L4 OFF   L4 ON    delta
+///   registrations, management     2395    2558     +163
+///   registrations, no-management  2384    2547     +163
+///   registrations, synthetic-jdk  2384    2547     +163
+///   TOTAL registrations, mgmt    13978   13978        0
+///   TOTAL registrations, no-mgmt 13610   13610        0
+///   TOTAL registrations, syn-jdk 13645   13645        0
+/// ```
+///
+/// **The OFF column is measured, not a `<=` pass read as equality.** This gate
+/// asserts `<=`, so a passing arm proves only that the tree is at or under its
+/// constant, and this file's own history has 3/12/3 of invisible slack
+/// accumulating exactly that way. The three OFF numbers were taken by forcing
+/// the constants to `1` so the ratchet had to PRINT them. They land on
+/// 2395 / 2384 / 2384 -- the three constants below, to the row -- so the whole
+/// +163 is this wave and none of it is inherited drift.
+///
+/// **This is the THIRD freeze of these constants today** (lane 5: 1894 -> 2339;
+/// lane 7: -> 2395; this one). Each was measured against the tree in front of
+/// it, which is why each decomposes cleanly. Anyone re-freezing tomorrow should
+/// expect the same and take the OFF number rather than subtracting.
+///
+/// **The total does not move, so this is case one of the three below:**
+/// existing fakes relabelled, not new ones written. All 138 distinct triples
+/// are in the L4 table and nothing outside it moved --
+/// `java/io/File` 51, `java/nio/ByteBuffer` 32, `java/io/DataInputStream` 18,
+/// `java/io/DataOutputStream` 15, `java/io/ByteArrayOutputStream` 13,
+/// `java/io/FilterOutputStream` 5, and one `order()` on each of the four
+/// `java/nio/ByteBufferAsCharBuffer{B,L,RB,RL}` views.
+///
+/// 138 distinct and +163 registrations, because this gate counts REGISTRATIONS:
+/// 25 of those triples are registered at more than one ordinal and the re-tag
+/// flips each one. The per-registration view is
+/// `scripts/baselines/jdk-only-kind-map-25-linux.tsv`, where the same 163 rows
+/// are adjudicated one by one.
+///
+/// **140 rows in the table, 138 in the delta.** `ByteBuffer.allocate(I)` and
+/// `allocateDirect(I)` were ALREADY `SyntheticStub` before this wave -- both
+/// appear in the arm-OFF dump -- so retiring them changes their strict-mode
+/// admission and not their kind.
+///
+/// # Re-frozen 2026-09-11 on the L4 merge: 2592 / 2603 / 2592
+///
+/// The two accounts above were measured on trees that had not seen each
+/// other: this branch's 2429/2440/2429 carried L0+L3 but not lane 4, and
+/// dev's 2547/2558/2547 carried lane 4's 163 but not L0's 19 or L3's 24.
+/// Neither describes this tree and their difference is not their sum, so
+/// this arm was re-measured from a forced failure on the merged tree.
+///
+/// ```text
+/// dev (lane 4's 163)                       2547 / 2558 / 2547
+/// + this branch's L0 (21) and L3 (24)        +45 in every arm
+/// = this merged tree                       2592 / 2603 / 2592   (measured)
+///
+/// and from the other side, as a check:
+/// this branch pre-merge                    2429 / 2440 / 2429
+/// + lane 4's wave                          +163 in every arm
+/// = the same three numbers
+/// ```
+///
+/// **Both decompositions land on the measured value**, which is the strongest
+/// form this account takes: two independent halves summing to the third, in
+/// two directions, on three arms. The `+45` has now reproduced on four
+/// different trees.
+///
+/// Totals stay **13623 / 13991 / 13658**, unchanged from before this merge, so
+/// lane 4's 163 are case (b) as well -- existing fakes relabelled, not new
+/// registrations. A retirement table re-tags `Bridge` -> `SyntheticStub` in
+/// `NativeMethodRegistry::register` before insertion; it moves the KIND and
+/// never the count.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2603;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1881,7 +1967,40 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2440;
 /// that. Totals are **13623 / 13991 / 13658**, the same three numbers this
 /// branch measured BEFORE this merge, so `dev`'s 44 commits added no
 /// registrations to this tree at all.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2429;
+///
+/// **Re-frozen 2026-09-11, 2384 -> 2547**, with the other two; the account is
+/// on [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]. +163, all of it lane 4 wave 1:
+/// the arm-OFF measurement lands on 2384 exactly.
+/// # Re-frozen 2026-09-11 on the L4 merge: 2592 / 2603 / 2592
+///
+/// The two accounts above were measured on trees that had not seen each
+/// other: this branch's 2429/2440/2429 carried L0+L3 but not lane 4, and
+/// dev's 2547/2558/2547 carried lane 4's 163 but not L0's 19 or L3's 24.
+/// Neither describes this tree and their difference is not their sum, so
+/// this arm was re-measured from a forced failure on the merged tree.
+///
+/// ```text
+/// dev (lane 4's 163)                       2547 / 2558 / 2547
+/// + this branch's L0 (21) and L3 (24)        +45 in every arm
+/// = this merged tree                       2592 / 2603 / 2592   (measured)
+///
+/// and from the other side, as a check:
+/// this branch pre-merge                    2429 / 2440 / 2429
+/// + lane 4's wave                          +163 in every arm
+/// = the same three numbers
+/// ```
+///
+/// **Both decompositions land on the measured value**, which is the strongest
+/// form this account takes: two independent halves summing to the third, in
+/// two directions, on three arms. The `+45` has now reproduced on four
+/// different trees.
+///
+/// Totals stay **13623 / 13991 / 13658**, unchanged from before this merge, so
+/// lane 4's 163 are case (b) as well -- existing fakes relabelled, not new
+/// registrations. A retirement table re-tags `Bridge` -> `SyntheticStub` in
+/// `NativeMethodRegistry::register` before insertion; it moves the KIND and
+/// never the count.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2592;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2003,7 +2122,42 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2429;
 /// that. Totals are **13623 / 13991 / 13658**, the same three numbers this
 /// branch measured BEFORE this merge, so `dev`'s 44 commits added no
 /// registrations to this tree at all.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2429;
+///
+/// **Re-frozen 2026-09-11, 2384 -> 2547**, in the same commit as the other two
+/// as the note above demands, and by RUNNING the third arm rather than copying
+/// its sibling -- it lands on the same number again, which is a measurement
+/// each time and not a rule. The account is on
+/// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
+/// # Re-frozen 2026-09-11 on the L4 merge: 2592 / 2603 / 2592
+///
+/// The two accounts above were measured on trees that had not seen each
+/// other: this branch's 2429/2440/2429 carried L0+L3 but not lane 4, and
+/// dev's 2547/2558/2547 carried lane 4's 163 but not L0's 19 or L3's 24.
+/// Neither describes this tree and their difference is not their sum, so
+/// this arm was re-measured from a forced failure on the merged tree.
+///
+/// ```text
+/// dev (lane 4's 163)                       2547 / 2558 / 2547
+/// + this branch's L0 (21) and L3 (24)        +45 in every arm
+/// = this merged tree                       2592 / 2603 / 2592   (measured)
+///
+/// and from the other side, as a check:
+/// this branch pre-merge                    2429 / 2440 / 2429
+/// + lane 4's wave                          +163 in every arm
+/// = the same three numbers
+/// ```
+///
+/// **Both decompositions land on the measured value**, which is the strongest
+/// form this account takes: two independent halves summing to the third, in
+/// two directions, on three arms. The `+45` has now reproduced on four
+/// different trees.
+///
+/// Totals stay **13623 / 13991 / 13658**, unchanged from before this merge, so
+/// lane 4's 163 are case (b) as well -- existing fakes relabelled, not new
+/// registrations. A retirement table re-tags `Bridge` -> `SyntheticStub` in
+/// `NativeMethodRegistry::register` before insertion; it moves the KIND and
+/// never the count.
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2592;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
