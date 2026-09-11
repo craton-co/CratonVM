@@ -1420,8 +1420,15 @@ pub(super) fn compile_osr_artifact(
                             // DEOPTS on a miss, so a bci the profile says is
                             // hardly ever a `String` must not get one. See
                             // `cratonvm_jit::receiver_profile_rejects_guard`.
-                            .filter(|&(_, _, _, guard_class_id)| {
+                            .filter(|&(entry, _, _, guard_class_id)| {
                                 if guard_class_id == 0 || !cratonvm_jit::receiver_despec_enabled() {
+                                    return true;
+                                }
+                                // A declining intrinsic's guard miss is a CALL,
+                                // not a deopt, so this screen has nothing to
+                                // protect against — see
+                                // `string_intrinsic_declines_to_a_call`.
+                                if cratonvm_jit::string_intrinsic_declines_to_a_call(entry) {
                                     return true;
                                 }
                                 let supported = cratonvm_jit::receiver_profile_supports_guard(
@@ -1452,6 +1459,45 @@ pub(super) fn compile_osr_artifact(
                                 !(by_profile || by_despec)
                             })
                         {
+                            // A declining intrinsic needs its own
+                            // `JitInvokeInfo` at THIS door too: the emitted
+                            // fast path declines into this exact dispatch, and
+                            // a site the resolver registers as an intrinsic
+                            // never reaches the generic `invoke_info.push`
+                            // below. Fixing only the method-entry door left
+                            // every once-invoked hot loop — which is every
+                            // method this door exists for — failing to compile
+                            // and running interpreted.
+                            if cratonvm_jit::string_intrinsic_declines_to_a_call(entry) {
+                                let class_box: Box<str> =
+                                    target_class.to_string().into_boxed_str();
+                                let method_box: Box<str> = mn.to_string().into_boxed_str();
+                                let desc_box: Box<str> = desc.to_string().into_boxed_str();
+                                let class_ref = &*class_box as *const str;
+                                let method_ref = &*method_box as *const str;
+                                let desc_ref = &*desc_box as *const str;
+                                owned_jit_strings2.push(class_box);
+                                owned_jit_strings2.push(method_box);
+                                owned_jit_strings2.push(desc_box);
+                                // SAFETY: the three `Box<str>` were just pushed
+                                // to `owned_jit_strings2`, which outlives the
+                                // `JitInvokeInfo` and the code compiled against
+                                // it.
+                                let info = Box::new(crate::jit::JitInvokeInfo {
+                                    class_name: unsafe { &*class_ref },
+                                    method_name: unsafe { &*method_ref },
+                                    descriptor: unsafe { &*desc_ref },
+                                    // Receiver-INCLUDED, unlike
+                                    // `JitDirectCall.num_params`.
+                                    num_jit_args: num_params + 1,
+                                    return_type: ret,
+                                    invoke_kind,
+                                    declaring_class_id: class_id.as_u32(),
+                                });
+                                let info_ptr: *const _ = &*info;
+                                owned_jit_invoke_infos2.push(info);
+                                invoke_info.push((pc, info_ptr));
+                            }
                             direct_calls2.push((
                                 pc,
                                 crate::jit::JitDirectCall {
@@ -4183,21 +4229,22 @@ pub(super) fn try_osr(
         // drain did until 2026-09-06 — `jit_npe_message_gated` had no
         // production caller at all.
         //
-        // LATENT, and deliberately so: measured 2026-09-06, this cannot change
-        // an observable message today. The ONLY setter of an action code is
-        // `jit_npe_with_action`, which pairs it with `set_jit_deopt_pending`,
-        // so a recorded action always bails to the interpreter, which replays
-        // the trapping bytecode and raises the FULLER message with the
-        // `because "…" is null` clause (HotSpot-exact — see
-        // `vm/tests/jit_npe_message_from_compiled_code.rs`). The other setter,
-        // `stash_jit_pending_npe_action`, has no callers. So every NPE that
-        // actually reaches this drain carries `NONE`, and
-        // `jit_action_message(NONE)` is `None`.
+        // It was LATENT when it was wired, and measured to be: on 2026-09-06
+        // the only setter of an action code was `jit_npe_with_action`, which
+        // pairs it with `set_jit_deopt_pending`, so a recorded action always
+        // bailed to the interpreter and every NPE that reached this drain
+        // carried `NONE`. It was wired anyway because the alternative is a
+        // silent drop — which is exactly how this machinery came to be fully
+        // built, unit-tested and connected to nothing.
         //
-        // Wired anyway because the alternative is a silent drop: a future stub
-        // that records an action WITHOUT deopting would otherwise lose it here
-        // with nothing to notice, which is exactly how this machinery came to
-        // be fully built, unit-tested and connected to nothing.
+        // It stopped being latent on 2026-09-11. The helpers that detect a null
+        // RECEIVER — `jit_getfield`, `jit_invoke_dispatch`,
+        // `jit_invoke_virtual_mic` and the direct-bound intrinsics — record a
+        // trap-site key or an `INVOKE_RECEIVER` code and DO reach here, because
+        // they do not deopt; that is the defect
+        // `the-helpful-npe-message-is-lost-in-compiled-code-FIXED-20260911.md`
+        // is about. The code is now read by `jit_npe_message` as the
+        // corroboration for a bci, and as the fallback message when it declines.
         let npe_action = crate::jit::helpers::take_jit_pending_npe_action();
         // Round-9/10 HIGH fix: route the NPE through the OSR'd method's own
         // exception table rather than losing it. The OSR target IS the method
@@ -4218,7 +4265,11 @@ pub(super) fn try_osr(
             shared,
             thread,
             RuntimeError::NullPointerException {
-                message: crate::runtime::exceptions::helpful_npe::jit_npe_message_gated(
+                // See `super::jit_npe_message` — the trapping method's own
+                // bytecode first, the action-only string as the fallback.
+                message: super::jit_npe_message::jit_npe_message(
+                    shared,
+                    npe_snapshot.as_deref(),
                     npe_action,
                 ),
             },
@@ -11853,7 +11904,14 @@ pub(super) fn execute_jit_call(
             shared,
             thread,
             RuntimeError::NullPointerException {
-                message: crate::runtime::exceptions::helpful_npe::jit_npe_message_gated(
+                // Rebuilt from the trapping method's OWN bytecode when the
+                // snapshot names the site, so a compiled row carries the same
+                // JEP 358 message its interpreted row does; falls back to the
+                // action-only string this used to build. See
+                // `super::jit_npe_message`.
+                message: super::jit_npe_message::jit_npe_message(
+                    shared,
+                    npe_snapshot.as_deref(),
                     sig.npe_action,
                 ),
             },
@@ -12383,7 +12441,14 @@ pub(super) fn execute_jit_call_decoded(
             shared,
             thread,
             RuntimeError::NullPointerException {
-                message: crate::runtime::exceptions::helpful_npe::jit_npe_message_gated(
+                // Rebuilt from the trapping method's OWN bytecode when the
+                // snapshot names the site, so a compiled row carries the same
+                // JEP 358 message its interpreted row does; falls back to the
+                // action-only string this used to build. See
+                // `super::jit_npe_message`.
+                message: super::jit_npe_message::jit_npe_message(
+                    shared,
+                    npe_snapshot.as_deref(),
                     sig.npe_action,
                 ),
             },
@@ -12810,7 +12875,14 @@ pub(super) fn execute_jit_call_oneshot(
             shared,
             thread,
             RuntimeError::NullPointerException {
-                message: crate::runtime::exceptions::helpful_npe::jit_npe_message_gated(
+                // Rebuilt from the trapping method's OWN bytecode when the
+                // snapshot names the site, so a compiled row carries the same
+                // JEP 358 message its interpreted row does; falls back to the
+                // action-only string this used to build. See
+                // `super::jit_npe_message`.
+                message: super::jit_npe_message::jit_npe_message(
+                    shared,
+                    npe_snapshot.as_deref(),
                     sig.npe_action,
                 ),
             },

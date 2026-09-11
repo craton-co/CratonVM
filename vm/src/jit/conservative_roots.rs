@@ -5463,6 +5463,19 @@ pub struct ActiveCompiledFrame {
     /// `true` on an EMPTY chain is meaningless and never read: there is nothing
     /// to expand.
     pub chain_exact: bool,
+    /// Did [`Self::bci`] come from an NPE trap site the EMITTER described
+    /// (`apply_npe_trap_site`), rather than from the safepoint-id slot?
+    ///
+    /// Both answers are good enough to print a LINE, which is why the walk has
+    /// never had to distinguish them. Rebuilding a JEP 358 *message* from the
+    /// bci is a stronger use: it reads the opcode at that index and names the
+    /// field or method it references, so a bci that is merely the last
+    /// safepoint this frame passed — rather than the program point that
+    /// trapped — yields a fluent sentence about the wrong dereference. A trap
+    /// site is recorded AT the null check it describes and cannot be stale.
+    ///
+    /// See `runtime::interpreter::jit_npe_message`, the only reader.
+    pub trap_site_exact: bool,
 }
 
 /// One level of a compiled frame's inline chain, as a stack walk consumes it.
@@ -5810,6 +5823,11 @@ pub fn apply_npe_trap_site(frames: &mut [ActiveCompiledFrame], trap_key: u32) {
     if want_bci {
         if let Ok(bci) = i32::try_from(site.bci) {
             top.bci = bci;
+            // The emitter recorded this bci AT the null check it describes, so
+            // it names the trapping program point rather than the last
+            // safepoint the frame passed. That is the difference
+            // `jit_npe_message` needs before it will read the opcode there.
+            top.trap_site_exact = true;
             cratonvm_jit::note_compiled_frame_line(cratonvm_jit::FRAME_LINE_ANSWERED_NPE_TRAP);
         }
     }
@@ -6046,6 +6064,9 @@ pub fn active_compiled_frames() -> Vec<ActiveCompiledFrame> {
                     (Vec::new(), false)
                 };
                 out.push(ActiveCompiledFrame {
+                    // The walk reads the safepoint-id slot; only
+                    // `apply_npe_trap_site` can promise an exact trap site.
+                    trap_site_exact: false,
                     interp_depth: e.interp_depth,
                     label: cm.method_label.clone(),
                     owner_class_id: cm.owner_class_id,

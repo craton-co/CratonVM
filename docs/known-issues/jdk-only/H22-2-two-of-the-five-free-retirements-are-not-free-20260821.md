@@ -145,7 +145,9 @@ CratonVM has two paths into the same capture:
 
 * **Unarmed** — the native `<init>` (`native_exc_init_*` in `lang_misc.rs`)
   calls `capture_throwable_trace(ctx, this)` **from a native frame**, so the
-  top Java frame is already the caller. Correct by construction.
+  top Java frame is already the caller. Correct by construction — **but only
+  when the class being instantiated is the one whose `<init>` is the native.
+  See §3b.**
 * **Armed / retired** — real `Throwable.<init>` bytecode runs, calls
   `fillInStackTrace()`, which reaches `Throwable.fillInStackTrace(I)` —
   `ACC_NATIVE` in the image, registered at `native-builtins/src/lib.rs:14535`,
@@ -158,12 +160,81 @@ and 7 (`Throwable`, `Exception`, `Error`, `UncheckedIOException`,
 `FormatterClosedException`) report `fillInStackTrace`, which is exactly what
 differing constructor-chain depths do to an off-by-N frame skip.
 
+### 3b. The unarmed path is NOT correct by construction, 2026-09-11
+
+Measured by lane L3 on `cratonvm-p18`, plain `--jdk-only`, **no dial**, with
+`apps/probes/ThrowableCtorFrameSkip.java` — 9 rows, 20 seconds:
+
+```text
+row                              HotSpot                    CratonVM
+A JDK direct RuntimeException    ThrowableCtorFrameSkip.jdkDirect     same
+D JDK direct IOException         ...jdkChecked                        same
+E JDK InaccessibleObjectException ...jdkReflective                    same
+F new Exception                  ...main                              same
+B app subclass depth 1           ...appDepth1        ThrowableCtorFrameSkip$D1.<init>
+C app subclass depth 2           ...appDepth2        ThrowableCtorFrameSkip$D1.<init>
+G thrown and caught              ...main             ThrowableCtorFrameSkip$Custom.<init>
+H explicit fillInStackTrace()    ...main             java.lang.Throwable.fillInStackTrace
+```
+
+**4 of 9 differ, and the mechanism is the one §3 names — one step earlier than
+§3 places it.** Capturing from a native frame drops the constructors that ARE
+natives, which is the JDK half of the chain. Every *application-level* `<init>`
+survives. Row C is the proof it is a chain and not an off-by-one: at depth 2 the
+top frame is `D1.<init>`, the native's immediate caller, not `D2.<init>`.
+
+So the correct statement is narrower than "unarmed is correct": unarmed is
+correct exactly when the instantiated class's own `<init>` is the registered
+native. A JDK throwable created directly qualifies. **A user-defined exception
+subclass never does, at any depth** — and that is most exceptions in real
+application code, which makes this a live defect in the shipping configuration
+rather than only a retirement blocker. Row H says an explicit
+`fillInStackTrace()` does not skip itself either.
+
+**This raises N2's priority.** The nomination is written as "unblocks 906
+registrations over 62 classes"; it also fixes `getStackTrace()[0]` for every
+application exception in the VM today. The 105-vector corpus checks neither,
+which is why two lanes reached this from opposite directions before anything
+went red.
+
+Not fixed here: lane L3 found it while measuring reflection retirements, it
+belongs with N2's owner, and a change to stack-trace capture wants the whole
+gate set and the arms behind it rather than a ride on a reflection wave.
+
+**Correction, 2026-09-11: the fix is NOT in `lang_misc.rs`, and attempting it
+there produces a worse defect than the one it fixes.** This paragraph and N2
+both said `capture_throwable_trace`; that function only *holds* the Vec. Two
+facts, read off the trait and the impl:
+
+* `NativeContext::capture_throwable_stack_trace` **stores** the trace as a side
+  effect (`vm_exec.rs:17020` — `store_throwable_stack_trace(throwable,
+  trace.clone())`, then returns the clone). The trait exposes exactly one
+  capture, one reader (`get_stack_trace`) and **no store**, so nothing on the
+  native side can put a trimmed trace back. Trimming the local Vec in
+  `capture_throwable_trace_body` changes only the `depth` field it writes; the
+  frames `getStackTrace()` materialises still come from the untrimmed store.
+* Captured traces are **outermost-first** — this file's own `STTRACE_DBG_TOP`
+  comment says so, and says an unlabelled "top=" is how one investigation was
+  sent to `TaskThread.run`. So the frames to drop are at the **end** of the
+  Vec, while `depth` sizes the array from the **start**. A `depth -= k` written
+  against the natural reading of "skip the constructor frames" drops the real
+  throw site and keeps the `<init>` frames — the exact inversion of the fix,
+  and it would pass any test that only asserts a shortened trace.
+
+So the skip has to happen where the frames are captured and stored: either in
+`capture_current_stack_trace`/`capture_throwable_stack_trace`
+(`vm/src/vm/vm_exec.rs`) or behind a new trait method that accepts a trimmed
+trace (`native-api/src/registry.rs:4305`). Note for whoever schedules it:
+`vm_exec.rs` took 33 commits in the seven days to 2026-09-11 and is the hottest
+file in the tree, which is a scheduling constraint on this fix, not a reason to
+retarget it at the cold file next door.
+
 **So the price of the largest zero-cost cell in `H14-3` is one missing frame
 skip in `capture_throwable_trace`.** Fix that and 906 registrations over 62
 classes become retirable; leave it and the retirement breaks the top frame of
 every exception in the VM, which the 105-vector corpus does not check even once.
 
-### 3b. The registrar's stated premise has expired
+### 3c. The registrar's stated premise has expired
 
 Its call site says it is for *synthetic-stub* Throwable subclasses — a
 `catch (Throwable t)` whose `t` is a fabricated stub with no bytecode behind
@@ -234,9 +305,12 @@ price; **they have the same scope question open** and nobody has answered it.
   remains measured-free is `HexFormat` (24, landed) and, at the *dial* level
   only, `ArrayDeque` (31) and `Optional` (20) — neither re-priced on its full
   class list.
-* **N2 — fix the frame skip in `capture_throwable_trace`** (`lang_misc.rs`), so
-  that a trace captured from inside `Throwable.<init>`/`fillInStackTrace(I)`
-  drops the constructor frames. Then re-run arm 6. If it comes back at 4
+* **N2 — fix the frame skip at the capture site** (`vm_exec.rs`'s
+  `capture_throwable_stack_trace`, or a new trait method that accepts a trimmed
+  trace), so that a trace captured from inside
+  `Throwable.<init>`/`fillInStackTrace(I)` drops the constructor frames. **Not
+  in `lang_misc.rs`** — see the 2026-09-11 correction in §3b for why that
+  produces the inverted fix. Then re-run arm 6. If it comes back at 4
   differing lines (the `setStackTrace(null)` pair), **906 registrations over 62
   classes become retirable in one commit** and it is the largest single item in
   the population. The arm is one env var and 20 seconds; the fix is the work.

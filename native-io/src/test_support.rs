@@ -1037,7 +1037,8 @@ impl cratonvm_native_api::NativeSystemAccess for MockNativeContext {
 }
 
 // ---------------------------------------------------------------------------
-// Cross-module test serialization for `set_path_confine_to_cwd`.
+// Cross-module test serialization for the two path-policy globals:
+// `set_path_confine_to_cwd` AND `set_path_validation_enabled`.
 //
 // `PATH_CONFINE_TO_CWD` is a global atomic; tests that flip it briefly
 // would otherwise race with parallel tests that depend on it being off
@@ -1045,6 +1046,20 @@ impl cratonvm_native_api::NativeSystemAccess for MockNativeContext {
 // paths). A single process-wide mutex guarantees only one confinement
 // test runs at a time, and the test always pairs `set(true)` with
 // `set(false)` while still holding the guard.
+//
+// `PATH_VALIDATION_ENABLED` (2026-09-11) is the same species and was not
+// covered here, which is a stronger defect than it sounds: a test that turns
+// validation OFF turns off the `..`-traversal guard for the WHOLE PROCESS,
+// so any parallel test asserting that a traversal path is REJECTED can read
+// it accepted instead. MEASURED: `files_validated_path_rejects_dotdot_segment`
+// failed about one run in twelve of `cargo test -p cratonvm-native-io --lib`
+// with `Files path with `..` segment accepted: Ok("../../etc/passwd")`, and
+// that is a security assertion silently not being made. Three tests turned the
+// flag off without this guard (`path_validation_disabled_allows_dotdot`,
+// `path_validation_disabled_still_rejects_null_byte`,
+// `files_validated_path_rejects_null_byte_even_when_disabled`) and three more
+// read a verdict that depends on it being on. All six now take it. A test that
+// touches either global, or whose assertion depends on either, must hold this.
 // ---------------------------------------------------------------------------
 
 use parking_lot::Mutex as PlMutex;

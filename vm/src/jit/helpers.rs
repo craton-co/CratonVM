@@ -1271,18 +1271,24 @@ pub(crate) fn stash_jit_pending_npe() {
     set_jit_pending_npe();
 }
 
-/// Raise the pending-NPE flag WITHOUT taking a compiled-frame snapshot.
+/// Raise the pending-NPE flag WITHOUT taking a compiled-frame snapshot and
+/// WITHOUT touching the JEP-358 action code.
 ///
 /// For the one shape [`stash_jit_pending_npe`] is wrong for: a door that
 /// drained the flag with [`take_jit_pending_npe`] and is putting it back. That
 /// take leaves `trap_frames` untouched, so the snapshot from the trap
 /// is still there and is still the right one; taking another would overwrite it
 /// with a stack the raising frame has already left.
+///
+/// The action cell is left alone for exactly the same reason, and it used to be
+/// ZEROED here. That take does not consume the action either, so the code
+/// sitting in the cell is this NPE's own — clearing it threw away the one thing
+/// that tells the eventual drain which opcode trapped, and an `invoke` on a
+/// null receiver that took a round trip through a door which declined to
+/// service it came out unmessaged. See
+/// `runtime::interpreter::jit_npe_message::jit_npe_message`, which reads it.
 pub(crate) fn set_jit_pending_npe_flag_only() {
-    JIT_SIGNALS.with(|s| {
-        s.npe.set(true);
-        s.npe_action.set(0);
-    });
+    JIT_SIGNALS.with(|s| s.npe.set(true));
 }
 
 /// Put back an NPE that [`take_all_jit_signals`] drained WHOLE -- flag, JEP-358
@@ -1458,6 +1464,24 @@ pub fn take_jit_pending_arithmetic() -> bool {
     JIT_SIGNALS.with(|s| s.arithmetic.take())
 }
 
+/// Put a compiled-frame snapshot back into the signal record, without touching
+/// any flag.
+///
+/// For a door that drained the snapshot to build a throwable it then had to
+/// DISCARD: the flag is restored separately (`set_jit_pending_npe_flag_only`),
+/// and the frames have to go with it or the next throwable is built from a bare
+/// flag and the trace names only the frames the interpreter still holds.
+///
+/// Assigns the slot, so it must be called at most once per restash — the same
+/// rule `handle_compiled_callee_deopt_sentinel`'s three-way restash states, for
+/// the same reason: there is ONE `trap_frames` cell and a second call with
+/// `None` wipes what the first put back.
+pub(crate) fn restash_jit_pending_trap_frames(
+    frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
+) {
+    JIT_SIGNALS.with(|s| *s.trap_frames.borrow_mut() = frames);
+}
+
 /// Re-stash a previously taken pending-arithmetic flag. Mirrors
 /// [`stash_jit_pending_aioobe`] for the OSR drain-without-route path, so a
 /// div-by-zero raised in OSR-compiled code with no in-frame handler survives the
@@ -1478,6 +1502,16 @@ pub(crate) fn stash_jit_pending_arithmetic() {
 /// exception table — same pattern as `take_jit_pending_aioobe`.
 pub fn take_jit_pending_npe() -> bool {
     JIT_SIGNALS.with(|s| s.npe.take())
+}
+
+/// Read the JEP-358 action code recorded alongside a pending JIT NPE WITHOUT
+/// consuming it.
+///
+/// For a door that drained the flag with [`take_jit_pending_npe`] and may put
+/// it back: it needs the code to build a message, and must not take it, because
+/// the drain that eventually services the NPE reads the same cell.
+pub(crate) fn peek_jit_pending_npe_action() -> u8 {
+    JIT_SIGNALS.with(|s| s.npe_action.get())
 }
 
 /// Take (consume) the JEP-358 *action code* recorded alongside a pending JIT
@@ -3268,6 +3302,7 @@ fn materialize_implicit_signal(
     thread: &mut JvmThread,
     signal: ImplicitSignal,
     trap_frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
+    npe_action: u8,
 ) -> Option<ObjectRef> {
     match signal {
         ImplicitSignal::Aioobe { index, length } => {
@@ -3292,11 +3327,30 @@ fn materialize_implicit_signal(
             Some(exc)
         }
         ImplicitSignal::Npe => {
+            // JEP 358, on the door the interpreter's drain does not serve.
+            //
+            // This arm passed `None` and so produced `getMessage() == null` for
+            // every null dereference CAUGHT by a compiled method's own handler
+            // — `probes/L2JitNpeProbe.java`'s `caughtHere` shape, where the
+            // interpreter and `java -XX:-OmitStackTraceInFastThrow` both name
+            // the field. It is the same
+            // defect as the drain's and it is fixed from the same place, so the
+            // two cannot answer differently: `jit_npe_message` rebuilds the
+            // message from the trapping method's bytecode, using the very
+            // snapshot this function is about to attach.
+            //
+            // Built BEFORE `attach_snapshotted_trap_frames`, which consumes the
+            // snapshot.
+            let message = crate::runtime::interpreter::jit_npe_message::jit_npe_message(
+                vm,
+                trap_frames.as_deref(),
+                npe_action,
+            );
             let exc = crate::runtime::exceptions::create_exception_object(
                 vm,
                 thread,
                 "java/lang/NullPointerException",
-                None,
+                message.as_deref(),
             )
             .ok()?;
             // The frames the helper snapshotted at the trap. Without this the
@@ -3805,7 +3859,15 @@ unsafe fn route_implicit_exc_through_callee(
         } else {
             None
         };
-        let exc = materialize_implicit_signal(vm, thread, implicit, trap_frames);
+        // The action code is PEEKED, not taken: this door drained the flag
+        // only, and the drain that eventually services this NPE reads the same
+        // cell.
+        let npe_action = peek_jit_pending_npe_action();
+        // Cloned for the discard path below. A snapshot is a handful of small
+        // structs and this is the cold exception path; the alternative is
+        // materialising the throwable twice to find out whether it is needed.
+        let unused_frames = trap_frames.clone();
+        let exc = materialize_implicit_signal(vm, thread, implicit, trap_frames, npe_action);
         if let Some(exc) = exc {
             if let Ok(v) = try_run_callee_handler(
                 vm,
@@ -3819,6 +3881,15 @@ unsafe fn route_implicit_exc_through_callee(
                 return v;
             }
         }
+        // The callee's table did not take it, so the throwable built above is
+        // DISCARDED and the caller-side drain will build another from the flag
+        // `restash_and_return` is about to put back. Everything the discarded
+        // one consumed has to go back with it — above all the compiled-frame
+        // snapshot, which `materialize_implicit_signal` moved out. Without this
+        // the second throwable is built from a bare flag and names only the
+        // frames the interpreter still holds: `len=1 [main]` where HotSpot
+        // reads five.
+        restash_jit_pending_trap_frames(unused_frames);
     }
     restash_and_return()
 }
@@ -4076,11 +4147,16 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
             // the arithmetic arm always existed; sharing the table is what stops
             // the two from disagreeing about the SET again. See
             // [`ImplicitSignal`].
+            // CLONED, not taken: the restash at the end of this function puts
+            // the snapshot back when nothing here consumes the throwable, and
+            // `take` left it with `None` to put back. Same defect and same fix
+            // as the sibling door's.
             let implicit = materialize_implicit_signal(
                 vm,
                 thread,
                 implicit_signal_of(signals.aioobe, signals.npe, signals.arithmetic),
-                signals.trap_frames.take(),
+                signals.trap_frames.clone(),
+                signals.npe_action,
             );
             if let Some(exc) = implicit {
                 if let Ok(v) = try_run_callee_handler(
@@ -9085,13 +9161,30 @@ mod jit_counter_block_tests {
     /// A site index past the end of the block is ignored, exactly as the
     /// `MEMBERSHIP_WALK_BY_SITE.get(site)` it replaced ignored it — this is
     /// the arm that kept an out-of-range site from panicking a release build.
+    ///
+    /// Read through THIS THREAD'S OWN block, not through
+    /// `leaf_native_hit_count()`, which sums every registered block in the
+    /// process. `cargo test` runs tests concurrently and several of them reach
+    /// compiled-dispatch code, so the global sum moves under this test for
+    /// reasons that have nothing to do with the out-of-range site — it failed
+    /// that way at 8121 against an expected 8072. A thread's own counter is the
+    /// only reading no other test can perturb, and it is the reading this test
+    /// always meant: the question is whether a bad index lands on a
+    /// NEIGHBOURING FIELD of the same block.
     #[test]
     fn an_out_of_range_site_is_ignored_rather_than_panicking() {
-        let before = leaf_native_hit_count();
+        fn my_leaf_hits() -> u64 {
+            JIT_COUNTERS.with(|block| {
+                block
+                    .leaf_native_hits
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+        }
+        let before = my_leaf_hits();
         note_membership_walk(MEMBERSHIP_WALK_SITE_NAMES.len());
         note_membership_walk(usize::MAX);
         assert_eq!(
-            leaf_native_hit_count(),
+            my_leaf_hits(),
             before,
             "an out-of-range site must not land on a neighbouring counter"
         );
@@ -9160,8 +9253,22 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
     // payload of whatever `Value` variant the slot holds, and a reference field
     // punned to a primitive becomes a wild pointer.
     let expect_ref = raw & cratonvm_jit_api::GETFIELD_EXPECT_REFERENCE != 0;
+    // The NPE trap-SITE key, so a null receiver here can carry JEP 358's
+    // message out. This helper has the receiver (null) and the slot index and
+    // neither names the field or the bci; the emitter knows both and recorded
+    // them under this key. `0` = the site was not described (the IR tier, the
+    // no-metadata arm, or the feature switched off) and yields the historical
+    // unmessaged NPE.
+    let npe_site = cratonvm_jit_api::getfield_npe_site_of(field_index);
     let field_index = cratonvm_jit_api::getfield_index_of(field_index);
-    jit_getfield_impl(vm_ptr, obj_ptr, field_index, !proven_oop, expect_ref)
+    jit_getfield_impl(
+        vm_ptr,
+        obj_ptr,
+        field_index,
+        !proven_oop,
+        expect_ref,
+        npe_site,
+    )
 }
 
 /// Reference loads whose slot did not hold a reference, degraded to null by
@@ -9309,6 +9416,7 @@ unsafe fn jit_getfield_impl(
     field_index: i64,
     validate_membership: bool,
     expect_ref: bool,
+    npe_site: u32,
 ) -> i64 {
     // ENGAGEMENT COUNTER for the guarded inline `getfield` fast path.
     //
@@ -9359,7 +9467,15 @@ unsafe fn jit_getfield_impl(
         // Flag the pending NPE (drained on every JIT method return — see
         // `take_jit_pending_npe` in runtime/interpreter.rs) and return the
         // `i64::MIN` deopt sentinel, mirroring `jit_arraylength`.
-        set_jit_pending_npe();
+        //
+        // `npe_site` names the trapping `getfield` so the drain can rebuild
+        // JEP 358's message from the bytecode there. Without it this NPE
+        // reaches the caller with `getMessage() == null` — the hot half of
+        // the-helpful-npe-message-is-lost-in-compiled-code-FIXED-20260911.
+        set_jit_pending_npe_action_at(
+            crate::runtime::exceptions::helpful_npe::jit_action::NONE,
+            npe_site,
+        );
         return i64::MIN;
     }
     let vm = &*(vm_ptr as *const SharedVm);
@@ -9367,6 +9483,10 @@ unsafe fn jit_getfield_impl(
         note_membership_walk(0);
         vm.mem.heap.is_object_address(obj_ptr as usize).is_none()
     } {
+        // A receiver that is plausible but not a live object is a MISCOMPILE,
+        // not a Java-level null, so it deliberately does NOT claim the trap
+        // site: the bci is right but the message ("because <expr> is null")
+        // would assert something about the program that is not true.
         set_jit_pending_npe();
         return i64::MIN;
     }
@@ -15710,7 +15830,17 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                 // normally instead of throwing, so `() -> nullRef.foo()` ran
                 // as a no-op under the JIT (the bug only reproduced JIT-on).
                 Value::Object(None) => {
-                    set_jit_pending_npe();
+                    // `INVOKE_RECEIVER` names the opcode family that trapped
+                    // rather than a message: the JEP 358 action half here is
+                    // `Cannot invoke "Owner.name(sig)"`, which only the call
+                    // site's bytecode knows. This helper is called AT a
+                    // published safepoint, so the frame's safepoint-id slot
+                    // holds this invoke's bci, and the code lets
+                    // `runtime::interpreter::jit_npe_message` corroborate that
+                    // bci before reading the opcode there.
+                    set_jit_pending_npe_action(
+                        crate::runtime::exceptions::helpful_npe::jit_action::INVOKE_RECEIVER,
+                    );
                     return i64::MIN;
                 }
                 // A non-object receiver slot is a miscompile, not a legitimate
@@ -18810,7 +18940,15 @@ pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64
     let census = crate::runtime::interp_census::direct_binds_enabled();
     let raw = receiver as u64;
     if raw == 0 {
-        set_jit_pending_npe();
+        // A null receiver at an `invokevirtual` this intrinsic replaced, so
+        // the JEP-358 action is the one the generic dispatch helper records:
+        // `INVOKE_RECEIVER` names the opcode family that trapped and lets
+        // `runtime::interpreter::jit_npe_message` corroborate the bci in this
+        // frame's safepoint-id slot. A direct-bound intrinsic must not answer
+        // `getMessage()` differently from the dispatch it stands in for.
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::INVOKE_RECEIVER,
+        );
         return i64::MIN;
     }
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
@@ -19069,7 +19207,15 @@ pub unsafe extern "C" fn jit_long_long_value_direct(vm_ptr: i64, receiver: i64) 
     let census = crate::runtime::interp_census::direct_binds_enabled();
     let raw = receiver as u64;
     if raw == 0 {
-        set_jit_pending_npe();
+        // A null receiver at an `invokevirtual` this intrinsic replaced, so
+        // the JEP-358 action is the one the generic dispatch helper records:
+        // `INVOKE_RECEIVER` names the opcode family that trapped and lets
+        // `runtime::interpreter::jit_npe_message` corroborate the bci in this
+        // frame's safepoint-id slot. A direct-bound intrinsic must not answer
+        // `getMessage()` differently from the dispatch it stands in for.
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::INVOKE_RECEIVER,
+        );
         return i64::MIN;
     }
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
@@ -19338,7 +19484,15 @@ pub unsafe extern "C" fn jit_dbb_put_byte_direct(
 ) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     if receiver == 0 {
-        set_jit_pending_npe();
+        // A null receiver at an `invokevirtual` this intrinsic replaced, so
+        // the JEP-358 action is the one the generic dispatch helper records:
+        // `INVOKE_RECEIVER` names the opcode family that trapped and lets
+        // `runtime::interpreter::jit_npe_message` corroborate the bci in this
+        // frame's safepoint-id slot. A direct-bound intrinsic must not answer
+        // `getMessage()` differently from the dispatch it stands in for.
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::INVOKE_RECEIVER,
+        );
         return i64::MIN;
     }
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
@@ -19389,7 +19543,15 @@ pub unsafe extern "C" fn jit_dbb_put_byte_direct(
 pub unsafe extern "C" fn jit_dbb_get_byte_direct(vm_ptr: i64, receiver: i64, index: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     if receiver == 0 {
-        set_jit_pending_npe();
+        // A null receiver at an `invokevirtual` this intrinsic replaced, so
+        // the JEP-358 action is the one the generic dispatch helper records:
+        // `INVOKE_RECEIVER` names the opcode family that trapped and lets
+        // `runtime::interpreter::jit_npe_message` corroborate the bci in this
+        // frame's safepoint-id slot. A direct-bound intrinsic must not answer
+        // `getMessage()` differently from the dispatch it stands in for.
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::INVOKE_RECEIVER,
+        );
         return i64::MIN;
     }
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
@@ -19454,7 +19616,15 @@ static MD_UPDATE_BYTE_INFO: JitInvokeInfo = JitInvokeInfo {
 pub unsafe extern "C" fn jit_md_update_byte_direct(vm_ptr: i64, receiver: i64, value: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     if receiver == 0 {
-        set_jit_pending_npe();
+        // A null receiver at an `invokevirtual` this intrinsic replaced, so
+        // the JEP-358 action is the one the generic dispatch helper records:
+        // `INVOKE_RECEIVER` names the opcode family that trapped and lets
+        // `runtime::interpreter::jit_npe_message` corroborate the bci in this
+        // frame's safepoint-id slot. A direct-bound intrinsic must not answer
+        // `getMessage()` differently from the dispatch it stands in for.
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::INVOKE_RECEIVER,
+        );
         return i64::MIN;
     }
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
@@ -20147,7 +20317,15 @@ pub unsafe extern "C" fn jit_hashmap_get_direct(vm_ptr: i64, receiver: i64, key:
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
     let vm = &*(vm_ptr as *const SharedVm);
     if receiver == 0 {
-        set_jit_pending_npe();
+        // A null receiver at an `invokevirtual` this intrinsic replaced, so
+        // the JEP-358 action is the one the generic dispatch helper records:
+        // `INVOKE_RECEIVER` names the opcode family that trapped and lets
+        // `runtime::interpreter::jit_npe_message` corroborate the bci in this
+        // frame's safepoint-id slot. A direct-bound intrinsic must not answer
+        // `getMessage()` differently from the dispatch it stands in for.
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::INVOKE_RECEIVER,
+        );
         return i64::MIN;
     }
     'fast: {
@@ -20404,7 +20582,15 @@ pub unsafe extern "C" fn jit_hashmap_put_direct(
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
     let vm = &*(vm_ptr as *const SharedVm);
     if receiver == 0 {
-        set_jit_pending_npe();
+        // A null receiver at an `invokevirtual` this intrinsic replaced, so
+        // the JEP-358 action is the one the generic dispatch helper records:
+        // `INVOKE_RECEIVER` names the opcode family that trapped and lets
+        // `runtime::interpreter::jit_npe_message` corroborate the bci in this
+        // frame's safepoint-id slot. A direct-bound intrinsic must not answer
+        // `getMessage()` differently from the dispatch it stands in for.
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::INVOKE_RECEIVER,
+        );
         return i64::MIN;
     }
     'fast: {
@@ -21922,7 +22108,17 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // i64::MIN sentinel so the interpreter's post-JIT drain builds the real
         // NPE and routes it through the method's exception table. Was `return
         // 0`, which silently swallowed a null-receiver call in hot JIT'd code.
-        set_jit_pending_npe();
+        //
+        // `INVOKE_RECEIVER`, and not the bare setter, for the reason the
+        // dispatch-helper twin gives: the code names the opcode family that
+        // trapped so `runtime::interpreter::jit_npe_message` can corroborate
+        // the bci it recovers from this frame's safepoint-id slot. The two
+        // doors must agree — a `getMessage()` that depended on whether the call
+        // site had warmed into a monomorphic inline cache would be its own
+        // wrong answer.
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::INVOKE_RECEIVER,
+        );
         return i64::MIN;
     }
     // Defensive: a receiver slot carrying tagged-long bits (low 3 bits set
@@ -25452,7 +25648,7 @@ mod tests {
         );
 
         // A caller that WILL dereference gets null.
-        let ref_arg = cratonvm_jit_api::getfield_index_arg(1, true, false) as i64;
+        let ref_arg = cratonvm_jit_api::getfield_index_arg(1, true, false, 0) as i64;
         let as_reference = unsafe { jit_getfield(vm_ptr, obj_ptr, ref_arg) };
         assert_eq!(
             as_reference,
@@ -25474,7 +25670,7 @@ mod tests {
             .mem
             .heap
             .set_field(obj, 0, Value::Object(Some(other)));
-        let arg0 = cratonvm_jit_api::getfield_index_arg(0, true, false) as i64;
+        let arg0 = cratonvm_jit_api::getfield_index_arg(0, true, false, 0) as i64;
         assert_eq!(
             unsafe { jit_getfield(vm_ptr, obj_ptr, arg0) },
             other.as_ptr() as i64,
@@ -25505,11 +25701,11 @@ mod tests {
     fn the_getfield_flag_bits_are_stripped_before_the_slot_index_is_used() {
         use cratonvm_jit_api::{
             getfield_index_arg, GETFIELD_EXPECT_REFERENCE, GETFIELD_FLAG_BITS,
-            GETFIELD_RECEIVER_PROVEN_OOP,
+            GETFIELD_NPE_SITE_MASK, GETFIELD_RECEIVER_PROVEN_OOP,
         };
         assert_eq!(
             GETFIELD_FLAG_BITS,
-            GETFIELD_EXPECT_REFERENCE | GETFIELD_RECEIVER_PROVEN_OOP,
+            GETFIELD_EXPECT_REFERENCE | GETFIELD_RECEIVER_PROVEN_OOP | GETFIELD_NPE_SITE_MASK,
             "every flag must be in the strip mask"
         );
         for (index, is_ref, proven) in [
@@ -25518,7 +25714,10 @@ mod tests {
             (7, true, true),
             (u16::MAX as u32, true, true),
         ] {
-            let arg = getfield_index_arg(index, is_ref, proven);
+            // A non-zero trap key on every row: it is the widest passenger and
+            // the newest, so a strip site that misses it turns the slot index
+            // into an astronomical one.
+            let arg = getfield_index_arg(index, is_ref, proven, 0x00ff_ffff);
             assert_eq!(
                 arg & !GETFIELD_FLAG_BITS,
                 index as u64,

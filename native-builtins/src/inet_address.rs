@@ -38,7 +38,7 @@
 use std::ffi::CString;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 
-use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeHandleScope, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
@@ -173,12 +173,18 @@ fn lookup_all_host_addr_impl(
     if filtered.is_empty() {
         return Err(unknown_host(format!("{host}: no matching family")));
     }
-    let arr = ctx.new_ref_array(ClassId::new(0), filtered.len());
+    // Every mirror is an allocation (plus the strings inside it), so the array
+    // has to be re-read from its handle at each store rather than carried as
+    // the address `new_ref_array` happened to return.
+    let mut scope = NativeHandleScope::new(ctx);
+    let arr_obj = scope.new_ref_array(ClassId::new(0), filtered.len());
+    let arr_h = scope.root(arr_obj);
     for (i, ip) in filtered.iter().enumerate() {
-        let mirror = alloc_inet_address_mirror(ctx, &host, ip);
-        ctx.set_array_element(arr, i, Value::Object(Some(mirror?)));
+        let mirror = alloc_inet_address_mirror(&mut *scope, &host, ip)?;
+        let arr = scope.get(&arr_h);
+        scope.set_array_element(arr, i, Value::Object(Some(mirror)));
     }
-    Ok(Some(Value::Object(Some(arr))))
+    Ok(Some(Value::Object(Some(scope.get(&arr_h)))))
 }
 
 // ---------------------------------------------------------------------------

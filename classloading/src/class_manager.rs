@@ -11482,9 +11482,19 @@ fn jdk_superclass(name: &str) -> &'static str {
         // ONLY edges where the parent contributes zero (or matching)
         // synthetic fields are listed here so we don't perturb existing
         // field-slot layouts that natives depend on. In particular,
-        // `LinkedHashMap`, `Properties`, and `Stack` keep their direct
-        // `Object` parent because their `synthetic_stub_fields` already
-        // count fields the candidate parent would also declare.
+        // `Properties` and `Stack` keep their direct `Object` parent because
+        // their `synthetic_stub_fields` already count fields the candidate
+        // parent would also declare.
+        //
+        // `LinkedHashMap` used to be in that list, and is no longer, because
+        // the condition it names stopped holding: its arm declared five OWN
+        // fields, three of which were `HashMap`'s, so naming `HashMap` as its
+        // parent would have counted those three twice. Its arm now declares
+        // the two it actually owns (`head`, `tail`), so the edge is honest and
+        // the chain reaches the same five slots -- `LHM_FIELD_HEAD = 3` and
+        // `LHM_FIELD_TAIL = 4` land exactly where they always did, after
+        // `HashMap`'s three. Naming the edge is what lets
+        // `synthetic_stub_total_field_count` see those five.
         //
         // Abstract bases (no synthetic fields):
         "java/util/AbstractCollection" => "java/lang/Object",
@@ -11547,6 +11557,7 @@ fn jdk_superclass(name: &str) -> &'static str {
 
         // Concrete Map hierarchy:
         "java/util/HashMap" => "java/util/AbstractMap",
+        "java/util/LinkedHashMap" => "java/util/HashMap",
         "java/util/TreeMap" => "java/util/AbstractMap",
         "java/util/IdentityHashMap" => "java/util/AbstractMap",
         "java/util/WeakHashMap" => "java/util/AbstractMap",
@@ -12746,6 +12757,39 @@ pub fn synthetic_stub_instance_field_count(name: &str) -> usize {
         .count()
 }
 
+/// The synthetic slot extent of `name`: its own fabricated instance fields
+/// PLUS every ancestor's, down the `jdk_superclass` chain.
+///
+/// This is the number a bytecode `new` of the stub actually sizes to, and so
+/// the number an absolute slot index has to fit inside.
+/// [`synthetic_stub_instance_field_count`] is the class's OWN contribution and
+/// is the wrong thing to compare an absolute index against: `LinkedHashMap`
+/// keeps `LHM_FIELD_HEAD = 3` and `LHM_FIELD_TAIL = 4`, which are its own two
+/// fields sitting after `HashMap`'s three — an extent of 5 from an own-count
+/// of 2. Comparing 2 against 5 reads as a three-slot shortfall that does not
+/// exist, and the way to make that comparison pass is to over-declare the
+/// table, which is how `LinkedHashMap` came to claim five own fields for two.
+///
+/// The chain is `jdk_superclass`, whose default arm is `java/lang/Object`, so
+/// the walk always terminates; a class with no arm contributes zero.
+#[must_use]
+pub fn synthetic_stub_total_field_count(name: &str) -> usize {
+    let mut total = 0usize;
+    let mut cur = name;
+    loop {
+        total += synthetic_stub_instance_field_count(cur);
+        if cur == "java/lang/Object" {
+            break;
+        }
+        let parent = jdk_superclass(cur);
+        if parent == cur {
+            break;
+        }
+        cur = parent;
+    }
+    total
+}
+
 /// CratonVM's fabricated slot **model** for `name` — the same table that sizes
 /// a bytecode `new` of the stub and that pads a real class up to the count
 /// native code was written against.
@@ -13187,17 +13231,42 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         "sun/reflect/generics/reflectiveObjects/GenericArrayTypeImpl" => {
             vec![named_field("genericComponentType", "Ljava/lang/reflect/Type;")]
         }
-        // Collections: ArrayList/Vector/Stack/CopyOnWriteArrayList = 2 fields (data, size)
+        // Collections: ArrayList/Vector/Stack/CopyOnWriteArrayList = 2 fields
+        // (data, size) -- `AL_FIELD_DATA`, `AL_FIELD_SIZE`, `AL_NUM_FIELDS = 2`
+        // in `native-collections`. This said 2 and reserved 4 until 2026-09-11;
+        // see the HashMap arm below for why that mattered and what the extra
+        // slots cost.
         "java/util/ArrayList"
         | "java/util/Vector"
         | "java/util/Stack"
-        | "java/util/concurrent/CopyOnWriteArrayList" => instance_fields(4),
+        | "java/util/concurrent/CopyOnWriteArrayList" => instance_fields(2),
         // HashMap/HashSet/ConcurrentHashMap = 3 fields (buckets, size, capacity)
+        // -- `MAP_FIELD_BUCKETS/SIZE/CAPACITY`, `HS_FIELD_MAP`,
+        // `CHM_FIELD_SEGMENTS` and its mask, all in `native-collections`. No
+        // native indexes a slot above 2 on any of these receivers.
+        //
+        // This said 3 and reserved 16 until 2026-09-11. The floor is applied in
+        // REAL-JDK mode too, as `max(declared, floor)`, and
+        // `build_compact_layout` fills the padding with 8-byte reference slots
+        // -- so an empty `java.util.HashMap` occupied 36 slots and 304 bytes
+        // against HotSpot's 48, with `table` already null and nothing allocated
+        // on the side to explain it. A `HashSet` cost 576. Bringing the two
+        // drifted floors down to what the natives actually index took HashMap to
+        // 64 bytes and ArrayList from 96 to 32, and 7% off the Hibernate HQL
+        // parse that found it.
+        //
+        // VALIDATED, because lowering a floor fails SILENTLY (an out-of-range
+        // `set_field` is dropped, not raised): 300 Hibernate ORM classes
+        // byte-for-byte identical, `regression-suite` 92/92, and
+        // `probes/CollectionSlotFloor.java` -- written for this -- passing in
+        // real-JDK mode and producing an IDENTICAL failure set to the unchanged
+        // build in synthetic-JDK mode, where the stub really is the layout.
+        // Raising a floor here is free; lowering one needs that evidence again.
         "java/util/HashMap"
         | "java/util/HashSet"
         | "java/util/EnumMap"
         | "java/util/Hashtable"
-        | "java/util/concurrent/ConcurrentHashMap" => instance_fields(16),
+        | "java/util/concurrent/ConcurrentHashMap" => instance_fields(3),
         // `ConcurrentHashMap$KeySetView` — the JDK's own two fields, named, so
         // `resolve_field_index_by_class_id` finds the same slots in synthetic
         // mode that it finds against the real class (`CollectionView.map` and
@@ -13243,10 +13312,47 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         ],
         // LinkedList = 3 fields (head, tail, size)
         "java/util/LinkedList" => instance_fields(3),
-        // LinkedHashMap = 5 fields
-        "java/util/LinkedHashMap" => instance_fields(5),
-        // TreeMap/TreeSet = 3 fields (data, size, comparator)
-        "java/util/TreeMap" | "java/util/TreeSet" => instance_fields(3),
+        // LinkedHashMap's OWN two: `head` and `tail`.
+        //
+        // The count here is a class's own fields, appended AFTER the parent's
+        // -- `stub_total` is `stub_parent_fields + stub_instance_count`. The
+        // synthetic indices `native-collections` writes are absolute:
+        // `LHM_FIELD_BUCKETS/SIZE/CAPACITY = 0/1/2` are HashMap's three, and
+        // LinkedHashMap adds `LHM_FIELD_HEAD = 3` and `LHM_FIELD_TAIL = 4`.
+        // That is an absolute EXTENT of 5, which is what the old comment
+        // ("= 5 fields") said -- but it was coded as 5 OWN fields on top of
+        // HashMap's 3, for an extent of 8. Three slots past anything indexed,
+        // in both modes.
+        //
+        // Comment and code disagreeing in the same direction is the signature
+        // this page already found twice (`HashMap` "= 3" coded as 16,
+        // `ArrayList` "= 2" coded as 4); this is the third and last of them.
+        //
+        // In real-JDK mode the arithmetic is what makes it expensive rather
+        // than merely untidy: the parent term is the REAL `HashMap`'s eight
+        // fields, so the floor came to 13 against a real `LinkedHashMap`'s
+        // twelve. Padded by ONE slot -- and a padded class is refused the
+        // compact layout entirely, so all thirteen became 16-byte tagged
+        // cells: 224 B measured, against HotSpot's 65.1 for the same twelve
+        // fields. At 2 the floor is 10, the real class is not padded, and the
+        // synthetic indices 3 and 4 are exactly where they always were.
+        "java/util/LinkedHashMap" => instance_fields(2),
+        // TreeMap = 3 fields (data, size, comparator).
+        //
+        // A real `java/util/TreeMap` declares nine, so this floor never pads
+        // it; it sizes the STUB, which in synthetic-jdk mode is the layout.
+        "java/util/TreeMap" => instance_fields(3),
+        // `TreeSet` was in that arm, and a real one declares exactly ONE
+        // instance field (`m`), so the three padded it -- over the
+        // `build_compact_layout` cliff, into 16-byte tagged cells.
+        //
+        // It is not padded for slots anyone indexes. `TS_FIELD_DATA/SIZE/
+        // COMPARATOR` name an address-keyed SIDE TABLE, not object storage:
+        // `ts_get_slot` / `ts_set_slot` say so ("The object's own fields are
+        // never touched") and contain no `set_field` at all. One slot is kept
+        // rather than zero so the `HS_FIELD_MAP = 0` shape -- `m`, the backing
+        // map, at absolute 0 -- still has somewhere to live in synthetic mode.
+        "java/util/TreeSet" => instance_fields(1),
         // ArrayDeque = 4 fields (data, head, tail, size)
         "java/util/ArrayDeque" => instance_fields(4),
         // EnumSet = 2 fields (elements backing, enum type)

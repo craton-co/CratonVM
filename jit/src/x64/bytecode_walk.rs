@@ -5788,7 +5788,7 @@ impl Compiler {
                             }
                             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                             self.load_slot_to_reg(ARG_REGS[1], obj_slot);
-                            self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag);
+                            self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag, pc);
                             crate::metrics::note_getfield_arm(1);
                             self.emit_call_absolute(self.helpers.getfield);
                             self.emit_post_invoke_exception_check(type_tag);
@@ -5987,7 +5987,7 @@ impl Compiler {
                             self.bind_implicit_null_recovery();
                             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                             self.load_slot_to_reg(ARG_REGS[1], obj_slot);
-                            self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag);
+                            self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag, pc);
                             crate::metrics::note_getfield_arm(2);
                             self.emit_call_absolute(self.helpers.getfield);
                             self.emit_post_invoke_exception_check(type_tag);
@@ -6019,7 +6019,7 @@ impl Compiler {
                         let obj_slot = self.pop_stack();
                         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                         self.load_slot_to_reg(ARG_REGS[1], obj_slot);
-                        self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag);
+                        self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag, pc);
                         crate::metrics::note_getfield_arm(3);
                         self.emit_call_absolute(self.helpers.getfield);
                         // See the inlined-callee getfield site above: the checked
@@ -10514,6 +10514,219 @@ impl Compiler {
                         }
                         // ===== INTRINSIC REGION END: BOX_UNBOX =====
 
+                        // ===== INTRINSIC REGION BEGIN: STRINGBUILDER_ACCESS =====
+                        // java.lang.StringBuilder: length()I and append(C).
+                        //
+                        // MEASURED on this tree, and the reason this region
+                        // exists: `StringBuilder.length()` is 194 ns/op and
+                        // `append(char)` 349 ns, while `String.length()` — the
+                        // same shape, already intrinsified two regions below —
+                        // is 2 ns. `System.identityHashCode`, a trivial native
+                        // with one object argument, is 120 ns, which is what
+                        // the boundary alone costs. The builder was paying it
+                        // on every call.
+                        //
+                        // # The slow edge is a CALL, not an uncommon trap
+                        //
+                        // Every other intrinsic in this file deopts on a failed
+                        // guard, because its guards fail on genuinely uncommon
+                        // things (a null receiver, an out-of-bounds index).
+                        // `append`'s do not: a full payload is what every
+                        // growing builder reaches O(log n) times, and a UTF16
+                        // builder fails the coder guard on EVERY call. Deopting
+                        // there would re-run the whole method in the
+                        // interpreter each time, so these edges go to the same
+                        // `invoke_dispatch` the site would have used anyway —
+                        // the decline-edge shape the FFM region above
+                        // established. Nothing here has to reproduce an
+                        // exception, a growth, or a coder inflation: the native
+                        // does all three, unchanged.
+                        if !intrinsic_handled
+                            && (callee_entry
+                                == crate::JitIntrinsic::StringBuilderLength.as_entry()
+                                || callee_entry
+                                    == crate::JitIntrinsic::StringBuilderAppendChar.as_entry())
+                        {
+                            let is_append = callee_entry
+                                == crate::JitIntrinsic::StringBuilderAppendChar.as_entry();
+                            let info_ptr = self
+                                .invoke_info_idx
+                                .get(&pc)
+                                .map(|&i| self.invoke_info[i].1);
+                            // The narrow-`value` refusal lives in
+                            // `StringBuilderFieldLayout::new`, not here, so
+                            // that registration and emission cannot disagree
+                            // about it — see that constructor.
+                            let layout = self.string_layout.and_then(|l| l.builder);
+                            match (info_ptr, layout) {
+                                (Some(info), Some(b)) if !info.is_null() => {
+                                    self.flush_scratch_registers();
+                                    // Operands, deepest first: receiver, then
+                                    // (append only) the char.
+                                    let ch_slot =
+                                        if is_append { Some(self.pop_stack()) } else { None };
+                                    let recv_slot = self.pop_stack();
+
+                                    let mut decline: Vec<usize> = Vec::new();
+
+                                    // RAX = receiver; null takes the call.
+                                    self.load_slot_to_reg(RAX, recv_slot);
+                                    self.emit_test_r64_r64(RAX);
+                                    decline.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+
+                                    // The receiver guard, and it is exact:
+                                    // `StringBuilder` is final, so a header
+                                    // class-id match IS that class. This is
+                                    // what keeps `StringBuffer` — synchronized
+                                    // methods, a `toStringCache` to invalidate
+                                    // on every mutation — off a path that
+                                    // emits neither obligation.
+                                    //   CMP DWORD [RAX + 0], class_id
+                                    self.buf.emit(&[0x81, 0x78, 0x00]);
+                                    self.buf.emit(&b.class_id.to_le_bytes());
+                                    decline.push(self.emit_jcc_rel32_patch(0x85)); // JNE
+
+                                    let done = if let Some(ch) = ch_slot {
+                                        // RCX = the char. LATIN1 only: a wider
+                                        // one inflates the payload to UTF16,
+                                        // which is the native's job.
+                                        //
+                                        // Destructured rather than `expect`ed:
+                                        // this file denies production panics
+                                        // (`hot_files_have_no_production_panics`),
+                                        // and `is_append` and `ch_slot.is_some()`
+                                        // are the same fact — the operand is
+                                        // popped under exactly that condition.
+                                        self.load_slot_to_reg(RCX, ch);
+                                        self.buf.emit(&[0x81, 0xF9]); // CMP ECX, imm32
+                                        self.buf.emit(&0xFFi32.to_le_bytes());
+                                        decline.push(self.emit_jcc_rel32_patch(0x87)); // JA
+
+                                        // One compact/legacy branch for the
+                                        // whole body rather than one per field:
+                                        // the body is ten instructions, and a
+                                        // per-field test would emit four
+                                        // branches over the same header bit.
+                                        self.emit_test_mem8_imm8(
+                                            RAX,
+                                            cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
+                                            cratonvm_types::GC_FLAG_COMPACT,
+                                        );
+                                        let legacy = self.emit_jcc_rel32_patch(0x84); // JZ
+                                        self.emit_sb_append_char_body(
+                                            b.count_compact_offset,
+                                            b.value_compact_offset,
+                                            b.coder_compact_offset,
+                                            b.coder_compact_is_byte,
+                                            &mut decline,
+                                        );
+                                        let joined = self.emit_jmp_rel32_patch();
+                                        self.patch_rel32_to_here(legacy);
+                                        self.emit_sb_append_char_body(
+                                            b.count_legacy_offset,
+                                            b.value_legacy_offset,
+                                            b.coder_legacy_offset,
+                                            false,
+                                            &mut decline,
+                                        );
+                                        self.patch_rel32_to_here(joined);
+                                        // `append` returns its receiver, which
+                                        // is still in RAX and was never moved:
+                                        // this path allocates nothing.
+                                        self.emit_jmp_rel32_patch()
+                                    } else {
+                                        // length() is `count`, sign-extended
+                                        // into the 64-bit operand slot the same
+                                        // way `String.length()` ends.
+                                        self.emit_load_string_i32_field(
+                                            RAX,
+                                            RAX,
+                                            b.count_compact_offset,
+                                            false,
+                                            b.count_legacy_offset,
+                                        );
+                                        self.emit_jmp_rel32_patch()
+                                    };
+
+                                    // ---- decline edge: the unchanged dispatch
+                                    for p in decline {
+                                        self.patch_rel32_to_here(p);
+                                    }
+                                    let nargs = if is_append { 2 } else { 1 };
+                                    let args_base = match self
+                                        .reserve_spill_slots(nargs, SpillReason::HelperArgs)
+                                    {
+                                        Some(base) => base,
+                                        None => {
+                                            self.fail(
+                                                "singlepass-codegen/sb-args-spill-exhausted",
+                                            );
+                                            return false;
+                                        }
+                                    };
+                                    // `jit_invoke_dispatch`'s buffer runs
+                                    // arg[0] at the HIGHEST offset down. Both
+                                    // operands are loaded before either is
+                                    // stored: the buffer can overlap the
+                                    // operand homes.
+                                    self.load_slot_to_reg(RAX, recv_slot);
+                                    if let Some(ch) = ch_slot {
+                                        self.load_slot_to_reg(RCX, ch);
+                                    }
+                                    // Cast: an argument count of 1 or 2.
+                                    let top = args_base + (nargs as i32 - 1) * 8;
+                                    self.emit_store_local(top, RAX);
+                                    if ch_slot.is_some() {
+                                        self.emit_store_local(top - 8, RCX);
+                                    }
+                                    self.emit_load_local(
+                                        ARG_REGS[0],
+                                        self.heap_local_offset,
+                                    );
+                                    self.emit_mov_imm64(ARG_REGS[1], info as *const _ as i64);
+                                    self.emit_lea_frame_slot(ARG_REGS[2], top);
+                                    self.emit_mov_imm32_sx(ARG_REGS[3], nargs as i32);
+                                    self.emit_pre_safepoint_spill();
+                                    self.emit_call_absolute(self.helpers.invoke_dispatch);
+                                    self.emit_oop_map_for_safepoint();
+                                    // `append` returns a reference, `length` an
+                                    // int; neither shares the `i64::MIN`
+                                    // pending-exception sentinel with a
+                                    // legitimate value, so both take the plain
+                                    // arm.
+                                    self.emit_post_invoke_exception_check(if is_append {
+                                        b'L'
+                                    } else {
+                                        b'I'
+                                    });
+
+                                    // ---- join -----------------------------
+                                    self.patch_rel32_to_here(done);
+                                    self.next_spill_offset = args_base;
+                                    self.push_from_rax();
+                                    if is_append {
+                                        // The builder it returns is the builder
+                                        // it was handed.
+                                        self.mark_top_as_oop();
+                                    }
+                                    intrinsic_handled = true;
+                                }
+                                // Falling through is NOT safe: the site carries
+                                // an intrinsic SENTINEL as its
+                                // `JitDirectCall::entry`, and the ordinary
+                                // direct-call path would CALL that sentinel.
+                                // Registration and emission must agree, so a
+                                // shape that cannot be emitted fails the
+                                // compile and drops the method to the
+                                // interpreter.
+                                _ => {
+                                    self.fail("singlepass-codegen/sb-intrinsic-unemittable");
+                                    return false;
+                                }
+                            }
+                        }
+                        // ===== INTRINSIC REGION END: STRINGBUILDER_ACCESS =====
+
                         // ===== INTRINSIC REGION BEGIN: STRING_ACCESS =====
                         // java.lang.String access intrinsics (Phase 3a):
                         // length()I, isEmpty()Z, charAt(I)C, hashCode()I.
@@ -13403,16 +13616,40 @@ impl Compiler {
                     self.flush_scratch_registers();
                     let atype = code[pc + 1] as i32; // Widening: always safe
                     let count_slot = self.pop_stack();
-                    // Load heap pointer → ARG_REGS[0]
-                    self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                    // atype immediate → ARG_REGS[1]
-                    self.emit_mov_imm32_sx(ARG_REGS[1], atype);
-                    // count → ARG_REGS[2]
-                    self.load_slot_to_reg(ARG_REGS[2], count_slot);
                     // Round-8 wave-3: defensive callee-saved spill
                     // before any GC-triggering CALL.
+                    //
+                    // Emitted BEFORE the fast path, not between it and the
+                    // helper, because both arms merge into one oop map below
+                    // and the spill has to cover the edge that calls. The
+                    // inline arm never calls, so it pays stores it does not
+                    // need — the `new` arm's `sink_alloc_blind_spill` is the
+                    // machinery for withholding them, and wiring an array-
+                    // shaped request into it is a separate change from giving
+                    // arrays a bump at all.
                     self.emit_pre_safepoint_spill();
-                    self.emit_call_absolute(self.helpers.newarray);
+                    // The inline TLAB bump, with `helpers.newarray` as its own
+                    // slow path. Declines (and emits nothing) for a shape it
+                    // cannot serve, leaving the unconditional call below.
+                    //
+                    // `ArrayElementType`'s discriminants ARE the JVM `atype`
+                    // values (`Boolean = 4` … `Long = 11`), which is what makes
+                    // `array_element_type_from_tag` the decode here; an
+                    // unrecognised tag yields `None` and keeps the call, the
+                    // same outcome `jit_newarray`'s own `_ => return 0` arm has.
+                    // Cast: an `atype` is one bytecode operand byte.
+                    let inlined = cratonvm_types::array_element_type_from_tag(atype as u8)
+                        .map(|elem| self.emit_inline_tlab_newarray(elem, atype, count_slot))
+                        .unwrap_or(false);
+                    if !inlined {
+                        // Load heap pointer → ARG_REGS[0]
+                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                        // atype immediate → ARG_REGS[1]
+                        self.emit_mov_imm32_sx(ARG_REGS[1], atype);
+                        // count → ARG_REGS[2]
+                        self.load_slot_to_reg(ARG_REGS[2], count_slot);
+                        self.emit_call_absolute(self.helpers.newarray);
+                    }
                     // T1.1.a — `newarray` is a GC-triggering safepoint.
                     self.emit_oop_map_for_safepoint();
                     // Heap-exhaustion guard: a null result means OOM (the helper

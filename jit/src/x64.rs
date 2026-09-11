@@ -248,6 +248,10 @@ pub use inlining::{
     inline_miss_edge_poison_counts, npe_trap_lines_enabled, InlineFrameLevel, InlineFrameMap,
     InlineFrameRow, NpeTrapMap, NpeTrapSite,
 };
+/// The JVMS 4.9.1 bci bound, re-exported for `ir_lower`'s twin of
+/// `record_npe_trap_site`: the optimizing tier screens against the same bound
+/// and a second copy of it would be a second place to fix.
+pub(crate) use inlining::INLINE_FRAME_MAX_BCI;
 mod arith;
 mod arrays;
 mod deopt_stubs;
@@ -259,6 +263,7 @@ pub(crate) use objects::note_ungated_ref_store;
 // other pays. `objects` is a private module, so the re-export is the seam.
 pub(crate) use objects::{ref_store_gates_of, ref_store_post_skip_mask_of};
 pub use objects::ref_store_site_counts;
+pub use objects::{inline_array_declines, inline_array_site_counts};
 pub(crate) use objects::note_gated_ref_store;
 pub use null_check_elim::receiver_null_check_counts;
 pub use null_check_elim::receiver_null_check_implicit_by_arm;

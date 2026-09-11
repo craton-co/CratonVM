@@ -44,6 +44,7 @@ jit_interp_differential
 jit_ir_athrow_dispatch
 jit_ir_exception_stub_throw_bci
 jit_ir_phi_copy_register_alias
+jit_npe_message_hot_equals_cold
 jit_null_receiver_npe
 jit_osr_athrow_lift
 jit_osr_throw_outside_try
@@ -136,6 +137,22 @@ writer_flush_real
 #                              it is a timeout being hit, not an assertion
 #                              disagreeing. Diagnose the 60s wait before
 #                              ratcheting it.
+#
+#                              DIAGNOSED AND FIXED 2026-09-11. "A timeout being
+#                              hit, not an assertion disagreeing" was exactly
+#                              right, and the 60s wait was a cap derived from a
+#                              RELEASE measurement applied to the debug binary
+#                              this step runs. The probe now prints
+#                              `progress remaining=` and the harness fails when
+#                              that stops falling instead of when a clock runs
+#                              out, so no host and no profile can fail a
+#                              healthy run. It survived 8 debug runs at loads
+#                              11-42 taking 28s to 179s, one of which contained
+#                              a 148s no-progress stall and still gave the right
+#                              answer. See
+#                              docs/internal/retired/vthread-and-prestart-probe-caps-FIXED-20260911.md.
+#                              Not ratcheted here yet: ratchet it after one
+#                              full-list run on Windows confirms the same.
 
 # ---------------------------------------------------------------------------
 # NOT ratcheted: RED. These RUN against a real binary and FAIL -- a defect,
@@ -203,16 +220,42 @@ writer_flush_real
 # only, and a missing javac still lets an e2e target report `ok` in 0.00s.
 #
 # FOUND WHILE MEASURING, and NOT caused by this change: `stack_trace_across_tiers`
-# fails DETERMINISTICALLY on dev (7/7, ~7.2s each), so this step is red until
-# that is fixed. It is filed at
-# docs/known-issues/jit/stack-trace-across-tiers-fails-deterministically-on-dev-20260909.md
-# with the evidence that the reflection-caller change in flight at the time is
-# not the cause. `wp2_5_proxy` also failed, for a different and benign reason:
+# failed DETERMINISTICALLY on dev (7/7, ~7.2s each), so this step was red.
+# FIXED 2026-09-11 -- the page is retired at
+# docs/internal/fixed-bugs/stack-trace-across-tiers-fails-deterministically-on-dev-FIXED-20260911.md.
+# Two halves: the kill-switch arm was softened on 2026-09-09 (`60965bb3e`),
+# which made a plain `cargo test` green and left THIS step red, because the
+# softened branch reports the unexercised coverage as a REQUIRE_E2E failure.
+# The second half is the fixture: `ir-splice-getstatic` going default-ON had
+# made the probe's throw site splicable all the way up, so the artifact that
+# contained the throw trapped on it and was made not-compilable, and no frame at
+# the hot throw came from an inlining artifact any more. One expression in
+# `probes/StackTraceAfterOsr.java` restores it. `wp2_5_proxy` also failed, for a
+# different and benign reason:
 # its fixture lives under gitignored `apps/`, so a fresh checkout has no
 # ProxyProbe.class and REQUIRE_E2E correctly turns that skip into a failure.
 #
+# A SECOND, INDEPENDENT HALF, fixed the same day by a different branch and
+# worth carrying here because it is about this step's own premise: the target
+# was ALSO flaky for a reason the fixture fix above does not touch. Its
+# kill-switch arms assumed the set of
+# COMPILED frames in a warmed-up trace was fixed run to run. It is not:
+# `CRATONVM_BG_COMPILE` has been default-ON since wire-tiered-manager Step 7, so
+# the OSR body races the end of the loop it was compiled for, and on a loaded
+# host it sometimes publishes after it. The arms now run against a control that
+# sets `CRATONVM_BG_COMPILE=0` (the opt-out `env_cache.rs::bg_compile` documents
+# for exactly this), which puts the compile back on the mutator at the
+# threshold; 24 consecutive REQUIRE_E2E runs pass, debug and release binaries,
+# at host load 40-130. The retired page is
+# docs/internal/fixed-bugs/stack-trace-across-tiers-kill-switch-arms-raced-the-compile-FIXED-20260911.md.
+# Read the general lesson before adding a target here: a REQUIRE_E2E row must
+# establish that the thing it is about ENGAGED in its own run, because on a
+# loaded runner "the JIT did not get there in time" and "the feature broke" look
+# identical from the assertion's side.
+#
 # The ninth, `vthread_probe_regression`, FAILED again on 2026-09-08 at 120s --
 # the FLAKY block above is right and its one green that morning was luck.
+# FIXED 2026-09-11; the FLAKY block records what it was.
 #
 # ---------------------------------------------------------------------------
 # TWO TARGETS IN THE RATCHETED LIST ABOVE ARE FLAKY ON WINDOWS. Found by
@@ -298,6 +341,49 @@ writer_flush_real
 # step starts running close to its wall this is a fair row to reconsider --
 # unlike the four cost-deferred candidates above, though, this one is a gate
 # against a defect that has already regressed once.
+#
+# COST, RE-MEASURED 2026-09-11 on the restored fixture: 2.92 s for the whole
+# target, Windows, against a RELEASE CRATONVM_BIN. The +42 s above was a DEBUG
+# binary, and most of the difference is the two 400 000-iteration warm-up loops.
+# Read the two numbers as what they are -- a profile difference, not a change
+# in what the target does.
+#
+# AND IT REGRESSED AGAIN, on 2026-09-09, which is the reason the "FIXED AND
+# PROMOTED" line above needs reading with the date attached. The verification
+# below was taken at `ccf731dd3`; `ir-splice-getstatic` went default-ON the same
+# day and took the anti-vacuity half of the third row with it, silently -- the
+# trace stayed correct, so only the kill-switch arm noticed. Closed again
+# 2026-09-11, this time with the reason written down in the FIXTURE rather than
+# in the test: see `probes/StackTraceAfterOsr.java`'s `MARK` and
+# docs/internal/fixed-bugs/stack-trace-across-tiers-fails-deterministically-on-dev-FIXED-20260911.md.
+#
+#   jit_npe_message_hot_equals_cold   PROMOTED 2026-09-11, and it is in the
+#                              ratcheted list above. NINE null-deref shapes
+#                              asked cold and hot in one process; the assertion
+#                              is that the two rows of a pair are equal, because
+#                              they differ in nothing but whether the method has
+#                              been compiled. Gate for
+#                              the-helpful-npe-message-is-lost-in-compiled-code-FIXED-20260911.md.
+#                              Measured 2026-09-11, Windows, release binary,
+#                              Temurin 25.0.3+9: 1 PASS in 6.81 s with
+#                              CRATONVM_REQUIRE_E2E=1 and <jdk>/bin on PATH.
+#                              The probe's 9 x 200 000 warm-up calls are what
+#                              makes the `hot` rows mean anything and they cost
+#                              under a second; the rest is javac and VM
+#                              start-up. THE TELL IS THE CLOCK here too: this
+#                              target cannot pass in 0.00 s, and if it does, its
+#                              javac or its binary was missing.
+#
+#                              It also drives `common::wait_draining` rather
+#                              than the poll-try_wait shape, and had to: every
+#                              arm sets CRATONVM_DBG_JITC=1, and this probe
+#                              writes enough stderr to fill the pipe and block
+#                              the child. Under the poll shape it read as
+#                              "timed out after 900 s" for a run that takes
+#                              0.8 s by hand. `stack_trace_across_tiers` was
+#                              converted with it -- same shape, same latent
+#                              hazard, and it had only been spared by the size
+#                              of its own JIT log.
 #
 # NO RED TARGET IS NAMED IN THIS FILE ANY MORE. That is not the same claim as
 # "there are none": the last full survey is the dated one in the header, and

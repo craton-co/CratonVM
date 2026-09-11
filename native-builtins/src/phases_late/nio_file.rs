@@ -301,13 +301,18 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "toFile", "()Ljava/io/File;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let file = try_alloc_concurrent_synthetic(ctx, "java/io/File", 1)?;
+        // WIDTH and the two extra writes: `cratonvm_native_api::file_layout`.
+        // A one-slot File takes the path and silently keeps `prefixLength = 0`,
+        // which is what made real `File` bytecode call every path relative.
+        let w = cratonvm_native_api::file_layout::alloc_width(ctx);
+        let file = try_alloc_concurrent_synthetic(ctx, "java/io/File", w)?;
         // Pin across the create_string below — a moving young GC there would
         // relocate the fresh File (native stale-local family).
         let file_pin = ctx.pin_native_root(file);
         let s = ctx.create_string(&p);
         let file = ctx.read_native_pin(file_pin, file);
         ctx.set_field(file, 0, Value::Object(Some(s)));
+        cratonvm_native_api::file_layout::write(ctx, file, s, &p);
         ctx.unpin_native_roots(file_pin);
         Ok(Some(Value::Object(Some(file))))
     });
@@ -1377,11 +1382,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // Pin across the list alloc below — a moving young GC there would
             // relocate the fresh array (native stale-local family).
             let arr_pin = ctx.pin_native_root(arr);
-            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3)?;
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
-            ctx.set_field(list, 0, Value::Int(0));
-            ctx.set_field(list, 1, Value::Object(Some(arr)));
-            ctx.set_field(list, 2, Value::Int(0));
+            // By NAME, not by raw slot. These three writes were
+            // `set_field(list, 0/1/2, ..)` against the REAL JDK layout
+            // (`AbstractList.modCount`, `ArrayList.elementData`,
+            // `ArrayList.size`) -- an absolute extent of 3 on a class this
+            // code does not own, which is what the T9C gate scores against the
+            // synthetic table's 2 and what that gate's own "rule when this
+            // fails" says to replace. Resolving by name is layout-independent:
+            // correct here, and in synthetic mode a write that finds no such
+            // field is dropped rather than landing on the wrong slot.
+            ctx.set_field_by_name(list, "modCount", Value::Int(0));
+            ctx.set_field_by_name(list, "elementData", Value::Object(Some(arr)));
+            ctx.set_field_by_name(list, "size", Value::Int(0));
             ctx.unpin_native_roots(arr_pin);
             Ok(Some(Value::Object(Some(list))))
         },
@@ -1459,11 +1473,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             ctx.set_array_element(arr, 0, Value::Object(Some(root_path)));
             // Real ArrayList field layout in real-JDK mode:
             //   [0]=AbstractList.modCount (int), [1]=elementData (Object[]), [2]=size (int).
-            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3)?;
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
-            ctx.set_field(list, 0, Value::Int(0));
-            ctx.set_field(list, 1, Value::Object(Some(arr)));
-            ctx.set_field(list, 2, Value::Int(1));
+            // By NAME, not by raw slot. These three writes were
+            // `set_field(list, 0/1/2, ..)` against the REAL JDK layout
+            // (`AbstractList.modCount`, `ArrayList.elementData`,
+            // `ArrayList.size`) -- an absolute extent of 3 on a class this
+            // code does not own, which is what the T9C gate scores against the
+            // synthetic table's 2 and what that gate's own "rule when this
+            // fails" says to replace. Resolving by name is layout-independent:
+            // correct here, and in synthetic mode a write that finds no such
+            // field is dropped rather than landing on the wrong slot.
+            ctx.set_field_by_name(list, "modCount", Value::Int(0));
+            ctx.set_field_by_name(list, "elementData", Value::Object(Some(arr)));
+            ctx.set_field_by_name(list, "size", Value::Int(1));
             ctx.unpin_native_roots(this_pin.map(|(h, _)| h).unwrap_or(root_path_pin));
             Ok(Some(Value::Object(Some(list))))
         },
@@ -2462,11 +2485,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             ctx.set_array_element(arr, 2, Value::Object(Some(jrt_p)));
             // Real ArrayList field layout in real-JDK mode:
             //   [0]=AbstractList.modCount (int), [1]=elementData (Object[]), [2]=size (int).
-            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3)?;
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
-            ctx.set_field(list, 0, Value::Int(0));
-            ctx.set_field(list, 1, Value::Object(Some(arr)));
-            ctx.set_field(list, 2, Value::Int(3));
+            // By NAME, not by raw slot. These three writes were
+            // `set_field(list, 0/1/2, ..)` against the REAL JDK layout
+            // (`AbstractList.modCount`, `ArrayList.elementData`,
+            // `ArrayList.size`) -- an absolute extent of 3 on a class this
+            // code does not own, which is what the T9C gate scores against the
+            // synthetic table's 2 and what that gate's own "rule when this
+            // fails" says to replace. Resolving by name is layout-independent:
+            // correct here, and in synthetic mode a write that finds no such
+            // field is dropped rather than landing on the wrong slot.
+            ctx.set_field_by_name(list, "modCount", Value::Int(0));
+            ctx.set_field_by_name(list, "elementData", Value::Object(Some(arr)));
+            ctx.set_field_by_name(list, "size", Value::Int(3));
             ctx.unpin_native_roots(file_pin);
             Ok(Some(Value::Object(Some(list))))
         },
@@ -2750,11 +2782,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // Pin across the list alloc below — a moving young GC there would
             // relocate the fresh array (native stale-local family).
             let arr_pin = ctx.pin_native_root(arr);
-            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3)?;
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
-            ctx.set_field(list, 0, Value::Int(0));
-            ctx.set_field(list, 1, Value::Object(Some(arr)));
-            ctx.set_field(list, 2, Value::Int(0));
+            // By NAME, not by raw slot. These three writes were
+            // `set_field(list, 0/1/2, ..)` against the REAL JDK layout
+            // (`AbstractList.modCount`, `ArrayList.elementData`,
+            // `ArrayList.size`) -- an absolute extent of 3 on a class this
+            // code does not own, which is what the T9C gate scores against the
+            // synthetic table's 2 and what that gate's own "rule when this
+            // fails" says to replace. Resolving by name is layout-independent:
+            // correct here, and in synthetic mode a write that finds no such
+            // field is dropped rather than landing on the wrong slot.
+            ctx.set_field_by_name(list, "modCount", Value::Int(0));
+            ctx.set_field_by_name(list, "elementData", Value::Object(Some(arr)));
+            ctx.set_field_by_name(list, "size", Value::Int(0));
             ctx.unpin_native_roots(arr_pin);
             Ok(Some(Value::Object(Some(list))))
         },
@@ -7635,13 +7676,18 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "toFile", "()Ljava/io/File;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let file = try_alloc_concurrent_synthetic(ctx, "java/io/File", 1)?;
+        // WIDTH and the two extra writes: `cratonvm_native_api::file_layout`.
+        // A one-slot File takes the path and silently keeps `prefixLength = 0`,
+        // which is what made real `File` bytecode call every path relative.
+        let w = cratonvm_native_api::file_layout::alloc_width(ctx);
+        let file = try_alloc_concurrent_synthetic(ctx, "java/io/File", w)?;
         // Pin across the create_string below — a moving young GC there would
         // relocate the fresh File (native stale-local family).
         let file_pin = ctx.pin_native_root(file);
         let s = ctx.create_string(&p);
         let file = ctx.read_native_pin(file_pin, file);
         ctx.set_field(file, 0, Value::Object(Some(s)));
+        cratonvm_native_api::file_layout::write(ctx, file, s, &p);
         ctx.unpin_native_roots(file_pin);
         Ok(Some(Value::Object(Some(file))))
     });
@@ -16800,13 +16846,16 @@ pub(crate) fn file_alloc_units(
     ctx: &mut dyn NativeContext,
     path: &[u16],
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/io/File", 1)?;
+    let w = cratonvm_native_api::file_layout::alloc_width(ctx);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/io/File", w)?;
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh File (native stale-local family).
     let obj_pin = ctx.pin_native_root(obj);
     let s = ctx.create_string_from_units(path);
     let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_field(obj, 0, Value::Object(Some(s)));
+    let text = String::from_utf16_lossy(path);
+    cratonvm_native_api::file_layout::write(ctx, obj, s, &text);
     ctx.unpin_native_roots(obj_pin);
     Ok(obj)
 }
@@ -16892,13 +16941,15 @@ pub(crate) fn file_alloc(
     ctx: &mut dyn NativeContext,
     path: &str,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/io/File", 1)?;
+    let w = cratonvm_native_api::file_layout::alloc_width(ctx);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/io/File", w)?;
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh File (native stale-local family).
     let obj_pin = ctx.pin_native_root(obj);
     let s = ctx.create_string(path);
     let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_field(obj, 0, Value::Object(Some(s)));
+    cratonvm_native_api::file_layout::write(ctx, obj, s, path);
     ctx.unpin_native_roots(obj_pin);
     Ok(obj)
 }

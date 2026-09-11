@@ -168,6 +168,63 @@
 #   defect in getLayer, is recorded, and is NOT frozen by this row: the
 #   sweep is checked in and goes red when it is fixed or when this answer
 #   drifts. Nothing else on java/lang/Module moves; this is one triple.
+# amended: 2026-09-10, the Class.getName review. ONE row edited by hand,
+#   not re-measured: bridge -> intrinsic, kind_stated 0 -> 1.
+#
+#   Same clause and same shape as the getModule note above, with a worse
+#   failure mode. `Class.getName()` is not ACC_NATIVE -- its body is
+#   `String name = this.name; return name != null ? name : initClassName();`
+#   -- so a native in front of it is a 1.4 shadow by the letter. The
+#   letter's remedy cannot apply: `Class.name` is filled by a VM, and this
+#   VM's mirror is not laid out like the JDK's Class. The registration has
+#   said so since long before 1.4 existed: *"Override with native since
+#   JDK's Class field layout differs from our mirror layout."*
+#
+#   Yielding does NOT answer null here. It answers the INTERNAL form:
+#
+#     HotSpot   java.lang.Object   [Ljava.lang.String;   Object
+#     yielded   java/lang/Object   [Ljava/lang/String;   java/lang/Object
+#
+#   which is worse than null because nothing throws, and it propagates into
+#   every name comparison in the JDK. MEASURED: it is why
+#   ServiceLoader.checkCaller failed with "module java.base does not declare
+#   `uses`" -- descriptor.uses() holds java.nio.file.spi.FileSystemProvider
+#   and the lookup asked for java/nio/file/spi/FileSystemProvider.
+#
+#   The Intrinsic claim is earned by apps/probes/ClassNameSweep.java, 24
+#   rows against HotSpot 25.0.3+9: 0 diffs unarmed, 24 of 24 when yielded,
+#   2 after this tag. One tag repaired 22 rows because the JDK derives
+#   getTypeName / getCanonicalName / getSimpleName from getName. The
+#   survivor is Class.forName on a nested binary name, which is forName0
+#   declining at a dispatch door -- and forName0 IS ACC_NATIVE, so 1.5
+#   makes Bridge correct for it. Not frozen by this row.
+#
+#   `initClassName` stays BRIDGE deliberately: it is ACC_NATIVE in the
+#   image, so 1.5 governs it and not 1.4. Two adjacent registrations, two
+#   different clauses.
+# amended: 2026-09-10, lane L0's Class/Module wave. 56 rows edited by hand,
+#   not re-measured: bridge -> synthetic-stub, kind_stated 0 -> 1, at every
+#   ordinal, for the triples named in RETIRED_SHADOW_L0_TRIPLES in
+#   `native-api/src/retired_shadow.rs`.
+#
+#   The table has 54 triples and only 56 of them have a row here, because this
+#   census is `mode: compatible` over a boot-and-println workload and the rest
+#   are never registered in it. Expected, and NOT evidence the wave is smaller
+#   than it says -- the paired `dump_synthetic_stubs` run recorded above
+#   `BASELINE_SYNTHETIC_STUBS_MANAGEMENT` enumerates all 54.
+#
+#   Each row was earned per-ROW against HotSpot 25.0.3+9 by
+#   `apps/probes/L0ClassModuleSurface.java`: of its 129 rows, 96 answer
+#   identically whether the native runs or yields, and 4 are WRONG today and
+#   right when yielded -- including `Module.addExports` on `java.base`, which
+#   the native PERMITS and HotSpot refuses with `IllegalCallerException`. The
+#   29 rows where yielding breaks a correct answer are held back, and
+#   `the_l0_held_families_are_not_retired` pins them.
+#
+#   NOT in this wave and deliberately: `Class.getName` and `Class.getModule`
+#   are reviewed `Intrinsic`s a few lines below, which is the OPPOSITE
+#   treatment -- an Intrinsic keeps winning at every door, a retired triple
+#   stops being registered under --jdk-only at all.
 # amended: 2026-09-10, lane 5 (java.util.concurrent / Thread / Unsafe).
 #   101 rows edited by hand and ONE row added, not re-measured:
 #   bridge -> synthetic-stub, kind_stated 0 -> 1.
@@ -196,7 +253,38 @@
 #
 #   The measurement is in
 #   docs/internal/retired/lane-5-concurrent-thread-unsafe-RETIRED-20260910.md.
+# amended: 2026-09-11, lane L0 wave 2. TWENTY-ONE rows edited by hand for
+#   NINETEEN triples, not re-measured: bridge -> synthetic-stub.
+#
+#   Derived by the same rule as the two amendments below: the retag in
+#   NativeMethodRegistry::register fires on (effective category Bridge +
+#   triple_is_retired_shadow) and lands on SyntheticStub.
+#
+#   21-for-19 is the SAME units gap L0's withdrawn 54-row amendment had at
+#   56-for-54, and it is two of the same triples:
+#   ModuleDescriptor$Version.equals and .hashCode are each registered at two
+#   ordinals, and the key here is (class, name, descriptor, ORDINAL), so the
+#   retag flips both. Verified three ways rather than asserted -- the stub
+#   ratchet moved +21 in all three configurations, and dump_synthetic_stubs
+#   lists all 19 triples as SyntheticStub.
+#
+#   These 19 are what came BACK after the 54 were withdrawn whole: the rows
+#   that none of the five failing corpus vectors dispatches. The attribution
+#   is in docs/known-issues/jdk-only-lanes/lane-0-integration-and-gates.md 7.2.
 # class	name	descriptor	ordinal	kind	kind_stated	kind_chosen
+# 2026-09-10, lane L3 wave 1: 24 rows bridge -> synthetic-stub, being
+# RETIRED_SHADOW_L3_TRIPLES. 24 triples, 24 rows, one ordinal apiece -- unlike
+# lane L0's amendment immediately before it, which touched 56 rows for 54
+# triples because two ModuleDescriptor$Version triples are registered twice.
+# Since the key here is (class, name, descriptor, ORDINAL), that difference is
+# visible in this file and nowhere else, so it is stated rather than left for a
+# reader to rediscover: L3's numbers agree because its registrations are 1:1.
+# The rows are core reflection's metadata accessors on Field, Method and
+# Constructor plus three MethodType accessors, measured per row against HotSpot
+# 25.0.3+9 with apps/probes/L3ReflectInvokeSurface.java (254 rows). The 218
+# rows of lane 3's population NOT amended here each have a recorded reason --
+# 88 held, 24 wrong both ways, 92 never dispatched, 12 agreeing only at a
+# default value -- see RETIRED_SHADOW_L3_TRIPLES' doc comment.
 CratonVM$HttpServerLoop	run	()V	0	bridge	0	1
 brave/internal/collect/WeakConcurrentMap$WeakKey	equals	(Ljava/lang/Object;)Z	0	bridge	0	1
 com/carrotsearch/randomizedtesting/RandomizedContext	context	(Ljava/lang/Thread;)Lcom/carrotsearch/randomizedtesting/RandomizedContext;	0	bridge	0	1
@@ -1273,60 +1361,60 @@ java/io/ByteArrayInputStream	read	([BII)I	1	bridge	0	1
 java/io/ByteArrayInputStream	reset	()V	0	bridge	0	1
 java/io/ByteArrayInputStream	skip	(J)J	0	bridge	0	1
 java/io/ByteArrayInputStream	skip	(J)J	1	bridge	0	1
-java/io/ByteArrayOutputStream	<init>	()V	0	bridge	0	1
-java/io/ByteArrayOutputStream	<init>	(I)V	0	bridge	0	1
-java/io/ByteArrayOutputStream	close	()V	0	bridge	0	1
-java/io/ByteArrayOutputStream	flush	()V	0	bridge	0	1
-java/io/ByteArrayOutputStream	reset	()V	0	bridge	0	1
-java/io/ByteArrayOutputStream	size	()I	0	bridge	0	1
-java/io/ByteArrayOutputStream	toByteArray	()[B	0	bridge	0	1
-java/io/ByteArrayOutputStream	toString	()Ljava/lang/String;	0	bridge	0	1
-java/io/ByteArrayOutputStream	toString	(Ljava/lang/String;)Ljava/lang/String;	0	bridge	0	1
-java/io/ByteArrayOutputStream	toString	(Ljava/nio/charset/Charset;)Ljava/lang/String;	0	bridge	0	1
-java/io/ByteArrayOutputStream	write	(I)V	0	bridge	0	1
-java/io/ByteArrayOutputStream	write	([B)V	0	bridge	0	1
-java/io/ByteArrayOutputStream	write	([BII)V	0	bridge	0	1
+java/io/ByteArrayOutputStream	<init>	()V	0	synthetic-stub	1	1
+java/io/ByteArrayOutputStream	<init>	(I)V	0	synthetic-stub	1	1
+java/io/ByteArrayOutputStream	close	()V	0	synthetic-stub	1	1
+java/io/ByteArrayOutputStream	flush	()V	0	synthetic-stub	1	1
+java/io/ByteArrayOutputStream	reset	()V	0	synthetic-stub	1	1
+java/io/ByteArrayOutputStream	size	()I	0	synthetic-stub	1	1
+java/io/ByteArrayOutputStream	toByteArray	()[B	0	synthetic-stub	1	1
+java/io/ByteArrayOutputStream	toString	()Ljava/lang/String;	0	synthetic-stub	1	1
+java/io/ByteArrayOutputStream	toString	(Ljava/lang/String;)Ljava/lang/String;	0	synthetic-stub	1	1
+java/io/ByteArrayOutputStream	toString	(Ljava/nio/charset/Charset;)Ljava/lang/String;	0	synthetic-stub	1	1
+java/io/ByteArrayOutputStream	write	(I)V	0	synthetic-stub	1	1
+java/io/ByteArrayOutputStream	write	([B)V	0	synthetic-stub	1	1
+java/io/ByteArrayOutputStream	write	([BII)V	0	synthetic-stub	1	1
 java/io/Closeable	close	()V	0	bridge	0	1
 java/io/Console	ttyStatus	()I	0	bridge	1	1
 java/io/Console$1	charset	()Ljava/nio/charset/Charset;	0	bridge	0	1
 java/io/Console$1	console	()Ljava/io/Console;	0	bridge	0	1
 java/io/DataInput	readInt	()I	0	bridge	0	1
 java/io/DataInput	readLong	()J	0	bridge	0	1
-java/io/DataInputStream	available	()I	0	bridge	0	1
-java/io/DataInputStream	close	()V	0	bridge	0	1
-java/io/DataInputStream	read	()I	0	bridge	0	1
-java/io/DataInputStream	read	([BII)I	0	bridge	0	1
-java/io/DataInputStream	readBoolean	()Z	0	bridge	0	1
-java/io/DataInputStream	readByte	()B	0	bridge	0	1
-java/io/DataInputStream	readChar	()C	0	bridge	0	1
-java/io/DataInputStream	readDouble	()D	0	bridge	0	1
-java/io/DataInputStream	readFloat	()F	0	bridge	0	1
-java/io/DataInputStream	readFully	([B)V	0	bridge	0	1
-java/io/DataInputStream	readFully	([BII)V	0	bridge	0	1
-java/io/DataInputStream	readInt	()I	0	bridge	0	1
-java/io/DataInputStream	readLong	()J	0	bridge	0	1
-java/io/DataInputStream	readShort	()S	0	bridge	0	1
-java/io/DataInputStream	readUTF	()Ljava/lang/String;	0	bridge	0	1
-java/io/DataInputStream	readUnsignedByte	()I	0	bridge	0	1
-java/io/DataInputStream	readUnsignedShort	()I	0	bridge	0	1
-java/io/DataInputStream	skipBytes	(I)I	0	bridge	0	1
+java/io/DataInputStream	available	()I	0	synthetic-stub	1	1
+java/io/DataInputStream	close	()V	0	synthetic-stub	1	1
+java/io/DataInputStream	read	()I	0	synthetic-stub	1	1
+java/io/DataInputStream	read	([BII)I	0	synthetic-stub	1	1
+java/io/DataInputStream	readBoolean	()Z	0	synthetic-stub	1	1
+java/io/DataInputStream	readByte	()B	0	synthetic-stub	1	1
+java/io/DataInputStream	readChar	()C	0	synthetic-stub	1	1
+java/io/DataInputStream	readDouble	()D	0	synthetic-stub	1	1
+java/io/DataInputStream	readFloat	()F	0	synthetic-stub	1	1
+java/io/DataInputStream	readFully	([B)V	0	synthetic-stub	1	1
+java/io/DataInputStream	readFully	([BII)V	0	synthetic-stub	1	1
+java/io/DataInputStream	readInt	()I	0	synthetic-stub	1	1
+java/io/DataInputStream	readLong	()J	0	synthetic-stub	1	1
+java/io/DataInputStream	readShort	()S	0	synthetic-stub	1	1
+java/io/DataInputStream	readUTF	()Ljava/lang/String;	0	synthetic-stub	1	1
+java/io/DataInputStream	readUnsignedByte	()I	0	synthetic-stub	1	1
+java/io/DataInputStream	readUnsignedShort	()I	0	synthetic-stub	1	1
+java/io/DataInputStream	skipBytes	(I)I	0	synthetic-stub	1	1
 java/io/DataOutput	writeInt	(I)V	0	bridge	0	1
 java/io/DataOutput	writeLong	(J)V	0	bridge	0	1
-java/io/DataOutputStream	<init>	(Ljava/io/OutputStream;)V	0	bridge	0	1
-java/io/DataOutputStream	close	()V	0	bridge	0	1
-java/io/DataOutputStream	flush	()V	0	bridge	0	1
-java/io/DataOutputStream	size	()I	0	bridge	0	1
-java/io/DataOutputStream	write	(I)V	0	bridge	0	1
-java/io/DataOutputStream	write	([BII)V	0	bridge	0	1
-java/io/DataOutputStream	writeBoolean	(Z)V	0	bridge	0	1
-java/io/DataOutputStream	writeByte	(I)V	0	bridge	0	1
-java/io/DataOutputStream	writeChar	(I)V	0	bridge	0	1
-java/io/DataOutputStream	writeDouble	(D)V	0	bridge	0	1
-java/io/DataOutputStream	writeFloat	(F)V	0	bridge	0	1
-java/io/DataOutputStream	writeInt	(I)V	0	bridge	0	1
-java/io/DataOutputStream	writeLong	(J)V	0	bridge	0	1
-java/io/DataOutputStream	writeShort	(I)V	0	bridge	0	1
-java/io/DataOutputStream	writeUTF	(Ljava/lang/String;)V	0	bridge	0	1
+java/io/DataOutputStream	<init>	(Ljava/io/OutputStream;)V	0	synthetic-stub	1	1
+java/io/DataOutputStream	close	()V	0	synthetic-stub	1	1
+java/io/DataOutputStream	flush	()V	0	synthetic-stub	1	1
+java/io/DataOutputStream	size	()I	0	synthetic-stub	1	1
+java/io/DataOutputStream	write	(I)V	0	synthetic-stub	1	1
+java/io/DataOutputStream	write	([BII)V	0	synthetic-stub	1	1
+java/io/DataOutputStream	writeBoolean	(Z)V	0	synthetic-stub	1	1
+java/io/DataOutputStream	writeByte	(I)V	0	synthetic-stub	1	1
+java/io/DataOutputStream	writeChar	(I)V	0	synthetic-stub	1	1
+java/io/DataOutputStream	writeDouble	(D)V	0	synthetic-stub	1	1
+java/io/DataOutputStream	writeFloat	(F)V	0	synthetic-stub	1	1
+java/io/DataOutputStream	writeInt	(I)V	0	synthetic-stub	1	1
+java/io/DataOutputStream	writeLong	(J)V	0	synthetic-stub	1	1
+java/io/DataOutputStream	writeShort	(I)V	0	synthetic-stub	1	1
+java/io/DataOutputStream	writeUTF	(Ljava/lang/String;)V	0	synthetic-stub	1	1
 java/io/EOFException	<init>	()V	0	bridge	0	1
 java/io/EOFException	<init>	()V	1	bridge	0	1
 java/io/EOFException	<init>	(Ljava/lang/String;)V	0	bridge	0	1
@@ -1350,83 +1438,83 @@ java/io/EOFException	setStackTrace	([Ljava/lang/StackTraceElement;)V	0	bridge	0	
 java/io/EOFException	toString	()Ljava/lang/String;	0	bridge	0	1
 java/io/EOFException	toString	()Ljava/lang/String;	1	bridge	0	1
 java/io/File	<clinit>	()V	0	bridge	0	1
-java/io/File	<init>	(Ljava/io/File;Ljava/lang/String;)V	0	bridge	0	1
-java/io/File	<init>	(Ljava/io/File;Ljava/lang/String;)V	1	bridge	0	1
-java/io/File	<init>	(Ljava/lang/String;)V	0	bridge	0	1
-java/io/File	<init>	(Ljava/lang/String;)V	1	bridge	0	1
-java/io/File	<init>	(Ljava/lang/String;Ljava/lang/String;)V	0	bridge	0	1
-java/io/File	<init>	(Ljava/lang/String;Ljava/lang/String;)V	1	bridge	0	1
-java/io/File	<init>	(Ljava/net/URI;)V	0	bridge	0	1
-java/io/File	canExecute	()Z	0	bridge	0	1
-java/io/File	canRead	()Z	0	bridge	0	1
-java/io/File	canRead	()Z	1	bridge	0	1
-java/io/File	canWrite	()Z	0	bridge	0	1
-java/io/File	canWrite	()Z	1	bridge	0	1
-java/io/File	compareTo	(Ljava/io/File;)I	0	bridge	0	1
-java/io/File	createNewFile	()Z	0	bridge	0	1
-java/io/File	createNewFile	()Z	1	bridge	0	1
+java/io/File	<init>	(Ljava/io/File;Ljava/lang/String;)V	0	synthetic-stub	1	1
+java/io/File	<init>	(Ljava/io/File;Ljava/lang/String;)V	1	synthetic-stub	1	1
+java/io/File	<init>	(Ljava/lang/String;)V	0	synthetic-stub	1	1
+java/io/File	<init>	(Ljava/lang/String;)V	1	synthetic-stub	1	1
+java/io/File	<init>	(Ljava/lang/String;Ljava/lang/String;)V	0	synthetic-stub	1	1
+java/io/File	<init>	(Ljava/lang/String;Ljava/lang/String;)V	1	synthetic-stub	1	1
+java/io/File	<init>	(Ljava/net/URI;)V	0	synthetic-stub	1	1
+java/io/File	canExecute	()Z	0	synthetic-stub	1	1
+java/io/File	canRead	()Z	0	synthetic-stub	1	1
+java/io/File	canRead	()Z	1	synthetic-stub	1	1
+java/io/File	canWrite	()Z	0	synthetic-stub	1	1
+java/io/File	canWrite	()Z	1	synthetic-stub	1	1
+java/io/File	compareTo	(Ljava/io/File;)I	0	synthetic-stub	1	1
+java/io/File	createNewFile	()Z	0	synthetic-stub	1	1
+java/io/File	createNewFile	()Z	1	synthetic-stub	1	1
 java/io/File	createTempFile	(Ljava/lang/String;Ljava/lang/String;)Ljava/io/File;	0	bridge	0	1
-java/io/File	createTempFile	(Ljava/lang/String;Ljava/lang/String;Ljava/io/File;)Ljava/io/File;	0	bridge	0	1
-java/io/File	delete	()Z	0	bridge	0	1
-java/io/File	delete	()Z	1	bridge	0	1
+java/io/File	createTempFile	(Ljava/lang/String;Ljava/lang/String;Ljava/io/File;)Ljava/io/File;	0	synthetic-stub	1	1
+java/io/File	delete	()Z	0	synthetic-stub	1	1
+java/io/File	delete	()Z	1	synthetic-stub	1	1
 java/io/File	deleteOnExit	()V	0	bridge	0	1
-java/io/File	equals	(Ljava/lang/Object;)Z	0	bridge	0	1
-java/io/File	exists	()Z	0	bridge	0	1
-java/io/File	exists	()Z	1	bridge	0	1
-java/io/File	getAbsoluteFile	()Ljava/io/File;	0	bridge	0	1
-java/io/File	getAbsolutePath	()Ljava/lang/String;	0	bridge	0	1
-java/io/File	getAbsolutePath	()Ljava/lang/String;	1	bridge	0	1
-java/io/File	getCanonicalFile	()Ljava/io/File;	0	bridge	0	1
-java/io/File	getCanonicalPath	()Ljava/lang/String;	0	bridge	0	1
-java/io/File	getFreeSpace	()J	0	bridge	0	1
-java/io/File	getName	()Ljava/lang/String;	0	bridge	0	1
-java/io/File	getName	()Ljava/lang/String;	1	bridge	0	1
-java/io/File	getParent	()Ljava/lang/String;	0	bridge	0	1
-java/io/File	getParent	()Ljava/lang/String;	1	bridge	0	1
-java/io/File	getParentFile	()Ljava/io/File;	0	bridge	0	1
-java/io/File	getPath	()Ljava/lang/String;	0	bridge	0	1
-java/io/File	getPath	()Ljava/lang/String;	1	bridge	0	1
-java/io/File	getTotalSpace	()J	0	bridge	0	1
-java/io/File	getUsableSpace	()J	0	bridge	0	1
-java/io/File	hashCode	()I	0	bridge	0	1
-java/io/File	isAbsolute	()Z	0	bridge	0	1
-java/io/File	isDirectory	()Z	0	bridge	0	1
-java/io/File	isDirectory	()Z	1	bridge	0	1
-java/io/File	isFile	()Z	0	bridge	0	1
-java/io/File	isFile	()Z	1	bridge	0	1
-java/io/File	isHidden	()Z	0	bridge	0	1
-java/io/File	lastModified	()J	0	bridge	0	1
-java/io/File	length	()J	0	bridge	0	1
-java/io/File	length	()J	1	bridge	0	1
-java/io/File	list	()[Ljava/lang/String;	0	bridge	0	1
-java/io/File	list	()[Ljava/lang/String;	1	bridge	0	1
-java/io/File	list	(Ljava/io/FilenameFilter;)[Ljava/lang/String;	0	bridge	0	1
-java/io/File	listFiles	()[Ljava/io/File;	0	bridge	0	1
-java/io/File	listFiles	(Ljava/io/FileFilter;)[Ljava/io/File;	0	bridge	0	1
-java/io/File	listFiles	(Ljava/io/FilenameFilter;)[Ljava/io/File;	0	bridge	0	1
-java/io/File	listRoots	()[Ljava/io/File;	0	bridge	0	1
-java/io/File	mkdir	()Z	0	bridge	0	1
-java/io/File	mkdir	()Z	1	bridge	0	1
-java/io/File	mkdirs	()Z	0	bridge	0	1
-java/io/File	mkdirs	()Z	1	bridge	0	1
+java/io/File	equals	(Ljava/lang/Object;)Z	0	synthetic-stub	1	1
+java/io/File	exists	()Z	0	synthetic-stub	1	1
+java/io/File	exists	()Z	1	synthetic-stub	1	1
+java/io/File	getAbsoluteFile	()Ljava/io/File;	0	synthetic-stub	1	1
+java/io/File	getAbsolutePath	()Ljava/lang/String;	0	synthetic-stub	1	1
+java/io/File	getAbsolutePath	()Ljava/lang/String;	1	synthetic-stub	1	1
+java/io/File	getCanonicalFile	()Ljava/io/File;	0	synthetic-stub	1	1
+java/io/File	getCanonicalPath	()Ljava/lang/String;	0	synthetic-stub	1	1
+java/io/File	getFreeSpace	()J	0	synthetic-stub	1	1
+java/io/File	getName	()Ljava/lang/String;	0	synthetic-stub	1	1
+java/io/File	getName	()Ljava/lang/String;	1	synthetic-stub	1	1
+java/io/File	getParent	()Ljava/lang/String;	0	synthetic-stub	1	1
+java/io/File	getParent	()Ljava/lang/String;	1	synthetic-stub	1	1
+java/io/File	getParentFile	()Ljava/io/File;	0	synthetic-stub	1	1
+java/io/File	getPath	()Ljava/lang/String;	0	synthetic-stub	1	1
+java/io/File	getPath	()Ljava/lang/String;	1	synthetic-stub	1	1
+java/io/File	getTotalSpace	()J	0	synthetic-stub	1	1
+java/io/File	getUsableSpace	()J	0	synthetic-stub	1	1
+java/io/File	hashCode	()I	0	synthetic-stub	1	1
+java/io/File	isAbsolute	()Z	0	synthetic-stub	1	1
+java/io/File	isDirectory	()Z	0	synthetic-stub	1	1
+java/io/File	isDirectory	()Z	1	synthetic-stub	1	1
+java/io/File	isFile	()Z	0	synthetic-stub	1	1
+java/io/File	isFile	()Z	1	synthetic-stub	1	1
+java/io/File	isHidden	()Z	0	synthetic-stub	1	1
+java/io/File	lastModified	()J	0	synthetic-stub	1	1
+java/io/File	length	()J	0	synthetic-stub	1	1
+java/io/File	length	()J	1	synthetic-stub	1	1
+java/io/File	list	()[Ljava/lang/String;	0	synthetic-stub	1	1
+java/io/File	list	()[Ljava/lang/String;	1	synthetic-stub	1	1
+java/io/File	list	(Ljava/io/FilenameFilter;)[Ljava/lang/String;	0	synthetic-stub	1	1
+java/io/File	listFiles	()[Ljava/io/File;	0	synthetic-stub	1	1
+java/io/File	listFiles	(Ljava/io/FileFilter;)[Ljava/io/File;	0	synthetic-stub	1	1
+java/io/File	listFiles	(Ljava/io/FilenameFilter;)[Ljava/io/File;	0	synthetic-stub	1	1
+java/io/File	listRoots	()[Ljava/io/File;	0	synthetic-stub	1	1
+java/io/File	mkdir	()Z	0	synthetic-stub	1	1
+java/io/File	mkdir	()Z	1	synthetic-stub	1	1
+java/io/File	mkdirs	()Z	0	synthetic-stub	1	1
+java/io/File	mkdirs	()Z	1	synthetic-stub	1	1
 java/io/File	pathSeparator	Ljava/lang/String;	0	bridge	0	1
 java/io/File	pathSeparatorChar	C	0	bridge	0	1
-java/io/File	renameTo	(Ljava/io/File;)Z	0	bridge	0	1
-java/io/File	renameTo	(Ljava/io/File;)Z	1	bridge	0	1
+java/io/File	renameTo	(Ljava/io/File;)Z	0	synthetic-stub	1	1
+java/io/File	renameTo	(Ljava/io/File;)Z	1	synthetic-stub	1	1
 java/io/File	separator	Ljava/lang/String;	0	bridge	0	1
 java/io/File	separatorChar	C	0	bridge	0	1
-java/io/File	setExecutable	(Z)Z	0	bridge	0	1
-java/io/File	setExecutable	(ZZ)Z	0	bridge	0	1
-java/io/File	setLastModified	(J)Z	0	bridge	0	1
-java/io/File	setReadOnly	()Z	0	bridge	0	1
-java/io/File	setReadable	(Z)Z	0	bridge	0	1
-java/io/File	setReadable	(ZZ)Z	0	bridge	0	1
-java/io/File	setWritable	(Z)Z	0	bridge	0	1
-java/io/File	setWritable	(ZZ)Z	0	bridge	0	1
-java/io/File	toPath	()Ljava/nio/file/Path;	0	bridge	0	1
-java/io/File	toPath	()Ljava/nio/file/Path;	1	bridge	0	1
-java/io/File	toString	()Ljava/lang/String;	0	bridge	0	1
-java/io/File	toURI	()Ljava/net/URI;	0	bridge	0	1
+java/io/File	setExecutable	(Z)Z	0	synthetic-stub	1	1
+java/io/File	setExecutable	(ZZ)Z	0	synthetic-stub	1	1
+java/io/File	setLastModified	(J)Z	0	synthetic-stub	1	1
+java/io/File	setReadOnly	()Z	0	synthetic-stub	1	1
+java/io/File	setReadable	(Z)Z	0	synthetic-stub	1	1
+java/io/File	setReadable	(ZZ)Z	0	synthetic-stub	1	1
+java/io/File	setWritable	(Z)Z	0	synthetic-stub	1	1
+java/io/File	setWritable	(ZZ)Z	0	synthetic-stub	1	1
+java/io/File	toPath	()Ljava/nio/file/Path;	0	synthetic-stub	1	1
+java/io/File	toPath	()Ljava/nio/file/Path;	1	synthetic-stub	1	1
+java/io/File	toString	()Ljava/lang/String;	0	synthetic-stub	1	1
+java/io/File	toURI	()Ljava/net/URI;	0	synthetic-stub	1	1
 java/io/FileCleanable	cleanupClose0	(IJ)V	0	bridge	1	1
 java/io/FileCleanable	register	(Ljava/io/FileDescriptor;)V	0	bridge	0	1
 java/io/FileDescriptor	<init>	()V	0	bridge	0	1
@@ -1504,12 +1592,12 @@ java/io/FileOutputStream	writeBytes	([BIIZ)V	0	bridge	1	1
 java/io/FilterInputStream	<init>	(Ljava/io/InputStream;)V	0	bridge	0	1
 java/io/FilterInputStream	skip	(J)J	0	bridge	0	1
 java/io/FilterOutputStream	<init>	(Ljava/io/OutputStream;)V	0	synthetic-stub	1	1
-java/io/FilterOutputStream	close	()V	0	bridge	0	1
-java/io/FilterOutputStream	close	()V	1	bridge	0	1
-java/io/FilterOutputStream	flush	()V	0	bridge	0	1
-java/io/FilterOutputStream	write	(I)V	0	bridge	0	1
-java/io/FilterOutputStream	write	([B)V	0	bridge	0	1
-java/io/FilterOutputStream	write	([BII)V	0	bridge	0	1
+java/io/FilterOutputStream	close	()V	0	synthetic-stub	1	1
+java/io/FilterOutputStream	close	()V	1	synthetic-stub	1	1
+java/io/FilterOutputStream	flush	()V	0	synthetic-stub	1	1
+java/io/FilterOutputStream	write	(I)V	0	synthetic-stub	1	1
+java/io/FilterOutputStream	write	([B)V	0	synthetic-stub	1	1
+java/io/FilterOutputStream	write	([BII)V	0	synthetic-stub	1	1
 java/io/IOException	<init>	()V	0	bridge	0	1
 java/io/IOException	<init>	()V	1	bridge	0	1
 java/io/IOException	<init>	(Ljava/lang/String;)V	0	bridge	0	1
@@ -1975,67 +2063,67 @@ java/lang/Character	toUpperCase	(C)C	1	bridge	0	1
 java/lang/Character	toUpperCase	(I)I	0	intrinsic	0	1
 java/lang/Character	toUpperCase	(I)I	1	bridge	0	1
 java/lang/Character	valueOf	(C)Ljava/lang/Character;	0	intrinsic	0	1
-java/lang/Class	arrayType	()Ljava/lang/Class;	0	bridge	0	1
-java/lang/Class	asSubclass	(Ljava/lang/Class;)Ljava/lang/Class;	0	bridge	0	1
-java/lang/Class	cast	(Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
-java/lang/Class	componentType	()Ljava/lang/Class;	0	bridge	0	1
+java/lang/Class	arrayType	()Ljava/lang/Class;	0	bridge	1	1
+java/lang/Class	asSubclass	(Ljava/lang/Class;)Ljava/lang/Class;	0	synthetic-stub	1	1
+java/lang/Class	cast	(Ljava/lang/Object;)Ljava/lang/Object;	0	synthetic-stub	1	1
+java/lang/Class	componentType	()Ljava/lang/Class;	0	bridge	1	1
 java/lang/Class	descriptorString	()Ljava/lang/String;	0	bridge	0	1
-java/lang/Class	desiredAssertionStatus	()Z	0	bridge	0	1
+java/lang/Class	desiredAssertionStatus	()Z	0	bridge	1	1
 java/lang/Class	desiredAssertionStatus0	(Ljava/lang/Class;)Z	0	bridge	1	1
-java/lang/Class	forName	(Ljava/lang/Module;Ljava/lang/String;)Ljava/lang/Class;	0	bridge	0	1
-java/lang/Class	forName	(Ljava/lang/String;)Ljava/lang/Class;	0	bridge	0	1
-java/lang/Class	forName	(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;	0	bridge	0	1
+java/lang/Class	forName	(Ljava/lang/Module;Ljava/lang/String;)Ljava/lang/Class;	0	bridge	1	1
+java/lang/Class	forName	(Ljava/lang/String;)Ljava/lang/Class;	0	bridge	1	1
+java/lang/Class	forName	(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;	0	bridge	1	1
 java/lang/Class	forName0	(Ljava/lang/String;ZLjava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/Class;	0	bridge	1	1
 java/lang/Class	forPrimitiveName	(Ljava/lang/String;)Ljava/lang/Class;	0	bridge	0	1
-java/lang/Class	getAnnotatedInterfaces	()[Ljava/lang/reflect/AnnotatedType;	0	bridge	0	1
-java/lang/Class	getAnnotatedSuperclass	()Ljava/lang/reflect/AnnotatedType;	0	bridge	0	1
+java/lang/Class	getAnnotatedInterfaces	()[Ljava/lang/reflect/AnnotatedType;	0	bridge	1	1
+java/lang/Class	getAnnotatedSuperclass	()Ljava/lang/reflect/AnnotatedType;	0	bridge	1	1
 java/lang/Class	getAnnotation	(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;	0	bridge	0	1
 java/lang/Class	getAnnotations	()[Ljava/lang/annotation/Annotation;	0	bridge	0	1
 java/lang/Class	getAnnotationsByType	(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;	0	bridge	0	1
-java/lang/Class	getCanonicalName	()Ljava/lang/String;	0	bridge	0	1
+java/lang/Class	getCanonicalName	()Ljava/lang/String;	0	bridge	1	1
 java/lang/Class	getClassAccessFlagsRaw0	()I	0	bridge	1	1
 java/lang/Class	getClassFileVersion0	()I	0	bridge	1	1
-java/lang/Class	getClassLoader	()Ljava/lang/ClassLoader;	0	bridge	0	1
+java/lang/Class	getClassLoader	()Ljava/lang/ClassLoader;	0	bridge	1	1
 java/lang/Class	getClassLoader0	()Ljava/lang/ClassLoader;	0	bridge	0	1
 java/lang/Class	getComponentType	()Ljava/lang/Class;	0	bridge	0	1
 java/lang/Class	getConstantPool	()Ljdk/internal/reflect/ConstantPool;	0	bridge	1	1
-java/lang/Class	getConstructor	([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;	0	bridge	0	1
-java/lang/Class	getConstructors	()[Ljava/lang/reflect/Constructor;	0	bridge	0	1
+java/lang/Class	getConstructor	([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;	0	bridge	1	1
+java/lang/Class	getConstructors	()[Ljava/lang/reflect/Constructor;	0	synthetic-stub	1	1
 java/lang/Class	getDeclaredAnnotation	(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;	0	bridge	0	1
 java/lang/Class	getDeclaredAnnotations	()[Ljava/lang/annotation/Annotation;	0	bridge	0	1
 java/lang/Class	getDeclaredAnnotationsByType	(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;	0	bridge	0	1
 java/lang/Class	getDeclaredClasses0	()[Ljava/lang/Class;	0	bridge	1	1
-java/lang/Class	getDeclaredConstructor	([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;	0	bridge	0	1
-java/lang/Class	getDeclaredConstructors	()[Ljava/lang/reflect/Constructor;	0	bridge	0	1
+java/lang/Class	getDeclaredConstructor	([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;	0	bridge	1	1
+java/lang/Class	getDeclaredConstructors	()[Ljava/lang/reflect/Constructor;	0	synthetic-stub	1	1
 java/lang/Class	getDeclaredConstructors0	(Z)[Ljava/lang/reflect/Constructor;	0	bridge	1	1
-java/lang/Class	getDeclaredField	(Ljava/lang/String;)Ljava/lang/reflect/Field;	0	bridge	0	1
-java/lang/Class	getDeclaredFields	()[Ljava/lang/reflect/Field;	0	bridge	0	1
+java/lang/Class	getDeclaredField	(Ljava/lang/String;)Ljava/lang/reflect/Field;	0	bridge	1	1
+java/lang/Class	getDeclaredFields	()[Ljava/lang/reflect/Field;	0	bridge	1	1
 java/lang/Class	getDeclaredFields0	(Z)[Ljava/lang/reflect/Field;	0	bridge	1	1
-java/lang/Class	getDeclaredMethod	(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;	0	bridge	0	1
-java/lang/Class	getDeclaredMethods	()[Ljava/lang/reflect/Method;	0	bridge	0	1
+java/lang/Class	getDeclaredMethod	(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;	0	synthetic-stub	1	1
+java/lang/Class	getDeclaredMethods	()[Ljava/lang/reflect/Method;	0	synthetic-stub	1	1
 java/lang/Class	getDeclaredMethods0	(Z)[Ljava/lang/reflect/Method;	0	bridge	1	1
 java/lang/Class	getDeclaringClass0	()Ljava/lang/Class;	0	bridge	1	1
-java/lang/Class	getEnclosingClass	()Ljava/lang/Class;	0	bridge	0	1
-java/lang/Class	getEnclosingConstructor	()Ljava/lang/reflect/Constructor;	0	bridge	0	1
-java/lang/Class	getEnclosingMethod	()Ljava/lang/reflect/Method;	0	bridge	0	1
+java/lang/Class	getEnclosingClass	()Ljava/lang/Class;	0	synthetic-stub	1	1
+java/lang/Class	getEnclosingConstructor	()Ljava/lang/reflect/Constructor;	0	synthetic-stub	1	1
+java/lang/Class	getEnclosingMethod	()Ljava/lang/reflect/Method;	0	synthetic-stub	1	1
 java/lang/Class	getEnclosingMethod0	()[Ljava/lang/Object;	0	bridge	1	1
-java/lang/Class	getEnumConstants	()[Ljava/lang/Object;	0	bridge	0	1
+java/lang/Class	getEnumConstants	()[Ljava/lang/Object;	0	synthetic-stub	1	1
 java/lang/Class	getEnumConstantsShared	()[Ljava/lang/Object;	0	bridge	0	1
-java/lang/Class	getField	(Ljava/lang/String;)Ljava/lang/reflect/Field;	0	bridge	0	1
-java/lang/Class	getFields	()[Ljava/lang/reflect/Field;	0	bridge	0	1
-java/lang/Class	getGenericInterfaces	()[Ljava/lang/reflect/Type;	0	bridge	0	1
+java/lang/Class	getField	(Ljava/lang/String;)Ljava/lang/reflect/Field;	0	bridge	1	1
+java/lang/Class	getFields	()[Ljava/lang/reflect/Field;	0	bridge	1	1
+java/lang/Class	getGenericInterfaces	()[Ljava/lang/reflect/Type;	0	bridge	1	1
 java/lang/Class	getGenericSignature0	()Ljava/lang/String;	0	bridge	1	1
-java/lang/Class	getGenericSuperclass	()Ljava/lang/reflect/Type;	0	bridge	0	1
+java/lang/Class	getGenericSuperclass	()Ljava/lang/reflect/Type;	0	bridge	1	1
 java/lang/Class	getInterfaces0	()[Ljava/lang/Class;	0	bridge	1	1
-java/lang/Class	getMethod	(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;	0	bridge	0	1
-java/lang/Class	getMethods	()[Ljava/lang/reflect/Method;	0	bridge	0	1
+java/lang/Class	getMethod	(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;	0	bridge	1	1
+java/lang/Class	getMethods	()[Ljava/lang/reflect/Method;	0	synthetic-stub	1	1
 java/lang/Class	getModifiers	()I	0	bridge	0	1
 java/lang/Class	getModule	()Ljava/lang/Module;	0	intrinsic	1	1
 java/lang/Class	getName	()Ljava/lang/String;	0	intrinsic	1	1
 java/lang/Class	getNestHost0	()Ljava/lang/Class;	0	bridge	1	1
 java/lang/Class	getNestMembers0	()[Ljava/lang/Class;	0	bridge	1	1
 java/lang/Class	getPackage	()Ljava/lang/Package;	0	bridge	0	1
-java/lang/Class	getPackageName	()Ljava/lang/String;	0	bridge	0	1
+java/lang/Class	getPackageName	()Ljava/lang/String;	0	bridge	1	1
 java/lang/Class	getPermittedSubclasses0	()[Ljava/lang/Class;	0	bridge	1	1
 java/lang/Class	getPrimitiveClass	(Ljava/lang/String;)Ljava/lang/Class;	0	bridge	1	1
 java/lang/Class	getProtectionDomain	()Ljava/security/ProtectionDomain;	0	bridge	0	1
@@ -2049,23 +2137,23 @@ java/lang/Class	getResource	(Ljava/lang/String;)Ljava/net/URL;	0	bridge	0	1
 java/lang/Class	getResource	(Ljava/lang/String;)Ljava/net/URL;	1	bridge	0	1
 java/lang/Class	getResourceAsStream	(Ljava/lang/String;)Ljava/io/InputStream;	0	bridge	0	1
 java/lang/Class	getResourceAsStream	(Ljava/lang/String;)Ljava/io/InputStream;	1	bridge	0	1
-java/lang/Class	getSigners	()[Ljava/lang/Object;	0	bridge	0	1
+java/lang/Class	getSigners	()[Ljava/lang/Object;	0	synthetic-stub	1	1
 java/lang/Class	getSimpleBinaryName0	()Ljava/lang/String;	0	bridge	1	1
-java/lang/Class	getSimpleName	()Ljava/lang/String;	0	bridge	0	1
+java/lang/Class	getSimpleName	()Ljava/lang/String;	0	bridge	1	1
 java/lang/Class	getSuperclass	()Ljava/lang/Class;	0	bridge	1	1
-java/lang/Class	getTypeName	()Ljava/lang/String;	0	bridge	0	1
-java/lang/Class	getTypeParameters	()[Ljava/lang/reflect/TypeVariable;	0	bridge	0	1
+java/lang/Class	getTypeName	()Ljava/lang/String;	0	bridge	1	1
+java/lang/Class	getTypeParameters	()[Ljava/lang/reflect/TypeVariable;	0	synthetic-stub	1	1
 java/lang/Class	hasRealParameterData	()Z	0	bridge	0	1
 java/lang/Class	initClassName	()Ljava/lang/String;	0	bridge	1	1
-java/lang/Class	isAnnotation	()Z	0	bridge	0	1
+java/lang/Class	isAnnotation	()Z	0	synthetic-stub	1	1
 java/lang/Class	isAnnotationPresent	(Ljava/lang/Class;)Z	0	bridge	0	1
-java/lang/Class	isArray	()Z	0	bridge	0	1
+java/lang/Class	isArray	()Z	0	bridge	1	1
 java/lang/Class	isAssignableFrom	(Ljava/lang/Class;)Z	0	bridge	1	1
-java/lang/Class	isEnum	()Z	0	bridge	0	1
+java/lang/Class	isEnum	()Z	0	synthetic-stub	1	1
 java/lang/Class	isHidden	()Z	0	bridge	1	1
 java/lang/Class	isInstance	(Ljava/lang/Object;)Z	0	bridge	1	1
-java/lang/Class	isInterface	()Z	0	bridge	0	1
-java/lang/Class	isPrimitive	()Z	0	bridge	0	1
+java/lang/Class	isInterface	()Z	0	bridge	1	1
+java/lang/Class	isPrimitive	()Z	0	bridge	1	1
 java/lang/Class	isRecord0	()Z	0	bridge	1	1
 java/lang/Class	newInstance	()Ljava/lang/Object;	0	bridge	0	1
 java/lang/Class	newReflectionData	(Ljava/lang/ref/SoftReference;I)Ljava/lang/Class$ReflectionData;	0	bridge	0	1
@@ -2163,7 +2251,7 @@ java/lang/ClassNotFoundException	printStackTrace	(Ljava/io/PrintWriter;)V	0	brid
 java/lang/ClassNotFoundException	setStackTrace	([Ljava/lang/StackTraceElement;)V	0	bridge	0	1
 java/lang/ClassNotFoundException	toString	()Ljava/lang/String;	0	bridge	0	1
 java/lang/ClassNotFoundException	toString	()Ljava/lang/String;	1	bridge	0	1
-java/lang/ClassValue	get	(Ljava/lang/Class;)Ljava/lang/Object;	0	bridge	0	1
+java/lang/ClassValue	get	(Ljava/lang/Class;)Ljava/lang/Object;	0	bridge	1	1
 java/lang/ClassValue	remove	(Ljava/lang/Class;)V	0	bridge	0	1
 java/lang/CloneNotSupportedException	<init>	()V	0	bridge	0	1
 java/lang/CloneNotSupportedException	<init>	()V	1	bridge	0	1
@@ -2655,21 +2743,21 @@ java/lang/Math	toRadians	(D)D	0	intrinsic	0	1
 java/lang/Math	ulp	(D)D	0	intrinsic	0	1
 java/lang/Math	ulp	(F)F	0	intrinsic	0	1
 java/lang/Math	unsignedMultiplyHigh	(JJ)J	0	intrinsic	0	1
-java/lang/Module	addExports	(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;	0	bridge	0	1
+java/lang/Module	addExports	(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;	0	bridge	1	1
 java/lang/Module	addExports0	(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V	0	bridge	1	1
 java/lang/Module	addExportsToAll0	(Ljava/lang/Module;Ljava/lang/String;)V	0	bridge	1	1
 java/lang/Module	addExportsToAllUnnamed0	(Ljava/lang/Module;Ljava/lang/String;)V	0	bridge	1	1
-java/lang/Module	addOpens	(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;	0	bridge	0	1
+java/lang/Module	addOpens	(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;	0	bridge	1	1
 java/lang/Module	addReads0	(Ljava/lang/Module;Ljava/lang/Module;)V	0	bridge	1	1
-java/lang/Module	addUses	(Ljava/lang/Class;)Ljava/lang/Module;	0	bridge	0	1
-java/lang/Module	canRead	(Ljava/lang/Module;)Z	0	bridge	0	1
-java/lang/Module	canUse	(Ljava/lang/Class;)Z	0	bridge	0	1
+java/lang/Module	addUses	(Ljava/lang/Class;)Ljava/lang/Module;	0	bridge	1	1
+java/lang/Module	canRead	(Ljava/lang/Module;)Z	0	bridge	1	1
+java/lang/Module	canUse	(Ljava/lang/Class;)Z	0	bridge	1	1
 java/lang/Module	defineModule0	(Ljava/lang/Module;ZLjava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)V	0	bridge	1	1
-java/lang/Module	getClassLoader	()Ljava/lang/ClassLoader;	0	bridge	0	1
-java/lang/Module	getDescriptor	()Ljava/lang/module/ModuleDescriptor;	0	bridge	0	1
+java/lang/Module	getClassLoader	()Ljava/lang/ClassLoader;	0	bridge	1	1
+java/lang/Module	getDescriptor	()Ljava/lang/module/ModuleDescriptor;	0	bridge	1	1
 java/lang/Module	getLayer	()Ljava/lang/ModuleLayer;	0	bridge	0	1
-java/lang/Module	getName	()Ljava/lang/String;	0	bridge	0	1
-java/lang/Module	getPackages	()Ljava/util/Set;	0	bridge	0	1
+java/lang/Module	getName	()Ljava/lang/String;	0	bridge	1	1
+java/lang/Module	getPackages	()Ljava/util/Set;	0	bridge	1	1
 java/lang/Module	getResourceAsStream	(Ljava/lang/String;)Ljava/io/InputStream;	0	bridge	0	1
 java/lang/Module	getResourceAsStream	(Ljava/lang/String;)Ljava/io/InputStream;	1	bridge	0	1
 java/lang/Module	implAddExports	(Ljava/lang/String;)V	0	bridge	0	1
@@ -4081,10 +4169,10 @@ java/lang/invoke/MethodType	methodType	(Ljava/lang/Class;Ljava/lang/Class;)Ljava
 java/lang/invoke/MethodType	methodType	(Ljava/lang/Class;Ljava/lang/Class;[Ljava/lang/Class;)Ljava/lang/invoke/MethodType;	0	bridge	0	1
 java/lang/invoke/MethodType	methodType	(Ljava/lang/Class;[Ljava/lang/Class;)Ljava/lang/invoke/MethodType;	0	bridge	0	1
 java/lang/invoke/MethodType	parameterArray	()[Ljava/lang/Class;	0	bridge	0	1
-java/lang/invoke/MethodType	parameterCount	()I	0	bridge	0	1
+java/lang/invoke/MethodType	parameterCount	()I	0	synthetic-stub	0	1
 java/lang/invoke/MethodType	parameterType	(I)Ljava/lang/Class;	0	bridge	0	1
-java/lang/invoke/MethodType	returnType	()Ljava/lang/Class;	0	bridge	0	1
-java/lang/invoke/MethodType	toString	()Ljava/lang/String;	0	bridge	0	1
+java/lang/invoke/MethodType	returnType	()Ljava/lang/Class;	0	synthetic-stub	0	1
+java/lang/invoke/MethodType	toString	()Ljava/lang/String;	0	synthetic-stub	0	1
 java/lang/invoke/MutableCallSite	dynamicInvoker	()Ljava/lang/invoke/MethodHandle;	0	bridge	0	1
 java/lang/invoke/MutableCallSite	setTarget	(Ljava/lang/invoke/MethodHandle;)V	0	bridge	0	1
 java/lang/invoke/VarHandle	accessModeTypeUncached	(Ljava/lang/invoke/VarHandle$AccessType;)Ljava/lang/invoke/MethodType;	0	bridge	0	1
@@ -4259,12 +4347,12 @@ java/lang/module/ModuleDescriptor$Requires	equals	(Ljava/lang/Object;)Z	0	bridge
 java/lang/module/ModuleDescriptor$Requires	hashCode	()I	0	bridge	0	1
 java/lang/module/ModuleDescriptor$Version	compareTo	(Ljava/lang/Object;)I	0	bridge	0	1
 java/lang/module/ModuleDescriptor$Version	compareTo	(Ljava/lang/Object;)I	1	bridge	0	1
-java/lang/module/ModuleDescriptor$Version	equals	(Ljava/lang/Object;)Z	0	bridge	0	1
-java/lang/module/ModuleDescriptor$Version	equals	(Ljava/lang/Object;)Z	1	bridge	0	1
-java/lang/module/ModuleDescriptor$Version	hashCode	()I	0	bridge	0	1
-java/lang/module/ModuleDescriptor$Version	hashCode	()I	1	bridge	0	1
-java/lang/module/ModuleDescriptor$Version	parse	(Ljava/lang/String;)Ljava/lang/module/ModuleDescriptor$Version;	0	bridge	0	1
-java/lang/module/ModuleDescriptor$Version	toString	()Ljava/lang/String;	0	bridge	0	1
+java/lang/module/ModuleDescriptor$Version	equals	(Ljava/lang/Object;)Z	0	synthetic-stub	1	1
+java/lang/module/ModuleDescriptor$Version	equals	(Ljava/lang/Object;)Z	1	synthetic-stub	1	1
+java/lang/module/ModuleDescriptor$Version	hashCode	()I	0	synthetic-stub	1	1
+java/lang/module/ModuleDescriptor$Version	hashCode	()I	1	synthetic-stub	1	1
+java/lang/module/ModuleDescriptor$Version	parse	(Ljava/lang/String;)Ljava/lang/module/ModuleDescriptor$Version;	0	synthetic-stub	1	1
+java/lang/module/ModuleDescriptor$Version	toString	()Ljava/lang/String;	0	synthetic-stub	1	1
 java/lang/module/ModuleFinder	findAll	()Ljava/util/Set;	0	bridge	0	1
 java/lang/module/ModuleFinder	ofSystem	()Ljava/lang/module/ModuleFinder;	0	bridge	0	1
 java/lang/module/ModuleReference	descriptor	()Ljava/lang/module/ModuleDescriptor;	0	bridge	0	1
@@ -4346,14 +4434,14 @@ java/lang/reflect/Constructor	getAnnotatedParameterTypes	()[Ljava/lang/reflect/A
 java/lang/reflect/Constructor	getAnnotation	(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;	0	bridge	0	1
 java/lang/reflect/Constructor	getAnnotations	()[Ljava/lang/annotation/Annotation;	0	bridge	0	1
 java/lang/reflect/Constructor	getDeclaredAnnotations	()[Ljava/lang/annotation/Annotation;	0	bridge	0	1
-java/lang/reflect/Constructor	getDeclaringClass	()Ljava/lang/Class;	0	bridge	0	1
+java/lang/reflect/Constructor	getDeclaringClass	()Ljava/lang/Class;	0	synthetic-stub	0	1
 java/lang/reflect/Constructor	getExceptionTypes	()[Ljava/lang/Class;	0	bridge	0	1
-java/lang/reflect/Constructor	getGenericParameterTypes	()[Ljava/lang/reflect/Type;	0	bridge	0	1
-java/lang/reflect/Constructor	getModifiers	()I	0	bridge	0	1
-java/lang/reflect/Constructor	getName	()Ljava/lang/String;	0	bridge	0	1
+java/lang/reflect/Constructor	getGenericParameterTypes	()[Ljava/lang/reflect/Type;	0	synthetic-stub	0	1
+java/lang/reflect/Constructor	getModifiers	()I	0	synthetic-stub	0	1
+java/lang/reflect/Constructor	getName	()Ljava/lang/String;	0	synthetic-stub	0	1
 java/lang/reflect/Constructor	getParameterAnnotations	()[[Ljava/lang/annotation/Annotation;	0	bridge	0	1
-java/lang/reflect/Constructor	getParameterCount	()I	0	bridge	0	1
-java/lang/reflect/Constructor	getParameterTypes	()[Ljava/lang/Class;	0	bridge	0	1
+java/lang/reflect/Constructor	getParameterCount	()I	0	synthetic-stub	0	1
+java/lang/reflect/Constructor	getParameterTypes	()[Ljava/lang/Class;	0	synthetic-stub	0	1
 java/lang/reflect/Constructor	getParameters	()[Ljava/lang/reflect/Parameter;	0	bridge	0	1
 java/lang/reflect/Constructor	getRoot	()Ljava/lang/reflect/Constructor;	0	bridge	0	1
 java/lang/reflect/Constructor	getTypeParameters	()[Ljava/lang/reflect/TypeVariable;	0	bridge	0	1
@@ -4376,17 +4464,17 @@ java/lang/reflect/Field	getBoolean	(Ljava/lang/Object;)Z	0	bridge	0	1
 java/lang/reflect/Field	getByte	(Ljava/lang/Object;)B	0	bridge	0	1
 java/lang/reflect/Field	getChar	(Ljava/lang/Object;)C	0	bridge	0	1
 java/lang/reflect/Field	getDeclaredAnnotations	()[Ljava/lang/annotation/Annotation;	0	bridge	0	1
-java/lang/reflect/Field	getDeclaringClass	()Ljava/lang/Class;	0	bridge	0	1
+java/lang/reflect/Field	getDeclaringClass	()Ljava/lang/Class;	0	synthetic-stub	0	1
 java/lang/reflect/Field	getDouble	(Ljava/lang/Object;)D	0	bridge	0	1
 java/lang/reflect/Field	getFloat	(Ljava/lang/Object;)F	0	bridge	0	1
 java/lang/reflect/Field	getGenericType	()Ljava/lang/reflect/Type;	0	bridge	0	1
 java/lang/reflect/Field	getInt	(Ljava/lang/Object;)I	0	bridge	0	1
 java/lang/reflect/Field	getLong	(Ljava/lang/Object;)J	0	bridge	0	1
-java/lang/reflect/Field	getModifiers	()I	0	bridge	0	1
-java/lang/reflect/Field	getName	()Ljava/lang/String;	0	bridge	0	1
+java/lang/reflect/Field	getModifiers	()I	0	synthetic-stub	0	1
+java/lang/reflect/Field	getName	()Ljava/lang/String;	0	synthetic-stub	0	1
 java/lang/reflect/Field	getRoot	()Ljava/lang/reflect/Field;	0	bridge	0	1
 java/lang/reflect/Field	getShort	(Ljava/lang/Object;)S	0	bridge	0	1
-java/lang/reflect/Field	getType	()Ljava/lang/Class;	0	bridge	0	1
+java/lang/reflect/Field	getType	()Ljava/lang/Class;	0	synthetic-stub	0	1
 java/lang/reflect/Field	getTypeAnnotationBytes0	()[B	0	bridge	1	1
 java/lang/reflect/Field	isAnnotationPresent	(Ljava/lang/Class;)Z	0	bridge	0	1
 java/lang/reflect/Field	isEnumConstant	()Z	0	bridge	0	1
@@ -4456,25 +4544,25 @@ java/lang/reflect/InvocationTargetException	toString	()Ljava/lang/String;	1	brid
 java/lang/reflect/Method	canAccess	(Ljava/lang/Object;)Z	0	bridge	0	1
 java/lang/reflect/Method	copy	()Ljava/lang/reflect/Method;	0	bridge	0	1
 java/lang/reflect/Method	getAnnotatedParameterTypes	()[Ljava/lang/reflect/AnnotatedType;	0	bridge	0	1
-java/lang/reflect/Method	getAnnotatedReturnType	()Ljava/lang/reflect/AnnotatedType;	0	bridge	0	1
+java/lang/reflect/Method	getAnnotatedReturnType	()Ljava/lang/reflect/AnnotatedType;	0	synthetic-stub	0	1
 java/lang/reflect/Method	getAnnotation	(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;	0	bridge	0	1
 java/lang/reflect/Method	getAnnotations	()[Ljava/lang/annotation/Annotation;	0	bridge	0	1
 java/lang/reflect/Method	getAnnotationsByType	(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;	0	bridge	0	1
 java/lang/reflect/Method	getDeclaredAnnotations	()[Ljava/lang/annotation/Annotation;	0	bridge	0	1
 java/lang/reflect/Method	getDeclaredAnnotationsByType	(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;	0	bridge	0	1
-java/lang/reflect/Method	getDeclaringClass	()Ljava/lang/Class;	0	bridge	0	1
+java/lang/reflect/Method	getDeclaringClass	()Ljava/lang/Class;	0	synthetic-stub	0	1
 java/lang/reflect/Method	getDefaultValue	()Ljava/lang/Object;	0	bridge	0	1
-java/lang/reflect/Method	getExceptionTypes	()[Ljava/lang/Class;	0	bridge	0	1
-java/lang/reflect/Method	getGenericExceptionTypes	()[Ljava/lang/reflect/Type;	0	bridge	0	1
+java/lang/reflect/Method	getExceptionTypes	()[Ljava/lang/Class;	0	synthetic-stub	0	1
+java/lang/reflect/Method	getGenericExceptionTypes	()[Ljava/lang/reflect/Type;	0	synthetic-stub	0	1
 java/lang/reflect/Method	getGenericParameterTypes	()[Ljava/lang/reflect/Type;	0	bridge	0	1
 java/lang/reflect/Method	getGenericReturnType	()Ljava/lang/reflect/Type;	0	bridge	0	1
-java/lang/reflect/Method	getModifiers	()I	0	bridge	0	1
-java/lang/reflect/Method	getName	()Ljava/lang/String;	0	bridge	0	1
+java/lang/reflect/Method	getModifiers	()I	0	synthetic-stub	0	1
+java/lang/reflect/Method	getName	()Ljava/lang/String;	0	synthetic-stub	0	1
 java/lang/reflect/Method	getParameterAnnotations	()[[Ljava/lang/annotation/Annotation;	0	bridge	0	1
-java/lang/reflect/Method	getParameterCount	()I	0	bridge	0	1
-java/lang/reflect/Method	getParameterTypes	()[Ljava/lang/Class;	0	bridge	0	1
+java/lang/reflect/Method	getParameterCount	()I	0	synthetic-stub	0	1
+java/lang/reflect/Method	getParameterTypes	()[Ljava/lang/Class;	0	synthetic-stub	0	1
 java/lang/reflect/Method	getParameters	()[Ljava/lang/reflect/Parameter;	0	bridge	0	1
-java/lang/reflect/Method	getReturnType	()Ljava/lang/Class;	0	bridge	0	1
+java/lang/reflect/Method	getReturnType	()Ljava/lang/Class;	0	synthetic-stub	0	1
 java/lang/reflect/Method	getRoot	()Ljava/lang/reflect/Method;	0	bridge	0	1
 java/lang/reflect/Method	getTypeParameters	()[Ljava/lang/reflect/TypeVariable;	0	bridge	0	1
 java/lang/reflect/Method	invoke	(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
@@ -4484,8 +4572,8 @@ java/lang/reflect/Method	isBridge	()Z	0	bridge	0	1
 java/lang/reflect/Method	isDefault	()Z	0	bridge	0	1
 java/lang/reflect/Method	isSynthetic	()Z	0	bridge	0	1
 java/lang/reflect/Method	isVarArgs	()Z	0	bridge	0	1
-java/lang/reflect/Method	setAccessible	(Z)V	0	bridge	0	1
-java/lang/reflect/Method	toString	()Ljava/lang/String;	0	bridge	0	1
+java/lang/reflect/Method	setAccessible	(Z)V	0	synthetic-stub	0	1
+java/lang/reflect/Method	toString	()Ljava/lang/String;	0	synthetic-stub	0	1
 java/lang/reflect/Method	trySetAccessible	()Z	0	bridge	0	1
 java/lang/reflect/Parameter	getAnnotatedType	()Ljava/lang/reflect/AnnotatedType;	0	bridge	0	1
 java/lang/reflect/Parameter	isImplicit	()Z	0	bridge	0	1
@@ -5028,11 +5116,11 @@ java/nio/Buffer$2	reserveMemory	(JJ)V	0	bridge	0	1
 java/nio/Buffer$2	scaleShifts	(Ljava/nio/Buffer;)I	0	bridge	0	1
 java/nio/Buffer$2	unreserveMemory	(JJ)V	0	bridge	0	1
 java/nio/ByteBuffer	allocate	(I)Ljava/nio/ByteBuffer;	0	synthetic-stub	0	1
-java/nio/ByteBuffer	allocate	(I)Ljava/nio/ByteBuffer;	1	bridge	0	1
+java/nio/ByteBuffer	allocate	(I)Ljava/nio/ByteBuffer;	1	synthetic-stub	1	1
 java/nio/ByteBuffer	allocateDirect	(I)Ljava/nio/ByteBuffer;	0	synthetic-stub	0	1
-java/nio/ByteBuffer	allocateDirect	(I)Ljava/nio/ByteBuffer;	1	bridge	0	1
-java/nio/ByteBuffer	array	()[B	0	bridge	0	1
-java/nio/ByteBuffer	arrayOffset	()I	0	bridge	0	1
+java/nio/ByteBuffer	allocateDirect	(I)Ljava/nio/ByteBuffer;	1	synthetic-stub	1	1
+java/nio/ByteBuffer	array	()[B	0	synthetic-stub	1	1
+java/nio/ByteBuffer	arrayOffset	()I	0	synthetic-stub	1	1
 java/nio/ByteBuffer	asCharBuffer	()Ljava/nio/CharBuffer;	0	bridge	0	1
 java/nio/ByteBuffer	asDoubleBuffer	()Ljava/nio/DoubleBuffer;	0	bridge	0	1
 java/nio/ByteBuffer	asFloatBuffer	()Ljava/nio/FloatBuffer;	0	bridge	0	1
@@ -5040,19 +5128,19 @@ java/nio/ByteBuffer	asIntBuffer	()Ljava/nio/IntBuffer;	0	bridge	0	1
 java/nio/ByteBuffer	asLongBuffer	()Ljava/nio/LongBuffer;	0	bridge	0	1
 java/nio/ByteBuffer	asReadOnlyBuffer	()Ljava/nio/ByteBuffer;	0	bridge	0	1
 java/nio/ByteBuffer	asShortBuffer	()Ljava/nio/ShortBuffer;	0	bridge	0	1
-java/nio/ByteBuffer	capacity	()I	0	bridge	0	1
+java/nio/ByteBuffer	capacity	()I	0	synthetic-stub	1	1
 java/nio/ByteBuffer	checkSession	()V	0	bridge	0	1
-java/nio/ByteBuffer	clear	()Ljava/nio/Buffer;	0	bridge	0	1
-java/nio/ByteBuffer	clear	()Ljava/nio/ByteBuffer;	0	bridge	0	1
+java/nio/ByteBuffer	clear	()Ljava/nio/Buffer;	0	synthetic-stub	1	1
+java/nio/ByteBuffer	clear	()Ljava/nio/ByteBuffer;	0	synthetic-stub	1	1
 java/nio/ByteBuffer	compact	()Ljava/nio/ByteBuffer;	0	bridge	0	1
-java/nio/ByteBuffer	compareTo	(Ljava/nio/ByteBuffer;)I	0	bridge	0	1
+java/nio/ByteBuffer	compareTo	(Ljava/nio/ByteBuffer;)I	0	synthetic-stub	1	1
 java/nio/ByteBuffer	duplicate	()Ljava/nio/ByteBuffer;	0	bridge	0	1
-java/nio/ByteBuffer	equals	(Ljava/lang/Object;)Z	0	bridge	0	1
-java/nio/ByteBuffer	flip	()Ljava/nio/Buffer;	0	bridge	0	1
-java/nio/ByteBuffer	flip	()Ljava/nio/ByteBuffer;	0	bridge	0	1
+java/nio/ByteBuffer	equals	(Ljava/lang/Object;)Z	0	synthetic-stub	1	1
+java/nio/ByteBuffer	flip	()Ljava/nio/Buffer;	0	synthetic-stub	1	1
+java/nio/ByteBuffer	flip	()Ljava/nio/ByteBuffer;	0	synthetic-stub	1	1
 java/nio/ByteBuffer	get	()B	0	bridge	0	1
 java/nio/ByteBuffer	get	(I)B	0	bridge	0	1
-java/nio/ByteBuffer	get	([B)Ljava/nio/ByteBuffer;	0	bridge	0	1
+java/nio/ByteBuffer	get	([B)Ljava/nio/ByteBuffer;	0	synthetic-stub	1	1
 java/nio/ByteBuffer	get	([BII)Ljava/nio/ByteBuffer;	0	bridge	0	1
 java/nio/ByteBuffer	getChar	()C	0	bridge	0	1
 java/nio/ByteBuffer	getChar	(I)C	0	bridge	0	1
@@ -5065,28 +5153,28 @@ java/nio/ByteBuffer	getLong	()J	0	bridge	0	1
 java/nio/ByteBuffer	getLong	(I)J	0	bridge	0	1
 java/nio/ByteBuffer	getShort	()S	0	bridge	0	1
 java/nio/ByteBuffer	getShort	(I)S	0	bridge	0	1
-java/nio/ByteBuffer	hasArray	()Z	0	bridge	0	1
-java/nio/ByteBuffer	hasRemaining	()Z	0	bridge	0	1
-java/nio/ByteBuffer	hashCode	()I	0	bridge	0	1
+java/nio/ByteBuffer	hasArray	()Z	0	synthetic-stub	1	1
+java/nio/ByteBuffer	hasRemaining	()Z	0	synthetic-stub	1	1
+java/nio/ByteBuffer	hashCode	()I	0	synthetic-stub	1	1
 java/nio/ByteBuffer	isDirect	()Z	0	bridge	0	1
 java/nio/ByteBuffer	isDirect	()Z	1	bridge	0	1
 java/nio/ByteBuffer	isReadOnly	()Z	0	bridge	0	1
 java/nio/ByteBuffer	isReadOnly	()Z	1	bridge	0	1
-java/nio/ByteBuffer	limit	()I	0	bridge	0	1
-java/nio/ByteBuffer	limit	(I)Ljava/nio/Buffer;	0	bridge	0	1
-java/nio/ByteBuffer	limit	(I)Ljava/nio/ByteBuffer;	0	bridge	0	1
-java/nio/ByteBuffer	mark	()Ljava/nio/Buffer;	0	bridge	0	1
-java/nio/ByteBuffer	mark	()Ljava/nio/ByteBuffer;	0	bridge	0	1
-java/nio/ByteBuffer	order	()Ljava/nio/ByteOrder;	0	bridge	0	1
-java/nio/ByteBuffer	order	(Ljava/nio/ByteOrder;)Ljava/nio/ByteBuffer;	0	bridge	0	1
-java/nio/ByteBuffer	position	()I	0	bridge	0	1
-java/nio/ByteBuffer	position	(I)Ljava/nio/Buffer;	0	bridge	0	1
-java/nio/ByteBuffer	position	(I)Ljava/nio/ByteBuffer;	0	bridge	0	1
+java/nio/ByteBuffer	limit	()I	0	synthetic-stub	1	1
+java/nio/ByteBuffer	limit	(I)Ljava/nio/Buffer;	0	synthetic-stub	1	1
+java/nio/ByteBuffer	limit	(I)Ljava/nio/ByteBuffer;	0	synthetic-stub	1	1
+java/nio/ByteBuffer	mark	()Ljava/nio/Buffer;	0	synthetic-stub	1	1
+java/nio/ByteBuffer	mark	()Ljava/nio/ByteBuffer;	0	synthetic-stub	1	1
+java/nio/ByteBuffer	order	()Ljava/nio/ByteOrder;	0	synthetic-stub	1	1
+java/nio/ByteBuffer	order	(Ljava/nio/ByteOrder;)Ljava/nio/ByteBuffer;	0	synthetic-stub	1	1
+java/nio/ByteBuffer	position	()I	0	synthetic-stub	1	1
+java/nio/ByteBuffer	position	(I)Ljava/nio/Buffer;	0	synthetic-stub	1	1
+java/nio/ByteBuffer	position	(I)Ljava/nio/ByteBuffer;	0	synthetic-stub	1	1
 java/nio/ByteBuffer	put	(B)Ljava/nio/ByteBuffer;	0	bridge	0	1
 java/nio/ByteBuffer	put	(IB)Ljava/nio/ByteBuffer;	0	bridge	0	1
-java/nio/ByteBuffer	put	(Ljava/nio/ByteBuffer;)Ljava/nio/ByteBuffer;	0	bridge	0	1
-java/nio/ByteBuffer	put	([B)Ljava/nio/ByteBuffer;	0	bridge	0	1
-java/nio/ByteBuffer	put	([BII)Ljava/nio/ByteBuffer;	0	bridge	0	1
+java/nio/ByteBuffer	put	(Ljava/nio/ByteBuffer;)Ljava/nio/ByteBuffer;	0	synthetic-stub	1	1
+java/nio/ByteBuffer	put	([B)Ljava/nio/ByteBuffer;	0	synthetic-stub	1	1
+java/nio/ByteBuffer	put	([BII)Ljava/nio/ByteBuffer;	0	synthetic-stub	1	1
 java/nio/ByteBuffer	putChar	(C)Ljava/nio/ByteBuffer;	0	bridge	0	1
 java/nio/ByteBuffer	putChar	(IC)Ljava/nio/ByteBuffer;	0	bridge	0	1
 java/nio/ByteBuffer	putDouble	(D)Ljava/nio/ByteBuffer;	0	bridge	0	1
@@ -5097,35 +5185,35 @@ java/nio/ByteBuffer	putLong	(IJ)Ljava/nio/ByteBuffer;	0	bridge	0	1
 java/nio/ByteBuffer	putLong	(J)Ljava/nio/ByteBuffer;	0	bridge	0	1
 java/nio/ByteBuffer	putShort	(IS)Ljava/nio/ByteBuffer;	0	bridge	0	1
 java/nio/ByteBuffer	putShort	(S)Ljava/nio/ByteBuffer;	0	bridge	0	1
-java/nio/ByteBuffer	remaining	()I	0	bridge	0	1
-java/nio/ByteBuffer	reset	()Ljava/nio/Buffer;	0	bridge	0	1
-java/nio/ByteBuffer	rewind	()Ljava/nio/Buffer;	0	bridge	0	1
-java/nio/ByteBuffer	rewind	()Ljava/nio/ByteBuffer;	0	bridge	0	1
+java/nio/ByteBuffer	remaining	()I	0	synthetic-stub	1	1
+java/nio/ByteBuffer	reset	()Ljava/nio/Buffer;	0	synthetic-stub	1	1
+java/nio/ByteBuffer	rewind	()Ljava/nio/Buffer;	0	synthetic-stub	1	1
+java/nio/ByteBuffer	rewind	()Ljava/nio/ByteBuffer;	0	synthetic-stub	1	1
 java/nio/ByteBuffer	session	()Ljdk/internal/foreign/MemorySessionImpl;	0	bridge	0	1
 java/nio/ByteBuffer	slice	()Ljava/nio/ByteBuffer;	0	bridge	0	1
 java/nio/ByteBuffer	slice	(II)Ljava/nio/ByteBuffer;	0	bridge	0	1
 java/nio/ByteBuffer	toString	()Ljava/lang/String;	0	bridge	0	1
-java/nio/ByteBuffer	wrap	([B)Ljava/nio/ByteBuffer;	0	bridge	0	1
-java/nio/ByteBuffer	wrap	([B)Ljava/nio/ByteBuffer;	1	bridge	0	1
-java/nio/ByteBuffer	wrap	([BII)Ljava/nio/ByteBuffer;	0	bridge	0	1
-java/nio/ByteBuffer	wrap	([BII)Ljava/nio/ByteBuffer;	1	bridge	0	1
+java/nio/ByteBuffer	wrap	([B)Ljava/nio/ByteBuffer;	0	synthetic-stub	1	1
+java/nio/ByteBuffer	wrap	([B)Ljava/nio/ByteBuffer;	1	synthetic-stub	1	1
+java/nio/ByteBuffer	wrap	([BII)Ljava/nio/ByteBuffer;	0	synthetic-stub	1	1
+java/nio/ByteBuffer	wrap	([BII)Ljava/nio/ByteBuffer;	1	synthetic-stub	1	1
 java/nio/ByteBufferAsCharBufferB	charAt	(I)C	0	intrinsic	0	1
 java/nio/ByteBufferAsCharBufferB	get	()C	0	intrinsic	0	1
 java/nio/ByteBufferAsCharBufferB	get	(I)C	0	intrinsic	0	1
 java/nio/ByteBufferAsCharBufferB	hasArray	()Z	0	intrinsic	0	1
-java/nio/ByteBufferAsCharBufferB	order	()Ljava/nio/ByteOrder;	0	bridge	0	1
+java/nio/ByteBufferAsCharBufferB	order	()Ljava/nio/ByteOrder;	0	synthetic-stub	1	1
 java/nio/ByteBufferAsCharBufferB	toString	()Ljava/lang/String;	0	intrinsic	0	1
 java/nio/ByteBufferAsCharBufferB	toString	(II)Ljava/lang/String;	0	bridge	0	1
 java/nio/ByteBufferAsCharBufferL	charAt	(I)C	0	intrinsic	0	1
 java/nio/ByteBufferAsCharBufferL	get	()C	0	intrinsic	0	1
 java/nio/ByteBufferAsCharBufferL	get	(I)C	0	intrinsic	0	1
 java/nio/ByteBufferAsCharBufferL	hasArray	()Z	0	intrinsic	0	1
-java/nio/ByteBufferAsCharBufferL	order	()Ljava/nio/ByteOrder;	0	bridge	0	1
+java/nio/ByteBufferAsCharBufferL	order	()Ljava/nio/ByteOrder;	0	synthetic-stub	1	1
 java/nio/ByteBufferAsCharBufferL	toString	()Ljava/lang/String;	0	intrinsic	0	1
 java/nio/ByteBufferAsCharBufferL	toString	(II)Ljava/lang/String;	0	bridge	0	1
-java/nio/ByteBufferAsCharBufferRB	order	()Ljava/nio/ByteOrder;	0	bridge	0	1
+java/nio/ByteBufferAsCharBufferRB	order	()Ljava/nio/ByteOrder;	0	synthetic-stub	1	1
 java/nio/ByteBufferAsCharBufferRB	toString	(II)Ljava/lang/String;	0	bridge	0	1
-java/nio/ByteBufferAsCharBufferRL	order	()Ljava/nio/ByteOrder;	0	bridge	0	1
+java/nio/ByteBufferAsCharBufferRL	order	()Ljava/nio/ByteOrder;	0	synthetic-stub	1	1
 java/nio/ByteBufferAsCharBufferRL	toString	(II)Ljava/lang/String;	0	bridge	0	1
 java/nio/ByteOrder	BIG_ENDIAN	Ljava/nio/ByteOrder;	0	bridge	0	1
 java/nio/ByteOrder	LITTLE_ENDIAN	Ljava/nio/ByteOrder;	0	bridge	0	1

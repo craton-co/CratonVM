@@ -499,3 +499,87 @@ implementation work with a name, which is not where this record started.
 * Not that `initPhase1` is now faithful. It publishes one more field of the
   several the real method sets.
 * Nothing about `--real-jdk`, which this change deliberately does not reach.
+
+## 13. `Class.getName` is the same clause as §11 with a worse failure mode
+
+§11 classified `Class.getModule` as a §1.4 shadow whose remedy cannot be
+applied, because `Class.module` is written by no Java code. `Class.getName` is
+the same clause, found by following the three `ServiceConfigurationError`
+vectors from §9's classification — and it is worse in the way that matters.
+
+### The diagnosis, and the wrong turn it avoided
+
+The three vectors fail in `ServiceLoader.checkCaller` with *"module java.base
+does not declare `uses`"*. The obvious reading is that the module descriptor is
+wrong, and `UsesProbe` unarmed says otherwise: both VMs agree, including
+`canUse FileSystemProvider |true|`. Armed, only one row differed.
+
+What gave it away was the error text carrying **slashes** —
+`java/nio/file/spi/FileSystemProvider`. `descriptor.uses()` holds the binary
+name with dots; the lookup asked with slashes. So the descriptor was right and
+the *name* was wrong.
+
+```text
+HotSpot   java.lang.Object    [Ljava.lang.String;    Object
+yielded   java/lang/Object    [Ljava/lang/String;    java/lang/Object
+```
+
+Real `Class.getName()` is
+
+```java
+    String name = this.name;
+    return name != null ? name : initClassName();
+```
+
+a field only a VM fills, in a layout this VM does not share — which the
+registration has said since long before §1.4 existed: *"Override with native
+since JDK's Class field layout differs from our mirror layout."*
+
+**Yielding here does not answer null. It answers the internal form.** That is
+worse than a null, because nothing throws: it propagates silently into every
+name comparison in the JDK, and `ServiceLoader` was one consumer of many.
+
+### Measured, and one tag repaired twenty-two rows
+
+`apps/probes/ClassNameSweep.java`, 24 rows over the four name shapes
+(`getName`, `getTypeName`, `getCanonicalName`, `getSimpleName`) across ordinary,
+nested, local, anonymous, enum, lambda, primitive and array receivers, plus
+`Class.forName` round trips and the `uses`/`canUse` pair:
+
+```text
+unarmed                      0 diffs of 24
+yielded (dial armed)        24 diffs of 24
+tagged NativeKind::Intrinsic 2 diffs of 24
+```
+
+Every row is right when the native runs and wrong when it yields, which is the
+whole argument for the reviewed `Intrinsic`. The 22-row repair from a single tag
+is not luck: the JDK derives `getTypeName`, `getCanonicalName` and
+`getSimpleName` from `getName`, and the probe was written with all four shapes
+precisely so that this claim would be measured rather than assumed.
+
+### The survivor, and why it is not this row's problem
+
+The remaining diff is `Class.forName(Nested.class.getName())` throwing
+`ClassNotFoundException: ClassNameSweep$Nested` under the dial. That is
+`forName0` declining at a dispatch door — and `forName0` **is** `ACC_NATIVE` in
+the image, so contract §1.5 makes `Bridge` correct for it. A dial artefact, not
+a retirement target.
+
+The same distinction runs through this increment: `initClassName` stays `Bridge`
+deliberately, for the identical reason. Two adjacent registrations on one class,
+governed by two different clauses — §1.4 for the one with bytecode behind it,
+§1.5 for the one that is genuinely native.
+
+### What this does NOT claim
+
+* Not that the name subsystem is correct. It claims 24 rows of it match
+  HotSpot with the native running, and that yielding breaks all 24.
+* Not that `ClassModuleSweep`'s armed count is a verdict on this change. It
+  moved by 2 under `CRATONVM_ENFORCE_NATIVE_SHADOW=all`, on
+  `Module.isExported` and `Module.getLayer` — other natives declining at other
+  doors. The acceptance measurement for this change is the two-binary A/B,
+  unarmed, which is the arm that ships.
+* Not that the three `ServiceConfigurationError` vectors now pass. The name is
+  repaired; §9's `BuiltinClassLoader` link failure is still in front of several
+  of them, and a first-failure count cannot score a fix in a chain.
