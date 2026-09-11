@@ -7,7 +7,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn probe_source() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -121,21 +121,44 @@ fn real_jdk_thread_pool_prestart_keeps_fresh_threads_startable() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn ThreadPoolExecutor prestart probe");
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        match child.try_wait().expect("poll prestart probe") {
-            Some(_) => break,
-            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("ThreadPoolExecutor prestart probe timed out");
-            }
-        }
-    }
-    let output = child
-        .wait_with_output()
-        .expect("collect prestart probe output");
+    // Was: a 120 s deadline polled with `try_wait` over piped stdio that
+    // nothing read until after the child exited. Both halves of that were
+    // wrong.
+    //
+    // The deadline, because 2000 iterations of this probe take **147 s real
+    // against 28 s user** with a debug binary on a busy 8-core host, and print
+    // `PRESTART_OK iterations=2000 workers=2000` when they get there — every
+    // assertion satisfied, the clock the only thing that failed, and the
+    // real/user ratio saying the host was busy rather than the VM slow. A
+    // deadline cannot tell "slow" from "stuck"; `remaining=` can, so the probe
+    // prints it and this watches it. See `common::Progress`.
+    //
+    // The poll loop, because it never read either pipe. A Linux pipe holds
+    // 64 KiB; a probe that writes more blocks in `write` and can never exit,
+    // and the parent reports a hang for a child that is waiting on the parent.
+    // This probe writes little today — but it now writes 40 progress lines it
+    // did not write before, and the VM behind it emitted 4.2 MB of stderr on
+    // one measured `VthreadProbe` run. `common::wait_watching` drains both
+    // pipes on their own threads for exactly that reason.
+    let watched = common::wait_watching(
+        child,
+        common::Progress {
+            countdown_key: "remaining=",
+            // A starvation budget, not a runtime one: the probe heartbeats
+            // every 50 iterations, which was ~3.7 s apart in the 147 s debug
+            // run. 120 s is the same budget the vthread probes use and is
+            // thirty times the worst gap measured.
+            stall: Duration::from_secs(120),
+            // Far above any measured run; the stall clock is the guard.
+            ceiling: Duration::from_secs(1800),
+        },
+    );
+    assert!(
+        watched.stop == common::Stop::Exited,
+        "{}",
+        watched.diagnosis("threadpoolexecutor_prestart")
+    );
+    let output = watched.output;
     let _ = fs::remove_dir_all(&probe_classes);
     let combined = format!(
         "{}\n--- STDERR ---\n{}",

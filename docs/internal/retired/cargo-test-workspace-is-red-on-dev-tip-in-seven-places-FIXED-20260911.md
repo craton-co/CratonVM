@@ -223,7 +223,10 @@ left at all. That is a real defect in the target and it is **not** this page's:
 owned by that file's lane, and the choice between a debug-aware cap, a smaller
 probe and a profile gate is a decision rather than a repair. Filed with the
 numbers above at
-`docs/known-issues/jit/vthread-and-prestart-probe-caps-are-sized-for-release-and-the-gate-runs-debug-20260911.md`.
+`docs/known-issues/jit/vthread-and-prestart-probe-caps-are-sized-for-release-and-the-gate-runs-debug-20260911.md`,
+retired the same day as
+`docs/internal/retired/vthread-and-prestart-probe-caps-FIXED-20260911.md` -- it took a
+workload decision and a progress-reporting probe, not a bigger cap.
 
 Until that lands, `vthread_probe_regression` is the one target in
 `cargo test --workspace` whose red is expected on a debug build.

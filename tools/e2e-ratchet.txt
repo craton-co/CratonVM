@@ -136,6 +136,22 @@ writer_flush_real
 #                              it is a timeout being hit, not an assertion
 #                              disagreeing. Diagnose the 60s wait before
 #                              ratcheting it.
+#
+#                              DIAGNOSED AND FIXED 2026-09-11. "A timeout being
+#                              hit, not an assertion disagreeing" was exactly
+#                              right, and the 60s wait was a cap derived from a
+#                              RELEASE measurement applied to the debug binary
+#                              this step runs. The probe now prints
+#                              `progress remaining=` and the harness fails when
+#                              that stops falling instead of when a clock runs
+#                              out, so no host and no profile can fail a
+#                              healthy run. It survived 8 debug runs at loads
+#                              11-42 taking 28s to 179s, one of which contained
+#                              a 148s no-progress stall and still gave the right
+#                              answer. See
+#                              docs/internal/retired/vthread-and-prestart-probe-caps-FIXED-20260911.md.
+#                              Not ratcheted here yet: ratchet it after one
+#                              full-list run on Windows confirms the same.
 
 # ---------------------------------------------------------------------------
 # NOT ratcheted: RED. These RUN against a real binary and FAIL -- a defect,
@@ -229,6 +245,7 @@ writer_flush_real
 #
 # The ninth, `vthread_probe_regression`, FAILED again on 2026-09-08 at 120s --
 # the FLAKY block above is right and its one green that morning was luck.
+# FIXED 2026-09-11; the FLAKY block records what it was.
 #
 # ---------------------------------------------------------------------------
 # TWO TARGETS IN THE RATCHETED LIST ABOVE ARE FLAKY ON WINDOWS. Found by
