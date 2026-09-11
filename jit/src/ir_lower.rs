@@ -1053,11 +1053,51 @@ struct Lowerer<'a> {
     /// Deferred carries planned, taken and read — engagement for the census.
     carry_deferred_planned: usize,
     carry_deferred_read: usize,
+    /// Why a `[input1, input0, cons]` triple was NOT deferred, per cause:
+    /// [0 no-RAX-carry-on-the-middle, 1 producer-already-carrying,
+    ///  2 producer-multi-use, 3 producer-type-or-arm, 4 producer-resident,
+    ///  5 operand-position, 6 consumer, 7 middle-arm-can-write-RCX].
+    ///
+    /// A bare `deferred=N/M` says how often the shape was TAKEN and nothing
+    /// about how often it was there, and that is the distinction
+    /// `c2-one-carry-slot-is-the-frame-traffic-ceiling-FIXED-20260910.md`
+    /// closed on — so the causes are split finely enough to name the next
+    /// increment rather than merely to record that there was one.
+    ///
+    /// Cause 0 is every other triple of scheduled nodes and is not a candidate;
+    /// [`Self::deferred_candidates`] is the denominator the rest divide into.
+    /// `deferred_mid_foldable` splits cause 7: how many of those middle arms
+    /// fold their own second operand into an immediate and so never reach
+    /// `gp_load_value(RCX, ..)` at all.
+    deferred_skips: [usize; 8],
+    deferred_mid_foldable: usize,
+    /// Windows in which the consumer already takes its FIRST operand in RAX —
+    /// the shape the second slot exists for, and the only honest denominator
+    /// for the causes above.
+    deferred_candidates: usize,
+    /// Writes to RCX this lowering has emitted, through every route in this
+    /// file that reaches the register. Snapshotted around each node so a
+    /// deferred carry's survival is OBSERVED rather than predicted — see
+    /// [`Self::note_rcx_written`].
+    rcx_writes: usize,
     /// Fused compares that read both operands where they already were.
     cmp_in_place: usize,
     /// Fused compares that read the second operand straight out of its frame
     /// slot instead of loading it into RCX first.
     cmp_in_place_frame: usize,
+    /// Fused compares against a CONSTANT second operand, by where the first
+    /// operand was read from: its register, and its frame slot.
+    ///
+    /// `i < 100` is the shape, and it is the most common comparison in Java.
+    /// Both forms fold the constant into the instruction instead of
+    /// materialising it in RCX first.
+    cmp_imm: usize,
+    cmp_imm_frame: usize,
+    /// `x + k` / `x - k` emitted as one `LEA` into the result's own register
+    /// instead of load-accumulate-publish, and — the common case — as one
+    /// `LEA` into the accumulator instead of a `MOV` and an `ADD`.
+    add_lea: usize,
+    add_lea_acc: usize,
     /// ENGAGEMENT, and its fail-closed counterpart. A refusal is not a
     /// miscompile — the value's home is `home_dropped`, so the fallback read
     /// refuses the compile as well — but it means the contract this planned
@@ -1627,8 +1667,16 @@ impl<'a> Lowerer<'a> {
             carry_deferred: Vec::new(),
             carry_deferred_planned: 0,
             carry_deferred_read: 0,
+            deferred_skips: [0; 8],
+            deferred_mid_foldable: 0,
+            deferred_candidates: 0,
+            rcx_writes: 0,
             cmp_in_place: 0,
             cmp_in_place_frame: 0,
+            cmp_imm: 0,
+            cmp_imm_frame: 0,
+            add_lea: 0,
+            add_lea_acc: 0,
             carries_taken: 0,
             carries_read: 0,
             carries_refused: 0,
@@ -2340,6 +2388,89 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Does lowering THIS NODE leave RCX exactly as it found it?
+    ///
+    /// [`op_preserves_rcx`] asked of the op, widened by the one fact an op
+    /// cannot express: a binary arm reaches RCX only through the REGISTER form
+    /// of its second operand, and an operand that folds into an immediate never
+    /// takes that branch. The three fold helpers (`emit_alu_acc_imm`,
+    /// `emit_imul_imm`, `emit_shift_imm`) all decide on `alu_imm32(id)`, so
+    /// asking that here is asking the arm's own question rather than a proxy
+    /// for it — and `every_folded_arm_reaches_rcx_only_in_its_register_form`
+    /// is what holds the two together.
+    ///
+    /// `alu_imm32` already answers `None` when `ir_alu_imm_enabled()` is off,
+    /// so the two flags cannot disagree: with folding off nothing here is
+    /// eligible and this collapses back to `op_preserves_rcx`.
+    ///
+    /// A prediction, and treated as one: `lower_data_node_tracked` compares
+    /// `rcx_writes` across the node and refuses the compile if the arm wrote
+    /// RCX anyway.
+    fn node_preserves_rcx(&self, id: NodeId) -> bool {
+        let Some(node) = self.graph.nodes.get(id as usize) else {
+            return false;
+        };
+        if op_preserves_rcx(&node.op) {
+            return true;
+        }
+        if !ir_carry_rcx_folded_enabled() {
+            return false;
+        }
+        // The FP forms of these ops go through `fp_load_value` into XMM0/XMM1
+        // and never reach the arm this reasons about.
+        if !matches!(node.ty, IrType::Int | IrType::Long) {
+            return false;
+        }
+        if !matches!(
+            node.op,
+            Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::And
+                | Op::Or
+                | Op::Xor
+                | Op::Shl
+                | Op::Shr
+                | Op::UShr
+        ) {
+            return false;
+        }
+        node.inputs
+            .get(1)
+            .is_some_and(|&b| self.alu_imm32(b).is_some())
+    }
+
+    /// Would `node_preserves_rcx` admit `id` if the folded widening were on?
+    ///
+    /// Census only, and deliberately independent of both flags: a run with
+    /// `CRATONVM_JIT_IR_CARRY_RCX_FOLDED=0` still reports how many triples the
+    /// widening would have converted, which is the number that prices it
+    /// WITHOUT a second run.
+    fn mid_would_fold(&self, id: NodeId) -> bool {
+        let Some(node) = self.graph.nodes.get(id as usize) else {
+            return false;
+        };
+        matches!(node.ty, IrType::Int | IrType::Long)
+            && matches!(
+                node.op,
+                Op::Add
+                    | Op::Sub
+                    | Op::Mul
+                    | Op::And
+                    | Op::Or
+                    | Op::Xor
+                    | Op::Shl
+                    | Op::Shr
+                    | Op::UShr
+            )
+            && node.inputs.get(1).is_some_and(|&b| {
+                matches!(
+                    self.graph.nodes.get(b as usize).map(|c| &c.op),
+                    Some(Op::Const(v)) if i32::try_from(*v).is_ok()
+                )
+            })
+    }
+
     /// `<op> EAX/RAX, imm32` in the one-byte accumulator form, if `id` is a
     /// constant. Answers whether it emitted, so the caller skips its
     /// register-to-register form.
@@ -2453,6 +2584,12 @@ impl<'a> Lowerer<'a> {
                 }
             }
         }
+        // Past both carry slots, so this read is not the one either was
+        // planned for. If it names RCX it is about to overwrite whatever a
+        // deferred carry left there.
+        if dst == RCX {
+            self.note_rcx_written();
+        }
         // 2026-09-02: a constant is an IMMEDIATE, not a frame word. The
         // `Op::Const` arm still writes its home (a deopt frame may name it,
         // and some sites still read slots directly), but no reader of a
@@ -2506,6 +2643,17 @@ impl<'a> Lowerer<'a> {
     /// `MOV dst, src` — 64-bit register to register, for any pair including the
     /// extended registers the GP file is made of.
     fn emit_mov_reg_reg64(&mut self, dst: u8, src: u8) {
+        if dst == RCX {
+            self.note_rcx_written();
+        }
+        self.emit_mov_reg_reg64_raw(dst, src);
+    }
+
+    /// [`Self::emit_mov_reg_reg64`] without the RCX bookkeeping, for the ONE
+    /// site that writes RCX on purpose while a deferred carry is being
+    /// INSTALLED: `store_rax` moving the carried value out of RAX. Every other
+    /// caller wants the counter to move.
+    fn emit_mov_reg_reg64_raw(&mut self, dst: u8, src: u8) {
         if dst == src {
             return;
         }
@@ -2549,6 +2697,164 @@ impl<'a> Lowerer<'a> {
         }
         self.buf.emit_byte(0x3B);
         self.emit_rbp_modrm_disp(a, offset);
+    }
+
+    /// `CMP a, imm` — register against a folded constant, 64-bit when `wide`.
+    fn emit_cmp_reg_imm(&mut self, a: u8, imm: i32, wide: bool) {
+        let (bytes, len) = cmp_reg_imm_bytes(a, imm, wide);
+        self.buf.emit(&bytes[..len]);
+    }
+
+    /// `CMP [RBP - offset], imm` — a value still in its slot against a folded
+    /// constant, 64-bit when `wide`. Three instructions become one, and the
+    /// one names no register at all.
+    fn emit_cmp_frame_imm(&mut self, offset: i32, imm: i32, wide: bool) {
+        let (bytes, len) = cmp_frame_imm_bytes(offset, imm, wide);
+        self.buf.emit(&bytes[..len]);
+    }
+
+    /// Which in-place form a fused compare of `a` against `b` can take, if any.
+    ///
+    /// Ordered by how much each saves, and the immediate forms come first
+    /// because they need the least: a constant folds into the instruction, so
+    /// only the FIRST operand needs a place to be read from, and a first
+    /// operand that lost its register is served as well as one that kept it.
+    ///
+    /// `alu_imm32` is the gate on the constant rather than a local
+    /// `Op::Const` match, deliberately. It declines a constant too wide for
+    /// `i32` — which every immediate form here sign-extends, so such a
+    /// constant has no immediate encoding at all — and it is OFF under a MIR
+    /// mode, where a tiled node is emitted by the selector and a fold here
+    /// would make the byte-equality lane compare two different programs.
+    ///
+    /// `slot_of_checked` rather than `slot_of`: a dropped home declines the
+    /// frame forms instead of latching a bailout on a path that has a
+    /// perfectly good fallback.
+    fn pick_cmp_form(&self, a: NodeId, b: NodeId) -> Option<CmpForm> {
+        if let Some(imm) = self.alu_imm32(b) {
+            return match self.resident_gpr(a) {
+                Some(ra) => Some(CmpForm::RegImm(ra, imm)),
+                None => self
+                    .slot_of_checked(a)
+                    .ok()
+                    .map(|off| CmpForm::FrameImm(off, imm)),
+            };
+        }
+        // Both remaining forms need the first operand in a register: there is
+        // no `CMP mem, mem`, and loading `a` to compare it against a slot
+        // would spend the instruction this exists to remove.
+        let ra = self.resident_gpr(a)?;
+        match self.resident_gpr(b) {
+            Some(rb) => Some(CmpForm::RegReg(ra, rb)),
+            None => self
+                .slot_of_checked(b)
+                .ok()
+                .map(|off| CmpForm::RegFrame(ra, off)),
+        }
+    }
+
+    /// `x + k` (or `x - k`) as a `LEA`, when `k` is a constant and `x` is
+    /// resident. Answers WHERE it left the result, so the caller knows how
+    /// much of its accumulator sequence still has to run.
+    ///
+    /// What it replaces, from `CmpImm.wide` with `i` in RBX:
+    ///
+    /// ```asm
+    /// mov rax,rbx        ; i -> RAX
+    /// add eax,1
+    /// ```
+    ///
+    /// Two instructions to add one to a value that was already in a register.
+    /// `LEA` is the only three-operand integer instruction on this machine, so
+    /// it is the only way to read a source and write a destination that is not
+    /// the source without routing through the accumulator — and `x + 1` in a
+    /// counted loop is exactly that shape.
+    ///
+    /// **Two forms, and the weaker one is the common case.** Which applies
+    /// turns on whether the result got a register of its own:
+    ///
+    /// * it did — [`AddForm::Done`], `lea r14d,[rbx+1]` writes that register
+    ///   directly and the arm owes nothing further;
+    /// * it did not — [`AddForm::InRax`], `lea eax,[rbx+1]` writes the
+    ///   accumulator and [`Self::store_rax`] finishes exactly as it would
+    ///   have. One instruction out of two, and nothing else about the arm
+    ///   changes.
+    ///
+    /// The second form is the one a loop-carried increment actually takes, and
+    /// it is why this is not written as a single all-or-nothing fold. Measured
+    /// on `CmpImm.wide`: `def_publishes=0` against `phi copies:
+    /// reg_publishes=10` — the loop-carried values are published by the phi
+    /// copies on the back edge, so `i + 1` itself writes a home word and is
+    /// given no register. A first version that required one engaged **nowhere**
+    /// on that probe.
+    ///
+    /// Unlike the fused compare this DEFINES a value, so the direct form owes
+    /// everything a definition owes:
+    ///
+    /// * neither operand may be a value a carry is holding, which has to be
+    ///   read through `gp_load_value` or the carry strands — and when `x` IS
+    ///   carried in RAX the accumulator path is already one instruction, so
+    ///   declining costs nothing;
+    /// * the result must not itself be PLANNED as a carry: `store_rax` hands a
+    ///   carried value to its consumer out of RAX, and the direct form never
+    ///   puts it there. The accumulator form needs no such guard — it falls
+    ///   into `store_rax` with RAX loaded, which is the contract that path
+    ///   already has;
+    /// * and when the home word survives (`home_dropped` is false — a deopt
+    ///   frame names it, say) it is still written, from the destination
+    ///   register, which by then holds exactly what RAX would have.
+    ///
+    /// The 32-bit form zero-extends into the destination, which is what `ADD
+    /// EAX, imm` did and what the 64-bit home store then writes, so the frame
+    /// image is byte-identical either way.
+    fn emit_add_lea(&mut self, id: NodeId, slot: i32, sub: bool, wide: bool) -> AddForm {
+        if !ir_add_lea_enabled() {
+            return AddForm::No;
+        }
+        let node = &self.graph.nodes[id as usize];
+        let (x, k) = (node.inputs[0], node.inputs[1]);
+        // Only the SECOND operand is tried as the constant. `Op::Add` is
+        // commutative and nothing canonicalises it, so `1 + i` is left to the
+        // accumulator path — a missed fold, never a wrong one, and javac does
+        // not emit that order for a counted loop.
+        let Some(imm) = self.alu_imm32(k) else {
+            return AddForm::No;
+        };
+        // `x - k` is `x + (-k)`, except at `i32::MIN`, whose negation is not an
+        // `i32` at all. One constant in the language, and it declines here
+        // rather than wrapping into a silent `+ MIN`.
+        let Some(disp) = (if sub { imm.checked_neg() } else { Some(imm) }) else {
+            return AddForm::No;
+        };
+        if self.carry_names(x) || self.carry_names(k) {
+            return AddForm::No;
+        }
+        let Some(base) = self.resident_gpr(x) else {
+            return AddForm::No;
+        };
+        // The direct form, when the result has a register to be written into
+        // and nothing has claimed RAX as the route to its consumer.
+        if let Some(dst) = self.assigned_gpr(id) {
+            if self.carry_at_store(slot).is_none() {
+                let (bytes, len) = lea_reg_base_disp_bytes(dst, base, disp, wide);
+                self.buf.emit(&bytes[..len]);
+                self.mark_gp_reg_live(id);
+                self.reg_publishes_at_def += 1;
+                self.cur_def_published = true;
+                if self.home_dropped.get(id as usize).copied().unwrap_or(false) {
+                    self.homes_dropped_at_def += 1;
+                    self.home_stores_dropped += 1;
+                } else {
+                    self.store_abi_reg(dst, slot);
+                }
+                self.add_lea += 1;
+                return AddForm::Done;
+            }
+        }
+        let (bytes, len) = lea_reg_base_disp_bytes(RAX, base, disp, wide);
+        self.buf.emit(&bytes[..len]);
+        self.add_lea_acc += 1;
+        AddForm::InRax
     }
 
     /// Is `id` a value some carry is holding in RAX or RCX right now?
@@ -3312,6 +3618,63 @@ impl<'a> Lowerer<'a> {
         // home word go stale at the same point, and an order that protects one
         // protects the other. A cycle's `Save` copies the pre-value out at the
         // same instant either way.
+        // ── Which register STAGES the value ──────────────────────────
+        //
+        // RAX was the staging register for every phi copy, and the publish
+        // below then copied RAX into the phi's own register. When the phi has
+        // one, that register is a strictly better temporary: the read lands
+        // there directly and the publish disappears, because the value is
+        // already where the publish was going to put it.
+        //
+        // Worth one instruction per phi per edge, i.e. per loop-carried value
+        // per iteration. On `probes/FieldLoop.java` `sum` the back edge was
+        //
+        //     mov rax,r15 / mov r12,rax          ; the `sum` phi
+        //     mov rax,[rbp-98h] / mov rbx,rax    ; the `i` phi
+        //
+        // which is four instructions in a 26-instruction loop body to move two
+        // values that are already in a register or a word.
+        //
+        // # Why it is the same program
+        //
+        // The write to the phi's register moves EARLIER inside this one
+        // `CopyOp` — from after the home store to before it — and nothing in
+        // between reads anything: the only instruction it crosses is this
+        // copy's own store, whose source it now is. Relative to every OTHER
+        // copy on this edge the ordering is unchanged, because the old publish
+        // was already inside this op and therefore already ahead of the next
+        // op's read. `resolve_parallel_copy`'s invariant (every source is read
+        // before anything writes it) is a statement about that cross-op order
+        // and is untouched.
+        //
+        // # What still goes through RAX, and why
+        //
+        // * a phi with no GP register — an FP phi publishes from its home word
+        //   in `emit_phi_copies`'s later loop, and a non-resident phi has
+        //   nowhere else to stage;
+        // * a DEFERRED publish — the home store is the only thing carrying the
+        //   value to the end of the edge, so writing the register here would
+        //   publish it at the wrong point;
+        // * `CopyOp::Save`, whose destination is the scratch word and has no
+        //   phi at all;
+        // * **a phi whose home store SURVIVES.** That one is a deliberate
+        //   restriction rather than an obstacle, and the reason is in
+        //   `a_phi_copy_that_keeps_its_home_is_byte_identical`: staging there
+        //   would also have to write the home from the staged register, and no
+        //   test in this crate can separate a right store from a wrong one on
+        //   that path — nothing reads a resident phi's home word back, so
+        //   `store_abi_reg(RAX, dst)` in place of the value produces identical
+        //   answers. Requiring the drop keeps every remaining path one this
+        //   suite can fail. It costs the home-keeping case one instruction, on
+        //   a path a `panic!` proved the whole crate never reaches.
+        let stage = phi_of_dst
+            .get(&dst)
+            .copied()
+            .filter(|_| ir_phi_copy_regs_enabled() && ir_phi_copy_direct_enabled())
+            .filter(|phi| !defer_publish.contains(phi))
+            .filter(|phi| self.home_dropped.get(*phi as usize).copied().unwrap_or(false))
+            .and_then(|phi| self.assigned_gpr(phi).map(|reg| (phi, reg)));
+        let stage_reg = stage.map_or(RAX, |(_, reg)| reg);
         let mut from_reg = false;
         if ir_phi_copy_regs_enabled() {
             if let Some(&sid) = src_node_of.get(&src) {
@@ -3330,7 +3693,10 @@ impl<'a> Lowerer<'a> {
                 };
                 match src_reg {
                     Some(r) => {
-                        self.emit_mov_reg_reg64(RAX, r);
+                        // A no-op when the source already sits in the phi's
+                        // register, which `emit_mov_reg_reg64` drops rather
+                        // than encoding `mov r,r`.
+                        self.emit_mov_reg_reg64(stage_reg, r);
                         from_reg = true;
                         self.phi_copy_reg_reads += 1;
                     }
@@ -3349,7 +3715,7 @@ impl<'a> Lowerer<'a> {
             }
         }
         if !from_reg {
-            self.load_to_rax(src);
+            self.load_reg_from_frame(stage_reg, src);
         }
         // ── The store, when anything could read it ───────────────────
         //
@@ -3367,6 +3733,16 @@ impl<'a> Lowerer<'a> {
         if drop_home {
             self.home_stores_dropped += 1;
         } else {
+            // Reached only with `stage_reg == RAX`: `stage` requires the phi's
+            // home to be dropped and `drop_home` is that same fact, so the two
+            // are the same condition read from the two directions. The
+            // `debug_assert` is what stops a future widening of `stage` from
+            // silently storing the wrong register here.
+            debug_assert_eq!(
+                stage_reg, RAX,
+                "a staged phi copy reached the home store; `stage` and \
+                 `drop_home` have come apart",
+            );
             self.store_rax(dst);
         }
         // ── Publish: from RAX, which provably holds the value ─────────
@@ -3376,7 +3752,15 @@ impl<'a> Lowerer<'a> {
         // `mov reg, [dst]` — the same word, written and read back across a
         // store-forwarding stall, once per phi per edge, i.e. once per loop
         // iteration for every loop-carried value.
-        if ir_phi_copy_regs_enabled() {
+        if let Some((phi, _)) = stage {
+            // Staged straight into the phi's register above: the value is
+            // already published, and the bookkeeping is the same either way so
+            // that `emit_phi_copies`'s `published` check cannot tell the two
+            // routes apart.
+            self.mark_gp_reg_live(phi);
+            published.push(phi);
+            self.phi_copy_reg_publishes += 1;
+        } else if ir_phi_copy_regs_enabled() {
             if let Some(&phi) = phi_of_dst.get(&dst) {
                 if let Some(dst_reg) = self.assigned_gpr(phi) {
                     if !defer_publish.contains(&phi) {
@@ -5274,6 +5658,7 @@ impl<'a> Lowerer<'a> {
 
     /// MOV RCX, [RBP - offset]
     fn load_to_rcx(&mut self, offset: i32) {
+        self.note_rcx_written();
         let mut bytes = FrameAccess::new();
         enc_frame_load(RCX, offset, &mut bytes);
         self.buf.emit(bytes.as_slice());
@@ -5298,8 +5683,11 @@ impl<'a> Lowerer<'a> {
         if let Some((id, reg, cons)) = carry {
             // RAX already holds it — that is what the store was about to
             // write. RCX costs one register move and still removes a load.
+            // `_raw`, because this write to RCX is the carry being INSTALLED:
+            // counting it would make the producer's own node look as if it had
+            // clobbered the value it just placed.
             if reg != RAX {
-                self.emit_mov_reg_reg64(reg, RAX);
+                self.emit_mov_reg_reg64_raw(reg, RAX);
             }
             if self.carry_deferred.get(id as usize).copied().unwrap_or(false) {
                 // The DEFERRED slot. `reg` is RCX by construction (the planner
@@ -5362,6 +5750,27 @@ impl<'a> Lowerer<'a> {
                 BailoutReason::UnallocatedValue { node: prod },
                 format!("n{prod}'s carry to n{cons} did not hold: {why}"),
             ));
+        }
+    }
+
+    /// Count a write to RCX, and kill a deferred carry it has just destroyed.
+    ///
+    /// The OBSERVATION half of the deferred carry's proof. `op_preserves_rcx`
+    /// and [`Self::node_preserves_rcx`] are audits of SOURCE, so they can be
+    /// wrong in the one direction that matters — claiming an arm leaves RCX
+    /// alone when it does not. Every route by which this file reaches RCX
+    /// (`gp_load_value`, `load_to_rcx`, `emit_mov_reg_reg64` and the two
+    /// immediate forms) calls this first, so a wrong audit costs the METHOD, at
+    /// the node that did it, and never a wrong answer at run time.
+    ///
+    /// The counter is what `lower_data_node_tracked` compares across a node:
+    /// "did this arm write RCX" is then a fact about the emission rather than a
+    /// prediction about the op, which is what lets the audit widen past the two
+    /// ops whose arms mention no RCX at all.
+    fn note_rcx_written(&mut self) {
+        self.rcx_writes += 1;
+        if self.deferred_rcx.is_some() {
+            self.refuse_deferred("RCX was written before its consumer read it");
         }
     }
 
@@ -5453,6 +5862,9 @@ impl<'a> Lowerer<'a> {
 
     /// MOV reg, imm64 (REX.W [+ REX.B for r8–r15]).
     fn emit_mov_reg_imm64(&mut self, reg: u8, val: u64) {
+        if reg == RCX {
+            self.note_rcx_written();
+        }
         let rex = 0x48 | if reg >= 8 { 0x01 } else { 0 }; // REX.W (+REX.B)
         self.buf.emit_byte(rex);
         self.buf.emit_byte(0xB8 + (reg & 7));
@@ -7368,6 +7780,9 @@ impl<'a> Lowerer<'a> {
         // Everything else is the adjacent rule verbatim: one use, an `Int` or
         // `Long`, a producer whose home store is one `store_rax`, a consumer
         // that reads RAX then RCX, and no residency claim on the value.
+        let mut deferred_skips = [0usize; 8];
+        let mut deferred_mid_foldable = 0usize;
+        let mut deferred_candidates = 0usize;
         if ir_carry_single_use_enabled() && ir_carry_second_operand_enabled() {
             if self.carry_deferred.len() < n_nodes {
                 self.carry_deferred.resize(n_nodes, false);
@@ -7382,38 +7797,66 @@ impl<'a> Lowerer<'a> {
                     // together deliberately, rather than dependence order
                     // happening to look the same.
                     if carry_of.get(mid as usize).copied().flatten() != Some((RAX, cons)) {
+                        deferred_skips[0] += 1;
                         continue;
                     }
-                    if carry_of.get(prod as usize).copied().flatten().is_some() {
-                        continue;
-                    }
-                    if use_count.get(prod as usize).copied().unwrap_or(0) != 1 {
-                        continue;
-                    }
-                    let (Some(pn), Some(cn), Some(mn)) = (
+                    // From here the window IS the shape the second slot exists
+                    // for — a consumer already taking its first operand in RAX
+                    // — so everything below is a CANDIDATE declined, and the
+                    // causes are split finely enough to be acted on. Above it is
+                    // every other triple of scheduled nodes, which is a
+                    // denominator no decision depends on.
+                    deferred_candidates += 1;
+                    let (Some(pn), Some(cn)) = (
                         self.graph.nodes.get(prod as usize),
                         self.graph.nodes.get(cons as usize),
-                        self.graph.nodes.get(mid as usize),
                     ) else {
                         continue;
                     };
                     // RCX is the second operand's register, so this only ever
-                    // applies to a value read there.
+                    // applies to a value read there. When the node two back is
+                    // not that operand, the operand is somewhere the pairing
+                    // pass could not bring it — another block, a phi, a
+                    // parameter, or behind a node it may not cross.
                     if cn.inputs.get(1) != Some(&prod) {
+                        deferred_skips[5] += 1;
+                        continue;
+                    }
+                    if carry_of.get(prod as usize).copied().flatten().is_some() {
+                        deferred_skips[1] += 1;
+                        continue;
+                    }
+                    if use_count.get(prod as usize).copied().unwrap_or(0) != 1 {
+                        deferred_skips[2] += 1;
                         continue;
                     }
                     if !matches!(pn.ty, IrType::Int | IrType::Long)
-                        || !matches!(cn.ty, IrType::Int | IrType::Long)
+                        || !op_home_is_one_store_rax(&pn.op)
                     {
-                        continue;
-                    }
-                    if !op_home_is_one_store_rax(&pn.op) || !op_reads_rax_then_rcx(&cn.op) {
-                        continue;
-                    }
-                    if !op_preserves_rcx(&mn.op) {
+                        deferred_skips[3] += 1;
                         continue;
                     }
                     if self.assigned_gpr(prod).is_some() {
+                        deferred_skips[4] += 1;
+                        continue;
+                    }
+                    if !matches!(cn.ty, IrType::Int | IrType::Long)
+                        || !op_reads_rax_then_rcx(&cn.op)
+                    {
+                        deferred_skips[6] += 1;
+                        continue;
+                    }
+                    // The one arm in between has to leave RCX alone. Asked of
+                    // the NODE, not the op: a binary arm reaches RCX only
+                    // through the register form of its own second operand, and
+                    // a folded operand never takes that branch.
+                    if !self.node_preserves_rcx(mid) {
+                        deferred_skips[7] += 1;
+                        // …and how many of those are the folded shape, so a run
+                        // with the widening switched OFF still prices it.
+                        if self.mid_would_fold(mid) {
+                            deferred_mid_foldable += 1;
+                        }
                         continue;
                     }
                     carry_of[prod as usize] = Some((RCX, cons));
@@ -7443,6 +7886,9 @@ impl<'a> Lowerer<'a> {
                 self.home_dropped[*id as usize] = true;
             }
         }
+        self.deferred_skips = deferred_skips;
+        self.deferred_mid_foldable = deferred_mid_foldable;
+        self.deferred_candidates = deferred_candidates;
         self.carry_skips = carry_skips;
         self.carry_named = carry_named;
         self.unreachable_homes += carry_unreachable;
@@ -7542,6 +7988,9 @@ impl<'a> Lowerer<'a> {
     /// bits: `mov r32, imm32` (zero-extends) for 0..=u32::MAX, `mov r64,
     /// simm32` for the rest of the i32 range, `mov r64, imm64` otherwise.
     fn emit_mov_reg_imm_smart(&mut self, reg: u8, val: i64) {
+        if reg == RCX {
+            self.note_rcx_written();
+        }
         if (0..=i64::from(u32::MAX)).contains(&val) {
             if reg >= 8 {
                 self.buf.emit_byte(0x41); // REX.B
@@ -7645,6 +8094,7 @@ impl<'a> Lowerer<'a> {
         let prev_published = self.cur_def_published;
         self.cur_def = Some(id);
         self.cur_def_published = false;
+        let rcx_writes_before = self.rcx_writes;
         self.lower_data_node(id);
         // A CARRIED value satisfies its dropped home the other way: it is left
         // in RAX or RCX for its one consumer rather than published into a
@@ -7694,12 +8144,13 @@ impl<'a> Lowerer<'a> {
             } else if id == cons {
                 // The consumer finished without taking it out of RCX.
                 self.refuse_deferred("its consumer finished without reading it");
-            } else if !self
-                .graph
-                .nodes
-                .get(id as usize)
-                .is_some_and(|n| op_preserves_rcx(&n.op))
-            {
+            } else if self.rcx_writes != rcx_writes_before {
+                // OBSERVED, not predicted. `note_rcx_written` has normally
+                // refused already; this is the same fact asked of the node as a
+                // whole, and it is what lets `node_preserves_rcx` widen past
+                // the two ops whose arms mention no RCX at all.
+                self.refuse_deferred("the arm in between wrote RCX");
+            } else if !self.node_preserves_rcx(id) {
                 self.refuse_deferred("an arm that can write RCX was lowered in between");
             } else if allowance == 0 {
                 self.refuse_deferred("more than one arm came between it and its consumer");
@@ -7774,18 +8225,27 @@ impl<'a> Lowerer<'a> {
                     self.fp_binop(0x58, XMM0, XMM1, is_d);
                     self.fp_store_value(id, slot, XMM0, is_d);
                 } else {
-                    self.gp_load_value(RAX, node.inputs[0]);
-                    if !self.emit_alu_acc_imm(node.inputs[1], 0x05, node.ty != IrType::Int) {
-                        self.gp_load_value(RCX, node.inputs[1]);
-                        if node.ty == IrType::Int {
-                            // ADD EAX, ECX
-                            self.buf.emit(&[0x01, 0xC8]);
-                        } else {
-                            // ADD RAX, RCX
-                            self.buf.emit(&[0x48, 0x01, 0xC8]);
+                    let form = self.emit_add_lea(id, slot, false, node.ty != IrType::Int);
+                    if matches!(form, AddForm::No) {
+                        self.gp_load_value(RAX, node.inputs[0]);
+                        if !self.emit_alu_acc_imm(node.inputs[1], 0x05, node.ty != IrType::Int) {
+                            self.gp_load_value(RCX, node.inputs[1]);
+                            if node.ty == IrType::Int {
+                                // ADD EAX, ECX
+                                self.buf.emit(&[0x01, 0xC8]);
+                            } else {
+                                // ADD RAX, RCX
+                                self.buf.emit(&[0x48, 0x01, 0xC8]);
+                            }
                         }
                     }
-                    self.store_rax(slot);
+                    // `Done` settled the home inside the helper, having
+                    // published the register itself; the other two leave the
+                    // value in RAX for this one store, exactly as the single
+                    // path used to.
+                    if !matches!(form, AddForm::Done) {
+                        self.store_rax(slot);
+                    }
                 }
             }
             Op::Sub => {
@@ -7798,18 +8258,23 @@ impl<'a> Lowerer<'a> {
                     self.fp_binop(0x5C, XMM0, XMM1, is_d);
                     self.fp_store_value(id, slot, XMM0, is_d);
                 } else {
-                    self.gp_load_value(RAX, node.inputs[0]);
-                    if !self.emit_alu_acc_imm(node.inputs[1], 0x2D, node.ty != IrType::Int) {
-                        self.gp_load_value(RCX, node.inputs[1]);
-                        if node.ty == IrType::Int {
-                            // SUB EAX, ECX
-                            self.buf.emit(&[0x29, 0xC8]);
-                        } else {
-                            // SUB RAX, RCX
-                            self.buf.emit(&[0x48, 0x29, 0xC8]);
+                    let form = self.emit_add_lea(id, slot, true, node.ty != IrType::Int);
+                    if matches!(form, AddForm::No) {
+                        self.gp_load_value(RAX, node.inputs[0]);
+                        if !self.emit_alu_acc_imm(node.inputs[1], 0x2D, node.ty != IrType::Int) {
+                            self.gp_load_value(RCX, node.inputs[1]);
+                            if node.ty == IrType::Int {
+                                // SUB EAX, ECX
+                                self.buf.emit(&[0x29, 0xC8]);
+                            } else {
+                                // SUB RAX, RCX
+                                self.buf.emit(&[0x48, 0x29, 0xC8]);
+                            }
                         }
                     }
-                    self.store_rax(slot);
+                    if !matches!(form, AddForm::Done) {
+                        self.store_rax(slot);
+                    }
                 }
             }
             Op::Mul => {
@@ -10178,44 +10643,42 @@ impl<'a> Lowerer<'a> {
                                 // the non-fused path below overwrites AL with
                                 // `SETcc` on the phi-copy layout, so no reader
                                 // could ever have relied on it.
-                                // Two in-place forms, in order of how much
-                                // they save. Both need the FIRST operand in a
-                                // register, and neither may touch a value some
-                                // carry is holding — that has to be read
-                                // through `gp_load_value` or the carry strands.
+                                // Four in-place forms — see `pick_cmp_form`
+                                // for which one wins and why. Neither operand
+                                // may be a value some carry is holding: that
+                                // has to be read through `gp_load_value` or
+                                // the carry strands.
                                 //
                                 // `b` in a frame slot is the common case, not
                                 // the fallback: `peak_live` routinely exceeds
                                 // the five-register file, and a loop bound is
                                 // exactly the long-lived value that loses.
-                                let in_place = if ir_cmp_in_place_enabled()
+                                // `b` a CONSTANT is commoner still — `i < 100`
+                                // is the shape of most Java loops.
+                                let form = if ir_cmp_in_place_enabled()
                                     && !self.carry_names(a)
                                     && !self.carry_names(b)
                                 {
-                                    match (self.resident_gpr(a), self.resident_gpr(b)) {
-                                        (Some(ra), Some(rb)) => Some(Ok((ra, rb))),
-                                        // `slot_of_checked` rather than
-                                        // `slot_of`: a dropped home declines
-                                        // this form instead of latching a
-                                        // bailout on a path that has a perfectly
-                                        // good fallback.
-                                        (Some(ra), None) => self
-                                            .slot_of_checked(b)
-                                            .ok()
-                                            .map(|off| Err((ra, off))),
-                                        _ => None,
-                                    }
+                                    self.pick_cmp_form(a, b)
                                 } else {
                                     None
                                 };
-                                match in_place {
-                                    Some(Ok((ra, rb))) => {
+                                match form {
+                                    Some(CmpForm::RegReg(ra, rb)) => {
                                         self.emit_cmp_reg_reg(ra, rb, ref_cmp);
                                         self.cmp_in_place += 1;
                                     }
-                                    Some(Err((ra, off))) => {
+                                    Some(CmpForm::RegFrame(ra, off)) => {
                                         self.emit_cmp_reg_frame(ra, off, ref_cmp);
                                         self.cmp_in_place_frame += 1;
+                                    }
+                                    Some(CmpForm::RegImm(ra, imm)) => {
+                                        self.emit_cmp_reg_imm(ra, imm, ref_cmp);
+                                        self.cmp_imm += 1;
+                                    }
+                                    Some(CmpForm::FrameImm(off, imm)) => {
+                                        self.emit_cmp_frame_imm(off, imm, ref_cmp);
+                                        self.cmp_imm_frame += 1;
                                     }
                                     None => {
                                         self.gp_load_value(RAX, a);
@@ -13825,6 +14288,114 @@ fn ir_carry_second_operand_enabled() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_IR_CARRY_RCX_FOLDED=0` — restrict a deferred carry's crossing
+/// to the ops [`op_preserves_rcx`] names, ignoring the folded-operand widening
+/// [`Lowerer::node_preserves_rcx`] adds.
+///
+/// Default ON since 2026-09-10. `op_preserves_rcx` is two ops, and its own doc
+/// gives the reason: *every* binary arm loads its second operand with
+/// `gp_load_value(RCX, node.inputs[1])`. That is true of the arm, and false of
+/// the arm on the path it takes when that operand is a CONSTANT — every one of
+/// them opens `if !self.emit_alu_acc_imm(node.inputs[1], ..)` (or the `imul` /
+/// shift form), and the folded branch never reaches the RCX read at all. The
+/// three fold helpers share one predicate, `alu_imm32(id).is_some()`, so the
+/// planner can ask the arm's own question rather than a weaker one.
+///
+/// That is a NODE-level fact, not an op-level one, which is why it cannot live
+/// in `op_preserves_rcx`. `x + 1`, `x & 0xFF`, `x >>> 3` and `x * 31` are the
+/// commonest producers in Java arithmetic, and before this every one of them
+/// disqualified whatever was scheduled behind it.
+fn ir_carry_rcx_folded_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CARRY_RCX_FOLDED").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
+/// `CRATONVM_JIT_IR_ADD_LEA=0` — lower `x + k` and `x - k` through the
+/// accumulator, the shape that predates 2026-09-10.
+///
+/// Default ON. `LEA` is the only three-operand integer instruction on x86-64,
+/// and an increment whose source and destination are both register-resident is
+/// exactly the case that needs one: without it the value makes a round trip
+/// through RAX it has no other reason to make.
+///
+/// The kill switch and the A/B. See [`Lowerer::emit_add_lea`] for what it
+/// replaces and for the obligations a DEFINING arm has that a fused compare
+/// does not.
+fn ir_add_lea_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_ADD_LEA").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
+/// The ops whose arms reach RCX ONLY through the register form of their second
+/// operand, so that folding that operand into an immediate leaves RCX
+/// untouched.
+///
+/// Membership is a claim about arm SHAPE and nothing else: one
+/// `gp_load_value(RAX, node.inputs[0])`, then a single
+/// `if !self.emit_<fold>(node.inputs[1], ..) { self.gp_load_value(RCX,
+/// node.inputs[1]); .. }`, then `store_rax`.
+/// `every_folded_arm_reaches_rcx_only_in_its_register_form` checks that, and
+/// checks the fold helpers' shared predicate too — the tie between "the
+/// planner thinks this folds" and "the arm took the folded branch".
+///
+/// The FP-typed forms of these ops take an entirely different path
+/// (`fp_load_value` into XMM0/XMM1), so `node_preserves_rcx` restricts to
+/// `Int`/`Long`.
+const RCX_FREE_WHEN_FOLDED: &[&str] = &[
+    "Add", "Sub", "Mul", "And", "Or", "Xor", "Shl", "Shr", "UShr",
+];
+
+/// Deferred carries, process-wide: `(candidate windows, taken, declined because
+/// the arm in between can write RCX, of which that arm folds its own second
+/// operand)`.
+///
+/// A CANDIDATE is a consumer already taking its first operand in RAX, which is
+/// the only honest denominator: the shape the second slot exists for.
+///
+/// A per-compile census answers "did it fire on THIS method", which is the
+/// question a kernel asks. Retiring
+/// `c2-one-carry-slot-is-the-frame-traffic-ceiling-FIXED-20260910.md` needed
+/// the other one — how often the shape occurs across a probe set — and that
+/// is a total over every method a run compiles, not a line per method to be
+/// summed by eye.
+static IR_CARRY_DEFERRED: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// `(candidates, taken, mid_writes_rcx, of_which_foldable)` since process start.
+pub fn ir_carry_deferred_census() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        IR_CARRY_DEFERRED[0].load(Relaxed),
+        IR_CARRY_DEFERRED[1].load(Relaxed),
+        IR_CARRY_DEFERRED[2].load(Relaxed),
+        IR_CARRY_DEFERRED[3].load(Relaxed),
+    )
+}
+
+fn note_deferred_census(candidates: usize, taken: usize, mid_rcx: usize, foldable: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    IR_CARRY_DEFERRED[0].fetch_add(candidates as u64, Relaxed);
+    IR_CARRY_DEFERRED[1].fetch_add(taken as u64, Relaxed);
+    IR_CARRY_DEFERRED[2].fetch_add(mid_rcx as u64, Relaxed);
+    IR_CARRY_DEFERRED[3].fetch_add(foldable as u64, Relaxed);
+}
+
 /// `CRATONVM_JIT_IR_CMP_IN_PLACE=0` — load both operands of a fused compare into
 /// RAX and RCX before comparing them, the shape that predates 2026-09-10.
 ///
@@ -13834,6 +14405,62 @@ fn ir_carry_second_operand_enabled() -> bool {
 /// both operands are register-resident the two `MOV`s ahead of it are pure
 /// overhead, and on a counted loop they are two of the seventeen instructions
 /// in the body.
+/// `CRATONVM_JIT_IR_PHI_COPY_DIRECT=0` — stage every phi edge copy through RAX
+/// and publish the phi's register from there, the shape that predates
+/// 2026-09-11.
+///
+/// Default ON. A phi copy whose destination has a register reads straight into
+/// it, which removes the `mov <phi reg>, rax` that followed every one — one
+/// instruction per loop-carried value per iteration. See
+/// [`Lowerer::emit_copy_op`] for why the two emissions are the same program.
+///
+/// Off restores the previous bytes exactly: RAX stages, the home store comes
+/// from RAX, and the publish is a separate move.
+#[cfg(test)]
+thread_local! {
+    /// Test-only override of [`ir_phi_copy_direct_enabled`], the same shape as
+    /// `LS_FORCE` and for the same reason: a differential lane has to hold both
+    /// of its arms in one process, and the production answer latches in a
+    /// `OnceLock`.
+    static PHI_COPY_DIRECT_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only RAII override of [`ir_phi_copy_direct_enabled`] on this thread.
+#[cfg(test)]
+struct PhiCopyDirectForce;
+
+#[cfg(test)]
+impl PhiCopyDirectForce {
+    fn set(on: bool) -> PhiCopyDirectForce {
+        PHI_COPY_DIRECT_FORCE.with(|c| c.set(Some(on)));
+        PhiCopyDirectForce
+    }
+}
+
+#[cfg(test)]
+impl Drop for PhiCopyDirectForce {
+    fn drop(&mut self) {
+        PHI_COPY_DIRECT_FORCE.with(|c| c.set(None));
+    }
+}
+
+fn ir_phi_copy_direct_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(forced) = PHI_COPY_DIRECT_FORCE.with(|c| c.get()) {
+            return forced;
+        }
+    }
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PHI_COPY_DIRECT").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
 fn ir_cmp_in_place_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -14372,6 +14999,182 @@ fn cmp_reg_reg_bytes(a: u8, b: u8, wide: bool) -> ([u8; 3], usize) {
     } else {
         ([rex, 0x39, modrm], 3)
     }
+}
+
+/// The bytes of `CMP a, imm` — 64-bit when `wide` — and how many of them.
+///
+/// Group 1 `/7`, the same `ModRM.reg`-as-opcode-extension column `ADD`/`SUB`
+/// live in: `83 /7 ib` sign-extends an `imm8`, `81 /7 id` an `imm32`. The
+/// short form is not a nicety — a Java counted loop compares against a small
+/// literal, so `imm8` is the case, and the long form is what catches the rest.
+///
+/// Both SIGN-EXTEND to the operand width, which is why [`Lowerer::alu_imm32`]
+/// declines a constant that does not fit `i32`: such a constant cannot be
+/// written as an immediate at all, and the register form is not a fallback but
+/// the only correct encoding.
+///
+/// A free function for the same reason `cmp_reg_reg_bytes` is one: the failure
+/// mode of a wrong `/digit` is another real instruction. `/7` is CMP; `/0` is
+/// ADD and `/5` is SUB, both of which WRITE the register and would corrupt a
+/// loop counter rather than fault.
+fn cmp_reg_imm_bytes(a: u8, imm: i32, wide: bool) -> ([u8; 7], usize) {
+    // REX.B extends the r/m field, which is where the single operand goes.
+    // There is no `reg` operand here — `/7` occupies that field — so REX.R is
+    // never set.
+    let rex = if wide { 0x48u8 } else { 0x40u8 } | u8::from(a >= 8);
+    let modrm = 0xF8 | (a & 7); // mod=11, /7, r/m=a
+    let mut out = [0u8; 7];
+    let mut n = 0;
+    if rex != 0x40 {
+        out[n] = rex;
+        n += 1;
+    }
+    match i8::try_from(imm) {
+        Ok(b) => {
+            out[n] = 0x83;
+            out[n + 1] = modrm;
+            // Cast: `i8` to its two's-complement byte, which is what the
+            // sign-extending `ib` field wants.
+            out[n + 2] = b as u8;
+            n += 3;
+        }
+        Err(_) => {
+            out[n] = 0x81;
+            out[n + 1] = modrm;
+            out[n + 2..n + 6].copy_from_slice(&imm.to_le_bytes());
+            n += 6;
+        }
+    }
+    (out, n)
+}
+
+/// The bytes of `CMP [RBP - offset], imm` — 64-bit when `wide`.
+///
+/// The same `/7` column as [`cmp_reg_imm_bytes`] with a memory `r/m`, and the
+/// displacement chosen exactly as [`Lowerer::emit_rbp_modrm_disp`] chooses it
+/// so the two cannot drift.
+///
+/// The 32-bit form reads four bytes of the slot where the `MOV` it replaces
+/// read eight — the same comparison, since the `CMP EAX, ECX` it replaces only
+/// ever looked at those four either.
+fn cmp_frame_imm_bytes(offset: i32, imm: i32, wide: bool) -> ([u8; 11], usize) {
+    let mut out = [0u8; 11];
+    let mut n = 0;
+    if wide {
+        out[n] = 0x48; // REX.W. RBP needs no REX.B, and `/7` leaves no `reg`.
+        n += 1;
+    }
+    let short = i8::try_from(imm);
+    out[n] = if short.is_ok() { 0x83 } else { 0x81 };
+    n += 1;
+    let neg = -offset;
+    if let Ok(d) = i8::try_from(neg) {
+        // mod=01, reg=/7, r/m=RBP(101), disp8; and the cast is the
+        // two's-complement byte of a displacement that fits `i8`.
+        out[n] = 0x7D;
+        out[n + 1] = d as u8;
+        n += 2;
+    } else {
+        out[n] = 0xBD; // mod=10, reg=/7, r/m=RBP(101), disp32
+        out[n + 1..n + 5].copy_from_slice(&neg.to_le_bytes());
+        n += 5;
+    }
+    match short {
+        Ok(b) => {
+            // Cast: as above.
+            out[n] = b as u8;
+            n += 1;
+        }
+        Err(_) => {
+            out[n..n + 4].copy_from_slice(&imm.to_le_bytes());
+            n += 4;
+        }
+    }
+    (out, n)
+}
+
+/// The bytes of `LEA dst, [base + disp]` — 64-bit when `wide` — and how many.
+///
+/// `8D /r`. The point of using it for `x + constant` is that it READS its
+/// operands and WRITES a third register without going through an accumulator:
+/// `mov rax,rbx; add eax,1; mov r14,rax` becomes `lea r14d,[rbx+1]`. It also
+/// leaves the flags alone, which the `ADD` it replaces does not — nothing here
+/// depends on that, but it is one fewer thing between an arm and a fused
+/// compare.
+///
+/// Two encoding traps, and both are silent rather than faulting:
+///
+/// * a base whose low three bits are `100` (RSP, **R12**) means "SIB follows"
+///   in the `r/m` field, so it needs a `24` SIB byte naming itself with no
+///   index. R12 is in this backend's GP file, so this is a live case, not a
+///   theoretical one.
+/// * a base whose low three bits are `101` (RBP, **R13**) has no `mod=00`
+///   form — that encoding means RIP-relative. This always emits a
+///   displacement, `disp8` of zero if that is what it takes, which sidesteps
+///   it for every base at the cost of one byte in the `+0` case.
+fn lea_reg_base_disp_bytes(dst: u8, base: u8, disp: i32, wide: bool) -> ([u8; 8], usize) {
+    // REX.R extends the destination (the `reg` field), REX.B the base (`r/m`,
+    // or the SIB base when there is one) — the opposite assignment from
+    // `cmp_reg_imm_bytes`, where the sole operand is the `r/m`.
+    let rex = if wide { 0x48u8 } else { 0x40u8 } | (u8::from(dst >= 8) << 2) | u8::from(base >= 8);
+    let mut out = [0u8; 8];
+    let mut n = 0;
+    if rex != 0x40 {
+        out[n] = rex;
+        n += 1;
+    }
+    out[n] = 0x8D;
+    n += 1;
+    let short = i8::try_from(disp);
+    let md = if short.is_ok() { 0x40u8 } else { 0x80u8 };
+    out[n] = md | ((dst & 7) << 3) | (base & 7);
+    n += 1;
+    if base & 7 == 4 {
+        out[n] = 0x24; // SIB: scale=0, index=none(100), base=r/m
+        n += 1;
+    }
+    match short {
+        Ok(d) => {
+            // Cast: two's-complement byte of a displacement that fits `i8`.
+            out[n] = d as u8;
+            n += 1;
+        }
+        Err(_) => {
+            out[n..n + 4].copy_from_slice(&disp.to_le_bytes());
+            n += 4;
+        }
+    }
+    (out, n)
+}
+
+/// Where an `x + k` / `x - k` arm left its result, and therefore what the arm
+/// still owes. See [`Lowerer::emit_add_lea`].
+enum AddForm {
+    /// A `LEA` wrote the result's own register and settled its home word. The
+    /// arm is finished.
+    Done,
+    /// A `LEA` left the result in RAX, exactly as `mov rax,x; add eax,k` would
+    /// have. The arm's `store_rax` runs unchanged.
+    InRax,
+    /// Nothing emitted — the accumulator sequence stands.
+    No,
+}
+
+/// Where a fused compare reads its two operands.
+///
+/// Named rather than a nest of `Option`/`Result` because there are four forms
+/// now and the reader of the arm should not have to decode which `Err` means
+/// "frame slot". Each variant is one instruction; the fallback the arm keeps
+/// for `None` is three.
+enum CmpForm {
+    /// Both operands already in registers: `cmp ebx, r12d`.
+    RegReg(u8, u8),
+    /// First resident, second still in its slot: `cmp ebx, [rbp-60h]`.
+    RegFrame(u8, i32),
+    /// First resident, second a constant: `cmp ebx, 100`.
+    RegImm(u8, i32),
+    /// First in its slot, second a constant: `cmp [rbp-60h], 100`.
+    FrameImm(i32, i32),
 }
 
 pub(crate) fn op_preserves_rcx(op: &Op) -> bool {
@@ -17448,10 +18251,21 @@ pub(crate) fn lower_inner_with_scopes(
     {
         let _ = lowerer.census_home_blocks();
     }
+    // Unconditional, and cheap: four relaxed adds per compiled method. The
+    // per-method lines below are behind a diagnostic flag; this total is what a
+    // probe-set census reads, and a census you have to switch on is one nobody
+    // has for the run they already did.
+    note_deferred_census(
+        lowerer.deferred_candidates,
+        lowerer.carry_deferred_planned,
+        lowerer.deferred_skips[7],
+        lowerer.deferred_mid_foldable,
+    );
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
         eprintln!(
             "[ir-ls] carries: planned={} taken={} read={} refused={} \
-             stores_dropped={} still_deopt_named={} deferred={}/{} cmp_in_place={}+{}",
+             stores_dropped={} still_deopt_named={} deferred={}/{} cmp_in_place={}+{} \
+             cmp_imm={}+{}",
             lowerer.carry_of.iter().filter(|c| c.is_some()).count(),
             lowerer.carries_taken,
             lowerer.carries_read,
@@ -17462,6 +18276,8 @@ pub(crate) fn lower_inner_with_scopes(
             lowerer.carry_deferred_read,
             lowerer.cmp_in_place,
             lowerer.cmp_in_place_frame,
+            lowerer.cmp_imm,
+            lowerer.cmp_imm_frame,
         );
         let s = lowerer.carry_skips;
         eprintln!(
@@ -17469,7 +18285,40 @@ pub(crate) fn lower_inner_with_scopes(
              already_resident={} consumer_arm={} operand_position={}",
             s[0], s[1], s[2], s[3], s[4], s[5],
         );
-        eprintln!("[ir-ls] alu immediates folded: {}", lowerer.alu_imms_folded);
+        let d = lowerer.deferred_skips;
+        eprintln!(
+            "[ir-ls] deferred candidates={} taken={} | declined: \
+             prod_carrying={} prod_multi_use={} prod_type_or_arm={} \
+             prod_resident={} operand_position={} consumer={} \
+             mid_writes_rcx={} (of which foldable={}) | non_candidate_windows={}",
+            lowerer.deferred_candidates,
+            lowerer.carry_deferred_planned,
+            d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+            lowerer.deferred_mid_foldable,
+            d[0],
+        );
+        eprintln!(
+            "[ir-ls] alu immediates folded: {} add_lea={}+{}",
+            lowerer.alu_imms_folded, lowerer.add_lea, lowerer.add_lea_acc,
+        );
+        // The SCHEDULER's half of the same question. `carry skips:
+        // operand_position` above says how often the emitter wanted a triple
+        // the scheduler had not formed; this says why it had not.
+        let pc = schedule.pairing;
+        eprintln!(
+            "[ir-ls] operand pairing: candidates={} paired={} | declined: \
+             multi_use={} producer_arm={} other_block={} after_consumer={} \
+             already_adjacent={} deopt_between={} no_node={}",
+            pc.candidates,
+            pc.paired,
+            pc.multi_use,
+            pc.producer_arm,
+            pc.other_block,
+            pc.after_consumer,
+            pc.already_adjacent,
+            pc.deopt_between,
+            pc.no_node,
+        );
         eprintln!(
             "[ir-ls] carried homes dropped: {}",
             lowerer.carried_homes_dropped,
@@ -25356,6 +26205,134 @@ mod tests {").next().unwrap_or(src);
         assert_eq!(cmp_reg_reg_bytes(RCX, RAX, false), ([0x39, 0xC1, 0], 2));
     }
 
+    /// `cmp_reg_imm_bytes` against hand-checked encodings.
+    ///
+    /// The `/digit` is the whole risk and it is a silent one: `/7` is CMP, but
+    /// `/0` in the same two opcodes is ADD and `/5` is SUB, and both of those
+    /// WRITE the register. A transposed digit would not fault — it would
+    /// increment the loop counter under the comparison.
+    #[test]
+    fn cmp_reg_imm_encodes_the_known_forms() {
+        // CMP EBX, 100 — the `i < 100` this exists for. `83 /7 ib`.
+        assert_eq!(
+            &cmp_reg_imm_bytes(3, 100, false).0[..3],
+            &[0x83, 0xFB, 0x64]
+        );
+        // CMP EAX, 0 — the low-register, zero-constant corner still uses the
+        // short form and emits no REX.
+        assert_eq!(
+            &cmp_reg_imm_bytes(RAX, 0, false).0[..3],
+            &[0x83, 0xF8, 0x00]
+        );
+        // CMP RBX, 100 — REX.W only.
+        assert_eq!(
+            &cmp_reg_imm_bytes(3, 100, true).0[..4],
+            &[0x48, 0x83, 0xFB, 0x64]
+        );
+        // CMP R12D, 100 — REX.B extends the r/m field, which is where the sole
+        // operand lives. REX.R is never set here: `/7` occupies `reg`.
+        assert_eq!(
+            &cmp_reg_imm_bytes(12, 100, false).0[..4],
+            &[0x41, 0x83, 0xFC, 0x64]
+        );
+        // CMP EAX, 4096 — too wide for `imm8`, so `81 /7 id`, six bytes.
+        assert_eq!(
+            cmp_reg_imm_bytes(RAX, 4096, false),
+            ([0x81, 0xF8, 0x00, 0x10, 0x00, 0x00, 0x00], 6)
+        );
+        // -128 is the last `imm8`; -129 is not. The boundary is worth pinning
+        // because an off-by-one there emits a six-byte instruction where a
+        // three-byte one was correct, which no test of behaviour would catch.
+        assert_eq!(cmp_reg_imm_bytes(RAX, -128, false).1, 3);
+        assert_eq!(cmp_reg_imm_bytes(RAX, -129, false).1, 6);
+    }
+
+    /// `cmp_frame_imm_bytes` against hand-checked encodings — the form that
+    /// names no register at all.
+    #[test]
+    fn cmp_frame_imm_encodes_the_known_forms() {
+        // CMP DWORD [RBP-60h], 100. mod=01, /7, r/m=RBP, disp8 = -0x60.
+        assert_eq!(
+            &cmp_frame_imm_bytes(0x60, 100, false).0[..4],
+            &[0x83, 0x7D, 0xA0, 0x64]
+        );
+        // CMP QWORD [RBP-60h], 100 — REX.W, and nothing else changes.
+        assert_eq!(
+            &cmp_frame_imm_bytes(0x60, 100, true).0[..5],
+            &[0x48, 0x83, 0x7D, 0xA0, 0x64]
+        );
+        // A slot past the disp8 reach takes mod=10 and a disp32.
+        assert_eq!(
+            &cmp_frame_imm_bytes(0x200, 1, false).0[..7],
+            &[0x83, 0xBD, 0x00, 0xFE, 0xFF, 0xFF, 0x01]
+        );
+        // Both fields long: disp32 and imm32, eleven bytes with REX.W.
+        assert_eq!(cmp_frame_imm_bytes(0x200, 4096, true).1, 11);
+    }
+
+    /// `lea_reg_base_disp_bytes` against hand-checked encodings.
+    ///
+    /// Two encodings here are wrong in ways that do not fault, which is why
+    /// they are written out rather than derived: an R12 base without its SIB
+    /// byte reads `[disp]` through a different addressing form, and an R13
+    /// base with `mod=00` is RIP-relative.
+    #[test]
+    fn lea_base_disp_encodes_the_known_forms() {
+        // LEA R14D, [RBX+1] — the `i + 1` this exists for.
+        assert_eq!(
+            &lea_reg_base_disp_bytes(14, 3, 1, false).0[..4],
+            &[0x44, 0x8D, 0x73, 0x01]
+        );
+        // LEA R14, [RBX+1] — the `long` form, REX.W added.
+        assert_eq!(
+            &lea_reg_base_disp_bytes(14, 3, 1, true).0[..4],
+            &[0x4C, 0x8D, 0x73, 0x01]
+        );
+        // LEA EAX, [RBX-1] — `x - k` arrives here as a negative displacement.
+        assert_eq!(
+            &lea_reg_base_disp_bytes(RAX, 3, -1, false).0[..3],
+            &[0x8D, 0x43, 0xFF]
+        );
+        // LEA EBX, [R12+1] — base r/m 100 means "SIB follows", so one must.
+        assert_eq!(
+            &lea_reg_base_disp_bytes(3, 12, 1, false).0[..5],
+            &[0x41, 0x8D, 0x5C, 0x24, 0x01]
+        );
+        // LEA EBX, [R13+0] — r/m 101 has no mod=00 form, so the zero
+        // displacement is emitted rather than elided.
+        assert_eq!(
+            &lea_reg_base_disp_bytes(3, 13, 0, false).0[..4],
+            &[0x41, 0x8D, 0x5D, 0x00]
+        );
+        // A displacement past `imm8` takes mod=10 and four bytes.
+        assert_eq!(lea_reg_base_disp_bytes(RAX, 3, 4096, false).1, 6);
+        assert_eq!(lea_reg_base_disp_bytes(RAX, 3, 127, false).1, 3);
+        assert_eq!(lea_reg_base_disp_bytes(RAX, 3, 128, false).1, 6);
+    }
+
+    /// `LEA` must not be transposed: the destination is the `reg` field and the
+    /// base is `r/m`, the OPPOSITE assignment from `cmp_reg_imm_bytes`, where
+    /// the sole operand is the `r/m` and `reg` is an opcode extension.
+    ///
+    /// Stated separately because the vectors above would all still pass if the
+    /// function and its expectations were transposed together.
+    #[test]
+    fn lea_puts_the_destination_in_reg_and_the_base_in_rm() {
+        // LEA EAX, [RCX+0] is `8D 41 00`; LEA ECX, [RAX+0] is `8D 48 00`.
+        assert_eq!(
+            &lea_reg_base_disp_bytes(RAX, RCX, 0, false).0[..3],
+            &[0x8D, 0x41, 0x00]
+        );
+        assert_eq!(
+            &lea_reg_base_disp_bytes(RCX, RAX, 0, false).0[..3],
+            &[0x8D, 0x48, 0x00]
+        );
+        // And the REX bits follow the same split: extending the DESTINATION
+        // sets REX.R (0x44), extending the BASE sets REX.B (0x41).
+        assert_eq!(lea_reg_base_disp_bytes(14, 3, 0, false).0[0], 0x44);
+        assert_eq!(lea_reg_base_disp_bytes(3, 14, 0, false).0[0], 0x41);
+    }
+
     #[test]
     fn every_rcx_preserving_arm_leaves_rcx_alone() {
         let src = include_str!("ir_lower.rs").replace("\r\n", "\n");
@@ -25451,6 +26428,483 @@ mod tests {").next().unwrap_or(src);
         }
     }
 
+    /// [`RCX_FREE_WHEN_FOLDED`] claims of nine binary arms that their ONLY
+    /// route to RCX is the REGISTER form of their own second operand — so an
+    /// operand folded to an immediate leaves RCX untouched and the arm can
+    /// carry a deferred value across itself.
+    ///
+    /// `op_preserves_rcx` could not express that: it is a claim about a NODE
+    /// (does *this* second operand fold?) rather than about an op. What makes
+    /// it safe is that the claim is checkable in the source three ways, and
+    /// this test does all three:
+    ///
+    /// 1. **The fold helpers decide on exactly the predicate the planner
+    ///    asks.** `emit_alu_acc_imm`, `emit_imul_imm` and `emit_shift_imm` all
+    ///    open `let Some(imm) = self.alu_imm32(id) else { return false; };`,
+    ///    which is what ties `node_preserves_rcx`'s question to the branch the
+    ///    arm actually takes. If one of them grew a second reason to decline,
+    ///    the planner could predict a fold the arm does not perform.
+    /// 2. **Every mention of RCX in the arm is inside that fold's `else`
+    ///    branch**, and there is exactly one such branch per arm.
+    /// 3. **Nothing outside it can reach RCX by another route** — no raw
+    ///    `buf.emit`, and only calls from a closed list, of which the sole
+    ///    register-bearing one is `gp_load_value(RAX, node.inputs[0])`.
+    ///
+    /// A failure here says the widening has drifted from the arms. The
+    /// emitter's `rcx_writes` comparison in `lower_data_node_tracked` is the
+    /// net under it — the compile is refused rather than wrong — but a refusal
+    /// is a silent perf cliff, so this is where it should be caught.
+    /// The two lists that have to agree: `RCX_FREE_WHEN_FOLDED`, which the
+    /// audit above checks against the arms, and the `matches!` inside
+    /// `Lowerer::node_preserves_rcx`, which is what the planner actually asks.
+    ///
+    /// They are separate because one is strings for a source scan and the other
+    /// is `Op` patterns for a match, and nothing in the language ties them
+    /// together. A name in the planner's list but not the audit's is an arm
+    /// claimed by NOTHING -- the widening would cross it on a promise no test
+    /// has read. A name in the audit's but not the planner's is only a missed
+    /// optimization, and it fails here too, because a list that is checked and
+    /// unused reads exactly like one that is checked and used.
+    #[test]
+    fn the_planner_and_the_audit_name_the_same_folded_ops() {
+        let src = include_str!("ir_lower.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn node_preserves_rcx(&self, id: NodeId) -> bool {")
+            .nth(1)
+            .expect("node_preserves_rcx is in this file")
+            .split("\n    }")
+            .next()
+            .expect("the function ends");
+        let mut planner = std::collections::BTreeSet::new();
+        collect_op_names(body, &mut planner);
+        // `op_preserves_rcx` is consulted first and contributes no names of its
+        // own here; the only `Op::` patterns in this body are the folded list
+        // and the `IrType` guard, which `collect_op_names` does not match.
+        let audited: std::collections::BTreeSet<String> = super::RCX_FREE_WHEN_FOLDED
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(
+            planner, audited,
+            "`node_preserves_rcx` and `RCX_FREE_WHEN_FOLDED` name different ops. \
+             The first decides what a deferred carry may cross; the second is \
+             what `every_folded_arm_reaches_rcx_only_in_its_register_form` \
+             checks against the arms. A name in the first and not the second is \
+             an arm crossed on a promise no test has read.",
+        );
+        assert!(
+            !planner.is_empty(),
+            "the planner scan found nothing - `node_preserves_rcx` changed \
+             shape and this test would now pass vacuously"
+        );
+    }
+
+    #[test]
+    fn every_folded_arm_reaches_rcx_only_in_its_register_form() {
+        let src = include_str!("ir_lower.rs").replace("\r\n", "\n");
+
+        // (1) The three fold helpers share one predicate with the planner.
+        for helper in ["emit_alu_acc_imm", "emit_imul_imm", "emit_shift_imm"] {
+            let f = src
+                .split(&format!("fn {helper}(&mut self,"))
+                .nth(1)
+                .unwrap_or_else(|| panic!("{helper} is in this file"))
+                .split("\n    fn ")
+                .next()
+                .expect("the function ends");
+            assert!(
+                f.starts_with(" id: NodeId,"),
+                "{helper}'s first parameter is no longer the operand node — \
+                 `node_preserves_rcx` passes `node.inputs[1]` to it",
+            );
+            assert!(
+                f.contains("let Some(imm) = self.alu_imm32(id) else {"),
+                "{helper} no longer declines exactly on `alu_imm32` — \
+                 `node_preserves_rcx` would then predict folds the arm does \
+                 not perform, and a deferred carry would cross an arm that \
+                 does reach `gp_load_value(RCX, ..)`",
+            );
+        }
+
+        let body = src
+            .split("fn lower_data_node(&mut self, id: NodeId) {")
+            .nth(1)
+            .expect("lower_data_node is in this file")
+            .split("\n    fn ")
+            .next()
+            .expect("the function ends");
+        let mut arms: Vec<(std::collections::BTreeSet<String>, Vec<String>)> = Vec::new();
+        for line in body.lines() {
+            if line.starts_with("            | Op::") {
+                if let Some(last) = arms.last_mut() {
+                    collect_op_names(line, &mut last.0);
+                    continue;
+                }
+            }
+            if line.starts_with("            Op::") {
+                let mut names = std::collections::BTreeSet::new();
+                collect_op_names(line, &mut names);
+                arms.push((names, Vec::new()));
+                continue;
+            }
+            if let Some(last) = arms.last_mut() {
+                last.1.push(line.to_string());
+            }
+        }
+        assert!(
+            !arms.is_empty(),
+            "the arm scan found nothing — `lower_data_node`'s shape changed \
+             and this test would now pass vacuously"
+        );
+
+        const GUARDS: &[&str] = &[
+            "if !self.emit_alu_acc_imm(node.inputs[1],",
+            "if !self.emit_imul_imm(node.inputs[1],",
+            "if !self.emit_shift_imm(node.inputs[1],",
+        ];
+        // Everything an admitted arm may call OUTSIDE the fold's else branch.
+        // `gp_load_value` is the only one that names a register, and the check
+        // below pins which one.
+        const OUTSIDE_CALLS: &[&str] = &[
+            "alloc_slot",
+            "gp_load_value",
+            "store_rax",
+            // The FP path of `Add`/`Sub`/`Mul`, which `node_preserves_rcx`
+            // never admits (it requires `IrType::Int | IrType::Long`) and
+            // which reaches XMM0/XMM1, never RCX.
+            "fp_load_value",
+            "fp_binop",
+            "fp_store_value",
+            // 2026-09-11: `Op::Add`'s arm grew an `LEA` form. It emits into
+            // `assigned_gpr(id)` or `resident_gpr(x)` or RAX, reads
+            // `carry_names` / `carry_at_store` without writing, and otherwise
+            // only stores and counts. None of those can be RCX, and that is
+            // asserted below rather than left to this comment.
+            "emit_add_lea",
+        ];
+        // The claim `emit_add_lea` rests on, checked here rather than argued:
+        // the residency file the arms write into names neither carry register.
+        // If it ever did, an `LEA` into a promoted value would land in RCX and
+        // a deferred carry crossing that arm would read it.
+        for r in crate::regalloc::xmm_roles::IR_GP_LINEAR_SCAN {
+            assert_ne!(r, RAX, "the GP file names RAX; no arm may publish there");
+            assert_ne!(r, RCX, "the GP file names RCX, which a deferred carry holds");
+        }
+
+        for name in super::RCX_FREE_WHEN_FOLDED {
+            let arm = arms
+                .iter()
+                .find(|(names, _)| names.contains(*name))
+                .unwrap_or_else(|| {
+                    panic!("`RCX_FREE_WHEN_FOLDED` claims Op::{name}, which has no arm")
+                });
+            let mut inside = false;
+            let mut depth = 0i32;
+            let mut guards = 0;
+            let mut outside: Vec<&str> = Vec::new();
+            let mut guarded: Vec<&str> = Vec::new();
+            for line in &arm.1 {
+                let t = line.trim();
+                if !inside && GUARDS.iter().any(|g| t.starts_with(g)) {
+                    inside = true;
+                    guards += 1;
+                    depth = line.matches('{').count() as i32 - line.matches('}').count() as i32;
+                    continue;
+                }
+                if inside {
+                    depth += line.matches('{').count() as i32;
+                    depth -= line.matches('}').count() as i32;
+                    guarded.push(line);
+                    if depth <= 0 {
+                        inside = false;
+                    }
+                    continue;
+                }
+                outside.push(line);
+            }
+            assert_eq!(
+                guards, 1,
+                "Op::{name}'s arm has {guards} fold guards on `node.inputs[1]`, \
+                 not one — `node_preserves_rcx` reasons about exactly one",
+            );
+            assert!(
+                guarded.iter().any(|l| l.contains("RCX")),
+                "Op::{name}'s fold guard has no RCX branch at all, so this arm \
+                 is not the shape `RCX_FREE_WHEN_FOLDED` describes and the test \
+                 would pass vacuously",
+            );
+            let outside_text = outside.join("\n");
+            assert!(
+                !outside_text.contains("RCX"),
+                "Op::{name}'s arm names RCX outside its folded operand's `else` \
+                 branch, so folding that operand does not make the arm \
+                 RCX-free — `RCX_FREE_WHEN_FOLDED` must not claim it",
+            );
+            assert!(
+                !outside_text.contains("self.buf.emit("),
+                "Op::{name}'s arm emits raw bytes outside its fold guard. A \
+                 ModRM byte can name RCX where the identifier scan cannot see \
+                 it — re-verify the arm before claiming it",
+            );
+            for call in outside_text.match_indices("self.").map(|(i, _)| {
+                let rest = &outside_text[i + "self.".len()..];
+                rest.split('(').next().unwrap_or("").trim().to_string()
+            }) {
+                assert!(
+                    OUTSIDE_CALLS.contains(&call.as_str()),
+                    "Op::{name}'s arm calls `self.{call}` outside its fold \
+                     guard, which this test has not verified to leave RCX \
+                     alone. Read it, then add it to OUTSIDE_CALLS or drop the \
+                     op from `RCX_FREE_WHEN_FOLDED`",
+                );
+            }
+            let reads: Vec<&str> = outside
+                .iter()
+                .map(|l| l.trim())
+                .filter(|l| l.starts_with("self.gp_load_value("))
+                .collect();
+            assert_eq!(
+                reads,
+                vec!["self.gp_load_value(RAX, node.inputs[0]);"],
+                "Op::{name}'s arm reads something other than its first operand \
+                 into RAX outside the fold guard",
+            );
+        }
+    }
+
+    /// A phi copy staged in the phi's own register computes the same integers
+    /// as one staged in RAX, and emits fewer bytes.
+    ///
+    /// The two halves are both needed and neither can stand in for the other.
+    ///
+    /// **Correctness** is the half no source audit can do: `emit_copy_op` moves
+    /// the write of the phi's register EARLIER inside one `CopyOp`, which is an
+    /// argument about `resolve_parallel_copy`'s ordering invariant, and an
+    /// argument is what this project keeps discovering was wrong about a
+    /// register it could not see (`op_preserves_rcx` claimed six arms that all
+    /// wrote RCX, and both suites passed). Both bodies come from ONE graph and
+    /// ONE schedule, so a divergence is attributable to the staging register
+    /// and to nothing else.
+    ///
+    /// **Engagement** is the half that stops it passing vacuously. A body whose
+    /// phis got no register emits identical bytes in both arms, and the
+    /// correctness half would then be comparing a body with itself and
+    /// reporting a pass. `direct < plain` is the assertion that the arms really
+    /// differ: each converted copy drops one three-byte `mov <phi reg>, rax`.
+    ///
+    /// The shape is a counted loop with two loop-carried values —
+    /// `for (i = 0; i < n; i++) a += i;` — because a phi copy only exists on a
+    /// back edge, and two of them is what `probes/FieldLoop.java` `sum` has.
+    #[test]
+    fn a_phi_copy_staged_in_its_own_register_computes_the_same_and_is_smaller() {
+        // int f(int n) { int a = 0; for (int i = 0; i < n; i++) a += i; return a; }
+        //  0 iconst_0     3 istore_2     6 if_icmpge +13   c istore_1
+        //  1 istore_1     4 iload_2      9 iload_1         d iinc 2,1
+        //  2 iconst_0     5 iload_0      a iload_2        10 goto -12
+        //                                b iadd           13 iload_1  14 ireturn
+        let code = [
+            0x03, 0x3C, 0x03, 0x3D, 0x1C, 0x1A, 0xA2, 0x00, 0x0D, 0x1B, 0x1C, 0x60, 0x3C, 0x84,
+            0x02, 0x01, 0xA7, 0xFF, 0xF4, 0x1B, 0xAC, 0, 0,
+        ];
+        let mut graph = IrBuilder::new(1, 3).build(&code, 21).expect("IR build");
+        ir_optimize::optimize(&mut graph);
+        let schedule = ir_schedule::schedule(&graph);
+
+        let (direct_cm, plain_cm) = {
+            let _f = super::PhiCopyDirectForce::set(true);
+            let direct = lower(&graph, &schedule, 1, 3, &no_helpers()).expect("direct body lowers");
+            drop(_f);
+            let _f = super::PhiCopyDirectForce::set(false);
+            let plain = lower(&graph, &schedule, 1, 3, &no_helpers()).expect("plain body lowers");
+            (direct, plain)
+        };
+
+        // Engagement. Read `ir_phi_copy_regs_enabled` too: with THAT kill switch
+        // off there is no register publish to fold away and the two arms are
+        // legitimately identical, which is a configuration the suite is allowed
+        // to run in.
+        if super::ir_phi_copy_regs_enabled() {
+            assert!(
+                direct_cm.code_len() < plain_cm.code_len(),
+                "staging in the phi's own register emitted no fewer bytes \
+                 ({} against {}) — either no phi on this loop got a register, \
+                 or the fold is not firing and the comparison below is a body \
+                 against itself",
+                direct_cm.code_len(),
+                plain_cm.code_len(),
+            );
+        }
+
+        // `ireturn` defines the low 32 bits of RAX and nothing above them.
+        for n in [0i32, 1, 2, 7, 100, -3] {
+            let want: i32 = (0..n.max(0)).fold(0i32, |acc, i| acc.wrapping_add(i));
+            let got_direct = unsafe { direct_cm.try_call(&[i64::from(n)]) }
+                .expect("the direct body runs");
+            let got_plain =
+                unsafe { plain_cm.try_call(&[i64::from(n)]) }.expect("the plain body runs");
+            assert_eq!(
+                got_direct as u32, got_plain as u32,
+                "the two staging registers disagree for n={n}",
+            );
+            assert_eq!(got_direct as u32 as i32, want, "direct body wrong for n={n}");
+        }
+    }
+
+    /// A phi whose home store SURVIVES is emitted byte for byte as before.
+    ///
+    /// # This test is the shape of a mutation that did not fail
+    ///
+    /// The first version of `stage` did not ask whether the home was dropped,
+    /// so a phi that kept its home staged in its register and then wrote the
+    /// home FROM that register. Replacing `store_abi_reg(stage_reg, dst)` with
+    /// `store_abi_reg(RAX, dst)` — a store of whatever was last in RAX instead
+    /// of the value — left every test green, and so did replacing it with a
+    /// `panic!`: the branch was unreachable from the whole `cratonvm-jit`
+    /// suite, 2356 unit tests and 145 differential tests included.
+    ///
+    /// Both facts have the same cause. `stage` and `drop_home` ask overlapping
+    /// questions, and on every loop small enough to write as a fixture a
+    /// resident phi owns its register exclusively, so `phi_home_droppable`
+    /// clears it and the store never runs. Forcing the store to run (with
+    /// `CRATONVM_JIT_IR_DROP_PHI_HOME=0`, below) does not help the first
+    /// problem: **nothing reads a resident phi's home word back**, so a store
+    /// of the wrong register is unobservable from any answer the body can
+    /// produce.
+    ///
+    /// A path this crate cannot fail is a path that should not ship, so `stage`
+    /// now requires the home to be dropped and this test pins the exclusion the
+    /// only way that is decisive: with the home kept, the two arms must be
+    /// **byte-identical**. The saving given up is one instruction on a path
+    /// nothing here reaches.
+    #[test]
+    fn a_phi_copy_that_keeps_its_home_is_byte_identical() {
+        // int f(int n) { int a = 0; for (int i = 0; i < n; i++) a += i; return a; }
+        let code = [
+            0x03, 0x3C, 0x03, 0x3D, 0x1C, 0x1A, 0xA2, 0x00, 0x0D, 0x1B, 0x1C, 0x60, 0x3C, 0x84,
+            0x02, 0x01, 0xA7, 0xFF, 0xF4, 0x1B, 0xAC, 0, 0,
+        ];
+        let mut graph = IrBuilder::new(1, 3).build(&code, 21).expect("IR build");
+        ir_optimize::optimize(&mut graph);
+        let schedule = ir_schedule::schedule(&graph);
+
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_JIT_IR_DROP_PHI_HOME", Some("0"))],
+            || {
+                let direct = {
+                    let _f = super::PhiCopyDirectForce::set(true);
+                    lower(&graph, &schedule, 1, 3, &no_helpers()).expect("direct body lowers")
+                };
+                let plain = {
+                    let _f = super::PhiCopyDirectForce::set(false);
+                    lower(&graph, &schedule, 1, 3, &no_helpers()).expect("plain body lowers")
+                };
+                assert_eq!(
+                    direct.code_len(),
+                    plain.code_len(),
+                    "with every phi home kept, direct staging must emit exactly \
+                     the bytes it did before — a difference here means `stage` \
+                     has been widened past what the tests can check",
+                );
+                // …and the sibling test's `direct < plain` must still be the
+                // live assertion, so this pair cannot both pass vacuously:
+                // one demands a difference, this one demands none, and they
+                // differ in exactly the switch named above.
+                for n in [0i32, 1, 7, 100] {
+                    let want: i32 = (0..n).fold(0i32, |acc, i| acc.wrapping_add(i));
+                    let got = unsafe { direct.try_call(&[i64::from(n)]) }
+                        .expect("the body runs");
+                    assert_eq!(got as u32 as i32, want, "wrong for n={n}");
+                }
+            },
+        );
+    }
+
+    /// The deferred carry EXECUTES correctly when it fires, with a folded
+    /// binary arm in between — the case `op_preserves_rcx` alone cannot admit.
+    ///
+    /// The source audits above prove the arms cannot write RCX. This proves the
+    /// other half, which no audit can: that a body in which one operand reached
+    /// its consumer through RCX across another arm computes the same integers
+    /// as one in which it went through the frame. Both schedules are lowered
+    /// from the same graph and both are called, so a divergence is attributable
+    /// to the pairing and to nothing else.
+    ///
+    /// `(a + 1) ^ (b * 3)` is the smallest shape that needs the widening:
+    /// dependence order puts the `Add` before the `Mul`, pairing sinks it to
+    /// `[Mul, Add, Xor]`, and the arm the `Mul`'s value has to survive is the
+    /// `Add` — which reaches RCX only through the register form of `+ 1`, and
+    /// `+ 1` folds.
+    #[test]
+    fn a_folded_middle_arm_carries_both_operands_and_still_computes_the_answer() {
+        // iload_0, iconst_1, iadd, iload_1, iconst_3, imul, ixor, ireturn
+        let code = [0x1a, 0x04, 0x60, 0x1b, 0x06, 0x68, 0x82, 0xac, 0, 0];
+        let mut graph = IrBuilder::new(2, 2).build(&code, 8).expect("IR build");
+        ir_optimize::optimize(&mut graph);
+
+        let plain = ir_schedule::schedule_with_options(
+            &graph,
+            &ir_schedule::ScheduleOptions {
+                pair_single_use_operands: false,
+                ..Default::default()
+            },
+        );
+        let paired = ir_schedule::schedule_with_options(
+            &graph,
+            &ir_schedule::ScheduleOptions {
+                pair_single_use_operands: true,
+                ..Default::default()
+            },
+        );
+
+        let before = super::ir_carry_deferred_census();
+        let paired_cm = lower(&graph, &paired, 2, 2, &no_helpers()).expect("the paired body lowers");
+        let after = super::ir_carry_deferred_census();
+        let plain_cm = lower(&graph, &plain, 2, 2, &no_helpers()).expect("the plain body lowers");
+
+        // Engagement, when the switches that reach it are on. A kill switch is
+        // a legitimate way to run the suite, so the correctness half below
+        // still runs either way — but a silent zero here with everything on
+        // would mean this test proves nothing at all.
+        if super::ir_carry_single_use_enabled()
+            && super::ir_carry_second_operand_enabled()
+            && super::ir_carry_rcx_folded_enabled()
+        {
+            assert!(
+                after.0 > before.0,
+                "the deferred carry never fired on the shape it exists for — \
+                 planned went {} -> {}",
+                before.0,
+                after.0,
+            );
+            assert_eq!(
+                after.1 - before.1,
+                after.0 - before.0,
+                "every deferred carry planned must be READ; an unread one is a \
+                 refused compile, not an optimization",
+            );
+        }
+
+        // `ireturn` defines the low 32 bits of RAX and nothing above them, so
+        // that is what is compared — and the two bodies are compared to each
+        // other, which is the assertion that attributes any divergence to the
+        // pairing rather than to this test's arithmetic.
+        for (a, b) in [(3i32, 4i32), (-1, 5), (0, 0), (7, -9), (i32::MAX, 2)] {
+            let want = a.wrapping_add(1) ^ b.wrapping_mul(3);
+            let args = [i64::from(a), i64::from(b)];
+            let got_paired = unsafe { paired_cm.try_call(&args) }.expect("the paired body runs");
+            let got_plain = unsafe { plain_cm.try_call(&args) }.expect("the plain body runs");
+            assert_eq!(
+                got_paired, got_plain,
+                "the two schedules disagree for ({a}, {b})",
+            );
+            assert_eq!(
+                got_paired as u32 as i32,
+                want,
+                "paired body wrong for ({a}, {b})",
+            );
+        }
+    }
+
     #[test]
     fn every_droppable_op_writes_its_home_once_through_store_rax() {
         let src = include_str!("ir_lower.rs").replace("\r\n", "\n");
@@ -25519,6 +26973,21 @@ mod tests {").next().unwrap_or(src);
                 "Op::{name}'s arm writes its home through `store_rax` {stores} times, \
                  not once — `op_home_is_one_store_rax` must not claim it"
             );
+            // `emit_add_lea` is the one helper in a claimed arm that can reach
+            // a home word WITHOUT that `store_rax` — its `AddForm::Done` path
+            // writes the home itself, having published the register itself.
+            // The scan above cannot see that, so the exception is named here
+            // and proved in `the_lea_add_form_publishes_what_it_does_not_store`.
+            // A NEW arm reaching for the helper has to come past this line.
+            if arm.1.contains("self.emit_add_lea(") {
+                assert!(
+                    name == "Add" || name == "Sub",
+                    "Op::{name}'s arm calls `emit_add_lea`, whose `AddForm::Done` path \
+                     writes a home word that `publish_def_at_store` never sees. Only \
+                     Add and Sub are certified for that by \
+                     `the_lea_add_form_publishes_what_it_does_not_store`"
+                );
+            }
             for forbidden in ["gp_store_value(", "emit_store_frame_imm32("] {
                 assert!(
                     !arm.1.contains(forbidden),
@@ -25528,6 +26997,84 @@ mod tests {").next().unwrap_or(src);
                 );
             }
         }
+    }
+
+    /// `emit_add_lea`'s direct form is the one home-writing path in a claimed
+    /// arm that does NOT go through `store_rax`, so the property
+    /// `publish_def_at_store` would have provided has to be proved of it
+    /// separately — against its SOURCE, for the same reason the test above
+    /// reads source: nothing in the type system says a register was published.
+    ///
+    /// The property: on the path that can SKIP the home store
+    /// (`home_dropped`), the value must already exist in its own register and
+    /// the arm must have said so. Both halves matter —
+    /// `lower_data_node_tracked` refuses the compile when a dropped home meets
+    /// `cur_def_published == false`, so a missing flag is a coverage loss; a
+    /// missing `mark_gp_reg_live` is worse, because the value would then be
+    /// unreadable from a register nothing recorded it in.
+    ///
+    /// A failure here says the direct form drifted and
+    /// `CRATONVM_JIT_IR_DROP_HOME` would emit a body that never writes a value
+    /// it later reads — the same failure the store-once test exists to prevent,
+    /// through the door that test now lets through.
+    #[test]
+    fn the_lea_add_form_publishes_what_it_does_not_store() {
+        let src = include_str!("ir_lower.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn emit_add_lea(&mut self, id: NodeId, slot: i32, sub: bool, wide: bool)")
+            .nth(1)
+            .expect("emit_add_lea is in this file")
+            .split("\n    fn ")
+            .next()
+            .expect("the function ends");
+        // The direct form: from the `assigned_gpr` gate to the `AddForm::Done`
+        // it returns. Everything after that is the accumulator form, which
+        // owes nothing because its caller's `store_rax` owes everything.
+        let direct = body
+            .split("if let Some(dst) = self.assigned_gpr(id) {")
+            .nth(1)
+            .expect("the direct form gates on an assigned register")
+            .split("AddForm::Done")
+            .next()
+            .expect("the direct form returns AddForm::Done");
+        for required in [
+            "self.mark_gp_reg_live(id);",
+            "self.cur_def_published = true;",
+            "self.store_abi_reg(dst, slot);",
+        ] {
+            assert!(
+                direct.contains(required),
+                "`emit_add_lea`'s direct form no longer contains `{required}` — it \
+                 skips the home store on the `home_dropped` path, so it must \
+                 publish the register and say that it did"
+            );
+        }
+        // The publish must PRECEDE the branch that decides whether to store, so
+        // there is no ordering in which a dropped home is skipped by a value
+        // that was never published.
+        let publish = direct
+            .find("self.mark_gp_reg_live(id);")
+            .expect("checked above");
+        let decide = direct.find("home_dropped").expect("the drop test is here");
+        assert!(
+            publish < decide,
+            "`emit_add_lea` decides whether to skip the home store before it \
+             publishes the register"
+        );
+        // And the accumulator form must NOT publish: its value is in RAX, and
+        // `store_rax` is what publishes and stores it.
+        let acc = body
+            .split("return AddForm::Done;")
+            .nth(1)
+            .expect("the direct form returns")
+            .split("AddForm::InRax")
+            .next()
+            .expect("the accumulator form returns");
+        assert!(
+            !acc.contains("mark_gp_reg_live"),
+            "`emit_add_lea`'s accumulator form publishes a register, which \
+             `store_rax` is about to publish again from RAX"
+        );
     }
 
     /// Every op the mechanical scan finds eligible for a dropped home is

@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-541 tokens.
+544 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -277,6 +277,7 @@ export inherited from a parent shell.
 | `ir-bailout` | `CRATONVM_DBG_IR_BAILOUT` |
 | `ir-call` | `CRATONVM_DBG_IR_CALL` |
 | `ir-bufsize` | `CRATONVM_DBG_IR_BUFSIZE` |
+| `code-near-globals` | `CRATONVM_DBG_CODE_NEAR_GLOBALS` |
 | `ir-compiles` | `CRATONVM_DBG_IR_COMPILES` |
 | `ir-isel` | `CRATONVM_DBG_IR_ISEL` |
 | `ir-linear-scan` | `CRATONVM_DBG_IR_LINEAR_SCAN` |
@@ -296,6 +297,8 @@ export inherited from a parent shell.
 | `jit-compiled` | `CRATONVM_DBG_JIT_COMPILED` |
 | `jit-disasm` | `CRATONVM_DBG_JIT_DISASM` |
 | `jit-slot-overlap` | `CRATONVM_DBG_JIT_SLOT_OVERLAP` |
+| `jit-locals-floor` | `CRATONVM_DBG_JIT_LOCALS_FLOOR` |
+| `zip-immune` | `CRATONVM_DBG_ZIPIMMUNE` |
 | `jit-dispatch` | `CRATONVM_DBG_JIT_DISPATCH` |
 | `jit-entry` | `CRATONVM_DBG_JIT_ENTRY` |
 | `jit-borrow-sites` | `CRATONVM_DBG_JIT_BORROW_SITES` |
@@ -607,7 +610,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-426 tokens.
+432 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -729,6 +732,7 @@ export inherited from a parent shell.
 | `ir-const-imm` | `CRATONVM_JIT_IR_CONST_IMM` |
 | `ir-phi-residency` | `CRATONVM_JIT_IR_PHI_RESIDENCY` |
 | `ir-phi-copy-regs` | `CRATONVM_JIT_IR_PHI_COPY_REGS` |
+| `ir-phi-copy-direct` | `CRATONVM_JIT_IR_PHI_COPY_DIRECT` |
 | `ir-phi-home-publish-guard` | `CRATONVM_JIT_IR_PHI_HOME_PUBLISH_GUARD` |
 | `ir-phi-edge-interfere` | `CRATONVM_JIT_IR_PHI_EDGE_INTERFERE` |
 | `ir-skip-republish` | `CRATONVM_JIT_IR_SKIP_REPUBLISH` |
@@ -766,6 +770,10 @@ export inherited from a parent shell.
 | `ir-carry-single-use` | `CRATONVM_JIT_IR_CARRY_SINGLE_USE` |
 | `ir-sink-late` | `CRATONVM_JIT_IR_SINK_LATE` |
 | `ir-alu-imm` | `CRATONVM_JIT_IR_ALU_IMM` |
+| `ir-pair-operands` | `CRATONVM_JIT_IR_PAIR_OPERANDS` |
+| `ir-carry-2nd` | `CRATONVM_JIT_IR_CARRY_2ND` |
+| `ir-cmp-in-place` | `CRATONVM_JIT_IR_CMP_IN_PLACE` |
+| `ir-add-lea` | `CRATONVM_JIT_IR_ADD_LEA` |
 | `merged-call-sentinel` | `CRATONVM_JIT_MERGED_CALL_SENTINEL` |
 | `ir-cold-arg-stage` | `CRATONVM_JIT_IR_COLD_ARG_STAGE` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
@@ -807,6 +815,7 @@ export inherited from a parent shell.
 | `ir-bce-range` | `CRATONVM_JIT_IR_BCE_RANGE` |
 | `ir-hot-layout` | `CRATONVM_JIT_IR_HOT_LAYOUT` |
 | `ir-list-sched` | `CRATONVM_JIT_IR_LIST_SCHED` |
+| `ir-carry-rcx-folded` | `CRATONVM_JIT_IR_CARRY_RCX_FOLDED` |
 | `ir-unroll-unreachable-frames` | `CRATONVM_JIT_IR_UNROLL_UNREACHABLE_FRAMES` |
 | `c2-accept` | `CRATONVM_C2_ACCEPT` |
 | `c2-accept-memo` | `CRATONVM_C2_ACCEPT_MEMO` |

@@ -89,10 +89,31 @@ const SKIPPED_DIRS: &[&str] = &["target", ".git", "vendor", "node_modules"];
 
 /// Re-derivation recipe for row 1 of "Where the surface stands", quoted back to
 /// the reader on failure so the fix does not require finding this file.
+///
+/// It has to MIRROR [`collect_rust`] — same prunes, same start — or the reader
+/// who follows the failure message writes a number this test then rejects. The
+/// previous form did not, and did not merely disagree: it printed **0**.
+///
+/// ```text
+/// grep -rhoE 'CRATONVM_[A-Z0-9_]+' --include='*.rs' --exclude-dir=target \
+///   --exclude-dir=vendor --exclude-dir=node_modules --exclude-dir='.*' .
+/// ```
+///
+/// `--exclude-dir` globs are matched without `FNM_PATHNAME`, so `*` crosses
+/// `/`: against the traversal path `./types` the glob `.*` matches `.` then
+/// `/types`, and every directory under the starting `.` is pruned. Measured on
+/// GNU grep 3.11 — 0 from `.`, 1,390 from an absolute path. A recipe that
+/// answers 0 for the whole repository is the kind of wrong that looks like a
+/// finding, and a reader who pastes 0 into the table makes this test fail
+/// against a number the recipe itself produced.
+///
+/// `find -mindepth 1` is used instead of more `--exclude-dir` because the same
+/// trap bites `-name '.*'`: without `-mindepth 1` it matches the starting `.`
+/// and prunes the entire tree.
 const ROW1_RECIPE: &str = concat!(
-    r#"grep -rhoE 'CRATONVM_[A-Z0-9_]+' --include='*.rs' --exclude-dir=target "#,
-    r#"--exclude-dir=vendor --exclude-dir=node_modules --exclude-dir='.*' "#,
-    r#". | sort -u | wc -l"#,
+    r#"find . -mindepth 1 \( -name target -o -name vendor -o -name node_modules "#,
+    r#"-o -name '.*' \) -prune -o -name '*.rs' -print0 "#,
+    r#"| xargs -0 grep -hoE 'CRATONVM_[A-Z0-9_]+' | sort -u | wc -l"#,
 );
 
 /// Re-derivation recipe for row 2. Note it scans `<member>/src` only, which is
