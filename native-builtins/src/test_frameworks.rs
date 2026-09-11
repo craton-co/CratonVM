@@ -3233,7 +3233,10 @@ pub(crate) fn native_surefire_system_property_manager_load_properties(
     // bytecode that touches the field (not via our overrides) sees a
     // non-null Map. Use a HashMap (well-known to our natives) rather
     // than ConcurrentHashMap to keep the placeholder layout-stable.
-    let placeholder = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 8)?;
+    // 3, not 8: nothing here writes a slot -- `native_map_init` and the
+    // `properties` field take the object as it is -- and a literal wider
+    // than the table is what the T9C gate scores the table short against.
+    let placeholder = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
     let placeholder_pin = ctx.pin_native_root(placeholder);
     if let Ok(_) =
         cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(placeholder))])

@@ -5293,6 +5293,18 @@ impl GenerationalHeap {
 
     /// Get the value of a field at the given index.
     pub fn get_field(&self, obj_ref: ObjectRef, index: usize) -> Value {
+        // The read side of the receiver screen. A stale receiver is just as
+        // wrong when it is read — the answer is whatever the pre-move copy
+        // held, typically the JVM default, and nothing about the value read
+        // says where it came from. Same predicate, same flag, same backtrace.
+        if gc_flags().dbg_deadref_store {
+            self.note_deadref_recv(
+                "get_field",
+                obj_ref.as_ptr() as usize,
+                index,
+                Value::Object(None),
+            );
+        }
         // KC16 SIGSEGV audit: runtime (not debug-only) bounds check. A
         // corrupted ObjectRef whose fake header has a huge num_slots would
         // happily pass the old debug_assert in release and then read
@@ -6321,6 +6333,14 @@ impl GenerationalHeap {
     ///
     /// Returns `Err` with the index if out of bounds.
     pub fn get_array_element(&self, obj_ref: ObjectRef, index: usize) -> Result<Value, i32> {
+        if gc_flags().dbg_deadref_store {
+            self.note_deadref_recv(
+                "get_array_element",
+                obj_ref.as_ptr() as usize,
+                index,
+                Value::Object(None),
+            );
+        }
         let header = self.get_header(obj_ref);
         debug_assert_eq!(header.kind(), ObjectKind::Array);
         if index >= header.array_length() as usize {
@@ -6482,8 +6502,9 @@ impl GenerationalHeap {
         eprintln!(
             "[deadref-recv] #{n} {reason} {site}: holder=0x{holder:x} slot={slot} <- {value:?} \
              (inactive semispace is [0x{lo:x},0x{hi:x})) — the RECEIVER named no live object at \
-             the moment of the store, so this write went into a copy nothing will read: the \
-             field stays at its JVM default and no later collection lost anything. \
+             the moment of the access, so it went to a copy nothing else will touch: a write \
+             there is lost (the field keeps its JVM default) and a read answers whatever the \
+             pre-move copy held. No later collection lost anything. \
              collection={}\n{:?}",
             self.stats.minor_gc_count.load(Ordering::Relaxed),
             std::backtrace::Backtrace::force_capture(),
@@ -6547,6 +6568,13 @@ impl GenerationalHeap {
             }
         }
         if gc_flags().dbg_deadref_store {
+            // The RECEIVER arm, as in `set_field`. An array is the commonest
+            // stale receiver of all, because the natural way to build one —
+            // allocate the array, then allocate each element — holds the
+            // array's address across every element's allocation. The value
+            // stored is a brand-new object and always live, so the value arm
+            // below is silent on exactly the defect that matters here.
+            self.note_deadref_recv("set_array_element", obj_ref.as_ptr() as usize, index, value);
             if let Value::Object(Some(p)) = value {
                 self.note_deadref_store(
                     "set_array_element",
@@ -22675,8 +22703,13 @@ mod tests {
     /// the whole addition exists to close, so a change that made
     /// `note_deadref_store` start firing on receivers would erase the
     /// distinction without failing anything.
+    /// `DEADREF_RECV_HITS` is process-global, so the two tests that assert on
+    /// a DELTA of it cannot run beside each other.
+    static RECV_HITS_SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     #[test]
     fn a_store_through_a_vacated_receiver_is_reported() {
+        let _serial = RECV_HITS_SERIAL.lock();
         let heap = GenerationalHeap::with_sizes(1024 * 1024, 1024 * 1024);
         let monitors = NoOpMonitors;
         let victim = heap.alloc_object(ClassId::new(1), 2);
@@ -22708,6 +22741,65 @@ mod tests {
             super::deadref_recv_hits(),
             before + 1,
             "a store into a vacated receiver must be reported by the receiver arm",
+        );
+    }
+
+    /// The other three receiver-taking primitives report too.
+    ///
+    /// `set_field` was the first arm, and it is the one the AssertJ defect
+    /// needed. It is not the commonest shape, though: building an array and
+    /// filling it element by element holds the ARRAY across every element's
+    /// allocation, so `set_array_element` is where this species actually
+    /// lives — twenty of the natives fixed alongside this test had exactly
+    /// that shape. Reads matter for the same reason in reverse: a read through
+    /// a vacated receiver answers whatever the pre-move copy held (usually the
+    /// JVM default) and nothing about the answer says where it came from.
+    #[test]
+    fn every_receiver_taking_primitive_reports_a_vacated_receiver() {
+        let _serial = RECV_HITS_SERIAL.lock();
+        let heap = GenerationalHeap::with_sizes(1024 * 1024, 1024 * 1024);
+        let monitors = NoOpMonitors;
+        let victim = heap.alloc_object(ClassId::new(1), 2);
+        let victim_arr = heap.alloc_array(ClassId::new(2), ArrayElementType::Int, 4);
+
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        heap.collect_garbage(&stw(), &mut roots, &monitors);
+        let (lo, hi) = heap.young_inactive_semispace_range();
+        for addr in [victim.as_ptr() as usize, victim_arr.as_ptr() as usize] {
+            assert!(
+                addr >= lo && addr < hi,
+                "the test needs both victims in the emptied semispace \
+                 (addr={addr:#x}, inactive=[{lo:#x},{hi:#x}))",
+            );
+        }
+
+        // The array primitives `debug_assert` on the receiver's header AFTER
+        // the screen has run, and a vacated address does not carry an array
+        // header any more — that assertion firing IS the stale access, one
+        // step later. Catch it: what is under test is that the screen counted
+        // the access, not that the access then completed.
+        let before = super::deadref_recv_hits();
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_DBG_DEADREF_STORE", Some("1"))],
+            || {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = heap.set_array_element(victim_arr, 0, Value::Int(1));
+                }));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = heap.get_array_element(victim_arr, 0);
+                }));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = heap.get_field(victim, 1);
+                }));
+            },
+        );
+        std::panic::set_hook(hook);
+        assert_eq!(
+            super::deadref_recv_hits(),
+            before + 3,
+            "set_array_element, get_array_element and get_field each screen the receiver",
         );
     }
 

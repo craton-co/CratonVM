@@ -856,6 +856,16 @@ struct Lowerer<'a> {
     /// post-JIT routing range-tests THIS method's own exception table against
     /// THIS method's throw site. See [`Self::emit_call_exc_stub`].
     call_exc_patches: Vec<(usize, usize)>,
+    /// Safepoint polls whose slow path was NOT emitted where the poll is, one
+    /// entry per poll site: `(jcc_patch, resume, spill_high_water)`.
+    ///
+    /// `jcc_patch` is the rel32 field of the site's `JNZ`, patched to the
+    /// outlined block when [`Self::emit_outlined_polls`] emits it; `resume` is
+    /// the byte after that `JNZ`, which the outlined block jumps back to; and
+    /// `spill_high_water` is the ONLY per-site input to the slow path's
+    /// content, which is what makes deferring it possible at all
+    /// (`emit_safepoint_map_if_enabled` reads nothing else).
+    outlined_polls: Vec<(usize, usize, i32)>,
     /// fib44-fix follow-up: native offsets of the rel32 operand of each direct
     /// self-recursive `CALL` (invoke_kind 4), patched at finalize to target the
     /// method's own entry (code offset 0). See `lower_self_call` / Op::Call.
@@ -1649,6 +1659,7 @@ impl<'a> Lowerer<'a> {
             saved_xmm_bytes,
             saved_gpr_bytes,
             call_exc_patches: Vec::new(),
+            outlined_polls: Vec::new(),
             self_call_patches: Vec::new(),
             direct_calls,
             ic_slots,
@@ -5478,6 +5489,33 @@ impl<'a> Lowerer<'a> {
             self.emit_mov_reg_imm64(R11, self.safepoint_flag_addr as u64);
             self.buf.emit(&[0x41, 0xF6, 0x03, 0xFF]); // TEST byte ptr [R11], 0xff
         }
+        // ── Out-of-line: the fast path does not branch at all ─────────────
+        //
+        // The polarity below (`JZ` over the slow path) makes the FAST path —
+        // every execution but the ones that actually stop — the TAKEN branch,
+        // and leaves the slow path's ~230 bytes sitting between the poll and
+        // whatever follows it. On `probes/FieldLoop.java`'s `sum` that is most
+        // of the loop: the body spans 412 bytes from header to back edge, 228
+        // of them this block, and roughly 123 of them ever execute.
+        //
+        // Emitting the slow path after the body instead inverts the test, so
+        // the hot path falls through and the loop's span collapses to what it
+        // runs. `CRATONVM_JIT_IR_POLL_OUTLINE=1`; default OFF.
+        if ir_poll_outline_enabled() {
+            IR_POLLS_OUTLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.buf.emit(&[0x0F, 0x85]); // JNZ .slow (outlined, after the body)
+            let slow_patch = self.buf.pos();
+            self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+            let resume = self.buf.pos();
+            self.outlined_polls
+                .push((slow_patch, resume, self.spill_high_water));
+            // Same bookkeeping as the inline arm below, for the same reason:
+            // the two paths must agree about what is readable from a register
+            // after the poll, and the outlined path still calls.
+            self.invalidate_ref_residency(None);
+            return;
+        }
+        IR_POLLS_INLINE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.buf.emit(&[0x0F, 0x84]); // JZ .clear
         let clear_patch = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
@@ -12392,6 +12430,41 @@ impl<'a> Lowerer<'a> {
     /// which stamps it; re-stamping the same value here is a no-op for it and
     /// keeps the stub's contract uniform — every exit through it leaves an
     /// `athrow_bci` belonging to THIS method.
+    /// Emit the slow path of every poll [`Self::emit_safepoint_poll`] outlined,
+    /// after the body, each ending in a `JMP` back to its own poll site.
+    ///
+    /// Byte-for-byte the same sequence the inline arm emits — optional oop map,
+    /// `MOV RAX, <slow path>` / `CALL RAX`, optional shadow reload — plus the
+    /// five-byte return jump. It is deferrable because the only per-site input
+    /// is `spill_high_water`, which the site recorded; `emit_safepoint_map`
+    /// reads nothing else, and the map it records is keyed by the CALL's return
+    /// address, which is correct wherever that call ends up.
+    ///
+    /// A no-op when nothing was outlined, which is every compile with
+    /// `CRATONVM_JIT_IR_POLL_OUTLINE` off.
+    fn emit_outlined_polls(&mut self) {
+        for (slow_patch, resume, live_hi) in std::mem::take(&mut self.outlined_polls) {
+            let rel = self.buf.pos() as i32 - (slow_patch as i32 + 4);
+            Self::patch_or_bail(&mut self.buf, slow_patch, rel);
+            // The site's high-water mark, not the method's final one: the map
+            // has to describe the frame as it stood AT THE POLL.
+            let saved = self.spill_high_water;
+            self.spill_high_water = live_hi;
+            let mapped = Self::ir_gc_point_maps_enabled() && self.emit_safepoint_map_if_enabled();
+            self.spill_high_water = saved;
+            self.emit_mov_reg_imm64(RAX, self.safepoint_slow_path as u64);
+            self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+            if mapped {
+                self.emit_shadow_reload();
+            }
+            self.buf.emit_byte(0xE9); // JMP back to the instruction after the poll
+            let back_patch = self.buf.pos();
+            self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+            let back_rel = resume as i32 - (back_patch as i32 + 4);
+            Self::patch_or_bail(&mut self.buf, back_patch, back_rel);
+        }
+    }
+
     fn emit_call_exc_stub(&mut self) {
         if self.call_exc_patches.is_empty() {
             return;
@@ -15326,6 +15399,47 @@ static BLOCK_JMPS_EMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// `force_c2_enabled` is not: it is read at compile time only, never on a
 /// runtime hot path, and caching would make it racy against whichever test
 /// thread lowers first.
+/// `true` when `CRATONVM_JIT_IR_POLL_OUTLINE` is set: a safepoint poll's slow
+/// path is emitted after the body rather than inline, and the poll's test is
+/// inverted so the fast path falls through instead of branching over it.
+///
+/// Default OFF — it moves a GC point's code, which is the blast radius that
+/// earns a switch of its own rather than a shared one.
+///
+/// Read LIVE on every call rather than cached in a `OnceLock`, so an in-process
+/// A/B can see both arms.
+/// Safepoint polls emitted with their slow path AFTER the body.
+static IR_POLLS_OUTLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Safepoint polls emitted with their slow path inline, the historical shape.
+static IR_POLLS_INLINE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(outlined, inline)` — every poll this process emitted, split by shape.
+///
+/// The two are exhaustive by construction: [`Lowerer::emit_safepoint_poll`]
+/// returns early before either counter when polls are switched off entirely,
+/// and otherwise takes exactly one of the two arms. So `outlined + inline` is
+/// the number of polls emitted, and a poll that counted neither is a third arm
+/// someone added without a counter.
+///
+/// Counted rather than asserted for the same reason
+/// [`ir_fallthrough_census`] is: a switch that silently does nothing looks
+/// exactly like a switch whose effect is invisible, and only a count tells
+/// them apart. Process-global and monotone — read a DELTA around the compile
+/// under test, never an absolute.
+pub fn ir_poll_census() -> (u64, u64) {
+    (
+        IR_POLLS_OUTLINED.load(std::sync::atomic::Ordering::Relaxed),
+        IR_POLLS_INLINE.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+fn ir_poll_outline_enabled() -> bool {
+    matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_POLL_OUTLINE").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
+}
+
 fn ir_fallthrough_enabled() -> bool {
     !matches!(
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_FALLTHROUGH").as_deref(),
@@ -18447,6 +18561,11 @@ pub(crate) fn lower_inner_with_scopes(
     // list, so afterwards the question cannot be asked.
     let osr_sentinel_free =
         lowerer.deopt_stub_patches.is_empty() && lowerer.call_exc_patches.is_empty();
+    // The outlined safepoint slow paths, before the other tail stubs: each is
+    // reached by a forward `JNZ` from the body and returns with a `JMP`, so it
+    // only needs to be after the body, and putting it first keeps both hops
+    // short.
+    lowerer.emit_outlined_polls();
     lowerer.emit_deopt_stub();
     // Gap B: emit the shared call-exception bail stub after the body so each
     // dispatch site's sentinel `JE` reaches it.
@@ -19613,6 +19732,129 @@ mod tests {").next().unwrap_or(src);
         // SAFETY: the generated function has no arguments and returns int 1.
         assert_eq!(unsafe { compiled.try_call(&[]) }, Ok(1));
         assert_eq!(HITS.load(Ordering::SeqCst), 1);
+    }
+
+    /// An OUTLINED safepoint poll stops exactly when the inline one does, and
+    /// the method finishes either way.
+    ///
+    /// # What is being risked
+    ///
+    /// `CRATONVM_JIT_IR_POLL_OUTLINE` does two things at once: it moves the
+    /// poll's slow path out of the body, and it INVERTS the poll's test so the
+    /// fast path falls through instead of branching over that block. Getting
+    /// the second half backwards is not a crash — it is a loop that calls into
+    /// the runtime on every iteration and still returns the right answer, which
+    /// no correctness test built only on the return value would notice.
+    ///
+    /// So the flag byte is the axis, not the arm:
+    ///
+    /// * with the flag SET the slow path must run, the same number of times in
+    ///   both arms — the outlined block is reached AND returns, since a return
+    ///   jump that missed would not come back to finish the sum;
+    /// * with the flag CLEAR it must not run at all — which is the assertion
+    ///   that fails if `JNZ` and `JZ` are the wrong way round.
+    ///
+    /// `sum` is `int sum(int n){int s=0;for(int i=0;i<n;i++)s+=i;return s;}`;
+    /// the bound is a parameter, so the loop survives the unroller and keeps a
+    /// back edge to poll on.
+    #[test]
+    fn an_outlined_safepoint_poll_stops_when_the_inline_one_does_and_not_otherwise() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static SET: u8 = 1;
+        static CLEAR: u8 = 0;
+        static HITS: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn slow_poll() {
+            HITS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let code = [
+            0x03u8, 0x3c, 0x03, 0x3d, 0x1c, 0x1a, 0xa2, 0x00, 0x0d, 0x1b, 0x1c, 0x60, 0x3c, 0x84,
+            0x02, 0x01, 0xa7, 0xff, 0xf4, 0x1b, 0xac,
+        ];
+        // Returns the method and the census delta this compile produced, as
+        // `(outlined, inline)`. Without the delta every assertion below passes
+        // when the switch does NOTHING — the inline poll is correct, so
+        // "correct" is not evidence that the outlined one ran.
+        let build = |outline: Option<&'static str>, flag: &'static u8| {
+            let before = ir_poll_census();
+            let cm = cratonvm_types::flags::with_thread_overrides(
+                &[("CRATONVM_JIT_IR_POLL_OUTLINE", outline)],
+                || {
+                    let mut graph = IrBuilder::new(1, 3).build(&code, 21).expect("IR build");
+                    ir_optimize::optimize(&mut graph);
+                    let schedule = ir_schedule::schedule(&graph);
+                    let mut helpers = no_helpers();
+                    helpers.safepoint_flag_addr = flag as *const u8 as usize;
+                    helpers.safepoint_slow_path = slow_poll as *const () as usize;
+                    lower(&graph, &schedule, 1, 3, &helpers).expect("the loop must lower")
+                },
+            );
+            let after = ir_poll_census();
+            (cm, (after.0 - before.0, after.1 - before.1))
+        };
+        // SAFETY (all four calls): the lowered body takes one `int` and returns
+        // one; `slow_poll` is `extern "C"` and touches only its own counter.
+        let run = |cm: &CompiledMethod| -> (i64, usize) {
+            HITS.store(0, Ordering::SeqCst);
+            let got = unsafe { cm.try_call(&[7]) }.expect("call");
+            (got, HITS.load(Ordering::SeqCst))
+        };
+
+        let (inline_cm, inline_census) = build(None, &SET);
+        let (out_cm, out_census) = build(Some("1"), &SET);
+        // The census is PROCESS-global and the suite runs in parallel, so the
+        // INLINE count picks up whatever else is compiling on another thread.
+        // The OUTLINED count does not: `CRATONVM_JIT_IR_POLL_OUTLINE` is set
+        // through `with_thread_overrides`, so only this thread can raise it,
+        // and only these assertions are made on it.
+        assert_eq!(
+            inline_census.0, 0,
+            "the default arm outlined {} poll(s) — nothing else in the suite \
+             sets this switch, so a non-zero count means it is not thread-local",
+            inline_census.0,
+        );
+        assert!(
+            out_census.0 >= 2,
+            "the switch outlined {} poll(s); this method emits a prologue poll \
+             and a back-edge poll, so fewer than two means it did not engage \
+             and every assertion below would pass on the inline code",
+            out_census.0,
+        );
+        assert_eq!(
+            out_census.1, 0,
+            "the switch left {} poll(s) inline; the two shapes are exclusive",
+            out_census.1,
+        );
+        let (inline_v, inline_hits) = run(&inline_cm);
+        let (out_v, out_hits) = run(&out_cm);
+        assert_eq!(inline_v, 21, "sum(7) is 21 with the poll inline");
+        assert_eq!(
+            out_v, 21,
+            "sum(7) is 21 with the poll outlined — a wrong answer here means \
+             the return jump did not land after the poll",
+        );
+        assert!(
+            inline_hits >= 1,
+            "the fixture is vacuous: a set flag must reach the slow path at \
+             least once, got {inline_hits}",
+        );
+        assert_eq!(
+            out_hits, inline_hits,
+            "the outlined poll must stop exactly as often as the inline one",
+        );
+
+        let (inline_clear_v, inline_clear_hits) = run(&build(None, &CLEAR).0);
+        let (out_clear_v, out_clear_hits) = run(&build(Some("1"), &CLEAR).0);
+        assert_eq!(inline_clear_v, 21);
+        assert_eq!(out_clear_v, 21);
+        assert_eq!(inline_clear_hits, 0, "a clear flag never stops");
+        assert_eq!(
+            out_clear_hits, 0,
+            "a clear flag never stops — {out_clear_hits} stops means the \
+             outlined poll's `JNZ` is the old `JZ`, i.e. the polarity was not \
+             inverted with the block that moved",
+        );
     }
 
     /// An argument past the entry ABI's register file arrives on the CALLER'S

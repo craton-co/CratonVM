@@ -359,3 +359,254 @@ pub fn wait_draining(mut child: Child, cap: Duration) -> TimedOutput {
         timed_out,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Waiting on a probe that is SLOW without waiting on one that is STUCK
+// ---------------------------------------------------------------------------
+
+/// What forward progress looks like in a probe's own output.
+///
+/// # Why a wall-clock cap could not tell those two apart
+///
+/// Every long-running probe in this suite is guarded by one constant: "fail if
+/// the child has not exited in N seconds". The constants are livelock guards —
+/// `VTHREAD_PROBE_CAP` says so in as many words — but a deadline cannot express
+/// "stopped making progress", only "took too long", and the two come apart
+/// badly here:
+///
+/// * **Profile.** Every one of those constants was derived from a `--release`
+///   measurement, and `ci.yml` runs `cargo test --workspace`, which is debug.
+///   Measured 2026-09-11 on one 8-core host: `VthreadGcStress` 16-23 s release
+///   against 400 s+ debug, `VthreadProbe` 6.3 s release against 30-125 s
+///   debug, `LoaderUnloadProbe` 15.7 s release against 400 s+ debug.
+/// * **Load.** The same host at load 40 turned a 52 s run into a 125 s one
+///   with no source change.
+///
+/// Both make a *healthy* run fail, which is the one thing a livelock guard
+/// must never do — and the repair everyone reaches for, raising the constant,
+/// is exactly the change that hides the hang it was there to catch.
+///
+/// # What this measures instead
+///
+/// The probe prints a counter that only ever goes DOWN, and the guard fails
+/// when that counter stops moving — not when the clock runs out. A run on a
+/// host so loaded it takes ten times as long still makes progress every
+/// second; the 2026-09-05 hang this suite exists for made none at all, from
+/// any thread, forever.
+pub struct Progress<'a> {
+    /// Substring introducing a counter that DECREASES as the probe advances,
+    /// e.g. `"remaining="`. A line carrying a value below the lowest seen so
+    /// far is forward progress and resets the stall clock; anything else —
+    /// including a repeat of the same value — is not, so a probe that keeps
+    /// printing while wedged is still caught.
+    pub countdown_key: &'a str,
+    /// Fail when no forward progress has been made for this long.
+    ///
+    /// This is the number that has to be defended, and it is a *starvation*
+    /// budget, not a runtime one: how long a working probe can go without
+    /// advancing its counter once on a host that is busy with other things.
+    pub stall: Duration,
+    /// Fail regardless once the whole run has taken this long.
+    ///
+    /// Backstop for the case the stall clock cannot see — a probe that keeps
+    /// advancing but will not finish, which is a defect of a different shape.
+    /// Generous on purpose; the stall clock is the guard.
+    pub ceiling: Duration,
+}
+
+/// Why [`wait_watching`] stopped waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    /// The child exited on its own. The only outcome that is not a failure.
+    Exited,
+    /// No forward progress for [`Progress::stall`]; the child was killed.
+    Stalled,
+    /// [`Progress::ceiling`] elapsed while the child was still advancing.
+    Ceiling,
+}
+
+/// Everything [`wait_watching`] observed, including on a failure.
+pub struct WatchedOutput {
+    pub output: Output,
+    pub stop: Stop,
+    /// Lowest countdown value seen; `None` if the probe never printed one,
+    /// which is itself a diagnosis — the child never got as far as its first
+    /// heartbeat.
+    pub lowest: Option<u64>,
+    /// How many times the countdown moved down.
+    pub advances: usize,
+    /// Wall time from spawn to stop.
+    pub elapsed: Duration,
+    /// Wall time since the last time the countdown moved down.
+    pub since_progress: Duration,
+}
+
+impl WatchedOutput {
+    /// A ready-made panic body naming what was seen and what it means, for a
+    /// caller that has decided `stop != Stop::Exited` is a failure.
+    pub fn diagnosis(&self, what: &str) -> String {
+        let stdout = String::from_utf8_lossy(&self.output.stdout);
+        let stderr = String::from_utf8_lossy(&self.output.stderr);
+        let verdict = match self.stop {
+            Stop::Exited => "exited",
+            Stop::Stalled => {
+                "STOPPED MAKING PROGRESS. This is the shape a livelock has: the \
+                 process is still there, and its counter is not moving. A slow \
+                 host does not do this — it advances the counter late, not \
+                 never. Do NOT repair this by raising the stall budget without \
+                 first establishing that the counter was moving."
+            }
+            Stop::Ceiling => {
+                "hit the absolute ceiling while STILL ADVANCING. That is not a \
+                 hang: the probe was working and did not finish. Either the \
+                 workload outgrew the ceiling or something is making \
+                 arbitrarily slow forward progress."
+            }
+        };
+        format!(
+            "[{what}] {verdict}\nelapsed={:.1}s  since last advance={:.1}s  \
+             advances={}  lowest countdown={}\nstdout:\n{}\nstderr (tail):\n{}",
+            self.elapsed.as_secs_f64(),
+            self.since_progress.as_secs_f64(),
+            self.advances,
+            match self.lowest {
+                Some(v) => v.to_string(),
+                None => "never printed one".to_string(),
+            },
+            stdout,
+            tail_chars(&stderr, 4000),
+        )
+    }
+}
+
+/// Last `n` characters of `s`, on a char boundary, prefixed when truncated.
+fn tail_chars(s: &str, n: usize) -> String {
+    let count = s.chars().count();
+    if count <= n {
+        return s.to_string();
+    }
+    let skipped = count - n;
+    let body: String = s.chars().skip(skipped).collect();
+    format!("...[{skipped} earlier chars elided]...\n{body}")
+}
+
+/// The digits immediately after `key` in `line`, if any.
+fn countdown_in(line: &[u8], key: &[u8]) -> Option<u64> {
+    if key.is_empty() {
+        return None;
+    }
+    let at = line.windows(key.len()).position(|w| w == key)? + key.len();
+    let digits: Vec<u8> = line[at..]
+        .iter()
+        .copied()
+        .take_while(u8::is_ascii_digit)
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    std::str::from_utf8(&digits).ok()?.parse().ok()
+}
+
+/// Wait for `child`, draining both pipes, and stop as soon as it exits, stops
+/// making progress, or exceeds the ceiling — see [`Progress`].
+///
+/// Drains exactly as [`wait_draining`] does and for the same reason: nothing
+/// here may depend on the child staying under a pipe buffer. It reads stdout a
+/// line at a time rather than to EOF so the countdown can be watched live; one
+/// `VthreadProbe` run measured 4.2 MB of stderr against 759 bytes of stdout,
+/// so "the child cannot outrun us" is not theoretical.
+pub fn wait_watching(mut child: Child, progress: Progress<'_>) -> WatchedOutput {
+    use std::io::BufRead;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let key: Vec<u8> = progress.countdown_key.as_bytes().to_vec();
+    let collected = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let lowest = Arc::new(Mutex::new(None::<u64>));
+    let advances = Arc::new(AtomicUsize::new(0));
+    let last_advance = Arc::new(Mutex::new(Instant::now()));
+
+    let out_pipe = child.stdout.take();
+    let out_reader = {
+        let collected = Arc::clone(&collected);
+        let lowest = Arc::clone(&lowest);
+        let advances = Arc::clone(&advances);
+        let last_advance = Arc::clone(&last_advance);
+        std::thread::spawn(move || {
+            let Some(pipe) = out_pipe else { return };
+            let mut reader = std::io::BufReader::new(pipe);
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                match reader.read_until(b'\n', &mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                collected
+                    .lock()
+                    .expect("stdout buffer")
+                    .extend_from_slice(&line);
+                if let Some(v) = countdown_in(&line, &key) {
+                    let mut low = lowest.lock().expect("countdown");
+                    if low.is_none_or(|seen| v < seen) {
+                        *low = Some(v);
+                        advances.fetch_add(1, Ordering::Relaxed);
+                        *last_advance.lock().expect("advance clock") = Instant::now();
+                    }
+                }
+            }
+        })
+    };
+    let mut err_pipe = child.stderr.take();
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = err_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let start = Instant::now();
+    let mut exited = None;
+    let stop = loop {
+        if let Some(status) = child.try_wait().expect("poll child") {
+            exited = Some(status);
+            break Stop::Exited;
+        }
+        if last_advance.lock().expect("advance clock").elapsed() >= progress.stall {
+            break Stop::Stalled;
+        }
+        if start.elapsed() >= progress.ceiling {
+            break Stop::Ceiling;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let status = match exited {
+        Some(s) => s,
+        None => {
+            // Killing closes the pipes, which is what lets both readers reach
+            // EOF and join below.
+            let _ = child.kill();
+            child.wait().expect("reap killed child")
+        }
+    };
+    let elapsed = start.elapsed();
+    let _ = out_reader.join();
+    let stderr = err_reader.join().unwrap_or_default();
+    let stdout = std::mem::take(&mut *collected.lock().expect("stdout buffer"));
+    let since_progress = last_advance.lock().expect("advance clock").elapsed();
+    let lowest = *lowest.lock().expect("countdown");
+    let advances = advances.load(Ordering::Relaxed);
+    WatchedOutput {
+        output: Output {
+            status,
+            stdout,
+            stderr,
+        },
+        stop,
+        lowest,
+        advances,
+        elapsed,
+        since_progress,
+    }
+}

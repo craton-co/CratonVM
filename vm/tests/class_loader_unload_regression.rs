@@ -147,19 +147,30 @@ fn run(mode: &str) {
     // that is not what makes this safe — a test must not depend on the process
     // it drives staying under 64 KiB.
     // THE CAP IS A HANG-CATCHER, SO IT IS SIZED AGAINST CONTENTION, NOT AGAINST
-    // THE ISOLATED TIME. This probe calls `System.gc()` 182 times: 4.5 s alone,
-    // and **183 s** inside a full `cargo test --workspace` on this 8-core host,
-    // where thirty-odd test binaries run at once (measured 2026-09-05, load
-    // average 17-24). At the old 180 s it therefore failed in the workspace run
-    // while passing every time it was run on its own — a timeout that said
-    // "class-loader unloading probe timed out" and meant "the box is busy".
+    // THE ISOLATED TIME. What the cap is for is a probe that will NEVER finish,
+    // and that is unbounded, so any generous number separates it. The deadlock
+    // this file was originally red for is caught directly, and in seconds, by
+    // `wait_draining_survives_a_child_that_outruns_the_pipe` -- this cap is not
+    // what guards it.
     //
-    // What the cap is for is a probe that will NEVER finish, and that is
-    // unbounded, so any generous number separates it. 600 s keeps ~130x margin
-    // on the isolated time and ~3x on the worst contended time seen. The
-    // deadlock this file was originally red for is caught directly, and in
-    // seconds, by `wait_draining_survives_a_child_that_outruns_the_pipe` —
-    // this cap is not what guards it.
+    // 2026-09-11: the numbers this comment used to quote -- "182 System.gc()
+    // calls: 4.5 s alone, and 183 s inside a full `cargo test --workspace`" --
+    // were two PROFILES, not two load levels, and sizing one cap against both
+    // hid a target that could not pass at all. Measured on one 8-core Linux host
+    // at load 25-30, same fixture, same arguments: the release binary ran the
+    // fixed 182-collection schedule in 15.7 s and the DEBUG binary did not
+    // finish it in 400 s, because one ZGC cycle costs ~86 ms built with `-O` and
+    // ~2.5 s built without. `cargo test --workspace` is the debug profile, so
+    // this target was unpassable there -- and nobody had seen it, because that
+    // gate is fail-fast and had been stopping in `native-builtins` long before
+    // reaching `vm` (see the page this was found from,
+    // docs/internal/retired/cargo-test-workspace-is-red-on-dev-tip-in-seven-places-FIXED-20260911.md).
+    //
+    // The fixture now POLLS instead of counting: same caps, same assertions, but
+    // it stops collecting once the weak references have cleared. It needs 8
+    // attempts rather than 182, and the whole target runs in 24-46 s in debug
+    // and 2.9 s in release. 600 s is left as the cap because it is a
+    // hang-catcher and the new isolated time gives it ~25x margin.
     let timed = common::wait_draining(child, Duration::from_secs(600));
     let output = timed.output;
     let combined = format!(
