@@ -11528,6 +11528,15 @@ fn map_resize_inner(
         // HotSpot reads 12, because 16 is the CAPACITY its constructor parked
         // there and nothing replaced it.
         //
+        // COST: two name-resolved field lookups per resize, each a
+        // class-manager read lock plus a hierarchy walk. Bounded by what it
+        // sits inside — `map_resize` already does one such lookup in
+        // `publish_map_table_volatile`, and the rehash above allocates a new
+        // table and walks every chain, so this is small change on an O(n)
+        // operation. Named rather than measured; if a resize-heavy profile
+        // ever shows it, the fix is to cache the pair per class id, not to
+        // drop the write.
+        //
         // Resolve on the RECEIVER's class, never on `java/util/HashMap` — the
         // note above this branch is about the census row that cost, where a
         // `HashMap`-resolved index 2 landed on `Hashtable.threshold`. A class

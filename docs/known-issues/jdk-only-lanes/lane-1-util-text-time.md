@@ -49,6 +49,45 @@ would invent a number neither took. What they retire, exactly:
                                                       -- WRITTEN, NOT ACCEPTED
 ```
 
+### Wave 5 — the acceptance
+
+Control `cratonvm-l1w5-base-20260911` is `origin/dev` at `565509592`
+untouched; trial `cratonvm-l1w5-trial-20260911` is that same tree plus this
+wave. Both built first-attempt on the same host, same toolchain, same day.
+
+```text
+  142 probes    0 worse    0 better
+    base differing 29    trial differing 29
+```
+
+**The baseline is 29, and the first reading was 33.** Four probes —
+`L5CasRace`, `L5SubwordAtomics`, `L5UnsafeAccess`, `JcaSunTlsVectors` — read
+as differing because HOTSPOT produced zero rows: it died on an
+`IllegalAccessError` for want of a runtime `--add-exports`, while this VM,
+which does not enforce that module boundary, printed its full output. Every
+row then counted as a difference. With the oracle configured like the VM
+under test all four go to **0 diff**, and `tree5.sh` now carries the exports
+with the 33 → 29 numbers in its comment. Configure the oracle like the thing
+you are testing, or you measure your own harness.
+
+**One probe moved, and it is a coin flip in BOTH arms.** `VtHandoffProbe`
+read 10 → 16 on the tree. Run alone six times per arm it looked damning —
+base `10 10 10 10 10 10`, trial `10 10 0 10 14 10` — which is a different
+claim from the one this probe was disarmed on last wave (there the CONTROL
+was the unstable one) and not something six unpaired runs can settle. Fourteen
+INTERLEAVED pairs, both arms in the same minute:
+
+```text
+  BASE : 10 0 10 10 10 10 10 10 10 10 0 14 10 10     3 excursions
+  TRIAL: 10 14 10 10 10 10 10 10 10 10 14 10 10 10   2 excursions
+```
+
+Same value set `{0, 10, 14}`, and the CONTROL has more excursions than the
+trial. The 6/6 stability was luck. The probe's own doc comment says why it
+cannot adjudicate this at all: *"on CratonVM it is 64 on an idle host and
+55-58 on a loaded one"* — its author measured the row as load-sensitive on
+this VM, and this host is never idle.
+
 **Wave 5 is not landed on the strength of its own table.** Its two rows are
 the one non-vacuous `+0` in item 6's bisection (3,792 door engagements), and
 an armed `+0` is what a LEAKED dial row looks like too — so the table is
