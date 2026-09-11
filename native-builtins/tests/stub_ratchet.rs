@@ -1432,6 +1432,21 @@ use cratonvm_types::compat::CompatibilityMode;
 /// removes the slack, and it is why this wave's delta reads +251 against the
 /// tree and +237/+248/+251 against the constants.
 ///
+/// # Re-frozen 2026-09-11 (the FOURTH merge): 2668 -> 2755, +87 for the fifth time
+///
+/// ```text
+///   dev alone   2641 / 2668 / 2641
+///   union       2728 / 2755 / 2728   totals 13609 / 13977 / 13644
+///   this branch  +87 /  +87 /  +87   totals -3
+/// ```
+///
+/// Five measurements, four dev merges, 241 commits, and the delta has not
+/// moved once. It is `RETIRED_SHADOW_L5R_TRIPLES` (67 `sun/misc/Unsafe`
+/// triples over 87 registrations) plus four deleted
+/// `AbstractExecutorService` registrations and one added
+/// `ForkJoinPool.execute(ForkJoinTask)V`. Nothing else in this branch touches
+/// either number.
+///
 /// # Re-frozen 2026-09-11 (the THIRD merge): 2622 -> 2709, +87 for the fourth time
 ///
 /// Measured on the union again rather than carried forward:
@@ -1982,7 +1997,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// time. Three independent derivations of one delta is what makes it a property
 /// of this branch rather than of a tree, which is the claim a re-freeze makes.
 ///
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2668;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2755;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2240,7 +2255,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2668;
 /// each registration is re-tagged separately. The `--jdk-only-report` census
 /// for the same prefixes reports **15 distinct triples refused, 0 with a
 /// survivor** -- the same population counted the other way.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2641;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2728;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2420,7 +2435,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2641;
 /// each registration is re-tagged separately. The `--jdk-only-report` census
 /// for the same prefixes reports **15 distinct triples refused, 0 with a
 /// survivor** -- the same population counted the other way.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2641;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2728;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
