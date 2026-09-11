@@ -356,13 +356,52 @@ Every remaining HELD family has a named blocker. In rough order of rows:
    build the real node graph, make it the authority, then retire. Retiring
    first hands real bytecode an empty map.
 2. **`LinkedHashMap` + views (102).** `lhm_overlay()`, same shape, same remedy.
-3. **`HashMap` + views (98).** The interesting one: the state IS real —
-   `receiver_table_slot` writes the receiver's own `table`, the nodes are real
-   `HashMap$Node`s in the real slot order, `map_size_slot` writes the real
-   `size`/`count`. Nine probes still move. Whatever is missing is **not** the
-   bucket array, and finding out what it is (`modCount`? `threshold` and
-   `loadFactor`, which `resize()` reads?) is the highest-value question left in
-   this lane, because `Hashtable` (79) is probably the same answer.
+3. **`HashMap` + views (98) — the blocker is now ONE METHOD, measured.**
+   `apps/probes/L1MapFieldProbe.java` reads, reflectively and under
+   `--add-opens=java.base/java.util=ALL-UNNAMED`, the five fields real
+   `HashMap$HashIterator` reads, on five receivers built five different ways.
+   Armed on `java/util/HashMap` alone, against HotSpot 25.0.4+7:
+
+   ```text
+                        table                  size mod thr  load
+     HotSpot   A put    [16]HashMap$Node        3    3   12  0.75
+     armed     A put    [16]HashMap$Node        3    3   12  0.75   <- exact
+     HotSpot   C copy   [4]HashMap$Node         3    3    3  0.75
+     armed     C copy   [4]HashMap$Node         3    3    3  0.75   <- exact
+   ```
+
+   **Every field matches, on every receiver.** So the 2026-09-10 reading —
+   "state IS real but nine probes move" — resolves: the object model is not the
+   problem and `modCount`/`threshold`/`loadFactor` are not the answer. What is
+   left is one observable:
+
+   ```text
+     armed:  keySet.size 3   values.size 3   entrySet.size 3
+             keySet walk [a,b,c]   entry walk [a=1,b=2,c=3]   values walk ok
+             keySet().toArray()  3      values().toArray()  3
+             entrySet().toArray() 0                          <- the blocker
+   ```
+
+   The entry ITERATOR works and the entry SIZE is right, so real
+   `AbstractCollection.toArray()` should answer 3 and answers 0. Arming
+   `AbstractCollection`, `AbstractSet`, `AbstractMap`, `Set`, `Collection` and
+   `Map` alongside changes nothing, so it is not one of those registrations
+   declining at a door — which, by the §8 argument, points at a native reached
+   from inside a native. `toArray` is registered on 34 classes and the
+   DISPATCH ROUTE decides the answer; that is where to look next, and the
+   probe row to watch is `A.ctor+put.views eToArray`.
+
+   **And the control is worse than the trial on three of these rows**, which
+   is worth landing on its own account: unarmed, `new HashMap<>()` + three
+   puts leaves `threshold = 0` where HotSpot has 12, `new HashMap<>(64)`
+   leaves `threshold = 64` where HotSpot has 48, and **the copy constructor
+   and `new HashMap<>(Map.of(..))` leave `table = [16]java.lang.Object` — an
+   UNTYPED array where HotSpot has `[4]`/`[2] java.util.HashMap$Node` — with
+   `loadFactor = 0.0`.** Retiring the family fixes all five.
+
+   `Hashtable` (79) is NOT the same answer: its fields already match HotSpot
+   unarmed, and its views survive arming (`G.hashtable.views` is byte-identical
+   in all three columns). Its four moving probes are a separate question.
 4. **`java/util/jar/` (45)** and **`java/text/` (12)**: both red only under
    `L1TailSweep`; neither has been bisected to a method. Start by splitting the
    scope — `JarFile` alone, `Manifest`/`Attributes` alone.
