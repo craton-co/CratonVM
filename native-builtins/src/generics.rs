@@ -633,12 +633,17 @@ pub fn type_sig_to_java(
                     // Only consulted when `getDeclaringClass` yields nothing, so a
                     // `Method`/`Constructor` scope (which always has a declaring
                     // class, and has no `getEnclosingClass`) never reaches it.
-                    let next = match ctx.invoke_virtual(
-                        scope,
-                        "getDeclaringClass",
-                        "()Ljava/lang/Class;",
-                        &[],
-                    ) {
+                    let declaring =
+                        ctx.invoke_virtual(scope, "getDeclaringClass", "()Ljava/lang/Class;", &[]);
+                    // This call allocates too, and the `enclosing != scope`
+                    // guard below compares `scope` against a reference the call
+                    // just produced. Re-read it off the pin FIRST: a moved
+                    // `scope` compares unequal to itself, the self-reference
+                    // guard passes, and the walk climbs into its own starting
+                    // point. The `getEnclosingClass` arm right below already
+                    // re-reads for exactly this reason; this arm did not.
+                    scope = ctx.read_native_pin(scope_pin, scope);
+                    let next = match declaring {
                         Ok(Some(Value::Object(Some(enclosing)))) if enclosing != scope => {
                             Some(enclosing)
                         }
@@ -647,7 +652,6 @@ pub fn type_sig_to_java(
                     let next = match next {
                         Some(n) => Some(n),
                         None => {
-                            // The `getDeclaringClass` call above allocates.
                             let scope = ctx.read_native_pin(scope_pin, scope);
                             match ctx.invoke_virtual(
                                 scope,

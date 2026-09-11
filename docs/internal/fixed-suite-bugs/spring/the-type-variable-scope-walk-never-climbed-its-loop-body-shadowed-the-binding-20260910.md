@@ -2,10 +2,32 @@
 
 | | |
 |---|---|
-| **Status** | **FIXED 2026-09-10** on `claude/spring-residuals-20260910`. Verified against stock HotSpot 25 on the same host with five probes and a 32-class rerun. |
+| **Status** | **FIXED 2026-09-10.** Landed on `dev` as `bb92afbb4` out of the Spring **Boot** lane (`claude/sb-sixfail-20260910`); found independently and at the same time from the Spring **Framework** lane (`claude/spring-residuals-20260910`), which contributes this record and the verification below. |
 | **Scope** | `native-builtins/src/generics.rs`, the `TypeSig::TypeVar` arm — every type-variable USE resolved through core reflection. |
 | **Population** | 20 Spring Framework classes failing with `IllegalArgumentException: Could not create type` or an `AssertionFailedError`. |
 | **Host** | Azure `20.80.105.49`, real JDK 25 (`/data/toolchain/jdk-25`), binary `cratonvm-springfix-20260910`. |
+
+## Found twice the same day, from two different suites
+
+Two sessions arrived at this line within hours of each other, from workloads
+with nothing in common but ByteBuddy:
+
+| lane | symptom | the type variable | its wrong declaration |
+|---|---|---|---|
+| Spring **Boot** (`bb92afbb4`, landed) | `Mockito.mock(MockRepository.class)` → `Cannot resolve T` | `T` in `QuerydslPredicateExecutor`'s `<S extends T, R> R findBy(...)` | the method `findBy` instead of the interface |
+| Spring **Framework** (this page) | AssertJ `SoftAssertions` → `Could not create type` … `Cannot resolve ACTUAL` | `SELF`/`ACTUAL` in `AbstractObjectAssert`'s `<T> SELF returns(T, Function<ACTUAL,T>)` | the method `returns` instead of the class |
+
+Both reduce to the same sentence: **a method-level signature that names its
+enclosing type's variable**. That shape is common enough to appear in two
+unrelated libraries on the same afternoon, which is the best available measure
+of the blast radius — and a reason to treat the 20 Spring Framework classes and
+the 3 Spring Boot GraphQL classes below as a lower bound on what it cost.
+
+The two fixes are structurally the same rewrite (`pin_base`, a `resolved`
+binding, re-pin on each climb, one `unpin_native_roots` at the foot). `dev`
+carries the Spring Boot one; this branch's own copy was dropped into it on
+merge. The verification in this page was then re-run against the **landed**
+code, not against the copy it replaced.
 
 ## The one line
 
@@ -163,6 +185,27 @@ the wrong declaring scope:
 `resolveFromOuterClass` states the defect in its own name: a type variable
 declared by an **outer** class is precisely what the walk existed to find, and
 precisely what a walk that cannot take a second step can never reach.
+
+## Verification against the landed code
+
+Everything above was taken with this branch's own copy of the fix. After
+`bb92afbb4` landed, all of it was re-run against **dev's** version
+(`cratonvm-springdev-20260911`, built from the merge):
+
+```console
+$ cratonvm-springdev-20260911 -cp "$CP" SoftProbe
+SOFT_OK
+
+$ diff tv-hs.txt tv-dev.txt | grep -c genericDeclaration
+0                       # every declaring scope now matches HotSpot
+
+$ ./run-suite.sh run --list verify29.tsv --tag verify29-dev
+classes: OK=29
+test-methods: found=474 passed=473 failed=0     # the 1 non-pass is a skip
+```
+
+29 classes: the 20 this defect accounts for plus the 9 restored
+`aop.target` fixture classes. All `OK`, no failed methods.
 
 ## Fixed in passing
 
