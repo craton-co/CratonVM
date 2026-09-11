@@ -179,8 +179,9 @@ arm order flipped, **every checksum `500000500000`**:
 |---|---|---|---:|---:|
 | quiet host | 1 696–1 843 ms | 1 448–1 489 ms | **−14.8 %** | **9 / 9** |
 | host drifting 2.2 s → 6.0 s mid-run | 2 153–6 054 ms | 1 841–4 816 ms | **−16.1 %** | **9 / 9** |
+| **on the merged tree**, after `origin/dev` (which also touched `ir_lower.rs`) | 2 229–2 770 ms | 1 908–2 824 ms | **−15.9 %** | 8 / 9 |
 
-Nine of nine, twice, on a within-binary A/B — and the second series is the
+Three series, −14.8 / −16.1 / −15.9 %, on a within-binary A/B — and the second series is the
 better evidence, not the worse. Its absolute numbers nearly TRIPLE partway
 through, which would have made any across-series statistic meaningless; a pair
 runs both arms back to back, so its ratio cancels whatever the machine was
