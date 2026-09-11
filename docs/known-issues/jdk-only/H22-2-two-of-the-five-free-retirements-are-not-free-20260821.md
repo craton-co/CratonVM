@@ -145,7 +145,9 @@ CratonVM has two paths into the same capture:
 
 * **Unarmed** — the native `<init>` (`native_exc_init_*` in `lang_misc.rs`)
   calls `capture_throwable_trace(ctx, this)` **from a native frame**, so the
-  top Java frame is already the caller. Correct by construction.
+  top Java frame is already the caller. Correct by construction — **but only
+  when the class being instantiated is the one whose `<init>` is the native.
+  See §3b.**
 * **Armed / retired** — real `Throwable.<init>` bytecode runs, calls
   `fillInStackTrace()`, which reaches `Throwable.fillInStackTrace(I)` —
   `ACC_NATIVE` in the image, registered at `native-builtins/src/lib.rs:14535`,
@@ -158,12 +160,54 @@ and 7 (`Throwable`, `Exception`, `Error`, `UncheckedIOException`,
 `FormatterClosedException`) report `fillInStackTrace`, which is exactly what
 differing constructor-chain depths do to an off-by-N frame skip.
 
+### 3b. The unarmed path is NOT correct by construction, 2026-09-11
+
+Measured by lane L3 on `cratonvm-p18`, plain `--jdk-only`, **no dial**, with
+`apps/probes/ThrowableCtorFrameSkip.java` — 9 rows, 20 seconds:
+
+```text
+row                              HotSpot                    CratonVM
+A JDK direct RuntimeException    ThrowableCtorFrameSkip.jdkDirect     same
+D JDK direct IOException         ...jdkChecked                        same
+E JDK InaccessibleObjectException ...jdkReflective                    same
+F new Exception                  ...main                              same
+B app subclass depth 1           ...appDepth1        ThrowableCtorFrameSkip$D1.<init>
+C app subclass depth 2           ...appDepth2        ThrowableCtorFrameSkip$D1.<init>
+G thrown and caught              ...main             ThrowableCtorFrameSkip$Custom.<init>
+H explicit fillInStackTrace()    ...main             java.lang.Throwable.fillInStackTrace
+```
+
+**4 of 9 differ, and the mechanism is the one §3 names — one step earlier than
+§3 places it.** Capturing from a native frame drops the constructors that ARE
+natives, which is the JDK half of the chain. Every *application-level* `<init>`
+survives. Row C is the proof it is a chain and not an off-by-one: at depth 2 the
+top frame is `D1.<init>`, the native's immediate caller, not `D2.<init>`.
+
+So the correct statement is narrower than "unarmed is correct": unarmed is
+correct exactly when the instantiated class's own `<init>` is the registered
+native. A JDK throwable created directly qualifies. **A user-defined exception
+subclass never does, at any depth** — and that is most exceptions in real
+application code, which makes this a live defect in the shipping configuration
+rather than only a retirement blocker. Row H says an explicit
+`fillInStackTrace()` does not skip itself either.
+
+**This raises N2's priority.** The nomination is written as "unblocks 906
+registrations over 62 classes"; it also fixes `getStackTrace()[0]` for every
+application exception in the VM today. The 105-vector corpus checks neither,
+which is why two lanes reached this from opposite directions before anything
+went red.
+
+Not fixed here: lane L3 found it while measuring reflection retirements, the
+fix is in `capture_throwable_trace` (`lang_misc.rs`) and belongs with N2's
+owner, and a change to stack-trace capture wants the whole gate set and the
+arms behind it rather than a ride on a reflection wave.
+
 **So the price of the largest zero-cost cell in `H14-3` is one missing frame
 skip in `capture_throwable_trace`.** Fix that and 906 registrations over 62
 classes become retirable; leave it and the retirement breaks the top frame of
 every exception in the VM, which the 105-vector corpus does not check even once.
 
-### 3b. The registrar's stated premise has expired
+### 3c. The registrar's stated premise has expired
 
 Its call site says it is for *synthetic-stub* Throwable subclasses — a
 `catch (Throwable t)` whose `t` is a fabricated stub with no bytecode behind

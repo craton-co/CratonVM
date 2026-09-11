@@ -447,6 +447,94 @@ oracle resolves it to `java.lang.reflect.Executable` and it counted `inv=1`
 
 ---
 
+## 8b. Wave 2, measured 2026-09-11: 6 of the 12 default-value deferrals clear
+
+Wave 1 deferred **twelve** triples for one reason — they agreed with HotSpot
+only at the value a blanket yield returns anyway (`false`, `null`, `0`), and an
+agreement that cannot be distinguished from the default is not evidence. Wave
+2's instrument gave each a row whose correct answer is the OTHER value. 16 rows
+over 12 triples, on `cratonvm-p18` (six lanes' tables), all four arms 271 lines
+with no NULs.
+
+**6 promote, 6 reject.** Every promoted row is `OK -> OK` at a NON-default
+oracle value, so the deferral reason is discharged:
+
+| triple | the row that discharged it | oracle |
+|---|---|---|
+| `Constructor.getExceptionTypes` | NON-EMPTY on a two-exception ctor | `[IllegalStateException, IOException]` |
+| `Constructor.isSynthetic` | census across four fixtures | `synthetic-ctors:0` |
+| `Constructor.isVarArgs` | TRUE on `VarCtor(String...)` | `true` |
+| `Field.isSynthetic` | TRUE on `this$0` | `synthetic:this$0` |
+| `Method.isBridge` | TRUE on a generic override | `bridges:1` |
+| `Method.isSynthetic` | count on an enum | `synthetic-methods:1` |
+
+The six rejections, each by a rule rather than a judgement:
+
+* **Still default-bound — 4.** `Field.isEnumConstant`, `Method.isDefault`,
+  `Method.isVarArgs`, `Field.trySetAccessible`. Wave 2 gave them a
+  non-default row where it could, but at least one attributed row still has
+  `false` as the oracle, so the family's blanket answer still passes it.
+* **`BAD -> BAD` — 2.** `Field.trySetAccessible` answers `true` where HotSpot
+  answers `false` for a JDK-internal field — **a real access-control defect,
+  not a retirement candidate.** `Constructor.setAccessible` differs only in the
+  throwing FRAME; see below.
+* **Secondary triple is HELD — 2.** `Field.setBoolean`'s two rows read the
+  value back through `Field.get`, and `Constructor.setAccessible`'s through
+  `Field.canAccess`. Both readers are held, so a disagreement could be the
+  reader's fault. This is wave 1's `Method.invoke` lesson applied in advance:
+  *a mapping keyed on the row's tag misses rows that drive the same triple
+  under another tag, and the miss runs in the dangerous direction.*
+
+### The 6 are candidates, not landings, and the reason is the dial
+
+The armed arm here is `CRATONVM_ENFORCE_NATIVE_SHADOW=java.lang.reflect`, and
+its own census read:
+
+```text
+[DIAL_DOOR_CENSUS] armed=true reached=1027 yielded=901 leaked=126
+```
+
+**All six promoted rows are `OK -> OK`, which means `armed == base`** — and a
+row where armed equals base is exactly the ambiguous case: either yielding
+changed nothing, or the dial leaked and never yielded there. 126 of 1027 did
+not yield, so these six cannot be cited as "the bytecode is right". A leaky
+dial is still usable, but only asymmetrically:
+
+* `armed != base` -> the dial demonstrably fired; the verdict means something.
+* `armed == base` -> ambiguous, and no amount of agreement fixes that.
+
+So wave 2's product is a **screen**: it discharges the deferral reason for six
+triples and hands them to a wave-3 build, where control-vs-retired on two
+binaries answers the retirement question the dial cannot. What wave 2 has
+already bought is the other half — **six triples definitively off the list**,
+four still default-bound and two with named defects.
+
+### Side-finding: `getStackTrace()[0]` is wrong for every application exception
+
+`Constructor.setAccessible`'s `BAD -> BAD` row has the right exception type and,
+once yielded, the byte-identical message; only the top frame differs — HotSpot
+`AccessibleObject.throwInaccessibleObjectException`, this VM
+`InaccessibleObjectException.<init>`. Chasing that produced a 9-row probe,
+`apps/probes/ThrowableCtorFrameSkip.java`, and a correction to a known issue
+rather than a new one: **`H22-2` §3b**. The defect is live unarmed, for any
+user-defined exception subclass at any depth, and `H22-2` had recorded the
+unarmed path as "correct by construction".
+
+Two instrument notes earned in the same hour:
+
+* **An `access()` row's frame column cannot distinguish "a different check
+  fired" from "the stack trace is off by a constructor chain".** It is still
+  the right column to print — a type alone cannot say which check fired — but a
+  frame difference now gets `ThrowableCtorFrameSkip` run against it before it
+  is read as an access-control finding.
+* **A `grep` stage on ONE arm of a cross-VM diff strips CR and turns every row
+  into a disagreement.** Both VMs write CRLF to a file on this host; MSYS
+  `grep` in a pipe strips it. My ad-hoc comparison read 9 of 9 rows differing
+  where 4 do. The lane's own scripts are safe because both arms go straight to
+  a file with no filter, and that was verified rather than assumed (raw diff 52
+  == normalised diff 52 on the wave-2 arms). Filter after the diff, never
+  before, and never on one side only.
+
 ## 9. Done
 
 Every bucket-A/B row in the prefix set is retired, classified as C/D/E/F, a
