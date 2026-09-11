@@ -99,14 +99,16 @@ nothing.
 Measured on `ClientTests`/Generational: 1 warning before, **0 after**, 12/12
 either way.
 
-## What survives: the `ServerTests` Generational SIGSEGV
+## What survived: the `ServerTests` Generational SIGSEGV — since FIXED
 
-This one is real and reproduces at dev tip. See its own page:
-[`hazelcast-servertests-generational-identity-hash-code-faults-on-a-vacated-young-address-20260909.md`](../../known-issues/springboot/hazelcast-servertests-generational-identity-hash-code-faults-on-a-vacated-young-address-20260909.md).
+This one was real and reproduced at dev tip. It got its own page, which is now
+retired too: [`hazelcast-servertests-identity-hash-code-on-a-vacated-young-address-FIXED-20260911.md`](hazelcast-servertests-identity-hash-code-on-a-vacated-young-address-FIXED-20260911.md).
 
-It is **not** the `Bits$1` read, and it is not new to this workload: it is the
+It is **not** the `Bits$1` read, and it was not new to this workload: it is the
 same "a stale reference reaches a reader after a moving young cycle" family as
-the two open `BindableTests` pages.
+the `BindableTests` pages. The producer was `huc_real_perform` handing its caller
+the pre-move address of the `HttpURLConnection` carrier after parking in a
+GC-blocking region for a socket wait.
 
 ## Reproducer (both classes, no PowerShell)
 

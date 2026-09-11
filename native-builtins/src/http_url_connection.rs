@@ -432,15 +432,15 @@ fn https_ensure_exchanged(ctx: &mut dyn NativeContext, this: &mut ObjectRef) {
 /// row — remove it and this function would drive a second HTTPS exchange on the
 /// next accessor call, repopulate the table, and answer as if the connection
 /// had never been torn down.
-fn https_ensure_exchanged_body(ctx: &mut dyn NativeContext, this: ObjectRef) {
+fn https_ensure_exchanged_body(ctx: &mut dyn NativeContext, mut this: ObjectRef) {
     // Key before the guard — see `record_https_peer_info`.
     let key = ctx.identity_hash_code(this) as u32 as u64;
     if https_peer_info().lock().unwrap().contains_key(&key) {
         return;
     }
-    if let Some(url_str) = huc_real_object_url(ctx, this) {
+    if let Some(url_str) = huc_real_object_url(ctx, &mut this) {
         if url_str.starts_with("https://") {
-            let _ = huc_real_perform(ctx, this, &url_str);
+            let _ = huc_real_perform(ctx, &mut this, &url_str);
         }
         return;
     }
@@ -898,15 +898,34 @@ fn with_real_req<R>(
 /// If `this` is a real-JDK URLConnection (field 0 is a `java/net/URL` object,
 /// not our synthetic int conn-id), return its full external-form URL string via
 /// `URL.toExternalForm()` (robust for both synthetic and real URL layouts).
-fn huc_real_object_url(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<String> {
-    let url_obj = match ctx.get_field(this, HUC_CONN_ID) {
+fn huc_real_object_url(ctx: &mut dyn NativeContext, this: &mut ObjectRef) -> Option<String> {
+    let url_obj = match ctx.get_field(*this, HUC_CONN_ID) {
         Value::Object(Some(o)) => o,
         _ => return None,
     };
-    match ctx.invoke_virtual(url_obj, "toExternalForm", "()Ljava/lang/String;", &[]) {
+    // `toExternalForm()` is ordinary Java and it allocates, so a moving young
+    // collection can complete inside this call and relocate the carrier.
+    //
+    // `this` is a bare Rust local. The caller's `safe_native_call` pin keeps the
+    // OBJECT alive and the collector remaps THAT pin — but not this copy, and
+    // not the caller's. Every caller then keys a side table on
+    // `identity_hash_code(this)` one statement later, which reads the mark word
+    // at the address the collection moved away from. On the Generational
+    // collector that address is in the semispace the flip emptied, and
+    // `CRATONVM_GEN_UNCOMMIT` has handed the granule back to the OS, so the read
+    // is a SIGSEGV rather than a wrong answer.
+    //
+    // `&mut ObjectRef` rather than a pin private to this function: pinning for
+    // our own use fixes nothing when the CALLER keeps the pre-move copy, and
+    // that is exactly the half that was missing.
+    let this_pin = ctx.pin_native_root(*this);
+    let out = match ctx.invoke_virtual(url_obj, "toExternalForm", "()Ljava/lang/String;", &[]) {
         Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
         _ => None,
-    }
+    };
+    *this = ctx.read_native_pin(this_pin, *this);
+    ctx.unpin_native_roots(this_pin);
+    out
 }
 
 /// Read the buffered request body for a real-JDK carrier from the
@@ -1051,11 +1070,11 @@ fn forget_live_fixed_stream(conn_key: i32) {
 /// JDK fixed-length contract exercised here are plain HTTP.
 fn start_live_fixed_stream(
     ctx: &mut dyn NativeContext,
-    this: ObjectRef,
+    mut this: ObjectRef,
     baos: ObjectRef,
     expected: u64,
 ) -> Result<bool, MethodCallFailed> {
-    let Some(url_str) = huc_real_object_url(ctx, this) else {
+    let Some(url_str) = huc_real_object_url(ctx, &mut this) else {
         return Ok(false);
     };
     let parsed = parse_url(&url_str).map_err(ioex)?;
@@ -1154,7 +1173,36 @@ fn start_live_fixed_stream(
 /// repeat getters re-raise `SocketTimeoutException` without blocking again.
 const HUC_TIMEOUT_STATUS: i32 = -2;
 
+/// [`huc_real_perform_inner`], with the carrier kept rooted across the WHOLE
+/// exchange and the caller's `this` rewritten to the post-move address.
+///
+/// The inner body already pins `this` for its own redirect loop, under a comment
+/// naming this very hazard: `perform` parks the thread in a GC-blocking region
+/// for every socket wait, so a moving collection can complete mid-exchange. What
+/// it never did was tell the CALLER. Every one of them holds a bare `ObjectRef`
+/// local across this call and then reaches `identity_hash_code(this)` —
+/// `huc_get_response_message`, `huc_get_input_stream` and
+/// `huc_get_content_length` do it within one or two statements — so the fix
+/// belongs at the boundary, not inside.
+///
+/// The window is at its widest exactly where it was measured: an HTTP request to
+/// a host that does not answer parks here for the whole connect timeout.
 fn huc_real_perform(
+    ctx: &mut dyn NativeContext,
+    this: &mut ObjectRef,
+    url_str: &str,
+) -> Result<i32, MethodCallFailed> {
+    // Taken BELOW the inner body's own pin, so the inner
+    // `unpin_native_roots(this_pin)` — which releases its base and everything
+    // above it — cannot release this one.
+    let pin = ctx.pin_native_root(*this);
+    let out = huc_real_perform_inner(ctx, *this, url_str);
+    *this = ctx.read_native_pin(pin, *this);
+    ctx.unpin_native_roots(pin);
+    out
+}
+
+fn huc_real_perform_inner(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     url_str: &str,
@@ -4240,12 +4288,12 @@ fn huc_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
 }
 
 fn huc_get_response_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
+    let mut this = obj_arg(args, 0)?;
     // Real-JDK sun.net.www HttpURLConnection (field 0 is the real URL object):
     // perform from the real URL rather than misreading our synthetic HUC_* slots.
-    if let Some(url_str) = huc_real_object_url(ctx, this) {
+    if let Some(url_str) = huc_real_object_url(ctx, &mut this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
-            return Ok(Some(Value::Int(huc_real_perform(ctx, this, &url_str)?)));
+            return Ok(Some(Value::Int(huc_real_perform(ctx, &mut this, &url_str)?)));
         }
     }
     ensure_connected(ctx, this)?;
@@ -4273,7 +4321,7 @@ fn status_reason(status: i32) -> String {
 }
 
 fn huc_get_response_message(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
+    let mut this = obj_arg(args, 0)?;
     // Real-JDK carrier: derive from the cached perform result. Prefer the
     // reason phrase actually read off the wire (real servers often deviate
     // from the RFC's canonical phrase, e.g. OkHttp MockWebServer's default
@@ -4281,9 +4329,9 @@ fn huc_get_response_message(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // HttpURLConnection.getResponseMessage() always returns exactly what the
     // server sent) — the hardcoded `status_reason` table is only a fallback
     // for when no reason was captured (e.g. the synthetic timeout result).
-    if let Some(url_str) = huc_real_object_url(ctx, this) {
+    if let Some(url_str) = huc_real_object_url(ctx, &mut this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
-            let status = huc_real_perform(ctx, this, &url_str)?;
+            let status = huc_real_perform(ctx, &mut this, &url_str)?;
             let key = ctx.identity_hash_code(this);
             let reason = real_results()
                 .lock()
@@ -4317,7 +4365,7 @@ fn huc_get_response_message(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn huc_get_input_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
+    let mut this = obj_arg(args, 0)?;
 
     // Compatibility: `java.net.URL.openConnection()` (registered in
     // `net_phase_e::register_re4_url_http` and in `lib.rs::register_net_natives`)
@@ -4338,14 +4386,23 @@ fn huc_get_input_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         // uses `openConnection().getInputStream()`, so treating a non-HTTP URL
         // as the HTTP carrier's empty response body makes inherited resources
         // appear as zero-byte streams (Hazelcast's filtered-loader XML config).
-        if let Some(full) = huc_real_object_url(ctx, this) {
+        if let Some(full) = huc_real_object_url(ctx, &mut this) {
             if full.starts_with("http://") || full.starts_with("https://") {
-                huc_real_perform(ctx, this, &full)?;
+                huc_real_perform(ctx, &mut this, &full)?;
                 let body = huc_real_body(ctx, this);
                 let truncated = huc_real_truncated(ctx, this);
                 return make_response_input_stream(ctx, &body, truncated, Some(this));
             }
-            return ctx.invoke_virtual(maybe_url, "openStream", "()Ljava/io/InputStream;", &[]);
+            // `maybe_url` was read out of the field BEFORE `huc_real_object_url`
+            // ran `toExternalForm()`, so a collection inside that call left this
+            // copy naming the pre-move address. `this` is current — it was just
+            // rewritten through the pin — so re-read the field rather than
+            // dispatching `openStream` on a dead receiver.
+            let url_now = match ctx.get_field(this, HUC_CONN_ID) {
+                Value::Object(Some(o)) => o,
+                _ => maybe_url,
+            };
+            return ctx.invoke_virtual(url_now, "openStream", "()Ljava/io/InputStream;", &[]);
         }
         // Peek at the external form via the URL's full-URL string field
         // (field 5 in our URL synthetic), falling back to field 0.
@@ -4379,11 +4436,11 @@ fn huc_get_input_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 fn huc_get_error_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
+    let mut this = obj_arg(args, 0)?;
     // Real-JDK carrier: serve the cached body when the response was an error.
-    if let Some(url_str) = huc_real_object_url(ctx, this) {
+    if let Some(url_str) = huc_real_object_url(ctx, &mut this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
-            let status = huc_real_perform(ctx, this, &url_str)?;
+            let status = huc_real_perform(ctx, &mut this, &url_str)?;
             if status < 400 {
                 return Ok(Some(Value::Object(None)));
             }
@@ -4411,7 +4468,7 @@ fn huc_get_error_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 fn huc_get_output_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
+    let mut this = obj_arg(args, 0)?;
     // Real-JDK carrier: the synthetic `HUC_DO_OUTPUT`/`HUC_CONNECTED` slots land
     // on unrelated real fields (one reads 1 → the old code wrongly threw "cannot
     // write after connect"). Use the identity-keyed `RealReq.do_output` and a
@@ -4497,7 +4554,7 @@ pub(crate) fn huc_get_header_field_named(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
+    let mut this = obj_arg(args, 0)?;
     let name = match args.get(1) {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(None))),
@@ -4506,9 +4563,9 @@ pub(crate) fn huc_get_header_field_named(
     // LAST duplicate wins, mirroring `sun.net.www.MessageHeader.findValue`'s
     // backwards iteration (see `content_length_of`'s doc for the MockWebServer
     // duplicate-Content-Length case that exposed this).
-    if let Some(url_str) = huc_real_object_url(ctx, this) {
+    if let Some(url_str) = huc_real_object_url(ctx, &mut this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
-            huc_real_perform(ctx, this, &url_str)?;
+            huc_real_perform(ctx, &mut this, &url_str)?;
             let v = huc_real_headers(ctx, this)
                 .into_iter()
                 .filter(|(k, _)| k.eq_ignore_ascii_case(&name))
@@ -4541,14 +4598,14 @@ pub(crate) fn huc_get_header_field_named(
 }
 
 fn huc_get_header_field_indexed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
+    let mut this = obj_arg(args, 0)?;
     let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(-1);
     if idx < 0 {
         return Ok(Some(Value::Object(None)));
     }
-    if let Some(url_str) = huc_real_object_url(ctx, this) {
+    if let Some(url_str) = huc_real_object_url(ctx, &mut this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
-            huc_real_perform(ctx, this, &url_str)?;
+            huc_real_perform(ctx, &mut this, &url_str)?;
             let v = huc_real_headers(ctx, this).get(idx as usize).cloned();
             return Ok(Some(match v {
                 Some((_k, val)) => Value::Object(Some(ctx.create_string(&val))),
@@ -4571,14 +4628,14 @@ fn huc_get_header_field_key_indexed(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
+    let mut this = obj_arg(args, 0)?;
     let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(-1);
     if idx < 0 {
         return Ok(Some(Value::Object(None)));
     }
-    if let Some(url_str) = huc_real_object_url(ctx, this) {
+    if let Some(url_str) = huc_real_object_url(ctx, &mut this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
-            huc_real_perform(ctx, this, &url_str)?;
+            huc_real_perform(ctx, &mut this, &url_str)?;
             let v = huc_real_headers(ctx, this).get(idx as usize).cloned();
             return Ok(Some(match v {
                 Some((k, _)) => Value::Object(Some(ctx.create_string(&k))),
@@ -4602,26 +4659,26 @@ fn huc_get_header_field_key_indexed(
 /// Registered nowhere before this fix, so it fell through to real-JDK bytecode
 /// that reads response state our shim never populated → empty map.
 fn huc_get_header_fields(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
+    let mut this = obj_arg(args, 0)?;
     // URL lookup can enter real-JDK code and collect. Keep the carrier rooted
     // until the subsequent perform/header operations have consumed it.
     let this_pin = ctx.pin_native_root(this);
     let result = (|| -> MethodCallResult {
-        let this = ctx.read_native_pin(this_pin, this);
-        let headers = if let Some(url_str) = huc_real_object_url(ctx, this) {
-            let this = ctx.read_native_pin(this_pin, this);
+        let mut this = ctx.read_native_pin(this_pin, this);
+        let headers = if let Some(url_str) = huc_real_object_url(ctx, &mut this) {
+            let mut this = ctx.read_native_pin(this_pin, this);
             if url_str.starts_with("http://") || url_str.starts_with("https://") {
-                huc_real_perform(ctx, this, &url_str)?;
-                let this = ctx.read_native_pin(this_pin, this);
+                huc_real_perform(ctx, &mut this, &url_str)?;
+                let mut this = ctx.read_native_pin(this_pin, this);
                 huc_real_headers(ctx, this)
             } else {
                 ensure_connected(ctx, this)?;
-                let this = ctx.read_native_pin(this_pin, this);
+                let mut this = ctx.read_native_pin(this_pin, this);
                 with_state(ctx, this, |s| s.response_headers.clone()).unwrap_or_default()
             }
         } else {
             ensure_connected(ctx, this)?;
-            let this = ctx.read_native_pin(this_pin, this);
+            let mut this = ctx.read_native_pin(this_pin, this);
             with_state(ctx, this, |s| s.response_headers.clone()).unwrap_or_default()
         };
         let map = build_header_map(ctx, &headers)?;
@@ -4660,10 +4717,10 @@ pub(crate) fn huc_get_content_length(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    if let Some(url_str) = huc_real_object_url(ctx, this) {
+    let mut this = obj_arg(args, 0)?;
+    if let Some(url_str) = huc_real_object_url(ctx, &mut this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
-            huc_real_perform(ctx, this, &url_str)?;
+            huc_real_perform(ctx, &mut this, &url_str)?;
             let n = content_length_of(&huc_real_headers(ctx, this), huc_real_body(ctx, this).len());
             return Ok(Some(Value::Int(n as i32)));
         }
@@ -4682,10 +4739,10 @@ pub(crate) fn huc_get_content_length_long(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    if let Some(url_str) = huc_real_object_url(ctx, this) {
+    let mut this = obj_arg(args, 0)?;
+    if let Some(url_str) = huc_real_object_url(ctx, &mut this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
-            huc_real_perform(ctx, this, &url_str)?;
+            huc_real_perform(ctx, &mut this, &url_str)?;
             let n = content_length_of(&huc_real_headers(ctx, this), huc_real_body(ctx, this).len());
             return Ok(Some(Value::Long(n)));
         }
