@@ -386,6 +386,20 @@ const DRIFT_GATE: &str = "tests/registrar_drift.rs";
 /// and that constant's doc says what it is and why all three registration sets
 /// carry it. This table is derived from `DRIFT_TRIPLES`, so the move is the
 /// ratchet working, not a second decision.
+/// **Re-taken 2026-09-11, +27 across six families, and no family's drift
+/// changed.** `registrar_drift.rs` was re-taken in the same commit after its
+/// site matcher learned `register_with_kind(` — 745 registration sites it had
+/// been skipping, whose shipping side is almost entirely
+/// `register_essential_natives_with_shims`. This table counts triples that
+/// `DRIFT_TRIPLES` shares with a shipping pass, so it moves with that re-take
+/// by construction. Pasting was the whole fix, which is what the failure text
+/// says to check first.
+///
+/// The six: `register_enterprise_final_natives` 118 -> 135,
+/// `register_classloader_natives` 82 -> 85, `register_phase69_natives` 8 -> 11,
+/// `register_serialization_natives` 2 -> 4,
+/// `register_java_lang_extras_natives` 27 -> 28,
+/// `register_unsafe_define_class` 1 -> 2. Every other family is unchanged.
 const FAMILY_DRIFT_EXPOSURE: &[(&str, usize)] = &[
     ("register_aot_natives", 1),
     ("register_atomic_boolean_natives", 8),
@@ -394,16 +408,11 @@ const FAMILY_DRIFT_EXPOSURE: &[(&str, usize)] = &[
     ("register_byte_array_output_stream", 0),
     ("register_cds_natives", 0),
     ("register_classfile_api_natives", 0),
-    // 81 -> 82 on 2026-09-09: `java/lang/System$2.defineClass(..)`, the JDK 21
-    // spelling of the `JavaLangAccess` carrier, joined the `System$1` row this
-    // subtree already carried. Both registrars that name the carrier now cover
-    // both names, so the twin exists under both. `registrar_drift.rs` was
-    // re-taken in the same commit and carries the matching row.
-    ("register_classloader_natives", 82),
+    ("register_classloader_natives", 85),
     ("register_completable_future_natives", 3),
     ("register_concurrent_extras", 3),
     ("register_crypto_impl_natives", 2),
-    ("register_enterprise_final_natives", 118),
+    ("register_enterprise_final_natives", 135),
     ("register_enterprise_natives", 0),
     ("register_enum_natives", 0),
     ("register_functional_completion_natives", 0),
@@ -411,7 +420,7 @@ const FAMILY_DRIFT_EXPOSURE: &[(&str, usize)] = &[
     ("register_graalvm_compat_natives", 0),
     ("register_http2_natives", 48),
     ("register_jackson_gson_natives", 0),
-    ("register_java_lang_extras_natives", 27),
+    ("register_java_lang_extras_natives", 28),
     ("register_jdk25_concurrency_natives", 0),
     ("register_jdk25_language_natives", 0),
     ("register_jdk25_patterns_natives", 0),
@@ -440,7 +449,7 @@ const FAMILY_DRIFT_EXPOSURE: &[(&str, usize)] = &[
     ("register_phase66_natives", 0),
     ("register_phase67_natives", 16),
     ("register_phase68_natives", 0),
-    ("register_phase69_natives", 8),
+    ("register_phase69_natives", 11),
     ("register_phase70_natives", 7),
     ("register_phase71_natives", 22),
     ("register_phase72_natives", 25),
@@ -450,7 +459,7 @@ const FAMILY_DRIFT_EXPOSURE: &[(&str, usize)] = &[
     ("register_s2_nio", 9),
     ("register_s3_http_client", 4),
     ("register_security_natives", 10),
-    ("register_serialization_natives", 2),
+    ("register_serialization_natives", 4),
     ("register_slf4j_natives", 45),
     ("register_t25_natives", 1),
     ("register_t310_scripting", 2),
@@ -463,7 +472,7 @@ const FAMILY_DRIFT_EXPOSURE: &[(&str, usize)] = &[
     ("register_time_extras_natives", 1),
     ("register_time_natives", 16),
     ("register_tls_natives", 51),
-    ("register_unsafe_define_class", 1),
+    ("register_unsafe_define_class", 2),
     ("register_vector_api_natives", 0),
 ];
 
