@@ -10722,10 +10722,71 @@ impl<'a> Lowerer<'a> {
                         // JMP. Same polarity rule as the general layout below:
                         // the taken (true) edge is the near one unless the
                         // profile says this branch is usually not taken.
-                        let favor_false = node
+                        let hint = node
                             .bytecode_pc
-                            .and_then(|pc| self.branch_hints.get(&pc).copied())
-                            == Some(false);
+                            .and_then(|pc| self.branch_hints.get(&pc).copied());
+                        // ── Which edge FALLS THROUGH ─────────────────────
+                        //
+                        // The profile when there is one, the LAYOUT when there
+                        // is not. Both were previously "the profile", and the
+                        // profile is empty on a default run.
+                        //
+                        // # What the missing case cost
+                        //
+                        // `branch_hints` is populated only under
+                        // `CRATONVM_TIER_PGO`, so with no hint this arm always
+                        // made the `true` edge the near one. For a javac
+                        // counted loop that is exactly backwards, and for a
+                        // reason the range-BCE pass already wrote down:
+                        // **javac puts the loop body on the FALSE edge.**
+                        // `for (i = 0; i < n; i++)` compiles to
+                        // `if_icmpge exit`, the builder preserves that
+                        // polarity, so `Proj(0)` — this arm's `true_block` —
+                        // is the loop EXIT.
+                        //
+                        // On `probes/FieldLoop.java` `sum` the result was
+                        //
+                        //     jl  +5      ; to the loop body, TAKEN every
+                        //     jmp exit    ; iteration, skipping this
+                        //
+                        // where the loop body was already the next block the
+                        // scheduler had laid out. One instruction and one
+                        // TAKEN branch per iteration, to reach the block
+                        // physically underneath.
+                        //
+                        // # Why the layout is the right tie-break, and only
+                        //   the tie-break
+                        //
+                        // `ir_schedule::layout_hot_paths` is default-ON and
+                        // needs no profile — `static_branch_probs` derives its
+                        // probabilities from loop structure alone — and it has
+                        // ALREADY decided which successor should be physically
+                        // next. Emission order is block index order, so
+                        // `block_idx + 1` IS that decision, and it is the same
+                        // test `emit_jmp_to_block_or_fall_through` reads.
+                        // At most one successor can be next, so this never has
+                        // to choose between two layout facts.
+                        //
+                        // It does NOT override a hint that exists.
+                        // `step4_ir_lower_consumes_branch_bias_hint` is the
+                        // contract that says so, and it caught this arm
+                        // overriding one: a profile is evidence about
+                        // FREQUENCY, which a layout heuristic is only guessing
+                        // at, and the two disagreeing is a fact worth leaving
+                        // visible rather than silently resolving. Where they
+                        // disagree the cost is one `JMP rel32` and no extra
+                        // taken branch, so deferring to the profile is cheap.
+                        let favor_false = match hint {
+                            Some(h) => !h,
+                            None if !ir_branch_layout_polarity_enabled() => false,
+                            None if false_block == block_idx + 1 => true,
+                            None if true_block == block_idx + 1 => false,
+                            None => false,
+                        };
+                        if hint.is_none() && favor_false {
+                            BRANCH_POLARITY_FROM_LAYOUT
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         // Jcc byte under which control goes to the FAR edge.
                         let (jcc_far, near_block, far_block) = match fused_cc {
                             Some(cc) if favor_false => (cc, false_block, true_block),
@@ -14405,6 +14466,81 @@ fn note_deferred_census(candidates: usize, taken: usize, mid_rcx: usize, foldabl
 /// both operands are register-resident the two `MOV`s ahead of it are pure
 /// overhead, and on a counted loop they are two of the seventeen instructions
 /// in the body.
+/// `CRATONVM_JIT_IR_BRANCH_LAYOUT_POLARITY=0` — choose a fused branch's
+/// fall-through edge from the PGO hint alone, the shape that predates
+/// 2026-09-11.
+///
+/// Default ON. See the comment at its one read site in `Op::If` for why the
+/// hint alone was not enough: it is empty without `CRATONVM_TIER_PGO`, and the
+/// fallback it left behind — "the `true` edge is the near one" — is inverted
+/// for every javac counted loop.
+///
+/// Off restores the previous bytes exactly.
+///
+/// It is a TIE-BREAK, not an override: a branch with a profile hint keeps the
+/// polarity that hint asks for, on or off. See the read site.
+fn ir_branch_layout_polarity_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(forced) = BRANCH_LAYOUT_POLARITY_FORCE.with(|c| c.get()) {
+            return forced;
+        }
+    }
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_BRANCH_LAYOUT_POLARITY").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override of [`ir_branch_layout_polarity_enabled`], the same
+    /// shape as `LS_FORCE` and for the same reason.
+    static BRANCH_LAYOUT_POLARITY_FORCE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only RAII override of [`ir_branch_layout_polarity_enabled`].
+#[cfg(test)]
+struct BranchLayoutPolarityForce;
+
+#[cfg(test)]
+impl BranchLayoutPolarityForce {
+    fn set(on: bool) -> BranchLayoutPolarityForce {
+        BRANCH_LAYOUT_POLARITY_FORCE.with(|c| c.set(Some(on)));
+        BranchLayoutPolarityForce
+    }
+}
+
+#[cfg(test)]
+impl Drop for BranchLayoutPolarityForce {
+    fn drop(&mut self) {
+        BRANCH_LAYOUT_POLARITY_FORCE.with(|c| c.set(None));
+    }
+}
+
+/// Fused branches whose fall-through edge the LAYOUT chose and the hint would
+/// not have.
+///
+/// The engagement number for [`ir_branch_layout_polarity_enabled`], and the
+/// only one that means anything: a flag whose census is zero on a workload
+/// changed nothing there, whatever the emitted size says. Reported beside
+/// `ir_fallthroughs_elided` under `CRATONVM_DBG=jitc`, because the two measure
+/// the two halves of one decision — this one picks which edge should fall
+/// through, that one elides the `JMP` when it does.
+static BRANCH_POLARITY_FROM_LAYOUT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many fused branches took their fall-through edge from the block layout
+/// rather than from the profile hint, since process start.
+pub fn ir_branch_polarity_from_layout() -> u64 {
+    BRANCH_POLARITY_FROM_LAYOUT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `CRATONVM_JIT_IR_PHI_COPY_DIRECT=0` — stage every phi edge copy through RAX
 /// and publish the phi's register from there, the shape that predates
 /// 2026-09-11.
@@ -20974,12 +21110,32 @@ mod tests {").next().unwrap_or(src);
 
     // ── wire-tiered-manager Step 4: PGO branch-bias in the IR (C2) path ──
 
-    /// The optimizing IR lowerer must consume the profiled branch bias: a
-    /// conditional the profile marks "usually NOT taken" flips from `JE`
-    /// (`0F 84`) to `JNE` (`0F 85`) so the not-taken edge becomes the
-    /// fall-through. No hint (the default) ⇒ the historical `JE` layout, and
-    /// a "usually taken" hint reproduces it byte-for-byte — only the
-    /// not-taken case inverts.
+    /// The optimizing IR lowerer must consume the profiled branch bias: the two
+    /// hints emit opposite branch polarities, and a hint outranks the block
+    /// layout.
+    ///
+    /// # What this test used to assert, and why it changed on 2026-09-11
+    ///
+    /// It used to pin the UNHINTED emission as the reference — "no hint ⇒ the
+    /// historical `JE` layout, and a usually-taken hint reproduces it
+    /// byte-for-byte". That reference moved deliberately: with no hint the arm
+    /// now takes its fall-through edge from the block layout
+    /// (`ir_branch_layout_polarity_enabled`), because the previous fallback —
+    /// "the `true` edge is the near one" — is inverted for every javac counted
+    /// loop and cost one taken branch and one `JMP rel32` per iteration.
+    ///
+    /// On THIS fixture the layout happens to agree with the not-taken hint, so
+    /// the old assertion ("a not-taken hint must invert the baseline") could no
+    /// longer hold however the code behaved: baseline and hinted arm are now
+    /// the same bytes. That is the change working, not the hint failing.
+    ///
+    /// **So the property is restated against the two hints rather than against
+    /// the baseline**, which is what the test was always about and is immune to
+    /// the default moving again: the two hints must disagree with each other,
+    /// in opposite polarities, and each must be reachable. The unhinted arm is
+    /// still asserted — against the LAYOUT's answer, and equal to whichever
+    /// hint agrees with it, which is the fact that would otherwise be silently
+    /// lost.
     #[test]
     fn step4_ir_lower_consumes_branch_bias_hint() {
         // iload_0; ifeq +5 (→pc6); iconst_1; ireturn; iconst_0; ireturn.
@@ -20997,59 +21153,65 @@ mod tests {").next().unwrap_or(src);
             (graph, schedule)
         };
 
-        // Default (no hint): a `JE` (0F 84), no inverted form.
-        let (g0, s0) = build();
-        let base_code = lower(&g0, &s0, 1, 1, &no_helpers())
-            .expect("lower baseline")
+        let lower_hinted = |bias: Option<bool>| {
+            let (g, sch) = build();
+            match bias {
+                None => lower(&g, &sch, 1, 1, &no_helpers()).expect("lower baseline"),
+                Some(b) => {
+                    let mut hints = HashMap::new();
+                    hints.insert(1usize, b);
+                    lower_with_branch_hints(&g, &sch, 1, 1, &no_helpers(), &hints)
+                        .expect("lower hinted")
+                }
+            }
             .code_bytes()
-            .to_vec();
-        // 2026-09-02: with the compare FUSED into the branch, the emitted
-        // condition is the compare's own inverse rather than `TEST` on a
-        // materialised boolean, so the concrete byte for this `ifeq` shape is
-        // `JNE` (0F 85) where it used to be `JE` (0F 84). What this test is
-        // for -- the hint INVERTS the branch, and only the hint does -- is
-        // unchanged, and is asserted as the property below rather than as one
-        // of the two bytes. Both polarities must appear across the arms, or
-        // the "inversion" being checked is vacuous.
-        let base_polarity = if contains_seq(&base_code, &[0x0F, 0x84]) {
-            0x84u8
-        } else {
-            assert!(
-                contains_seq(&base_code, &[0x0F, 0x85]),
-                "the baseline IR branch emitted neither JE nor JNE"
-            );
-            0x85u8
+            .to_vec()
         };
 
-        // "usually not taken" at the ifeq PC (1): inverted to `JNE` (0F 85),
-        // and a different code buffer.
-        let mut hints = HashMap::new();
-        hints.insert(1usize, false);
-        let (g1, s1) = build();
-        let hint_code = lower_with_branch_hints(&g1, &s1, 1, 1, &no_helpers(), &hints)
-            .expect("lower hinted")
-            .code_bytes()
-            .to_vec();
-        assert!(
-            contains_seq(&hint_code, &[0x0F, base_polarity ^ 1]),
-            "a not-taken hint must invert the branch polarity"
+        let base_code = lower_hinted(None);
+        let not_taken = lower_hinted(Some(false));
+        let taken = lower_hinted(Some(true));
+
+        // Both polarities must actually appear across the arms, or the
+        // "inversion" being checked is vacuous.
+        let polarity = |code: &[u8]| {
+            if contains_seq(code, &[0x0F, 0x84]) {
+                0x84u8
+            } else {
+                assert!(
+                    contains_seq(code, &[0x0F, 0x85]),
+                    "an IR branch emitted neither JE nor JNE"
+                );
+                0x85u8
+            }
+        };
+        assert_eq!(
+            polarity(&not_taken),
+            polarity(&taken) ^ 1,
+            "the two hints must emit OPPOSITE branch polarities; that is the \
+             whole of what consuming a branch bias means"
         );
         assert_ne!(
-            base_code, hint_code,
-            "branch-bias hint must change the emitted code"
+            not_taken, taken,
+            "the two hints must produce different code buffers"
         );
 
-        // "usually taken" keeps the default layout (byte-identical).
-        let mut taken_hints = HashMap::new();
-        taken_hints.insert(1usize, true);
-        let (g2, s2) = build();
-        let taken_code = lower_with_branch_hints(&g2, &s2, 1, 1, &no_helpers(), &taken_hints)
-            .expect("lower taken-hinted")
-            .code_bytes()
-            .to_vec();
+        // And the unhinted arm follows the LAYOUT, which on this fixture puts
+        // the false edge physically next. Asserted rather than left implicit:
+        // if the layout tie-break is ever switched off, the baseline goes back
+        // to matching the taken arm, and the reader should be told which of
+        // the two it is.
+        let expected_base = if super::ir_branch_layout_polarity_enabled() {
+            &not_taken
+        } else {
+            &taken
+        };
         assert_eq!(
-            base_code, taken_code,
-            "usually-taken hint must reproduce the default layout byte-for-byte"
+            &base_code, expected_base,
+            "with no hint the fall-through edge comes from the block layout \
+             (`ir_branch_layout_polarity_enabled` = {}), and this fixture's \
+             layout agrees with the not-taken hint",
+            super::ir_branch_layout_polarity_enabled(),
         );
     }
 
@@ -26669,6 +26831,84 @@ mod tests {").next().unwrap_or(src);
                 "Op::{name}'s arm reads something other than its first operand \
                  into RAX outside the fold guard",
             );
+        }
+    }
+
+    /// A counted loop's fused branch falls through to the loop BODY, and the
+    /// answers do not change.
+    ///
+    /// # The bug this pins is a polarity convention, not a bug in the layout
+    ///
+    /// `ir_schedule::layout_hot_paths` is default-ON and already puts the loop
+    /// body physically next. The fused-branch arm then chose its fall-through
+    /// edge from `branch_hints`, which is EMPTY without `CRATONVM_TIER_PGO` —
+    /// so it always made the `true` edge the near one, and for a javac counted
+    /// loop the `true` edge is the loop EXIT (`for (i = 0; i < n; i++)`
+    /// compiles to `if_icmpge exit`, and the builder preserves that polarity;
+    /// the range-BCE pass records the same trap). The loop then reached the
+    /// block underneath it by a TAKEN `jl` plus a `jmp` it had to skip.
+    ///
+    /// # Both halves, because neither is enough alone
+    ///
+    /// The byte comparison is engagement: with the hint absent and the layout
+    /// ignored the two arms are identical, and the execution half would then be
+    /// comparing a body with itself. The execution half is correctness: a
+    /// polarity flip that inverts a condition and does not swap its targets
+    /// computes a plausible wrong answer, which is the one failure a size
+    /// assertion cannot see. `n = 0` runs the loop zero times and is the case
+    /// that catches a swapped-but-not-inverted branch.
+    #[test]
+    fn a_counted_loop_falls_through_to_its_body_and_still_sums() {
+        // int f(int n) { int a = 0; for (int i = 0; i < n; i++) a += i; return a; }
+        let code = [
+            0x03, 0x3C, 0x03, 0x3D, 0x1C, 0x1A, 0xA2, 0x00, 0x0D, 0x1B, 0x1C, 0x60, 0x3C, 0x84,
+            0x02, 0x01, 0xA7, 0xFF, 0xF4, 0x1B, 0xAC, 0, 0,
+        ];
+        let mut graph = IrBuilder::new(1, 3).build(&code, 21).expect("IR build");
+        ir_optimize::optimize(&mut graph);
+        let schedule = ir_schedule::schedule(&graph);
+
+        let before = super::ir_branch_polarity_from_layout();
+        let laid_out = {
+            let _f = super::BranchLayoutPolarityForce::set(true);
+            lower(&graph, &schedule, 1, 3, &no_helpers()).expect("the laid-out body lowers")
+        };
+        let engaged = super::ir_branch_polarity_from_layout() > before;
+        let hinted = {
+            let _f = super::BranchLayoutPolarityForce::set(false);
+            lower(&graph, &schedule, 1, 3, &no_helpers()).expect("the hinted body lowers")
+        };
+
+        // Engagement, when the two switches that reach this arm are on. A kill
+        // switch is a legitimate way to run the suite, so the correctness half
+        // below runs either way.
+        if super::ir_fused_branch_enabled() && super::ir_fallthrough_enabled() {
+            assert!(
+                engaged,
+                "the layout never overrode the hint on a counted loop — either \
+                 this fixture's branch is not fused, or the arm stopped \
+                 counting, and the size assertion below then means nothing",
+            );
+            assert!(
+                laid_out.code_len() < hinted.code_len(),
+                "falling through to the loop body emitted no fewer bytes \
+                 ({} against {}); the elided `JMP rel32` is five of them",
+                laid_out.code_len(),
+                hinted.code_len(),
+            );
+        }
+
+        for n in [0i32, 1, 2, 7, 100, -3] {
+            let want: i32 = (0..n.max(0)).fold(0i32, |acc, i| acc.wrapping_add(i));
+            let got_laid = unsafe { laid_out.try_call(&[i64::from(n)]) }
+                .expect("the laid-out body runs");
+            let got_hint =
+                unsafe { hinted.try_call(&[i64::from(n)]) }.expect("the hinted body runs");
+            assert_eq!(
+                got_laid as u32, got_hint as u32,
+                "the two branch polarities disagree for n={n}",
+            );
+            assert_eq!(got_laid as u32 as i32, want, "laid-out body wrong for n={n}");
         }
     }
 

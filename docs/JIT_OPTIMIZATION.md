@@ -4982,3 +4982,53 @@ being that this tier does not unroll (so it pays the safepoint poll and the back
 edge every iteration rather than every fourth) and that its receiver null check
 is explicit where the single-pass tier's is implicit — in
 [`internal/performance/c2-the-phi-copy-staging-register-20260911.md`](internal/performance/c2-the-phi-copy-staging-register-20260911.md).
+
+### The same budget's next line: the loop branched the wrong way
+
+`FieldLoop.sum` takes **four** branches per iteration at this tier against the
+single-pass tier's one, and one of the four was free:
+
+```asm
+25d: cmp ebx,r14d
+260: jl  +5        ; to the loop body -- TAKEN every iteration
+266: jmp exit      ;   ...skipping this
+26b: <loop body>
+```
+
+The fused-branch arm picks its fall-through edge from `branch_hints`, which is
+empty without `CRATONVM_TIER_PGO`. The fallback that left behind — *the `true`
+edge is the near one* — is inverted for every javac counted loop, and for a
+reason this document already records in the range-BCE closeout: **javac puts the
+loop body on the FALSE edge**, because `for (i = 0; i < n; i++)` compiles to
+`if_icmpge exit`. So the near edge was the loop EXIT, the exit was not the next
+block, and `ir_fallthrough_enabled`'s `JMP rel32` elision — default-ON since
+2026-09-09 and built for exactly this — could never reach it.
+
+`CRATONVM_JIT_IR_BRANCH_LAYOUT_POLARITY` (default ON) takes the fall-through
+edge from the block LAYOUT when there is no hint: `layout_hot_paths` is
+default-ON, needs no profile, and `block_idx + 1` is its decision. The sequence
+becomes one not-taken `jge exit`: **−5 bytes, −1 instruction, −1 taken branch
+per iteration**, and 41 branches take it on `CratonBenchC2`.
+
+**It measures nothing** — UNMEASURABLE on `FieldLoop` (+0.6% against a 0.6%
+floor) and on `CratonBenchC2` (−2.5% against a 4.8% floor), checksums identical
+throughout. It ships ON because it is weakly better in both instructions and
+taken branches and strictly better whenever the near edge would otherwise need a
+`JMP`, not because anything here shows it pays.
+
+**It does not override a profile hint, and a test caught it trying.**
+`step4_ir_lower_consumes_branch_bias_hint` went red on the first version. The
+interaction it exposed is a real gap: `ScheduleOptions::branch_counts` is
+documented as taking the same per-bci bias the lowerer takes, and
+`production_schedule_options()` leaves it **empty** — so a profile informs the
+polarity of one `Jcc` and never informs which block is placed next. Populating
+it is small, and nobody has.
+
+**And a harness finding worth more than the number.** The first run reported
++1.3% against a **0.0%** floor — the tightest this apparatus has printed, and
+meaningless: Windows accounts CPU in ~15.625 ms ticks, the samples were 0.586 s,
+so one tick was 2.7% of a sample and both medians had merely landed on the same
+one. `cpu-ab.ps1` now prints the tick as a percentage of the median and refuses
+a verdict inside it. That is the second way a clean floor misleads — the first
+being drift between invocations (§5.2 of the GP-register page) — and both make a
+tight floor read as permission to stop.

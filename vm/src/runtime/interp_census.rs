@@ -444,6 +444,15 @@ pub fn report_at_exit() {
         // it. Read the two lines together: the numbers above are what the
         // emitter could take, the numbers below are why the scheduler did or
         // did not offer it.
+        // Fused branches whose fall-through edge the LAYOUT chose. OUTSIDE the
+        // supersede gate for the reason the deferred-carry line above is: a
+        // workload that compiles thousands of methods and supersedes none
+        // would report zero from an instrument that was never armed, which is
+        // an artefact of the gate rather than a fact about the code.
+        eprintln!(
+            "[c2-supersede] ir branch polarity from layout: {}",
+            cratonvm_jit::ir_lower::ir_branch_polarity_from_layout(),
+        );
         let pc = cratonvm_jit::ir_schedule::ir_pair_census();
         eprintln!(
             "[c2-supersede] ir operand pairing: candidates={} paired={} | declined: \
