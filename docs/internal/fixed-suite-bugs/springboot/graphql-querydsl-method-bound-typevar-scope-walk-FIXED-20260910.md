@@ -154,6 +154,6 @@ unrelated and are filed separately:
 * `loader/spring-boot-loader … UrlJarFilesTests` —
   `urljarfilestests-zip-immunity-vs-mockito-inline-mock-FIXED-20260910.md`
 * `module/spring-boot-kafka … KafkaAutoConfigurationIntegrationTests` —
-  `known-issues/springboot/kafka-scala-statics-anyhash-jit-miscompile-20260910.md`
+  `internal/fixed-suite-bugs/springboot/kafka-scala-statics-anyhash-jit-miscompile-FIXED-20260910.md`
 * `module/spring-boot-flyway … ResourceProviderCustomizerBeanRegistrationAotProcessorTests` —
   `known-issues/springboot/flyway-aot-receiver-class-confusion-under-concurrency-20260910.md`

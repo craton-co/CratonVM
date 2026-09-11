@@ -10805,7 +10805,24 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         if opts.initialize {
             // Best-effort init; failures bubble back as Err.
             if let Err(e) = self.initialize_class(cid) {
-                return Err(format!("initialize after define failed for {name}: {e}"));
+                // `MethodCallFailed::ExceptionThrown`'s Display is the raw
+                // heap address, so this used to read
+                //   initialize after define failed for <name>: exception
+                //   thrown: ref(0x7b5b041c3720)
+                // which names neither the exception class nor its message. The
+                // caller turns this string into a `ClassFormatError` message,
+                // so the pointer is what an operator, a probe diff and a
+                // regression vector all end up holding. `describe_throwable`
+                // is the same reader the uncaught-exception path uses.
+                let cause = match &e {
+                    cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc) => {
+                        describe_throwable(&self.shared, *exc)
+                    }
+                    other => other.to_string(),
+                };
+                return Err(format!(
+                    "initialize after define failed for {name}: {cause}"
+                ));
             }
         }
         Ok(cid)
