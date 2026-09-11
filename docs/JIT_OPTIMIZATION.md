@@ -5092,3 +5092,53 @@ version of this feature.
 Full write-up, including the census, the refusal taxonomy and the partial-unroll
 design that was not built, in
 [`internal/performance/c2-unrolling-is-a-deopt-metadata-problem-20260911.md`](internal/performance/c2-unrolling-is-a-deopt-metadata-problem-20260911.md).
+
+### FOLLOW-UP: the per-copy deopt frame, built (`CRATONVM_JIT_IR_PER_COPY_FRAMES`, default OFF)
+
+The "bounded change to three named places" above is done, and it is off by
+default because it is deopt metadata: the failure mode is a right-looking wrong
+answer, not a crash.
+
+* **`Node::frame_snapshot: Option<u32>`** — the per-copy identity, on the node.
+  `None` on everything the builder makes, so the by-bci scan is unchanged for
+  every compile that does not unroll. `Graph::set_node_frame_snapshot` refuses a
+  snapshot whose bci is not the node's own.
+* **`ir_optimize::install_copy_frames`** — one substituted snapshot per
+  iteration; iteration 0 rewrites its own in place so `bci_native`'s anchor and
+  the frame at it keep describing the same code.
+* **`Lowerer::snapshot_native` / `resolve_frame_state_for_site`** — the anchor
+  and the frame taken from the copy rather than from the bci.
+
+Two places the design note did not name turned out to matter. **GVN's identity**
+now includes `frame_snapshot`: two copies of a body compute the same value at
+different program points, and merging them hands one copy's code the other's
+frame. And **`ir_verify`'s duplicate-bci rule**, which existed because of this
+exact collapse, is now *"a duplicated bci is a violation unless every snapshot at
+it is claimed by a node"* — an unclaimed duplicate is still the bug, and is what
+a half-finished copy looks like.
+
+**One thing the end-to-end run taught that is not about unrolling.** The probe
+that exercises a deopt out of copy 3 still crashed on a default run, and the
+reason was `ir_evidence::accept`: it priced the unrolled C2 body as not worth
+publishing and handed the method back to the single-pass tier. The C2 body was
+never running. `CRATONVM_C2_ACCEPT=always` installs it, and then all three
+shapes match HotSpot exactly (20 000 `NullPointerException`s out of a cloned
+body, each resuming in the copy that trapped). Worth remembering generally: with
+an acceptance gate between a transform and its execution, "the checksum matched"
+can be a statement about code that never ran.
+
+**It wins nothing measurable yet, and that is expected.** The census above says
+every counted loop in both suites has a runtime bound, so `per_copy_frames`
+(a new sub-count of `unrolled`) is zero there. What it buys is that the sentence
+the previous page ended on is no longer owed: the partial unroller can now be
+written against a frame mechanism instead of around one.
+
+One cost is worth knowing before it is discovered: **safepoint slots are DCE
+roots**, so per-copy frames keep every iteration's intermediates alive to
+describe them. On the `for (i = 0; i < 5; i++) a += i;` fixture the loop folds to
+`Const(10)` and five `Const` nodes survive anyway, materialised purely for the
+frames. The narrower fix (root only snapshots that can be consulted) is a DCE
+change, not this one.
+
+Full write-up in
+[`internal/performance/c2-per-copy-deopt-frames-20260911.md`](internal/performance/c2-per-copy-deopt-frames-20260911.md).

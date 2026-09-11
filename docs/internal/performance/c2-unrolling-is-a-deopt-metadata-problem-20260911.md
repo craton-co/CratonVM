@@ -193,6 +193,26 @@ query by reading a frame slot nothing had written. Anyone taking it should
 expect the test to be an executable differential over `n % U != 0`, not a source
 audit.
 
+> **DONE, same day, behind `CRATONVM_JIT_IR_PER_COPY_FRAMES` (default OFF).**
+> `Node::frame_snapshot` is the per-copy identity; `ir_optimize::
+> install_copy_frames` appends the substituted snapshots;
+> `Lowerer::snapshot_native` takes the anchor from the copy's own nodes and
+> `resolve_frame_state_for_site` takes the frame. Two places this section did
+> not name turned out to be load-bearing: GVN's identity (two copies compute the
+> same value at different program points, and merging them hands one copy's code
+> the other's frame) and `ir_verify`'s duplicate-bci rule, which existed because
+> of this very collapse and is now "duplicates are fine when every one of them is
+> CLAIMED".
+>
+> The fixture in §1 — the one this page shows being recognised and then declined
+> — unrolls, and its five copies carry five frames holding `(0,0) (0,1) (1,2)
+> (3,3) (6,4)`, anchored at five distinct native offsets.
+>
+> Write-up, including the refusal taxonomy that first draft got wrong and the
+> DCE-rooting cost it introduces:
+> [`c2-per-copy-deopt-frames-20260911.md`](c2-per-copy-deopt-frames-20260911.md).
+> **§4's zeros are unchanged** — this is the prerequisite, not the prize.
+
 ## 6. What was landed
 
 The census, the typed refusals it needed, and this page. Specifically:
