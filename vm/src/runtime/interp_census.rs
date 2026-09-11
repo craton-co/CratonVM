@@ -320,6 +320,16 @@ pub fn report_at_exit() {
         eprintln!(
             "[c2-supersede] refusals by optimizer activity: simplified={ref_simpl} inert={ref_inert}"
         );
+        // The third refusal reason, and the one that means the opposite of the
+        // other two: these bodies DID carry evidence the list accepts and were
+        // refused anyway, because the transform they carried made them slower.
+        // A non-zero count is the priced gate catching what the transform list
+        // alone published -- see `ir_evidence`'s header for the 897 ms against
+        // 338 ms that motivated pricing it.
+        let (cost_ref, cost_ns) = cratonvm_jit::ir_evidence::cost_regression_census();
+        eprintln!(
+            "[c2-supersede] refused as a cost regression: bodies={cost_ref} est_ns_per_execution_declined={cost_ns}"
+        );
         // Array guard elision. Elided AND emitted on both rows, always: an
         // elision count alone cannot tell a working pass from a workload that
         // compiles no array accesses in this tier.
@@ -401,6 +411,32 @@ pub fn report_at_exit() {
         eprintln!(
             "[c2-supersede] deferred-new retries: held={held} spent={spent} retired={retired} re_offered={}",
             crate::runtime::interpreter::jit_bridge::deferred_new_reoffered(),
+        );
+    }
+    // The DEFERRED carry -- a consumer taking BOTH of its single-use operands
+    // in registers rather than one.
+    //
+    // OUTSIDE the supersede block on purpose. Everything above it is gated on
+    // a C1 body having been superseded, and most workloads that compile
+    // hundreds of methods never supersede one: the first run of this census
+    // over the probe set reported `planned=0` from 54 processes that had
+    // compiled thousands of methods between them, which is an instrument
+    // armed where nobody reads it rather than a fact about the code.
+    //
+    // Read against its denominator. `taken` alone says how often the shape
+    // was TAKEN and nothing about how often it was there, and
+    // `c2-one-carry-slot-is-the-frame-traffic-ceiling-FIXED-20260910.md`
+    // closed on exactly that distinction. `candidates` is every consumer
+    // already taking its first
+    // operand in RAX -- the shape the second slot exists for.
+    // `declined_mid_writes_rcx` is the share of those refused because the arm
+    // in between can write RCX, and `foldable` is the part of THAT which
+    // `CRATONVM_JIT_IR_CARRY_RCX_FOLDED` converts.
+    if crate::runtime::env_cache::dbg_jitc() {
+        let (dc, dt, dm, df) = cratonvm_jit::ir_lower::ir_carry_deferred_census();
+        eprintln!(
+            "[c2-supersede] ir deferred carries: candidates={dc} taken={dt} \
+             declined_mid_writes_rcx={dm} (foldable={df})"
         );
     }
     if direct_binds_enabled() {

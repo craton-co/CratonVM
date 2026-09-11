@@ -984,7 +984,8 @@ downgrade that gate was shut for.
 2. **Every compiled call still republishes RBP and pushes/reloads the shadow
    stack.** Those buy precise roots, not nothing, and removing them is a GC
    trade rather than a codegen one.
-3. **Nothing compares a C2 body against the C1 body it replaces.** The
+3. **Nothing compares a C2 body against the C1 body it replaces.**
+   *(Partly closed 2026-09-10 — see the note at the end of this item.)* The
    policy question is unchanged and deliberately still open — the obvious
    static metrics both misjudge the good cases, since a bigger body is usually
    inlining or unrolling and more call sites can be a callee's own calls after
@@ -993,6 +994,30 @@ downgrade that gate was shut for.
    also does is remove the causes that made a C2 body worse — the tier now has
    an inline TLAB bump, gated inline reference stores, and a register file.
    **What that instrument then said is below.**
+   **2026-09-10, what is now closed of item 3.** The acceptance gate no longer
+   judges only by *what the tier did*. `ir_evidence::CompileRecord` carries the
+   per-execution cost a compile introduced beside its transform bitset, and
+   `is_worth_publishing` refuses a body whose priced cost went UP however much
+   it transformed. Evidence is now necessary, not sufficient.
+
+   The prices are the two this crate already reasons in — a blind
+   `jit_invoke_dispatch` resolves by name at ~175 ns against a direct `CALL`'s
+   ~4 — and the trade they settle is splicing: a spliced frame saves a call, a
+   call the splice strands without a bindable target costs a resolution on every
+   execution. What is NOT modelled is site execution frequency, so a resolution
+   on a cold branch is charged like one in a loop; that errs toward refusing,
+   which is the safe direction, and it is the first thing to fix if the gate is
+   ever measured refusing better bodies.
+
+   This is still not a general C1-vs-C2 comparison. It prices one specific trade
+   because that trade has measured constants; the rest of item 3 stands.
+   `[c2-supersede] refused as a cost regression: bodies=N est_ns_per_execution_declined=M`
+   is the reading. It came out of a case where a transform's presence was the
+   evidence that published a 3x regression — `Objects.checkIndex` spliced into
+   `ArrayList.get` set `Inlined`, the stranded call was native-shadowed, and the
+   published body ran its probe in 897 ms against the single-pass 338. See
+   `internal/performance/c2-splice-checkcast-and-instanceof-20260909.md`.
+
 4. **`Node` is still 48 bytes against HotSpot's 24.** Unchanged, structural,
    and a GC item: see
    `known-issues/perf/perf-bintrees-9x-gap-characterised.md`.
@@ -1327,6 +1352,8 @@ Generational; `cratonvm-jit` 2225 passed.
 | Deferred-`new` retry held until the class resolves | **ON** | `CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND=1` |
 | Reverse-postorder block layout (def before use) | **ON** | `CRATONVM_JIT_IR_RPO_LAYOUT=0` |
 | IR-tier fused compare-and-branch, trampoline-free branches | **ON** | `CRATONVM_JIT_IR_FUSED_BRANCH=0` |
+| IR-tier fused compare reads its operands in place (register, frame slot or folded immediate) | **ON** | `CRATONVM_JIT_IR_CMP_IN_PLACE=0` |
+| IR-tier `x + k` / `x - k` as one `LEA` | **ON** | `CRATONVM_JIT_IR_ADD_LEA=0` |
 | IR-tier receiver-guard CSE (once per receiver per block) | **ON** | `CRATONVM_JIT_IR_RECEIVER_GUARD_CSE=0` |
 | IR-tier gated inline reference stores | **ON** where a collector publishes a plan | `CRATONVM_JIT_IR_GATED_REF_STORE=0` |
 | IR-tier inline TLAB bump for `Op::New` | off — the sequence has a defect `RJitMapTierDiff` reproduces 4/10; see `ir_inline_tlab_enabled` | `CRATONVM_JIT_IR_INLINE_TLAB=1` |
@@ -1632,6 +1659,18 @@ the same slot two instructions apart —
 
 — with the accumulator itself crossing the back edge through the frame, so
 every iteration waits on the previous one's store.
+
+**That pair has since been removed for one shape, and the removal is where this
+tier's remaining frame traffic was finally counted.** A second carry slot lets a
+consumer take BOTH of its single-use operands in registers instead of one, which
+deletes exactly the store-and-reload above; widening the rule that says which
+arm a carried value may cross — from an OP-level allowlist to the NODE-level
+question the arm actually asks — took the probe set from 1 such carry to 11 and
+is worth 1.009x against a 0.1% floor on a kernel that has the shape. The census
+that made possible is the part to read before reaching for this paragraph again:
+**82% of the candidate sites fail on operand POSITION**, not on anything the
+emitter decides. Full write-up in
+`c2-one-carry-slot-is-the-frame-traffic-ceiling-FIXED-20260910.md`.
 
 The exact stall could not be named: this host is a VM without PMU passthrough
 (`perf stat` reports `<not supported>` for cycles and instructions), so
@@ -2584,6 +2623,143 @@ constant.
 | + the fold alone | 53 | 31 | 17 | 14 |
 | + everything else | 44 | 10 | 3 | 7 |
 | **+ everything** | **40** | **10** | **3** | **7** |
+
+#### The loop control itself, 2026-09-11
+
+The fold above reaches every `x op k` in a method, and the residue it left
+behind was the three instructions at the bottom of every counted loop. Two
+changes finish it. Both are default-ON with a kill switch, both strictly remove
+instructions **and** bytes wherever they fire, and neither resolves on this
+build host's clock — which is said here rather than dressed up.
+
+**A fused compare reads its operands where they already are.** A compare whose
+only consumer is the `If` defines no value, writes no home and publishes no
+register; the only thing that outlives it is the flags, and those are the same
+whichever registers or addresses the comparison names. So it names them:
+
+```text
+mov rax,rbx / mov rcx,r12        / cmp eax,ecx    becomes   cmp ebx,r12d
+mov rax,rbx / mov rcx,[rbp-60h]  / cmp eax,ecx    becomes   cmp ebx,[rbp-60h]
+mov rax,rbx / mov ecx,64h        / cmp eax,ecx    becomes   cmp ebx,64h
+mov rax,[rbp-60h] / mov ecx,64h  / cmp eax,ecx    becomes   cmp [rbp-60h],64h
+```
+
+Four forms, `pick_cmp_form` in that order of preference. The two immediate forms
+are the common ones — `i < 100` is the shape of most Java loops — and the two
+frame forms are not fallbacks: `peak_live` routinely exceeds the five-register
+GP file, and a loop bound is exactly the long-lived value that loses its
+register.
+
+Three guards, each of which fails closed rather than wrong. `carry_names`
+declines either operand a carry is holding, because a carried value has to be
+read through `gp_load_value` or the carry strands. The frame forms go through
+`slot_of_checked`, so a dropped home declines the form rather than latching a
+bailout on a path with a perfectly good fallback. And the immediate forms gate
+on `alu_imm32`, which is the same gate the arithmetic folds use: it declines a
+constant too wide for `i32` (every immediate form here sign-extends, so such a
+constant has no immediate encoding at all) and it is off under a MIR mode, where
+a tiled node is emitted by the selector and a fold here would leave the
+byte-equality lane comparing two different programs.
+
+The 32-bit frame forms read four bytes where the `MOV` they replace read eight.
+That is the same comparison: the slot holds the `int` in its low word, and the
+`CMP EAX, ECX` being replaced only ever looked at those four bytes either.
+
+**`x + k` and `x - k` become one `LEA`.** `LEA` is the only three-operand
+integer instruction on this machine, so it is the only way to read a source and
+write a different destination without routing through the accumulator:
+
+```text
+mov rax,rbx / add eax,1 / mov r14,rax     becomes   lea r14d,[rbx+1]
+mov rax,rbx / add eax,1                   becomes   lea eax,[rbx+1]
+```
+
+Two forms, and **the weaker one is the common case**, which is the thing to know
+about this change. Whether the first is reachable turns on whether the result
+got a register of its own, and a loop-carried increment does not: measured on
+`CmpImm.wide`, `def_publishes=0` against `phi copies: reg_publishes=10` — the
+loop-carried values are published by the phi copies on the back edge, so `i + 1`
+writes a home word and is given no register. A first version that required one
+engaged **nowhere** on that probe. `PollReach.hotLoop` is where the direct form
+does fire (`add_lea=1+0`), and it is worth two instructions there rather than
+one.
+
+Unlike the compare this DEFINES a value, so the direct form owes everything a
+definition owes, and `every_droppable_op_writes_its_home_once_through_store_rax`
+had to grow an exception for it — the one home write in a claimed arm that does
+not go through `store_rax`. The exception is named in that test and proved in
+`the_lea_add_form_publishes_what_it_does_not_store`, which reads the direct
+form's source and requires that it publish the register and say so BEFORE it
+decides whether to skip the home store. The accumulator form needs none of that:
+it leaves RAX holding exactly what `mov rax,x; add eax,k` would have, and
+`store_rax` finishes unchanged.
+
+`x - k` is `x + (-k)` through the same encoder, except at `Integer.MIN_VALUE`,
+whose negation is not an `int`. One constant in the language, and it declines
+rather than wrapping into a silent `+ MIN`.
+
+**Measured — instructions and bytes yes, time no.** Release binary, the two
+flags as the A/B, first optimizing-tier compile of each method:
+
+| probe | both off | cmp only | lea only | **both on** | forms that fired |
+|---|---:|---:|---:|---:|---|
+| `CmpImm.wide` | 186 / 923 | 184 / 919 | 185 / 918 | **183 / 914** | `cmp_imm=1+0 add_lea=0+1` |
+| `CmpImm.down` | 186 / 919 | 184 / 912 | 185 / 914 | **183 / 907** | `cmp_imm=1+0 add_lea=0+1` |
+| `LoopCtl.spin` | 189 / 933 | 187 / 927 | 188 / 928 | **186 / 922** | `cmp_in_place=0+1 add_lea=0+1` |
+| `PollReach.hotLoop` | 200 / 1190 | 198 / 1185 | 198 / 1183 | **196 / 1178** | `cmp_in_place=1+0 add_lea=1+0` |
+| `PollReach.wideLoop` | 268 / 1637 | 266 / 1631 | 267 / 1632 | **265 / 1626** | `cmp_in_place=0+1 add_lea=0+1` |
+
+instructions / bytes. The four arms are additive to the instruction, which is
+what says the two levers are disjoint. Bytes fall in every arm — the point worth
+contrasting with the operand-pairing pass, which bought its one instruction for
+three extra bytes and was rejected.
+
+All four compare forms engage somewhere: the register-immediate form on
+`CmpImm.wide`, the frame-immediate form on `CmpImmProbe` (`cmp_imm=0+2` on one
+compile) and on `CmpImm.tight` (`1+1`), the register-register form on
+`PollReach.hotLoop`, the register-frame form on `LoopCtl.spin`.
+
+**The timing is a null on this host and no speedup is claimed.** Three arms
+interleaved ABCCBA, A and C the SAME build, so the A-C spread is the floor:
+
+| probe | rounds | floor (A vs C) | effect (B→A) |
+|---|---:|---:|---:|
+| `CmpImm.wide` | 12 | 1.43% median / 1.18% min | −2.62% median / +3.05% min |
+| `LoopCtl.spin` | 12 | 5.69% median / 1.55% min | +3.19% median / +3.49% min |
+| `CmpImm.wide` | 20 | **14.63%** median / 0.07% min | +9.35% median / **−5.28%** min |
+| `LoopCtl.spin` | 20 | 3.11% median / 2.74% min | +22.22% median / +0.40% min |
+
+Host load ran 40-111 on 8 cores across those runs, and it shows: two identical
+builds come out 14.63% apart, the measured "effect" ranges from −5.28% to
++22.22%, and the median and the minimum disagree about its SIGN. **That is a
+null, not a small win**, and adding rounds made it worse rather than better
+because the load rose faster than the averaging helped. A quieter box is what
+this needs; the instruction and byte counts above need nothing, being exact.
+
+**One mechanism worth writing down, because it is the only argument AGAINST the
+`LEA`.** `mov rax,rbx` is eliminated at rename on every current x86-64, so the
+instruction the accumulator form removes was very likely already free. On Intel
+`LEA` also issues on fewer ports than `ADD` (1 and 5, against 0/1/5/6), so in a
+port-1/5-bound loop it could in principle cost a cycle it does not spend. **Not
+on this host** — an AMD EPYC 9V45 (Zen 5), where the simple base-plus-
+displacement form runs on all four ALUs — but the flag is not host-specific
+and the next machine may be. So: the `LEA` removes an instruction and five bytes
+but probably not a uop. It ships ON for the decode and I-cache saving, which is
+not in doubt, and `CRATONVM_JIT_IR_ADD_LEA=0` is the way back. The compare has
+no such counter-argument — `mov ecx,imm` is a real uop that no renamer
+removes.
+
+**Verified.** 2366 `cratonvm-jit` unit tests and 2645 `cratonvm-vm` unit tests in
+debug, so `debug_assert` is live; 145 `ir_vs_singlepass` differential tests. The
+regression suite **92/92 with the new defaults and 92/92 with both kill
+switches** — both directions, because a switch nobody exercises is not a switch.
+`probes/CmpImmProbe.java` agrees with HotSpot to the checksum under the
+defaults, under each kill switch, under both, under `CRATONVM_JIT_IR_ALU_IMM=0`,
+under `CRATONVM_JIT_IR_LINEAR_SCAN=0` and under `--nojit`; it covers the
+`imm8`/`imm32` boundary in both signs, negative bounds, a `long` constant outside
+`i32` that no immediate can express, `Integer.MIN_VALUE` as a bound and as an
+addend, a first operand forced out of its register, and a reference against
+`null`.
 
 `alu immediates folded: 5`, and `ck=5100017428506113` in every arm.
 

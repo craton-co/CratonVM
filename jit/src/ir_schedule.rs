@@ -159,6 +159,9 @@ pub struct ScheduleOptions {
     /// List-schedule the pure nodes inside each block by critical path and
     /// register pressure instead of plain dependence order.
     pub priority_within_blocks: bool,
+    /// Move a single-use operand to sit immediately before the node that reads
+    /// it. See [`pair_single_use_operands`].
+    pub pair_single_use_operands: bool,
     /// Groups of block indices (in the *pre-layout* numbering) that must stay
     /// contiguous and in relative order — the shape an exception handler's
     /// protected range takes once the IR grows exception edges.
@@ -644,6 +647,160 @@ impl Schedule {
 /// block list, each block's node order and therefore the bytes `ir_lower`
 /// emits are unchanged from before block frequencies existed; the only
 /// addition is the read-only [`Schedule::freq`] / [`Schedule::layout`] report.
+/// Uses of each node as an INPUT of another node, indexed by `NodeId`.
+///
+/// The same count `ir_lower`'s carry planner reads, derived the same way, so
+/// "single use" means one thing in both places. A value named by a frame state
+/// is NOT a use here: frame states pin a value's home, which is a separate
+/// question and one [`pair_single_use_operands`] does not touch.
+fn use_counts(graph: &Graph) -> Vec<u32> {
+    let mut out = vec![0u32; graph.nodes.len()];
+    for node in &graph.nodes {
+        for &input in &node.inputs {
+            if input != NO_NODE {
+                if let Some(c) = out.get_mut(input as usize) {
+                    *c = c.saturating_add(1);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `CRATONVM_JIT_IR_PAIR_OPERANDS=0` — schedule single-use operands in plain
+/// dependence order again, so `ir_lower`'s carry sees only what the list
+/// scheduler happened to leave adjacent.
+///
+/// Default ON. Both orders compute the same values from the same inputs; what
+/// differs is how many of them the lowerer can keep in a register.
+fn pair_operands_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PAIR_OPERANDS").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
+/// Move a consumer's single-use operands to sit immediately before it, as
+/// `[input1, input0, cons]`.
+///
+/// # What this is for
+///
+/// `ir_lower` gives every node a frame slot, writes the node's result to it and
+/// reloads it at the use. Its carry removes that round trip, but only for
+/// ADJACENT scheduled pairs — it leaves the value in RAX (or copies it to RCX)
+/// and lets the consumer's arm read it where it already is.
+///
+/// Measured on a `s += i ^ (s >>> 3)` loop with `CRATONVM_DBG_IR_LINEAR_SCAN=1`:
+/// of 25 nodes, residency skipped 16 as `single_use` — it will not spend a
+/// callee-saved register plus its prologue save on a value read once — and the
+/// carry that exists to cover exactly those took 2. The rest went through the
+/// frame: `[rbp-78h]` was written and reloaded two instructions later with the
+/// value still live in a register.
+///
+/// Those producers were not ineligible. They were not ADJACENT: `I2L` and the
+/// `Xor` that reads it had the other operand's `UShr` scheduled between them.
+///
+/// # Why the order is `[input1, input0, cons]` and not the reverse
+///
+/// A consumer's arm reads its first operand from RAX and its second from RCX
+/// (`ir_lower::op_reads_rax_then_rcx`). RAX is where a producer's arm already
+/// leaves the value, so `input0` goes adjacent and carries in RAX for free.
+/// `input1` is copied to RCX at its own home store and has to survive
+/// `input0`'s arm — which is why `ir_lower::op_preserves_rcx` exists and is
+/// short. Putting them the other way round would ask a value to survive in RAX,
+/// which every arm overwrites.
+///
+/// # Why sinking a definition later is safe here
+///
+/// It is not safe in general: a value defined later is UNDEFINED at any deopt
+/// arriving in between, and `graph.safepoints` names the full operand stack at
+/// every bci, so an intermediate is named from its definition until its
+/// consumer pops it. Sinking past a point a deopt can arrive at would hand the
+/// interpreter a frame slot nothing had written.
+///
+/// The condition is therefore about what is CROSSED, not about the value: every
+/// node strictly between the operand's old position and its new one must be one
+/// no deopt can arrive at (`ir_lower::op_cannot_deopt`, the same enumeration
+/// `compute_deopt_named_reachable` builds its trapping-bci set from). When that
+/// holds there is no program point between the two positions where a frame
+/// state can be read, so none can observe the difference.
+///
+/// Two further restrictions keep this to the case it was written for:
+///
+///   * the operand is used exactly once, so nothing between it and the consumer
+///     can read it — the reordering is invisible to every other node;
+///   * its op is one `ir_lower::op_home_is_one_store_rax` certifies, the same
+///     allowlist the carry planner requires. Moving a value the carry will
+///     refuse anyway buys nothing and widens the blast radius for no reason.
+///
+/// Returns how many operands moved.
+fn pair_single_use_operands(graph: &Graph, uses: &[u32], nodes: &mut Vec<NodeId>) -> usize {
+    let mut moved = 0usize;
+    // Descending, so sinking an operand cannot disturb a consumer this loop has
+    // yet to visit: everything it moves lands below the current index.
+    let mut ci = nodes.len();
+    while ci > 0 {
+        ci -= 1;
+        if ci >= nodes.len() {
+            continue;
+        }
+        let cons = nodes[ci];
+        let Some(cn) = graph.nodes.get(cons as usize) else {
+            continue;
+        };
+        // Reverse operand order: `input1` is sunk first and `input0` lands
+        // below it, giving `[input1, input0, cons]`.
+        let operands: Vec<NodeId> = cn.inputs.iter().copied().take(2).collect();
+        for &prod in operands.iter().rev() {
+            if prod == NO_NODE || prod == cons {
+                continue;
+            }
+            if uses.get(prod as usize).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            let Some(pn) = graph.nodes.get(prod as usize) else {
+                continue;
+            };
+            if !crate::ir_lower::op_home_is_one_store_rax(&pn.op) {
+                continue;
+            }
+            // Re-read both positions: a previous sink in this same iteration
+            // has already shifted the consumer down by one.
+            let Some(ci_now) = nodes.iter().position(|&n| n == cons) else {
+                continue;
+            };
+            let Some(pi) = nodes.iter().position(|&n| n == prod) else {
+                continue;
+            };
+            if pi >= ci_now || pi + 1 == ci_now {
+                // Not ahead of the consumer in this block, or already adjacent.
+                continue;
+            }
+            // The crossing condition: everything in between must be a node no
+            // deopt can arrive at.
+            if !nodes[pi + 1..ci_now].iter().all(|&mid| {
+                graph
+                    .nodes
+                    .get(mid as usize)
+                    .is_some_and(|m| crate::ir_lower::op_cannot_deopt(&m.op))
+            }) {
+                continue;
+            }
+            let id = nodes.remove(pi);
+            // `ci_now` was the consumer's index BEFORE the removal, and the
+            // removal was below it, so the consumer now sits at `ci_now - 1`
+            // and the operand belongs immediately before it.
+            nodes.insert(ci_now - 1, id);
+            moved += 1;
+        }
+    }
+    moved
+}
+
 pub fn schedule(graph: &Graph) -> Schedule {
     schedule_with_options(graph, &production_schedule_options())
 }
@@ -690,6 +847,7 @@ pub fn production_schedule_options() -> ScheduleOptions {
     ScheduleOptions {
         layout_hot_paths: hot_layout_enabled(),
         priority_within_blocks: list_sched_enabled(),
+        pair_single_use_operands: pair_operands_enabled(),
         ..ScheduleOptions::default()
     }
 }
@@ -899,6 +1057,16 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
         topo_sort_block(graph, &mut block.nodes);
         if opts.priority_within_blocks {
             priority_sort_block(graph, &mut block.nodes);
+        }
+    }
+
+    // Step 5b: put a consumer's single-use operands next to it, so `ir_lower`
+    // can carry them in registers instead of round-tripping them through the
+    // frame. See `pair_single_use_operands`.
+    if opts.pair_single_use_operands {
+        let uses = use_counts(graph);
+        for block in &mut blocks {
+            pair_single_use_operands(graph, &uses, &mut block.nodes);
         }
     }
 
@@ -3061,6 +3229,128 @@ mod tests {
                 "block {} was reordered illegally",
                 b.id
             );
+        }
+    }
+
+    /// Pairing may only ever REORDER: every block keeps exactly the node set it
+    /// had. A node it dropped or duplicated would be one `ir_lower` emits twice
+    /// or not at all.
+    #[test]
+    fn pairing_preserves_every_block_node_set() {
+        let code = [0x1a, 0x1b, 0x60, 0x1a, 0x68, 0x1b, 0x64, 0xac, 0, 0];
+        let builder = IrBuilder::new(2, 2);
+        let mut graph = builder.build(&code, 8).expect("build failed");
+        ir_optimize::optimize(&mut graph);
+        let off = schedule_with_options(
+            &graph,
+            &ScheduleOptions {
+                pair_single_use_operands: false,
+                ..ScheduleOptions::default()
+            },
+        );
+        let on = schedule_with_options(
+            &graph,
+            &ScheduleOptions {
+                pair_single_use_operands: true,
+                ..ScheduleOptions::default()
+            },
+        );
+        assert_eq!(off.blocks.len(), on.blocks.len());
+        for (a, b) in off.blocks.iter().zip(on.blocks.iter()) {
+            let mut xs = a.nodes.clone();
+            let mut ys = b.nodes.clone();
+            xs.sort_unstable();
+            ys.sort_unstable();
+            assert_eq!(xs, ys, "block {} lost or gained a node", a.id);
+        }
+    }
+
+    /// Pairing only ever sinks, so it cannot move a node above one of its own
+    /// inputs — which is exactly the kind of claim that stops being true when
+    /// someone widens the pass. Asserted over the emitted order rather than
+    /// trusted.
+    #[test]
+    fn pairing_keeps_every_definition_before_its_uses() {
+        let code = [0x1a, 0x1b, 0x60, 0x1a, 0x68, 0x1b, 0x64, 0xac, 0, 0];
+        let builder = IrBuilder::new(2, 2);
+        let mut graph = builder.build(&code, 8).expect("build failed");
+        ir_optimize::optimize(&mut graph);
+        let sched = schedule_with_options(
+            &graph,
+            &ScheduleOptions {
+                pair_single_use_operands: true,
+                ..ScheduleOptions::default()
+            },
+        );
+        for block in &sched.blocks {
+            let mut seen = std::collections::HashSet::new();
+            for &nid in &block.nodes {
+                for &input in &graph.nodes[nid as usize].inputs {
+                    if input == NO_NODE {
+                        continue;
+                    }
+                    if block.nodes.contains(&input) {
+                        assert!(
+                            seen.contains(&input),
+                            "node {nid} reads {input}, which this block defines later"
+                        );
+                    }
+                }
+                seen.insert(nid);
+            }
+        }
+    }
+
+    /// A single-use operand must not be sunk past anything a deopt can arrive
+    /// at: it is undefined there, and `graph.safepoints` names the whole
+    /// operand stack at every bci.
+    ///
+    /// `idiv` is the available trapping node — it deopts on a zero divisor
+    /// after reading its operands.
+    #[test]
+    fn pairing_does_not_sink_past_a_node_a_deopt_can_reach() {
+        let code = [
+            0x1a, // iload_0
+            0x1b, // iload_1
+            0x60, // iadd     <- a single-use operand of the outer iadd
+            0x1a, // iload_0
+            0x1b, // iload_1
+            0x6c, // idiv     <- can deopt
+            0x60, // iadd
+            0xac, // ireturn
+            0, 0,
+        ];
+        let builder = IrBuilder::new(2, 2);
+        let Some(mut graph) = builder.build(&code, 8) else {
+            return;
+        };
+        ir_optimize::optimize(&mut graph);
+        let sched = schedule_with_options(
+            &graph,
+            &ScheduleOptions {
+                pair_single_use_operands: true,
+                ..ScheduleOptions::default()
+            },
+        );
+        for block in &sched.blocks {
+            let Some(div) = block
+                .nodes
+                .iter()
+                .position(|&n| matches!(graph.nodes[n as usize].op, Op::Div))
+            else {
+                continue;
+            };
+            for &i in &graph.nodes[block.nodes[div] as usize].inputs {
+                if i == NO_NODE {
+                    continue;
+                }
+                if let Some(pos) = block.nodes.iter().position(|&x| x == i) {
+                    assert!(
+                        pos < div,
+                        "an operand of the trapping node was sunk past it"
+                    );
+                }
+            }
         }
     }
 

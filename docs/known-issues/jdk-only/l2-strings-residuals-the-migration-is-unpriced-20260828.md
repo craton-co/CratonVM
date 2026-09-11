@@ -1,8 +1,13 @@
 # L2 residuals — both priced now, and the one item that is not this lane's
 
-**Status: OPEN, ONE item, and it is not in this lane's families.** N1 and N2
-are both answered with numbers and are kept below as the record of what the
-numbers were; N3 stands as a guard. The live item is §4.
+**Status: CLOSED 2026-09-10 — the live item passes, and nobody here fixed it.**
+N1 and N2 are both answered with numbers and are kept below as the record of
+what the numbers were; N3 stands as a guard. §4's `RJdkEnumerations` is now
+green on both arms it was recorded red on; see the note at the end of §4.
+
+**Superseded status line:** OPEN, ONE item, and it is not in this lane's
+families. N1 and N2 are both answered with numbers and are kept below as the
+record of what the numbers were; N3 stands as a guard. The live item is §4.
 
 **Superseded status line:** OPEN, two items, neither a correctness question. 2026-08-28. The
 correctness half is closed and recorded in the retired
@@ -169,3 +174,32 @@ native registered on a fabricated class NAME, where the name may be resolved for
 DISPATCH rather than allocated.
 
 **Unowned.** L3 owned `java.util` and is closed.
+
+### CLOSED 2026-09-10, by observation rather than by a fix
+
+Re-measured by lane 2 of the 2026-09-10 nine-lane campaign, on binary
+`09d7ad35d2deea4a` built from `7a8b79526` plus that lane's own changes (which do
+not touch collections, iterators or class fabrication):
+
+```text
+  CRATONVM_ARGS=--jdk-only bash regression-suite/run.sh    40 passed,   0 failed
+  SUITE=all                bash regression-suite/run.sh   132 passed,   0 failed
+```
+
+`RJdkEnumerations` passes on both — the two arms this section recorded it red
+on, and the reason it was called "the last red ... that every lane has been
+writing off as known". The `NoClassDefFoundError:
+cratonvm/internal/ArrayListViewItr` it failed with does not reproduce.
+
+**What is NOT claimed:** that anyone found the cause. This page's §4 is a
+diagnosis and a starting point for a fix that was never taken; between
+2026-08-28 and 2026-09-10 something on `dev` made the symptom go away, and this
+close does not say what. A future reader who sees the symptom return should
+start from §4's analysis, which remains the best account of it, rather than
+assume the ground moved again.
+
+Two things make this a real close rather than a lucky run. The vector is not on
+`regression-suite/known-flaky.txt`, and the same binary was measured on all
+three arms in one sitting with the corpus green on each — a fabricated-class
+refusal is a deterministic link failure, not a load-sensitive one, so a single
+clean pair of arms is the right weight of evidence for it.

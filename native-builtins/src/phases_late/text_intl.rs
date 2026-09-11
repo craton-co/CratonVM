@@ -788,6 +788,9 @@ pub(crate) fn register_p61_text_formatting(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/CharSequence;Ljava/text/Normalizer$Form;)Ljava/lang/String;",
         |ctx, args| {
             use unicode_normalization::UnicodeNormalization;
+            // The same contract as the real-JDK twin in `locale_resources.rs`;
+            // one helper so the pair cannot sit half-fixed.
+            crate::locale_resources::normalizer_reject_nulls(args.first(), args.get(1))?;
             let input = match args.first() {
                 Some(Value::Object(Some(s))) => read_char_sequence(ctx, *s),
                 _ => return Ok(Some(Value::Object(None))),
@@ -825,6 +828,7 @@ pub(crate) fn register_p61_text_formatting(r: &mut NativeMethodRegistry) {
             use unicode_normalization::{
                 is_nfc_quick, is_nfd_quick, is_nfkc_quick, is_nfkd_quick, IsNormalized,
             };
+            crate::locale_resources::normalizer_reject_nulls(args.first(), args.get(1))?;
             let input = match args.first() {
                 Some(Value::Object(Some(s))) => read_char_sequence(ctx, *s),
                 _ => return Ok(Some(Value::Int(1))),

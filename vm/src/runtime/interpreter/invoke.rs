@@ -359,7 +359,14 @@ pub(crate) fn invokevirtual_site_final_owner(
         store,
     )?;
     let owner = store.get(declaring_id).map(|c| c.name.to_string())?;
-    if final_devirt_native_shadow(shared, cm, cp_class_id, declaring_id, method_name, descriptor) {
+    if final_devirt_native_shadow(
+        shared,
+        cm,
+        cp_class_id,
+        declaring_id,
+        method_name,
+        descriptor,
+    ) {
         cratonvm_jit::FINAL_DEVIRT_NATIVE_SHADOW_REFUSED
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if crate::runtime::env_cache::dbg_jitc() {
@@ -450,7 +457,10 @@ fn final_devirt_native_shadow(
     // declaring class are the only receivers there are.
     for id in [cp_class_id, declaring_id] {
         if let Some(class) = store.get(id) {
-            if registry.find(&class.name, method_name, descriptor).is_some() {
+            if registry
+                .find(&class.name, method_name, descriptor)
+                .is_some()
+            {
                 return true;
             }
         }
@@ -3617,6 +3627,15 @@ pub(super) fn try_stackless_invoke(
         cratonvm_native_api::registry::lookup_census::INVOKE_STACKLESS,
     );
 
+    // The receiver, for the two redefine-immunity gates below. Only the ZIP arm
+    // of the immunity looks at it (see `zip_immunity_waived_for_receiver`), and
+    // only after a redefinition has actually happened, so this costs a slice
+    // index on every invoke and nothing else.
+    let receiver_for_immunity = match args.first() {
+        Some(Value::Object(Some(obj))) => Some(*obj),
+        _ => None,
+    };
+
     // `CRATONVM_DBG_DEADREF_STORE`: were the arguments ALREADY dead on entry?
     //
     // `[deadref-arg]` fires where the arguments are laid into the callee's
@@ -4038,7 +4057,13 @@ pub(super) fn try_stackless_invoke(
             // native instead. Skip an ancestor's native the same way the
             // receiver-class check does.
             let parent_redefined = native_shadow_suppressed_in(&cm, &parent.name)
-                && !redefine_immune_forced_native(&parent.name, method_name, descriptor);
+                && !redefine_immune_forced_native_for_receiver(
+                    shared,
+                    &parent.name,
+                    method_name,
+                    descriptor,
+                    receiver_for_immunity,
+                );
             if !parent_redefined {
                 if let Some(cb) =
                     shared
@@ -4065,8 +4090,13 @@ pub(super) fn try_stackless_invoke(
     // Reflection-metadata natives stay authoritative (see
     // `redefine_immune_reflection_native`).
     let native_cb = if native_shadow_suppressed_by_redefine(shared, class_name)
-        && !redefine_immune_forced_native(class_name, method_name, descriptor)
-    {
+        && !redefine_immune_forced_native_for_receiver(
+            shared,
+            class_name,
+            method_name,
+            descriptor,
+            receiver_for_immunity,
+        ) {
         None
     } else {
         native_cb
@@ -4536,15 +4566,29 @@ pub(super) fn try_stackless_invoke(
     // `java.lang.reflect.Method` must not disable annotation reflection.
     let force_interface_default_native = declaring_is_interface
         && !is_static
-        && should_force_registered_native_over_bytecode(
+        && should_force_registered_native_over_bytecode_for_receiver(
             shared,
             &class_name_arc,
             method_name,
             descriptor,
+            receiver_for_immunity,
         );
+    // This is the gate that actually decides for `java/util/zip/ZipFile.close`
+    // and `.getName` on a Mockito inline mock. Measured 2026-09-10: with the
+    // other five converted and this one left receiver-blind,
+    // `CRATONVM_DBG_ZIPIMMUNE=off` intercepted and stubbed the mock perfectly
+    // while the receiver-aware waiver recorded zero invocations — the
+    // `[zipimmune]` trace showed the `java/util/zip/ZipFile` consultation
+    // arriving with no waiver line beside it, i.e. from here.
     if (!(declaring_is_interface && !is_static) || force_interface_default_native)
         && (!native_shadow_suppressed_by_redefine(shared, &class_name_arc)
-            || redefine_immune_forced_native(&class_name_arc, method_name, descriptor))
+            || redefine_immune_forced_native_for_receiver(
+                shared,
+                &class_name_arc,
+                method_name,
+                descriptor,
+                receiver_for_immunity,
+            ))
     {
         // `find` -> `resolve_id` + `callback_of`: one hash either way
         // (`resolve_id(..).and_then(callback_of)` is documented to equal

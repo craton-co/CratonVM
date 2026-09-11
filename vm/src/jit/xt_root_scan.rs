@@ -461,6 +461,17 @@ fn dbg() -> bool {
     cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_XT_JIT_ROOT_SCAN").is_some()
 }
 
+/// Opt-in verification that the roster `take_over_pass` is handed really does
+/// cover every thread that can be in compiled code. Deliberately NOT part of
+/// `dbg()`: the audit re-walks the whole system thread table, which is the
+/// exact cost the roster exists to remove, and folding it into the ordinary
+/// scan-debug flag would make the scan un-observable without also restoring
+/// that cost. See `imp::audit_roster_covers_jit_peers`.
+#[inline]
+fn roster_audit_enabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_XT_ROOT_SCAN_AUDIT").is_some()
+}
+
 /// Handles of peer threads that were suspended in JIT code and must be
 /// resumed once the collection completes. Resuming is mandatory for liveness
 /// (a leaked suspend wedges the peer forever), so this is `#[must_use]`.
@@ -661,30 +672,76 @@ mod imp {
     /// One enumeration pass: suspend each not-yet-taken peer thread, and for
     /// those whose `Rip` is in JIT code, scan + keep them frozen. Returns the
     /// number of peers newly taken over this pass.
-    pub fn take_over_pass<F>(taken: &mut TakenOver, is_obj: &F, roots: &mut Vec<ObjectRef>) -> usize
+    ///
+    /// `live_tids` is the roster of OS thread ids this pass may freeze — the
+    /// registered Java threads, re-read by the caller on every barrier round
+    /// so a thread that registers mid-collection is picked up on the next one.
+    ///
+    /// ## Why a caller-supplied roster and not `CreateToolhelp32Snapshot`
+    ///
+    /// (2026-09-10.) That call enumerates every thread on the MACHINE, not in
+    /// this process, and the `Thread32Next` walk that follows filters the
+    /// whole system table down to the handful of entries that belong here.
+    /// Measured on the reference box: 6,952 system threads to find 44 of ours,
+    /// 9.9ms for the snapshot and 83ms for snapshot+walk — per pass. This pass
+    /// runs once per barrier round, so a `VthreadGcStress` run spent 14.5s
+    /// across 174 passes walking the machine's thread table to freeze nothing
+    /// at all (0 peers taken over in every pass of every run measured). That
+    /// cost is why `CRATONVM_XT_JIT_ROOT_SCAN=0` finished the same workload in
+    /// 5s against 13-37s with the scan on; it was never the SuspendThread /
+    /// GetThreadContext / ResumeThread triples, which come to ~0.1s for all
+    /// 6,960 of them.
+    ///
+    /// The Linux implementation never had this problem — it reads
+    /// `/proc/self/task`, which is already process-local. The roster restores
+    /// the two platforms to asking the same question rather than making
+    /// Windows ask a machine-wide one.
+    ///
+    /// ## Coverage obligation
+    ///
+    /// The roster MUST contain every thread that can have `Rip` inside a
+    /// registered JIT code range. A peer this pass does not freeze is a peer
+    /// whose registers and spill slots go unscanned — a missed conservative
+    /// root, and a use-after-free of an object only that peer still names.
+    ///
+    /// It does contain them: compiled code is entered only through
+    /// `JitEntryGuard::enter_with_compiled` / `enter_with_compiled_at`, whose
+    /// production call sites all sit on Java execution paths
+    /// (`runtime::interpreter`, `runtime::interpreter::jit_bridge`,
+    /// `jit::helpers`), and every thread executing Java is in the registry
+    /// with its OS tid published. (`memory::roots` uses the plain
+    /// `JitEntryGuard::enter`, which records a chain entry for the root walk
+    /// and transfers control to nothing, so it never puts `Rip` in JIT code.)
+    ///
+    /// Because being wrong here is silent and fatal, the argument is also
+    /// checked at runtime rather than only asserted: setting
+    /// `CRATONVM_XT_ROOT_SCAN_AUDIT=1` enables
+    /// [`audit_roster_covers_jit_peers`], which re-walks the full system
+    /// snapshot and reports any in-process thread absent from the roster,
+    /// loudly if its `Rip` is in JIT code.
+    pub fn take_over_pass<F>(
+        taken: &mut TakenOver,
+        is_obj: &F,
+        roots: &mut Vec<ObjectRef>,
+        live_tids: &[u32],
+    ) -> usize
     where
         F: Fn(usize) -> Option<ObjectRef>,
     {
         let self_tid = unsafe { GetCurrentThreadId() };
-        let pid = unsafe { GetCurrentProcessId() };
         // BUG-03 deadlock avoidance: snapshot the JIT code ranges BEFORE
         // suspending any peer. Classifying a frozen peer's Rip via the
         // lock-taking `lookup_jit_code_range` would deadlock if that peer was
         // suspended while holding the code-range lock (mid-registration). The
         // local snapshot lets us classify with a lock-free range check.
         let ranges = crate::jit::jit_code_ranges_snapshot();
-        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-        if snap == -1 || snap == 0 {
-            return 0;
-        }
         let mut newly = 0usize;
         let mut dbg_suspended = 0usize;
-        let mut e: ThreadEntry32 = unsafe { core::mem::zeroed() };
-        e.dw_size = core::mem::size_of::<ThreadEntry32>() as u32;
-        let mut ok = unsafe { Thread32First(snap, &mut e) };
-        while ok != 0 {
-            let tid = e.th32_thread_id;
-            if e.th32_owner_process_id == pid && tid != self_tid && !taken.contains(tid) {
+        for &tid in live_tids {
+            // tid 0 is "unpublished": a thread that registered but has not yet
+            // reached `set_os_tid_current`. It has not run Java either, so it
+            // cannot be in compiled code, and OpenThread(0) would fail anyway.
+            if tid != 0 && tid != self_tid && !taken.contains(tid) {
                 dbg_suspended += 1;
                 if let Some((kept, found)) = unsafe { try_take(tid, &ranges, is_obj, roots) } {
                     if kept != 0 {
@@ -718,10 +775,10 @@ mod imp {
                     }
                 }
             }
-            e.dw_size = core::mem::size_of::<ThreadEntry32>() as u32;
-            ok = unsafe { Thread32Next(snap, &mut e) };
         }
-        unsafe { CloseHandle(snap) };
+        if roster_audit_enabled() {
+            audit_roster_covers_jit_peers(self_tid, live_tids, &ranges);
+        }
         if dbg() {
             eprintln!(
                 "[xt-jit-roots] pass: examined {dbg_suspended} peer(s), {newly} newly taken over (Rip in JIT); {} code ranges; any_thread_in_jit={} jit_gate={}",
@@ -731,6 +788,107 @@ mod imp {
             );
         }
         newly
+    }
+
+
+    /// Number of times the audit found an in-process thread that was absent
+    /// from the roster `take_over_pass` was given AND had its `Rip` inside a
+    /// registered JIT code range — i.e. a peer the pass would have failed to
+    /// freeze and scan. Any non-zero value is a coverage hole in the roster
+    /// and a live use-after-free risk; see `take_over_pass`'s
+    /// "Coverage obligation".
+    pub static XT_ROSTER_MISSED_JIT_PEERS: AtomicU64 = AtomicU64::new(0);
+
+    /// Number of in-process threads seen by the system snapshot but absent
+    /// from the roster while NOT in JIT code. Expected to be non-zero and
+    /// harmless: the Rust-side threads (JIT compiler, GC workers, watchdogs)
+    /// never execute compiled Java. Tracked so the audit can distinguish
+    /// "the roster is narrower, as designed" from "the roster is wrong".
+    pub static XT_ROSTER_SKIPPED_NON_JAVA: AtomicU64 = AtomicU64::new(0);
+
+    /// Check, the expensive way, that the roster handed to `take_over_pass`
+    /// really did cover every thread that could be in compiled code.
+    ///
+    /// This deliberately does the thing `take_over_pass` no longer does — walk
+    /// the whole system thread table — and then suspends each in-process
+    /// thread the roster omitted just long enough to read its `Rip`. It is
+    /// gated on its own `CRATONVM_XT_ROOT_SCAN_AUDIT` rather than on `dbg()`
+    /// because that walk is precisely the 83ms-per-pass cost the roster exists
+    /// to avoid: leaving it on the ordinary scan-debug flag would put the cost
+    /// back the moment anyone tried to observe the scan, which is how the
+    /// coupling described in `stw_takeover_should_scan` stayed invisible. It is
+    /// not a fast path and must never be called on one.
+    ///
+    /// The point is that the roster's coverage argument is a claim about every
+    /// site that can transfer into compiled code, and such claims rot silently
+    /// as call sites are added. This turns the claim into something a soak run
+    /// can falsify.
+    fn audit_roster_covers_jit_peers(self_tid: u32, live_tids: &[u32], ranges: &[(usize, usize)]) {
+        let pid = unsafe { GetCurrentProcessId() };
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snap == -1 || snap == 0 {
+            return;
+        }
+        let mut e: ThreadEntry32 = unsafe { core::mem::zeroed() };
+        e.dw_size = core::mem::size_of::<ThreadEntry32>() as u32;
+        let mut ok = unsafe { Thread32First(snap, &mut e) };
+        while ok != 0 {
+            let tid = e.th32_thread_id;
+            if e.th32_owner_process_id == pid
+                && tid != self_tid
+                && tid != 0
+                && !live_tids.contains(&tid)
+            {
+                match unsafe { rip_of(tid) } {
+                    Some(rip) if ranges.iter().any(|&(b, end)| rip >= b && rip < end) => {
+                        XT_ROSTER_MISSED_JIT_PEERS.fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "[xt-jit-roots] ROSTER HOLE: tid={tid} is in JIT code (rip={rip:#x}) \
+                             but was absent from the roster, so take_over_pass would NOT have \
+                             frozen or scanned it. Its registers and spill slots are unscanned \
+                             conservative roots. See take_over_pass's coverage obligation."
+                        );
+                    }
+                    _ => {
+                        XT_ROSTER_SKIPPED_NON_JAVA.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            e.dw_size = core::mem::size_of::<ThreadEntry32>() as u32;
+            ok = unsafe { Thread32Next(snap, &mut e) };
+        }
+        unsafe { CloseHandle(snap) };
+    }
+
+    /// Suspend `tid` just long enough to read its `Rip`, then resume it.
+    /// Audit-only: unlike `try_take` this never keeps the peer frozen and
+    /// never scans it, so it cannot contribute roots.
+    unsafe fn rip_of(tid: u32) -> Option<usize> {
+        let h = OpenThread(
+            THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION,
+            0,
+            tid,
+        );
+        if h == 0 {
+            return None;
+        }
+        if SuspendThread(h) == u32::MAX {
+            CloseHandle(h);
+            return None;
+        }
+        #[repr(C, align(16))]
+        struct Ctx([u8; CTX_SIZE]);
+        let mut ctx = Ctx([0u8; CTX_SIZE]);
+        *(ctx.0.as_mut_ptr().add(OFF_FLAGS) as *mut u32) = CONTEXT_CONTROL_INTEGER;
+        let got = GetThreadContext(h, ctx.0.as_mut_ptr());
+        let rip = if got == 0 {
+            None
+        } else {
+            Some(*(ctx.0.as_ptr().add(OFF_RIP) as *const u64) as usize)
+        };
+        ResumeThread(h);
+        CloseHandle(h);
+        rip
     }
 
     /// Suspend `tid`, read its context. If its `Rip` is in a JIT code range,
@@ -839,11 +997,6 @@ mod imp {
             return (0, 0);
         }
         let self_tid = unsafe { GetCurrentThreadId() };
-        let pid = unsafe { GetCurrentProcessId() };
-        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-        if snap == -1 || snap == 0 {
-            return (0, 0);
-        }
         // Reusable copy buffer for each peer's used stack. Pre-sized so the
         // common case never allocates while a peer is frozen; grown (with the
         // peer running) when a band is larger.
@@ -855,11 +1008,16 @@ mod imp {
         // Per-cycle, so reset before the pass rather than accumulated.
         super::XT_HELPER_WINDOWS_UNPINNED_CYCLE.store(0, Ordering::Release);
         let mut found_total = 0usize;
-        let mut e: ThreadEntry32 = unsafe { core::mem::zeroed() };
-        e.dw_size = core::mem::size_of::<ThreadEntry32>() as u32;
-        let mut ok = unsafe { Thread32First(snap, &mut e) };
-        while ok != 0 {
-            let tid = e.th32_thread_id;
+        // Iterate the blocked roster directly rather than walking the system
+        // thread table (2026-09-10). The filter below was always
+        // `blocked_os_tids.contains(&tid)`, so `CreateToolhelp32Snapshot` +
+        // `Thread32Next` were enumerating every thread on the MACHINE — 6,952
+        // of them on the reference box — purely to intersect with a list this
+        // function is handed as an argument. That walk cost ~83ms a pass and
+        // this pass runs once per collection: 5.4s across the 65 passes of one
+        // `VthreadGcStress` run. Iterating the roster is exactly equivalent
+        // (a blocked tid is in-process by construction) and does no I/O.
+        for &tid in blocked_os_tids {
             // xt-hardening follow-up (2026-07-03): this pass exists ONLY to
             // close the BLOCKED-thread coverage gap (deposit_root_snapshot
             // never scans the JIT band) — a cooperatively-arrived mutator
@@ -871,11 +1029,7 @@ mod imp {
             // just adds corruption surface). Skip any peer not in the
             // blocked-tid snapshot — this also skips the suspend/resume
             // round-trip entirely for the (large majority) non-blocked case.
-            if e.th32_owner_process_id == pid
-                && tid != self_tid
-                && !taken.contains(tid)
-                && blocked_os_tids.contains(&tid)
-            {
+            if tid != 0 && tid != self_tid && !taken.contains(tid) {
                 if let Some((ctx, band_len)) = unsafe { snapshot_peer(tid, &mut band) } {
                     candidates.clear();
                     // Integer registers: a callee-saved register can still
@@ -997,10 +1151,7 @@ mod imp {
                     }
                 }
             }
-            e.dw_size = core::mem::size_of::<ThreadEntry32>() as u32;
-            ok = unsafe { Thread32Next(snap, &mut e) };
         }
-        unsafe { CloseHandle(snap) };
         XT_HELPER_WINDOWS_SCANNED.fetch_add(windows as u64, Ordering::Relaxed);
         XT_HELPER_WINDOW_ROOTS.fetch_add(found_total as u64, Ordering::Relaxed);
         super::XT_HELPER_WINDOWS_PINNED.fetch_add(pinned_windows as u64, Ordering::Relaxed);
@@ -1759,7 +1910,18 @@ mod imp {
     /// a private signal to peer threads. The handler only parks peers interrupted
     /// inside registered JIT code; interpreter/native peers return immediately
     /// and remain cooperative barrier participants.
-    pub fn take_over_pass<F>(taken: &mut TakenOver, is_obj: &F, roots: &mut Vec<ObjectRef>) -> usize
+    /// `_live_tids` is accepted for signature parity with the Windows
+    /// implementation and deliberately ignored: `list_thread_tids` reads
+    /// `/proc/self/task`, which is already process-local and therefore already
+    /// cheap, and it enumerates the true superset (every thread of this
+    /// process, not just the registered Java ones). See the Windows
+    /// `take_over_pass` for why that platform needs the roster instead.
+    pub fn take_over_pass<F>(
+        taken: &mut TakenOver,
+        is_obj: &F,
+        roots: &mut Vec<ObjectRef>,
+        _live_tids: &[u32],
+    ) -> usize
     where
         F: Fn(usize) -> Option<ObjectRef>,
     {
@@ -2109,7 +2271,12 @@ pub use imp::{helper_window_pass, resume, take_over_pass};
 // ---------------------------------------------------------------------------
 
 #[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
-pub fn take_over_pass<F>(_taken: &mut TakenOver, _is_obj: &F, _roots: &mut Vec<ObjectRef>) -> usize
+pub fn take_over_pass<F>(
+    _taken: &mut TakenOver,
+    _is_obj: &F,
+    _roots: &mut Vec<ObjectRef>,
+    _live_tids: &[u32],
+) -> usize
 where
     F: Fn(usize) -> Option<ObjectRef>,
 {
