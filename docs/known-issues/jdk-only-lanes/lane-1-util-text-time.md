@@ -584,14 +584,43 @@ Every remaining HELD family has a named blocker. In rough order of rows:
    unarmed and its views survive arming byte-identically
    (`L1EntrySetRouteProbe`'s `C.hashtable.*` rows are clean in all three
    columns). Its own question, unbisected.
-5. **`java/util/jar/` (45)** and **`java/text/` (12)**: both red only under
-   `L1TailSweep`; neither has been bisected to a method. Start by splitting the
-   scope — `JarFile` alone, `Manifest`/`Attributes` alone —
-   `/data/l1hm/bisect.sh`'s shape is the loop, and after wave 3 the rule for
-   reading it is "a red arm is a candidate, not a verdict" (see below).
+5. **`java/util/jar/JarFile` and `java/text/BreakIterator`.** What is left
+   of §7's two vacuous greens after wave 4 took the other six classes: each
+   family's whole regression is ONE class, and each is unbisected BELOW the
+   class. `JarFile` is 32 registrations and `BreakIterator` 17; split by
+   method next, not by prefix. One row of `apps/probes/L1JarTextSweep.java`
+   is already waiting for whoever does — `E.attributesFromJar` reads `null`
+   where HotSpot reads the jar's per-entry manifest section, and it is
+   `JarFile`'s, not `JarEntry`'s: the class declares no native for
+   `getAttributes`, so nothing wave 4 could retire repairs it.
 6. **`Date`/`TimeZone`/`sun/util/calendar/` (40)** and **`Locale` + providers
-   (35)**: read §6 of the previous revision of this page, preserved as the
-   locale-provider trap below, before pricing either.
+   (35)**: read the locale-provider trap below before pricing either — and
+   start from the bisection, which is now taken. Armed one class at a time on
+   `LocaleDateTzShadowSweep` (base 2 diffs), against
+   `cratonvm-l1hm-base-20260911`:
+
+   ```text
+     java/util/Locale                       +117 WORSE  rc 1   reached=58
+     sun/util/calendar/ZoneInfo               +4 WORSE         reached=5723
+     java/util/TimeZone                       +2 WORSE         reached=53
+     java/util/Currency                       +2 WORSE         reached=4
+     sun/util/calendar/ZoneInfoFile           +0 same          reached=3792
+     java/util/Date                           +0 same          reached=0  VACUOUS
+     sun/util/locale/provider/CalendarDataUtility      +0      reached=0  VACUOUS
+     sun/util/locale/provider/JRELocaleProviderAdapter +0      reached=0  VACUOUS
+     sun/util/locale/provider/LocaleResources          +0      reached=0  VACUOUS
+     sun/util/resources/Bundles                        +0      reached=0  VACUOUS
+     sun/util/resources/LocaleData                     +0      reached=0  VACUOUS
+   ```
+
+   `java/util/Locale` is the family's whole weight and it takes the probe
+   down with it. **`sun/util/calendar/ZoneInfoFile` is the one real
+   candidate** — `+0` with 3,792 door engagements, which is a green that
+   means something. Every one of the five PROVIDER classes read `+0` with
+   `reached == 0`: the probe never asks them anything, so those five rows are
+   §7's trap and say nothing at all. That is the measurement the trap
+   predicted, and the next step on this family is a probe that reaches a
+   provider lookup, not another sweep.
 7. **`HashSet`/`LinkedHashSet` (13 + lane T's 42)**: blocked on lane T
    releasing `register_hashset_natives`. Nothing for L1 to do until then —
    except that wave 3 left it one measured row to start from:
