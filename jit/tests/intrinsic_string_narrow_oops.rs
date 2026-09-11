@@ -421,9 +421,12 @@ fn string_intrinsics_decode_a_narrow_value_slot() {
     assert_eq!(length(empty.ptr()), 0, "empty length");
     assert_eq!(is_empty(empty.ptr()), 1, "empty isEmpty");
 
-    // Keep the backing arrays alive past the last JIT call that reads them.
-    drop(latin1);
-    drop(empty_arr);
-    drop(s);
-    drop(empty);
+    // No keep-alive is needed, and the four `drop(..)` calls that used to stand
+    // here are gone with the `Vec<u64>` they were written for. `FakeObj` is one
+    // raw pointer into the arena `arena_alloc` LEAKS on purpose (see its doc),
+    // so there is nothing for a drop to free and nothing a compiler could free
+    // early. Since `534e1921b` clippy said so too — `drop_non_drop`, four
+    // errors, which is a `-D warnings` failure on a step that runs BEFORE
+    // `cargo test --workspace` in `ci.yml` and therefore takes the whole test
+    // gate with it.
 }

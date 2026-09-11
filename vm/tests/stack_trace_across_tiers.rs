@@ -65,8 +65,8 @@
 //!
 //! | switch | expected effect on `after_main_osr` |
 //! |---|---|
-//! | `CRATONVM_JIT_NO_COMPILED_FRAME_LINES=1` | a non-positive line reappears |
-//! | `CRATONVM_JIT_NO_INLINE_FRAME_MAP=1` | `mid` and `outer` disappear — *if this run inlined them*, see below |
+//! | `CRATONVM_JIT_NO_COMPILED_FRAME_LINES=1` | the refusal census counts the frames that took it, and the row moves |
+//! | `CRATONVM_JIT_NO_INLINE_FRAME_MAP=1` | the callees the map supplied stop contributing frames |
 //! | `CRATONVM_JIT_NO_OSR_PC_REFRESH=1` | `main`'s line moves back to the back-edge |
 //!
 //! Those double as the anti-vacuity guard: a switch that reverts proves the
@@ -93,26 +93,70 @@
 //! was only ever observed together with `CRATONVM_JIT_NO_INLINE=1`, and a check
 //! whose expected output nobody has measured is a false red waiting to happen.
 //!
-//! # Flakiness
+//! # Flakiness, and the claim that was wrong about it
 //!
-//! The interesting row exists only if `main` really OSR-compiles, so a test
-//! that assumed it would is a test that fails for the wrong reason on a busy
-//! machine. Two things make that risk small and one makes it visible:
+//! The interesting row exists only if `main` really OSR-compiles AND the
+//! artifact is entered before the loop it was compiled for ends. Until
+//! 2026-09-11 this section said the second half came for free:
 //!
-//! * tier-up here is **counter-driven, not time-driven** — the probe runs
-//!   400_000 back-edges against a default `CRATONVM_TIER_OSR_THRESHOLD` of
-//!   10_000, a 40x margin that no amount of host load moves;
-//! * background compilation is **off by default** (`CRATONVM_BG_COMPILE` is
-//!   opt-in), so the compile happens on the mutator at the threshold rather
-//!   than racing the end of the loop from a worker thread. The arms below
-//!   deliberately do not force it either way — an A/B is only an A/B when one
-//!   variable differs;
-//! * and if `main` nevertheless did not tier up, that is reported as its OWN
-//!   clearly-worded outcome — witnessed by the `[cratonvm-jitc] OSR-compile`
-//!   line under `CRATONVM_DBG_JITC=1`, not inferred from the trace — instead of
-//!   being dressed up as an assertion failure. It is loud on stderr and
-//!   `CRATONVM_REQUIRE_E2E=1` turns it into a failure, so CI still cannot go
-//!   green on a run that measured nothing.
+//! > background compilation is off by default (`CRATONVM_BG_COMPILE` is
+//! > opt-in), so the compile happens on the mutator at the threshold rather
+//! > than racing the end of the loop from a worker thread
+//!
+//! **That has been false since wire-tiered-manager Step 7.**
+//! `vm/src/runtime/env_cache.rs::bg_compile` returns `true` when the variable is
+//! unset -- the flag is an opt-OUT, `CRATONVM_BG_COMPILE=0`, which its own
+//! comment offers to "suites that still need the historical inline tier-up".
+//! So the compile does race the end of the loop, and every kill-switch
+//! assertion in this file was written as though it could not.
+//!
+//! What that cost, MEASURED on one debug binary with nothing else changing:
+//!
+//! * `CRATONVM_DBG_JITC=1` prints the same compile events on every run in a
+//!   different ORDER. When `mid`'s optimizing body supersedes its baseline one
+//!   (`c2-supersede published ... epoch_bumped=true`) relative to the third
+//!   throw decides whether `probe`'s bound direct call to `outer` is still bound
+//!   when that throw happens.
+//! * So `after_main_osr` is produced sometimes by two JIT entries (`main`'s OSR
+//!   artifact and a compiled `leaf`) and sometimes by one, with the chain
+//!   interpreted -- and on a host at load 100, twice in ten runs, by NONE: the
+//!   OSR body published after the loop had ended.
+//! * The default arm cannot see any of that, because every one of its lines is
+//!   correct either way. That is the point of the fix this file guards, and it
+//!   is also why the variance went unnoticed until the reverted arms were asked
+//!   to be deterministic.
+//! * `CRATONVM_JIT_NO_COMPILED_FRAME_LINES=1` accordingly printed three
+//!   different hot rows across sixteen runs, all three of them the switch
+//!   working, and the assertion demanded the shape of one of them.
+//!
+//! Tier-up itself was never the risk the old text worried about: the probe runs
+//! 400_000 back-edges against a default `CRATONVM_TIER_OSR_THRESHOLD` of 10_000,
+//! a 40x margin no host load moves. It is the PUBLICATION that raced. So the
+//! kill-switch arms now run against a control that sets `CRATONVM_BG_COMPILE=0`
+//! -- see the comment where that control is built -- which puts the compile back
+//! on the mutator at the threshold and makes all four rows bit-identical run to
+//! run, census included. The default arm keeps the shipping configuration, and
+//! a run in which `main` never tiered up at all is still reported as its own
+//! clearly-worded ENVIRONMENT outcome rather than dressed up as an assertion
+//! failure, loud on stderr and a failure under `CRATONVM_REQUIRE_E2E`.
+//!
+//! # What the kill-switch arms are pinned on
+//!
+//! Every arm establishes that the feature ENGAGED in its own run before
+//! asserting that switching it off reverted anything, and each pins the revert
+//! where it is decided rather than at the shape it happens to take in a trace:
+//!
+//! * defect 1 on the refusal census `CRATONVM_DBG_JIT_METHOD_STATS=1` prints
+//!   ([`frame_line_census`]) -- `switched-off > 0` and `answered == 0` -- plus
+//!   the requirement that the row moved and that every cell that moved is
+//!   attributable to the switch;
+//! * defect 2 on what the map owes and no more: a callee it supplied is gone,
+//!   only a callee it could have supplied may go, and nothing it did not supply
+//!   moves. WHICH callees the chain carried is an inlining decision this file
+//!   does not pin;
+//! * defect 3 on `main` having been a COMPILED frame at the throw
+//!   ([`main_was_a_compiled_frame`]), which is stronger than an OSR-compile line
+//!   in the log and is exactly the reading an unmoved line would otherwise have.
 //!
 //! # Flags
 //!
@@ -126,6 +170,7 @@
 //! settles the choice: these flags are read by the `cratonvm` binary we spawn,
 //! so the environment of that spawn is the supported way to set them.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -284,8 +329,12 @@ fn compile_probe(javac: &Path, src: &Path) -> Option<PathBuf> {
 /// `extra_env` differs, which is what makes this an A/B rather than a
 /// comparison of two builds.
 ///
-/// `CRATONVM_DBG_JITC=1` is set on every arm, including the interpreter one, so
-/// the arms differ by exactly the switch under test.
+/// `CRATONVM_DBG_JITC=1` and `CRATONVM_DBG_SWCHAIN=1` are set on every arm,
+/// including the interpreter one, so the arms differ by exactly the switch under
+/// test. Neither arms anything on a path the JIT runs hot -- `dbg_swchain_enabled`
+/// is read inside the stack walk itself -- which is why they can be blanket
+/// defaults here and `CRATONVM_DBG_JIT_METHOD_STATS` cannot; see
+/// [`frame_line_census`].
 fn run_arm(
     bin: &Path,
     jdk: &Path,
@@ -294,7 +343,10 @@ fn run_arm(
     extra_env: &[(&str, &str)],
 ) -> (String, String) {
     let mut cmd = Command::new(bin);
-    cmd.arg("--java-home").arg(jdk).env("CRATONVM_DBG_JITC", "1");
+    cmd.arg("--java-home")
+        .arg(jdk)
+        .env("CRATONVM_DBG_JITC", "1")
+        .env("CRATONVM_DBG_SWCHAIN", "1");
     for &(key, value) in extra_env {
         cmd.env(key, value);
     }
@@ -411,6 +463,118 @@ fn methods(frames: &[Frame]) -> Vec<&str> {
 
 fn line_of<'a>(frames: &'a [Frame], method: &str) -> Option<&'a Frame> {
     frames.iter().find(|f| f.method == method)
+}
+
+/// The marker `jit::tiered::dump_method_stats_to_stderr` prints the refusal
+/// census behind, under `CRATONVM_DBG_JIT_METHOD_STATS=1`.
+const CENSUS_MARK: &str = "compiled-frame lines: ";
+
+/// Why each compiled frame in a run's stack traces did, or did not, get a line
+/// -- `jit::compiled_frame_line_counts`, parsed by slot name.
+///
+/// # Why defect 1's arm is pinned on this and not on the shape of a trace
+///
+/// `switched-off` counts the frames that took the kill switch's arm, at the
+/// site that decides it, and the three [`answered`] slots count the frames the
+/// recovery resolved. A switch that has stopped being read reads as
+/// `switched-off == 0` whatever else the run did; a switch read by some arms of
+/// `activation_bci` and not others reads as both counters non-zero. Neither
+/// statement can be made from a trace, which prints `(Unknown Source)` for four
+/// different refusals plus the switch.
+///
+/// The assertion that stood in its place was `any(|f| f.line <= 0)` on the hot
+/// row, and it failed about one run in ten. MEASURED, 2026-09-11: under
+/// `CRATONVM_JIT_NO_COMPILED_FRAME_LINES=1` one debug binary printed
+/// `leaf:-1 ... main:62` fourteen times, `leaf:-1 ... main:66` once and
+/// `leaf:25 ... main:62` once. All three are the switch working -- on the third
+/// the only compiled frame in the row was `main`'s OSR artifact, whose revert
+/// shows up as a LINE moving back to the back-edge. The kill-switch control
+/// (`CRATONVM_BG_COMPILE=0`, see the comment where it is built) is what removed
+/// that variance at its source; this census is what makes the arm's claim true
+/// by construction rather than by luck.
+///
+/// # Why `CRATONVM_DBG_JIT_METHOD_STATS` is on the control and not every arm
+///
+/// It is not a print-only flag: it also arms `getfield_census_counting_enabled`
+/// (`vm/src/jit/helpers.rs`) and `code_ptr_memo_census_enabled`
+/// (`jit/src/lib.rs`), which count on paths the JIT runs hot. Setting it on the
+/// default arm would make that arm's timing differ from the shipping
+/// configuration it is there to measure. On the control, where tier-up is
+/// counter-driven on the mutator, the extra counting cannot change what gets
+/// compiled -- and it is on both sides of every pair, so no A/B is disturbed.
+fn frame_line_census(stderr: &str, arm: &str) -> BTreeMap<String, u64> {
+    let Some(line) = stderr.lines().find(|l| l.contains(CENSUS_MARK)) else {
+        panic!(
+            "[{TAG}] {arm}: the probe printed no `{CENSUS_MARK}` line, so \
+             CRATONVM_DBG_JIT_METHOD_STATS=1 did not reach the VM or the exit dump stopped \
+             printing it. Defect 1's arm is pinned on that census, so this is an environment \
+             failure, not a verdict on the trace.\nstderr tail:\n{}",
+            tail(stderr)
+        );
+    };
+    let body = line
+        .split(CENSUS_MARK)
+        .nth(1)
+        .unwrap_or("")
+        .split('|')
+        .next()
+        .unwrap_or("");
+    let mut out = BTreeMap::new();
+    for token in body.split_whitespace() {
+        if let Some((name, value)) = token.rsplit_once('=') {
+            if let Ok(n) = value.parse::<u64>() {
+                out.insert(name.to_string(), n);
+            }
+        }
+    }
+    assert!(
+        out.contains_key("switched-off") && out.contains_key("single-pass"),
+        "[{TAG}] {arm}: the `{CENSUS_MARK}` line no longer carries the slot names this file \
+         reads. `jit::FRAME_LINE_SLOT_NAMES` is the one source of them and this parser has \
+         fallen behind it.\ngot: {line}"
+    );
+    out
+}
+
+/// The three census slots that mean a compiled frame's bci WAS recovered, as
+/// opposed to refused for one of the four reasons -- or the kill switch --
+/// beside them.
+fn answered(census: &BTreeMap<String, u64>) -> u64 {
+    ["single-pass", "ir", "npe-trap"]
+        .iter()
+        .filter_map(|k| census.get(*k))
+        .sum()
+}
+
+/// One census slot, or zero.
+fn slot(census: &BTreeMap<String, u64>, name: &str) -> u64 {
+    census.get(name).copied().unwrap_or_default()
+}
+
+/// Was `main` a COMPILED frame at a throw in this run?
+///
+/// [`osr_entered_main`] answers a different and weaker question: whether an OSR
+/// compile of `main` ever happened. It is true in a run where the artifact was
+/// published after the hot loop had already ended, so `probe()` was called from
+/// an interpreted `main` and there was no OSR-entered frame in the trace at all.
+/// MEASURED: that is what two runs in ten looked like on a host at load 100 with
+/// background compilation on, and it is the reading defect 3's arm has to be
+/// able to exclude before it can call an unmoved `main` line a regression.
+///
+/// `CRATONVM_DBG_SWCHAIN=1` prints the compiled-frame chain that
+/// `active_compiled_frames` walked, and that walk happens only when a trace is
+/// captured -- three times in this probe, none of them before `main` could have
+/// OSR-compiled. So a `boundary=StackTraceAfterOsr.main` line can only have come
+/// from a throw taken while `main` was executing its own compiled artifact,
+/// which is the precondition the OSR arm needs and the only one it needs.
+///
+/// Unlike `CRATONVM_DBG_JIT_METHOD_STATS`, this switch arms nothing on a hot
+/// path: `dbg_swchain_enabled` is read inside the stack walk itself, so it is
+/// safe to set on every arm and keep them comparable.
+fn main_was_a_compiled_frame(stderr: &str) -> bool {
+    stderr
+        .lines()
+        .any(|l| l.contains("boundary=StackTraceAfterOsr.main"))
 }
 
 /// The last few KiB of a stream — full JIT debug output is far too large to
@@ -621,118 +785,243 @@ fn a_warmed_up_stack_trace_keeps_every_frame_and_every_line() {
     }
 
     // ---- the kill switches must still revert ------------------------------
-    // Each of these is BOTH a pin on the switch and the proof that the default
-    // arm's green came from the feature rather than from the feature never
-    // having been needed.
+    //
+    // Every arm below is the SAME control configuration plus ONE switch, and it
+    // is compared against that control rather than against the default arm.
+    // Three things about the control, each of them a repair:
+    //
+    // `CRATONVM_BG_COMPILE=0`. The header of this file used to say background
+    // compilation was off by default, "so the compile happens on the mutator at
+    // the threshold rather than racing the end of the loop from a worker
+    // thread". That has been FALSE since wire-tiered-manager Step 7:
+    // `vm/src/runtime/env_cache.rs::bg_compile` returns `true` when the variable
+    // is unset, and its own comment offers `CRATONVM_BG_COMPILE=0` to "suites
+    // that still need the historical inline tier-up". The consequence is the
+    // whole flakiness this section carried. MEASURED, 2026-09-11, sixteen runs
+    // of the hot row on one debug binary: `CRATONVM_DBG_JITC=1` prints the same
+    // compile events every time in a different ORDER, and which frames of
+    // `after_main_osr` are COMPILED moves with it -- sometimes `main`'s OSR
+    // artifact and a compiled `leaf`, sometimes `main`'s alone, and on a host at
+    // load 100, twice in ten runs, not even `main`: the OSR body published after
+    // the loop it was for had already ended. Every assertion here was written as
+    // if that set were fixed. With the flag at 0 the compile happens on the
+    // mutator at the back-edge threshold, and all four rows below are
+    // bit-identical run to run, census included.
+    //
+    // `CRATONVM_JIT_IR_SPLICE_GETSTATIC=0`. Restores the inlined callee the
+    // map arm needs to take away. `ir-splice-getstatic` landing default-ON on
+    // 2026-09-09 is what removed it: `leaf` reads the static `table`, so
+    // admitting `getstatic` for splicing made every body on this chain bigger
+    // (`outer`'s optimizing body went 493 -> 731 bytes) and the inline budget
+    // then refused a splice that used to fit. The previous version of that arm
+    // ran in the shipping configuration, found nothing to take away, and
+    // reported a coverage gap -- five runs in five, which is how it took the
+    // `CRATONVM_REQUIRE_E2E` leg of CI red with it.
+    //
+    // `CRATONVM_DBG_JIT_METHOD_STATS=1`. Prints the refusal census
+    // [`frame_line_census`] reads, which is where the bci arm's revert is
+    // pinned. It also arms hot-path counting (`getfield_census_counting_enabled`,
+    // `code_ptr_memo_census_enabled`), which is why it is on the CONTROL and not
+    // a blanket default -- under `CRATONVM_BG_COMPILE=0` the tier-up is
+    // counter-driven, so the extra counting can no longer change what gets
+    // compiled.
+    //
+    // None of the three is under test. Each is held equal across the pair.
+    const CONTROL_ENV: &[(&str, &str)] = &[
+        ("CRATONVM_BG_COMPILE", "0"),
+        ("CRATONVM_DBG_JIT_METHOD_STATS", "1"),
+        ("CRATONVM_JIT_IR_SPLICE_GETSTATIC", "0"),
+    ];
+    const CONTROL_ARM: &str = "BG_COMPILE=0 DBG_JIT_METHOD_STATS=1 JIT_IR_SPLICE_GETSTATIC=0";
+    let arm_env = |switch: &'static str| -> Vec<(&'static str, &'static str)> {
+        let mut env = CONTROL_ENV.to_vec();
+        env.push((switch, "1"));
+        env
+    };
 
-    // Defect 1's switch: a compiled frame goes back to carrying no bci.
+    let (ctl_out, ctl_err) = run_arm(&bin, &jdk, &classes, CONTROL_ARM, CONTROL_ENV);
+    let ctl = parse_row(&ctl_out, &ctl_err, HOT_ROW, CONTROL_ARM);
+    let ctl_census = frame_line_census(&ctl_err, CONTROL_ARM);
+
+    // The control must produce the trace the DEFAULT arm produced. That is a
+    // cross-configuration claim and not an A/B: it says that who compiled a
+    // frame (mutator or worker), and whether a callee was spliced, do not move
+    // a line -- an inlined callee is supplied by the frame map with its own
+    // recorded bci and a callee that is not supplies its own interpreter frame.
+    // If this ever fails, the map disagrees with the interpreter about one
+    // throw, which is this file's own defect one configuration over.
+    assert_eq!(
+        ctl,
+        jit_rows[2],
+        "[{TAG}] the kill-switch control ({CONTROL_ARM}) prints a different {HOT_ROW} from the \
+         default arm. Neither of those three flags is under test and none of them may move a \
+         line.\ncontrol: {}\ndefault arm: {}",
+        render(&ctl),
+        render(&jit_rows[2])
+    );
+    // Engagement, at the control, once for all three arms: the hot throw was
+    // taken from a COMPILED `main` frame. Under `CRATONVM_BG_COMPILE=0` the OSR
+    // compile happens on the mutator at the back-edge threshold, 40x before the
+    // loop ends, so this is deterministic -- the race that made it not so is the
+    // first paragraph above.
+    assert!(
+        main_was_a_compiled_frame(&ctl_err),
+        "[{TAG}] no stack walk in the control crossed a compiled `main` frame, so the hot throw \
+         was taken from an INTERPRETED `main` even with the tier-up on the mutator. The \
+         OSR-compile line the guard above found says the compile happened; something between \
+         that and the frame refused the entry (grep the stderr for `OSR-reject`, `OSR-DENY`, \
+         `osr optimizing`). Every arm below would then compare two interpreted \
+         rows.\ncontrol: {}\nstderr tail:\n{}",
+        render(&ctl),
+        tail(&ctl_err)
+    );
+    // The first assertion in this file that a compiled frame's bci was
+    // RECOVERED at all. Every assertion above is satisfied by a trace whose
+    // every line came from an interpreter frame's own LineNumberTable, and
+    // would go on being satisfied if the recovery were deleted.
+    assert!(
+        answered(&ctl_census) > 0,
+        "[{TAG}] the control resolved NO compiled frame's bci in the whole run (single-pass + \
+         ir + npe-trap = 0), so this file measured nothing about the recovery it exists to \
+         guard and the arms below have nothing to revert.\ncensus: {ctl_census:?}"
+    );
+    assert_eq!(
+        slot(&ctl_census, "switched-off"),
+        0,
+        "[{TAG}] the control reports frames that took a kill switch's arm, so this environment \
+         already has CRATONVM_JIT_NO_COMPILED_FRAME_LINES or CRATONVM_JIT_NO_IR_FRAME_LINES \
+         set. Every A/B below then compares that configuration against itself and proves \
+         nothing.\ncensus: {ctl_census:?}"
+    );
+
+    // ---- defect 1's switch: a compiled frame goes back to carrying no bci ---
+    //
+    // Pinned WHERE IT IS DECIDED -- the refusal census -- and then checked to be
+    // observable in the row. The assertion that stood here was
+    // `no_lines.iter().any(|f| f.line <= 0)`, and before the control above it
+    // failed about one run in ten, because on those runs the only compiled frame
+    // in the row was `main`'s OSR artifact and its revert shows up as a LINE
+    // moving back to the back-edge, not as a non-positive number anywhere.
+    const NO_LINES_ARM: &str = "CRATONVM_JIT_NO_COMPILED_FRAME_LINES=1";
     let (no_lines_out, no_lines_err) = run_arm(
         &bin,
         &jdk,
         &classes,
-        "CRATONVM_JIT_NO_COMPILED_FRAME_LINES=1",
-        &[("CRATONVM_JIT_NO_COMPILED_FRAME_LINES", "1")],
+        NO_LINES_ARM,
+        &arm_env("CRATONVM_JIT_NO_COMPILED_FRAME_LINES"),
     );
-    let no_lines = parse_row(
-        &no_lines_out,
-        &no_lines_err,
-        HOT_ROW,
-        "CRATONVM_JIT_NO_COMPILED_FRAME_LINES=1",
-    );
+    let no_lines = parse_row(&no_lines_out, &no_lines_err, HOT_ROW, NO_LINES_ARM);
+    let no_lines_census = frame_line_census(&no_lines_err, NO_LINES_ARM);
     assert!(
-        no_lines.iter().any(|f| f.line <= 0),
-        "[{TAG}] CRATONVM_JIT_NO_COMPILED_FRAME_LINES=1 no longer restores the historical `-1` on \
-         any frame of {HOT_ROW}. Either the switch has stopped reverting — and with it the only \
-         way to attribute a suspect line in a warmed-up trace to bci recovery rather than to the \
-         LineNumberTable, inside one binary — or nothing in that row is a compiled frame any \
-         more.\ngot: {}\ndefault arm: {}",
-        render(&no_lines),
-        render(&jit_rows[2])
+        slot(&no_lines_census, "switched-off") > 0,
+        "[{TAG}] {NO_LINES_ARM} left `switched-off` at zero, so not one compiled frame in the \
+         whole run took the kill switch's arm. The switch has stopped being read by \
+         `compiled_frame_bci_enabled` (vm/src/jit/conservative_roots.rs) -- and with it goes \
+         the only way to attribute a suspect line in a warmed-up trace to bci recovery rather \
+         than to the LineNumberTable, inside one binary.\ncensus: {no_lines_census:?}\ncontrol \
+         census: {ctl_census:?}"
     );
+    assert_eq!(
+        answered(&no_lines_census),
+        0,
+        "[{TAG}] {NO_LINES_ARM} still RESOLVED {} compiled frame bci(s), so the switch is read \
+         by some arms of `activation_bci` and not others. A half-reverted switch is worse than \
+         either state: the trace it produces is neither the historical answer nor the current \
+         one.\ncensus: {no_lines_census:?}",
+        answered(&no_lines_census)
+    );
+    // Defect 1's switch alone: it takes the BCI away, not the FRAME. Losing a
+    // frame here would mean it has picked up defect 2's half.
+    assert_eq!(
+        methods(&no_lines),
+        methods(&ctl),
+        "[{TAG}] {NO_LINES_ARM} changed the FRAMES of {HOT_ROW}, not just their \
+         lines.\ngot: {}\ncontrol: {}",
+        render(&no_lines),
+        render(&ctl)
+    );
+    // ... and the revert is OBSERVABLE, in one of exactly two shapes. A frame
+    // whose own bci is gone reports the historical `-1`; `main` reports the
+    // back-edge it tiered up at, because `stackwalker`'s display-only override
+    // is the bci of a compiled half that no longer has one. Any OTHER cell
+    // moving is this switch reaching past the recovery it names.
+    let moved: Vec<(&str, i32, i32)> = no_lines
+        .iter()
+        .zip(ctl.iter())
+        .filter(|(got, want)| got.line != want.line)
+        .map(|(got, want)| (got.method.as_str(), want.line, got.line))
+        .collect();
+    assert!(
+        !moved.is_empty(),
+        "[{TAG}] {NO_LINES_ARM} counted {} frame(s) that took its arm and yet {HOT_ROW} is \
+         byte-identical to the control. The refusal is being counted and then not applied, so \
+         the census and the trace disagree about one run.\ngot: {}\ncontrol: {}",
+        slot(&no_lines_census, "switched-off"),
+        render(&no_lines),
+        render(&ctl)
+    );
+    for (method, was, now) in &moved {
+        assert!(
+            *now <= 0 || *method == "main",
+            "[{TAG}] {NO_LINES_ARM} moved `{method}` from line {was} to line {now} in \
+             {HOT_ROW}. This switch has two legal shapes -- a compiled frame reporting the \
+             historical `-1`, and `main` falling back to the back-edge it tiered up at -- and a \
+             positive line on any other frame is neither. It means the reverted path is \
+             inventing a line rather than refusing to supply one.\ngot: {}\ncontrol: {}",
+            render(&no_lines),
+            render(&ctl)
+        );
+    }
 
-    // Defect 2's switch: the inlined callees stop contributing frames.
+    // ---- defect 2's switch: the inlined callees stop contributing frames ----
+    //
+    // WHICH of `leaf`, `mid` and `outer` the chain carries is an inlining
+    // decision this probe influences but does not choose, and the version of
+    // this arm that demanded `mid` AND `outer` was pinning that decision rather
+    // than the map. What the map owes is narrower and is what is asserted: a
+    // callee it supplied is gone when it is switched off, only a callee it could
+    // have supplied may go, and nothing it did not supply moves. MEASURED,
+    // 2026-09-11, five runs: the control's five frames become four, with `mid`
+    // gone, every time.
+    const NO_MAP_ARM: &str = "CRATONVM_JIT_NO_INLINE_FRAME_MAP=1";
     let (no_map_out, no_map_err) = run_arm(
         &bin,
         &jdk,
         &classes,
-        "CRATONVM_JIT_NO_INLINE_FRAME_MAP=1",
-        &[("CRATONVM_JIT_NO_INLINE_FRAME_MAP", "1")],
+        NO_MAP_ARM,
+        &arm_env("CRATONVM_JIT_NO_INLINE_FRAME_MAP"),
     );
-    let no_map = parse_row(
-        &no_map_out,
-        &no_map_err,
-        HOT_ROW,
-        "CRATONVM_JIT_NO_INLINE_FRAME_MAP=1",
-    );
-    // Which of this switch's two observable reverts a run can show depends on
-    // something this test does not control: whether the hot throw actually
-    // passed through an artifact with INLINED callees.
-    //
-    // It did until 2026-09-09. `ir-splice-getstatic` landing default-ON is what
-    // changed it, and not by breaking anything: `leaf` reads the static
-    // `table`, so admitting `getstatic` for splicing made every body along this
-    // chain bigger (`outer`'s optimizing body went 493 -> 731 bytes), and the
-    // inline budget then refused a splice that used to fit. The consequence for
-    // this row is visible in `CRATONVM_DBG_SWCHAIN=1`:
-    //
-    //   before: one JIT entry, activations=3 [leaf | probe | main]
-    //           -- `mid` and `outer` are INLINE LEVELS, so the map supplies them
-    //   after:  two JIT entries, activations=1 [main] and 1 [leaf]
-    //           -- `mid` and `outer` are ordinary INTERPRETER frames
-    //
-    // Both traces are correct, and both match the interpreter oracle asserted
-    // above. But in the second shape there is no inlined callee at this throw
-    // for the switch to take away, so demanding that `mid` and `outer`
-    // disappear asserts an inlining decision rather than the map -- and a test
-    // that pins an inlining decision it never chose goes red on the next budget
-    // change too.
-    //
-    // So: assert the strong form when the chain actually contributed a frame,
-    // and otherwise assert the switch still reverts *something* and say plainly
-    // that the chain half went unexercised. The second branch is an
-    // ENVIRONMENT outcome in the same sense as "main did not OSR" above, and is
-    // a failure under `CRATONVM_REQUIRE_E2E` for the same reason: a run that
-    // measured nothing must not be able to make CI green.
-    let chain_contributed = no_map.len() < jit_rows[2].len();
-    if chain_contributed {
-        for gone in ["mid", "outer"] {
-            assert!(
-                line_of(&no_map, gone).is_none(),
-                "[{TAG}] CRATONVM_JIT_NO_INLINE_FRAME_MAP=1 dropped frames from {HOT_ROW} but \
-                 kept `{gone}`. The switch is still reverting the inline-frame map -- the row is \
-                 shorter -- so this is not the switch having stopped being read by both halves \
-                 (the emitter in jit/src/x64/inlining.rs and the walk in \
-                 vm/src/jit/conservative_roots.rs read the same name deliberately). It is the \
-                 chain having contributed a DIFFERENT set of callees than the one this probe is \
-                 built to produce.\ngot: {}\ndefault arm: {}",
-                render(&no_map),
-                render(&jit_rows[2])
-            );
-        }
-    } else {
-        // The chain contributed nothing, so the only thing left to pin is that
-        // the switch is still wired at all. It reverts the innermost frame's
-        // line here -- `apply_npe_trap_site` gates that on the same
-        // `inline_frame_chains_enabled()` -- so an inert switch is still caught.
+    let no_map = parse_row(&no_map_out, &no_map_err, HOT_ROW, NO_MAP_ARM);
+    let survivors = methods(&no_map);
+    let dropped: Vec<&str> = methods(&ctl)
+        .into_iter()
+        .filter(|m| !survivors.contains(m))
+        .collect();
+    if dropped.is_empty() {
+        // The chain contributed nothing even here, so the only thing left to
+        // pin is that the switch is still wired at all: it reverts the
+        // innermost frame's line too, because `apply_npe_trap_site` gates that
+        // on the same `inline_frame_chains_enabled()`.
         assert_ne!(
             no_map,
-            jit_rows[2],
-            "[{TAG}] CRATONVM_JIT_NO_INLINE_FRAME_MAP=1 changed NOTHING about {HOT_ROW}: same \
-             frames, same lines. Every other reading of this row is accounted for, so this one \
-             means the switch has stopped being read -- check that both halves still name it \
+            ctl,
+            "[{TAG}] {NO_MAP_ARM} changed NOTHING about {HOT_ROW}: same frames, same lines. \
+             Every other reading of this row is accounted for, so this one means the switch has \
+             stopped being read -- check that both halves still name it \
              (jit/src/x64/inlining.rs and vm/src/jit/conservative_roots.rs).\ngot: {}",
             render(&no_map)
         );
         let note = format!(
-            "[{TAG}] NOTE: no callee was INLINED at {HOT_ROW} in this run, so \
-             CRATONVM_JIT_NO_INLINE_FRAME_MAP=1 had no inlined frame to take away and the \
-             default arm's frame count proves nothing about the map's chain half. The switch is \
-             still live -- it reverted the innermost frame's line -- and the trace still matches \
-             the interpreter oracle, so this is a coverage gap, not a defect. Restore the \
-             coverage by making this probe's hot throw pass through an artifact that inlines \
-             again; see the comment above this assertion for why it stopped.\n\
-             default arm: {}\nno-map arm:  {}",
-            render(&jit_rows[2]),
+            "[{TAG}] NOTE: the hot throw did not pass through an artifact with inlined callees, \
+             even with CRATONVM_JIT_IR_SPLICE_GETSTATIC=0 holding the inlining decision where \
+             this probe was built for it, so the inline-frame map's CHAIN half went unexercised \
+             in this run. The switch is pinned to still revert something -- the assertion just \
+             above -- and the trace still matches the interpreter oracle, so this is a coverage \
+             gap rather than a defect. But this was the last lever this file had for that half, \
+             so the gap is now total. Check `CRATONVM_DBG_JITC=1` for `nest-static leaf(I)I ... \
+             -> SPLICED` on this chain: if a budget change refused the splice again, this arm \
+             needs a new lever, not a softer assertion.\ncontrol: {}\nno-map arm: {}",
+            render(&ctl),
             render(&no_map)
         );
         assert!(
@@ -740,40 +1029,85 @@ fn a_warmed_up_stack_trace_keeps_every_frame_and_every_line() {
             "{note}\n\nCRATONVM_REQUIRE_E2E is set, so this incomplete run is a failure."
         );
         eprintln!("{note}");
+    } else {
+        // `probe` carries an exception table, so the planner refuses to inline
+        // it (`inline-resolve REFUSED ... callee-exception-table`), and `main`
+        // is the OSR root. Neither can ever be a spliced callee, so neither may
+        // disappear when the map does.
+        for kept in ["probe", "main"] {
+            assert!(
+                survivors.contains(&kept),
+                "[{TAG}] {NO_MAP_ARM} dropped `{kept}` from {HOT_ROW}. That frame is not a \
+                 spliced callee -- `probe` carries an exception table and is refused by the \
+                 inline planner, `main` is the OSR root -- so the inline-frame map cannot be \
+                 what was supplying it. Switching the map off has taken away a frame that came \
+                 from somewhere else.\ngot: {}\ncontrol: {}",
+                render(&no_map),
+                render(&ctl)
+            );
+        }
+        for gone in &dropped {
+            assert!(
+                ["leaf", "mid", "outer"].contains(gone),
+                "[{TAG}] {NO_MAP_ARM} dropped `{gone}` from {HOT_ROW}, which is not on the \
+                 chain this probe splices (`outer` -> `mid` -> `leaf`). The switch is reverting \
+                 more than the inline-frame map.\ngot: {}\ncontrol: {}",
+                render(&no_map),
+                render(&ctl)
+            );
+        }
+        // Every frame that SURVIVED keeps the line it had. The map's chain half
+        // supplies frames; it must not move the ones it did not supply.
+        for name in &survivors {
+            if *name == "leaf" {
+                // The one documented exception: `apply_npe_trap_site` gates the
+                // innermost frame's line on the same switch, so `leaf` reports
+                // the historical `-1` here for the same reason defect 1's arm
+                // produces one.
+                continue;
+            }
+            let (a, b) = (line_of(&no_map, name), line_of(&ctl, name));
+            assert_eq!(
+                a.map(|f| f.line),
+                b.map(|f| f.line),
+                "[{TAG}] {NO_MAP_ARM} moved `{name}` in {HOT_ROW}. The map's chain half \
+                 supplies FRAMES; a frame it did not supply must keep its own \
+                 line.\ngot: {}\ncontrol: {}",
+                render(&no_map),
+                render(&ctl)
+            );
+        }
     }
 
-    // Defect 3's switch: the OSR frame goes back to reporting its back-edge.
+    // ---- defect 3's switch: the OSR frame reports its back-edge again ------
+    const NO_REFRESH_ARM: &str = "CRATONVM_JIT_NO_OSR_PC_REFRESH=1";
     let (no_refresh_out, no_refresh_err) = run_arm(
         &bin,
         &jdk,
         &classes,
-        "CRATONVM_JIT_NO_OSR_PC_REFRESH=1",
-        &[("CRATONVM_JIT_NO_OSR_PC_REFRESH", "1")],
+        NO_REFRESH_ARM,
+        &arm_env("CRATONVM_JIT_NO_OSR_PC_REFRESH"),
     );
-    let no_refresh = parse_row(
-        &no_refresh_out,
-        &no_refresh_err,
-        HOT_ROW,
-        "CRATONVM_JIT_NO_OSR_PC_REFRESH=1",
-    );
-    let reverted_main = line_of(&no_refresh, "main").map(|f| f.line);
-    let default_main = line_of(&jit_rows[2], "main").map(|f| f.line);
+    let no_refresh = parse_row(&no_refresh_out, &no_refresh_err, HOT_ROW, NO_REFRESH_ARM);
     assert_ne!(
-        reverted_main, default_main,
-        "[{TAG}] CRATONVM_JIT_NO_OSR_PC_REFRESH=1 leaves `main` on the same line as the default \
-         arm in {HOT_ROW}, so it no longer reverts the OSR continuation registry. Without that \
-         revert a wrong line in a warmed-up trace can no longer be attributed to the OSR pc \
-         refresh inside one binary.\ngot: {}\ndefault arm: {}",
+        line_of(&no_refresh, "main").map(|f| f.line),
+        line_of(&ctl, "main").map(|f| f.line),
+        "[{TAG}] {NO_REFRESH_ARM} leaves `main` on the same line as the control in {HOT_ROW}, \
+         so it no longer reverts the OSR continuation registry. The control asserted that this \
+         configuration takes the hot throw from a COMPILED `main` frame, so the reading that \
+         there was no OSR frame to revert is excluded. Without the revert a wrong line in a \
+         warmed-up trace can no longer be attributed to the OSR pc refresh inside one \
+         binary.\ngot: {}\ncontrol: {}",
         render(&no_refresh),
-        render(&jit_rows[2])
+        render(&ctl)
     );
     // It reverts THAT half and only that half: the frames themselves stay.
     assert_eq!(
         methods(&no_refresh),
         EXPECTED_METHODS.to_vec(),
-        "[{TAG}] CRATONVM_JIT_NO_OSR_PC_REFRESH=1 changed the FRAMES of {HOT_ROW}, not just \
-         `main`'s line. It is defect 3's switch alone; losing frames here means it has picked up \
-         defect 2's half as well.\ngot: {}",
+        "[{TAG}] {NO_REFRESH_ARM} changed the FRAMES of {HOT_ROW}, not just `main`'s line. It \
+         is defect 3's switch alone; losing frames here means it has picked up defect 2's half \
+         as well.\ngot: {}",
         render(&no_refresh)
     );
 }
