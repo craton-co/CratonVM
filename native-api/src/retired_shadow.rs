@@ -3130,11 +3130,7 @@ static RETIRED_SHADOW_L1_HM_TRIPLES: &[(&str, &str, &str)] = &[
         "(Ljava/lang/Object;)Z",
     ),
     ("java/util/HashMap", "entrySet", "()Ljava/util/Set;"),
-    (
-        "java/util/HashMap",
-        "equals",
-        "(Ljava/lang/Object;)Z",
-    ),
+    ("java/util/HashMap", "equals", "(Ljava/lang/Object;)Z"),
     (
         "java/util/HashMap",
         "forEach",
@@ -3200,16 +3196,8 @@ static RETIRED_SHADOW_L1_HM_TRIPLES: &[(&str, &str, &str)] = &[
         "(Ljava/util/function/BiFunction;)V",
     ),
     ("java/util/HashMap", "size", "()I"),
-    (
-        "java/util/HashMap",
-        "toString",
-        "()Ljava/lang/String;",
-    ),
-    (
-        "java/util/HashMap",
-        "values",
-        "()Ljava/util/Collection;",
-    ),
+    ("java/util/HashMap", "toString", "()Ljava/lang/String;"),
+    ("java/util/HashMap", "values", "()Ljava/util/Collection;"),
     (
         "java/util/HashMap",
         "writeObject",
@@ -3318,11 +3306,7 @@ static RETIRED_SHADOW_L1_HM_TRIPLES: &[(&str, &str, &str)] = &[
         "()Ljava/lang/Object;",
     ),
     ("java/util/HashMap$KeyIterator", "remove", "()V"),
-    (
-        "java/util/HashMap$KeySet",
-        "add",
-        "(Ljava/lang/Object;)Z",
-    ),
+    ("java/util/HashMap$KeySet", "add", "(Ljava/lang/Object;)Z"),
     (
         "java/util/HashMap$KeySet",
         "addAll",
@@ -3601,11 +3585,7 @@ mod tests {
                 "iterator",
                 "()Ljava/util/Iterator;",
             ),
-            (
-                "java/util/LinkedHashMap$LinkedKeySet",
-                "size",
-                "()I",
-            ),
+            ("java/util/LinkedHashMap$LinkedKeySet", "size", "()I"),
             (
                 "java/util/Hashtable",
                 "put",
