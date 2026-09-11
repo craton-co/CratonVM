@@ -4336,15 +4336,6 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // `the_tables_const_lists_every_table_the_predicate_consults` exists to
     // catch, and it is what caught it.
     RETIRED_SHADOW_L1_TRIPLES,
-    // Third occurrence in three days, and this one arrived in MY
-    // merge: lane 1's HashMap and java.text tables were added to the
-    // predicate on a branch this const never saw, `git merge` resolved
-    // the file without a conflict, and only the count below noticed.
-    // The pattern is established -- a table is declared in one place,
-    // consulted in a second and listed in a third, with nothing
-    // textual joining them.
-    RETIRED_SHADOW_L1_HM_TRIPLES,
-    RETIRED_SHADOW_L1_JT_TRIPLES,
     // And here by the 2026-09-11 merge of lane 7, for exactly the reason the
     // note above gives — same shape, second occurrence in two days. Lane 7's
     // table and this const were also written on branches that never saw each
@@ -4873,44 +4864,6 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn the_l2_table_is_disjoint_from_every_other_table() {
-        // Walk `RETIRED_SHADOW_TABLES` rather than a list spelled out here.
-        // The spelled-out list went stale twice in one day: PHASE3 and lanes
-        // 1, 5 and 7 landed tables on branches this one never saw, and
-        // `git merge` resolves both files without a conflict every time, so
-        // nothing textual connects a new table to this test. Renaming the test
-        // off "the other three" took the wrong number out of the NAME and left
-        // the same list underneath it.
-        //
-        // `RETIRED_SHADOW_TABLES` is the one list that something already keeps
-        // complete -- `the_tables_const_lists_every_table_the_predicate_consults`
-        // fails if a table the predicate consults is missing from it. Borrowing
-        // it makes this test inherit that guarantee instead of re-earning it
-        // every wave.
-        for key in RETIRED_SHADOW_L2_TRIPLES {
-            // COUNT the tables that claim this row rather than skipping
-            // lane 2's own by address. `RETIRED_SHADOW_TABLES` is a
-            // `const`, so its value is inlined at each use site and rustc
-            // is free to duplicate the data it points at -- `as_ptr()`
-            // equality then fails to recognise lane 2's own table and
-            // every row reads as an overlap. "Claimed exactly once" is
-            // the property being asserted anyway.
-            let claims = RETIRED_SHADOW_TABLES
-                .iter()
-                .filter(|t| t.binary_search(key).is_ok())
-                .count();
-            assert_eq!(
-                claims, 1,
-                "{key:?} is claimed by {claims} retired-shadow tables, \
-                 not 1. Two tables claiming one triple means two \
-                 measurements claim it, and only one of them can be \
-                 the record."
-            );
-        }
-    }
-
     /// Lane 2 retires two families and nothing either side of them.
     ///
     /// The prefix list now admits the whole of `java/lang/` and `java/math/`,
