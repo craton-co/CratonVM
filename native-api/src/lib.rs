@@ -48,6 +48,10 @@ pub mod no_image_receiver;
 /// `sun.jnu.encoding` and the three stream encodings, which JEP 400 did NOT
 /// pin to UTF-8 (only `file.encoding`).
 pub mod os_encoding;
+/// The slot map of a synthetic `java/nio/file/Path`, resolved from the
+/// platform implementation class instead of hard-coded. Two crates produce
+/// that carrier, so its layout is decided in one place.
+pub mod path_layout;
 pub mod poly_call_site;
 /// Where an absorbed failure is **recorded** — `PrintStream`/`PrintWriter`'s
 /// `trouble` flag (read back by `checkError()`) and a `Handler`'s
