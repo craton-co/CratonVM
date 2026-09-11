@@ -710,7 +710,30 @@ count is a statement about the counter rather than the dispatch.
   byte-identical to this branch's pre-merge readings, so `dev`'s 44 commits
   added no registrations at all.
 
-The control dump in the pipeline is therefore a confirmation, not a dependency.
+The control dump in the pipeline is therefore a confirmation, not a
+dependency — and it CONFIRMED, on `p20` itself (md5
+`f7b43fdc4763597b34c5a52b6dd14dba`, `mode: jdk-only`, schema 5,
+`image_adjudication: true`):
+
+```text
+all four preconditions, 9 of 9.  owns_slot true, kind bridge,
+has_code true, acc_native false, invocations 3/7/3/3/3/3/6/5/3
+```
+
+The invocation counts are **identical to p18's**, so the transfer argument
+above is now a measurement rather than an inference. The three rows recovered
+by §8b's correction also reproduce on the new binary — `61 M isVarArgs`,
+`64 M isDefault iface` and `256 W2 F isEnumConstant TRUE` all read `true` in
+`hs`, `base` AND `armed`, with all three arms at 271 lines.
+
+**And the dial's leak is byte-identical across the two binaries**:
+`reached=1027 yielded=901 leaked=126` on p18 and again on p20. Two
+independently built binaries, five weeks of `dev` apart, same three numbers.
+That makes the leak a DETERMINISTIC property of the dial rather than a load
+artefact — so the asymmetry rule in §8b is permanent, not circumstantial, and
+no amount of re-running will turn an `armed == base` row into evidence. The
+two-binary A/B is the only instrument that can promote these nine, and it is
+not a matter of taste.
 
 **One sequencing trap, recorded because it would have destroyed the control:**
 the table edit must NOT be applied until `p20` is pinned. The release build
