@@ -236,6 +236,45 @@ read zero, correctly. `[deadref-recv]`, added with that fix, is the missing arm.
 
 The threshold after it: BindableTests passes at 262 144, 131 072 and 65 536.
 
+## Another witness, on a different class: `Arrays$ArrayList`'s backing array
+
+Found 2026-09-11 while closing
+[`flyway-aot-receiver-class-confusion-under-concurrency`](flyway-aot-receiver-class-confusion-under-concurrency-FIXED-20260911.md),
+and recorded here because it is this page's shape and not that one's.
+
+`module/spring-boot-flyway …
+ResourceProviderCustomizerBeanRegistrationAotProcessorTests` under
+`CRATONVM_DBG_GC_STRESS=262144` fails with
+
+```text
+java.lang.ExceptionInInitializerError
+  at …MessageSourceSupport.<clinit>(MessageSourceSupport.java:48)
+Caused by: java.lang.ClassCastException: class java.lang.Object cannot be cast
+           to class [Ljava.lang.Object;
+  at java.util.Spliterators.spliterator(Spliterators.java:130)
+  at java.util.Arrays$ArrayList.spliterator(Arrays.java:4257)
+```
+
+`Arrays$ArrayList.spliterator()` passes its own `a` field, declared `E[]`, and
+the receiver it reaches is a plain `java.lang.Object` — a field holding an
+address something else now occupies, which is this page's ten-times-over
+finding, not a class mirror and not a frame slot.
+
+Three things narrow it for the next reader:
+
+* **It is GC-stress-only.** No ordinary run of that class reproduces it at any
+  concurrency measured (160 paired runs, 8 processes at a time, including a
+  forcing arm that raises the mirror row's rate by an order of magnitude).
+* **It is not the mirror defect.** Present at the same rate before and after the
+  `roots.rs` step-6 fix that closed the flyway row — 2/8 and 4/8 on one burst,
+  both arms, same signature.
+* **It is not `--XX:UseGc Generational`.** This page's scope line says
+  Generational; this witness is the DEFAULT collector (ZGC). Whether the ten
+  fixed defects' shape recurs here through a ZGC-specific path, or this is an
+  eleventh `ObjectRef`-across-an-allocation in the `Arrays.asList` /
+  `Spliterators` route, is the open question — `CRATONVM_DBG_DEADREF_STORE=1` is
+  the screen that answers it, and it has not been run on this witness.
+
 ## A standing audit, from the same shape
 
 A mechanical scan of `native-collections/src/lib.rs` for "an argument-derived

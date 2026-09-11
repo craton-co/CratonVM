@@ -1372,6 +1372,58 @@ impl SharedVm {
 
     /// Create a new SharedVm from a VmConfig.
     pub fn new(mut config: VmConfig) -> Self {
+        // ── Put the layout-replacement epoch counter next to the code that
+        //    guards on it ─────────────────────────────────────────────────
+        //
+        // Deliberately the FIRST statement in the constructor, and the reason
+        // is an ordering requirement rather than taste.
+        // `install_layout_epoch_cell` fails closed once the counter has been
+        // read, bumped or baked even once — because compiled code bakes the
+        // ADDRESS and `register_class_layout` bumps whatever cell the
+        // `LazyLock` resolved to, so swapping later would leave compiled
+        // guards reading a word nobody increments. Every registration, every
+        // JIT compile and every diagnostic that could force that resolution is
+        // downstream of here.
+        //
+        // A `false` costs the short encoding and nothing else, which is why
+        // this is not a panic. What it does NOT have is a test at this level:
+        // a `cargo test` process builds many VMs and only the first could
+        // install, so an assertion here would pass or fail by test order.
+        // `types/tests/layout_epoch_cell.rs` pins the install and
+        // `layout_epoch_cell_too_late.rs` pins the refusal, each in a process
+        // of its own; what pins THIS call site is
+        // `CRATONVM_DBG_EPOCH_CELL=1`, which prints the origin on any real
+        // boot and reads `Heap` instead of `CodeAdjacent` the moment this
+        // statement stops being first.
+        //
+        // The cell comes from the code cache's own allocator, which is also
+        // what keeps "exactly one strategy owns placement" true:
+        // `alloc_code_adjacent_cell` returns `None` while
+        // `CRATONVM_JIT_CODE_NEAR_GLOBALS` is set, so that strategy and this
+        // one can never both be engaged. See
+        // `internal/performance/c2-the-layout-epoch-guard-was-unreachable-by-rip-20260910.md`,
+        // "Route 4".
+        if let Some(cell) = cratonvm_jit::platform::alloc_code_adjacent_cell() {
+            // SAFETY: `alloc_code_adjacent_cell` hands back a freshly carved,
+            // zero-filled, 64-byte-aligned cell that no other reference names
+            // and that is never unmapped or recycled — which is exactly
+            // `install_layout_epoch_cell`'s contract, 4-byte alignment
+            // included.
+            unsafe {
+                cratonvm_types::field_layout::install_layout_epoch_cell(cell.cast::<u32>());
+            }
+        }
+        // Latch the choice HERE rather than leaving it to whoever reads the
+        // counter first. Without this the decision point drifts with unrelated
+        // boot order, and a regression in it would show up as a silently
+        // longer encoding on some runs and not others — the failure mode this
+        // whole area keeps producing.
+        let epoch_cell_origin = cratonvm_types::field_layout::layout_epoch_cell_origin();
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_EPOCH_CELL").is_some() {
+            let (addr, _) = cratonvm_types::field_layout::layout_replace_epoch_guard();
+            eprintln!("[epoch-cell] origin={epoch_cell_origin:?} addr={addr:p}");
+        }
+
         apply_container_default_heap(&mut config);
 
         // ── Strict-mode boot precondition (jdk-only-mode.md §1.1, §8) ──────

@@ -383,12 +383,32 @@ impl Compiler {
     /// type-punned primitive as a pointer.
     ///
     /// Every `getfield` helper call site in this backend goes through here, so
-    /// the flag cannot be forgotten at one arm. `emit_mov_imm64` still picks
-    /// the short imm32 encoding when no flag is set, so primitive loads emit
-    /// exactly the bytes they emitted before.
-    pub(super) fn emit_getfield_index_arg(&mut self, reg: u8, field_index: usize, type_tag: u8) {
+    /// the flag cannot be forgotten at one arm.
+    ///
+    /// `bc_pc` is the trapping bytecode index — this method's own for a
+    /// top-level `getfield`, the CALLEE's inside a splice; the separation is
+    /// `record_npe_trap_site`'s job, not the call site's. It is recorded as an
+    /// NPE trap site and its key rides in the same argument, which is what lets
+    /// the helper's null arm raise a MESSAGED `NullPointerException`: the
+    /// helper has the receiver (null) and the slot index, and neither names the
+    /// field or the bci. See `cratonvm_jit_api::GETFIELD_NPE_SITE_SHIFT`.
+    ///
+    /// The key costs the argument its short imm32 encoding on a primitive load
+    /// (a reference load already carried a flag at bit 61 and was imm64
+    /// anyway), i.e. three bytes at a HELPER call site — the arm that is
+    /// already paying a call. `record_npe_trap_site` answers `0` when the
+    /// feature is switched off, and a zero key restores the previous encoding
+    /// byte for byte.
+    pub(super) fn emit_getfield_index_arg(
+        &mut self,
+        reg: u8,
+        field_index: usize,
+        type_tag: u8,
+        bc_pc: usize,
+    ) {
         let is_ref = type_tag == b'L' || type_tag == b'[';
-        let arg = cratonvm_jit_api::getfield_index_arg(field_index as u32, is_ref, false);
+        let key = crate::x64::inlining::record_npe_trap_site(bc_pc);
+        let arg = cratonvm_jit_api::getfield_index_arg(field_index as u32, is_ref, false, key);
         // Cast: the flag bits sit at 61/62, so the value stays positive in i64.
         self.emit_mov_imm64(reg, arg as i64);
     }

@@ -1271,18 +1271,24 @@ pub(crate) fn stash_jit_pending_npe() {
     set_jit_pending_npe();
 }
 
-/// Raise the pending-NPE flag WITHOUT taking a compiled-frame snapshot.
+/// Raise the pending-NPE flag WITHOUT taking a compiled-frame snapshot and
+/// WITHOUT touching the JEP-358 action code.
 ///
 /// For the one shape [`stash_jit_pending_npe`] is wrong for: a door that
 /// drained the flag with [`take_jit_pending_npe`] and is putting it back. That
 /// take leaves `trap_frames` untouched, so the snapshot from the trap
 /// is still there and is still the right one; taking another would overwrite it
 /// with a stack the raising frame has already left.
+///
+/// The action cell is left alone for exactly the same reason, and it used to be
+/// ZEROED here. That take does not consume the action either, so the code
+/// sitting in the cell is this NPE's own — clearing it threw away the one thing
+/// that tells the eventual drain which opcode trapped, and an `invoke` on a
+/// null receiver that took a round trip through a door which declined to
+/// service it came out unmessaged. See
+/// `runtime::interpreter::jit_npe_message::jit_npe_message`, which reads it.
 pub(crate) fn set_jit_pending_npe_flag_only() {
-    JIT_SIGNALS.with(|s| {
-        s.npe.set(true);
-        s.npe_action.set(0);
-    });
+    JIT_SIGNALS.with(|s| s.npe.set(true));
 }
 
 /// Put back an NPE that [`take_all_jit_signals`] drained WHOLE -- flag, JEP-358
@@ -1458,6 +1464,24 @@ pub fn take_jit_pending_arithmetic() -> bool {
     JIT_SIGNALS.with(|s| s.arithmetic.take())
 }
 
+/// Put a compiled-frame snapshot back into the signal record, without touching
+/// any flag.
+///
+/// For a door that drained the snapshot to build a throwable it then had to
+/// DISCARD: the flag is restored separately (`set_jit_pending_npe_flag_only`),
+/// and the frames have to go with it or the next throwable is built from a bare
+/// flag and the trace names only the frames the interpreter still holds.
+///
+/// Assigns the slot, so it must be called at most once per restash — the same
+/// rule `handle_compiled_callee_deopt_sentinel`'s three-way restash states, for
+/// the same reason: there is ONE `trap_frames` cell and a second call with
+/// `None` wipes what the first put back.
+pub(crate) fn restash_jit_pending_trap_frames(
+    frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
+) {
+    JIT_SIGNALS.with(|s| *s.trap_frames.borrow_mut() = frames);
+}
+
 /// Re-stash a previously taken pending-arithmetic flag. Mirrors
 /// [`stash_jit_pending_aioobe`] for the OSR drain-without-route path, so a
 /// div-by-zero raised in OSR-compiled code with no in-frame handler survives the
@@ -1478,6 +1502,16 @@ pub(crate) fn stash_jit_pending_arithmetic() {
 /// exception table — same pattern as `take_jit_pending_aioobe`.
 pub fn take_jit_pending_npe() -> bool {
     JIT_SIGNALS.with(|s| s.npe.take())
+}
+
+/// Read the JEP-358 action code recorded alongside a pending JIT NPE WITHOUT
+/// consuming it.
+///
+/// For a door that drained the flag with [`take_jit_pending_npe`] and may put
+/// it back: it needs the code to build a message, and must not take it, because
+/// the drain that eventually services the NPE reads the same cell.
+pub(crate) fn peek_jit_pending_npe_action() -> u8 {
+    JIT_SIGNALS.with(|s| s.npe_action.get())
 }
 
 /// Take (consume) the JEP-358 *action code* recorded alongside a pending JIT
@@ -3268,6 +3302,7 @@ fn materialize_implicit_signal(
     thread: &mut JvmThread,
     signal: ImplicitSignal,
     trap_frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
+    npe_action: u8,
 ) -> Option<ObjectRef> {
     match signal {
         ImplicitSignal::Aioobe { index, length } => {
@@ -3292,11 +3327,30 @@ fn materialize_implicit_signal(
             Some(exc)
         }
         ImplicitSignal::Npe => {
+            // JEP 358, on the door the interpreter's drain does not serve.
+            //
+            // This arm passed `None` and so produced `getMessage() == null` for
+            // every null dereference CAUGHT by a compiled method's own handler
+            // — `probes/L2JitNpeProbe.java`'s `caughtHere` shape, where the
+            // interpreter and `java -XX:-OmitStackTraceInFastThrow` both name
+            // the field. It is the same
+            // defect as the drain's and it is fixed from the same place, so the
+            // two cannot answer differently: `jit_npe_message` rebuilds the
+            // message from the trapping method's bytecode, using the very
+            // snapshot this function is about to attach.
+            //
+            // Built BEFORE `attach_snapshotted_trap_frames`, which consumes the
+            // snapshot.
+            let message = crate::runtime::interpreter::jit_npe_message::jit_npe_message(
+                vm,
+                trap_frames.as_deref(),
+                npe_action,
+            );
             let exc = crate::runtime::exceptions::create_exception_object(
                 vm,
                 thread,
                 "java/lang/NullPointerException",
-                None,
+                message.as_deref(),
             )
             .ok()?;
             // The frames the helper snapshotted at the trap. Without this the
@@ -3805,7 +3859,15 @@ unsafe fn route_implicit_exc_through_callee(
         } else {
             None
         };
-        let exc = materialize_implicit_signal(vm, thread, implicit, trap_frames);
+        // The action code is PEEKED, not taken: this door drained the flag
+        // only, and the drain that eventually services this NPE reads the same
+        // cell.
+        let npe_action = peek_jit_pending_npe_action();
+        // Cloned for the discard path below. A snapshot is a handful of small
+        // structs and this is the cold exception path; the alternative is
+        // materialising the throwable twice to find out whether it is needed.
+        let unused_frames = trap_frames.clone();
+        let exc = materialize_implicit_signal(vm, thread, implicit, trap_frames, npe_action);
         if let Some(exc) = exc {
             if let Ok(v) = try_run_callee_handler(
                 vm,
@@ -3819,6 +3881,15 @@ unsafe fn route_implicit_exc_through_callee(
                 return v;
             }
         }
+        // The callee's table did not take it, so the throwable built above is
+        // DISCARDED and the caller-side drain will build another from the flag
+        // `restash_and_return` is about to put back. Everything the discarded
+        // one consumed has to go back with it — above all the compiled-frame
+        // snapshot, which `materialize_implicit_signal` moved out. Without this
+        // the second throwable is built from a bare flag and names only the
+        // frames the interpreter still holds: `len=1 [main]` where HotSpot
+        // reads five.
+        restash_jit_pending_trap_frames(unused_frames);
     }
     restash_and_return()
 }
@@ -4076,11 +4147,16 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
             // the arithmetic arm always existed; sharing the table is what stops
             // the two from disagreeing about the SET again. See
             // [`ImplicitSignal`].
+            // CLONED, not taken: the restash at the end of this function puts
+            // the snapshot back when nothing here consumes the throwable, and
+            // `take` left it with `None` to put back. Same defect and same fix
+            // as the sibling door's.
             let implicit = materialize_implicit_signal(
                 vm,
                 thread,
                 implicit_signal_of(signals.aioobe, signals.npe, signals.arithmetic),
-                signals.trap_frames.take(),
+                signals.trap_frames.clone(),
+                signals.npe_action,
             );
             if let Some(exc) = implicit {
                 if let Ok(v) = try_run_callee_handler(
@@ -4596,8 +4672,24 @@ unsafe fn decode_dispatch_values_into(
     receiver: Option<Option<ObjectRef>>,
     values: &mut JitDecodedArgs,
 ) {
+    decode_dispatch_values_into_shaped(vm, info, args_slice, receiver, None, values)
+}
+
+/// [`decode_dispatch_values_into`] for a caller holding the site's parameter
+/// tags already — see [`NativeSiteDescriptor`]. `params` is `None` for a
+/// caller that has none, and then the descriptor is parsed exactly as before.
+#[inline]
+unsafe fn decode_dispatch_values_into_shaped(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+    args_slice: &[i64],
+    receiver: Option<Option<ObjectRef>>,
+    params: Option<&[u8]>,
+    values: &mut JitDecodedArgs,
+) {
     values.clear();
     let mut desc_iter = DescriptorParamIter::new(info.descriptor);
+    let mut param_index = 0usize;
 
     if info.invoke_kind != 3 {
         if !args_slice.is_empty() {
@@ -4631,7 +4723,15 @@ unsafe fn decode_dispatch_values_into(
 
     let start_idx = if info.invoke_kind != 3 { 1 } else { 0 };
     for &raw in &args_slice[start_idx..] {
-        let val = match desc_iter.next() {
+        let tag = match params {
+            Some(tags) => {
+                let tag = tags.get(param_index).copied();
+                param_index += 1;
+                tag
+            }
+            None => desc_iter.next(),
+        };
+        let val = match tag {
             Some(b'I') | Some(b'B') | Some(b'C') | Some(b'S') | Some(b'Z') => {
                 Value::Int(raw as i32)
             }
@@ -8927,17 +9027,13 @@ fn dump_getfield_guard_failure(obj_ptr: i64) {
 /// Index: 0 = `jit_getfield_impl`, 1 = `try_jit_site_cached_native_dispatch`,
 /// 2 = `decode_dispatch_values_into`, 3 = `jit_invoke_dispatch`,
 /// 4 = `jit_checkcast`, 5 = `jit_instanceof`, 6 = everything else.
-pub static MEMBERSHIP_WALK_BY_SITE: [std::sync::atomic::AtomicU64; 7] = [
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-];
-
-/// Names for [`MEMBERSHIP_WALK_BY_SITE`], index-parallel.
+///
+/// The counters themselves live per-thread in [`JitCounterBlock`] — this is
+/// only the naming. They used to be one process-global `AtomicU64` array and a
+/// `fetch_add` per walk, which `jit_native_dispatch_profile` priced at 4-5 ns
+/// on a path that also does the ~3 ns walk being counted.
+///
+/// Index-parallel with [`JitCounterBlock::membership_walk`].
 pub const MEMBERSHIP_WALK_SITE_NAMES: [&str; 7] = [
     "getfield",
     "native-dispatch-cached",
@@ -8948,20 +9044,180 @@ pub const MEMBERSHIP_WALK_SITE_NAMES: [&str; 7] = [
     "other",
 ];
 
+/// One thread's tallies for the always-on JIT dispatch counters.
+///
+/// # Why these are not `fetch_add` on a process-global any more
+///
+/// Three of them fire on every site-cached native dispatch from compiled code
+/// — the membership-walk site counter, the leaf/non-leaf hit counter, and the
+/// registry's per-slot `record_invocation`. Each was a `lock xadd`, which on
+/// x86 is a full barrier rather than a store, and
+/// `jit_native_dispatch_profile` prices them at 4-5 ns EACH and 7-10 ns for the
+/// pair-plus-one a dispatch actually pays — against a ~50 ns dispatch. That is
+/// a diagnostic costing more than several of the things it is used to measure.
+///
+/// The fix keeps every count EXACT rather than gating or sampling. Each thread
+/// owns its own block and is the only writer; it increments with a relaxed
+/// load-add-store, which is an ordinary store with no lock prefix. Readers walk
+/// [`JIT_COUNTER_BLOCKS`] and sum. The fields stay atomic only so that a reader
+/// on another thread is not a data race — no reader needs a consistent instant
+/// across counters, and none of them ever did.
+///
+/// Blocks are never removed: a thread that exits leaves its counts behind,
+/// which is exactly what a whole-run census wants.
+#[derive(Default)]
+struct JitCounterBlock {
+    membership_walk: [std::sync::atomic::AtomicU64; MEMBERSHIP_WALK_SITE_NAMES.len()],
+    leaf_native_hits: std::sync::atomic::AtomicU64,
+    site_cached_native_hits: std::sync::atomic::AtomicU64,
+}
+
+impl JitCounterBlock {
+    /// This thread's own +1. Sound only from the owning thread — see the type
+    /// doc for why that is the whole point.
+    #[inline]
+    fn bump(counter: &std::sync::atomic::AtomicU64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        counter.store(counter.load(Relaxed).wrapping_add(1), Relaxed);
+    }
+}
+
+/// Every thread's block, for the readers. Touched once per thread, on the
+/// thread's first counted event.
+static JIT_COUNTER_BLOCKS: std::sync::Mutex<Vec<std::sync::Arc<JitCounterBlock>>> =
+    std::sync::Mutex::new(Vec::new());
+
+thread_local! {
+    /// This thread's block. The `Arc` is cloned into [`JIT_COUNTER_BLOCKS`]
+    /// once, at creation, so the global mutex is never touched again.
+    static JIT_COUNTERS: std::sync::Arc<JitCounterBlock> = {
+        let block = std::sync::Arc::new(JitCounterBlock::default());
+        if let Ok(mut blocks) = JIT_COUNTER_BLOCKS.lock() {
+            blocks.push(std::sync::Arc::clone(&block));
+        }
+        block
+    };
+}
+
+#[cfg(test)]
+mod jit_counter_block_tests {
+    use super::*;
+
+    /// The tallies moved off process-global `fetch_add` and into per-thread
+    /// blocks to stop paying a `lock xadd` per dispatch. The whole claim is
+    /// that they stayed EXACT while doing it, so assert exactly that: every
+    /// increment from every thread, including threads that have since exited,
+    /// must be visible to the reader.
+    ///
+    /// Asserted on a DELTA rather than an absolute, because these are
+    /// process-global counters and the rest of this binary's tests dispatch
+    /// natives of their own.
+    #[test]
+    fn every_thread_s_increments_survive_and_are_summed() {
+        const THREADS: usize = 4;
+        const PER_THREAD: u64 = 10_000;
+
+        let before_walks = membership_walks_by_site()
+            .into_iter()
+            .find(|(n, _)| *n == MEMBERSHIP_WALK_SITE_NAMES[1])
+            .map(|(_, v)| v)
+            .unwrap_or(0);
+        let before_leaf = leaf_native_hit_count();
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..PER_THREAD {
+                        note_membership_walk(1);
+                        note_leaf_native_hit();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker panicked");
+        }
+        // Every worker has EXITED by now. Its block is still registered, which
+        // is what a whole-run census needs.
+        let after_walks = membership_walks_by_site()
+            .into_iter()
+            .find(|(n, _)| *n == MEMBERSHIP_WALK_SITE_NAMES[1])
+            .map(|(_, v)| v)
+            .unwrap_or(0);
+        let after_leaf = leaf_native_hit_count();
+
+        assert_eq!(
+            after_walks - before_walks,
+            PER_THREAD * THREADS as u64,
+            "membership-walk tally lost increments across threads"
+        );
+        assert_eq!(
+            after_leaf - before_leaf,
+            PER_THREAD * THREADS as u64,
+            "leaf-hit tally lost increments across threads"
+        );
+    }
+
+    /// A site index past the end of the block is ignored, exactly as the
+    /// `MEMBERSHIP_WALK_BY_SITE.get(site)` it replaced ignored it — this is
+    /// the arm that kept an out-of-range site from panicking a release build.
+    #[test]
+    fn an_out_of_range_site_is_ignored_rather_than_panicking() {
+        let before = leaf_native_hit_count();
+        note_membership_walk(MEMBERSHIP_WALK_SITE_NAMES.len());
+        note_membership_walk(usize::MAX);
+        assert_eq!(
+            leaf_native_hit_count(),
+            before,
+            "an out-of-range site must not land on a neighbouring counter"
+        );
+    }
+
+    /// Every name has a counter behind it. The two arrays are index-parallel
+    /// by contract and nothing else checks it now that the counters live in a
+    /// struct rather than beside the names.
+    #[test]
+    fn the_block_has_one_counter_per_site_name() {
+        let block = JitCounterBlock::default();
+        assert_eq!(
+            block.membership_walk.len(),
+            MEMBERSHIP_WALK_SITE_NAMES.len(),
+            "site names and per-thread counters must stay index-parallel"
+        );
+    }
+}
+
+/// Sum one field across every thread's block.
+fn jit_counter_total(pick: impl Fn(&JitCounterBlock) -> u64) -> u64 {
+    match JIT_COUNTER_BLOCKS.lock() {
+        Ok(blocks) => blocks.iter().map(|b| pick(b)).sum(),
+        Err(poisoned) => poisoned.into_inner().iter().map(|b| pick(b)).sum(),
+    }
+}
+
 /// Record one membership walk at `site`.
 #[inline]
 pub fn note_membership_walk(site: usize) {
-    if let Some(c) = MEMBERSHIP_WALK_BY_SITE.get(site) {
-        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
+    JIT_COUNTERS.with(|block| {
+        if let Some(c) = block.membership_walk.get(site) {
+            JitCounterBlock::bump(c);
+        }
+    });
 }
 
 /// `(name, count)` for every site that walked at least once.
 pub fn membership_walks_by_site() -> Vec<(&'static str, u64)> {
     MEMBERSHIP_WALK_SITE_NAMES
         .iter()
-        .zip(MEMBERSHIP_WALK_BY_SITE.iter())
-        .map(|(n, c)| (*n, c.load(std::sync::atomic::Ordering::Relaxed)))
+        .enumerate()
+        .map(|(i, n)| {
+            (
+                *n,
+                jit_counter_total(|b| {
+                    b.membership_walk[i].load(std::sync::atomic::Ordering::Relaxed)
+                }),
+            )
+        })
         .filter(|(_, v)| *v > 0)
         .collect()
 }
@@ -8980,8 +9236,22 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
     // payload of whatever `Value` variant the slot holds, and a reference field
     // punned to a primitive becomes a wild pointer.
     let expect_ref = raw & cratonvm_jit_api::GETFIELD_EXPECT_REFERENCE != 0;
+    // The NPE trap-SITE key, so a null receiver here can carry JEP 358's
+    // message out. This helper has the receiver (null) and the slot index and
+    // neither names the field or the bci; the emitter knows both and recorded
+    // them under this key. `0` = the site was not described (the IR tier, the
+    // no-metadata arm, or the feature switched off) and yields the historical
+    // unmessaged NPE.
+    let npe_site = cratonvm_jit_api::getfield_npe_site_of(field_index);
     let field_index = cratonvm_jit_api::getfield_index_of(field_index);
-    jit_getfield_impl(vm_ptr, obj_ptr, field_index, !proven_oop, expect_ref)
+    jit_getfield_impl(
+        vm_ptr,
+        obj_ptr,
+        field_index,
+        !proven_oop,
+        expect_ref,
+        npe_site,
+    )
 }
 
 /// Reference loads whose slot did not hold a reference, degraded to null by
@@ -9129,6 +9399,7 @@ unsafe fn jit_getfield_impl(
     field_index: i64,
     validate_membership: bool,
     expect_ref: bool,
+    npe_site: u32,
 ) -> i64 {
     // ENGAGEMENT COUNTER for the guarded inline `getfield` fast path.
     //
@@ -9179,7 +9450,15 @@ unsafe fn jit_getfield_impl(
         // Flag the pending NPE (drained on every JIT method return — see
         // `take_jit_pending_npe` in runtime/interpreter.rs) and return the
         // `i64::MIN` deopt sentinel, mirroring `jit_arraylength`.
-        set_jit_pending_npe();
+        //
+        // `npe_site` names the trapping `getfield` so the drain can rebuild
+        // JEP 358's message from the bytecode there. Without it this NPE
+        // reaches the caller with `getMessage() == null` — the hot half of
+        // the-helpful-npe-message-is-lost-in-compiled-code-FIXED-20260911.
+        set_jit_pending_npe_action_at(
+            crate::runtime::exceptions::helpful_npe::jit_action::NONE,
+            npe_site,
+        );
         return i64::MIN;
     }
     let vm = &*(vm_ptr as *const SharedVm);
@@ -9187,6 +9466,10 @@ unsafe fn jit_getfield_impl(
         note_membership_walk(0);
         vm.mem.heap.is_object_address(obj_ptr as usize).is_none()
     } {
+        // A receiver that is plausible but not a live object is a MISCOMPILE,
+        // not a Java-level null, so it deliberately does NOT claim the trap
+        // site: the bci is right but the message ("because <expr> is null")
+        // would assert something about the program that is not true.
         set_jit_pending_npe();
         return i64::MIN;
     }
@@ -12792,11 +13075,15 @@ fn admit_jit_fast_native_resolved(
 /// showed it. A JIT-side path has one extra way to be silently inert — the
 /// site cache can resolve to `None` and cache the refusal forever — so the
 /// number this prints is the acceptance criterion, not the ns/op.
-static LEAF_NATIVE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// Leaf-native dispatches served from compiled code this run.
 pub fn leaf_native_hit_count() -> u64 {
-    LEAF_NATIVE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    jit_counter_total(|b| b.leaf_native_hits.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// This thread's +1 for a leaf dispatch. See [`JitCounterBlock`].
+#[inline]
+fn note_leaf_native_hit() {
+    JIT_COUNTERS.with(|b| JitCounterBlock::bump(&b.leaf_native_hits));
 }
 
 /// Site-cached NON-leaf native dispatches from compiled code — the ones that
@@ -12806,7 +13093,12 @@ pub fn leaf_native_hit_count() -> u64 {
 /// questions and have different expected magnitudes: this is every registered
 /// native a compiled method calls, whereas the leaf count is only the audited
 /// accessor set.
-static SITE_CACHED_NATIVE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// This thread's +1 for a non-leaf site-cached dispatch. See
+/// [`JitCounterBlock`].
+#[inline]
+fn note_site_cached_native_hit() {
+    JIT_COUNTERS.with(|b| JitCounterBlock::bump(&b.site_cached_native_hits));
+}
 
 /// Is the per-call-site native fast path for compiled code enabled?
 ///
@@ -12853,7 +13145,10 @@ pub(crate) fn native_site_cache_enabled() -> bool {
 
 /// Non-leaf natives dispatched from a resolved call site this run.
 pub fn site_cached_native_hit_count() -> u64 {
-    SITE_CACHED_NATIVE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    jit_counter_total(|b| {
+        b.site_cached_native_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    })
 }
 
 /// Call sites `resolve_native_site` declined, and why.
@@ -13356,6 +13651,10 @@ fn resolve_native_site(
         native_id,
         receiver_class_id: guard,
         poly: poly_descriptor.is_some(),
+        // Decoded HERE, on the one cold path that builds an entry, so the
+        // dispatch never parses this descriptor again. See
+        // `NativeSiteDescriptor`.
+        desc: NativeSiteDescriptor::decode(info.descriptor),
     })
 }
 
@@ -13692,6 +13991,72 @@ struct NativeSiteCache {
     /// every other entry uses — would hand a boxed `Integer` back into an
     /// `int` return slot.
     poly: bool,
+    /// This site's descriptor, decoded once — see [`NativeSiteDescriptor`].
+    desc: NativeSiteDescriptor,
+}
+
+/// A call site's descriptor, decoded once and carried on the cache entry the
+/// dispatch already probes.
+///
+/// A site-cached native dispatch used to parse `info.descriptor` twice per
+/// call: `decode_dispatch_values_into` walked it to type each argument, and
+/// `coerce_native_return` scanned it again for the return tag. Measured on
+/// this file's `jit_native_dispatch_profile`, that argument decode cost
+/// 12.4-14.7 ns for a receiver-plus-one-object site against 9.5-11.9 ns with
+/// the tags already in hand.
+///
+/// It rides on [`NativeSiteCache`] rather than in a memo of its own because
+/// that entry is already fetched — the probe is 0.8 ns and is paid whether or
+/// not this is here. A separate `JitSiteKey`-keyed map was tried first and
+/// measured 14 ns per lookup, i.e. more than the parsing it removed.
+///
+/// Validity needs no argument beyond the one the entry already carries: the
+/// descriptor belongs to the `JitInvokeInfo` this entry was resolved against,
+/// and every path that can invalidate the entry (registry generation, receiver
+/// class, class redefinition, the site-memo flush on a JIT generation change)
+/// invalidates the decode with it.
+#[derive(Clone, Copy)]
+struct NativeSiteDescriptor {
+    /// One descriptor tag per PARAMETER, receiver excluded.
+    params: [u8; INLINE_JIT_NATIVE_ARGS],
+    /// Parameters decoded into `params`, or `u8::MAX` when the site declares
+    /// more than `INLINE_JIT_NATIVE_ARGS` of them — then `params` is unusable
+    /// and the caller parses the descriptor exactly as before.
+    params_len: u8,
+    /// What `cratonvm_jit::return_type` answers for this descriptor.
+    ret: u8,
+}
+
+impl NativeSiteDescriptor {
+    fn decode(descriptor: &str) -> Self {
+        let mut params = [0u8; INLINE_JIT_NATIVE_ARGS];
+        let mut count = 0usize;
+        for tag in DescriptorParamIter::new(descriptor) {
+            if count < INLINE_JIT_NATIVE_ARGS {
+                params[count] = tag;
+            }
+            count += 1;
+        }
+        Self {
+            params,
+            params_len: if count > INLINE_JIT_NATIVE_ARGS {
+                u8::MAX
+            } else {
+                count as u8
+            },
+            ret: cratonvm_jit::return_type(descriptor),
+        }
+    }
+
+    /// The decoded tags, or `None` for a site with more parameters than this
+    /// can hold.
+    fn params(&self) -> Option<&[u8]> {
+        if self.params_len == u8::MAX {
+            None
+        } else {
+            Some(&self.params[..self.params_len as usize])
+        }
+    }
 }
 
 // Thread-local map from [`JitSiteKey`] -> cached JIT entry.
@@ -15448,7 +15813,17 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                 // normally instead of throwing, so `() -> nullRef.foo()` ran
                 // as a no-op under the JIT (the bug only reproduced JIT-on).
                 Value::Object(None) => {
-                    set_jit_pending_npe();
+                    // `INVOKE_RECEIVER` names the opcode family that trapped
+                    // rather than a message: the JEP 358 action half here is
+                    // `Cannot invoke "Owner.name(sig)"`, which only the call
+                    // site's bytecode knows. This helper is called AT a
+                    // published safepoint, so the frame's safepoint-id slot
+                    // holds this invoke's bci, and the code lets
+                    // `runtime::interpreter::jit_npe_message` corroborate that
+                    // bci before reading the opcode there.
+                    set_jit_pending_npe_action(
+                        crate::runtime::exceptions::helpful_npe::jit_action::INVOKE_RECEIVER,
+                    );
                     return i64::MIN;
                 }
                 // A non-object receiver slot is a miscompile, not a legitimate
@@ -16461,7 +16836,7 @@ unsafe fn try_jit_site_cached_native_dispatch(
         // it does not exist yet, fall through: the ordinary dispatcher runs
         // `current_thread_object`'s allocating slow path that builds it.
         let obj = thread.java_thread_obj?;
-        LEAF_NATIVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        note_leaf_native_hit();
         count_jit_native_dispatch(vm, entry.native_id);
         // Object-return handoff root, same contract as every other JIT native
         // fast path (see `jit_integer_value_of_direct`).
@@ -16474,7 +16849,7 @@ unsafe fn try_jit_site_cached_native_dispatch(
     // `try_varhandle_instance_field_read`.
     if entry.poly {
         if let Some(bits) = try_varhandle_instance_field_read(vm, info, args_slice, thread) {
-            SITE_CACHED_NATIVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            note_site_cached_native_hit();
             VARHANDLE_FIELD_READ_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             count_jit_native_dispatch(vm, entry.native_id);
             return Some(bits);
@@ -16484,7 +16859,7 @@ unsafe fn try_jit_site_cached_native_dispatch(
         // See `try_varhandle_instance_field_cas`.
         if varhandle_cas_funnel_fast_enabled() {
             if let Some(bits) = try_varhandle_instance_field_cas(vm, info, args_slice) {
-                SITE_CACHED_NATIVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                note_site_cached_native_hit();
                 VARHANDLE_FIELD_CAS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 count_jit_native_dispatch(vm, entry.native_id);
                 return Some(bits);
@@ -16498,11 +16873,18 @@ unsafe fn try_jit_site_cached_native_dispatch(
     // nothing to do (`jit_native_dispatch_profile`). This is the buffer the
     // decode fills in place.
     let mut values = JitDecodedArgs::new();
-    decode_dispatch_values_into(vm, info, args_slice, receiver.map(Some), &mut values);
+    decode_dispatch_values_into_shaped(
+        vm,
+        info,
+        args_slice,
+        receiver.map(Some),
+        entry.desc.params(),
+        &mut values,
+    );
     if entry.leaf {
-        LEAF_NATIVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        note_leaf_native_hit();
     } else {
-        SITE_CACHED_NATIVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        note_site_cached_native_hit();
     }
     count_jit_native_dispatch(vm, entry.native_id);
     // `decode_dispatch_values` heap-validated every object argument, which is
@@ -16530,11 +16912,11 @@ unsafe fn try_jit_site_cached_native_dispatch(
                 info.descriptor,
                 info.method_name,
             ) {
-                Ok(unboxed) => crate::vm::coerce_native_return(unboxed, info.descriptor),
+                Ok(unboxed) => crate::vm::coerce_native_return_typed(unboxed, entry.desc.ret),
                 Err(error) => return Some(handle_jit_dispatch_error(vm, thread, error, info)),
             }
         }
-        Ok(value) => crate::vm::coerce_native_return(value, info.descriptor),
+        Ok(value) => crate::vm::coerce_native_return_typed(value, entry.desc.ret),
         Err(error) => return Some(handle_jit_dispatch_error(vm, thread, error, info)),
     };
     Some(match result {
@@ -18541,7 +18923,15 @@ pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64
     let census = crate::runtime::interp_census::direct_binds_enabled();
     let raw = receiver as u64;
     if raw == 0 {
-        set_jit_pending_npe();
+        // A null receiver at an `invokevirtual` this intrinsic replaced, so
+        // the JEP-358 action is the one the generic dispatch helper records:
+        // `INVOKE_RECEIVER` names the opcode family that trapped and lets
+        // `runtime::interpreter::jit_npe_message` corroborate the bci in this
+        // frame's safepoint-id slot. A direct-bound intrinsic must not answer
+        // `getMessage()` differently from the dispatch it stands in for.
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::INVOKE_RECEIVER,
+        );
         return i64::MIN;
     }
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
@@ -18800,7 +19190,15 @@ pub unsafe extern "C" fn jit_long_long_value_direct(vm_ptr: i64, receiver: i64) 
     let census = crate::runtime::interp_census::direct_binds_enabled();
     let raw = receiver as u64;
     if raw == 0 {
-        set_jit_pending_npe();
+        // A null receiver at an `invokevirtual` this intrinsic replaced, so
+        // the JEP-358 action is the one the generic dispatch helper records:
+        // `INVOKE_RECEIVER` names the opcode family that trapped and lets
+        // `runtime::interpreter::jit_npe_message` corroborate the bci in this
+        // frame's safepoint-id slot. A direct-bound intrinsic must not answer
+        // `getMessage()` differently from the dispatch it stands in for.
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::INVOKE_RECEIVER,
+        );
         return i64::MIN;
     }
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
@@ -19069,7 +19467,15 @@ pub unsafe extern "C" fn jit_dbb_put_byte_direct(
 ) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     if receiver == 0 {
-        set_jit_pending_npe();
+        // A null receiver at an `invokevirtual` this intrinsic replaced, so
+        // the JEP-358 action is the one the generic dispatch helper records:
+        // `INVOKE_RECEIVER` names the opcode family that trapped and lets
+        // `runtime::interpreter::jit_npe_message` corroborate the bci in this
+        // frame's safepoint-id slot. A direct-bound intrinsic must not answer
+        // `getMessage()` differently from the dispatch it stands in for.
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::INVOKE_RECEIVER,
+        );
         return i64::MIN;
     }
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
@@ -19120,7 +19526,15 @@ pub unsafe extern "C" fn jit_dbb_put_byte_direct(
 pub unsafe extern "C" fn jit_dbb_get_byte_direct(vm_ptr: i64, receiver: i64, index: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     if receiver == 0 {
-        set_jit_pending_npe();
+        // A null receiver at an `invokevirtual` this intrinsic replaced, so
+        // the JEP-358 action is the one the generic dispatch helper records:
+        // `INVOKE_RECEIVER` names the opcode family that trapped and lets
+        // `runtime::interpreter::jit_npe_message` corroborate the bci in this
+        // frame's safepoint-id slot. A direct-bound intrinsic must not answer
+        // `getMessage()` differently from the dispatch it stands in for.
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::INVOKE_RECEIVER,
+        );
         return i64::MIN;
     }
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
@@ -19185,7 +19599,15 @@ static MD_UPDATE_BYTE_INFO: JitInvokeInfo = JitInvokeInfo {
 pub unsafe extern "C" fn jit_md_update_byte_direct(vm_ptr: i64, receiver: i64, value: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     if receiver == 0 {
-        set_jit_pending_npe();
+        // A null receiver at an `invokevirtual` this intrinsic replaced, so
+        // the JEP-358 action is the one the generic dispatch helper records:
+        // `INVOKE_RECEIVER` names the opcode family that trapped and lets
+        // `runtime::interpreter::jit_npe_message` corroborate the bci in this
+        // frame's safepoint-id slot. A direct-bound intrinsic must not answer
+        // `getMessage()` differently from the dispatch it stands in for.
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::INVOKE_RECEIVER,
+        );
         return i64::MIN;
     }
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
@@ -19878,7 +20300,15 @@ pub unsafe extern "C" fn jit_hashmap_get_direct(vm_ptr: i64, receiver: i64, key:
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
     let vm = &*(vm_ptr as *const SharedVm);
     if receiver == 0 {
-        set_jit_pending_npe();
+        // A null receiver at an `invokevirtual` this intrinsic replaced, so
+        // the JEP-358 action is the one the generic dispatch helper records:
+        // `INVOKE_RECEIVER` names the opcode family that trapped and lets
+        // `runtime::interpreter::jit_npe_message` corroborate the bci in this
+        // frame's safepoint-id slot. A direct-bound intrinsic must not answer
+        // `getMessage()` differently from the dispatch it stands in for.
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::INVOKE_RECEIVER,
+        );
         return i64::MIN;
     }
     'fast: {
@@ -20135,7 +20565,15 @@ pub unsafe extern "C" fn jit_hashmap_put_direct(
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
     let vm = &*(vm_ptr as *const SharedVm);
     if receiver == 0 {
-        set_jit_pending_npe();
+        // A null receiver at an `invokevirtual` this intrinsic replaced, so
+        // the JEP-358 action is the one the generic dispatch helper records:
+        // `INVOKE_RECEIVER` names the opcode family that trapped and lets
+        // `runtime::interpreter::jit_npe_message` corroborate the bci in this
+        // frame's safepoint-id slot. A direct-bound intrinsic must not answer
+        // `getMessage()` differently from the dispatch it stands in for.
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::INVOKE_RECEIVER,
+        );
         return i64::MIN;
     }
     'fast: {
@@ -21653,7 +22091,17 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // i64::MIN sentinel so the interpreter's post-JIT drain builds the real
         // NPE and routes it through the method's exception table. Was `return
         // 0`, which silently swallowed a null-receiver call in hot JIT'd code.
-        set_jit_pending_npe();
+        //
+        // `INVOKE_RECEIVER`, and not the bare setter, for the reason the
+        // dispatch-helper twin gives: the code names the opcode family that
+        // trapped so `runtime::interpreter::jit_npe_message` can corroborate
+        // the bci it recovers from this frame's safepoint-id slot. The two
+        // doors must agree — a `getMessage()` that depended on whether the call
+        // site had warmed into a monomorphic inline cache would be its own
+        // wrong answer.
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::INVOKE_RECEIVER,
+        );
         return i64::MIN;
     }
     // Defensive: a receiver slot carrying tagged-long bits (low 3 bits set
@@ -25183,7 +25631,7 @@ mod tests {
         );
 
         // A caller that WILL dereference gets null.
-        let ref_arg = cratonvm_jit_api::getfield_index_arg(1, true, false) as i64;
+        let ref_arg = cratonvm_jit_api::getfield_index_arg(1, true, false, 0) as i64;
         let as_reference = unsafe { jit_getfield(vm_ptr, obj_ptr, ref_arg) };
         assert_eq!(
             as_reference,
@@ -25205,7 +25653,7 @@ mod tests {
             .mem
             .heap
             .set_field(obj, 0, Value::Object(Some(other)));
-        let arg0 = cratonvm_jit_api::getfield_index_arg(0, true, false) as i64;
+        let arg0 = cratonvm_jit_api::getfield_index_arg(0, true, false, 0) as i64;
         assert_eq!(
             unsafe { jit_getfield(vm_ptr, obj_ptr, arg0) },
             other.as_ptr() as i64,
@@ -25236,11 +25684,11 @@ mod tests {
     fn the_getfield_flag_bits_are_stripped_before_the_slot_index_is_used() {
         use cratonvm_jit_api::{
             getfield_index_arg, GETFIELD_EXPECT_REFERENCE, GETFIELD_FLAG_BITS,
-            GETFIELD_RECEIVER_PROVEN_OOP,
+            GETFIELD_NPE_SITE_MASK, GETFIELD_RECEIVER_PROVEN_OOP,
         };
         assert_eq!(
             GETFIELD_FLAG_BITS,
-            GETFIELD_EXPECT_REFERENCE | GETFIELD_RECEIVER_PROVEN_OOP,
+            GETFIELD_EXPECT_REFERENCE | GETFIELD_RECEIVER_PROVEN_OOP | GETFIELD_NPE_SITE_MASK,
             "every flag must be in the strip mask"
         );
         for (index, is_ref, proven) in [
@@ -25249,7 +25697,10 @@ mod tests {
             (7, true, true),
             (u16::MAX as u32, true, true),
         ] {
-            let arg = getfield_index_arg(index, is_ref, proven);
+            // A non-zero trap key on every row: it is the widest passenger and
+            // the newest, so a strip site that misses it turns the slot index
+            // into an astronomical one.
+            let arg = getfield_index_arg(index, is_ref, proven, 0x00ff_ffff);
             assert_eq!(
                 arg & !GETFIELD_FLAG_BITS,
                 index as u64,
@@ -27165,6 +27616,7 @@ mod jit_native_dispatch_profile {
                         callback: cb,
                         native_id: None,
                         receiver_class_id: Some(0),
+                        desc: NativeSiteDescriptor::decode(GET_INFO.descriptor),
                         // These rungs price the ORDINARY native dispatch. A
                         // signature-polymorphic entry takes a different tail
                         // (`try_varhandle_instance_field_read`), so setting
@@ -27327,6 +27779,39 @@ mod jit_native_dispatch_profile {
 
         rung("record_invocation() [no id]", || {
             count_jit_native_dispatch(&shared, None);
+        });
+        // The three DIAGNOSTIC counters every site-cached native dispatch pays,
+        // priced separately because the rung above takes the `None` arm and so
+        // measures nothing. Each is a `lock xadd` on x86 — a full barrier, not
+        // a store — and a dispatch pays all three.
+        rung("counter: note_membership_walk(1)", || {
+            note_membership_walk(1);
+        });
+        rung("counter: leaf-hit tally (per-thread block)", || {
+            note_leaf_native_hit();
+        });
+        {
+            let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+            registry.with_category(cratonvm_native_api::NativeKind::Bridge, |r| {
+                r.register("p/P", "m", "()V", noop_native);
+            });
+            let id = registry.resolve_id("p/P", "m", "()V");
+            rung("counter: record_invocation() [real id]", || {
+                if let Some(id) = id {
+                    registry.record_invocation(id);
+                }
+            });
+        }
+        rung("counter: all three, as one dispatch pays them", || {
+            note_membership_walk(1);
+            note_leaf_native_hit();
+            count_jit_native_dispatch(&shared, None);
+        });
+        rung("counter: both JIT-side tallies, one TLS access", || {
+            JIT_COUNTERS.with(|b| {
+                JitCounterBlock::bump(&b.membership_walk[1]);
+                JitCounterBlock::bump(&b.leaf_native_hits);
+            });
         });
         rung("coerce_native_return(Int, \"()I\")", || {
             black_box(crate::vm::coerce_native_return(

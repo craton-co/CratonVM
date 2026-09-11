@@ -27,6 +27,22 @@
 //! receive a non-`NONE` action would otherwise silently drop it — and it is not
 //! what makes this test pass. This file does not pretend otherwise.
 //!
+//! # What the drains build NOW, and why this file still measures what it did
+//!
+//! Since 2026-09-11 they no longer build the action-only string either: they go
+//! through `runtime::interpreter::jit_npe_message`, which rebuilds the FULL
+//! message from the trapping method's own bytecode. That closed
+//! `the-helpful-npe-message-is-lost-in-compiled-code-FIXED-20260911.md`, whose array
+//! rows were the ones this apparatus does serve — the shapes there are hot on
+//! the SAME path every call, so they take the null check rather than the
+//! unreached-code trap the fixture below takes on its first null.
+//!
+//! The fixture here is unchanged and so is its reading: `warm != 0` on every
+//! warm-up call means the null arm is never executed before it is asked for, so
+//! it is an uncommon trap that fires and the interpreter re-executes. The
+//! sibling file `jit_npe_message_hot_equals_cold.rs` is the one that exercises
+//! the drains, and it exists because this one structurally cannot.
+//!
 //! # The oracle is real HotSpot
 //!
 //! The expected strings are what `java` prints for THIS fixture after 20 000

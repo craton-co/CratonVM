@@ -18380,6 +18380,29 @@ fn hs_set_backing_map(ctx: &mut dyn NativeContext, set: ObjectRef, backing: Obje
 
 fn hs_backing_map(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
     let slot = hs_map_slot(ctx, this)?;
+    // BOUND THE SLOT AGAINST THE OBJECT, not against the class.
+    //
+    // For a [`SET_VIEW_CARRIERS`] entry [`hs_map_slot`] answers
+    // `class_num_total_fields` — a slot PAST the class's own declared fields,
+    // which only exists because [`alloc_set_view_carrier`] allocates the
+    // carrier wider than the class declares. A view the IMAGE'S OWN BYTECODE
+    // built is exactly as wide as it declares, so that slot is off the end of
+    // it, and `java/util/HashMap$EntrySet` declares one field:
+    //
+    // ```text
+    //   WARN zgc real: field index OOB index=1 num_slots=1 op="get"   (x10)
+    // ```
+    //
+    // Ten of those per `hashMap.entrySet().toArray()` on the 2026-09-11
+    // dial-armed trace, on a run that otherwise looks clean. The heap hands
+    // back a default for an out-of-range slot, so the read already ANSWERED
+    // `None` and this bound changes no caller's answer — it stops the VM
+    // reading a cell that is not the object's and saying so ten times. The
+    // shape is `has_byte_array_stream_layout`'s, one family over: ask the slot
+    // count before probing the layout.
+    if slot >= ctx.object_num_fields(this) {
+        return None;
+    }
     match ctx.get_field(this, slot) {
         Value::Object(Some(m)) => Some(m),
         _ => None,

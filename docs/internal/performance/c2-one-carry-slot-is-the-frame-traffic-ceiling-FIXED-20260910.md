@@ -402,16 +402,41 @@ scratch register instead of RCX — "a mechanical change to ~50 arms rather than
 design question". It is a change to ~50 arms for **0.9% of candidate windows**.
 Do not start it from this page.
 
-**The lever is operand POSITION: 82% of candidates.** The node two positions
-back is not the consumer's second operand, so the triple
-`[input1, input0, cons]` that both slots need was never formed.
-`ir_schedule::pair_single_use_operands` is what would form it, and it declines
-for reasons it already enumerates: the operand is used more than once, its op is
-not one `op_home_is_one_store_rax` certifies, it is in another block, or there
-is a node between it and the consumer that a deopt can arrive at. **Which of
-those four dominates is not yet counted** — the pairing pass has no census, and
-that is the next thing to build, not the next thing to fix. It is one counter
-per `continue` in a 60-line function.
+~~**The lever is operand POSITION: 82% of candidates.**~~ **BUILT, AND IT SAYS
+THE OPPOSITE — 2026-09-11.** The census this paragraph asks for exists
+(`ir_schedule::PairCensus`, one counter per `continue`, under an accounting
+identity) and has been run over this same probe set:
+
+> 188 probes, **34,289 pairing windows**: `multi_use` **78.3%**,
+> `producer_arm` **16.2%**, and the four buckets that mean POSITION — already
+> adjacent, in another block, a deopt in between, after the consumer — **3.8%
+> together**. The pass is not failing to place eligible operands; **94.5% of
+> them were never eligible**, and no scheduling change reaches them.
+>
+> The discrepancy is entirely the denominator, which is why both numbers are
+> right. This page's 82% is over windows where a consumer already takes its
+> first operand in RAX — the shape the second carry slot exists for. The pass's
+> census is over every `(consumer, operand)` pair, and only that one says what
+> the PASS could act on.
+>
+> **So: do not start work on `pair_single_use_operands` from the 82% figure.**
+> `producer_arm` is the row with something in it, and
+> [`c2-the-phi-copy-staging-register-20260911.md`](c2-the-phi-copy-staging-register-20260911.md)
+> §1 names the op to look at first.
+
+The claim as it was written, kept because a page that edits away its own
+prediction cannot be checked against the outcome:
+
+> The node two positions
+> back is not the consumer's second operand, so the triple
+> `[input1, input0, cons]` that both slots need was never formed.
+> `ir_schedule::pair_single_use_operands` is what would form it, and it declines
+> for reasons it already enumerates: the operand is used more than once, its op
+> is not one `op_home_is_one_store_rax` certifies, it is in another block, or
+> there is a node between it and the consumer that a deopt can arrive at.
+> **Which of those four dominates is not yet counted** — the pairing pass has no
+> census, and that is the next thing to build, not the next thing to fix. It is
+> one counter per `continue` in a 60-line function.
 
 **Still standing, unchanged: promote single-use values into caller-saved scratch
 registers.** They cannot repay a callee-saved register's prologue save, which is
