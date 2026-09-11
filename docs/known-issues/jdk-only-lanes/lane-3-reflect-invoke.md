@@ -623,9 +623,14 @@ from `77f9953b1`:
   (`SUITE=core`), all with `missing=0`;
 * gate set all five arms `rc=0`, `nb-default` re-run at 11 targets / 4285
   passed / 0 failed;
-* **52 distinct refused triples, 0 survivors** over all 132 kept reports, so
-  this lane's rows yield the slot to bytecode rather than falling through to an
-  older native.
+* **26 distinct refused triples for this lane, 0 with a survivor** (corrected
+  2026-09-11 — the earlier "52, 0 survivors" was one number for L0+L3 computed
+  with a broken key; the lane-0 page's §7.3 has the account). This lane's 26 is
+  identical on p19 and p20, and every one yields the slot to bytecode rather
+  than falling through to an older native.
+* Campaign-wide there ARE five refusals carrying a survivor, all
+  `java/util/logging/` with an `Intrinsic` winner — inert retirements, none of
+  them this lane's. §7.3 of the lane-0 page names them.
 
 The full account, including why the arms were re-run after `dev` brought 19
 JIT/C2 commits and why one run header reads a different revision, is in the

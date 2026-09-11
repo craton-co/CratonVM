@@ -496,15 +496,62 @@ isolated at 0.02–0.12s under no load. The re-run matters beyond the one test:
 `cargo test --tests` is fail-fast **across targets**, so that abort skipped 10
 of 11 targets and the first arm's count was a prefix, not a result.
 
-**Survivors: 52 distinct refused triples, 0 with a survivor**, taken as the
-union over all 132 kept `--jdk-only` reports. This is the check that separates
+**Survivors — and the first number here was wrong, twice over.** Corrected
+2026-09-11 against `p20`'s 133 kept reports:
+
+```text
+                        p19    p20
+all lanes              2271   2323     (+52 = L1's 50 new triples + L7's 2)
+L0 (this lane)           47     47
+L3                       26     26
+L0+L3                    73     73
+refusals with a SURVIVOR  5      5     <- campaign-wide, NOT zero
+```
+
+Two defects in my own instrument produced the earlier "52, 0 survivors":
+
+* **The report has no `name` field.** All 335,160 `synthetic-native-registered`
+  rows carry `method`; my script read `r.get("name")`, got `None`, and
+  collapsed every triple to `(class, None, descriptor)`. The undercount looked
+  entirely plausible — 52 against a real 73.
+* **`java/lang/Class` is a prefix of `java/lang/ClassLoader`**, so the filter
+  counted L7's rows as this lane's. That is the same trap §2 records about this
+  page's OWN ownership table, committed by the person who wrote the warning.
+  `ClassLoader.registerAsParallelCapable()Z` was the row that exposed it.
+
+The `+52` is a free consistency check: lane 1's waves 3-4 are 21 + 29 and lane
+7's table is 2, and the refusal set grew by exactly 52. L0's 47 and L3's 26 are
+unchanged across the two binaries, which is the invariant to want — neither
+lane's table moved in the merge.
+
+**`0 survivors` holds for L0 and L3, and does NOT hold campaign-wide.** The
+`survivor` field was read correctly all along, but only ever asked about this
+lane's prefixes. Asked of every lane, five refusals carry one:
+
+```text
+java/util/logging/Handler.getLevel      survivor intrinsic@phases_early.rs:22252
+java/util/logging/Handler.setLevel      survivor intrinsic@phases_early.rs:22235
+java/util/logging/LogRecord.getLevel    survivor intrinsic@phases_early.rs:22016
+java/util/logging/LogRecord.getMessage  survivor intrinsic@phases_early.rs:22022
+java/util/logging/LogRecord.getSequenceNumber
+                                        survivor intrinsic@phases_early.rs:22165
+```
+
+**These five are inert retirements, and the kind map already explained them.**
+Its header says of this exact family: *the retag fires only on an effective
+category of `Bridge`, and this registration's ambient category was `Intrinsic`*
+— so the table entry never re-tags the WINNING registration, the `Intrinsic`
+keeps serving, and strict mode runs it instead of the bytecode. They are also
+the same five triples as the five legitimate `intrinsic` rows in the baseline,
+which is why those rows are correct and must stay exempt from the 581.
+
+`java/util/logging/` is L1's prefix. Recorded here because this lane runs the
+check; the adjudication is L1's. This is the check that separates
 a retirement from a no-op: `register_inner` refuses a `SyntheticStub` without
 inserting it, but a refusal carrying a non-null `survivor` means an earlier
 registration still owns the slot and still serves, so strict mode runs that
 older native and every probe reads exactly as it did before. Zero survivors
-means all 52 yielded to bytecode. (A single report counts 73 refusal *events*
-over those 52 triples — several are refused at more than one ordinal, the same
-shape as the kind map's 21 rows for 19 triples.)
+means all 52 yielded to bytecode.
 
 What this does and does not settle: it answers the combination question the
 bullet above deferred, **for these six tables on this binary**. It is not a
