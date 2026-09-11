@@ -1287,6 +1287,7 @@ mod tests {
             ty,
             inputs: Inputs::from(inputs),
             bytecode_pc: None,
+            frame_snapshot: None,
         });
         id
     }

@@ -26,9 +26,15 @@
 #
 #   timeout   a FLOOR, not an absolute: the class runs with
 #             max(this, the run's --timeout/$TIMEOUT). `-` = no override.
-#   flags     extra CratonVM flags appended for this class only, before the
-#             @common.args argfile. Space-separated. Already-present flags are
-#             not duplicated. `-` = none.
+#   flags     extra CratonVM flags appended for this class only, AFTER the
+#             @common.args argfile — so a `-D` here beats the same `-D` in
+#             common.args (last one wins, on CratonVM and HotSpot alike).
+#             They used to be placed BEFORE the argfile, which silently made
+#             every `-D` entry a no-op; changed 2026-09-11 for JpaLargeBlobTest
+#             below, which needs common.args' per-test
+#             `-Djunit.jupiter.execution.timeout.default=120s` raised.
+#             Space-separated. Already-present flags are not duplicated.
+#             `-` = none.
 #
 # Verify the table is actually live before trusting a suite run:
 #     ./run-hib.sh overrides
@@ -122,3 +128,53 @@ org.hibernate.orm.test.sql.exec.SmokeTests	900	-
 # six-way shard run would produce) took 1452-1456s each. That is also where the
 # page's headline "1447s" came from.
 org.hibernate.orm.test.hql.ASTParserLoadingTest	3600	-
+
+# JpaLargeBlobTest — the first class to be killed by the PER-TEST cap rather
+# than the per-class one, and it needs both columns to survive.
+#
+# The body is one test method that hands H2 a `LobInputStream` and asks it to
+# store `LobEntity.BLOB_LENGTH` = 100,000,000 bytes. `available()` returns 1,
+# so `InputStream.read(byte[],int,int)`'s default implementation falls back to
+# one `read()` call per byte, and each of those 100 million calls executes
+# `new Random().nextInt()` — a fresh Random per byte. It is a pure
+# allocate-and-nanoTime loop, nothing to do with the database.
+#
+# MEASURED 2026-09-11, same box (32 cores), same common.args, ZGC, --Xmx 1500m,
+# fork-per-class, 3 runs per arm:
+#
+#   real HotSpot 25.0.3+9   ok=1   6.5s / 7.1s / 8.4s
+#   CratonVM (ZGC, c1c2)    ok=1   144s idle; 270s and 277s with one other
+#                                  CratonVM copy of the same class on the box
+#
+# ~18x, the same order as OffsetDateTimeTest/ZonedDateTimeTest/SmokeTests above,
+# so: slow, not hung.
+#
+# WHY THE FLAGS COLUMN IS NEEDED TOO. 144s is over common.args' per-test
+# `-Djunit.jupiter.execution.timeout.default=120s`, which is a JUnit-level cap
+# and is NOT raised by the timeout column. Left at 120s the run does not fail
+# fast either: JUnit's SAME_THREAD timeout only interrupts, the byte loop never
+# checks the flag, and the interrupted run then takes LONGER than the
+# uninterrupted one — 238s/270s/286s over 3 runs, ending in
+# `TimeoutException: jpaBlobStream(...) timed out after 120 seconds`. That is
+# the whole 2026-09-11 suite observation: at 6 shards x 2 JIT arms the same work
+# crossed the flat 300s wall cap first and was recorded HANG rc=124 with ms=0 in
+# BOTH arms. Verified as JUnit behaviour, not a CratonVM one: HotSpot with the
+# cap forced to 1s/3s behaves identically (runs to completion, 11.3s/11.6s vs
+# an 8s baseline, then reports the same TimeoutException).
+#
+# So the floor alone would convert HANG into FAIL, and the flag alone would
+# leave it HANG. 900s on both, matching the temporal/SmokeTests floors and
+# leaving room for the 12-way contention a full two-arm run produces.
+#
+# CORRECTS TWO DOCS. known-issues/hibernate/
+# jpalargeblobtest-per-native-call-floor-20260830.md and the retired
+# jpalargeblob-random-state-side-table-FIXED-20260830.md both say the 120s is
+# "`@Timeout(120)`, a METHOD-level JUnit annotation, which no runner property
+# widens". There is no `@Timeout` anywhere in JpaLargeBlobTest.java; the 120s is
+# common.args' `junit.jupiter.execution.timeout.default`, and raising it does
+# widen the budget (measured: the same run that reports TimeoutException at 120s
+# reports ok=1 at 900s). That wrong sentence is why this class had no override.
+# The throughput finding on that page stands — 2318 ns/byte there, ~1440 today
+# after 5903d40ca inlined Long.longValue/Integer.intValue — it is only the
+# "cannot be widened" claim that is false.
+org.hibernate.orm.test.lob.JpaLargeBlobTest	900	-Djunit.jupiter.execution.timeout.default=900s

@@ -4596,8 +4596,24 @@ unsafe fn decode_dispatch_values_into(
     receiver: Option<Option<ObjectRef>>,
     values: &mut JitDecodedArgs,
 ) {
+    decode_dispatch_values_into_shaped(vm, info, args_slice, receiver, None, values)
+}
+
+/// [`decode_dispatch_values_into`] for a caller holding the site's parameter
+/// tags already — see [`NativeSiteDescriptor`]. `params` is `None` for a
+/// caller that has none, and then the descriptor is parsed exactly as before.
+#[inline]
+unsafe fn decode_dispatch_values_into_shaped(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+    args_slice: &[i64],
+    receiver: Option<Option<ObjectRef>>,
+    params: Option<&[u8]>,
+    values: &mut JitDecodedArgs,
+) {
     values.clear();
     let mut desc_iter = DescriptorParamIter::new(info.descriptor);
+    let mut param_index = 0usize;
 
     if info.invoke_kind != 3 {
         if !args_slice.is_empty() {
@@ -4631,7 +4647,15 @@ unsafe fn decode_dispatch_values_into(
 
     let start_idx = if info.invoke_kind != 3 { 1 } else { 0 };
     for &raw in &args_slice[start_idx..] {
-        let val = match desc_iter.next() {
+        let tag = match params {
+            Some(tags) => {
+                let tag = tags.get(param_index).copied();
+                param_index += 1;
+                tag
+            }
+            None => desc_iter.next(),
+        };
+        let val = match tag {
             Some(b'I') | Some(b'B') | Some(b'C') | Some(b'S') | Some(b'Z') => {
                 Value::Int(raw as i32)
             }
@@ -8927,17 +8951,13 @@ fn dump_getfield_guard_failure(obj_ptr: i64) {
 /// Index: 0 = `jit_getfield_impl`, 1 = `try_jit_site_cached_native_dispatch`,
 /// 2 = `decode_dispatch_values_into`, 3 = `jit_invoke_dispatch`,
 /// 4 = `jit_checkcast`, 5 = `jit_instanceof`, 6 = everything else.
-pub static MEMBERSHIP_WALK_BY_SITE: [std::sync::atomic::AtomicU64; 7] = [
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-];
-
-/// Names for [`MEMBERSHIP_WALK_BY_SITE`], index-parallel.
+///
+/// The counters themselves live per-thread in [`JitCounterBlock`] — this is
+/// only the naming. They used to be one process-global `AtomicU64` array and a
+/// `fetch_add` per walk, which `jit_native_dispatch_profile` priced at 4-5 ns
+/// on a path that also does the ~3 ns walk being counted.
+///
+/// Index-parallel with [`JitCounterBlock::membership_walk`].
 pub const MEMBERSHIP_WALK_SITE_NAMES: [&str; 7] = [
     "getfield",
     "native-dispatch-cached",
@@ -8948,20 +8968,180 @@ pub const MEMBERSHIP_WALK_SITE_NAMES: [&str; 7] = [
     "other",
 ];
 
+/// One thread's tallies for the always-on JIT dispatch counters.
+///
+/// # Why these are not `fetch_add` on a process-global any more
+///
+/// Three of them fire on every site-cached native dispatch from compiled code
+/// — the membership-walk site counter, the leaf/non-leaf hit counter, and the
+/// registry's per-slot `record_invocation`. Each was a `lock xadd`, which on
+/// x86 is a full barrier rather than a store, and
+/// `jit_native_dispatch_profile` prices them at 4-5 ns EACH and 7-10 ns for the
+/// pair-plus-one a dispatch actually pays — against a ~50 ns dispatch. That is
+/// a diagnostic costing more than several of the things it is used to measure.
+///
+/// The fix keeps every count EXACT rather than gating or sampling. Each thread
+/// owns its own block and is the only writer; it increments with a relaxed
+/// load-add-store, which is an ordinary store with no lock prefix. Readers walk
+/// [`JIT_COUNTER_BLOCKS`] and sum. The fields stay atomic only so that a reader
+/// on another thread is not a data race — no reader needs a consistent instant
+/// across counters, and none of them ever did.
+///
+/// Blocks are never removed: a thread that exits leaves its counts behind,
+/// which is exactly what a whole-run census wants.
+#[derive(Default)]
+struct JitCounterBlock {
+    membership_walk: [std::sync::atomic::AtomicU64; MEMBERSHIP_WALK_SITE_NAMES.len()],
+    leaf_native_hits: std::sync::atomic::AtomicU64,
+    site_cached_native_hits: std::sync::atomic::AtomicU64,
+}
+
+impl JitCounterBlock {
+    /// This thread's own +1. Sound only from the owning thread — see the type
+    /// doc for why that is the whole point.
+    #[inline]
+    fn bump(counter: &std::sync::atomic::AtomicU64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        counter.store(counter.load(Relaxed).wrapping_add(1), Relaxed);
+    }
+}
+
+/// Every thread's block, for the readers. Touched once per thread, on the
+/// thread's first counted event.
+static JIT_COUNTER_BLOCKS: std::sync::Mutex<Vec<std::sync::Arc<JitCounterBlock>>> =
+    std::sync::Mutex::new(Vec::new());
+
+thread_local! {
+    /// This thread's block. The `Arc` is cloned into [`JIT_COUNTER_BLOCKS`]
+    /// once, at creation, so the global mutex is never touched again.
+    static JIT_COUNTERS: std::sync::Arc<JitCounterBlock> = {
+        let block = std::sync::Arc::new(JitCounterBlock::default());
+        if let Ok(mut blocks) = JIT_COUNTER_BLOCKS.lock() {
+            blocks.push(std::sync::Arc::clone(&block));
+        }
+        block
+    };
+}
+
+#[cfg(test)]
+mod jit_counter_block_tests {
+    use super::*;
+
+    /// The tallies moved off process-global `fetch_add` and into per-thread
+    /// blocks to stop paying a `lock xadd` per dispatch. The whole claim is
+    /// that they stayed EXACT while doing it, so assert exactly that: every
+    /// increment from every thread, including threads that have since exited,
+    /// must be visible to the reader.
+    ///
+    /// Asserted on a DELTA rather than an absolute, because these are
+    /// process-global counters and the rest of this binary's tests dispatch
+    /// natives of their own.
+    #[test]
+    fn every_thread_s_increments_survive_and_are_summed() {
+        const THREADS: usize = 4;
+        const PER_THREAD: u64 = 10_000;
+
+        let before_walks = membership_walks_by_site()
+            .into_iter()
+            .find(|(n, _)| *n == MEMBERSHIP_WALK_SITE_NAMES[1])
+            .map(|(_, v)| v)
+            .unwrap_or(0);
+        let before_leaf = leaf_native_hit_count();
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..PER_THREAD {
+                        note_membership_walk(1);
+                        note_leaf_native_hit();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker panicked");
+        }
+        // Every worker has EXITED by now. Its block is still registered, which
+        // is what a whole-run census needs.
+        let after_walks = membership_walks_by_site()
+            .into_iter()
+            .find(|(n, _)| *n == MEMBERSHIP_WALK_SITE_NAMES[1])
+            .map(|(_, v)| v)
+            .unwrap_or(0);
+        let after_leaf = leaf_native_hit_count();
+
+        assert_eq!(
+            after_walks - before_walks,
+            PER_THREAD * THREADS as u64,
+            "membership-walk tally lost increments across threads"
+        );
+        assert_eq!(
+            after_leaf - before_leaf,
+            PER_THREAD * THREADS as u64,
+            "leaf-hit tally lost increments across threads"
+        );
+    }
+
+    /// A site index past the end of the block is ignored, exactly as the
+    /// `MEMBERSHIP_WALK_BY_SITE.get(site)` it replaced ignored it — this is
+    /// the arm that kept an out-of-range site from panicking a release build.
+    #[test]
+    fn an_out_of_range_site_is_ignored_rather_than_panicking() {
+        let before = leaf_native_hit_count();
+        note_membership_walk(MEMBERSHIP_WALK_SITE_NAMES.len());
+        note_membership_walk(usize::MAX);
+        assert_eq!(
+            leaf_native_hit_count(),
+            before,
+            "an out-of-range site must not land on a neighbouring counter"
+        );
+    }
+
+    /// Every name has a counter behind it. The two arrays are index-parallel
+    /// by contract and nothing else checks it now that the counters live in a
+    /// struct rather than beside the names.
+    #[test]
+    fn the_block_has_one_counter_per_site_name() {
+        let block = JitCounterBlock::default();
+        assert_eq!(
+            block.membership_walk.len(),
+            MEMBERSHIP_WALK_SITE_NAMES.len(),
+            "site names and per-thread counters must stay index-parallel"
+        );
+    }
+}
+
+/// Sum one field across every thread's block.
+fn jit_counter_total(pick: impl Fn(&JitCounterBlock) -> u64) -> u64 {
+    match JIT_COUNTER_BLOCKS.lock() {
+        Ok(blocks) => blocks.iter().map(|b| pick(b)).sum(),
+        Err(poisoned) => poisoned.into_inner().iter().map(|b| pick(b)).sum(),
+    }
+}
+
 /// Record one membership walk at `site`.
 #[inline]
 pub fn note_membership_walk(site: usize) {
-    if let Some(c) = MEMBERSHIP_WALK_BY_SITE.get(site) {
-        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
+    JIT_COUNTERS.with(|block| {
+        if let Some(c) = block.membership_walk.get(site) {
+            JitCounterBlock::bump(c);
+        }
+    });
 }
 
 /// `(name, count)` for every site that walked at least once.
 pub fn membership_walks_by_site() -> Vec<(&'static str, u64)> {
     MEMBERSHIP_WALK_SITE_NAMES
         .iter()
-        .zip(MEMBERSHIP_WALK_BY_SITE.iter())
-        .map(|(n, c)| (*n, c.load(std::sync::atomic::Ordering::Relaxed)))
+        .enumerate()
+        .map(|(i, n)| {
+            (
+                *n,
+                jit_counter_total(|b| {
+                    b.membership_walk[i].load(std::sync::atomic::Ordering::Relaxed)
+                }),
+            )
+        })
         .filter(|(_, v)| *v > 0)
         .collect()
 }
@@ -12792,11 +12972,15 @@ fn admit_jit_fast_native_resolved(
 /// showed it. A JIT-side path has one extra way to be silently inert — the
 /// site cache can resolve to `None` and cache the refusal forever — so the
 /// number this prints is the acceptance criterion, not the ns/op.
-static LEAF_NATIVE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// Leaf-native dispatches served from compiled code this run.
 pub fn leaf_native_hit_count() -> u64 {
-    LEAF_NATIVE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    jit_counter_total(|b| b.leaf_native_hits.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// This thread's +1 for a leaf dispatch. See [`JitCounterBlock`].
+#[inline]
+fn note_leaf_native_hit() {
+    JIT_COUNTERS.with(|b| JitCounterBlock::bump(&b.leaf_native_hits));
 }
 
 /// Site-cached NON-leaf native dispatches from compiled code — the ones that
@@ -12806,7 +12990,12 @@ pub fn leaf_native_hit_count() -> u64 {
 /// questions and have different expected magnitudes: this is every registered
 /// native a compiled method calls, whereas the leaf count is only the audited
 /// accessor set.
-static SITE_CACHED_NATIVE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// This thread's +1 for a non-leaf site-cached dispatch. See
+/// [`JitCounterBlock`].
+#[inline]
+fn note_site_cached_native_hit() {
+    JIT_COUNTERS.with(|b| JitCounterBlock::bump(&b.site_cached_native_hits));
+}
 
 /// Is the per-call-site native fast path for compiled code enabled?
 ///
@@ -12853,7 +13042,10 @@ pub(crate) fn native_site_cache_enabled() -> bool {
 
 /// Non-leaf natives dispatched from a resolved call site this run.
 pub fn site_cached_native_hit_count() -> u64 {
-    SITE_CACHED_NATIVE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    jit_counter_total(|b| {
+        b.site_cached_native_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    })
 }
 
 /// Call sites `resolve_native_site` declined, and why.
@@ -13356,6 +13548,10 @@ fn resolve_native_site(
         native_id,
         receiver_class_id: guard,
         poly: poly_descriptor.is_some(),
+        // Decoded HERE, on the one cold path that builds an entry, so the
+        // dispatch never parses this descriptor again. See
+        // `NativeSiteDescriptor`.
+        desc: NativeSiteDescriptor::decode(info.descriptor),
     })
 }
 
@@ -13692,6 +13888,72 @@ struct NativeSiteCache {
     /// every other entry uses — would hand a boxed `Integer` back into an
     /// `int` return slot.
     poly: bool,
+    /// This site's descriptor, decoded once — see [`NativeSiteDescriptor`].
+    desc: NativeSiteDescriptor,
+}
+
+/// A call site's descriptor, decoded once and carried on the cache entry the
+/// dispatch already probes.
+///
+/// A site-cached native dispatch used to parse `info.descriptor` twice per
+/// call: `decode_dispatch_values_into` walked it to type each argument, and
+/// `coerce_native_return` scanned it again for the return tag. Measured on
+/// this file's `jit_native_dispatch_profile`, that argument decode cost
+/// 12.4-14.7 ns for a receiver-plus-one-object site against 9.5-11.9 ns with
+/// the tags already in hand.
+///
+/// It rides on [`NativeSiteCache`] rather than in a memo of its own because
+/// that entry is already fetched — the probe is 0.8 ns and is paid whether or
+/// not this is here. A separate `JitSiteKey`-keyed map was tried first and
+/// measured 14 ns per lookup, i.e. more than the parsing it removed.
+///
+/// Validity needs no argument beyond the one the entry already carries: the
+/// descriptor belongs to the `JitInvokeInfo` this entry was resolved against,
+/// and every path that can invalidate the entry (registry generation, receiver
+/// class, class redefinition, the site-memo flush on a JIT generation change)
+/// invalidates the decode with it.
+#[derive(Clone, Copy)]
+struct NativeSiteDescriptor {
+    /// One descriptor tag per PARAMETER, receiver excluded.
+    params: [u8; INLINE_JIT_NATIVE_ARGS],
+    /// Parameters decoded into `params`, or `u8::MAX` when the site declares
+    /// more than `INLINE_JIT_NATIVE_ARGS` of them — then `params` is unusable
+    /// and the caller parses the descriptor exactly as before.
+    params_len: u8,
+    /// What `cratonvm_jit::return_type` answers for this descriptor.
+    ret: u8,
+}
+
+impl NativeSiteDescriptor {
+    fn decode(descriptor: &str) -> Self {
+        let mut params = [0u8; INLINE_JIT_NATIVE_ARGS];
+        let mut count = 0usize;
+        for tag in DescriptorParamIter::new(descriptor) {
+            if count < INLINE_JIT_NATIVE_ARGS {
+                params[count] = tag;
+            }
+            count += 1;
+        }
+        Self {
+            params,
+            params_len: if count > INLINE_JIT_NATIVE_ARGS {
+                u8::MAX
+            } else {
+                count as u8
+            },
+            ret: cratonvm_jit::return_type(descriptor),
+        }
+    }
+
+    /// The decoded tags, or `None` for a site with more parameters than this
+    /// can hold.
+    fn params(&self) -> Option<&[u8]> {
+        if self.params_len == u8::MAX {
+            None
+        } else {
+            Some(&self.params[..self.params_len as usize])
+        }
+    }
 }
 
 // Thread-local map from [`JitSiteKey`] -> cached JIT entry.
@@ -16461,7 +16723,7 @@ unsafe fn try_jit_site_cached_native_dispatch(
         // it does not exist yet, fall through: the ordinary dispatcher runs
         // `current_thread_object`'s allocating slow path that builds it.
         let obj = thread.java_thread_obj?;
-        LEAF_NATIVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        note_leaf_native_hit();
         count_jit_native_dispatch(vm, entry.native_id);
         // Object-return handoff root, same contract as every other JIT native
         // fast path (see `jit_integer_value_of_direct`).
@@ -16474,7 +16736,7 @@ unsafe fn try_jit_site_cached_native_dispatch(
     // `try_varhandle_instance_field_read`.
     if entry.poly {
         if let Some(bits) = try_varhandle_instance_field_read(vm, info, args_slice, thread) {
-            SITE_CACHED_NATIVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            note_site_cached_native_hit();
             VARHANDLE_FIELD_READ_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             count_jit_native_dispatch(vm, entry.native_id);
             return Some(bits);
@@ -16484,7 +16746,7 @@ unsafe fn try_jit_site_cached_native_dispatch(
         // See `try_varhandle_instance_field_cas`.
         if varhandle_cas_funnel_fast_enabled() {
             if let Some(bits) = try_varhandle_instance_field_cas(vm, info, args_slice) {
-                SITE_CACHED_NATIVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                note_site_cached_native_hit();
                 VARHANDLE_FIELD_CAS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 count_jit_native_dispatch(vm, entry.native_id);
                 return Some(bits);
@@ -16498,11 +16760,18 @@ unsafe fn try_jit_site_cached_native_dispatch(
     // nothing to do (`jit_native_dispatch_profile`). This is the buffer the
     // decode fills in place.
     let mut values = JitDecodedArgs::new();
-    decode_dispatch_values_into(vm, info, args_slice, receiver.map(Some), &mut values);
+    decode_dispatch_values_into_shaped(
+        vm,
+        info,
+        args_slice,
+        receiver.map(Some),
+        entry.desc.params(),
+        &mut values,
+    );
     if entry.leaf {
-        LEAF_NATIVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        note_leaf_native_hit();
     } else {
-        SITE_CACHED_NATIVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        note_site_cached_native_hit();
     }
     count_jit_native_dispatch(vm, entry.native_id);
     // `decode_dispatch_values` heap-validated every object argument, which is
@@ -16530,11 +16799,11 @@ unsafe fn try_jit_site_cached_native_dispatch(
                 info.descriptor,
                 info.method_name,
             ) {
-                Ok(unboxed) => crate::vm::coerce_native_return(unboxed, info.descriptor),
+                Ok(unboxed) => crate::vm::coerce_native_return_typed(unboxed, entry.desc.ret),
                 Err(error) => return Some(handle_jit_dispatch_error(vm, thread, error, info)),
             }
         }
-        Ok(value) => crate::vm::coerce_native_return(value, info.descriptor),
+        Ok(value) => crate::vm::coerce_native_return_typed(value, entry.desc.ret),
         Err(error) => return Some(handle_jit_dispatch_error(vm, thread, error, info)),
     };
     Some(match result {
@@ -27165,6 +27434,7 @@ mod jit_native_dispatch_profile {
                         callback: cb,
                         native_id: None,
                         receiver_class_id: Some(0),
+                        desc: NativeSiteDescriptor::decode(GET_INFO.descriptor),
                         // These rungs price the ORDINARY native dispatch. A
                         // signature-polymorphic entry takes a different tail
                         // (`try_varhandle_instance_field_read`), so setting
@@ -27327,6 +27597,39 @@ mod jit_native_dispatch_profile {
 
         rung("record_invocation() [no id]", || {
             count_jit_native_dispatch(&shared, None);
+        });
+        // The three DIAGNOSTIC counters every site-cached native dispatch pays,
+        // priced separately because the rung above takes the `None` arm and so
+        // measures nothing. Each is a `lock xadd` on x86 — a full barrier, not
+        // a store — and a dispatch pays all three.
+        rung("counter: note_membership_walk(1)", || {
+            note_membership_walk(1);
+        });
+        rung("counter: leaf-hit tally (per-thread block)", || {
+            note_leaf_native_hit();
+        });
+        {
+            let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+            registry.with_category(cratonvm_native_api::NativeKind::Bridge, |r| {
+                r.register("p/P", "m", "()V", noop_native);
+            });
+            let id = registry.resolve_id("p/P", "m", "()V");
+            rung("counter: record_invocation() [real id]", || {
+                if let Some(id) = id {
+                    registry.record_invocation(id);
+                }
+            });
+        }
+        rung("counter: all three, as one dispatch pays them", || {
+            note_membership_walk(1);
+            note_leaf_native_hit();
+            count_jit_native_dispatch(&shared, None);
+        });
+        rung("counter: both JIT-side tallies, one TLS access", || {
+            JIT_COUNTERS.with(|b| {
+                JitCounterBlock::bump(&b.membership_walk[1]);
+                JitCounterBlock::bump(&b.leaf_native_hits);
+            });
         });
         rung("coerce_native_return(Int, \"()I\")", || {
             black_box(crate::vm::coerce_native_return(
