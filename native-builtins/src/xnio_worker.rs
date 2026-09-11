@@ -85,7 +85,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeHandleScope, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::{ObjectRef, Value};
 
@@ -1613,13 +1613,24 @@ fn native_worker_get_io_threads(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let worker = read_worker(ctx, this)
         .ok_or_else(|| mcf_runtime("XnioWorker.getIoThreads: not registered"))?;
     let count = worker.io_threads.len();
-    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), count);
+    // The array and the receiver both outlive one mirror allocation per thread
+    // (and the strings `set_io_thread_mirror_fields` makes), so both are held
+    // in the scope rather than as addresses.
+    let mut scope = NativeHandleScope::new(ctx);
+    let arr_obj = scope.new_ref_array(cratonvm_types::ClassId::new(0), count);
+    let arr_h = scope.root(arr_obj);
+    let this_h = scope.root(this);
     for (i, h) in worker.io_threads.iter().enumerate() {
-        let obj = try_alloc_concurrent_synthetic(ctx, "org/xnio/XnioIoThread", IOT_NUM_SLOTS)?;
-        set_io_thread_mirror_fields(ctx, obj, this, h.id);
-        ctx.set_array_element(arr, i, Value::Object(Some(obj)));
+        let obj =
+            try_alloc_concurrent_synthetic(&mut *scope, "org/xnio/XnioIoThread", IOT_NUM_SLOTS)?;
+        let obj_h = scope.root(obj);
+        let this_now = scope.get(&this_h);
+        set_io_thread_mirror_fields(&mut *scope, obj, this_now, h.id);
+        let arr = scope.get(&arr_h);
+        let obj = scope.get(&obj_h);
+        scope.set_array_element(arr, i, Value::Object(Some(obj)));
     }
-    Ok(Some(Value::Object(Some(arr))))
+    Ok(Some(Value::Object(Some(scope.get(&arr_h)))))
 }
 
 // --- XnioWorker.execute(Runnable) ---

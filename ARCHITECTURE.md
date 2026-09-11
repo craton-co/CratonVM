@@ -110,13 +110,16 @@ actually is:
 
 Measured 2026-09-09 with the command above, one directory at a time;
 `native-api` re-measured 2026-09-10, when lane L1's retirement table took
-it from 37k to 38,923.
+it from 37k to 38,923, and again 2026-09-11 at 41,321: lane 4's table plus
+`file_layout.rs`. This crate now moves whenever a lane retires a wave, because
+every retirement table lives in `retired_shadow.rs` -- the 5% tolerance on the
+row below is roughly two waves wide.
 
 | Crate | LoC | Crate | LoC |
 |-------|----:|-------|----:|
 | `native-builtins` | 753,000 | `native-awt` | 18,000 |
 | `vm` | 480,000 | `types` | 44,000 |
-| `jit` | 269,000 | `native-api` | 39,000 |
+| `jit` | 269,000 | `native-api` | 41,000 |
 | `gc` | 190,000 | `reader` | 17,000 |
 | `native-collections` | 88,000 | `jfr` | 20,000 |
 | `native-io` | 85,000 | `jit-cuda` | 14,000 |

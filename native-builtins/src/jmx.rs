@@ -4,7 +4,9 @@
 //! JMX (Java Management Extensions) native method implementations.
 //! Provides MBeanServer and platform MXBeans for runtime monitoring.
 
-use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry, ThreadJmxSnapshot};
+use cratonvm_native_api::{
+    NativeContext, NativeHandleScope, NativeKind, NativeMethodRegistry, ThreadJmxSnapshot,
+};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::ClassId;
 use cratonvm_types::{ObjectRef, Value};
@@ -2259,12 +2261,16 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
             let mgr_cid = ctx
                 .ensure_class_initialized("sun/management/MemoryManagerImpl")
                 .unwrap_or(ClassId::new(0));
-            let arr = ctx.new_ref_array(mgr_cid, 1);
+            let mut scope = NativeHandleScope::new(ctx);
+            let arr_obj = scope.new_ref_array(mgr_cid, 1);
+            let arr_h = scope.root(arr_obj);
             // GarbageCollectorImpl extends MemoryManagerImpl + implements
             // GarbageCollectorMXBean — single instance covers both the
             // manager list and (via the instanceof filter) the GC list.
-            let gc = alloc_garbage_collector_impl(ctx, "G1 Young Generation")?;
-            ctx.set_array_element(arr, 0, Value::Object(Some(gc)));
+            // Building it allocates, so the array's address is re-read after.
+            let gc = alloc_garbage_collector_impl(&mut *scope, "G1 Young Generation")?;
+            let arr = scope.get(&arr_h);
+            scope.set_array_element(arr, 0, Value::Object(Some(gc)));
             Ok(Some(Value::Object(Some(arr))))
         },
         NativeKind::Bridge,
@@ -7497,29 +7503,49 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
                 let onames_opt = mbs_onames(ctx, this);
                 let old_len = names_opt.map(|n| ctx.array_length(n)).unwrap_or(0);
                 if old_len > 0 {
-                    let new_names = ctx.new_ref_array(ClassId::new(0), old_len - 1);
-                    let new_beans = ctx.new_ref_array(ClassId::new(0), old_len - 1);
-                    let new_onames = ctx.new_ref_array(ClassId::new(0), old_len - 1);
+                    // Three allocations in a row: each one can move the arrays
+                    // allocated before it, and the receiver and the three
+                    // source arrays as well. Root everything, then read every
+                    // address back once the last allocation is behind us.
+                    let mut scope = NativeHandleScope::new(ctx);
+                    let this_h = scope.root(this);
+                    let names_src_h = names_opt.map(|n| scope.root(n));
+                    let beans_src_h = beans_opt.map(|b| scope.root(b));
+                    let onames_src_h = onames_opt.map(|o| scope.root(o));
+                    let new_names_obj = scope.new_ref_array(ClassId::new(0), old_len - 1);
+                    let new_names_h = scope.root(new_names_obj);
+                    let new_beans_obj = scope.new_ref_array(ClassId::new(0), old_len - 1);
+                    let new_beans_h = scope.root(new_beans_obj);
+                    let new_onames = scope.new_ref_array(ClassId::new(0), old_len - 1);
+                    let new_names = scope.get(&new_names_h);
+                    let new_beans = scope.get(&new_beans_h);
+                    let names_opt = names_src_h.as_ref().map(|h| scope.get(h));
+                    let beans_opt = beans_src_h.as_ref().map(|h| scope.get(h));
+                    let onames_opt = onames_src_h.as_ref().map(|h| scope.get(h));
+                    let this = scope.get(&this_h);
                     let mut w = 0usize;
                     for rd in 0..old_len {
                         if rd == idx {
                             continue;
                         }
                         if let Some(names) = names_opt {
-                            ctx.set_array_element(new_names, w, ctx.get_array_element(names, rd));
+                            let v = scope.get_array_element(names, rd);
+                            scope.set_array_element(new_names, w, v);
                         }
                         if let Some(beans) = beans_opt {
-                            ctx.set_array_element(new_beans, w, ctx.get_array_element(beans, rd));
+                            let v = scope.get_array_element(beans, rd);
+                            scope.set_array_element(new_beans, w, v);
                         }
                         if let Some(onames) = onames_opt {
-                            ctx.set_array_element(new_onames, w, ctx.get_array_element(onames, rd));
+                            let v = scope.get_array_element(onames, rd);
+                            scope.set_array_element(new_onames, w, v);
                         }
                         w += 1;
                     }
-                    ctx.set_field(this, MBS_NAMES, Value::Object(Some(new_names)));
-                    ctx.set_field(this, MBS_BEANS, Value::Object(Some(new_beans)));
-                    ctx.set_field(this, MBS_ONAMES, Value::Object(Some(new_onames)));
-                    ctx.set_field(this, MBS_COUNT, Value::Int((old_len - 1) as i32));
+                    scope.set_field(this, MBS_NAMES, Value::Object(Some(new_names)));
+                    scope.set_field(this, MBS_BEANS, Value::Object(Some(new_beans)));
+                    scope.set_field(this, MBS_ONAMES, Value::Object(Some(new_onames)));
+                    scope.set_field(this, MBS_COUNT, Value::Int((old_len - 1) as i32));
                 }
             }
             Ok(None)
