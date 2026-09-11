@@ -1432,6 +1432,35 @@ use cratonvm_types::compat::CompatibilityMode;
 /// removes the slack, and it is why this wave's delta reads +251 against the
 /// tree and +237/+248/+251 against the constants.
 ///
+/// # Re-frozen 2026-09-11 (the MERGE): 2558 -> 2645, and both deltas reproduce
+///
+/// Two accounts sit above this constant because two branches re-froze it on
+/// the same day for different waves, and the merge of them is neither number.
+/// Measured on the union, all three arms:
+///
+/// ```text
+///   tree                     no-mgmt    mgmt   syn-jdk    total (no-mgmt)
+///   dev alone                   2547    2558      2547              13610
+///   union (this merge)          2634    2645      2634              13607
+///   delta                        +87     +87       +87                 -3
+/// ```
+///
+/// **Both of this branch's deltas reproduce exactly on top of dev's new
+/// baseline**, which is the whole reason the values were left unset in the
+/// merge commit rather than added up:
+///
+///   * **+87 stubs** — `RETIRED_SHADOW_L5R_TRIPLES`, 67 `sun/misc/Unsafe`
+///     triples across 87 registrations. The same +87 this branch measured
+///     against the pre-merge tree, unchanged by dev's wave landing underneath
+///     it, which is what "case one" predicts and what a collision would not.
+///   * **-3 total** — the four deleted `AbstractExecutorService` registrations
+///     and the one added `ForkJoinPool.execute(ForkJoinTask)V`. Also unchanged.
+///
+/// Dev's own +189 (2369 -> 2558, on its side of the merge) is accounted for on
+/// its own block above this one. Nothing here absorbs it: the two waves touch
+/// disjoint tables, and `no_triple_is_claimed_by_two_tables` is the gate that
+/// says so rather than the arithmetic.
+///
 /// # Re-frozen 2026-09-11 (second time today): 2339 -> 2426, +87 stubs and -3 total
 ///
 /// The lane-5 RESIDUAL wave. Both numbers moved and they moved in OPPOSITE
@@ -1664,7 +1693,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// appear in the arm-OFF dump -- so retiring them changes their strict-mode
 /// admission and not their kind.
 ///
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2558;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2645;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1730,7 +1759,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2558;
 /// **Re-frozen 2026-09-11, 2384 -> 2547**, with the other two; the account is
 /// on [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]. +163, all of it lane 4 wave 1:
 /// the arm-OFF measurement lands on 2384 exactly.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2547;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2634;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1827,7 +1856,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2547;
 /// its sibling -- it lands on the same number again, which is a measurement
 /// each time and not a rule. The account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2547;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2634;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
