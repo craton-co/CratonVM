@@ -1432,6 +1432,35 @@ use cratonvm_types::compat::CompatibilityMode;
 /// removes the slack, and it is why this wave's delta reads +251 against the
 /// tree and +237/+248/+251 against the constants.
 ///
+/// # Re-frozen 2026-09-11 (the SECOND merge): 2620 -> 2707, isolated by substitution
+///
+/// Dev moved 91 more commits between this branch's verification and its push,
+/// and re-froze DOWNWARD in the process (an unretire switch landed). Neither
+/// branch's number describes the union, and this time the delta was not taken
+/// by subtracting constants — it was measured by SUBSTITUTION, reverting this
+/// branch's three source changes on the merged tree and re-running:
+///
+/// ```text
+///   union, this branch's changes present   2696 / 2707   totals 13607 / 13975
+///   union, the same three reverted to dev  2609 / 2620   totals 13610 / 13978
+///   this branch                             +87 / +87            -3 /    -3
+/// ```
+///
+/// **+87 and -3 for the third time**, unchanged by two dev merges and 214
+/// commits landing underneath. That reproducibility is the evidence the count
+/// tracks this branch's table and registrations rather than the tree it sits in.
+///
+/// The 2609 / 2620 row is EXACTLY dev's frozen constants, so dev's stub
+/// baselines were right for dev's tree.
+///
+/// **Its TOTALS were not, and the totals here drop 13 of dev's.** Dev froze
+/// 13623 / 13991 / 13658 where its own tree measures 13610 / 13978 / 13645 —
+/// stale by 13, in the ungated constant this file's own doc warns can only ever
+/// be worth its last refresh. The values below are the measured union
+/// (13607 / 13975 / 13642), which is dev's true number plus this branch's -3.
+/// Nothing is absorbed: the -3 is attributed above and the 13 is named here as
+/// dev's drift rather than folded in silently.
+///
 /// # Re-frozen 2026-09-11 (the MERGE): 2558 -> 2645, and both deltas reproduce
 ///
 /// Two accounts sit above this constant because two branches re-froze it on
@@ -1834,7 +1863,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// side: on a branch this busy the constant is re-measured per merge, never
 /// added up. Totals stay 13623 / 13991 / 13658, so lane 6's 17 are
 /// relabellings too.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2620;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2707;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2059,7 +2088,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2620;
 /// side: on a branch this busy the constant is re-measured per merge, never
 /// added up. Totals stay 13623 / 13991 / 13658, so lane 6's 17 are
 /// relabellings too.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2609;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2696;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2206,7 +2235,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2609;
 /// side: on a branch this busy the constant is re-measured per merge, never
 /// added up. Totals stay 13623 / 13991 / 13658, so lane 6's 17 are
 /// relabellings too.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2609;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2696;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -2266,7 +2295,7 @@ const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2609;
 /// was the only trace a real defect left in this gate, and staleness meant
 /// nobody could have read it. The `synthetic-jdk` arm has no constant here and
 /// measured 13645 on the same tree.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13991;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13975;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
@@ -2279,7 +2308,7 @@ const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13991;
 /// dev's staleness rather than either wave's — the localisation is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13623;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13607;
 
 /// The `--features synthetic-jdk` total, which had no constant at all.
 ///
@@ -2305,7 +2334,7 @@ const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13623;
 /// and 13645 on that tree against 13658 on this one is exactly the drift a
 /// sentence cannot track.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13658;
+const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13642;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;
