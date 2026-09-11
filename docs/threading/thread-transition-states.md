@@ -138,6 +138,7 @@ stateDiagram-v2
     Deoptimizing --> VmRunning
 
     Terminated --> Starting: OS thread re-attach
+    Terminated --> JavaRunning: carrier picks up the next virtual thread
     Terminated --> [*]
 ```
 
@@ -192,6 +193,45 @@ Every edge below is one the code performs. Edges the code performs that look
 | `CompiledUninterruptible` | `Deoptimizing` | deopt trap raises the out-of-band signal | `jit/helpers.rs:850`, `:874`, `:2192` |
 | `Deoptimizing` | `JavaRunning` | frames materialised, interpreter resumes | `interpreter.rs:13290` (`resume_from_ir_deopt`), `:14142` (`real_frame_deopt_resume_and_despeculate`) |
 | `Terminated` | `Starting` | the same OS thread re-attaching after a detach | `jni.rs::attach_foreign_thread` |
+| `Terminated` | **anything** | the cell's LOGICAL thread died; the OS thread it belongs to did not — see below | `thread_registry.rs::mark_stw_ready`, `gc_barrier.rs::leave_blocked_region_flagged` |
+
+### `Terminated` is a state of the CELL, not of the OS thread
+
+The shadow record is one cell per OS thread, and the states in it belong to a
+**logical** thread. Those are the same object only for platform threads. A
+carrier multiplexes virtual threads: when one dies, `mark_dead` records
+`Terminated` on the **carrier's** cell, and the carrier then picks up the next
+continuation and records whatever that one is doing.
+
+Measured 2026-09-11, one `VthreadProbe` run — 10 000 virtual threads, debug
+binary, `CRATONVM_STRESS_THREAD_STATES` at its `cfg!(debug_assertions)`
+default:
+
+| count | edge | site |
+|---|---|---|
+| 8314 | `Terminated -> JavaRunning` | `gc_barrier::leave_blocked_region_flagged` |
+| 1667 | `Terminated -> JavaRunning` | `thread_registry::mark_stw_ready` |
+| 3 | `Terminated -> SafepointParked` | `gc_barrier::leave_blocked_region_flagged:drain` |
+| 2 | `Terminated -> SafepointParked` | `gc_barrier::arrive_and_wait_inner:excluded` |
+| 2 | `SafepointParked -> Terminated` | `gc_barrier::arrive_and_wait_inner:resume` |
+
+9 986 reports, one per virtual thread, 4.2 MB of `tracing::error!` on a probe
+whose real output is 759 bytes — and, with `CRATONVM_STRESS_THREAD_STATES=1`,
+9 986 **panics**: all eight carriers died and the VM wedged waiting for
+mutators that were gone. The stress mode was unusable on any virtual-thread
+workload.
+
+`is_legal` now returns `true` for every edge out of `Terminated`.
+`try_record_transition` had always called `revive_current_cell()` for
+`from == Terminated`, so revival was already a modelled concept; only the
+legality check had not been told about it. The `Terminated -> Starting` row
+above stays because it is the one such edge with a named call site.
+
+What this gives up: a genuinely resurrected thread recorded on the same cell
+now reads as a revival. The record cannot tell the two apart — under M:N the
+cell is the carrier's and the identity is the continuation's — so the choice
+was between missing that and reporting every virtual thread in the process.
+The last row of the table above is untouched by the change and still reports.
 
 Deliberately **absent** (asserted as illegal in the tests):
 
@@ -202,7 +242,10 @@ Deliberately **absent** (asserted as illegal in the tests):
   materialisation is entered only from compiled code.
 * `NativeBlocked -> CompiledUninterruptible` — the blocked region must be left
   (and its fixup applied) first, or the JIT frame resumes on vacated addresses.
-* `Terminated -> *` except `Starting`.
+* ~~`Terminated -> *` except `Starting`~~ — **withdrawn 2026-09-11.** The test
+  that asserted it (`representative_illegal_transitions_are_rejected`, "a dead
+  thread must not resume as {to}") was wrong about what a cell in `Terminated`
+  means. See the section above.
 * `Starting -> {VmRunning, NativeRunning, NativeBlocked, CompiledUninterruptible}` —
   a not-yet-`stw_ready` carrier runs no natives and no compiled code.
 

@@ -28878,6 +28878,11 @@ mod io_tests {
 
     #[test]
     fn path_validation_rejects_dotdot() {
+        // PATH_VALIDATION_ENABLED is a process-global atomic, exactly like
+        // PATH_CONFINE_TO_CWD, and this test's verdict depends on it. Take the
+        // same shared guard: without it a parallel test that turns validation
+        // OFF makes this one read a tree it never set up.
+        let _g = crate::test_support::confine_test_lock().lock();
         set_path_validation_enabled(true);
         // A *leading* `..` segment escapes the start directory and is always
         // rejected — the always-on traversal guard, independent of CWD
@@ -28917,6 +28922,11 @@ mod io_tests {
     /// directory (more `..` than preceding names) is still rejected.
     #[test]
     fn path_validation_rejects_net_escaping_dotdot() {
+        // PATH_VALIDATION_ENABLED is a process-global atomic, exactly like
+        // PATH_CONFINE_TO_CWD, and this test's verdict depends on it. Take the
+        // same shared guard: without it a parallel test that turns validation
+        // OFF makes this one read a tree it never set up.
+        let _g = crate::test_support::confine_test_lock().lock();
         set_path_validation_enabled(true);
         // `a/../../b` → one name, two parents → escapes one level above start.
         let result = validate_path("a/../../b.txt");
@@ -29010,6 +29020,11 @@ mod io_tests {
 
     #[test]
     fn path_validation_rejects_null_byte() {
+        // PATH_VALIDATION_ENABLED is a process-global atomic, exactly like
+        // PATH_CONFINE_TO_CWD, and this test's verdict depends on it. Take the
+        // same shared guard: without it a parallel test that turns validation
+        // OFF makes this one read a tree it never set up.
+        let _g = crate::test_support::confine_test_lock().lock();
         set_path_validation_enabled(true);
         let result = validate_path("/etc/passwd\0.txt");
         assert!(result.is_err());
@@ -29035,6 +29050,13 @@ mod io_tests {
 
     #[test]
     fn path_validation_disabled_allows_dotdot() {
+        // Turning validation OFF is process-global: hold the shared guard for
+        // the whole window, or every parallel test that asserts a path is
+        // REJECTED can observe it accepted instead. That is exactly how
+        // `files_validated_path_rejects_dotdot_segment` failed about one run
+        // in twelve of `cargo test -p cratonvm-native-io --lib`, reporting
+        // `Files path with `..` segment accepted: Ok("../../etc/passwd")`.
+        let _g = crate::test_support::confine_test_lock().lock();
         set_path_validation_enabled(false);
         let result = validate_path("/etc/../passwd");
         assert!(result.is_ok());
@@ -29062,6 +29084,13 @@ mod io_tests {
     /// must run even when path validation is otherwise disabled.
     #[test]
     fn path_validation_disabled_still_rejects_null_byte() {
+        // Turning validation OFF is process-global: hold the shared guard for
+        // the whole window, or every parallel test that asserts a path is
+        // REJECTED can observe it accepted instead. That is exactly how
+        // `files_validated_path_rejects_dotdot_segment` failed about one run
+        // in twelve of `cargo test -p cratonvm-native-io --lib`, reporting
+        // `Files path with `..` segment accepted: Ok("../../etc/passwd")`.
+        let _g = crate::test_support::confine_test_lock().lock();
         set_path_validation_enabled(false);
         let result = validate_path("/etc/passwd\0.txt");
         assert!(result.is_err(), "null byte accepted with validation off");
@@ -29106,6 +29135,13 @@ mod io_tests {
     /// C-string boundary).
     #[test]
     fn files_validated_path_rejects_null_byte_even_when_disabled() {
+        // Turning validation OFF is process-global: hold the shared guard for
+        // the whole window, or every parallel test that asserts a path is
+        // REJECTED can observe it accepted instead. That is exactly how
+        // `files_validated_path_rejects_dotdot_segment` failed about one run
+        // in twelve of `cargo test -p cratonvm-native-io --lib`, reporting
+        // `Files path with `..` segment accepted: Ok("../../etc/passwd")`.
+        let _g = crate::test_support::confine_test_lock().lock();
         set_path_validation_enabled(false);
         let result = validated_path("/tmp/evil\0.txt");
         assert!(
