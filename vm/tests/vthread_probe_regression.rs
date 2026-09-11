@@ -84,27 +84,49 @@ fn cratonvm_binary_lookup() -> Option<PathBuf> {
 
 /// Compile the vthread probes via `javac` if the classes directory is missing
 /// or stale relative to the .java source files. Best-effort.
+///
+/// # The staleness half of that sentence was a claim, not a check
+///
+/// This function's contract has said "or stale" since it was written, and the
+/// test was `required.iter().all(|f| classes.join(f).exists())` — existence
+/// only. `classes/` is CHECKED IN, so editing a probe's `.java` and running
+/// the test re-ran the old `.class` and reported on source that was no longer
+/// in the tree. Found 2026-09-11 while adding the progress heartbeats these
+/// probes now print: the new `.java` files were in place, the test was green,
+/// and not one heartbeat appeared.
+///
+/// It is the same family as `common::warn_if_stale`, one level down — that one
+/// catches a launcher older than the sources, this one a FIXTURE older than
+/// its own source — and the same failure mode: a green that is about something
+/// other than what you changed.
 fn ensure_probes_compiled() -> bool {
     let classes = probe_classes_dir();
     let required = [
-        "Counter.class",
-        "Tiny.class",
-        "VthreadProbe.class",
-        "VthreadGcStress.class",
+        ("Counter.class", "Counter.java"),
+        ("Tiny.class", "Tiny.java"),
+        ("VthreadProbe.class", "VthreadProbe.java"),
+        ("VthreadGcStress.class", "VthreadGcStress.java"),
     ];
-    if required.iter().all(|f| classes.join(f).exists()) {
+    let dir = probe_dir();
+    let fresh = |class: &str, java: &str| -> bool {
+        let (Ok(c), Ok(j)) = (
+            std::fs::metadata(classes.join(class)).and_then(|m| m.modified()),
+            std::fs::metadata(dir.join(java)).and_then(|m| m.modified()),
+        ) else {
+            // No `.class` at all, or no `.java` to compare against. The first
+            // means compile; the second is a broken checkout the compile step
+            // below reports far better than a silent `true` would.
+            return false;
+        };
+        c >= j
+    };
+    if required.iter().all(|(c, j)| fresh(c, j)) {
         return true;
     }
     let _ = std::fs::create_dir_all(&classes);
-    let dir = probe_dir();
-    let sources: Vec<PathBuf> = [
-        "Counter.java",
-        "Tiny.java",
-        "VthreadProbe.java",
-        "VthreadGcStress.java",
-    ]
-    .iter()
-        .map(|f| dir.join(f))
+    let sources: Vec<PathBuf> = required
+        .iter()
+        .map(|(_, java)| dir.join(java))
         .filter(|p| p.exists())
         .collect();
     if sources.is_empty() {
@@ -127,7 +149,7 @@ fn ensure_probes_compiled() -> bool {
              javac stderr:\n{}",
                 String::from_utf8_lossy(&o.stderr)
             );
-            required.iter().all(|f| classes.join(f).exists())
+            required.iter().all(|(c, _)| classes.join(c).exists())
         }
     }
 }
@@ -136,7 +158,7 @@ fn ensure_probes_compiled() -> bool {
 /// `Some((stdout, stderr))` on successful spawn (regardless of exit code, so
 /// callers can examine output even when the VM exits non-zero), `None` when
 /// pre-requisites are unavailable so the caller can `return` and report skip.
-fn run_probe(class_name: &str, timeout: Duration) -> Option<(String, String)> {
+fn run_probe(class_name: &str, guard: Guard) -> Option<(String, String)> {
     if !ensure_probes_compiled() {
         eprintln!(
             "[vthread_probe_regression] vthread_probe class files unavailable; skipping {class_name}"
@@ -157,10 +179,17 @@ fn run_probe(class_name: &str, timeout: Duration) -> Option<(String, String)> {
     // Spawn a child process with the requested timeout. We use a thread-based
     // wait so we can kill the child if it hangs (helps when the v-thread
     // scheduler regresses to a 1-carrier livelock).
-    let mut child = match Command::new(&bin)
-        .arg("-c")
-        .arg(&classes)
-        .arg(class_name)
+    let mut cmd = Command::new(&bin);
+    cmd.arg("-c").arg(&classes).arg(class_name);
+    if class_name == "VthreadGcStress" {
+        let (threads, rounds) = gc_stress_workload();
+        // `[threads] [gcRounds] [gcSleepMillis]`, and the sleep stays 1 ms:
+        // it is what keeps a pause nearly always in flight.
+        cmd.arg(threads.to_string())
+            .arg(rounds.to_string())
+            .arg("1");
+    }
+    let mut child = match cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -180,72 +209,200 @@ fn run_probe(class_name: &str, timeout: Duration) -> Option<(String, String)> {
     // in 10 on Linux, and the next diagnostic anyone adds to the VM re-creates
     // it. `common::wait_draining` reads both pipes on their own threads and
     // returns what it captured even when the cap is hit.
-    let timed = common::wait_draining(child, timeout);
-    let stdout = String::from_utf8_lossy(&timed.output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&timed.output.stderr).into_owned();
-    if timed.timed_out {
-        panic!(
-            "[vthread_probe_regression] {class_name} timed out after {timeout:?}
-             stdout:
-{stdout}
-stderr:
-{stderr}"
-        );
-    }
+    let watched = match guard {
+        Guard::Cap(cap) => {
+            let timed = common::wait_draining(child, cap);
+            let stdout = String::from_utf8_lossy(&timed.output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&timed.output.stderr).into_owned();
+            assert!(
+                !timed.timed_out,
+                "[vthread_probe_regression] {class_name} timed out after {cap:?}. This probe \
+                 runs ONE virtual thread and prints one line, so it has no progress to report \
+                 and is guarded by a plain cap; the two big probes are not. stdout:\n{stdout}\n\
+                 stderr:\n{stderr}"
+            );
+            return Some((stdout, stderr));
+        }
+        Guard::Countdown { stall, ceiling } => common::wait_watching(
+            child,
+            common::Progress {
+                countdown_key: "remaining=",
+                stall,
+                ceiling,
+            },
+        ),
+    };
+    assert!(
+        watched.stop == common::Stop::Exited,
+        "{}",
+        watched.diagnosis(&format!("vthread_probe_regression {class_name}"))
+    );
+    let stdout = String::from_utf8_lossy(&watched.output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&watched.output.stderr).into_owned();
     Some((stdout, stderr))
 }
 
-/// The hang cap for `VthreadProbe`. It is a LIVELOCK GUARD, not a performance
-/// assertion: the test asserts `counted=10000 ok=true`, and this only exists so
-/// a scheduler that stops making progress fails fast instead of hanging the
-/// suite.
+/// The `VthreadGcStress` workload: thread count and `System.gc()` rounds.
 ///
-/// # It was briefly 300 s, and that was wrong
+/// Keyed on the profile of the **binary under test**, not on
+/// `cfg!(debug_assertions)` — that describes the harness, and the harness is
+/// not what runs for 40 minutes.
 ///
-/// `vthread_probe_10000_all_increment` flaked in the 2026-09-05 Linux sweep
-/// (2 failures in 8). Twenty runs of the probe under added load looked like a
-/// heavy tail — 20/20 correct, 3.36 s to 26.39 s — so the cap was raised to
-/// 300 s on the theory that 60 s sat inside that tail.
+/// # Why the debug run is smaller, and what that costs
 ///
-/// THE TAIL WAS NOT THE STORY. Running the VM DIRECTLY, no test harness
-/// involved, ten times on Windows:
+/// 3000 threads x 400 rounds is the documented gate: "8 hangs in 8 at a 60 s
+/// cap before the fix, 8 clean in 8 (7-22 s) after it", measured against a
+/// RELEASE binary. `ci.yml` runs `cargo test --workspace`, which is debug, and
+/// nobody had ever watched that combination finish — `registrar_drift` was red
+/// upstream of it, and `cargo test` stops at the first failing binary.
+///
+/// It does not finish. Measured 2026-09-11 on an 8-core host, debug binary,
+/// `remaining=` heartbeats watched throughout:
+///
+/// | threads x rounds | wall | user |
+/// |---|---|---|
+/// | 300 x 400 | 162 s | 141 s |
+/// | 400 x 400 | 170 s | 161 s |
+/// | 750 x 400 | 305 s | 283 s |
+/// | 1500 x 400 | 319 s | 304 s |
+/// | **1500 x 200** | **168 s / 170 s** | 155 s / 156 s |
+/// | **3000 x 400** | **killed at 2400 s**, 231 of 400 rounds done | — |
+///
+/// `user` tracks `real` in every row, so this is compute and not contention:
+/// a debug pause costs ~0.4 s (the ~150 s floor every row pays is 400 of
+/// them), and the per-pause cost grows with the number of live continuations
+/// until 3000 of them stops finishing altogether. Release does the whole thing
+/// in 16-23 s.
+///
+/// So the release configuration stays exactly what it was and the debug one is
+/// **1500 x 200** — still 200 stop-the-world pauses against 1500 live
+/// continuations, which is the shape of the defect, at a fifteenth of the
+/// thread-pause product. What it gives up is the *deterministic* claim: 8-in-8
+/// was measured at 3000 x 400 and nobody has measured the reduced
+/// configuration against a pre-fix binary, because the pre-fix binary is 60
+/// commits back. A debug run that detects the hang some of the time is worth
+/// having; a debug run nobody can afford to wait for is not, and that is what
+/// was there.
+fn gc_stress_workload() -> (u32, u32) {
+    // An explicit `CRATONVM_BIN` is a deliberate act and may point anywhere,
+    // so an unrecognisable path gets the full gate rather than the concession.
+    let debug_build = cratonvm_binary_lookup().is_some_and(|p| {
+        p.parent()
+            .and_then(|d| d.file_name())
+            .is_some_and(|n| n == "debug")
+    });
+    if debug_build {
+        (1500, 200)
+    } else {
+        (3000, 400)
+    }
+}
+
+/// How a probe run is guarded.
+///
+/// # The two caps this replaces, and why neither could work
 ///
 /// ```text
-/// 8 runs   2-4 s   counted=10000 ok=true
-/// 2 runs   killed at 120 s, no output at all
+/// const VTHREAD_PROBE_CAP: Duration = Duration::from_secs(60);
+/// const VTHREAD_GC_STRESS_CAP: Duration = Duration::from_secs(120);
 /// ```
 ///
-/// Bimodal, with nothing in between, and independent of machine load — one
-/// failure came with three background compilers running and three of the
-/// passes came with the same three. That is a HANG, and a cap cannot fix a
-/// hang: raising it to 300 s bought nothing except making CI wait five times
-/// longer to report a real defect, so it is back to 60 s — twenty times the
-/// healthy runtime and twice the worst completed run ever measured.
+/// Both said, at length and correctly, that they were LIVELOCK GUARDS and not
+/// performance assertions. Neither could be one. A deadline cannot express
+/// "stopped making progress", only "took too long", and those two came apart
+/// in three separate ways:
 ///
-/// # What the hang was (FIXED 2026-09-05)
+/// * **Profile.** `VTHREAD_PROBE_CAP`'s derivation — "twenty times the healthy
+///   runtime and twice the worst completed run ever measured" — rests on "8
+///   runs 2-4 s" taken "running the VM DIRECTLY", which was a **release**
+///   binary. `ci.yml` line 252 runs `cargo test --workspace`, which is debug.
+///   Measured 2026-09-11 on one 8-core host: `VthreadProbe` 6.3 s release
+///   against 30-125 s debug, `VthreadGcStress` 16-23 s release against 400 s+
+///   debug. 60 s was 2x the healthy debug runtime, not 20x.
+/// * **Load.** The same binary on the same host at load 40 took 52 s where it
+///   had taken 30 s. `user` was 19 s of a 52 s wall clock: the probe was not
+///   working harder, it was waiting for a core.
+/// * **A debug-only tripwire, which turned out NOT to be the cost.**
+///   `thread_state::stress_checks_enabled()` defaults to
+///   `cfg!(debug_assertions)`, and its model is per-OS-THREAD while the states
+///   it tracks belong to a LOGICAL thread, so a carrier reported every virtual
+///   thread that died on it — 9 992 `illegal thread-state transition` lines,
+///   4.2 MB of `tracing::error!`, on a probe whose real output is 759 bytes.
+///   It is fixed (`thread_state::is_legal`) and it is recorded here because it
+///   LOOKED like the explanation and is not: three paired runs came in at
+///   46/179/46 s with the checks off against 22/23/74 s with them on. The
+///   spread is host load, in both arms, and it swamps everything else.
 ///
-/// Not the carrier pool, and not the scheduler. A virtual thread that yields
-/// (`Thread.sleep` -> `ContinuationYield`) deposited its root snapshot — which
-/// raises `in_blocked_region` and excludes it from FUTURE pauses — and then
-/// handed itself to `suspend_runtime` WITHOUT arriving for a pause that was
-/// already in flight and had already counted it in `expected`. The carrier
-/// went back to `wait_for_task_until`, nothing on that OS thread ever arrived
-/// for that `tid` again, and `wait_for_all` blocked forever. See
-/// `vthread-probe-intermittent-hang-FIXED-20260905.md`.
+/// Every one of those makes a HEALTHY run fail, which is the one thing a
+/// livelock guard must never do — and the obvious repair, raising the
+/// constant, is exactly the change that hides the hang the guard exists for.
+/// `VTHREAD_PROBE_CAP` had already been to 300 s and back on 2026-09-05 for
+/// that reason.
 ///
-/// This test remains a one-in-five detector for that defect, which is not a
-/// gate — `vthread_gc_stress_completes` below is the deterministic one.
-const VTHREAD_PROBE_CAP: Duration = Duration::from_secs(60);
+/// So the probes print a counter that only goes down and the guard watches the
+/// COUNTER. See `common::Progress`.
+enum Guard {
+    /// A plain wall-clock cap, for a probe that runs one virtual thread and
+    /// prints one line. There is nothing to watch, and nothing that takes
+    /// long enough for the profile to matter.
+    Cap(Duration),
+    /// Watch `remaining=` and fail when it stops moving.
+    Countdown { stall: Duration, ceiling: Duration },
+}
 
-/// Cap for `VthreadGcStress`. Healthy runs finish in 7-22 s on a loaded
-/// 8-core host; the pre-fix binary hung 8 times out of 8 and was still hung at
-/// 60 s every time, so 120 s is a generous livelock guard rather than a
-/// performance assertion.
-const VTHREAD_GC_STRESS_CAP: Duration = Duration::from_secs(120);
+/// How long a working vthread probe may go without advancing `remaining=`
+/// once.
+///
+/// This is the one number the gate now depends on, and it is a **no-progress**
+/// budget rather than a runtime one: it does not move when the workload, the
+/// profile or the host does, because a probe that is working advances its
+/// counter whatever else is true.
+///
+/// # What it had to be sized against, which was not what was expected
+///
+/// The probes heartbeat every 1/200th of their thread count through the spawn
+/// loop and once a second afterwards, so the expected gap is a second or two —
+/// and on a quiet host (load 11-13) that is what four runs showed, worst gap
+/// 12.5 s. On the same host at load 33-42, two runs out of four stalled for
+/// **146.9 s and 148.0 s** in the middle of the spawn loop, and then finished
+/// correctly (166.8 s and 166.7 s wall, `counted=10000 ok=true`).
+///
+/// Those two stalls are the interesting measurement in this whole page:
+///
+/// * The process was **burning CPU** throughout — `main-vm` in state `R`,
+///   ~0.8 cores for the whole 148 s, one carrier busy and the other seven
+///   parked. Sampled live from `/proc`.
+/// * `user` tracked `real` for the run as a whole (136 s and 147 s of 167 s).
+/// * Both runs produced the right answer.
+///
+/// So it is not the 2026-09-05 deadlock, which used no CPU at all and never
+/// finished; and it is not starvation, which does not look like 0.8 cores of
+/// `R`. It is a long compute phase — an unoptimised collector or compiler
+/// doing work whose cost the release build hides — that a Java-side progress
+/// signal cannot report on, because whatever holds the world holds the thread
+/// that would print the heartbeat. **A budget of this shape must exceed the
+/// longest such phase, and 148 s is the longest one measured.**
+///
+/// 600 s is four times that. It is a large number and it buys the right thing:
+/// a genuine freeze is reported 600 s after the last heartbeat rather than
+/// 60 s after process start, and in exchange no healthy run can fail however
+/// slow the profile or however busy the host. The 60 s cap this replaces had
+/// already failed healthy runs twice, and been raised and lowered once.
+const VTHREAD_STALL: Duration = Duration::from_secs(600);
+
+/// Absolute backstop for a probe that keeps advancing and never finishes — a
+/// different defect from the one the stall clock watches for, and one nobody
+/// has seen here.
+///
+/// Deliberately far above any measured run (the worst completed run was
+/// 179 s), because a ceiling that competes with the stall clock re-introduces
+/// the bug this whole block is about. If it ever fires, the diagnosis says the
+/// counter WAS moving, which is the fact worth having.
+const VTHREAD_CEILING: Duration = Duration::from_secs(1800);
 
 /// Memoize each probe run so all subtests targeting the same class share one
 /// VM spawn. Keyed by class name.
-fn cached_run(class_name: &'static str, timeout: Duration) -> Option<(String, String)> {
+fn cached_run(class_name: &'static str, guard: Guard) -> Option<(String, String)> {
     static COUNTER: OnceLock<Option<(String, String)>> = OnceLock::new();
     static TINY: OnceLock<Option<(String, String)>> = OnceLock::new();
     static VTHREAD: OnceLock<Option<(String, String)>> = OnceLock::new();
@@ -257,7 +414,7 @@ fn cached_run(class_name: &'static str, timeout: Duration) -> Option<(String, St
         "VthreadGcStress" => &GC_STRESS,
         other => panic!("unknown vthread probe class: {other}"),
     };
-    cell.get_or_init(|| run_probe(class_name, timeout)).clone()
+    cell.get_or_init(|| run_probe(class_name, guard)).clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -271,7 +428,7 @@ fn cached_run(class_name: &'static str, timeout: Duration) -> Option<(String, St
 /// as `n=0` rather than an unrelated timeout/crash.
 #[test]
 fn vthread_counter_single_increments_to_1() {
-    let (stdout, stderr) = match cached_run("Counter", Duration::from_secs(30)) {
+    let (stdout, stderr) = match cached_run("Counter", Guard::Cap(Duration::from_secs(30))) {
         Some(o) => o,
         None => return,
     };
@@ -298,7 +455,7 @@ fn vthread_counter_single_increments_to_1() {
 /// (`Joined OK`).
 #[test]
 fn vthread_tiny_builder_start_join() {
-    let (stdout, stderr) = match cached_run("Tiny", Duration::from_secs(30)) {
+    let (stdout, stderr) = match cached_run("Tiny", Guard::Cap(Duration::from_secs(30))) {
         Some(o) => o,
         None => return,
     };
@@ -319,7 +476,13 @@ fn vthread_tiny_builder_start_join() {
 /// "Thread.sleep on a v-thread never resumes".
 #[test]
 fn vthread_probe_10000_all_increment() {
-    let (stdout, stderr) = match cached_run("VthreadProbe", VTHREAD_PROBE_CAP) {
+    let (stdout, stderr) = match cached_run(
+        "VthreadProbe",
+        Guard::Countdown {
+            stall: VTHREAD_STALL,
+            ceiling: VTHREAD_CEILING,
+        },
+    ) {
         Some(o) => o,
         None => return,
     };
@@ -366,20 +529,30 @@ fn vthread_probe_10000_all_increment() {
 /// which is why this fixture exists.
 #[test]
 fn vthread_gc_stress_completes() {
-    let (stdout, stderr) = match cached_run("VthreadGcStress", VTHREAD_GC_STRESS_CAP) {
+    let (stdout, stderr) = match cached_run(
+        "VthreadGcStress",
+        Guard::Countdown {
+            stall: VTHREAD_STALL,
+            ceiling: VTHREAD_CEILING,
+        },
+    ) {
         Some(o) => o,
         None => return,
     };
-    let combined = format!("{stdout}
+    let combined = format!(
+        "{stdout}
 --- STDERR ---
-{stderr}");
-    if !combined.contains("counted=3000 ok=true") {
+{stderr}"
+    );
+    let (threads, rounds) = gc_stress_workload();
+    let expected = format!("counted={threads} ok=true");
+    if !combined.contains(&expected) {
         let counted_line = combined
             .lines()
             .find(|l| l.starts_with("counted="))
             .unwrap_or("(no `counted=` line emitted)");
         panic!(
-            "VthreadGcStress failed to count all 3000 vthreads.
+            "VthreadGcStress failed to count all {threads} vthreads              ({rounds} System.gc() rounds -- see `gc_stress_workload`).
              observed: {counted_line}
              full output:
 {combined}"
@@ -387,7 +560,7 @@ fn vthread_gc_stress_completes() {
     }
     assert!(
         combined.contains("OK"),
-        "VthreadGcStress printed counted=3000 but never reached the final          'OK' marker. Output:
+        "VthreadGcStress printed {expected} but never reached the final 'OK'          marker. Output:
 {combined}"
     );
 }
