@@ -611,7 +611,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-434 tokens.
+435 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -820,6 +820,7 @@ export inherited from a parent shell.
 | `ir-list-sched` | `CRATONVM_JIT_IR_LIST_SCHED` |
 | `ir-carry-rcx-folded` | `CRATONVM_JIT_IR_CARRY_RCX_FOLDED` |
 | `ir-unroll-unreachable-frames` | `CRATONVM_JIT_IR_UNROLL_UNREACHABLE_FRAMES` |
+| `ir-per-copy-frames` | `CRATONVM_JIT_IR_PER_COPY_FRAMES` |
 | `c2-accept` | `CRATONVM_C2_ACCEPT` |
 | `c2-accept-memo` | `CRATONVM_C2_ACCEPT_MEMO` |
 | `ir-unresolved-class-trap` | `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` |

@@ -1552,7 +1552,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// `java/util/jar/Attributes`, `$Name`, `JarEntry`, `Manifest` and
 /// `java/text/Normalizer` (29); both are in
 /// `native-api/src/retired_shadow.rs` with their acceptance.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2391;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2343;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1609,7 +1609,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2391;
 /// `java/util/jar/Attributes`, `$Name`, `JarEntry`, `Manifest` and
 /// `java/text/Normalizer` (29); both are in
 /// `native-api/src/retired_shadow.rs` with their acceptance.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2380;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2332;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1695,7 +1695,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2380;
 /// `java/util/jar/Attributes`, `$Name`, `JarEntry`, `Manifest` and
 /// `java/text/Normalizer` (29); both are in
 /// `native-api/src/retired_shadow.rs` with their acceptance.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2380;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2332;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
