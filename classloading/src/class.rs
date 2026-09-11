@@ -1547,10 +1547,25 @@ impl ClassStore {
                     l.ref_offsets.len(),
                     l.field_offsets.len()
                 ),
-                None => eprintln!(
-                    "[layout] {name} cid={} LEGACY, no compact layout",
-                    id.as_u32()
-                ),
+                // A `None` here is almost always the `padded` refusal below,
+                // and the two numbers that say so are the ones the message
+                // used to omit: a class whose `num_total_fields` exceeds the
+                // instance fields its chain actually DECLARES was padded to a
+                // synthetic-stub floor, and pays the legacy 16-byte tagged
+                // cell for every slot -- not just for the padding. Printing
+                // them turns "no compact layout" from a fact into a cause.
+                None => {
+                    let (total, declared) = self.declared_vs_total(id);
+                    eprintln!(
+                        "[layout] {name} cid={} LEGACY, no compact layout (num_total_fields={total} declared_instance_fields={declared}{})",
+                        id.as_u32(),
+                        if total > declared {
+                            format!(" PADDED by {}", total - declared)
+                        } else {
+                            String::new()
+                        }
+                    );
+                }
             }
         }
         if let Some(layout) = built {
@@ -1560,6 +1575,29 @@ impl ClassStore {
                 Arc::new(layout),
             );
         }
+    }
+
+    /// `(num_total_fields, instance fields actually DECLARED by the chain)`
+    /// for `id` -- the pair whose difference is the synthetic-stub padding.
+    ///
+    /// Read only by the `CRATONVM_DBG_LAYOUT` message above. Kept beside
+    /// [`Self::build_compact_layout`] because it walks the same chain and must
+    /// count the same way the padding loop there does: instance fields only,
+    /// every ancestor, `java/lang/Object` included.
+    fn declared_vs_total(&self, id: ClassId) -> (usize, usize) {
+        let total = self.get(id).map_or(0, |c| c.num_total_fields);
+        let mut declared = 0usize;
+        let mut cur = Some(id);
+        while let Some(cid) = cur {
+            let Some(class) = self.get(cid) else { break };
+            declared += class
+                .fields
+                .iter()
+                .filter(|f| !f.access_flags.contains(FieldAccessFlags::STATIC))
+                .count();
+            cur = class.superclass;
+        }
+        (total, declared)
     }
 
     /// Build the per-class compact instance-field layout: a naturally aligned

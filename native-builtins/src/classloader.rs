@@ -1508,13 +1508,13 @@ pub(crate) fn alloc_classloader(
     // works without additional intercepts.
     if loader_type == LOADER_PLATFORM || loader_type == LOADER_APP {
         let name_to_module =
-            try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
+            try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 3)?;
         let name_to_module_pin = ctx.pin_native_root(name_to_module);
         obj = ctx.read_native_pin(obj_pin, obj);
         let name_to_module = ctx.read_native_pin(name_to_module_pin, name_to_module);
         ctx.set_field_by_name(obj, "nameToModule", Value::Object(Some(name_to_module)));
         let module_to_reader =
-            try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
+            try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 3)?;
         let module_to_reader_pin = ctx.pin_native_root(module_to_reader);
         obj = ctx.read_native_pin(obj_pin, obj);
         let module_to_reader = ctx.read_native_pin(module_to_reader_pin, module_to_reader);
@@ -1533,7 +1533,7 @@ pub(crate) fn alloc_classloader(
     // then `packages()`. Pre-populate an empty CHM so the bytecode path runs
     // without additional intercepts.
     let packages_map =
-        try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
+        try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 3)?;
     let packages_map_pin = ctx.pin_native_root(packages_map);
     obj = ctx.read_native_pin(obj_pin, obj);
     let packages_map = ctx.read_native_pin(packages_map_pin, packages_map);
@@ -1901,7 +1901,7 @@ fn cl_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // S111r17: see alloc_classloader — initialize `packages` CHM so
     // ClassLoader.packages() doesn't NPE on `getfield + values()`.
     let packages_map =
-        try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
+        try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 3)?;
     ctx.set_field_by_name(this, "packages", Value::Object(Some(packages_map)));
     Ok(None)
 }
@@ -1930,7 +1930,7 @@ fn cl_init_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
     // S111r17: see alloc_classloader.
     let packages_map =
-        try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
+        try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 3)?;
     ctx.set_field_by_name(this, "packages", Value::Object(Some(packages_map)));
     Ok(None)
 }
@@ -1966,7 +1966,7 @@ fn cl_init_name_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
     // S111r17: see alloc_classloader.
     let packages_map =
-        try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
+        try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 3)?;
     ctx.set_field_by_name(this, "packages", Value::Object(Some(packages_map)));
     if synthetic_layout {
         ctx.set_field(this, CL_LOADER_ID, Value::Int(lid as i32));
