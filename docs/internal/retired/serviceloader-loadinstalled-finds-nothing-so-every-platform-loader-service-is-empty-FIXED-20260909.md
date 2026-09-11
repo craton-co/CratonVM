@@ -1,3 +1,108 @@
+# RETIRED — FIXED 2026-09-09, residual closed 2026-09-10. `ServiceLoader.loadInstalled` finds the platform loader's services, and the last `--jdk-only` cell now answers non-US separators
+
+**Retired from**
+`docs/known-issues/serviceloader-loadinstalled-finds-nothing-so-every-platform-loader-service-is-empty-20260909.md`.
+The page below is kept verbatim: it already carried its own root cause
+(section 7) and its own after-the-fix measurements, and the three refutations
+in section 3 are still the reason this took three probes to reach. This header
+records only what was still open when it was filed — section 8's residual —
+and re-measures the page's claims on `origin/dev` so the retirement is not
+taken on trust.
+
+## 1. The residual is closed, and it was not closed by a further fix here
+
+Section 8 recorded one cell still wrong after the `loadInstalled` repair:
+
+> **`--jdk-only` on JDK 21 still answers US separators** … Whatever is left is
+> downstream of the supported-locale set, is specific to `--jdk-only`, and is
+> specific to JDK 21.
+
+That reading was exactly right, and the thing downstream had already been
+identified independently and landed the same day as the wave-5
+`DecimalFormatSymbolsProvider` arm of
+`JRELocaleProviderAdapter.getLocaleServiceProvider`
+(`native-builtins/src/locale_bootstrap.rs`, and
+`docs/internal/retired/jdk-21-strict-mode-answers-a-non-root-locale-with-root-resources-FIXED-20260909.md`).
+The blanket `null` that native returned made `LocaleProviderAdapter.findAdapter`
+reject every adapter, so `getAdapter` fell through to
+`FallbackLocaleProviderAdapter` — which on JDK 21, and only there, hands back
+its root `LocaleResources` for any locale. That is the whole of "specific to
+`--jdk-only`, specific to JDK 21".
+
+Measured 2026-09-10 on a pristine `origin/dev` build, with no changes of this
+branch applied, `probes/LocaleAdapter.java`:
+
+```
+DecimalFormatSymbols.getInstance    de-DE decimal   fr-FR grouping   en-US decimal (control)
+  HotSpot 21                        U+002C          U+202F          U+002E
+  HotSpot 25                        U+002C          U+202F          U+002E
+  CratonVM 21 --real-jdk            U+002C          U+202F          U+002E
+  CratonVM 21 --jdk-only            U+002C          U+202F          U+002E   <- was U+002E for de-DE
+  CratonVM 25 --real-jdk            U+002C          U+202F          U+002E
+  CratonVM 25 --jdk-only            U+002C          U+202F          U+002E
+```
+
+All four cells match HotSpot, including `fr-FR`'s narrow no-break space, and
+the `en-US` control reads the same everywhere — which is the page's own test
+for a probe that still means something.
+
+## 2. The page's own after-the-fix table, re-measured on dev
+
+Section 7's numbers were taken on the fix branch. Re-taken on `origin/dev` with
+`probes/LoadInstalled.java` and `probes/CldrLocales.java`, all four cells:
+
+```
+                                 load()   loadInstalled()     CLDR availableLocales   has `de`
+  HotSpot 21                       2             2                   1063              true
+  CratonVM 21 --real-jdk           2             2                   1063              true
+  CratonVM 21 --jdk-only           2             2                   1063              true
+  CratonVM 25 --real-jdk           2             2                   1152              true
+  CratonVM 25 --jdk-only           2             2                   1152              true
+```
+
+`FileSystemProvider` is 2/2 in every cell as well, and `Chronology` is 0/0 on
+both VMs — the control the page named, still a control.
+
+**One correction to the reproduction instructions.** `probes/LoadInstalled.java`
+reaches `sun.util.locale.provider.LocaleDataMetaInfo` by name, so it needs
+`--add-exports java.base/sun.util.locale.provider=ALL-UNNAMED` — the page's own
+section 6 has it and section 9 drops it. Run without the flag, the probe reports
+`load() = 0 [<ServiceConfigurationError>]` on HotSpot **and** on CratonVM: a
+broken probe, not a finding. Anyone re-running this should use section 6's
+command line. (`probes/CldrLocales.java` additionally needs
+`--add-opens java.base/sun.util.cldr=ALL-UNNAMED`, or it throws before printing
+the count.)
+
+## 3. The side observation the page parked, also gone
+
+> Also noticed and NOT chased: under `load()`, CratonVM's
+> `JrtFileSystemProvider` instantiation reports a `NoSuchMethodError` where
+> HotSpot does not.
+
+Not reproducible on dev as of 2026-09-10: `LoadInstalled` under both modes and
+both images emits no `NoSuchMethodError` on stderr, and instantiates both
+providers. Recorded as closed by observation rather than by a located fix — if
+it returns it is a new page, not this one.
+
+Not closed, and not this page's: `probes/CalWeek.java` provokes a
+`NoSuchMethodError` for
+`java/lang/String.parse(Ljava/lang/String;Ljava/text/ParsePosition;Z)` — a
+receiver-class mismatch on a `sun.util.locale` parse. It is present identically
+on pristine `origin/dev`, so it predates and survives this work, and it does not
+affect any answer measured above.
+
+## 4. What this page is worth keeping for
+
+Its section 3 and its closing rule. Three probes looked healthy because every
+one of them used `ServiceLoader.load` while the code under test used
+`loadInstalled`; a probe that does not use the same lookup the code under test
+uses cannot see the defect. That is the transferable part, and it is why the
+page is retired rather than deleted.
+
+---
+
+*(original page follows verbatim)*
+
 # `ServiceLoader.loadInstalled` finds nothing, so every service the JDK looks up through the platform loader is silently empty
 
 **Status:** FIXED 2026-09-09 (`claude/jdkonly-svcloader-20260909`). One

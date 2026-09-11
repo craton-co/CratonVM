@@ -82,7 +82,8 @@ not a corpus arm.
 reports `2` and `4` — the `CalendarDataProvider` arm, still on the blanket
 `null`. It is **mode-independent** (it reads the same under `--real-jdk`), so it
 is not a strict-mode row, and it is filed separately as
-`docs/known-issues/calendar-firstdayofweek-is-root-data-because-the-provider-lookup-answers-null-20260909.md`.
+`calendar-week-rules-are-one-region-table-not-a-per-locale-integer-FIXED-20260910.md`
+(retired 2026-09-10).
 It is the obvious next arm to delegate.
 
 ---
@@ -97,7 +98,7 @@ resource selection", which is where the next person should start.
 correct, and **both** modes on JDK 25 are correct.
 **Found:** 2026-09-09, as the residual left after the
 `ServiceLoader.loadInstalled` fix
-(`../../known-issues/serviceloader-loadinstalled-finds-nothing-so-every-platform-loader-service-is-empty-20260909.md`)
+(`serviceloader-loadinstalled-finds-nothing-so-every-platform-loader-service-is-empty-FIXED-20260909.md`)
 removed the dominant cause of the same symptom.
 
 ## 1. The one wrong cell
