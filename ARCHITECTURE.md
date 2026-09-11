@@ -109,14 +109,17 @@ Rough size distribution, largest first, so newcomers know where the mass
 actually is:
 
 Measured 2026-09-09 with the command above, one directory at a time;
-`native-api` re-measured 2026-09-10, when lane L1's retirement table took
-it from 37k to 38,923.
+`native-api` re-measured twice since, both times because a jdk-only lane added
+a retirement table to `retired_shadow.rs`: L1's 329 triples took it from 37k to
+38,923 on 2026-09-10, and lane T's 906 to 43,982 on 2026-09-11. A campaign that
+adds one table per lane moves this row on every landing, so re-derive it rather
+than assuming the last lane's number still holds.
 
 | Crate | LoC | Crate | LoC |
 |-------|----:|-------|----:|
 | `native-builtins` | 753,000 | `native-awt` | 18,000 |
 | `vm` | 480,000 | `types` | 44,000 |
-| `jit` | 269,000 | `native-api` | 39,000 |
+| `jit` | 269,000 | `native-api` | 44,000 |
 | `gc` | 190,000 | `reader` | 17,000 |
 | `native-collections` | 88,000 | `jfr` | 20,000 |
 | `native-io` | 85,000 | `jit-cuda` | 14,000 |

@@ -314,3 +314,71 @@ on the `protected` field §4 specifies, and `LTKeyStoreEngineSweep` stays
 unpromoted until they land: its `getKey with the WRONG password` rows go
 through a store this VM wrote, so they are KS-5's rows and this fix does not
 move them.
+
+## 8. KS-5 and KS-6 are FIXED, 2026-09-11, and one new residual replaces two old ones
+
+`EntryKind::PrivateKey` gained a `protected: Option<Vec<u8>>` field: the
+envelope the ENTRY password builds, kept alongside the plaintext `key_der` the
+TLS identity path still needs. `engineSetKeyEntry` and `setEntry` now read the
+password argument they previously discarded and wrap the key in it (JKS format
+for a `JavaKeyStore`/`JceKeyStore` receiver, PBES2 for a `PKCS12KeyStore` one);
+both writers emit that envelope verbatim instead of re-encrypting under the
+STORE password; `engine_get_key` checks the ENTRY password against it before
+ever reaching KS-1's ciphertext check, which is the in-memory half KS-1 could
+not see (an entry set through the API never has ciphertext in `key_der` to
+catch). `recover_key_any_scheme` replaces the JKS-only unlock funnel with one
+that tries both schemes, so a bag the store password did not open at load time
+gets a second chance at `getKey` time under the entry password — that is KS-6.
+
+MEASURED on `cratonvm-lt8.exe` with `apps/probes/KSInteropWriteRead.java`,
+which writes each store type with `setKeyEntry(alias, key, KEYPW, chain)`
+under store password `PW` (KEYPW != PW) and asks `getKey` three ways —
+matching HotSpot 25.0.3+9 exactly means throwing for WRONG and STORE and
+returning a usable key for ENTRY:
+
+```text
+                                          before KS-5/6   after
+   writer=hs  PKCS12  reader=cratonvm     2 of 3          3 of 3   <- KS-6
+   writer=cv  PKCS12  reader=cratonvm     3 of 3          3 of 3   (KS-5: no envelope to lose)
+   writer=hs  JKS     reader=cratonvm     3 of 3          3 of 3
+   writer=cv  JKS     reader=cratonvm     3 of 3          3 of 3
+   writer=hs  JCEKS   reader=cratonvm     2 of 3          2 of 3   <- KS-7, see below
+   writer=cv  JCEKS   reader=cratonvm     3 of 3          3 of 3   (KS-5)
+
+   rows matching HotSpot exactly (of 9 writer x reader pairs)   7 of 9  ->  8 of 9
+```
+
+**PKCS12 is now correct end to end**, both directions: this VM's own writes
+protect the entry with the entry password (KS-5) and its own reads recover
+either scheme (KS-6). **JKS was already correct** (§7) and is unmoved.
+
+### KS-7: a HotSpot-written JCEKS entry password still does not open
+
+The one cell that did not move: `writer=hs JCEKS reader=cratonvm`, `ENTRY`
+password. Before this fix it returned ciphertext wearing a `PrivateKey` mirror
+(the same silent-wrong-answer KS-1 closed for the other five cells); after it
+throws `UnrecoverableKeyException` for the entry password too, which is a
+*different* defect from the one KS-6 fixed, not a survival of it — WRONG and
+STORE both now correctly throw, matching HotSpot, and only ENTRY is wrong.
+
+The cause is `spi_wants_pkcs12_envelope`'s own documented choice: it treats
+JCEKS as a JKS-format receiver, because that is the format THIS VM's write
+side uses for the JCEKS entries IT creates (`write_jks_with_magic` under
+`JCEKS_MAGIC`, §2 of the writer's own comment). Real `JceKeyStore` does not
+write JKS's `KeyProtector` envelope for a JCEKS entry password — it uses
+SunJCE's own `PBEWithMD5AndTripleDES`-family cipher, undocumented outside the
+JDK source, with a key-derivation and salt/IV scheme that is neither JKS's
+`KeyProtector` nor PKCS#12's `PBES2`/legacy RC2/3DES bags.
+`recover_key_any_scheme` tries exactly those two, so a real JCEKS entry
+envelope parses as neither and every password refuses.
+
+Closing this needs a third scheme in `recover_key_any_scheme` and
+`protect_key_for_store`, reverse-engineered from `com.sun.crypto.provider`'s
+`JceKeyStore` (not shipped as source in a normal JDK distribution — it is in
+`src.zip` under `com.sun.crypto.provider`, module `jdk.crypto.cryptoki` /
+`java.base`'s closed provider jar, readable via `javap` or a decompiler against
+the installed JDK). Out of scope for this pass: it is a new cipher to
+implement, not a wiring gap like KS-5/KS-6 were.
+
+`apps/probes/LTKeyStoreEngineSweep.java` stays unpromoted (§4 item 4): KS-7
+keeps one of its rows red.

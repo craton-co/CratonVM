@@ -1255,7 +1255,7 @@ pub fn build_key_manager_state(keystore_id: i32) -> KeyManagerState {
     }
     let mut private_key_aliases = Vec::new();
     for (alias, entry) in &store.entries {
-        if let keystore::EntryKind::PrivateKey { key_der, chain } = &entry.kind {
+        if let keystore::EntryKind::PrivateKey { key_der, chain, .. } = &entry.kind {
             if chain.is_empty() {
                 continue;
             }
@@ -6339,6 +6339,7 @@ mod tests {
                 kind: crate::keystore::EntryKind::PrivateKey {
                     key_der: vec![0x30, 0x00],
                     chain: vec![server_only.clone()],
+                    protected: None,
                 },
             },
         );
@@ -6365,6 +6366,7 @@ mod tests {
                     kind: crate::keystore::EntryKind::PrivateKey {
                         key_der: vec![0x30, 0x00],
                         chain: vec![der.clone()],
+                        protected: None,
                     },
                 },
             );
