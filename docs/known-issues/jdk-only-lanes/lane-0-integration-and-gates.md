@@ -64,7 +64,7 @@ Sets are disjoint; the totals below reconcile to 5,549 exactly.
 | **L0** (this page) | `java/lang/Class*`, `java/lang/Module*`, `java/lang/module/` | 131 | 9 | 131 |
 | **LT** | *whole cross-cutting registrars* (see §3) | **1,100** | 87 | **57** |
 | **L1** | `java/util/` (less `concurrent/`), `java/text/`, `sun/util/`, `java/time/` | 963 | 98 | 726 |
-| **L2** | `java/lang/` remainder, `java/math/` | 390 | 57 | 279 |
+| **L2** | `java/lang/` remainder, `java/math/` | 390 | 57 | 279 | <!-- RETIRED 2026-09-11 -->
 | **L3** | `java/lang/reflect/`, `jdk/internal/reflect/`, `sun/reflect/`, `java/lang/invoke/` | 251 | 36 | 246 |
 | **L4** | `java/io/`, `java/nio/`, `sun/nio/`, `jdk/internal/foreign` | 1,110 | 131 | 615 |
 | **L5** | `java/util/concurrent/`, `jdk/internal/misc/`, `sun/misc/`, `java/lang/Thread*`, `jdk/internal/vm/` | 405 | 23 | 345 |
@@ -92,7 +92,7 @@ row whose target was resolved by walking up the hierarchy has found
 seven of L2's bucket-B `<init>` rows are that — six on `java.lang.management`
 INTERFACES, which have no constructor at all. Campaign-wide: 23 such rows over
 21 classes of 1,719. They belong in C/F. See
-[`lane-2-lang-values.md`](lane-2-lang-values.md) §6.
+[`lane-2-lang-values-RETIRED-20260911.md`](../../internal/jdk-only/lane-2-lang-values-RETIRED-20260911.md) §5.
 
 **The 316 unowned rows are frozen, not unassigned-by-accident.** They are
 `jdk/internal/foreign/layout` leftovers, `java/beans`, `sun/java2d`,

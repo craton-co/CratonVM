@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-541 tokens.
+542 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -296,6 +296,7 @@ export inherited from a parent shell.
 | `jit-compiled` | `CRATONVM_DBG_JIT_COMPILED` |
 | `jit-disasm` | `CRATONVM_DBG_JIT_DISASM` |
 | `jit-slot-overlap` | `CRATONVM_DBG_JIT_SLOT_OVERLAP` |
+| `zip-immune` | `CRATONVM_DBG_ZIPIMMUNE` |
 | `jit-dispatch` | `CRATONVM_DBG_JIT_DISPATCH` |
 | `jit-entry` | `CRATONVM_DBG_JIT_ENTRY` |
 | `jit-borrow-sites` | `CRATONVM_DBG_JIT_BORROW_SITES` |
