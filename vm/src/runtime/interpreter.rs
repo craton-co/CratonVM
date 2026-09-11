@@ -9516,6 +9516,9 @@ mod native_override;
 pub use native_override::*;
 pub(crate) mod jit_bridge;
 pub use jit_bridge::*;
+// JEP 358 for an NPE raised inside COMPILED code: rebuilds the full message
+// from the trapping method's own bytecode, so a hot row equals its cold row.
+pub(crate) mod jit_npe_message;
 // The frame-level half of the osr-02 exit differential: back-edge arrivals and
 // OSR-exit resumed frames, in one format, under one flag. Inert unless
 // `CRATONVM_DBG_OSR_FRAME_TRACE` names a class substring.
