@@ -76,7 +76,7 @@ was false` — a `latch.await(30, SECONDS)` that expires — while stock HotSpot
 25 on the same classpath is 2 of 2 clean and CratonVM `--nojit` is 2 of 2
 clean. The cause is a JIT miscompile of `scala.runtime.Statics.anyHash(Long)`
 in the embedded broker, filed with a twenty-line reproducer in
-[`kafka-scala-statics-anyhash-jit-miscompile-20260910.md`](kafka-scala-statics-anyhash-jit-miscompile-20260910.md).
+[`../../internal/fixed-suite-bugs/springboot/kafka-scala-statics-anyhash-jit-miscompile-FIXED-20260910.md`](../../internal/fixed-suite-bugs/springboot/kafka-scala-statics-anyhash-jit-miscompile-FIXED-20260910.md) (FIXED the same day).
 
 Two lessons for this page, and they are why the row is being kept rather than
 deleted:

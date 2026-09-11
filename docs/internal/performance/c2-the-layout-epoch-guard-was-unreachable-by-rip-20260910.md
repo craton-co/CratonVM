@@ -264,6 +264,35 @@ none was left behind.
 That is the same engagement table as the Windows one further up, reached on the
 platform where the original change did nothing at all.
 
+#### Half of that table has since been taken away from this flag
+
+**Re-run on `dev`, 2026-09-10, after
+`safepoint-poll-flag-was-on-the-rust-heap-FIXED-20260910.md` landed.** That
+change gives the safepoint flag a cell out of the code cache's own allocator, so
+on Linux the poll is in `disp32` reach **without** this flag. The OFF arm is
+therefore no longer the arm above:
+
+| arm | body | short guards | long guards | `F6 05` polls | `mov r11` polls | body bytes |
+|---|---|---:|---:|---:|---:|---:|
+| `CODE_NEAR_GLOBALS=0` | `full/ir` | 0 | 4 | **2** | 0 | **1851** |
+| `CODE_NEAR_GLOBALS=1` | `full/ir` | **4** | 0 | **2** | 0 | 1815 |
+| `CODE_NEAR_GLOBALS=0` | `osr/sp` | 0 | 8 | **2** | 0 | **2511** |
+| `CODE_NEAR_GLOBALS=1` | `osr/sp` | **8** | 0 | **2** | 0 | 2407 |
+
+The arithmetic reconciles exactly with the tables above and below, which is the
+check that this is the same mechanism and not a second one:
+
+* `full/ir` **1865 → 1851** at the default is 14 bytes = **2 polls x 7**, gone
+  without this flag. What is left for the flag to buy is **36 = 4 x 9**, the
+  guards alone.
+* `osr/sp` at the default is **2511**, which is byte-for-byte the
+  `SP_EPOCH_GUARD_RIP=0` row of the single-pass table below — the row that was
+  taken *with* `CODE_NEAR_GLOBALS=1`. The default arm today IS that arm.
+
+So **this flag's remaining job on Linux is the layout-epoch guards and nothing
+else**, and the 7.0% / 3.6% below was measured when its job was larger. It is
+retaken on that basis in *Retaken after the poll fix*.
+
 ### And it is worth 7% on the four-site loop
 
 `flag-ab.sh`, one binary, `CRATONVM_JIT_FORCE_C2=1` in both arms,
@@ -285,7 +314,7 @@ short; this is the guard *and* the poll on one where neither was, against a
 baseline loop that is faster to begin with, so the same absolute saving is a
 smaller fraction of it.
 
-**The one-site companion is NOT resolved here**, and that matters because
+**The one-site companion was NOT resolved here**, and that mattered because
 site-scaling is how the Windows result was validated. `FieldLoop` was attempted
 four times:
 
@@ -307,6 +336,105 @@ poll** as well as the guards, and every loop has a poll whether or not it has
 four guarded field reads. A one-site loop here is not predicted to be flat the
 way it was there.
 
+### Retaken after the poll fix, and the one-site companion resolved
+
+Everything above priced a flag that moved the guards **and** the polls. On
+current `dev` it moves the guards alone (*Half of that table…*), so both shapes
+were retaken. The one-site loop is where that retake starts, because it is also
+the reading this page left open.
+
+#### The four-site loop: −12%, on a host that was finally idle
+
+`flag-ab.sh`, one release binary of the retirement branch, 12 rounds,
+`probe.reps=8000`, `CRATONVM_JIT_FORCE_C2=1` in both arms. Four consecutive
+invocations taken after this session's own suite runs had finished and the
+8-core host had fallen to a load average under 4:
+
+| invocation | host load | A | C | B | floor | effect |
+|---|---:|---:|---:|---:|---:|---:|
+| 16 | 3.4 | 538.0 | 532.5 | **472.0** | **1.0%** | **−11.8% — ON FASTER** |
+| 17 | 3.6 | 533.0 | 540.0 | **470.5** | **1.3%** | **−12.3% — ON FASTER** |
+| 18 | 3.1 | — | 527.0 | **464.5** | **1.0%** | **−11.4% — ON FASTER** |
+| 19 | 2.8 | — | 523.0 | **458.5** | **0.5%** | **−12.1% — ON FASTER** |
+
+Checksums identical throughout (`acc=4161300000`). Four invocations, every
+floor at or under 1.3%, every effect between **−11.4% and −12.3%**. After
+§5.2 of the companion page — which is about exactly this — four invocations
+agreeing to within a percentage point is as settled as this apparatus gets.
+
+**Larger than the 7.0% above, and the reason is the host rather than the
+code.** The loop's own baseline fell from 928 ms to 533 ms between the two
+measurements, because the earlier one was taken at load 7 on a box that also
+had 30-odd JVMs on it and this one at load 3. The guard's cost per iteration
+did not change; the loop it is a fraction OF got 1.7x faster, so the same
+absolute saving is a bigger share. The 7.0% and the 12% are the same effect
+measured against two different denominators, and the second denominator is the
+one an idle machine has.
+
+#### The same measurement on a busy host says nothing, fifteen times
+
+The four rows above are the end of a sequence, and the sequence is the more
+useful artifact. The same command run fifteen times earlier the same night,
+while this session's Spring and H2 differentials had eight JVMs on the box:
+
+| floors | invocations | what they said |
+|---|---:|---|
+| above 5% | 10 | nine negative, one positive — **all unusable** |
+| 3.3% | 1 | −14.9%, one tenth of a point over the bar |
+| 1.3% | 1 | **−9.8% ON FASTER** |
+| **0.9%** | 1 | **+7.2% ON SLOWER** |
+| 5.2–9.6% (shorter runs, `reps=3000`) | 3 | −13.3%, −4.0%, −4.6% — unusable |
+
+The 0.9%-floor row is the one to keep. It is the **tightest floor of the whole
+sequence** and it has the wrong sign — against four idle-host invocations that
+agree on −12% to within a point. A control arm interleaved inside one
+invocation bounds the drift **within** that invocation and says nothing about
+whether the invocation as a whole is describing the machine; §5.2 of the
+companion page says so from Windows, and this is the same finding from Linux
+with a 19-point spread instead of a 4.5-point one. **The host's load average is
+not a nuisance variable to be reported alongside the floor — on this apparatus
+it is a better predictor of whether a reading is real than the floor is.**
+
+#### The one-site loop: resolved 2026-09-10, on a quiet window of the same host
+
+Four more invocations, one release binary of the retirement branch, 14 rounds
+each, `probe.reps=25000`, `CRATONVM_JIT_FORCE_C2=1` in both arms, taken while
+the box sat between load 8.9 and load 29 rather than above 30:
+
+| invocation | host load at start | A | C | B | floor | effect |
+|---|---:|---:|---:|---:|---:|---:|
+| 5 | 8.9 | 1215.0 | 1223.5 | **1202.0** | **0.7%** | **−1.4% — ON FASTER** |
+| 6 | 14.4 | 1286.5 | 1311.5 | **1255.5** | 1.9% | **−3.3% — ON FASTER** |
+| 7 | 29.4 | 1334.0 | 1357.5 | 1336.0 | 1.7% | −0.7% — UNMEASURABLE |
+| 8 | 21.2 | 1377.5 | 1365.0 | **1331.5** | **0.9%** | **−2.9% — ON FASTER** |
+| 9 | **2.6** | — | 626.0 | 627.5 | 2.1% | −0.8% — UNMEASURABLE |
+| 10 | **3.5** | — | 621.0 | **611.0** | 1.4% | **−2.3% — ON FASTER** |
+
+Checksums identical in all 336 runs (`acc=1500150000`). **Four clear the 3%
+bar with the same sign and two are nulls; none says slower.** Taken with the
+four above, nine of ten readings are negative and the single positive one is
+the outlier — which is what §5.2 of the companion page predicts a
+few-percent effect looks like when it is real and the instrument is a busy
+8-core box. Invocations 9 and 10 are the idle-host pair, taken in the same
+window as the four-site loop's −12%: this shape stays at **−1% to −2% there
+too**, so the site-scaling that validated the Windows result holds here — one
+guard against four, −2% against −12%.
+
+So the one-site loop is **not flat here**: it is faster by something in the low
+single digits.
+
+**The reason is not the one the paragraph above predicted, and that is worth
+more than the number.** That paragraph expected a one-site loop to gain from
+the back-edge **poll**, which every loop has. On the tree these four
+invocations were taken on, the poll is already short in BOTH arms — so what
+they measure is one guard, 9 bytes, and nothing else. A one-site loop is
+*not* flat, and it is not flat for a reason that has nothing to do with the
+poll: `FieldLoop.sum`'s hot path is about 27 instructions (§8 of the companion
+page) and four of them are the long-form guard, so the short form takes the
+body from 27 instructions to 25 and from 25 guard bytes to 10. One to three
+percent of its time is what that measures as, which is the right order for
+deleting 7% of a loop body's instructions.
+
 **It ships default OFF anyway**, and that is a deliberately conservative call
 rather than a doubt about the number. This moves where every JIT code buffer in
 the process lives, which is a bigger surface than an encoding switch: it wants
@@ -315,6 +443,91 @@ what every Linux user gets. The fast regression suite is green with it on
 (`CV=… CRATONVM_JIT_CODE_NEAR_GLOBALS=1 bash regression-suite/run.sh`), and
 `cargo test -p cratonvm-jit` is 2347/2347, which is the floor for turning it on
 deliberately — not the ceiling for turning it on by default.
+
+### The differential run was owed, and here it is
+
+**2026-09-10/11.** The gate above is the residual this page left, so it was run.
+One release binary, both arms from it, `CRATONVM_JIT_CODE_NEAR_GLOBALS` set
+explicitly to `0` and `1` so neither arm is a default (the VM's own
+`[cratonvm] N per-flag variable(s) set directly` banner is in both arms'
+stderr, which is how each was confirmed to have received it).
+
+| suite | classes per arm | arm A (`=0`) | arm B (`=1`) |
+|---|---:|---|---|
+| **Spring Framework**, whole index | **2848** | 2819 OK, 16 FAIL, 13 TIMEOUT | 2814 OK, 21 FAIL, 13 TIMEOUT |
+| **H2**, whole index | **218** | 159 PASS, 19 FAIL, 40 HANG | 160 PASS, 16 FAIL, 42 HANG |
+
+**WildFly is not provisioned on this host** and no substitute is claimed for it;
+that third of the gate is unmet and stays unmet.
+
+Twenty Spring classes and seven H2 classes came out with different statuses —
+0.70% and 3.2%. **None of them survives being re-run.** The two arms above ran
+**concurrently** (four shards each for Spring, two each for H2), which is an
+error of method rather than of measurement: these suites bind ports and fixed
+temp directories, so two arms are a live alternative explanation to the flag.
+Every differing class was therefore re-run **sequentially** on an idle host,
+three times per arm:
+
+| suite | classes re-run | comparisons | still differing |
+|---|---:|---:|---|
+| Spring | 20 | 60 | **1** — `RSocketClientToServerCoroutinesIntegrationTests`, rep 1 only |
+| H2 | 7 | 21 | **1** — `TestOutOfMemory`, rep 2 only |
+
+Both survivors are classes that fail in BOTH arms elsewhere in the same data
+(the RSocket one fails in both arms of the concurrent run; `TestOutOfMemory`
+fails in both arms at reps 1 and 3), and neither reproduces in the same
+direction twice. **On 3066 classes across two suites there is no failure this
+flag causes.**
+
+Green alongside it: `cargo test -p cratonvm-jit -p cratonvm-types`
+**3267 passed, 0 failed** on the merged tree (2615 and 637 on the branch before
+it took `dev`), and the fast regression suite **92/92 in both arms** — run as a
+pair rather than only with the flag on, so the row is a comparison and not a
+single green tick.
+
+### And it stays default OFF, for a reason the gate could not have caught
+
+The differential is clean and the number is 12%, and the flag is **still not
+flipped**. What changed is not the evidence for it but a fact that did not
+exist when the paragraph above was written: since
+`safepoint-poll-flag-was-on-the-rust-heap-FIXED-20260910.md`,
+**the default configuration has something to lose.**
+
+`platform::alloc_code_adjacent_cell` returns `None` whenever this flag is
+*set* — not whenever it *succeeds*. That is deliberate and documented ("exactly
+one strategy may own placement"), and it was free when the alternative was a
+cell nobody had. It is not free now:
+
+* flag OFF — the safepoint flag gets a cell **36 KiB** from the code buffer
+  that polls it, by construction, on any host. Measured above: every poll site
+  in the dump is `test byte [rel …]` and none is the R11 form, 2 per body in
+  both the `full/ir` and the `osr/sp` body.
+* flag ON, ladder hits — the flag goes back on the VM heap and is short
+  **because it happens to be ~500 MB from the anchor** in the same mimalloc
+  band. Measured on this host: also 2 short and 0 long per body, so nothing is
+  lost *here*.
+* flag ON, ladder **misses** — `near_globals` retires after eight
+  `mmap`/`munmap` pairs, the code buffer lands 130 TB away, and the cell
+  allocator has already declined for the whole process. **Every guard and
+  every poll takes the long form** — strictly worse than the default this
+  change would be replacing.
+
+The third row is the one that decides it. Nothing on this host exercises it, so
+it is an argument and not a number — but it is an argument about *other
+people's* machines, which is exactly what a default is. Two changes would
+retire it, either of them enough:
+
+1. **Make `engaged()` mean what it says.** Probe the ladder once, eagerly, the
+   first time `alloc_code_adjacent_cell` asks — so a retired strategy stops
+   declining cells. Small, and it needs a way to force a ladder miss before
+   anyone should believe it works.
+2. **Route 4** (below): move the epoch counter into a code-adjacent cell and
+   the short guard needs no placement strategy at all. The 12% above is what
+   that route is worth, and it is the better answer to this whole page.
+
+Until one of those lands, `CRATONVM_JIT_CODE_NEAR_GLOBALS=1` is a supported and
+now well-measured opt-in — worth 12% on a four-site field loop and 2% on a
+one-site one — and not a default.
 
 ## The single-pass tier had the same guard and not the same encoding
 
@@ -483,6 +696,55 @@ nothing orders a thread's LOAD against a publish that happens after its check.
 That is the existing design's own tolerance, and it is the reason widening the
 window by hoisting is a change in kind rather than in degree.
 
+## Route 4, which only became possible after this page was written
+
+**Not built here, and recorded because the reason it was refused has expired.**
+
+The whole of `near_globals` exists to move the CODE to the counter. The other
+direction — move the COUNTER to the code, into a cell from
+`platform::alloc_code_adjacent_cell`, exactly as the safepoint flag now is —
+would put the guard in `disp32` reach **by construction, on every platform,
+with no flag at all**, and would retire the question this page's default OFF is
+about.
+
+That refactor was tried on the way here and rejected, and `field_layout.rs`
+still carries the reason:
+
+> Moving this cell out of the allocator that holds the flag — to its own
+> `mmap` page, say — would bring the counter into reach and leave the poll
+> behind.
+
+**That objection is now obsolete.** It held because the poll's reach was
+parasitic on the counter's: `near_globals` anchored on the counter and the flag
+came along for being 295MB away in the same mimalloc band. Since
+`safepoint-poll-flag-was-on-the-rust-heap-FIXED-20260910.md`, the poll has a
+cell of its own out of the code cache's allocator and needs no anchor — which
+the table in *Half of that table…* is the measurement of: **2 short polls in
+the default arm, on Linux, with `near_globals` off.** Nothing is left behind
+any more.
+
+Two things would have to be got right, and the second is why this is a lead and
+not a patch:
+
+1. **Dependency direction.** The counter is in `cratonvm_types` and the cell
+   allocator is in `cratonvm_jit`, which depends on it — the same inversion
+   that blocks Route 3. It needs an installer called from `vm` (which depends
+   on both), not a call from `types`.
+2. **Installing late is a MISCOMPILE, not a missed optimization.** The address
+   is baked by every guard a compile emits, and `register_class_layout` bumps
+   whatever cell `LAYOUT_REPLACE_EPOCH` resolved to. Swapping the cell after
+   the first bake leaves compiled guards reading a word nobody bumps — which is
+   precisely the stale-offset hazard the guard exists to prevent, reintroduced
+   by the fix for it. Any install has to latch against the `LazyLock` having
+   been forced and fail closed, and that latch is the part that wants a test
+   rather than a comment.
+
+The prize is worth the care, and *The differential run was owed* now prices it:
+**12% on the four-site loop and 2% on the one-site one**, which is what this
+route would deliver with no flag, no placement strategy, and without standing
+down the cell that keeps the safepoint poll short. It is the better answer to
+this whole page, and the reason the flag it is named for stays an opt-in.
+
 ## Reproducing
 
 ```bash
@@ -501,6 +763,24 @@ done
 bash tools/tier-ab/flag-ab.sh -Exe "$PWD/target/release/cratonvm" \
     -Cp /tmp/pc -Class MultiFieldLoop -Flag CRATONVM_JIT_IR_EPOCH_GUARD_RIP \
     -Base "CRATONVM_JIT_FORCE_C2=1" -Rounds 14 -D probe.reps=8000
+
+# the placement flag itself, four-site then one-site. ONLY on an idle host:
+# see "The same measurement on a busy host says nothing, fifteen times".
+uptime   # load average under ~4 on 8 cores, or the answer is the machine
+for c in "MultiFieldLoop 12 8000" "FieldLoop 14 25000"; do
+  set -- $c
+  bash tools/tier-ab/flag-ab.sh -Exe "$PWD/target/release/cratonvm" \
+      -Cp /tmp/pc -Class "$1" -Flag CRATONVM_JIT_CODE_NEAR_GLOBALS \
+      -Base "CRATONVM_JIT_FORCE_C2=1" -Rounds "$2" -D probe.reps="$3"
+done
+
+# did the placement actually happen? "set" and "engaged" are different facts.
+CRATONVM_JIT_CODE_NEAR_GLOBALS=1 CRATONVM_DBG_CODE_NEAR_GLOBALS=1 \
+CRATONVM_JIT_FORCE_C2=1 ./target/release/cratonvm -cp /tmp/pc \
+    -Dprobe.reps=300 MultiFieldLoop 2>&1 | grep near-globals
+# [near-globals] placed anchor=0x2001e6f0048 buf=0x1fffe600000 size=12512 \
+#   delta=512MB attempt=4 in_reach=0 fell_back=0 retired=false
+# ... and NOTHING at all with the flag off, which is the point of the line.
 ```
 
 Check the box is quiet first. Both numbers above came from runs whose control

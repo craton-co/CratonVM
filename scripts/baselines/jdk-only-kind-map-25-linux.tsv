@@ -160,6 +160,34 @@
 #   defect in getLayer, is recorded, and is NOT frozen by this row: the
 #   sweep is checked in and goes red when it is fixed or when this answer
 #   drifts. Nothing else on java/lang/Module moves; this is one triple.
+# amended: 2026-09-10, lane 5 (java.util.concurrent / Thread / Unsafe).
+#   101 rows edited by hand and ONE row added, not re-measured:
+#   bridge -> synthetic-stub, kind_stated 0 -> 1.
+#
+#   The value is DERIVED, not guessed, by the same deterministic rule the
+#   2026-09-09 Phase 3 amendment above uses: the retag in
+#   NativeMethodRegistry::register fires on (effective category Bridge +
+#   triple_is_retired_shadow) and lands on SyntheticStub with kind_stated
+#   true. So 98 table triples produce 101 rows here, because three of them
+#   are registered at more than one ordinal and the retag flips every one.
+#
+#   IT WAS 103 ROWS FOR 100 TRIPLES until the two
+#   ScheduledThreadPoolExecutor rows came back out of the table on the same
+#   day -- they are the pair keep_real_scheduled_executor_bridge holds in
+#   REAL-JDK mode, and the retag, which runs first, would have disarmed it.
+#   See RETIRED_SHADOW_L5_TRIPLES, "a retirement is mode-blind and a keep arm
+#   is not". Those two rows are therefore UNCHANGED from the freeze here.
+#
+#   THE ADDED ROW is the exception worth naming:
+#   PriorityBlockingQueue.poll(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;
+#   is in the tree and in the retirement table and was NOT in this file --
+#   it is a registration added after the last full freeze. Adding it with a
+#   derived value is the same move as editing the other 103, but a freeze
+#   that has a row MISSING is a different kind of stale from one that has a
+#   row WRONG, and a linux re-freeze should be expected to find more of it.
+#
+#   The measurement is in
+#   docs/internal/retired/lane-5-concurrent-thread-unsafe-RETIRED-20260910.md.
 # class	name	descriptor	ordinal	kind	kind_stated	kind_chosen
 CratonVM$HttpServerLoop	run	()V	0	bridge	0	1
 brave/internal/collect/WeakConcurrentMap$WeakKey	equals	(Ljava/lang/Object;)Z	0	bridge	0	1
@@ -3519,9 +3547,9 @@ java/lang/Thread	suspend0	()V	0	bridge	0	1
 java/lang/Thread	threadState	()Ljava/lang/Thread$State;	0	bridge	0	1
 java/lang/Thread	yield	()V	0	bridge	0	1
 java/lang/Thread	yield0	()V	0	bridge	1	1
-java/lang/Thread$FieldHolder	<init>	(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;JIZ)V	0	bridge	0	1
-java/lang/Thread$State	valueOf	(Ljava/lang/String;)Ljava/lang/Thread$State;	0	bridge	0	1
-java/lang/Thread$State	values	()[Ljava/lang/Thread$State;	0	bridge	0	1
+java/lang/Thread$FieldHolder	<init>	(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;JIZ)V	0	synthetic-stub	1	1
+java/lang/Thread$State	valueOf	(Ljava/lang/String;)Ljava/lang/Thread$State;	0	synthetic-stub	1	1
+java/lang/Thread$State	values	()[Ljava/lang/Thread$State;	0	synthetic-stub	1	1
 java/lang/Thread$UncaughtExceptionHandler	uncaughtException	(Ljava/lang/Thread;Ljava/lang/Throwable;)V	0	bridge	0	1
 java/lang/ThreadGroup	<init>	(Ljava/lang/String;)V	0	bridge	0	1
 java/lang/ThreadGroup	<init>	(Ljava/lang/ThreadGroup;Ljava/lang/String;)V	0	bridge	0	1
@@ -7540,16 +7568,16 @@ java/util/concurrent/CompletableFuture	completeExceptionally	(Ljava/lang/Throwab
 java/util/concurrent/CompletableFuture	completeValue	(Ljava/lang/Object;)Z	0	bridge	0	1
 java/util/concurrent/CompletableFuture	exceptionally	(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;	0	bridge	0	1
 java/util/concurrent/CompletableFuture	handle	(Ljava/util/function/BiFunction;)Ljava/util/concurrent/CompletableFuture;	0	bridge	0	1
-java/util/concurrent/CompletableFuture	isCompletedExceptionally	()Z	0	bridge	0	1
+java/util/concurrent/CompletableFuture	isCompletedExceptionally	()Z	0	synthetic-stub	1	1
 java/util/concurrent/CompletableFuture	thenAccept	(Ljava/util/function/Consumer;)Ljava/util/concurrent/CompletableFuture;	0	bridge	0	1
-java/util/concurrent/CompletableFuture	thenAcceptAsync	(Ljava/util/function/Consumer;)Ljava/util/concurrent/CompletableFuture;	0	bridge	0	1
+java/util/concurrent/CompletableFuture	thenAcceptAsync	(Ljava/util/function/Consumer;)Ljava/util/concurrent/CompletableFuture;	0	synthetic-stub	1	1
 java/util/concurrent/CompletableFuture	thenApply	(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;	0	bridge	0	1
-java/util/concurrent/CompletableFuture	thenApplyAsync	(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;	0	bridge	0	1
-java/util/concurrent/CompletableFuture	thenCombine	(Ljava/util/concurrent/CompletionStage;Ljava/util/function/BiFunction;)Ljava/util/concurrent/CompletableFuture;	0	bridge	0	1
+java/util/concurrent/CompletableFuture	thenApplyAsync	(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;	0	synthetic-stub	1	1
+java/util/concurrent/CompletableFuture	thenCombine	(Ljava/util/concurrent/CompletionStage;Ljava/util/function/BiFunction;)Ljava/util/concurrent/CompletableFuture;	0	synthetic-stub	1	1
 java/util/concurrent/CompletableFuture	thenCompose	(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;	0	bridge	0	1
-java/util/concurrent/CompletableFuture	thenComposeAsync	(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;	0	bridge	0	1
+java/util/concurrent/CompletableFuture	thenComposeAsync	(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;	0	synthetic-stub	1	1
 java/util/concurrent/CompletableFuture	thenRun	(Ljava/lang/Runnable;)Ljava/util/concurrent/CompletableFuture;	0	bridge	0	1
-java/util/concurrent/CompletableFuture	thenRunAsync	(Ljava/lang/Runnable;)Ljava/util/concurrent/CompletableFuture;	0	bridge	0	1
+java/util/concurrent/CompletableFuture	thenRunAsync	(Ljava/lang/Runnable;)Ljava/util/concurrent/CompletableFuture;	0	synthetic-stub	1	1
 java/util/concurrent/CompletableFuture	whenComplete	(Ljava/util/function/BiConsumer;)Ljava/util/concurrent/CompletableFuture;	0	bridge	0	1
 java/util/concurrent/CompletedFuture	cancel	(Z)Z	0	synthetic-stub	1	1
 java/util/concurrent/CompletedFuture	get	()Ljava/lang/Object;	0	synthetic-stub	1	1
@@ -7657,25 +7685,25 @@ java/util/concurrent/ConcurrentMap	get	(Ljava/lang/Object;)Ljava/lang/Object;	0	
 java/util/concurrent/ConcurrentMap	put	(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
 java/util/concurrent/ConcurrentMap	remove	(Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
 java/util/concurrent/ConcurrentMap	size	()I	0	bridge	0	1
-java/util/concurrent/CopyOnWriteArrayList	add	(ILjava/lang/Object;)V	0	bridge	0	1
-java/util/concurrent/CopyOnWriteArrayList	add	(Ljava/lang/Object;)Z	0	bridge	0	1
-java/util/concurrent/CopyOnWriteArrayList	addAll	(Ljava/util/Collection;)Z	0	bridge	0	1
-java/util/concurrent/CopyOnWriteArrayList	addIfAbsent	(Ljava/lang/Object;)Z	0	bridge	0	1
-java/util/concurrent/CopyOnWriteArrayList	addIfAbsent	(Ljava/lang/Object;)Z	1	bridge	0	1
-java/util/concurrent/CopyOnWriteArrayList	addIfAbsent	(Ljava/lang/Object;)Z	2	bridge	0	1
-java/util/concurrent/CopyOnWriteArrayList	bulkRemove	(Ljava/util/function/Predicate;)Z	0	bridge	0	1
-java/util/concurrent/CopyOnWriteArrayList	clear	()V	0	bridge	0	1
-java/util/concurrent/CopyOnWriteArrayList	contains	(Ljava/lang/Object;)Z	0	bridge	0	1
-java/util/concurrent/CopyOnWriteArrayList	contains	(Ljava/lang/Object;)Z	1	bridge	0	1
-java/util/concurrent/CopyOnWriteArrayList	get	(I)Ljava/lang/Object;	0	bridge	0	1
-java/util/concurrent/CopyOnWriteArrayList	indexOf	(Ljava/lang/Object;)I	0	bridge	0	1
-java/util/concurrent/CopyOnWriteArrayList	isEmpty	()Z	0	bridge	0	1
-java/util/concurrent/CopyOnWriteArrayList	iterator	()Ljava/util/Iterator;	0	bridge	0	1
-java/util/concurrent/CopyOnWriteArrayList	remove	(I)Ljava/lang/Object;	0	bridge	0	1
-java/util/concurrent/CopyOnWriteArrayList	remove	(Ljava/lang/Object;)Z	0	bridge	0	1
-java/util/concurrent/CopyOnWriteArrayList	set	(ILjava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
-java/util/concurrent/CopyOnWriteArrayList	size	()I	0	bridge	0	1
-java/util/concurrent/CopyOnWriteArrayList	toArray	()[Ljava/lang/Object;	0	bridge	0	1
+java/util/concurrent/CopyOnWriteArrayList	add	(ILjava/lang/Object;)V	0	synthetic-stub	1	1
+java/util/concurrent/CopyOnWriteArrayList	add	(Ljava/lang/Object;)Z	0	synthetic-stub	1	1
+java/util/concurrent/CopyOnWriteArrayList	addAll	(Ljava/util/Collection;)Z	0	synthetic-stub	1	1
+java/util/concurrent/CopyOnWriteArrayList	addIfAbsent	(Ljava/lang/Object;)Z	0	synthetic-stub	1	1
+java/util/concurrent/CopyOnWriteArrayList	addIfAbsent	(Ljava/lang/Object;)Z	1	synthetic-stub	1	1
+java/util/concurrent/CopyOnWriteArrayList	addIfAbsent	(Ljava/lang/Object;)Z	2	synthetic-stub	1	1
+java/util/concurrent/CopyOnWriteArrayList	bulkRemove	(Ljava/util/function/Predicate;)Z	0	synthetic-stub	1	1
+java/util/concurrent/CopyOnWriteArrayList	clear	()V	0	synthetic-stub	1	1
+java/util/concurrent/CopyOnWriteArrayList	contains	(Ljava/lang/Object;)Z	0	synthetic-stub	1	1
+java/util/concurrent/CopyOnWriteArrayList	contains	(Ljava/lang/Object;)Z	1	synthetic-stub	1	1
+java/util/concurrent/CopyOnWriteArrayList	get	(I)Ljava/lang/Object;	0	synthetic-stub	1	1
+java/util/concurrent/CopyOnWriteArrayList	indexOf	(Ljava/lang/Object;)I	0	synthetic-stub	1	1
+java/util/concurrent/CopyOnWriteArrayList	isEmpty	()Z	0	synthetic-stub	1	1
+java/util/concurrent/CopyOnWriteArrayList	iterator	()Ljava/util/Iterator;	0	synthetic-stub	1	1
+java/util/concurrent/CopyOnWriteArrayList	remove	(I)Ljava/lang/Object;	0	synthetic-stub	1	1
+java/util/concurrent/CopyOnWriteArrayList	remove	(Ljava/lang/Object;)Z	0	synthetic-stub	1	1
+java/util/concurrent/CopyOnWriteArrayList	set	(ILjava/lang/Object;)Ljava/lang/Object;	0	synthetic-stub	1	1
+java/util/concurrent/CopyOnWriteArrayList	size	()I	0	synthetic-stub	1	1
+java/util/concurrent/CopyOnWriteArrayList	toArray	()[Ljava/lang/Object;	0	synthetic-stub	1	1
 java/util/concurrent/CopyOnWriteArraySet	<init>	()V	0	bridge	0	1
 java/util/concurrent/CopyOnWriteArraySet	<init>	(I)V	0	bridge	0	1
 java/util/concurrent/CopyOnWriteArraySet	<init>	(IF)V	0	bridge	0	1
@@ -7818,14 +7846,15 @@ java/util/concurrent/ForkJoinTask	quietlyJoinPoolInvokeAllTask	(J)V	0	bridge	1	1
 java/util/concurrent/ForkJoinTask	quietlyJoinPoolInvokeAllTask	(J)V	1	bridge	1	1
 java/util/concurrent/ForkJoinTask	quietlyJoinUninterruptibly	(JLjava/util/concurrent/TimeUnit;)Z	0	bridge	1	1
 java/util/concurrent/ForkJoinTask	quietlyJoinUninterruptibly	(JLjava/util/concurrent/TimeUnit;)Z	1	bridge	1	1
-java/util/concurrent/PriorityBlockingQueue	<init>	()V	0	bridge	0	1
-java/util/concurrent/PriorityBlockingQueue	isEmpty	()Z	0	bridge	0	1
-java/util/concurrent/PriorityBlockingQueue	offer	(Ljava/lang/Object;)Z	0	bridge	0	1
-java/util/concurrent/PriorityBlockingQueue	peek	()Ljava/lang/Object;	0	bridge	0	1
-java/util/concurrent/PriorityBlockingQueue	poll	()Ljava/lang/Object;	0	bridge	0	1
-java/util/concurrent/PriorityBlockingQueue	put	(Ljava/lang/Object;)V	0	bridge	0	1
-java/util/concurrent/PriorityBlockingQueue	size	()I	0	bridge	0	1
-java/util/concurrent/PriorityBlockingQueue	take	()Ljava/lang/Object;	0	bridge	0	1
+java/util/concurrent/PriorityBlockingQueue	<init>	()V	0	synthetic-stub	1	1
+java/util/concurrent/PriorityBlockingQueue	isEmpty	()Z	0	synthetic-stub	1	1
+java/util/concurrent/PriorityBlockingQueue	offer	(Ljava/lang/Object;)Z	0	synthetic-stub	1	1
+java/util/concurrent/PriorityBlockingQueue	peek	()Ljava/lang/Object;	0	synthetic-stub	1	1
+java/util/concurrent/PriorityBlockingQueue	poll	()Ljava/lang/Object;	0	synthetic-stub	1	1
+java/util/concurrent/PriorityBlockingQueue	poll	(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;	0	synthetic-stub	1	1
+java/util/concurrent/PriorityBlockingQueue	put	(Ljava/lang/Object;)V	0	synthetic-stub	1	1
+java/util/concurrent/PriorityBlockingQueue	size	()I	0	synthetic-stub	1	1
+java/util/concurrent/PriorityBlockingQueue	take	()Ljava/lang/Object;	0	synthetic-stub	1	1
 java/util/concurrent/RecursiveAction	cancel	(Z)Z	0	bridge	0	1
 java/util/concurrent/RecursiveAction	completeExceptionally	(Ljava/lang/Throwable;)V	0	bridge	0	1
 java/util/concurrent/RecursiveAction	fork	()Ljava/util/concurrent/ForkJoinTask;	0	bridge	0	1
@@ -7875,7 +7904,7 @@ java/util/concurrent/ScheduledExecutorService	isShutdown	()Z	0	intrinsic	0	1
 java/util/concurrent/ScheduledExecutorService	shutdown	()V	0	intrinsic	0	1
 java/util/concurrent/ScheduledThreadPoolExecutor	<init>	(ILjava/util/concurrent/ThreadFactory;Ljava/util/concurrent/RejectedExecutionHandler;)V	0	bridge	0	1
 java/util/concurrent/ScheduledThreadPoolExecutor	getCorePoolSize	()I	0	bridge	0	1
-java/util/concurrent/ThreadPoolExecutor	awaitTermination	(JLjava/util/concurrent/TimeUnit;)Z	0	bridge	0	1
+java/util/concurrent/ThreadPoolExecutor	awaitTermination	(JLjava/util/concurrent/TimeUnit;)Z	0	synthetic-stub	1	1
 java/util/concurrent/ThreadPoolExecutor	execute	(Ljava/lang/Runnable;)V	0	synthetic-stub	1	1
 java/util/concurrent/ThreadPoolExecutor	getActiveCount	()I	0	bridge	0	1
 java/util/concurrent/ThreadPoolExecutor	getCompletedTaskCount	()J	0	bridge	0	1
@@ -9498,36 +9527,36 @@ jdk/internal/misc/CDS	logLambdaFormInvoker	(Ljava/lang/String;)V	0	bridge	1	1
 jdk/internal/misc/CDS	logLambdaFormInvoker	(Ljava/lang/String;)V	1	bridge	1	1
 jdk/internal/misc/PreviewFeatures	isPreviewEnabled	()Z	0	bridge	1	1
 jdk/internal/misc/ScopedMemoryAccess	closeScope0	(Ljdk/internal/foreign/MemorySessionImpl;Ljdk/internal/misc/ScopedMemoryAccess$ScopedAccessError;)V	0	bridge	1	1
-jdk/internal/misc/ScopedMemoryAccess	copyMemory	(Ljdk/internal/foreign/MemorySessionImpl;Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JLjava/lang/Object;JJ)V	0	bridge	0	1
-jdk/internal/misc/ScopedMemoryAccess	copyMemoryInternal	(Ljdk/internal/foreign/MemorySessionImpl;Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JLjava/lang/Object;JJ)V	0	bridge	0	1
+jdk/internal/misc/ScopedMemoryAccess	copyMemory	(Ljdk/internal/foreign/MemorySessionImpl;Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JLjava/lang/Object;JJ)V	0	synthetic-stub	1	1
+jdk/internal/misc/ScopedMemoryAccess	copyMemoryInternal	(Ljdk/internal/foreign/MemorySessionImpl;Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JLjava/lang/Object;JJ)V	0	synthetic-stub	1	1
 jdk/internal/misc/ScopedMemoryAccess	getByte	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;J)B	0	bridge	0	1
 jdk/internal/misc/ScopedMemoryAccess	getByteInternal	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;J)B	0	bridge	0	1
 jdk/internal/misc/ScopedMemoryAccess	getInt	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;J)I	0	bridge	0	1
 jdk/internal/misc/ScopedMemoryAccess	getIntInternal	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;J)I	0	bridge	0	1
-jdk/internal/misc/ScopedMemoryAccess	getIntUnaligned	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)I	0	bridge	0	1
-jdk/internal/misc/ScopedMemoryAccess	getIntUnalignedInternal	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)I	0	bridge	0	1
+jdk/internal/misc/ScopedMemoryAccess	getIntUnaligned	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)I	0	synthetic-stub	1	1
+jdk/internal/misc/ScopedMemoryAccess	getIntUnalignedInternal	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)I	0	synthetic-stub	1	1
 jdk/internal/misc/ScopedMemoryAccess	getLong	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;J)J	0	bridge	0	1
 jdk/internal/misc/ScopedMemoryAccess	getLongInternal	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;J)J	0	bridge	0	1
-jdk/internal/misc/ScopedMemoryAccess	getLongUnaligned	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)J	0	bridge	0	1
-jdk/internal/misc/ScopedMemoryAccess	getLongUnalignedInternal	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)J	0	bridge	0	1
+jdk/internal/misc/ScopedMemoryAccess	getLongUnaligned	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)J	0	synthetic-stub	1	1
+jdk/internal/misc/ScopedMemoryAccess	getLongUnalignedInternal	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)J	0	synthetic-stub	1	1
 jdk/internal/misc/ScopedMemoryAccess	getShort	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;J)S	0	bridge	0	1
 jdk/internal/misc/ScopedMemoryAccess	getShortInternal	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;J)S	0	bridge	0	1
-jdk/internal/misc/ScopedMemoryAccess	getShortUnaligned	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)S	0	bridge	0	1
-jdk/internal/misc/ScopedMemoryAccess	getShortUnalignedInternal	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)S	0	bridge	0	1
+jdk/internal/misc/ScopedMemoryAccess	getShortUnaligned	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)S	0	synthetic-stub	1	1
+jdk/internal/misc/ScopedMemoryAccess	getShortUnalignedInternal	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)S	0	synthetic-stub	1	1
 jdk/internal/misc/ScopedMemoryAccess	putByte	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JB)V	0	bridge	0	1
 jdk/internal/misc/ScopedMemoryAccess	putByteInternal	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JB)V	0	bridge	0	1
-jdk/internal/misc/ScopedMemoryAccess	putInt	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JI)V	0	bridge	0	1
-jdk/internal/misc/ScopedMemoryAccess	putIntInternal	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JI)V	0	bridge	0	1
-jdk/internal/misc/ScopedMemoryAccess	putIntUnaligned	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JIZ)V	0	bridge	0	1
-jdk/internal/misc/ScopedMemoryAccess	putIntUnalignedInternal	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JIZ)V	0	bridge	0	1
+jdk/internal/misc/ScopedMemoryAccess	putInt	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JI)V	0	synthetic-stub	1	1
+jdk/internal/misc/ScopedMemoryAccess	putIntInternal	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JI)V	0	synthetic-stub	1	1
+jdk/internal/misc/ScopedMemoryAccess	putIntUnaligned	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JIZ)V	0	synthetic-stub	1	1
+jdk/internal/misc/ScopedMemoryAccess	putIntUnalignedInternal	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JIZ)V	0	synthetic-stub	1	1
 jdk/internal/misc/ScopedMemoryAccess	putLong	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JJ)V	0	bridge	0	1
 jdk/internal/misc/ScopedMemoryAccess	putLongInternal	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JJ)V	0	bridge	0	1
-jdk/internal/misc/ScopedMemoryAccess	putLongUnaligned	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JJZ)V	0	bridge	0	1
-jdk/internal/misc/ScopedMemoryAccess	putLongUnalignedInternal	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JJZ)V	0	bridge	0	1
+jdk/internal/misc/ScopedMemoryAccess	putLongUnaligned	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JJZ)V	0	synthetic-stub	1	1
+jdk/internal/misc/ScopedMemoryAccess	putLongUnalignedInternal	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JJZ)V	0	synthetic-stub	1	1
 jdk/internal/misc/ScopedMemoryAccess	putShort	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JS)V	0	bridge	0	1
 jdk/internal/misc/ScopedMemoryAccess	putShortInternal	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JS)V	0	bridge	0	1
-jdk/internal/misc/ScopedMemoryAccess	putShortUnaligned	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JSZ)V	0	bridge	0	1
-jdk/internal/misc/ScopedMemoryAccess	putShortUnalignedInternal	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JSZ)V	0	bridge	0	1
+jdk/internal/misc/ScopedMemoryAccess	putShortUnaligned	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JSZ)V	0	synthetic-stub	1	1
+jdk/internal/misc/ScopedMemoryAccess	putShortUnalignedInternal	(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JSZ)V	0	synthetic-stub	1	1
 jdk/internal/misc/ScopedMemoryAccess	registerNatives	()V	0	bridge	1	1
 jdk/internal/misc/SharedSecrets	getJavaIOAccess	()Ljdk/internal/access/JavaIOAccess;	0	synthetic-stub	1	1
 jdk/internal/misc/SharedSecrets	getJavaIOFileDescriptorAccess	()Ljdk/internal/access/JavaIOFileDescriptorAccess;	0	synthetic-stub	1	1
@@ -9623,12 +9652,12 @@ jdk/internal/misc/Unsafe	freeMemory0	(J)V	5	bridge	1	1
 jdk/internal/misc/Unsafe	fullFence	()V	0	bridge	1	1
 jdk/internal/misc/Unsafe	getAddress	(J)J	0	bridge	0	1
 jdk/internal/misc/Unsafe	getAndAddByte	(Ljava/lang/Object;JB)B	0	bridge	0	1
-jdk/internal/misc/Unsafe	getAndAddInt	(Ljava/lang/Object;JI)I	0	bridge	0	1
-jdk/internal/misc/Unsafe	getAndAddLong	(Ljava/lang/Object;JJ)J	0	bridge	0	1
+jdk/internal/misc/Unsafe	getAndAddInt	(Ljava/lang/Object;JI)I	0	synthetic-stub	1	1
+jdk/internal/misc/Unsafe	getAndAddLong	(Ljava/lang/Object;JJ)J	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	getAndAddShort	(Ljava/lang/Object;JS)S	0	bridge	0	1
-jdk/internal/misc/Unsafe	getAndSetInt	(Ljava/lang/Object;JI)I	0	bridge	0	1
-jdk/internal/misc/Unsafe	getAndSetLong	(Ljava/lang/Object;JJ)J	0	bridge	0	1
-jdk/internal/misc/Unsafe	getAndSetReference	(Ljava/lang/Object;JLjava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
+jdk/internal/misc/Unsafe	getAndSetInt	(Ljava/lang/Object;JI)I	0	synthetic-stub	1	1
+jdk/internal/misc/Unsafe	getAndSetLong	(Ljava/lang/Object;JJ)J	0	synthetic-stub	1	1
+jdk/internal/misc/Unsafe	getAndSetReference	(Ljava/lang/Object;JLjava/lang/Object;)Ljava/lang/Object;	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	getBoolean	(Ljava/lang/Object;J)Z	0	bridge	1	1
 jdk/internal/misc/Unsafe	getBooleanVolatile	(Ljava/lang/Object;J)Z	0	bridge	1	1
 jdk/internal/misc/Unsafe	getByte	(J)B	0	bridge	0	1
@@ -9667,7 +9696,7 @@ jdk/internal/misc/Unsafe	getLongUnaligned	(Ljava/lang/Object;JZ)J	0	bridge	0	1
 jdk/internal/misc/Unsafe	getLongUnaligned	(Ljava/lang/Object;JZ)J	1	bridge	0	1
 jdk/internal/misc/Unsafe	getLongVolatile	(Ljava/lang/Object;J)J	0	bridge	1	1
 jdk/internal/misc/Unsafe	getReference	(Ljava/lang/Object;J)Ljava/lang/Object;	0	bridge	1	1
-jdk/internal/misc/Unsafe	getReferenceAcquire	(Ljava/lang/Object;J)Ljava/lang/Object;	0	bridge	0	1
+jdk/internal/misc/Unsafe	getReferenceAcquire	(Ljava/lang/Object;J)Ljava/lang/Object;	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	getReferenceOpaque	(Ljava/lang/Object;J)Ljava/lang/Object;	0	bridge	0	1
 jdk/internal/misc/Unsafe	getReferencePlain	(Ljava/lang/Object;J)Ljava/lang/Object;	0	bridge	0	1
 jdk/internal/misc/Unsafe	getReferenceVolatile	(Ljava/lang/Object;J)Ljava/lang/Object;	0	bridge	1	1
@@ -9684,7 +9713,7 @@ jdk/internal/misc/Unsafe	getUnsafe	()Ljdk/internal/misc/Unsafe;	0	bridge	0	1
 jdk/internal/misc/Unsafe	invokeCleaner	(Ljava/nio/ByteBuffer;)V	0	bridge	0	1
 jdk/internal/misc/Unsafe	isBigEndian0	()Z	0	bridge	0	1
 jdk/internal/misc/Unsafe	isBigEndian0	()Z	1	bridge	0	1
-jdk/internal/misc/Unsafe	loadFence	()V	0	bridge	0	1
+jdk/internal/misc/Unsafe	loadFence	()V	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	loadLoadFence	()V	0	bridge	0	1
 jdk/internal/misc/Unsafe	loadLoadFence	()V	1	bridge	0	1
 jdk/internal/misc/Unsafe	monitorEnter	(Ljava/lang/Object;)V	0	bridge	0	1
@@ -9717,7 +9746,7 @@ jdk/internal/misc/Unsafe	putFloat	(Ljava/lang/Object;JF)V	0	bridge	1	1
 jdk/internal/misc/Unsafe	putFloatVolatile	(Ljava/lang/Object;JF)V	0	bridge	1	1
 jdk/internal/misc/Unsafe	putInt	(JI)V	0	bridge	0	1
 jdk/internal/misc/Unsafe	putInt	(Ljava/lang/Object;JI)V	0	bridge	1	1
-jdk/internal/misc/Unsafe	putIntOpaque	(Ljava/lang/Object;JI)V	0	bridge	0	1
+jdk/internal/misc/Unsafe	putIntOpaque	(Ljava/lang/Object;JI)V	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	putIntRelease	(Ljava/lang/Object;JI)V	0	bridge	0	1
 jdk/internal/misc/Unsafe	putIntUnaligned	(Ljava/lang/Object;JI)V	0	bridge	0	1
 jdk/internal/misc/Unsafe	putIntUnaligned	(Ljava/lang/Object;JI)V	1	bridge	0	1
@@ -9733,9 +9762,9 @@ jdk/internal/misc/Unsafe	putLongUnaligned	(Ljava/lang/Object;JJZ)V	0	bridge	0	1
 jdk/internal/misc/Unsafe	putLongUnaligned	(Ljava/lang/Object;JJZ)V	1	bridge	0	1
 jdk/internal/misc/Unsafe	putLongVolatile	(Ljava/lang/Object;JJ)V	0	bridge	1	1
 jdk/internal/misc/Unsafe	putReference	(Ljava/lang/Object;JLjava/lang/Object;)V	0	bridge	1	1
-jdk/internal/misc/Unsafe	putReferenceOpaque	(Ljava/lang/Object;JLjava/lang/Object;)V	0	bridge	0	1
+jdk/internal/misc/Unsafe	putReferenceOpaque	(Ljava/lang/Object;JLjava/lang/Object;)V	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	putReferencePlain	(Ljava/lang/Object;JLjava/lang/Object;)V	0	bridge	0	1
-jdk/internal/misc/Unsafe	putReferenceRelease	(Ljava/lang/Object;JLjava/lang/Object;)V	0	bridge	0	1
+jdk/internal/misc/Unsafe	putReferenceRelease	(Ljava/lang/Object;JLjava/lang/Object;)V	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	putReferenceVolatile	(Ljava/lang/Object;JLjava/lang/Object;)V	0	bridge	1	1
 jdk/internal/misc/Unsafe	putShort	(JS)V	0	bridge	0	1
 jdk/internal/misc/Unsafe	putShort	(Ljava/lang/Object;JS)V	0	bridge	1	1
@@ -9767,9 +9796,9 @@ jdk/internal/misc/Unsafe	staticFieldBase	(Ljava/lang/reflect/Field;)Ljava/lang/O
 jdk/internal/misc/Unsafe	staticFieldBase0	(Ljava/lang/reflect/Field;)Ljava/lang/Object;	0	bridge	1	1
 jdk/internal/misc/Unsafe	staticFieldOffset	(Ljava/lang/reflect/Field;)J	0	bridge	0	1
 jdk/internal/misc/Unsafe	staticFieldOffset0	(Ljava/lang/reflect/Field;)J	0	bridge	1	1
-jdk/internal/misc/Unsafe	storeFence	()V	0	bridge	0	1
-jdk/internal/misc/Unsafe	storeStoreFence	()V	0	bridge	0	1
-jdk/internal/misc/Unsafe	storeStoreFence	()V	1	bridge	0	1
+jdk/internal/misc/Unsafe	storeFence	()V	0	synthetic-stub	1	1
+jdk/internal/misc/Unsafe	storeStoreFence	()V	0	synthetic-stub	1	1
+jdk/internal/misc/Unsafe	storeStoreFence	()V	1	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	throwException	(Ljava/lang/Throwable;)V	0	bridge	1	1
 jdk/internal/misc/Unsafe	unalignedAccess0	()Z	0	bridge	0	1
 jdk/internal/misc/Unsafe	unalignedAccess0	()Z	1	bridge	0	1
@@ -9784,16 +9813,16 @@ jdk/internal/misc/Unsafe	weakCompareAndExchangeObject	(Ljava/lang/Object;JLjava/
 jdk/internal/misc/Unsafe	weakCompareAndExchangeReference	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
 jdk/internal/misc/Unsafe	weakCompareAndExchangeReferenceAcquire	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
 jdk/internal/misc/Unsafe	weakCompareAndExchangeReferenceRelease	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
-jdk/internal/misc/Unsafe	weakCompareAndSetInt	(Ljava/lang/Object;JII)Z	0	bridge	0	1
+jdk/internal/misc/Unsafe	weakCompareAndSetInt	(Ljava/lang/Object;JII)Z	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	weakCompareAndSetIntAcquire	(Ljava/lang/Object;JII)Z	0	bridge	0	1
-jdk/internal/misc/Unsafe	weakCompareAndSetIntPlain	(Ljava/lang/Object;JII)Z	0	bridge	0	1
+jdk/internal/misc/Unsafe	weakCompareAndSetIntPlain	(Ljava/lang/Object;JII)Z	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	weakCompareAndSetIntRelease	(Ljava/lang/Object;JII)Z	0	bridge	0	1
-jdk/internal/misc/Unsafe	weakCompareAndSetLong	(Ljava/lang/Object;JJJ)Z	0	bridge	0	1
+jdk/internal/misc/Unsafe	weakCompareAndSetLong	(Ljava/lang/Object;JJJ)Z	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	weakCompareAndSetLongAcquire	(Ljava/lang/Object;JJJ)Z	0	bridge	0	1
 jdk/internal/misc/Unsafe	weakCompareAndSetLongPlain	(Ljava/lang/Object;JJJ)Z	0	bridge	0	1
 jdk/internal/misc/Unsafe	weakCompareAndSetLongRelease	(Ljava/lang/Object;JJJ)Z	0	bridge	0	1
 jdk/internal/misc/Unsafe	weakCompareAndSetObject	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z	0	bridge	0	1
-jdk/internal/misc/Unsafe	weakCompareAndSetReference	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z	0	bridge	0	1
+jdk/internal/misc/Unsafe	weakCompareAndSetReference	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	weakCompareAndSetReferenceAcquire	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z	0	bridge	0	1
 jdk/internal/misc/Unsafe	weakCompareAndSetReferencePlain	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z	0	bridge	0	1
 jdk/internal/misc/Unsafe	weakCompareAndSetReferenceRelease	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z	0	bridge	0	1
@@ -9803,19 +9832,19 @@ jdk/internal/misc/Unsafe	writebackPreSync0	()V	0	bridge	1	1
 jdk/internal/misc/VM	awaitInitLevel	(I)V	0	bridge	0	1
 jdk/internal/misc/VM	getNanoTimeAdjustment	(J)J	0	bridge	1	1
 jdk/internal/misc/VM	getRuntimeArguments	()[Ljava/lang/String;	0	bridge	1	1
-jdk/internal/misc/VM	getSavedProperty	(Ljava/lang/String;)Ljava/lang/String;	0	bridge	0	1
+jdk/internal/misc/VM	getSavedProperty	(Ljava/lang/String;)Ljava/lang/String;	0	synthetic-stub	1	1
 jdk/internal/misc/VM	getegid	()J	0	bridge	1	1
 jdk/internal/misc/VM	geteuid	()J	0	bridge	1	1
 jdk/internal/misc/VM	getgid	()J	0	bridge	1	1
 jdk/internal/misc/VM	getuid	()J	0	bridge	1	1
 jdk/internal/misc/VM	initLevel	()I	0	bridge	0	1
 jdk/internal/misc/VM	initialize	()V	0	bridge	1	1
-jdk/internal/misc/VM	isBooted	()Z	0	bridge	0	1
+jdk/internal/misc/VM	isBooted	()Z	0	synthetic-stub	1	1
 jdk/internal/misc/VM	isJavaLangInvokeInited	()Z	0	bridge	0	1
 jdk/internal/misc/VM	isSupportedClassFileVersion	(II)Z	0	bridge	0	1
 jdk/internal/misc/VM	isSupportedModuleDescriptorVersion	(II)Z	0	bridge	0	1
 jdk/internal/misc/VM	latestUserDefinedLoader0	()Ljava/lang/ClassLoader;	0	bridge	1	1
-jdk/internal/misc/VM	maxDirectMemory	()J	0	bridge	0	1
+jdk/internal/misc/VM	maxDirectMemory	()J	0	synthetic-stub	1	1
 jdk/internal/misc/VM	setJavaLangInvokeInited	()V	0	bridge	0	1
 jdk/internal/misc/VM$BufferPool	getCount	()J	0	bridge	0	1
 jdk/internal/misc/VM$BufferPool	getMemoryUsed	()J	0	bridge	0	1

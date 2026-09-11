@@ -567,3 +567,28 @@ anchor 511MB inside it, so a hint walk that only goes *up* from the anchor is
 inside that mapping for the entire reachable window. The room is underneath the
 arena's base. Full write-up in
 [`c2-the-layout-epoch-guard-was-unreachable-by-rip-20260910.md`](c2-the-layout-epoch-guard-was-unreachable-by-rip-20260910.md).
+
+**Chased to the end on 2026-09-11, and both of this row's open ends are
+closed.** That page's own residuals were the last ones either file had:
+
+* **The one-site companion is resolved**, and so is the four-site number it was
+  supposed to scale against. On an idle host the flag is worth **−11.4% to
+  −12.3%** on `MultiFieldLoop` across four invocations whose floors are all
+  under 1.3%, and **−1% to −3%** on `FieldLoop` — one guard against four. The
+  7.0% this row quotes was measured on a busy box against a 1.7x slower
+  baseline; it is the same effect over a different denominator.
+* **The differential run the flag's default was waiting on has been run**:
+  the whole Spring index (2848 classes) and the whole H2 index (218), both arms
+  from one binary. Twenty-seven classes differed; **none survives re-running**,
+  and the re-run is the finding — the two arms had been run concurrently on
+  suites that bind ports and temp directories.
+* **The flag still ships OFF**, and the reason is new rather than a lack of
+  evidence: setting it makes `alloc_code_adjacent_cell` decline for the whole
+  process, so on a host where the placement ladder misses, the safepoint poll
+  loses the short form it has by construction today. That page names the two
+  changes that retire the objection.
+
+That page also carries the methodological row worth reading beside §5.2 of this
+one: **fifteen invocations of the same A/B on a loaded box**, one of which
+produced the tightest floor of the entire sequence — 0.9% — **with the wrong
+sign**. Here it was three runs disagreeing by 4.5 points; there it is nineteen.

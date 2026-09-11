@@ -58,6 +58,38 @@ the class alone with a large `--one-to`.
   like a class that could not start" reporting problem, at a tenth the
   magnitude.
 
+## 2026-09-10/11 re-measurement, and the family this belongs to
+
+Re-run on the 2026-09-10 Spring residual sweep (binary
+`cratonvm-springfix2-20260910`, `claude/spring-residuals-20260910`):
+
+| | status | found | succ | wall | host load |
+|---|---|---:|---:|---:|---|
+| HotSpot JDK 25 | OK | 14 | 14 | **66.5 s** | 75–92 |
+| CratonVM, `ONE_TO=900` | TIMEOUT | 0 | 0 | killed at **900 s** | 40–90 |
+
+Still correct-or-unknown rather than failing: it has never produced a failed
+method since 2026-08-06, and it did not produce one here — it simply does not
+finish inside any cap the suite has offered it. The 66.5 s HotSpot figure is a
+loaded-host number against the page's 10.7 s idle one, so the ratio to quote
+from this run is a floor (≥13.5×), not the ~100× the idle pairing gives.
+
+**It is now one of three, and they are not all the same animal.** After the
+2026-09-10 reflection fix the Spring Framework suite's entire residual set is
+this class plus two others, and every one of them is *correct but slow*:
+
+| class | CratonVM | HotSpot | dominated by |
+|---|---:|---:|---|
+| `beans.factory.aot.BeanRegistrationsAotContributionTests` | >900 s | 66.5 s | 10 001 bean definitions → generate + javac |
+| `test.context.aot.AotIntegrationTests` | 906 s (`OK`, 2/4 + 2 skip = HotSpot) | 63 s | AOT processing + javac + a nested JUnit run |
+| `test.context.junit.jupiter.parallel.ParallelExecutionSpringExtensionTests` | 811 s (10/10 `SUCCESSFUL`) | 26.3 s | 10 000 nested tests, per-test Spring TestContext work — **no** AOT, **no** javac |
+
+The third one has its own page
+(`parallelexecutionspringextensiontests-is-a-10000-test-throughput-bench-and-parallelism-is-not-the-gap-20260910.md`),
+and it matters here because it rules out the tempting unification: a
+generate-and-compile explanation cannot cover a class that compiles nothing.
+Whatever is shared between all three, if anything, is further down than AOT.
+
 ## Next steps
 
 1. Fix the baseline: is 1067 s a regression, or the standing cost?

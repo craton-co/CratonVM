@@ -221,8 +221,8 @@ fn ois_filter_state() -> &'static Mutex<HashMap<usize, ObjectInputFilterState>> 
 ///
 /// CORRECTNESS: the counter must move in lock-step with map membership. We
 /// keep it consistent by funnelling every insert through `filter_state_set`
-/// and every removal/clear through `filter_state_remove` / `filter_state_-
-/// clear_all`, each of which updates the count while holding the map lock so
+/// and every removal through `filter_state_remove`, which updates the count
+/// while holding the map lock so
 /// the count is never observed to under-report a live entry. A short-circuit
 /// only fires when the count reads zero, which (because increments happen
 /// before/with the insert under the lock) can only mean no entry exists for
@@ -251,13 +251,6 @@ fn filter_state_remove(addr: usize) {
     if map.remove(&addr).is_some() {
         ois_filter_state_count().fetch_sub(1, Ordering::Relaxed);
     }
-}
-
-/// Drop every filter-state entry and reset the count (process reset / tests).
-fn filter_state_clear_all() {
-    let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
-    map.clear();
-    ois_filter_state_count().store(0, Ordering::Relaxed);
 }
 
 /// Install (or replace) the filter state for a stream. Returning a
@@ -937,29 +930,55 @@ fn read_class_descriptor(addr: usize) -> Option<ClassDescriptor> {
     })
 }
 
+/// Reset the process-global serialization state belonging to ONE stream
+/// address, plus the single piece that really is process-wide.
+///
+/// This replaces `reset_serialization_globals()`, which `clear()`ed the whole
+/// of `oos_buffers` / `ois_buffers` / `handle_registry` / the JEP-290
+/// filter-state map. Every one of those maps is keyed by stream address and is
+/// shared by ALL tests in the binary — `cargo test` runs the tests of one
+/// binary in threads of ONE process — so a test that cleared them wiped the
+/// entries a concurrently-running sibling had just installed, between that
+/// sibling's write and its read.
+///
+/// That is the measured cause of `jep290_unbounded_defaults_do_not_reject`
+/// failing inside the 4408-test suite and passing alone. Running
+/// `serialization::` with `--test-threads=16` in a loop reproduced it in
+/// 60/200 runs before this change and 0/200 after, and the same loop showed
+/// the fault is not confined to that one test: `jep290_maxbytes_not_tripped_-
+/// when_under_limit` (filter state) and `m24_int_roundtrip_via_buffers`
+/// (stream buffers) fail through the identical window.
+///
+/// Scoping the reset to the caller's own address removes the interference at
+/// its source, rather than relying on every future test remembering to take
+/// `serialization_test_guard()` — a guard only helps when BOTH sides hold it,
+/// and the jep290 filter tests never did. The one entry that is not per-stream,
+/// the process-wide `jdk.serialFilter`, is still cleared globally; every caller
+/// of this function holds the guard while it does so.
 #[cfg(test)]
-pub(crate) fn reset_serialization_globals() {
+pub(crate) fn reset_serialization_state_for(addr: usize) {
     oos_buffers()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .clear();
+        .remove(&addr);
     ois_buffers()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .clear();
+        .remove(&addr);
     handle_registry()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .clear();
-    // PERF: clear via the helper so `ois_filter_state_count` is reset too.
-    filter_state_clear_all();
-    // Clear the per-stream and process-wide JEP-290 filters too, so leftover
-    // filter installs from a prior test can never bleed into the next one
-    // (the synthetic read-path now consults these globals — see C3).
+        .remove(&addr);
+    // PERF: through the helper so `ois_filter_state_count` stays in sync.
+    filter_state_remove(addr);
+    // The per-stream JEP-290 filter for this address only (the synthetic
+    // read-path consults it — see C3).
     ois_stream_filters()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .clear();
+        .remove(&addr);
+    // Genuinely process-wide, so it cannot be scoped; the callers' shared
+    // `serialization_test_guard()` is what keeps this one safe.
     *process_serial_filter()
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = None;
@@ -6904,6 +6923,53 @@ mod serialization_tests {
         assert!(!snapshot.rejected);
     }
 
+    /// The suite-only failure this file's isolation contract exists to stop.
+    ///
+    /// `jep290_unbounded_defaults_do_not_reject` above failed inside the
+    /// 4408-test binary and passed alone, because the reset the marshal tests
+    /// ran cleared the WHOLE of the address-keyed serialization maps and so
+    /// wiped the filter entry this test had just installed. Nothing about the
+    /// jep290 subject was wrong; the sibling was.
+    ///
+    /// Asserting the scoping directly makes that a checked contract instead of
+    /// something a flake has to re-discover: a reset aimed at one stream must
+    /// leave every other stream's buffers, handles and filter state intact.
+    #[test]
+    fn resetting_one_stream_leaves_every_other_stream_alone() {
+        let _serial_guard = super::serialization_test_guard();
+        let mine = 0x5E11_0001_usize;
+        let theirs = 0x5E11_0002_usize;
+
+        // A sibling's state: an output buffer, an input buffer, a filter.
+        oos_buf_reset(theirs);
+        filter_state_remove(theirs);
+        oos_buf_write(theirs, &[1, 2, 3]);
+        ois_buf_load(theirs, vec![9, 9]);
+        ois_set_filter_state(theirs, parse_serial_filter("maxbytes=64"));
+
+        reset_serialization_state_for(mine);
+
+        assert_eq!(
+            oos_buf_snapshot(theirs),
+            vec![1, 2, 3],
+            "a reset of another stream must not clear this one's output buffer"
+        );
+        assert_eq!(
+            ois_buf_remaining(theirs),
+            2,
+            "a reset of another stream must not clear this one's input buffer"
+        );
+        assert!(
+            ois_get_filter_state(theirs).is_some(),
+            "a reset of another stream must not drop this one's JEP-290 filter; \
+             that drop is what stranded jep290_unbounded_defaults_do_not_reject \
+             inside the full suite"
+        );
+
+        filter_state_remove(theirs);
+        oos_buf_reset(theirs);
+    }
+
     #[test]
     fn jep290_combined_limits_each_independently_enforced() {
         // Acceptance test 5(d): single filter with several `=N` clauses
@@ -7452,7 +7518,7 @@ mod marshal_tests {
         ctx.set_field(h, 2, Value::Object(Some(p)));
 
         let addr = 0x9000_0001_usize;
-        reset_serialization_globals();
+        reset_serialization_state_for(addr);
         oos_buf_reset(addr);
         handle_registry()
             .lock()
@@ -7500,7 +7566,7 @@ mod marshal_tests {
         let obj = ctx.alloc_object(plain, 1);
 
         let addr = 0x9000_0002_usize;
-        reset_serialization_globals();
+        reset_serialization_state_for(addr);
         oos_buf_reset(addr);
 
         let err = oos_write_value(&mut ctx, addr, &Value::Object(Some(obj)))
@@ -7535,7 +7601,7 @@ mod marshal_tests {
         ctx.set_field(h, 2, Value::Object(Some(h))); // self-reference
 
         let addr = 0x9000_0003_usize;
-        reset_serialization_globals();
+        reset_serialization_state_for(addr);
         oos_buf_reset(addr);
         handle_registry()
             .lock()
@@ -7586,7 +7652,7 @@ mod marshal_tests {
         ctx.set_field(h, 0, Value::Object(Some(arr)));
 
         let addr = 0x9000_0004_usize;
-        reset_serialization_globals();
+        reset_serialization_state_for(addr);
         oos_buf_reset(addr);
         handle_registry()
             .lock()

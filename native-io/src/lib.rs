@@ -2177,10 +2177,18 @@ fn native_fis_length0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
 /// `java.io.FileInputStream.position0()J` — the current read offset.
 ///
-/// Derived as `length - available`: the fd table's `available()` already
-/// accounts for both the bytes still buffered in the `BufReader` and the bytes
-/// left in the underlying file, so this is the LOGICAL position the Java layer
-/// expects (not the buffered reader's physical offset).
+/// `rw_position` is the LOGICAL cursor: `BufReader`'s `Seek` subtracts what it
+/// still holds buffered, so this is the offset the Java layer expects and not
+/// the inner file's physical one.
+///
+/// **It was `length - available` until 2026-09-10, and that identity breaks at
+/// exactly the position this lane's residual is about.** `skip0` is an `lseek`
+/// and may leave the cursor PAST the end; `available()` clamps at zero there
+/// (`end.saturating_sub(pos)`), so the subtraction pinned the answer to `length`
+/// — a 2-byte file read to EOF and skipped 4 reports position 2 where HotSpot
+/// reports 6. `FileInputStream.readAllBytes()` sizes its buffer from
+/// `length0() - position0()`, so the derived form also could not go negative,
+/// which is the signal that sends the real bytecode to its non-fast path.
 fn native_fis_position0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -2189,27 +2197,76 @@ fn native_fis_position0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let Some(fd) = fis_get_fd(ctx, this) else {
         return Ok(Some(Value::Long(0)));
     };
-    let Ok(len) = ctx.fd_table().file_size(fd) else {
-        return Ok(Some(Value::Long(0)));
-    };
-    let remaining = ctx.fd_table().available(fd).unwrap_or(0) as u64;
-    Ok(Some(Value::Long(len.saturating_sub(remaining) as i64)))
+    match ctx.fd_table().rw_position(fd) {
+        Ok(pos) => Ok(Some(Value::Long(pos as i64))),
+        // Not a seekable entry (a pipe, a socket, stdin). HotSpot's
+        // `position0` is `lseek(fd, 0, SEEK_CUR)`, which fails `ESPIPE` on
+        // those and throws — but every caller of this native inside the JDK
+        // reaches it only after `isRegularFile()` said yes, so the arm is
+        // unreachable through bytecode and answering 0 keeps a synthetic-mode
+        // caller from taking an exception the real one cannot see.
+        Err(_) => Ok(Some(Value::Long(0))),
+    }
 }
 
-/// `java.io.FileInputStream.isRegularFile0(FileDescriptor)Z` — static, so
-/// `args[0]` is the descriptor rather than a receiver.
+/// The `FdId` behind a `java.io.FileDescriptor` object, from either spelling of
+/// its own slot (`fd` on Unix, `handle` on Windows).
+///
+/// Split out of [`native_fis_is_regular_file0`] so the descriptor read and the
+/// RECEIVER read cannot be confused for each other again — see that function.
+fn fd_of_descriptor(ctx: &dyn NativeContext, fd_obj: ObjectRef) -> Option<FdId> {
+    match ctx.get_field_by_name(fd_obj, "fd") {
+        // `fd == 0` is a legitimate descriptor (stdin); `-1` means closed.
+        Value::Int(v) if v >= 0 => return Some(v as FdId),
+        _ => {}
+    }
+    match ctx.get_field_by_name(fd_obj, "handle") {
+        Value::Long(v) if v >= 0 => Some(v as FdId),
+        _ => None,
+    }
+}
+
+/// `java.io.FileInputStream.isRegularFile0(Ljava/io/FileDescriptor;)Z`.
+///
+/// **IT IS AN INSTANCE METHOD, so `args[0]` is the RECEIVER and `args[1]` is the
+/// descriptor.** This body's doc comment said "static, so `args[0]` is the
+/// descriptor", read `args[0]`, and asked it for a field called `fd` — and
+/// `java.io.FileInputStream` DECLARES a field called `fd`, of type
+/// `FileDescriptor`. So the read succeeded, produced `Value::Object` where the
+/// match wanted `Value::Int`, fell through both arms, and this native answered
+/// **false for every file in every run**.
+///
+/// That single wrong answer is the whole `FileInputStream.skip` residual this
+/// lane carried from 2026-08-28 to 2026-09-10, and it was never a dispatch
+/// defect. `FileInputStream.skip` is
+///
+/// ```text
+/// if (isRegularFile()) return skip0(n);
+/// else                 return super.skip(n);   // read-and-discard
+/// ```
+///
+/// so a false here sends every `skip` down `InputStream.skip` — which is
+/// precisely the four answers the record attributed to "the superclass body
+/// being entered for a method the subclass declares and overrides". The
+/// bytecode was choosing that branch, correctly, on a false this native
+/// produced. `readAllBytes()` branches on the same predicate.
+///
+/// *An `args[0]` that resolves is not an `args[0]` that is right* — the
+/// receiver and the first parameter had the same field name, so nothing failed
+/// loudly. See `a-natives-args1-is-the-first-parameter-not-the-first-argument`.
 fn native_fis_is_regular_file0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(Value::Object(Some(fd_obj))) = args.first() else {
-        return Ok(Some(Value::Int(0)));
-    };
-    let fd_obj = *fd_obj;
-    let fd = match ctx.get_field_by_name(fd_obj, "fd") {
-        Value::Int(v) if v >= 0 => Some(v as FdId),
-        _ => match ctx.get_field_by_name(fd_obj, "handle") {
-            Value::Long(v) if v >= 0 => Some(v as FdId),
-            _ => None,
-        },
-    };
+    // The declared parameter first; the receiver's own `fd` field as the
+    // fallback, which is what the call site passes anyway
+    // (`isRegularFile0(this.fd)`) and which keeps a synthetic-mode arm that
+    // dispatches without the argument working.
+    let fd = match args.get(1) {
+        Some(Value::Object(Some(fd_obj))) => fd_of_descriptor(ctx, *fd_obj),
+        _ => None,
+    }
+    .or_else(|| match args.first() {
+        Some(Value::Object(Some(this))) => fis_get_fd(ctx, *this),
+        _ => None,
+    });
     // `file_size` is only implemented for the file-backed fd-table entries;
     // sockets, pipes, child streams and stdin all fail, which is exactly the
     // "is this a regular file" question being asked.
@@ -2255,66 +2312,75 @@ fn native_fis_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(fd) => fd,
         None => return Ok(Some(Value::Long(0))),
     };
-    // An OPEN stream keeps its previous answer for a non-positive count: HotSpot
-    // `skip(0)` is `0` (measured), and a negative count seeks BACKWARD there,
-    // which this forward-only reader has no counterpart for. Deliberately not
-    // widened — the repair above is about WHEN the descriptor is consulted, not
-    // about growing a backward seek.
+    // `skip0` IS ONE `lseek`, and the four-row residual this lane carried for
+    // thirteen days was the difference between that and read-and-discard:
+    //
+    // ```text
+    //                               HotSpot        this VM (before)
+    //   skip(4) at EOF                   4              0
+    //   skip(2) on a 1-byte file         2              1
+    //   skip(100), 1 byte remaining    100              0
+    //   skip(-1) at position 0     IOException     no-throw
+    // ```
+    //
+    // `FileInputStream.skip`'s javadoc says it "may skip more bytes than what
+    // are remaining in the backing file ... the number of bytes skipped may
+    // include some number of bytes that were beyond the EOF", because HotSpot's
+    // `skip0` is literally
+    //
+    // ```c
+    // cur = lseek(fd, 0, SEEK_CUR);  end = lseek(fd, toSkip, SEEK_CUR);
+    // return end - cur;              // both -1s throw IOException
+    // ```
+    //
+    // which is what the three lines below are. A negative count that would land
+    // before the start fails `EINVAL` there, and answering `0` for it made a
+    // rewind attempt look like a no-op that succeeded.
+    //
+    // WHY THIS BODY WAS TWICE MEASURED INERT, AND WHAT THAT MEASUREMENT MEANT.
+    // A seek-based body was written here on 2026-08-28 and again on 2026-08-30,
+    // each time measured to change nothing, each time reverted, and the second
+    // reversion concluded "a DISPATCH finding — the superclass body is entered
+    // for a method the subclass declares and overrides — and no edit to either
+    // native in this file can move it". The conclusion was wrong and the
+    // measurement was right: this body cannot run while
+    // `native_fis_is_regular_file0` answers false, because
+    // `FileInputStream.skip` is `if (isRegularFile()) skip0(n); else
+    // super.skip(n);`. That native read `args[0]` — the RECEIVER — as its
+    // `FileDescriptor` parameter, and answered false for every file ever
+    // opened. Fixing it is what makes this reachable; see its own note.
+    //
+    // *Inert code is evidence about its guard, not only about itself.* Two
+    // correct fixes were reverted because the thing in front of them was never
+    // suspected.
+    //
+    // `rw_position`/`rw_seek` are the LOGICAL cursor: `BufReader`'s `Seek`
+    // subtracts what it still holds buffered, so `SeekFrom::Current(n)` means
+    // the same thing to a Java caller as `lseek` does to HotSpot, which reads
+    // through no buffer at all.
+    let seekable = ctx.fd_table().file_size(fd).is_ok();
+    if seekable {
+        let cur = ctx.fd_table().rw_position(fd).map_err(io_err)?;
+        let end = ctx
+            .fd_table()
+            .rw_seek(fd, io::SeekFrom::Current(n))
+            .map_err(io_err)?;
+        return Ok(Some(Value::Long(end as i64 - cur as i64)));
+    }
+    // NOT a regular file — a pipe, a socket, stdin, a child stream. The real
+    // `skip` never reaches `skip0` for one of those: `isRegularFile()` sends it
+    // to `InputStream.skip`'s read-and-discard, and this native answers the
+    // `skip(J)J` triple as well as `skip0(J)J` (as a `SyntheticStub`, for the
+    // synthetic-JDK build where there is no bytecode to make that choice), so
+    // it makes the same choice here rather than raising `ESPIPE` at a caller
+    // the JDK would have served.
     if n <= 0 {
         return Ok(Some(Value::Long(0)));
     }
-    // Read and discard up to `n` bytes. `read_bytes` is not guaranteed
-    // to fill the whole buffer in a single call (and we cap the scratch
-    // buffer at a sane chunk size to bound memory), so loop until `n`
-    // bytes have been skipped or EOF is reached. Return the actual
-    // number of bytes skipped, matching `java.io.FileInputStream.skip`.
-    // NOT REPAIRED HERE, AND THE REASON HAS BEEN RE-MEASURED (2026-08-30).
-    // The conclusion below stands; both pieces of evidence the previous note
-    // gave for it were wrong, which is why they are replaced rather than kept.
-    //
-    // THE DEFECT IS THREE ROWS, NOT ONE. `FileInputStream.skip` is not
-    // `InputStream.skip`: its javadoc says it "may skip more bytes than what
-    // are remaining in the backing file ... the number of bytes skipped may
-    // include some number of bytes that were beyond the EOF", because HotSpot's
-    // `skip0` is one `lseek`. Read-and-discard can only answer what is there:
-    //
-    //   4-byte file at EOF   skip(4)    HotSpot 4     this VM 0
-    //   4-byte file, 1 left  skip(100)  HotSpot 100   this VM 1
-    //   at position 0        skip(-1)   HotSpot IOException   this VM 0
-    //
-    // WRONG EVIDENCE #1 — "the `skip(J)J` triple is not registered at all under
-    // `--jdk-only`, and `skip0(J)J` has `invocations: 0` in both". The registry
-    // now reads `skip 0 / skip0 5` for a five-`skip` program. That number is
-    // real and it is not entry: an `eprintln!` placed in THIS body printed
-    // nothing, in `--jdk-only` AND in the default mode. The counter counts a
-    // dispatch ATTEMPT; the body was never reached. (Same family as
-    // `a-zero-invocation-count-is-evidence-about-a-counter`, from the other
-    // side: a NON-zero count is evidence about a counter too.)
-    //
-    // WRONG EVIDENCE #2 — "`FileInputStream.skip` resolves to its superclass's
-    // method". It does not. Measured through reflection, identical to HotSpot:
-    //
-    //   FileInputStream.class.getMethod("skip", long.class).getDeclaringClass()
-    //     HotSpot   java.io.FileInputStream
-    //     this VM   java.io.FileInputStream
-    //
-    // and `getDeclaredMethods` lists `skip` AND `skip0` on the class, exactly
-    // as HotSpot does. RESOLUTION is correct; what differs is the body
-    // `invokevirtual` actually enters. The three answers above are precisely
-    // `InputStream.skip`'s read-and-discard default, so that is the bytecode
-    // running.
-    //
-    // So this is a DISPATCH finding — the superclass body is entered for a
-    // method the subclass declares and overrides — and no edit to either native
-    // in this file can move it. A seek-based body was written and measured
-    // inert twice, most recently on 2026-08-30; it is not carried here, because
-    // code that cannot run is worse than the absence of it. Nominated out of
-    // this lane.
-    //
-    // Contract-legal in the meantime only in the weak sense: `InputStream.skip`
-    // may "skip over some smaller number of bytes, possibly zero", but
-    // `FileInputStream` overrides that contract, and it is the override a
-    // caller holding a `FileInputStream` is entitled to.
+    // Read and discard up to `n` bytes. `read_bytes` is not guaranteed to fill
+    // the whole buffer in a single call (and we cap the scratch buffer at a
+    // sane chunk size to bound memory), so loop until `n` bytes have been
+    // skipped or EOF is reached.
     const CHUNK: usize = 8192;
     let mut remaining = n as u64;
     let mut total_skipped: u64 = 0;
@@ -12691,10 +12757,7 @@ fn native_fc_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // Read path string from Path object (field 0 is String) or directly if it's a String
     let path_str = ctx
         .read_string(path_obj)
-        .or_else(|| match ctx.get_field(path_obj, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s),
-            _ => None,
-        })
+        .or_else(|| path_slot_string(ctx, path_obj))
         .unwrap_or_default();
 
     // Decode the `OpenOption[]`. Names are read through the same two helpers
@@ -15428,7 +15491,15 @@ fn native_dos_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 // Phase 32: java.nio.file — Path, Paths, Files
 // ===========================================================================
 
-// Path = 1-field synthetic (field 0 = String path)
+/// The slot a synthetic `Path`'s String used to live in, unconditionally, and
+/// still does on a mock or a VM that cannot load the platform's Path class.
+///
+/// **Not the answer on its own any more.** Where a real Path keeps its String
+/// is `cratonvm_native_api::path_layout` — `stringValue`(2) on
+/// `sun.nio.fs.UnixPath`, `path` on `WindowsPath` — and slot 0 there is `fs`.
+/// This is the fallback arm of that map, kept because `read_path_str` still has
+/// to serve objects built at the historical layout (the crate's own mock
+/// fixtures do exactly that).
 const PATH_FIELD_STR: usize = 0;
 
 /// Resolve a numeric uid/gid to its name via the passwd/group database.
@@ -15757,17 +15828,22 @@ fn register_nio_file_natives(registry: &mut NativeMethodRegistry) {
 }
 
 fn alloc_path(ctx: &mut dyn NativeContext, path_str: &str) -> ObjectRef {
-    // RA.6: Allocate under a Rust-owned synthetic subclass if it
-    // exists, else under `java.nio.file.Path`. Writing `path` via
-    // by-name covers concrete real-JDK path types whose string field
-    // is also named `path` (sun.nio.fs.WindowsPath does).
+    // RA.6: Allocate under a Rust-owned synthetic subclass if it exists, else
+    // under `java.nio.file.Path`.
+    //
+    // WIDTH AND SLOT COME FROM `path_layout`, not from a literal: this is the
+    // third site in the workspace that produces this carrier, and the other two
+    // are in `native-builtins`. Before 2026-09-10 all three wrote the String at
+    // slot 0, which on the class `getClass()` reports (`sun.nio.fs.UnixPath`) is
+    // where the owning `UnixFileSystem` belongs.
+    let slots = cratonvm_native_api::path_layout::resolve(ctx);
     let path = match ctx.ensure_class_initialized("java/nio/file/Path") {
         Ok(cid) => {
             let real = ctx.class_num_total_fields(cid);
-            let n = real.max(1);
+            let n = real.max(slots.width);
             ctx.alloc_object(cid, n)
         }
-        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 1),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), slots.width),
     };
     // GC: nothing in Java refers to this object yet, so this Rust local is
     // its ONLY reference — and the allocation below can collect. Under the
@@ -15779,9 +15855,25 @@ fn alloc_path(ctx: &mut dyn NativeContext, path_str: &str) -> ObjectRef {
     let __pin = ctx.pin_native_root(path);
     let s = ctx.create_string(path_str);
     let path = ctx.read_native_pin(__pin, path);
-    ctx.set_field(path, PATH_FIELD_STR, Value::Object(Some(s)));
-    // Dual-write — no-ops if class has no such field.
+    ctx.set_field(path, slots.string, Value::Object(Some(s)));
+    // Dual-write by name — covers a concrete real-JDK path type whose String
+    // field is also called `path` (`sun.nio.fs.WindowsPath`), and no-ops when
+    // the class has no such field. It cannot substitute for the indexed write
+    // above: an object stamped with the INTERFACE resolves no `UnixPath` field
+    // name at all, which is why two earlier by-name attempts at this were
+    // measured inert.
     ctx.set_field_by_name(path, "path", Value::Object(Some(s)));
+    // The encoded bytes, where the platform class keeps them separately from
+    // the String — real `UnixPath.compareTo`/`hashCode`/`initOffsets` read
+    // these, and a null array there is an NPE rather than a wrong answer.
+    if let Some(bytes_slot) = slots.bytes {
+        let raw = path_str.as_bytes();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, raw.len());
+        ctx.write_byte_array_from(arr, 0, raw);
+        let path = ctx.read_native_pin(__pin, path);
+        ctx.set_field(path, bytes_slot, Value::Object(Some(arr)));
+    }
+    let path = ctx.read_native_pin(__pin, path);
     ctx.unpin_native_roots(__pin);
     path
 }
@@ -15892,10 +15984,32 @@ fn read_path_str(ctx: &dyn NativeContext, path: ObjectRef) -> String {
             return t;
         }
     }
-    match ctx.get_field(path, PATH_FIELD_STR) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
+    path_slot_string(ctx, path).unwrap_or_default()
+}
+
+/// The path String out of a `Path`'s own slot — **the one read** in this crate,
+/// the twin of `nio_file.rs`'s `p57_path_slot_string`.
+///
+/// Two arms, and neither can mis-fire: `read_string` REFUSES a non-String, so
+/// asking the historical slot 0 of a NEW-layout Path yields `None` (it holds
+/// the `fs` object) rather than a mis-decoded path, and asking the mapped slot
+/// of a LEGACY-layout object — this crate's own mock fixtures build one — is an
+/// out-of-range read the accessor answers `None` for.
+fn path_slot_string(ctx: &dyn NativeContext, path: ObjectRef) -> Option<String> {
+    let mapped = cratonvm_native_api::path_layout::slots().string;
+    if let Value::Object(Some(s)) = ctx.get_field(path, mapped) {
+        if let Some(t) = ctx.read_string(s) {
+            return Some(t);
+        }
     }
+    if mapped != PATH_FIELD_STR {
+        if let Value::Object(Some(s)) = ctx.get_field(path, PATH_FIELD_STR) {
+            if let Some(t) = ctx.read_string(s) {
+                return Some(t);
+            }
+        }
+    }
+    None
 }
 
 fn native_paths_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15934,7 +16048,24 @@ fn native_path_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field(this, PATH_FIELD_STR)))
+    // The stored String OBJECT, not a fresh copy of its text: `toString()` on
+    // one Path twice hands back the same reference, which is what the real
+    // `UnixPath` does out of its cached `stringValue` and what an identity
+    // comparison in a caller's cache key depends on.
+    let slot = cratonvm_native_api::path_layout::slots().string;
+    if let Value::Object(Some(s)) = ctx.get_field(this, slot) {
+        if ctx.read_string(s).is_some() {
+            return Ok(Some(Value::Object(Some(s))));
+        }
+    }
+    if slot != PATH_FIELD_STR {
+        if let Value::Object(Some(s)) = ctx.get_field(this, PATH_FIELD_STR) {
+            if ctx.read_string(s).is_some() {
+                return Ok(Some(Value::Object(Some(s))));
+            }
+        }
+    }
+    Ok(Some(Value::Object(None)))
 }
 
 fn native_path_get_file_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -25023,15 +25154,45 @@ fn watch_context_path(
             return Ok(v);
         }
     }
-    // No watchable (or the real Path surface refused): fall back to the
-    // historical 2-field synthetic Path — [0] = name String, [1] = FileSystem.
-    let path_s = ctx.create_string(name);
-    let path_pin = ctx.pin_native_root(path_s);
-    let path_obj = try_alloc_synthetic(ctx, "java/nio/file/Path", 2)?;
-    let path_s = ctx.read_native_pin(path_pin, path_s);
-    ctx.set_field(path_obj, 0, Value::Object(Some(path_s)));
-    ctx.unpin_native_roots(path_pin);
-    Ok(Value::Object(Some(path_obj)))
+    // No watchable (or the real Path surface refused): fall back to a synthetic
+    // Path. NOT the historical two-slot shape — `path_layout` decides where a
+    // Path's String and FileSystem live, because `native-builtins` produces this
+    // same carrier and the two must not disagree about it.
+    Ok(Value::Object(Some(alloc_synthetic_path(ctx, name)?)))
+}
+
+/// Allocate a synthetic `java/nio/file/Path` carrying `text`.
+///
+/// **The slot map comes from `cratonvm_native_api::path_layout`, not from a
+/// literal here.** A Path is stamped with the interface and reported by
+/// `getClass()` as `sun.nio.fs.UnixPath` / `WindowsPath`, whose real layouts put
+/// the path String at a different index than the two hard-coded constants this
+/// crate and `native-builtins` both used to write. `native-builtins` produces
+/// the same carrier; a second literal here is how the two would drift, which is
+/// the whole reason the map lives in `native-api`.
+fn alloc_synthetic_path(
+    ctx: &mut dyn NativeContext,
+    text: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let slots = cratonvm_native_api::path_layout::resolve(ctx);
+    let path_obj = try_alloc_synthetic(ctx, "java/nio/file/Path", slots.width)?;
+    let pin = ctx.pin_native_root(path_obj);
+    let path_s = ctx.create_string(text);
+    let path_obj = ctx.read_native_pin(pin, path_obj);
+    ctx.set_field(path_obj, slots.string, Value::Object(Some(path_s)));
+    // The encoded bytes as well as the String: real `UnixPath.compareTo` (so
+    // `equals`), `hashCode` and `initOffsets` all read them, and publishing one
+    // slot without the other turns a wrong answer into an NPE.
+    if let Some(bytes_slot) = slots.bytes {
+        let raw = text.as_bytes();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, raw.len());
+        ctx.write_byte_array_from(arr, 0, raw);
+        let path_obj = ctx.read_native_pin(pin, path_obj);
+        ctx.set_field(path_obj, bytes_slot, Value::Object(Some(arr)));
+    }
+    let path_obj = ctx.read_native_pin(pin, path_obj);
+    ctx.unpin_native_roots(pin);
+    Ok(path_obj)
 }
 
 /// `java.nio.file.ClosedWatchServiceException` — what the JDK throws from
@@ -25193,10 +25354,7 @@ fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // Read path string
     let path_str = ctx
         .read_string(path_obj)
-        .or_else(|| match ctx.get_field(path_obj, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s),
-            _ => None,
-        })
+        .or_else(|| path_slot_string(ctx, path_obj))
         .unwrap_or_default();
     if path_str.is_empty() {
         return Err(RuntimeError::IOException {
@@ -25744,13 +25902,7 @@ fn native_wk_watchable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
-    let path_s = ctx.create_string(&name);
-    let path_pin = ctx.pin_native_root(path_s);
-    let path_obj = try_alloc_synthetic(ctx, "java/nio/file/Path", 2)?;
-    let path_s = ctx.read_native_pin(path_pin, path_s);
-    ctx.set_field(path_obj, 0, Value::Object(Some(path_s)));
-    ctx.unpin_native_roots(path_pin);
-    Ok(Some(Value::Object(Some(path_obj))))
+    Ok(Some(Value::Object(Some(alloc_synthetic_path(ctx, &name)?))))
 }
 
 fn native_wk_cancel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

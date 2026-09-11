@@ -1862,12 +1862,63 @@ const FINALIZER_QUEUE_MAX_CAPACITY: usize = 100_000;
 /// Per-finalizer timeout in milliseconds (matches HotSpot's 2-second default).
 const FINALIZER_TIMEOUT_MS: u64 = 2_000;
 
+/// The finalizer queue: FIFO order plus an O(1) membership index.
+///
+/// The two halves live behind ONE lock and are only ever updated together,
+/// because an index that drifts from the order fails silently in both
+/// directions — refusing a legitimate enqueue forever, or letting a duplicate
+/// through. `FINALIZER_QUEUE_MAX_CAPACITY` is 100_000, so the index is not a
+/// micro-optimization: scanning the order on every enqueue would make a burst
+/// of enqueues quadratic.
+#[derive(Default)]
+struct FinalizerQueue {
+    order: VecDeque<usize>,
+    present: FxHashSet<usize>,
+}
+
+impl FinalizerQueue {
+    fn contains(&self, addr: usize) -> bool {
+        self.present.contains(&addr)
+    }
+
+    fn push(&mut self, addr: usize) {
+        self.order.push_back(addr);
+        self.present.insert(addr);
+    }
+
+    fn pop(&mut self) -> Option<usize> {
+        let addr = self.order.pop_front()?;
+        self.present.remove(&addr);
+        Some(addr)
+    }
+
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    fn addresses(&self) -> Vec<usize> {
+        self.order.iter().copied().collect()
+    }
+
+    /// Rewrite every entry through `relocate`, rebuilding the index from the
+    /// result rather than patching it: a collection can relocate one entry onto
+    /// another's old address, so only a rebuild is guaranteed to agree with the
+    /// order it indexes.
+    fn remap(&mut self, relocate: impl Fn(usize) -> usize) {
+        for addr in self.order.iter_mut() {
+            *addr = relocate(*addr);
+        }
+        self.present.clear();
+        self.present.extend(self.order.iter().copied());
+    }
+}
+
 /// Manages the queue of objects awaiting `finalize()` execution.
 ///
 /// Includes resurrection detection: objects that have already been finalized
 /// once are tracked and will not be finalized again (per JLS §12.6).
 pub struct FinalizerThread {
-    finalization_queue: Mutex<VecDeque<usize>>,
+    finalization_queue: Mutex<FinalizerQueue>,
     /// Set of object addresses that have already been finalized once.
     /// Prevents double-finalization from resurrection attacks.
     /// T10.9.B: FxHashSet — object addresses are internal.
@@ -1880,21 +1931,42 @@ pub struct FinalizerThread {
 impl FinalizerThread {
     pub fn new() -> Self {
         Self {
-            finalization_queue: Mutex::new(VecDeque::new()),
+            finalization_queue: Mutex::new(FinalizerQueue::default()),
             already_finalized: Mutex::new(FxHashSet::default()),
             running: AtomicBool::new(false),
             dropped_count: AtomicUsize::new(0),
         }
     }
 
-    /// Enqueue an object for finalization. Returns `false` if the object
-    /// has already been finalized (resurrection) or the queue is full.
+    /// Enqueue an object for finalization. Returns `false` if the object has
+    /// already been finalized (resurrection), is already waiting in the queue,
+    /// or the queue is full.
     pub fn enqueue(&self, obj_addr: usize) -> bool {
         // Check resurrection: skip if already finalized once
         if self.already_finalized.lock().contains(&obj_addr) {
             return false;
         }
         let mut queue = self.finalization_queue.lock();
+        // Already waiting to run. `finalize()` must happen at most once per
+        // object (JLS §12.6), and callers legitimately offer the same address
+        // more than once: `finalizable_roots` hands the collector this queue's
+        // own contents (`pending_addresses`) so that a deferred entry stays
+        // rooted, and a collector that reports unreachable finalizable
+        // candidates then reports those queued objects right back — correctly,
+        // since they ARE unreachable. Without this guard every collection
+        // between an enqueue and its `run_finalizers` appends the object again,
+        // and `finalize()` runs once per GC the object waited through.
+        //
+        // Keying on the address is sound HERE, unlike `already_finalized`
+        // above: an entry in this queue is handed to the collector as a
+        // finalizable root, so its object cannot have been reclaimed and its
+        // address cannot have been recycled while it sits here. The
+        // `already_finalized` set has no such protection — it outlives its
+        // object, which is why it is a genuine address-reuse hazard and this
+        // is not.
+        if queue.contains(obj_addr) {
+            return false;
+        }
         if queue.len() >= FINALIZER_QUEUE_MAX_CAPACITY {
             self.dropped_count.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
@@ -1904,13 +1976,13 @@ impl FinalizerThread {
             );
             return false;
         }
-        queue.push_back(obj_addr);
+        queue.push(obj_addr);
         true
     }
 
     /// Dequeue the next object for finalization, marking it as finalized.
     pub fn dequeue(&self) -> Option<usize> {
-        let addr = self.finalization_queue.lock().pop_front()?;
+        let addr = self.finalization_queue.lock().pop()?;
         // Mark as finalized — prevents double-finalization on resurrection
         self.already_finalized.lock().insert(addr);
         Some(addr)
@@ -1930,12 +2002,9 @@ impl FinalizerThread {
         if pointer_map.is_empty() {
             return;
         }
-        let mut queue = self.finalization_queue.lock();
-        for addr in queue.iter_mut() {
-            if let Some(&new) = pointer_map.get(addr) {
-                *addr = new;
-            }
-        }
+        self.finalization_queue
+            .lock()
+            .remap(|addr| pointer_map.get(&addr).copied().unwrap_or(addr));
     }
 
     pub fn pending_count(&self) -> usize {
@@ -1957,7 +2026,7 @@ impl FinalizerThread {
     /// §12.6 requires anyway: `finalize()` runs *on* the object and may even
     /// resurrect it.
     pub fn pending_addresses(&self) -> Vec<usize> {
-        self.finalization_queue.lock().iter().copied().collect()
+        self.finalization_queue.lock().addresses()
     }
 
     pub fn dropped_count(&self) -> usize {
@@ -2160,6 +2229,55 @@ mod tests {
         assert_eq!(ft.dequeue(), Some(2));
         assert_eq!(ft.dequeue(), Some(3));
         assert_eq!(ft.dequeue(), None);
+    }
+
+    /// An object already waiting in the queue must not be enqueued again.
+    ///
+    /// `finalizable_roots` hands the collector this queue's own contents so a
+    /// deferred entry stays rooted, and the collector then reports those
+    /// (genuinely unreachable) objects back as dead on every cycle — so without
+    /// the guard, `finalize()` runs once per GC the object waited through.
+    #[test]
+    fn a_queued_object_is_not_enqueued_twice() {
+        let ft = FinalizerThread::new();
+        assert!(ft.enqueue(0xBEEF), "first enqueue is accepted");
+        assert!(!ft.enqueue(0xBEEF), "a second enqueue while queued is refused");
+        assert!(!ft.enqueue(0xBEEF), "and stays refused");
+        assert_eq!(ft.pending_count(), 1);
+
+        // Once it has actually run, the `already_finalized` guard takes over.
+        assert_eq!(ft.dequeue(), Some(0xBEEF));
+        assert_eq!(ft.pending_count(), 0);
+        assert!(
+            !ft.enqueue(0xBEEF),
+            "an object that has already been finalized is never re-enqueued"
+        );
+    }
+
+    /// The membership index must survive a relocating collection: after
+    /// `update_after_gc` rewrites an entry, the NEW address is the one that
+    /// must be refused and the OLD one must no longer be indexed.
+    #[test]
+    fn the_queue_index_follows_a_relocation() {
+        let ft = FinalizerThread::new();
+        ft.enqueue(0x1000);
+
+        let mut map = cratonvm_types::PointerMap::default();
+        map.insert(0x1000, 0x2000);
+        ft.update_after_gc(&map);
+
+        assert_eq!(ft.pending_addresses(), vec![0x2000]);
+        assert!(
+            !ft.enqueue(0x2000),
+            "the relocated address is the one now queued, and must be refused"
+        );
+        // The vacated address is no longer queued, so an object that legitimately
+        // lands there later is still allowed in.
+        assert!(
+            ft.enqueue(0x1000),
+            "the pre-relocation address must not stay indexed"
+        );
+        assert_eq!(ft.pending_count(), 2);
     }
 
     // 16. Reference queue association & enqueue ----------------------------
