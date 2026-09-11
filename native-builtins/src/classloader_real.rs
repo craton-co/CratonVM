@@ -159,26 +159,29 @@ fn init_classloader_common_fields(
     // `classes` — ArrayList the JDK uses to pin loaded classes. JDK code
     // (`addClass`) does `synchronized (classes) { classes.add(c); }`; a
     // null here would NPE on monitorenter.
-    let classes = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 4)?;
+    // 2 = the table's own count. Nothing here writes a slot; the list is
+    // handed to `ClassLoader.classes` and filled through `add`. See the T9C
+    // gate: a literal wider than the table reads as an indexed shape.
+    let classes = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this, "classes", Value::Object(Some(classes)));
 
     // `packages` — ConcurrentHashMap; `ClassLoader.packages()` does
     // `getfield packages → values()` and would NPE on null.
     let packages =
-        try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
+        try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 3)?;
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this, "packages", Value::Object(Some(packages)));
 
     // `package2certs` — ConcurrentHashMap consulted by `checkCerts`.
     let pkg2certs =
-        try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
+        try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 3)?;
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this, "package2certs", Value::Object(Some(pkg2certs)));
 
     // `parallelLockMap` — used by `getClassLoadingLock`.
     let lock_map =
-        try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
+        try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 3)?;
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this, "parallelLockMap", Value::Object(Some(lock_map)));
 

@@ -3225,7 +3225,7 @@ pub(crate) fn native_surefire_system_property_manager_load_properties(
     // bytecode that touches the field (not via our overrides) sees a
     // non-null Map. Use a HashMap (well-known to our natives) rather
     // than ConcurrentHashMap to keep the placeholder layout-stable.
-    let placeholder = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 8)?;
+    let placeholder = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
     if let Ok(_) =
         cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(placeholder))])
     {}
