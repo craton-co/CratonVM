@@ -178,7 +178,17 @@ assuming it did.
 * `regression-suite/run.sh` DELETES its per-vector `--jdk-only-report` files
   after printing the census. Pass `KEEP_JDK_ONLY_REPORTS=<dir>` when you need
   them — the census is their summary, not a substitute, and adjudication reads
-  the files.
+  the files;
+* **a filter stage on ONE arm of a cross-VM diff strips CR and every row becomes
+  a disagreement.** Both HotSpot and CratonVM write CRLF to a file on this host;
+  MSYS `grep` in a pipe strips it. Measured 2026-09-11: 9 CRs direct to a file,
+  0 through `| grep`, and an ad-hoc comparison then read **9 of 9** rows
+  differing where **4** do. Send both arms straight to a file and filter after
+  the diff, never before and never on one side only. The lane's `arm3.sh` and
+  `l3w2run.sh` are safe for exactly that reason, and it was verified rather than
+  assumed — raw diff 52 == normalised diff 52 on the wave-2 arms. Same species
+  as the NUL trap two bullets down in §1: the instrument reported a number, and
+  the number was about the pipeline.
 
 ---
 
