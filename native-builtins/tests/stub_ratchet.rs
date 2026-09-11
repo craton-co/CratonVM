@@ -1432,36 +1432,43 @@ use cratonvm_types::compat::CompatibilityMode;
 /// removes the slack, and it is why this wave's delta reads +251 against the
 /// tree and +237/+248/+251 against the constants.
 ///
-/// # Re-frozen 2026-09-10, lane 5: 1894 -> 2008, and 13 of the move is not this branch's
+/// # Re-frozen 2026-09-11: 1894 -> 2339, and only 101 of the +445 is lane 5
 ///
-/// All three constants move together and the account is here, as always. The
-/// three arms on the merged tree:
+/// All three constants move together and the account is here, as always. This
+/// re-freeze lands on a tree carrying TWO retirement waves that neither
+/// re-froze — lane 1's 325 triples and lane 5's 98 — plus drift from neither.
+/// Decomposed by emptying one table at a time on the merged tree and
+/// re-running all three arms, which is twelve measurements rather than one
+/// subtraction:
 ///
 /// ```text
-///   arm            constant   dev tip   this branch
-///   no-management      1883      1896          1997
-///   management         1894      1907          2008
-///   synthetic-jdk      1883      1896          1997
+///   what is in the tree          no-mgmt   mgmt   syn-jdk     delta
+///   the frozen constants            1883   1894      1883         -
+///   neither L1 nor L5               1900   1911      1900       +17
+///   + RETIRED_SHADOW_L1_TRIPLES     2227   2238      2227      +327
+///   + RETIRED_SHADOW_L5_TRIPLES     2328   2339      2328      +101
 /// ```
 ///
-/// **The middle column is the part worth reading.** `origin/dev`'s own tip is
-/// +13 on every arm before this branch touches anything, and re-freezing to the
-/// right-hand column absorbs that silently unless it is said out loud. It is
-/// measured, not inferred: dev's `retired_shadow.rs` substituted into this tree
-/// reads 1896 / 1907 / 1896 in two separate runs, and a pristine `origin/dev`
-/// worktree agrees.
+/// So:
 ///
-/// **All 13 of it is `RETIRED_SHADOW_L2_TRIPLES`, and that is measured too.**
-/// Substituting `retired_shadow.rs` from `b996b39f7` — the commit that last set
-/// these constants — into dev's own tip reads 1883 / 1894 / 1883, which is
-/// EXACTLY the three constants. So every one of the 13
-/// comes from that one file, and `e366e3273` (lane 2 wave 1, the `BigInteger`
-/// shift intrinsics) is the only commit to touch it in the window. Eleven
-/// triples, 13 registrations — two of the eleven are registered at more than
-/// one ordinal, the same effect this branch's 98 -> 101 has.
+///   * **+17 is neither wave.** Thirteen of it is `RETIRED_SHADOW_L2_TRIPLES`,
+///     measured directly: `retired_shadow.rs` from `b996b39f7` (the commit that
+///     last set these constants) substituted into `origin/dev`'s tip reads
+///     1883 / 1894 / 1883, EXACTLY the three constants, and `e366e3273` (lane 2
+///     wave 1) is the only commit to touch that file in that window. The other
+///     +4 arrived with the 21 dev commits merged on 2026-09-11.
+///   * **+327 is lane 1's wave 2**, 325 triples with two registered at more
+///     than one ordinal. It landed without re-freezing, so a lane merging dev
+///     after it inherits a red gate that is not theirs — which is what this
+///     table exists to say.
+///   * **+101 is this branch**, 98 triples with three registered at more than
+///     one ordinal.
 ///
-/// Run it with `-- --nocapture`, or the arm that PASSES prints nothing and the
-/// measurement looks like a failed command. That cost a round trip here.
+/// Re-freezing to the bottom row absorbs all three unless it is written down,
+/// so it is written down.
+///
+/// Run these with `-- --nocapture`, or the arm that PASSES prints nothing and
+/// the measurement looks like a failed command. That cost a round trip here.
 ///
 /// **This branch's own share is +101 registrations for 98 table triples**, and
 /// it is case ONE of the three classified on
@@ -1470,17 +1477,22 @@ use cratonvm_types::compat::CompatibilityMode;
 /// honestly so `--jdk-only` drops it and the JDK's own bytecode runs. Three
 /// independent measurements say so and none of them is arithmetic:
 ///
-///   * the TOTAL registration count is IDENTICAL either side of the table —
-///     13610 / 13978 / 13645 with dev's `retired_shadow.rs` and 13610 / 13978
-///     / 13645 with this branch's. Rows up, total flat, which is what case one
-///     means and what distinguishes it from a new fake;
-///   * `dump_synthetic_stubs` on dev's tip lists 1717 distinct stub triples and
-///     on this branch 1815. The 98 added are exactly
-///     `RETIRED_SHADOW_L5_TRIPLES`, class for class: 16 `Unsafe`, 16
+///   * the TOTAL registration count is IDENTICAL at every step of the
+///     decomposition above — 13610 / 13978 / 13645 with both tables emptied,
+///     with L1 alone, and with both. Rows up, total flat, which is what case
+///     one means and what distinguishes it from a new fake. (It holds for
+///     lane 1's +327 as well as for this branch's +101, so that wave is case
+///     one too, and the re-freeze is not absorbing a regression of theirs.);
+///   * `dump_synthetic_stubs` before this branch's dev merge listed 1717
+///     distinct stub triples and 1815 with the table. The 98 added were
+///     exactly `RETIRED_SHADOW_L5_TRIPLES`, class for class: 16 `Unsafe`, 16
 ///     `ScopedMemoryAccess`, 16 `CopyOnWriteArrayList`, 15 `ThreadPoolExecutor`,
 ///     11 `CompletableFuture`, 9 `TimeUnit`, 9 `PriorityBlockingQueue`, 3
 ///     `jdk/internal/misc/VM`, 2 `Thread$State`, 1 `Thread$FieldHolder`. The
-///     reverse direction (`comm -23`) is 0 rows: this branch removes none;
+///     reverse direction (`comm -23`) was 0 rows: this branch removes none.
+///     Those two absolute numbers are pre-merge and the decomposition above
+///     supersedes them; the class breakdown is a property of the table and
+///     still holds;
 ///   * 98 distinct triples produce 101 REGISTRATIONS because three of them are
 ///     registered at more than one ordinal and the re-tag flips every one —
 ///     independently derived, and agreeing with, the "101 rows edited" count in
@@ -1500,9 +1512,13 @@ use cratonvm_types::compat::CompatibilityMode;
 ///    98-row table   1997 stubs out of 13610 / 13978 / 13645 total
 /// ```
 ///
-/// The stub count did not move — a dropped registration is not a stub — so
-/// **the ONLY trace was the total falling by exactly 2**, which is case three
-/// ("registrations were DELETED") hiding inside a case-one wave. That number is
+/// **Read the TOTALS, not the stub counts.** The two runs are on trees either
+/// side of a dev merge, so the +13 in the stub column is lane 2's and has
+/// nothing to do with the two rows: the two contributed ZERO stubs in both
+/// runs, because a registration that real-layout mode drops outright is not a
+/// stub. Their entire footprint is the total, and it is exactly 2 in all three
+/// arms — case three ("registrations were DELETED") hiding inside a case-one
+/// wave. That number is
 /// `MEASURED_TOTAL_REGISTRATIONS_*`, which is not asserted and was 99 stale, so
 /// it could not have fired. What caught it was a unit test in another crate
 /// (`registry::tests::real_layout_mode_drops_enumset_native_surface`), by luck,
@@ -1512,7 +1528,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// worth only as much as its last refresh, and this is the first time one of
 /// them would have had something to say.
 ///
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2008;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2339;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1541,11 +1557,11 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2008;
 /// unowned for three days before it had a constant at all.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-/// **Re-frozen 2026-09-10, lane 5: 1883 -> 1997.** +13 of that is `dev`'s tip
-/// before this branch and +101 is this branch; the account, the three-way
-/// table and the three measurements behind the classification are all on
+/// **Re-frozen 2026-09-11: 1883 -> 2328.** +17 of that is drift neither wave
+/// owns, +327 is lane 1's wave 2 and +101 is this branch; the decomposition
+/// and the three measurements behind the classification are all on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1997;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2328;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1602,12 +1618,12 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1997;
 /// re-freeze ALL THREE — see the pointer on both siblings.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-/// **Re-frozen 2026-09-10, lane 5: 1883 -> 1997**, by running the third arm
+/// **Re-frozen 2026-09-11: 1883 -> 2328**, by running the third arm
 /// rather than copying its sibling — it lands on the same number as
 /// [`BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT`] again, as it has every time, and
 /// that is still a measurement each time rather than a rule. The account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1997;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2328;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -1657,9 +1673,11 @@ const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1997;
 /// `cratonvm/internal/ArrayListViewItr` rows), and the other three accumulated
 /// across merges nobody had to re-freeze for. An ungated constant used to
 /// classify a gated one is worth only as much as its last refresh.
-/// **REFRESHED 2026-09-10, lane 5: 13879 -> 13978.** None of the +99 is this
-/// branch: the total is identical with dev's `retired_shadow.rs` substituted
-/// in, which is how the stub movement beside it was classified as case one.
+/// **REFRESHED 2026-09-10, lane 5: 13879 -> 13978**, and re-measured on the
+/// 2026-09-11 merged tree, where it is 13978 still. None of the +99 is this
+/// branch or lane 1: the total is identical at every step of the decomposition
+/// on [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`], which is how both waves'
+/// movements beside it were classified as case one.
 /// The refresh matters more than usual this time — see the closing section on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`], where a 2-row fall in this number
 /// was the only trace a real defect left in this gate, and staleness meant
