@@ -5418,11 +5418,30 @@ fn is_synthetic_backed_collection(ctx: &mut dyn NativeContext, obj: ObjectRef) -
 /// real `List`/`Set`/`Map` implementation — run the receiver's OWN bytecode for
 /// the method instead of returning the empty sentinel.
 ///
-/// `invoke_special` does an *exact* per-class native lookup (which finds nothing
-/// for these real classes) and then runs their real `Code`, so there is no
-/// recursion back into this native. Returns `None` (caller keeps its sentinel)
-/// for CratonVM's synthetic collections and for non-collection receivers
-/// (reflection / lambda-metafactory funnels a `Charset`, `String`, … here).
+/// Returns `None` (caller keeps its sentinel) for CratonVM's synthetic
+/// collections and for non-collection receivers (reflection /
+/// lambda-metafactory funnels a `Charset`, `String`, … here).
+///
+/// THE PREMISE THIS HELPER WAS WRITTEN ON IS FALSE FOR PART OF ITS INPUT, and
+/// the correction is the `class_declares_method` branch in the body. It used
+/// to read:
+///
+/// > `invoke_special` does an *exact* per-class native lookup (which finds
+/// > nothing for these real classes) and then runs their real `Code`, so there
+/// > is no recursion back into this native.
+///
+/// It finds nothing for `Collections$SingletonList` and friends, which is the
+/// input the sentence was written about. It finds a native for every
+/// [`SET_VIEW_CARRIERS`] entry, because this VM registers those natives under
+/// the REAL JDK class name — so on a real `java/util/HashMap$EntrySet` the
+/// lookup re-finds the very native that called us, the re-entrancy guard
+/// below trips, and the caller returns the sentinel this helper exists to
+/// avoid: `size()` answers 0 for a three-entry map, four frames below a
+/// `size()` that answers 3. Measured 2026-09-11, wave 3 of lane 1 — see
+/// `docs/known-issues/jdk-only-lanes/lane-1-util-text-time.md` §3.
+///
+/// A comment is not a compile-time link to the premise it depends on, which is
+/// why the branch asks the registry instead of restating the claim.
 thread_local! {
     /// Re-entrancy guard for [`try_delegate_real_collection`]. Holds the
     /// `(object pointer, method name)` pairs whose real-collection delegation is
@@ -5482,7 +5501,26 @@ fn try_delegate_real_collection(
             return None;
         }
     };
-    let r = ctx.invoke_special(&cls, method, descriptor, &[Value::Object(Some(this))]);
+    // ASK, DO NOT ASSUME, whether this class's own `method` is native-backed.
+    //
+    // When the receiver's OWN class declares the method, its `Code` is the
+    // thing we want and `invoke_special_bytecode_only` is the API for exactly
+    // this case — its contract is "for a native that IS ITSELF the native
+    // registered for (class, method, descriptor)". It binds statically on
+    // `cls`, never virtually on a subclass, so it cannot re-dispatch into an
+    // override that calls us back.
+    //
+    // When the class does NOT declare it, the resolution walks up to a
+    // supertype that may be abstract or may have no body at all (a synthetic
+    // stub), and `invoke_special`'s native-first lookup is the safer answer —
+    // that is the input the original premise was written about, and its
+    // behaviour is unchanged here.
+    let declares_own = ctx.class_declares_method(ctx.class_id_of_object(this), method, descriptor);
+    let r = if declares_own {
+        ctx.invoke_special_bytecode_only(&cls, method, descriptor, &[Value::Object(Some(this))])
+    } else {
+        ctx.invoke_special(&cls, method, descriptor, &[Value::Object(Some(this))])
+    };
     DELEGATE_GUARD.with(|g| {
         g.borrow_mut().retain(|k| *k != key);
     });
@@ -11007,6 +11045,28 @@ impl Drop for ChmResizeLockGuard {
 /// species as `chm_publish_real_table`). Of the three call sites exactly one
 /// re-read through its own pin and two did not. Taking `&mut` makes forgetting
 /// a COMPILE ERROR rather than something the next audit has to find again.
+/// `HashMap.resize()`'s closing line: `newThr = (int)(newCap * loadFactor)`.
+///
+/// Extracted so the arithmetic has a test that does not need a heap — the
+/// same reason [`unmod_view_size`] is a free function. The write itself is one
+/// `set_field` in [`map_resize_inner`]'s non-`Hashtable` arm, and it is the
+/// half of `resize()` this VM never did.
+///
+/// Saturating rather than wrapping: `new_cap` is bounded by
+/// `MAP_MAX_CAPACITY` well below the `i32` range, so the product cannot
+/// overflow in practice, but a `f32` cast of a value that did would produce
+/// an implementation-defined result rather than a clamp.
+fn resize_threshold(new_cap: i32, load_factor: f32) -> i32 {
+    if !load_factor.is_finite() || load_factor <= 0.0 {
+        // A non-positive or NaN factor is not a threshold. `map_ctor_capacity
+        // _load_check` already refuses these at the constructor; reaching here
+        // means the field was written by bytecode this VM did not screen, and
+        // the JDK's own default is the honest answer.
+        return ((new_cap as f32) * 0.75_f32).max(0.0) as i32;
+    }
+    ((new_cap as f32) * load_factor).max(0.0) as i32
+}
+
 fn map_resize(ctx: &mut dyn NativeContext, this: &mut ObjectRef) {
     let is_concurrent = CHM_RESIZE_LOCK_NEEDED.with(|c| c.get());
     *this = map_resize_inner(ctx, *this, is_concurrent);
@@ -11445,6 +11505,48 @@ fn map_resize_inner(
     if !uses_native_hashtable_layout(ctx, this) {
         publish_map_table_volatile(ctx, this, new_buckets, new_cap);
         set_map_size(ctx, this, size);
+        // `HashMap.resize()`'s OTHER postcondition. The `Hashtable` arm below
+        // has always written its `threshold`; the HashMap family never did, so
+        // a grown map kept whatever its constructor wrote and the field went
+        // stale the moment the table changed size.
+        //
+        // While `table == null` the JDK overloads `threshold` to mean "the
+        // size the first `resize()` will allocate" (see [`map_state`]'s
+        // capacity reader, which depends on exactly that). `resize()` ends
+        // that overload: it allocates `newCap` and leaves
+        // `threshold = newCap * loadFactor`. Skipping the second half left the
+        // two meanings mixed — MEASURED 2026-09-11,
+        // `apps/probes/L1MapFieldProbe`'s `F.hashSet.backing.fields`:
+        // `new HashSet<>(List.of("a","b","c"))` read `threshold = 16` where
+        // HotSpot reads 12, because 16 is the CAPACITY its constructor parked
+        // there and nothing replaced it.
+        //
+        // Resolve on the RECEIVER's class, never on `java/util/HashMap` — the
+        // note above this branch is about the census row that cost, where a
+        // `HashMap`-resolved index 2 landed on `Hashtable.threshold`. A class
+        // with no such field (`ConcurrentHashMap`, which keeps `sizeCtl`
+        // instead, and every fabricated-layout map) resolves to `None` and is
+        // left alone. The slot is bounded against the OBJECT rather than the
+        // class for the reason `hs_backing_map` is.
+        if let Some(slot) =
+            ctx.resolve_field_index_by_class_id(ctx.class_id_of_object(this), "threshold")
+        {
+            if slot < ctx.object_num_fields(this) {
+                // `newCap * loadFactor`, with the field's own load factor when
+                // the receiver carries one. `(cap * 3) / 4` is the 0.75 case
+                // and is what the `Hashtable` arm hardcodes; a map built with
+                // a different factor deserves its own arithmetic.
+                let lf = match ctx
+                    .resolve_field_index_by_class_id(ctx.class_id_of_object(this), "loadFactor")
+                    .filter(|s| *s < ctx.object_num_fields(this))
+                    .map(|s| ctx.get_field(this, s))
+                {
+                    Some(Value::Float(f)) if f > 0.0 && f.is_finite() => f,
+                    _ => 0.75_f32,
+                };
+                ctx.set_field(this, slot, Value::Int(resize_threshold(new_cap, lf)));
+            }
+        }
     } else {
         ctx.set_field_volatile(this, MAP_FIELD_BUCKETS, Value::Object(Some(new_buckets)));
         set_map_size(ctx, this, size);
@@ -76830,6 +76932,78 @@ mod tests {
     // -----------------------------------------------------------------------
     // ArrayList method completeness (addAll, subList, etc.)
     // -----------------------------------------------------------------------
+
+    /// `HashMap.resize()`'s closing line, which this VM never ran.
+    ///
+    /// The row that found it: `new HashSet<>(List.of("a","b","c"))` gives its
+    /// backing map a 16-bucket table, and HotSpot leaves `threshold = 12`
+    /// while this VM left the 16 its constructor had parked there to mean
+    /// "the size the first resize will allocate".
+    #[test]
+    fn resize_threshold_is_capacity_times_load_factor() {
+        // The measured row.
+        assert_eq!(resize_threshold(16, 0.75), 12);
+        // The doubling chain a growing map walks.
+        assert_eq!(resize_threshold(32, 0.75), 24);
+        assert_eq!(resize_threshold(64, 0.75), 48);
+        // `new HashMap<>(n, lf)` with a factor of its own. The JDK truncates,
+        // it does not round: 16 * 0.6 is 9.6 and HotSpot stores 9.
+        assert_eq!(resize_threshold(16, 0.6), 9);
+        assert_eq!(resize_threshold(16, 1.0), 16);
+        // A factor above 1 is legal in the JDK (`HashMap(int, float)` only
+        // rejects <= 0 and NaN) and produces a threshold above the table size,
+        // which is exactly what HotSpot does.
+        assert_eq!(resize_threshold(16, 2.0), 32);
+    }
+
+    /// A load factor that cannot produce a threshold falls back to the JDK
+    /// default rather than writing a nonsense one.
+    ///
+    /// `map_ctor_capacity_load_check` refuses these at the constructor, so
+    /// reaching the resize with one means the field was written by bytecode
+    /// this VM did not screen. Writing `NaN as i32` there would store 0 and
+    /// make the map resize on every single insert.
+    #[test]
+    fn a_load_factor_that_is_not_one_falls_back_to_the_jdk_default() {
+        assert_eq!(resize_threshold(16, f32::NAN), 12);
+        assert_eq!(resize_threshold(16, 0.0), 12);
+        assert_eq!(resize_threshold(16, -1.0), 12);
+        assert_eq!(resize_threshold(16, f32::INFINITY), 12);
+        // And a zero-width table is a zero threshold, not a negative one.
+        assert_eq!(resize_threshold(0, 0.75), 0);
+        assert_eq!(resize_threshold(-8, 0.75), 0);
+    }
+
+    /// The premise `try_delegate_real_collection` was written on, asserted
+    /// against the registry rather than restated in a comment.
+    ///
+    /// That doc comment used to claim `invoke_special` "does an exact
+    /// per-class native lookup (which finds nothing for these real classes)".
+    /// It finds nothing for `Collections$SingletonList`, which is what the
+    /// sentence was written about. It finds a native for every
+    /// [`SET_VIEW_CARRIERS`] entry, because this VM registers those under the
+    /// REAL JDK class name — so the helper re-found the native that called it,
+    /// tripped its own re-entrancy guard, and returned the sentinel it exists
+    /// to avoid.
+    ///
+    /// If a future change stops registering `size`/`isEmpty` on these classes,
+    /// this test goes red and the `class_declares_method` branch in the helper
+    /// can be simplified back. That is the compile-time link the comment was
+    /// not.
+    #[test]
+    fn every_set_view_carrier_has_the_natives_that_falsified_the_delegate_premise() {
+        let r = build_registry();
+        for c in SET_VIEW_CARRIERS {
+            assert!(
+                r.find(c, "size", "()I").is_some(),
+                "{c} has no `size()I` native — the premise                  `try_delegate_real_collection` guards against no longer holds                  for it, and the guard can be revisited."
+            );
+            assert!(
+                r.find(c, "isEmpty", "()Z").is_some(),
+                "{c} has no `isEmpty()Z` native — same as above."
+            );
+        }
+    }
 
     #[test]
     fn arraylist_extended_methods_registered() {
