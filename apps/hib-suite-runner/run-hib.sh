@@ -602,16 +602,29 @@ run_shard() {
     cls_fl="${CLASS_FLAGS_OVERRIDE[$cls]:-}"
     eff_to="$TIMEOUT"
     if [ -n "$cls_to" ] && [ "$cls_to" -gt "$TIMEOUT" ] 2>/dev/null; then eff_to="$cls_to"; fi
+    if [ -n "$cls_to" ] || [ -n "$cls_fl" ]; then
+      echo "[override] $cls timeout=${eff_to}s (default ${TIMEOUT}s) extra_flags=${cls_fl:--}" >> "$RAW"
+      echo "[override] $cls timeout=${eff_to}s extra_flags=${cls_fl:--}" >> "$OUT/../overrides.log"
+    fi
+    # ORDER IS LOAD-BEARING: the argfile goes on FIRST and the per-class flags
+    # AFTER it, so that a per-class `-D` can actually override one of
+    # $COMMON's. It used to be the other way round, which made the flags column
+    # unable to accommodate the one thing it is most likely to be asked to
+    # accommodate: `common.args` carries
+    # `-Djunit.jupiter.execution.timeout.default=120s`, a PER-TEST cap entirely
+    # separate from this script's per-class wall cap, and a flags entry placed
+    # before the argfile lost to it silently (last `-D` wins, verified on both
+    # CratonVM and HotSpot). `lob.JpaLargeBlobTest` is the first class whose
+    # single test method legitimately runs longer than 120s on CratonVM, so
+    # until this change no combination of table entries could stop it being
+    # reported FAIL/HANG. No row had ever used the flags column, so this moves
+    # nothing that was already relied on.
+    eff_flags+=(@"$COMMON")
     if [ -n "$cls_fl" ]; then
       for f in $cls_fl; do
         case " ${eff_flags[*]} " in *" $f "*) ;; *) eff_flags+=("$f");; esac
       done
     fi
-    if [ -n "$cls_to" ] || [ -n "$cls_fl" ]; then
-      echo "[override] $cls timeout=${eff_to}s (default ${TIMEOUT}s) extra_flags=${cls_fl:--}" >> "$RAW"
-      echo "[override] $cls timeout=${eff_to}s extra_flags=${cls_fl:--}" >> "$OUT/../overrides.log"
-    fi
-    eff_flags+=(@"$COMMON")
 
     tmp=$(mktemp)
     CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 timeout "$eff_to" "$CV_BIN" "${eff_flags[@]}" \
