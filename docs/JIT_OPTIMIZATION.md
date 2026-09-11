@@ -4887,3 +4887,148 @@ log (86 lines); on, zero. Suite 92/92, 2,285 jit tests green.
 inside this host's noise floor, and today's two withdrawn results are the reason
 that is left as a measurement someone takes on a quiet host rather than a figure
 asserted here.
+
+---
+
+## 2026-09-11 — a phi copy staged in RAX, and a census that redirected the work
+
+Two things landed, and the second is the reason the first was findable.
+
+### The census: operand POSITION is 3.8%, not 82%
+
+`c2-one-carry-slot-is-the-frame-traffic-ceiling-FIXED-20260910.md` closed by
+naming `ir_schedule::pair_single_use_operands` as the next lever, on the
+strength of the deferred carry declining **82%** of its candidate windows for
+`operand_position`, and asking for a census of that pass because *"which of
+those four dominates is not yet counted"*.
+
+Built (`ir_schedule::PairCensus` — one counter per `continue`, under a
+`debug_assert`ed accounting identity so a new reason cannot read low) and run
+over 188 probes, **34,289 windows**:
+
+| cause | share |
+|---|---:|
+| producer is multi-use | **78.3%** |
+| producer's arm not certified by `op_home_is_one_store_rax` | **16.2%** |
+| the four POSITION buckets, together | **3.8%** |
+| paired | 1.7% |
+
+The two figures have different denominators and both are right — the carry's
+82% is over windows where a consumer already takes its first operand in RAX,
+the pass's is over every `(consumer, operand)` pair — but only the second says
+what the PASS could act on. **94.5% of the operands it sees were never
+eligible**, and no scheduling change reaches them. The carry page now carries
+the correction beside its prediction.
+
+Where it points instead: `producer_arm`, and inside it `Op::Load`. A
+`getfield`'s three lowering paths are mutually exclusive and each ends in one
+`store_rax` with RAX holding the result, but the mechanical test counts
+`self.store_rax(slot);` textually and sees three, so the op is excluded from a
+certification it appears to satisfy. Unowned, and the per-op breakdown that
+would size it is one more counter.
+
+### The change: `CRATONVM_JIT_IR_PHI_COPY_DIRECT`, default ON
+
+Every phi edge copy staged through RAX and then published into the phi's own
+register. On a loop back edge that is `mov rax,r15` / `mov r12,rax` for a
+resident source and `mov rax,[slot]` / `mov rbx,rax` for one still in its
+word — **one instruction per loop-carried value per iteration**, to move a
+value that is already in a register or already in the word.
+
+`emit_copy_op` now reads straight into the phi's register when it has one, so
+the publish disappears. It is the same program: the write to that register
+moves earlier inside ONE `CopyOp`, crossing only that copy's own store, so
+`resolve_parallel_copy`'s cross-op invariant is untouched.
+
+`FieldLoop.sum`'s back edge goes from four instructions to two, its loop body
+from 26 to 24, and its body from 1071 to 1059 bytes. Measured
+(`tools/tier-ab/cpu-ab.ps1`, four invocations, all outside their own floors and
+agreeing on the sign, the last re-taken after merging `dev`):
+**−4.8% / −7.0% / −7.3% / −10.5%**, i.e. about **1.08x** on
+that shape, and the tiering inversion there goes **1.208x → 1.11x** on this
+host. `FieldLoop.sumWide`, which folds twice as many copies, is
+**UNMEASURABLE** — four times the arithmetic per iteration, so the same two
+instructions are a quarter of the share.
+
+**A restriction worth copying, not just recording.** The first version also
+staged when the phi's home store survived, and wrote that home from the staged
+register. Replacing that store with `panic!()` left the **entire**
+`cratonvm-jit` suite green — 2356 unit tests and 145 differential tests — so
+the branch was shipping unexercised; and forcing it to run still could not
+catch storing the WRONG register, because nothing reads a resident phi's home
+word back. The change was narrowed to the home-dropped case (where the store
+does not exist at all) rather than the test weakened, and
+`a_phi_copy_that_keeps_its_home_is_byte_identical` pins the exclusion by
+demanding byte equality. One instruction given up on a path nothing reaches,
+in exchange for every remaining path being one the suite can fail.
+
+### And a third witness that the register file is not the constraint
+
+`c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md` argued from
+census counters that widening the GP file does not pay. The disassembly now
+shows what the two extra Win64 registers actually buy: with
+`CRATONVM_JIT_IR_GP_WIDE=1` the induction variable's home store AND its reload
+on the back edge disappear entirely — `lea r15d,[rbx+1]`, no frame traffic —
+which is exactly the store-to-load-forwarding pair this document traced the
+tier's residual 1.36x to. It still measures **+0.4% against a 0.8% floor**.
+
+So that chain is not this loop's critical path, whatever its latency is in
+isolation, and the next person reaching for "the loop-carried value round-trips
+through the frame" has a measurement to answer first.
+
+Full write-up, including the per-iteration instruction budget that says where
+the remaining gap is — **20 instructions against 26**, with the two survivors
+being that this tier does not unroll (so it pays the safepoint poll and the back
+edge every iteration rather than every fourth) and that its receiver null check
+is explicit where the single-pass tier's is implicit — in
+[`internal/performance/c2-the-phi-copy-staging-register-20260911.md`](internal/performance/c2-the-phi-copy-staging-register-20260911.md).
+
+### The same budget's next line: the loop branched the wrong way
+
+`FieldLoop.sum` takes **four** branches per iteration at this tier against the
+single-pass tier's one, and one of the four was free:
+
+```asm
+25d: cmp ebx,r14d
+260: jl  +5        ; to the loop body -- TAKEN every iteration
+266: jmp exit      ;   ...skipping this
+26b: <loop body>
+```
+
+The fused-branch arm picks its fall-through edge from `branch_hints`, which is
+empty without `CRATONVM_TIER_PGO`. The fallback that left behind — *the `true`
+edge is the near one* — is inverted for every javac counted loop, and for a
+reason this document already records in the range-BCE closeout: **javac puts the
+loop body on the FALSE edge**, because `for (i = 0; i < n; i++)` compiles to
+`if_icmpge exit`. So the near edge was the loop EXIT, the exit was not the next
+block, and `ir_fallthrough_enabled`'s `JMP rel32` elision — default-ON since
+2026-09-09 and built for exactly this — could never reach it.
+
+`CRATONVM_JIT_IR_BRANCH_LAYOUT_POLARITY` (default ON) takes the fall-through
+edge from the block LAYOUT when there is no hint: `layout_hot_paths` is
+default-ON, needs no profile, and `block_idx + 1` is its decision. The sequence
+becomes one not-taken `jge exit`: **−5 bytes, −1 instruction, −1 taken branch
+per iteration**, and 41 branches take it on `CratonBenchC2`.
+
+**It measures nothing** — UNMEASURABLE on `FieldLoop` (+0.6% against a 0.6%
+floor) and on `CratonBenchC2` (−2.5% against a 4.8% floor), checksums identical
+throughout. It ships ON because it is weakly better in both instructions and
+taken branches and strictly better whenever the near edge would otherwise need a
+`JMP`, not because anything here shows it pays.
+
+**It does not override a profile hint, and a test caught it trying.**
+`step4_ir_lower_consumes_branch_bias_hint` went red on the first version. The
+interaction it exposed is a real gap: `ScheduleOptions::branch_counts` is
+documented as taking the same per-bci bias the lowerer takes, and
+`production_schedule_options()` leaves it **empty** — so a profile informs the
+polarity of one `Jcc` and never informs which block is placed next. Populating
+it is small, and nobody has.
+
+**And a harness finding worth more than the number.** The first run reported
++1.3% against a **0.0%** floor — the tightest this apparatus has printed, and
+meaningless: Windows accounts CPU in ~15.625 ms ticks, the samples were 0.586 s,
+so one tick was 2.7% of a sample and both medians had merely landed on the same
+one. `cpu-ab.ps1` now prints the tick as a percentage of the median and refuses
+a verdict inside it. That is the second way a clean floor misleads — the first
+being drift between invocations (§5.2 of the GP-register page) — and both make a
+tight floor read as permission to stop.

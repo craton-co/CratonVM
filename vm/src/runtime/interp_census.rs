@@ -438,6 +438,36 @@ pub fn report_at_exit() {
             "[c2-supersede] ir deferred carries: candidates={dc} taken={dt} \
              declined_mid_writes_rcx={dm} (foldable={df})"
         );
+        // And the pass UPSTREAM of that one. The deferred carry's largest
+        // decline is `operand_position` -- the triple it needs was never
+        // formed -- and this is the census of the pass whose job is forming
+        // it. Read the two lines together: the numbers above are what the
+        // emitter could take, the numbers below are why the scheduler did or
+        // did not offer it.
+        // Fused branches whose fall-through edge the LAYOUT chose. OUTSIDE the
+        // supersede gate for the reason the deferred-carry line above is: a
+        // workload that compiles thousands of methods and supersedes none
+        // would report zero from an instrument that was never armed, which is
+        // an artefact of the gate rather than a fact about the code.
+        eprintln!(
+            "[c2-supersede] ir branch polarity from layout: {}",
+            cratonvm_jit::ir_lower::ir_branch_polarity_from_layout(),
+        );
+        let pc = cratonvm_jit::ir_schedule::ir_pair_census();
+        eprintln!(
+            "[c2-supersede] ir operand pairing: candidates={} paired={} | declined: \
+             multi_use={} producer_arm={} other_block={} after_consumer={} \
+             already_adjacent={} deopt_between={} no_node={}",
+            pc.candidates,
+            pc.paired,
+            pc.multi_use,
+            pc.producer_arm,
+            pc.other_block,
+            pc.after_consumer,
+            pc.already_adjacent,
+            pc.deopt_between,
+            pc.no_node,
+        );
     }
     if direct_binds_enabled() {
         eprintln!(
