@@ -644,8 +644,46 @@ for all nine):
 |---|---|---|
 | 1 | dial ASKED | discharged by wave 2 (§8b) |
 | 2 | whole probe tree no worse | discharged by wave 2, 271 lines, four arms |
-| 3 | image target carries `Code` | **NOT verified** |
-| 4 | `invocations > 0` per TRIPLE | **NOT verified** |
+| 3 | image target carries `Code` | **discharged**, 9 of 9 |
+| 4 | `invocations > 0` per TRIPLE | **discharged**, 9 of 9 |
+
+**3 and 4 were answered without a new build**, from the dump wave 2 already
+took — `w2p18/L3ReflectInvokeSurface.registry.json`, `schema_version: 5`,
+`image_adjudication: true`. All nine come back identical in shape:
+
+```text
+owns_slot  true      kind  bridge     invocations  3..7 (invocations_complete true)
+image_declaring_method: image_has_class true, declared true,
+                        acc_native FALSE, has_code TRUE
+```
+
+`acc_native: false` with `has_code: true` puts all nine in bucket A, so §1.5
+does not govern them and there is real bytecode to yield to. `owns_slot: true`
+means the table edit will not be inert. `invocations_complete: true` matters
+separately — the registry's counter saturates on a warm loop, so an incomplete
+count is a statement about the counter rather than the dispatch.
+
+**Why p18's answers transfer to p20, stated rather than assumed:**
+
+* Precondition 3 is a property of the **JDK image**, not of the VM build. Same
+  JDK 25, same answer.
+* Precondition 4 can only move upward. More retirements elsewhere add
+  dispatches — a retired producer makes a previously unreachable consumer
+  reachable, which is the finding that brought six of seven excluded rows back
+  in an earlier wave. A row at `>0` on p18 cannot fall to `0` on p20.
+* `owns_slot` would move only if some lane added a competing REGISTRATION.
+  None did: the merged tree's registration totals are 13623 / 13991 / 13658,
+  byte-identical to this branch's pre-merge readings, so `dev`'s 44 commits
+  added no registrations at all.
+
+The control dump in the pipeline is therefore a confirmation, not a dependency.
+
+**One sequencing trap, recorded because it would have destroyed the control:**
+the table edit must NOT be applied until `p20` is pinned. The release build
+takes the working tree as it stands, so applying the nine before it runs makes
+`p20` carry the rows it is supposed to be the control for — and the A/B would
+compare a binary against itself, scoring both arms identical and reading as
+"the retirement changes nothing".
 
 **Precondition 3 cannot be read off the kind map, and it is worth saying why,
 because the file looks like it answers.** Its trailing columns are ordinal,
@@ -659,7 +697,7 @@ carrying wave 3, because a retired producer can make a zero-invocation consumer
 reachable — the finding that brought six of seven excluded rows back in an
 earlier wave.
 
-Both are single-launch checks (seconds), and they gate a build, not a decision.
+Both turned out to need no launch at all — see above.
 The mechanical edit is written and checked for control bytes; it applies the
 nine in sorted position and writes LF. Sequence, exploiting the fact that lane
 0's verification binary is this wave's control:
