@@ -2237,6 +2237,23 @@ fn synthetic_stub_count_does_not_regress() {
     );
     println!("stub-ratchet: const {BASELINE_CONST}: usize = {synthetic};");
 
+    // A count that did NOT move is the reading this gate never addressed, and
+    // on 2026-09-11 it cost a lane most of a day: lane 2 retired 50 triples,
+    // the VM's own `--jdk-only-report` refusals under `java/lang` + `java/math`
+    // went 95 -> 144 with zero survivors, and this number did not change by a
+    // single row. Printed on every run, beside the number, because silence is
+    // where the wrong conclusion gets drawn and no failure message is reached.
+    println!(
+        "stub-ratchet(scope): this censuses `vm_init`'s BOOT PATH. Measured \
+         2026-09-11 on one tree: 132 SyntheticStub rows the shipped VM \
+         dispatches sit OUTSIDE it (54 native-awt, 25 jmx, 21 \
+         native-collections, 15 jar_manifest, 12 native-builtins/lib.rs, \
+         3 others). So a count that did NOT move is not evidence that a \
+         retirement did nothing, and rows registered only by the jmx \
+         registrars are invisible here in the no-management \
+         configuration by construction. See W7-30 §12."
+    );
+
     // WHERE the population lives, not just how big it is. Printed on every run,
     // pass or fail: a green ratchet whose composition shifted underneath it is
     // the case a single number is structurally unable to show.
@@ -2300,9 +2317,20 @@ fn synthetic_stub_count_does_not_regress() {
          {BASELINE_SYNTHETIC_STUBS}.\n\
          \n\
          FIRST, find out WHICH rows, because this number cannot tell you why it \
-         moved. Run `dump_synthetic_stubs` here and at the commit that last set \
-         `{BASELINE_CONST}`, and diff the sorted `@@STUB` lines. This run already \
-         printed the per-file breakdown; the top eight are: {breakdown}\n\
+         moved. Set `CRATONVM_RATCHET_ROWS=1` here and at the commit that last \
+         set `{BASELINE_CONST}`, and diff the sorted `stub-ratchet(row):` lines: \
+         those are per-REGISTRATION and carry the registering file.\n\
+         \n\
+         `dump_synthetic_stubs` is the weaker instrument and can come back \
+         EMPTY for a real delta, so do not attribute with it alone. It prints \
+         DISTINCT triples while this count is REGISTRATIONS: a triple registered \
+         twice, with one registration already a stub and the other re-tagged, \
+         moves this number by 1 and that dump by 0. Measured 2026-09-11 — a \
+         +30 delta with a byte-identical dump, which read as "the retirement \
+         did nothing" and nearly cost a lane its table. See W7-30 §12.\n\
+         \n\
+         This run already printed the per-file breakdown; the top eight are: \
+         {breakdown}\n\
          \n\
          Then read each added triple, because there are TWO causes and they want \
          opposite responses:\n\
