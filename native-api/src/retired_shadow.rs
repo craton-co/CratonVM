@@ -3758,10 +3758,7 @@ mod tests {
                 ),
                 (RETIRED_SHADOW_L5_TRIPLES, "RETIRED_SHADOW_L5_TRIPLES"),
                 (RETIRED_SHADOW_L1_TRIPLES, "RETIRED_SHADOW_L1_TRIPLES"),
-                (
-                    RETIRED_SHADOW_L1_HM_TRIPLES,
-                    "RETIRED_SHADOW_L1_HM_TRIPLES",
-                ),
+                (RETIRED_SHADOW_L1_HM_TRIPLES, "RETIRED_SHADOW_L1_HM_TRIPLES"),
             ] {
                 assert!(
                     other.binary_search(key).is_err(),
