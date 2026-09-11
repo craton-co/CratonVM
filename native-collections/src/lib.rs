@@ -53471,9 +53471,20 @@ fn native_tm_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => return Ok(None),
     };
     // Seed identity-hash so the side-table key survives GC moves.
+    // The backing array is NOT allocated here. `native_tm_put`'s `data_opt ==
+    // None` arm installs it on the FIRST insert, and `tm_get_slot` documents
+    // `Value::Object(None)` as the layout-independent default for a map with no
+    // side-table entry -- so the eager allocation this constructor used to do
+    // bought nothing but a `TM_DEFAULT_CAPACITY * 2` array on every `new
+    // TreeMap()`, retained for as long as the map was.
+    //
+    // MEASURED (probes/CollectionShapeCause.java, retained heap per empty
+    // instance, Temurin 25.0.3+9): `TreeMap` 352 B against HotSpot's 48.1, of
+    // which 272 B is exactly this `Object[32]`. HotSpot allocates nothing until
+    // the first `put` -- `root` stays null -- and an empty map that is never
+    // written is the common shape in configuration and model code.
     ih_seed(ctx, this);
-    let buf = alloc_ref_array_or_oom(ctx, TM_DEFAULT_CAPACITY * 2)?;
-    tm_set_slot(ctx, this, TM_FIELD_DATA, Value::Object(Some(buf)));
+    tm_set_slot(ctx, this, TM_FIELD_DATA, Value::Object(None));
     tm_set_slot(ctx, this, TM_FIELD_SIZE, Value::Int(0));
     tm_set_slot(ctx, this, TM_FIELD_COMPARATOR, Value::Object(None));
     Ok(None)
@@ -53484,10 +53495,11 @@ fn native_tm_init_comparator(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // See `native_tm_init`: the backing array is installed on first insert.
+    // No allocation here also means `cmp` needs no pin across one.
     ih_seed(ctx, this);
     let cmp = args.get(1).copied().unwrap_or(Value::Object(None));
-    let buf = alloc_ref_array_or_oom(ctx, TM_DEFAULT_CAPACITY * 2)?;
-    tm_set_slot(ctx, this, TM_FIELD_DATA, Value::Object(Some(buf)));
+    tm_set_slot(ctx, this, TM_FIELD_DATA, Value::Object(None));
     tm_set_slot(ctx, this, TM_FIELD_SIZE, Value::Int(0));
     tm_set_slot(ctx, this, TM_FIELD_COMPARATOR, cmp);
     Ok(None)
@@ -56156,8 +56168,20 @@ fn native_ts_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // The backing array is NOT allocated here. `native_ts_add`'s `data_opt ==
+    // None` arm installs it on the FIRST insert, and `ts_get_slot` documents
+    // `Value::Object(None)` as the layout-independent default for a set with no
+    // side-table entry -- so the eager allocation this constructor used to do
+    // bought nothing but a `TS_DEFAULT_CAPACITY` array on every `new
+    // TreeSet()`, retained for as long as the set was.
+    //
+    // MEASURED (probes/CollectionShapeCause.java, retained heap per empty
+    // instance, Temurin 25.0.3+9): `TreeSet` 208 B against HotSpot's 64.1, of
+    // which 144 B is exactly this `Object[16]`. HotSpot allocates nothing until
+    // the first `add` -- its backing `TreeMap.root` stays null -- and an empty set that is never
+    // written is the common shape in configuration and model code.
     ih_seed(ctx, this);
-    let (this, _buf) = ts_install_backing_array(ctx, this, TS_DEFAULT_CAPACITY);
+    ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(None));
     ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(0));
     ts_set_slot(ctx, this, TS_FIELD_COMPARATOR, Value::Object(None));
     Ok(None)
@@ -56168,12 +56192,11 @@ fn native_ts_init_comparator(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // See `native_ts_init`: the backing array is installed on first `add`.
+    // Nothing here allocates any more, so `cmp` needs no pin across one.
     ih_seed(ctx, this);
     let cmp = args.get(1).copied().unwrap_or(Value::Object(None));
-    let cmp_pin = pin_value(ctx, cmp);
-    let (this, _buf) = ts_install_backing_array(ctx, this, TS_DEFAULT_CAPACITY);
-    let cmp = read_pinned_elem(ctx, cmp_pin, cmp);
-    ctx.unpin_native_roots(cmp_pin);
+    ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(None));
     ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(0));
     ts_set_slot(ctx, this, TS_FIELD_COMPARATOR, cmp);
     Ok(None)
