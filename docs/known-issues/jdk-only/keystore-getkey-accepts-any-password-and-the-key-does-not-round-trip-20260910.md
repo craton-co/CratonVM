@@ -267,3 +267,50 @@ four-slot mirror, so `equals` stays false and `getEncoded` stays whatever the
 mirror was given. That needs a real key object, and it is the same "the class's
 state has to become real before its shadow can be retired" ordering every other
 family in this campaign hit.
+
+---
+
+## 7. KS-1 is FIXED, 2026-09-10, and the matrix says by how much
+
+`engine_get_key` now throws `java.security.UnrecoverableKeyException` when the
+entry's material is still inside an envelope, instead of wrapping the
+ciphertext in the `PrivateKey` mirror and returning it. `is_encrypted_private_key`
+recognises both envelopes this VM can hold — the JKS key protector by its OID,
+a PKCS#12 `EncryptedPrivateKeyInfo` by parsing — and
+`an_envelope_is_told_from_a_key_exactly` pins the discrimination in the
+direction that would hurt: a plaintext PKCS#8 must never read as an envelope,
+or every `getKey` with the CORRECT password starts throwing.
+
+MEASURED on `cratonvm-lt6.exe`, the same six stores as §6, HotSpot-written and
+read by CratonVM — the arm where this VM is the reader and the specification
+says what should happen:
+
+```text
+                        HotSpot        before            after
+   JKS    ENTRY pw      usable         usable            usable
+          STORE pw      throws         NOT-A-KEY         throws
+          WRONG pw      throws         NOT-A-KEY         throws
+   PKCS12 ENTRY pw      usable         NOT-A-KEY         throws      <- KS-6
+   JCEKS  STORE pw      throws         NOT-A-KEY         throws
+          WRONG pw      throws         NOT-A-KEY         throws
+
+   rows matching HotSpot          1 of 9   ->   7 of 9
+   rows still wrong               8 silent ->   2 LOUD
+```
+
+**JKS now matches HotSpot exactly.** The two rows that remain wrong are KS-6's
+— a HotSpot-written PKCS#12 or JCEKS whose entry password differs from the
+store password never decrypts at all, so the correct password now throws where
+HotSpot returns the key. That is a worse *answer* and a better *failure*: it
+trades a silent wrong key for a loud refusal, which is the direction this
+campaign's own rule points, and it is visible to the application instead of
+being discovered when a signature fails to verify on a peer.
+
+**Nothing changed for a store this VM wrote**, because KS-5 is upstream of this
+fix: those keys are protected with the STORE password and therefore decrypt at
+load, so no envelope survives for `getKey` to refuse. Every `CRATONVM -> CRATONVM`
+row in §6 still reads `usable` for all three passwords. KS-5 and KS-6 both wait
+on the `protected` field §4 specifies, and `LTKeyStoreEngineSweep` stays
+unpromoted until they land: its `getKey with the WRONG password` rows go
+through a store this VM wrote, so they are KS-5's rows and this fix does not
+move them.
