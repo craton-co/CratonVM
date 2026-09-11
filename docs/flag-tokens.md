@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-543 tokens.
+544 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -277,6 +277,7 @@ export inherited from a parent shell.
 | `ir-bailout` | `CRATONVM_DBG_IR_BAILOUT` |
 | `ir-call` | `CRATONVM_DBG_IR_CALL` |
 | `ir-bufsize` | `CRATONVM_DBG_IR_BUFSIZE` |
+| `code-near-globals` | `CRATONVM_DBG_CODE_NEAR_GLOBALS` |
 | `ir-compiles` | `CRATONVM_DBG_IR_COMPILES` |
 | `ir-isel` | `CRATONVM_DBG_IR_ISEL` |
 | `ir-linear-scan` | `CRATONVM_DBG_IR_LINEAR_SCAN` |

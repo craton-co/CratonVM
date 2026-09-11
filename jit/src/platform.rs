@@ -540,6 +540,7 @@ mod near_globals {
                 return None;
             };
             if in_reach(p as usize, size, anchor) {
+                report("placed", anchor, p as usize, size, attempt);
                 let end = (p as usize).saturating_add(size);
                 let next = (end + HINT_ALIGN - 1) & !(HINT_ALIGN - 1);
                 // A cursor that has walked out of the window is cleared rather
@@ -570,7 +571,49 @@ mod near_globals {
         // eight wasted `mmap`/`munmap` pairs each time.
         RETIRED.store(true, Ordering::Relaxed);
         FELL_BACK.fetch_add(1, Ordering::Relaxed);
+        report("RETIRED", anchor, 0, size, NEAR_GIVE_UP_AFTER);
         None
+    }
+
+    /// `CRATONVM_DBG_CODE_NEAR_GLOBALS=1` — one line per placement DECISION,
+    /// which is the only way a run can be shown to have engaged this strategy
+    /// rather than merely to have set its flag.
+    ///
+    /// # Why this is not optional bookkeeping
+    ///
+    /// [`stats`] has said since it was written that it exists "for the
+    /// diagnostic line", and there was no diagnostic line — nothing in the
+    /// process read it. That gap is not cosmetic on THIS flag: it is a hint to
+    /// `mmap` and the kernel is free to ignore it, so "the flag was set" and
+    /// "the code moved" are genuinely different facts, and on a host with no
+    /// room near the anchor the second is false while the first is true. A
+    /// differential run whose arms are indistinguishable from the outside
+    /// proves nothing, and before this line the only way to tell them apart
+    /// was to disassemble a method and count `81 3D` opcodes.
+    ///
+    /// `[near-globals] placed anchor=0x… buf=0x… size=… delta=…MB attempt=N
+    /// in_reach=… fell_back=… retired=…`
+    ///
+    /// `delta` is what actually decides the encoding, so it is printed rather
+    /// than left for the reader to subtract: a buffer inside the window is
+    /// what makes `rip_disp32` hand out the short form.
+    fn report(outcome: &str, anchor: usize, buf: usize, size: usize, attempt: usize) {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CODE_NEAR_GLOBALS").is_none() {
+            return;
+        }
+        let (in_reach_n, fell_back_n, retired) = stats();
+        // Megabytes, integer: the question this answers is "inside ±1.5GB or
+        // not", and a byte count makes that harder to read, not easier.
+        let delta_mb = if buf == 0 {
+            0
+        } else {
+            buf.abs_diff(anchor) / (1 << 20)
+        };
+        eprintln!(
+            "[near-globals] {outcome} anchor={anchor:#x} buf={buf:#x} size={size} \
+             delta={delta_mb}MB attempt={attempt} in_reach={in_reach_n} \
+             fell_back={fell_back_n} retired={retired}"
+        );
     }
 
     /// The window [`in_reach`] enforces, so a test can state the architectural
