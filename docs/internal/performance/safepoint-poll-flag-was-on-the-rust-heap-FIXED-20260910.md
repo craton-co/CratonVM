@@ -120,10 +120,50 @@ through `VirtualAlloc` and lands in the same low region as the code cache. What
 the Windows numbers do show is the difference between 489 MiB of luck and
 128 KiB of construction.
 
-**The Linux confirmation is still owed**, and it is the one that matters: build
+**The Linux confirmation was still owed**, and it is the one that matters: build
 with the default (no `CRATONVM_JIT_CODE_NEAR_GLOBALS`), run the probe on
 20.80.105.49, and read any loop body. `test byte [rel …]` means in reach,
 `mov r11, <imm64>` means it is not.
+
+### Paid, 2026-09-10, on 20.80.105.49
+
+Ubuntu 24.04 x86-64, release build of `dev`, **default flags** —
+no `CRATONVM_JIT_CODE_NEAR_GLOBALS`, which is the configuration this section
+exists for. `probes/MultiFieldLoop.java`, `CRATONVM_JIT_FORCE_C2=1`,
+`CRATONVM_DBG_JIT_DISASM=MultiFieldLoop.sumGuarded`:
+
+```text
+[cratonvm-jit-disasm] osr/sp  MultiFieldLoop.sumGuarded(I)I entry=0x7b3f61876000
+  8c: f6056d6f0000ff    test byte [rel 7B3F6187F000h],0FFh
+```
+
+The flag byte is **36 KiB** from the code buffer that reads it — a cell out of
+`alloc_code_adjacent_cell`'s own chunk, exactly as designed. Counted per body,
+by resolving each site rather than by grepping the dump — **every poll site in
+every body takes `test byte [rel …]` and none takes the R11 form**, in both
+arms of the placement flag:
+
+| body | arm | `test byte [rel …]` | `mov r11` + `test byte [r11]` |
+|---|---|---:|---:|
+| `sumGuarded` `full/ir` | default | **2** | 0 |
+| `sumGuarded` `osr/sp` | default | **2** | 0 |
+| `main` `osr/sp` | default | **3** | 0 |
+| `sumGuarded` `full/ir` | `CODE_NEAR_GLOBALS=1` | **2** | 0 |
+| `sumGuarded` `osr/sp` | `CODE_NEAR_GLOBALS=1` | **2** | 0 |
+| `main` `osr/sp` | `CODE_NEAR_GLOBALS=1` | **3** | 0 |
+
+So the answer to the question this page asked is *in reach*, and the Windows
+table above — which could not show an encoding change because that host was
+already in reach by luck — now has the platform where it was not.
+
+**It also changes what the sibling page's flag is worth**, which is why this
+is not just a box ticked. `near_globals` used to move the polls AND the guards;
+on a tree with this fix the polls are already short without it, so all it moves
+is the guards. Measured on the same probe, the `full/ir` body is 1851 bytes at
+the default and 1815 with the flag: **36 bytes, which is 4 guards x 9 and no
+poll component at all.** The 50-byte figure in
+`c2-the-layout-epoch-guard-was-unreachable-by-rip-20260910.md`'s engagement
+table was 4 x 9 + 2 x 7, and the 2 x 7 is what this page took away from it.
 
 ## Guarded by
 
