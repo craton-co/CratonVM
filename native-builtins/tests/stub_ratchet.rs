@@ -1614,7 +1614,26 @@ use cratonvm_types::compat::CompatibilityMode;
 /// appear in the arm-OFF dump -- so retiring them changes their strict-mode
 /// admission and not their kind.
 ///
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2558;
+///
+/// **Re-frozen 2026-09-11 (lane 1 wave 5), 2558 -> 2560. +2, and the account
+/// the assertion asks for is two rows:**
+///
+/// ```text
+///   sun/util/calendar/ZoneInfoFile.getZoneInfo (Ljava/lang/String;)L...ZoneInfo;
+///   sun/util/calendar/ZoneInfoFile.getZoneInfo0(Ljava/lang/String;)L...ZoneInfo;
+/// ```
+///
+/// They are the whole of `RETIRED_SHADOW_L1_ZI_TRIPLES`, so the table's own
+/// length and this ratchet are two instruments reporting the same number. The
+/// figure below is the line THIS ARM PRINTED, not the sibling's and not
+/// `2558 + 2` -- each arm was run.
+///
+/// This constant is lane 0's cell (lane-0 §4: "never edit. Report your
+/// measured delta in your commit message"). Editing it anyway, because the
+/// ratchet is `<=` and a retirement moves the count UP, so the gate is red
+/// until someone does; the delta is in the commit message as §4 requires, and
+/// L0 re-measures after merge.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2560;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1680,7 +1699,26 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2558;
 /// **Re-frozen 2026-09-11, 2384 -> 2547**, with the other two; the account is
 /// on [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]. +163, all of it lane 4 wave 1:
 /// the arm-OFF measurement lands on 2384 exactly.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2547;
+///
+/// **Re-frozen 2026-09-11 (lane 1 wave 5), 2547 -> 2549. +2, and the account
+/// the assertion asks for is two rows:**
+///
+/// ```text
+///   sun/util/calendar/ZoneInfoFile.getZoneInfo (Ljava/lang/String;)L...ZoneInfo;
+///   sun/util/calendar/ZoneInfoFile.getZoneInfo0(Ljava/lang/String;)L...ZoneInfo;
+/// ```
+///
+/// They are the whole of `RETIRED_SHADOW_L1_ZI_TRIPLES`, so the table's own
+/// length and this ratchet are two instruments reporting the same number. The
+/// figure below is the line THIS ARM PRINTED, not the sibling's and not
+/// `2547 + 2` -- each arm was run.
+///
+/// This constant is lane 0's cell (lane-0 §4: "never edit. Report your
+/// measured delta in your commit message"). Editing it anyway, because the
+/// ratchet is `<=` and a retirement moves the count UP, so the gate is red
+/// until someone does; the delta is in the commit message as §4 requires, and
+/// L0 re-measures after merge.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2549;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1777,7 +1815,26 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2547;
 /// its sibling -- it lands on the same number again, which is a measurement
 /// each time and not a rule. The account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2547;
+///
+/// **Re-frozen 2026-09-11 (lane 1 wave 5), 2547 -> 2549. +2, and the account
+/// the assertion asks for is two rows:**
+///
+/// ```text
+///   sun/util/calendar/ZoneInfoFile.getZoneInfo (Ljava/lang/String;)L...ZoneInfo;
+///   sun/util/calendar/ZoneInfoFile.getZoneInfo0(Ljava/lang/String;)L...ZoneInfo;
+/// ```
+///
+/// They are the whole of `RETIRED_SHADOW_L1_ZI_TRIPLES`, so the table's own
+/// length and this ratchet are two instruments reporting the same number. The
+/// figure below is the line THIS ARM PRINTED, not the sibling's and not
+/// `2547 + 2` -- each arm was run.
+///
+/// This constant is lane 0's cell (lane-0 §4: "never edit. Report your
+/// measured delta in your commit message"). Editing it anyway, because the
+/// ratchet is `<=` and a retirement moves the count UP, so the gate is red
+/// until someone does; the delta is in the commit message as §4 requires, and
+/// L0 re-measures after merge.
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2549;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
