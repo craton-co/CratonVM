@@ -593,6 +593,27 @@ Every remaining HELD family has a named blocker. In rough order of rows:
    where HotSpot reads the jar's per-entry manifest section, and it is
    `JarFile`'s, not `JarEntry`'s: the class declares no native for
    `getAttributes`, so nothing wave 4 could retire repairs it.
+
+   **Neither `+34` nor `+16` is thirty-four or sixteen wrong answers.** Both
+   are ONE throw and a truncated section, which is why the prefix numbers
+   looked so much worse than the families are:
+
+   ```text
+     java/util/jar/JarFile armed
+       SECTION-DIED.zipAndJar  java.lang.NullPointerException
+       — right after `jar.exists |true|`, i.e. on `new JarFile(f)` itself
+     java/text/BreakIterator armed
+       SECTION-DIED.text       java.lang.AbstractMethodError
+   ```
+
+   The `AbstractMethodError` is the tell, and it links this item to item 6:
+   `BreakIterator` is ABSTRACT, and yielding `getWordInstance` sends real
+   bytecode to the locale provider for a concrete
+   `sun.text.RuleBasedBreakIterator` it does not get. That is the SAME
+   provider lookup item 6's five vacuous rows are about — one blocker, two
+   families — and it is the second time this lane has watched a fabricated
+   abstract receiver trade a missing object for an `AbstractMethodError`.
+   Fix the provider lookup and both move.
 6. **`Date`/`TimeZone`/`sun/util/calendar/` (40)** and **`Locale` + providers
    (35)**: read the locale-provider trap below before pricing either — and
    start from the bisection, which is now taken. Armed one class at a time on
