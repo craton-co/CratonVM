@@ -69,7 +69,7 @@ Sets are disjoint; the totals below reconcile to 5,549 exactly.
 | **L4** | `java/io/`, `java/nio/`, `sun/nio/`, `jdk/internal/foreign` | 1,110 | 131 | 615 |
 | **L5** | `java/util/concurrent/`, `jdk/internal/misc/`, `sun/misc/`, `java/lang/Thread*`, `jdk/internal/vm/` | 405 | 23 | 345 |
 | **L6** | `java/net/`, `sun/net/`, `javax/net/`, `java/security/`, `sun/security/`, `javax/crypto/`, `javax/security/`, `jdk/net/` | 819 | 90 | 663 |
-| **L7** | `java/lang/ClassLoader*`, `jdk/internal/loader/` **+ the bootstrap failure triage** | 47 | 12 | 45 |
+| **L7** | `java/lang/ClassLoader*`, `jdk/internal/loader/`, **`java/security/SecureClassLoader`** (claimed 2026-09-10, one `<clinit>` row, from L6) **+ the bootstrap failure triage** | 20 | 6 | 18 |
 | — | **UNOWNED, frozen** | 316 | 83 | 291 |
 | | **TOTAL** | **5,549** | **631** | **3,395** |
 
@@ -265,6 +265,34 @@ paragraph cannot drift apart the way §7's held set did.
 The two reviewed `Intrinsic`s sit outside that sum -- adjudicating a kind
 removes a triple from the `Bridge` population, so they are no longer shadows to
 count.
+
+- **`Class.getModule` → reviewed `Intrinsic`.** Not `ACC_NATIVE`, so §1.4 makes
+  it a shadow; but `Class.module` is written only by a real VM at class
+  definition, so yielding returns **null**, which is 12 of the corpus failures.
+  Reviewed with `apps/probes/ClassModuleSweep.java` (32 rows, 31 matching).
+- **`Class.getName` → reviewed `Intrinsic`.** Yielding returns the **internal
+  form** (`java/lang/Object`), which is worse than null because nothing throws;
+  it propagates into every JDK name comparison and is why `ServiceLoader`
+  reports *"module java.base does not declare `uses`"*.
+
+  **This bullet described a tag that had not landed, and said so in the past
+  tense for a day.** Measured 2026-09-10: the registration was still
+  `bridge`/`kind_stated:false` in `--dump-native-registry`, the kind-map row
+  still read `bridge 0 1`, and `apps/probes/ClassNameSweep.java` existed in no
+  commit — `git log --all -S ClassNameSweep` finds only the commit that wrote
+  this bullet. It landed that day, reviewed with a sweep of **85** rows (not
+  24): **0 rows differ unarmed, 9 differ armed before the tag and 1 after**, and
+  the nine include `Class.forName(X.class.getName())` throwing
+  `ClassNotFoundException` for every reference type. One tag repairs eight of
+  them, because the JDK derives
+  `getTypeName`/`getCanonicalName`/`getSimpleName`/`toString` from `getName`.
+  The ninth is a `Class.forName` defect on a NESTED application class and is
+  recorded, not frozen — the sweep is checked in.
+
+  Two things this cost, worth keeping: a prose claim of "already resolved" is
+  not a measurement, and the armed/unarmed split alone would have missed it —
+  rows reached through a method reference kept the native and answered
+  correctly, so a probe that asked one dispatch route called the family clean.
 
 **Instrument:** `apps/probes/L0ClassModuleSurface.java`, 129 rows over the
 whole surface, measured three ways against HotSpot 25.0.3+9 -- unarmed, and
@@ -549,9 +577,12 @@ underneath it.
 `Class.getModule` and `Class.getName` are **not** retirements and
 `the_two_reviewed_intrinsics_are_not_retirements` pins that. Yielding gives a
 null module and the internal name form (`java/lang/Object`) — worse than null,
-because nothing throws. `getName` alone repaired 22 of 24 `ClassNameSweep`
-rows, since the JDK derives `getTypeName`/`getCanonicalName`/`getSimpleName`
-from it.
+because nothing throws. `getName` alone repaired 8 of the 9 rows
+`ClassNameSweep` finds differing under the dial, since the JDK derives
+`getTypeName`/`getCanonicalName`/`getSimpleName`/`toString` from it. (This
+sentence read "22 of 24" until the 2026-09-11 merge. The sweep is **85** rows,
+not 24 — see the corrected bullet above, which is the measurement; the 24 was
+from a draft of the probe that never landed.)
 
 ### The §1.4 reviewed-`Intrinsic` protocol, which every lane will need
 
