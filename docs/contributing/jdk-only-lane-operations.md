@@ -186,21 +186,50 @@ assuming it did.
 
 ```bash
 # 1. gate — this is the whole set; do not shorten it
-cargo test -p cratonvm-types
+cargo test -p cratonvm-types --no-fail-fast
 # Name NOTHING by hand here. `--tests` is the authority and the directory GROWS.
-cargo test -p cratonvm-native-builtins --tests
-cargo test -p cratonvm-native-builtins --features management --tests
-cargo test -p cratonvm-native-builtins --features synthetic-jdk --tests
+cargo test -p cratonvm-native-builtins --tests --no-fail-fast
+cargo test -p cratonvm-native-builtins --features management --tests --no-fail-fast
+cargo test -p cratonvm-native-builtins --features synthetic-jdk --tests --no-fail-fast
 # plus --lib for any other crate you changed
 
-# 2. the three arms, on a RELEASE build of the MERGED tree
+# 2. build the binary the arms will score — and CHECK that it built
+rm -f target/release/cratonvm          # a stale one must not stand in for yours
+cargo build --release -p cratonvm-cli || exit 1
+test -f target/release/cratonvm        || exit 1
+
+# 3. the three arms, on THAT release build of the MERGED tree
 CRATONVM_ARGS=--jdk-only bash regression-suite/run.sh
 SUITE=all                bash regression-suite/run.sh
 SUITE=core               bash regression-suite/run.sh
 
-# 3. push, in its OWN command, keyed on the gate RESULT
+# 4. push, in its OWN command, keyed on the gate RESULT
 git push origin HEAD:dev
 ```
+
+**Step 2 is a step because a failed build does not fail the run that follows
+it.** `target/release/cratonvm` from your PREVIOUS build is still sitting there,
+the arms pick it up, and they score a tree that is not the one you are landing —
+green, at full length, with no warning anywhere in the output. Measured
+2026-09-11: `cargo build --release` was OOM-killed (`signal: 9, SIGKILL`) on a
+host at load 198, and the three arms then reported 132/0, 132/0 and 92/0 against
+a binary built four hours and two merges earlier. Nothing in the arms' output
+distinguishes that from a real pass. The `rm -f` is what makes the failure loud:
+without a binary the arms cannot start at all. If you script the protocol, print
+the build's exit code and the binary's mtime beside the arm results, and stamp
+the revision into both.
+
+**`--no-fail-fast`, because cargo stops at the first failing test BINARY.** Not
+the first failing test — the first failing binary, and the remaining binaries in
+that invocation never run. `cargo test -p cratonvm-types` reported one failure,
+`doc_numeric_claims::flag_inventory_surface_counts_are_current`; fixing it
+revealed `flag_docs_generated`'s two, which had been red the whole time. Three
+gates, one cause, discovered over three round trips of roughly forty minutes
+each. The flag itself has no downside here: the exit code is still non-zero if
+anything failed, and you get the whole picture in one run. The same reasoning
+applies to the five commands as a list — run all five and collect their exit
+codes, rather than `&&`-chaining them, or arm 5 never runs on the day arm 1 is
+red for an unrelated reason.
 
 **Do not chain the push behind the gates.** A red `doc_citation_paths` reached
 `dev` because the conditional was keyed on `behind=0` instead of on the test
