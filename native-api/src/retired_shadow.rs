@@ -3289,11 +3289,7 @@ static RETIRED_SHADOW_L1_JT_TRIPLES: &[(&str, &str, &str)] = &[
         "containsKey",
         "(Ljava/lang/Object;)Z",
     ),
-    (
-        "java/util/jar/Attributes",
-        "entrySet",
-        "()Ljava/util/Set;",
-    ),
+    ("java/util/jar/Attributes", "entrySet", "()Ljava/util/Set;"),
     (
         "java/util/jar/Attributes",
         "get",
@@ -3331,11 +3327,7 @@ static RETIRED_SHADOW_L1_JT_TRIPLES: &[(&str, &str, &str)] = &[
         "toString",
         "()Ljava/lang/String;",
     ),
-    (
-        "java/util/jar/JarEntry",
-        "<init>",
-        "(Ljava/lang/String;)V",
-    ),
+    ("java/util/jar/JarEntry", "<init>", "(Ljava/lang/String;)V"),
     (
         "java/util/jar/JarEntry",
         "getComment",
@@ -3343,11 +3335,7 @@ static RETIRED_SHADOW_L1_JT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     ("java/util/jar/JarEntry", "getCompressedSize", "()J"),
     ("java/util/jar/JarEntry", "getMethod", "()I"),
-    (
-        "java/util/jar/JarEntry",
-        "getName",
-        "()Ljava/lang/String;",
-    ),
+    ("java/util/jar/JarEntry", "getName", "()Ljava/lang/String;"),
     ("java/util/jar/JarEntry", "getSize", "()J"),
     ("java/util/jar/JarEntry", "isDirectory", "()Z"),
     ("java/util/jar/Manifest", "<init>", "()V"),
@@ -3371,11 +3359,7 @@ static RETIRED_SHADOW_L1_JT_TRIPLES: &[(&str, &str, &str)] = &[
         "<init>",
         "(Ljava/util/jar/Manifest;)V",
     ),
-    (
-        "java/util/jar/Manifest",
-        "getEntries",
-        "()Ljava/util/Map;",
-    ),
+    ("java/util/jar/Manifest", "getEntries", "()Ljava/util/Map;"),
     (
         "java/util/jar/Manifest",
         "getMainAttributes",
