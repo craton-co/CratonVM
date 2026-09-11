@@ -443,7 +443,27 @@ Two things this is not:
   `the_l0_attributed_triples_are_not_retired` pins them out, so re-adding one
   takes the bisection rather than a steady hand.
 
-### 7.3 Verified on the binary that ships, 2026-09-11
+### 7.3 Verified on `p19` at `77f9953b1`, and NOT on the current tip
+
+> **Read this first, added the same day.** The numbers below are a measurement
+> on a specific binary, and that binary is **no longer this branch's tip**. A
+> third `origin/dev` merge landed 44 commits after they were taken — lane 1's
+> waves 3 and 4, lane 7's table, and dev's JIT/C2 work — so the tip carries
+> **three more lanes' retirements** than `p19` did. `p20` is building; its arms
+> replace this table and the §7.3 heading loses this warning when they do.
+>
+> This paragraph exists because leaving the heading reading "the binary that
+> ships" would be the same defect §7.1 catches: the page advertising a state
+> the code no longer has. Two of the three times this lane has been wrong on
+> the record, that was the shape — 54 triples that did not exist, and 23-vs-21
+> in the held set. A stale number with a date beside it is recoverable; a stale
+> number labelled *current* is what sends the next reader down a wrong path.
+>
+> What does carry over unchanged: the **method** below, and the two structural
+> results the merge established independently of any corpus arm — lane 1's 139
+> wave-3/4 rows pass the real-JDK keep-arm gate they had never been asked, and
+> the ratchets re-froze at 2429 / 2440 / 2429 with `+45` reproducing for a third
+> time on a third tree.
 
 Measured, not committed to. The binary is `cratonvm-p19.exe`, md5
 `c88f146699d0e39cb406b1433ef65a5a`, built from `77f9953b1` — six lanes' tables

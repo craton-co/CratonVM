@@ -539,7 +539,14 @@ Two instrument notes earned in the same hour:
   == normalised diff 52 on the wave-2 arms). Filter after the diff, never
   before, and never on one side only.
 
-### 8c. Verified on the binary that ships, 2026-09-11
+### 8c. Verified on `p19` at `77f9953b1`, and NOT on the current tip
+
+**The tip moved after these numbers were taken** — a third `origin/dev` merge
+brought 44 commits, so the tree now carries lane 1's waves 3-4, lane 7's table
+and dev's JIT work on top of what `p19` had. `p20` is building and its arms
+replace this block; the lane-0 page's §7.3 carries the same warning and the
+reasoning for it. Treat the three numbers below as a reading on a named
+revision, not as this lane's current state.
 
 This lane's 24 retired triples were re-measured as part of a six-lane binary
 rather than alone. `cratonvm-p19.exe`, md5 `c88f146699d0e39cb406b1433ef65a5a`,
