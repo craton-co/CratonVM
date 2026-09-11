@@ -393,14 +393,15 @@ trial:
 
 ```text
   control  91/92 (failed: RBlockingQueue)   92/92   92/92
-  trial    92/92 ...
+  trial    92/92                            92/92   92/92
 ```
 
-A different vector fails on the control, and none fails on two of its three
-runs. `RSocketChannelInterrupt` is a socket-plus-interrupt vector and
-`RBlockingQueue` a concurrency one; the arm that fails moves with the host's
-load, not with the binary. **Host load flips pass/fail, not only timings** —
-and the cheap way to tell was that the control failed at all.
+The trial is 92/92 three times out of three, and the run that failed is the
+CONTROL's, on a different vector. `RSocketChannelInterrupt` is a
+socket-plus-interrupt vector and `RBlockingQueue` a concurrency one; which arm
+fails moves with the host's load, not with the binary. **Host load flips
+pass/fail, not only timings** — and the cheap tell, before any of these six
+runs, was that the control failed at all.
 
 ### The instrument lesson: two arms of a filesystem probe collide
 
