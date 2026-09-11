@@ -125,8 +125,14 @@ workload.
 
 `module/spring-boot-flyway … ResourceProviderCustomizerBeanRegistrationAotProcessorTests`
 was filed the same day with a note that it might be the same underlying fault.
-It is not: it fails on the pre-fix binary and the post-fix binary alike, and
-its page has been re-measured rather than retired. See
+It is not, and that is measured rather than assumed: four arms in one burst,
+24 runs each, gave **21 of 24 failed on the pre-fix binary and 21 of 24 on the
+post-fix binary** -- the same number -- against 0 of 16 with `--nojit`. A
+smaller 16-run burst had read 11 against 15 and looked like this fix had made
+that vector worse; it had not, and the larger sample is the one to cite.
+Directly: on a failing Flyway run the floor logs **zero** ENCLOSING overlaps and
+names no frame in that stack. Its page has been re-measured rather than
+retired. See
 `known-issues/springboot/flyway-aot-receiver-class-confusion-under-concurrency-20260910.md`.
 
 ## Related

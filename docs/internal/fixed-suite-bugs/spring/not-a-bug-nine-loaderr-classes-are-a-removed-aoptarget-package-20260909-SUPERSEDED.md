@@ -1,3 +1,16 @@
+> **SUPERSEDED 2026-09-10, and its mechanism was wrong.** The disposition
+> below — not a CratonVM bug — stands. The explanation does not: the
+> `org.springframework.aop.target` package was **not** removed upstream and the
+> discovery list was **not** stale. `git ls-tree HEAD` lists all 23 sources, and
+> `git status` showed 40 tracked files deleted from the Spring checkout's
+> *working tree*, uncommitted, on 2026-09-01. They were restored, recompiled,
+> and all 9 classes now pass identically on CratonVM and HotSpot. See
+> [the-nine-loaderr-classes-were-forty-fixture-files-deleted-from-the-working-tree-20260910.md](the-nine-loaderr-classes-were-forty-fixture-files-deleted-from-the-working-tree-20260910.md).
+>
+> Kept because the wrong reading is instructive: every piece of evidence below
+> is true and none of it separates "removed upstream" from "deleted locally".
+> The question it never asked was whether git still had the files.
+
 # The 9-class Spring Framework LOADERR cluster is NOT a CratonVM bug — the whole `org.springframework.aop.target` test package no longer exists in this checkout
 
 | | |

@@ -1256,11 +1256,13 @@ const REFLECTION_INTERNAL_CLASSES: &[&str] = &[
 /// reflection native" -- but `ReflectionFactory.newConstructorForSerialization`
 /// does exactly that, and so does its `jdk.internal.reflect` delegate:
 ///
-///     SerTrace.show                                         <- was resolved as the caller
-///     sun.reflect.ReflectionFactory.newConstructorForSerialization      skipped
-///     jdk.internal.reflect.ReflectionFactory.newConstructorForSerialization  skipped
-///     jdk.internal.reflect.ReflectionFactory.generateConstructor        skipped
-///       -> c.setAccessible(true)                            ReflectionFactory.java:437
+/// ```text
+/// SerTrace.show                                         <- was resolved as the caller
+/// sun.reflect.ReflectionFactory.newConstructorForSerialization      skipped
+/// jdk.internal.reflect.ReflectionFactory.newConstructorForSerialization  skipped
+/// jdk.internal.reflect.ReflectionFactory.generateConstructor        skipped
+///   -> c.setAccessible(true)                            ReflectionFactory.java:437
+/// ```
 ///
 /// `generateConstructor` marks the constructor it just built accessible,
 /// because serialization must construct types nobody opened. Skipping those

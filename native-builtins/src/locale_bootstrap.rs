@@ -1147,6 +1147,50 @@ fn jre_adapter_get_locale_service_provider(
             }
         }
     }
+    if spi.as_deref() == Some("java.util.spi.CalendarDataProvider") {
+        // Wave-6, 2026-09-10: the SECOND arm, and it is the one
+        // `Calendar.getInstance(loc)` waits on.
+        // `CalendarDataUtility.retrieveFirstDayOfWeek` asks
+        // `LocaleServiceProviderPool.getPool(CalendarDataProvider.class)`, and
+        // the pool reaches every candidate through THIS method. A null here
+        // means no provider is ever found, the pool answers null, and
+        // `retrieveFirstDayOfWeek`'s "not in 1..7" guard substitutes its own
+        // default of 1 -- so every locale reports Sunday and one minimal day,
+        // `en-US` included, which is why the defect passed its own control.
+        //
+        // This arm is only half the repair and MUST NOT be landed alone. The
+        // provider parses `getCalendarData("firstDayOfWeek")` as a region
+        // table; while that bundle carried the synthesised bare `"1"`
+        // (`locale_resources.rs`) the arm made every locale answer the same
+        // wrong thing and REGRESSED the `en-US` control -- measured and
+        // reverted on 2026-09-09. It is correct now because
+        // `populate_calendar_data_from_cldr` serves the image's real table.
+        match ctx.invoke_virtual(
+            this,
+            "getCalendarDataProvider",
+            "()Ljava/util/spi/CalendarDataProvider;",
+            &[],
+        ) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                // Same DEGRADE contract as the arm above: fall back to the
+                // legacy null rather than propagate, so this arm can only
+                // improve on the previous behaviour. The previous behaviour is
+                // week rules of 1/1 for every locale, which is wrong but does
+                // not throw, and a throw out of `Calendar.getInstance` would be
+                // a new failure mode on any image that cannot walk the
+                // resource-bundle chain.
+                tracing::warn!(
+                    error = ?e,
+                    "getCalendarDataProvider threw; falling back to the legacy \
+                     null. Calendar week rules then come from \
+                     CalendarDataUtility's own defaults -- firstDayOfWeek=1, \
+                     minimalDaysInFirstWeek=1 -- for every locale."
+                );
+                return Ok(Some(Value::Object(None)));
+            }
+        }
+    }
     Ok(Some(Value::Object(None)))
 }
 
@@ -1278,6 +1322,15 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     //
     // Wave-5, 2026-09-09: the FIRST arm of that faithful fix is now landed —
     // `DecimalFormatSymbolsProvider` only. Every other SPI still answers null.
+    //
+    // Wave-6, 2026-09-10: `CalendarDataProvider` is the SECOND arm. It is the
+    // one `Calendar.getInstance(loc)` needs — `CalendarDataUtility` reaches
+    // its provider through `LocaleServiceProviderPool`, which reaches every
+    // candidate through this method — and it was landed together with the
+    // `CalendarData` bundle repair in `locale_resources.rs`, never separately:
+    // the 2026-09-09 attempt at this arm ALONE regressed the `en-US` control,
+    // because a provider that reads a bare `"1"` where CLDR has a region table
+    // answers every locale the same wrong way. See the arm body.
     //
     // Why this arm first. It is the one a `--jdk-only` corpus row was waiting
     // on. `DecimalFormatSymbols.initialize` calls
@@ -2009,6 +2062,10 @@ mod locale_service_provider_delegation_tests {
             // A sentinel Int is not a legal return here; it is used BECAUSE it
             // cannot be confused with anything the blanket-null path produces.
             Some(Ok(Some(Value::Int(0x0DF5))))
+        } else if method_name == "getCalendarDataProvider"
+            && descriptor == "()Ljava/util/spi/CalendarDataProvider;"
+        {
+            Some(Ok(Some(Value::Int(0x0CDA))))
         } else {
             None
         }
@@ -2035,6 +2092,32 @@ mod locale_service_provider_delegation_tests {
         );
     }
 
+    /// Wave-6's arm. `Calendar.getInstance(de-DE)` reported Sunday / 1 minimal
+    /// day -- the same as every other locale -- because
+    /// `CalendarDataUtility.retrieveFirstDayOfWeek` reaches its provider
+    /// through `LocaleServiceProviderPool`, the pool reaches every candidate
+    /// through this method, and this method answered null for all of them.
+    #[test]
+    fn the_calendar_data_provider_is_delegated_to_the_real_getter() {
+        let mut ctx = MockNativeContext::new();
+        let (adapter, mirror) =
+            adapter_and_spi_mirror(&mut ctx, "java/util/spi/CalendarDataProvider");
+        ctx.set_invoke_virtual_hook(record_call);
+
+        let got = jre_adapter_get_locale_service_provider(
+            &mut ctx,
+            &[Value::Object(Some(adapter)), Value::Object(Some(mirror))],
+        );
+
+        assert_eq!(
+            got.ok().flatten(),
+            Some(Value::Int(0x0CDA)),
+            "the CalendarDataProvider arm did not delegate; a null here makes \
+             the pool find no provider at all, and every locale then gets \
+             CalendarDataUtility's own 1/1 defaults"
+        );
+    }
+
     /// The control that makes the test above mean something. Without it, an arm
     /// that delegated for EVERY spi class would pass, and every one of the
     /// remaining SPIs would silently start walking the resource-bundle chain
@@ -2042,8 +2125,11 @@ mod locale_service_provider_delegation_tests {
     #[test]
     fn an_spi_that_has_no_arm_yet_still_answers_null() {
         let mut ctx = MockNativeContext::new();
+        // `CalendarDataProvider` used to be this control's example; it has an
+        // arm of its own since wave-6, so the control moved to an SPI that
+        // still has none. `BreakIteratorProvider` is one of the ~11 left.
         let (adapter, mirror) =
-            adapter_and_spi_mirror(&mut ctx, "java/util/spi/CalendarDataProvider");
+            adapter_and_spi_mirror(&mut ctx, "java/text/spi/BreakIteratorProvider");
         ctx.set_invoke_virtual_hook(record_call);
 
         let got = jre_adapter_get_locale_service_provider(

@@ -180,7 +180,7 @@ JDK25=<jdk25> CRATONVM_BIN=<cratonvm> ./run-suite.sh run \
   — the full root-cause derivation, both fixes, and the throughput measurement.
 - `../../fixed-bugs/precise-deoptimization-unavailable-cross-suite-crash-20260907-FIXED.md`
   — the same defect's H2 half (8 crash classes, all closed).
-- `../../../known-issues/spring/not-cratonvm-bugs-consolidated.md` —
+- `./not-cratonvm-bugs-consolidated.md` —
   `FileNativeConfigurationWriterTests`.
 - `../../../known-issues/spring/beanregistrations-verylarge-throughput-20260907.md`
   — the one residual this fix exposed rather than closed.
