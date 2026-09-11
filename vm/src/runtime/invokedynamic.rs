@@ -2186,22 +2186,19 @@ fn allocate_lambda_proxy_from_values(
                 .collect();
             eprintln!(
                 "[deadref-capture] {reason} capture[{i}] = 0x{:x} was ALREADY dead when the                  lambda proxy popped it off the operand stack (cid={:#x}, {} captures) — the                  pin below cannot help, the value was wrong before this call.                  moved_away_to={:?} (needs CRATONVM_DBG_VACATED_FRAMES; Some means the                  referent was RELOCATED and a rewrite was missed, None means it was never                  relocated — reclaimed while referenced, or never a valid reference)
+in_native_pins={} frames={}
 {}",
                 o.as_ptr() as usize,
                 proxy_class_id.as_u32(),
                 num_captures,
                 cratonvm_gc::gc_quiescence::moved_away_to(o.as_ptr() as usize),
-                format!(
-                    "in_native_pins={} frames={}
-{}",
-                    thread
-                        .native_pin_roots
-                        .iter()
-                        .any(|r| r.as_ptr() as usize == dead),
-                    thread.frames.len(),
-                    stack.join("
+                thread
+                    .native_pin_roots
+                    .iter()
+                    .any(|r| r.as_ptr() as usize == dead),
+                thread.frames.len(),
+                stack.join("
 "),
-                ),
             );
         }
     }

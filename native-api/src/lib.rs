@@ -11,6 +11,10 @@
 /// `native-builtins` forwards to it. See W7-68-live-under-allocations.md and
 /// W7-49-slot-index-recensus.md §8.
 pub mod appended_slots;
+/// Can `new` legally produce an instance of this class? The JVMS 6.5
+/// predicate behind every fabricated-abstract-receiver fix, shared by the
+/// crate that MINTS such receivers and the one that REPORTS their class.
+pub mod array_store;
 pub mod capability;
 pub mod charset;
 /// Class-identity answers a native can act on: the ambiguous-vs-absent
@@ -23,11 +27,13 @@ pub mod class_identity;
 pub mod delegated_close;
 pub mod fd_table;
 pub mod ffi;
+/// What a `java.io.File` this VM builds has to contain for the JDK own
+/// `File` bytecode to agree with it -- `path` and `prefixLength`, written
+/// beside the slot-0 string every producer already writes. Six producers
+/// across two crates, which is why the rule lives here rather than in one
+/// of them. Sibling of [`path_layout`] and [`appended_slots`].
+pub mod file_layout;
 pub mod init_level;
-/// Can `new` legally produce an instance of this class? The JVMS 6.5
-/// predicate behind every fabricated-abstract-receiver fix, shared by the
-/// crate that MINTS such receivers and the one that REPORTS their class.
-pub mod array_store;
 pub mod instantiable;
 pub mod intrinsic;
 /// The layout-alias census — the one detector that sees every native object

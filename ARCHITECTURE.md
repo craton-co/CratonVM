@@ -110,7 +110,10 @@ actually is:
 
 Measured 2026-09-09 with the command above, one directory at a time;
 `native-api` re-measured 2026-09-10, when lane L1's retirement table took
-it from 37k to 38,923.
+it from 37k to 38,923, and again 2026-09-11 at 41,321: lane 4's table plus
+`file_layout.rs`. This crate now moves whenever a lane retires a wave, because
+every retirement table lives in `retired_shadow.rs` -- the 5% tolerance on the
+row below is roughly two waves wide.
 
 | Crate | LoC | Crate | LoC |
 |-------|----:|-------|----:|

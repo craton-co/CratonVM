@@ -371,6 +371,14 @@ pub fn report_at_exit() {
         eprintln!(
             "[c2-supersede] ir block exits: fell_through={ft_elided} jmp_emitted={ft_jmps}"
         );
+        // Safepoint polls, by shape. The inline shape branches over its own
+        // slow path on the FAST path, so a hot loop pays a taken jump and
+        // carries ~230 bytes it never enters; `CRATONVM_JIT_IR_POLL_OUTLINE`
+        // moves the block after the body and inverts the test.
+        let (poll_out, poll_inline) = cratonvm_jit::ir_lower::ir_poll_census();
+        eprintln!(
+            "[c2-supersede] ir safepoint polls: outlined={poll_out} inline={poll_inline}"
+        );
         // Speculation. A zero with `CRATONVM_JIT_IR_SPECULATE=1` means no
         // branch in this workload was one-sided over the sample — a fact about
         // the program, not about the pass — and that is precisely what a bare
