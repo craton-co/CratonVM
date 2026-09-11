@@ -820,6 +820,42 @@ ONLY one that asks this dial, and the other 133 still read `VACUOUS`. A
 vacuous scope is a request for a workload, not a verdict, and this page said so
 itself before anybody acted on it.
 
+### The residual wave's acceptance
+
+Two binaries from one revision, differing in the residual commits: `r0` at
+`dev` (`8f1666414`) and `r2` at the branch tip.
+
+```text
+  not inert       r2 raises 87 sun/misc/Unsafe refusals unarmed, r0 raises 0.
+                  87 is the kind-map's row count for 67 triples -- the third
+                  independent route to the same number, after the table and
+                  the stub ratchet.
+  the workload    d(r0,r2) = 0 on 50 rows. Identical output.
+  probe tree      135 measured, arms concurrent: 1 worse, 1 better,
+                  1 line-count moved
+  corpus on r2    --jdk-only 132/132, SUITE=all 132/132, SUITE=core 92/92
+  gates at tip    native-api --lib 377/0; stub_ratchet and registry_contracts
+                  green in all three feature arms; cratonvm-types green
+```
+
+**Both moved rows are instruments, and both were re-measured rather than
+argued.**
+
+`L4FileSweep` read `ctl=488 trial=421, d(hs,trial)=83` with the line count
+moved — which is the collision this page already documents for the filesystem
+family, down to the tell. Run ALONE it is **488 rows and 0 diffs on both
+binaries, three times out of three.** The earlier `r0`-vs-`r1` pass of the same
+tree had it clean, so the collision is intermittent, which is why the remedy is
+to score this family sequentially rather than to trust either reading.
+
+`VtHandoffProbe` read `-10`, and §7 prices that probe's noise floor at 14 lines
+on an unchanged binary. It is not claimed as an improvement.
+
+The `--jdk-only` corpus arm also read 131/132 once, with a `HARNESS ERROR [G3]`
+on `RArrayStoreLibrary` — a vector that published no check count, which is a
+harness-level complaint rather than a behaviour diff. Re-run it is **132/132 on
+r2 AND on r0**, so it reproduces on neither binary.
+
 ## 10. What the next wave should do, in order (as written 2026-09-10; see §9a for what happened)
 
 1. **`ForkJoinPool`'s external submission.** §3 localises it to the submitter's
