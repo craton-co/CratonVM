@@ -203,13 +203,29 @@ writer_flush_real
 # only, and a missing javac still lets an e2e target report `ok` in 0.00s.
 #
 # FOUND WHILE MEASURING, and NOT caused by this change: `stack_trace_across_tiers`
-# fails DETERMINISTICALLY on dev (7/7, ~7.2s each), so this step is red until
-# that is fixed. It is filed at
+# fails DETERMINISTICALLY on dev (7/7, ~7.2s each), so this step was red until
+# that was fixed. It was filed at
 # docs/known-issues/jit/stack-trace-across-tiers-fails-deterministically-on-dev-20260909.md
 # with the evidence that the reflection-caller change in flight at the time is
 # not the cause. `wp2_5_proxy` also failed, for a different and benign reason:
 # its fixture lives under gitignored `apps/`, so a fresh checkout has no
 # ProxyProbe.class and REQUIRE_E2E correctly turns that skip into a failure.
+#
+# FIXED 2026-09-11, and the diagnosis is worth carrying here because it is about
+# this step's own premise. The target's kill-switch arms assumed the set of
+# COMPILED frames in a warmed-up trace was fixed run to run. It is not:
+# `CRATONVM_BG_COMPILE` has been default-ON since wire-tiered-manager Step 7, so
+# the OSR body races the end of the loop it was compiled for, and on a loaded
+# host it sometimes publishes after it. The arms now run against a control that
+# sets `CRATONVM_BG_COMPILE=0` (the opt-out `env_cache.rs::bg_compile` documents
+# for exactly this), which puts the compile back on the mutator at the
+# threshold; 24 consecutive REQUIRE_E2E runs pass, debug and release binaries,
+# at host load 40-130. The retired page is
+# docs/internal/retired/stack-trace-across-tiers-fails-deterministically-on-dev-FIXED-20260911.md.
+# Read the general lesson before adding a target here: a REQUIRE_E2E row must
+# establish that the thing it is about ENGAGED in its own run, because on a
+# loaded runner "the JIT did not get there in time" and "the feature broke" look
+# identical from the assertion's side.
 #
 # The ninth, `vthread_probe_regression`, FAILED again on 2026-09-08 at 120s --
 # the FLAKY block above is right and its one green that morning was luck.
