@@ -32,3 +32,20 @@ cratonvm --java-home <jdk25> -cp ".:$CP" SoftProbe | grep -v '^\[cratonvm\]'
 `KStack` is generally useful beyond this defect: the suite runner's
 `failcauses.log` records only an exception's type and message, and for an
 `AssertionFailedError` that message is often empty.
+
+## Two more, for the throughput residuals
+
+Added the same day while separating "slow" from "stopped" on the classes the
+180 s per-class cap reports as `TIMEOUT`:
+
+| probe | question | verdict |
+|---|---|---|
+| `KProgress` | run a class printing every test start/finish with a timestamp | a `TIMEOUT` row carries `found=0`, which cannot distinguish a stall from a slow run; this counts completed work units instead. `ParallelExecutionSpringExtensionTests`: 10/10 repetitions, monotone, 811 s vs HotSpot's 26 s |
+| `ParProbe` | run that class's nested `TestCase` with the parallel switch under our control | parallelism is **not** the gap — `parallel=off` widens the CratonVM/HotSpot ratio from 7.7× to 12.3× |
+
+`ParProbe` must be compiled into package
+`org.springframework.test.context.junit.jupiter.parallel`: the `TestCase` it
+selects is a package-private nested class of the suite class. It also doubles
+as the A/B harness that showed the 2026-09-10 reflection fix did **not** cost
+throughput (two binaries one commit apart, run concurrently — never
+sequentially, on a host this contended).
