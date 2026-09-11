@@ -1284,6 +1284,29 @@ const RETIRED_SHADOW_PREFIXES: &[&str] = &[
     // same tables answers `true` for exactly the two `java/time/` rows this
     // wave adds and `false` for everything else, as before.
     "java/time/",
+    // 2026-09-11, lane L6. The whole adjudication, all 1,414 rows of it, is in
+    // `docs/internal/retired/lane-6-net-security-RETIRED-20260910.md`.
+    //
+    // ONE prefix for a lane that owns nine, and deliberately the NARROW
+    // spelling: `java/net/` and not `java/`. Under it, TWO classes of the
+    // fourteen the wave tried.
+    //
+    // `javax/security/auth/x500/` was here through the fifth of six builds and
+    // is not here now: `X500Principal` alone breaks `RSslLiveSession`, because
+    // this VM fills that class's one declared `X500Name` slot with a String.
+    // Every other class the lane tried was measured out the same way, by a
+    // corpus vector rather than by a probe -- the table's header is the
+    // ladder, one row per build.
+    //
+    // The lane's other eight prefixes carry no table at all. Each was armed on
+    // the whole 125-probe tree and each either moved a probe AWAY from HotSpot
+    // (`javax/net/`, and the four security prefixes together) or never reached
+    // the dial (`sun/net/`, `jdk/net/`, `jdk/internal/net/`: 123 of 125 probes
+    // VACUOUS). Adding a prefix whose table is empty is provably inert, but it
+    // would read to the next lane as a claim that something under it was
+    // retired, and `the_lane_l6_security_and_tls_prefixes_are_not_admitted`
+    // exists to keep that claim from being made by accident.
+    "java/net/",
 ];
 
 /// The 2026-08-30 Phase 2 wave: ONE triple, and the size is the finding.
@@ -4157,6 +4180,164 @@ static RETIRED_SHADOW_L4_TRIPLES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// The 2026-09-11 lane-L6 wave: `java/net/HttpURLConnection` and
+/// `ProxySelector.getDefault` -- 15 rows of a lane of 966, after the corpus
+/// refused 109 that the probe tree had cleared.
+///
+/// A fifth table rather than rows merged into a sibling, for the reason the
+/// second gives for existing: these were adjudicated by a different METHOD --
+/// eight differential probes written for this lane, and then six builds of
+/// paired corpus runs -- and the method is the part worth being able to see at
+/// a glance.
+///
+/// # The probe tree cleared 124 rows. The corpus refused 109 of them.
+///
+/// This is the finding of the wave and it goes first, because it re-states one
+/// of the four preconditions and every future lane will meet it.
+///
+/// Armed on the candidate prefixes, **all 125 probes in the tree got no worse**
+/// and five got dramatically better. Built, and run as a two-binary A/B
+/// against a control from the same merged tree, the same five improved --
+/// `L6UriSweep` 80 diff lines to 0, `L6X500Sweep` 276 to 0,
+/// `L6HttpLogicSweep` 64 to 18, `L6InetSweep` 380 to 368, `L6SocketSweep` 42
+/// to 38 -- and **zero probes regressed**. Both instruments said 124 rows.
+///
+/// The `--jdk-only` corpus, paired against that control and run alone, said
+/// 15. The ladder, one build per row:
+///
+/// ```text
+///   #  table                          corpus (paired, alone)   measured out
+///   1  124 rows, 10 classes           trial 126/132            URL, DatagramSocket,
+///                                     ctrl  132/132            MulticastSocket, Inet*  (70)
+///   2   54 rows,  4 classes           trial 130/132            URI (29) -- RJdkBridge1
+///   3   25 rows,  3 classes           RSslLiveSession 3/3 red  nothing: a guess
+///   4   11 rows,  2 classes           RSslLiveSession 3/3 red  nothing: the same guess
+///   5   10 rows, X500Principal alone  RSslLiveSession 3/3 red  X500Principal (10)
+///   6   15 rows                       trial 132/132, ctrl 132/132   --
+/// ```
+///
+/// Builds 3 and 4 are listed because they are the cost of guessing:
+/// `HttpURLConnection` was the plausible culprit for an HTTPS vector, was
+/// dropped twice, was innocent, and is one of the two classes this table
+/// carries.
+///
+/// # Precondition 3 is checked one frame too high
+///
+/// Every refusal is the same species:
+///
+/// ```text
+///   RJdkServices              NPE  URLStreamHandler.openConnection, "this.handler" is null
+///   RServiceLoaderDoubleSource   (same)
+///   RJdkDefineClass           NPE  URLStreamHandler.getDefaultPort,  "this.handler" is null
+///   RJdkNet                   ULE  sun/nio/ch/DatagramChannelImpl.receive0
+///   RJdkNet  (InetAddress)    ULE  java/net/Inet6AddressImpl.lookupAllHostAddr
+///   RNetIfaceScope            every scoped IPv6 address must round-trip, 2 did not
+///   RJdkBridge1               URL.toURI().getPath() lost a lone surrogate to U+FFFD
+///   RSslLiveSession           CK client.responseCode = 200 unclassified
+/// ```
+///
+/// Precondition 3 asks whether the IMAGE METHOD carries `Code` to yield to.
+/// All 124 rows passed it. It does not ask what that code then CALLS:
+///
+///  * `java.net.URL`'s methods are one line each through `this.handler`, a
+///    field only the real constructor writes -- and this VM MINTS `URL`
+///    objects in `classloader.rs` without running it;
+///  * `X500Principal` has one declared instance field, `transient X500Name
+///    thisX500Name`, and `native-builtins/src/jca/x500.rs` documents in its own
+///    header that this VM repurposes that slot to hold a **String**. Any JDK
+///    bytecode on the class dereferences a String as an `X500Name`;
+///  * `java.net.URI` is the same shape one level out: `URL.toURI()` allocates a
+///    real `java.net.URI` and publishes fields into it rather than running its
+///    constructor;
+///  * `InetAddress.getByName` and `DatagramSocket` yield into
+///    `Inet6AddressImpl.lookupAllHostAddr` and
+///    `sun/nio/ch/DatagramChannelImpl.receive0`, both `ACC_NATIVE` and neither
+///    implemented here -- so the retirement trades a shadow for an
+///    `UnsatisfiedLinkError`, one frame deeper than precondition 3 looks.
+///
+/// **So precondition 3 is really: the image method carries `Code`, AND that
+/// code's own callees are satisfiable in this VM.** Four of the six are a
+/// field only a real constructor writes, which is `Class.getModule`'s
+/// situation from lane-0 §7. A VM that allocates a JDK carrier without
+/// constructing it has, for every such class, a shadow that cannot be retired
+/// until the carrier is built properly.
+///
+/// # The dial is a lead in both directions, and a hand-run vector is not a run
+///
+/// Two instrument traps, both paid for here:
+///
+///  * the dial (`CRATONVM_ENFORCE_NATIVE_SHADOW`) was **optimistic** on
+///    `URL`/`DatagramSocket`/`Inet*`, **pessimistic on the wrong vector** for
+///    `X500Principal` (it failed `RJdkX509Intercept`, which passes on every
+///    binary built here), and **silent** about `RSslLiveSession`, the vector
+///    that actually refuses it. It DECLINES at dispatch and arms a PREFIX;
+///    this table re-tags at REGISTRATION and is per-triple;
+///  * `cratonvm --jdk-only -cp build:... RJdkBridge1` passes on a binary whose
+///    HARNESS run of the same vector fails. `run.sh` builds the classpath,
+///    sets the flags and applies the cross-VM diff. The isolation that settles
+///    a vector is `ONLY=<Vector> bash regression-suite/run.sh`, three runs on
+///    each binary.
+///
+/// # Why the lane's other prefixes carry no table
+///
+/// Each was armed ALONE on the whole 125-probe tree:
+///
+/// ```text
+///   javax/net/                                    2 probes worse   L6TlsParamSweep 66 -> 94
+///   java/security/,sun/security/,
+///     javax/crypto/,javax/security/               8 probes worse   SecuritySurfaceSweep 0 -> 2594
+///   sun/net/                                      0               123 of 125 VACUOUS
+///   jdk/net/,jdk/internal/net/                    0               123 of 125 VACUOUS
+/// ```
+///
+/// A VACUOUS arm is not a pass: `sun/net/` and the two `jdk` prefixes reached
+/// the dial in 2 probes of 125, which is precondition 1 and the trap 146 of
+/// Phase 2's 236 candidates fell into.
+///
+/// Three structural reasons sit behind the rest, each recorded in full in
+/// `docs/internal/retired/lane-6-net-security-RETIRED-20260910.md`:
+///
+///  1. **`javax/net/ssl/` and `sun/security/ssl/` are an IMPLEMENTATION.**
+///     This VM's TLS is rustls (`native-builtins/src/t27_tls.rs`, 20,630
+///     lines). Yielding does not restore a JDK behaviour this VM approximates
+///     -- it removes TLS. That is `StrictMath`'s situation: a 0-diff probe is
+///     evidence the family WORKS, never on its own a reason to retire it.
+///  2. **The 67 `HttpsURLConnectionImpl` rows are a null-`delegate`
+///     workaround.** `register_https_delegate_forwarders` exists because this
+///     VM ALLOCATES that carrier rather than constructing it, and each
+///     forwarder runs the SUPERCLASS body the Impl overrides -- the
+///     retirement's own remedy, one level up.
+///  3. **A base-class row loses the dispatch to its own subclass.** 15 of
+///     `InetAddress`'s 18 bucket-A rows are never dispatched, because every
+///     instance is an `Inet4Address` or an `Inet6Address` and the door asks
+///     the registry about the DECLARING class.
+///
+/// # The refusals are not inert
+///
+/// A refusal is a retirement only when nothing already owns the triple:
+/// `JdkOnlyViolation::SyntheticNativeRegistered` carries a `survivor`, and a
+/// non-null one means an earlier registration is still serving, so strict mode
+/// runs that older native and every probe reads exactly as before. Measured on
+/// the trial binary over a `--jdk-only-report` of the probe tree: every row of
+/// this table appears in the refusal set and ZERO refusals carry a survivor.
+static RETIRED_SHADOW_L6_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/net/HttpURLConnection", "<init>", "(Ljava/net/URL;)V"),
+    ("java/net/HttpURLConnection", "addRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V"),
+    ("java/net/HttpURLConnection", "getHeaderFieldDate", "(Ljava/lang/String;J)J"),
+    ("java/net/HttpURLConnection", "getInstanceFollowRedirects", "()Z"),
+    ("java/net/HttpURLConnection", "getRequestMethod", "()Ljava/lang/String;"),
+    ("java/net/HttpURLConnection", "getRequestProperties", "()Ljava/util/Map;"),
+    ("java/net/HttpURLConnection", "getRequestProperty", "(Ljava/lang/String;)Ljava/lang/String;"),
+    ("java/net/HttpURLConnection", "setChunkedStreamingMode", "(I)V"),
+    ("java/net/HttpURLConnection", "setConnectTimeout", "(I)V"),
+    ("java/net/HttpURLConnection", "setDoOutput", "(Z)V"),
+    ("java/net/HttpURLConnection", "setFixedLengthStreamingMode", "(I)V"),
+    ("java/net/HttpURLConnection", "setReadTimeout", "(I)V"),
+    ("java/net/HttpURLConnection", "setRequestMethod", "(Ljava/lang/String;)V"),
+    ("java/net/HttpURLConnection", "setRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V"),
+    ("java/net/ProxySelector", "getDefault", "()Ljava/net/ProxySelector;"),
+];
+
 /// Is this exact triple a retired §1.4 shadow?
 ///
 /// The class-name prefix test is a cheap discriminator: every entry is under
@@ -4195,6 +4376,13 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
     RETIRED_SHADOW_TABLES
         .iter()
         .any(|table| table.binary_search(&key).is_ok())
+        // `CRATONVM_UNRETIRE_NATIVE_SHADOW` turns named rows back off, so a
+        // wave can be bisected in RUNS rather than one build per hypothesis.
+        // Unset -- every shipping configuration -- this is `false` without
+        // consulting anything; see [`crate::unretire`], whose
+        // `the_default_is_inert_across_every_retired_row` asserts it against
+        // every row of every table above.
+        && !crate::unretire::is_excluded(class_name, method_name, descriptor)
 }
 
 /// Every retired-shadow table, in one slice, so a gate can walk the whole
@@ -4246,6 +4434,14 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // the same omission would have UN-RETIRED both waves instead of merely
     // under-covering them -- a louder failure, and the reason the loop is worth
     // having: the two lists cannot disagree, because there is only one.
+    // Lane 6, added under the loop rather than beside a `||` arm -- which is
+    // the whole difference the loop makes. This lane hit the old failure mode
+    // twice while the chain still existed: once on its own table, once on
+    // lane 1's waves 3 and 4, which were consulted by the chain and missing
+    // from this const on `dev`. Under the loop neither omission is possible,
+    // because forgetting the const row does not under-cover a table -- it
+    // un-retires it, loudly, in the lane's own probe run.
+    RETIRED_SHADOW_L6_TRIPLES,
     RETIRED_SHADOW_L1_HM_TRIPLES,
     RETIRED_SHADOW_L1_JT_TRIPLES,
 ];
@@ -4946,6 +5142,117 @@ mod tests {
                     && RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(t).is_err()
                     && RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(t).is_err(),
                 "{t:?} is in the phase-3 table and an earlier one"
+            );
+        }
+        for t in RETIRED_SHADOW_L6_TRIPLES {
+            assert!(
+                RETIRED_SHADOW_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(t).is_err(),
+                "{t:?} is in the L6 table and an earlier one"
+            );
+        }
+    }
+
+    /// Sorted and binary-searched like every sibling. An out-of-order entry
+    /// makes the predicate answer `false` for a row that IS present, which
+    /// reads as "not retired" and is invisible in a workload — the one failure
+    /// mode of this file that no gate downstream can see.
+    #[test]
+    fn the_l6_table_is_sorted_and_unique() {
+        for w in RETIRED_SHADOW_L6_TRIPLES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "out of order or duplicated: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    /// Every L6 entry is asked through the REAL predicate, not through the
+    /// table it lives in.
+    ///
+    /// This wave added a prefix (`java/net/`), which is the case where a
+    /// missing one would be caught — but it is also the case where a
+    /// MIS-SPELLED one would not be, because a table whose every row starts
+    /// with `java/net/` and a prefix list containing `java/nett/` produce a
+    /// predicate that answers `false` for all 114 rows and a build that
+    /// compiles and passes every other test in this file.
+    #[test]
+    fn every_l6_entry_is_reachable() {
+        for (c, m, d) in RETIRED_SHADOW_L6_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "unreachable entry: {c}.{m}{d}"
+            );
+        }
+    }
+
+    /// The lane's OTHER eight prefixes retire nothing, and that is deliberate.
+    ///
+    /// `javax/net/`, `sun/net/`, `java/security/`, `sun/security/`,
+    /// `javax/crypto/`, `javax/security/`, `jdk/net/` and `jdk/internal/net/`
+    /// were each armed on the whole probe tree and each moved at least one
+    /// probe AWAY from HotSpot — the TLS stack because it is rustls rather
+    /// than a shim, the `HttpsURLConnectionImpl` rows because they forward to
+    /// a superclass body in place of a null `delegate`. Their absence from
+    /// `RETIRED_SHADOW_PREFIXES` is a measured verdict, so this test states it
+    /// as one: if a future wave adds a table under one of them it must delete
+    /// this test in the same commit, which is the point.
+    #[test]
+    fn the_lane_l6_security_and_tls_prefixes_are_not_admitted() {
+        for p in [
+            "javax/net/",
+            "sun/net/",
+            "java/security/",
+            "sun/security/",
+            "javax/crypto/",
+            "javax/security/",
+            "javax/security/auth/x500/",
+            "jdk/net/",
+            "jdk/internal/net/",
+        ] {
+            assert!(
+                !RETIRED_SHADOW_PREFIXES.contains(&p),
+                "{p} is admitted, but no L6 table retires anything under it"
+            );
+        }
+        // `javax/security/auth/x500/` is in that list for a reason worth
+        // stating: it was ADMITTED through the fifth of this wave's six builds
+        // and came back out, because `X500Principal` alone breaks
+        // `RSslLiveSession`. A future lane that re-admits it has to delete the
+        // line above, which is the point.
+        //
+        // ...and the one prefix that IS admitted carries every row of the
+        // table. `java/net/` is wider than the table under it: two classes of
+        // the package are retired and six more were measured out by a corpus
+        // vector each. A prefix admits a package to the binary search; the
+        // table decides what is retired.
+        for (c, _, _) in RETIRED_SHADOW_L6_TRIPLES {
+            assert!(
+                c.starts_with("java/net/"),
+                "{c} is in the L6 table but outside the prefix that admits it"
+            );
+        }
+    }
+
+    /// The four rows lane T holds must NOT be here.
+    ///
+    /// `MalformedURLException` and `UnknownHostException` sit inside this
+    /// lane's prefix set and are produced by `lang_misc.rs`'s throwable-family
+    /// registrar, which spans seven lanes. Lane-0 §3: while lane T holds a
+    /// registrar, no prefix lane may retire any triple that registrar
+    /// produces — even one inside its own prefixes. They were candidates and
+    /// they were dropped; a later wave that adds them without lane T's
+    /// registrar moving is the mistake this test names.
+    #[test]
+    fn the_throwable_family_rows_are_left_to_lane_t() {
+        for (c, _, _) in RETIRED_SHADOW_L6_TRIPLES {
+            assert!(
+                !c.ends_with("Exception"),
+                "{c} is registered by the cross-lane throwable table"
             );
         }
     }

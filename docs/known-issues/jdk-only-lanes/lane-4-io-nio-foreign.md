@@ -266,12 +266,27 @@ very table and so never run. The `File` under test came from `createTempFile`'s
 producer in `native-builtins`. **A carrier rule belongs in `native-api`, beside
 `path_layout` and `appended_slots`, and every producer has to be found first.**
 
-**The instrument that would have attributed it in one run still does not
-exist:** a runtime exclusion switch on the retirement table, so a per-triple
-bisection costs a run instead of a build. It needs a declared `CRATONVM_*` flag,
-which pulls in the flag-census fixture and the inventory counts — a change of
-its own, not something to bury in a retirement wave. It remains the
-highest-leverage thing anyone could build for the remaining eight lanes.
+**The instrument that would have attributed it in one run now EXISTS**, built
+2026-09-11 off the back of this wave: `CRATONVM_UNRETIRE_NATIVE_SHADOW` turns
+named rows of the retirement tables back off at runtime, so the bisection that
+cost this wave three builds is a sequence of runs.
+
+```text
+  CRATONVM_UNRETIRE_NATIVE_SHADOW=all                          is it the wave?
+  CRATONVM_UNRETIRE_NATIVE_SHADOW=java/io/                     which package?
+  CRATONVM_UNRETIRE_NATIVE_SHADOW=java/io/File                 which class?
+  CRATONVM_UNRETIRE_NATIVE_SHADOW=java/io/File.isAbsolute()Z   which row?
+```
+
+It resolves each rule against the tables **at arm time and prints the row
+count**, because the failure this instrument would otherwise invite is the one
+that makes bisection worse than useless: a mistyped rule matches nothing, the
+vector still fails, and the reader concludes the triple is exonerated. A rule
+reaching zero rows is named on stderr before any dispatch.
+
+See [`crate::unretire`] (`native-api/src/unretire.rs`). The eighteen triples
+this section leaves un-attributed for `RJdkSecurity` are now bisectable in
+eighteen runs by anyone who wants the answer the carrier fix made moot.
 
 ### 9.5 What the residual work before it was
 
