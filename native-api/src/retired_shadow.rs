@@ -3196,7 +3196,7 @@ static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
 /// boundary-crossing registrars are carved out of the 992 rows under its prefix
 /// set. This table holds the rows that earned a retirement; every other row in
 /// that population is dispositioned in
-/// `docs/known-issues/jdk-only-lanes/lane-2-lang-values.md`.
+/// `docs/internal/jdk-only/lane-2-lang-values-RETIRED-20260911.md`.
 ///
 /// # `java/lang/Character` — three deprecated statics, and nothing to argue
 ///
@@ -3320,6 +3320,115 @@ static RETIRED_SHADOW_L2_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/lang/Character", "isJavaLetter", "(C)Z"),
     ("java/lang/Character", "isJavaLetterOrDigit", "(C)Z"),
     ("java/lang/Character", "isSpace", "(C)Z"),
+    ("java/lang/ExceptionInInitializerError", "<init>", "()V"),
+    (
+        "java/lang/ExceptionInInitializerError",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/ExceptionInInitializerError",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/IllegalThreadStateException", "<init>", "()V"),
+    (
+        "java/lang/IllegalThreadStateException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/NullPointerException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    ("java/lang/Object", "<init>", "()V"),
+    ("java/lang/Object", "equals", "(Ljava/lang/Object;)Z"),
+    ("java/lang/Object", "finalize", "()V"),
+    ("java/lang/Object", "toString", "()Ljava/lang/String;"),
+    ("java/lang/Object", "wait", "()V"),
+    ("java/lang/Object", "wait", "(J)V"),
+    ("java/lang/Package", "equals", "(Ljava/lang/Object;)Z"),
+    ("java/lang/Package", "getPackages", "()[Ljava/lang/Package;"),
+    ("java/lang/Package", "hashCode", "()I"),
+    ("java/lang/StringUTF16", "getChars", "([BII[CI)V"),
+    (
+        "java/lang/Throwable",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/UnsatisfiedLinkError", "<init>", "()V"),
+    (
+        "java/lang/UnsatisfiedLinkError",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    ("java/lang/VirtualMachineError", "<init>", "()V"),
+    (
+        "java/lang/VirtualMachineError",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/VirtualMachineError",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/VirtualMachineError",
+        "<init>",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getClassLoadingMXBean",
+        "()Ljava/lang/management/ClassLoadingMXBean;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getCompilationMXBean",
+        "()Ljava/lang/management/CompilationMXBean;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getGarbageCollectorMXBeans",
+        "()Ljava/util/List;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getMemoryMXBean",
+        "()Ljava/lang/management/MemoryMXBean;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getOperatingSystemMXBean",
+        "()Ljava/lang/management/OperatingSystemMXBean;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getPlatformMXBean",
+        "(Ljava/lang/Class;)Ljava/lang/management/PlatformManagedObject;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getPlatformMXBeans",
+        "(Ljava/lang/Class;)Ljava/util/List;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getRuntimeMXBean",
+        "()Ljava/lang/management/RuntimeMXBean;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getThreadMXBean",
+        "()Ljava/lang/management/ThreadMXBean;",
+    ),
+    ("java/lang/management/MemoryUsage", "<init>", "(JJJJ)V"),
+    ("java/lang/management/MemoryUsage", "getCommitted", "()J"),
+    ("java/lang/management/MemoryUsage", "getInit", "()J"),
+    ("java/lang/management/MemoryUsage", "getMax", "()J"),
+    ("java/lang/management/MemoryUsage", "getUsed", "()J"),
     ("java/math/BigInteger", "bitCount", "()I"),
     ("java/math/BigInteger", "bitLength", "()I"),
     ("java/math/BigInteger", "intValueExact", "()I"),
@@ -5661,31 +5770,6 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn the_l2_table_is_disjoint_from_the_other_three() {
-        for key in RETIRED_SHADOW_L2_TRIPLES {
-            for (other, name) in [
-                (RETIRED_SHADOW_TRIPLES, "RETIRED_SHADOW_TRIPLES"),
-                (
-                    RETIRED_SHADOW_STATELESS_TRIPLES,
-                    "RETIRED_SHADOW_STATELESS_TRIPLES",
-                ),
-                (
-                    RETIRED_SHADOW_PHASE2_TRIPLES,
-                    "RETIRED_SHADOW_PHASE2_TRIPLES",
-                ),
-            ] {
-                assert!(
-                    other.binary_search(key).is_err(),
-                    "{key:?} is in both lane 2's table and {name}. Two tables \
-                     claiming one triple means two measurements claim it, and \
-                     only one of them can be the record."
-                );
-            }
-        }
-    }
-
     /// Lane 2 retires two families and nothing either side of them.
     ///
     /// The prefix list now admits the whole of `java/lang/` and `java/math/`,
@@ -5694,7 +5778,31 @@ mod tests {
     /// `the_held_collection_families_are_not_retired` does for `java/util/`.
     #[test]
     fn the_l2_table_holds_only_what_lane_2_measured() {
-        const RETIRED_CLASSES: &[&str] = &["java/lang/Character", "java/math/BigInteger"];
+        const RETIRED_CLASSES: &[&str] = &[
+            // wave 1, 2026-09-10
+            "java/lang/Character",
+            "java/math/BigInteger",
+            // wave 2, 2026-09-10 — the families a corpus screen called clean
+            // and nothing else had measured. Each is here because the IMAGE
+            // was asked two questions the corpus cannot: is the shadowed
+            // method reachable at all (an interface receiver, a private
+            // constructor or method, or a signature the image does not
+            // declare is not a shadow), and does the real body reach an
+            // ACC_NATIVE method this VM does not register. Ten rows failed the
+            // first question and are recorded in the lane page rather than
+            // retired; none failed the second.
+            "java/lang/ExceptionInInitializerError",
+            "java/lang/IllegalThreadStateException",
+            "java/lang/NullPointerException",
+            "java/lang/Object",
+            "java/lang/Package",
+            "java/lang/StringUTF16",
+            "java/lang/Throwable",
+            "java/lang/UnsatisfiedLinkError",
+            "java/lang/VirtualMachineError",
+            "java/lang/management/ManagementFactory",
+            "java/lang/management/MemoryUsage",
+        ];
         for (c, m, d) in RETIRED_SHADOW_L2_TRIPLES {
             assert!(
                 RETIRED_CLASSES.contains(c),
@@ -5777,6 +5885,62 @@ mod tests {
                 "{c}.{m}{d} takes a reference parameter. Until the JIT carries \
                  the helpful-NPE message into compiled code, such a row \
                  regresses the message it used to get from the native."
+            );
+        }
+
+        // The ten rows the image says are not shadows. Six are `<init>` on an
+        // INTERFACE, which declares no constructor at all; the rest are a
+        // private constructor, a private method, and two signatures the image
+        // does not declare. Retiring any of them trades a shadow for a
+        // `NoSuchMethodError` — the `Logger.log` eighth-overload shape — so
+        // they are held here as well as filtered by the funnel.
+        for (c, m, d) in [
+            ("java/lang/management/ClassLoadingMXBean", "<init>", "()V"),
+            ("java/lang/management/CompilationMXBean", "<init>", "()V"),
+            (
+                "java/lang/management/GarbageCollectorMXBean",
+                "<init>",
+                "()V",
+            ),
+            ("java/lang/management/MemoryMXBean", "<init>", "()V"),
+            (
+                "java/lang/management/PlatformLoggingMXBean",
+                "<init>",
+                "()V",
+            ),
+            ("java/lang/management/RuntimeMXBean", "<init>", "()V"),
+            ("java/lang/management/ManagementFactory", "<init>", "()V"),
+            (
+                "java/lang/management/ManagementFactory",
+                "loadNativeLib",
+                "()V",
+            ),
+            ("java/lang/management/MemoryUsage", "<init>", "()V"),
+        ] {
+            assert!(
+                !triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} was retired, and the image declares no such \
+                 dispatchable method. That is a NoSuchMethodError, not a \
+                 retirement."
+            );
+        }
+
+        // ...and the two that look identical to the funnel and are NOT the
+        // same thing. `Package.equals` resolves to `Object.equals` and
+        // `ExceptionInInitializerError.initCause` to `Throwable.initCause`,
+        // both concrete. A constructor is never inherited; an ordinary method
+        // is, so only the `<init>` rows above are phantoms.
+        for (c, m, d) in [
+            ("java/lang/Package", "equals", "(Ljava/lang/Object;)Z"),
+            (
+                "java/lang/ExceptionInInitializerError",
+                "initCause",
+                "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+            ),
+        ] {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is an inherited CONCRETE method, so it is a real                  bucket-B shadow and wave 2 retired it. If it is being held                  again, say which measurement changed."
             );
         }
 

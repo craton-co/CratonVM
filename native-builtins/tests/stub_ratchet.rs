@@ -1737,6 +1737,56 @@ use cratonvm_types::compat::CompatibilityMode;
 /// admission and not their kind.
 ///
 /// # Re-frozen 2026-09-11 on the L6 merge: 2609 / 2620 / 2609
+/// # Re-frozen 2026-09-11 for jdk-only lane 2 wave 2, 2558 -> 2604
+///
+/// Lane 2 retired 50 triples under `java/lang` and `java/math`. Every number
+/// below was RUN on this tree against a binary built from `origin/dev`
+/// (`6d16472f5`), which sits exactly on its own baseline in all three arms --
+/// so the whole delta is this branch's:
+///
+/// ```text
+///   arm              dev    this branch   delta   total registrations
+///   no-management   2547       2577        +30    13610 -> 13610
+///   management      2558       2604        +46    13978 -> 13978
+///   synthetic-jdk   2547       2577        +30    13645 -> 13645
+/// ```
+///
+/// **Case (b), and the second column says so:** the total did not move by one
+/// row in any arm. 30 added registrations in the boot arm, **0 removed**, every
+/// one a lane-2 triple, taken with `CRATONVM_RATCHET_ROWS=1` on both binaries
+/// and `comm`-diffed. The management arm's extra 16 are the
+/// `java/lang/management/*` rows -- 14 distinct triples, two of them registered
+/// twice -- which the other two arms do not compile.
+///
+/// **30 registrations, 0 new distinct triples.** `dump_synthetic_stubs` is
+/// byte-identical between the two binaries, and that is not a contradiction:
+/// these triples are registered more than once (`ExceptionInInitializerError.
+/// <init>()V` from both `lang_misc.rs` and `lib.rs`, `Throwable.initCause` from
+/// both `lang_misc.rs` and `reflect_annotations.rs`), one registration was
+/// already a `SyntheticStub`, and the table re-tags the other. The DISTINCT set
+/// therefore cannot see this retirement while this ratchet can. Anyone
+/// attributing a delta with the dump alone will read a real retirement as a
+/// no-op -- it nearly cost lane 2 its own table.
+///
+/// The VM agrees, which is the third instrument: `--jdk-only-report` refusals
+/// under those two prefixes go 95 -> 144 with **zero survivors**.
+///
+/// **Beware a shared `CARGO_TARGET_DIR`.** Both arms were first measured into
+/// one target dir and cargo reported `Finished in 0.18s`, compiled nothing and
+/// scored this tree with dev's binary -- freshness is by mtime, and a
+/// `git merge` writes files OLDER than artefacts built after it. The numbers
+/// above come from builds asserted by a non-zero `Compiling` count, with each
+/// binary copied out and its sha256 printed and differing.
+///
+/// # Re-frozen 2026-09-11 by lane L6: +17, measured on three merge bases
+///
+/// `RETIRED_SHADOW_L6_TRIPLES` retires 15 triples, and re-tagging a `Bridge`
+/// to `SyntheticStub` is what raises this count -- case (b) in the failure
+/// message above: a fake labelled honestly so `--jdk-only` drops it and the
+/// JDK's own bytecode runs.
+///
+/// The substitution experiment, with the control pinned to the merge's own
+/// SECOND PARENT rather than to the moving `origin/dev` ref:
 ///
 /// ```text
 /// dev (lane 6's +17)                     2564 / 2575 / 2564
@@ -1768,7 +1818,48 @@ use cratonvm_types::compat::CompatibilityMode;
 /// `2620 + 2` was NOT assumed — each arm was run again and this is its printed
 /// line. That is the treadmill the note above names: on a branch this busy the
 /// constant is re-measured per merge, never added up.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2622;
+///
+/// **+17 for 15 triples is not an error.** The unit of this count is a
+/// REGISTRATION, not a triple, and two of the fifteen are registered twice:
+/// the same `(class, name, descriptor)` reaches `register` from two sites and
+/// each registration is re-tagged separately. The `--jdk-only-report` census
+/// for the same prefixes reports **15 distinct triples refused, 0 with a
+/// survivor** -- the same population counted the other way.
+/// **Re-measured 2026-09-11 after lane L6's +17 landed, and the delta is the
+/// same +30/+46/+30.** The table above was taken over dev `6d16472f5`; L6 then
+/// re-froze these constants to 2564/2575/2564 and this branch re-merged. The
+/// numbers were RE-RUN on the merged tree rather than added to L6's, because
+/// arithmetic is how this file's header records a constant sitting six above
+/// the truth for a week:
+///
+/// ```text
+///   arm             control f98c8a7ec   trial    delta
+///   no-management       2564 GREEN       2594     +30
+///   management          2575 GREEN       2621     +46
+///   synthetic-jdk       2564 GREEN       2594     +30
+/// ```
+///
+/// Control green on its own baseline in all three arms is the load-bearing
+/// half: it says the whole delta is this branch's and none of it is drift being
+/// absorbed. Six binaries, six distinct sha256s, every build asserted by a
+/// non-zero `Compiling` count.
+///
+/// **Third measurement of the same delta, 2026-09-11.** dev re-froze twice more
+/// while this branch was being verified (L6's +17, then lane 1's provider wave),
+/// so the arms were re-run against each new tip rather than incremented:
+///
+/// ```text
+///   control          no-mgmt   mgmt    syn-jdk      trial gives
+///   6d16472f5  GREEN    2547    2558     2547      2577 / 2604 / 2577
+///   f98c8a7ec  GREEN    2564    2575     2564      2594 / 2621 / 2594
+///   8f09c89b9  GREEN    2611    2622     2611      2641 / 2668 / 2641
+/// ```
+///
+/// +30 / +46 / +30 every time, with the control green on its own baseline every
+/// time. Three independent derivations of one delta is what makes it a property
+/// of this branch rather than of a tree, which is the claim a re-freeze makes.
+///
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2668;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1975,6 +2066,19 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2622;
 /// on [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]. +163, all of it lane 4 wave 1:
 /// the arm-OFF measurement lands on 2384 exactly.
 /// # Re-frozen 2026-09-11 on the L6 merge: 2609 / 2620 / 2609
+/// **Re-frozen 2026-09-11, 2547 -> 2577** for jdk-only lane 2 wave 2, in the
+/// same commit as the other two, each arm RUN rather than derived from its
+/// sibling. The account is on [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
+///
+/// # Re-frozen 2026-09-11 by lane L6: +17, measured on three merge bases
+///
+/// `RETIRED_SHADOW_L6_TRIPLES` retires 15 triples, and re-tagging a `Bridge`
+/// to `SyntheticStub` is what raises this count -- case (b) in the failure
+/// message above: a fake labelled honestly so `--jdk-only` drops it and the
+/// JDK's own bytecode runs.
+///
+/// The substitution experiment, with the control pinned to the merge's own
+/// SECOND PARENT rather than to the moving `origin/dev` ref:
 ///
 /// ```text
 /// dev (lane 6's +17)                     2564 / 2575 / 2564
@@ -2006,7 +2110,14 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2622;
 /// `2609 + 2` was NOT assumed — each arm was run again and this is its printed
 /// line. That is the treadmill the note above names: on a branch this busy the
 /// constant is re-measured per merge, never added up.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2611;
+///
+/// **+17 for 15 triples is not an error.** The unit of this count is a
+/// REGISTRATION, not a triple, and two of the fifteen are registered twice:
+/// the same `(class, name, descriptor)` reaches `register` from two sites and
+/// each registration is re-tagged separately. The `--jdk-only-report` census
+/// for the same prefixes reports **15 distinct triples refused, 0 with a
+/// survivor** -- the same population counted the other way.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2641;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2135,6 +2246,19 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2611;
 /// each time and not a rule. The account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
 /// # Re-frozen 2026-09-11 on the L6 merge: 2609 / 2620 / 2609
+/// **Re-frozen 2026-09-11, 2547 -> 2577** for jdk-only lane 2 wave 2, in the
+/// same commit as the other two, each arm RUN rather than derived from its
+/// sibling. The account is on [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
+///
+/// # Re-frozen 2026-09-11 by lane L6: +17, measured on three merge bases
+///
+/// `RETIRED_SHADOW_L6_TRIPLES` retires 15 triples, and re-tagging a `Bridge`
+/// to `SyntheticStub` is what raises this count -- case (b) in the failure
+/// message above: a fake labelled honestly so `--jdk-only` drops it and the
+/// JDK's own bytecode runs.
+///
+/// The substitution experiment, with the control pinned to the merge's own
+/// SECOND PARENT rather than to the moving `origin/dev` ref:
 ///
 /// ```text
 /// dev (lane 6's +17)                     2564 / 2575 / 2564
@@ -2166,7 +2290,14 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2611;
 /// `2609 + 2` was NOT assumed — each arm was run again and this is its printed
 /// line. That is the treadmill the note above names: on a branch this busy the
 /// constant is re-measured per merge, never added up.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2611;
+///
+/// **+17 for 15 triples is not an error.** The unit of this count is a
+/// REGISTRATION, not a triple, and two of the fifteen are registered twice:
+/// the same `(class, name, descriptor)` reaches `register` from two sites and
+/// each registration is re-tagged separately. The `--jdk-only-report` census
+/// for the same prefixes reports **15 distinct triples refused, 0 with a
+/// survivor** -- the same population counted the other way.
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2641;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
