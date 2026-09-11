@@ -1215,6 +1215,16 @@ const RETIRED_SHADOW_PREFIXES: &[&str] = &[
     // under it is retirable. `java/lang/ref/` is still absent on purpose —
     // see the `sun/nio/fs/` block in this module's header.
     "sun/nio/fs/",
+    // 2026-09-10, lane 2. `java/math/` cost one corpus vector of 36 on the
+    // 2026-08-19 package screen, which is why it was never admitted; re-taking
+    // that screen per CLASS rather than per package found the cost was
+    // `BigInteger`'s and named it — `RJdkSecurity`, on `2^127-1 must be
+    // prime`. See `RETIRED_SHADOW_L2_TRIPLES` for what that turned out to be.
+    // `java/lang/` is the wider of the two and admits the whole package tree to
+    // one extra binary search; the table decides what is retired, and it
+    // retires three rows under it.
+    "java/lang/",
+    "java/math/",
     // 2026-08-30, Phase 2. **This narrows the note above rather than
     // overruling it.** That note is a PACKAGE verdict from a package-scoped
     // dial sweep, and it is still the right default: this lane's own
@@ -2487,6 +2497,152 @@ static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
     ("jdk/internal/misc/VM", "maxDirectMemory", "()J"),
 ];
 
+/// Lane 2 (`java/lang/` remainder, `java/math/`), 2026-09-10.
+///
+/// Lane 2's own population is **390 shadows over 57 classes**, once lane T's
+/// boundary-crossing registrars are carved out of the 992 rows under its prefix
+/// set. This table holds the rows that earned a retirement; every other row in
+/// that population is dispositioned in
+/// `docs/known-issues/jdk-only-lanes/lane-2-lang-values.md`.
+///
+/// # `java/lang/Character` — three deprecated statics, and nothing to argue
+///
+/// `isJavaLetter`, `isJavaLetterOrDigit` and `isSpace`. The first two are
+/// one-line delegations to `isJavaIdentifierStart` / `isJavaIdentifierPart`,
+/// which carry no native here and so already run real bytecode; `isSpace` is
+/// pure arithmetic over a 64-bit constant and calls nothing at all:
+///
+/// ```text
+///   public static boolean isSpace(char);
+///        0: iload_0
+///        1: bipush 32
+///        3: if_icmpgt 22
+///        6: ldc2_w  // long 4294981120l
+///        ...
+/// ```
+///
+/// Armed alone over the 40-vector `--jdk-only` corpus: **40 passed, 0 failed**,
+/// the unarmed baseline exactly.
+///
+/// # `java/math/BigInteger` — 24 rows, and the blocker was a different native
+///
+/// The 2026-08-19 package screen recorded `java/math/` at 35/36 armed, and that
+/// number is why the prefix was never admitted. Re-taken 2026-09-10 per class,
+/// the cost is `BigInteger`'s and the vector is `RJdkSecurity`, asserting
+/// `2^127-1 must be prime`.
+///
+/// It is not a `BigInteger` shadow at all. Real `BigInteger.shiftRight`
+/// bytecode returned `(2^127-2) >> 1` short by exactly 2^32 — the top `mag[]`
+/// limb left at zero — because JDK 25 does that shift in
+/// `shiftRightImplWorker`, an `@IntrinsicCandidate` this VM registers a native
+/// over in `native-builtins/src/biginteger_intrinsics.rs`. Both that worker and
+/// its left-shift twin ran one iteration short of the JDK contract.
+///
+/// **The census could not see either of them**, because they are registered
+/// `NativeKind::Intrinsic` and an `Intrinsic` is exempt from the shadow census
+/// by construction. So the native blocking this lane's retirement was, by the
+/// instrument's own design, invisible to the lane. Measured by calling the five
+/// registered intrinsics reflectively (`apps/probes/L2IntrinsicProbe.java`):
+/// **33 of 60 rows differed from HotSpot 25.0.4+7, all in the two shift
+/// workers**, while `implSquareToLen`, `implMulAdd` and `mulAdd` were 0-diff in
+/// the same run. Fixed in the same change as this table.
+///
+/// The 24 rows themselves were already probed: `apps/probes/BigIntegerSweep.java`
+/// is **13253 rows, 0 diffs**, every ordered pair of a boundary corpus through
+/// every binary operation.
+///
+/// ## Nine of the 24 are HELD BACK, and each half has its own cause
+///
+/// With all 24 retired, the probe-tree A/B on two binaries — control
+/// `db988f6a76365f1f` without this table, trial `06307f0eca53c714` with it, same
+/// tree otherwise — reads:
+///
+/// ```text
+///   BigIntegerSweep   control (no table, JIT on)    0 differing lines
+///                     trial   (table,    JIT on)   18   = 9 rows
+///                     trial   (table,   --nojit)    6   = 3 rows
+/// ```
+///
+/// A positive delta is the one result that is a reason not to retire, so the
+/// nine are held per-TRIPLE — the same instrument the `java/util/logging` wave
+/// used for `Logger.log`'s eighth overload — and each is named:
+///
+/// **`add`, `subtract`, `multiply` — a SURVIVOR.** All three are registered
+/// twice. `phases_late.rs` owns the slot as a `Bridge`; `math_bignum.rs`
+/// registered an `Intrinsic` first and owns no slot, so it is *dead in
+/// compatible mode and never dispatched*. Refusing the `Bridge` under
+/// `--jdk-only` does not reach bytecode — it wakes the dead loser, which
+/// returns **null** for a null argument where the real body throws:
+///
+/// ```text
+///   --jdk-only-report, BigIntegerSweep run:
+///     27 synthetic-native-registered refusals on the retired classes
+///      3 of them carrying a survivor
+///        add       survivor=intrinsic@native-builtins/src/math_bignum.rs:1404
+///        subtract  survivor=intrinsic@native-builtins/src/math_bignum.rs:1410
+///        multiply  survivor=intrinsic@native-builtins/src/math_bignum.rs:1416
+/// ```
+///
+/// This is the `refused is not retired` check earning its place: the probe rows
+/// moved, so the wave *looked* measurable, and the retirement was inert.
+/// Retiring these three means removing the dead `math_bignum.rs` registrations
+/// first, which changes nothing in compatible mode because they own no slot.
+///
+/// **`remainder`, `mod`, `gcd`, `and`, `or`, `xor` — the JIT drops the
+/// message.** These do reach bytecode, and interpreted they are HotSpot-exact.
+/// Once the real body is JIT-compiled the `NullPointerException` arrives with
+/// no message at all. It is not a `BigInteger` fact — `apps/probes/L2JitNpeProbe.java`
+/// asks five null-deref shapes cold and hot with no JDK class involved and
+/// every one of them loses its message when hot. See
+/// `docs/known-issues/jit/the-helpful-npe-message-is-lost-in-compiled-code-20260910.md`.
+/// Retiring them today would trade a correct message for none on exactly the
+/// rows a caller reads when something has already gone wrong.
+///
+/// ## ...and the held set is every REFERENCE-argument row, not a list of six
+///
+/// The six above are what regressed on the 24-triple binary. On the 13-triple
+/// one, `remainder` and friends were correct and `modInverse` and `modPow`
+/// regressed instead — the same defect surfacing on different rows, because
+/// which bodies the JIT has compiled by the time the probe's null section runs
+/// is not fixed between runs. Reading one run's diff and holding exactly the
+/// rows in it would be freezing a coin flip.
+///
+/// So the hold is structural rather than empirical: **a row is exposed if its
+/// real body can dereference a null reference ARGUMENT**, and wave 1 retires
+/// only signatures that take none. That is the twelve rows of `divide`,
+/// `modInverse`, `modPow`, `add`, `subtract`, `multiply`, `remainder`, `mod`,
+/// `gcd`, `and`, `or`, `xor` held for the JIT reason or the survivor reason,
+/// plus the two `byte[]` constructors, which the sweep never asks with null and
+/// so cannot vouch for either way.
+///
+/// What remains is ten value-shaped rows — `bitCount`, `bitLength`,
+/// `intValueExact`, `isProbablePrime`, `longValueExact`, `not`, `shiftLeft`,
+/// `shiftRight`, `testBit`, `toByteArray` — and they are 0-diff over the whole
+/// 13253-row sweep with the JIT on.
+static RETIRED_SHADOW_L2_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/lang/Character", "isJavaLetter", "(C)Z"),
+    ("java/lang/Character", "isJavaLetterOrDigit", "(C)Z"),
+    ("java/lang/Character", "isSpace", "(C)Z"),
+    ("java/math/BigInteger", "bitCount", "()I"),
+    ("java/math/BigInteger", "bitLength", "()I"),
+    ("java/math/BigInteger", "intValueExact", "()I"),
+    ("java/math/BigInteger", "isProbablePrime", "(I)Z"),
+    ("java/math/BigInteger", "longValueExact", "()J"),
+    ("java/math/BigInteger", "not", "()Ljava/math/BigInteger;"),
+    (
+        "java/math/BigInteger",
+        "shiftLeft",
+        "(I)Ljava/math/BigInteger;",
+    ),
+    (
+        "java/math/BigInteger",
+        "shiftRight",
+        "(I)Ljava/math/BigInteger;",
+    ),
+    ("java/math/BigInteger", "testBit", "(I)Z"),
+    ("java/math/BigInteger", "toByteArray", "()[B"),
+];
+
 /// Is this exact triple a retired §1.4 shadow?
 ///
 /// The class-name prefix test is a cheap discriminator: every entry is under
@@ -2513,6 +2669,7 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
     RETIRED_SHADOW_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(&key).is_ok()
+        || RETIRED_SHADOW_L2_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_L5_TRIPLES.binary_search(&key).is_ok()
 }
@@ -2520,6 +2677,167 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_l2_table_is_sorted_and_unique() {
+        for w in RETIRED_SHADOW_L2_TRIPLES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "lane 2's table is binary-searched, so it must be sorted and \
+                 unique: {:?} does not precede {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn every_l2_entry_is_reachable_through_the_predicate() {
+        for (c, m, d) in RETIRED_SHADOW_L2_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is in lane 2's table but answers false — the \
+                 prefix list does not admit it, so the entry is inert and \
+                 silent."
+            );
+        }
+    }
+
+    #[test]
+    fn the_l2_table_is_disjoint_from_the_other_three() {
+        for key in RETIRED_SHADOW_L2_TRIPLES {
+            for (other, name) in [
+                (RETIRED_SHADOW_TRIPLES, "RETIRED_SHADOW_TRIPLES"),
+                (
+                    RETIRED_SHADOW_STATELESS_TRIPLES,
+                    "RETIRED_SHADOW_STATELESS_TRIPLES",
+                ),
+                (
+                    RETIRED_SHADOW_PHASE2_TRIPLES,
+                    "RETIRED_SHADOW_PHASE2_TRIPLES",
+                ),
+            ] {
+                assert!(
+                    other.binary_search(key).is_err(),
+                    "{key:?} is in both lane 2's table and {name}. Two tables \
+                     claiming one triple means two measurements claim it, and \
+                     only one of them can be the record."
+                );
+            }
+        }
+    }
+
+    /// Lane 2 retires two families and nothing either side of them.
+    ///
+    /// The prefix list now admits the whole of `java/lang/` and `java/math/`,
+    /// which is a much wider door than the table's three classes. This is the
+    /// guard that says widening the door changed no answer — the same job
+    /// `the_held_collection_families_are_not_retired` does for `java/util/`.
+    #[test]
+    fn the_l2_table_holds_only_what_lane_2_measured() {
+        const RETIRED_CLASSES: &[&str] = &["java/lang/Character", "java/math/BigInteger"];
+        for (c, m, d) in RETIRED_SHADOW_L2_TRIPLES {
+            assert!(
+                RETIRED_CLASSES.contains(c),
+                "{c}.{m}{d} is outside the two classes lane 2 measured. Take \
+                 the per-class corpus screen and the probe-tree A/B before \
+                 adding a third."
+            );
+        }
+        // The nine BigInteger triples held back, and WHY each is held. A
+        // re-add has to move the blocker first, and the blocker is not in this
+        // file: `add`/`subtract`/`multiply` need the dead `math_bignum.rs`
+        // registrations gone, the other six need the JIT to stop dropping the
+        // helpful-NPE message. Both are measured; see this table's doc comment.
+        for m in ["add", "subtract", "multiply"] {
+            assert!(
+                !triple_is_retired_shadow(
+                    "java/math/BigInteger",
+                    m,
+                    "(Ljava/math/BigInteger;)Ljava/math/BigInteger;"
+                ),
+                "BigInteger.{m} was retired, but an older math_bignum.rs \
+                 Intrinsic still owns the slot after the refusal — the \
+                 retirement is INERT and the survivor returns null for a null \
+                 argument where the real body throws."
+            );
+        }
+        for m in [
+            "remainder",
+            "mod",
+            "gcd",
+            "and",
+            "or",
+            "xor",
+            "divide",
+            "modInverse",
+        ] {
+            assert!(
+                !triple_is_retired_shadow(
+                    "java/math/BigInteger",
+                    m,
+                    "(Ljava/math/BigInteger;)Ljava/math/BigInteger;"
+                ),
+                "BigInteger.{m} was retired. It reaches bytecode correctly \
+                 INTERPRETED, and loses its NullPointerException message once \
+                 the body is JIT-compiled."
+            );
+        }
+        for (m, d) in [
+            (
+                "modPow",
+                "(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+            ),
+            ("<init>", "([B)V"),
+            ("<init>", "(I[B)V"),
+        ] {
+            assert!(
+                !triple_is_retired_shadow("java/math/BigInteger", m, d),
+                "BigInteger.{m}{d} was retired. Wave 1's rule is structural: a \
+                 row whose real body can dereference a null reference ARGUMENT \
+                 is exposed to the JIT's dropped NullPointerException message, \
+                 and which rows show it varies run to run."
+            );
+        }
+
+        // Wave 1's rule, asserted over the TABLE rather than over a list of
+        // names, so a row added later has to satisfy it too. Only the parameter
+        // list is examined: `toByteArray()[B` returns an array and takes
+        // nothing, and reading the whole descriptor would reject it.
+        for (c, m, d) in RETIRED_SHADOW_L2_TRIPLES {
+            if *c != "java/math/BigInteger" {
+                continue;
+            }
+            let params = d
+                .split_once('(')
+                .and_then(|(_, rest)| rest.split_once(')'))
+                .map(|(p, _)| p)
+                .unwrap_or("");
+            assert!(
+                !params.contains('L') && !params.contains('['),
+                "{c}.{m}{d} takes a reference parameter. Until the JIT carries \
+                 the helpful-NPE message into compiled code, such a row \
+                 regresses the message it used to get from the native."
+            );
+        }
+
+        // The lane's three named blockers, each with a measurement behind it.
+        // `StringBuilder` is the JIT intrinsic door (2026-08-28, N2);
+        // `System.getProperty` is the property-store inversion; `System$1` is
+        // the hidden-class `defineClass0` failure found on 2026-09-10.
+        for (c, m, d) in [
+            ("java/lang/StringBuilder", "append", "(I)Ljava/lang/StringBuilder;"),
+            ("java/lang/AbstractStringBuilder", "charAt", "(I)C"),
+            ("java/lang/System", "getProperty", "(Ljava/lang/String;)Ljava/lang/String;"),
+            ("java/lang/System$1", "defineClass", "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BLjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;"),
+        ] {
+            assert!(
+                !triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} was retired, and it is one of lane 2's recorded \
+                 blockers. Read the lane page before moving it."
+            );
+        }
+    }
 
     /// The stateless table is binary-searched too, so ordering is correctness
     /// there for the identical reason.

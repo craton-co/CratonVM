@@ -189,19 +189,15 @@ throughput-neutral.
 
 ## 5. What a spliced callee is still refused for
 
-`putstatic`, `anewarray` / `multianewarray`, `checkcast` / `instanceof`,
-`athrow`, `monitorenter` / `monitorexit`, `tableswitch` / `lookupswitch`,
+`putstatic`, `anewarray` / `multianewarray`, `athrow`,
+`monitorenter` / `monitorexit`, `tableswitch` / `lookupswitch`,
 `invokedynamic`, `jsr`/`ret`, integer division, and any body with more than one
 `return` or a `return` that is not last.
 
-**`checkcast` / `instanceof` is the next one to take, and it is the same shape
-as this one.** `IrBuilder` has both arms already (`Op::CheckCast`,
-`Op::InstanceOf`, keyed by pc through `set_checkcast_info` /
-`set_instanceof_info`), so what is missing is again a rebase — plus, unlike
-`getstatic`, a resolution step, because `InlineSite` carries no checkcast rows
-today and the arms want `(name_ptr, name_len)` into an arena this compile owns.
-Every typed read out of an untyped container is a `checkcast`, so on framework
-code it is likely worth more than `getstatic` was.
+`checkcast` / `instanceof` **came off this list on 2026-09-09**, and this
+section's prediction — same shape, a rebase plus a resolution step — was
+carried out. It has its own page:
+`c2-splice-checkcast-and-instanceof-20260909.md`. It shipped default ON.
 
 `putstatic` is the one that should stay refused until somebody does the barrier
 work, not until somebody does the plumbing.
@@ -253,6 +249,19 @@ The fast regression suite is 92 of 92 against HotSpot, and the crate suites are
   14x body it accepted here it accepted for a reason it still cannot see. What
   changes is that the specific way a body could be that much worse now has a
   census row instead of only a wall clock.
+* **It spends inline budget, and that is not free.** Admitting `getstatic`
+  makes the bodies along an accessor chain bigger — on
+  `probes/StackTraceAfterOsr.java`, whose `leaf` reads a static array,
+  `outer`'s optimizing body went 493 → 731 bytes — and the inline budget
+  (`MAX_INLINE_BUDGET`, 750) then refuses a splice further out that used to
+  fit. On that probe an OSR-compiled `main` stopped inlining `probe`, so `mid`
+  and `outer` went from inline levels to ordinary interpreter frames. Nothing
+  about the traces got worse (they still match the interpreter oracle exactly)
+  and nothing measured got slower, but "more splicing at the bottom" is not
+  monotone with "more inlining overall", and this is the first shape where that
+  showed. It was found by
+  `vm/tests/stack_trace_across_tiers.rs`, whose kill-switch arm went red
+  because it had no inlined callee left to revert — see the comment there.
 * **One host, one shape.** These numbers are from a Windows dev box, not the
   Azure bench host `BENCHMARK.md`'s table comes from, so the absolutes are not
   comparable to it. The A/B is: same binary, same window, alternated and

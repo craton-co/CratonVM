@@ -5444,12 +5444,35 @@ pub(super) fn redefine_immune_layout_native(
     method_name: &str,
     method_descriptor: &str,
 ) -> bool {
+    // The ZIP arm is DELIBERATELY absent here, and this is the one arm whose
+    // two aggregators must NOT match.
+    //
+    // Every other member of this set is decided by the CLASS: a synthetic
+    // collection, a VM-minted carrier, a `ThreadLocal`, a `StringBuilder` — for
+    // those, every instance of the class is in the same position and a
+    // receiver-blind cache entry is a correct one. `ZipFile`/`JarFile` are not:
+    // a REAL archive keeps its handle in `jar_table()` and must stay on the
+    // native, while a Mockito INLINE mock of the same class has no handle at
+    // all and must reach the woven advice. Same class, same method, opposite
+    // answers — which is exactly what a per-call-site cache cannot express, and
+    // caching either answer is wrong for the other receiver.
+    //
+    // So the cache paths refuse to decide: with the arm gone, a redefined
+    // `ZipFile`/`JarFile` fails their immunity check, the cached native is not
+    // installed (or is evicted), and dispatch falls through to the slow path —
+    // where `redefine_immune_forced_native_for_receiver` HAS the receiver and
+    // answers per instance. A real archive still gets its native there; only
+    // the fast path is given up, and only in a process that mocked one of these
+    // two classes.
+    //
+    // `leaves_the_zip_arm_to_the_receiver_aware_slow_path` pins this, and says
+    // so, because the standing rule for this file is the opposite one
+    // (`thread_local_immunity_reaches_the_invoke_cache_sites_too`).
     redefine_immune_string_builder_native(class_name, method_name, method_descriptor)
         || redefine_immune_path_native(class_name, method_name, method_descriptor)
         || redefine_immune_synthetic_collection_native(class_name)
         || redefine_immune_vm_minted_carrier_native(class_name)
         || redefine_immune_thread_local_native(class_name)
-        || redefine_immune_zip_file_native(class_name, method_name)
 }
 
 pub(super) fn redefine_immune_string_builder_native(
@@ -5602,7 +5625,144 @@ pub(crate) fn is_datagram_channel_open_native_override(
 /// every force-native method here is immune, and nothing else is. A `JarFile`
 /// method NOT on that list is ordinary bytecode and stays evictable, so an
 /// agent can still weave it.
+/// `System.identityHashCode(obj)` computed from `shared` alone.
+///
+/// Byte-identical to `NativeContextImpl::identity_hash_code` (and therefore to
+/// the `java/lang/System.identityHashCode` native, which is that method's only
+/// caller), because the side table this key indexes is written from the native
+/// side and read from here. A different derivation would look up under a key
+/// nothing ever wrote.
+pub(crate) fn vm_identity_hash(shared: &SharedVm, obj: ObjectRef) -> i32 {
+    let heap = &shared.mem.heap;
+    let heap_answer = heap.identity_hash_code(obj);
+    shared
+        .threads
+        .monitors
+        .java_identity_hash(obj, heap_answer, || heap.next_identity_hash())
+}
+
+/// Does the `ZipFile`/`JarFile` redefine immunity have to stand DOWN for this
+/// receiver?
+///
+/// [`redefine_immune_zip_file_native`] is class-and-method scoped and says so:
+/// a method is forced to its native "because the instance lacks the JDK field
+/// graph it needs, and a redefinition cannot conjure that field graph". That
+/// is the right rule for a real archive and the wrong one for a receiver that
+/// is not an archive at all.
+///
+/// Mockito's inline mock maker mocks `java.util.jar.JarFile` by retransforming
+/// `JarFile` and `ZipFile` themselves and instantiating the target through
+/// objenesis -- no constructor runs, so `open_and_register` never gave the
+/// object a handle. The immunity then keeps a native that has nothing to
+/// answer from: `mock(JarFile.class).getName()` returns `null` and `.close()`
+/// does nothing, and neither call is RECORDED, so
+/// `then(jarFile).should().close()` surfaces as an unfinished verification on
+/// the NEXT `mock()` in the class. Spring Boot's `UrlJarFilesTests` fails two
+/// tests that way, each naming an EARLIER test whose `close()` never landed.
+///
+/// So the immunity is asked one more question -- is this receiver an archive
+/// we actually opened? -- and stands down when the answer is no, letting
+/// dispatch fall through to the woven bytecode where the mock advice lives.
+///
+/// Two deliberate narrowings:
+///
+///  * `<init>` is NEVER waived. A real archive's handle is registered BY the
+///    constructor, so at its entry the receiver necessarily has none yet;
+///    waiving there would cede every real `new JarFile(...)` in a redefined
+///    process to a JDK body that cannot open it.
+///  * The receiver must be in hand. At a gate that does not carry one the
+///    immunity stands, which is the pre-existing behaviour.
+///
+/// The set behind `identity_is_known_archive` is append-only, so a CLOSED
+/// archive still counts as real -- `close` is on the immunity list and a
+/// double-close must not reach `ZipFile.close`'s real body, which reads the
+/// `res` field CratonVM never populates.
+pub(crate) fn zip_immunity_waived_for_receiver(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    receiver: Option<ObjectRef>,
+) -> bool {
+    if method_name == "<init>" {
+        return false;
+    }
+    if !redefine_immune_zip_file_native(class_name, method_name) {
+        return false;
+    }
+    let Some(obj) = receiver else {
+        if dbg_zip_immune().is_some() {
+            eprintln!("[zipimmune] {class_name}.{method_name} waiver: NO RECEIVER");
+        }
+        return false;
+    };
+    let known =
+        cratonvm_native_io::zip_real_jar::identity_is_known_archive(vm_identity_hash(shared, obj));
+    if dbg_zip_immune().is_some() {
+        eprintln!(
+            "[zipimmune] {class_name}.{method_name} waiver: known_archive={known} -> waived={}",
+            !known
+        );
+    }
+    !known
+}
+
+/// [`redefine_immune_forced_native`] with the receiver-aware ZIP waiver
+/// applied. Every gate that HAS the receiver calls this instead.
+pub(crate) fn redefine_immune_forced_native_for_receiver(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+    receiver: Option<ObjectRef>,
+) -> bool {
+    redefine_immune_forced_native(class_name, method_name, method_descriptor)
+        && !zip_immunity_waived_for_receiver(shared, class_name, method_name, receiver)
+}
+
+/// `CRATONVM_DBG_ZIPIMMUNE` — the ZIP redefine-immunity lever. Two values:
+///
+///  * `1` — trace: one line per distinct (class, method) the immunity is
+///    consulted for, plus one per waiver decision. This is what named the last
+///    receiver-blind gate: a `java/util/zip/ZipFile` consultation printed with
+///    no waiver line beside it is a caller that is not asking about the
+///    receiver.
+///  * `off` — force the immunity to `false` everywhere. Behaviour-changing, and
+///    the point: it separates "this gate decides" from "some other gate
+///    decides" in one run, which three rounds of converting gates one at a time
+///    could not.
+///
+/// Both are inert unless set, and the read is one `OnceLock`.
+fn dbg_zip_immune() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<String>> = OnceLock::new();
+    C.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_ZIPIMMUNE").ok())
+        .as_deref()
+}
+
 pub(super) fn redefine_immune_zip_file_native(class_name: &str, method_name: &str) -> bool {
+    let hit = redefine_immune_zip_file_native_inner(class_name, method_name);
+    if let Some(mode) = dbg_zip_immune() {
+        if hit {
+            use parking_lot::Mutex;
+            use std::sync::OnceLock;
+            static SEEN: OnceLock<Mutex<std::collections::BTreeSet<(String, String)>>> =
+                OnceLock::new();
+            let seen = SEEN.get_or_init(|| Mutex::new(Default::default()));
+            if seen
+                .lock()
+                .insert((class_name.to_string(), method_name.to_string()))
+            {
+                eprintln!("[zipimmune] {class_name}.{method_name} immune=true mode={mode}");
+            }
+        }
+        if mode == "off" {
+            return false;
+        }
+    }
+    hit
+}
+
+fn redefine_immune_zip_file_native_inner(class_name: &str, method_name: &str) -> bool {
     match class_name {
         "java/util/zip/ZipFile" => matches!(
             method_name,
@@ -5926,6 +6086,67 @@ pub(super) fn should_force_registered_native_over_bytecode_precomputed(
     force_native
         && (!native_shadow_suppressed_by_redefine(shared, class_name)
             || redefine_immune_forced_native(class_name, method_name, method_descriptor))
+}
+
+/// [`should_force_registered_native_over_bytecode_precomputed`] with the
+/// receiver-aware ZIP waiver applied to the immunity term.
+///
+/// This is THE gate that decides for `java/util/jar/JarFile.close()V`: the
+/// method is a force-native entry, so it never reaches the shadow-drop gates in
+/// `invoke_or_native` and `try_stackless_invoke` at all. Patching those two and
+/// not this one moves the `[native-shadow]` diagnostic to `dropped=true` and
+/// changes nothing about which body runs -- measured 2026-09-10, `mock(JarFile
+/// .class).close()` still recorded zero invocations.
+///
+/// The `real_http_url_connection_native` arm a few hundred lines below is the
+/// same idea reached independently: it tells "a genuinely real carrier" from
+/// "a mock or synthetic carrier" by checking the receiver's field 0, because an
+/// Objenesis-constructed mock never ran a constructor. This asks the archive
+/// tables the same question, which is exact rather than a proxy.
+pub(super) fn should_force_registered_native_over_bytecode_precomputed_for_receiver(
+    shared: &SharedVm,
+    force_native: bool,
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+    receiver: Option<ObjectRef>,
+) -> bool {
+    force_native
+        && (!native_shadow_suppressed_by_redefine(shared, class_name)
+            || redefine_immune_forced_native_for_receiver(
+                shared,
+                class_name,
+                method_name,
+                method_descriptor,
+                receiver,
+            ))
+}
+
+/// [`should_force_registered_native_over_bytecode`], receiver-aware.
+pub(crate) fn should_force_registered_native_over_bytecode_for_receiver(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+    receiver: Option<ObjectRef>,
+) -> bool {
+    should_force_registered_native_over_bytecode_precomputed_for_receiver(
+        shared,
+        force_native_over_real_jdk_bytecode_memoized(class_name, method_name, method_descriptor),
+        class_name,
+        method_name,
+        method_descriptor,
+        receiver,
+    )
+}
+
+/// The receiver of an instance call, for the gates above. `None` for a static
+/// call, a null receiver, or a primitive first argument.
+pub(super) fn receiver_of(args: &[Value]) -> Option<ObjectRef> {
+    match args.first() {
+        Some(Value::Object(Some(obj))) => Some(*obj),
+        _ => None,
+    }
 }
 
 /// Route a force-native interception through §7 policy, and count it.
@@ -6518,11 +6739,12 @@ pub(super) fn intercept_force_registered_native(
     // the native, so the instrumentation advice runs. Reflection-metadata
     // natives are exempt (see `redefine_immune_reflection_native`): the real
     // bytecode cannot reproduce them under CratonVM.
-    if !should_force_registered_native_over_bytecode(
+    if !should_force_registered_native_over_bytecode_for_receiver(
         shared,
         class_name,
         method_name,
         method_descriptor,
+        receiver_of(args),
     ) {
         return None;
     }
@@ -6703,12 +6925,13 @@ pub(super) fn intercept_force_registered_native_cached(
     // the native, so the instrumentation advice runs. Reflection-metadata
     // natives are exempt (see `redefine_immune_reflection_native`): the real
     // bytecode cannot reproduce them under CratonVM.
-    if !should_force_registered_native_over_bytecode_precomputed(
+    if !should_force_registered_native_over_bytecode_precomputed_for_receiver(
         shared,
         force_native,
         class_name,
         method_name,
         method_descriptor,
+        receiver_of(args),
     ) {
         return None;
     }
@@ -8970,11 +9193,16 @@ mod redefine_immunity_tests {
     }
 
     /// Every operation CratonVM forces to its `ZipFile`/`JarFile` native must
-    /// survive a redefinition of those two classes, on BOTH aggregators. One
-    /// `spy()` of a `JarFile` subclass retransforms the whole chain, and the
-    /// real bodies read a `res`/`zsrc` field graph no CratonVM archive has.
+    /// survive a redefinition of those two classes on the SLOW-path
+    /// aggregator, and must NOT be immune on the invoke-cache one. One `spy()`
+    /// of a `JarFile` subclass retransforms the whole chain, and the real
+    /// bodies read a `res`/`zsrc` field graph no CratonVM archive has — but a
+    /// Mockito inline MOCK of the same class has no archive handle either, and
+    /// only the slow path can tell the two apart. See
+    /// `redefine_immune_layout_native`'s note on why this arm is the one that
+    /// must differ between the aggregators.
     #[test]
-    fn zip_and_jar_layout_natives_survive_a_redefinition() {
+    fn leaves_the_zip_arm_to_the_receiver_aware_slow_path() {
         for name in [
             "<init>",
             "getEntry",
@@ -8992,8 +9220,10 @@ mod redefine_immunity_tests {
                 "java/util/zip/ZipFile.{name} must survive a redefinition"
             );
             assert!(
-                super::redefine_immune_layout_native("java/util/zip/ZipFile", name, "()V"),
-                "java/util/zip/ZipFile.{name} must be immune on the invoke-cache path too"
+                !super::redefine_immune_layout_native("java/util/zip/ZipFile", name, "()V"),
+                "java/util/zip/ZipFile.{name} must NOT be immune on the invoke-cache \
+                 path: that path cannot tell a real archive from a mock of the same \
+                 class, so it has to defer to the receiver-aware slow path"
             );
         }
         for name in [
@@ -9014,8 +9244,9 @@ mod redefine_immunity_tests {
                 "java/util/jar/JarFile.{name} must survive a redefinition"
             );
             assert!(
-                super::redefine_immune_layout_native("java/util/jar/JarFile", name, "()V"),
-                "java/util/jar/JarFile.{name} must be immune on the invoke-cache path too"
+                !super::redefine_immune_layout_native("java/util/jar/JarFile", name, "()V"),
+                "java/util/jar/JarFile.{name} must NOT be immune on the invoke-cache \
+                 path: see the ZipFile arm above"
             );
         }
     }
@@ -9251,25 +9482,39 @@ mod redefine_immunity_tests {
         // the aggregator bodies and ask whether the call is inside one. If an
         // aggregator is ever renamed this stops finding it and its own arms
         // start failing — loud, and the right direction to fail in.
-        let aggregator_bodies: Vec<(usize, usize)> = [
+        //
+        // The list IS the exemption, and its LENGTH is the findability
+        // check: a composer added here can never silently widen the gate's
+        // blind spot without also being visible in this array.
+        const EXEMPT_BODIES: [&str; 3] = [
             "redefine_immune_layout_native",
             "redefine_immune_forced_native",
-        ]
-        .iter()
-        .filter_map(|name| {
-            let start = src.find(&format!("fn {name}("))?;
-            // A top-level body ends at the first `}` in column 0 after it.
-            let end = src[start..]
-                .find("\n}")
-                .map_or(src.len(), |i| start + i + 2);
-            Some((start, end))
-        })
-        .collect();
-        assert_eq!(
-            aggregator_bodies.len(),
-            2,
-            "both aggregators must be findable, or this gate exempts nothing \
-             and polices everything"
+            // The receiver-aware composer. It names the ZIP arm for the same
+            // reason the two aggregators name their own: composing them IS its
+            // job. What the gate forbids is a DISPATCH SITE open-coding an arm,
+            // and this is not one — every dispatch site calls
+            // `redefine_immune_forced_native_for_receiver`, never this.
+            "zip_immunity_waived_for_receiver",
+        ];
+        let aggregator_bodies: Vec<(usize, usize)> = EXEMPT_BODIES
+            .iter()
+            .filter_map(|name| {
+                let start = src.find(&format!("fn {name}("))?;
+                // A top-level body ends at the first `}` in column 0 after it.
+                let end = src[start..]
+                    .find("\n}")
+                    .map_or(src.len(), |i| start + i + 2);
+                Some((start, end))
+            })
+            .collect();
+        let missing: Vec<&str> = EXEMPT_BODIES
+            .iter()
+            .copied()
+            .filter(|name| !src.contains(&format!("fn {name}(")))
+            .collect();
+        assert!(
+            missing.is_empty() && aggregator_bodies.len() == EXEMPT_BODIES.len(),
+            "every exempt body must be findable. Not found: {missing:?}"
         );
 
         let mut offenders = Vec::new();

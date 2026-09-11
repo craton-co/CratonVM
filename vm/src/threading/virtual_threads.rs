@@ -841,6 +841,7 @@ fn spawn_starvation_watchdog(
         .spawn(move || {
             let mut last_dispatch = scheduler.dispatch_count();
             let mut stalled_samples: u32 = 0;
+            let (mut last_pause_epoch, _) = crate::threading::gc_barrier::stw_pause_state();
             loop {
                 std::thread::sleep(CARRIER_STALL_SAMPLE_INTERVAL);
                 if !scheduler.is_running() {
@@ -849,6 +850,61 @@ fn spawn_starvation_watchdog(
                 let dispatch = scheduler.dispatch_count();
                 let dispatch_moved = dispatch != last_dispatch;
                 last_dispatch = dispatch;
+                // A stop-the-world pause parks every carrier, so
+                // `dispatch_count` CANNOT move across one -- which is exactly
+                // this watchdog's stall signature. Sampling through a pause
+                // therefore reads "starved" off a VM that is merely stopped,
+                // and the carrier it then adds is not idle for long: it is one
+                // more OS thread for the next pause to stop, and on Windows one
+                // more for `xt_root_scan::take_over_pass` to `SuspendThread` +
+                // `GetThreadContext` + `ResumeThread`, which that pass does for
+                // EVERY thread in the process on EVERY collection. That closes a
+                // loop: slower pause -> more stalled samples -> more carriers ->
+                // slower pause. Measured on `VthreadGcStress` (3000 virtual
+                // threads, 400 `System.gc()` rounds), the pool ran away from its
+                // base 32 to 233+ and `dispatch_count` froze for good; with the
+                // scan off it stayed at 32 and the probe finished in 5 s.
+                //
+                // So: a sample whose interval CONTAINED a pause says nothing
+                // about starvation. Drop it, and do not let it advance the
+                // consecutive-stall count that growth is gated on. This does not
+                // weaken the watchdog for the case it exists for -- a carrier
+                // blocked in `monitorenter` stays blocked across as many pauses
+                // as you like, so its stalled samples simply resume accruing
+                // from the first pause-free interval.
+                let (pause_epoch, pause_now) =
+                    crate::threading::gc_barrier::stw_pause_state();
+                let paused_in_interval = pause_now || pause_epoch != last_pause_epoch;
+                last_pause_epoch = pause_epoch;
+                // `CRATONVM_DBG_CARRIER=1` -- one line per sample, printed
+                // BEFORE the skip above so a pause-contaminated sample is
+                // visible as such rather than silently absent. The pool
+                // climbing away from its base size while `dispatch` sits still
+                // is the signature of the loop described above, and without
+                // this reading it presents only as "the VM hung".
+                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CARRIER").is_some() {
+                    eprintln!(
+                        "[carrier] queued={} busy={} live={} dispatch={} moved={} paused={}",
+                        scheduler.queued_len(),
+                        scheduler.busy_carriers(),
+                        scheduler.live_carriers(),
+                        dispatch,
+                        dispatch_moved,
+                        paused_in_interval,
+                    );
+                    let census = crate::threading::thread_state::thread_state_census();
+                    let mut parts: Vec<String> = Vec::new();
+                    for st in crate::threading::thread_state::ThreadExecState::ALL.iter() {
+                        let n = census.get(*st);
+                        if n > 0 {
+                            parts.push(format!("{st:?}={n}"));
+                        }
+                    }
+                    eprintln!("[carrier-states] {}", parts.join(" "));
+                }
+                if paused_in_interval {
+                    continue;
+                }
                 if carrier_pool_is_stalled(
                     scheduler.queued_len(),
                     scheduler.busy_carriers(),

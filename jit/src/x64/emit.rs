@@ -1408,6 +1408,49 @@ impl Compiler {
         true
     }
 
+    /// `CMP DWORD [rip+disp32], imm32` — the RIP-relative compare against a
+    /// **fixed absolute address**, for a 32-bit counter within ±2GB of the
+    /// instruction being emitted.
+    ///
+    /// The epoch guard's whole comparison in **one 10-byte instruction and no
+    /// register**, against `MOV R11, imm64` (10 bytes) + `MOV ECX, [R11]`
+    /// (3) + `CMP ECX, imm32` (6) — three instructions, nineteen bytes, and
+    /// two clobbered registers to read one `u32`. `81 /7 id` with ModRM
+    /// `mod=00, rm=101` is the RIP-relative form (`0x3D`).
+    ///
+    /// The reference point is the end of the WHOLE instruction, past the
+    /// trailing `imm32` — which is why `LEN` is 10 and why the
+    /// `rip_abs_disp32_patches` entry declares a trail of **4**, not the
+    /// poll's 1. Get either wrong and the guard compares an unrelated global
+    /// against a baked epoch: no fault, no failing smoke test, just a check
+    /// that answers about the wrong word forever.
+    ///
+    /// The load stays a single aligned 32-bit read, so it is as atomic as the
+    /// `MOV ECX` it replaces.
+    ///
+    /// Returns `false` **without emitting anything** when the target is out of
+    /// disp32 reach, so the caller can fall back to the register-materializing
+    /// form — same contract, and same reason, as
+    /// [`Self::emit_test_mem8_abs_imm8`] above.
+    pub(super) fn emit_cmp_mem32_abs_imm32(&mut self, addr: usize, imm32: u32) -> bool {
+        // 81 3D <disp32> <imm32>
+        const LEN: usize = 10;
+        // Cast: non-negative index/count to usize
+        let here = self.buf.as_ptr() as usize + self.buf.pos();
+        let next_pc = here.wrapping_add(LEN);
+        // Widening: i64/usize -> i128 (no truncation, for range check)
+        let delta: i128 = (addr as i128) - (next_pc as i128);
+        // Widening: i64/usize -> i128 (no truncation, for range check)
+        if delta < i32::MIN as i128 || delta > i32::MAX as i128 {
+            return false;
+        }
+        self.buf.emit(&[0x81, 0x3D]); // CMP r/m32, imm32 with ModRM(00, /7, RIP)
+        self.rip_abs_disp32_patches.push((self.buf.pos(), 4));
+        self.buf.emit(&(delta as i32).to_le_bytes()); // Cast: rel32 displacement
+        self.buf.emit(&(imm32 as i32).to_le_bytes()); // Cast: the baked epoch
+        true
+    }
+
     /// `TEST BYTE [base+disp], imm8` -- checks a per-object header flag byte
     /// (e.g. `GC_FLAG_COMPACT`) without needing any scratch register: the
     /// memory operand is read and discarded by the CPU, `base` and the

@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-540 tokens.
+541 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -535,6 +535,7 @@ export inherited from a parent shell.
 | `stw-native-ring` | `CRATONVM_DBG_STW_NATIVE_RING` |
 | `surefire-ipc-dbg` | `CRATONVM_SUREFIRE_IPC_DBG` |
 | `swchain` | `CRATONVM_DBG_SWCHAIN` |
+| `carrier` | `CRATONVM_DBG_CARRIER` |
 | `sweep-census` | `CRATONVM_DBG_SWEEP_CENSUS` |
 | `sweep-edges` | `CRATONVM_DBG_SWEEP_EDGES` |
 | `unreg-declined` | `CRATONVM_DBG_UNREG_DECLINED` |
@@ -606,7 +607,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-420 tokens.
+426 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -737,6 +738,7 @@ export inherited from a parent shell.
 | `ir-splice-branch` | `CRATONVM_JIT_IR_SPLICE_BRANCH` |
 | `ir-splice-direct-call` | `CRATONVM_JIT_IR_SPLICE_DIRECT_CALL` |
 | `ir-splice-typecheck` | `CRATONVM_JIT_IR_SPLICE_TYPECHECK` |
+| `ir-splice-refuse-unbindable` | `CRATONVM_JIT_IR_SPLICE_REFUSE_UNBINDABLE` |
 | `ir-splice-getstatic` | `CRATONVM_JIT_IR_SPLICE_GETSTATIC` |
 | `osr-optimizing-cache` | `CRATONVM_JIT_OSR_OPTIMIZING_CACHE` |
 | `ir-fallthrough` | `CRATONVM_JIT_IR_FALLTHROUGH` |
@@ -744,6 +746,10 @@ export inherited from a parent shell.
 | `ir-reg-authoritative` | `CRATONVM_JIT_IR_REG_AUTHORITATIVE` |
 | `ir-gp-wide` | `CRATONVM_JIT_IR_GP_WIDE` |
 | `ir-epoch-guard-rip` | `CRATONVM_JIT_IR_EPOCH_GUARD_RIP` |
+| `sp-epoch-guard-rip` | `CRATONVM_JIT_SP_EPOCH_GUARD_RIP` |
+| `sp-field-layout-guard` | `CRATONVM_JIT_SP_FIELD_LAYOUT_GUARD` |
+| `layout-epoch-static` | `CRATONVM_JIT_LAYOUT_EPOCH_STATIC` |
+| `code-near-globals` | `CRATONVM_JIT_CODE_NEAR_GLOBALS` |
 | `ir-speculate` | `CRATONVM_JIT_IR_SPECULATE` |
 | `band-skip` | `CRATONVM_JIT_BAND_SKIP` |
 | `ls-carry-relief` | `CRATONVM_JIT_LS_CARRY_RELIEF` |
@@ -1010,6 +1016,7 @@ export inherited from a parent shell.
 | `xt-helper-window-scan` | `CRATONVM_XT_HELPER_WINDOW_SCAN` |
 | `xt-no-safe-peer-read` | `CRATONVM_XT_NO_SAFE_PEER_READ` |
 | `xt-jit-root-scan` | `CRATONVM_XT_JIT_ROOT_SCAN` |
+| `xt-root-scan-audit` | `CRATONVM_XT_ROOT_SCAN_AUDIT` |
 | `xt-peer-deadline-ms` | `CRATONVM_XT_PEER_DEADLINE_MS` |
 | `xt-peer-total-ms` | `CRATONVM_XT_PEER_TOTAL_MS` |
 | `direct-call-arg-maps` | `CRATONVM_JIT_DIRECT_CALL_ARG_MAPS` |
