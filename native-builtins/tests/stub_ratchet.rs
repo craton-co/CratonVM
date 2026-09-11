@@ -1449,9 +1449,19 @@ use cratonvm_types::compat::CompatibilityMode;
 /// right-hand column absorbs that silently unless it is said out loud. It is
 /// measured, not inferred: dev's `retired_shadow.rs` substituted into this tree
 /// reads 1896 / 1907 / 1896 in two separate runs, and a pristine `origin/dev`
-/// worktree agrees. The +13 landed after `b996b39f7`, the commit that last set
-/// this constant, and `RETIRED_SHADOW_L2_TRIPLES` (lane 2's eleven
-/// `Character`/`BigInteger` rows) is most of it.
+/// worktree agrees.
+///
+/// **All 13 of it is `RETIRED_SHADOW_L2_TRIPLES`, and that is measured too.**
+/// Substituting `retired_shadow.rs` from `b996b39f7` — the commit that last set
+/// these constants — into dev's own tip reads 1883 / 1894 / 1883, which is
+/// EXACTLY the three constants. So every one of the 13
+/// comes from that one file, and `e366e3273` (lane 2 wave 1, the `BigInteger`
+/// shift intrinsics) is the only commit to touch it in the window. Eleven
+/// triples, 13 registrations — two of the eleven are registered at more than
+/// one ordinal, the same effect this branch's 98 -> 101 has.
+///
+/// Run it with `-- --nocapture`, or the arm that PASSES prints nothing and the
+/// measurement looks like a failed command. That cost a round trip here.
 ///
 /// **This branch's own share is +101 registrations for 98 table triples**, and
 /// it is case ONE of the three classified on
