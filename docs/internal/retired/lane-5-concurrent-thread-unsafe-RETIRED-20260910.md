@@ -384,8 +384,23 @@ reads exactly as it did before. On binary c:
 ```text
   CRATONVM_ARGS=--jdk-only    132 passed, 0 failed
   SUITE=all                   132 passed, 0 failed
-  SUITE=core                  see the commit message
+  SUITE=core                   91 passed, 1 failed  (RSocketChannelInterrupt)
 ```
+
+**That one failure is the host, and it is attributed rather than assumed.**
+`SUITE=core` run three more times on the CONTROL binary and three more on the
+trial:
+
+```text
+  control  91/92 (failed: RBlockingQueue)   92/92   92/92
+  trial    92/92 ...
+```
+
+A different vector fails on the control, and none fails on two of its three
+runs. `RSocketChannelInterrupt` is a socket-plus-interrupt vector and
+`RBlockingQueue` a concurrency one; the arm that fails moves with the host's
+load, not with the binary. **Host load flips pass/fail, not only timings** —
+and the cheap way to tell was that the control failed at all.
 
 ### The instrument lesson: two arms of a filesystem probe collide
 
