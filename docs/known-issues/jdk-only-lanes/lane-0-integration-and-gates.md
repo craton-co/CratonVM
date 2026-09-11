@@ -743,6 +743,50 @@ So if this gate reddens after your tag:
 `--test` targets by hand hid both, which is how the `getModule` adjudication
 shipped with this gate already red.
 
+### 7.5 The INTRINSIC ratchet is one row stale, and `<=` is why nobody saw it
+
+Measured 2026-09-11 on the sixth `origin/dev` merge, by running the stub
+ratchet with `--nocapture` on a **passing** run:
+
+```text
+intrinsic-ratchet [no-management]: 1386 Intrinsic registrations out of 13623
+                                   total (baseline 1387)
+stub-ratchet(scope):  boot 2592 stubs / 13623 rows        <- matches, exactly
+```
+
+The stub side is tight: 2592 is the constant this branch just froze. The
+**intrinsic** side is not — actual 1386 against a frozen 1387 — and the gate
+is green anyway, because like the stub ratchet it asserts `<=`. A DECREASE
+passes silently. This is the hazard `../../contributing/stub-ratchet.md`
+already names, observed live in a sibling ratchet nobody was watching.
+
+**Not re-frozen here, deliberately.** A missing `Intrinsic` has two readings
+and they want opposite responses:
+
+* a reviewed exemption was **removed on purpose** — re-freeze to 1386 and note
+  which row and why; or
+* a reviewed exemption was **lost by accident**, which is a regression: an
+  `Intrinsic` that reverts to `Bridge` re-enters the population the dial and
+  the retirement tables can act on, so a later wave may retire a row that was
+  exempt for a measured reason. L0 §7's protocol exists because those rows
+  break when yielded — `Class.getName` answering the internal form is the
+  worked example.
+
+Re-freezing without knowing which of the two happened is precisely what this
+file's doctrine forbids: a constant is a before-number, and the account is the
+point. **The next step is a census diff naming the row**, not an edit to the
+constant.
+
+Recorded rather than fixed because the change is not this branch's: the count
+was 1387 through this branch's own arms and moved on a `dev` merge that touches
+no retirement table. Whoever removed it has the account; this section just
+makes the number visible, which the `<=` assert does not.
+
+**Worth generalising: read the printed number on a PASSING ratchet run.** Every
+ratchet in this file prints its live value under `--nocapture` whether it
+passes or fails. Reading it takes one command and is the only way a one-sided
+assert tells you the truth in the direction it does not guard.
+
 ### 7.4 Lane 1's waves 3 and 4 will fire a BLOCKING CI gate, 2026-09-11
 
 Found while merging `origin/dev`, by checking each lane's table against the
