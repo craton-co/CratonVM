@@ -133,7 +133,7 @@ that vector worse; it had not, and the larger sample is the one to cite.
 Directly: on a failing Flyway run the floor logs **zero** ENCLOSING overlaps and
 names no frame in that stack. Its page has been re-measured rather than
 retired. See
-`known-issues/springboot/flyway-aot-receiver-class-confusion-under-concurrency-20260910.md`.
+`internal/springboot/flyway-aot-receiver-class-confusion-under-concurrency-FIXED-20260911.md`.
 
 ## Related
 

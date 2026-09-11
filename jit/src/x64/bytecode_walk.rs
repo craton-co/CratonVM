@@ -5788,7 +5788,7 @@ impl Compiler {
                             }
                             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                             self.load_slot_to_reg(ARG_REGS[1], obj_slot);
-                            self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag);
+                            self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag, pc);
                             crate::metrics::note_getfield_arm(1);
                             self.emit_call_absolute(self.helpers.getfield);
                             self.emit_post_invoke_exception_check(type_tag);
@@ -5987,7 +5987,7 @@ impl Compiler {
                             self.bind_implicit_null_recovery();
                             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                             self.load_slot_to_reg(ARG_REGS[1], obj_slot);
-                            self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag);
+                            self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag, pc);
                             crate::metrics::note_getfield_arm(2);
                             self.emit_call_absolute(self.helpers.getfield);
                             self.emit_post_invoke_exception_check(type_tag);
@@ -6019,7 +6019,7 @@ impl Compiler {
                         let obj_slot = self.pop_stack();
                         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                         self.load_slot_to_reg(ARG_REGS[1], obj_slot);
-                        self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag);
+                        self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag, pc);
                         crate::metrics::note_getfield_arm(3);
                         self.emit_call_absolute(self.helpers.getfield);
                         // See the inlined-callee getfield site above: the checked

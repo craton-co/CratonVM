@@ -2175,7 +2175,17 @@ pub fn coerce_value_for_return(value: Value, ret_type: u8) -> Value {
 /// the method descriptor's return type.
 #[inline]
 pub fn coerce_native_return(value: Option<Value>, descriptor: &str) -> Option<Value> {
-    let ret = crate::jit::return_type(descriptor);
+    coerce_native_return_typed(value, crate::jit::return_type(descriptor))
+}
+
+/// [`coerce_native_return`] for a caller that already holds the descriptor's
+/// return tag.
+///
+/// `crate::jit::return_type` is a byte-at-a-time scan for `)`, and the compiled
+/// native dispatch path runs it on every call for a descriptor it has already
+/// decoded once (see `jit::helpers::JitArgShape`). Same answer, no scan.
+#[inline]
+pub fn coerce_native_return_typed(value: Option<Value>, ret: u8) -> Option<Value> {
     if ret == b'V' {
         return value;
     }
@@ -3305,6 +3315,93 @@ struct NativeDiagState {
 /// Cheap and confined: this is the native boundary, not the interpreter's
 /// `putfield`, and the barrier short-circuits on anything that is not a moved
 /// object.
+/// Stores `NativeContext::set_field_by_name` DROPPED because the receiver's
+/// class does not declare the named field.
+static FIELD_BY_NAME_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many `set_field_by_name` calls named a field their receiver does not
+/// have. Always counted; see [`note_field_by_name_dropped`] for what a non-zero
+/// value does and does not mean.
+pub fn field_by_name_dropped_count() -> u64 {
+    FIELD_BY_NAME_DROPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The silent arm of `set_field_by_name`, made audible under
+/// `CRATONVM_DBG_DEADREF_STORE`.
+///
+/// # Why this is where a stale receiver actually surfaces
+///
+/// `set_field_by_name` resolves the field against the class of whatever object
+/// is AT the address it is handed. A native that kept a receiver across an
+/// allocation hands it a vacated address — and a young semispace is re-served
+/// from the same base every cycle, so that address is usually occupied by some
+/// unrelated object by the time the store runs. The field name then does not
+/// resolve, and the store disappears **before** it reaches the heap: no
+/// `set_field`, so no `[deadref-store]`, no `[deadref-recv]`, no
+/// `[CELLWATCH]`, no `[PUTFIELD-WATCH]`. Nothing in the VM said anything.
+///
+/// That is exactly how `native_assertj_lightweight_comparable_assert`'s
+/// `objects` store vanished (see
+/// `docs/internal/springboot/bindabletests-assertj-objects-receiver-stale-across-clinit-20260911.md`),
+/// and it is why the heap-side screens could not have found it however many
+/// arms they grew.
+///
+/// # Why it is counted always and printed only under the flag
+///
+/// A miss is not always a defect: several natives set a field that only some
+/// subclasses declare (`strings` and `failures` on the AssertJ assertions are
+/// the local example), so an unconditional warning would be noise — MEASURED, a
+/// single `BindableTests` run drops 2 710 stores and ~2 700 of them are one
+/// benign shape, `StringBuilder.toStringCache`. The COUNT is free and makes
+/// "did this happen at all" answerable; the line with its backtrace is behind
+/// the same switch as the rest of the stale-reference family, because that is
+/// when someone is asking this question, and it is deduped by
+/// `(receiver class, field name)` so that population cannot crowd out the one
+/// row a reader opened the log for.
+#[cold]
+#[inline(never)]
+fn note_field_by_name_dropped(
+    class_id: ClassId,
+    class_name: &str,
+    field_name: &str,
+    obj: ObjectRef,
+    value: Value,
+) {
+    FIELD_BY_NAME_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !cratonvm_types::flags().gc.dbg_deadref_store {
+        return;
+    }
+    // DEDUPE BY SHAPE, not by occurrence count. A plain "first N" cap is worse
+    // than useless here and was measured to be: a BindableTests run drops 2 710
+    // stores, ~2 700 of them one benign shape (`StringBuilder.toStringCache`),
+    // so a 32-line cap spends every line on the noise and never reaches the
+    // one that matters. One line per distinct `(receiver class, field name)`
+    // turns the same population into a handful of rows, and a stale receiver is
+    // a shape nothing else in the run produces.
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(u32, String)>>> =
+        std::sync::Mutex::new(None);
+    let mut guard = match SEEN.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let seen = guard.get_or_insert_with(std::collections::HashSet::new);
+    if seen.len() >= 256 || !seen.insert((class_id.as_u32(), field_name.to_string())) {
+        return;
+    }
+    let n = seen.len() - 1;
+    drop(guard);
+    eprintln!(
+        "[field-by-name-dropped] #{n} obj=0x{:x} recv_class={class_name} \
+         recv_class_id={} field={field_name:?} value={value:?} — the receiver's class does not \
+         declare this field, so the store was DROPPED. Either the caller named a field only some \
+         subclasses have, or the receiver is a stale address now occupied by a different object.\n{:?}",
+        obj.as_ptr() as usize,
+        class_id.as_u32(),
+        std::backtrace::Backtrace::force_capture(),
+    );
+}
+
 #[inline]
 fn forward_boundary_value(heap: &crate::memory::VmHeap, value: Value) -> Value {
     match value {
@@ -3464,7 +3561,9 @@ pub(crate) fn safe_native_call_leaf(
     // Copy nothing unless the barrier has something to rewrite — see the same
     // shape, and the measurement behind it, in `safe_native_call_impl`.
     const INLINE_NATIVE_ARGS: usize = crate::jit::helpers::INLINE_JIT_NATIVE_ARGS;
-    let mut inline_forwarded = [Value::Object(None); INLINE_NATIVE_ARGS];
+    // Declared, not initialised — see the same shape, and the measurement, in
+    // `safe_native_call_impl`.
+    let mut inline_forwarded: [Value; INLINE_NATIVE_ARGS];
     let mut heap_forwarded: Vec<Value>;
     let mut moved = None;
     for (index, value) in args.iter().enumerate() {
@@ -3480,6 +3579,7 @@ pub(crate) fn safe_native_call_leaf(
         None => args,
         Some(first_moved) => {
             let buf: &mut [Value] = if args.len() <= INLINE_NATIVE_ARGS {
+                inline_forwarded = [Value::Object(None); INLINE_NATIVE_ARGS];
                 inline_forwarded[..args.len()].copy_from_slice(args);
                 &mut inline_forwarded[..args.len()]
             } else {
@@ -3828,12 +3928,27 @@ fn safe_native_call_impl(
     // whether or not one is used, measured at 7.3 ns for the two scratch arrays
     // together in `native_funnel_profile` (`vm_exec.rs`), against a ~23 ns
     // one-argument funnel.
-    let mut inline_forwarded = [Value::Object(None); INLINE_NATIVE_ARGS];
+    // DECLARED, not initialised. The comment above prices the eight-`Value`
+    // fill at 7.3 ns for the pair and says it is paid "whether or not one is
+    // used" — and the ordinary case is that none is, because an argument that
+    // forwards to itself needs no scratch at all. Definite-assignment lets the
+    // fill move into the arm that actually reads it, so the common path stores
+    // nothing. Measured at 2.7-3.8 ns for the remaining array on
+    // `native_funnel_profile`'s scratch rung, against a ~26 ns funnel.
+    let mut inline_forwarded: [Value; INLINE_NATIVE_ARGS];
     let mut heap_forwarded: Vec<Value>;
     let mut moved = None;
     for (index, value) in args.iter().enumerate() {
         if let Value::Object(Some(obj)) = value {
-            let forwarded = shared.mem.heap.load_and_forward(*obj);
+            // The caller already walked these pointers when it validated them;
+            // `load_and_forward` would walk each one again. See
+            // `VmHeap::load_and_forward_validated` for the contract, and
+            // `safe_native_call_prevalidated_objects` for who establishes it.
+            let forwarded = if prevalidated_objects {
+                shared.mem.heap.load_and_forward_validated(*obj)
+            } else {
+                shared.mem.heap.load_and_forward(*obj)
+            };
             if forwarded.as_ptr() != obj.as_ptr() {
                 moved = Some(index);
                 break;
@@ -3847,6 +3962,7 @@ fn safe_native_call_impl(
         // its own forwarding target.
         Some(first_moved) => {
             let forwarded_args: &mut [Value] = if args.len() <= INLINE_NATIVE_ARGS {
+                inline_forwarded = [Value::Object(None); INLINE_NATIVE_ARGS];
                 inline_forwarded[..args.len()].copy_from_slice(args);
                 &mut inline_forwarded[..args.len()]
             } else {
@@ -6254,6 +6370,108 @@ pub struct NativeContextImpl<'a> {
 }
 
 impl NativeContextImpl<'_> {
+    /// Charge a native-side allocation that did NOT come out of the calling
+    /// thread's TLAB to the two allocation counters.
+    ///
+    /// # Why this exists
+    ///
+    /// `getThreadAllocatedBytes` / `getTotalThreadAllocatedBytes` are fed from
+    /// exactly two places (see `cratonvm_gc::tlab`): the TLAB cursor, and
+    /// `note_external_allocation` for everything that bypassed the TLAB. The
+    /// interpreter's own slow paths (`alloc_object_shared`, `gc_alloc_array`)
+    /// have always called the second. The NATIVE allocation funnels did not,
+    /// on any of their non-TLAB arms -- and every collection, string, box and
+    /// reflective object in this VM is built through them.
+    ///
+    /// The hole was invisible while the counter had a larger over-count on top
+    /// of it, and it is not small. MEASURED, `Integer.valueOf(100000 + i)` a
+    /// million times: 24.0 bytes per object retained on the heap, and **0.0**
+    /// reported by BOTH counters on Generational and ZGC, against a correct
+    /// 24.0 on G1 -- not because G1 counted better, but because G1 is the one
+    /// backend with neither a native old-gen batch pool nor a disabled-by-
+    /// default TLAB refill, so its native allocations happened to land on the
+    /// one arm that was already counted. On the Hibernate HQL parse this
+    /// record is about, the difference between the two is 72 MB against 191 MB
+    /// for byte-identical bytecode.
+    ///
+    /// An under-count is the dangerous direction: it is what makes a byte
+    /// budget pass vacuously. `HqlParserMemoryUsageTest` asserts one.
+    ///
+    /// Sized from the ALLOCATED OBJECT's own header, not from the slot count
+    /// the caller asked for. The two differ: `alloc_object` clamps a native
+    /// caller's slot count up to the class's real field count, and the heap
+    /// rounds the result, so charging the request over-reported a boxed
+    /// `Integer` at 32 bytes where its header says 24. Reading the header back
+    /// is one load and cannot drift from what was actually laid down.
+    #[inline]
+    fn note_native_object_alloc(&mut self, obj: ObjectRef) {
+        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
+        let slots = self.shared.mem.heap.get_header(obj).num_slots() as usize;
+        self.thread
+            .tlab
+            .note_external_allocation(HEADER_SIZE + slots.saturating_mul(SLOT_SIZE));
+    }
+
+    /// [`Self::note_native_object_alloc`] for an array. The data area is sized
+    /// by the same `array_data_size` the allocator used, so the charge is the
+    /// footprint and not the element count.
+    #[inline]
+    fn note_native_array_alloc(&mut self, array: ObjectRef) {
+        self.thread
+            .tlab
+            .note_external_allocation(self.native_array_footprint(array));
+    }
+
+    /// Footprint of an allocated array, read back from the heap: header plus
+    /// the `array_data_size` of its own length and element type. Shares the
+    /// sizing rule with the allocator rather than restating it.
+    ///
+    /// Read straight off the header rather than through `array_length` /
+    /// `element_type_of`. Those two are the defensive accessors: they run
+    /// `is_object_address` first, which on ZGC is a registry lookup, and this
+    /// runs on every native array allocation -- every collection resize in the
+    /// process. The defence buys nothing here, because the only callers pass an
+    /// array this method's own allocator returned microseconds earlier.
+    #[inline]
+    fn native_array_footprint(&self, array: ObjectRef) -> usize {
+        use cratonvm_gc::heap::HEADER_SIZE;
+        let header = self.shared.mem.heap.get_header(array);
+        if header.kind() != ObjectKind::Array {
+            // Not an array: charge nothing. Reachable only through the String
+            // helper, whose field 0 is an array on every real layout but is a
+            // duck-typed read -- and inventing a header's worth of allocation
+            // for a String that turned out not to have a backing array would be
+            // a bias in the over-reporting direction, which is the one this
+            // whole record exists to remove.
+            return 0;
+        }
+        let len = header.array_length() as usize;
+        let data = cratonvm_types::array_data_size(len, header.element_type()).unwrap_or(0);
+        HEADER_SIZE.saturating_add(data)
+    }
+
+    /// [`Self::note_native_object_alloc`] for a freshly built `java/lang/String`,
+    /// charging BOTH the String object and its backing array.
+    ///
+    /// Sized by reading the object back rather than from the source text: the
+    /// String's slot count and its backing array's element type (LATIN1 `byte[]`
+    /// against UTF16, or a legacy `char[]`) are layout decisions made inside
+    /// `alloc_java_string_object`, and re-deriving them here would be a second
+    /// copy of that logic to keep in step.
+    ///
+    /// The caller decides WHETHER to call this, because the pooled constructor
+    /// returns an existing object on an intern hit and that allocates nothing.
+    fn note_native_string_alloc(&mut self, s: ObjectRef) {
+        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
+        let slots = self.shared.mem.heap.get_header(s).num_slots() as usize;
+        let mut bytes = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
+        if let Value::Object(Some(backing)) = self.shared.mem.heap.get_field(s, 0) {
+            // `native_array_footprint` screens the kind off the header itself.
+            bytes = bytes.saturating_add(self.native_array_footprint(backing));
+        }
+        self.thread.tlab.note_external_allocation(bytes);
+    }
+
     /// Terminal object allocation for [`NativeContext::alloc_object`], with the
     /// heap-exhaustion unwind applied (see `crate::runtime::native_oom`).
     ///
@@ -8949,7 +9167,7 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         // "what class is this" read lands here, so a victim that reaches
         // neither of the other two is still named. `ClassId::new(0)` on a hit
         // is what a reclaimed header already reads as.
-        if deadrecv_check(&self.shared, obj, "class_id_of_object") {
+        if deadrecv_check(&self.shared, self.thread, obj, "class_id_of_object") {
             return ClassId::new(0);
         }
         self.shared.mem.heap.class_id_of(obj)
@@ -11967,6 +12185,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 }))
             })?;
         crate::runtime::interpreter::init_primitive_fields(self.shared, obj_ref, class_id);
+        self.note_native_object_alloc(obj_ref);
         Ok(Some(Value::Object(Some(obj_ref))))
     }
 
@@ -12008,6 +12227,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                     ))
                 })?;
             crate::runtime::interpreter::init_primitive_fields(self.shared, obj_ref, class_id);
+            self.note_native_object_alloc(obj_ref);
 
             // Keep the new object and constructor object arguments rooted until
             // the Java `<init>` frame owns them in scanned locals.
@@ -12640,7 +12860,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // victims instead of dying at the first. That makes the flag
         // behaviour-changing -- a 0 identity hash is otherwise impossible, see
         // the C28 note below -- which is why it is opt-in and named DBG.
-        if deadrecv_check(&self.shared, obj, "identity_hash_code") {
+        if deadrecv_check(&self.shared, self.thread, obj, "identity_hash_code") {
             return 0;
         }
         // C28: identityHashCode must NEVER return 0. JDK's
@@ -13030,6 +13250,13 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             drop(cm);
             self.shared.mem.heap.set_field(obj, index, value);
             // write_barrier fires automatically inside set_field
+        } else {
+            let class_name = cm
+                .get_class(class_id)
+                .map(|c| c.name.to_string())
+                .unwrap_or_else(|| "<unresolved>".to_string());
+            drop(cm);
+            note_field_by_name_dropped(class_id, &class_name, field_name, obj, value);
         }
     }
 
@@ -13078,6 +13305,9 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 .native_array_gc_requested
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        // Straight to the heap, never through the TLAB -- so the counters only
+        // learn about it here. See `note_native_object_alloc`.
+        self.note_native_array_alloc(array);
         array
     }
 
@@ -13116,6 +13346,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 .native_array_gc_requested
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        self.note_native_array_alloc(array);
         array
     }
 
@@ -13124,10 +13355,15 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // young→old-gen spill path reports `None` on true exhaustion instead of
         // aborting, so native callers (e.g. `ArrayList(int)`) can raise a
         // catchable OutOfMemoryError matching HotSpot.
-        self.shared
-            .mem
-            .heap
-            .try_alloc_array_full(class_id, ArrayElementType::Reference, length)
+        let array = self.shared.mem.heap.try_alloc_array_full(
+            class_id,
+            ArrayElementType::Reference,
+            length,
+        );
+        if let Some(a) = array {
+            self.note_native_array_alloc(a);
+        }
+        array
     }
 
     fn try_new_array(
@@ -13137,10 +13373,15 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     ) -> Option<ObjectRef> {
         // Fallible sibling of `new_array` (primitive arrays) — see
         // `try_new_ref_array`.
-        self.shared
-            .mem
-            .heap
-            .try_alloc_array_full(ClassId::new(0), element_type, length)
+        let array =
+            self.shared
+                .mem
+                .heap
+                .try_alloc_array_full(ClassId::new(0), element_type, length);
+        if let Some(a) = array {
+            self.note_native_array_alloc(a);
+        }
+        array
     }
 
     fn reclaim_before_alloc_retry(&mut self) -> bool {
@@ -13294,7 +13535,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // Generational `--nojit` reclaim: 1 crash in 3 faults in
         // `get_array_element_unboxing` rather than in `identity_hash_code`.
         // Asked before `load_and_forward`, which dereferences.
-        if deadrecv_check(&self.shared, obj, "get_array_element") {
+        if deadrecv_check(&self.shared, self.thread, obj, "get_array_element") {
             return Value::Object(None);
         }
         let obj = self.shared.mem.heap.load_and_forward(obj);
@@ -13872,11 +14113,20 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     }
 
     fn create_string(&mut self, text: &str) -> ObjectRef {
-        super::create_java_string(self.shared, text)
+        // Pooled: an intern HIT returns an existing object and allocates
+        // nothing, and only a miss is charged. The constructor reports which
+        // happened, so the hit path does not pay a second pool lock.
+        let (s, allocated) = super::create_java_string_reporting(self.shared, text);
+        if allocated {
+            self.note_native_string_alloc(s);
+        }
+        s
     }
 
     fn create_string_uninterned(&mut self, text: &str) -> ObjectRef {
-        super::create_java_string_uninterned(self.shared, text)
+        let s = super::create_java_string_uninterned(self.shared, text);
+        self.note_native_string_alloc(s);
+        s
     }
 
     fn create_string_uninterned_gc_safe(&mut self, text: &str) -> ObjectRef {
@@ -13904,7 +14154,10 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             crate::runtime::interpreter::maybe_gc(self.shared, self.thread);
         }
-        super::create_java_string_uninterned_gc_safe_threaded(self.shared, self.thread, text)
+        let s =
+            super::create_java_string_uninterned_gc_safe_threaded(self.shared, self.thread, text);
+        self.note_native_string_alloc(s);
+        s
     }
 
     fn get_ascii_case_string_cached(
@@ -14001,7 +14254,9 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     }
 
     fn create_string_from_units(&mut self, units: &[u16]) -> ObjectRef {
-        super::create_java_string_from_units(self.shared, units)
+        let s = super::create_java_string_from_units(self.shared, units);
+        self.note_native_string_alloc(s);
+        s
     }
 
     fn read_string(&self, obj: ObjectRef) -> Option<String> {
@@ -14154,7 +14409,9 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 let cached = self.shared.classes.anon_class_cache[num_fields]
                     .load(std::sync::atomic::Ordering::Relaxed);
                 if cached != 0 {
-                    return self.heap_alloc_object(ClassId::new(cached), num_fields);
+                    let obj = self.heap_alloc_object(ClassId::new(cached), num_fields);
+                    self.note_native_object_alloc(obj);
+                    return obj;
                 }
             }
             let name = format!("cratonvm/synthetic/AnonymousObject${num_fields}");
@@ -14383,6 +14640,11 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 if self.thread.native_alloc_pool.is_empty() {
                     self.thread.native_alloc_pool_layout = None;
                 }
+                // Charged as each object is HANDED OUT, not when the batch of
+                // 2048 was carved: the batch is a lock-amortisation device, and
+                // charging it up front would report 2048 objects' worth of
+                // allocation to whichever caller happened to trip the refill.
+                self.note_native_object_alloc(obj);
                 return obj;
             }
             self.thread.native_alloc_pool_layout = None;
@@ -14446,10 +14708,18 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 } else {
                     Some((class_id, slots))
                 };
+                // Only the object handed out here; the rest are charged as the
+                // pool arm above pops them.
+                self.note_native_object_alloc(obj);
                 return obj;
             }
         }
-        self.heap_alloc_object(class_id, slots)
+        // The TLAB arm above is NOT charged here -- its bytes are the TLAB
+        // cursor's advance, which both counters already read. Every other arm
+        // of this method bypassed the TLAB and has to say so.
+        let obj = self.heap_alloc_object(class_id, slots);
+        self.note_native_object_alloc(obj);
+        obj
     }
 
     fn object_num_fields(&self, obj: ObjectRef) -> usize {
@@ -14474,9 +14744,19 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // peer's in-flight cursor may not be read while its owner runs, so the
         // under-count is bounded by one TLAB per running thread — and the value
         // stays monotonic, which the occupancy gauge this replaced was not.
+        //
+        // `consumed_bytes()` — the LIVE SPAN — not `thread_allocated_bytes()`,
+        // which is that span PLUS this thread's whole running total. That total
+        // is already inside `process_allocated_bytes()`: every retire and every
+        // `note_external_allocation` credits both. Adding it again made this
+        // counter report exactly 2x of the truth on Generational and G1 (and
+        // 3x under ZGC, whose heap-staging TLAB layer was crediting the global
+        // a second time — see `TlabAccounting`). Hibernate's
+        // `HqlParserMemoryUsageTest` reads this counter and budgets 256 MiB
+        // against it, so the doubling alone turned a passing parse into a FAIL.
         Some(
             cratonvm_gc::tlab::process_allocated_bytes()
-                .saturating_add(self.thread.tlab.thread_allocated_bytes()),
+                .saturating_add(self.thread.tlab.consumed_bytes() as u64),
         )
     }
 
@@ -19360,10 +19640,14 @@ pub(super) fn convert_element_value(
 // Env-gated and `#[cold]`: the enabled path takes a global `Mutex` and formats
 // a `String` per call, so it is a diagnosis tool, not something to leave on.
 #[cold]
-/// `CRATONVM_DBG_DEADRECV`: at `identity_hash_code`, ask the reclamation rings
-/// whether the receiver is an address this process already freed, BEFORE the
-/// first dereference, and report it through `reclaim_guard` instead of
-/// faulting on it.
+/// `CRATONVM_DBG_DEADRECV`: at `identity_hash_code`, ask whether the receiver is
+/// an address this process already freed, BEFORE the first dereference, and
+/// report it through `reclaim_guard` instead of faulting on it.
+///
+/// Two sources, because no single one covers both collectors: the reclamation
+/// RINGS for the non-moving reclamations that feed them, and the published
+/// young GEOMETRY for a moving young cycle, which feeds no ring at all. See
+/// `deadrecv_check` for why the second arm exists and what it costs.
 ///
 /// Opt-in and behaviour-changing: a hit returns 0, which `identity_hash_code`
 /// otherwise never does (C28). That is deliberate, so one run names many
@@ -19376,14 +19660,19 @@ fn dbg_deadrecv() -> bool {
 /// `CRATONVM_DBG_DEADRECV`'s shared body: is `obj` an address this process has
 /// already reclaimed, asked BEFORE anything dereferences it?
 ///
-/// Both lookups are keyed on the ADDRESS and read only the always-on
-/// reclamation rings, so they answer whether or not the page is still mapped —
-/// which is the whole point, because this defect's face is a fault on the read
-/// that every other consumer performs first.
+/// Every lookup is keyed on the ADDRESS and dereferences nothing, so they answer
+/// whether or not the page is still mapped — which is the whole point, because
+/// this defect's face is a fault on the read that every other consumer performs
+/// first.
 ///
 /// `true` means reported; the caller returns a benign value rather than
 /// walking into the fault, so one run names MANY victims.
-pub(crate) fn deadrecv_check(shared: &SharedVm, obj: ObjectRef, site: &'static str) -> bool {
+pub(crate) fn deadrecv_check(
+    shared: &SharedVm,
+    thread: &JvmThread,
+    obj: ObjectRef,
+    site: &'static str,
+) -> bool {
     if !dbg_deadrecv() {
         return false;
     }
@@ -19432,16 +19721,94 @@ pub(crate) fn deadrecv_check(shared: &SharedVm, obj: ObjectRef, site: &'static s
     if cratonvm_gc::gen_heap::old_freed_lookup_covering(addr).is_some()
         || cratonvm_gc::gen_heap::young_freed_lookup(addr).is_some()
     {
-        crate::memory::reclaim_guard::report_reclaimed_receiver_forced(
-            shared,
-            addr,
-            site,
-            "java/lang/Object",
-            0,
+        report_deadrecv(shared, thread, addr, site);
+        return true;
+    }
+    // THE MOVING-YOUNG ARM, and without it this probe is silent on the one
+    // collector it was written for.
+    //
+    // Both rings above are fed by a NON-MOVING reclamation: `old_freed_*` by
+    // the old-gen sweep and mark-compact, `young_freed_*` by
+    // `sweep_young_non_moving`'s `record_young_span_freed`. A MOVING young
+    // cycle writes to neither — it evacuates the semispace and
+    // `uncommit_evacuated_young` hands the span back to the OS — so on
+    // `--XX:UseGc Generational` with moving cycles in the history, the rings
+    // answer nothing about exactly the addresses that fault. That is the
+    // Hazelcast `ServerTests` face: the crash handler names the span
+    // (`site=unbumped-middle`, `and NOT re-committed since`) and this guard,
+    // asked about the same address one instruction earlier, said "live".
+    //
+    // The question is address-keyed and dereferences NOTHING, which is what
+    // lets it answer on a released granule: `is_object_address` screened above
+    // through the commit bitmap and the arena's object-start bitmap, and
+    // `young_geometry_span` is four relaxed loads and two range compares. A
+    // live young reference always names an object start, so "inside the young
+    // geometry and no object starts there" names no live object.
+    //
+    // Cheap enough to stay armed, which is the property the page asked for:
+    // the `CRATONVM_DBG_VACATED_FRAMES` ledger that answers the same question
+    // exactly costs a RECORD path running all process long and dilates this
+    // workload about ninefold, past the window the crash needs.
+    if let Some(span) = cratonvm_gc::gen_heap::young_geometry_span(addr) {
+        tracing::error!(
+            target: "cratonvm::gc::guard",
+            obj = format!("{addr:#x}"),
+            site = site,
+            semispace = span,
+            "receiver names a YOUNG address at which no object starts: a moving young cycle evacuated this span and nothing rewrote the reference. INACTIVE-SEMISPACE is the arena the last flip emptied; ACTIVE-SEMISPACE means the span was re-served, but not to an object base.",
         );
+        report_deadrecv(shared, thread, addr, site);
         return true;
     }
     false
+}
+
+/// The shared report for both [`deadrecv_check`] arms: the reclaim guard's
+/// verdict, then the Java stack that handed the dead receiver in.
+///
+/// The guard answers WHAT the address is and proves no live heap object holds it
+/// — which leaves "a frame local, a register, or a native side table", and says
+/// nothing about WHICH. The Java stack is the cheapest thing that narrows that:
+/// the receiver was on some frame's operand stack one bytecode ago, so the
+/// innermost frames bound where it came from.
+fn report_deadrecv(shared: &SharedVm, thread: &JvmThread, addr: usize, site: &'static str) {
+    crate::memory::reclaim_guard::report_reclaimed_receiver_forced(
+        shared,
+        addr,
+        site,
+        "java/lang/Object",
+        0,
+    );
+    tracing::error!(
+        target: "cratonvm::gc::guard",
+        obj = format!("{addr:#x}"),
+        site = site,
+        java_frames = %deadrecv_java_frames(thread),
+        "…and THIS is the Java stack that handed the dead receiver in. The innermost frame is the call site; the producer is the native, or the reference copy, that put this address on its operand stack.",
+    );
+}
+
+/// Innermost Java frames, for [`report_deadrecv`].
+///
+/// Bounded at eight: this is an error path, and a full Hazelcast stack is
+/// hundreds deep with nothing in the tail the top does not already say.
+fn deadrecv_java_frames(thread: &JvmThread) -> String {
+    thread
+        .frames
+        .iter()
+        .rev()
+        .take(8)
+        .map(|f| {
+            format!(
+                "{}.{}{} pc={}",
+                f.class_name(),
+                f.method_name(),
+                f.method_descriptor(),
+                f.pc
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" <- ")
 }
 
 pub fn dbg_dispatch_tally(site: &str, class_name: &str, method_name: &str, descriptor: &str) {

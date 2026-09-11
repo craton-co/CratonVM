@@ -173,7 +173,7 @@ as a whole when a window is available.
 
 ## Gates
 
-- `SrParity` (58 lines) and `apps/probes/StringBuilderShadowSweep.java`
+- `probes/SrParity.java` (58 lines) and `apps/probes/StringBuilderShadowSweep.java`
   (747 lines) are byte-identical to HotSpot on both arms. `SrParity` was
   written for this change and covers what it touches: multi-group and
   non-participating captures, the failing-`find()` clear path, `find(int)`,

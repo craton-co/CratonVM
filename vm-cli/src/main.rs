@@ -367,6 +367,31 @@ fn maybe_dump_shutdown_reports() {
             eprintln!("[cratonvm] generational young uncommit: {bytes} bytes returned to the OS");
         }
     }
+    // FIELD-BY-NAME STORES THAT WENT NOWHERE. `NativeContext::set_field_by_name`
+    // resolves the field against the class of whatever object is AT the address
+    // it is handed, and DROPS the store when it does not resolve. That is a
+    // legitimate outcome for a native setting a field only some subclasses
+    // declare — and it is also what a stale receiver looks like, because a
+    // vacated young address is usually re-served to an unrelated object before
+    // the store runs. The drop happens before the heap is touched, so no
+    // `[deadref-*]` arm, no `[CELLWATCH]` and no `[PUTFIELD-WATCH]` can see it;
+    // this counter is the only place it is visible at all.
+    //
+    // A non-zero number is not a defect by itself. It is the denominator for
+    // `CRATONVM_DBG_DEADREF_STORE=1`, which turns each one into a
+    // `[field-by-name-dropped]` line with the receiver's class and a backtrace.
+    {
+        let dropped = cratonvm_vm::vm::field_by_name_dropped_count();
+        if dropped != 0 {
+            eprintln!(
+                "[cratonvm] set_field_by_name stores dropped: {dropped} — the receiver's class did \
+                 not declare the named field. Expected for natives that set a field only some \
+                 subclasses have; ALSO the shape a stale receiver takes, because the drop happens \
+                 before the heap is touched and no stale-reference probe can see it. \
+                 CRATONVM_DBG_DEADREF_STORE=1 names each one."
+            );
+        }
+    }
     // STATIC ROOT SLOTS -- the engagement number for the slot-carrying
     // root path (`CRATONVM_GC_STATIC_ROOT_SLOTS`). Both halves, for the
     // usual reason: `slots=0` alone cannot distinguish the kill switch
@@ -479,7 +504,7 @@ accepted={accepted} total={ms}ms",
     }
 
     // The per-SITE half of the same question, and the reason it once took a
-    // sampled-backtrace build to answer: `MEMBERSHIP_WALK_BY_SITE` has counted
+    // sampled-backtrace build to answer: the per-thread walk tallies have counted
     // every JIT-helper membership walk since it was added, and
     // `membership_walks_by_site()` -- its only reader -- had NO CALLER at all.
     // A write-only counter is a diagnosis nobody can read; the census's own doc
