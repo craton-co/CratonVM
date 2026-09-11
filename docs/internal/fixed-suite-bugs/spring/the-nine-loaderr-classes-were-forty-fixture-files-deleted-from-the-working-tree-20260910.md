@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | **RESOLVED 2026-09-10.** Fixture restored on the Azure host; 9/9 `OK` under CratonVM and under stock HotSpot 25, byte-identical counts. |
-| **Supersedes** | `docs/known-issues/spring/not-a-bug-nine-loaderr-classes-are-a-removed-aoptarget-package-20260909.md`, whose disposition ("not a CratonVM bug") was right and whose **mechanism was wrong**. |
+| **Supersedes** | `./not-a-bug-nine-loaderr-classes-are-a-removed-aoptarget-package-20260909-SUPERSEDED.md`, whose disposition ("not a CratonVM bug") was right and whose **mechanism was wrong**. |
 | **Scope** | `apps/spring-framework` on Azure `20.80.105.49` — the shared suite fixture, not the CratonVM tree. |
 
 ## What the 2026-09-09 page said, and what was actually true
