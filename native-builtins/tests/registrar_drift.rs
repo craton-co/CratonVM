@@ -181,19 +181,24 @@ const SYNTHETIC_FEATURE: &str = "synthetic-jdk";
 // of them. That is why the RATCHET below is a set and not an equality on
 // counts.
 
-/// `.rs` files parsed across all seven crate `src` trees (measured 361; 361).
+/// `.rs` files parsed across all seven crate `src` trees (measured 377;
+/// was 361).
 const MIN_FILES: usize = 250;
-/// `fn` definitions parsed (measured 34,062; was 33,710).
+/// `fn` definitions parsed (measured 36,722; was 34,062).
 const MIN_FN_DEFS: usize = 20_000;
-/// Definitions whose signature mentions `NativeMethodRegistry` (measured 845).
+/// Definitions whose signature mentions `NativeMethodRegistry` (measured 864;
+/// was 845).
 const MIN_PASSES: usize = 600;
-/// `.register(` call sites found, of any arity (measured 14,088; was 14,063).
+/// `.register(` and `.register_with_kind(` call sites found, of any arity
+/// (measured 14,887; 14,142 on the same tree before the matcher learned
+/// `register_with_kind`, and 14,088 at the 2026-08-17 take).
 const MIN_REGISTER_SITES: usize = 9_000;
-/// Sites whose first three arguments all resolved (measured 12,623).
+/// Sites whose first three arguments all resolved (measured 13,662; was 12,623).
 const MIN_RESOLVED_SITES: usize = 8_000;
-/// Distinct `(class, name, descriptor)` triples recovered (measured 11,458).
+/// Distinct `(class, name, descriptor)` triples recovered (measured 13,260;
+/// was 11,458).
 const MIN_TRIPLES: usize = 7_000;
-/// Passes reachable from the shipping side (measured 509; was 521).
+/// Passes reachable from the shipping side (measured 521; was 509).
 const MIN_SHIPPING: usize = 350;
 /// Synthetic-only passes (measured 280; `registrar_reachability.rs` says 284
 /// for `native-builtins` alone -- this scan sees the other crates' shipping
@@ -210,7 +215,7 @@ const MIN_SYNTHETIC_OVERRIDES_BODY: usize = 60_000;
 /// resolving descriptors reports a small, clean, entirely fictional number, and
 /// every other assertion here passes.
 const MIN_TOTAL_DRIFT: usize = 900;
-/// Sites inside an expanded `for` loop (measured 696). Without loop expansion
+/// Sites inside an expanded `for` loop (measured 1,294; was 696). Without loop expansion
 /// whole classes vanish from the census with no other symptom.
 const MIN_LOOP_EXPANDED_SITES: usize = 400;
 
@@ -222,6 +227,14 @@ const MIN_LOOP_EXPANDED_SITES: usize = 400;
 ///
 /// Measured 2026-08-17: 950 = 892 `unbound-identifier` + 18 `format!` +
 /// 15 `no-enclosing-fn` + 14 `no-registry-owner` + 11 `expression`.
+///
+/// Re-measured 2026-09-11: 698 = 589 `unbound-identifier` + 60 `format!` +
+/// 16 `no-enclosing-fn` + 15 `no-registry-owner` + 18 `expression`. It went
+/// DOWN while the census grew, which is the shape to expect from teaching the
+/// matcher `register_with_kind`: 745 sites that used to be skipped before they
+/// could be classified now enter the scan, and 699 of them resolve. The 45
+/// that do not are inside the blind region and counted there -- which is the
+/// point of bounding it rather than asserting it is empty.
 ///
 /// The 2026-08-16 record's admission was that new drift arriving through one of
 /// these forms is invisible to the gate. It still is -- this constant does not
@@ -266,6 +279,55 @@ const MAX_BLIND_SITES: usize = 1_000;
 /// both names; this change did not create it, does not answer it, and would
 /// have left it asymmetric (watched on one carrier, unwatched on the other) if
 /// this row were not added.
+/// **Re-taken 2026-09-11, +51 triples / +54 pairs, and NOT because anything
+/// drifted.** The scanner was blind to `register_with_kind(`: its site matcher
+/// required a `(` immediately after `register`, and the skip comment named
+/// `register_with_kind(` alongside `registered_by` as though it were noise. It
+/// is not noise -- it sets the ambient kind, calls `register` with the SAME
+/// first three arguments, and restores it -- so 745 real registration sites in
+/// the five scanned crates were invisible to this gate.
+///
+/// How it surfaced: `0b2791ac7` (2026-09-10) switched ONE site,
+/// `java/lang/Class.getModule()Ljava/lang/Module;` in `lib.rs`, from `register`
+/// to `register_with_kind` to tag it `SyntheticStub`. That did not remove the
+/// twin -- `phases_late.rs`'s own TWIN table still describes the pair, two
+/// canonical-Module caches for one identity invariant -- but it removed the
+/// shipping side from this scan, and `the_drift_baseline_has_no_stale_rows`
+/// then reported the row as FIXED. A resolver blind spot reads exactly like a
+/// fix, which is why that test's failure text says to read
+/// `the_drift_scanner_is_not_vacuous` first. Following that instruction is what
+/// found this.
+///
+/// Census on one tree, scanner before vs after:
+///
+/// ```text
+///                         before    after
+///   register sites        14,142   14,887    +745
+///   resolved sites        12,963   13,662    +699
+///   distinct triples      12,629   13,260    +631
+///   DRIFTING triples       1,223    1,275     +52
+///   blind (excl arity<4)     653      698     +45   ceiling 1,000
+/// ```
+///
+/// Every one of the 54 new pairs has the SAME shipping twin,
+/// `register_essential_natives_with_shims` -- the real-JDK essential path,
+/// which is where the kind-tagging campaign has been converting call sites.
+/// Nothing was removed from the table. By synthetic-only pass:
+/// `register_synthetic_overrides` 27 (`Object.clone`/`hashCode`/`notify`,
+/// `System.arraycopy`/`nanoTime`, `Class.getSuperclass`/`isInstance`,
+/// `Thread.start0`, `String.intern`, the `Double`/`Float` bit casts),
+/// `register_core_stdlib_extras` 16 (the `jdk/internal/misc` surface --
+/// `CDS`, `Unsafe`, `VM`, `ScopedMemoryAccess` -- plus the `List`/`Map`/`Set`
+/// `copyOf` trio), `register_classloader_define_class` 3, `register_p69_misc` 3
+/// (the same `copyOf` trio from a second synthetic pass),
+/// `register_object_stream_class` 2, and one each from
+/// `register_enterprise_final_natives` (`Class.isHidden`),
+/// `register_java_lang_extras_natives` (`Thread.holdsLock`) and
+/// `register_unsafe_define_class`.
+///
+/// **These 51 rows are debt this gate could not see, not debt this change
+/// created.** They are recorded rather than fixed, which is what every other
+/// row in this table is: "Every row is a debt, not a permission."
 const BASELINE_TOTAL_DRIFT: usize = 1275;
 
 /// `(synthetic-only pass, triple)` PAIRS in [`DRIFT_TRIPLES`] -- larger than
@@ -827,27 +889,6 @@ const FIXED_NOT_DRIFTING: &[(&str, &str, &str)] = &[
 ///
 /// A pass absent from this table has an allowance of ZERO triples -- so a pass
 /// that starts drifting fails even though nothing else about it changed.
-/// **RE-TAKEN 2026-09-10, and the +54 pairs are NOT new drift.** They are drift
-/// this file's second sweep could not see: it required the byte after
-/// `register` to be `(`, so every `register_with_kind(` SHIPPING registration
-/// was invisible to it while the call-site sweep above (which matches
-/// `name.starts_with("register")`) counted them. 745 call sites across the six
-/// scanned crates are spelled that way.
-///
-/// The disagreement had already turned this gate red on `dev` and nobody could
-/// act on it, because it reported the loss as GOOD NEWS:
-/// `the_drift_baseline_has_no_stale_rows` said the
-/// `(register_p59_module, java/lang/Class.getModule)` pair "no longer drifts"
-/// from the moment `getModule` was tagged `Intrinsic` (`0b2791ac7`,
-/// 2026-09-09) — the tag is what made the shipping side unreadable. Tagging
-/// `java/lang/Class.getName` on 2026-09-10 reproduced it exactly, which is how
-/// the parser bug was found rather than the second row baselined away.
-///
-/// With the sweep fixed, both stale rows come back and 54 further pairs appear,
-/// all of the same shape — a synthetic-only pass plus
-/// `register_essential_natives_with_shims` — and all of them real. Nothing was
-/// deleted from this baseline; it grew by what the scanner had been unable to
-/// read.
 const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
     (
         "register_aot_natives",
@@ -4131,36 +4172,32 @@ fn build_analysis() -> Analysis {
                 i += 1;
                 continue;
             }
-            // `register(` and `register_with_kind(` are BOTH registrations,
-            // and this file's two sweeps used to disagree about that: the
-            // call-site sweep above matches `name.starts_with("register")`,
-            // which includes `register_with_kind`, while this one required the
-            // very next byte to be `(` and skipped it — its own comment said so.
+            let after = p + 8;
+            // `register_with_kind(class, name, desc, cb, kind)` sets the
+            // ambient kind, calls `register` with the SAME first three
+            // arguments and restores it (`native-api/src/registry.rs`). It is a
+            // registration, and this scan has to see it. It did not: the skip
+            // below used to name it in the same breath as `registered_by`, and
+            // 747 sites in the five scanned crates were invisible to this gate.
             //
-            // The disagreement is not cosmetic, because `register_with_kind` is
-            // exactly how a triple gets TAGGED. Tagging one makes its SHIPPING
-            // registration invisible to this sweep, so a pair that still drifts
-            // reads as "no longer drifts" and `the_drift_baseline_has_no_stale_rows`
-            // reports it as GOOD NEWS — the failure mode that file's own header
-            // warns about, arriving through the parser instead of a refactor.
-            //
-            // MEASURED, two independent instances of the same shape:
-            //   `java/lang/Class.getModule` — tagged `Intrinsic` on 2026-09-09
-            //     (`0b2791ac7`). This gate has been RED on `dev` ever since, and
-            //     the stale row it names is that pair.
-            //   `java/lang/Class.getName` — tagged on 2026-09-10 by the
-            //     loader-and-bootstrap lane, and it reproduced the red exactly.
-            //
-            // `register_with_kind` has FIVE arguments and the first three are
-            // the same class/name/descriptor, so the `arity<4` filter and the
-            // three-argument resolution below need no change.
-            let mut after = p + 8;
-            if after <= n && t[after..].starts_with(b"_with_kind") {
-                after += 10;
-            }
+            // What that cost, measured 2026-09-10: `0b2791ac7` switched ONE
+            // site -- `java/lang/Class.getModule()Ljava/lang/Module;` in
+            // `lib.rs` -- from `register` to `register_with_kind`, and
+            // `the_drift_baseline_has_no_stale_rows` then reported that
+            // baseline row as no longer drifting. Both twins were still in the
+            // tree; `phases_late.rs`'s own TWIN table still describes the pair
+            // ("essential (lib.rs) caches ONE canonical Module per module name
+            // … p59 has its own"). A resolver blind spot reads exactly like a
+            // fix, which is the failure mode this file's vacuity control exists
+            // for and which a per-site skip like this one walks straight past.
+            let after = if t[after..].starts_with(b"_with_kind") {
+                after + 10
+            } else {
+                after
+            };
             let q = skip_ws(t, after);
             if q >= n || t[q] != b'(' {
-                // `registered_by`, `register_leaf_…`, …
+                // `registered_by`, `register_natives`, …
                 i += 1;
                 continue;
             }

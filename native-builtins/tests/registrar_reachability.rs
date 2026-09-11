@@ -386,18 +386,20 @@ const DRIFT_GATE: &str = "tests/registrar_drift.rs";
 /// and that constant's doc says what it is and why all three registration sets
 /// carry it. This table is derived from `DRIFT_TRIPLES`, so the move is the
 /// ratchet working, not a second decision.
-/// **RE-TAKEN 2026-09-10, in the same commit as `registrar_drift.rs`'s own
-/// re-take, and that is the whole reason it moved.** Six families gained
-/// exposure — `register_classloader_natives` 82 -> 85,
-/// `register_enterprise_final_natives` 118 -> 135,
-/// `register_java_lang_extras_natives` 27 -> 28, `register_phase69_natives`
-/// 8 -> 11, `register_serialization_natives` 2 -> 4,
-/// `register_unsafe_define_class` 1 -> 2 — because the drift scanner's
-/// enclosing-fn sweep learned to read `register_with_kind(`, which it had been
-/// skipping. Every added triple is a shipping registration that was always
-/// there and could not be seen. This table's own panic text names the rule:
-/// pasting is the whole fix when the sibling gate was re-taken in the same
-/// commit, and only then.
+/// **Re-taken 2026-09-11, +27 across six families, and no family's drift
+/// changed.** `registrar_drift.rs` was re-taken in the same commit after its
+/// site matcher learned `register_with_kind(` — 745 registration sites it had
+/// been skipping, whose shipping side is almost entirely
+/// `register_essential_natives_with_shims`. This table counts triples that
+/// `DRIFT_TRIPLES` shares with a shipping pass, so it moves with that re-take
+/// by construction. Pasting was the whole fix, which is what the failure text
+/// says to check first.
+///
+/// The six: `register_enterprise_final_natives` 118 -> 135,
+/// `register_classloader_natives` 82 -> 85, `register_phase69_natives` 8 -> 11,
+/// `register_serialization_natives` 2 -> 4,
+/// `register_java_lang_extras_natives` 27 -> 28,
+/// `register_unsafe_define_class` 1 -> 2. Every other family is unchanged.
 const FAMILY_DRIFT_EXPOSURE: &[(&str, usize)] = &[
     ("register_aot_natives", 1),
     ("register_atomic_boolean_natives", 8),
