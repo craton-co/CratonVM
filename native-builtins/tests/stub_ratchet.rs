@@ -2943,8 +2943,8 @@ fn synthetic_stub_count_does_not_regress() {
          DISTINCT triples while this count is REGISTRATIONS: a triple registered \
          twice, with one registration already a stub and the other re-tagged, \
          moves this number by 1 and that dump by 0. Measured 2026-09-11 — a \
-         +30 delta with a byte-identical dump, which read as "the retirement \
-         did nothing" and nearly cost a lane its table. See W7-30 §12.\n\
+         +30 delta with a byte-identical dump, which read as `the retirement \
+         did nothing` and nearly cost a lane its table. See W7-30 §12.\n\
          \n\
          This run already printed the per-file breakdown; the top eight are: \
          {breakdown}\n\
