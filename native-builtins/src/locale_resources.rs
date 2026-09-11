@@ -2726,6 +2726,58 @@ fn locale_calendar_name(
         .map(|(name, _)| name.to_string())
 }
 
+
+/// `java.text.Normalizer`'s two null contracts, measured rather than guessed.
+///
+/// Both public entry points take `(CharSequence src, Normalizer.Form form)`
+/// and neither declares a check; the NPEs come out of the first dereference
+/// each one performs, so the ORDER is observable and `src` wins:
+///
+/// ```text
+///   HotSpot 25.0.4+7, java.text.Normalizer
+///     normalize(null, NFC)    NPE: Cannot invoke "java.lang.CharSequence.toString()" because "src" is null
+///     normalize("a", null)    NPE: Cannot invoke "java.text.Normalizer$Form.ordinal()" because "form" is null
+///     normalize(null, null)   NPE: ... "src" is null          <- src first
+///     isNormalized(null, NFC) NPE: ... "src" is null
+///     isNormalized("a", null) NPE: ... "form" is null
+/// ```
+///
+/// Measured 2026-09-10 with `apps/probes/L1TailSweep.java`; this VM answered
+/// `null`, `"a"`, `null`, `true`, `true` for those five. `java/text/` is a
+/// HELD family for L1 — arming it moves `L1TailSweep` eleven rows AWAY from
+/// HotSpot — so the remedy §1.4 would prefer (yield to the bytecode) is not
+/// available here and the native has to carry the contract itself.
+///
+/// Registered TWICE (`locale_resources.rs` for the real-JDK boot,
+/// `phases_late/text_intl.rs` for synthetic mode), so both call this: a
+/// duplicate pair that sits half-fixed is the shape `owns_slot` exists to
+/// catch, and only one of the two wins any given boot.
+pub(crate) fn normalizer_reject_nulls(
+    src: Option<&Value>,
+    form: Option<&Value>,
+) -> Result<(), MethodCallFailed> {
+    let null = |v: Option<&Value>| !matches!(v, Some(Value::Object(Some(_))));
+    if null(src) {
+        return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot invoke \"java.lang.CharSequence.toString()\" because \"src\" is null"
+                    .to_string(),
+            ),
+        }
+        .into());
+    }
+    if null(form) {
+        return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot invoke \"java.text.Normalizer$Form.ordinal()\" because \"form\" is null"
+                    .to_string(),
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 pub fn register(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -3802,6 +3854,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/CharSequence;Ljava/text/Normalizer$Form;)Ljava/lang/String;",
         |ctx, args| {
             use unicode_normalization::UnicodeNormalization;
+            normalizer_reject_nulls(args.first(), args.get(1))?;
             let input = match args.first() {
                 Some(Value::Object(Some(s))) => normalizer_read_char_sequence(ctx, *s),
                 _ => return Ok(Some(Value::Object(None))),
@@ -3846,6 +3899,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             use unicode_normalization::{
                 is_nfc_quick, is_nfd_quick, is_nfkc_quick, is_nfkd_quick, IsNormalized,
             };
+            normalizer_reject_nulls(args.first(), args.get(1))?;
             let input = match args.first() {
                 Some(Value::Object(Some(s))) => normalizer_read_char_sequence(ctx, *s),
                 _ => return Ok(Some(Value::Int(1))),
