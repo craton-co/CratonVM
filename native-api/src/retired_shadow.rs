@@ -3505,11 +3505,11 @@ mod tests {
         }
     }
 
-    /// The thirteen rows wave 4 exists to repair, by the triple that repairs
+    /// The twelve rows wave 4 repairs, by the triple that repairs
     /// each. A later edit that drops one of these fails here rather than in a
     /// probe nobody runs.
     #[test]
-    fn the_thirteen_jar_text_defect_rows_are_retired() {
+    fn the_twelve_jar_text_defect_rows_this_wave_repairs_are_retired() {
         for (c, m, d) in [
             (
                 "java/util/jar/Attributes",
@@ -3537,11 +3537,14 @@ mod tests {
                 "(Ljava/util/jar/Manifest;)V",
             ),
             ("java/util/jar/JarEntry", "<init>", "(Ljava/lang/String;)V"),
-            (
-                "java/util/jar/JarEntry",
-                "getAttributes",
-                "()Ljava/util/jar/Attributes;",
-            ),
+            // `JarEntry.getAttributes` is deliberately NOT here.
+            // `L1JarTextSweep`'s `E.attributesFromJar` row is a real control
+            // defect — a jar's per-entry manifest section reads `null` where
+            // HotSpot reads `section-value` — but the class declares no
+            // native for it, so nothing in THIS table can repair it. It
+            // belongs to whatever fills a `JarEntry` in on the way out of
+            // `java/util/jar/JarFile`, which stays `Bridge`. Twelve of the
+            // thirteen are this wave's; the thirteenth is §10 item 5's.
         ] {
             assert!(
                 triple_is_retired_shadow(c, m, d),
@@ -4824,16 +4827,39 @@ Ljava/nio/channels/FileChannel;"
                 "getJarEntry",
                 "(Ljava/lang/String;)Ljava/util/jar/JarEntry;",
             ),
-            ("java/util/jar/Manifest", "getMainAttributes", "()Ljava/util/jar/Attributes;"),
+            // 2026-09-11, L1 wave 4: `java/util/jar/Manifest` came OFF this
+            // list and `java/util/jar/JarFile` took its place. The vacuous
+            // green was real and so was the red that replaced it — but the
+            // red is ONE CLASS. Armed alone on `L1TailSweep` (base 13
+            // diffs): `JarFile` +34, `JarEntry` +0 (reached 16), `Manifest`
+            // +0 (reached 23), `Attributes` +0 (reached 156),
+            // `Attributes$Name` +0 (reached 127).
+            (
+                "java/util/jar/JarFile",
+                "getManifest",
+                "()Ljava/util/jar/Manifest;",
+            ),
             (
                 "java/text/BreakIterator",
                 "getWordInstance",
                 "(Ljava/util/Locale;)Ljava/text/BreakIterator;",
             ),
+            // 2026-09-11, L1 wave 4: `java/text/Normalizer` came OFF this
+            // list and `java/text/BreakIterator` took its place, on the same
+            // bisection. `java/text/` armed whole is +16 on `L1TailSweep`
+            // and `BreakIterator` armed alone is the same +16;
+            // `ParseException` and `Normalizer` are +0 with the dial
+            // engaged (reached 1 and 10), and `DateFormat` is +0 with
+            // `reached == 0`, which is §7's trap and stays out.
+            //
+            // Retiring `Normalizer` is what §9 said it could not do: with
+            // `java/text/` held, the null-argument contract had to live in
+            // `normalizer_reject_nulls` inside the native. It can now be the
+            // image's own body again, in `--jdk-only`.
             (
-                "java/text/Normalizer",
-                "normalize",
-                "(Ljava/lang/CharSequence;Ljava/text/Normalizer$Form;)Ljava/lang/String;",
+                "java/text/BreakIterator",
+                "next",
+                "()I",
             ),
             // NOT a vacuous green — this one was clean over 51 probes with
             // the dial armed and turned red only on the trial binary, because
@@ -4988,13 +5014,18 @@ Ljava/nio/channels/FileChannel;"
                 "put",
                 "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
             ),
-            // 9 probes worse, two truncate — even though `table` IS a real
-            // `HashMap$Node[]` in the receiver's own field. Whatever is
-            // missing here is not the bucket array.
+            // 2026-09-11, L1 wave 3: `java/util/HashMap.put` came OFF this
+            // list. "9 probes worse, two truncate" was true of the DIAL and
+            // false of the change: a trial binary that retires the map
+            // surface is 0 diffs on all 142 rows of
+            // `apps/probes/L1MapFamilySweep.java`. What the dial could not
+            // see, and what still holds 77 of the family's 98, is on the
+            // row below — see `RETIRED_SHADOW_L1_HM_TRIPLES` and
+            // `wave_three_refused_the_iterators_the_views_and_lhm_s_inherited_eight`.
             (
-                "java/util/HashMap",
-                "put",
-                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                "java/util/HashMap$KeySet",
+                "iterator",
+                "()Ljava/util/Iterator;",
             ),
             // 4 probes worse.
             (
