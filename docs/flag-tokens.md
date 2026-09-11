@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-546 tokens.
+547 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -424,6 +424,7 @@ export inherited from a parent shell.
 | `null-native` | `CRATONVM_DBG_NULL_NATIVE` |
 | `nullthis` | `CRATONVM_DBG_NULLTHIS` |
 | `obj-equals` | `CRATONVM_DBG_OBJ_EQUALS` |
+| `obj-watch` | `CRATONVM_DBG_OBJ_WATCH` |
 | `objects` | `CRATONVM_DBG_OBJECTS` |
 | `objkey` | `CRATONVM_DBG_OBJKEY` |
 | `obsreg` | `CRATONVM_DBG_OBSREG` |

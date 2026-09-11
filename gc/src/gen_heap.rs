@@ -3089,6 +3089,119 @@ fn reset_forward_refusals() {
     LAST_CYCLE_REFUSALS.lock().clear();
 }
 
+/// `CRATONVM_DBG_OBJ_WATCH=<class-name-substring>` — the evacuation history of
+/// one class's instances.
+///
+/// # Why an address watch is not enough
+///
+/// `CRATONVM_DBG_WATCH_CELL` watches ONE address. A young object does not stay
+/// at one address: under GC stress it is copied every cycle, and a semispace is
+/// re-served from the same base each time, so an address names a different
+/// object on every pass. That makes the cell watch excellent at answering "who
+/// wrote HERE" and useless at answering "what happened to THIS OBJECT" — which
+/// is the question a field that reads null in old gen actually raises, because
+/// the value was lost somewhere along a chain of copies whose addresses nobody
+/// recorded.
+///
+/// This watch is keyed by CLASS instead, so it follows the object: one line per
+/// evacuation, with the body words as they stand AT THE SOURCE. Chaining the
+/// lines by `dst` → next line's `src` reconstructs the object's whole path, and
+/// the first line whose word is zero dates the loss to a single cycle.
+fn obj_watch_pattern() -> Option<&'static String> {
+    static P: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_OBJ_WATCH")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
+    .as_ref()
+}
+
+/// Sequence number for [`obj_watch_pattern`]'s lines — the copies of one object
+/// have to be ordered, and the collector has no cycle counter reachable from
+/// the static evacuator.
+static OBJ_WATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// How many `[deadref-recv]` reports `GenerationalHeap::note_deadref_recv` has
+/// produced. See [`deadref_recv_hits`].
+static DEADREF_RECV_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Stores whose RECEIVER named no live object, over the life of the process.
+///
+/// Only counts while `CRATONVM_DBG_DEADREF_STORE` is set — the screen is behind
+/// that gate — so a zero means "armed and clean" only when the flag was on.
+pub fn deadref_recv_hits() -> u64 {
+    DEADREF_RECV_HITS.load(Ordering::Relaxed)
+}
+
+/// One `[OBJWATCH]` line for a copy of a watched class's instance. No-op (one
+/// cached load) unless `CRATONVM_DBG_OBJ_WATCH` is set.
+fn note_obj_watch_copy(
+    header: &ObjectHeader,
+    old_ptr: *mut u8,
+    new_ptr: *mut u8,
+    total_size: usize,
+    promoted: bool,
+) {
+    let Some(pattern) = obj_watch_pattern() else {
+        return;
+    };
+    let cid = header.class_id.as_u32();
+    let Some((name, _)) = crate::gc::resolve_class_info(cid) else {
+        return;
+    };
+    if !name.contains(pattern.as_str()) {
+        return;
+    }
+    let seq = OBJ_WATCH_SEQ.fetch_add(1, Ordering::Relaxed);
+    let body = total_size.saturating_sub(HEADER_SIZE);
+    let mut words = String::new();
+    for i in 0..(body / 8).min(16) {
+        // SAFETY: `old_ptr` is the live source object, whose extent is
+        // `total_size`; `HEADER_SIZE + i * 8 + 8 <= total_size` by the bound.
+        let w = unsafe {
+            std::ptr::read_unaligned((old_ptr as usize + HEADER_SIZE + i * 8) as *const u64)
+        };
+        words.push_str(&format!(" [{i}]=0x{w:x}"));
+    }
+    eprintln!(
+        "[OBJWATCH] seq={seq} class={name} cid={cid} src=0x{:x} dst=0x{:x} size={total_size} \
+         promoted={promoted} gc_age={} flags=0x{:x} srcbody:{words}",
+        old_ptr as usize,
+        new_ptr as usize,
+        header.gc_age(),
+        header.gc_flags(),
+    );
+}
+
+/// The store half of [`obj_watch_pattern`]: every `set_field` whose RECEIVER is
+/// an instance of the watched class, with the Rust caller.
+///
+/// The copy half answers "when did this field change"; this one answers "who
+/// changed it", and the two questions have different suspects. A field that
+/// reads null is not necessarily a field nobody wrote — it is just as often a
+/// field somebody wrote NULL to, through a receiver they should not still have
+/// been holding, and the interpreter's `[PUTFIELD-WATCH]` cannot see that
+/// because the writer is not bytecode.
+fn note_obj_watch_store(header: &ObjectHeader, obj_ref: ObjectRef, index: usize, value: Value) {
+    let Some(pattern) = obj_watch_pattern() else {
+        return;
+    };
+    let cid = header.class_id.as_u32();
+    let Some((name, _)) = crate::gc::resolve_class_info(cid) else {
+        return;
+    };
+    if !name.contains(pattern.as_str()) {
+        return;
+    }
+    eprintln!(
+        "[OBJWATCH] store obj=0x{:x} class={name} cid={cid} index={index} value={value:?}\n{}",
+        obj_ref.as_ptr() as usize,
+        std::backtrace::Backtrace::force_capture(),
+    );
+}
+
 /// Record one refusal. Cheap and unconditional: `forward_object_impl` reaches
 /// it only on a path that already declined to copy.
 fn record_forward_refusal(addr: usize, reason: &'static str) {
@@ -5595,6 +5708,18 @@ impl GenerationalHeap {
             }
         }
         if gc_flags().dbg_deadref_store {
+            // The RECEIVER, before the value. `note_deadref_store` asks whether
+            // the value being stored names a live object; it never asked the
+            // same question about the object being stored INTO, and those are
+            // two different defects with the same cause. A native that holds a
+            // receiver across an allocation writes a perfectly live value into
+            // a dead address: `[deadref-store]` sees nothing wrong, the write
+            // lands in the pre-move copy, and the surviving object keeps the
+            // field's JVM default. That is silent in every arm of the
+            // `CRATONVM_DBG_DEADREF_STORE` family — which is how
+            // `native_assertj_lightweight_comparable_assert`'s `objects` store
+            // survived the sweep that fixed ten of its siblings.
+            self.note_deadref_recv("set_field", obj_ref.as_ptr() as usize, index, value);
             if let Value::Object(Some(p)) = value {
                 self.note_deadref_store(
                     "set_field",
@@ -5814,6 +5939,7 @@ impl GenerationalHeap {
                 std::thread::current().name().unwrap_or("?"),
             );
         }
+        note_obj_watch_store(header, obj_ref, index, value);
         // Compact layout: store the descriptor-derived tagless payload. The
         // write barrier fires for reference arms exactly as on the legacy path.
         if let Some((off, storage)) = compact_field_slot(header, index) {
@@ -5846,6 +5972,18 @@ impl GenerationalHeap {
                 // reference by construction — `box_for_reference_slot` returns
                 // either the caller's `Value::Object(_)` or a fresh wrapper.
                 let base = unsafe { obj_ref.as_ptr().add(HEADER_SIZE + off) };
+                // The compact reference store was the one heap write primitive
+                // `CRATONVM_DBG_WATCH_CELL` could not see. Every other writer
+                // — `write_slot`, the two evacuation copies, the three
+                // `forward_ref_slots` arms — reports; this one did not, so a
+                // watch aimed at a compact object's reference field answered
+                // "nobody wrote it" for a cell that had in fact been written.
+                crate::heap::cell_watch_check(
+                    base as usize,
+                    ref_field_size(),
+                    "set_field-compact-ref",
+                    &value,
+                );
                 unsafe { write_prim_element(base, 0, ArrayElementType::Reference, value) };
                 self.write_barrier(obj_ref, value);
             } else {
@@ -6302,6 +6440,56 @@ impl GenerationalHeap {
     /// the `gc_flags()` gate is a startup-static bool and the common case is
     /// one predicted-not-taken branch.
     #[cold]
+    /// `[deadref-recv]` — a field STORE whose RECEIVER names no live object.
+    ///
+    /// The twin of [`Self::note_deadref_store`], on the other operand. That one
+    /// asks "is the value I am storing dead"; this one asks "is the object I am
+    /// storing into dead", and the answers are independent: a native that
+    /// captured a receiver before an allocation and stored through it
+    /// afterwards writes a LIVE value into a DEAD address, so every arm of the
+    /// value-side family reads zero while the field it meant to set stays at
+    /// its JVM default.
+    ///
+    /// That shape is not hypothetical and it is not rare: the ten `ObjectRef`s
+    /// the BindableTests family fixed on 2026-09-09 were all value-side, and
+    /// the residual that survived them
+    /// (`native_assertj_lightweight_comparable_assert`'s `objects` store) was
+    /// receiver-side and therefore invisible to all of them. This arm is what
+    /// makes the screen total.
+    ///
+    /// Same predicate, same rate limit, same backtrace as the value arm.
+    fn note_deadref_recv(&self, site: &str, holder: usize, slot: usize, value: Value) {
+        if holder == 0 {
+            return;
+        }
+        let (lo, hi) = self.young_inactive_semispace_range();
+        let Some(reason) = self.dead_young_ref_reason(holder) else {
+            return;
+        };
+        // Counted before the rate limit, so the number is the population and
+        // not the printout. The value arm has no counter and reads as "some or
+        // none"; this one has to be readable as a total, because its headline
+        // claim — that a receiver-side store is now screened — is exactly the
+        // kind of claim a silent instrument can appear to support while being
+        // unwired. `deadref_recv_hits` is what
+        // `a_store_through_a_vacated_receiver_is_reported` asserts on.
+        DEADREF_RECV_HITS.fetch_add(1, Ordering::Relaxed);
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n >= 24 {
+            return;
+        }
+        eprintln!(
+            "[deadref-recv] #{n} {reason} {site}: holder=0x{holder:x} slot={slot} <- {value:?} \
+             (inactive semispace is [0x{lo:x},0x{hi:x})) — the RECEIVER named no live object at \
+             the moment of the store, so this write went into a copy nothing will read: the \
+             field stays at its JVM default and no later collection lost anything. \
+             collection={}\n{:?}",
+            self.stats.minor_gc_count.load(Ordering::Relaxed),
+            std::backtrace::Backtrace::force_capture(),
+        );
+    }
+
     fn note_deadref_store(&self, site: &str, holder: usize, slot: usize, value: usize) {
         if value == 0 {
             return;
@@ -11784,6 +11972,7 @@ impl GenerationalHeap {
                                         );
                                     }
                                 }
+                                note_obj_watch_copy(header, src, dst, total_size, true);
                                 // SAFETY: src/dst are valid, non-overlapping, total_size bytes.
                                 unsafe { std::ptr::copy_nonoverlapping(src, dst, total_size) };
                                 // Replicate the atomic mark_word through atomic ops
@@ -17338,6 +17527,13 @@ impl GenerationalHeap {
         // old gen is full, so `should_promote` is not the answer.
         copy_tally_add(old_gen.contains(new_ptr), total_size as u64);
         copy_tally_arm(false);
+        note_obj_watch_copy(
+            header,
+            old_ptr,
+            new_ptr,
+            total_size,
+            old_gen.contains(new_ptr),
+        );
         // SAFETY: `old_ptr` and `new_ptr` are valid, non-overlapping regions of `total_size` bytes.
         unsafe {
             std::ptr::copy_nonoverlapping(old_ptr, new_ptr, total_size);
@@ -22465,6 +22661,54 @@ mod tests {
             "the parallel copy phase never engaged — this test asserted nothing about it",
         );
         out
+    }
+
+    /// `[deadref-recv]` must fire on a store whose RECEIVER is a vacated
+    /// address, and the value arm must stay silent for it.
+    ///
+    /// This is the wiring test, and it is not ceremonial. The receiver-side
+    /// screen was added because the workload it was added for
+    /// (`BindableTests`' AssertJ residual, 2026-09-11) reported ZERO on every
+    /// value-side arm — and an instrument whose only evidence is a zero is
+    /// indistinguishable from an instrument that is not connected. The value
+    /// arm's silence here is asserted for the same reason: it is the asymmetry
+    /// the whole addition exists to close, so a change that made
+    /// `note_deadref_store` start firing on receivers would erase the
+    /// distinction without failing anything.
+    #[test]
+    fn a_store_through_a_vacated_receiver_is_reported() {
+        let heap = GenerationalHeap::with_sizes(1024 * 1024, 1024 * 1024);
+        let monitors = NoOpMonitors;
+        let victim = heap.alloc_object(ClassId::new(1), 2);
+        heap.set_field(victim, 1, Value::Int(7));
+
+        // No roots: the collector is entitled to leave `victim` behind, and the
+        // semispace swap then puts its address in the INACTIVE half — which is
+        // precisely what `dead_young_ref_reason` calls dead.
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        heap.collect_garbage(&stw(), &mut roots, &monitors);
+        let (lo, hi) = heap.young_inactive_semispace_range();
+        let addr = victim.as_ptr() as usize;
+        assert!(
+            addr >= lo && addr < hi,
+            "the test needs the victim's address to be in the emptied semispace \
+             (addr={addr:#x}, inactive=[{lo:#x},{hi:#x}))",
+        );
+
+        let before = super::deadref_recv_hits();
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_DBG_DEADREF_STORE", Some("1"))],
+            || {
+                // A LIVE value into a DEAD receiver: the exact shape the value
+                // arm cannot see.
+                heap.set_field(victim, 1, Value::Int(9));
+            },
+        );
+        assert_eq!(
+            super::deadref_recv_hits(),
+            before + 1,
+            "a store into a vacated receiver must be reported by the receiver arm",
+        );
     }
 
     /// Build a chain of `n` two-slot objects, each pointing at the next, and
