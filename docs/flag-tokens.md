@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-547 tokens.
+548 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -351,6 +351,7 @@ export inherited from a parent shell.
 | `linkage` | `CRATONVM_DBG_LINKAGE` |
 | `linkage-bt` | `CRATONVM_DBG_LINKAGE_BT` |
 | `linker` | `CRATONVM_DBG_LINKER` |
+| `load-cse` | `CRATONVM_DBG_LOAD_CSE` |
 | `loadclass` | `CRATONVM_DBG_LOADCLASS` |
 | `loader-chain` | `CRATONVM_DBG_LOADER_CHAIN` |
 | `loader-trace` | `CRATONVM_DBG_LOADER_TRACE` |
@@ -613,7 +614,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-440 tokens.
+442 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -825,6 +826,8 @@ export inherited from a parent shell.
 | `ir-licm-mem-edge` | `CRATONVM_JIT_IR_LICM_MEM_EDGE` |
 | `ir-licm-before-unroll` | `CRATONVM_JIT_IR_LICM_BEFORE_UNROLL` |
 | `ir-poll-outline` | `CRATONVM_JIT_IR_POLL_OUTLINE` |
+| `ir-load-cse` | `CRATONVM_JIT_IR_LOAD_CSE` |
+| `ir-licm-hoist-counted` | `CRATONVM_JIT_IR_LICM_HOIST_COUNTED` |
 | `ir-per-copy-frames` | `CRATONVM_JIT_IR_PER_COPY_FRAMES` |
 | `ir-partial-unroll` | `CRATONVM_JIT_IR_PARTIAL_UNROLL` |
 | `ir-partial-unroll-factor` | `CRATONVM_JIT_IR_PARTIAL_UNROLL_FACTOR` |
