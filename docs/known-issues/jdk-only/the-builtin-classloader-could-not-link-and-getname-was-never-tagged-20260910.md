@@ -542,6 +542,29 @@ timing out below that and the corpus then silently reporting 131 vectors.)
   RJitArraycopyRefDeopt  RNioNoFollow  RStringBuilderContent  RStrings
 ```
 
+**CORRECTION, 2026-09-11: `RJdkForkJoin` is in that list and should not be read
+as closed by this wave.** Lane 5 root-caused the same vector independently and
+found a real defect underneath it — `unsafe_natives_ext.rs` split every
+`Unsafe.getAndSet*` on the RECEIVER'S SHAPE, and while the field arm was a
+`compare_and_swap_field` retry loop the ARRAY arm was a bare
+`get_array_element` + `set_array_element` pair, so a queued task could be
+claimed twice and EXECUTED twice. See
+[`lane-5-concurrent-thread-unsafe-RETIRED-20260910`](../../internal/retired/lane-5-concurrent-thread-unsafe-RETIRED-20260910.md) §2.
+
+A divide-and-conquer sum is idempotent, so every ordinary ForkJoin assertion
+passes over that race; `RJdkForkJoin.countedCompleter` is the one assertion in
+the corpus that counts SIDE EFFECTS rather than reducing values, and it is
+therefore RACY rather than deterministic. This wave removed the loader failure
+that was this vector's FIRST failure and then observed a pass — which is a pass
+of a racy assertion, not evidence that the race was gone. The fix for it is
+lane 5's, landed separately.
+
+The general form is the one this record argues for everywhere else: a
+first-failure count cannot score a fix in a chain, and a single PASS of a
+non-deterministic assertion is not a measurement. The other sixteen rows are
+unaffected — none of them is a race — but the honest statement of +17 is "17
+first failures removed", which is what the section below reports.
+
 ### The number that keeps +17 honest
 
 The lane page's own rule is to report *"N first-failures removed, M new blockers
