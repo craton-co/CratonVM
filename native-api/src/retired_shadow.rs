@@ -3823,6 +3823,19 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // `the_tables_const_lists_every_table_the_predicate_consults` exists to
     // catch, and it is what caught it.
     RETIRED_SHADOW_L1_TRIPLES,
+    // And again on 2026-09-11, one merge later, for lanes L0 and L3 -- same
+    // mechanism, same silence. This const arrived on `dev` while L0's and L3's
+    // tables were being written on this branch, so neither file conflicted and
+    // the predicate chain above ended up consulting NINE tables against this
+    // const's SEVEN. The count assertion is the only thing that noticed.
+    //
+    // The cost was not cosmetic: this const is what feeds
+    // `real_layout_bridge_keeps_are_not_retired_shadows`, so until this line
+    // L0's 19 and L3's 24 were never asked whether their `Bridge` ->
+    // `SyntheticStub` re-tag disarms a `keep_real_*_bridge` arm in REAL-JDK
+    // mode -- the question that took lane 5 from 100 rows to 98.
+    RETIRED_SHADOW_L0_TRIPLES,
+    RETIRED_SHADOW_L3_TRIPLES,
 ];
 
 #[cfg(test)]

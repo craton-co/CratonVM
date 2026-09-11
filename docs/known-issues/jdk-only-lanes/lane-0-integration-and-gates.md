@@ -404,10 +404,12 @@ mtime** — the arm scripts of that era piped through `tail`, which cut the
 Two things this is not:
 
 * It is not an argument about the *combination*. The table now ships beside
-  L1's, L2's and L3's, and individually-safe retirements can interact — Phase 2
-  armed 236 dial-safe classes together and broke 54 of 118 vectors. Every
-  number above was measured with L0 alone, so the wave still gets the three
-  arms on its own binary.
+  L1's 329, L2's 13, L3's 24, L5's 98 and the three phase tables — and
+  individually-safe retirements can interact, which is the Phase 2 finding:
+  236 dial-safe classes armed together broke 54 of 118 vectors. Every number
+  above was measured with L0 alone, so the wave still gets the three arms on
+  its own binary, and that binary is the first one to carry **six** lanes'
+  tables at once.
 * The 10 are withdrawn *as touched*, not as convicted. Attribution by dispatch
   over-collects by design: it names every row that could be responsible.
   `the_l0_attributed_triples_are_not_retired` pins them out, so re-adding one
