@@ -379,6 +379,12 @@ pub fn report_at_exit() {
         eprintln!(
             "[c2-supersede] ir safepoint polls: outlined={poll_out} inline={poll_inline}"
         );
+        // Reads eliminated as redundant with one already performed in the
+        // same block (`CRATONVM_JIT_IR_LOAD_CSE`). A zero with the flag on means
+        // no method in this workload read one cell twice out of one heap state
+        // — a fact about the workload, not a broken pass.
+        let load_cse = cratonvm_jit::ir_optimize::ir_load_cse_census();
+        eprintln!("[c2-supersede] ir redundant reads removed: {load_cse}");
         // Speculation. A zero with `CRATONVM_JIT_IR_SPECULATE=1` means no
         // branch in this workload was one-sided over the sample — a fact about
         // the program, not about the pass — and that is precisely what a bare
