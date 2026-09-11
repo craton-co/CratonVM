@@ -20,26 +20,37 @@ preconditions and the landing protocol are in
 
 | disposition | rows | what decided it |
 |---|---:|---|
-| **RETIRED** — `RETIRED_SHADOW_L1_TRIPLES` | **329** | waves 1 and 2, §3 |
-| **RETIRED** — `RETIRED_SHADOW_L1_HM_TRIPLES` | **21** | wave 3, `HashMap`'s own map surface, §3 |
-| HELD — `HashMap`'s views, iterators, `$Node` and 8 inherited methods | 77 | **wave 3 retired all 98 and measured 12 probes worse** — §3 |
+| **RETIRED** — waves 1 and 2, `RETIRED_SHADOW_L1_TRIPLES` | **329** | §3 |
 | HELD — `TreeMap`/`TreeSet` | 157 | state is `tm_array_table()`, a Rust side table; 9 probes worse armed |
 | HELD — `LinkedHashMap` + its four views + iterators | 102 | state is `lhm_overlay()`, a Rust side table; 11 probes worse |
+| PART RETIRED — `HashMap` + views + iterators + `$Node` | 98 | **wave 3**: 21 retired, 77 held. The nine rows that held it were a DIAL ARTEFACT; the twelve probes that hold the 77 are not — §3 |
 | HELD — `Hashtable` + views + `$Entry` | 79 | 4 probes worse |
-| HELD — `java/util/jar/` | 45 | **a vacuous green**: 0 worse over 44 probes until one reached it, then +28 |
-| HELD — `Date` / `TimeZone` / `sun/util/calendar/` | 40 | 5 probes worse |
-| HELD — `Locale` + `sun/util/locale/` + `sun/util/resources/` + `Currency` | 35 | 3 probes worse, one truncates 125 → 8 |
+| PART RETIRED — `java/util/jar/` | 45 | **wave 4**: everything but `JarFile`, which is the whole of the `+34` — §3 |
+| HELD — `Date` / `TimeZone` / `sun/util/calendar/` | 40 | 5 probes worse; bisected §10 item 6 |
+| HELD — `Locale` + `sun/util/locale/` + `sun/util/resources/` + `Currency` | 35 | 3 probes worse, one truncates 125 → 8; bisected §10 item 6 |
 | HELD — the interface and abstract receivers | 28 | §6 — they are NOT dead, and no per-class trial was run |
 | HELD — `HashSet` / `LinkedHashSet` remainder | 13 | lane T holds `register_hashset_natives` |
-| HELD — `java/text/` | 12 | the second **vacuous green**: 0 worse, then +11 |
+| PART RETIRED — `java/text/` | 12 | **wave 4**: everything but `BreakIterator` (the whole of the `+16`) and `DateFormat` (vacuous) — §3 |
 | HELD — `ResourceBundle` + `$Control` | 12 | **armed-clean over 51 probes, red on the trial binary** — §8 |
 | EXCLUDED — no dispatch any probe can produce | 9 | §5 |
 | | **959** | |
 
-`RETIRED_SHADOW_L1_TRIPLES` and `RETIRED_SHADOW_L1_HM_TRIPLES` in
-`native-api/src/retired_shadow.rs` carry the 427 with the numbers per family;
-the tests beside them pin every HELD verdict, so changing one means changing a
-test.
+The 959 and its split are the 2026-09-10 census. **Waves 3 and 4 are counted
+on their own census (2026-09-11) and are NOT added into that column**, because
+two censuses of the same tree are two measurements and forcing them to add up
+would invent a number neither took. What they retire, exactly:
+
+```text
+  wave 3  RETIRED_SHADOW_L1_HM_TRIPLES   21 triples   java/util/HashMap
+  wave 4  RETIRED_SHADOW_L1_JT_TRIPLES   41 triples   java/util/jar/Attributes,
+                                                      $Name, JarEntry, Manifest,
+                                                      java/text/ParseException,
+                                                      java/text/Normalizer
+```
+
+All three tables live in `native-api/src/retired_shadow.rs` with the numbers
+per family, and the tests beside them pin every HELD verdict — including the
+ones waves 3 and 4 had to CHANGE, which is the point of writing them down.
 
 **Wave 3 is the lane's most transferable result, and it cuts twice.**
 `java/util/HashMap` sat in the HELD column for two revisions of this page on
