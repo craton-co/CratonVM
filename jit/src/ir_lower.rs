@@ -11816,7 +11816,10 @@ impl<'a> Lowerer<'a> {
         }
         // Planned first, emitted second: the plan reads `self` immutably and
         // the emission needs it mutably.
-        let mut plans: Vec<(u32, usize, Vec<(usize, NodeId)>, Vec<NodeId>)> = Vec::new();
+        // The trailing `usize` is the BLOCK this plan came from, kept only so
+        // the one-entry-per-bci filter below can ask what kind of control node
+        // the block starts with. It is dropped before emission.
+        let mut plans: Vec<(u32, usize, Vec<(usize, NodeId)>, Vec<NodeId>, usize)> = Vec::new();
         let mut refusals: Vec<&'static str> = Vec::new();
         // Keyed by BLOCK, not by bci. Two reasons, and the first is fatal on
         // its own: `bci_native` anchors DATA nodes, and a loop header's bci is
@@ -11972,12 +11975,67 @@ impl<'a> Lowerer<'a> {
                 continue;
             }
             // Cast: a bci fits u32 (`IR_MAX_BYTECODE_SIZE` is far below it).
-            plans.push((bci as u32, native, seeds, const_seeds));
+            plans.push((bci as u32, native, seeds, const_seeds, bi));
         }
+
+        // ── One entry per bci, or none ───────────────────────────────
+        //
+        // `CompiledMethod::ir_osr_entry_addr` resolves a bci by `.find()`, so
+        // the FIRST plan at a bci wins and any others are unreachable — but
+        // "first" is block order, which is not a property the interpreter
+        // knows anything about. A bci claimed by two blocks is a resume point
+        // that is not a function, and entering the wrong one runs a prefix of
+        // the loop body that the interpreter has already run.
+        //
+        // Nothing could claim a bci twice until a transform CLONED a control
+        // node: the partial unroller gives every copy its own `If`/`Proj`
+        // triple at the loop test's own bci (it has to — the pc is also the
+        // site key), so a four-way unroll offers four blocks at the header bci
+        // and three of them are mid-group. That was measured as a wrong answer:
+        // `C2PartialUnrollProbe` returned `sum(trip + factor - 1)` on roughly
+        // 40% of runs, and vanished with `CRATONVM_JIT_IR_OSR_ENTRY=0`.
+        //
+        // The tie-break is not "take the first" but "take the LOOP HEADER":
+        // an interpreter arriving at a loop's bci is at that loop's header, and
+        // a header is a `Merge`/`Region` while every copy's block is a `Proj`.
+        // Where that does not single one block out, the bci is refused
+        // entirely — no OSR entry is always correct, and the interpreter simply
+        // keeps running the frame it is in.
+        {
+            let mut claims: std::collections::HashMap<u32, usize> =
+                std::collections::HashMap::new();
+            for (bci, _, _, _, _) in &plans {
+                *claims.entry(*bci).or_insert(0) += 1;
+            }
+            if claims.values().any(|&n| n > 1) {
+                let is_header = |bi: usize| {
+                    let ctrl = self.schedule.blocks[bi].ctrl;
+                    matches!(
+                        self.graph.nodes.get(ctrl as usize).map(|n| &n.op),
+                        Some(Op::Merge) | Some(Op::Region)
+                    )
+                };
+                let mut headers: std::collections::HashMap<u32, usize> =
+                    std::collections::HashMap::new();
+                for (bci, _, _, _, bi) in &plans {
+                    if is_header(*bi) {
+                        *headers.entry(*bci).or_insert(0) += 1;
+                    }
+                }
+                plans.retain(|(bci, _, _, _, bi)| {
+                    if claims.get(bci).copied().unwrap_or(0) <= 1 {
+                        return true;
+                    }
+                    headers.get(bci).copied() == Some(1) && is_header(*bi)
+                });
+                refusals.push("bci claimed by more than one block");
+            }
+        }
+
         for why in refusals {
             self.note_osr_refusal(why);
         }
-        for (bci, native, seeds, const_seeds) in plans {
+        for (bci, native, seeds, const_seeds, _bi) in plans {
             // Cast: a JVM local index plus one; `max_locals` is u16.
             let seeds_hi = seeds.iter().map(|(i, _)| *i as u32 + 1).max().unwrap_or(0);
             let stub = self.buf.pos();
@@ -23055,6 +23113,97 @@ mod tests {").next().unwrap_or(src);
         assert_eq!(sum(5), 10, "0+1+2+3+4 = 10");
         assert_eq!(sum(0), 0, "empty loop = 0");
         assert_eq!(sum(10), 45, "sum 0..9 = 45");
+    }
+
+    /// A partially unrolled loop offers **one** OSR entry at its header bci,
+    /// and entering through it finishes the loop the interpreter started.
+    ///
+    /// # The defect
+    ///
+    /// `emit_osr_entry_stubs` plans one entry per BLOCK and
+    /// `ir_osr_entry_addr` resolves one per BCI with `.find()`, so a bci two
+    /// blocks claim silently resolves to whichever came first in block order.
+    /// Nothing could claim a bci twice until a transform cloned a CONTROL node.
+    /// The partial unroller gives every copy its own `If`/`Proj` triple at the
+    /// loop test's own bci — it has to, because the pc is also the site key —
+    /// so a factor-4 unroll offers four blocks at the header bci and three of
+    /// them are mid-group.
+    ///
+    /// Entering mid-group re-runs the copies after it, which the interpreter
+    /// has already run. Measured on `C2PartialUnrollProbe` before the fix: the
+    /// probe returned `sum(trip + factor - 1)` on roughly 40% of runs — the
+    /// wrong answer and a 3x slowdown arriving together, and both vanishing
+    /// under `CRATONVM_JIT_IR_OSR_ENTRY=0`.
+    ///
+    /// # Why this test is an entry and not a count
+    ///
+    /// The count alone (`one entry at bci 4`) is what a wrong version can also
+    /// have: keeping the first plan rather than the header's gives exactly one
+    /// entry too, and it is the mid-group one. So this ENTERS, from a state the
+    /// method could not have reached on its own — `i` already at 3 with `s`
+    /// holding a value no prefix of this loop produces — and asks for the
+    /// answer the interpreter would have finished with. A mid-group door
+    /// returns a larger sum, because it runs the copies below it before
+    /// reaching the test that should have stopped it.
+    #[test]
+    fn a_partially_unrolled_loop_has_one_osr_door_and_it_is_the_header() {
+        // int sum(int n){ int s=0; for(int i=0;i<n;i++) s+=i; return s; }
+        let code = [
+            0x03, 0x3c, 0x03, 0x3d, 0x1c, 0x1a, 0xa2, 0x00, 0x0d, 0x1b, 0x1c, 0x60, 0x3c, 0x84,
+            0x02, 0x01, 0xa7, 0xff, 0xf4, 0x1b, 0xac, 0, 0,
+        ];
+        let cm = cratonvm_types::flags::with_thread_overrides(
+            &[
+                ("CRATONVM_JIT_IR_PER_COPY_FRAMES", Some("1")),
+                ("CRATONVM_JIT_IR_PARTIAL_UNROLL", Some("1")),
+                ("CRATONVM_JIT_IR_PARTIAL_UNROLL_FACTOR", Some("4")),
+            ],
+            || compile_via_ir(&code, 21, 1, 3).expect("the partially unrolled loop compiles"),
+        );
+
+        // Cast: the low 32 bits of RAX are this method's `int` result.
+        let sum = |n: i64| unsafe { cm.try_call(&[n]).expect("call") } as i32;
+        for n in 0..24i64 {
+            let want: i32 = (0..n as i32).sum();
+            assert_eq!(sum(n), want, "the ordinary door got sum({n}) wrong");
+        }
+
+        let at_header = cm
+            .ir_osr_entries
+            .iter()
+            .filter(|(bci, _, _)| *bci == 4)
+            .count();
+        assert!(
+            at_header <= 1,
+            "bci 4 is claimed by {at_header} OSR entries; `ir_osr_entry_addr` \
+             resolves one by `.find()`, so the others are unreachable and the \
+             one that wins is whichever block order put first",
+        );
+
+        let Some((_addr, _needed)) = cm.ir_osr_entry_addr(4) else {
+            // Refusing the bci outright is the other correct answer, and the
+            // one the filter falls back to when the header cannot be singled
+            // out. Nothing else may hold a door.
+            assert!(
+                cm.ir_osr_entries.is_empty(),
+                "the header bci was refused but some other bci kept a door",
+            );
+            return;
+        };
+
+        // Enter as the interpreter would, mid-loop, in a state no prefix of
+        // this loop produces: `s = 1000` with `i = 3`. Finishing correctly
+        // means adding 3..n-1 and nothing else.
+        for n in [4i64, 7, 12, 24] {
+            let want: i32 = 1000 + (3..n as i32).sum::<i32>();
+            let got = unsafe { cm.ir_osr_enter(4, 0, &[n, 1000, 3]) }
+                .expect("the header door accepts three locals");
+            assert_eq!(
+                got as i32, want,
+                "entered at the header with (s=1000, i=3, n={n}) — a mid-group \
+                 door re-runs the copies below it and reads larger",
+            );
+        }
     }
 
     /// **The one that matters: enter the loop part-way and finish it.**
