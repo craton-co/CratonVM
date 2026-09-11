@@ -535,6 +535,30 @@ Two instrument notes earned in the same hour:
   == normalised diff 52 on the wave-2 arms). Filter after the diff, never
   before, and never on one side only.
 
+### 8c. Verified on the binary that ships, 2026-09-11
+
+This lane's 24 retired triples were re-measured as part of a six-lane binary
+rather than alone. `cratonvm-p19.exe`, md5 `c88f146699d0e39cb406b1433ef65a5a`,
+from `77f9953b1`:
+
+* three arms **132/0** (`--jdk-only`), **132/0** (`SUITE=all`), **92/0**
+  (`SUITE=core`), all with `missing=0`;
+* gate set all five arms `rc=0`, `nb-default` re-run at 11 targets / 4285
+  passed / 0 failed;
+* **52 distinct refused triples, 0 survivors** over all 132 kept reports, so
+  this lane's rows yield the slot to bytecode rather than falling through to an
+  older native.
+
+The full account, including why the arms were re-run after `dev` brought 19
+JIT/C2 commits and why one run header reads a different revision, is in the
+lane-0 page's §7.3 — recorded once there rather than twice.
+
+**This does not promote wave 2's six candidates.** Those still need the
+two-binary control-vs-retired build of §8b: with `leaked=126` every one of them
+is an `armed == base` row, which is exactly the shape a leak produces. A green
+corpus on a binary whose table does not contain them is not evidence about
+them.
+
 ## 9. Done
 
 Every bucket-A/B row in the prefix set is retired, classified as C/D/E/F, a

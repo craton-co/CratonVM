@@ -409,11 +409,60 @@ Two things this is not:
   236 dial-safe classes armed together broke 54 of 118 vectors. Every number
   above was measured with L0 alone, so the wave still gets the three arms on
   its own binary, and that binary is the first one to carry **six** lanes'
-  tables at once.
+  tables at once. **Done — the result is §7.3.**
 * The 10 are withdrawn *as touched*, not as convicted. Attribution by dispatch
   over-collects by design: it names every row that could be responsible.
   `the_l0_attributed_triples_are_not_retired` pins them out, so re-adding one
   takes the bisection rather than a steady hand.
+
+### 7.3 Verified on the binary that ships, 2026-09-11
+
+Measured, not committed to. The binary is `cratonvm-p19.exe`, md5
+`c88f146699d0e39cb406b1433ef65a5a`, built from `77f9953b1` — six lanes' tables
+(L0 19, L1 329, L2 13, L3 24, L5 98, plus TRIPLES 102 / STATELESS 235 / PHASE2
+25 / PHASE3 185) and two `origin/dev` merges, the second of which brought 19
+JIT/C2 commits. That last point is why the arms were re-run rather than carried
+forward from `722fbec3b`: a retired shadow means real bytecode runs, and real
+bytecode is what the JIT then compiles, so the combination is not free.
+
+| arm | scheduled | result |
+|---|---|---|
+| `CRATONVM_ARGS=--jdk-only` | 132, missing=0 | **132 passed, 0 failed** |
+| `SUITE=all` | 132, missing=0 | **132 passed, 0 failed** |
+| `SUITE=core` | 92, missing=0 | **92 passed, 0 failed** |
+
+The run headers say `rev=77f9953b1` for the first arm and `rev=e6e933a2b` for
+the second and third, because a documentation commit landed between them. The
+delta is one file under `docs/` (`git diff --name-only 77f9953b1..HEAD` outside
+`docs/` is empty) and the binary is the same md5 in all three, so the three
+numbers are comparable — recorded here because the header shows two revisions
+and a reader should not have to work out which difference it was.
+
+**Gate set: all five arms `rc=0`.** `cargo test -p cratonvm-types`;
+`-p cratonvm-native-api`; and `-p cratonvm-native-builtins --tests` under each
+of {default, `--features management`, `--features synthetic-jdk`}. The
+`nb-default` number is from a re-run — **11 targets, 4285 passed, 0 failed**.
+Its first attempt aborted on a 2-second `await_termination` deadline in
+`xnio_worker`, which passed in the other two arms of the same run and 3/3
+isolated at 0.02–0.12s under no load. The re-run matters beyond the one test:
+`cargo test --tests` is fail-fast **across targets**, so that abort skipped 10
+of 11 targets and the first arm's count was a prefix, not a result.
+
+**Survivors: 52 distinct refused triples, 0 with a survivor**, taken as the
+union over all 132 kept `--jdk-only` reports. This is the check that separates
+a retirement from a no-op: `register_inner` refuses a `SyntheticStub` without
+inserting it, but a refusal carrying a non-null `survivor` means an earlier
+registration still owns the slot and still serves, so strict mode runs that
+older native and every probe reads exactly as it did before. Zero survivors
+means all 52 yielded to bytecode. (A single report counts 73 refusal *events*
+over those 52 triples — several are refused at more than one ordinal, the same
+shape as the kind map's 21 rows for 19 triples.)
+
+What this does and does not settle: it answers the combination question the
+bullet above deferred, **for these six tables on this binary**. It is not a
+general claim that individually-safe retirements compose — Phase 2's 236
+dial-safe classes broke 54 of 118 vectors together, and nothing here repeals
+that.
 
 ### Held: 23 triples, each with the row that held it
 
