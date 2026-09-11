@@ -25593,6 +25593,51 @@ mod tests {").next().unwrap_or(src);
     /// emitter's `rcx_writes` comparison in `lower_data_node_tracked` is the
     /// net under it — the compile is refused rather than wrong — but a refusal
     /// is a silent perf cliff, so this is where it should be caught.
+    /// The two lists that have to agree: `RCX_FREE_WHEN_FOLDED`, which the
+    /// audit above checks against the arms, and the `matches!` inside
+    /// `Lowerer::node_preserves_rcx`, which is what the planner actually asks.
+    ///
+    /// They are separate because one is strings for a source scan and the other
+    /// is `Op` patterns for a match, and nothing in the language ties them
+    /// together. A name in the planner's list but not the audit's is an arm
+    /// claimed by NOTHING -- the widening would cross it on a promise no test
+    /// has read. A name in the audit's but not the planner's is only a missed
+    /// optimization, and it fails here too, because a list that is checked and
+    /// unused reads exactly like one that is checked and used.
+    #[test]
+    fn the_planner_and_the_audit_name_the_same_folded_ops() {
+        let src = include_str!("ir_lower.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn node_preserves_rcx(&self, id: NodeId) -> bool {")
+            .nth(1)
+            .expect("node_preserves_rcx is in this file")
+            .split("\n    }")
+            .next()
+            .expect("the function ends");
+        let mut planner = std::collections::BTreeSet::new();
+        collect_op_names(body, &mut planner);
+        // `op_preserves_rcx` is consulted first and contributes no names of its
+        // own here; the only `Op::` patterns in this body are the folded list
+        // and the `IrType` guard, which `collect_op_names` does not match.
+        let audited: std::collections::BTreeSet<String> = super::RCX_FREE_WHEN_FOLDED
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(
+            planner, audited,
+            "`node_preserves_rcx` and `RCX_FREE_WHEN_FOLDED` name different ops. \
+             The first decides what a deferred carry may cross; the second is \
+             what `every_folded_arm_reaches_rcx_only_in_its_register_form` \
+             checks against the arms. A name in the first and not the second is \
+             an arm crossed on a promise no test has read.",
+        );
+        assert!(
+            !planner.is_empty(),
+            "the planner scan found nothing - `node_preserves_rcx` changed \
+             shape and this test would now pass vacuously"
+        );
+    }
+
     #[test]
     fn every_folded_arm_reaches_rcx_only_in_its_register_form() {
         let src = include_str!("ir_lower.rs").replace("\r\n", "\n");
