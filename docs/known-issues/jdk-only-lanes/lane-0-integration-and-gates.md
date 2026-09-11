@@ -255,7 +255,13 @@ A release build is **17-50 minutes** and the host is shared. Rules:
 `module/ModuleDescriptor$Version` (5), `ModuleLayer` (4), `Class$Atomic` (3),
 `ClassValue` (2), `Class$ReflectionData` (1).
 
-**The account closes exactly: 54 retired + 23 held + 27 undispatched = 104.**
+**The account closes exactly: 23 held + 54 measured-then-withdrawn + 27
+undispatched = 104.** The middle column is the 2026-09-10 correction and
+the rest of this section is written as it was measured, in order: the wave
+landed 54, the corpus rejected them, and what survives is the measurement
+and an attribution. **`RETIRED_SHADOW_L0_TRIPLES` ships empty**, and
+`the_l0_table_is_sorted_and_unique` asserts that rather than leaving it to
+be noticed.
 The two reviewed `Intrinsic`s sit outside that sum -- adjudicating a kind
 removes a triple from the `Bridge` population, so they are no longer shadows to
 count.
@@ -270,7 +276,9 @@ unarmed   8 diff lines of 130      yielded  58 diff lines of 130
 ```
 
 Read as an aggregate that says *retire nothing here*, and it would be a wrong
-conclusion drawn from a true number. **Per row:**
+conclusion drawn from a true number. **Per row — and this table is the
+`CRATONVM_ENFORCE_NATIVE_SHADOW` dial's, which is not the instrument a
+retirement is scored on; §7.1 is why:**
 
 | | rows | verdict |
 |---|---|---|
@@ -301,15 +309,86 @@ may widen its own exports, and this VM let an unnamed module widen
 `java.base`'s. The rest are the JDK's argument-validation layer, which is the
 surface a retirement usually buys.
 
-### Landed: 54 triples in `RETIRED_SHADOW_L0_TRIPLES`
+### 7.1 Landed 54, withdrew 54: the dial is not the retirement
 
-Prefixes added: `java/lang/Class` and `java/lang/Module`, the narrowest that
-cover the table. Both also admit classes that are *not* L0's, because a prefix
-is a string; the table decides, and `java/lang/ref/` stays out so
-`a_prefix_alone_retires_nothing` keeps its guard. Ratchets re-frozen from the
-gates' own output: stubs 1883→1939 / 1894→1950 / 1883→1939, and the 54-vs-56
-gap is a units difference (two `Version` triples are registered at two
-ordinals each), enumerated rather than assumed.
+The wave landed 54 triples behind the prefixes `java/lang/Class` and
+`java/lang/Module` on the strength of the 2×2 above, and the `--jdk-only`
+corpus arm came back **97 of 132** where the four preceding binaries
+(`p4`, `p7`, `p8`, `p9`) had each scored **132/0**. Both prefixes and all 54
+rows are gone; the table ships empty.
+
+**Two independent reasons the dial arm could not have said otherwise:**
+
+* **It arms a different population.** `CRATONVM_ENFORCE_NATIVE_SHADOW=all`
+  makes *every* native decline at a dispatch door. A table of 54 refuses *54
+  registrations*. The 29 `OK → BAD` rows above are the whole surface yielding
+  at once, which is neither an upper nor a lower bound on what 54 rows do — so
+  the 2×2 cannot be read as "the other 100 are safe to retire".
+* **It leaked, and said so.** The run's own census line read
+  `[DIAL_DOOR_CENSUS] armed=true reached=3680 yielded=3593 leaked=87`. 87
+  dispatches reached the dial and were *not* yielded, and a leaked row reports
+  the **native's** answer while reading, in a three-arm diff, as "the bytecode
+  is fine here". `Class.isArray` was one: armed printed `true/false`, matching
+  HotSpot exactly, and the real retirement answers `false/false` — JDK 22+
+  implements `isArray()` as `componentType != null` and this VM never fills
+  that field, which *this table's own held list already recorded*.
+
+Re-measured the way the ops page says (control binary without the table,
+retired binary with it, HotSpot — **no dial anywhere**), on the same 129 probe
+rows:
+
+```text
+the 54 as shipped   117 OK->OK   4 BAD->OK   8 OK->BAD
+after round 1 (-16) 125 OK->OK   4 BAD->OK   0 OK->BAD     table = 38
+```
+
+Round 1's eight `OK → BAD` rows are one mechanism and a tail: `componentType`
+is retired, the VM never fills the field, so `isArray` answers `false` and
+`getTypeName`/`getSimpleName`/`getCanonicalName` fall back to `[[I` for arrays.
+Round 2 took nine more — every `java/lang/Module` row — on `RJdkModule`.
+**Neither round was enough:** at 29 triples, with `OK → BAD == 0` on the probe,
+the corpus still scored 127/132, and the five it lost passed 5/0 on the control
+binary run concurrently through the same harness. So the table was emptied
+rather than shipped on a probe that had stopped being able to see the defect.
+
+**Withdrawal is invisible to the ratchet.** `stub_ratchet` asserts `<=`, so
+removing entries passes silently and the constants sat 16 above the tree with
+every arm green. Recover the real number by setting each baseline to `1` and
+reading the paste-ready line out of the failure.
+
+### 7.2 Which triple? The census attributes it without a build per hypothesis
+
+A build is 65 minutes, so bisecting 29 triples is a day. The per-vector census
+report answers a weaker question for free, and the weaker question is enough:
+**which of the 29 does this vector dispatch at all?** A registration the vector
+never consults cannot be the row that broke it. Measured on `p16` (L0 table
+empty, so all 29 natives present and counted), the five vectors passing 5/0,
+all five reports written, `saturation: none`:
+
+| vector | of the 29, dispatched |
+|---|---|
+| `RClassUnloadSweep` | 5 |
+| `RClassUnloadSweepGen` | 5 |
+| `RJdkModule` | 8 |
+| `RLoaderIdentity` | 6 |
+| `RServiceLoaderDoubleSource` | 6 |
+
+Their **union is 10**: `desiredAssertionStatus`, `forName` ×3,
+`getConstructor`, `getDeclaredConstructor`, `getMethod`, `getPackageName`,
+`isInterface`, `isPrimitive`. Every one is class-loading or member-lookup
+plumbing that a class-unload sweep and a two-source `ServiceLoader` lean on
+directly, which is the sort of coupling a 129-row probe on `java.lang.Class`
+does not reach.
+
+The remaining **19 are touched by none of the five** and are this lane's next
+candidate set, recorded here so the next wave starts from evidence rather than
+from the 54. Two caveats belong with them, not in a later commit:
+
+* "Not dispatched in these five" is not "not dispatched anywhere". The 19 still
+  need the full corpus arm, on their own binary, before they are a table.
+* The 10 are withdrawn *as touched*, not as convicted. Attribution by dispatch
+  over-collects by design: it names every row that could be responsible, and
+  bisection is what would name the one that is.
 
 ### Held: 23 triples, each with the row that held it
 
@@ -333,7 +412,10 @@ family looks guarded.
 
 It surfaced by **closing the population by subtraction and checking the residue
 is empty**: 77 dispatched - 54 retired = 23, the array held 21, and the two
-survivors of `dispatched - retired - held` were exactly the pair. The prose
+survivors of `dispatched - retired - held` were exactly the pair. (That
+subtraction is written at the wave's numbers, when 54 were retired. Run today
+it is 77 - 0 - 23 = 54, and the 54 are §7.1's withdrawal — the residue is still
+enumerated, it has just moved column.) The prose
 above said 23 and the code said 21 for the same reason the prose was right,
 that `getAnnotation*` is six methods and the row now spells them out. Any lane
 adding a table should run that subtraction rather than trusting a hand count of
