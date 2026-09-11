@@ -761,6 +761,21 @@ gate cannot run where the work happens; the baseline has drifted behind many
 waves as a result; and the fix is one `--update-baseline` on Linux with a note,
 not 581 hand-edits by anyone.
 
+**The durable repair, and the order matters.** Once the baseline is re-taken on
+Linux, the table-vs-baseline comparison should become an ordinary Rust test so
+that the next wave cannot drift: it needs no VM, no JDK and no census, and it
+runs on Windows where the real gate refuses. Written against the PUBLIC
+predicate rather than the tables it can read every future table for free —
+*for each baseline row, if `triple_is_retired_shadow` says retired then the
+kind must be `synthetic-stub`* — with the five `intrinsic` rows exempted by
+name and the reason from the baseline's own header.
+
+Do NOT add that test before the baseline is repaired. Landing it against a
+581-row drift means shipping it with a 581-entry exemption list, which
+enshrines the drift as the expected state and makes the gate decorative — the
+exact shape the bridge-ratchet's own header says it exists to avoid. Repair
+first, then gate.
+
 ### The root cause, MEASURED: this gate cannot run on Windows
 
 Running it here, `CV=p19 JAVA_HOME=<jdk25> sh regression-suite/bridge-ratchet.sh`:
