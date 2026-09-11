@@ -10,7 +10,10 @@ use std::hash::{Hash, Hasher};
 
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
-use super::ir::{CmpOp, Graph, IrType, MemKind, Node, NodeId, Op, NO_NODE};
+use super::ir::{
+    CmpOp, Graph, IrType, MemKind, Node, NodeId, Op, SafepointSlotKind, SafepointSnapshot,
+    NO_NODE,
+};
 
 // ── Public API ───────────────────────────────────────────────────────
 
@@ -785,13 +788,20 @@ fn gvn(graph: &mut Graph) {
         if node.op == Op::Dead || !node.op.is_pure() {
             continue;
         }
-        let hash = gvn_hash(&node.op, node.ty, &node.inputs);
+        let hash = gvn_hash(&node.op, node.ty, node.frame_snapshot, &node.inputs);
         if let Some(&existing) = value_map.get(&hash) {
             // Verify it is actually the same node (hash collision check).
             let existing_node = &graph.nodes[existing as usize];
+            // `frame_snapshot` is part of the identity, not decoration: two
+            // nodes computing the same value in different COPIES of an
+            // unrolled body are different program points, and merging them
+            // would give one copy's code the other copy's deopt frame. `None`
+            // on both is every node of every graph that did not unroll, so
+            // this costs nothing there.
             if existing != id as NodeId
                 && existing_node.op == node.op
                 && existing_node.ty == node.ty
+                && existing_node.frame_snapshot == node.frame_snapshot
                 && existing_node.inputs == node.inputs
             {
                 graph.replace_all_uses(id as NodeId, existing);
@@ -808,10 +818,11 @@ fn gvn(graph: &mut Graph) {
 /// Uses `FxHasher` rather than the std default (SipHash) — GVN runs on every
 /// JIT compile and the values are non-adversarial node identifiers, so the
 /// 2-3x faster Fx hash is a strict win.
-fn gvn_hash(op: &Op, ty: IrType, inputs: &[NodeId]) -> u64 {
+fn gvn_hash(op: &Op, ty: IrType, frame_snapshot: Option<u32>, inputs: &[NodeId]) -> u64 {
     let mut hasher = FxHasher::default();
     op.hash(&mut hasher);
     ty.hash(&mut hasher);
+    frame_snapshot.hash(&mut hasher);
     inputs.hash(&mut hasher);
     hasher.finish()
 }
@@ -2797,6 +2808,15 @@ pub struct UnrollCensus {
     /// A body value escapes the loop, or an invariant load is pinned to the
     /// header.
     pub escapes_or_pinned: usize,
+    /// A safepoint snapshot names the body at a bci **no cloned node carries**,
+    /// so per-copy frames could not be built and the loop was refused.
+    ///
+    /// Distinct from [`Self::safepoint_named`], which is the refusal taken when
+    /// per-copy frames are switched OFF. This one is taken with them ON: the
+    /// mechanism was available and the loop still could not use it, because a
+    /// copy's frame has to hang on a program point the copy actually has. See
+    /// [`plan_copy_frames`].
+    pub frame_uncopyable: usize,
     /// Of [`Self::runtime_bound`], how many sit in a graph NOTHING can deopt
     /// from. **Not part of the closing identity** — it is a sub-count of
     /// `runtime_bound`, not a bucket of its own.
@@ -2819,6 +2839,16 @@ pub struct UnrollCensus {
     /// METHOD is trap-free, this one whether the cloned NODES are. See
     /// [`partial_unroll_body_is_pure`].
     pub runtime_bound_pure_body: usize,
+    /// Of [`Self::unrolled`], how many were unrolled over a body a safepoint
+    /// snapshot names — i.e. how many took per-copy frames. **Not part of the
+    /// closing identity**; it is a sub-count of `unrolled`.
+    ///
+    /// The engagement number for [`ir_per_copy_frames_enabled`]. Zero with the
+    /// flag off, and zero with it on until a loop is met that the old
+    /// [`Self::safepoint_named`] refusal would have declined — which is the
+    /// pair of counters to read together, because one moving without the other
+    /// falling means the mechanism is firing on loops that never needed it.
+    pub per_copy_frames: usize,
 }
 
 impl UnrollCensus {
@@ -2834,6 +2864,7 @@ impl UnrollCensus {
             + self.body_unclonable
             + self.safepoint_named
             + self.escapes_or_pinned
+            + self.frame_uncopyable
             == self.headers
     }
 }
@@ -2843,7 +2874,9 @@ impl UnrollCensus {
 /// Unconditional and cheap -- at most one relaxed add per candidate loop
 /// header per compile. A census you have to switch on is one nobody has for
 /// the run they already did.
-static IR_UNROLL_CENSUS: [std::sync::atomic::AtomicU64; 13] = [
+static IR_UNROLL_CENSUS: [std::sync::atomic::AtomicU64; 15] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -2872,10 +2905,16 @@ mod unroll_bucket {
     pub const BODY_UNCLONABLE: usize = 8;
     pub const SAFEPOINT_NAMED: usize = 9;
     pub const ESCAPES_OR_PINNED: usize = 10;
+    /// A real refusal, so it sits INSIDE the identity -- and it must sit below
+    /// `RUNTIME_BOUND_TRAP_FREE`, because that is where the identity's sum
+    /// stops.
+    pub const FRAME_UNCOPYABLE: usize = 11;
     /// A sub-count of `RUNTIME_BOUND`, deliberately outside the identity.
-    pub const RUNTIME_BOUND_TRAP_FREE: usize = 11;
+    pub const RUNTIME_BOUND_TRAP_FREE: usize = 12;
     /// Also a sub-count of `RUNTIME_BOUND`, also outside the identity.
-    pub const RUNTIME_BOUND_PURE_BODY: usize = 12;
+    pub const RUNTIME_BOUND_PURE_BODY: usize = 13;
+    /// A sub-count of `UNROLLED`, also outside the identity.
+    pub const PER_COPY_FRAMES: usize = 14;
 }
 
 /// Add one compile's tally to the process-wide totals.
@@ -2884,7 +2923,7 @@ mod unroll_bucket {
 /// below can be asserted on a tally no other thread is touching: background
 /// compilation is default-ON, and a process-wide check would race a sibling
 /// thread that has counted a header and not yet its bucket.
-fn publish_unroll_census(local: &[usize; 13]) {
+fn publish_unroll_census(local: &[usize; 15]) {
     debug_assert!(
         {
             // `RUNTIME_BOUND_TRAP_FREE` is a sub-count of `RUNTIME_BOUND`, so
@@ -2920,8 +2959,10 @@ pub fn ir_unroll_census() -> UnrollCensus {
         body_unclonable: v[8],
         safepoint_named: v[9],
         escapes_or_pinned: v[10],
-        runtime_bound_trap_free: v[11],
-        runtime_bound_pure_body: v[12],
+        frame_uncopyable: v[11],
+        runtime_bound_trap_free: v[12],
+        runtime_bound_pure_body: v[13],
+        per_copy_frames: v[14],
     }
 }
 
@@ -3364,10 +3405,209 @@ fn unroll_over_unreachable_frames() -> bool {
     })
 }
 
+/// May the unroller give each copy of a cloned body its **own** deopt frames,
+/// instead of refusing a loop a safepoint snapshot names? **Default OFF**;
+/// `CRATONVM_JIT_IR_PER_COPY_FRAMES=1` arms it.
+///
+/// # What it turns on
+///
+/// A cloned node keeps the original's `bytecode_pc`, so after an unroll there
+/// are `trip` nodes at each body bci. `ir_lower` resolves a trapping node's
+/// deopt frame by scanning `graph.safepoints` for the first snapshot with that
+/// bci, so all `trip` copies resolve to copy 0's frame — which names copy 0's
+/// values. Copies `1..trip` would then deopt into an interpreter frame holding
+/// another iteration's locals.
+///
+/// With this on, [`install_copy_frames`] gives each copy a substituted
+/// snapshot of its own and stamps the copy's nodes with
+/// [`Node::frame_snapshot`], which `ir_lower` prefers over the scan.
+///
+/// # Why it is off
+///
+/// This is the deopt metadata, and `internal/fixed-bugs/` records what a defect
+/// in it looks like from the outside: an H2 `GROUP BY` that returned 3 rows of
+/// 5, because a resume read a frame slot nothing had written. A wrong frame
+/// does not crash — it answers. So the mechanism lands armed by a flag and
+/// earns its default the way `ir_register_authoritative_enabled` did, on a soak
+/// with checksum parity, not on the argument above.
+fn ir_per_copy_frames_enabled() -> bool {
+    // Read live rather than cached in a `OnceLock`, like
+    // `ir_lower::ir_drop_unreachable_homes_enabled` and unlike its
+    // `unroll_over_unreachable_frames` neighbour. Two reasons, and the second
+    // is the one that matters: it is read once per candidate loop header, so
+    // the cache buys nothing; and a process-wide cache makes the OFF arm
+    // untestable in the same process as the ON arm, which is precisely the
+    // differential this mechanism has to be held to.
+    matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PER_COPY_FRAMES").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
+}
+
+/// Which snapshots need a per-copy version, and what they looked like BEFORE
+/// the unroll touched them. `Err` when this loop cannot have per-copy frames at
+/// all.
+///
+/// # Three kinds of snapshot, and only one of them is a refusal
+///
+/// A copy's frame has to hang on a program point the copy actually has, and the
+/// only program points a copy has are the bcis its cloned nodes carry. So:
+///
+///   * **at a cloned bci** — copied, one per iteration. This is the mechanism.
+///   * **at a bci NO live node in the graph carries** — left exactly as it is,
+///     and this is the common case rather than an edge one: `IrBuilder` records
+///     a snapshot at *every* bytecode index, including the `istore` and `goto`
+///     that close a javac loop body, and neither of those produces a node. Such
+///     a snapshot cannot be consulted by anything. `build_deopt_points` anchors
+///     through `bci_native`, which is populated only from nodes, so it is
+///     skipped; and every deopt this file emits resumes at some node's own
+///     `bytecode_pc`, so no guard names it either. Its slots are left to be
+///     stranded and normalised to `NO_NODE` by `eliminate_dead_nodes`, which is
+///     what already happens to every unconsultable snapshot on every compile.
+///     Copying it instead would be worse than useless: safepoint slots are DCE
+///     ROOTS, so `trip` copies of a frame nothing reads would keep every
+///     iteration's intermediates alive to describe a program point with no
+///     code.
+///   * **at a bci some OTHER node carries** — refused
+///     ([`UnrollCensus::frame_uncopyable`]). Here the code really is emitted,
+///     really can be resumed at, and the frame names a body value with no
+///     iteration to belong to. There is no substitution that is right, so the
+///     loop is declined rather than given a frame picked from whichever
+///     iteration was convenient.
+///
+/// A snapshot naming only CARRIED phis, at any bci, is fine and is not refused:
+/// `unroll`'s teardown rewrites every use of a carried phi to its post-loop
+/// value, and `Graph::replace_all_uses` routes safepoint slots, so those slots
+/// are repaired by the transform itself.
+///
+/// # Why the snapshots are returned by value
+///
+/// Iteration 0 rewrites its snapshot IN PLACE (see [`install_copy_frames`]), so
+/// by iteration 1 the entry in `graph.safepoints` no longer names the original
+/// nodes the substitution has to start from. The pre-unroll copy returned here
+/// is that starting point, and taking it once is also what keeps the borrow of
+/// `graph` out of the mutating loop.
+fn plan_copy_frames(
+    graph: &Graph,
+    to_clone: &FxHashSet<NodeId>,
+) -> Result<Vec<(u32, SafepointSnapshot)>, ()> {
+    let mut cloned_bcis: FxHashSet<usize> = FxHashSet::default();
+    for &d in to_clone {
+        if let Some(pc) = graph.nodes[d as usize].bytecode_pc {
+            cloned_bcis.insert(pc);
+        }
+    }
+    // Every bci the emitted code will actually carry. Read from live nodes
+    // only: a node the optimizer already killed emits nothing, so a bci carried
+    // solely by one is as unreachable as a bci carried by nothing.
+    let mut node_bcis: FxHashSet<usize> = FxHashSet::default();
+    for node in &graph.nodes {
+        if node.op == Op::Dead {
+            continue;
+        }
+        if let Some(pc) = node.bytecode_pc {
+            node_bcis.insert(pc);
+        }
+    }
+    let mut plan: Vec<(u32, SafepointSnapshot)> = Vec::new();
+    for (si, sp) in graph.safepoints.iter().enumerate() {
+        if cloned_bcis.contains(&sp.bci) {
+            plan.push((si as u32, sp.clone()));
+            continue;
+        }
+        let names_body = sp
+            .locals
+            .iter()
+            .chain(sp.stack.iter())
+            .any(|slot| to_clone.contains(slot));
+        if names_body && node_bcis.contains(&sp.bci) {
+            return Err(());
+        }
+    }
+    Ok(plan)
+}
+
+/// Give iteration `t` its own copy of every body snapshot, and stamp that
+/// iteration's clones with it.
+///
+/// `subst` is iteration `t`'s substitution — body node → this iteration's
+/// clone, carried phi → the value entering this iteration — which is exactly
+/// the rename a frame at a body bci needs. A slot naming something outside the
+/// loop is left alone, because a loop-invariant value is the same in every
+/// copy.
+///
+/// # Iteration 0 rewrites in place; the rest append
+///
+/// Not a micro-optimization. `bci_native` anchors a bci at the EARLIEST native
+/// offset emitted for it, which is copy 0's, and `build_deopt_points` falls
+/// back to that anchor for any snapshot no node claims. If copy 0 got a fresh
+/// appended snapshot and the original were left naming dead nodes, the original
+/// would keep the copy-0 anchor and the table's point at that offset would
+/// describe an iteration that no longer exists. Making the original BE copy 0's
+/// frame keeps the anchor and its frame describing the same code.
+///
+/// # Ordering
+///
+/// Call this after iteration `t`'s clone loop and before the carried phis are
+/// advanced: the substitution must be complete (a snapshot at bci B may name
+/// any value live at B, which is any body node cloned at or before B), and it
+/// must not yet contain iteration `t+1`'s induction constant.
+fn install_copy_frames(
+    graph: &mut Graph,
+    plan: &[(u32, SafepointSnapshot)],
+    subst: &FxHashMap<NodeId, NodeId>,
+    iter_clones: &[NodeId],
+    first_iteration: bool,
+) {
+    let mut snap_for_bci: FxHashMap<usize, u32> = FxHashMap::default();
+    for (orig_si, orig) in plan {
+        let rename = |n: &NodeId| subst.get(n).copied().unwrap_or(*n);
+        let locals: Vec<NodeId> = orig.locals.iter().map(rename).collect();
+        let stack: Vec<NodeId> = orig.stack.iter().map(rename).collect();
+        let si = if first_iteration {
+            // Through `set_safepoint_slot`, not a direct write: installing a
+            // reference is the one snapshot edit the def-use edges cannot
+            // notice, and a stale use list is how a value a frame still names
+            // gets collected.
+            for (k, &v) in locals.iter().enumerate() {
+                graph.set_safepoint_slot(*orig_si as usize, SafepointSlotKind::Local, k, v);
+            }
+            for (k, &v) in stack.iter().enumerate() {
+                graph.set_safepoint_slot(*orig_si as usize, SafepointSlotKind::Stack, k, v);
+            }
+            *orig_si
+        } else {
+            let si = graph.safepoints.len() as u32;
+            graph.push_safepoint(SafepointSnapshot {
+                bci: orig.bci,
+                locals,
+                stack,
+            });
+            si
+        };
+        snap_for_bci.insert(orig.bci, si);
+    }
+    for &clone in iter_clones {
+        let Some(pc) = graph.nodes[clone as usize].bytecode_pc else {
+            continue;
+        };
+        let Some(&si) = snap_for_bci.get(&pc) else {
+            continue;
+        };
+        let bound = graph.set_node_frame_snapshot(clone, si);
+        debug_assert!(
+            bound,
+            "per-copy frame {si} refused for clone {clone} at bci {pc} -- \
+             `plan_copy_frames` and `set_node_frame_snapshot` disagree about \
+             which snapshot describes this node",
+        );
+    }
+}
+
 fn unroll(graph: &mut Graph) -> bool {
     let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNROLL").is_some();
     // Per-call, in `UnrollCensus` field order. See `publish_unroll_census`.
-    let mut census = [0usize; 13];
+    let mut census = [0usize; 15];
     // Computed ONCE for the whole graph, before any header is transformed:
     // unrolling only clones pure nodes and `Op::Load`s, so it cannot introduce
     // a trapping op, and re-deriving it per header would give the same answer
@@ -3658,7 +3898,27 @@ fn unroll(graph: &mut Graph) -> bool {
         // body no snapshot names, which on javac output is almost none -- a
         // snapshot records the full operand stack at every bci, so any loop
         // whose body leaves a value on the stack was refused.
-        if body_named_by_safepoint {
+        //
+        // ...or unless each copy gets a frame of its OWN, which is what the
+        // comment above calls "a per-iteration snapshot index" and what
+        // `ir_per_copy_frames_enabled` turns on. That path does not rest on any
+        // prediction about reachability: it answers the objection rather than
+        // arguing the objection cannot be reached, so it needs neither the
+        // trap-free fact nor the net below.
+        let mut per_copy: Option<Vec<(u32, SafepointSnapshot)>> = None;
+        if body_named_by_safepoint && ir_per_copy_frames_enabled() {
+            match plan_copy_frames(graph, &to_clone) {
+                Ok(plan) => per_copy = Some(plan),
+                Err(()) => {
+                    if dbg {
+                        eprintln!("[DBG_UNROLL] region {region}: bail — a snapshot names the body at a bci no clone carries");
+                    }
+                    census[unroll_bucket::FRAME_UNCOPYABLE] += 1;
+                    continue;
+                }
+            }
+        }
+        if body_named_by_safepoint && per_copy.is_none() {
             // The relaxation additionally requires the CONSUMER of the
             // trap-free fact to be available: if `build_deopt_points` is not
             // going to skip the points, the snapshots are live and the original
@@ -3676,8 +3936,15 @@ fn unroll(graph: &mut Graph) -> bool {
         // re-anchor them); milestone-1 only handles variant (cloned) loads.
         let mut pinned_invariant_load = false;
         for id in 0..graph.nodes.len() {
+            // Both body anchors, for the reason the `subst` above now covers
+            // both: an invariant load pinned to the BACK EDGE is left naming a
+            // killed control node just as surely as one pinned to the header,
+            // and this check is what keeps it from getting there.
             if matches!(graph.nodes[id].op, Op::Load(_))
-                && graph.nodes[id].inputs.first().copied() == Some(region)
+                && matches!(
+                    graph.nodes[id].inputs.first().copied(),
+                    Some(c) if c == region || c == back_ctrl
+                )
                 && !to_clone.contains(&(id as NodeId))
             {
                 pinned_invariant_load = true;
@@ -3754,10 +4021,29 @@ fn unroll(graph: &mut Graph) -> bool {
             // concrete constant init + t*stride).
             let mut subst: FxHashMap<NodeId, NodeId> = FxHashMap::default();
             subst.insert(region, entry_pred);
+            // ...and the OTHER control node a body value can be anchored to.
+            //
+            // This pass's own side-effect scan spells the body's control
+            // anchors `ctrl == region || ctrl == back_ctrl`, and `subst` covered
+            // only the first. A cloned `Op::Load` pinned to the back edge
+            // therefore kept `back_ctrl` as its control input across the
+            // teardown's `graph.kill(back_ctrl)`, and every copy pointed at a
+            // `Op::Dead`. `ir_verify`'s structural lane caught it -- "n24:
+            // Load(Int) input[0] = n16 refers to a removed (Dead) node", ten
+            // violations for five copies of a two-load body -- and the compile
+            // was refused, so the shape never reached the code. It was
+            // unreachable before per-copy frames only because a loop with a
+            // loop-carried receiver is one a safepoint snapshot names.
+            //
+            // `entry_pred` is right for both: a fully unrolled loop runs every
+            // iteration unconditionally in the preheader, so every body anchor
+            // becomes the preheader.
+            subst.insert(back_ctrl, entry_pred);
             for (&p, &v) in &cur {
                 subst.insert(p, v);
             }
             // Clone the per-iteration computation in topo order.
+            let mut iter_clones: Vec<NodeId> = Vec::with_capacity(order.len());
             for &d in &order {
                 let (op, ty, pc) = {
                     let nd = &graph.nodes[d as usize];
@@ -3770,6 +4056,13 @@ fn unroll(graph: &mut Graph) -> bool {
                     .collect();
                 let clone = graph.add(op, ty, new_inputs, pc);
                 subst.insert(d, clone);
+                iter_clones.push(clone);
+            }
+            // Per-copy deopt metadata, while `subst` still describes exactly
+            // this iteration. See `install_copy_frames` for why the order
+            // matters.
+            if let Some(plan) = per_copy.as_ref() {
+                install_copy_frames(graph, plan, &subst, &iter_clones, t == 0);
             }
             // Advance carried phis to their next-iteration values.
             let mut next: FxHashMap<NodeId, NodeId> = FxHashMap::default();
@@ -3817,6 +4110,9 @@ fn unroll(graph: &mut Graph) -> bool {
             );
         }
         census[unroll_bucket::UNROLLED] += 1;
+        if per_copy.is_some() {
+            census[unroll_bucket::PER_COPY_FRAMES] += 1;
+        }
         changed = true;
     }
     publish_unroll_census(&census);
@@ -4172,18 +4468,21 @@ mod tests {
             ty,
             inputs: vec![].into(),
             bytecode_pc: None,
+            frame_snapshot: None,
         });
         nodes.push(Node {
             op: Op::Const(b),
             ty,
             inputs: vec![].into(),
             bytecode_pc: None,
+            frame_snapshot: None,
         });
         nodes.push(Node {
             op,
             ty,
             inputs: vec![0, 1].into(),
             bytecode_pc: None,
+            frame_snapshot: None,
         });
         try_fold(&nodes, 2)
     }
@@ -4195,12 +4494,14 @@ mod tests {
             ty,
             inputs: vec![].into(),
             bytecode_pc: None,
+            frame_snapshot: None,
         });
         nodes.push(Node {
             op,
             ty,
             inputs: vec![0].into(),
             bytecode_pc: None,
+            frame_snapshot: None,
         });
         try_fold(&nodes, 1)
     }
@@ -6144,6 +6445,316 @@ mod tests {
         assert!(
             licm_scev_corroborates(&code, code.len()),
             "SCEV must corroborate a simple counted loop"
+        );
+    }
+}
+
+
+// ── Per-copy deopt metadata ──────────────────────────────────────────
+//
+// These two tests are deliberately OPPOSED. The first asserts the loop
+// unrolls with per-copy frames and that each copy's frame holds that copy's
+// values; the second asserts the SAME fixture is refused with the flag off.
+// Neither can pass vacuously while the other holds: if the fixture were one
+// the unroller took anyway, the second would fail, and the first would then be
+// proving nothing about the mechanism.
+
+#[cfg(test)]
+mod per_copy_frames_tests {
+    use super::*;
+    use crate::ir::IrBuilder;
+
+    /// `int f() { int a = 0; for (int i = 0; i < 5; i++) a += i; return a; }`
+    ///
+    /// Two locals, no parameters, and — the point of the fixture — built by the
+    /// real front end, so it carries a `SafepointSnapshot` at every one of its
+    /// 15 bytecode indices. The hand-built graphs elsewhere in this module
+    /// carry none, which is exactly why they never reach the refusal this
+    /// mechanism lifts.
+    const LOOP5: [u8; 21] = [
+        0x03, 0x3B, // iconst_0; istore_0        a = 0
+        0x03, 0x3C, // iconst_0; istore_1        i = 0
+        0x1B, 0x08, 0xA2, 0x00, 0x0D, // iload_1; iconst_5; if_icmpge 19
+        0x1A, 0x1B, 0x60, 0x3B, // iload_0; iload_1; iadd; istore_0   a += i
+        0x84, 0x01, 0x01, // iinc 1, 1                                i++
+        0xA7, 0xFF, 0xF4, // goto 4
+        0x1A, 0xAC, // iload_0; ireturn
+    ];
+
+    /// The bci of the `iadd` — the one body bci that survives as real code, and
+    /// so the one whose snapshots the copies must not share.
+    const IADD_BCI: usize = 11;
+
+    fn optimized(per_copy: bool) -> Graph {
+        cratonvm_types::flags::with_thread_overrides(
+            &[(
+                "CRATONVM_JIT_IR_PER_COPY_FRAMES",
+                Some(if per_copy { "1" } else { "0" }),
+            )],
+            || {
+                let mut g = IrBuilder::new(0, 2).build(&LOOP5, 21).expect("IR build");
+                optimize(&mut g);
+                g
+            },
+        )
+    }
+
+    /// Read a snapshot slot as a constant, for a graph the post-unroll fold has
+    /// already collapsed to constants.
+    fn const_slot(g: &Graph, slot: NodeId) -> Option<i64> {
+        match g.node_opt(slot)?.op {
+            Op::Const(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Each copy of an unrolled body gets an interpreter frame holding ITS
+    /// OWN values.
+    ///
+    /// This is the whole mechanism, and it is asserted on the numbers rather
+    /// than on the shape, because the shape is what a wrong version also has.
+    /// A cloned node keeps the original's `bytecode_pc`, so all five copies of
+    /// the `iadd` sit at bci 11; the by-bci scan `ir_lower` uses would hand
+    /// every one of them copy 0's frame. What the accumulator actually holds
+    /// entering iteration `t` is `0, 0, 1, 3, 6` — five different numbers — and
+    /// the induction variable holds `0..4`. A version that shares one frame
+    /// reads `(0, 0)` five times and fails here on the second copy.
+    #[test]
+    fn each_copy_of_an_unrolled_body_names_its_own_interpreter_frame() {
+        let before = ir_unroll_census();
+        let g = optimized(true);
+        let fired = ir_unroll_census().per_copy_frames > before.per_copy_frames;
+        assert!(
+            fired,
+            "the fixture did not unroll over per-copy frames, so everything \
+             below is vacuous -- check that `unroll_enabled` is on and that \
+             the loop is still recognised as counted",
+        );
+
+        let mut frames: Vec<(i64, i64)> = Vec::new();
+        for sp in g.safepoints.iter().filter(|sp| sp.bci == IADD_BCI) {
+            let a = const_slot(&g, sp.locals[0]);
+            let i = const_slot(&g, sp.locals[1]);
+            match (a, i) {
+                (Some(a), Some(i)) => frames.push((a, i)),
+                _ => panic!(
+                    "a frame at bci {IADD_BCI} names a non-constant slot \
+                     (locals {:?}) -- after the post-unroll fold every copy's \
+                     values are concrete, so this is a slot the unroll \
+                     stranded",
+                    sp.locals
+                ),
+            }
+        }
+        assert_eq!(
+            frames,
+            vec![(0, 0), (0, 1), (1, 2), (3, 3), (6, 4)],
+            "the five copies of bci {IADD_BCI} do not each hold their own \
+             (accumulator, induction) pair",
+        );
+
+        // Every one of those frames must be CLAIMED by the copy it describes:
+        // the numbers above are only reachable at run time if the trapping
+        // node names its own snapshot instead of falling back to the by-bci
+        // scan, which finds the first.
+        let claimed: std::collections::HashSet<u32> = g
+            .nodes
+            .iter()
+            .filter(|n| n.op != Op::Dead)
+            .filter_map(|n| n.frame_snapshot)
+            .collect();
+        let at_iadd: Vec<u32> = g
+            .safepoints
+            .iter()
+            .enumerate()
+            .filter(|(_, sp)| sp.bci == IADD_BCI)
+            .map(|(si, _)| si as u32)
+            .collect();
+        for si in &at_iadd {
+            assert!(
+                claimed.contains(si),
+                "safepoint[{si}] at bci {IADD_BCI} is one of {} copies and no \
+                 node names it; `ir_lower` would resolve that copy through the \
+                 by-bci scan and hand it copy 0's frame",
+                at_iadd.len(),
+            );
+        }
+
+        // And the graph must survive the frame-state verifier, which is what
+        // says the relaxed duplicate-bci rule and the producer agree.
+        // Frame states only. `check_arena_order` is a heuristic that fires on
+        // essentially every optimized graph (unroll appends its clones after
+        // the `Return` that uses them), and it is off in production for that
+        // reason -- turning it on here would fail for something this change
+        // has nothing to do with.
+        let opts = crate::ir_verify::VerifyOptions {
+            check_frame_states: true,
+            ..crate::ir_verify::VerifyOptions::structural()
+        };
+        crate::ir_verify::verify_graph(&g, "per-copy-frames", opts)
+            .expect("an unrolled graph with per-copy frames must verify");
+    }
+
+    /// The same fixture, with the mechanism off, is REFUSED — and refused for
+    /// the reason the mechanism addresses.
+    ///
+    /// Without this, the test above proves nothing: a fixture the unroller
+    /// would have taken anyway would satisfy every assertion there while the
+    /// per-copy code did no work at all. This is the half that pins the
+    /// fixture to the refusal.
+    #[test]
+    fn the_same_loop_is_refused_when_per_copy_frames_are_off() {
+        let before = ir_unroll_census();
+        let g = optimized(false);
+        let after = ir_unroll_census();
+        assert!(
+            after.safepoint_named > before.safepoint_named,
+            "the fixture was not declined for `safepoint_named` with per-copy \
+             frames off (census delta: {:?} -> {:?}); either the refusal moved \
+             or this loop no longer reaches it",
+            before,
+            after,
+        );
+        assert!(
+            g.nodes.iter().any(|n| {
+                matches!(n.op, Op::Region | Op::Merge) && n.inputs.len() == 2
+            }),
+            "the loop header is gone, so the loop was unrolled after all",
+        );
+    }
+
+    /// A body value pinned to the BACK EDGE survives the unroll.
+    ///
+    /// The defect this pins was found by running a probe, not by reading the
+    /// code, and it was found the first time per-copy frames let a loop with a
+    /// loop-carried RECEIVER unroll:
+    ///
+    /// ```text
+    /// [ir] verifier rejected UT3.walk(LUT3$N;)I: 10 violation(s):
+    ///      n24:Load(Int) input[0] = n16 refers to a removed (Dead) node; ...
+    /// ```
+    ///
+    /// Ten violations, two loads per body, five copies. `unroll` substituted
+    /// `region` into each clone's inputs but not `back_ctrl` — and this pass's
+    /// own side-effect scan spells the body's control anchors
+    /// `ctrl == region || ctrl == back_ctrl`, so the second one was always
+    /// there to be read. Every copy of a load pinned to the back edge kept a
+    /// control input the teardown then killed.
+    ///
+    /// It failed CLOSED (`ir_verify`'s structural lane runs in production and
+    /// the compile was refused), which is why it cost a probe rather than a
+    /// wrong answer — and is also why no assertion about behaviour would have
+    /// caught it. This one asks the graph.
+    ///
+    /// `walk` is `static int walk(N o) { int a = 0; for (int i = 0; i < 5;
+    /// i++) { a += o.v; o = o.next; } return a; }`, which is the smallest
+    /// shape with a loop-carried receiver.
+    #[test]
+    fn a_body_value_pinned_to_the_back_edge_survives_the_unroll() {
+        let code = [
+            0x03u8, 0x3C, // iconst_0; istore_1            a = 0
+            0x03, 0x3D, // iconst_0; istore_2               i = 0
+            0x1C, 0x08, 0xA2, 0x00, 0x15, // iload_2; iconst_5; if_icmpge 27
+            0x1B, 0x2A, 0xB4, 0x00, 0x07, 0x60, 0x3C, // a += o.v
+            0x2A, 0xB4, 0x00, 0x0D, 0x4B, // o = o.next
+            0x84, 0x02, 0x01, // iinc 2, 1
+            0xA7, 0xFF, 0xEC, // goto 4
+            0x1B, 0xAC, // iload_1; ireturn
+        ];
+        // pc → (field index, type tag). 11 is `v` (int), 17 is `next` (ref).
+        let mut info: std::collections::HashMap<usize, (usize, u8)> =
+            std::collections::HashMap::new();
+        info.insert(11, (0, b'I'));
+        info.insert(17, (1, b'L'));
+
+        let g = cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_JIT_IR_PER_COPY_FRAMES", Some("1"))],
+            || {
+                let mut builder = IrBuilder::new(1, 3);
+                builder.set_field_info(info.clone());
+                let mut g = builder.build(&code, 29).expect("IR build");
+                optimize(&mut g);
+                g
+            },
+        );
+
+        assert!(
+            g.nodes.iter().any(|n| matches!(n.op, Op::Load(_))),
+            "the fixture built no loads, so it is not the shape under test",
+        );
+        for (id, node) in g.nodes.iter().enumerate() {
+            if node.op == Op::Dead {
+                continue;
+            }
+            for (k, &inp) in node.inputs.iter().enumerate() {
+                if inp == NO_NODE {
+                    continue;
+                }
+                assert_ne!(
+                    g.nodes[inp as usize].op,
+                    Op::Dead,
+                    "n{id}:{:?} input[{k}] = n{inp} names a node the unroll killed",
+                    node.op,
+                );
+            }
+        }
+        crate::ir_verify::verify_graph(
+            &g,
+            "back-edge-anchor",
+            crate::ir_verify::VerifyOptions::structural(),
+        )
+        .expect("an unrolled loop with a loop-carried receiver must verify");
+    }
+
+    /// `set_node_frame_snapshot` refuses a snapshot that is not this node's
+    /// program point.
+    ///
+    /// The fail-closed half of the API. A node bound to a frame resuming at
+    /// another bytecode index is not a copy identity — it is a
+    /// mis-substitution, and it is the one that does not announce itself: the
+    /// interpreter resumes in the wrong instruction holding values that look
+    /// entirely plausible.
+    #[test]
+    fn a_frame_snapshot_must_be_the_nodes_own_program_point() {
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: 0,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+            receiver_param: None,
+        };
+        let here = g.add(Op::Const(1), IrType::Int, vec![], Some(7));
+        let no_pc = g.add(Op::Const(2), IrType::Int, vec![], None);
+        g.push_safepoint(SafepointSnapshot {
+            bci: 7,
+            locals: vec![here],
+            stack: vec![],
+        });
+        g.push_safepoint(SafepointSnapshot {
+            bci: 9,
+            locals: vec![here],
+            stack: vec![],
+        });
+
+        assert!(g.set_node_frame_snapshot(here, 0), "bci 7 == bci 7");
+        assert_eq!(g.nodes[here as usize].frame_snapshot, Some(0));
+        assert!(
+            !g.set_node_frame_snapshot(here, 1),
+            "a node at bci 7 must not take a frame that resumes at bci 9",
+        );
+        assert!(
+            !g.set_node_frame_snapshot(here, 99),
+            "a snapshot index past the end must be refused, not installed",
+        );
+        assert!(
+            !g.set_node_frame_snapshot(no_pc, 0),
+            "a node with no program point has nothing to agree with",
+        );
+        assert_eq!(
+            g.nodes[here as usize].frame_snapshot,
+            Some(0),
+            "a refused call must leave the previous binding alone",
         );
     }
 }

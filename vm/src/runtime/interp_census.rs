@@ -451,17 +451,20 @@ pub fn report_at_exit() {
         // the existing one refuses on a default run.
         let uc = cratonvm_jit::ir_optimize::ir_unroll_census();
         eprintln!(
-            "[c2-supersede] ir unroll: merges={} (loops = merges - not_single_backedge) unrolled={} | declined: \
+            "[c2-supersede] ir unroll: merges={} (loops = merges - not_single_backedge) unrolled={} \
+             (of which per_copy_frames={}) | declined: \
              runtime_bound={} (of which trap_free={} pure_body={}) safepoint_named={} \
-             side_effect={} not_counted={} control_shape={} \
+             frame_uncopyable={} side_effect={} not_counted={} control_shape={} \
              body_unclonable={} trip_over_cap={} escapes_or_pinned={} \
              not_single_backedge={}",
             uc.headers,
             uc.unrolled,
+            uc.per_copy_frames,
             uc.runtime_bound,
             uc.runtime_bound_trap_free,
             uc.runtime_bound_pure_body,
             uc.safepoint_named,
+            uc.frame_uncopyable,
             uc.side_effect,
             uc.not_counted,
             uc.control_shape,
