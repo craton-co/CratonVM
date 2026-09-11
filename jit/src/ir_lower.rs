@@ -1053,6 +1053,11 @@ struct Lowerer<'a> {
     /// Deferred carries planned, taken and read — engagement for the census.
     carry_deferred_planned: usize,
     carry_deferred_read: usize,
+    /// Fused compares that read both operands where they already were.
+    cmp_in_place: usize,
+    /// Fused compares that read the second operand straight out of its frame
+    /// slot instead of loading it into RCX first.
+    cmp_in_place_frame: usize,
     /// ENGAGEMENT, and its fail-closed counterpart. A refusal is not a
     /// miscompile — the value's home is `home_dropped`, so the fallback read
     /// refuses the compile as well — but it means the contract this planned
@@ -1622,6 +1627,8 @@ impl<'a> Lowerer<'a> {
             carry_deferred: Vec::new(),
             carry_deferred_planned: 0,
             carry_deferred_read: 0,
+            cmp_in_place: 0,
+            cmp_in_place_frame: 0,
             carries_taken: 0,
             carries_read: 0,
             carries_refused: 0,
@@ -2505,6 +2512,56 @@ impl<'a> Lowerer<'a> {
         let rex = 0x48u8 | (((src >= 8) as u8) << 2) | ((dst >= 8) as u8);
         self.buf
             .emit(&[rex, 0x89, 0xC0 | ((src & 7) << 3) | (dst & 7)]);
+    }
+
+    /// `CMP a, b` — register to register, any pair, 64-bit when `wide`.
+    ///
+    /// `39 /r` is `CMP r/m, r`, so the FIRST operand goes in the ModRM `r/m`
+    /// field and the second in `reg` — the opposite nesting from the mnemonic,
+    /// and the reason this is a named helper rather than three inline literals.
+    /// The flags it sets are `a - b`, which is the order `CmpCond::x64_cc`
+    /// expects.
+    ///
+    /// The 32-bit form emits REX only when it has to name an extended register,
+    /// so a comparison of two low registers stays two bytes exactly as
+    /// `CMP EAX, ECX` did.
+    fn emit_cmp_reg_reg(&mut self, a: u8, b: u8, wide: bool) {
+        let (bytes, len) = cmp_reg_reg_bytes(a, b, wide);
+        self.buf.emit(&bytes[..len]);
+    }
+
+    /// `CMP a, [RBP - offset]` — 64-bit when `wide`.
+    ///
+    /// `3B /r` is `CMP r, r/m`, the mirror of the `39 /r` above: here the FIRST
+    /// operand is the `reg` field and the second comes from memory, which is
+    /// the direction needed to compare a resident value against one still in
+    /// its frame slot. Flags are `a - [slot]`, the same order
+    /// `CmpCond::x64_cc` expects.
+    ///
+    /// The 32-bit form reads four bytes where the `MOV` it replaces read eight.
+    /// That is the same comparison: the slot holds a sign-extended `int` in its
+    /// low word, and the `CMP EAX, ECX` this replaces only ever looked at those
+    /// four bytes either.
+    fn emit_cmp_reg_frame(&mut self, a: u8, offset: i32, wide: bool) {
+        let rex = if wide { 0x48u8 } else { 0x40u8 } | (((a >= 8) as u8) << 2);
+        if rex != 0x40 {
+            self.buf.emit_byte(rex);
+        }
+        self.buf.emit_byte(0x3B);
+        self.emit_rbp_modrm_disp(a, offset);
+    }
+
+    /// Is `id` a value some carry is holding in RAX or RCX right now?
+    ///
+    /// A carried value must be read through `gp_load_value`, which is what
+    /// takes it out of the slot; a site that reads it any other way would leave
+    /// the carry stranded and refuse the compile. `plan_carries` already
+    /// declines to carry anything the residency file assigned a register, so a
+    /// resident value is never carried — this is the belt to that braces,
+    /// because the failure is silent at the point it is made.
+    fn carry_names(&self, id: NodeId) -> bool {
+        matches!(self.live_carry, Some((prod, _, _, _)) if prod == id)
+            || matches!(self.deferred_rcx, Some((prod, _, _)) if prod == id)
     }
 
     /// Latch a structured bailout raised from an infallible legacy accessor.
@@ -10109,12 +10166,66 @@ impl<'a> Lowerer<'a> {
                                 let ref_cmp =
                                     matches!(self.graph.nodes[a as usize].ty, IrType::Ref)
                                         || matches!(self.graph.nodes[b as usize].ty, IrType::Ref);
-                                self.gp_load_value(RAX, a);
-                                self.gp_load_value(RCX, b);
-                                if ref_cmp {
-                                    self.buf.emit(&[0x48, 0x39, 0xC8]); // CMP RAX, RCX
+                                // Both already in registers: compare them
+                                // there. A fused compare is the one arm that
+                                // may do this without owing anything else — it
+                                // defines no value, writes no home and
+                                // publishes no register, so the only thing that
+                                // outlives it is the flags, and those are the
+                                // same either way.
+                                //
+                                // Nothing downstream may assume RAX holds `a`:
+                                // the non-fused path below overwrites AL with
+                                // `SETcc` on the phi-copy layout, so no reader
+                                // could ever have relied on it.
+                                // Two in-place forms, in order of how much
+                                // they save. Both need the FIRST operand in a
+                                // register, and neither may touch a value some
+                                // carry is holding — that has to be read
+                                // through `gp_load_value` or the carry strands.
+                                //
+                                // `b` in a frame slot is the common case, not
+                                // the fallback: `peak_live` routinely exceeds
+                                // the five-register file, and a loop bound is
+                                // exactly the long-lived value that loses.
+                                let in_place = if ir_cmp_in_place_enabled()
+                                    && !self.carry_names(a)
+                                    && !self.carry_names(b)
+                                {
+                                    match (self.resident_gpr(a), self.resident_gpr(b)) {
+                                        (Some(ra), Some(rb)) => Some(Ok((ra, rb))),
+                                        // `slot_of_checked` rather than
+                                        // `slot_of`: a dropped home declines
+                                        // this form instead of latching a
+                                        // bailout on a path that has a perfectly
+                                        // good fallback.
+                                        (Some(ra), None) => self
+                                            .slot_of_checked(b)
+                                            .ok()
+                                            .map(|off| Err((ra, off))),
+                                        _ => None,
+                                    }
                                 } else {
-                                    self.buf.emit(&[0x39, 0xC8]); // CMP EAX, ECX
+                                    None
+                                };
+                                match in_place {
+                                    Some(Ok((ra, rb))) => {
+                                        self.emit_cmp_reg_reg(ra, rb, ref_cmp);
+                                        self.cmp_in_place += 1;
+                                    }
+                                    Some(Err((ra, off))) => {
+                                        self.emit_cmp_reg_frame(ra, off, ref_cmp);
+                                        self.cmp_in_place_frame += 1;
+                                    }
+                                    None => {
+                                        self.gp_load_value(RAX, a);
+                                        self.gp_load_value(RCX, b);
+                                        if ref_cmp {
+                                            self.buf.emit(&[0x48, 0x39, 0xC8]); // CMP RAX, RCX
+                                        } else {
+                                            self.buf.emit(&[0x39, 0xC8]); // CMP EAX, ECX
+                                        }
+                                    }
                                 }
                                 Some(cc.x64_cc())
                             }
@@ -13714,6 +13825,26 @@ fn ir_carry_second_operand_enabled() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_IR_CMP_IN_PLACE=0` — load both operands of a fused compare into
+/// RAX and RCX before comparing them, the shape that predates 2026-09-10.
+///
+/// Default ON. A fused compare is the one arm that can read its operands
+/// wherever they already are without any further obligation: it produces no
+/// value, writes no home, publishes no register and leaves only flags. When
+/// both operands are register-resident the two `MOV`s ahead of it are pure
+/// overhead, and on a counted loop they are two of the seventeen instructions
+/// in the body.
+fn ir_cmp_in_place_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CMP_IN_PLACE").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
 /// Does lowering `op` read its first input into RAX, and its second (if it has
 /// one) into RCX, before emitting anything else?
 ///
@@ -14221,6 +14352,28 @@ pub fn ir_aastore_census() -> u64 {
 /// fail: it scans the claimed arms' source for any mention of RCX and pins the
 /// exact bytes they emit, because a raw `buf.emit(&[..])` can name RCX in a
 /// ModRM byte where no identifier scan would see it.
+/// The bytes of `CMP a, b` — 64-bit when `wide` — and how many of them.
+///
+/// A free function so the encoding can be tested against known-good vectors
+/// without standing up a `Lowerer`. It is worth testing: a ModRM field swapped
+/// here compares two registers that both exist, so the result is a plausible
+/// wrong branch rather than a fault.
+///
+/// `39 /r` is `CMP r/m, r`, so the FIRST operand lands in `r/m` and the second
+/// in `reg` — the opposite nesting from the mnemonic. REX.R extends the `reg`
+/// field (the second operand) and REX.B the `r/m` field (the first).
+fn cmp_reg_reg_bytes(a: u8, b: u8, wide: bool) -> ([u8; 3], usize) {
+    let rex = if wide { 0x48u8 } else { 0x40u8 } | (((b >= 8) as u8) << 2) | ((a >= 8) as u8);
+    let modrm = 0xC0 | ((b & 7) << 3) | (a & 7);
+    if rex == 0x40 {
+        // No extended register and no width prefix — two bytes, exactly the
+        // `CMP EAX, ECX` this replaced.
+        ([0x39, modrm, 0], 2)
+    } else {
+        ([rex, 0x39, modrm], 3)
+    }
+}
+
 pub(crate) fn op_preserves_rcx(op: &Op) -> bool {
     matches!(op, Op::I2L | Op::L2I)
 }
@@ -17298,7 +17451,7 @@ pub(crate) fn lower_inner_with_scopes(
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
         eprintln!(
             "[ir-ls] carries: planned={} taken={} read={} refused={} \
-             stores_dropped={} still_deopt_named={} deferred={}/{}",
+             stores_dropped={} still_deopt_named={} deferred={}/{} cmp_in_place={}+{}",
             lowerer.carry_of.iter().filter(|c| c.is_some()).count(),
             lowerer.carries_taken,
             lowerer.carries_read,
@@ -17307,6 +17460,8 @@ pub(crate) fn lower_inner_with_scopes(
             lowerer.carry_named,
             lowerer.carry_deferred_planned,
             lowerer.carry_deferred_read,
+            lowerer.cmp_in_place,
+            lowerer.cmp_in_place_frame,
         );
         let s = lowerer.carry_skips;
         eprintln!(
@@ -25166,6 +25321,41 @@ mod tests {").next().unwrap_or(src);
     ///   * the arm's raw `buf.emit(&[..])` byte literals are exactly the ones
     ///     recorded here — catches a ModRM byte that encodes RCX as a
     ///     destination, which no identifier scan can see.
+    /// `cmp_reg_reg_bytes` against hand-checked encodings.
+    ///
+    /// A swapped ModRM field here compares two registers that both exist, so
+    /// the failure is a plausible wrong branch and not a fault — which is why
+    /// the vectors are written out rather than derived by the same arithmetic
+    /// the function uses.
+    ///
+    /// The first two are the sequences this replaced, so a regression that
+    /// changes the low-register case shows up as a byte difference.
+    #[test]
+    fn cmp_reg_reg_encodes_the_known_forms() {
+        // CMP EAX, ECX — the exact two bytes the fused compare emitted before.
+        assert_eq!(cmp_reg_reg_bytes(RAX, RCX, false), ([0x39, 0xC8, 0], 2));
+        // CMP RAX, RCX — and the exact three of the ref/64-bit form.
+        assert_eq!(cmp_reg_reg_bytes(RAX, RCX, true), ([0x48, 0x39, 0xC8], 3));
+        // CMP EBX, R12D — REX.R extends the SECOND operand into r8..r15.
+        assert_eq!(cmp_reg_reg_bytes(3, 12, false), ([0x44, 0x39, 0xE3], 3));
+        // CMP R13, RBX — REX.B extends the FIRST operand.
+        assert_eq!(cmp_reg_reg_bytes(13, 3, true), ([0x49, 0x39, 0xDD], 3));
+        // Both extended, 64-bit: REX.W|REX.R|REX.B.
+        assert_eq!(cmp_reg_reg_bytes(14, 15, true), ([0x4D, 0x39, 0xFE], 3));
+    }
+
+    /// The operand ORDER must survive the r/m-versus-reg inversion: `CMP a, b`
+    /// sets the flags of `a - b`, which is what `CmpCond::x64_cc` reads.
+    ///
+    /// Stated as a distinct test because the encoding one above would still
+    /// pass if both the function and its vectors were transposed together.
+    /// `CMP EAX, ECX` is `39 C8` in every reference; `CMP ECX, EAX` is `39 C1`.
+    #[test]
+    fn cmp_reg_reg_puts_the_first_operand_in_rm() {
+        assert_eq!(cmp_reg_reg_bytes(RAX, RCX, false), ([0x39, 0xC8, 0], 2));
+        assert_eq!(cmp_reg_reg_bytes(RCX, RAX, false), ([0x39, 0xC1, 0], 2));
+    }
+
     #[test]
     fn every_rcx_preserving_arm_leaves_rcx_alone() {
         let src = include_str!("ir_lower.rs").replace("\r\n", "\n");
