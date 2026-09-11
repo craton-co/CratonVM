@@ -181,19 +181,24 @@ const SYNTHETIC_FEATURE: &str = "synthetic-jdk";
 // of them. That is why the RATCHET below is a set and not an equality on
 // counts.
 
-/// `.rs` files parsed across all seven crate `src` trees (measured 361; 361).
+/// `.rs` files parsed across all seven crate `src` trees (measured 377;
+/// was 361).
 const MIN_FILES: usize = 250;
-/// `fn` definitions parsed (measured 34,062; was 33,710).
+/// `fn` definitions parsed (measured 36,722; was 34,062).
 const MIN_FN_DEFS: usize = 20_000;
-/// Definitions whose signature mentions `NativeMethodRegistry` (measured 845).
+/// Definitions whose signature mentions `NativeMethodRegistry` (measured 864;
+/// was 845).
 const MIN_PASSES: usize = 600;
-/// `.register(` call sites found, of any arity (measured 14,088; was 14,063).
+/// `.register(` and `.register_with_kind(` call sites found, of any arity
+/// (measured 14,887; 14,142 on the same tree before the matcher learned
+/// `register_with_kind`, and 14,088 at the 2026-08-17 take).
 const MIN_REGISTER_SITES: usize = 9_000;
-/// Sites whose first three arguments all resolved (measured 12,623).
+/// Sites whose first three arguments all resolved (measured 13,662; was 12,623).
 const MIN_RESOLVED_SITES: usize = 8_000;
-/// Distinct `(class, name, descriptor)` triples recovered (measured 11,458).
+/// Distinct `(class, name, descriptor)` triples recovered (measured 13,260;
+/// was 11,458).
 const MIN_TRIPLES: usize = 7_000;
-/// Passes reachable from the shipping side (measured 509; was 521).
+/// Passes reachable from the shipping side (measured 521; was 509).
 const MIN_SHIPPING: usize = 350;
 /// Synthetic-only passes (measured 280; `registrar_reachability.rs` says 284
 /// for `native-builtins` alone -- this scan sees the other crates' shipping
@@ -210,7 +215,7 @@ const MIN_SYNTHETIC_OVERRIDES_BODY: usize = 60_000;
 /// resolving descriptors reports a small, clean, entirely fictional number, and
 /// every other assertion here passes.
 const MIN_TOTAL_DRIFT: usize = 900;
-/// Sites inside an expanded `for` loop (measured 696). Without loop expansion
+/// Sites inside an expanded `for` loop (measured 1,294; was 696). Without loop expansion
 /// whole classes vanish from the census with no other symptom.
 const MIN_LOOP_EXPANDED_SITES: usize = 400;
 
@@ -222,6 +227,14 @@ const MIN_LOOP_EXPANDED_SITES: usize = 400;
 ///
 /// Measured 2026-08-17: 950 = 892 `unbound-identifier` + 18 `format!` +
 /// 15 `no-enclosing-fn` + 14 `no-registry-owner` + 11 `expression`.
+///
+/// Re-measured 2026-09-11: 698 = 589 `unbound-identifier` + 60 `format!` +
+/// 16 `no-enclosing-fn` + 15 `no-registry-owner` + 18 `expression`. It went
+/// DOWN while the census grew, which is the shape to expect from teaching the
+/// matcher `register_with_kind`: 745 sites that used to be skipped before they
+/// could be classified now enter the scan, and 699 of them resolve. The 45
+/// that do not are inside the blind region and counted there -- which is the
+/// point of bounding it rather than asserting it is empty.
 ///
 /// The 2026-08-16 record's admission was that new drift arriving through one of
 /// these forms is invisible to the gate. It still is -- this constant does not
@@ -266,63 +279,74 @@ const MAX_BLIND_SITES: usize = 1_000;
 /// both names; this change did not create it, does not answer it, and would
 /// have left it asymmetric (watched on one carrier, unwatched on the other) if
 /// this row were not added.
-/// **Re-taken 2026-09-10, +51 distinct / +54 pairs, and NONE of it is new
-/// drift.** The scanner was widened; these pairs were always there.
+/// **Re-taken 2026-09-11, +51 triples / +54 pairs, and NOT because anything
+/// drifted.** The scanner was blind to `register_with_kind(`: its site matcher
+/// required a `(` immediately after `register`, and the skip comment named
+/// `register_with_kind(` alongside `registered_by` as though it were noise. It
+/// is not noise -- it sets the ambient kind, calls `register` with the SAME
+/// first three arguments, and restores it -- so 745 real registration sites in
+/// the five scanned crates were invisible to this gate.
 ///
-/// This scan required the byte after `register` to be `(`, so
-/// `register_with_kind(class, name, descriptor, body, kind)` was skipped --
-/// the old code said so in a comment and filed it with `registered_by` as
-/// noise. It is not noise. **757 sites tree-wide** spell the call that way, and
-/// they are not a uniform sample of the registry: they are precisely the sites
-/// whose kind was ADJUDICATED. Converting `register` -> `register_with_kind`
-/// is the standard remedy for a contract 1.4 shadow, so every adjudication
-/// silently deleted the SHIPPING half of any drift pair the triple belonged
-/// to, and this gate reported the deletion as `STALE BASELINE -- recorded
-/// drift pair(s) no longer drift`. Good news wearing a defect's clothes, once
-/// per adjudication.
+/// How it surfaced: `0b2791ac7` (2026-09-10) switched ONE site,
+/// `java/lang/Class.getModule()Ljava/lang/Module;` in `lib.rs`, from `register`
+/// to `register_with_kind` to tag it `SyntheticStub`. That did not remove the
+/// twin -- `phases_late.rs`'s own TWIN table still describes the pair, two
+/// canonical-Module caches for one identity invariant -- but it removed the
+/// shipping side from this scan, and `the_drift_baseline_has_no_stale_rows`
+/// then reported the row as FIXED. A resolver blind spot reads exactly like a
+/// fix, which is why that test's failure text says to read
+/// `the_drift_scanner_is_not_vacuous` first. Following that instruction is what
+/// found this.
 ///
-/// **Same species as the six gates `d5ca22357` fixed on 2026-08-30** -- that
-/// commit counted 230 `register_with_kind(` sites in `native-builtins/src/lib
-/// .rs` alone against 1207 plain ones, and repaired four gates that read that
-/// file as text. This file was the one it did not reach, which is why the
-/// family was closed and this member of it stayed open for eleven more days.
+/// Census on one tree, scanner before vs after:
 ///
-/// Found by tagging `java/lang/Class.getName` an `Intrinsic`. The gate went red
-/// claiming two pairs had stopped drifting; only ONE of them had, and not for
-/// the reason the message implied:
+/// ```text
+///                         before    after
+///   register sites        14,142   14,887    +745
+///   resolved sites        12,963   13,662    +699
+///   distinct triples      12,629   13,260    +631
+///   DRIFTING triples       1,223    1,275     +52
+///   blind (excl arity<4)     653      698     +45   ceiling 1,000
+/// ```
 ///
-/// * `Class.getName` -- both registrations resolve to the SAME function,
-///   `lang_class::native_class_get_name` (`use lang_class::*` in `lib.rs`
-///   makes the synthetic site's bare name the qualified one). One body, two
-///   pointers, exactly the `SSLContext.getProvider` case recorded below.
-/// * `Class.getModule` -- two DIFFERENT closures, `lib.rs` versus
-///   `phases_late/reflect_invoke.rs`. Still two implementations, one per mode.
-///   It had been a recorded row here for weeks; the tag hid it.
+/// Every one of the 54 new pairs has the SAME shipping twin,
+/// `register_essential_natives_with_shims` -- the real-JDK essential path,
+/// which is where the kind-tagging campaign has been converting call sites.
+/// Nothing was removed from the table. By synthetic-only pass:
+/// `register_synthetic_overrides` 27 (`Object.clone`/`hashCode`/`notify`,
+/// `System.arraycopy`/`nanoTime`, `Class.getSuperclass`/`isInstance`,
+/// `Thread.start0`, `String.intern`, the `Double`/`Float` bit casts),
+/// `register_core_stdlib_extras` 16 (the `jdk/internal/misc` surface --
+/// `CDS`, `Unsafe`, `VM`, `ScopedMemoryAccess` -- plus the `List`/`Map`/`Set`
+/// `copyOf` trio), `register_classloader_define_class` 3, `register_p69_misc` 3
+/// (the same `copyOf` trio from a second synthetic pass),
+/// `register_object_stream_class` 2, and one each from
+/// `register_enterprise_final_natives` (`Class.isHidden`),
+/// `register_java_lang_extras_natives` (`Thread.holdsLock`) and
+/// `register_unsafe_define_class`.
 ///
-/// **Read the BODIES before believing "no longer drifts".** The first fix
-/// attempted here moved both triples to `FIXED_NOT_DRIFTING` with a note
-/// claiming the kinds now agreed -- true of one and false of the other, and
-/// only the bodies separate them.
+/// **These 51 rows are debt this gate could not see, not debt this change
+/// created.** They are recorded rather than fixed, which is what every other
+/// row in this table is: "Every row is a debt, not a permission."
 ///
-/// So the fix is the scanner, not the baseline. Both triples are back in the
-/// table below where they always belonged, and the 54 pairs are what the blind
-/// spot had been covering. They are RECORDED rather than adjudicated because
-/// each needs its own "do the two bodies agree?" answer, and several are not
-/// cosmetic -- `ClassLoader.defineClass0/1/2`, `Class.getSuperclass`,
-/// `Class.isInstance`, `Class.isAssignableFrom`,
-/// `ObjectStreamClass.hasStaticInitializer`, `Unsafe.defineClass0`. Routed to
-/// lanes L0, L4, L5 and L7 by `docs/known-issues/jdk-only-lanes/`.
+/// **Found twice, independently, on the same day** -- this branch (lane L0)
+/// and `claude/gate-baselines-refresh-20260911` both widened this scan on
+/// 2026-09-10/11 and both landed on +51/+54. The counts of blind sites differ
+/// by scope, not by disagreement: 745-747 in the five scanned crates, 757
+/// tree-wide.
 ///
-/// `registrar_reachability.rs`'s `FAMILY_DRIFT_EXPOSURE` was re-taken in the
-/// same commit, which is what its own panic prescribes when this file moved:
-/// six families rose (`register_classloader_natives` 82 -> 85,
-/// `register_enterprise_final_natives` 118 -> 135,
-/// `register_java_lang_extras_natives` 27 -> 28, `register_phase69_natives`
-/// 8 -> 11, `register_serialization_natives` 2 -> 4,
-/// `register_unsafe_define_class` 1 -> 2). It cross-checks per family and
-/// caught the phantom independently before this note was written. Every number
-/// in both files came from the gates' own paste-ready output, never from
-/// arithmetic.
+/// One thing worth adding to the account above, because it explains the
+/// *rate*: the blind set is not a uniform sample of the registry. Converting
+/// `register` -> `register_with_kind` is this campaign's standard remedy for a
+/// contract-1.4 shadow, so the sites spelled that way are precisely the ones
+/// whose kind was ADJUDICATED. Every adjudication therefore removed the
+/// shipping half of any drift pair its triple belonged to, and this gate
+/// reported the removal as `STALE BASELINE -- recorded drift pair(s) no longer
+/// drift`. Good news wearing a defect's clothes, once per adjudication --
+/// which is the same species as the six gates `d5ca22357` repaired on
+/// 2026-08-30, counting 230 `register_with_kind(` sites in
+/// `native-builtins/src/lib.rs` alone against 1207 plain ones. This file was
+/// the one that commit did not reach.
 const BASELINE_TOTAL_DRIFT: usize = 1275;
 
 /// `(synthetic-only pass, triple)` PAIRS in [`DRIFT_TRIPLES`] -- larger than
@@ -4168,31 +4192,36 @@ fn build_analysis() -> Analysis {
                 continue;
             }
             let after = p + 8;
-            let mut q = skip_ws(t, after);
-            // `register_with_kind(class, name, desc, body, kind)` is a
-            // registration like any other, and this scan used to skip it
-            // because the byte after `register` is not `(`. That blind spot
-            // covered 757 sites tree-wide -- and it is not a uniform sample of
-            // the registry, it is exactly the sites whose kind was ADJUDICATED.
-            // Converting `register` -> `register_with_kind` is this campaign's
-            // standard remedy for a contract-1.4 shadow, so every such
-            // conversion silently removed the shipping half of a drift pair and
-            // this gate reported the erasure as "no longer drifts". Measured
-            // 2026-09-10 on `Class.getModule`, whose two bodies (lib.rs closure
-            // vs `phases_late/reflect_invoke.rs` closure) still differ.
+            // `register_with_kind(class, name, desc, cb, kind)` sets the
+            // ambient kind, calls `register` with the SAME first three
+            // arguments and restores it (`native-api/src/registry.rs`). It is a
+            // registration, and this scan has to see it. It did not: the skip
+            // below used to name it in the same breath as `registered_by`, and
+            // 747 sites in the five scanned crates were invisible to this gate.
             //
-            // Same species as the six gates d5ca22357 fixed on 2026-08-30 --
-            // that commit counted 230 `register_with_kind(` sites in lib.rs
-            // alone against 1207 plain ones -- and this file was the one it
-            // did not reach.
-            //
-            // The first three arguments are in the same positions, so
-            // everything downstream is unchanged.
-            if !(q < n && t[q] == b'(') && t[after..].starts_with(b"_with_kind") {
-                q = skip_ws(t, after + 10);
-            }
+            // What that cost, measured 2026-09-10: `0b2791ac7` switched ONE
+            // site -- `java/lang/Class.getModule()Ljava/lang/Module;` in
+            // `lib.rs` -- from `register` to `register_with_kind`, and
+            // `the_drift_baseline_has_no_stale_rows` then reported that
+            // baseline row as no longer drifting. Both twins were still in the
+            // tree; `phases_late.rs`'s own TWIN table still describes the pair
+            // ("essential (lib.rs) caches ONE canonical Module per module name
+            // … p59 has its own"). A resolver blind spot reads exactly like a
+            // fix, which is the failure mode this file's vacuity control exists
+            // for and which a per-site skip like this one walks straight past.
+            // Two lanes widened this scan independently on the same day and
+            // agreed on the pair count; the site counts differ by scope only
+            // (745-747 in the five scanned crates, 757 tree-wide). The
+            // addendum on the baseline's doc comment has why the blind set is
+            // not a uniform sample of the registry.
+            let after = if t[after..].starts_with(b"_with_kind") {
+                after + 10
+            } else {
+                after
+            };
+            let q = skip_ws(t, after);
             if q >= n || t[q] != b'(' {
-                // `registered_by`, `register_all`, `registers`, …
+                // `registered_by`, `register_natives`, …
                 i += 1;
                 continue;
             }
