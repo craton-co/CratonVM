@@ -778,12 +778,29 @@ Terminal deprecation says nothing about whether a method works today, and the
 one row where the VMs disagree is `getUnsafe` — which JDK 25 does not declare
 at all.
 
-Three of the 82 are **deletions rather than retirements**: `getUnsafe`,
-`ensureClassInitialized` and `shouldBeInitialized` answer
-`NoSuchMethodException` on HotSpot 25, so nothing can dispatch them on a
-supported image. Thirty-one more were simply not reached by this workload and
-stay out, because precondition 4 is per-triple however obvious a sibling looks.
-Widening the probe takes them, and that is a probe edit rather than a build.
+Two of the 82 are **deletions rather than retirements**:
+`ensureClassInitialized` and `shouldBeInitialized`, which `javap -p
+sun.misc.Unsafe` declares on none of the 17, 21 or 25 images. Thirty-two more
+were simply not reached by this workload and stay out, because precondition 4
+is per-triple however obvious a sibling looks. Widening the probe takes them,
+and that is a probe edit rather than a build.
+
+**A third row was recorded as a deletion and it was wrong.** `getUnsafe` also
+answered `NoSuchMethodException`, and this page first read that as absence. It
+is declared — `public static`, on all three images — and the exception was the
+JDK's core-reflection METHOD FILTER hiding it, which is the door that stops a
+library acquiring `Unsafe` reflectively. CratonVM's `getUnsafe` native is
+correct (`SecurityException` off the boot path, measured); what diverges is
+that this VM implements no member filter at all, so nine of ten filtered JDK
+members are reflectively visible here and `java.lang.ClassLoader` reports 18
+fields where HotSpot reports 0. That is cross-cutting rather than this lane's
+and has its own page,
+`docs/known-issues/jdk-only/core-reflection-has-no-member-filter-20260911.md`,
+with `apps/probes/ReflectMemberFilter.java` as its instrument.
+
+The lesson outlives the row: **the image is not the authority on what
+reflection answers.** A census built from class files cannot see that defect,
+and `javap` is what caught the wrong claim.
 
 **The instrument lesson.** §5's blocker for this class was true and useless at
 the same time: "no probe reaches it" is a statement about the probe tree, not

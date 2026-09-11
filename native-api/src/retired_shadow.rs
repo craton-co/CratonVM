@@ -3302,20 +3302,38 @@ static RETIRED_SHADOW_L1_TRIPLES: &[(&str, &str, &str)] = &[
 ///
 /// # The 34 rows NOT here, and why each is out
 ///
-///   * **`getUnsafe()Lsun/misc/Unsafe;`, `ensureClassInitialized(Ljava/lang/Class;)V`
-///     and `shouldBeInitialized(Ljava/lang/Class;)Z` are ABSENT from the JDK 25
-///     image** — the workload gets `NoSuchMethodException` for all three on
-///     HotSpot. Nothing can dispatch them on a supported image, so they are
-///     bucket-F DELETIONS rather than retirements, the same verdict
-///     `AbstractExecutorService`'s four rows got. Left for a deletion commit
-///     with its own census: a retirement table entry would claim a dispatch
-///     nobody has observed, which is the rule this table is under.
+///   * **`ensureClassInitialized(Ljava/lang/Class;)V` and
+///     `shouldBeInitialized(Ljava/lang/Class;)Z` are ABSENT from the JDK 25
+///     image** — `javap -p sun.misc.Unsafe` declares neither, and the workload
+///     gets `NoSuchMethodException` for both on HotSpot. Nothing can dispatch
+///     them on a supported image, so they are bucket-F DELETIONS rather than
+///     retirements, the same verdict `AbstractExecutorService`'s four rows got.
+///     Left for a deletion commit with its own census: a retirement table entry
+///     would claim a dispatch nobody has observed, which is the rule this table
+///     is under.
+///   * **`getUnsafe()Lsun/misc/Unsafe;` is NOT absent, and the first version of
+///     this note said it was.** `javap -p sun.misc.Unsafe` prints
+///     `public static sun.misc.Unsafe getUnsafe();` on the 17, 21 AND 25
+///     images. The `NoSuchMethodException` that put it in the list above came
+///     from `getMethod`, and it is the JDK's core-reflection METHOD FILTER
+///     working: `jdk.internal.reflect.Reflection.methodFilterMap` hides this
+///     one method from the reflective surface, which is the door that stops a
+///     library from acquiring `Unsafe` reflectively.
 ///
-///     `getUnsafe` is also the ONE row where the two VMs disagree:
-///     `SecurityException` here against `NoSuchMethodException` on HotSpot.
-///     That is CratonVM answering for a method the image does not declare, and
-///     it is a defect — a small one, and not this wave's, because retiring a
-///     triple the image lacks does nothing.
+///     So it is not a deletion candidate, and CratonVM's `getUnsafe` native is
+///     correct — it throws `SecurityException` for a caller off the boot path,
+///     measured against HotSpot. What diverges is that this VM implements no
+///     member filter AT ALL, so the method is reflectively visible here and
+///     invisible there. That is cross-cutting rather than lane 5's, and it has
+///     its own page:
+///     `docs/known-issues/jdk-only/core-reflection-has-no-member-filter-20260911.md`.
+///     It stays out of this table because the divergence is in the reflective
+///     surface, not in the native, and retiring the native would not move it.
+///
+///     **The lesson is worth more than the row: the image is not the authority
+///     on what reflection answers.** A census built from class files cannot see
+///     this defect, and a `javap` check would have prevented the wrong claim —
+///     which is what eventually caught it.
 ///   * **the rest were not dispatched by this workload.** Thirty-one more
 ///     registrations exist on the class and the probe does not reach them
 ///     (`reallocateMemory`, `copyMemory`, the remaining volatile put/get
@@ -3770,11 +3788,18 @@ mod tests {
     /// The three `sun/misc/Unsafe` triples the JDK 25 image does NOT declare
     /// must stay OUT of the table.
     ///
-    /// `getUnsafe`, `ensureClassInitialized` and `shouldBeInitialized` answer
-    /// `NoSuchMethodException` on HotSpot 25 — nothing can dispatch them, so
-    /// they are deletions rather than retirements, and a table entry would
-    /// claim a dispatch nobody has observed. This is the guard that says the
-    /// distinction was kept, since it is invisible in the count.
+    /// `ensureClassInitialized` and `shouldBeInitialized` are declared by no
+    /// supported image (`javap -p sun.misc.Unsafe` on 17, 21 and 25), so
+    /// nothing can dispatch them: they are deletions rather than retirements,
+    /// and a table entry would claim a dispatch nobody has observed.
+    ///
+    /// `getUnsafe` is here for a DIFFERENT reason and the test keeps all three
+    /// so the reason cannot be lost. It IS declared — public, on all three
+    /// images — and the `NoSuchMethodException` that first put it in this list
+    /// was the JDK's core-reflection method filter hiding it, not its absence.
+    /// It stays out because the divergence is in the reflective surface rather
+    /// than in the native (which is correct), so retiring the native would not
+    /// move it. See `core-reflection-has-no-member-filter-20260911.md`.
     #[test]
     fn the_l5r_wave_excludes_the_triples_no_supported_image_declares() {
         for (m, d) in [
