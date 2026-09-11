@@ -3739,6 +3739,39 @@ mod tests {
     }
 
     #[test]
+    fn the_l1_jar_text_table_is_disjoint_from_every_other_table() {
+        for key in RETIRED_SHADOW_L1_JT_TRIPLES {
+            for (other, name) in [
+                (RETIRED_SHADOW_TRIPLES, "RETIRED_SHADOW_TRIPLES"),
+                (
+                    RETIRED_SHADOW_STATELESS_TRIPLES,
+                    "RETIRED_SHADOW_STATELESS_TRIPLES",
+                ),
+                (
+                    RETIRED_SHADOW_PHASE2_TRIPLES,
+                    "RETIRED_SHADOW_PHASE2_TRIPLES",
+                ),
+                (RETIRED_SHADOW_L2_TRIPLES, "RETIRED_SHADOW_L2_TRIPLES"),
+                (
+                    RETIRED_SHADOW_PHASE3_TRIPLES,
+                    "RETIRED_SHADOW_PHASE3_TRIPLES",
+                ),
+                (RETIRED_SHADOW_L5_TRIPLES, "RETIRED_SHADOW_L5_TRIPLES"),
+                (RETIRED_SHADOW_L1_TRIPLES, "RETIRED_SHADOW_L1_TRIPLES"),
+                (
+                    RETIRED_SHADOW_L1_HM_TRIPLES,
+                    "RETIRED_SHADOW_L1_HM_TRIPLES",
+                ),
+            ] {
+                assert!(
+                    other.binary_search(key).is_err(),
+                    "{key:?} is in both lane 1 wave 4's table and {name}."
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_l1_jar_text_table_is_sorted_and_unique() {
         for w in RETIRED_SHADOW_L1_JT_TRIPLES.windows(2) {
             assert!(
@@ -3932,6 +3965,14 @@ mod tests {
                     "RETIRED_SHADOW_PHASE3_TRIPLES",
                 ),
                 (RETIRED_SHADOW_L1_TRIPLES, "RETIRED_SHADOW_L1_TRIPLES"),
+                // Lane 5 landed on `origin/dev` between this wave's
+                // acceptance and its merge. Named here rather than
+                // assumed: a patch authored on a stale base has once
+                // `git apply`'d clean over this same file and silently
+                // deleted a sibling lane's 311-line table, so every
+                // table in the chain is checked against every other
+                // BY NAME.
+                (RETIRED_SHADOW_L5_TRIPLES, "RETIRED_SHADOW_L5_TRIPLES"),
             ] {
                 assert!(
                     other.binary_search(key).is_err(),
