@@ -1481,7 +1481,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// the defect this file's header describes, where two such ratchets disagreed
 /// by 364 registrations for weeks. Here it is a units difference, not a
 /// measurement error -- but only enumerating the added set showed which.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1918;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2262;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1569,7 +1569,35 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1918;
 /// A ratchet that only guards one direction cannot be used to detect that
 /// work was UNDONE. If a wave withdraws entries, re-freeze from a forced
 /// failure, never from arithmetic on the old constant.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1907;
+/// # Re-frozen on the MERGE, and it decomposes exactly
+///
+/// ```text
+/// dev's own tree            2227 / 2238 / 2227   (measured, see below)
+/// + lane L3's table           24
+/// = this merged tree        2251 / 2262 / 2251   (measured)
+///
+/// dev's COMMITTED constants 2328 / 2339 / 2328   -- 101 ABOVE its own tree
+/// ```
+///
+/// **`dev`'s baseline is drifted 101 registrations high, and this gate is
+/// structurally unable to notice.** The assertion is `<=`, so a DECREASE
+/// passes silently: something withdrew ~101 registrations on `dev` without
+/// re-freezing, every arm stayed green, and the constant has been describing a
+/// tree that no longer exists. This branch hit the same thing on its own
+/// withdrawals earlier today and the ops page now carries the rule --
+/// re-freeze a withdrawal from a FORCED FAILURE, because arithmetic on a
+/// constant that may itself be stale is not a measurement.
+///
+/// dev's 2227 was not inferred from the arithmetic: `RETIRED_SHADOW_L3_TRIPLES`
+/// was temporarily emptied on the merged tree and the census re-run, which is
+/// the only way to separate "dev drifted" from "the merge lost registrations".
+/// The two readings then agree to the triple: 2227 + 24 = 2251.
+///
+/// So this constant moves UP relative to this branch (1907 -> 2251, dev's L1
+/// and L2 waves arriving) and DOWN relative to `dev` (2328 -> 2251, its drift
+/// corrected). Both directions in one re-freeze, which is why the account
+/// matters more than the number.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2251;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1626,7 +1654,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1907;
 /// re-freeze ALL THREE — see the pointer on both siblings.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1907;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2251;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
