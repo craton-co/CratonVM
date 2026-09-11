@@ -2466,20 +2466,6 @@ static RETIRED_SHADOW_PHASE3_TRIPLES: &[(&str, &str, &str)] = &[
 /// of this table appears in the refusal set and ZERO refusals carry a
 /// survivor.**
 static RETIRED_SHADOW_L6_TRIPLES: &[(&str, &str, &str)] = &[
-    ("java/net/HttpURLConnection", "<init>", "(Ljava/net/URL;)V"),
-    ("java/net/HttpURLConnection", "addRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V"),
-    ("java/net/HttpURLConnection", "getHeaderFieldDate", "(Ljava/lang/String;J)J"),
-    ("java/net/HttpURLConnection", "getInstanceFollowRedirects", "()Z"),
-    ("java/net/HttpURLConnection", "getRequestMethod", "()Ljava/lang/String;"),
-    ("java/net/HttpURLConnection", "getRequestProperties", "()Ljava/util/Map;"),
-    ("java/net/HttpURLConnection", "getRequestProperty", "(Ljava/lang/String;)Ljava/lang/String;"),
-    ("java/net/HttpURLConnection", "setChunkedStreamingMode", "(I)V"),
-    ("java/net/HttpURLConnection", "setConnectTimeout", "(I)V"),
-    ("java/net/HttpURLConnection", "setDoOutput", "(Z)V"),
-    ("java/net/HttpURLConnection", "setFixedLengthStreamingMode", "(I)V"),
-    ("java/net/HttpURLConnection", "setReadTimeout", "(I)V"),
-    ("java/net/HttpURLConnection", "setRequestMethod", "(Ljava/lang/String;)V"),
-    ("java/net/HttpURLConnection", "setRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V"),
     ("java/net/ProxySelector", "getDefault", "()Ljava/net/ProxySelector;"),
     ("javax/security/auth/x500/X500Principal", "<init>", "(Ljava/io/InputStream;)V"),
     ("javax/security/auth/x500/X500Principal", "<init>", "(Ljava/lang/String;)V"),
