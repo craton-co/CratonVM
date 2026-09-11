@@ -1,4 +1,4 @@
-# Lane 6 — networking, TLS and `java.security`: 54 shadows retired, 912 adjudicated, and the corpus took 70 back — RETIRED 2026-09-10
+# Lane 6 — networking, TLS and `java.security`: 15 shadows retired of 966, and the six builds it took to find out which — RETIRED 2026-09-11
 
 **Retires `docs/known-issues/jdk-only-lanes/lane-6-net-security.md`**, deleted
 in the same commit. The method it worked to is
@@ -15,10 +15,10 @@ them, not with a guess.
 |---|---|
 | **Scope as opened** | "819 §1.4 shadows over 90 classes, from 663 registration sites." |
 | **Scope as measured** | **966** bucket-A/B shadows over **99** classes, from **693** sites. The page's numbers were a day old; `dev` moved. |
-| **Retired** | **54 triples** — `java/net/URI` (29), `java/net/HttpURLConnection` (14), `ProxySelector.getDefault` (1) and `X500Principal` (10). |
-| **Adjudicated, not retired** | **912**, every one with a verdict and a measurement (§5). 70 of them are rows the probe tree cleared and the CORPUS refused — §2.1, and the most useful paragraph on this page. |
-| **Probe rows this closes** | **201** of the 496 differing rows the lane's eight new probes find against HotSpot. |
-| **Where** | Azure host 2 (`20.80.105.49`), branch `claude/l6-net-security-20260910` off `origin/dev` `7a8b79526`, JDK 25.0.4+7 image, HotSpot 25.0.4+7 as oracle. Host load ranged 38-190 throughout; every number here is a correctness delta, never a timing. |
+| **Retired** | **15 triples** — `java/net/HttpURLConnection` (14) and `ProxySelector.getDefault` (1). Verified at 132/132 against a control built from the same tree. |
+| **Adjudicated, not retired** | **951**, every one with a verdict and a measurement (§5). **109 of them are rows the probe tree cleared and the corpus refused** — §2 is the ladder, and it is the most useful part of this page. |
+| **Probe rows this closes** | **22** of the 496 differing rows the lane's eight new probes find against HotSpot. The other 474 are measured, catalogued in §1, and left to the work §8 names. |
+| **Where** | Azure host 2 (`20.80.105.49`), branch `claude/l6-net-security-20260910` off `origin/dev`, merged with `dev` at `0d18c01bd`, JDK 25.0.4+7 image, HotSpot 25.0.4+7 as oracle. Host load ranged 14-190 and the filesystem hit 100% twice; every number here is a correctness delta, never a timing. |
 
 ---
 
@@ -86,207 +86,180 @@ that was **wrong**:
   `method javax/net/ssl/SSLSocket.getEnableSessionCreation()Z has no Code attribute`
   on an unconnected socket.
 
-## 2. The retirement: 54 triples, and the 70 the corpus took back
+## 2. The ladder: six builds, and what each one measured out
 
-`RETIRED_SHADOW_L6_TRIPLES` in `native-api/src/retired_shadow.rs`. Two prefixes
-admitted, both the narrow spelling: `java/net/` and
-`javax/security/auth/x500/`.
+**This is the finding of the wave.** The probe tree cleared 124 rows. The
+corpus refused 109 of them, one class at a time, across five more builds. Every
+refusal has a named mechanism, and they are all the same species.
 
-```text
-  29  java/net/URI                  14  java/net/HttpURLConnection
-  10  javax/security/auth/x500/X500Principal
-   1  java/net/ProxySelector.getDefault
-```
+| # | table | corpus, paired and alone | what it measured out |
+|---|---|---|---|
+| 1 | **124** rows, 10 classes | trial 126/132, ctrl 132/132 | `URL` (16), `DatagramSocket` (30), `MulticastSocket` (6), `InetAddress` (3), `Inet4Address` (8), `Inet6Address` (7) |
+| 2 | **54**, 4 classes | trial 130/132, ctrl 132/132 | `URI` (29) — `RJdkBridge1` |
+| 3 | **25**, 3 classes | `RSslLiveSession` 3/3 red | nothing — `HttpURLConnection` dropped on a guess, and it was innocent |
+| 4 | **11**, 2 classes | `RSslLiveSession` 3/3 red | nothing — the guess again |
+| 5 | **10**, `X500Principal` alone | `RSslLiveSession` 3/3 red | `X500Principal` (10) |
+| 6 | **15**, `HttpURLConnection` + `ProxySelector` | **trial 132/132, ctrl 132/132** | — |
 
-Measured on a **paired pair of binaries built from the same merged tree**,
-differing only in this one file — the control has the table reverted to
-`origin/dev`'s version, nothing else:
+Builds 3 and 4 are in the table because they are the cost of guessing. After
+build 2 the remaining failure was `RSslLiveSession`, an HTTPS vector, and
+`HttpURLConnection` was the obvious suspect; it was dropped twice before build
+5 tested `X500Principal` on its own and found it sufficient. **Two builds and
+about ninety minutes bought nothing, and the class they blamed went back in at
+build 6 and is one of the two this lane retires.**
 
-```text
-  L6X500Sweep       276 diff lines -> 0      (401 rows,  4,669 yields)
-  L6UriSweep         80            -> 0      (925 rows,  7,179 yields)
-  L6HttpLogicSweep   64            -> 18     (164 rows,  2,913 yields)
-  every other probe in the 125-probe tree: delta exactly 0
-```
+### 2.1 Precondition 3 is checked one frame too high
 
-### 2.1 The probe tree said 124. The corpus said 54.
-
-**This is the finding of the wave** and it re-states one of the four
-preconditions, so it goes before the good news rather than after it.
-
-The first table carried 124 rows: the four classes above plus `java/net/URL`
-(16), `DatagramSocket` (30), `MulticastSocket` (6), `InetAddress` (3),
-`Inet4Address` (8) and `Inet6Address` (7). Both instruments cleared it:
-
-* armed on the two prefixes, **all 125 probes in the tree got no worse** and
-  five got dramatically better;
-* **built**, and run as a two-binary A/B against a control from the same tree,
-  the same five improved (`L6UriSweep` 80 → 0, `L6X500Sweep` 276 → 0,
-  `L6HttpLogicSweep` 64 → 18, `L6InetSweep` 380 → 368, `L6SocketSweep` 42 →
-  38) and nothing regressed. One probe moved the wrong way by 4 lines and it
-  was `VtHandoffProbe`, the campaign's named noise floor.
-
-The `--jdk-only` corpus, on that same pair of binaries, went from **132 of 132
-to 126 of 132**:
+Every one of the six refusals is the same species:
 
 ```text
-  RJdkServices               NPE: URLStreamHandler.openConnection, "this.handler" is null
-  RServiceLoaderDoubleSource    (same)
-  RJdkDefineClass            NPE: URLStreamHandler.getDefaultPort,  "this.handler" is null
-  RJdkNet                    UnsatisfiedLinkError: sun/nio/ch/DatagramChannelImpl.receive0
-  RJdkNet   (InetAddress)    UnsatisfiedLinkError: java/net/Inet6AddressImpl.lookupAllHostAddr
-  RNetIfaceScope             AssertionError: every scoped IPv6 address must round-trip, 2 did not
+  RJdkServices                NPE: URLStreamHandler.openConnection, "this.handler" is null
+  RServiceLoaderDoubleSource     (same)
+  RJdkDefineClass             NPE: URLStreamHandler.getDefaultPort,  "this.handler" is null
+  RJdkNet                     UnsatisfiedLinkError sun/nio/ch/DatagramChannelImpl.receive0
+  RJdkNet   (InetAddress)     UnsatisfiedLinkError java/net/Inet6AddressImpl.lookupAllHostAddr
+  RNetIfaceScope              AssertionError: every scoped IPv6 address must round-trip, 2 did not
+  RJdkBridge1                 URL.toURI().getPath() must carry the lone surrogate, got U+FFFD
+  RSslLiveSession             CK client.responseCode = 200 unclassified
 ```
 
-Six vectors, one species. **Precondition 3 asks whether the IMAGE METHOD
-carries `Code` to yield to. All 124 rows passed it. What it does not ask is
-what that `Code` then calls.**
+**Precondition 3 asks whether the IMAGE METHOD carries `Code` to yield to. All
+124 rows passed it. It does not ask what that code then CALLS.**
 
 * `java.net.URL`'s methods are one line each — `handler.openConnection(this)`,
   `handler.getDefaultPort()`, `handler.equals(this, u)`. `handler` is written
   only by the real constructor, and this VM **mints** `URL` objects in
-  `classloader.rs` without running it. Yielding turns every one of them into an
-  NPE. This is `Class.getModule`'s situation exactly (lane-0 §7): a field only
-  a real VM writes.
+  `classloader.rs` without running it.
+* `javax.security.auth.x500.X500Principal` has exactly one declared instance
+  field, `transient X500Name thisX500Name`, and
+  `native-builtins/src/jca/x500.rs` documents in its own header that this VM
+  **repurposes that slot to hold a String**. Any JDK bytecode on the class
+  dereferences a String as an `X500Name`. `RSslLiveSession` reaches it through
+  the TLS peer certificate's `getSubjectX500Principal()`.
+* `java.net.URI` is the same shape one level out: `URL.toURI()` allocates a
+  real `java.net.URI` carrier and publishes fields into it rather than running
+  its constructor, and the native's own comment (`G75-1 N1`) records why — a
+  string that has been through `read_string` cannot hold an unpaired surrogate.
 * `InetAddress.getByName` yields to bytecode that calls
-  `Inet6AddressImpl.lookupAllHostAddr`, which is `ACC_NATIVE` and which this VM
-  does not implement. `DatagramSocket` yields to bytecode that routes through
-  `sun.nio.ch.DatagramChannelImpl.receive0`, likewise. The retirement trades a
-  shadow for an `UnsatisfiedLinkError` — which is precisely what precondition 3
-  exists to prevent, one frame deeper than it looks.
+  `Inet6AddressImpl.lookupAllHostAddr`, and `DatagramSocket` to bytecode that
+  routes through `sun.nio.ch.DatagramChannelImpl.receive0`. Both are
+  `ACC_NATIVE` and neither is implemented here, so the retirement trades a
+  shadow for an `UnsatisfiedLinkError` — the exact failure precondition 3
+  exists to prevent, one frame deeper than it is checked.
 
-**So precondition 3 is really: the image method carries `Code`, AND that code's
-own callees are satisfiable in this VM.** The cheap approximation of the second
-half is the corpus. The probe tree cannot substitute for it, and this wave is
-the proof: 125 probes and a two-binary A/B both scored 124 rows clean.
+**So precondition 3 is really: the image method carries `Code`, AND that
+code's own callees are satisfiable in this VM.** Four of the six are a field
+only a real constructor writes, which is `Class.getModule`'s situation from
+lane-0 §7 — and that is not a coincidence. A VM that allocates a JDK carrier
+without constructing it has, for every such class, a shadow that cannot be
+retired until the carrier is built properly.
 
-That also settles what the lane page called *"`URLStreamHandler` NPE, 2
-vectors, yours right now."* The page was right that it exists and wrong that it
-was already failing: it is **latent**, and retiring `java/net/URL` is what
-wakes it.
+### 2.2 The probe tree cannot substitute for the corpus, and it is not close
 
-### 2.2 How the six were attributed, in about twenty minutes and no rebuild
+Both instruments cleared all 124 rows:
 
-Arming one class at a time on the CONTROL binary with
-`CRATONVM_ENFORCE_NATIVE_SHADOW` and running only the six failing vectors —
-eleven scopes by six vectors, sixty-six VM runs.
+* armed on the two prefixes with `CRATONVM_ENFORCE_NATIVE_SHADOW`, **all 125
+  probes got no worse** and five got dramatically better;
+* **built**, and run as a two-binary A/B against a control from the same merged
+  tree, the same five improved — `L6UriSweep` 80 → 0, `L6X500Sweep` 276 → 0,
+  `L6HttpLogicSweep` 64 → 18, `L6InetSweep` 380 → 368, `L6SocketSweep` 42 → 38
+  — and **zero probes regressed**.
 
-Two traps it walked into and out of, both already on the operations page:
+The corpus then refused 109 of those rows. The probe tree is 3,183 rows of
+contract edges and it could not see any of it, because the defects are not in
+the families' own behaviour: they are in what the VM's OTHER natives hand to
+the retired bytecode. **A retirement's blast radius is its class's users**, and
+a probe tree's users are the probes.
 
-* **`rc` is 0 when a vector fails.** The VM reports the failure in its own
-  summary line (`main-vm run() returned Err`), and the first version of the
-  bisect keyed on the exit code and called all six green. *Check `rc` before
-  believing a harness label* cuts both ways.
-* **The dial is not the table.** `RNetIfaceScope` does **not** reproduce under
-  the dial with all three `Inet*` classes armed, and does fail on the built
-  trial binary. The dial declines at DISPATCH and arms a PREFIX;
-  `retired_shadow.rs` re-tags at REGISTRATION and is per-triple, so a
-  constructor or a class-initialiser path can differ. A dial result is a lead
-  in both directions, never a verdict.
+### 2.3 The dial is a lead in both directions, not a verdict
 
-`RSslLiveSession` was in the trial arm's failing set and is **not** one of the
-six. What is measured about it here, and all that is measured: it passed 11 of
-11 runs on the control binary during the bisect — with nothing armed and with
-each of ten scopes armed — and it failed once, in an arm that ran concurrently
-with a 125-probe A/B and a five-configuration `cargo test`. It is a live TLS
-handshake vector, and the operations page §6 records an unnamed TLS vector
-whose client loop discards the reply it asserts on when three records arrive in
-one read under load. That may or may not be this one; **this page does not
-claim it is**, and the honest statement is that `RSslLiveSession` is not
-reproducible as a consequence of this wave. `RNetIfaceScope` looked the same
-and is not the same: it reproduces alone, on the trial binary, every time.
+Three separate times in this wave the enforcement dial and the built table
+disagreed:
 
-### 2.3 The dial is wrong in BOTH directions, and this wave measured both
+* **optimistic** — `URL`, `DatagramSocket` and the `Inet*` family scored clean
+  on every probe under the dial and broke six corpus vectors when built;
+* **pessimistic, wrong vector** — arming `javax/security/auth/x500/` failed
+  `RJdkX509Intercept`, which passes on every binary ever built here. The dial
+  named the right class for the wrong reason and would have been dismissed as
+  an artefact on that basis;
+* **silent** — the dial said nothing about `RSslLiveSession`, which is the
+  vector that actually refuses `X500Principal`.
 
-The narrowed 54-row set was pre-checked by arming its four scopes on the
-control binary and running the whole `--jdk-only` corpus. It came back **130 of
-132**, with two failures the first table never had:
+The dial DECLINES at dispatch and arms a PREFIX; `retired_shadow.rs` re-tags at
+REGISTRATION and is per-triple. They are different mechanisms and they do not
+agree often enough to substitute.
 
-```text
-  RJdkBridge1        AssertionError: URL.toURI().getPath() must carry the lone
-                     surrogate at 2, got charAt(2)=fffd in: /a<fffd>b
-  RJdkX509Intercept  NoSuchMethodError: java.lang.String.getRFC2253Name()
-                       at javax/security/auth/x500/X500Principal.getName(X500Principal.java:318)
+### 2.4 A vector run by hand is not the vector the suite runs
+
+This one cost a wrong commit, so it is written down. `RJdkBridge1` and
+`RJdkX509Intercept` were both dismissed as dial artefacts on the strength of
+
+```bash
+cratonvm --java-home "$JDK" --jdk-only -cp build:modules-overlay:resources RJdkBridge1
 ```
 
-Both look like exactly the species §2.1 is about, and the second is almost
-persuasive: this VM stores a **String** in `X500Principal`'s single declared
-slot, `transient X500Name thisX500Name` (`native-builtins/src/jca/x500.rs`
-documents the repurposing), so JDK bytecode that calls
-`thisX500Name.getRFC2253Name()` on it is a `NoSuchMethodError` waiting to
-happen.
+passing on the very binary the harness fails it on. `run.sh` builds the
+classpath, sets the flags and applies the cross-VM diff; a vector can pass by
+hand and fail under it. The isolation that settles a vector is the one the
+suite's own `known-flaky.txt` prescribes:
 
-**Neither is real.** Both vectors pass on the BUILT binary that carries those
-very rows — the 124-row trial binary contains all 29 `URI` rows and all 10
-`X500Principal` rows, and `RJdkBridge1` and `RJdkX509Intercept` are not in its
-six failures. Run directly, one vector at a time, on the control binary and on
-that trial binary, all four runs are clean.
+```bash
+ONLY=<Vector> CV=... JDK=... CRATONVM_ARGS=--jdk-only bash regression-suite/run.sh
+```
 
-The reason is the one the operations page gives and this lane has now hit three
-times: **the dial DECLINES at dispatch and arms a PREFIX; `retired_shadow.rs`
-re-tags at REGISTRATION and is per-TRIPLE.** Arming `javax/security/auth/x500/`
-declines every dispatch on the package, including on principals the VM minted
-itself with a String in that slot and including the one `X500Principal`
-registration the table does not carry. The table refuses 10 named
-registrations, and instances built through the retired constructor get a real
-`X500Name`.
+run three times on each binary. Every verdict in the ladder above is from that
+form, and `RSslLiveSession` — which had looked like a load flake, passing 11 of
+11 by hand — came back FAIL FAIL FAIL on trial and pass pass pass on control.
 
-So this lane measured the dial wrong in both directions within one wave:
-
-* **optimistic** — `java/net/URL`, `DatagramSocket` and the `Inet*` family
-  scored clean on every probe under the dial and broke six corpus vectors when
-  built (§2.1);
-* **pessimistic** — `java/net/URI` and `X500Principal` broke two corpus vectors
-  under the dial and are clean when built.
-
-A dial result is a lead. The verdict is a built binary.
-
-### 2.4 The four preconditions, and what each removed
+### 2.5 The four preconditions, and what each removed
 
 Applied per triple against a dump from a run of **the very probes whose
-improvement is cited above** — never against a corpus census, which is a
-different workload. (That is the `FileChannelImpl.open` mistake recorded on
-`RETIRED_SHADOW_PHASE2_TRIPLES`: a whole build spent retiring the one triple
-the corpus had dispatched and the probe never touched.)
+improvement is cited** — never against a corpus census, which is a different
+workload. (That is the `FileChannelImpl.open` mistake recorded on
+`RETIRED_SHADOW_PHASE2_TRIPLES`.)
 
 ```text
   owns the slot + effective kind Bridge   -34 not-owner, -55 already retagged
   bucket A or B (something to yield to)   -91 C/D/F
   dispatched by the instrument (inv > 0) -127 never reached
   registrar not held by lane T             -4 the throwable ctor table
-  the corpus tolerates it                 -70 §2.1
+  the corpus tolerates it                -109 the ladder above
 ```
 
-### 2.5 The refusals are not inert
+### 2.6 The refusals are not inert
 
 A refusal is a retirement **only when nothing already owns the triple**.
-`NativeMethodRegistry::register_inner` refuses a `SyntheticStub` under
-`--jdk-only` without inserting it; `JdkOnlyViolation::SyntheticNativeRegistered`
-carries a `survivor`, and a non-null one means an earlier registration is still
-in the slot and still serving — strict mode then runs that older native, every
-probe reads exactly as before, and the wave is a no-op that looks like a clean
-result.
+`JdkOnlyViolation::SyntheticNativeRegistered` carries a `survivor`, and a
+non-null one means an earlier registration is still serving — strict mode runs
+that older native, every probe reads exactly as before, and the wave is a
+no-op that looks like a clean result.
 
-Measured on the trial binary, over a `--jdk-only-report` of the probe tree:
-**every row of the table appears in the refusal set, and ZERO refusals carry a
-survivor.** The refusal census counts more triples than the table has rows —
-it is a property of the PREFIX, and `java/net/` already contained registrations
-that were `SyntheticStub` before this wave (`PlainServerSocketImpl`,
-`InetAddressImplFactory`). Twelve of the triples are registered more than once,
-and each registration is refused separately.
+Measured on the final trial binary, over a `--jdk-only-report` of three probes
+that dispatch these classes:
 
-## 3. Why the other seven prefixes are not retirable, with the arm that says so
+```text
+  15 distinct triples refused, 0 with a survivor
+```
 
-Each was armed **alone** on the same 125-probe tree.
+15 of 15. Every row of the table appears in the refusal set, and none of them
+left an older registration serving. A row present in the table and absent from
+the refusals would be a row the retag never reached — the silent half of this
+mechanism, and the thing a green probe run cannot distinguish from success.
+
+## 3. The prefixes that never got as far as a build
+
+§2 is about the candidates the probe tree cleared and the corpus refused. This
+section is about the ones that never became candidates: each was armed **alone**
+on the same 125-probe tree, and the dial arm was enough to stop it.
 
 | arm | probes worse | verdict |
 |---|---:|---|
-| `java/net/` | 0 | **TAKEN**, 114 rows |
-| `javax/security/auth/x500/` | 0 | **TAKEN**, 10 rows |
-| `javax/net/` | 2 | refused — `L6TlsParamSweep` 66 → 94 diffs |
-| `java/security/`, `sun/security/`, `javax/crypto/`, `javax/security/` | 8 | refused — `SecuritySurfaceSweep` 0 → 2,594 |
-| `sun/net/` | 0 | refused — **123 of 125 probes VACUOUS** |
-| `jdk/net/`, `jdk/internal/net/` | 0 | refused — **123 of 125 probes VACUOUS** |
+| `java/net/` | 0 | went to the ladder in §2 |
+| `javax/security/auth/x500/` | 0 | went to the ladder in §2, and was refused at build 5 |
+| `javax/net/` | 2 | refused here — `L6TlsParamSweep` 66 → 94 diffs |
+| `java/security/`, `sun/security/`, `javax/crypto/`, `javax/security/` | 8 | refused here — `SecuritySurfaceSweep` 0 → 2,594 |
+| `sun/net/` | 0 | refused here — **123 of 125 probes VACUOUS** |
+| `jdk/net/`, `jdk/internal/net/` | 0 | refused here — **123 of 125 probes VACUOUS** |
 
 **A vacuous arm is not a pass.** `sun/net/` and the two `jdk` prefixes reached
 the enforcement dial in 2 probes of 125; arming them changed nothing and read
@@ -305,6 +278,11 @@ driver itself:
   caused it. Both re-ran **3/3 clean, 0 diffs, in both arms** at lower host
   load. They were the load artefact the operations page warns about, and the
   driver's own vacuity column is what made them cheap to dismiss.
+
+Note what this section could NOT do, which §2 is the answer to: a clean dial arm
+is not a candidate cleared. `java/net/` and `javax/security/auth/x500/` both
+scored 0 probes worse here, and between them they lost 109 rows to the corpus
+over the next five builds.
 
 ### 3.1 The TLS stack is an implementation, not a shadow
 
@@ -378,37 +356,48 @@ counted them would report 139 retirements for the same behaviour change.
 
 ## 4. What is retired
 
-44 rows under `java/net/`:
+15 rows, all under `java/net/`:
 
 ```text
-  29  java/net/URI                   14  java/net/HttpURLConnection
-   1  java/net/ProxySelector.getDefault
+  14  java/net/HttpURLConnection    <init>(URL), addRequestProperty,
+                                    getHeaderFieldDate, getInstanceFollowRedirects,
+                                    getRequestMethod, getRequestProperties,
+                                    getRequestProperty, setChunkedStreamingMode,
+                                    setConnectTimeout, setDoOutput,
+                                    setFixedLengthStreamingMode, setReadTimeout,
+                                    setRequestMethod, setRequestProperty
+   1  java/net/ProxySelector        getDefault
 ```
 
-10 under `javax/security/auth/x500/`: the whole of `X500Principal` — four
-constructors, `equals`, `hashCode`, `toString`, `getEncoded` and both
-`getName` overloads.
-
-The tenth X500 row is worth a sentence, because it is the one precondition 4
-would otherwise have cost. `X500Principal.<init>(String, Map)` is reached by no
-other row and the first version of `L6X500Sweep` never called it, so it read as
-`invocations: 0` and would have been dropped — leaving nine tenths of one class
-retired for no reason a reader could reconstruct. Seven rows were added to the
-probe to reach it. **A family that is retired 9/10 is a family whose next reader
-has to re-derive why.**
-
-`java/net/URI` is 29 of its 30 rows. The one left out is
-`compareTo(Ljava/lang/Object;)I`, the `Comparable` bridge, which the probe
-reaches through `compareTo(URI)` and never through the erased signature, so it
-reads `invocations: 0`. It is a single synthetic forwarder and it is left
-unretired rather than claimed on an argument.
-
-`java/net/HttpURLConnection` is 14 of its 30. The other 16 are the
+`HttpURLConnection` is 14 of its 30 rows. The other 16 are the
 connection-state family — `getInputStream`, `getResponseCode`,
 `getHeaderField(s)`, `getContentLength` — which no probe in this tree
 dispatched; §5.1.
 
-## 5. The 912 that stay, every one with a verdict
+What it buys, on the final pair of binaries — the whole 125-probe tree, plain
+`--jdk-only`, no dial:
+
+```text
+  L6HttpLogicSweep   64 diff lines -> 20     (164 rows, 2,913 yields)
+  every other probe in the tree             delta exactly 0
+```
+
+22 differing rows closed. The rows are the perimeter this campaign predicts and
+the happy path never reaches: `setRequestMethod` accepted `CONNECT` and
+silently upper-cased `get`; `setRequestProperty` did not REPLACE what
+`addRequestProperty` had appended, leaving `[3, 4]` where the JDK leaves `[4]`;
+`getRequestProperties` handed back a MODIFIABLE map, and so did its value
+lists; `setFixedLengthStreamingMode` and `setRequestProperty` were accepted
+after `connect()` where the JDK throws `IllegalStateException`;
+`setConnectTimeout(-1)` and `setReadTimeout(-1)` threw the right type with the
+wrong message; and the RFC-850 and asctime `Date` header formats parsed as
+`-1`.
+
+One other probe moved, `HibfixVarHandleProbe` at −2 of 16, on a
+`VarHandle` surface nothing in this wave touches. It is reported and not
+claimed.
+
+## 5. The 951 that stay, every one with a verdict
 
 Adjudicated by `scripts`-free analysis of one
 `--dump-native-registry --explain-jdk-only` dump plus the eight per-probe dumps,
@@ -419,9 +408,9 @@ exactly one verdict; "the rest" is not a classification.
 |---:|---|
 | 557 | **BLOCKED** — measured to break the rustls TLS / JCA stack (§3.1) |
 | 176 | **C** — declared abstract or on an interface; no door dispatches it |
-| **54** | **RETIRED** |
+| **15** | **RETIRED** |
 | 104 | **UNOBSERVED** — no probe in this tree dispatched it (§5.1) |
-| 70 | **KEEP** — the corpus refused the retirement (§2.1) |
+| 109 | **KEEP** — the corpus refused the retirement (§2, the ladder) |
 | 86 | **BLOCKED** — the arm was VACUOUS; the dial was never asked (§3) |
 | 84 | **LOSER** — another registration owns the slot; the edit would be inert |
 | 73 | **KIND** — already `SyntheticStub`, outside the mechanism |
@@ -432,7 +421,7 @@ exactly one verdict; "the rest" is not a classification.
 | 28 | **LANE-T** — the cross-lane throwable registrar and its siblings |
 | 9 | **E** — no such class in the JDK image |
 
-The goal population reconciles exactly: `54 + 70 + 557 + 86 + 67 + 104 + 28 = 966`.
+The goal population reconciles exactly: `15 + 109 + 557 + 86 + 67 + 104 + 28 = 966`.
 
 ### 5.1 The 104 unobserved rows, and what it would take to reach them
 
@@ -479,33 +468,37 @@ should do.
 
 * *"Much of this lane is blocked behind L7."* — **No longer true, and the page
   says to re-confirm.** The `--jdk-only` corpus is **132 of 132 passing** on
-  `dev` `7a8b79526`; the `ServiceLoader.checkCaller` failure the page describes
-  is fixed, and `BuiltinClassLoader` no longer blocks ten vectors. What blocks
-  the provider/algorithm rows is not L7 — it is §3.1.
+  `dev`; the `ServiceLoader.checkCaller` failure the page describes is fixed,
+  and `BuiltinClassLoader` no longer blocks ten vectors. What blocks the
+  provider/algorithm rows is not L7 — it is §3.1.
 * *"`URLStreamHandler` NPE, 2 vectors, yours right now."* — **Half right, and
   the half it got wrong is the interesting one.** No corpus vector fails today,
-  so there was nothing to fix; but the NPE is real and LATENT, and retiring
-  `java/net/URL` wakes it in three vectors. See §2.1.
-* *"`URI` (30 rows) — the best mechanical wave here."* — **Correct, and it was.**
-  80 diff lines to zero, and the 30 rows include the `<init>` that 970 of the
-  probe's dispatches go through.
+  so there was nothing to fix. But the NPE is real and **latent**: retiring
+  `java/net/URL` wakes it in three vectors, not two. §2.1.
+* *"`URI` (30 rows) — pure parsing, and the best mechanical wave here."* —
+  **Right about the parsing and wrong about the wave.** `URI` IS pure parsing:
+  yielding takes `L6UriSweep` from 80 differing lines to zero, the cleanest
+  result in the lane. It is still not retirable, because `URL.toURI()` hands
+  the JDK's `URI` a carrier it allocated and published fields into rather than
+  constructed, and `RJdkBridge1` measures the difference on an unpaired
+  surrogate. The blocker is not in `URI`.
 * *"`InetAddress` deserves care; ask only structural questions."* — **Correct,
   and it was load-bearing.** The probe asks no DNS question, and the finding is
-  precisely that *CratonVM* does.
-* *"Retire the TLS stack base-class-first."* — **Overtaken.** The ordering advice
-  presumes the stack is retirable at all; §3.1 and §3.2 say it is not, for two
-  independent reasons.
-* *"`URLStreamHandler` NPE, 2 vectors, yours right now."* — the second half of
-  that entry, corrected. No vector fails today, and the page read that as the
-  work being available. It is **latent**: retiring `java/net/URL` wakes it in
-  three vectors, not two. §2.1.
+  precisely that *CratonVM* does: `getByName("256.1.1.1")` goes to the
+  resolver, where HotSpot rejects it as a malformed literal without a lookup.
+* *"Retire the TLS stack base-class-first."* — **Overtaken.** The ordering
+  advice presumes the stack is retirable at all; §3.1 and §3.2 say it is not,
+  for two independent reasons.
 * *"`javax/net/`, `javax/crypto/`, `javax/security/` may not be in
   `RETIRED_SHADOW_PREFIXES` yet."* — **True, and they still are not**, now
   deliberately. `the_lane_l6_security_and_tls_prefixes_are_not_admitted` pins
   that as a measured verdict rather than an omission.
-* *"Check `rc` before believing a harness label."* — **Earned its place.** Two
-  `delta > 0` rows in the X500 arm carried `y/r=0/0`, which is the driver saying
-  the arming could not have caused them; both re-ran clean 3/3.
+* *"Check `rc` before believing a harness label."* — **Earned its place twice.**
+  `rc` is 0 when a corpus vector fails: the tell is the VM's own
+  `main-vm run() returned Err` line, and the first bisect keyed on the exit
+  code and called all six failures green.
+* *"819 shadows over 90 classes, from 663 registration sites."* — the lane is
+  **966 over 99 classes from 693 sites**. The page's numbers were a day old.
 
 ## 7. The gates
 
@@ -513,56 +506,77 @@ should do.
 
 ## 8. What this leaves for the next lane
 
-Ordered by what unblocks the most rows per unit of work, with the exact remedy
-where this wave found it. The first three are each a KEEP that a specific,
-nameable change would turn back into a candidate.
+Every KEEP in this lane except the TLS/JCA question is **one nameable change
+away from being a candidate again**, and this wave found the change and the
+vector that tests it. Ordered by rows unblocked per unit of work.
 
 1. **`java/net/URL` (16 rows) — give the carrier a `handler`, or stop minting
    it.** Every JDK method on `URL` is one line through `this.handler`, and this
    VM mints `URL` objects in `native-builtins/src/classloader.rs` without
-   running the constructor that sets it. Either mint through the real
-   constructor, or populate `handler` at the mint sites. Three corpus vectors
-   are the test: `RJdkServices`, `RServiceLoaderDoubleSource`,
-   `RJdkDefineClass`.
-2. **`java/net/InetAddress` + `Inet4Address` + `Inet6Address` (18 rows) —
-   implement `java/net/Inet6AddressImpl.lookupAllHostAddr`.** That single
-   `ACC_NATIVE` method is what the JDK's `getByName` bytecode calls, and its
-   absence is the whole blocker. `RJdkNet` and `RNetIfaceScope` are the test.
-3. **`java/net/DatagramSocket` + `MulticastSocket` (36 rows) — implement
-   `sun/nio/ch/DatagramChannelImpl.receive0`.** Same shape, one level further
+   running the constructor that sets it. Tests: `RJdkServices`,
+   `RServiceLoaderDoubleSource`, `RJdkDefineClass`.
+2. **`javax/security/auth/x500/X500Principal` (10 rows) — put a real
+   `X500Name` in `thisX500Name`.** `native-builtins/src/jca/x500.rs` documents
+   the repurposing of that slot to a String, and every JDK method on the class
+   dereferences it. The sites that mint principals without the real constructor
+   are in `phases_late/ssl_security.rs` and `http_url_connection.rs`. Retiring
+   this is worth **138 differing probe rows**, the single largest correctness
+   win the lane measured. Test: `RSslLiveSession`.
+3. **`java/net/URI` (29 rows) — make `URL.toURI()` construct rather than
+   publish.** `net_phase_e.rs`'s `toURI` allocates a `java.net.URI` and writes
+   its fields, because a string that has been through `read_string` cannot hold
+   an unpaired surrogate (its own `G75-1 N1` comment). Invoking
+   `URI.<init>(String)` with the original String OBJECT preserves the unit and
+   populates the carrier properly — but the fallback for `jar:`/`nested:` URLs
+   has to survive, and that path is load-bearing for Spring and Tomcat. Worth
+   **40 differing probe rows**. Test: `RJdkBridge1`.
+4. **`java/net/InetAddress` + `Inet4Address` + `Inet6Address` (18 rows) —
+   implement `java/net/Inet6AddressImpl.lookupAllHostAddr`.** That one
+   `ACC_NATIVE` method is what the JDK's `getByName` bytecode calls. Tests:
+   `RJdkNet`, `RNetIfaceScope`.
+5. **`java/net/DatagramSocket` + `MulticastSocket` (36 rows) — implement
+   `sun/nio/ch/DatagramChannelImpl.receive0`.** Same shape one level further
    down the NIO stack, and it is **L4's** prefix rather than this lane's, so
-   the two lanes have to agree before either moves. `RJdkNet` is the test.
-4. **The TLS/JCA contract question (557 rows).** Is a first-class rustls
+   the two lanes have to agree before either moves. Test: `RJdkNet`.
+6. **The TLS/JCA contract question (557 rows).** Is a first-class rustls
    implementation a §1.4 shadow at all? If it is not, those rows leave the goal
-   population and the campaign denominator changes. That is L0's call, not a
-   lane's, and nothing here should be retired until it is answered.
-5. **The defects §1 lists inside that blocked set are fixable in the natives
-   today**, without waiting for the answer to (4). In rough order of severity:
-   `Cipher` WRAP/UNWRAP does not round-trip (it produces neither the JDK's
-   ciphertext nor the original key); `GCMParameterSpec` tag lengths are ignored
-   and not validated; `AES/CTR/NoPadding` resolves to no provider;
+   population and the campaign denominator changes. That is L0's call, and
+   nothing there should be retired until it is answered.
+7. **The defects §1 lists inside that blocked set are fixable in the natives
+   today**, without waiting for (6). In rough order of severity: `Cipher`
+   WRAP/UNWRAP does not round-trip (it produces neither the JDK's ciphertext
+   nor the original key); `GCMParameterSpec` tag lengths are ignored and not
+   validated; `AES/CTR/NoPadding` resolves to no provider;
    `SSLSocket.getEnableSessionCreation` raises `AbstractMethodError`;
    `SSLParameters.setApplicationProtocols` accepts null and empty elements.
    Each has a row in `L6JcaSweep` or `L6TlsParamSweep` that goes green when it
    is fixed.
-6. **The 30 connection-state rows** (`HttpURLConnection`/`URLConnection`
+8. **The 30 connection-state rows** (`HttpURLConnection`/`URLConnection`
    `getInputStream`, `getResponseCode`, `getHeaderField(s)`,
    `getContentLength`) need either a loopback HTTP fixture in the probe tree or
-   a corpus vector that asserts them. `L6HttpLogicSweep` keeps 18 differing
-   rows after this wave and they are mostly this family: asked for
-   `getContentLength()` on a subclass that overrides every header accessor,
-   CratonVM attempts a real transport where HotSpot answers from the fixture.
-7. **`java/net/URLClassLoader` (12 rows) should move to L7** by amending
+   a corpus vector that asserts them.
+9. **`java/net/URLClassLoader` (12 rows) should move to L7** by amending
    lane-0 §2's ownership table: it is the loader story wearing a `java/net/`
    prefix.
-8. **The four `MalformedURLException`/`UnknownHostException` rows** unblock the
-   moment lane T releases the throwable registrar.
+10. **The four `MalformedURLException`/`UnknownHostException` rows** unblock
+    the moment lane T releases the throwable registrar.
 
-### And one thing to carry into every lane, not just this one
+### Three things to carry into every lane, not just this one
 
 **Precondition 3 is checked one frame too high.** "The image method carries
-`Code`" was true for all 124 rows and false about six of them, because what
-that code CALLS was not satisfiable in this VM: a field only a real
-constructor writes, or an `ACC_NATIVE` method nobody implemented. Until the
-funnel can answer the deeper question, the corpus is the check that catches it
-— and the probe tree, at 125 probes and a two-binary A/B, demonstrably cannot.
+`Code`" was true for all 124 rows and false about 109 of them, because what
+that code CALLS was not satisfiable here: a field only a real constructor
+writes, or an `ACC_NATIVE` method nobody implemented. Until the funnel can ask
+the deeper question, the corpus is the check that catches it.
+
+**The probe tree cannot substitute for the corpus.** 3,183 rows of contract
+edges, 125 probes, and a two-binary A/B all scored 124 rows clean. The corpus
+refused 109. The defects were never in the retired families' own behaviour;
+they were in what the VM's other natives hand to the retired bytecode.
+
+**Narrow by measurement, not by suspicion.** Two of the six builds here were
+spent dropping `java/net/HttpURLConnection` because it was the plausible
+culprit for an HTTPS vector. It was innocent, it went back in at the last
+build, and it is one of the two classes this lane retires. When a build costs
+twenty-five minutes, the cheapest next experiment is the one that ISOLATES a
+suspect, not the one that removes it.
