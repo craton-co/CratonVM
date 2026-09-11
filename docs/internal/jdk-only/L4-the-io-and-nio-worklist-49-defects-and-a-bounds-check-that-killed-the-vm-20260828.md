@@ -1,5 +1,33 @@
 # L4 — the `java.io` / `java.nio` worklist: 199 native-won triples, 89 defects, 8 shadows retired, and a bounds check that killed the VM
 
+> **RETIRED 2026-09-10 — every residual below is closed, and two of this
+> record's conclusions were wrong.** The account is kept verbatim because what
+> it BELIEVED is the useful part; the corrections are marked in place at §4.3,
+> §4.4, §P6.6, §P6.7 and §P6.8, and the measurement is in
+> `internal/jdk-only/L4-residuals-the-dispatch-finding-was-a-boolean-20260910.md`.
+>
+> * **§P6.7's "DISPATCH finding" was one native answering `false`.**
+>   `FileInputStream.skip` is `if (isRegularFile()) skip0(n); else
+>   super.skip(n);`, and `native_fis_is_regular_file0` read `args[0]` — the
+>   RECEIVER — as its `FileDescriptor` parameter, on the strength of a doc
+>   comment that called an instance method static. The bytecode was choosing
+>   the superclass branch correctly, on a false this VM produced. All four rows
+>   now match HotSpot.
+> * **§P6.8's "the repair is the whole thing" was two constants.** `UnixPath`'s
+>   layout is resolvable BY NAME against the implementation class, and writing
+>   it BY INDEX is what the real `getfield` does; the two earlier attempts
+>   failed because they resolved names through the object's own (interface)
+>   stamp. `cratonvm_native_api::path_layout` now holds the map.
+> * **§4.4's nomination was already implemented, twenty lines away.**
+>   `concrete_receiver::alloc_concrete` + `mirror_class_registrations` is what
+>   `FILE_STORE_IMPLS` and `DIR_STREAM_IMPLS` in the same file use; the provider
+>   allocator simply had no list.
+>
+> Two of those three were declined on evidence that was itself sound — the
+> seek-based `skip0` really was inert, and the by-name `stringValue` write
+> really was a no-op. **Inert code is evidence about its guard, not only about
+> itself.**
+
 **Status: MEASURED AND FIXED, 2026-08-28.** Lane L4 of
 `HANDOFF-20260828-SCOPE.md`. Worktree `/data/cvm-l4io-20260828`, branch
 `claude/l4-io-nio-20260828`.
@@ -495,6 +523,10 @@ as well as this lane's own: `TailFamilySweep` and `L4StreamTailSweep` are both
 
 ### 4.3 THE RESIDUAL — `FileInputStream.skip` past end of file
 
+> **CLOSED 2026-09-10.** Not a resolution defect and not unmovable: a registrar
+> edit did move it, in the native this section never suspected. See the banner
+> and `internal/jdk-only/L4-residuals-the-dispatch-finding-was-a-boolean-20260910.md` §1.
+
 ```text
 new FileInputStream(<2-byte file>); read × 3; skip(4)
   HotSpot   4   and the channel position is 6
@@ -520,6 +552,11 @@ seek WAS written here first and reverted when the registry showed it could not
 fire — the `owns_slot` discipline applied to the invocation column.
 
 ### 4.4 The fabricated abstract provider behind `probeContentType`
+
+> **CLOSED 2026-09-10.** The nomination was right about the defect and did not
+> notice that this workspace already runs the remedy for twelve other
+> `java.nio` classes — two of them registered in this very file. See
+> `internal/jdk-only/L4-residuals-the-dispatch-finding-was-a-boolean-20260910.md` §3.
 
 The entry point is repaired: `Files.probeContentType` is now registered and
 answers from an extension table or null, which is the documented contract ("the
@@ -2106,6 +2143,12 @@ java/nio/file/Path                         102     102
 
 ## P6.6 The last two families are one cause, and it is not this lane's
 
+> **CLOSED 2026-09-10, and the section's framing was the obstacle.** "The fix
+> is to mint the real classes, and that is a change to how this VM allocates
+> paths and providers" is true and reads as out of reach; both turned out to be
+> the two changes this campaign had already made twelve times elsewhere. See
+> `internal/jdk-only/L4-residuals-the-dispatch-finding-was-a-boolean-20260910.md` §2 and §3.
+
 `Files` (6) and `Path` (102) do not need four more fixes. They need one, and it
 is structural.
 
@@ -2151,6 +2194,21 @@ Deliberately not done.
 
 
 ## P6.7 The last residual, re-measured — it was three rows more than the record said
+
+> **CORRECTED 2026-09-10 — the conclusion is wrong, and the corrections in it
+> are right.** Widening the probe from one row to four was correct and stands.
+> Refuting the two pieces of "wrong evidence" was correct and stands. The
+> replacement conclusion — *"a DISPATCH finding — the superclass body is entered
+> for a method the subclass declares and overrides"* — is not: the subclass body
+> IS entered, and it branches to `InputStream.skip` on
+> `isRegularFile()`, which this VM answered `false` for every file because
+> `native_fis_is_regular_file0` read its RECEIVER as its `FileDescriptor`
+> parameter. Measured directly by `apps/probes/L4SkipDiag.java`; see
+> `internal/jdk-only/L4-residuals-the-dispatch-finding-was-a-boolean-20260910.md` §1.
+>
+> The section reverted a correct seek-based `skip0` for the second time, on a
+> correct measurement that it was inert. It was inert because of the guard in
+> front of it.
 
 `FileInputStream.skip` past EOF has been this lane's single carried residual
 since part one, on a §4.3 note that called it "contract-legal, and a resolution
@@ -2215,6 +2273,17 @@ because the VM got worse.
 
 
 ## P6.8 `UnixPath` is real — it is the instances that are empty
+
+> **CLOSED 2026-09-10, and the diagnosis in it is exactly right.** The layout
+> table below, the identity explanation for why both by-name attempts were
+> no-ops, and the note that reflection reads through a class this object is not
+> filed under are all correct and are what made the fix a short one. What did
+> not follow is the size estimate: resolving the three field indices against the
+> IMPLEMENTATION class and writing them BY INDEX needs neither a re-stamped
+> allocation nor a by-name route, because `getfield` in the real bytecode
+> resolves against its own constant pool's class and not against the receiver's
+> stamp. `cratonvm_native_api::path_layout` is 150 lines; the eight producers
+> and four readers of the carrier now share it. See `internal/jdk-only/L4-residuals-the-dispatch-finding-was-a-boolean-20260910.md` §2.
 
 §P6.6 concluded that `sun/nio/fs/UnixPath` is "a class NAME with no bytecode
 behind it", inferred from `Object.toString()` running under the armed dial. That

@@ -9,13 +9,21 @@
 # The oracle output does not depend on the scope, so it is captured ONCE and
 # reused -- otherwise this is 156 redundant HotSpot runs.
 #
-# Reading the result: `diff=2` is the floor (the known FileInputStream.skip
-# residual). Anything above that is what arming that family costs today.
+# Reading the result: the floor was `diff=2` until 2026-09-10 — the
+# `FileInputStream.skip` residual, which is now FIXED, so **the floor is 0**.
+# Anything above it is what arming that family costs today.
+#
+# W / CV / OUT / JDK COME FROM THE ENVIRONMENT, with the 2026-08-28 lane's
+# values as defaults. They were hard-coded to that lane's worktree and its
+# frozen binary, which made this script unrunnable from anywhere else — a
+# retirement instrument only its author could point at anything. `l4run.sh`
+# beside it already took `$CV`; this now matches.
 set +e
-W=/data/cvm-l4io-20260828
-OUT=/data/l4fam
-JDK=/data/toolchain/jdk-25
-CV=/data/vm-l4io
+W="${W:-$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null)}"
+W="${W:-/data/cvm-l4io-20260828}"
+OUT="${OUT:-/data/l4fam}"
+JDK="${JDK:-/data/toolchain/jdk-25}"
+CV="${CV:-/data/vm-l4io}"
 rm -rf "$OUT"; mkdir -p "$OUT/oracle"
 cd "$W" || exit 1
 export CRATONVM_DISABLE_DEFAULT_WATCHDOG=1

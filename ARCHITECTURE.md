@@ -108,13 +108,15 @@ from the same command.
 Rough size distribution, largest first, so newcomers know where the mass
 actually is:
 
-Measured 2026-09-09 with the command above, one directory at a time.
+Measured 2026-09-09 with the command above, one directory at a time;
+`native-api` re-measured 2026-09-10, when lane L1's retirement table took
+it from 37k to 38,923.
 
 | Crate | LoC | Crate | LoC |
 |-------|----:|-------|----:|
 | `native-builtins` | 753,000 | `native-awt` | 18,000 |
 | `vm` | 480,000 | `types` | 44,000 |
-| `jit` | 269,000 | `native-api` | 37,000 |
+| `jit` | 269,000 | `native-api` | 39,000 |
 | `gc` | 190,000 | `reader` | 17,000 |
 | `native-collections` | 88,000 | `jfr` | 20,000 |
 | `native-io` | 85,000 | `jit-cuda` | 14,000 |

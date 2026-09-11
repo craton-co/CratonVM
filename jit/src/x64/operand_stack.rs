@@ -15,13 +15,15 @@
 //! `checked_spill_range_end`) lives here for the same reason — it is the
 //! allocation side of the same simulation.
 
-use super::*;
 /// The kill switch and engagement counter for the open-inline-locals floor
 /// enforced in `reserve_spill_slots`. Declared beside their siblings in
 /// `inlining.rs` (which owns the splice whose locals the floor protects) and
 /// named here rather than glob-imported, so a reader of either file can find
 /// the other end.
-use super::inlining::{inline_locals_floor_disabled, note_inline_locals_floor};
+use super::inlining::{
+    dbg_note_locals_floor, inline_locals_floor_disabled, note_inline_locals_floor,
+};
+use super::*;
 
 /// TEST-ONLY, opt-in: cap `spill_slots` at this many words, whatever
 /// `max_stack` asks for. Unset (the default) means no cap.
@@ -146,10 +148,19 @@ impl Compiler {
         // the floor belongs. See `open_inline_locals_floor`.
         let mut start = self.next_spill_offset;
         if !inline_locals_floor_disabled() {
-            let floor = self.open_inline_locals_floor();
-            if start < floor {
-                start = floor;
+            let cleared = self.inline_locals_clear_of_range(start, slots);
+            if cleared != start {
+                start = cleared;
                 note_inline_locals_floor();
+                dbg_note_locals_floor(why, self.next_spill_offset, slots, start, "BUMPED", self);
+            } else if self.next_spill_offset < self.open_inline_locals_floor() {
+                // The one-sided rule WOULD have moved this reservation and the
+                // range rule did not: the words it wants sit below an open
+                // enclosing scope's locals and are owned by nobody. Reported
+                // rather than silent, because this is exactly the population
+                // the one-sided rule was corrupting -- see
+                // `inline_locals_clear_of_range`.
+                dbg_note_locals_floor(why, self.next_spill_offset, slots, start, "KEPT", self);
             }
         }
         let end = self.checked_spill_range_end(start, slots)?;
@@ -237,6 +248,73 @@ impl Compiler {
             .map(|scope| scope.local_base + (scope.num_locals as i32) * 8) // Cast: x86-64 frame offset
             .max()
             .unwrap_or(i32::MIN)
+    }
+
+    /// The lowest offset at or above `start` at which a `slots`-word
+    /// reservation touches NO open ENCLOSING inline scope's locals.
+    ///
+    /// # Why this is not `max(start, open_inline_locals_floor())`
+    ///
+    /// That was the first cut, and it is a ONE-SIDED test: it compares `start`
+    /// against the TOP of the highest enclosing scope's locals and moves every
+    /// reservation beginning anywhere below it. A reservation that would have
+    /// fitted ENTIRELY UNDERNEATH those locals -- owning no word any scope
+    /// owns, overlapping nothing -- was displaced just the same.
+    ///
+    /// That displacement is not free and it is not theoretical. Measured
+    /// 2026-09-10 on `scala.runtime.Statics.anyHash(Long)`: the whole run took
+    /// **one** floor bump; that bump overlapped **no** scope (the same run with
+    /// `CRATONVM_JIT_NO_INLINE_LOCALS_FLOOR=1` and
+    /// `CRATONVM_DBG=jit-slot-overlap` reports zero ENCLOSING rows); and the
+    /// compiled body then answered a per-run CONSTANT for every argument --
+    /// 299,498 wrong hashes in 300,000 calls, 9 runs in 10, against 0 in 10
+    /// with the floor off, interleaved, one binary, one switch.
+    ///
+    /// So the test is the RANGE test -- the same `start < s_end && s_start <
+    /// end` that `dbg_note_spill_overlap` uses to decide a report is a hazard,
+    /// which is what this guard always meant by "inside". Every genuine case
+    /// the floor was written for is still caught: the census that produced it
+    /// (`CriteriaWindowFunctionTest`, 151 of 304 reports against an enclosing
+    /// scope) recorded that in every sampled report "the reservation range was
+    /// EXACTLY the scope's locals range", and an exact range intersects under
+    /// either rule.
+    ///
+    /// # Why it iterates
+    ///
+    /// Clearing one scope can walk the range into the next one up. Each pass
+    /// clears at least one scope and never lowers the cursor, so `enclosing`
+    /// passes are enough and the loop is bounded by the splice depth.
+    ///
+    /// A zero-word reservation occupies nothing and therefore intersects
+    /// nothing; it comes back unmoved, which is what the range test says.
+    ///
+    /// Returns `start` unchanged when fewer than two splices are open, so this
+    /// is inert for every non-inlined method and for a lone splice.
+    pub(super) fn inline_locals_clear_of_range(&self, start: i32, slots: usize) -> i32 {
+        // `len - 1` scopes: every open splice EXCEPT the innermost, which is
+        // the one that is RETURNING. See `open_inline_locals_floor` for why
+        // including it is wrong rather than merely wasteful.
+        let enclosing = self.inline_oop_scopes.len().saturating_sub(1);
+        if enclosing == 0 || slots == 0 {
+            return start;
+        }
+        let span = (slots as i32) * 8; // Cast: x86-64 frame offset
+        let mut cur = start;
+        for _ in 0..enclosing {
+            let mut next = cur;
+            for scope in self.inline_oop_scopes.iter().take(enclosing) {
+                let s_start = scope.local_base;
+                let s_end = scope.local_base + (scope.num_locals as i32) * 8; // Cast: x86-64 frame offset
+                if cur < s_end && s_start < cur.saturating_add(span) {
+                    next = next.max(s_end);
+                }
+            }
+            if next == cur {
+                break;
+            }
+            cur = next;
+        }
+        cur
     }
 
     /// Does an OPEN inline scope still publish any of the locals in
@@ -1504,10 +1582,9 @@ impl Compiler {
     /// Invalidate any CalleeSaved or Scratch stack entries for `reg` before it
     /// is overwritten. All references are materialized to a single shared spill slot.
     pub(super) fn invalidate_callee_saved(&mut self, reg: u8) {
-        let needs_spill = self
-            .stack
-            .iter()
-            .any(|s| matches!(s, StackSlot::CalleeSaved(r) | StackSlot::Scratch(r, ..) if *r == reg));
+        let needs_spill = self.stack.iter().any(
+            |s| matches!(s, StackSlot::CalleeSaved(r) | StackSlot::Scratch(r, ..) if *r == reg),
+        );
         if !needs_spill {
             return;
         }

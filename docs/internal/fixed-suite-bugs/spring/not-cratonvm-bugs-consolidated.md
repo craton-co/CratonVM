@@ -1,3 +1,25 @@
+> **RETIRED to `internal/` 2026-09-10, re-verified the same day.** Moved out of
+> `known-issues/` because the residual set it was the reference for is
+> discharged: after the 2026-09-10 type-variable scope-walk fix the whole
+> Spring Framework suite (2 848 classes) leaves **three** non-`OK` classes when
+> each is run alone, and `FileNativeConfigurationWriterTests` — the single entry
+> in the table below — is one of them, re-measured on the same host the same
+> day and still failing **identically on stock HotSpot 25**:
+>
+> ```
+> aot.nativex.FileNativeConfigurationWriterTests  HotSpot  FAIL  found=9 pass=3 fail=6  2007 ms
+> aot.nativex.FileNativeConfigurationWriterTests  CratonVM FAIL  found=9 pass=3 fail=6   773 ms
+> ```
+>
+> Same class, same six methods, same counts, both VMs. The finding below stands
+> unchanged and needs no further work. The other two residuals are throughput,
+> not correctness, and keep their own open pages under `known-issues/spring/`.
+>
+> The "other 87 classes" section is now fully historical: every one of the three
+> write-ups it points at is closed, and the 2026-09-10 sweep is the
+> confirmation — 30 269 of 30 462 test methods passed with 22 failures, and an
+> alone-rerun of every non-`OK` class reduces that to the six methods above.
+
 # Spring Framework non-passing classes confirmed NOT CratonVM bugs — consolidated reference
 
 **Purpose: stop future sessions re-investigating these.** Every entry below
