@@ -1614,7 +1614,38 @@ use cratonvm_types::compat::CompatibilityMode;
 /// appear in the arm-OFF dump -- so retiring them changes their strict-mode
 /// admission and not their kind.
 ///
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2558;
+
+/// # Re-frozen 2026-09-11 by lane L6: +17, measured on three merge bases
+///
+/// `RETIRED_SHADOW_L6_TRIPLES` retires 15 triples, and re-tagging a `Bridge`
+/// to `SyntheticStub` is what raises this count -- case (b) in the failure
+/// message above: a fake labelled honestly so `--jdk-only` drops it and the
+/// JDK's own bytecode runs.
+///
+/// The substitution experiment, with the control pinned to the merge's own
+/// SECOND PARENT rather than to the moving `origin/dev` ref:
+///
+/// ```text
+///   merge base   CTRL (all three arms)   TRIAL                delta
+///   dd5112832    GREEN at 2328 / 2339    2345 / 2356 / 2345    +17
+///   feeb02b66    GREEN at 2384 / 2395    2401 / 2412 / 2401    +17
+///   3947e36b0    GREEN at 2547 / 2558    2564 / 2575 / 2564    +17
+/// ```
+///
+/// **CTRL green on every base is the load-bearing half.** It says the whole
+/// +17 is this lane's and none of it is drift the lane is absorbing -- the
+/// mistake this file's own header records three of, at 3/3/12. Measured three
+/// times because `dev` re-froze these constants between each merge, and each
+/// number is read off the merged tree rather than added to the last by
+/// arithmetic.
+///
+/// **+17 for 15 triples is not an error.** The unit of this count is a
+/// REGISTRATION, not a triple, and two of the fifteen are registered twice:
+/// the same `(class, name, descriptor)` reaches `register` from two sites and
+/// each registration is re-tagged separately. The `--jdk-only-report` census
+/// for the same prefixes reports **15 distinct triples refused, 0 with a
+/// survivor** -- the same population counted the other way.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2575;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1680,7 +1711,38 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2558;
 /// **Re-frozen 2026-09-11, 2384 -> 2547**, with the other two; the account is
 /// on [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]. +163, all of it lane 4 wave 1:
 /// the arm-OFF measurement lands on 2384 exactly.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2547;
+
+/// # Re-frozen 2026-09-11 by lane L6: +17, measured on three merge bases
+///
+/// `RETIRED_SHADOW_L6_TRIPLES` retires 15 triples, and re-tagging a `Bridge`
+/// to `SyntheticStub` is what raises this count -- case (b) in the failure
+/// message above: a fake labelled honestly so `--jdk-only` drops it and the
+/// JDK's own bytecode runs.
+///
+/// The substitution experiment, with the control pinned to the merge's own
+/// SECOND PARENT rather than to the moving `origin/dev` ref:
+///
+/// ```text
+///   merge base   CTRL (all three arms)   TRIAL                delta
+///   dd5112832    GREEN at 2328 / 2339    2345 / 2356 / 2345    +17
+///   feeb02b66    GREEN at 2384 / 2395    2401 / 2412 / 2401    +17
+///   3947e36b0    GREEN at 2547 / 2558    2564 / 2575 / 2564    +17
+/// ```
+///
+/// **CTRL green on every base is the load-bearing half.** It says the whole
+/// +17 is this lane's and none of it is drift the lane is absorbing -- the
+/// mistake this file's own header records three of, at 3/3/12. Measured three
+/// times because `dev` re-froze these constants between each merge, and each
+/// number is read off the merged tree rather than added to the last by
+/// arithmetic.
+///
+/// **+17 for 15 triples is not an error.** The unit of this count is a
+/// REGISTRATION, not a triple, and two of the fifteen are registered twice:
+/// the same `(class, name, descriptor)` reaches `register` from two sites and
+/// each registration is re-tagged separately. The `--jdk-only-report` census
+/// for the same prefixes reports **15 distinct triples refused, 0 with a
+/// survivor** -- the same population counted the other way.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2564;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1777,7 +1839,38 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2547;
 /// its sibling -- it lands on the same number again, which is a measurement
 /// each time and not a rule. The account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2547;
+
+/// # Re-frozen 2026-09-11 by lane L6: +17, measured on three merge bases
+///
+/// `RETIRED_SHADOW_L6_TRIPLES` retires 15 triples, and re-tagging a `Bridge`
+/// to `SyntheticStub` is what raises this count -- case (b) in the failure
+/// message above: a fake labelled honestly so `--jdk-only` drops it and the
+/// JDK's own bytecode runs.
+///
+/// The substitution experiment, with the control pinned to the merge's own
+/// SECOND PARENT rather than to the moving `origin/dev` ref:
+///
+/// ```text
+///   merge base   CTRL (all three arms)   TRIAL                delta
+///   dd5112832    GREEN at 2328 / 2339    2345 / 2356 / 2345    +17
+///   feeb02b66    GREEN at 2384 / 2395    2401 / 2412 / 2401    +17
+///   3947e36b0    GREEN at 2547 / 2558    2564 / 2575 / 2564    +17
+/// ```
+///
+/// **CTRL green on every base is the load-bearing half.** It says the whole
+/// +17 is this lane's and none of it is drift the lane is absorbing -- the
+/// mistake this file's own header records three of, at 3/3/12. Measured three
+/// times because `dev` re-froze these constants between each merge, and each
+/// number is read off the merged tree rather than added to the last by
+/// arithmetic.
+///
+/// **+17 for 15 triples is not an error.** The unit of this count is a
+/// REGISTRATION, not a triple, and two of the fifteen are registered twice:
+/// the same `(class, name, descriptor)` reaches `register` from two sites and
+/// each registration is re-tagged separately. The `--jdk-only-report` census
+/// for the same prefixes reports **15 distinct triples refused, 0 with a
+/// survivor** -- the same population counted the other way.
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2564;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
