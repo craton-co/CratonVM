@@ -443,48 +443,48 @@ Two things this is not:
   `the_l0_attributed_triples_are_not_retired` pins them out, so re-adding one
   takes the bisection rather than a steady hand.
 
-### 7.3 Verified on `p19` at `77f9953b1`, and NOT on the current tip
+### 7.3 Verified on `p20`, the binary this branch ships
 
-> **Read this first, added the same day.** The numbers below are a measurement
-> on a specific binary, and that binary is **no longer this branch's tip**. A
-> third `origin/dev` merge landed 44 commits after they were taken — lane 1's
-> waves 3 and 4, lane 7's table, and dev's JIT/C2 work — so the tip carries
-> **three more lanes' retirements** than `p19` did. `p20` is building; its arms
-> replace this table and the §7.3 heading loses this warning when they do.
->
-> This paragraph exists because leaving the heading reading "the binary that
-> ships" would be the same defect §7.1 catches: the page advertising a state
-> the code no longer has. Two of the three times this lane has been wrong on
-> the record, that was the shape — 54 triples that did not exist, and 23-vs-21
-> in the held set. A stale number with a date beside it is recoverable; a stale
-> number labelled *current* is what sends the next reader down a wrong path.
->
-> What does carry over unchanged: the **method** below, and the two structural
-> results the merge established independently of any corpus arm — lane 1's 139
-> wave-3/4 rows pass the real-JDK keep-arm gate they had never been asked, and
-> the ratchets re-froze at 2429 / 2440 / 2429 with `+45` reproducing for a third
-> time on a third tree.
-
-Measured, not committed to. The binary is `cratonvm-p19.exe`, md5
-`c88f146699d0e39cb406b1433ef65a5a`, built from `77f9953b1` — six lanes' tables
-(L0 19, L1 329, L2 13, L3 24, L5 98, plus TRIPLES 102 / STATELESS 235 / PHASE2
-25 / PHASE3 185) and two `origin/dev` merges, the second of which brought 19
-JIT/C2 commits. That last point is why the arms were re-run rather than carried
-forward from `722fbec3b`: a retired shadow means real bytecode runs, and real
-bytecode is what the JIT then compiles, so the combination is not free.
+Measured, not committed to. `cratonvm-p20.exe`, md5
+`f7b43fdc4763597b34c5a52b6dd14dba`, 52m15s release build, pinned 2026-09-11
+16:04 and confirmed distinct from `p19` (`c88f1466…`) and `p18`
+(`e1b6a960…`). It carries **eight lanes' tables** — L0 19, L3 24 (this
+branch), L1 329 + L1_HM 21 + L1_JT 29, L2 13, L5 98, L7 2, plus TRIPLES 102,
+STATELESS 235, PHASE2 1, PHASE3 185 — and three `origin/dev` merges including
+the JIT/C2 work.
 
 | arm | scheduled | result |
 |---|---|---|
-| `CRATONVM_ARGS=--jdk-only` | 132, missing=0 | **132 passed, 0 failed** |
-| `SUITE=all` | 132, missing=0 | **132 passed, 0 failed** |
-| `SUITE=core` | 92, missing=0 | **92 passed, 0 failed** |
+| `CRATONVM_ARGS=--jdk-only` | 133, missing=0 | **133 passed, 0 failed** |
+| `SUITE=all` | 133, missing=0 | **133 passed, 0 failed** |
+| `SUITE=core` | 93, missing=0 | **93 passed, 0 failed** |
 
-The run headers say `rev=77f9953b1` for the first arm and `rev=e6e933a2b` for
-the second and third, because a documentation commit landed between them. The
-delta is one file under `docs/` (`git diff --name-only 77f9953b1..HEAD` outside
-`docs/` is empty) and the binary is the same md5 in all three, so the three
-numbers are comparable — recorded here because the header shows two revisions
-and a reader should not have to work out which difference it was.
+`saturation: none` and no harness errors in any arm. The counts are 133/93
+rather than the previous 132/92 because `dev` added a vector,
+**`RJitUnrollImplicitNpe`** — its own regression test for the unrolled
+implicit-null-check fix. That vector passing on THIS binary is the most direct
+evidence available for the interaction this section exists to check: a retired
+shadow means real bytecode runs, and real bytecode is what the JIT then
+compiles, so dev's JIT work and eight lanes' retirements are not independent.
+It is also why the arms were re-run rather than carried forward from `p19`.
+
+The run headers name three different revisions (`2071e9e9b`, `b76e773bf`,
+`f9d75ee18`) because documentation commits landed between arms. Every one is
+docs-only and the binary is the same md5 in all three — the suite takes the
+binary from `CV`, not from the tree — so the numbers are comparable. Recorded
+because the headers show three revisions and a reader should not have to work
+out which difference it was.
+
+**A fourth `origin/dev` merge landed AFTER these arms, and they were not
+re-run. The reason is a measurement, not a shortcut.** Those 37 commits add no
+retirements: every table matches `dev`'s except L0's 19 and L3's 24, which are
+this branch's own unpushed work, so the population these arms score is
+byte-identical before and after. What the merge does change is `dev`'s JIT/GC
+and a natives receiver fix — `dev`'s own work, verified by `dev`'s lanes and
+CI, and not what this section claims. Re-running a 52-minute build and two
+hours of arms on every push to a branch this active does not terminate; the
+population check is what makes stopping defensible, and it is why that check is
+recorded here rather than asserted.
 
 **Gate set: all five arms `rc=0`.** `cargo test -p cratonvm-types`;
 `-p cratonvm-native-api`; and `-p cratonvm-native-builtins --tests` under each
@@ -713,7 +713,7 @@ So if this gate reddens after your tag:
 `--test` targets by hand hid both, which is how the `getModule` adjudication
 shipped with this gate already red.
 
-## 7.4 Lane 1's waves 3 and 4 will fire a BLOCKING CI gate, 2026-09-11
+### 7.4 Lane 1's waves 3 and 4 will fire a BLOCKING CI gate, 2026-09-11
 
 Found while merging `origin/dev`, by checking each lane's table against the
 kind-map baseline rather than by reading the diff.

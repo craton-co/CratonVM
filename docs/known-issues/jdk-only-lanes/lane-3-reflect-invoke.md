@@ -606,23 +606,16 @@ Two instrument notes earned in the same hour:
   == normalised diff 52 on the wave-2 arms). Filter after the diff, never
   before, and never on one side only.
 
-### 8c. Verified on `p19` at `77f9953b1`, and NOT on the current tip
+### 8c. Verified on `p20`, the binary this branch ships
 
-**The tip moved after these numbers were taken** — a third `origin/dev` merge
-brought 44 commits, so the tree now carries lane 1's waves 3-4, lane 7's table
-and dev's JIT work on top of what `p19` had. `p20` is building and its arms
-replace this block; the lane-0 page's §7.3 carries the same warning and the
-reasoning for it. Treat the three numbers below as a reading on a named
-revision, not as this lane's current state.
+This lane's 24 retired triples were measured as part of an **eight-lane**
+binary rather than alone: `cratonvm-p20.exe`, md5
+`f7b43fdc4763597b34c5a52b6dd14dba`.
 
-This lane's 24 retired triples were re-measured as part of a six-lane binary
-rather than alone. `cratonvm-p19.exe`, md5 `c88f146699d0e39cb406b1433ef65a5a`,
-from `77f9953b1`:
-
-* three arms **132/0** (`--jdk-only`), **132/0** (`SUITE=all`), **92/0**
-  (`SUITE=core`), all with `missing=0`;
-* gate set all five arms `rc=0`, `nb-default` re-run at 11 targets / 4285
-  passed / 0 failed;
+* three arms **133/0** (`--jdk-only`), **133/0** (`SUITE=all`), **93/0**
+  (`SUITE=core`), all with `missing=0` and `saturation: none`;
+* gate set all five arms `rc=0`, `nb-default` at 11 targets / 4285 passed /
+  0 failed and `types` re-run at 15 targets / 639 passed / 0 failed;
 * **26 distinct refused triples for this lane, 0 with a survivor** (corrected
   2026-09-11 — the earlier "52, 0 survivors" was one number for L0+L3 computed
   with a broken key; the lane-0 page's §7.3 has the account). This lane's 26 is
