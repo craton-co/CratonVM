@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-542 tokens.
+543 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -296,6 +296,7 @@ export inherited from a parent shell.
 | `jit-compiled` | `CRATONVM_DBG_JIT_COMPILED` |
 | `jit-disasm` | `CRATONVM_DBG_JIT_DISASM` |
 | `jit-slot-overlap` | `CRATONVM_DBG_JIT_SLOT_OVERLAP` |
+| `jit-locals-floor` | `CRATONVM_DBG_JIT_LOCALS_FLOOR` |
 | `zip-immune` | `CRATONVM_DBG_ZIPIMMUNE` |
 | `jit-dispatch` | `CRATONVM_DBG_JIT_DISPATCH` |
 | `jit-entry` | `CRATONVM_DBG_JIT_ENTRY` |
@@ -608,7 +609,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-426 tokens.
+429 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -765,6 +766,9 @@ export inherited from a parent shell.
 | `ir-drop-home` | `CRATONVM_JIT_IR_DROP_HOME` |
 | `ir-drop-unreachable-homes` | `CRATONVM_JIT_IR_DROP_UNREACHABLE_HOMES` |
 | `ir-carry-single-use` | `CRATONVM_JIT_IR_CARRY_SINGLE_USE` |
+| `ir-carry-2nd` | `CRATONVM_JIT_IR_CARRY_2ND` |
+| `ir-cmp-in-place` | `CRATONVM_JIT_IR_CMP_IN_PLACE` |
+| `ir-pair-operands` | `CRATONVM_JIT_IR_PAIR_OPERANDS` |
 | `ir-sink-late` | `CRATONVM_JIT_IR_SINK_LATE` |
 | `ir-alu-imm` | `CRATONVM_JIT_IR_ALU_IMM` |
 | `merged-call-sentinel` | `CRATONVM_JIT_MERGED_CALL_SENTINEL` |
