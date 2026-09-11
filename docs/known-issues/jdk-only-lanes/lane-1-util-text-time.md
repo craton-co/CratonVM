@@ -512,10 +512,26 @@ anything any run produced:
   stub-ratchet: const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2380;
 ```
 
-`2328 -> 2380` is `+52`, and it is the same `+52` the jdk-only census reports
-for `synthetic-native-registered` — two instruments, one number, which is the
-check neither can make alone. The rise IS the retirement: a `Bridge` re-tagged
-`SyntheticStub` is exactly what makes `--jdk-only` drop it.
+All three arms are re-frozen, each from its own printed line:
+
+```text
+  BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT   2328 -> 2380   (+52)
+  BASELINE_SYNTHETIC_STUBS_MANAGEMENT      2339 -> 2391   (+52)
+  BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK   2328 -> 2380   (+52)
+```
+
+and `+52` is the same `+52` the jdk-only census reports for
+`synthetic-native-registered` (2202 → 2254). **Two instruments, one number**,
+and the arithmetic closes against the tables themselves: 50 distinct triples
+plus the two that are registered twice — `java/util/HashMap.<init>()V` and
+`java/util/jar/JarEntry.getComment()`. The rise IS the retirement: `register()`
+re-tags a retired `Bridge` as `SyntheticStub` so `register_inner` can refuse
+it under `--jdk-only`, and this ratchet counts exactly that re-tagging.
+
+Earlier waves of this lane REPORTED the deltas instead of re-freezing, on the
+grounds that the constants were lane 0's. That is no longer the convention on
+`dev` — lane 5 re-froze them itself on 2026-09-11 — so leaving the gate red
+would land a red test, and these are re-frozen.
 
 ## 4. The finding this lane would most like the next lane to have: a retired PRODUCER makes a zero-invocation CONSUMER reachable
 
