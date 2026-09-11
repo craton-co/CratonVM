@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 2026-09-11 The loop control: a folded immediate, and `LEA` for the increment
+
+The residue `c2-a-fused-compare-can-read-its-operands-where-they-are-20260910.md`
+left behind, finished and the page retired.
+
+A fused compare now has four forms instead of two. It already read two resident
+operands in place, and a resident one against a frame slot; it now also folds a
+CONSTANT second operand into the instruction, with the first operand read from
+either its register or its frame slot. `i < 100` is the shape of most Java
+loops, and it used to cost `mov rax,rbx ; mov ecx,64h ; cmp eax,ecx` where
+`cmp ebx,64h` does. `CRATONVM_JIT_IR_CMP_IN_PLACE=0` remains the kill switch for
+all four.
+
+`x + k` and `x - k` lower to one `LEA` where `k` is a constant and `x` is
+resident — `lea eax,[rbx+1]` for `mov rax,rbx ; add eax,1`, or
+`lea r14d,[rbx+1]` for the three-instruction form when the result has a register
+of its own. New flag `CRATONVM_JIT_IR_ADD_LEA=0`.
+
+Instructions AND bytes fall wherever either fires — 189/933 to 186/922 on
+`LoopCtl.spin`, 200/1190 to 196/1178 on `PollReach.hotLoop`, and the two levers
+are additive to the instruction. **No speedup is claimed**: the build host's
+noise floor between two identical binaries reached 14.6% during the A/B, so the
+timing is a null. See
+`docs/internal/retired/c2-a-fused-compare-can-read-its-operands-where-they-are-RETIRED-20260911.md`
+§8 for why, in numbers.
+
+Four `CRATONVM_*` names that were read by code but declared nowhere —
+`CRATONVM_JIT_IR_ADD_LEA`, `CRATONVM_JIT_IR_CMP_IN_PLACE`,
+`CRATONVM_JIT_IR_CARRY_2ND` and `CRATONVM_JIT_IR_PAIR_OPERANDS` — now have rows
+in `flag_groups.rs::INVENTORY` and the generated flag docs, so they are served
+from the latched `VmFlags` snapshot rather than a live `getenv`.
+
+New probes `probes/CmpImm.java` (timing and census) and `probes/CmpImmProbe.java`
+(differential against HotSpot: the `imm8`/`imm32` boundary in both signs, a
+`long` constant outside `i32`, `Integer.MIN_VALUE` as a bound and as an addend,
+a spilled first operand, and a reference against `null`).
+
+
 ### 2026-09-10 The safepoint poll's flag byte, from the code cache's own allocator
 
 The second half of the placement problem `CRATONVM_JIT_CODE_NEAR_GLOBALS`

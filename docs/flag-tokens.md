@@ -609,7 +609,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-429 tokens.
+433 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -771,6 +771,10 @@ export inherited from a parent shell.
 | `ir-pair-operands` | `CRATONVM_JIT_IR_PAIR_OPERANDS` |
 | `ir-sink-late` | `CRATONVM_JIT_IR_SINK_LATE` |
 | `ir-alu-imm` | `CRATONVM_JIT_IR_ALU_IMM` |
+| `ir-pair-operands` | `CRATONVM_JIT_IR_PAIR_OPERANDS` |
+| `ir-carry-2nd` | `CRATONVM_JIT_IR_CARRY_2ND` |
+| `ir-cmp-in-place` | `CRATONVM_JIT_IR_CMP_IN_PLACE` |
+| `ir-add-lea` | `CRATONVM_JIT_IR_ADD_LEA` |
 | `merged-call-sentinel` | `CRATONVM_JIT_MERGED_CALL_SENTINEL` |
 | `ir-cold-arg-stage` | `CRATONVM_JIT_IR_COLD_ARG_STAGE` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
