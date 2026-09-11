@@ -17292,13 +17292,87 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
     }
 }
 
+impl<'a> NativeContextImpl<'a> {
+    /// Drop the frames that belong to the throwable's own CONSTRUCTION.
+    ///
+    /// `Throwable.<init>` calls `fillInStackTrace()`, so a throwable built from
+    /// real bytecode captures its own constructor chain at the top of its
+    /// trace. HotSpot removes it -- `java_lang_Throwable::fill_in_stack_trace`
+    /// skips a leading frame while its method is `<init>` **and the throwable
+    /// is an instance of that frame's declaring class**, stopping at the first
+    /// frame that is not.
+    ///
+    /// The second half of that condition is the part worth stating, because the
+    /// obvious simplification -- skip any leading `<init>` of a `Throwable`
+    /// subclass -- is wrong in a case the JDK gets right:
+    ///
+    /// ```text
+    ///   class Bad extends RuntimeException { Bad() { throw new IllegalStateException(); } }
+    ///   frames: main / Bad.<init> / IllegalStateException.<init> / ... / Throwable.<init>
+    /// ```
+    ///
+    /// The `IllegalStateException` is not a `Bad`, so skipping stops at
+    /// `Bad.<init>` and the trace still names the constructor that threw. The
+    /// simplification would delete it and point at `main`.
+    ///
+    /// # Why this is not only about retirement
+    ///
+    /// It is a live defect on `dev`, and the natives were hiding it. The
+    /// throwable-constructor shadows run INSTEAD of `<init>`, so they push no
+    /// constructor frame and there is nothing to trim -- but a subclass whose
+    /// own constructor is bytecode still does:
+    ///
+    /// ```text
+    ///   new VirtualMachineError() {}       HotSpot   depth=1  L2FrameProbe.main
+    ///                                      CratonVM  depth=2  L2FrameProbe$1.<init> / main
+    /// ```
+    ///
+    /// Measured 2026-09-10 with `apps/probes/L2FrameProbe.java`, which pairs
+    /// each shadowed throwable with an unshadowed control so the two causes
+    /// cannot be confused.
+    ///
+    /// Traces are stored OUTERMOST-first, so the construction frames are at the
+    /// TAIL and this truncates rather than drains from the front.
+    fn trim_throwable_construction_frames(
+        &self,
+        throwable: ObjectRef,
+        trace: &mut Vec<StackTraceEntry>,
+    ) {
+        if trace.is_empty() {
+            return;
+        }
+        let thrown = self.class_id_of_object(throwable);
+        if thrown == ClassId::new(0) {
+            // A reclaimed or unresolvable header. Fail CLOSED: an unmodified
+            // trace carries a frame too many, which is a worse diagnostic but
+            // never a missing one.
+            return;
+        }
+        let cm = self.shared.classes.class_manager.read();
+        while let Some(top) = trace.last() {
+            if &*top.method_name != "<init>" {
+                break;
+            }
+            // `class_id` is `None` only for synthetic entries with no backing
+            // interpreter frame; without it there is no sound assignability
+            // question to ask, so stop rather than guess by name.
+            let Some(holder) = top.class_id else { break };
+            if thrown != holder && !cm.is_subclass_of(thrown, holder) {
+                break;
+            }
+            trace.pop();
+        }
+    }
+}
+
 impl<'a> NativeExceptionAccess for NativeContextImpl<'a> {
     fn capture_stack_trace(&mut self, _throwable_hash: i32) -> Vec<StackTraceEntry> {
         self.capture_current_stack_trace()
     }
 
     fn capture_throwable_stack_trace(&mut self, throwable: ObjectRef) -> Vec<StackTraceEntry> {
-        let trace = self.capture_current_stack_trace();
+        let mut trace = self.capture_current_stack_trace();
+        self.trim_throwable_construction_frames(throwable, &mut trace);
         self.shared
             .store_throwable_stack_trace(throwable, trace.clone());
         trace
