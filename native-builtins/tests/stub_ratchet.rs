@@ -1614,7 +1614,47 @@ use cratonvm_types::compat::CompatibilityMode;
 /// appear in the arm-OFF dump -- so retiring them changes their strict-mode
 /// admission and not their kind.
 ///
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2558;
+/// # Re-frozen 2026-09-11 for jdk-only lane 2 wave 2, 2558 -> 2604
+///
+/// Lane 2 retired 50 triples under `java/lang` and `java/math`. Every number
+/// below was RUN on this tree against a binary built from `origin/dev`
+/// (`6d16472f5`), which sits exactly on its own baseline in all three arms --
+/// so the whole delta is this branch's:
+///
+/// ```text
+///   arm              dev    this branch   delta   total registrations
+///   no-management   2547       2577        +30    13610 -> 13610
+///   management      2558       2604        +46    13978 -> 13978
+///   synthetic-jdk   2547       2577        +30    13645 -> 13645
+/// ```
+///
+/// **Case (b), and the second column says so:** the total did not move by one
+/// row in any arm. 30 added registrations in the boot arm, **0 removed**, every
+/// one a lane-2 triple, taken with `CRATONVM_RATCHET_ROWS=1` on both binaries
+/// and `comm`-diffed. The management arm's extra 16 are the
+/// `java/lang/management/*` rows -- 14 distinct triples, two of them registered
+/// twice -- which the other two arms do not compile.
+///
+/// **30 registrations, 0 new distinct triples.** `dump_synthetic_stubs` is
+/// byte-identical between the two binaries, and that is not a contradiction:
+/// these triples are registered more than once (`ExceptionInInitializerError.
+/// <init>()V` from both `lang_misc.rs` and `lib.rs`, `Throwable.initCause` from
+/// both `lang_misc.rs` and `reflect_annotations.rs`), one registration was
+/// already a `SyntheticStub`, and the table re-tags the other. The DISTINCT set
+/// therefore cannot see this retirement while this ratchet can. Anyone
+/// attributing a delta with the dump alone will read a real retirement as a
+/// no-op -- it nearly cost lane 2 its own table.
+///
+/// The VM agrees, which is the third instrument: `--jdk-only-report` refusals
+/// under those two prefixes go 95 -> 144 with **zero survivors**.
+///
+/// **Beware a shared `CARGO_TARGET_DIR`.** Both arms were first measured into
+/// one target dir and cargo reported `Finished in 0.18s`, compiled nothing and
+/// scored this tree with dev's binary -- freshness is by mtime, and a
+/// `git merge` writes files OLDER than artefacts built after it. The numbers
+/// above come from builds asserted by a non-zero `Compiling` count, with each
+/// binary copied out and its sha256 printed and differing.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2604;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1680,7 +1720,10 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2558;
 /// **Re-frozen 2026-09-11, 2384 -> 2547**, with the other two; the account is
 /// on [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]. +163, all of it lane 4 wave 1:
 /// the arm-OFF measurement lands on 2384 exactly.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2547;
+/// **Re-frozen 2026-09-11, 2547 -> 2577** for jdk-only lane 2 wave 2, in the
+/// same commit as the other two, each arm RUN rather than derived from its
+/// sibling. The account is on [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2577;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1777,7 +1820,10 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2547;
 /// its sibling -- it lands on the same number again, which is a measurement
 /// each time and not a rule. The account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2547;
+/// **Re-frozen 2026-09-11, 2547 -> 2577** for jdk-only lane 2 wave 2, in the
+/// same commit as the other two, each arm RUN rather than derived from its
+/// sibling. The account is on [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2577;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
