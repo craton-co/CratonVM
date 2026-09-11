@@ -513,7 +513,41 @@ The six rejections, each by a rule rather than a judgement:
   to be present for the verdict to come out as it did.
 * **`BAD -> BAD` — 2.** `Field.trySetAccessible` answers `true` where HotSpot
   answers `false` for a JDK-internal field — **a real access-control defect,
-  not a retirement candidate.** `Constructor.setAccessible` differs only in the
+  not a retirement candidate.** The row is
+  `System.class.getDeclaredField("props").trySetAccessible()`: HotSpot `false`,
+  this VM `true`.
+
+  **Priced 2026-09-11, and it is smaller than the source comment implies.**
+  `lang_reflect.rs` says the VM "doesn't enforce module-level deep-reflection",
+  which reads as an absent subsystem. It is not: the module state the JDK's own
+  check needs is tracked and already queryable from natives —
+  `Module.isOpen(String)` and `isOpen(String, Module)` are registered and
+  backed by `ctx.is_package_open_unqualified` / `is_package_open_to`, which read
+  a real `module_registry` (`vm_exec.rs:10088`). What is missing is the CHECK at
+  this one door, not the data behind it.
+
+  Three things anyone taking it should know, none of which is the code:
+
+  1. **The existing carve-out is one hard-coded row, not a model.**
+     `check_class_loader_define_class_is_encapsulated` fires only for declaring
+     class `java/lang/ClassLoader` and member `defineClass`. Extending it by
+     adding `System.props` and friends would close this row and generalise to
+     nothing — the anti-pattern of a literal table in front of a registry that
+     already knows the answer.
+  2. **`is_package_open_to` FAILS OPEN on an empty registry** (`return true`).
+     Anything built on it is vacuous for the window before the module graph is
+     populated, so the check needs its own positive control: a row that must be
+     DENIED, asserted to be denied, or the gate cannot tell enforcement from
+     early-boot.
+  3. **The blast radius is every `setAccessible` in the process**, not this
+     row. Twelve of the 134 corpus vectors call it directly, and the framework
+     suites (Spring, Hibernate, Jackson, ByteBuddy/CGLIB) are built on it — the
+     population the source comment was protecting. So this wants its own gate
+     set plus the app suites, and it is not a reflection-wave item.
+
+  Recorded as priced, not fixed. A retirement wave is the wrong vehicle: the
+  remedy here is a check the VM does not perform, which is the opposite of
+  yielding to bytecode. `Constructor.setAccessible` differs only in the
   throwing FRAME; see below.
 * **Secondary triple is HELD — 2.** `Field.setBoolean`'s two rows read the
   value back through `Field.get`, and `Constructor.setAccessible`'s through
