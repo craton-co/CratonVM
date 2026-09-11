@@ -379,7 +379,8 @@ What it buys, on the final pair of binaries — the whole 125-probe tree, plain
 
 ```text
   L6HttpLogicSweep   64 diff lines -> 20     (164 rows, 2,913 yields)
-  every other probe in the tree             delta exactly 0
+  every other probe in the tree             delta exactly 0, except the
+                                            VtHandoffProbe noise floor (§7)
 ```
 
 22 differing rows closed. The rows are the perimeter this campaign predicts and
@@ -502,7 +503,85 @@ should do.
 
 ## 7. The gates
 
-<!-- GATES-PLACEHOLDER -->
+All of it on the MERGED tree, with a control binary built from the same tree
+and differing only in `native-api/src/retired_shadow.rs`.
+
+### The three arms
+
+```text
+  --jdk-only corpus    trial 132/132     ctrl 132/132    (paired, each arm ALONE)
+  SUITE=all            132/132
+  SUITE=core            92/92
+```
+
+### The probe tree, two binaries
+
+```text
+  measured 125 probes
+  moved AWAY from HotSpot:   1      VtHandoffProbe, +4
+  moved TOWARD HotSpot:      1      L6HttpLogicSweep, 64 diff lines -> 20
+  one side did not finish:   0
+```
+
+`VtHandoffProbe` is the campaign's named noise floor: it counts virtual-thread
+handoffs and `allJoined`, both nondeterministic on this VM, and the operations
+page records six successive A/Bs scoring its sibling at `0, -2, 0, 0, +2, +2`.
+Within this wave alone it scored **−14** in one arm and **+4** in another, on
+tables that share not one row. Nothing here touches virtual threads.
+
+### The gate set of `jdk-only-lane-operations.md` §5
+
+```text
+  cargo test -p cratonvm-types                                    rc=0
+  cargo test -p cratonvm-native-api --tests                       rc=0
+  cargo test -p cratonvm-native-builtins --tests                  rc=0
+  cargo test -p cratonvm-native-builtins --features management --tests      rc=0
+  cargo test -p cratonvm-native-builtins --features synthetic-jdk --tests   rc=0
+```
+
+Two gates moved and both were run to ground rather than re-frozen on sight.
+
+**`the_tables_const_lists_every_table_the_predicate_consults`** failed: the
+predicate consults seven tables and `RETIRED_SHADOW_TABLES` listed six. Lane 1
+hit exactly this one merge earlier and left the note in the const. Two waves in
+a row is not a one-off: a lane adding a table writes the predicate arm in one
+hunk and the const row in another, `git merge` cannot know they belong
+together, and the guard is the only thing that does.
+
+**`synthetic_stub_count_does_not_regress`** moved by **+17**, and the account
+is three numbers, taken by substitution on the merged tree with the control
+pinned to the merge's own **second parent** rather than to `origin/dev`:
+
+```text
+  CTRL  (retired_shadow.rs from HEAD^2)   all three arms GREEN
+  TRIAL (this branch)                     2345 / 2356 / 2345
+  baseline before                         2328 / 2339 / 2328
+```
+
+`CTRL` green is the load-bearing half: the whole +17 is this lane's, and none
+of it is drift the lane would otherwise be absorbing — the mistake this file's
+own header records three of, at 3/3/12. Re-frozen to 2345 / 2356 / 2345 with
+that account written into `stub_ratchet.rs`.
+
+**+17 for 15 triples is not an error.** The unit of the stub count is a
+REGISTRATION and two of the fifteen are registered twice, each re-tagged
+separately. The `--jdk-only-report` census for the same prefixes reports **15
+distinct triples refused, 0 with a survivor** — the same population counted the
+other way, and the check that says no refusal left an older native serving.
+
+`registrar_drift` is GREEN on both arms: this wave moves no registration site.
+
+### One earlier red that was not a red, and why it looked like one
+
+An earlier pass reported `NullArgMsgProbe` at +2 on a
+`CopyOnWriteArrayList.addAll(null)` row — a `java/util/concurrent/` class this
+lane does not touch. It was an artefact of the CONTROL, not of the trial: the
+control's `retired_shadow.rs` came from `git show origin/dev:`, and
+`origin/dev` is a **moving ref** that had picked up lane 5's 98-row table
+between the merge and the build. The control was retiring `addAll`; the trial,
+built from an older merge, was not. **A paired control has to be the merge's
+own other side**, and `git rev-parse HEAD^2` is what makes it one. With the
+control pinned, the row is gone.
 
 ## 8. What this leaves for the next lane
 
