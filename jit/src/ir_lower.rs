@@ -467,6 +467,29 @@ struct Lowerer<'a> {
     /// for that bci. Populated as nodes are lowered; used to anchor each
     /// safepoint snapshot to a native offset for `DeoptimizationPoint`.
     bci_native: HashMap<usize, usize>,
+    /// `Graph::safepoints` index → earliest native offset emitted for a node
+    /// that names it through [`crate::ir::Node::frame_snapshot`].
+    ///
+    /// The per-COPY counterpart of [`Self::bci_native`]. A cloned loop body has
+    /// `trip` nodes at each of its bcis, so `bci_native` holds one offset for
+    /// all of them (copy 0's) and the other copies have no anchor of their own.
+    /// A snapshot that belongs to a specific copy anchors here instead, at an
+    /// offset inside that copy's code.
+    ///
+    /// EMPTY on every compile that does not unroll over a named body, which
+    /// makes `build_deopt_points` fall through to `bci_native` for every
+    /// snapshot exactly as it always did.
+    snapshot_native: HashMap<u32, usize>,
+    /// `Graph::safepoints` index the node currently being lowered names as its
+    /// own frame, or `None` when it names none — which is every node of every
+    /// graph that did not unroll over a named body.
+    ///
+    /// Read by [`Self::resolve_frame_state_for_site`], which is what every
+    /// guard's boxed deopt point goes through. Set beside [`Self::cur_node_pc`]
+    /// and reset the same way, for the same reason: a stale copy identity
+    /// attributed to a later node is a frame from the wrong iteration, and this
+    /// area's rule is that no frame is better than a wrong one.
+    cur_node_frame: Option<u32>,
     /// Bytecode pc of the node currently being lowered — the throw-site bci
     /// every exceptional exit emitted while lowering it belongs to.
     ///
@@ -833,6 +856,16 @@ struct Lowerer<'a> {
     /// post-JIT routing range-tests THIS method's own exception table against
     /// THIS method's throw site. See [`Self::emit_call_exc_stub`].
     call_exc_patches: Vec<(usize, usize)>,
+    /// Safepoint polls whose slow path was NOT emitted where the poll is, one
+    /// entry per poll site: `(jcc_patch, resume, spill_high_water)`.
+    ///
+    /// `jcc_patch` is the rel32 field of the site's `JNZ`, patched to the
+    /// outlined block when [`Self::emit_outlined_polls`] emits it; `resume` is
+    /// the byte after that `JNZ`, which the outlined block jumps back to; and
+    /// `spill_high_water` is the ONLY per-site input to the slow path's
+    /// content, which is what makes deferring it possible at all
+    /// (`emit_safepoint_map_if_enabled` reads nothing else).
+    outlined_polls: Vec<(usize, usize, i32)>,
     /// fib44-fix follow-up: native offsets of the rel32 operand of each direct
     /// self-recursive `CALL` (invoke_kind 4), patched at finalize to target the
     /// method's own entry (code offset 0). See `lower_self_call` / Op::Call.
@@ -931,6 +964,15 @@ struct Lowerer<'a> {
     /// `CompiledMethod::inline_frame_map`. Empty ⇒ the artifact carries the
     /// same empty map it always did.
     inline_frame_rows: Vec<crate::x64::InlineFrameRow>,
+    /// NPE trap sites this lowering described, becoming
+    /// `CompiledMethod::npe_trap_map`. Empty ⇒ the artifact carries the same
+    /// empty map every optimizing-tier body carried before 2026-09-11, and a
+    /// null receiver in it raises an UNMESSAGED `NullPointerException` exactly
+    /// as it did then. See [`Self::record_npe_trap_site`].
+    npe_trap_sites: Vec<(u32, crate::x64::NpeTrapSite)>,
+    /// Monotonic id for [`Self::npe_trap_sites`]. Per-ARTIFACT, like the
+    /// single-pass backend's — `NpeTrapMap::get` searches one map.
+    npe_trap_next_id: u32,
 
     // ── Linear-scan register read cache ──────────────────────────────
     //
@@ -1548,6 +1590,8 @@ impl<'a> Lowerer<'a> {
             num_locals,
             frame_size,
             bci_native: HashMap::new(),
+            snapshot_native: HashMap::new(),
+            cur_node_frame: None,
             cur_bci: 0,
             deopt_stub_patches: Vec::new(),
             transfer_bcis: std::collections::HashSet::new(),
@@ -1615,6 +1659,7 @@ impl<'a> Lowerer<'a> {
             saved_xmm_bytes,
             saved_gpr_bytes,
             call_exc_patches: Vec::new(),
+            outlined_polls: Vec::new(),
             self_call_patches: Vec::new(),
             direct_calls,
             ic_slots,
@@ -1642,6 +1687,8 @@ impl<'a> Lowerer<'a> {
             inline_scopes,
             inline_frame_sites,
             inline_frame_rows: Vec::new(),
+            npe_trap_sites: Vec::new(),
+            npe_trap_next_id: 0,
             cur_node_pc: None,
             // Off by default; `lower_inner_with_scopes` installs a plan when
             // `CRATONVM_JIT_IR_LINEAR_SCAN` is on. Empty vectors, not
@@ -3618,6 +3665,63 @@ impl<'a> Lowerer<'a> {
         // home word go stale at the same point, and an order that protects one
         // protects the other. A cycle's `Save` copies the pre-value out at the
         // same instant either way.
+        // ── Which register STAGES the value ──────────────────────────
+        //
+        // RAX was the staging register for every phi copy, and the publish
+        // below then copied RAX into the phi's own register. When the phi has
+        // one, that register is a strictly better temporary: the read lands
+        // there directly and the publish disappears, because the value is
+        // already where the publish was going to put it.
+        //
+        // Worth one instruction per phi per edge, i.e. per loop-carried value
+        // per iteration. On `probes/FieldLoop.java` `sum` the back edge was
+        //
+        //     mov rax,r15 / mov r12,rax          ; the `sum` phi
+        //     mov rax,[rbp-98h] / mov rbx,rax    ; the `i` phi
+        //
+        // which is four instructions in a 26-instruction loop body to move two
+        // values that are already in a register or a word.
+        //
+        // # Why it is the same program
+        //
+        // The write to the phi's register moves EARLIER inside this one
+        // `CopyOp` — from after the home store to before it — and nothing in
+        // between reads anything: the only instruction it crosses is this
+        // copy's own store, whose source it now is. Relative to every OTHER
+        // copy on this edge the ordering is unchanged, because the old publish
+        // was already inside this op and therefore already ahead of the next
+        // op's read. `resolve_parallel_copy`'s invariant (every source is read
+        // before anything writes it) is a statement about that cross-op order
+        // and is untouched.
+        //
+        // # What still goes through RAX, and why
+        //
+        // * a phi with no GP register — an FP phi publishes from its home word
+        //   in `emit_phi_copies`'s later loop, and a non-resident phi has
+        //   nowhere else to stage;
+        // * a DEFERRED publish — the home store is the only thing carrying the
+        //   value to the end of the edge, so writing the register here would
+        //   publish it at the wrong point;
+        // * `CopyOp::Save`, whose destination is the scratch word and has no
+        //   phi at all;
+        // * **a phi whose home store SURVIVES.** That one is a deliberate
+        //   restriction rather than an obstacle, and the reason is in
+        //   `a_phi_copy_that_keeps_its_home_is_byte_identical`: staging there
+        //   would also have to write the home from the staged register, and no
+        //   test in this crate can separate a right store from a wrong one on
+        //   that path — nothing reads a resident phi's home word back, so
+        //   `store_abi_reg(RAX, dst)` in place of the value produces identical
+        //   answers. Requiring the drop keeps every remaining path one this
+        //   suite can fail. It costs the home-keeping case one instruction, on
+        //   a path a `panic!` proved the whole crate never reaches.
+        let stage = phi_of_dst
+            .get(&dst)
+            .copied()
+            .filter(|_| ir_phi_copy_regs_enabled() && ir_phi_copy_direct_enabled())
+            .filter(|phi| !defer_publish.contains(phi))
+            .filter(|phi| self.home_dropped.get(*phi as usize).copied().unwrap_or(false))
+            .and_then(|phi| self.assigned_gpr(phi).map(|reg| (phi, reg)));
+        let stage_reg = stage.map_or(RAX, |(_, reg)| reg);
         let mut from_reg = false;
         if ir_phi_copy_regs_enabled() {
             if let Some(&sid) = src_node_of.get(&src) {
@@ -3636,7 +3740,10 @@ impl<'a> Lowerer<'a> {
                 };
                 match src_reg {
                     Some(r) => {
-                        self.emit_mov_reg_reg64(RAX, r);
+                        // A no-op when the source already sits in the phi's
+                        // register, which `emit_mov_reg_reg64` drops rather
+                        // than encoding `mov r,r`.
+                        self.emit_mov_reg_reg64(stage_reg, r);
                         from_reg = true;
                         self.phi_copy_reg_reads += 1;
                     }
@@ -3655,7 +3762,7 @@ impl<'a> Lowerer<'a> {
             }
         }
         if !from_reg {
-            self.load_to_rax(src);
+            self.load_reg_from_frame(stage_reg, src);
         }
         // ── The store, when anything could read it ───────────────────
         //
@@ -3673,6 +3780,16 @@ impl<'a> Lowerer<'a> {
         if drop_home {
             self.home_stores_dropped += 1;
         } else {
+            // Reached only with `stage_reg == RAX`: `stage` requires the phi's
+            // home to be dropped and `drop_home` is that same fact, so the two
+            // are the same condition read from the two directions. The
+            // `debug_assert` is what stops a future widening of `stage` from
+            // silently storing the wrong register here.
+            debug_assert_eq!(
+                stage_reg, RAX,
+                "a staged phi copy reached the home store; `stage` and \
+                 `drop_home` have come apart",
+            );
             self.store_rax(dst);
         }
         // ── Publish: from RAX, which provably holds the value ─────────
@@ -3682,7 +3799,15 @@ impl<'a> Lowerer<'a> {
         // `mov reg, [dst]` — the same word, written and read back across a
         // store-forwarding stall, once per phi per edge, i.e. once per loop
         // iteration for every loop-carried value.
-        if ir_phi_copy_regs_enabled() {
+        if let Some((phi, _)) = stage {
+            // Staged straight into the phi's register above: the value is
+            // already published, and the bookkeeping is the same either way so
+            // that `emit_phi_copies`'s `published` check cannot tell the two
+            // routes apart.
+            self.mark_gp_reg_live(phi);
+            published.push(phi);
+            self.phi_copy_reg_publishes += 1;
+        } else if ir_phi_copy_regs_enabled() {
             if let Some(&phi) = phi_of_dst.get(&dst) {
                 if let Some(dst_reg) = self.assigned_gpr(phi) {
                     if !defer_publish.contains(&phi) {
@@ -5158,8 +5283,16 @@ impl<'a> Lowerer<'a> {
         // declared `[C`, read back as `Int(1)`, and the `arraylength` that
         // followed faulted at `addr=0x5`.
         let base_is_proven_oop = self.graph.nodes[base as usize].ty == IrType::Ref;
-        let arg2 =
-            cratonvm_jit_api::getfield_index_arg(field_index as u32, ref_node, base_is_proven_oop);
+        // The NPE trap-site key, so a null receiver reaching the helper can
+        // carry JEP 358's message out: the helper has the receiver (null) and
+        // the slot index, and neither names the field or the bci.
+        let npe_site = self.record_npe_trap_site(pc);
+        let arg2 = cratonvm_jit_api::getfield_index_arg(
+            field_index as u32,
+            ref_node,
+            base_is_proven_oop,
+            npe_site,
+        );
         self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
         self.gp_load_value(CALL_ARG_REGS[1], base);
         self.emit_mov_reg_imm64(CALL_ARG_REGS[2], arg2);
@@ -5340,6 +5473,33 @@ impl<'a> Lowerer<'a> {
             self.emit_mov_reg_imm64(R11, self.safepoint_flag_addr as u64);
             self.buf.emit(&[0x41, 0xF6, 0x03, 0xFF]); // TEST byte ptr [R11], 0xff
         }
+        // ── Out-of-line: the fast path does not branch at all ─────────────
+        //
+        // The polarity below (`JZ` over the slow path) makes the FAST path —
+        // every execution but the ones that actually stop — the TAKEN branch,
+        // and leaves the slow path's ~230 bytes sitting between the poll and
+        // whatever follows it. On `probes/FieldLoop.java`'s `sum` that is most
+        // of the loop: the body spans 412 bytes from header to back edge, 228
+        // of them this block, and roughly 123 of them ever execute.
+        //
+        // Emitting the slow path after the body instead inverts the test, so
+        // the hot path falls through and the loop's span collapses to what it
+        // runs. `CRATONVM_JIT_IR_POLL_OUTLINE=1`; default OFF.
+        if ir_poll_outline_enabled() {
+            IR_POLLS_OUTLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.buf.emit(&[0x0F, 0x85]); // JNZ .slow (outlined, after the body)
+            let slow_patch = self.buf.pos();
+            self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+            let resume = self.buf.pos();
+            self.outlined_polls
+                .push((slow_patch, resume, self.spill_high_water));
+            // Same bookkeeping as the inline arm below, for the same reason:
+            // the two paths must agree about what is readable from a register
+            // after the poll, and the outlined path still calls.
+            self.invalidate_ref_residency(None);
+            return;
+        }
+        IR_POLLS_INLINE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.buf.emit(&[0x0F, 0x84]); // JZ .clear
         let clear_patch = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
@@ -6969,6 +7129,70 @@ impl<'a> Lowerer<'a> {
         });
     }
 
+    /// Describe one NPE trap site and return its key, or `0` for "not
+    /// described" — which every caller passes straight through to the helper
+    /// argument, where zero means the historical unmessaged NPE.
+    ///
+    /// This is [`crate::x64::inlining::record_npe_trap_site`]'s optimizing-tier
+    /// twin, and it answers the same two questions from this backend's own
+    /// data: the ENCLOSING method's bci for the program point
+    /// (`IrInlineFrameSites::enclosing_bci_at`, or `node_pc` itself when the
+    /// point is not inside a spliced body), and the callees spliced there
+    /// (`chain_at`, innermost first).
+    ///
+    /// Both halves respect the same kill switches the single-pass twin does, so
+    /// `CRATONVM_JIT_NO_NPE_TRAP_LINES=1` and
+    /// `CRATONVM_JIT_NO_INLINE_FRAME_MAP=1` revert this tier and that one
+    /// together rather than leaving one of them describing sites the walk will
+    /// not read.
+    fn record_npe_trap_site(&mut self, node_pc: usize) -> u32 {
+        if !crate::x64::npe_trap_lines_enabled() || !crate::x64::inline_frame_map_enabled() {
+            return 0;
+        }
+        // The compiling method's own bci. Inside a splice that is the outermost
+        // caller pc; outside one the node's pc already IS it.
+        let own_pc = match u32::try_from(node_pc) {
+            Ok(v) => v,
+            Err(_) => return 0,
+        };
+        let bci = if self.inline_frame_sites.is_empty() {
+            own_pc
+        } else {
+            // `None` means the point is not inside any spliced body, so the
+            // node's own pc already IS the compiling method's bci.
+            self.inline_frame_sites
+                .enclosing_bci_at(node_pc)
+                .unwrap_or(own_pc)
+        };
+        // JVMS 4.9.1: `Code.code_length` is below 65536. A bci at or above it
+        // is not a bytecode index and describing a site with one would hand the
+        // consumer a confidently wrong opcode. The SAME constant the
+        // single-pass twin screens against, not a second copy of the bound.
+        if bci as usize >= crate::x64::INLINE_FRAME_MAX_BCI {
+            return 0;
+        }
+        let chain: Vec<crate::x64::InlineFrameLevel> = self
+            .inline_frame_sites
+            .chain_at(node_pc)
+            .into_iter()
+            .map(|l| crate::x64::InlineFrameLevel {
+                label: l.method_key,
+                bci: l.bci,
+                class_id: l.class_id,
+            })
+            .collect();
+        self.npe_trap_next_id = self.npe_trap_next_id.wrapping_add(1);
+        let id = self.npe_trap_next_id;
+        // The key rides in 24 bits of one helper argument; a compile with more
+        // sites than that describes no more of them.
+        if id >= (1 << 24) {
+            return 0;
+        }
+        self.npe_trap_sites
+            .push((id, crate::x64::NpeTrapSite { bci, chain }));
+        id
+    }
+
     fn emit_call_return_check(&mut self, slot: i32, ty: IrType) {
         // The return address for the call just emitted is HERE, before any of
         // the post-call sequence below moves `buf`.
@@ -7179,6 +7403,22 @@ impl<'a> Lowerer<'a> {
             self.cur_bci = pc;
             self.bci_native
                 .entry(pc)
+                .and_modify(|e| {
+                    if here < *e {
+                        *e = here;
+                    }
+                })
+                .or_insert(here);
+        }
+        // Per-copy deopt metadata: a node belonging to a specific copy of a
+        // cloned body anchors its OWN snapshot, at an offset inside that copy.
+        // `None` (every node of every graph that did not unroll) leaves both
+        // the map and every frame resolution exactly as they were.
+        self.cur_node_frame = self.graph.nodes[id as usize].frame_snapshot;
+        if let Some(si) = self.cur_node_frame {
+            let here = self.buf.pos();
+            self.snapshot_native
+                .entry(si)
                 .and_modify(|e| {
                     if here < *e {
                         *e = here;
@@ -8095,6 +8335,22 @@ impl<'a> Lowerer<'a> {
             self.cur_bci = pc;
             self.bci_native
                 .entry(pc)
+                .and_modify(|e| {
+                    if here < *e {
+                        *e = here;
+                    }
+                })
+                .or_insert(here);
+        }
+        // Per-copy deopt metadata: a node belonging to a specific copy of a
+        // cloned body anchors its OWN snapshot, at an offset inside that copy.
+        // `None` (every node of every graph that did not unroll) leaves both
+        // the map and every frame resolution exactly as they were.
+        self.cur_node_frame = self.graph.nodes[id as usize].frame_snapshot;
+        if let Some(si) = self.cur_node_frame {
+            let here = self.buf.pos();
+            self.snapshot_native
+                .entry(si)
                 .and_modify(|e| {
                     if here < *e {
                         *e = here;
@@ -9165,7 +9421,7 @@ impl<'a> Lowerer<'a> {
                 // A fence and an asymmetry is one fence away from the bug;
                 // agreeing with the other emitters costs nothing.
                 let bci = self.resume_bci(bci);
-                let frame_state = self.resolve_frame_state_for_bci(bci);
+                let frame_state = self.resolve_frame_state_for_site(bci);
                 let reason = DeoptReason::UncommonTrap;
                 let point = Box::new(DeoptimizationPoint {
                     native_offset: self.buf.pos() as u32,
@@ -9246,6 +9502,11 @@ impl<'a> Lowerer<'a> {
                 }
                 if self.getfield != 0 {
                     crate::metrics::note_getfield_arm(5);
+                    // See the inline-compact arm: `0` when this node carries no
+                    // bytecode pc, which is also the "not described" key.
+                    let npe_site = node
+                        .bytecode_pc
+                        .map_or(0, |pc| self.record_npe_trap_site(pc));
                     self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
                     self.gp_load_value(CALL_ARG_REGS[1], base);
                     // Reference loads must carry `GETFIELD_EXPECT_REFERENCE` at
@@ -9254,10 +9515,12 @@ impl<'a> Lowerer<'a> {
                     // here.
                     self.emit_mov_reg_imm64(
                         CALL_ARG_REGS[2],
+                        // The trap-site key — see the sibling arm above.
                         cratonvm_jit_api::getfield_index_arg(
                             field_index as u32,
                             node.ty == IrType::Ref,
                             false,
+                            npe_site,
                         ),
                     );
                     self.emit_mov_reg_imm64(RAX, self.getfield as u64);
@@ -10454,6 +10717,10 @@ impl<'a> Lowerer<'a> {
         if let Some(pc) = self.graph.nodes[term as usize].bytecode_pc {
             self.cur_bci = pc;
         }
+        // Same reset discipline as `cur_node_pc`: a terminator carries no copy
+        // identity of its own (the unroller clones no control node), so this
+        // clears rather than inheriting the last data node's.
+        self.cur_node_frame = self.graph.nodes[term as usize].frame_snapshot;
         let node = &self.graph.nodes[term as usize];
         match &node.op {
             // ── cov-07: athrow ─────────────────────────────────────────
@@ -10644,10 +10911,71 @@ impl<'a> Lowerer<'a> {
                         // JMP. Same polarity rule as the general layout below:
                         // the taken (true) edge is the near one unless the
                         // profile says this branch is usually not taken.
-                        let favor_false = node
+                        let hint = node
                             .bytecode_pc
-                            .and_then(|pc| self.branch_hints.get(&pc).copied())
-                            == Some(false);
+                            .and_then(|pc| self.branch_hints.get(&pc).copied());
+                        // ── Which edge FALLS THROUGH ─────────────────────
+                        //
+                        // The profile when there is one, the LAYOUT when there
+                        // is not. Both were previously "the profile", and the
+                        // profile is empty on a default run.
+                        //
+                        // # What the missing case cost
+                        //
+                        // `branch_hints` is populated only under
+                        // `CRATONVM_TIER_PGO`, so with no hint this arm always
+                        // made the `true` edge the near one. For a javac
+                        // counted loop that is exactly backwards, and for a
+                        // reason the range-BCE pass already wrote down:
+                        // **javac puts the loop body on the FALSE edge.**
+                        // `for (i = 0; i < n; i++)` compiles to
+                        // `if_icmpge exit`, the builder preserves that
+                        // polarity, so `Proj(0)` — this arm's `true_block` —
+                        // is the loop EXIT.
+                        //
+                        // On `probes/FieldLoop.java` `sum` the result was
+                        //
+                        //     jl  +5      ; to the loop body, TAKEN every
+                        //     jmp exit    ; iteration, skipping this
+                        //
+                        // where the loop body was already the next block the
+                        // scheduler had laid out. One instruction and one
+                        // TAKEN branch per iteration, to reach the block
+                        // physically underneath.
+                        //
+                        // # Why the layout is the right tie-break, and only
+                        //   the tie-break
+                        //
+                        // `ir_schedule::layout_hot_paths` is default-ON and
+                        // needs no profile — `static_branch_probs` derives its
+                        // probabilities from loop structure alone — and it has
+                        // ALREADY decided which successor should be physically
+                        // next. Emission order is block index order, so
+                        // `block_idx + 1` IS that decision, and it is the same
+                        // test `emit_jmp_to_block_or_fall_through` reads.
+                        // At most one successor can be next, so this never has
+                        // to choose between two layout facts.
+                        //
+                        // It does NOT override a hint that exists.
+                        // `step4_ir_lower_consumes_branch_bias_hint` is the
+                        // contract that says so, and it caught this arm
+                        // overriding one: a profile is evidence about
+                        // FREQUENCY, which a layout heuristic is only guessing
+                        // at, and the two disagreeing is a fact worth leaving
+                        // visible rather than silently resolving. Where they
+                        // disagree the cost is one `JMP rel32` and no extra
+                        // taken branch, so deferring to the profile is cheap.
+                        let favor_false = match hint {
+                            Some(h) => !h,
+                            None if !ir_branch_layout_polarity_enabled() => false,
+                            None if false_block == block_idx + 1 => true,
+                            None if true_block == block_idx + 1 => false,
+                            None => false,
+                        };
+                        if hint.is_none() && favor_false {
+                            BRANCH_POLARITY_FROM_LAYOUT
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         // Jcc byte under which control goes to the FAR edge.
                         let (jcc_far, near_block, far_block) = match fused_cc {
                             Some(cc) if favor_false => (cc, false_block, true_block),
@@ -11009,6 +11337,39 @@ impl<'a> Lowerer<'a> {
             .any(|&(start, end, _)| pc >= start && pc < end)
     }
 
+    /// The frame state for a deopt emitted while lowering the CURRENT node,
+    /// resuming at `bci`.
+    ///
+    /// [`Self::resolve_frame_state_for_bci`] with one thing added: when the
+    /// node being lowered names its own snapshot
+    /// ([`crate::ir::Node::frame_snapshot`]), that snapshot wins over the
+    /// by-bci scan. After an unroll there are `trip` nodes at each body bci and
+    /// the scan finds copy 0's snapshot for every one of them; this is what
+    /// makes copy `k`'s guard resume into copy `k`'s values.
+    ///
+    /// # Fail closed on a bci disagreement
+    ///
+    /// The named snapshot is used only when its `bci` is the one being resumed
+    /// at. It should always be — `Graph::set_node_frame_snapshot` refuses to
+    /// install a snapshot whose bci differs from the node's — but the bci
+    /// reaching here has been through [`Self::resume_bci`], which rewrites a
+    /// combined-buffer pc inside a spliced body to the enclosing `invoke`. A
+    /// node that was both spliced and cloned would arrive with the two
+    /// disagreeing, and the honest answer there is the caller's `invoke` frame
+    /// the splice contract promises, not a callee frame from some iteration.
+    /// Falling back rather than asserting keeps that a missed optimization
+    /// instead of a refused compile.
+    fn resolve_frame_state_for_site(&self, bci: usize) -> FrameState {
+        if let Some(si) = self.cur_node_frame {
+            if let Some(sp) = self.graph.safepoints.get(si as usize) {
+                if sp.bci == bci {
+                    return self.resolve_frame_state(sp, si as usize);
+                }
+            }
+        }
+        self.resolve_frame_state_for_bci(bci)
+    }
+
     fn resolve_frame_state_for_bci(&self, bci: usize) -> FrameState {
         match self.graph.safepoints.iter().position(|s| s.bci == bci) {
             Some(idx) => self.resolve_frame_state(&self.graph.safepoints[idx], idx),
@@ -11205,7 +11566,7 @@ impl<'a> Lowerer<'a> {
         let bci = self.resume_bci(bci);
         // This bci CAN transfer. See `transfer_bcis`.
         self.transfer_bcis.insert(bci);
-        let frame_state = self.resolve_frame_state_for_bci(bci);
+        let frame_state = self.resolve_frame_state_for_site(bci);
         let point = Box::new(DeoptimizationPoint {
             native_offset: self.buf.pos() as u32,
             bci: bci as u32,
@@ -11493,7 +11854,10 @@ impl<'a> Lowerer<'a> {
         }
         // Planned first, emitted second: the plan reads `self` immutably and
         // the emission needs it mutably.
-        let mut plans: Vec<(u32, usize, Vec<(usize, NodeId)>, Vec<NodeId>)> = Vec::new();
+        // The trailing `usize` is the BLOCK this plan came from, kept only so
+        // the one-entry-per-bci filter below can ask what kind of control node
+        // the block starts with. It is dropped before emission.
+        let mut plans: Vec<(u32, usize, Vec<(usize, NodeId)>, Vec<NodeId>, usize)> = Vec::new();
         let mut refusals: Vec<&'static str> = Vec::new();
         // Keyed by BLOCK, not by bci. Two reasons, and the first is fatal on
         // its own: `bci_native` anchors DATA nodes, and a loop header's bci is
@@ -11649,12 +12013,67 @@ impl<'a> Lowerer<'a> {
                 continue;
             }
             // Cast: a bci fits u32 (`IR_MAX_BYTECODE_SIZE` is far below it).
-            plans.push((bci as u32, native, seeds, const_seeds));
+            plans.push((bci as u32, native, seeds, const_seeds, bi));
         }
+
+        // ── One entry per bci, or none ───────────────────────────────
+        //
+        // `CompiledMethod::ir_osr_entry_addr` resolves a bci by `.find()`, so
+        // the FIRST plan at a bci wins and any others are unreachable — but
+        // "first" is block order, which is not a property the interpreter
+        // knows anything about. A bci claimed by two blocks is a resume point
+        // that is not a function, and entering the wrong one runs a prefix of
+        // the loop body that the interpreter has already run.
+        //
+        // Nothing could claim a bci twice until a transform CLONED a control
+        // node: the partial unroller gives every copy its own `If`/`Proj`
+        // triple at the loop test's own bci (it has to — the pc is also the
+        // site key), so a four-way unroll offers four blocks at the header bci
+        // and three of them are mid-group. That was measured as a wrong answer:
+        // `C2PartialUnrollProbe` returned `sum(trip + factor - 1)` on roughly
+        // 40% of runs, and vanished with `CRATONVM_JIT_IR_OSR_ENTRY=0`.
+        //
+        // The tie-break is not "take the first" but "take the LOOP HEADER":
+        // an interpreter arriving at a loop's bci is at that loop's header, and
+        // a header is a `Merge`/`Region` while every copy's block is a `Proj`.
+        // Where that does not single one block out, the bci is refused
+        // entirely — no OSR entry is always correct, and the interpreter simply
+        // keeps running the frame it is in.
+        {
+            let mut claims: std::collections::HashMap<u32, usize> =
+                std::collections::HashMap::new();
+            for (bci, _, _, _, _) in &plans {
+                *claims.entry(*bci).or_insert(0) += 1;
+            }
+            if claims.values().any(|&n| n > 1) {
+                let is_header = |bi: usize| {
+                    let ctrl = self.schedule.blocks[bi].ctrl;
+                    matches!(
+                        self.graph.nodes.get(ctrl as usize).map(|n| &n.op),
+                        Some(Op::Merge) | Some(Op::Region)
+                    )
+                };
+                let mut headers: std::collections::HashMap<u32, usize> =
+                    std::collections::HashMap::new();
+                for (bci, _, _, _, bi) in &plans {
+                    if is_header(*bi) {
+                        *headers.entry(*bci).or_insert(0) += 1;
+                    }
+                }
+                plans.retain(|(bci, _, _, _, bi)| {
+                    if claims.get(bci).copied().unwrap_or(0) <= 1 {
+                        return true;
+                    }
+                    headers.get(bci).copied() == Some(1) && is_header(*bi)
+                });
+                refusals.push("bci claimed by more than one block");
+            }
+        }
+
         for why in refusals {
             self.note_osr_refusal(why);
         }
-        for (bci, native, seeds, const_seeds) in plans {
+        for (bci, native, seeds, const_seeds, _bi) in plans {
             // Cast: a JVM local index plus one; `max_locals` is u16.
             let seeds_hi = seeds.iter().map(|(i, _)| *i as u32 + 1).max().unwrap_or(0);
             let stub = self.buf.pos();
@@ -11959,6 +12378,41 @@ impl<'a> Lowerer<'a> {
     /// which stamps it; re-stamping the same value here is a no-op for it and
     /// keeps the stub's contract uniform — every exit through it leaves an
     /// `athrow_bci` belonging to THIS method.
+    /// Emit the slow path of every poll [`Self::emit_safepoint_poll`] outlined,
+    /// after the body, each ending in a `JMP` back to its own poll site.
+    ///
+    /// Byte-for-byte the same sequence the inline arm emits — optional oop map,
+    /// `MOV RAX, <slow path>` / `CALL RAX`, optional shadow reload — plus the
+    /// five-byte return jump. It is deferrable because the only per-site input
+    /// is `spill_high_water`, which the site recorded; `emit_safepoint_map`
+    /// reads nothing else, and the map it records is keyed by the CALL's return
+    /// address, which is correct wherever that call ends up.
+    ///
+    /// A no-op when nothing was outlined, which is every compile with
+    /// `CRATONVM_JIT_IR_POLL_OUTLINE` off.
+    fn emit_outlined_polls(&mut self) {
+        for (slow_patch, resume, live_hi) in std::mem::take(&mut self.outlined_polls) {
+            let rel = self.buf.pos() as i32 - (slow_patch as i32 + 4);
+            Self::patch_or_bail(&mut self.buf, slow_patch, rel);
+            // The site's high-water mark, not the method's final one: the map
+            // has to describe the frame as it stood AT THE POLL.
+            let saved = self.spill_high_water;
+            self.spill_high_water = live_hi;
+            let mapped = Self::ir_gc_point_maps_enabled() && self.emit_safepoint_map_if_enabled();
+            self.spill_high_water = saved;
+            self.emit_mov_reg_imm64(RAX, self.safepoint_slow_path as u64);
+            self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+            if mapped {
+                self.emit_shadow_reload();
+            }
+            self.buf.emit_byte(0xE9); // JMP back to the instruction after the poll
+            let back_patch = self.buf.pos();
+            self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+            let back_rel = resume as i32 - (back_patch as i32 + 4);
+            Self::patch_or_bail(&mut self.buf, back_patch, back_rel);
+        }
+    }
+
     fn emit_call_exc_stub(&mut self) {
         if self.call_exc_patches.is_empty() {
             return;
@@ -12412,7 +12866,16 @@ impl<'a> Lowerer<'a> {
         let at_traps_only = ir_deopt_points_at_traps_enabled();
         let mut points: Vec<DeoptimizationPoint> = Vec::with_capacity(self.graph.safepoints.len());
         for (index, sp) in self.graph.safepoints.iter().enumerate() {
-            let native_offset = match self.bci_native.get(&sp.bci) {
+            // A snapshot a copy's nodes claim anchors inside THAT copy;
+            // `bci_native` holds one offset per bci (the earliest, i.e. copy
+            // 0's) and would give every copy of an unrolled body the same
+            // point. `snapshot_native` is empty unless something cloned a
+            // region, so this is `bci_native` verbatim on every other compile.
+            let native_offset = match self
+                .snapshot_native
+                .get(&(index as u32))
+                .or_else(|| self.bci_native.get(&sp.bci))
+            {
                 Some(&off) => off as u32,
                 // bci produced no node / no machine code — nothing to anchor.
                 None => continue,
@@ -14327,6 +14790,137 @@ fn note_deferred_census(candidates: usize, taken: usize, mid_rcx: usize, foldabl
 /// both operands are register-resident the two `MOV`s ahead of it are pure
 /// overhead, and on a counted loop they are two of the seventeen instructions
 /// in the body.
+/// `CRATONVM_JIT_IR_BRANCH_LAYOUT_POLARITY=0` — choose a fused branch's
+/// fall-through edge from the PGO hint alone, the shape that predates
+/// 2026-09-11.
+///
+/// Default ON. See the comment at its one read site in `Op::If` for why the
+/// hint alone was not enough: it is empty without `CRATONVM_TIER_PGO`, and the
+/// fallback it left behind — "the `true` edge is the near one" — is inverted
+/// for every javac counted loop.
+///
+/// Off restores the previous bytes exactly.
+///
+/// It is a TIE-BREAK, not an override: a branch with a profile hint keeps the
+/// polarity that hint asks for, on or off. See the read site.
+fn ir_branch_layout_polarity_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(forced) = BRANCH_LAYOUT_POLARITY_FORCE.with(|c| c.get()) {
+            return forced;
+        }
+    }
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_BRANCH_LAYOUT_POLARITY").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override of [`ir_branch_layout_polarity_enabled`], the same
+    /// shape as `LS_FORCE` and for the same reason.
+    static BRANCH_LAYOUT_POLARITY_FORCE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only RAII override of [`ir_branch_layout_polarity_enabled`].
+#[cfg(test)]
+struct BranchLayoutPolarityForce;
+
+#[cfg(test)]
+impl BranchLayoutPolarityForce {
+    fn set(on: bool) -> BranchLayoutPolarityForce {
+        BRANCH_LAYOUT_POLARITY_FORCE.with(|c| c.set(Some(on)));
+        BranchLayoutPolarityForce
+    }
+}
+
+#[cfg(test)]
+impl Drop for BranchLayoutPolarityForce {
+    fn drop(&mut self) {
+        BRANCH_LAYOUT_POLARITY_FORCE.with(|c| c.set(None));
+    }
+}
+
+/// Fused branches whose fall-through edge the LAYOUT chose and the hint would
+/// not have.
+///
+/// The engagement number for [`ir_branch_layout_polarity_enabled`], and the
+/// only one that means anything: a flag whose census is zero on a workload
+/// changed nothing there, whatever the emitted size says. Reported beside
+/// `ir_fallthroughs_elided` under `CRATONVM_DBG=jitc`, because the two measure
+/// the two halves of one decision — this one picks which edge should fall
+/// through, that one elides the `JMP` when it does.
+static BRANCH_POLARITY_FROM_LAYOUT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many fused branches took their fall-through edge from the block layout
+/// rather than from the profile hint, since process start.
+pub fn ir_branch_polarity_from_layout() -> u64 {
+    BRANCH_POLARITY_FROM_LAYOUT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `CRATONVM_JIT_IR_PHI_COPY_DIRECT=0` — stage every phi edge copy through RAX
+/// and publish the phi's register from there, the shape that predates
+/// 2026-09-11.
+///
+/// Default ON. A phi copy whose destination has a register reads straight into
+/// it, which removes the `mov <phi reg>, rax` that followed every one — one
+/// instruction per loop-carried value per iteration. See
+/// [`Lowerer::emit_copy_op`] for why the two emissions are the same program.
+///
+/// Off restores the previous bytes exactly: RAX stages, the home store comes
+/// from RAX, and the publish is a separate move.
+#[cfg(test)]
+thread_local! {
+    /// Test-only override of [`ir_phi_copy_direct_enabled`], the same shape as
+    /// `LS_FORCE` and for the same reason: a differential lane has to hold both
+    /// of its arms in one process, and the production answer latches in a
+    /// `OnceLock`.
+    static PHI_COPY_DIRECT_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only RAII override of [`ir_phi_copy_direct_enabled`] on this thread.
+#[cfg(test)]
+struct PhiCopyDirectForce;
+
+#[cfg(test)]
+impl PhiCopyDirectForce {
+    fn set(on: bool) -> PhiCopyDirectForce {
+        PHI_COPY_DIRECT_FORCE.with(|c| c.set(Some(on)));
+        PhiCopyDirectForce
+    }
+}
+
+#[cfg(test)]
+impl Drop for PhiCopyDirectForce {
+    fn drop(&mut self) {
+        PHI_COPY_DIRECT_FORCE.with(|c| c.set(None));
+    }
+}
+
+fn ir_phi_copy_direct_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(forced) = PHI_COPY_DIRECT_FORCE.with(|c| c.get()) {
+            return forced;
+        }
+    }
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PHI_COPY_DIRECT").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
 fn ir_cmp_in_place_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -14753,6 +15347,47 @@ static BLOCK_JMPS_EMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// `force_c2_enabled` is not: it is read at compile time only, never on a
 /// runtime hot path, and caching would make it racy against whichever test
 /// thread lowers first.
+/// `true` when `CRATONVM_JIT_IR_POLL_OUTLINE` is set: a safepoint poll's slow
+/// path is emitted after the body rather than inline, and the poll's test is
+/// inverted so the fast path falls through instead of branching over it.
+///
+/// Default OFF — it moves a GC point's code, which is the blast radius that
+/// earns a switch of its own rather than a shared one.
+///
+/// Read LIVE on every call rather than cached in a `OnceLock`, so an in-process
+/// A/B can see both arms.
+/// Safepoint polls emitted with their slow path AFTER the body.
+static IR_POLLS_OUTLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Safepoint polls emitted with their slow path inline, the historical shape.
+static IR_POLLS_INLINE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(outlined, inline)` — every poll this process emitted, split by shape.
+///
+/// The two are exhaustive by construction: [`Lowerer::emit_safepoint_poll`]
+/// returns early before either counter when polls are switched off entirely,
+/// and otherwise takes exactly one of the two arms. So `outlined + inline` is
+/// the number of polls emitted, and a poll that counted neither is a third arm
+/// someone added without a counter.
+///
+/// Counted rather than asserted for the same reason
+/// [`ir_fallthrough_census`] is: a switch that silently does nothing looks
+/// exactly like a switch whose effect is invisible, and only a count tells
+/// them apart. Process-global and monotone — read a DELTA around the compile
+/// under test, never an absolute.
+pub fn ir_poll_census() -> (u64, u64) {
+    (
+        IR_POLLS_OUTLINED.load(std::sync::atomic::Ordering::Relaxed),
+        IR_POLLS_INLINE.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+fn ir_poll_outline_enabled() -> bool {
+    matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_POLL_OUTLINE").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
+}
+
 fn ir_fallthrough_enabled() -> bool {
     !matches!(
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_FALLTHROUGH").as_deref(),
@@ -17874,6 +18509,11 @@ pub(crate) fn lower_inner_with_scopes(
     // list, so afterwards the question cannot be asked.
     let osr_sentinel_free =
         lowerer.deopt_stub_patches.is_empty() && lowerer.call_exc_patches.is_empty();
+    // The outlined safepoint slow paths, before the other tail stubs: each is
+    // reached by a forward `JNZ` from the body and returns with a `JMP`, so it
+    // only needs to be after the body, and putting it first keeps both hops
+    // short.
+    lowerer.emit_outlined_polls();
     lowerer.emit_deopt_stub();
     // Gap B: emit the shared call-exception bail stub after the body so each
     // dispatch site's sentinel `JE` reaches it.
@@ -17944,6 +18584,7 @@ pub(crate) fn lower_inner_with_scopes(
     let oop_maps = std::mem::take(&mut lowerer.oop_maps);
     let sp_id_bcis = std::mem::take(&mut lowerer.sp_id_bcis);
     let inline_frame_rows = std::mem::take(&mut lowerer.inline_frame_rows);
+    let npe_trap_sites = std::mem::take(&mut lowerer.npe_trap_sites);
     let locals_size = lowerer.locals_size;
     let first_spill = lowerer.first_spill;
     let spill_cap_off = lowerer.spill_cap_off;
@@ -18167,6 +18808,24 @@ pub(crate) fn lower_inner_with_scopes(
             "[ir-ls] alu immediates folded: {} add_lea={}+{}",
             lowerer.alu_imms_folded, lowerer.add_lea, lowerer.add_lea_acc,
         );
+        // The SCHEDULER's half of the same question. `carry skips:
+        // operand_position` above says how often the emitter wanted a triple
+        // the scheduler had not formed; this says why it had not.
+        let pc = schedule.pairing;
+        eprintln!(
+            "[ir-ls] operand pairing: candidates={} paired={} | declined: \
+             multi_use={} producer_arm={} other_block={} after_consumer={} \
+             already_adjacent={} deopt_between={} no_node={}",
+            pc.candidates,
+            pc.paired,
+            pc.multi_use,
+            pc.producer_arm,
+            pc.other_block,
+            pc.after_consumer,
+            pc.already_adjacent,
+            pc.deopt_between,
+            pc.no_node,
+        );
         eprintln!(
             "[ir-ls] carried homes dropped: {}",
             lowerer.carried_homes_dropped,
@@ -18277,6 +18936,10 @@ pub(crate) fn lower_inner_with_scopes(
     // when `compiled_frame_inline_chain` returned on its `is_empty()` guard and
     // IR-tier inlining contributed no frames at all.
     cm.inline_frame_map = crate::x64::InlineFrameMap::from_rows(inline_frame_rows, cm.code_len());
+    // No `code_len` screen, for the reason the single-pass twin states at its
+    // own publication site: the keys are monotonic ids rather than code
+    // offsets, so a row nothing carries a key for is simply unreachable.
+    cm.npe_trap_map = crate::x64::NpeTrapMap::from_rows(npe_trap_sites);
     cm.safepoint_bci_table = {
         let mut t = sp_id_bcis;
         t.sort_unstable_by_key(|(id, _)| *id);
@@ -19002,6 +19665,129 @@ mod tests {").next().unwrap_or(src);
         // SAFETY: the generated function has no arguments and returns int 1.
         assert_eq!(unsafe { compiled.try_call(&[]) }, Ok(1));
         assert_eq!(HITS.load(Ordering::SeqCst), 1);
+    }
+
+    /// An OUTLINED safepoint poll stops exactly when the inline one does, and
+    /// the method finishes either way.
+    ///
+    /// # What is being risked
+    ///
+    /// `CRATONVM_JIT_IR_POLL_OUTLINE` does two things at once: it moves the
+    /// poll's slow path out of the body, and it INVERTS the poll's test so the
+    /// fast path falls through instead of branching over that block. Getting
+    /// the second half backwards is not a crash — it is a loop that calls into
+    /// the runtime on every iteration and still returns the right answer, which
+    /// no correctness test built only on the return value would notice.
+    ///
+    /// So the flag byte is the axis, not the arm:
+    ///
+    /// * with the flag SET the slow path must run, the same number of times in
+    ///   both arms — the outlined block is reached AND returns, since a return
+    ///   jump that missed would not come back to finish the sum;
+    /// * with the flag CLEAR it must not run at all — which is the assertion
+    ///   that fails if `JNZ` and `JZ` are the wrong way round.
+    ///
+    /// `sum` is `int sum(int n){int s=0;for(int i=0;i<n;i++)s+=i;return s;}`;
+    /// the bound is a parameter, so the loop survives the unroller and keeps a
+    /// back edge to poll on.
+    #[test]
+    fn an_outlined_safepoint_poll_stops_when_the_inline_one_does_and_not_otherwise() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static SET: u8 = 1;
+        static CLEAR: u8 = 0;
+        static HITS: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn slow_poll() {
+            HITS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let code = [
+            0x03u8, 0x3c, 0x03, 0x3d, 0x1c, 0x1a, 0xa2, 0x00, 0x0d, 0x1b, 0x1c, 0x60, 0x3c, 0x84,
+            0x02, 0x01, 0xa7, 0xff, 0xf4, 0x1b, 0xac,
+        ];
+        // Returns the method and the census delta this compile produced, as
+        // `(outlined, inline)`. Without the delta every assertion below passes
+        // when the switch does NOTHING — the inline poll is correct, so
+        // "correct" is not evidence that the outlined one ran.
+        let build = |outline: Option<&'static str>, flag: &'static u8| {
+            let before = ir_poll_census();
+            let cm = cratonvm_types::flags::with_thread_overrides(
+                &[("CRATONVM_JIT_IR_POLL_OUTLINE", outline)],
+                || {
+                    let mut graph = IrBuilder::new(1, 3).build(&code, 21).expect("IR build");
+                    ir_optimize::optimize(&mut graph);
+                    let schedule = ir_schedule::schedule(&graph);
+                    let mut helpers = no_helpers();
+                    helpers.safepoint_flag_addr = flag as *const u8 as usize;
+                    helpers.safepoint_slow_path = slow_poll as *const () as usize;
+                    lower(&graph, &schedule, 1, 3, &helpers).expect("the loop must lower")
+                },
+            );
+            let after = ir_poll_census();
+            (cm, (after.0 - before.0, after.1 - before.1))
+        };
+        // SAFETY (all four calls): the lowered body takes one `int` and returns
+        // one; `slow_poll` is `extern "C"` and touches only its own counter.
+        let run = |cm: &CompiledMethod| -> (i64, usize) {
+            HITS.store(0, Ordering::SeqCst);
+            let got = unsafe { cm.try_call(&[7]) }.expect("call");
+            (got, HITS.load(Ordering::SeqCst))
+        };
+
+        let (inline_cm, inline_census) = build(None, &SET);
+        let (out_cm, out_census) = build(Some("1"), &SET);
+        // The census is PROCESS-global and the suite runs in parallel, so the
+        // INLINE count picks up whatever else is compiling on another thread.
+        // The OUTLINED count does not: `CRATONVM_JIT_IR_POLL_OUTLINE` is set
+        // through `with_thread_overrides`, so only this thread can raise it,
+        // and only these assertions are made on it.
+        assert_eq!(
+            inline_census.0, 0,
+            "the default arm outlined {} poll(s) — nothing else in the suite \
+             sets this switch, so a non-zero count means it is not thread-local",
+            inline_census.0,
+        );
+        assert!(
+            out_census.0 >= 2,
+            "the switch outlined {} poll(s); this method emits a prologue poll \
+             and a back-edge poll, so fewer than two means it did not engage \
+             and every assertion below would pass on the inline code",
+            out_census.0,
+        );
+        assert_eq!(
+            out_census.1, 0,
+            "the switch left {} poll(s) inline; the two shapes are exclusive",
+            out_census.1,
+        );
+        let (inline_v, inline_hits) = run(&inline_cm);
+        let (out_v, out_hits) = run(&out_cm);
+        assert_eq!(inline_v, 21, "sum(7) is 21 with the poll inline");
+        assert_eq!(
+            out_v, 21,
+            "sum(7) is 21 with the poll outlined — a wrong answer here means \
+             the return jump did not land after the poll",
+        );
+        assert!(
+            inline_hits >= 1,
+            "the fixture is vacuous: a set flag must reach the slow path at \
+             least once, got {inline_hits}",
+        );
+        assert_eq!(
+            out_hits, inline_hits,
+            "the outlined poll must stop exactly as often as the inline one",
+        );
+
+        let (inline_clear_v, inline_clear_hits) = run(&build(None, &CLEAR).0);
+        let (out_clear_v, out_clear_hits) = run(&build(Some("1"), &CLEAR).0);
+        assert_eq!(inline_clear_v, 21);
+        assert_eq!(out_clear_v, 21);
+        assert_eq!(inline_clear_hits, 0, "a clear flag never stops");
+        assert_eq!(
+            out_clear_hits, 0,
+            "a clear flag never stops — {out_clear_hits} stops means the \
+             outlined poll's `JNZ` is the old `JZ`, i.e. the polarity was not \
+             inverted with the block that moved",
+        );
     }
 
     /// An argument past the entry ABI's register file arrives on the CALLER'S
@@ -19913,8 +20699,8 @@ mod tests {").next().unwrap_or(src);
         // computed from the thing under test is not an expectation.
         const EXPECT_REF: u64 = cratonvm_jit_api::GETFIELD_EXPECT_REFERENCE;
         const PROVEN: u64 = cratonvm_jit_api::GETFIELD_RECEIVER_PROVEN_OOP;
-        let proven = (5u64 | EXPECT_REF | PROVEN).to_le_bytes();
-        let unproven = (5u64 | EXPECT_REF).to_le_bytes();
+        let proven = 5u64 | EXPECT_REF | PROVEN;
+        let unproven = 5u64 | EXPECT_REF;
         //
         // Accepting either means this pins "the emitted code flags the load",
         // not "every arm flags it" — measured: patching `ref_node` out of the
@@ -19923,7 +20709,8 @@ mod tests {").next().unwrap_or(src);
         // in both backends through `getfield_index_arg`, plus the control that
         // disables that encoder and turns this red.
         assert!(
-            contains_seq(cm.code_bytes(), &proven) || contains_seq(cm.code_bytes(), &unproven),
+            contains_getfield_arg(cm.code_bytes(), proven)
+                || contains_getfield_arg(cm.code_bytes(), unproven),
             "no getfield argument in the emitted code carries \
              GETFIELD_EXPECT_REFERENCE, so the helper will hand this \
              dereferencing arm whatever primitive the slot happens to hold"
@@ -19942,7 +20729,8 @@ mod tests {").next().unwrap_or(src);
         let schedule = ir_schedule::schedule(&graph);
         let cm = lower(&graph, &schedule, 1, 1, &helpers).expect("must compile");
         assert!(
-            !contains_seq(cm.code_bytes(), &proven) && !contains_seq(cm.code_bytes(), &unproven),
+            !contains_getfield_arg(cm.code_bytes(), proven)
+                && !contains_getfield_arg(cm.code_bytes(), unproven),
             "an int field must not claim GETFIELD_EXPECT_REFERENCE"
         );
     }
@@ -19957,6 +20745,23 @@ mod tests {").next().unwrap_or(src);
         let graph = builder.build(code, code_len).expect("IR build");
         let schedule = ir_schedule::schedule(&graph);
         lower(&graph, &schedule, num_params, num_locals, &no_helpers()).expect("lower")
+    }
+
+    /// Does the emitted code bake a `jit_getfield` third argument equal to
+    /// `want`, ignoring the NPE trap-SITE key?
+    ///
+    /// A byte-sequence search used to be enough, and stopped being enough when
+    /// the argument grew a third passenger: the key is a per-compile monotonic
+    /// id, so the eight bytes differ from `want` by a value no expectation can
+    /// name without becoming a copy of the emitter. Masking ONE documented
+    /// field off keeps the property this test was written for -- the
+    /// expectation is built from constants, never from `getfield_index_arg` --
+    /// while letting the passenger through.
+    fn contains_getfield_arg(hay: &[u8], want: u64) -> bool {
+        hay.windows(8).any(|w| {
+            let v = u64::from_le_bytes(w.try_into().expect("an 8-byte window"));
+            v & !cratonvm_jit_api::GETFIELD_NPE_SITE_MASK == want
+        })
     }
 
     /// True iff `needle` appears as a contiguous subsequence of `hay`.
@@ -20822,12 +21627,32 @@ mod tests {").next().unwrap_or(src);
 
     // ── wire-tiered-manager Step 4: PGO branch-bias in the IR (C2) path ──
 
-    /// The optimizing IR lowerer must consume the profiled branch bias: a
-    /// conditional the profile marks "usually NOT taken" flips from `JE`
-    /// (`0F 84`) to `JNE` (`0F 85`) so the not-taken edge becomes the
-    /// fall-through. No hint (the default) ⇒ the historical `JE` layout, and
-    /// a "usually taken" hint reproduces it byte-for-byte — only the
-    /// not-taken case inverts.
+    /// The optimizing IR lowerer must consume the profiled branch bias: the two
+    /// hints emit opposite branch polarities, and a hint outranks the block
+    /// layout.
+    ///
+    /// # What this test used to assert, and why it changed on 2026-09-11
+    ///
+    /// It used to pin the UNHINTED emission as the reference — "no hint ⇒ the
+    /// historical `JE` layout, and a usually-taken hint reproduces it
+    /// byte-for-byte". That reference moved deliberately: with no hint the arm
+    /// now takes its fall-through edge from the block layout
+    /// (`ir_branch_layout_polarity_enabled`), because the previous fallback —
+    /// "the `true` edge is the near one" — is inverted for every javac counted
+    /// loop and cost one taken branch and one `JMP rel32` per iteration.
+    ///
+    /// On THIS fixture the layout happens to agree with the not-taken hint, so
+    /// the old assertion ("a not-taken hint must invert the baseline") could no
+    /// longer hold however the code behaved: baseline and hinted arm are now
+    /// the same bytes. That is the change working, not the hint failing.
+    ///
+    /// **So the property is restated against the two hints rather than against
+    /// the baseline**, which is what the test was always about and is immune to
+    /// the default moving again: the two hints must disagree with each other,
+    /// in opposite polarities, and each must be reachable. The unhinted arm is
+    /// still asserted — against the LAYOUT's answer, and equal to whichever
+    /// hint agrees with it, which is the fact that would otherwise be silently
+    /// lost.
     #[test]
     fn step4_ir_lower_consumes_branch_bias_hint() {
         // iload_0; ifeq +5 (→pc6); iconst_1; ireturn; iconst_0; ireturn.
@@ -20845,59 +21670,65 @@ mod tests {").next().unwrap_or(src);
             (graph, schedule)
         };
 
-        // Default (no hint): a `JE` (0F 84), no inverted form.
-        let (g0, s0) = build();
-        let base_code = lower(&g0, &s0, 1, 1, &no_helpers())
-            .expect("lower baseline")
+        let lower_hinted = |bias: Option<bool>| {
+            let (g, sch) = build();
+            match bias {
+                None => lower(&g, &sch, 1, 1, &no_helpers()).expect("lower baseline"),
+                Some(b) => {
+                    let mut hints = HashMap::new();
+                    hints.insert(1usize, b);
+                    lower_with_branch_hints(&g, &sch, 1, 1, &no_helpers(), &hints)
+                        .expect("lower hinted")
+                }
+            }
             .code_bytes()
-            .to_vec();
-        // 2026-09-02: with the compare FUSED into the branch, the emitted
-        // condition is the compare's own inverse rather than `TEST` on a
-        // materialised boolean, so the concrete byte for this `ifeq` shape is
-        // `JNE` (0F 85) where it used to be `JE` (0F 84). What this test is
-        // for -- the hint INVERTS the branch, and only the hint does -- is
-        // unchanged, and is asserted as the property below rather than as one
-        // of the two bytes. Both polarities must appear across the arms, or
-        // the "inversion" being checked is vacuous.
-        let base_polarity = if contains_seq(&base_code, &[0x0F, 0x84]) {
-            0x84u8
-        } else {
-            assert!(
-                contains_seq(&base_code, &[0x0F, 0x85]),
-                "the baseline IR branch emitted neither JE nor JNE"
-            );
-            0x85u8
+            .to_vec()
         };
 
-        // "usually not taken" at the ifeq PC (1): inverted to `JNE` (0F 85),
-        // and a different code buffer.
-        let mut hints = HashMap::new();
-        hints.insert(1usize, false);
-        let (g1, s1) = build();
-        let hint_code = lower_with_branch_hints(&g1, &s1, 1, 1, &no_helpers(), &hints)
-            .expect("lower hinted")
-            .code_bytes()
-            .to_vec();
-        assert!(
-            contains_seq(&hint_code, &[0x0F, base_polarity ^ 1]),
-            "a not-taken hint must invert the branch polarity"
+        let base_code = lower_hinted(None);
+        let not_taken = lower_hinted(Some(false));
+        let taken = lower_hinted(Some(true));
+
+        // Both polarities must actually appear across the arms, or the
+        // "inversion" being checked is vacuous.
+        let polarity = |code: &[u8]| {
+            if contains_seq(code, &[0x0F, 0x84]) {
+                0x84u8
+            } else {
+                assert!(
+                    contains_seq(code, &[0x0F, 0x85]),
+                    "an IR branch emitted neither JE nor JNE"
+                );
+                0x85u8
+            }
+        };
+        assert_eq!(
+            polarity(&not_taken),
+            polarity(&taken) ^ 1,
+            "the two hints must emit OPPOSITE branch polarities; that is the \
+             whole of what consuming a branch bias means"
         );
         assert_ne!(
-            base_code, hint_code,
-            "branch-bias hint must change the emitted code"
+            not_taken, taken,
+            "the two hints must produce different code buffers"
         );
 
-        // "usually taken" keeps the default layout (byte-identical).
-        let mut taken_hints = HashMap::new();
-        taken_hints.insert(1usize, true);
-        let (g2, s2) = build();
-        let taken_code = lower_with_branch_hints(&g2, &s2, 1, 1, &no_helpers(), &taken_hints)
-            .expect("lower taken-hinted")
-            .code_bytes()
-            .to_vec();
+        // And the unhinted arm follows the LAYOUT, which on this fixture puts
+        // the false edge physically next. Asserted rather than left implicit:
+        // if the layout tie-break is ever switched off, the baseline goes back
+        // to matching the taken arm, and the reader should be told which of
+        // the two it is.
+        let expected_base = if super::ir_branch_layout_polarity_enabled() {
+            &not_taken
+        } else {
+            &taken
+        };
         assert_eq!(
-            base_code, taken_code,
-            "usually-taken hint must reproduce the default layout byte-for-byte"
+            &base_code, expected_base,
+            "with no hint the fall-through edge comes from the block layout \
+             (`ir_branch_layout_polarity_enabled` = {}), and this fixture's \
+             layout agrees with the not-taken hint",
+            super::ir_branch_layout_polarity_enabled(),
         );
     }
 
@@ -22524,6 +23355,97 @@ mod tests {").next().unwrap_or(src);
         assert_eq!(sum(5), 10, "0+1+2+3+4 = 10");
         assert_eq!(sum(0), 0, "empty loop = 0");
         assert_eq!(sum(10), 45, "sum 0..9 = 45");
+    }
+
+    /// A partially unrolled loop offers **one** OSR entry at its header bci,
+    /// and entering through it finishes the loop the interpreter started.
+    ///
+    /// # The defect
+    ///
+    /// `emit_osr_entry_stubs` plans one entry per BLOCK and
+    /// `ir_osr_entry_addr` resolves one per BCI with `.find()`, so a bci two
+    /// blocks claim silently resolves to whichever came first in block order.
+    /// Nothing could claim a bci twice until a transform cloned a CONTROL node.
+    /// The partial unroller gives every copy its own `If`/`Proj` triple at the
+    /// loop test's own bci — it has to, because the pc is also the site key —
+    /// so a factor-4 unroll offers four blocks at the header bci and three of
+    /// them are mid-group.
+    ///
+    /// Entering mid-group re-runs the copies after it, which the interpreter
+    /// has already run. Measured on `C2PartialUnrollProbe` before the fix: the
+    /// probe returned `sum(trip + factor - 1)` on roughly 40% of runs — the
+    /// wrong answer and a 3x slowdown arriving together, and both vanishing
+    /// under `CRATONVM_JIT_IR_OSR_ENTRY=0`.
+    ///
+    /// # Why this test is an entry and not a count
+    ///
+    /// The count alone (`one entry at bci 4`) is what a wrong version can also
+    /// have: keeping the first plan rather than the header's gives exactly one
+    /// entry too, and it is the mid-group one. So this ENTERS, from a state the
+    /// method could not have reached on its own — `i` already at 3 with `s`
+    /// holding a value no prefix of this loop produces — and asks for the
+    /// answer the interpreter would have finished with. A mid-group door
+    /// returns a larger sum, because it runs the copies below it before
+    /// reaching the test that should have stopped it.
+    #[test]
+    fn a_partially_unrolled_loop_has_one_osr_door_and_it_is_the_header() {
+        // int sum(int n){ int s=0; for(int i=0;i<n;i++) s+=i; return s; }
+        let code = [
+            0x03, 0x3c, 0x03, 0x3d, 0x1c, 0x1a, 0xa2, 0x00, 0x0d, 0x1b, 0x1c, 0x60, 0x3c, 0x84,
+            0x02, 0x01, 0xa7, 0xff, 0xf4, 0x1b, 0xac, 0, 0,
+        ];
+        let cm = cratonvm_types::flags::with_thread_overrides(
+            &[
+                ("CRATONVM_JIT_IR_PER_COPY_FRAMES", Some("1")),
+                ("CRATONVM_JIT_IR_PARTIAL_UNROLL", Some("1")),
+                ("CRATONVM_JIT_IR_PARTIAL_UNROLL_FACTOR", Some("4")),
+            ],
+            || compile_via_ir(&code, 21, 1, 3).expect("the partially unrolled loop compiles"),
+        );
+
+        // Cast: the low 32 bits of RAX are this method's `int` result.
+        let sum = |n: i64| unsafe { cm.try_call(&[n]).expect("call") } as i32;
+        for n in 0..24i64 {
+            let want: i32 = (0..n as i32).sum();
+            assert_eq!(sum(n), want, "the ordinary door got sum({n}) wrong");
+        }
+
+        let at_header = cm
+            .ir_osr_entries
+            .iter()
+            .filter(|(bci, _, _)| *bci == 4)
+            .count();
+        assert!(
+            at_header <= 1,
+            "bci 4 is claimed by {at_header} OSR entries; `ir_osr_entry_addr` \
+             resolves one by `.find()`, so the others are unreachable and the \
+             one that wins is whichever block order put first",
+        );
+
+        let Some((_addr, _needed)) = cm.ir_osr_entry_addr(4) else {
+            // Refusing the bci outright is the other correct answer, and the
+            // one the filter falls back to when the header cannot be singled
+            // out. Nothing else may hold a door.
+            assert!(
+                cm.ir_osr_entries.is_empty(),
+                "the header bci was refused but some other bci kept a door",
+            );
+            return;
+        };
+
+        // Enter as the interpreter would, mid-loop, in a state no prefix of
+        // this loop produces: `s = 1000` with `i = 3`. Finishing correctly
+        // means adding 3..n-1 and nothing else.
+        for n in [4i64, 7, 12, 24] {
+            let want: i32 = 1000 + (3..n as i32).sum::<i32>();
+            let got = unsafe { cm.ir_osr_enter(4, 0, &[n, 1000, 3]) }
+                .expect("the header door accepts three locals");
+            assert_eq!(
+                got as i32, want,
+                "entered at the header with (s=1000, i=3, n={n}) — a mid-group \
+                 door re-runs the copies below it and reads larger",
+            );
+        }
     }
 
     /// **The one that matters: enter the loop part-way and finish it.**
@@ -26518,6 +27440,311 @@ mod tests {").next().unwrap_or(src);
                  into RAX outside the fold guard",
             );
         }
+    }
+
+    /// A counted loop's fused branch falls through to the loop BODY, and the
+    /// answers do not change.
+    ///
+    /// # The bug this pins is a polarity convention, not a bug in the layout
+    ///
+    /// `ir_schedule::layout_hot_paths` is default-ON and already puts the loop
+    /// body physically next. The fused-branch arm then chose its fall-through
+    /// edge from `branch_hints`, which is EMPTY without `CRATONVM_TIER_PGO` —
+    /// so it always made the `true` edge the near one, and for a javac counted
+    /// loop the `true` edge is the loop EXIT (`for (i = 0; i < n; i++)`
+    /// compiles to `if_icmpge exit`, and the builder preserves that polarity;
+    /// the range-BCE pass records the same trap). The loop then reached the
+    /// block underneath it by a TAKEN `jl` plus a `jmp` it had to skip.
+    ///
+    /// # Both halves, because neither is enough alone
+    ///
+    /// The byte comparison is engagement: with the hint absent and the layout
+    /// ignored the two arms are identical, and the execution half would then be
+    /// comparing a body with itself. The execution half is correctness: a
+    /// polarity flip that inverts a condition and does not swap its targets
+    /// computes a plausible wrong answer, which is the one failure a size
+    /// assertion cannot see. `n = 0` runs the loop zero times and is the case
+    /// that catches a swapped-but-not-inverted branch.
+    #[test]
+    fn a_counted_loop_falls_through_to_its_body_and_still_sums() {
+        // int f(int n) { int a = 0; for (int i = 0; i < n; i++) a += i; return a; }
+        let code = [
+            0x03, 0x3C, 0x03, 0x3D, 0x1C, 0x1A, 0xA2, 0x00, 0x0D, 0x1B, 0x1C, 0x60, 0x3C, 0x84,
+            0x02, 0x01, 0xA7, 0xFF, 0xF4, 0x1B, 0xAC, 0, 0,
+        ];
+        let mut graph = IrBuilder::new(1, 3).build(&code, 21).expect("IR build");
+        ir_optimize::optimize(&mut graph);
+        let schedule = ir_schedule::schedule(&graph);
+
+        let before = super::ir_branch_polarity_from_layout();
+        let laid_out = {
+            let _f = super::BranchLayoutPolarityForce::set(true);
+            lower(&graph, &schedule, 1, 3, &no_helpers()).expect("the laid-out body lowers")
+        };
+        let engaged = super::ir_branch_polarity_from_layout() > before;
+        let hinted = {
+            let _f = super::BranchLayoutPolarityForce::set(false);
+            lower(&graph, &schedule, 1, 3, &no_helpers()).expect("the hinted body lowers")
+        };
+
+        // Engagement, when the two switches that reach this arm are on. A kill
+        // switch is a legitimate way to run the suite, so the correctness half
+        // below runs either way.
+        if super::ir_fused_branch_enabled() && super::ir_fallthrough_enabled() {
+            assert!(
+                engaged,
+                "the layout never overrode the hint on a counted loop — either \
+                 this fixture's branch is not fused, or the arm stopped \
+                 counting, and the size assertion below then means nothing",
+            );
+            assert!(
+                laid_out.code_len() < hinted.code_len(),
+                "falling through to the loop body emitted no fewer bytes \
+                 ({} against {}); the elided `JMP rel32` is five of them",
+                laid_out.code_len(),
+                hinted.code_len(),
+            );
+        }
+
+        for n in [0i32, 1, 2, 7, 100, -3] {
+            let want: i32 = (0..n.max(0)).fold(0i32, |acc, i| acc.wrapping_add(i));
+            let got_laid = unsafe { laid_out.try_call(&[i64::from(n)]) }
+                .expect("the laid-out body runs");
+            let got_hint =
+                unsafe { hinted.try_call(&[i64::from(n)]) }.expect("the hinted body runs");
+            assert_eq!(
+                got_laid as u32, got_hint as u32,
+                "the two branch polarities disagree for n={n}",
+            );
+            assert_eq!(got_laid as u32 as i32, want, "laid-out body wrong for n={n}");
+        }
+    }
+
+    /// A loop unrolled over per-copy deopt frames computes the same answer,
+    /// and each copy's frame is anchored inside that copy's own code.
+    ///
+    /// The half `ir_optimize`'s tests cannot do. Those assert the GRAPH: five
+    /// snapshots at bci 11, each holding its own `(accumulator, induction)`
+    /// pair. This asserts the two things only the lowerer decides.
+    ///
+    /// **The answer.** The unrolled body is the arm that only exists with the
+    /// flag on, so nothing else in the suite executes it. Ten is
+    /// `0 + 1 + 2 + 3 + 4`, and the rolled arm is right there to disagree with.
+    ///
+    /// **The anchor.** `bci_native` keeps ONE native offset per bci — the
+    /// earliest, i.e. copy 0's — so a table built through it gives all five
+    /// copies one deopt point and `dedup_by_key` throws four of them away.
+    /// `snapshot_native` is what makes each copy's frame anchor inside that
+    /// copy, and five distinct offsets at one bci is exactly what it produces
+    /// and what nothing else in this file can.
+    #[test]
+    fn an_unrolled_body_carries_a_deopt_point_per_copy() {
+        // int f() { int a = 0; for (int i = 0; i < 5; i++) a += i; return a; }
+        let code = [
+            0x03u8, 0x3B, 0x03, 0x3C, 0x1B, 0x08, 0xA2, 0x00, 0x0D, 0x1A, 0x1B, 0x60, 0x3B, 0x84,
+            0x01, 0x01, 0xA7, 0xFF, 0xF4, 0x1A, 0xAC,
+        ];
+        let compile = |per_copy: bool| {
+            cratonvm_types::flags::with_thread_overrides(
+                &[(
+                    "CRATONVM_JIT_IR_PER_COPY_FRAMES",
+                    Some(if per_copy { "1" } else { "0" }),
+                )],
+                || {
+                    let mut graph = IrBuilder::new(0, 2).build(&code, 21).expect("IR build");
+                    ir_optimize::optimize(&mut graph);
+                    let schedule = ir_schedule::schedule(&graph);
+                    lower(&graph, &schedule, 0, 2, &no_helpers()).expect("the body lowers")
+                },
+            )
+        };
+
+        let rolled = compile(false);
+        let unrolled = compile(true);
+
+        for (what, cm) in [("rolled", &rolled), ("unrolled", &unrolled)] {
+            let got = unsafe { cm.try_call(&[]) }.expect("the body runs");
+            assert_eq!(got as u32 as i32, 10, "the {what} body summed 0..4 wrong");
+        }
+
+        // One deopt point per copy of the `iadd`'s bci, each at its own native
+        // offset. `dedup_by_key(native_offset)` runs after the sort, so a
+        // shared anchor cannot survive as five entries even by accident.
+        let at_iadd: Vec<u32> = unrolled
+            .deopt_points
+            .iter()
+            .filter(|p| p.bci == 11)
+            .map(|p| p.native_offset)
+            .collect();
+        let found = at_iadd.len();
+        assert_eq!(
+            found,
+            5,
+            "expected one deopt point per unrolled copy of bci 11, got {found} \
+             ({at_iadd:?}) -- `snapshot_native` is what anchors a copy's frame \
+             inside that copy's code, and `bci_native` alone gives all five the \
+             same offset",
+        );
+        let mut sorted = at_iadd.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 5, "two copies share a native offset: {at_iadd:?}");
+
+        // The rolled arm has one, which is what says the five above are the
+        // mechanism and not something this fixture would have produced anyway.
+        let rolled_at_iadd = rolled.deopt_points.iter().filter(|p| p.bci == 11).count();
+        assert!(
+            rolled_at_iadd <= 1,
+            "the rolled body already has {rolled_at_iadd} points at bci 11, so \
+             the count above is not evidence of anything",
+        );
+    }
+
+    /// A phi copy staged in the phi's own register computes the same integers
+    /// as one staged in RAX, and emits fewer bytes.
+    ///
+    /// The two halves are both needed and neither can stand in for the other.
+    ///
+    /// **Correctness** is the half no source audit can do: `emit_copy_op` moves
+    /// the write of the phi's register EARLIER inside one `CopyOp`, which is an
+    /// argument about `resolve_parallel_copy`'s ordering invariant, and an
+    /// argument is what this project keeps discovering was wrong about a
+    /// register it could not see (`op_preserves_rcx` claimed six arms that all
+    /// wrote RCX, and both suites passed). Both bodies come from ONE graph and
+    /// ONE schedule, so a divergence is attributable to the staging register
+    /// and to nothing else.
+    ///
+    /// **Engagement** is the half that stops it passing vacuously. A body whose
+    /// phis got no register emits identical bytes in both arms, and the
+    /// correctness half would then be comparing a body with itself and
+    /// reporting a pass. `direct < plain` is the assertion that the arms really
+    /// differ: each converted copy drops one three-byte `mov <phi reg>, rax`.
+    ///
+    /// The shape is a counted loop with two loop-carried values —
+    /// `for (i = 0; i < n; i++) a += i;` — because a phi copy only exists on a
+    /// back edge, and two of them is what `probes/FieldLoop.java` `sum` has.
+    #[test]
+    fn a_phi_copy_staged_in_its_own_register_computes_the_same_and_is_smaller() {
+        // int f(int n) { int a = 0; for (int i = 0; i < n; i++) a += i; return a; }
+        //  0 iconst_0     3 istore_2     6 if_icmpge +13   c istore_1
+        //  1 istore_1     4 iload_2      9 iload_1         d iinc 2,1
+        //  2 iconst_0     5 iload_0      a iload_2        10 goto -12
+        //                                b iadd           13 iload_1  14 ireturn
+        let code = [
+            0x03, 0x3C, 0x03, 0x3D, 0x1C, 0x1A, 0xA2, 0x00, 0x0D, 0x1B, 0x1C, 0x60, 0x3C, 0x84,
+            0x02, 0x01, 0xA7, 0xFF, 0xF4, 0x1B, 0xAC, 0, 0,
+        ];
+        let mut graph = IrBuilder::new(1, 3).build(&code, 21).expect("IR build");
+        ir_optimize::optimize(&mut graph);
+        let schedule = ir_schedule::schedule(&graph);
+
+        let (direct_cm, plain_cm) = {
+            let _f = super::PhiCopyDirectForce::set(true);
+            let direct = lower(&graph, &schedule, 1, 3, &no_helpers()).expect("direct body lowers");
+            drop(_f);
+            let _f = super::PhiCopyDirectForce::set(false);
+            let plain = lower(&graph, &schedule, 1, 3, &no_helpers()).expect("plain body lowers");
+            (direct, plain)
+        };
+
+        // Engagement. Read `ir_phi_copy_regs_enabled` too: with THAT kill switch
+        // off there is no register publish to fold away and the two arms are
+        // legitimately identical, which is a configuration the suite is allowed
+        // to run in.
+        if super::ir_phi_copy_regs_enabled() {
+            assert!(
+                direct_cm.code_len() < plain_cm.code_len(),
+                "staging in the phi's own register emitted no fewer bytes \
+                 ({} against {}) — either no phi on this loop got a register, \
+                 or the fold is not firing and the comparison below is a body \
+                 against itself",
+                direct_cm.code_len(),
+                plain_cm.code_len(),
+            );
+        }
+
+        // `ireturn` defines the low 32 bits of RAX and nothing above them.
+        for n in [0i32, 1, 2, 7, 100, -3] {
+            let want: i32 = (0..n.max(0)).fold(0i32, |acc, i| acc.wrapping_add(i));
+            let got_direct = unsafe { direct_cm.try_call(&[i64::from(n)]) }
+                .expect("the direct body runs");
+            let got_plain =
+                unsafe { plain_cm.try_call(&[i64::from(n)]) }.expect("the plain body runs");
+            assert_eq!(
+                got_direct as u32, got_plain as u32,
+                "the two staging registers disagree for n={n}",
+            );
+            assert_eq!(got_direct as u32 as i32, want, "direct body wrong for n={n}");
+        }
+    }
+
+    /// A phi whose home store SURVIVES is emitted byte for byte as before.
+    ///
+    /// # This test is the shape of a mutation that did not fail
+    ///
+    /// The first version of `stage` did not ask whether the home was dropped,
+    /// so a phi that kept its home staged in its register and then wrote the
+    /// home FROM that register. Replacing `store_abi_reg(stage_reg, dst)` with
+    /// `store_abi_reg(RAX, dst)` — a store of whatever was last in RAX instead
+    /// of the value — left every test green, and so did replacing it with a
+    /// `panic!`: the branch was unreachable from the whole `cratonvm-jit`
+    /// suite, 2356 unit tests and 145 differential tests included.
+    ///
+    /// Both facts have the same cause. `stage` and `drop_home` ask overlapping
+    /// questions, and on every loop small enough to write as a fixture a
+    /// resident phi owns its register exclusively, so `phi_home_droppable`
+    /// clears it and the store never runs. Forcing the store to run (with
+    /// `CRATONVM_JIT_IR_DROP_PHI_HOME=0`, below) does not help the first
+    /// problem: **nothing reads a resident phi's home word back**, so a store
+    /// of the wrong register is unobservable from any answer the body can
+    /// produce.
+    ///
+    /// A path this crate cannot fail is a path that should not ship, so `stage`
+    /// now requires the home to be dropped and this test pins the exclusion the
+    /// only way that is decisive: with the home kept, the two arms must be
+    /// **byte-identical**. The saving given up is one instruction on a path
+    /// nothing here reaches.
+    #[test]
+    fn a_phi_copy_that_keeps_its_home_is_byte_identical() {
+        // int f(int n) { int a = 0; for (int i = 0; i < n; i++) a += i; return a; }
+        let code = [
+            0x03, 0x3C, 0x03, 0x3D, 0x1C, 0x1A, 0xA2, 0x00, 0x0D, 0x1B, 0x1C, 0x60, 0x3C, 0x84,
+            0x02, 0x01, 0xA7, 0xFF, 0xF4, 0x1B, 0xAC, 0, 0,
+        ];
+        let mut graph = IrBuilder::new(1, 3).build(&code, 21).expect("IR build");
+        ir_optimize::optimize(&mut graph);
+        let schedule = ir_schedule::schedule(&graph);
+
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_JIT_IR_DROP_PHI_HOME", Some("0"))],
+            || {
+                let direct = {
+                    let _f = super::PhiCopyDirectForce::set(true);
+                    lower(&graph, &schedule, 1, 3, &no_helpers()).expect("direct body lowers")
+                };
+                let plain = {
+                    let _f = super::PhiCopyDirectForce::set(false);
+                    lower(&graph, &schedule, 1, 3, &no_helpers()).expect("plain body lowers")
+                };
+                assert_eq!(
+                    direct.code_len(),
+                    plain.code_len(),
+                    "with every phi home kept, direct staging must emit exactly \
+                     the bytes it did before — a difference here means `stage` \
+                     has been widened past what the tests can check",
+                );
+                // …and the sibling test's `direct < plain` must still be the
+                // live assertion, so this pair cannot both pass vacuously:
+                // one demands a difference, this one demands none, and they
+                // differ in exactly the switch named above.
+                for n in [0i32, 1, 7, 100] {
+                    let want: i32 = (0..n).fold(0i32, |acc, i| acc.wrapping_add(i));
+                    let got = unsafe { direct.try_call(&[i64::from(n)]) }
+                        .expect("the body runs");
+                    assert_eq!(got as u32 as i32, want, "wrong for n={n}");
+                }
+            },
+        );
     }
 
     /// The deferred carry EXECUTES correctly when it fires, with a folded

@@ -2230,12 +2230,18 @@ fn a_stub_decodes_the_getfield_slot_argument_like_the_real_helper() {
     for slot in [0u32, 1, 7, 63] {
         for is_ref in [false, true] {
             for proven in [false, true] {
-                let arg = cratonvm_jit_api::getfield_index_arg(slot, is_ref, proven) as i64;
-                assert_eq!(
-                    decode_field_slot(arg),
-                    Some(slot as usize),
-                    "slot {slot} (is_ref={is_ref}, proven={proven}) must survive the round trip",
-                );
+                // Every key too: the NPE trap-site key is the widest passenger
+                // in this argument, so a stub that strips only the two flags
+                // indexes the object with a 24-bit number.
+                for key in [0u32, 1, 0x00ff_ffff] {
+                    let arg =
+                        cratonvm_jit_api::getfield_index_arg(slot, is_ref, proven, key) as i64;
+                    assert_eq!(
+                        decode_field_slot(arg),
+                        Some(slot as usize),
+                        "slot {slot} (is_ref={is_ref}, proven={proven}, key={key}) must survive                          the round trip",
+                    );
+                }
             }
         }
     }
@@ -2243,7 +2249,7 @@ fn a_stub_decodes_the_getfield_slot_argument_like_the_real_helper() {
     // The exact argument that used to abort the process: slot 0 with
     // `GETFIELD_EXPECT_REFERENCE`. Decoding it is the difference between a
     // read of field 0 and a multiply overflow.
-    let flagged = cratonvm_jit_api::getfield_index_arg(0, true, false) as i64;
+    let flagged = cratonvm_jit_api::getfield_index_arg(0, true, false, 0) as i64;
     assert_eq!(flagged as u64, cratonvm_jit_api::GETFIELD_EXPECT_REFERENCE);
     assert_eq!(decode_field_slot(flagged), Some(0));
 

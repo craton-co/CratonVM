@@ -3435,6 +3435,22 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     /// Returns `ArrayElementType::Reference` for non-array objects or reference arrays.
     fn heap_element_type_of(&self, obj: ObjectRef) -> ArrayElementType;
 
+    /// An array's element type and length together, or `None` when `obj` is
+    /// not a live array.
+    ///
+    /// The default composes the three single-answer accessors, so every
+    /// implementation keeps working unchanged. A real heap should override it:
+    /// `object_is_array`, `heap_element_type_of` and `array_length` each
+    /// repeat the SAME membership walk and forwarding barrier, and callers
+    /// that want all three answers (`StringBuilder`'s payload view asks for
+    /// them on every `append`) pay that walk three times for one header.
+    fn array_shape(&self, obj: ObjectRef) -> Option<(ArrayElementType, usize)> {
+        if !self.object_is_array(obj) {
+            return None;
+        }
+        Some((self.heap_element_type_of(obj), self.array_length(obj)))
+    }
+
     /// Create a Java String object from a Rust &str. Returns the ObjectRef.
     ///
     /// Consults and populates the VM's interned-string pool: equal text yields

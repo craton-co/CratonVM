@@ -371,6 +371,14 @@ pub fn report_at_exit() {
         eprintln!(
             "[c2-supersede] ir block exits: fell_through={ft_elided} jmp_emitted={ft_jmps}"
         );
+        // Safepoint polls, by shape. The inline shape branches over its own
+        // slow path on the FAST path, so a hot loop pays a taken jump and
+        // carries ~230 bytes it never enters; `CRATONVM_JIT_IR_POLL_OUTLINE`
+        // moves the block after the body and inverts the test.
+        let (poll_out, poll_inline) = cratonvm_jit::ir_lower::ir_poll_census();
+        eprintln!(
+            "[c2-supersede] ir safepoint polls: outlined={poll_out} inline={poll_inline}"
+        );
         // Speculation. A zero with `CRATONVM_JIT_IR_SPECULATE=1` means no
         // branch in this workload was one-sided over the sample — a fact about
         // the program, not about the pass — and that is precisely what a bare
@@ -437,6 +445,76 @@ pub fn report_at_exit() {
         eprintln!(
             "[c2-supersede] ir deferred carries: candidates={dc} taken={dt} \
              declined_mid_writes_rcx={dm} (foldable={df})"
+        );
+        // And the pass UPSTREAM of that one. The deferred carry's largest
+        // decline is `operand_position` -- the triple it needs was never
+        // formed -- and this is the census of the pass whose job is forming
+        // it. Read the two lines together: the numbers above are what the
+        // emitter could take, the numbers below are why the scheduler did or
+        // did not offer it.
+        // Loop unrolling. OUTSIDE the supersede gate, and read as a
+        // DISTRIBUTION rather than a total: `unrolled=0` is the expected
+        // reading and says nothing on its own, while `runtime_bound` sizes the
+        // PARTIAL unroller's population and `safepoint_named` sizes what the
+        // full one refuses on a default run.
+        //
+        // `runtime_bound` is a SHAPE count and deliberately not a term of the
+        // closing identity; `runtime_bound_refused` is its terminal counterpart,
+        // and the two are EQUAL until the partial unroller is armed. Read
+        // `partially_unrolled` against the gap between them: it is how many of
+        // the loops the partial unroller took responsibility for it actually
+        // transformed, and the rest went to one of the shared refusals on this
+        // same line.
+        let uc = cratonvm_jit::ir_optimize::ir_unroll_census();
+        eprintln!(
+            "[c2-supersede] ir unroll: merges={} (loops = merges - not_single_backedge) unrolled={} \
+             (of which per_copy_frames={}) partially_unrolled={} | declined: \
+             runtime_bound={} (of which refused_outright={} trap_free={} pure_body={}) \
+             safepoint_named={} \
+             frame_uncopyable={} side_effect={} not_counted={} control_shape={} \
+             body_unclonable={} trip_over_cap={} escapes_or_pinned={} \
+             not_single_backedge={}",
+            uc.headers,
+            uc.unrolled,
+            uc.per_copy_frames,
+            uc.partially_unrolled,
+            uc.runtime_bound,
+            uc.runtime_bound_refused,
+            uc.runtime_bound_trap_free,
+            uc.runtime_bound_pure_body,
+            uc.safepoint_named,
+            uc.frame_uncopyable,
+            uc.side_effect,
+            uc.not_counted,
+            uc.control_shape,
+            uc.body_unclonable,
+            uc.trip_over_cap,
+            uc.escapes_or_pinned,
+            uc.not_single_backedge,
+        );
+        // Fused branches whose fall-through edge the LAYOUT chose. OUTSIDE the
+        // supersede gate for the reason the deferred-carry line above is: a
+        // workload that compiles thousands of methods and supersedes none
+        // would report zero from an instrument that was never armed, which is
+        // an artefact of the gate rather than a fact about the code.
+        eprintln!(
+            "[c2-supersede] ir branch polarity from layout: {}",
+            cratonvm_jit::ir_lower::ir_branch_polarity_from_layout(),
+        );
+        let pc = cratonvm_jit::ir_schedule::ir_pair_census();
+        eprintln!(
+            "[c2-supersede] ir operand pairing: candidates={} paired={} | declined: \
+             multi_use={} producer_arm={} other_block={} after_consumer={} \
+             already_adjacent={} deopt_between={} no_node={}",
+            pc.candidates,
+            pc.paired,
+            pc.multi_use,
+            pc.producer_arm,
+            pc.other_block,
+            pc.after_consumer,
+            pc.already_adjacent,
+            pc.deopt_between,
+            pc.no_node,
         );
     }
     if direct_binds_enabled() {

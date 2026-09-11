@@ -1578,7 +1578,93 @@ use cratonvm_types::compat::CompatibilityMode;
 /// worth only as much as its last refresh, and this is the first time one of
 /// them would have had something to say.
 ///
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2426;
+/// # 2343 → 2395 / 2332 → 2384, 2026-09-11 (JDK-only lane L1 waves 3 and 4)
+///
+/// `+52` on all three arms, and the number is pasted from the line each arm
+/// printed — this file's own rule, and the reason it exists.
+///
+/// Measured TWICE, because `origin/dev` re-froze these constants underneath
+/// this branch between the two runs: `2328/2339 -> 2380/2391` before lane 7's
+/// wave landed and `2332/2343 -> 2384/2395` after. The BASELINE moved by +4
+/// and this branch's contribution did not move at all, which is what it means
+/// for the delta to belong to the branch rather than to the tree.
+///
+/// It closes against two other instruments, which is the check none of the
+/// three can make alone:
+///
+/// ```text
+///   stub-ratchet             +52 on every arm
+///   jdk-only census          synthetic-native-registered 2202 -> 2254
+///   the two tables            50 distinct triples
+///                             + 2 registered twice
+///                               (java/util/HashMap.<init>()V and
+///                                java/util/jar/JarEntry.getComment)
+/// ```
+///
+/// The rise IS the retirement: `register()` re-tags a retired `Bridge` as
+/// `SyntheticStub` so `register_inner` can refuse it under `--jdk-only`, and
+/// this ratchet counts exactly that re-tagging. Wave 3 is
+/// `java/util/HashMap`'s own map surface (21) and wave 4 is
+/// `java/util/jar/Attributes`, `$Name`, `JarEntry`, `Manifest` and
+/// `java/text/Normalizer` (29); both are in
+/// `native-api/src/retired_shadow.rs` with their acceptance.
+/// # Re-frozen 2026-09-11 (third today): +163, and ALL of it is lane 4 wave 1
+///
+/// `native-api`'s `RETIRED_SHADOW_L4_TRIPLES` retires 140 triples over ten
+/// classes of `java/io/` and `java/nio/` -- the same mechanism as the lane-1,
+/// lane-5 and lane-7 entries above, and the same reason it moves a
+/// COMPATIBLE-mode census: `NativeMethodRegistry::register` re-tags a retired
+/// triple `SyntheticStub` wherever `effective_category()` is `Bridge`, and that
+/// re-tag is not gated on mode. The body is untouched; only
+/// `allowed_in(JdkOnly)` reads the new kind.
+///
+/// Measured with the paired ratchet on the merged tree -- the same tree scored
+/// twice, once with the L4 arm of `triple_is_retired_shadow` short-circuited
+/// and once live:
+///
+/// ```text
+///                              L4 OFF   L4 ON    delta
+///   registrations, management     2395    2558     +163
+///   registrations, no-management  2384    2547     +163
+///   registrations, synthetic-jdk  2384    2547     +163
+///   TOTAL registrations, mgmt    13978   13978        0
+///   TOTAL registrations, no-mgmt 13610   13610        0
+///   TOTAL registrations, syn-jdk 13645   13645        0
+/// ```
+///
+/// **The OFF column is measured, not a `<=` pass read as equality.** This gate
+/// asserts `<=`, so a passing arm proves only that the tree is at or under its
+/// constant, and this file's own history has 3/12/3 of invisible slack
+/// accumulating exactly that way. The three OFF numbers were taken by forcing
+/// the constants to `1` so the ratchet had to PRINT them. They land on
+/// 2395 / 2384 / 2384 -- the three constants below, to the row -- so the whole
+/// +163 is this wave and none of it is inherited drift.
+///
+/// **This is the THIRD freeze of these constants today** (lane 5: 1894 -> 2339;
+/// lane 7: -> 2395; this one). Each was measured against the tree in front of
+/// it, which is why each decomposes cleanly. Anyone re-freezing tomorrow should
+/// expect the same and take the OFF number rather than subtracting.
+///
+/// **The total does not move, so this is case one of the three below:**
+/// existing fakes relabelled, not new ones written. All 138 distinct triples
+/// are in the L4 table and nothing outside it moved --
+/// `java/io/File` 51, `java/nio/ByteBuffer` 32, `java/io/DataInputStream` 18,
+/// `java/io/DataOutputStream` 15, `java/io/ByteArrayOutputStream` 13,
+/// `java/io/FilterOutputStream` 5, and one `order()` on each of the four
+/// `java/nio/ByteBufferAsCharBuffer{B,L,RB,RL}` views.
+///
+/// 138 distinct and +163 registrations, because this gate counts REGISTRATIONS:
+/// 25 of those triples are registered at more than one ordinal and the re-tag
+/// flips each one. The per-registration view is
+/// `scripts/baselines/jdk-only-kind-map-25-linux.tsv`, where the same 163 rows
+/// are adjudicated one by one.
+///
+/// **140 rows in the table, 138 in the delta.** `ByteBuffer.allocate(I)` and
+/// `allocateDirect(I)` were ALREADY `SyntheticStub` before this wave -- both
+/// appear in the arm-OFF dump -- so retiring them changes their strict-mode
+/// admission and not their kind.
+///
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2558;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1611,7 +1697,40 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2426;
 /// owns, +327 is lane 1's wave 2 and +101 is this branch; the decomposition
 /// and the three measurements behind the classification are all on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2415;
+/// # 2343 → 2395 / 2332 → 2384, 2026-09-11 (JDK-only lane L1 waves 3 and 4)
+///
+/// `+52` on all three arms, and the number is pasted from the line each arm
+/// printed — this file's own rule, and the reason it exists.
+///
+/// Measured TWICE, because `origin/dev` re-froze these constants underneath
+/// this branch between the two runs: `2328/2339 -> 2380/2391` before lane 7's
+/// wave landed and `2332/2343 -> 2384/2395` after. The BASELINE moved by +4
+/// and this branch's contribution did not move at all, which is what it means
+/// for the delta to belong to the branch rather than to the tree.
+///
+/// It closes against two other instruments, which is the check none of the
+/// three can make alone:
+///
+/// ```text
+///   stub-ratchet             +52 on every arm
+///   jdk-only census          synthetic-native-registered 2202 -> 2254
+///   the two tables            50 distinct triples
+///                             + 2 registered twice
+///                               (java/util/HashMap.<init>()V and
+///                                java/util/jar/JarEntry.getComment)
+/// ```
+///
+/// The rise IS the retirement: `register()` re-tags a retired `Bridge` as
+/// `SyntheticStub` so `register_inner` can refuse it under `--jdk-only`, and
+/// this ratchet counts exactly that re-tagging. Wave 3 is
+/// `java/util/HashMap`'s own map surface (21) and wave 4 is
+/// `java/util/jar/Attributes`, `$Name`, `JarEntry`, `Manifest` and
+/// `java/text/Normalizer` (29); both are in
+/// `native-api/src/retired_shadow.rs` with their acceptance.
+/// **Re-frozen 2026-09-11, 2384 -> 2547**, with the other two; the account is
+/// on [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]. +163, all of it lane 4 wave 1:
+/// the arm-OFF measurement lands on 2384 exactly.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2547;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1673,7 +1792,42 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2415;
 /// [`BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT`] again, as it has every time, and
 /// that is still a measurement each time rather than a rule. The account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2415;
+/// # 2343 → 2395 / 2332 → 2384, 2026-09-11 (JDK-only lane L1 waves 3 and 4)
+///
+/// `+52` on all three arms, and the number is pasted from the line each arm
+/// printed — this file's own rule, and the reason it exists.
+///
+/// Measured TWICE, because `origin/dev` re-froze these constants underneath
+/// this branch between the two runs: `2328/2339 -> 2380/2391` before lane 7's
+/// wave landed and `2332/2343 -> 2384/2395` after. The BASELINE moved by +4
+/// and this branch's contribution did not move at all, which is what it means
+/// for the delta to belong to the branch rather than to the tree.
+///
+/// It closes against two other instruments, which is the check none of the
+/// three can make alone:
+///
+/// ```text
+///   stub-ratchet             +52 on every arm
+///   jdk-only census          synthetic-native-registered 2202 -> 2254
+///   the two tables            50 distinct triples
+///                             + 2 registered twice
+///                               (java/util/HashMap.<init>()V and
+///                                java/util/jar/JarEntry.getComment)
+/// ```
+///
+/// The rise IS the retirement: `register()` re-tags a retired `Bridge` as
+/// `SyntheticStub` so `register_inner` can refuse it under `--jdk-only`, and
+/// this ratchet counts exactly that re-tagging. Wave 3 is
+/// `java/util/HashMap`'s own map surface (21) and wave 4 is
+/// `java/util/jar/Attributes`, `$Name`, `JarEntry`, `Manifest` and
+/// `java/text/Normalizer` (29); both are in
+/// `native-api/src/retired_shadow.rs` with their acceptance.
+/// **Re-frozen 2026-09-11, 2384 -> 2547**, in the same commit as the other two
+/// as the note above demands, and by RUNNING the third arm rather than copying
+/// its sibling -- it lands on the same number again, which is a measurement
+/// each time and not a rule. The account is on
+/// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2547;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///

@@ -47,7 +47,7 @@ install, no `rt.jar`, one self-contained binary.
 CPU, vs HotSpot JDK 25 C2 — same flags both sides, checksum-verified against
 HotSpot on every run (zero mismatches):
 
-| Benchmark                | JDK 25 C2 | CratonVM   | Ratio     | Growth        |
+| Benchmark                | JDK 25 C2 | CratonVM   | Ratio     |  Growth       |
 |--------------------------|-----------|------------|-----------|---------------|
 | Arithmetic (2B ops)      | 1,852 ms  | 3,601 ms   | 1.94x     | linear        |
 | Fibonacci(44)            | 1,449 ms  | 5,059 ms   | 3.49x     | linear        |
@@ -78,12 +78,12 @@ likely because the 1M run is short enough (553 ms) for fixed per-process
 costs to still be a meaningful share of it on both sides.
 
 ‡ These nine rows run CratonVM under G1 (`--XX:UseGc G1`; HotSpot already
-defaults to G1 on JDK 25) rather than the Generational collector this project
+defaults to G1 on JDK 25) rather than the ZGC collector this project
 defaults to. G1 is a large but uneven win here: 7.4-7.6x faster than
-Generational on Binary Trees at every depth measured, a smaller win on
+ZGC on Binary Trees at every depth measured, a smaller win on
 HashMap and small String/Regex, and a measured ~21% **regression** at
 String/Regex 10M. Full per-size data, checksums, CV, and the
-Generational-vs-G1 delta are in [BENCHMARK.md](BENCHMARK.md).
+ZGC-vs-G1 delta are in [BENCHMARK.md](BENCHMARK.md).
 
 GPU offload, vs HotSpot C2 and [TornadoVM](https://github.com/beehive-lab/TornadoVM)
 4.0.1 (RTX 2060, N = 2²⁴, warm, full H2D+kernel+D2H round-trip, checksums

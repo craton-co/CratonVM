@@ -10,7 +10,10 @@ use std::hash::{Hash, Hasher};
 
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
-use super::ir::{CmpOp, Graph, IrType, MemKind, Node, NodeId, Op, NO_NODE};
+use super::ir::{
+    CmpOp, Graph, IrType, MemKind, Node, NodeId, Op, SafepointSlotKind, SafepointSnapshot,
+    NO_NODE,
+};
 
 // ── Public API ───────────────────────────────────────────────────────
 
@@ -53,6 +56,32 @@ pub fn optimize(graph: &mut Graph) {
     // constants; re-runs the cleanup so the unrolled straight-line code folds
     // (the concrete induction values collapse the per-iteration computation)
     // and the retired loop nodes are reclaimed.
+    //
+    // ── Pass ORDER: unroll, then LICM — unless the order is flipped ────
+    //
+    // The unroller refuses a loop whose body holds an invariant `Op::Load`
+    // still anchored to the header or the back edge (`escapes_or_pinned`): the
+    // load is not in the clone set, so cloning the body would leave it naming a
+    // control node the transform killed. LICM is the pass that re-anchors
+    // exactly those loads to the pre-header — and it runs *after* the
+    // unroller, so the unroller never sees the re-anchored form.
+    //
+    // That ordering is why `probes/FieldLoop.java`'s `sum` — `a += this.fx`,
+    // the one loop the tiering inversion is actually measured on — refuses.
+    // `this.fx` is loop-invariant, so its load is pinned to the header and the
+    // partial unroller never reaches the shape whose per-iteration budget
+    // (`docs/internal/performance/c2-the-phi-copy-staging-register-20260911.md`
+    // §4) prices unrolling at three of the six instructions separating the
+    // tiers.
+    //
+    // `CRATONVM_JIT_IR_LICM_BEFORE_UNROLL=1` runs LICM first instead. Default
+    // OFF: both passes are default-ON, so flipping their order also changes
+    // which loops the *full* unroller takes, and that is a default-config
+    // behaviour change that has to earn its place on evidence.
+    let licm_first = licm_before_unroll_enabled();
+    if licm_first {
+        run_licm_pass(graph);
+    }
     if unroll_enabled() && unroll(graph) {
         crate::ir_evidence::note(crate::ir_evidence::Transform::Unrolled);
         for _ in 0..8 {
@@ -67,21 +96,97 @@ pub fn optimize(graph: &mut Graph) {
             }
         }
     }
-    // SCEV-driven loop-invariant code motion. Default-**ON**;
-    // `CRATONVM_JIT_LICM=0` turns it off (`licm_enabled` is `map_or(true, ..)`).
-    // Same correction, same date, same reason as the unroll comment above: it
-    // is why the single-pass `aaload`/FP hoists are not on the veto list in
-    // `x64/single_pass_only.rs`. Runs once *after* the fixed-point cleanup so it sees already-folded /
-    // GVN'd invariant expressions, then a final lightweight cleanup re-runs
-    // GVN + DCE to dedup any anchor edges it rewrote.
+    if !licm_first {
+        run_licm_pass(graph);
+    }
+    if graph.live_count() < nodes_before {
+        crate::ir_evidence::note(crate::ir_evidence::Transform::Simplified);
+    }
+}
+
+/// SCEV-driven loop-invariant code motion, plus the cleanup that follows it.
+///
+/// Default-**ON**; `CRATONVM_JIT_LICM=0` turns it off (`licm_enabled` is
+/// `map_or(true, ..)`). It is why the single-pass `aaload`/FP hoists are not on
+/// the veto list in `x64/single_pass_only.rs`. Runs after the fixed-point
+/// cleanup so it sees already-folded / GVN'd invariant expressions, then a
+/// lightweight cleanup re-runs GVN + DCE to dedup any anchor edges it rewrote.
+///
+/// Extracted from [`optimize`] so the pass can be called from *either* side of
+/// the unroller without its body being written twice — see
+/// [`licm_before_unroll_enabled`].
+fn run_licm_pass(graph: &mut Graph) {
     if licm_enabled() && licm(graph) {
         crate::ir_evidence::note(crate::ir_evidence::Transform::Licm);
         gvn(graph);
         eliminate_dead_nodes(graph);
     }
-    if graph.live_count() < nodes_before {
-        crate::ir_evidence::note(crate::ir_evidence::Transform::Simplified);
+}
+
+/// Is `base` non-null on entry to the method, so that a load of it hoisted
+/// above the loop test cannot invent a `NullPointerException`?
+///
+/// Two sources, both already believed elsewhere in this crate: the receiver
+/// parameter (`Graph::receiver_param` is a parameter INDEX, so the node is
+/// whichever `Op::Param` carries it — reading it as a node id would seed an
+/// arbitrary node non-null), and the ops `ir_check_elim::definitely_non_null`
+/// answers for. Anything else is `false`; this is a permission, not an
+/// analysis.
+fn base_non_null_on_entry(graph: &Graph, base: NodeId) -> bool {
+    if base == NO_NODE || base as usize >= graph.nodes.len() {
+        return false;
     }
+    match graph.receiver_param {
+        Some(recv) => matches!(graph.nodes[base as usize].op, Op::Param(p) if p == recv),
+        None => false,
+    }
+}
+
+/// A hoisted invariant load has its MEMORY edge moved to the loop-entry memory
+/// state as well as its control edge — which is what actually gets it scheduled
+/// outside the loop. **Default ON** since 2026-09-11;
+/// `CRATONVM_JIT_IR_LICM_MEM_EDGE=0` is the kill switch.
+///
+/// Without it the hoist is cosmetic: `ir_schedule::find_best_block` puts a data
+/// node in the deepest block dominated by all of its input blocks, so a load
+/// still naming the header's memory phi is scheduled back into the loop LICM
+/// just moved it out of. See the hoist site in [`licm`], and
+/// `docs/internal/performance/c2-the-loop-body-is-mostly-code-it-never-runs-20260911.md`.
+///
+/// Flipped ON against the bar this tree uses for a default: on
+/// `probes/FieldLoop.java` `sum` the optimizing tier goes from 1.12x SLOWER
+/// than the single-pass tier to **0.68x**, measured interleaved with a
+/// same-config control; CratonBench's seven checksums are byte-identical in
+/// every arm; and the whole `cratonvm-jit` suite — 2,373 unit tests and the 145
+/// `ir_vs_singlepass` differential cases — passes gate-ON exactly as gate-OFF.
+///
+/// Read LIVE on every call rather than cached in a `OnceLock`, for the reason
+/// `ir_per_copy_frames_enabled` spells out: a cached read makes one arm of an
+/// in-process A/B untestable, because whichever arm runs first fixes the answer
+/// for the whole process.
+fn licm_mem_edge_enabled() -> bool {
+    !matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_LICM_MEM_EDGE").as_deref(),
+        Ok("0") | Ok("false") | Ok("off") | Ok("no")
+    )
+}
+
+/// `true` when `CRATONVM_JIT_IR_LICM_BEFORE_UNROLL` is set: LICM runs *before*
+/// the unroller instead of after it, so the unroller sees invariant loads
+/// already re-anchored to the pre-header rather than pinned to the header.
+///
+/// Default OFF — see the pass-order comment in [`optimize`] for what the
+/// order costs and why flipping it is a measurement rather than a cleanup.
+///
+/// Read LIVE on every call rather than cached in a `OnceLock`, for the reason
+/// `ir_per_copy_frames_enabled` spells out: a cached read makes the ON arm of
+/// an in-process A/B untestable, because whichever arm runs first fixes the
+/// answer for the whole process and both arms then emit identical code.
+fn licm_before_unroll_enabled() -> bool {
+    matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_LICM_BEFORE_UNROLL").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
 }
 
 /// `true` (default) when the SCEV-driven loop-invariant code-motion pass runs.
@@ -785,13 +890,20 @@ fn gvn(graph: &mut Graph) {
         if node.op == Op::Dead || !node.op.is_pure() {
             continue;
         }
-        let hash = gvn_hash(&node.op, node.ty, &node.inputs);
+        let hash = gvn_hash(&node.op, node.ty, node.frame_snapshot, &node.inputs);
         if let Some(&existing) = value_map.get(&hash) {
             // Verify it is actually the same node (hash collision check).
             let existing_node = &graph.nodes[existing as usize];
+            // `frame_snapshot` is part of the identity, not decoration: two
+            // nodes computing the same value in different COPIES of an
+            // unrolled body are different program points, and merging them
+            // would give one copy's code the other copy's deopt frame. `None`
+            // on both is every node of every graph that did not unroll, so
+            // this costs nothing there.
             if existing != id as NodeId
                 && existing_node.op == node.op
                 && existing_node.ty == node.ty
+                && existing_node.frame_snapshot == node.frame_snapshot
                 && existing_node.inputs == node.inputs
             {
                 graph.replace_all_uses(id as NodeId, existing);
@@ -808,10 +920,11 @@ fn gvn(graph: &mut Graph) {
 /// Uses `FxHasher` rather than the std default (SipHash) — GVN runs on every
 /// JIT compile and the values are non-adversarial node identifiers, so the
 /// 2-3x faster Fx hash is a strict win.
-fn gvn_hash(op: &Op, ty: IrType, inputs: &[NodeId]) -> u64 {
+fn gvn_hash(op: &Op, ty: IrType, frame_snapshot: Option<u32>, inputs: &[NodeId]) -> u64 {
     let mut hasher = FxHasher::default();
     op.hash(&mut hasher);
     ty.hash(&mut hasher);
+    frame_snapshot.hash(&mut hasher);
     inputs.hash(&mut hasher);
     hasher.finish()
 }
@@ -1894,8 +2007,104 @@ fn licm(graph: &mut Graph) -> bool {
             // (already established) makes it loop-entry schedulable.
             if inputs.len() >= 3 {
                 // Full form: repoint ctrl (slot 0) to the pre-header control.
-                if graph.nodes[load as usize].inputs[0] != preheader {
+                //
+                // Slot 1 is the MEMORY edge, and until 2026-09-11 this arm left
+                // it alone — which made the hoist cosmetic. `ir_schedule`'s
+                // `find_best_block` places a data node in the DEEPEST block
+                // dominated by every one of its input blocks, and a body load's
+                // memory input is the header's memory phi, whose block IS the
+                // header. So the load was re-anchored to the pre-header in the
+                // graph and scheduled straight back into the loop in the code.
+                //
+                // Measured on `probes/FieldLoop.java`'s `sum` — the loop the
+                // tiering inversion is quoted on — `CRATONVM_DBG_LICM=1` printed
+                // `hoisted 1 invariant load(s) to loop pre-header(s)` while the
+                // emitted body still ran the whole `getfield` sequence every
+                // iteration: epoch guard, null test, compact test, the read and
+                // the jump over the legacy arm, nine of its ~24 hot-path
+                // instructions. A hoist nothing observes is not a hoist.
+                //
+                // The read-hoist arm above has always moved BOTH edges, with
+                // this same `loop_entry_memory`. This is that rewrite, in the
+                // arm that reaches the loops the other one declines (it fires
+                // only for a loop `licm_read_hoist_enabled` singles out — one
+                // that only its own reads and guards disqualify — and
+                // `FieldLoop.sum` has no disqualifying barrier at all, so it
+                // never went near it).
+                //
+                // `CRATONVM_JIT_IR_LICM_MEM_EDGE=1` turns it on. Default OFF:
+                // LICM is default-ON, so this changes where a load lands in
+                // every method that hoists one.
+                //
+                // ── Speculation: the pre-header runs when the body does not ──
+                //
+                // A hoist to the pre-header is SPECULATIVE. The pre-header runs
+                // on every entry and the body does not, so a load that reaches
+                // the pre-header executes for a loop that iterates zero times.
+                // A `getfield` carries its own null check, so speculating one
+                // speculates the `NullPointerException` with it.
+                //
+                // That is not hypothetical. `probes/ZeroTripHoist.java` is
+                // `static int walk(N o, int n) { int a = 0; for (int i = 0;
+                // i < n; i++) a += o.v; return a; }`, and `walk(null, 0)` came
+                // back as a thrown NPE where HotSpot returns 0 — on the
+                // optimizing tier, from THIS arm: it survives
+                // `CRATONVM_JIT_NO_LICM_READ_HOIST=1` and vanishes under
+                // `CRATONVM_JIT_LICM=0`. A wrong answer, not a crash — and it
+                // reproduced under `CRATONVM_C2_SUPERSEDE=0` too, which stops
+                // the optimizing body from SUPERSEDING and not from being
+                // compiled.
+                //
+                // So the hoist asks whether it may speculate, and three answers
+                // are accepted:
+                //
+                //   * the load is anchored at the HEADER itself — the header
+                //     runs whenever the loop is reached, zero trips included,
+                //     so the pre-header is not earlier in any execution;
+                //   * the base is the RECEIVER, which the JVM guarantees
+                //     non-null at the call site and SSA gives no other
+                //     definition — the fact `ir_check_elim` already seeds;
+                //   * `definitely_non_null` already answers for the base (a
+                //     fresh allocation, a materialized constant).
+                //
+                // This is a permission, not an analysis: anything else refuses,
+                // and a refusal costs an optimization rather than an answer. It
+                // is deliberately NOT behind `CRATONVM_JIT_IR_LICM_MEM_EDGE` —
+                // the control-edge move below is the one that was already
+                // wrong, and it is default-ON.
+                let hoist_is_safe = inputs[0] == region
+                    || base_non_null_on_entry(graph, base)
+                    || crate::ir_check_elim::definitely_non_null(&graph.nodes[base as usize].op);
+                if !hoist_is_safe {
+                    if dbg {
+                        eprintln!(
+                            "[DBG_LICM] load {load}: NOT hoisted — base {base} may be null at \
+                             the pre-header and the body may not run"
+                        );
+                    }
+                    continue;
+                }
+                let new_mem = if licm_mem_edge_enabled() {
+                    if is_loop_invariant(graph, inputs[1], region, &body) {
+                        inputs[1]
+                    } else {
+                        loop_entry_memory(graph, region, entry_pred).unwrap_or(NO_NODE)
+                    }
+                } else {
+                    NO_NODE
+                };
+                let move_mem = new_mem != NO_NODE && new_mem != inputs[1];
+                if graph.nodes[load as usize].inputs[0] != preheader || move_mem {
                     graph.nodes[load as usize].inputs[0] = preheader;
+                    if move_mem {
+                        graph.nodes[load as usize].inputs[1] = new_mem;
+                        if dbg {
+                            eprintln!(
+                                "[DBG_LICM] load {load}: mem {} -> {new_mem} (the edge that                                  decides the block)",
+                                inputs[1]
+                            );
+                        }
+                    }
                     changed = true;
                     hoisted += 1;
                 }
@@ -2728,6 +2937,282 @@ pub fn unroll_enabled() -> bool {
     })
 }
 
+/// Why each candidate loop header did or did not unroll.
+///
+/// # Why this exists
+///
+/// `docs/JIT_OPTIMIZATION.md` has said since 2026-09-03 that *"the optimizing
+/// tier does not unroll"*, and priced that at about 1.12x on a counted loop.
+/// Both halves needed checking before anything was built, and only one of them
+/// survived: this pass EXISTS, is correct, and recognises a javac counted loop
+/// (`analyze_counted_loop` returns `trip=5 init=0 stride=1` on one). What it
+/// then does is refuse it.
+///
+/// A bare "it did not fire" cannot distinguish the two reasons that matter,
+/// and they call for opposite work:
+///
+///   * [`Self::runtime_bound`] — a counted loop whose bound is a VALUE rather
+///     than a constant, which is most Java loops and every one this pass was
+///     never meant to serve. Full unrolling can never apply to it; PARTIAL
+///     unrolling is the thing that would, and it is unbuilt. This counter is
+///     how big that prize is.
+///   * [`Self::safepoint_named`] — a loop this pass fully models and declines
+///     anyway, because `SafepointSnapshot` is keyed by one bci and an unrolled
+///     body has several copies of each. That refusal has an escape hatch for a
+///     trap-free graph, and the hatch is gated on
+///     `CRATONVM_JIT_IR_DROP_UNREACHABLE_HOMES`, which is **default OFF** — so
+///     on a default run this pass refuses essentially every loop it
+///     understands. This counter is how much is being left on the floor by a
+///     flag that is off for an unrelated reason.
+///
+/// Every candidate header falls into exactly one bucket, which
+/// [`Self::closes`] checks and `unroll` debug-asserts, for the reason
+/// `c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md` §10.1
+/// gives: a census that computes its own answer instead of reading the one the
+/// code used will drift, and it drifts towards zero.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct UnrollCensus {
+    /// Two-input control merges examined — **not** a count of loops.
+    ///
+    /// `unroll` scans every `Region`/`Merge` with at least two control inputs,
+    /// and most of those are if/else joins rather than loop headers. They land
+    /// in [`Self::not_single_backedge`], which is therefore mostly "not a loop"
+    /// rather than "a loop of a shape this pass declines". The count of loops
+    /// actually FOUND is `headers - not_single_backedge`, and the honest
+    /// denominator for anything about unrolling is that, not this.
+    pub headers: usize,
+    /// Unrolled.
+    pub unrolled: usize,
+    /// Not a single-back-edge loop, or no entry predecessor. **Mostly not a
+    /// loop at all** — see [`Self::headers`].
+    pub not_single_backedge: usize,
+    /// No constant-stride induction phi, or no single loop-exit `If`.
+    pub not_counted: usize,
+    /// A counted loop whose BOUND is a runtime value. The partial-unroll
+    /// population, and the one thing on this list that is a missing feature
+    /// rather than a refusal.
+    pub runtime_bound: usize,
+    /// Constant trip count above `UNROLL_MAX_TRIP`.
+    pub trip_over_cap: usize,
+    /// Not a single-block loop (region/if/proj shape).
+    pub control_shape: usize,
+    /// A store, call, allocation or array access in the loop.
+    pub side_effect: usize,
+    /// A body node this pass cannot clone, or a body over `UNROLL_MAX_BODY`.
+    pub body_unclonable: usize,
+    /// A safepoint snapshot names the body, and the trap-free escape was not
+    /// available. **On a default run this is the dominant refusal.**
+    pub safepoint_named: usize,
+    /// A body value escapes the loop, or an invariant load is pinned to the
+    /// header.
+    pub escapes_or_pinned: usize,
+    /// A safepoint snapshot names the body at a bci **no cloned node carries**,
+    /// so per-copy frames could not be built and the loop was refused.
+    ///
+    /// Distinct from [`Self::safepoint_named`], which is the refusal taken when
+    /// per-copy frames are switched OFF. This one is taken with them ON: the
+    /// mechanism was available and the loop still could not use it, because a
+    /// copy's frame has to hang on a program point the copy actually has. See
+    /// [`plan_copy_frames`].
+    pub frame_uncopyable: usize,
+    /// Of [`Self::runtime_bound`], how many sit in a graph NOTHING can deopt
+    /// from. **Not part of the closing identity** — it is a sub-count of
+    /// `runtime_bound`, not a bucket of its own.
+    ///
+    /// This is the number that decides whether a partial unroller is worth
+    /// building, and it is the only honest denominator for one. A partial
+    /// unroll clones the body, a deopt out of copy `k` needs a frame state
+    /// naming copy `k`'s values, and `SafepointSnapshot` is keyed by one bci —
+    /// so on a graph that CAN deopt, partial unrolling needs the same
+    /// per-iteration snapshot index the full unroller's own comment calls "a
+    /// lowerer change". On a trap-free graph no snapshot can ever be consulted
+    /// and that whole obligation is discharged by construction.
+    pub runtime_bound_trap_free: usize,
+    /// Of [`Self::runtime_bound`], how many have a body a partial unroller
+    /// could clone whose clones can none of them DEOPT. **Not part of the
+    /// closing identity.**
+    ///
+    /// The honest denominator for a partial unroller, and a different question
+    /// from [`Self::runtime_bound_trap_free`]: that one asks whether the whole
+    /// METHOD is trap-free, this one whether the cloned NODES are. See
+    /// [`partial_unroll_body_is_pure`].
+    pub runtime_bound_pure_body: usize,
+    /// Of [`Self::unrolled`], how many were unrolled over a body a safepoint
+    /// snapshot names — i.e. how many took per-copy frames. **Not part of the
+    /// closing identity**; it is a sub-count of `unrolled`.
+    ///
+    /// The engagement number for [`ir_per_copy_frames_enabled`]. Zero with the
+    /// flag off, and zero with it on until a loop is met that the old
+    /// [`Self::safepoint_named`] refusal would have declined — which is the
+    /// pair of counters to read together, because one moving without the other
+    /// falling means the mechanism is firing on loops that never needed it.
+    pub per_copy_frames: usize,
+    /// Runtime-bound loops declined for being runtime-bound **and nothing
+    /// else** — i.e. with `CRATONVM_JIT_IR_PARTIAL_UNROLL` off. Part of the
+    /// closing identity; [`Self::runtime_bound`] is its non-terminal superset.
+    ///
+    /// Equal to `runtime_bound` on a default run. The gap between them, when
+    /// the flag is on, is the number of loops the partial unroller took
+    /// responsibility for — whether it then unrolled them or refused them for a
+    /// second reason.
+    pub runtime_bound_refused: usize,
+    /// Loops given a PARTIAL unroll: the body emitted `factor` times, each copy
+    /// behind its own copy of the loop test, the loop itself kept. Part of the
+    /// closing identity, and disjoint from [`Self::unrolled`], which counts only
+    /// loops that were retired entirely.
+    pub partially_unrolled: usize,
+}
+
+impl UnrollCensus {
+    /// Does every candidate header fall into exactly one bucket?
+    ///
+    /// [`Self::runtime_bound`] is deliberately NOT a term, and it stopped being
+    /// one when the partial unroller landed. It counts a loop SHAPE — "the bound
+    /// is a value" — which is no longer a disposition: such a loop now goes on
+    /// to the same control-shape, side-effect, clonability and frame checks a
+    /// constant-trip one does, and lands in whichever of those buckets, or in
+    /// [`Self::partially_unrolled`], actually disposed of it. Its terminal
+    /// counterpart is [`Self::runtime_bound_refused`], which is the count of
+    /// runtime-bound loops declined for being runtime-bound and nothing else.
+    ///
+    /// With `CRATONVM_JIT_IR_PARTIAL_UNROLL` off (the default) the two are
+    /// equal and every published number is what it was before.
+    pub fn closes(&self) -> bool {
+        self.unrolled
+            + self.partially_unrolled
+            + self.not_single_backedge
+            + self.not_counted
+            + self.runtime_bound_refused
+            + self.trip_over_cap
+            + self.control_shape
+            + self.side_effect
+            + self.body_unclonable
+            + self.safepoint_named
+            + self.escapes_or_pinned
+            + self.frame_uncopyable
+            == self.headers
+    }
+}
+
+/// Process-wide unroll totals, in [`UnrollCensus`] field order.
+///
+/// Unconditional and cheap -- at most one relaxed add per candidate loop
+/// header per compile. A census you have to switch on is one nobody has for
+/// the run they already did.
+static IR_UNROLL_CENSUS: [std::sync::atomic::AtomicU64; 17] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Index into [`IR_UNROLL_CENSUS`], in [`UnrollCensus`] field order.
+mod unroll_bucket {
+    pub const HEADERS: usize = 0;
+    pub const UNROLLED: usize = 1;
+    pub const NOT_SINGLE_BACKEDGE: usize = 2;
+    pub const NOT_COUNTED: usize = 3;
+    pub const RUNTIME_BOUND: usize = 4;
+    pub const TRIP_OVER_CAP: usize = 5;
+    pub const CONTROL_SHAPE: usize = 6;
+    pub const SIDE_EFFECT: usize = 7;
+    pub const BODY_UNCLONABLE: usize = 8;
+    pub const SAFEPOINT_NAMED: usize = 9;
+    pub const ESCAPES_OR_PINNED: usize = 10;
+    /// A real refusal, so it sits INSIDE the identity -- and it must sit below
+    /// `RUNTIME_BOUND_TRAP_FREE`, because that is where the identity's sum
+    /// stops.
+    pub const FRAME_UNCOPYABLE: usize = 11;
+    /// A sub-count of `RUNTIME_BOUND`, deliberately outside the identity.
+    pub const RUNTIME_BOUND_TRAP_FREE: usize = 12;
+    /// Also a sub-count of `RUNTIME_BOUND`, also outside the identity.
+    pub const RUNTIME_BOUND_PURE_BODY: usize = 13;
+    /// A sub-count of `UNROLLED`, also outside the identity.
+    pub const PER_COPY_FRAMES: usize = 14;
+    /// A runtime-bound loop declined for being runtime-bound and nothing else.
+    /// The TERMINAL counterpart of `RUNTIME_BOUND`, and the one in the identity.
+    pub const RUNTIME_BOUND_REFUSED: usize = 15;
+    /// A loop given a partial unroll. In the identity, disjoint from `UNROLLED`.
+    pub const PARTIALLY_UNROLLED: usize = 16;
+}
+
+/// Add one compile's tally to the process-wide totals.
+///
+/// Published once per `unroll` call rather than per header, so the identity
+/// below can be asserted on a tally no other thread is touching: background
+/// compilation is default-ON, and a process-wide check would race a sibling
+/// thread that has counted a header and not yet its bucket.
+fn publish_unroll_census(local: &[usize; 17]) {
+    debug_assert!(
+        {
+            // Spelled out rather than taken as a slice range, because the
+            // terminal buckets are no longer contiguous: `RUNTIME_BOUND` sits
+            // among them and is a SHAPE count, not a disposition (see
+            // `UnrollCensus::closes`), while `PARTIALLY_UNROLLED` and
+            // `RUNTIME_BOUND_REFUSED` were appended after the sub-counts. A
+            // range would silently take the wrong terms.
+            let total: usize = local[unroll_bucket::UNROLLED]
+                + local[unroll_bucket::PARTIALLY_UNROLLED]
+                + local[unroll_bucket::NOT_SINGLE_BACKEDGE]
+                + local[unroll_bucket::NOT_COUNTED]
+                + local[unroll_bucket::RUNTIME_BOUND_REFUSED]
+                + local[unroll_bucket::TRIP_OVER_CAP]
+                + local[unroll_bucket::CONTROL_SHAPE]
+                + local[unroll_bucket::SIDE_EFFECT]
+                + local[unroll_bucket::BODY_UNCLONABLE]
+                + local[unroll_bucket::SAFEPOINT_NAMED]
+                + local[unroll_bucket::ESCAPES_OR_PINNED]
+                + local[unroll_bucket::FRAME_UNCOPYABLE];
+            total == local[unroll_bucket::HEADERS]
+        },
+        "UnrollCensus does not close: {local:?} -- a `continue` in `unroll` has          no counter",
+    );
+    for (slot, v) in IR_UNROLL_CENSUS.iter().zip(local.iter()) {
+        slot.fetch_add(*v as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The process-wide unroll census since process start.
+pub fn ir_unroll_census() -> UnrollCensus {
+    use std::sync::atomic::Ordering::Relaxed;
+    let v: Vec<usize> = IR_UNROLL_CENSUS
+        .iter()
+        .map(|a| a.load(Relaxed) as usize)
+        .collect();
+    UnrollCensus {
+        headers: v[0],
+        unrolled: v[1],
+        not_single_backedge: v[2],
+        not_counted: v[3],
+        runtime_bound: v[4],
+        trip_over_cap: v[5],
+        control_shape: v[6],
+        side_effect: v[7],
+        body_unclonable: v[8],
+        safepoint_named: v[9],
+        escapes_or_pinned: v[10],
+        frame_uncopyable: v[11],
+        runtime_bound_trap_free: v[12],
+        runtime_bound_pure_body: v[13],
+        per_copy_frames: v[14],
+        runtime_bound_refused: v[15],
+        partially_unrolled: v[16],
+    }
+}
+
 /// Only fully unroll loops whose constant trip count is at most this (bounds
 /// code growth; larger counted loops are left rolled).
 const UNROLL_MAX_TRIP: i64 = 8;
@@ -2750,6 +3235,45 @@ fn eval_cmp_i64(op: CmpOp, x: i64, y: i64) -> bool {
         CmpOp::Gt => x > y,
         CmpOp::Ge => x >= y,
     }
+}
+
+/// Why [`analyze_counted_loop`] declined, when it did.
+///
+/// `RuntimeBound` is split out from every other refusal because it is the only
+/// one that is a MISSING FEATURE rather than a shape this pass does not model:
+/// the loop is a textbook counted loop in every respect except that its bound
+/// is a value. Full unrolling can never serve it — the trip count is not known
+/// until the loop runs — and partial unrolling is what would. Counting the two
+/// together would hide the entire partial-unroll population inside "not a
+/// counted loop", which is how a census reports a prize as a non-event.
+enum NotCounted {
+    /// No constant-stride induction phi, no single exit test, or a shape this
+    /// pass does not model.
+    Shape,
+    /// A counted loop against a NON-CONSTANT bound.
+    ///
+    /// Carries the shape a PARTIAL unroller needs, which is everything
+    /// [`CountedLoop`] holds except the three facts that depend on the bound
+    /// being constant (`iv_init`, `iv_stride`, `trip`). Partial unrolling never
+    /// evaluates the induction variable — it keeps the loop test in every copy
+    /// and lets the hardware decide — so it needs none of them.
+    RuntimeBound(RuntimeBoundLoop),
+    /// A counted loop whose constant trip count exceeds `UNROLL_MAX_TRIP`.
+    TripOverCap,
+}
+
+/// A counted loop whose bound is a runtime value — the population
+/// [`partial_unroll_loop`] serves, and the one the census on
+/// `c2-unrolling-is-a-deopt-metadata-problem-20260911.md` found to be **every**
+/// counted loop in both benchmark suites.
+///
+/// Recognised to exactly the same standard as [`CountedLoop`]: one
+/// constant-stride induction phi, one loop-exit `If`, and a back edge that is
+/// one of that `If`'s two projections. The only thing missing is a trip count,
+/// and the transform that consumes this does not want one.
+struct RuntimeBoundLoop {
+    if_node: NodeId,
+    exit_ctrl: NodeId,
 }
 
 /// A recognised constant-trip counted loop suitable for full unrolling.
@@ -2789,7 +3313,11 @@ fn build_users(graph: &Graph) -> Vec<Vec<NodeId>> {
 /// `back_ctrl`). Conservative: `None` on any shape we don't fully model
 /// (non-constant init/stride/bound, induction tested against a non-constant,
 /// multiple header tests, …).
-fn analyze_counted_loop(graph: &Graph, region: NodeId, back_ctrl: NodeId) -> Option<CountedLoop> {
+fn analyze_counted_loop(
+    graph: &Graph,
+    region: NodeId,
+    back_ctrl: NodeId,
+) -> Result<CountedLoop, NotCounted> {
     let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNROLL").is_some();
     let n = graph.nodes.len();
     // Induction phi: Phi anchored at `region`, inputs [region, init(Const), next],
@@ -2835,7 +3363,7 @@ fn analyze_counted_loop(graph: &Graph, region: NodeId, back_ctrl: NodeId) -> Opt
             if dbg {
                 eprintln!("[DBG_UNROLL] region {region}: bail — no constant-stride induction phi");
             }
-            return None;
+            return Err(NotCounted::Shape);
         }
     };
 
@@ -2855,7 +3383,7 @@ fn analyze_counted_loop(graph: &Graph, region: NodeId, back_ctrl: NodeId) -> Opt
                 if dbg {
                     eprintln!("[DBG_UNROLL] region {region}: bail — multiple loop tests");
                 }
-                return None;
+                return Err(NotCounted::Shape);
             }
             if_node = id as NodeId;
         }
@@ -2866,39 +3394,75 @@ fn analyze_counted_loop(graph: &Graph, region: NodeId, back_ctrl: NodeId) -> Opt
                 "[DBG_UNROLL] region {region}: bail — no loop exit If (ctrl==region/back_ctrl)"
             );
         }
-        return None;
+        return Err(NotCounted::Shape);
     }
-    let cond = *graph.nodes[if_node as usize].inputs.get(1)?;
-    let op = match graph.nodes.get(cond as usize)?.op {
+    let cond = *graph
+        .nodes[if_node as usize]
+        .inputs
+        .get(1)
+        .ok_or(NotCounted::Shape)?;
+    let op = match graph.nodes.get(cond as usize).ok_or(NotCounted::Shape)?.op {
         Op::Cmp(o) => o,
-        _ => return None,
+        _ => return Err(NotCounted::Shape),
     };
     let ci = &graph.nodes[cond as usize].inputs;
     if ci.len() != 2 {
-        return None;
+        return Err(NotCounted::Shape);
     }
-    // Compare the induction phi against a constant bound.
-    let (iv_on_left, bound) = if ci[0] == iv_phi {
-        (true, const_i64(graph, ci[1])?)
+    // Compare the induction phi against a bound. A NON-CONSTANT bound is a
+    // counted loop FULL unrolling cannot serve -- the trip count is not known
+    // until the loop runs -- and is reported as such rather than as "not a
+    // counted loop", because the two call for different work.
+    let (iv_on_left, other) = if ci[0] == iv_phi {
+        (true, ci[1])
     } else if ci[1] == iv_phi {
-        (false, const_i64(graph, ci[0])?)
+        (false, ci[0])
     } else {
-        return None;
+        return Err(NotCounted::Shape);
     };
+    // Read, but not yet acted on. The runtime-bound refusal is deferred to
+    // below the exit-shape checks, because `NotCounted::RuntimeBound` now
+    // carries that shape to the partial unroller: a loop reported as
+    // "runtime bound" must have been recognised as completely as one reported
+    // as counted, or the census counts a loop the transform would then refuse
+    // for a second reason it never named.
+    let bound_if_const = const_i64(graph, other);
 
     // Which If projection re-enters the loop (the "continue" edge)?
-    if graph.nodes.get(back_ctrl as usize)?.inputs.first().copied() != Some(if_node) {
-        return None;
+    if graph
+        .nodes
+        .get(back_ctrl as usize)
+        .ok_or(NotCounted::Shape)?
+        .inputs
+        .first()
+        .copied()
+        != Some(if_node)
+    {
+        return Err(NotCounted::Shape);
     }
     let back_is_true = match graph.nodes[back_ctrl as usize].op {
         Op::Proj(0) => true,
         Op::Proj(1) => false,
-        _ => return None,
+        _ => return Err(NotCounted::Shape),
     };
     let exit_ctrl = proj_user(graph, if_node, if back_is_true { 1 } else { 0 });
     if exit_ctrl == NO_NODE {
-        return None;
+        return Err(NotCounted::Shape);
     }
+
+    // The deferred refusal, now that the shape a partial unroll needs is known.
+    let bound = match bound_if_const {
+        Some(b) => b,
+        None => {
+            if dbg {
+                eprintln!("[DBG_UNROLL] region {region}: bail — bound is a runtime value");
+            }
+            return Err(NotCounted::RuntimeBound(RuntimeBoundLoop {
+                if_node,
+                exit_ctrl,
+            }));
+        }
+    };
 
     // Concrete trip count by simulation (init/stride/bound all constant).
     let mut i = iv_init;
@@ -2916,10 +3480,11 @@ fn analyze_counted_loop(graph: &Graph, region: NodeId, back_ctrl: NodeId) -> Opt
         i = i.wrapping_add(iv_stride);
         trip += 1;
         if trip > UNROLL_MAX_TRIP {
-            return None; // too large / non-terminating within the cap
+            // Too large, or non-terminating within the cap.
+            return Err(NotCounted::TripOverCap);
         }
     }
-    Some(CountedLoop {
+    Ok(CountedLoop {
         iv_phi,
         iv_init,
         iv_stride,
@@ -2969,6 +3534,102 @@ fn forward_control_closure(
         }
     }
     set
+}
+
+/// Would a partial unroller be able to clone this loop's body, and would the
+/// clones be DEOPT-FREE?
+///
+/// # Census only — it transforms nothing
+///
+/// `unroll` answers this question for a loop it is about to unroll, as a side
+/// effect of building the clone set. A loop refused earlier for
+/// [`NotCounted::RuntimeBound`] never reaches that code, so the population a
+/// PARTIAL unroller would serve is invisible in the census. This mirrors the
+/// same walk to size it.
+///
+/// # The gate that matters is per-BODY, not per-graph
+///
+/// `unroll`'s existing escape from the safepoint refusal asks
+/// `graph_cannot_deopt` — a WHOLE-METHOD property, false for any method
+/// containing a single call, field access or array access anywhere. Measured
+/// across CratonBench, CratonBenchC2 and the probe set, it is true for **zero**
+/// of the counted loops found, so a partial unroller gated on it would fire on
+/// nothing.
+///
+/// The obligation it stands in for is narrower. Cloning a body duplicates its
+/// bcis, and `build_deopt_points` anchors a point at `bci_native[bci]`, which
+/// keeps only the EARLIEST native offset for a bci — so copy 1..U-1 get no
+/// deopt point at all, and a trap inside them has no frame to reconstruct.
+/// That objection is about the CLONED NODES. If none of them can deopt, no
+/// copy needs a point and the obligation is discharged whatever the rest of
+/// the method does.
+///
+/// So this asks the narrow question, and [`UnrollCensus::runtime_bound_pure_body`]
+/// is the answer.
+fn partial_unroll_body_is_pure(
+    graph: &Graph,
+    users: &[Vec<NodeId>],
+    region: NodeId,
+    back_ctrl: NodeId,
+    if_node: NodeId,
+) -> bool {
+    let mut carried: Vec<NodeId> = Vec::new();
+    for id in 0..graph.nodes.len() {
+        let node = &graph.nodes[id];
+        if node.op == Op::Phi && node.inputs.first().copied() == Some(region) {
+            if node.inputs.len() < 3 {
+                return false;
+            }
+            carried.push(id as NodeId);
+        }
+    }
+    if carried.is_empty() {
+        return false;
+    }
+    let carried_set: FxHashSet<NodeId> = carried.iter().copied().collect();
+    let mut variant: FxHashSet<NodeId> = carried_set.clone();
+    let mut vw: Vec<NodeId> = carried.clone();
+    while let Some(c) = vw.pop() {
+        for &u in &users[c as usize] {
+            if variant.insert(u) {
+                vw.push(u);
+            }
+        }
+    }
+    // The same seeds the transform uses: the loop condition and each carried
+    // phi's back-edge value.
+    let cond = match graph.nodes[if_node as usize].inputs.get(1) {
+        Some(&c) => c,
+        None => return false,
+    };
+    let mut work: Vec<NodeId> = vec![cond];
+    for &c in &carried {
+        work.push(graph.nodes[c as usize].inputs[2]);
+    }
+    let mut seen: FxHashSet<NodeId> = FxHashSet::default();
+    while let Some(c) = work.pop() {
+        if c == NO_NODE
+            || c as usize >= graph.nodes.len()
+            || carried_set.contains(&c)
+            || !variant.contains(&c)
+        {
+            continue;
+        }
+        if graph.nodes[c as usize].op.is_control() || !seen.insert(c) {
+            continue;
+        }
+        // PURE ONLY. `unroll` also admits `Op::Load`, because a full unroll
+        // deletes the loop and its bcis with it; a PARTIAL unroll keeps them
+        // and a cloned `Op::Load` can NPE at a bci whose only deopt point
+        // belongs to copy 0.
+        if !graph.nodes[c as usize].op.is_pure() {
+            return false;
+        }
+        for &inp in &graph.nodes[c as usize].inputs {
+            work.push(inp);
+        }
+    }
+    !seen.is_empty() && seen.len() <= UNROLL_MAX_BODY
 }
 
 /// Fully unroll small constant-trip counted loops (gated by [`unroll_enabled`]).
@@ -3023,8 +3684,541 @@ fn unroll_over_unreachable_frames() -> bool {
     })
 }
 
+/// May the unroller give each copy of a cloned body its **own** deopt frames,
+/// instead of refusing a loop a safepoint snapshot names? **Default OFF**;
+/// `CRATONVM_JIT_IR_PER_COPY_FRAMES=1` arms it.
+///
+/// # What it turns on
+///
+/// A cloned node keeps the original's `bytecode_pc`, so after an unroll there
+/// are `trip` nodes at each body bci. `ir_lower` resolves a trapping node's
+/// deopt frame by scanning `graph.safepoints` for the first snapshot with that
+/// bci, so all `trip` copies resolve to copy 0's frame — which names copy 0's
+/// values. Copies `1..trip` would then deopt into an interpreter frame holding
+/// another iteration's locals.
+///
+/// With this on, [`install_copy_frames`] gives each copy a substituted
+/// snapshot of its own and stamps the copy's nodes with
+/// [`Node::frame_snapshot`], which `ir_lower` prefers over the scan.
+///
+/// # Why it is off
+///
+/// This is the deopt metadata, and `internal/fixed-bugs/` records what a defect
+/// in it looks like from the outside: an H2 `GROUP BY` that returned 3 rows of
+/// 5, because a resume read a frame slot nothing had written. A wrong frame
+/// does not crash — it answers. So the mechanism lands armed by a flag and
+/// earns its default the way `ir_register_authoritative_enabled` did, on a soak
+/// with checksum parity, not on the argument above.
+fn ir_per_copy_frames_enabled() -> bool {
+    // Read live rather than cached in a `OnceLock`, like
+    // `ir_lower::ir_drop_unreachable_homes_enabled` and unlike its
+    // `unroll_over_unreachable_frames` neighbour. Two reasons, and the second
+    // is the one that matters: it is read once per candidate loop header, so
+    // the cache buys nothing; and a process-wide cache makes the OFF arm
+    // untestable in the same process as the ON arm, which is precisely the
+    // differential this mechanism has to be held to.
+    matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PER_COPY_FRAMES").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
+}
+
+/// May the unroller PARTIALLY unroll a counted loop whose bound is a runtime
+/// value? **Default OFF**; `CRATONVM_JIT_IR_PARTIAL_UNROLL=1` arms it.
+///
+/// Off for the same reason [`ir_per_copy_frames_enabled`] is, and it is the
+/// same reason: this transform's correctness rests on that one, which has not
+/// yet earned its default on a soak. A partial unroll that needs per-copy
+/// frames and cannot have them is refused, so the two flags compose by
+/// refusing rather than by miscompiling — but the population that needs them is
+/// the population worth having, so arming this one alone buys little.
+fn partial_unroll_enabled() -> bool {
+    // Read live rather than cached, for [`ir_per_copy_frames_enabled`]'s second
+    // reason: a process-wide cache makes the OFF arm untestable in the same
+    // process as the ON arm, and the ON/OFF differential is how this is held.
+    matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PARTIAL_UNROLL").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
+}
+
+/// How many copies of the body a partial unroll emits, counting the original.
+///
+/// 4 is the factor `c2-unrolling-is-a-deopt-metadata-problem-20260911.md` §3
+/// priced: it removes `(U−1)/U × (poll 2 + back edge 1)` per iteration, which
+/// at `U = 4` is 2.25 instructions of `FieldLoop.sum`'s 23. Past 4 the series
+/// `(U−1)/U` flattens while code size keeps growing linearly, so the knob
+/// exists to measure that rather than to be turned up.
+///
+/// Clamped to `2..=8`: 1 is not an unroll, and 8 copies of a body already
+/// exceeds what [`UNROLL_MAX_BODY`] admits for anything but a tiny one.
+fn partial_unroll_factor() -> usize {
+    cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PARTIAL_UNROLL_FACTOR")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(4)
+        .clamp(2, 8)
+}
+
+/// Which snapshots need a per-copy version, and what they looked like BEFORE
+/// the unroll touched them. `Err` when this loop cannot have per-copy frames at
+/// all.
+///
+/// # Three kinds of snapshot, and only one of them is a refusal
+///
+/// A copy's frame has to hang on a program point the copy actually has, and the
+/// only program points a copy has are the bcis its cloned nodes carry. So:
+///
+///   * **at a cloned bci** — copied, one per iteration. This is the mechanism.
+///   * **at a bci NO live node in the graph carries** — left exactly as it is,
+///     and this is the common case rather than an edge one: `IrBuilder` records
+///     a snapshot at *every* bytecode index, including the `istore` and `goto`
+///     that close a javac loop body, and neither of those produces a node. Such
+///     a snapshot cannot be consulted by anything. `build_deopt_points` anchors
+///     through `bci_native`, which is populated only from nodes, so it is
+///     skipped; and every deopt this file emits resumes at some node's own
+///     `bytecode_pc`, so no guard names it either. Its slots are left to be
+///     stranded and normalised to `NO_NODE` by `eliminate_dead_nodes`, which is
+///     what already happens to every unconsultable snapshot on every compile.
+///     Copying it instead would be worse than useless: safepoint slots are DCE
+///     ROOTS, so `trip` copies of a frame nothing reads would keep every
+///     iteration's intermediates alive to describe a program point with no
+///     code.
+///   * **at a bci some OTHER node carries** — refused
+///     ([`UnrollCensus::frame_uncopyable`]). Here the code really is emitted,
+///     really can be resumed at, and the frame names a body value with no
+///     iteration to belong to. There is no substitution that is right, so the
+///     loop is declined rather than given a frame picked from whichever
+///     iteration was convenient.
+///
+/// A snapshot naming only CARRIED phis, at any bci, is fine and is not refused:
+/// `unroll`'s teardown rewrites every use of a carried phi to its post-loop
+/// value, and `Graph::replace_all_uses` routes safepoint slots, so those slots
+/// are repaired by the transform itself.
+///
+/// # Why the snapshots are returned by value
+///
+/// Iteration 0 rewrites its snapshot IN PLACE (see [`install_copy_frames`]), so
+/// by iteration 1 the entry in `graph.safepoints` no longer names the original
+/// nodes the substitution has to start from. The pre-unroll copy returned here
+/// is that starting point, and taking it once is also what keeps the borrow of
+/// `graph` out of the mutating loop.
+fn plan_copy_frames(
+    graph: &Graph,
+    to_clone: &FxHashSet<NodeId>,
+) -> Result<Vec<(u32, SafepointSnapshot)>, ()> {
+    let mut cloned_bcis: FxHashSet<usize> = FxHashSet::default();
+    for &d in to_clone {
+        if let Some(pc) = graph.nodes[d as usize].bytecode_pc {
+            cloned_bcis.insert(pc);
+        }
+    }
+    // Every bci the emitted code will actually carry. Read from live nodes
+    // only: a node the optimizer already killed emits nothing, so a bci carried
+    // solely by one is as unreachable as a bci carried by nothing.
+    let mut node_bcis: FxHashSet<usize> = FxHashSet::default();
+    for node in &graph.nodes {
+        if node.op == Op::Dead {
+            continue;
+        }
+        if let Some(pc) = node.bytecode_pc {
+            node_bcis.insert(pc);
+        }
+    }
+    let mut plan: Vec<(u32, SafepointSnapshot)> = Vec::new();
+    for (si, sp) in graph.safepoints.iter().enumerate() {
+        if cloned_bcis.contains(&sp.bci) {
+            plan.push((si as u32, sp.clone()));
+            continue;
+        }
+        let names_body = sp
+            .locals
+            .iter()
+            .chain(sp.stack.iter())
+            .any(|slot| to_clone.contains(slot));
+        if names_body && node_bcis.contains(&sp.bci) {
+            return Err(());
+        }
+    }
+    Ok(plan)
+}
+
+/// Give iteration `t` its own copy of every body snapshot, and stamp that
+/// iteration's clones with it.
+///
+/// `subst` is iteration `t`'s substitution — body node → this iteration's
+/// clone, carried phi → the value entering this iteration — which is exactly
+/// the rename a frame at a body bci needs. A slot naming something outside the
+/// loop is left alone, because a loop-invariant value is the same in every
+/// copy.
+///
+/// # Iteration 0 rewrites in place; the rest append
+///
+/// Not a micro-optimization. `bci_native` anchors a bci at the EARLIEST native
+/// offset emitted for it, which is copy 0's, and `build_deopt_points` falls
+/// back to that anchor for any snapshot no node claims. If copy 0 got a fresh
+/// appended snapshot and the original were left naming dead nodes, the original
+/// would keep the copy-0 anchor and the table's point at that offset would
+/// describe an iteration that no longer exists. Making the original BE copy 0's
+/// frame keeps the anchor and its frame describing the same code.
+///
+/// # Ordering
+///
+/// Call this after iteration `t`'s clone loop and before the carried phis are
+/// advanced: the substitution must be complete (a snapshot at bci B may name
+/// any value live at B, which is any body node cloned at or before B), and it
+/// must not yet contain iteration `t+1`'s induction constant.
+fn install_copy_frames(
+    graph: &mut Graph,
+    plan: &[(u32, SafepointSnapshot)],
+    subst: &FxHashMap<NodeId, NodeId>,
+    iter_clones: &[NodeId],
+    first_iteration: bool,
+) {
+    let mut snap_for_bci: FxHashMap<usize, u32> = FxHashMap::default();
+    for (orig_si, orig) in plan {
+        let rename = |n: &NodeId| subst.get(n).copied().unwrap_or(*n);
+        let locals: Vec<NodeId> = orig.locals.iter().map(rename).collect();
+        let stack: Vec<NodeId> = orig.stack.iter().map(rename).collect();
+        let si = if first_iteration {
+            // Through `set_safepoint_slot`, not a direct write: installing a
+            // reference is the one snapshot edit the def-use edges cannot
+            // notice, and a stale use list is how a value a frame still names
+            // gets collected.
+            for (k, &v) in locals.iter().enumerate() {
+                graph.set_safepoint_slot(*orig_si as usize, SafepointSlotKind::Local, k, v);
+            }
+            for (k, &v) in stack.iter().enumerate() {
+                graph.set_safepoint_slot(*orig_si as usize, SafepointSlotKind::Stack, k, v);
+            }
+            *orig_si
+        } else {
+            let si = graph.safepoints.len() as u32;
+            graph.push_safepoint(SafepointSnapshot {
+                bci: orig.bci,
+                locals,
+                stack,
+            });
+            si
+        };
+        snap_for_bci.insert(orig.bci, si);
+    }
+    for &clone in iter_clones {
+        let Some(pc) = graph.nodes[clone as usize].bytecode_pc else {
+            continue;
+        };
+        let Some(&si) = snap_for_bci.get(&pc) else {
+            continue;
+        };
+        let bound = graph.set_node_frame_snapshot(clone, si);
+        debug_assert!(
+            bound,
+            "per-copy frame {si} refused for clone {clone} at bci {pc} -- \
+             `plan_copy_frames` and `set_node_frame_snapshot` disagree about \
+             which snapshot describes this node",
+        );
+    }
+}
+
+/// The loop skeleton [`partial_unroll_loop`] rewrites, as `unroll` found it.
+struct PartialUnroll {
+    /// The loop header. Its inputs are `[entry_pred, back_ctrl]` — the shared
+    /// checks above have already established the arity, and this transform
+    /// re-checks the ORDER, which they do not.
+    region: NodeId,
+    /// The `If` projection that re-enters the loop.
+    back_ctrl: NodeId,
+    /// The single loop-exit test.
+    if_node: NodeId,
+    /// Copies of the body to end up with, counting the original as one.
+    factor: usize,
+}
+
+/// Partially unroll a counted loop whose bound is a runtime value.
+///
+/// # The shape, and why this one
+///
+/// Read off the single-pass tier's own disassembly rather than assumed
+/// (`c2-unrolling-is-a-deopt-metadata-problem-20260911.md` §3): **the loop test
+/// is kept in every copy**, and only the back edge and its safepoint poll are
+/// amortised.
+///
+/// ```text
+/// header:
+///   cmp i, n ; jge exit      <- every copy keeps this
+///   BODY(i)  ; i += s
+///   cmp i, n ; jge exit
+///   BODY(i)  ; i += s        <- `factor` copies
+///   ...
+///   poll ; jmp header        <- paid once per `factor`
+/// ```
+///
+/// That needs **no trip-count arithmetic**, which is where the soundness risk
+/// in the textbook main-loop-plus-remainder form lives: the range-BCE closeout
+/// records that `i + (U-1)*s` overflows at the top of the `int` range and that
+/// the wrapped value passes a signed test. This form never computes that
+/// expression, so it never has to answer for it.
+///
+/// It also introduces **no speculation**. Copy `k` runs only if copy `k`'s own
+/// test passed, exactly as iteration `k` did before — which is what makes
+/// cloning a body containing a trapping `Op::Load` no different here from
+/// leaving it where it was.
+///
+/// # Where the early exits go, and why there is no exit merge
+///
+/// The textbook rendering of the diagram above gives each copy's failing test
+/// its own edge OUT of the loop, which needs a `factor`-way exit merge and, at
+/// it, an exit phi per carried value — and then every post-loop use of a
+/// carried phi, in node inputs AND in safepoint slots, has to be rewritten to
+/// the exit phi while every in-loop use is left alone. That rewrite is a
+/// partition of a use list by "is this inside the loop", and getting it wrong
+/// is not a crash: it is a frame slot naming the wrong iteration, which is the
+/// defect class `internal/fixed-bugs/` records as an H2 `GROUP BY` returning 3
+/// rows of 5.
+///
+/// So the early exits do not leave the loop. **Copy `k`'s failing test branches
+/// back to the header**, carrying that copy's values on a new header
+/// predecessor; the header's own test — copy 0's, which is the original `If`,
+/// untouched — then fails on those same values and leaves through the original
+/// exit.
+///
+/// The cost is one redundant header test, once, on the way out of the loop. The
+/// benefit is that **nothing outside the loop changes at all**: `exit_ctrl`
+/// keeps its users, the carried phis keep their identities and therefore their
+/// post-loop uses, and no safepoint slot anywhere in the method needs a
+/// rewrite. The transform is closed under the loop it is given.
+///
+/// # What it mutates
+///
+///  * appends `factor - 1` `If`/`Proj`/`Proj` triples, chained through the true
+///    edges, plus `factor - 1` clones of the body;
+///  * repoints the header's back edge at the LAST copy's true projection, and
+///    each carried phi's back-edge value at that copy's output;
+///  * appends the `factor - 1` early-exit projections as extra header
+///    predecessors, each with its copy's values as the matching phi inputs.
+///
+/// # Errors
+///
+/// The bucket of [`unroll_bucket`] to charge the refusal to. Every one of them
+/// is a shape this function declines to rewrite, never a partial rewrite
+/// abandoned halfway: each check runs before the first node is added.
+fn partial_unroll_loop(
+    graph: &mut Graph,
+    loop_: &PartialUnroll,
+    carried: &[NodeId],
+    order: &[NodeId],
+    per_copy: Option<&[(u32, SafepointSnapshot)]>,
+    dbg: bool,
+) -> Result<(), usize> {
+    let PartialUnroll {
+        region,
+        back_ctrl,
+        if_node,
+        factor,
+    } = *loop_;
+
+    // ── Everything that can refuse, before anything is added ─────────
+
+    // The back edge must be the header's input 1. The shared analysis found
+    // `back_ctrl` among the header's inputs without caring which slot it sat
+    // in, and `analyze_counted_loop` then read each carried phi's entry value
+    // from `inputs[1]` and its back-edge value from `inputs[2]` — which is only
+    // those two things if the header's predecessors are in that order. A
+    // reversed header is rare enough to decline and too quiet to assume.
+    let rin = graph.nodes[region as usize].inputs.as_slice().to_vec();
+    if rin.len() != 2 || rin[1] != back_ctrl {
+        if dbg {
+            eprintln!(
+                "[DBG_UNROLL] region {region}: partial bail — back edge is not header input 1"
+            );
+        }
+        return Err(unroll_bucket::CONTROL_SHAPE);
+    }
+    if rin[0] == NO_NODE || rin[0] == back_ctrl {
+        return Err(unroll_bucket::CONTROL_SHAPE);
+    }
+    // Each carried phi must have exactly the two values those two predecessors
+    // call for, so that appending one value per new predecessor keeps the
+    // positional pairing `ir_verify::check_phis` enforces.
+    for &p in carried {
+        if graph.nodes[p as usize].inputs.len() != 3 {
+            return Err(unroll_bucket::CONTROL_SHAPE);
+        }
+    }
+
+    // The condition has to be one of the nodes being cloned: every copy needs
+    // its OWN test, and a condition the clone set does not contain is one whose
+    // value does not change per copy — so every copy's test would read copy 0's
+    // induction variable and the loop would run forever.
+    let cond = graph.nodes[if_node as usize].inputs[1];
+    if !order.contains(&cond) {
+        if dbg {
+            eprintln!(
+                "[DBG_UNROLL] region {region}: partial bail — loop condition {cond} is not in the clone set"
+            );
+        }
+        return Err(unroll_bucket::BODY_UNCLONABLE);
+    }
+
+    // Which projection is which, read from the node rather than assumed.
+    let back_which = match graph.nodes[back_ctrl as usize].op {
+        Op::Proj(w) if w <= 1 => w,
+        _ => return Err(unroll_bucket::CONTROL_SHAPE),
+    };
+    let if_pc = graph.nodes[if_node as usize].bytecode_pc;
+
+    // ── From here the graph is edited; nothing below may refuse ──────
+
+    // Copy 0 is the ORIGINAL body and needs no clone — but it does need its
+    // nodes STAMPED with the original snapshot, because after this there are
+    // `factor` snapshots at each body bci and `ir_verify::check_frame_states`
+    // permits a duplicated bci only when every snapshot at it is CLAIMED. The
+    // substitution is empty, so `install_copy_frames`' in-place rewrite writes
+    // each slot its own current value and the frame is unchanged.
+    if let Some(plan) = per_copy {
+        let identity: FxHashMap<NodeId, NodeId> = FxHashMap::default();
+        install_copy_frames(graph, plan, &identity, order, true);
+    }
+
+    // The back-edge value of each carried phi, read before any of them is
+    // repointed: this is the ORIGINAL body's output, i.e. the values copy 1 is
+    // entered with.
+    let back_val: Vec<NodeId> = carried
+        .iter()
+        .map(|&p| graph.nodes[p as usize].inputs[2])
+        .collect();
+
+    let mut cur: FxHashMap<NodeId, NodeId> = carried
+        .iter()
+        .copied()
+        .zip(back_val.iter().copied())
+        .collect();
+
+    // The header predecessors this transform appends, in the order their phi
+    // inputs must be appended too: `(early_exit_proj, values entering that
+    // copy)`.
+    let mut extra_preds: Vec<(NodeId, Vec<NodeId>)> = Vec::with_capacity(factor - 1);
+    // The true edge the next copy hangs off. Copy 1 hangs off copy 0's.
+    let mut prev_true = back_ctrl;
+
+    for _k in 1..factor {
+        // The test first, so the copy's body has a control node to be anchored
+        // at. Its condition input is seeded with the ORIGINAL condition rather
+        // than a placeholder — a real edge keeps the use lists valid across the
+        // clone loop — and is repointed at this copy's own clone below.
+        let if_k = graph.add(Op::If, IrType::Control, vec![prev_true, cond], if_pc);
+        // `Proj(0)` before `Proj(1)`, which is the order `IrBuilder` adds them
+        // in and therefore the order every graph in this tree had until a
+        // transform cloned an `If`. `ir_schedule` no longer depends on it — it
+        // sorts an `If`'s successors by projection index precisely because this
+        // code broke that assumption once — but emitting the conventional order
+        // costs nothing and keeps a cloned loop reading like a built one.
+        let proj_lo = graph.add(Op::Proj(0), IrType::Control, vec![if_k], if_pc);
+        let proj_hi = graph.add(Op::Proj(1), IrType::Control, vec![if_k], if_pc);
+        let (t_k, x_k) = if back_which == 0 {
+            (proj_lo, proj_hi)
+        } else {
+            (proj_hi, proj_lo)
+        };
+
+        // The rename this copy is built under.
+        //
+        // The two control anchors are the two the shared side-effect scan
+        // spells (`ctrl == region || ctrl == back_ctrl`), and they map to
+        // DIFFERENT blocks, which is the whole of why a copy lands where it
+        // should:
+        //
+        //   * `region` — the header, i.e. before this copy's test — maps to
+        //     `prev_true`, the block that runs just before `if_k`;
+        //   * `back_ctrl` — after this copy's test — maps to `t_k`.
+        let mut subst: FxHashMap<NodeId, NodeId> = FxHashMap::default();
+        subst.insert(region, prev_true);
+        subst.insert(back_ctrl, t_k);
+        for (&p, &v) in &cur {
+            subst.insert(p, v);
+        }
+
+        let mut iter_clones: Vec<NodeId> = Vec::with_capacity(order.len());
+        for &d in order {
+            let (op, ty, pc) = {
+                let nd = &graph.nodes[d as usize];
+                (nd.op.clone(), nd.ty, nd.bytecode_pc)
+            };
+            let new_inputs: Vec<NodeId> = graph.nodes[d as usize]
+                .inputs
+                .iter()
+                .map(|&inp| subst.get(&inp).copied().unwrap_or(inp))
+                .collect();
+            let clone = graph.add(op, ty, new_inputs, pc);
+            subst.insert(d, clone);
+            iter_clones.push(clone);
+        }
+
+        // This copy's own test, now that its clone exists. `cond` is in `order`
+        // (checked above), so the lookup cannot miss.
+        let cond_k = subst[&cond];
+        graph.set_input(if_k, 1, cond_k);
+
+        // Per-copy deopt metadata, while `subst` still describes exactly this
+        // copy — the same ordering constraint `install_copy_frames` documents
+        // for the full unroller, and for the same reason.
+        if let Some(plan) = per_copy {
+            install_copy_frames(graph, plan, &subst, &iter_clones, false);
+        }
+
+        // This copy's test fails on the values the copy was ENTERED with, so
+        // those are what its early exit carries back to the header.
+        extra_preds.push((x_k, carried.iter().map(|p| cur[p]).collect::<Vec<NodeId>>()));
+
+        // Advance to the values the next copy is entered with.
+        cur = carried
+            .iter()
+            .copied()
+            .zip(
+                back_val
+                    .iter()
+                    .map(|bv| subst.get(bv).copied().unwrap_or(*bv)),
+            )
+            .collect();
+        prev_true = t_k;
+    }
+
+    // The real back edge is now the LAST copy's true projection, and each
+    // carried phi's back-edge value is that copy's output.
+    graph.set_input(region, 1, prev_true);
+    for (i, &p) in carried.iter().enumerate() {
+        let fin = cur[&p];
+        if fin != back_val[i] {
+            graph.set_input(p, 2, fin);
+        }
+    }
+
+    // The early exits, appended as extra header predecessors. Predecessor `j`
+    // of the header pairs with phi input `j + 1`, so the two pushes have to
+    // stay in lockstep — which is why each copy's values were captured
+    // alongside its projection rather than recomputed here.
+    for (x_k, vals) in extra_preds {
+        graph.push_input(region, x_k);
+        for (&p, &v) in carried.iter().zip(vals.iter()) {
+            graph.push_input(p, v);
+        }
+    }
+
+    if dbg {
+        eprintln!(
+            "[DBG_UNROLL] partially unrolled counted loop (region {region}, factor {factor}, \
+             {} cloned nodes/copy, per-copy frames: {})",
+            order.len(),
+            per_copy.is_some(),
+        );
+    }
+    Ok(())
+}
+
 fn unroll(graph: &mut Graph) -> bool {
     let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNROLL").is_some();
+    // Per-call, in `UnrollCensus` field order. See `publish_unroll_census`.
+    let mut census = [0usize; 17];
     // Computed ONCE for the whole graph, before any header is transformed:
     // unrolling only clones pure nodes and `Op::Load`s, so it cannot introduce
     // a trapping op, and re-deriving it per header would give the same answer
@@ -3052,8 +4246,10 @@ fn unroll(graph: &mut Graph) -> bool {
         if !matches!(graph.nodes[region as usize].op, Op::Region | Op::Merge) {
             continue; // killed by an earlier unroll in this pass
         }
+        census[unroll_bucket::HEADERS] += 1;
         let rin = graph.nodes[region as usize].inputs.clone();
         if rin.len() != 2 {
+            census[unroll_bucket::NOT_SINGLE_BACKEDGE] += 1;
             continue; // single back-edge only
         }
         let users = build_users(graph);
@@ -3069,6 +4265,7 @@ fn unroll(graph: &mut Graph) -> bool {
             if dbg {
                 eprintln!("[DBG_UNROLL] header {region}: bail — not a single-back-edge loop (back={back_inputs:?})");
             }
+            census[unroll_bucket::NOT_SINGLE_BACKEDGE] += 1;
             continue;
         }
         let back_ctrl = back_inputs[0];
@@ -3078,11 +4275,58 @@ fn unroll(graph: &mut Graph) -> bool {
             .find(|&i| i != back_ctrl)
             .unwrap_or(NO_NODE);
         if entry_pred == NO_NODE {
+            census[unroll_bucket::NOT_SINGLE_BACKEDGE] += 1;
             continue;
         }
+        // `partial` selects the transform at the bottom of this body. Every
+        // check between here and there is shared: a partial unroll clones the
+        // same node set, under the same control-shape, side-effect, escape and
+        // frame obligations. The two differ only in what they emit — a full
+        // unroll retires the loop, a partial one keeps it — so sharing the
+        // analysis is what keeps a widening of either from silently applying to
+        // the other with no reasoning behind it.
+        let mut partial = false;
         let info = match analyze_counted_loop(graph, region, back_ctrl) {
-            Some(i) => i,
-            None => continue,
+            Ok(i) => i,
+            Err(NotCounted::Shape) => {
+                census[unroll_bucket::NOT_COUNTED] += 1;
+                continue;
+            }
+            Err(NotCounted::RuntimeBound(rb)) => {
+                census[unroll_bucket::RUNTIME_BOUND] += 1;
+                if trap_free {
+                    census[unroll_bucket::RUNTIME_BOUND_TRAP_FREE] += 1;
+                }
+                if partial_unroll_body_is_pure(graph, &users, region, back_ctrl, rb.if_node) {
+                    census[unroll_bucket::RUNTIME_BOUND_PURE_BODY] += 1;
+                }
+                if !partial_unroll_enabled() {
+                    // Terminal here, and only here: with the flag off, "the
+                    // bound is a value" is the whole disposition.
+                    census[unroll_bucket::RUNTIME_BOUND_REFUSED] += 1;
+                    continue;
+                }
+                partial = true;
+                // The three bound-dependent fields are not merely unknown here,
+                // they are unused: `partial_unroll_loop` never evaluates the
+                // induction variable. `iv_phi` is `NO_NODE` so that the one
+                // place the full-unroll emitter special-cases it
+                // (`p == info.iv_phi`, which substitutes a concrete constant)
+                // cannot match a real phi on this path even if the two emitters
+                // are ever merged.
+                CountedLoop {
+                    iv_phi: NO_NODE,
+                    iv_init: 0,
+                    iv_stride: 0,
+                    trip: 0,
+                    if_node: rb.if_node,
+                    exit_ctrl: rb.exit_ctrl,
+                }
+            }
+            Err(NotCounted::TripOverCap) => {
+                census[unroll_bucket::TRIP_OVER_CAP] += 1;
+                continue;
+            }
         };
 
         // Control simplicity: the loop must be a single block —
@@ -3098,6 +4342,7 @@ fn unroll(graph: &mut Graph) -> bool {
             if dbg {
                 eprintln!("[DBG_UNROLL] region {region}: bail — region control users {region_ctrl_users:?} != [if {}]", info.if_node);
             }
+            census[unroll_bucket::CONTROL_SHAPE] += 1;
             continue;
         }
         let mut if_users = users[info.if_node as usize].clone();
@@ -3108,6 +4353,7 @@ fn unroll(graph: &mut Graph) -> bool {
             if dbg {
                 eprintln!("[DBG_UNROLL] region {region}: bail — if users {if_users:?} != projs {expect_projs:?}");
             }
+            census[unroll_bucket::CONTROL_SHAPE] += 1;
             continue;
         }
         let back_ctrl_users: Vec<NodeId> = users[back_ctrl as usize]
@@ -3119,6 +4365,7 @@ fn unroll(graph: &mut Graph) -> bool {
             if dbg {
                 eprintln!("[DBG_UNROLL] region {region}: bail — back_ctrl control users {back_ctrl_users:?} != [region {region}]");
             }
+            census[unroll_bucket::CONTROL_SHAPE] += 1;
             continue;
         }
 
@@ -3136,6 +4383,7 @@ fn unroll(graph: &mut Graph) -> bool {
             }
         }
         if !ok {
+            census[unroll_bucket::CONTROL_SHAPE] += 1;
             continue;
         }
         let carried_set: FxHashSet<NodeId> = carried.iter().copied().collect();
@@ -3187,6 +4435,7 @@ fn unroll(graph: &mut Graph) -> bool {
             }
         }
         if !ok {
+            census[unroll_bucket::SIDE_EFFECT] += 1;
             continue;
         }
 
@@ -3229,9 +4478,22 @@ fn unroll(graph: &mut Graph) -> bool {
             }
         }
         if !ok {
+            census[unroll_bucket::BODY_UNCLONABLE] += 1;
             continue;
         }
         if to_clone.len() > UNROLL_MAX_BODY {
+            census[unroll_bucket::BODY_UNCLONABLE] += 1;
+            continue;
+        }
+        // A partial unroll emits `factor` copies of the body and KEEPS them —
+        // a full unroll's copies mostly fold away against concrete induction
+        // constants, and these cannot, because there is no trip count to make
+        // them concrete. So the budget applies to the emitted total, not to one
+        // copy. An empty body is refused for the separate reason that
+        // unrolling one buys nothing and still adds `factor - 1` tests.
+        let factor = partial_unroll_factor();
+        if partial && (to_clone.is_empty() || to_clone.len() * factor > UNROLL_MAX_BODY) {
+            census[unroll_bucket::BODY_UNCLONABLE] += 1;
             continue;
         }
         // Refuse a loop whose body (or carried phi) is named by a safepoint
@@ -3276,7 +4538,43 @@ fn unroll(graph: &mut Graph) -> bool {
         // body no snapshot names, which on javac output is almost none -- a
         // snapshot records the full operand stack at every bci, so any loop
         // whose body leaves a value on the stack was refused.
-        if body_named_by_safepoint {
+        //
+        // ...or unless each copy gets a frame of its OWN, which is what the
+        // comment above calls "a per-iteration snapshot index" and what
+        // `ir_per_copy_frames_enabled` turns on. That path does not rest on any
+        // prediction about reachability: it answers the objection rather than
+        // arguing the objection cannot be reached, so it needs neither the
+        // trap-free fact nor the net below.
+        let mut per_copy: Option<Vec<(u32, SafepointSnapshot)>> = None;
+        if body_named_by_safepoint && ir_per_copy_frames_enabled() {
+            match plan_copy_frames(graph, &to_clone) {
+                Ok(plan) => per_copy = Some(plan),
+                Err(()) => {
+                    if dbg {
+                        eprintln!("[DBG_UNROLL] region {region}: bail — a snapshot names the body at a bci no clone carries");
+                    }
+                    census[unroll_bucket::FRAME_UNCOPYABLE] += 1;
+                    continue;
+                }
+            }
+        }
+        if body_named_by_safepoint && per_copy.is_none() {
+            // A PARTIAL unroll may not take the unreachable-frames escape, and
+            // the reason is not caution — the escape does not apply to it.
+            //
+            // It rests on `build_deopt_points` skipping every point in a
+            // trap-free graph, which makes the collapsed frames unconsultable.
+            // For a full unroll that is the whole story, because the loop is
+            // gone and there is no other reader. A partial unroll KEEPS the
+            // loop, and the safepoint POLL on its back edge is emitted whether
+            // or not the graph can deopt — so the snapshots at the body's bcis
+            // remain live oop-map material describing copy 0 while copies
+            // `1..factor` execute. Per-copy frames are not an optimization
+            // here; they are the transform's precondition.
+            if partial {
+                census[unroll_bucket::SAFEPOINT_NAMED] += 1;
+                continue;
+            }
             // The relaxation additionally requires the CONSUMER of the
             // trap-free fact to be available: if `build_deopt_points` is not
             // going to skip the points, the snapshots are live and the original
@@ -3285,6 +4583,7 @@ fn unroll(graph: &mut Graph) -> bool {
                 && trap_free
                 && crate::ir_lower::ir_drop_unreachable_homes_enabled())
             {
+                census[unroll_bucket::SAFEPOINT_NAMED] += 1;
                 continue;
             }
             UNROLL_USED_UNREACHABLE_FRAMES.with(|c| c.set(true));
@@ -3293,8 +4592,15 @@ fn unroll(graph: &mut Graph) -> bool {
         // re-anchor them); milestone-1 only handles variant (cloned) loads.
         let mut pinned_invariant_load = false;
         for id in 0..graph.nodes.len() {
+            // Both body anchors, for the reason the `subst` above now covers
+            // both: an invariant load pinned to the BACK EDGE is left naming a
+            // killed control node just as surely as one pinned to the header,
+            // and this check is what keeps it from getting there.
             if matches!(graph.nodes[id].op, Op::Load(_))
-                && graph.nodes[id].inputs.first().copied() == Some(region)
+                && matches!(
+                    graph.nodes[id].inputs.first().copied(),
+                    Some(c) if c == region || c == back_ctrl
+                )
                 && !to_clone.contains(&(id as NodeId))
             {
                 pinned_invariant_load = true;
@@ -3305,6 +4611,7 @@ fn unroll(graph: &mut Graph) -> bool {
             if dbg {
                 eprintln!("[DBG_UNROLL] region {region}: bail — invariant load pinned to header");
             }
+            census[unroll_bucket::ESCAPES_OR_PINNED] += 1;
             continue;
         }
 
@@ -3327,6 +4634,7 @@ fn unroll(graph: &mut Graph) -> bool {
             if dbg {
                 eprintln!("[DBG_UNROLL] region {region}: bail — a body value escapes the loop");
             }
+            census[unroll_bucket::ESCAPES_OR_PINNED] += 1;
             continue;
         }
 
@@ -3356,6 +4664,34 @@ fn unroll(graph: &mut Graph) -> bool {
             }
         }
 
+        if partial {
+            match partial_unroll_loop(
+                graph,
+                &PartialUnroll {
+                    region,
+                    back_ctrl,
+                    if_node: info.if_node,
+                    factor,
+                },
+                &carried,
+                &order,
+                per_copy.as_deref(),
+                dbg,
+            ) {
+                Ok(()) => {}
+                Err(bucket) => {
+                    census[bucket] += 1;
+                    continue;
+                }
+            }
+            census[unroll_bucket::PARTIALLY_UNROLLED] += 1;
+            if per_copy.is_some() {
+                census[unroll_bucket::PER_COPY_FRAMES] += 1;
+            }
+            changed = true;
+            continue;
+        }
+
         // Running value of each carried phi entering the current iteration,
         // seeded with its preheader (entry) value.
         let mut cur: FxHashMap<NodeId, NodeId> = FxHashMap::default();
@@ -3369,10 +4705,29 @@ fn unroll(graph: &mut Graph) -> bool {
             // concrete constant init + t*stride).
             let mut subst: FxHashMap<NodeId, NodeId> = FxHashMap::default();
             subst.insert(region, entry_pred);
+            // ...and the OTHER control node a body value can be anchored to.
+            //
+            // This pass's own side-effect scan spells the body's control
+            // anchors `ctrl == region || ctrl == back_ctrl`, and `subst` covered
+            // only the first. A cloned `Op::Load` pinned to the back edge
+            // therefore kept `back_ctrl` as its control input across the
+            // teardown's `graph.kill(back_ctrl)`, and every copy pointed at a
+            // `Op::Dead`. `ir_verify`'s structural lane caught it -- "n24:
+            // Load(Int) input[0] = n16 refers to a removed (Dead) node", ten
+            // violations for five copies of a two-load body -- and the compile
+            // was refused, so the shape never reached the code. It was
+            // unreachable before per-copy frames only because a loop with a
+            // loop-carried receiver is one a safepoint snapshot names.
+            //
+            // `entry_pred` is right for both: a fully unrolled loop runs every
+            // iteration unconditionally in the preheader, so every body anchor
+            // becomes the preheader.
+            subst.insert(back_ctrl, entry_pred);
             for (&p, &v) in &cur {
                 subst.insert(p, v);
             }
             // Clone the per-iteration computation in topo order.
+            let mut iter_clones: Vec<NodeId> = Vec::with_capacity(order.len());
             for &d in &order {
                 let (op, ty, pc) = {
                     let nd = &graph.nodes[d as usize];
@@ -3385,6 +4740,13 @@ fn unroll(graph: &mut Graph) -> bool {
                     .collect();
                 let clone = graph.add(op, ty, new_inputs, pc);
                 subst.insert(d, clone);
+                iter_clones.push(clone);
+            }
+            // Per-copy deopt metadata, while `subst` still describes exactly
+            // this iteration. See `install_copy_frames` for why the order
+            // matters.
+            if let Some(plan) = per_copy.as_ref() {
+                install_copy_frames(graph, plan, &subst, &iter_clones, t == 0);
             }
             // Advance carried phis to their next-iteration values.
             let mut next: FxHashMap<NodeId, NodeId> = FxHashMap::default();
@@ -3431,8 +4793,13 @@ fn unroll(graph: &mut Graph) -> bool {
                 to_clone.len()
             );
         }
+        census[unroll_bucket::UNROLLED] += 1;
+        if per_copy.is_some() {
+            census[unroll_bucket::PER_COPY_FRAMES] += 1;
+        }
         changed = true;
     }
+    publish_unroll_census(&census);
     changed
 }
 
@@ -3785,18 +5152,21 @@ mod tests {
             ty,
             inputs: vec![].into(),
             bytecode_pc: None,
+            frame_snapshot: None,
         });
         nodes.push(Node {
             op: Op::Const(b),
             ty,
             inputs: vec![].into(),
             bytecode_pc: None,
+            frame_snapshot: None,
         });
         nodes.push(Node {
             op,
             ty,
             inputs: vec![0, 1].into(),
             bytecode_pc: None,
+            frame_snapshot: None,
         });
         try_fold(&nodes, 2)
     }
@@ -3808,12 +5178,14 @@ mod tests {
             ty,
             inputs: vec![].into(),
             bytecode_pc: None,
+            frame_snapshot: None,
         });
         nodes.push(Node {
             op,
             ty,
             inputs: vec![0].into(),
             bytecode_pc: None,
+            frame_snapshot: None,
         });
         try_fold(&nodes, 1)
     }
@@ -5757,6 +7129,755 @@ mod tests {
         assert!(
             licm_scev_corroborates(&code, code.len()),
             "SCEV must corroborate a simple counted loop"
+        );
+    }
+}
+
+
+// ── Per-copy deopt metadata ──────────────────────────────────────────
+//
+// These two tests are deliberately OPPOSED. The first asserts the loop
+// unrolls with per-copy frames and that each copy's frame holds that copy's
+// values; the second asserts the SAME fixture is refused with the flag off.
+// Neither can pass vacuously while the other holds: if the fixture were one
+// the unroller took anyway, the second would fail, and the first would then be
+// proving nothing about the mechanism.
+
+#[cfg(test)]
+mod per_copy_frames_tests {
+    use super::*;
+    use crate::ir::IrBuilder;
+
+    /// `int f() { int a = 0; for (int i = 0; i < 5; i++) a += i; return a; }`
+    ///
+    /// Two locals, no parameters, and — the point of the fixture — built by the
+    /// real front end, so it carries a `SafepointSnapshot` at every one of its
+    /// 15 bytecode indices. The hand-built graphs elsewhere in this module
+    /// carry none, which is exactly why they never reach the refusal this
+    /// mechanism lifts.
+    const LOOP5: [u8; 21] = [
+        0x03, 0x3B, // iconst_0; istore_0        a = 0
+        0x03, 0x3C, // iconst_0; istore_1        i = 0
+        0x1B, 0x08, 0xA2, 0x00, 0x0D, // iload_1; iconst_5; if_icmpge 19
+        0x1A, 0x1B, 0x60, 0x3B, // iload_0; iload_1; iadd; istore_0   a += i
+        0x84, 0x01, 0x01, // iinc 1, 1                                i++
+        0xA7, 0xFF, 0xF4, // goto 4
+        0x1A, 0xAC, // iload_0; ireturn
+    ];
+
+    /// The bci of the `iadd` — the one body bci that survives as real code, and
+    /// so the one whose snapshots the copies must not share.
+    const IADD_BCI: usize = 11;
+
+    fn optimized(per_copy: bool) -> Graph {
+        cratonvm_types::flags::with_thread_overrides(
+            &[(
+                "CRATONVM_JIT_IR_PER_COPY_FRAMES",
+                Some(if per_copy { "1" } else { "0" }),
+            )],
+            || {
+                let mut g = IrBuilder::new(0, 2).build(&LOOP5, 21).expect("IR build");
+                optimize(&mut g);
+                g
+            },
+        )
+    }
+
+    /// Read a snapshot slot as a constant, for a graph the post-unroll fold has
+    /// already collapsed to constants.
+    fn const_slot(g: &Graph, slot: NodeId) -> Option<i64> {
+        match g.node_opt(slot)?.op {
+            Op::Const(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Each copy of an unrolled body gets an interpreter frame holding ITS
+    /// OWN values.
+    ///
+    /// This is the whole mechanism, and it is asserted on the numbers rather
+    /// than on the shape, because the shape is what a wrong version also has.
+    /// A cloned node keeps the original's `bytecode_pc`, so all five copies of
+    /// the `iadd` sit at bci 11; the by-bci scan `ir_lower` uses would hand
+    /// every one of them copy 0's frame. What the accumulator actually holds
+    /// entering iteration `t` is `0, 0, 1, 3, 6` — five different numbers — and
+    /// the induction variable holds `0..4`. A version that shares one frame
+    /// reads `(0, 0)` five times and fails here on the second copy.
+    #[test]
+    fn each_copy_of_an_unrolled_body_names_its_own_interpreter_frame() {
+        let before = ir_unroll_census();
+        let g = optimized(true);
+        let fired = ir_unroll_census().per_copy_frames > before.per_copy_frames;
+        assert!(
+            fired,
+            "the fixture did not unroll over per-copy frames, so everything \
+             below is vacuous -- check that `unroll_enabled` is on and that \
+             the loop is still recognised as counted",
+        );
+
+        let mut frames: Vec<(i64, i64)> = Vec::new();
+        for sp in g.safepoints.iter().filter(|sp| sp.bci == IADD_BCI) {
+            let a = const_slot(&g, sp.locals[0]);
+            let i = const_slot(&g, sp.locals[1]);
+            match (a, i) {
+                (Some(a), Some(i)) => frames.push((a, i)),
+                _ => panic!(
+                    "a frame at bci {IADD_BCI} names a non-constant slot \
+                     (locals {:?}) -- after the post-unroll fold every copy's \
+                     values are concrete, so this is a slot the unroll \
+                     stranded",
+                    sp.locals
+                ),
+            }
+        }
+        assert_eq!(
+            frames,
+            vec![(0, 0), (0, 1), (1, 2), (3, 3), (6, 4)],
+            "the five copies of bci {IADD_BCI} do not each hold their own \
+             (accumulator, induction) pair",
+        );
+
+        // Every one of those frames must be CLAIMED by the copy it describes:
+        // the numbers above are only reachable at run time if the trapping
+        // node names its own snapshot instead of falling back to the by-bci
+        // scan, which finds the first.
+        let claimed: std::collections::HashSet<u32> = g
+            .nodes
+            .iter()
+            .filter(|n| n.op != Op::Dead)
+            .filter_map(|n| n.frame_snapshot)
+            .collect();
+        let at_iadd: Vec<u32> = g
+            .safepoints
+            .iter()
+            .enumerate()
+            .filter(|(_, sp)| sp.bci == IADD_BCI)
+            .map(|(si, _)| si as u32)
+            .collect();
+        for si in &at_iadd {
+            assert!(
+                claimed.contains(si),
+                "safepoint[{si}] at bci {IADD_BCI} is one of {} copies and no \
+                 node names it; `ir_lower` would resolve that copy through the \
+                 by-bci scan and hand it copy 0's frame",
+                at_iadd.len(),
+            );
+        }
+
+        // And the graph must survive the frame-state verifier, which is what
+        // says the relaxed duplicate-bci rule and the producer agree.
+        // Frame states only. `check_arena_order` is a heuristic that fires on
+        // essentially every optimized graph (unroll appends its clones after
+        // the `Return` that uses them), and it is off in production for that
+        // reason -- turning it on here would fail for something this change
+        // has nothing to do with.
+        let opts = crate::ir_verify::VerifyOptions {
+            check_frame_states: true,
+            ..crate::ir_verify::VerifyOptions::structural()
+        };
+        crate::ir_verify::verify_graph(&g, "per-copy-frames", opts)
+            .expect("an unrolled graph with per-copy frames must verify");
+    }
+
+    /// The same fixture, with the mechanism off, is REFUSED — and refused for
+    /// the reason the mechanism addresses.
+    ///
+    /// Without this, the test above proves nothing: a fixture the unroller
+    /// would have taken anyway would satisfy every assertion there while the
+    /// per-copy code did no work at all. This is the half that pins the
+    /// fixture to the refusal.
+    #[test]
+    fn the_same_loop_is_refused_when_per_copy_frames_are_off() {
+        let before = ir_unroll_census();
+        let g = optimized(false);
+        let after = ir_unroll_census();
+        assert!(
+            after.safepoint_named > before.safepoint_named,
+            "the fixture was not declined for `safepoint_named` with per-copy \
+             frames off (census delta: {:?} -> {:?}); either the refusal moved \
+             or this loop no longer reaches it",
+            before,
+            after,
+        );
+        assert!(
+            g.nodes.iter().any(|n| {
+                matches!(n.op, Op::Region | Op::Merge) && n.inputs.len() == 2
+            }),
+            "the loop header is gone, so the loop was unrolled after all",
+        );
+    }
+
+    /// A javac counted loop with a RUNTIME bound is partially unrolled.
+    ///
+    /// This is the population `c2-unrolling-is-a-deopt-metadata-problem-*.md`
+    /// measured and found to be **every** counted loop in both benchmark
+    /// suites: `for (i = 0; i < n; i++)`, where `n` is a value. Full unrolling
+    /// can never serve one, and before the partial unroller the census recorded
+    /// it as `runtime_bound` and stopped.
+    ///
+    /// The assertions are on the resulting graph's NUMBERS rather than on its
+    /// shape, because a wrong version has the same shape. With `factor = 4` the
+    /// loop must end up with:
+    ///
+    ///   * **four** `If`s — one test per copy, which is the whole point of this
+    ///     unroll form: no trip-count arithmetic, so nothing is elided;
+    ///   * a header with **five** predecessors — the pre-header, the one real
+    ///     back edge from the last copy, and the three early exits, which in
+    ///     this form re-enter the header instead of leaving the loop;
+    ///   * carried phis with **six** inputs — the merge plus one value per
+    ///     predecessor, the pairing `ir_verify::check_phis` enforces.
+    ///
+    /// `f` is `static int f(int n) { int a = 0; for (int i = 0; i < n; i++) a
+    /// += i; return a; }` — §1's fixture with its constant bound replaced by a
+    /// parameter, which is the single edit that moves it from one unroller's
+    /// population to the other's.
+    #[test]
+    fn a_runtime_bound_counted_loop_is_partially_unrolled() {
+        let code = [
+            0x03u8, 0x3C, // iconst_0; istore_1        a = 0
+            0x03, 0x3D, // iconst_0; istore_2          i = 0
+            0x1C, 0x1A, 0xA2, 0x00, 0x0D, // iload_2; iload_0; if_icmpge 19
+            0x1B, 0x1C, 0x60, 0x3C, // iload_1; iload_2; iadd; istore_1
+            0x84, 0x02, 0x01, // iinc 2, 1
+            0xA7, 0xFF, 0xF4, // goto 4
+            0x1B, 0xAC, // iload_1; ireturn
+        ];
+
+        let g = cratonvm_types::flags::with_thread_overrides(
+            &[
+                ("CRATONVM_JIT_IR_PER_COPY_FRAMES", Some("1")),
+                ("CRATONVM_JIT_IR_PARTIAL_UNROLL", Some("1")),
+                ("CRATONVM_JIT_IR_PARTIAL_UNROLL_FACTOR", Some("4")),
+            ],
+            || {
+                let mut g = IrBuilder::new(1, 3).build(&code, 21).expect("IR build");
+                optimize(&mut g);
+                g
+            },
+        );
+
+        let ifs = g.nodes.iter().filter(|n| n.op == Op::If).count();
+        assert_eq!(
+            ifs, 4,
+            "factor 4 keeps the loop test in every copy, so four `If`s — got {ifs}",
+        );
+
+        // The header is the one Merge/Region a phi is anchored at.
+        let header = g
+            .nodes
+            .iter()
+            .find(|n| n.op == Op::Phi)
+            .and_then(|n| n.inputs.first().copied())
+            .expect("the loop must still have a carried phi");
+        assert_eq!(
+            g.nodes[header as usize].inputs.len(),
+            5,
+            "pre-header + one real back edge + three early exits that re-enter",
+        );
+        for (id, node) in g.nodes.iter().enumerate() {
+            if node.op != Op::Phi || node.inputs.first().copied() != Some(header) {
+                continue;
+            }
+            assert_eq!(
+                node.inputs.len(),
+                6,
+                "n{id} is a phi at a five-predecessor merge and needs five values",
+            );
+        }
+
+        crate::ir_verify::verify_graph(
+            &g,
+            "partial-unroll-runtime-bound",
+            crate::ir_verify::VerifyOptions::structural(),
+        )
+        .expect("a partially unrolled loop must verify");
+    }
+
+    /// A partially unrolled body may contain a LOAD, and every copy of it keeps
+    /// a live control anchor.
+    ///
+    /// The same fixture as `a_body_value_pinned_to_the_back_edge_survives_the_
+    /// unroll`, with its constant bound replaced by a parameter so it reaches
+    /// the partial unroller instead of the full one. It is the shape that found
+    /// the full unroller's missing `back_ctrl` substitution, and the partial
+    /// unroller substitutes BOTH anchors to different blocks — `region` to the
+    /// block before this copy's test and `back_ctrl` to the block after it — so
+    /// it has strictly more to get wrong, not less.
+    ///
+    /// A `Load` can also deopt, which is what makes this the test that per-copy
+    /// frames are actually being installed on the partial path: without them
+    /// the loop is refused (`safepoint_named`) and the assertion on the `If`
+    /// count fails.
+    ///
+    /// `walk` is `static int walk(N o, int n) { int a = 0; for (int i = 0; i <
+    /// n; i++) { a += o.v; o = o.next; } return a; }`.
+    #[test]
+    fn a_partially_unrolled_body_may_contain_a_load() {
+        let code = [
+            0x03u8, 0x3D, // iconst_0; istore_2           a = 0
+            0x03, 0x3E, // iconst_0; istore_3             i = 0
+            0x1D, 0x1B, 0xA2, 0x00, 0x15, // iload_3; iload_1; if_icmpge 27
+            0x1C, 0x2A, 0xB4, 0x00, 0x07, 0x60, 0x3D, // a += o.v
+            0x2A, 0xB4, 0x00, 0x0D, 0x4B, // o = o.next
+            0x84, 0x03, 0x01, // iinc 3, 1
+            0xA7, 0xFF, 0xEC, // goto 4
+            0x1C, 0xAC, // iload_2; ireturn
+        ];
+        // pc → (field index, type tag). 11 is `v` (int), 17 is `next` (ref).
+        let mut info: std::collections::HashMap<usize, (usize, u8)> =
+            std::collections::HashMap::new();
+        info.insert(11, (0, b'I'));
+        info.insert(17, (1, b'L'));
+
+        let g = cratonvm_types::flags::with_thread_overrides(
+            &[
+                ("CRATONVM_JIT_IR_PER_COPY_FRAMES", Some("1")),
+                ("CRATONVM_JIT_IR_PARTIAL_UNROLL", Some("1")),
+                ("CRATONVM_JIT_IR_PARTIAL_UNROLL_FACTOR", Some("2")),
+            ],
+            || {
+                let mut builder = IrBuilder::new(2, 4);
+                builder.set_field_info(info.clone());
+                let mut g = builder.build(&code, 29).expect("IR build");
+                optimize(&mut g);
+                g
+            },
+        );
+
+        let ifs = g.nodes.iter().filter(|n| n.op == Op::If).count();
+        assert_eq!(ifs, 2, "factor 2 keeps one test per copy — got {ifs}");
+        let loads = g
+            .nodes
+            .iter()
+            .filter(|n| n.op != Op::Dead && matches!(n.op, Op::Load(_)))
+            .count();
+        assert_eq!(
+            loads, 4,
+            "two loads per body, two copies — got {loads}; a fixture with none \
+             is not the shape under test",
+        );
+
+        for (id, node) in g.nodes.iter().enumerate() {
+            if node.op == Op::Dead {
+                continue;
+            }
+            for (k, &inp) in node.inputs.iter().enumerate() {
+                if inp == NO_NODE {
+                    continue;
+                }
+                assert_ne!(
+                    g.nodes[inp as usize].op,
+                    Op::Dead,
+                    "n{id}:{:?} input[{k}] = n{inp} names a node the unroll killed",
+                    node.op,
+                );
+            }
+        }
+        crate::ir_verify::verify_graph(
+            &g,
+            "partial-unroll-with-loads",
+            crate::ir_verify::VerifyOptions::structural(),
+        )
+        .expect("a partially unrolled loop with loads must verify");
+    }
+
+    /// An invariant load whose base may be null is NOT hoisted out of a loop
+    /// that may not run.
+    ///
+    /// # The wrong answer this pins
+    ///
+    /// `probes/ZeroTripHoist.java` is `static int walk(N o, int n) { int a = 0;
+    /// for (int i = 0; i < n; i++) a += o.v; return a; }`. `walk(null, 0)`
+    /// returns 0 — the body never runs, so `o` is never dereferenced. Hoisting
+    /// the read to the pre-header makes it run anyway, and the `getfield`'s own
+    /// null check comes with it, so the method throws where it should return.
+    /// Measured against Temurin 25 before the fix: HotSpot `0`, CratonVM's
+    /// optimizing tier a thrown `NullPointerException`.
+    ///
+    /// # Why both arms
+    ///
+    /// The fix is a PERMISSION, not a refusal to hoist at all — hoisting is the
+    /// point of the pass, and a guard that turned it off everywhere would pass
+    /// a one-armed test while destroying the optimization. So the same graph is
+    /// run twice, differing only in whether the base is the receiver:
+    ///
+    /// * a STATIC method's first parameter can be null — refused, the load's
+    ///   control edge does not move;
+    /// * the same parameter as a RECEIVER is non-null by the JVM's own
+    ///   guarantee — hoisted, and the edge does move.
+    ///
+    /// One arm alone cannot tell "safe" from "switched off".
+    #[test]
+    fn an_invariant_load_of_a_maybe_null_base_is_not_hoisted_out_of_a_maybe_empty_loop() {
+        let code = [
+            0x03u8, 0x3D, // iconst_0; istore_2           a = 0
+            0x03, 0x3E, // iconst_0; istore_3             i = 0
+            0x1D, 0x1B, 0xA2, 0x00, 0x10, // iload_3; iload_1; if_icmpge 22
+            0x1C, 0x2A, 0xB4, 0x00, 0x07, 0x60, 0x3D, // a += o.v
+            0x84, 0x03, 0x01, // iinc 3, 1
+            0xA7, 0xFF, 0xF1, // goto 4
+            0x1C, 0xAC, // iload_2; ireturn
+        ];
+        let mut info: std::collections::HashMap<usize, (usize, u8)> =
+            std::collections::HashMap::new();
+        info.insert(11, (0, b'I'));
+
+        // Returns (load id, control edge before licm, control edge after).
+        let anchor_move = |receiver: Option<u16>| -> (NodeId, NodeId, NodeId) {
+            let mut builder = IrBuilder::new(2, 4);
+            builder.set_field_info(info.clone());
+            let mut g = builder.build(&code, 24).expect("IR build");
+            g.receiver_param = receiver;
+            // The cleanup `optimize` runs before LICM, so the pass sees the
+            // same graph it would in production — but LICM is called directly,
+            // because what is under test is one pass's decision and `optimize`
+            // would fold the evidence away.
+            for _ in 0..8 {
+                let before = g.live_count();
+                fold_constants(&mut g);
+                algebraic_simplify(&mut g);
+                gvn(&mut g);
+                eliminate_dead_nodes(&mut g);
+                if g.live_count() == before {
+                    break;
+                }
+            }
+            // Normalize the single-input merges FIRST. `licm` does this
+            // itself, and it renumbers a load's control anchor without moving
+            // it — which would make the before/after comparison below read a
+            // hoist that never happened.
+            collapse_trivial_merges(&mut g);
+            let load = g
+                .nodes
+                .iter()
+                .position(|n| matches!(n.op, Op::Load(_)))
+                .expect("the fixture must contain the field read") as NodeId;
+            let before = g.nodes[load as usize].inputs[0];
+            licm(&mut g);
+            (load, before, g.nodes[load as usize].inputs[0])
+        };
+
+        let (load, was, now) = anchor_move(None);
+        assert_eq!(
+            was, now,
+            "n{load} is a read of a STATIC method's parameter, which may be \
+             null, in a loop that may run zero times — hoisting it invents an \
+             NPE (probes/ZeroTripHoist.java)",
+        );
+
+        let (load, was, now) = anchor_move(Some(0));
+        assert_ne!(
+            was, now,
+            "n{load} is a read of the RECEIVER, which the JVM guarantees \
+             non-null, so the hoist is safe and must still happen — a guard \
+             that refuses this one is not a safety condition, it is LICM \
+             switched off",
+        );
+    }
+
+    /// LICM before the unroller, with the memory edge moved, makes the copies
+    /// of an unrolled body SHARE one invariant read instead of cloning it.
+    ///
+    /// # What each half does, and why neither is enough alone
+    ///
+    /// `CRATONVM_JIT_IR_LICM_BEFORE_UNROLL` moves the pass. On its own it
+    /// changes nothing here: the unroller builds its clone set by DATA
+    /// dependence, so a read the accumulator consumes is cloned per copy
+    /// whatever its control anchor says. Measured, not assumed — the flag alone
+    /// leaves this fixture with two reads.
+    ///
+    /// `CRATONVM_JIT_IR_LICM_MEM_EDGE` moves the hoisted load's MEMORY input to
+    /// the loop-entry state. That is what makes the copies identical
+    /// expressions, so the trailing GVN folds them to one; without it each
+    /// clone still names the header's memory phi and they stay distinct.
+    ///
+    /// Together they are the pair, which is why this test sets both from one
+    /// switch: the arms are `neither` and `both`.
+    ///
+    /// # The load count is the load-bearing assertion
+    ///
+    /// The `If` count only says the loop unrolled, and it unrolls in BOTH arms
+    /// — asserted, so a future change that stops unrolling this shape fails
+    /// here rather than quietly making the contrast vacuous. The LOAD count is
+    /// the claim: two reads become one.
+    ///
+    /// `walk` is `static int walk(N o, int n) { int a = 0; for (int i = 0;
+    /// i < n; i++) { a += o.v; } return a; }` — `o` is never reassigned, which
+    /// is what makes the read invariant.
+    #[test]
+    fn licm_before_unroll_with_the_memory_edge_shares_one_read_across_copies() {
+        let code = [
+            0x03u8, 0x3D, // iconst_0; istore_2           a = 0
+            0x03, 0x3E, // iconst_0; istore_3             i = 0
+            0x1D, 0x1B, 0xA2, 0x00, 0x10, // iload_3; iload_1; if_icmpge 22
+            0x1C, 0x2A, 0xB4, 0x00, 0x07, 0x60, 0x3D, // a += o.v
+            0x84, 0x03, 0x01, // iinc 3, 1
+            0xA7, 0xFF, 0xF1, // goto 4
+            0x1C, 0xAC, // iload_2; ireturn
+        ];
+        // pc 11 is `v` (int). The only field this fixture reads.
+        let mut info: std::collections::HashMap<usize, (usize, u8)> =
+            std::collections::HashMap::new();
+        info.insert(11, (0, b'I'));
+
+        let build = |licm_first: Option<&'static str>| {
+            cratonvm_types::flags::with_thread_overrides(
+                &[
+                    ("CRATONVM_JIT_IR_PER_COPY_FRAMES", Some("1")),
+                    ("CRATONVM_JIT_IR_PARTIAL_UNROLL", Some("1")),
+                    ("CRATONVM_JIT_IR_PARTIAL_UNROLL_FACTOR", Some("2")),
+                    ("CRATONVM_JIT_IR_LICM_BEFORE_UNROLL", licm_first),
+                    // The memory edge is default-ON, so the "neither" arm has
+                    // to turn it OFF explicitly — leaving it unset would run
+                    // both arms with it on and make the contrast vacuous.
+                    ("CRATONVM_JIT_IR_LICM_MEM_EDGE", Some(licm_first.unwrap_or("0"))),
+                ],
+                || {
+                    let mut builder = IrBuilder::new(2, 4);
+                    builder.set_field_info(info.clone());
+                    let mut g = builder.build(&code, 24).expect("IR build");
+                    // Parameter 0 is the RECEIVER. Without this the base is a
+                    // parameter that may be null, LICM refuses to speculate the
+                    // read past a loop that may not run (see
+                    // `an_invariant_load_of_a_maybe_null_base_is_not_hoisted_
+                    // out_of_a_maybe_empty_loop`), and there is no hoist for
+                    // either arm to share. `probes/FieldLoop.java`'s `sum`,
+                    // which this fixture stands in for, reads `this.fx`.
+                    g.receiver_param = Some(0);
+                    optimize(&mut g);
+                    g
+                },
+            )
+        };
+        let live_ifs = |g: &Graph| g.nodes.iter().filter(|n| n.op == Op::If).count();
+        let live_loads = |g: &Graph| {
+            g.nodes
+                .iter()
+                .filter(|n| n.op != Op::Dead && matches!(n.op, Op::Load(_)))
+                .count()
+        };
+
+        // Default order: the unroller runs first and CLONES the read, because
+        // nothing has re-anchored it yet. The loop unrolls either way — what
+        // the order decides is how many reads the unrolled body contains.
+        let rolled = build(None);
+        assert_eq!(
+            live_ifs(&rolled),
+            2,
+            "factor 2 keeps one test per copy in BOTH arms; if this arm does \
+             not unroll, the contrast below is not the one being measured",
+        );
+        assert_eq!(
+            live_loads(&rolled),
+            2,
+            "the default order clones the invariant read once per copy",
+        );
+
+        // LICM first: the read is re-anchored to the pre-header before the
+        // unroller looks, so it is outside the body that gets cloned and ONE
+        // read serves every copy.
+        let unrolled = build(Some("1"));
+        assert_eq!(live_ifs(&unrolled), 2, "factor 2 keeps one test per copy");
+        assert_eq!(
+            live_loads(&unrolled),
+            1,
+            "the hoisted read is shared by every copy; two would mean the body \
+             was cloned without LICM having run first",
+        );
+
+        for (id, node) in unrolled.nodes.iter().enumerate() {
+            if node.op == Op::Dead {
+                continue;
+            }
+            for (k, &inp) in node.inputs.iter().enumerate() {
+                if inp == NO_NODE {
+                    continue;
+                }
+                assert_ne!(
+                    unrolled.nodes[inp as usize].op,
+                    Op::Dead,
+                    "n{id}:{:?} input[{k}] = n{inp} names a node the unroll killed",
+                    node.op,
+                );
+            }
+        }
+        crate::ir_verify::verify_graph(
+            &unrolled,
+            "licm-before-partial-unroll",
+            crate::ir_verify::VerifyOptions::structural(),
+        )
+        .expect("a partially unrolled invariant-read loop must verify");
+    }
+
+    /// With the flag off, a runtime-bound loop is left exactly as it was.
+    ///
+    /// The default arm, and the one that has to stay true while the mechanism
+    /// soaks: same fixture as
+    /// [`a_runtime_bound_counted_loop_is_partially_unrolled`], no flag, one
+    /// `If` and a two-predecessor header.
+    #[test]
+    fn the_partial_unroller_is_off_by_default() {
+        let code = [
+            0x03u8, 0x3C, 0x03, 0x3D, 0x1C, 0x1A, 0xA2, 0x00, 0x0D, 0x1B, 0x1C, 0x60, 0x3C, 0x84,
+            0x02, 0x01, 0xA7, 0xFF, 0xF4, 0x1B, 0xAC,
+        ];
+        let g = cratonvm_types::flags::with_thread_overrides(
+            &[
+                ("CRATONVM_JIT_IR_PER_COPY_FRAMES", Some("1")),
+                ("CRATONVM_JIT_IR_PARTIAL_UNROLL", None),
+            ],
+            || {
+                let mut g = IrBuilder::new(1, 3).build(&code, 21).expect("IR build");
+                optimize(&mut g);
+                g
+            },
+        );
+        assert_eq!(
+            g.nodes.iter().filter(|n| n.op == Op::If).count(),
+            1,
+            "the default arm must leave the loop rolled",
+        );
+        let header = g
+            .nodes
+            .iter()
+            .find(|n| n.op == Op::Phi)
+            .and_then(|n| n.inputs.first().copied())
+            .expect("carried phi");
+        assert_eq!(g.nodes[header as usize].inputs.len(), 2);
+    }
+
+    /// A body value pinned to the BACK EDGE survives the unroll.
+    ///
+    /// The defect this pins was found by running a probe, not by reading the
+    /// code, and it was found the first time per-copy frames let a loop with a
+    /// loop-carried RECEIVER unroll:
+    ///
+    /// ```text
+    /// [ir] verifier rejected UT3.walk(LUT3$N;)I: 10 violation(s):
+    ///      n24:Load(Int) input[0] = n16 refers to a removed (Dead) node; ...
+    /// ```
+    ///
+    /// Ten violations, two loads per body, five copies. `unroll` substituted
+    /// `region` into each clone's inputs but not `back_ctrl` — and this pass's
+    /// own side-effect scan spells the body's control anchors
+    /// `ctrl == region || ctrl == back_ctrl`, so the second one was always
+    /// there to be read. Every copy of a load pinned to the back edge kept a
+    /// control input the teardown then killed.
+    ///
+    /// It failed CLOSED (`ir_verify`'s structural lane runs in production and
+    /// the compile was refused), which is why it cost a probe rather than a
+    /// wrong answer — and is also why no assertion about behaviour would have
+    /// caught it. This one asks the graph.
+    ///
+    /// `walk` is `static int walk(N o) { int a = 0; for (int i = 0; i < 5;
+    /// i++) { a += o.v; o = o.next; } return a; }`, which is the smallest
+    /// shape with a loop-carried receiver.
+    #[test]
+    fn a_body_value_pinned_to_the_back_edge_survives_the_unroll() {
+        let code = [
+            0x03u8, 0x3C, // iconst_0; istore_1            a = 0
+            0x03, 0x3D, // iconst_0; istore_2               i = 0
+            0x1C, 0x08, 0xA2, 0x00, 0x15, // iload_2; iconst_5; if_icmpge 27
+            0x1B, 0x2A, 0xB4, 0x00, 0x07, 0x60, 0x3C, // a += o.v
+            0x2A, 0xB4, 0x00, 0x0D, 0x4B, // o = o.next
+            0x84, 0x02, 0x01, // iinc 2, 1
+            0xA7, 0xFF, 0xEC, // goto 4
+            0x1B, 0xAC, // iload_1; ireturn
+        ];
+        // pc → (field index, type tag). 11 is `v` (int), 17 is `next` (ref).
+        let mut info: std::collections::HashMap<usize, (usize, u8)> =
+            std::collections::HashMap::new();
+        info.insert(11, (0, b'I'));
+        info.insert(17, (1, b'L'));
+
+        let g = cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_JIT_IR_PER_COPY_FRAMES", Some("1"))],
+            || {
+                let mut builder = IrBuilder::new(1, 3);
+                builder.set_field_info(info.clone());
+                let mut g = builder.build(&code, 29).expect("IR build");
+                optimize(&mut g);
+                g
+            },
+        );
+
+        assert!(
+            g.nodes.iter().any(|n| matches!(n.op, Op::Load(_))),
+            "the fixture built no loads, so it is not the shape under test",
+        );
+        for (id, node) in g.nodes.iter().enumerate() {
+            if node.op == Op::Dead {
+                continue;
+            }
+            for (k, &inp) in node.inputs.iter().enumerate() {
+                if inp == NO_NODE {
+                    continue;
+                }
+                assert_ne!(
+                    g.nodes[inp as usize].op,
+                    Op::Dead,
+                    "n{id}:{:?} input[{k}] = n{inp} names a node the unroll killed",
+                    node.op,
+                );
+            }
+        }
+        crate::ir_verify::verify_graph(
+            &g,
+            "back-edge-anchor",
+            crate::ir_verify::VerifyOptions::structural(),
+        )
+        .expect("an unrolled loop with a loop-carried receiver must verify");
+    }
+
+    /// `set_node_frame_snapshot` refuses a snapshot that is not this node's
+    /// program point.
+    ///
+    /// The fail-closed half of the API. A node bound to a frame resuming at
+    /// another bytecode index is not a copy identity — it is a
+    /// mis-substitution, and it is the one that does not announce itself: the
+    /// interpreter resumes in the wrong instruction holding values that look
+    /// entirely plausible.
+    #[test]
+    fn a_frame_snapshot_must_be_the_nodes_own_program_point() {
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: 0,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+            receiver_param: None,
+        };
+        let here = g.add(Op::Const(1), IrType::Int, vec![], Some(7));
+        let no_pc = g.add(Op::Const(2), IrType::Int, vec![], None);
+        g.push_safepoint(SafepointSnapshot {
+            bci: 7,
+            locals: vec![here],
+            stack: vec![],
+        });
+        g.push_safepoint(SafepointSnapshot {
+            bci: 9,
+            locals: vec![here],
+            stack: vec![],
+        });
+
+        assert!(g.set_node_frame_snapshot(here, 0), "bci 7 == bci 7");
+        assert_eq!(g.nodes[here as usize].frame_snapshot, Some(0));
+        assert!(
+            !g.set_node_frame_snapshot(here, 1),
+            "a node at bci 7 must not take a frame that resumes at bci 9",
+        );
+        assert!(
+            !g.set_node_frame_snapshot(here, 99),
+            "a snapshot index past the end must be refused, not installed",
+        );
+        assert!(
+            !g.set_node_frame_snapshot(no_pc, 0),
+            "a node with no program point has nothing to agree with",
+        );
+        assert_eq!(
+            g.nodes[here as usize].frame_snapshot,
+            Some(0),
+            "a refused call must leave the previous binding alone",
         );
     }
 }
