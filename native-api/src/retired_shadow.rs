@@ -3690,6 +3690,97 @@ mod tests {
         }
     }
 
+    /// **The N-way disjointness test**, over [`RETIRED_SHADOW_TABLES`] rather
+    /// than over a list of sibling names typed out by hand.
+    ///
+    /// `docs/known-issues/jdk-only-lanes/lane-0-integration-and-gates.md` §4
+    /// specifies one of these and assigns it to L0, in the skeleton commit that
+    /// was to land before any lane started. That commit never landed — lane 1
+    /// says so in `RETIRED_SHADOW_TABLES`' own comment — so each lane wrote its
+    /// own instead, and on 2026-09-11 they had drifted into covering different
+    /// and partial sets:
+    ///
+    /// ```text
+    ///   L1  no disjointness test at all
+    ///   L2  STATELESS, PHASE2
+    ///   L5  STATELESS, PHASE2, PHASE3
+    ///   L7  STATELESS, PHASE2, PHASE3, L1, L2, L5
+    /// ```
+    ///
+    /// So L1's rows were checked against nothing, and L2xL5, L2xL7, L2xPHASE3
+    /// and L5xL1 were checked by neither side. A per-lane test cannot close
+    /// this: it names its siblings at the moment it is written, and the next
+    /// lane to land is not on the list.
+    ///
+    /// A collision is harmless to the predicate, which ORs, and NOT harmless to
+    /// the record — two waves each report having retired the row and the next
+    /// reader cannot tell which measurement backs the decision. This walks
+    /// every table against every other, so a new table is covered by being in
+    /// the const, which is the same thing that makes it consulted.
+    #[test]
+    fn no_triple_is_claimed_by_two_tables() {
+        use std::collections::BTreeMap;
+        let mut first: BTreeMap<(&str, &str, &str), usize> = BTreeMap::new();
+        let mut collisions = Vec::new();
+        for (i, table) in RETIRED_SHADOW_TABLES.iter().enumerate() {
+            for t in table.iter() {
+                if let Some(prev) = first.insert(*t, i) {
+                    collisions.push((*t, prev, i));
+                }
+            }
+        }
+        assert!(
+            collisions.is_empty(),
+            "{} triple(s) are claimed by two tables of `RETIRED_SHADOW_TABLES`. \
+             Each is retired twice, so two waves each report having retired it \
+             and neither measurement is identifiable as the one behind the \
+             decision. Delete the later claim, keeping the row in the table \
+             whose page measured it: {:?}",
+            collisions.len(),
+            collisions
+        );
+    }
+
+    /// Sorted and unique for EVERY table, for the same reason each lane asserts
+    /// it of its own: the predicate binary-searches, so an out-of-order entry
+    /// answers `false` for a row that is present and retires nothing, silently.
+    /// Driven off the const so a new table cannot arrive unchecked.
+    #[test]
+    fn every_table_is_sorted_and_unique() {
+        for (i, table) in RETIRED_SHADOW_TABLES.iter().enumerate() {
+            for w in table.windows(2) {
+                assert!(
+                    w[0] < w[1],
+                    "table {i} of `RETIRED_SHADOW_TABLES` is out of order or \
+                     has a duplicate: {:?} then {:?}",
+                    w[0],
+                    w[1]
+                );
+            }
+        }
+    }
+
+    /// Every row of every table answers `true` through the REAL predicate.
+    ///
+    /// Per-lane versions of this exist and each covers its own table; this one
+    /// covers the tables nobody wrote one for. A row outside every
+    /// [`RETIRED_SHADOW_PREFIXES`] entry answers `false`, which reads as "not
+    /// retired" and is invisible in a workload — a missing prefix is the one
+    /// edit that silently un-retires a whole wave.
+    #[test]
+    fn every_row_of_every_table_is_reachable() {
+        for (i, table) in RETIRED_SHADOW_TABLES.iter().enumerate() {
+            for (c, m, d) in table.iter() {
+                assert!(
+                    triple_is_retired_shadow(c, m, d),
+                    "table {i}: {c}.{m}{d} is in a retired-shadow table and the \
+                     predicate says it is not retired — almost always a missing \
+                     `RETIRED_SHADOW_PREFIXES` entry"
+                );
+            }
+        }
+    }
+
     /// Sorted, unique and binary-searched like every sibling, and for the same
     /// reason: an out-of-order entry makes the predicate answer `false` for a
     /// row that is present, which reads as "not retired" and is invisible.
