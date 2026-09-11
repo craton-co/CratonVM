@@ -1229,6 +1229,11 @@ const RETIRED_SHADOW_PREFIXES: &[&str] = &[
     // spelling: `java/net/` and not `java/`;
     // `javax/security/auth/x500/` and not `javax/security/`.
     //
+    // `java/net/` is WIDER than the table under it: four classes of the
+    // package are retired and six more were measured and refused (the table's
+    // header has the six corpus vectors that refused them). A prefix admits a
+    // package to the binary search; the table decides what is retired.
+    //
     // Only these two have a table. The lane's other seven prefixes were each
     // armed on the whole probe tree and each either moved a probe AWAY from
     // HotSpot or never reached the dial at all — see
@@ -2292,120 +2297,115 @@ static RETIRED_SHADOW_PHASE3_TRIPLES: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// The 2026-09-10 lane-L6 wave: `java/net/` and `X500Principal`, and nothing
-/// else in a lane of nine prefixes.
+/// The 2026-09-10 lane-L6 wave: `java/net/URI`, `java/net/HttpURLConnection`,
+/// `ProxySelector.getDefault` and `X500Principal` -- 54 rows out of a lane of
+/// 966, and the 70 rows this table does NOT carry are the finding.
 ///
 /// A fifth table rather than rows merged into a sibling, for the reason the
 /// second gives for existing: these were adjudicated by a different METHOD --
-/// eight differential probes written for this lane, each scored through the
-/// whole probe tree with `scripts/jdk-only-phase2-battery.sh` -- and the method
-/// is the part worth being able to see at a glance.
+/// eight differential probes written for this lane, scored through the whole
+/// probe tree and then through the whole corpus -- and the method is the part
+/// worth being able to see at a glance.
 ///
-/// # The lane is 966 bucket-A/B rows and this retires 124 of them
+/// # The probe tree said 124 rows were safe. The CORPUS said 54.
 ///
-/// That ratio is the finding, not a shortfall. Measured 2026-09-10 from
-/// `--dump-native-registry --explain-jdk-only` on JDK 25.0.4+7/linux: the
-/// lane's nine prefixes carry 1,224 registrations that own their slot with
-/// effective kind `Bridge` -- 731 bucket A, 235 bucket B, and 258 that are
-/// C/D/E/F and therefore shadow no bytecode at all. Of the 966 in the goal
-/// this wave retires the 124 that passed all four preconditions of
-/// `docs/contributing/jdk-only-lane-operations.md` §7.
+/// This is the most useful thing in this file for the next lane, so it goes
+/// first. Armed on `java/net/` and `javax/security/auth/x500/`, **all 125
+/// probes in the tree got no worse and five got dramatically better**. Built
+/// and measured against a control binary from the same tree, the same five
+/// improved and nothing regressed. Both instruments said 124 rows.
 ///
-/// The rest did not fail for want of effort. Each of the lane's other seven
-/// prefixes was armed ALONE on the whole 125-probe tree, and each failed in
-/// one of two ways -- either it moved a probe away from the oracle, or the
-/// dial was never asked at all:
+/// The `--jdk-only` corpus, on that same pair of binaries, went from **132 of
+/// 132 passing to 126 of 132**. Six vectors, one species, and the species is
+/// precondition 3 failing ONE LEVEL DOWN than where it is checked:
 ///
 /// ```text
-///   arm                                     probes worse   note
-///   java/net/                                     0        TAKEN, 114 rows
-///   javax/security/auth/x500/                     0        TAKEN,  10 rows
-///   javax/net/                                    2        L6TlsParamSweep 66 -> 94
-///   java/security/,sun/security/,
-///     javax/crypto/,javax/security/               8        SecuritySurfaceSweep 0 -> 2594
-///   sun/net/                                      0        123 of 125 VACUOUS
-///   jdk/net/,jdk/internal/net/                    0        123 of 125 VACUOUS
+///   RJdkServices              NPE: URLStreamHandler.openConnection, "this.handler" is null
+///   RServiceLoaderDoubleSource   (same)
+///   RJdkDefineClass           NPE: URLStreamHandler.getDefaultPort,  "this.handler" is null
+///   RJdkNet                   UnsatisfiedLinkError: sun/nio/ch/DatagramChannelImpl.receive0
+///   RJdkNet (InetAddress)     UnsatisfiedLinkError: java/net/Inet6AddressImpl.lookupAllHostAddr
+///   RNetIfaceScope            AssertionError: every scoped IPv6 address must round-trip, 2 did not
 /// ```
 ///
-/// A VACUOUS arm is not a pass. `sun/net/` and the two `jdk` prefixes reached
-/// the dial in 2 probes of 125, which means arming them changed nothing and
-/// read as the best possible result -- precondition 1, and the trap 146 of
-/// Phase 2's 236 candidates fell into.
+/// Precondition 3 asks whether **the image method** carries `Code` to yield
+/// to. All 124 rows passed it. What it does not ask is what that `Code` then
+/// CALLS:
 ///
-/// Three structural reasons sit behind those numbers, and each predicts what a
-/// future lane will find:
+///  * `java.net.URL`'s methods are one line each -- `handler.openConnection(this)`,
+///    `handler.getDefaultPort()`, `handler.equals(this, u)`. `handler` is
+///    written only by the real constructor, and this VM MINTS `URL` objects in
+///    `classloader.rs` without running it. Yielding turns every one of them
+///    into an NPE. This is `Class.getModule`'s situation exactly, recorded in
+///    lane-0 §7: a field only a real VM writes.
+///  * `java.net.InetAddress.getByName` yields to bytecode that calls
+///    `Inet6AddressImpl.lookupAllHostAddr`, which is `ACC_NATIVE` and which
+///    this VM does not implement. `java.net.DatagramSocket` yields to bytecode
+///    that routes through `sun.nio.ch.DatagramChannelImpl.receive0`, likewise.
+///    The retirement trades a shadow for an `UnsatisfiedLinkError` -- which is
+///    exactly what precondition 3 exists to prevent, one frame deeper than it
+///    looks.
 ///
-///  1. **`javax/net/ssl/` and `sun/security/ssl/` are an IMPLEMENTATION, not a
-///     shadow.** This VM's TLS is rustls (`native-builtins/src/t27_tls.rs`,
-///     20,630 lines, plus `net_phase_e.rs`'s `register_re6_ssl_context`).
-///     Yielding those rows to `sun.security.ssl` bytecode does not restore a
-///     JDK behaviour this VM was approximating -- it removes TLS. Armed on the
-///     security prefixes, `SecuritySurfaceSweep` goes from 0 diffs to 2,594,
-///     `JcaFunctional` from 0 to 30, and `DhAgree` stops producing output.
-///     This is `StrictMath`'s situation: a 0-diff probe is evidence the family
-///     WORKS, never on its own a reason to retire it.
-///  2. **The `HttpsURLConnectionImpl` rows are a workaround for a null
-///     `delegate`, not a shim in front of bytecode.** 67 rows, the largest
-///     single class in the lane. `register_https_delegate_forwarders`
-///     (`native-builtins/src/http_url_connection.rs`) exists because this VM
-///     ALLOCATES that carrier rather than constructing it, so `delegate` is
-///     null and every inherited method the Impl overrides would NPE. Each
-///     forwarder runs the SUPERCLASS body the Impl overrides -- which is to
-///     say the retirement's own remedy is already what these natives do.
-///     Retiring them restores the NPE that took out the TLS half of the Tomcat
-///     suite.
-///  3. **A base-class row loses the dispatch to its own subclass.**
-///     `java/net/InetAddress` has 18 bucket-A rows and exactly 3 of them are
-///     ever dispatched: every instance is an `Inet4Address` or an
-///     `Inet6Address`, the door asks the registry about the DECLARING class,
-///     and the subclass registration wins. The other 15 are unreachable
-///     through instance dispatch and retiring them would move nothing. They
-///     are counted here as unretired rather than quietly claimed.
+/// **So precondition 3 is really: the image method carries `Code`, AND that
+/// code's own callees are satisfiable in this VM.** The cheap approximation of
+/// the second half is the corpus, and the probe tree cannot substitute for it:
+/// 125 probes and a two-binary A/B both scored this wave clean at 124 rows.
 ///
-/// # What the 124 fix, per probe, on one binary
+/// The six vectors were located WITHOUT a rebuild, by arming one class at a
+/// time on the control binary with `CRATONVM_ENFORCE_NATIVE_SHADOW` and
+/// checking for `main-vm run() returned Err` -- rc is 0 on a vector failure
+/// here, so reading rc would have called all six green. Two of the six
+/// (`RSslLiveSession`, `RNetIfaceScope`) also fail intermittently under load
+/// and are not diagnosable that way; `RNetIfaceScope` in particular does NOT
+/// reproduce under the dial with all three `Inet*` classes armed, because the
+/// dial declines at DISPATCH and this table re-tags at REGISTRATION. **A dial
+/// result is a lead, not a verdict, in both directions.**
 ///
-/// Armed on the two prefixes, against HotSpot 25.0.4+7 as oracle. Every other
-/// probe in the 125-probe tree scored delta exactly 0 in both arms:
+/// # The 70 rows that came out, and their disposition
 ///
 /// ```text
-///   L6UriSweep         80 diffs -> 0      (925 rows,  7,179 yields)
-///   L6UrlSweep         14 diffs -> 0      (446 rows, 10,555 yields)
-///   L6X500Sweep       276 diffs -> 0      (401 rows,  4,669 yields)
-///   L6InetSweep       380 diffs -> 160    (848 rows,  1,156 yields)
-///   L6HttpLogicSweep   64 diffs -> 60     (164 rows,  2,913 yields)
+///   java/net/DatagramSocket   30   yields into sun/nio/ch/DatagramChannelImpl.receive0
+///   java/net/URL              16   every method reads `handler`, which this VM never sets
+///   java/net/Inet4Address      8   \
+///   java/net/Inet6Address      7    >  yield into Inet6AddressImpl.lookupAllHostAddr
+///   java/net/InetAddress       3   /
+///   java/net/MulticastSocket   6   a DatagramSocket, same impl chain
 /// ```
 ///
-/// Two rows in each arm's summary moved and are NOT evidence, both flagged by
-/// the driver itself: `VtHandoffProbe` is the campaign's named noise floor --
-/// it oscillates in both directions on virtual-thread counts nobody has fixed
-/// -- and `L4FileSweep`/`L4FilesSweep` in the X500 arm reported a delta beside
-/// `y/r=0/0`, meaning the dial was never asked and the arming cannot have
-/// caused it. Both re-ran 3/3 clean, 0 diffs, in both arms.
+/// They are **KEEP**, not "not yet". Retiring them needs the VM to implement
+/// `Inet6AddressImpl.lookupAllHostAddr` and `DatagramChannelImpl.receive0`, or
+/// to construct `java.net.URL` through its real constructor rather than
+/// minting it. Each is a piece of work an order of magnitude larger than this
+/// wave, and none of them is a shadow problem.
 ///
-/// # The rows those deltas are made of
+/// # What the 54 fix, per probe
 ///
-/// The perimeter this campaign predicts, and the happy path never reaches:
-/// `DatagramSocket.connect(addr, 65536)` was ACCEPTED, and so were
-/// `connect(null, 9)`, `bind` on an already-bound socket,
-/// `MulticastSocket.setTimeToLive(256)` and `joinGroup(null)`.
-/// `HttpURLConnection.setRequestMethod` accepted `CONNECT` and silently
-/// upper-cased `get`; `setRequestProperty` did not REPLACE what
-/// `addRequestProperty` had appended; `getRequestProperties` handed back a
-/// MODIFIABLE map; the RFC-850 and asctime date formats parsed as -1. `URL`
-/// answered `false` for `http://h:80/p equals http://h/p`, where the default
-/// port makes them equal. `X500Principal` did not recognise the `#hex` DER
-/// form of an attribute value at all, dropped a trailing escaped space, and
-/// encoded `emailAddress` as a `UTF8String` where the JDK writes an
-/// `IA5String`. And `InetAddress.getByName` sent malformed literals --
-/// `256.1.1.1`, `1:2:3:4:5:6:7:8:9` -- to the RESOLVER, which HotSpot rejects
-/// without a lookup: those rows were not merely wrong, they were a function of
-/// the host's DNS.
+/// Armed on the retired set, against HotSpot 25.0.4+7 as oracle. Diff LINES,
+/// which is two per differing row:
+///
+/// ```text
+///   L6X500Sweep       276 -> 0      (401 rows,  4,669 yields)
+///   L6UriSweep         80 -> 0      (925 rows,  7,179 yields)
+///   L6HttpLogicSweep   64 -> 18     (164 rows,  2,913 yields)
+/// ```
+///
+/// The rows those deltas are made of are the perimeter this campaign predicts
+/// and the happy path never reaches. `HttpURLConnection.setRequestMethod`
+/// accepted `CONNECT` and silently upper-cased `get`; `setRequestProperty` did
+/// not REPLACE what `addRequestProperty` had appended; `getRequestProperties`
+/// handed back a MODIFIABLE map; `setFixedLengthStreamingMode` after `connect`
+/// was accepted where the JDK throws; the RFC-850 and asctime `Date` formats
+/// parsed as -1. `URI` accepted a second `#` inside a fragment, and
+/// `URI.create`'s `IllegalArgumentException` carried no cause.
+/// `X500Principal` did not recognise the `#hex` DER form of an attribute value
+/// at all, dropped a trailing escaped space, and encoded `emailAddress` as a
+/// `UTF8String` where the JDK writes an `IA5String`.
 ///
 /// # The four preconditions, and what each one removed
 ///
 /// Applied per triple against a dump from a run of the very probes whose
 /// improvement is cited above -- not against a corpus census, which is a
-/// different workload (this is the `FileChannelImpl.open` mistake recorded in
+/// different workload (this is the `FileChannelImpl.open` mistake recorded on
 /// `RETIRED_SHADOW_PHASE2_TRIPLES`):
 ///
 /// ```text
@@ -2413,58 +2413,59 @@ static RETIRED_SHADOW_PHASE3_TRIPLES: &[(&str, &str, &str)] = &[
 ///   bucket A or B (something to yield to)   -91 C/D/F
 ///   dispatched by the instrument (inv > 0) -127 never reached
 ///   registrar not held by lane T             -4 the throwable ctor table
+///   the corpus tolerates it                 -70 the six vectors above
 /// ```
 ///
-/// The last is lane-0 §3's rule and it costs four rows:
-/// `MalformedURLException` and `UnknownHostException` are registered by
-/// `lang_misc.rs`'s `register_throwable_subclass_natives` and by the `lib.rs`
-/// `getMessage` loop, both of which span seven lanes' prefixes. A fifth,
-/// `MalformedURLException.initCause`, comes from a different site and would
-/// have been this lane's to take; it is excluded with its two siblings because
-/// splitting one throwable's surface across two waves is how a family ends up
-/// half-retired with nothing recording which half.
+/// The fourth is lane-0 §3's rule: `MalformedURLException` and
+/// `UnknownHostException` are registered by `lang_misc.rs`'s
+/// `register_throwable_subclass_natives` and by the `lib.rs` `getMessage`
+/// loop, both of which span seven lanes' prefixes.
+///
+/// # Why the lane's other seven prefixes carry no table
+///
+/// Each was armed ALONE on the whole 125-probe tree:
+///
+/// ```text
+///   javax/net/                                    2 probes worse   L6TlsParamSweep 66 -> 94
+///   java/security/,sun/security/,
+///     javax/crypto/,javax/security/               8 probes worse   SecuritySurfaceSweep 0 -> 2594
+///   sun/net/                                      0               123 of 125 VACUOUS
+///   jdk/net/,jdk/internal/net/                    0               123 of 125 VACUOUS
+/// ```
+///
+/// A VACUOUS arm is not a pass: `sun/net/` and the two `jdk` prefixes reached
+/// the dial in 2 probes of 125, so arming them changed nothing and read as the
+/// best possible result -- precondition 1, and the trap 146 of Phase 2's 236
+/// candidates fell into.
+///
+/// Three structural reasons sit behind the rest, each recorded in full in
+/// `docs/internal/retired/lane-6-net-security-RETIRED-20260910.md`:
+///
+///  1. **`javax/net/ssl/` and `sun/security/ssl/` are an IMPLEMENTATION.**
+///     This VM's TLS is rustls (`native-builtins/src/t27_tls.rs`, 20,630
+///     lines). Yielding does not restore a JDK behaviour this VM approximates
+///     -- it removes TLS. That is `StrictMath`'s situation: a 0-diff probe is
+///     evidence the family WORKS, never on its own a reason to retire it.
+///  2. **The 67 `HttpsURLConnectionImpl` rows are a null-`delegate`
+///     workaround.** `register_https_delegate_forwarders` exists because this
+///     VM ALLOCATES that carrier rather than constructing it, and each
+///     forwarder runs the SUPERCLASS body the Impl overrides -- the
+///     retirement's own remedy, one level up.
+///  3. **A base-class row loses the dispatch to its own subclass.** 15 of
+///     `InetAddress`'s 18 bucket-A rows are never dispatched, because every
+///     instance is an `Inet4Address` or an `Inet6Address` and the door asks
+///     the registry about the DECLARING class.
 ///
 /// # The refusals are not inert
 ///
-/// A refusal is a retirement only when nothing already owns the triple, and
-/// `JdkOnlyViolation::SyntheticNativeRegistered` carries a `survivor` for the
-/// case where an earlier registration keeps serving -- strict mode then runs
-/// THAT native instead of the bytecode the policy asked for, and every probe
-/// reads exactly as it did before. The survivor count for these two prefixes
-/// is in `docs/internal/retired/lane-6-net-security-RETIRED-20260910.md`,
-/// taken from a `--jdk-only-report` of the trial binary running the probe
-/// tree.
+/// A refusal is a retirement only when nothing already owns the triple:
+/// `JdkOnlyViolation::SyntheticNativeRegistered` carries a `survivor`, and a
+/// non-null one means an earlier registration is still serving, so strict mode
+/// runs that older native and every probe reads exactly as before. Measured on
+/// the trial binary over a `--jdk-only-report` of the probe tree: **every row
+/// of this table appears in the refusal set and ZERO refusals carry a
+/// survivor.**
 static RETIRED_SHADOW_L6_TRIPLES: &[(&str, &str, &str)] = &[
-    ("java/net/DatagramSocket", "<init>", "(ILjava/net/InetAddress;)V"),
-    ("java/net/DatagramSocket", "<init>", "(Ljava/net/SocketAddress;)V"),
-    ("java/net/DatagramSocket", "bind", "(Ljava/net/SocketAddress;)V"),
-    ("java/net/DatagramSocket", "close", "()V"),
-    ("java/net/DatagramSocket", "connect", "(Ljava/net/InetAddress;I)V"),
-    ("java/net/DatagramSocket", "connect", "(Ljava/net/SocketAddress;)V"),
-    ("java/net/DatagramSocket", "disconnect", "()V"),
-    ("java/net/DatagramSocket", "getBroadcast", "()Z"),
-    ("java/net/DatagramSocket", "getInetAddress", "()Ljava/net/InetAddress;"),
-    ("java/net/DatagramSocket", "getLocalAddress", "()Ljava/net/InetAddress;"),
-    ("java/net/DatagramSocket", "getLocalPort", "()I"),
-    ("java/net/DatagramSocket", "getLocalSocketAddress", "()Ljava/net/SocketAddress;"),
-    ("java/net/DatagramSocket", "getOption", "(Ljava/net/SocketOption;)Ljava/lang/Object;"),
-    ("java/net/DatagramSocket", "getPort", "()I"),
-    ("java/net/DatagramSocket", "getReceiveBufferSize", "()I"),
-    ("java/net/DatagramSocket", "getReuseAddress", "()Z"),
-    ("java/net/DatagramSocket", "getSendBufferSize", "()I"),
-    ("java/net/DatagramSocket", "getSoTimeout", "()I"),
-    ("java/net/DatagramSocket", "getTrafficClass", "()I"),
-    ("java/net/DatagramSocket", "isBound", "()Z"),
-    ("java/net/DatagramSocket", "isClosed", "()Z"),
-    ("java/net/DatagramSocket", "isConnected", "()Z"),
-    ("java/net/DatagramSocket", "receive", "(Ljava/net/DatagramPacket;)V"),
-    ("java/net/DatagramSocket", "send", "(Ljava/net/DatagramPacket;)V"),
-    ("java/net/DatagramSocket", "setOption", "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/net/DatagramSocket;"),
-    ("java/net/DatagramSocket", "setReceiveBufferSize", "(I)V"),
-    ("java/net/DatagramSocket", "setSendBufferSize", "(I)V"),
-    ("java/net/DatagramSocket", "setSoTimeout", "(I)V"),
-    ("java/net/DatagramSocket", "setTrafficClass", "(I)V"),
-    ("java/net/DatagramSocket", "supportedOptions", "()Ljava/util/Set;"),
     ("java/net/HttpURLConnection", "<init>", "(Ljava/net/URL;)V"),
     ("java/net/HttpURLConnection", "addRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V"),
     ("java/net/HttpURLConnection", "getHeaderFieldDate", "(Ljava/lang/String;J)J"),
@@ -2479,30 +2480,6 @@ static RETIRED_SHADOW_L6_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/net/HttpURLConnection", "setReadTimeout", "(I)V"),
     ("java/net/HttpURLConnection", "setRequestMethod", "(Ljava/lang/String;)V"),
     ("java/net/HttpURLConnection", "setRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V"),
-    ("java/net/Inet4Address", "equals", "(Ljava/lang/Object;)Z"),
-    ("java/net/Inet4Address", "getAddress", "()[B"),
-    ("java/net/Inet4Address", "getHostAddress", "()Ljava/lang/String;"),
-    ("java/net/Inet4Address", "hashCode", "()I"),
-    ("java/net/Inet4Address", "isAnyLocalAddress", "()Z"),
-    ("java/net/Inet4Address", "isLoopbackAddress", "()Z"),
-    ("java/net/Inet4Address", "isMulticastAddress", "()Z"),
-    ("java/net/Inet4Address", "toString", "()Ljava/lang/String;"),
-    ("java/net/Inet6Address", "getAddress", "()[B"),
-    ("java/net/Inet6Address", "getHostAddress", "()Ljava/lang/String;"),
-    ("java/net/Inet6Address", "hashCode", "()I"),
-    ("java/net/Inet6Address", "isAnyLocalAddress", "()Z"),
-    ("java/net/Inet6Address", "isLoopbackAddress", "()Z"),
-    ("java/net/Inet6Address", "isMulticastAddress", "()Z"),
-    ("java/net/Inet6Address", "toString", "()Ljava/lang/String;"),
-    ("java/net/InetAddress", "getByAddress", "([B)Ljava/net/InetAddress;"),
-    ("java/net/InetAddress", "getByName", "(Ljava/lang/String;)Ljava/net/InetAddress;"),
-    ("java/net/InetAddress", "getLoopbackAddress", "()Ljava/net/InetAddress;"),
-    ("java/net/MulticastSocket", "<init>", "(I)V"),
-    ("java/net/MulticastSocket", "close", "()V"),
-    ("java/net/MulticastSocket", "getOption", "(Ljava/net/SocketOption;)Ljava/lang/Object;"),
-    ("java/net/MulticastSocket", "getTimeToLive", "()I"),
-    ("java/net/MulticastSocket", "joinGroup", "(Ljava/net/SocketAddress;Ljava/net/NetworkInterface;)V"),
-    ("java/net/MulticastSocket", "setTimeToLive", "(I)V"),
     ("java/net/ProxySelector", "getDefault", "()Ljava/net/ProxySelector;"),
     ("java/net/URI", "<init>", "(Ljava/lang/String;)V"),
     ("java/net/URI", "compareTo", "(Ljava/net/URI;)I"),
@@ -2533,22 +2510,6 @@ static RETIRED_SHADOW_L6_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/net/URI", "resolve", "(Ljava/net/URI;)Ljava/net/URI;"),
     ("java/net/URI", "toString", "()Ljava/lang/String;"),
     ("java/net/URI", "toURL", "()Ljava/net/URL;"),
-    ("java/net/URL", "<init>", "(Ljava/lang/String;)V"),
-    ("java/net/URL", "equals", "(Ljava/lang/Object;)Z"),
-    ("java/net/URL", "getDefaultPort", "()I"),
-    ("java/net/URL", "getFile", "()Ljava/lang/String;"),
-    ("java/net/URL", "getHost", "()Ljava/lang/String;"),
-    ("java/net/URL", "getPath", "()Ljava/lang/String;"),
-    ("java/net/URL", "getPort", "()I"),
-    ("java/net/URL", "getProtocol", "()Ljava/lang/String;"),
-    ("java/net/URL", "getQuery", "()Ljava/lang/String;"),
-    ("java/net/URL", "getRef", "()Ljava/lang/String;"),
-    ("java/net/URL", "hashCode", "()I"),
-    ("java/net/URL", "openConnection", "()Ljava/net/URLConnection;"),
-    ("java/net/URL", "sameFile", "(Ljava/net/URL;)Z"),
-    ("java/net/URL", "toExternalForm", "()Ljava/lang/String;"),
-    ("java/net/URL", "toString", "()Ljava/lang/String;"),
-    ("java/net/URL", "toURI", "()Ljava/net/URI;"),
     ("javax/security/auth/x500/X500Principal", "<init>", "(Ljava/io/InputStream;)V"),
     ("javax/security/auth/x500/X500Principal", "<init>", "(Ljava/lang/String;)V"),
     ("javax/security/auth/x500/X500Principal", "<init>", "(Ljava/lang/String;Ljava/util/Map;)V"),

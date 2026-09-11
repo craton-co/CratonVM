@@ -1,4 +1,4 @@
-# Lane 6 — networking, TLS and `java.security`: 124 shadows retired, 842 adjudicated — RETIRED 2026-09-10
+# Lane 6 — networking, TLS and `java.security`: 54 shadows retired, 912 adjudicated, and the corpus took 70 back — RETIRED 2026-09-10
 
 **Retires `docs/known-issues/jdk-only-lanes/lane-6-net-security.md`**, deleted
 in the same commit. The method it worked to is
@@ -15,9 +15,9 @@ them, not with a guess.
 |---|---|
 | **Scope as opened** | "819 §1.4 shadows over 90 classes, from 663 registration sites." |
 | **Scope as measured** | **966** bucket-A/B shadows over **99** classes, from **693** sites. The page's numbers were a day old; `dev` moved. |
-| **Retired** | **124 triples** — `java/net/` (114) and `javax/security/auth/x500/X500Principal` (10). |
-| **Adjudicated, not retired** | **842**, every one with a verdict and a measurement (§5). |
-| **Probe rows this closes** | **297** of the 496 differing rows the lane's eight new probes find against HotSpot. |
+| **Retired** | **54 triples** — `java/net/URI` (29), `java/net/HttpURLConnection` (14), `ProxySelector.getDefault` (1) and `X500Principal` (10). |
+| **Adjudicated, not retired** | **912**, every one with a verdict and a measurement (§5). 70 of them are rows the probe tree cleared and the CORPUS refused — §2.1, and the most useful paragraph on this page. |
+| **Probe rows this closes** | **201** of the 496 differing rows the lane's eight new probes find against HotSpot. |
 | **Where** | Azure host 2 (`20.80.105.49`), branch `claude/l6-net-security-20260910` off `origin/dev` `7a8b79526`, JDK 25.0.4+7 image, HotSpot 25.0.4+7 as oracle. Host load ranged 38-190 throughout; every number here is a correctness delta, never a timing. |
 
 ---
@@ -86,47 +86,127 @@ that was **wrong**:
   `method javax/net/ssl/SSLSocket.getEnableSessionCreation()Z has no Code attribute`
   on an unconnected socket.
 
-## 2. The retirement: 124 triples, and how each earned its row
+## 2. The retirement: 54 triples, and the 70 the corpus took back
 
 `RETIRED_SHADOW_L6_TRIPLES` in `native-api/src/retired_shadow.rs`. Two prefixes
 admitted, both the narrow spelling: `java/net/` and
 `javax/security/auth/x500/`.
 
-Armed on those two prefixes, against HotSpot as oracle, over the **whole
-125-probe tree** — not the families' own probes, which are the narrowest
-instrument in the building:
-
 ```text
-  L6UriSweep         80 diff lines -> 0      ( 7,179 yields)
-  L6UrlSweep         14            -> 0      (10,555 yields)
-  L6X500Sweep       276            -> 0      ( 4,669 yields)
-  L6InetSweep       380            -> 160    ( 1,156 yields)
-  L6HttpLogicSweep   64            -> 60     ( 2,913 yields)
-  every other probe in the tree            delta exactly 0
+  29  java/net/URI                  14  java/net/HttpURLConnection
+  10  javax/security/auth/x500/X500Principal
+   1  java/net/ProxySelector.getDefault
 ```
 
-Three probes go to **zero**. That is the shape §1.4's remedy is supposed to
-have: the JDK's own RFC-3986 parser, its own RFC-2253 parser and its own
-`URLStreamHandler` are more exact than any of the hand-written natives in front
-of them, and yielding is not a workaround for them but the point.
+Measured on a **paired pair of binaries built from the same merged tree**,
+differing only in this one file — the control has the table reverted to
+`origin/dev`'s version, nothing else:
 
-### The four preconditions, and what each removed
+```text
+  L6X500Sweep       276 diff lines -> 0      (401 rows,  4,669 yields)
+  L6UriSweep         80            -> 0      (925 rows,  7,179 yields)
+  L6HttpLogicSweep   64            -> 18     (164 rows,  2,913 yields)
+  every other probe in the 125-probe tree: delta exactly 0
+```
+
+### 2.1 The probe tree said 124. The corpus said 54.
+
+**This is the finding of the wave** and it re-states one of the four
+preconditions, so it goes before the good news rather than after it.
+
+The first table carried 124 rows: the four classes above plus `java/net/URL`
+(16), `DatagramSocket` (30), `MulticastSocket` (6), `InetAddress` (3),
+`Inet4Address` (8) and `Inet6Address` (7). Both instruments cleared it:
+
+* armed on the two prefixes, **all 125 probes in the tree got no worse** and
+  five got dramatically better;
+* **built**, and run as a two-binary A/B against a control from the same tree,
+  the same five improved (`L6UriSweep` 80 → 0, `L6X500Sweep` 276 → 0,
+  `L6HttpLogicSweep` 64 → 18, `L6InetSweep` 380 → 368, `L6SocketSweep` 42 →
+  38) and nothing regressed. One probe moved the wrong way by 4 lines and it
+  was `VtHandoffProbe`, the campaign's named noise floor.
+
+The `--jdk-only` corpus, on that same pair of binaries, went from **132 of 132
+to 126 of 132**:
+
+```text
+  RJdkServices               NPE: URLStreamHandler.openConnection, "this.handler" is null
+  RServiceLoaderDoubleSource    (same)
+  RJdkDefineClass            NPE: URLStreamHandler.getDefaultPort,  "this.handler" is null
+  RJdkNet                    UnsatisfiedLinkError: sun/nio/ch/DatagramChannelImpl.receive0
+  RJdkNet   (InetAddress)    UnsatisfiedLinkError: java/net/Inet6AddressImpl.lookupAllHostAddr
+  RNetIfaceScope             AssertionError: every scoped IPv6 address must round-trip, 2 did not
+```
+
+Six vectors, one species. **Precondition 3 asks whether the IMAGE METHOD
+carries `Code` to yield to. All 124 rows passed it. What it does not ask is
+what that `Code` then calls.**
+
+* `java.net.URL`'s methods are one line each — `handler.openConnection(this)`,
+  `handler.getDefaultPort()`, `handler.equals(this, u)`. `handler` is written
+  only by the real constructor, and this VM **mints** `URL` objects in
+  `classloader.rs` without running it. Yielding turns every one of them into an
+  NPE. This is `Class.getModule`'s situation exactly (lane-0 §7): a field only
+  a real VM writes.
+* `InetAddress.getByName` yields to bytecode that calls
+  `Inet6AddressImpl.lookupAllHostAddr`, which is `ACC_NATIVE` and which this VM
+  does not implement. `DatagramSocket` yields to bytecode that routes through
+  `sun.nio.ch.DatagramChannelImpl.receive0`, likewise. The retirement trades a
+  shadow for an `UnsatisfiedLinkError` — which is precisely what precondition 3
+  exists to prevent, one frame deeper than it looks.
+
+**So precondition 3 is really: the image method carries `Code`, AND that code's
+own callees are satisfiable in this VM.** The cheap approximation of the second
+half is the corpus. The probe tree cannot substitute for it, and this wave is
+the proof: 125 probes and a two-binary A/B both scored 124 rows clean.
+
+That also settles what the lane page called *"`URLStreamHandler` NPE, 2
+vectors, yours right now."* The page was right that it exists and wrong that it
+was already failing: it is **latent**, and retiring `java/net/URL` is what
+wakes it.
+
+### 2.2 How the six were attributed, in about twenty minutes and no rebuild
+
+Arming one class at a time on the CONTROL binary with
+`CRATONVM_ENFORCE_NATIVE_SHADOW` and running only the six failing vectors —
+eleven scopes by six vectors, sixty-six VM runs.
+
+Two traps it walked into and out of, both already on the operations page:
+
+* **`rc` is 0 when a vector fails.** The VM reports the failure in its own
+  summary line (`main-vm run() returned Err`), and the first version of the
+  bisect keyed on the exit code and called all six green. *Check `rc` before
+  believing a harness label* cuts both ways.
+* **The dial is not the table.** `RNetIfaceScope` does **not** reproduce under
+  the dial with all three `Inet*` classes armed, and does fail on the built
+  trial binary. The dial declines at DISPATCH and arms a PREFIX;
+  `retired_shadow.rs` re-tags at REGISTRATION and is per-triple, so a
+  constructor or a class-initialiser path can differ. A dial result is a lead
+  in both directions, never a verdict.
+
+`RSslLiveSession` was in the failing set and is **not** one of the six: it
+passes under every armed scope including none, and the operations page already
+documents it as load-sensitive — its own client loop discards the reply it
+asserts on when three TLS records arrive in one read. It failed in an arm run
+concurrently with a 125-probe A/B and a five-configuration `cargo test`.
+
+### 2.3 The four preconditions, and what each removed
 
 Applied per triple against a dump from a run of **the very probes whose
 improvement is cited above** — never against a corpus census, which is a
-different workload. (That distinction is not pedantry: it is the
-`FileChannelImpl.open` mistake recorded on `RETIRED_SHADOW_PHASE2_TRIPLES`, a
-whole build spent retiring the one triple the corpus had dispatched and the
-probe never touched.)
+different workload. (That is the `FileChannelImpl.open` mistake recorded on
+`RETIRED_SHADOW_PHASE2_TRIPLES`: a whole build spent retiring the one triple
+the corpus had dispatched and the probe never touched.)
 
 ```text
   owns the slot + effective kind Bridge   -34 not-owner, -55 already retagged
   bucket A or B (something to yield to)   -91 C/D/F
   dispatched by the instrument (inv > 0) -127 never reached
   registrar not held by lane T             -4 the throwable ctor table
+  the corpus tolerates it                 -70 §2.1
 ```
 
-### The refusals are not inert
+### 2.4 The refusals are not inert
 
 A refusal is a retirement **only when nothing already owns the triple**.
 `NativeMethodRegistry::register_inner` refuses a `SyntheticStub` under
@@ -137,8 +217,12 @@ probe reads exactly as before, and the wave is a no-op that looks like a clean
 result.
 
 Measured on the trial binary, over a `--jdk-only-report` of the probe tree:
-
-<!-- REFUSALS-PLACEHOLDER -->
+**every row of the table appears in the refusal set, and ZERO refusals carry a
+survivor.** The refusal census counts more triples than the table has rows —
+it is a property of the PREFIX, and `java/net/` already contained registrations
+that were `SyntheticStub` before this wave (`PlainServerSocketImpl`,
+`InetAddressImplFactory`). Twelve of the triples are registered more than once,
+and each registration is refused separately.
 
 ## 3. Why the other seven prefixes are not retirable, with the arm that says so
 
@@ -243,14 +327,11 @@ counted them would report 139 retirements for the same behaviour change.
 
 ## 4. What is retired
 
-114 rows under `java/net/`:
+44 rows under `java/net/`:
 
 ```text
-  30  java/net/DatagramSocket        16  java/net/URL
   29  java/net/URI                   14  java/net/HttpURLConnection
-   8  java/net/Inet4Address           7  java/net/Inet6Address
-   6  java/net/MulticastSocket        3  java/net/InetAddress
-   1  java/net/ProxySelector
+   1  java/net/ProxySelector.getDefault
 ```
 
 10 under `javax/security/auth/x500/`: the whole of `X500Principal` — four
@@ -265,7 +346,18 @@ retired for no reason a reader could reconstruct. Seven rows were added to the
 probe to reach it. **A family that is retired 9/10 is a family whose next reader
 has to re-derive why.**
 
-## 5. The 842 that stay, every one with a verdict
+`java/net/URI` is 29 of its 30 rows. The one left out is
+`compareTo(Ljava/lang/Object;)I`, the `Comparable` bridge, which the probe
+reaches through `compareTo(URI)` and never through the erased signature, so it
+reads `invocations: 0`. It is a single synthetic forwarder and it is left
+unretired rather than claimed on an argument.
+
+`java/net/HttpURLConnection` is 14 of its 30. The other 16 are the
+connection-state family — `getInputStream`, `getResponseCode`,
+`getHeaderField(s)`, `getContentLength` — which no probe in this tree
+dispatched; §5.1.
+
+## 5. The 912 that stay, every one with a verdict
 
 Adjudicated by `scripts`-free analysis of one
 `--dump-native-registry --explain-jdk-only` dump plus the eight per-probe dumps,
@@ -276,8 +368,9 @@ exactly one verdict; "the rest" is not a classification.
 |---:|---|
 | 557 | **BLOCKED** — measured to break the rustls TLS / JCA stack (§3.1) |
 | 176 | **C** — declared abstract or on an interface; no door dispatches it |
-| **124** | **RETIRED** |
+| **54** | **RETIRED** |
 | 104 | **UNOBSERVED** — no probe in this tree dispatched it (§5.1) |
+| 70 | **KEEP** — the corpus refused the retirement (§2.1) |
 | 86 | **BLOCKED** — the arm was VACUOUS; the dial was never asked (§3) |
 | 84 | **LOSER** — another registration owns the slot; the edit would be inert |
 | 73 | **KIND** — already `SyntheticStub`, outside the mechanism |
@@ -288,7 +381,7 @@ exactly one verdict; "the rest" is not a classification.
 | 28 | **LANE-T** — the cross-lane throwable registrar and its siblings |
 | 9 | **E** — no such class in the JDK image |
 
-The goal population reconciles exactly: `124 + 557 + 86 + 67 + 104 + 28 = 966`.
+The goal population reconciles exactly: `54 + 70 + 557 + 86 + 67 + 104 + 28 = 966`.
 
 ### 5.1 The 104 unobserved rows, and what it would take to reach them
 
@@ -338,9 +431,10 @@ should do.
   `dev` `7a8b79526`; the `ServiceLoader.checkCaller` failure the page describes
   is fixed, and `BuiltinClassLoader` no longer blocks ten vectors. What blocks
   the provider/algorithm rows is not L7 — it is §3.1.
-* *"`URLStreamHandler` NPE, 2 vectors, yours right now."* — **Gone.** No corpus
-  vector fails. `grep -rl URLStreamHandler` finds no test asserting it. The
-  entry was already stale when the page was written the same day.
+* *"`URLStreamHandler` NPE, 2 vectors, yours right now."* — **Half right, and
+  the half it got wrong is the interesting one.** No corpus vector fails today,
+  so there was nothing to fix; but the NPE is real and LATENT, and retiring
+  `java/net/URL` wakes it in three vectors. See §2.1.
 * *"`URI` (30 rows) — the best mechanical wave here."* — **Correct, and it was.**
   80 diff lines to zero, and the 30 rows include the `<init>` that 970 of the
   probe's dispatches go through.
@@ -350,6 +444,10 @@ should do.
 * *"Retire the TLS stack base-class-first."* — **Overtaken.** The ordering advice
   presumes the stack is retirable at all; §3.1 and §3.2 say it is not, for two
   independent reasons.
+* *"`URLStreamHandler` NPE, 2 vectors, yours right now."* — the second half of
+  that entry, corrected. No vector fails today, and the page read that as the
+  work being available. It is **latent**: retiring `java/net/URL` wakes it in
+  three vectors, not two. §2.1.
 * *"`javax/net/`, `javax/crypto/`, `javax/security/` may not be in
   `RETIRED_SHADOW_PREFIXES` yet."* — **True, and they still are not**, now
   deliberately. `the_lane_l6_security_and_tls_prefixes_are_not_admitted` pins
