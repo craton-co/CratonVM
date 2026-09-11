@@ -5,7 +5,9 @@
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use cratonvm_native_api::{NativeCallback, NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{
+    NativeCallback, NativeContext, NativeHandleScope, NativeMethodRegistry,
+};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
@@ -337,24 +339,47 @@ pub(crate) fn fill_stack_trace_element(
     file_name: Option<&str>,
     line: i32,
 ) {
-    let cls_str = ctx.create_string(class_dotted);
-    let meth_str = ctx.create_string(method_name);
-    let file_val = match file_name {
-        Some(f) => Value::Object(Some(ctx.create_string(f))),
-        None => Value::Object(None),
+    // `ste` is a young object the caller allocated one statement ago, and every
+    // `create_string` below can collect. Holding the caller's address across
+    // them and storing through it writes the whole element into a copy nothing
+    // reads: `getStackTrace()` then answers an array of blank frames, with no
+    // probe firing, because the values stored were live the whole time and only
+    // the RECEIVER was stale. Root it — and the strings, which have the same
+    // problem in the other direction — and read every address back at the store.
+    let mut scope = NativeHandleScope::new(ctx);
+    let ste_h = scope.root(ste);
+    let cls_obj = scope.create_string(class_dotted);
+    let cls_h = scope.root(cls_obj);
+    let meth_obj = scope.create_string(method_name);
+    let meth_h = scope.root(meth_obj);
+    let file_h = match file_name {
+        Some(f) => {
+            let s = scope.create_string(f);
+            Some(scope.root(s))
+        }
+        None => None,
     };
 
     // Real-JDK layout iff the loaded class carries a named `declaringClass`
     // String field. Synthetic-stub StackTraceElement has no named fields.
-    let real_layout = ctx
+    // (This can load the class, so it stays ahead of every address read.)
+    let real_layout = scope
         .resolve_field_index("java/lang/StackTraceElement", "declaringClass")
         .is_some();
 
+    let ste = scope.get(&ste_h);
+    let cls_str = scope.get(&cls_h);
+    let meth_str = scope.get(&meth_h);
+    let file_val = match &file_h {
+        Some(h) => Value::Object(Some(scope.get(h))),
+        None => Value::Object(None),
+    };
+
     if real_layout {
-        ctx.set_field_by_name(ste, "declaringClass", Value::Object(Some(cls_str)));
-        ctx.set_field_by_name(ste, "methodName", Value::Object(Some(meth_str)));
-        ctx.set_field_by_name(ste, "fileName", file_val);
-        ctx.set_field_by_name(ste, "lineNumber", Value::Int(line));
+        scope.set_field_by_name(ste, "declaringClass", Value::Object(Some(cls_str)));
+        scope.set_field_by_name(ste, "methodName", Value::Object(Some(meth_str)));
+        scope.set_field_by_name(ste, "fileName", file_val);
+        scope.set_field_by_name(ste, "lineNumber", Value::Int(line));
         // Populate the transient `declaringClassObject` with the real Class
         // mirror so `computeFormat()` (which does
         // `getfield declaringClassObject; invokevirtual getClassLoader0`)
@@ -370,19 +395,21 @@ pub(crate) fn fill_stack_trace_element(
         // name (lambdas, not-yet-loaded, etc.), fall back to `java/lang/Object`'s
         // bootstrap-loaded mirror so `computeFormat` runs cleanly — only the
         // module/loader display prefix is affected, never correctness.
-        let mirror_cid = ctx
+        let mirror_cid = scope
             .class_id_by_name(class_slashed)
-            .or_else(|| ctx.class_id_by_name("java/lang/Object"));
+            .or_else(|| scope.class_id_by_name("java/lang/Object"));
         if let Some(cid) = mirror_cid {
-            let mirror = ctx.get_class_mirror(cid);
-            ctx.set_field_by_name(ste, "declaringClassObject", Value::Object(Some(mirror)));
+            // Materialising a mirror allocates, so `ste` has to be read again.
+            let mirror = scope.get_class_mirror(cid);
+            let ste = scope.get(&ste_h);
+            scope.set_field_by_name(ste, "declaringClassObject", Value::Object(Some(mirror)));
         }
     } else {
         // Legacy synthetic-stub layout: [class, method, file, line].
-        ctx.set_field(ste, 0, Value::Object(Some(cls_str)));
-        ctx.set_field(ste, 1, Value::Object(Some(meth_str)));
-        ctx.set_field(ste, 2, file_val);
-        ctx.set_field(ste, 3, Value::Int(line));
+        scope.set_field(ste, 0, Value::Object(Some(cls_str)));
+        scope.set_field(ste, 1, Value::Object(Some(meth_str)));
+        scope.set_field(ste, 2, file_val);
+        scope.set_field(ste, 3, Value::Int(line));
     }
 }
 
@@ -2507,20 +2534,30 @@ pub(crate) fn native_throwable_get_stack_trace_array(
 
     let len = trace_data.len();
     let ste_cid = cached_ste_class_id(ctx);
-    let arr = ctx.new_ref_array(ste_cid, len);
+    // The array outlives one allocation per frame (the element, its three
+    // strings, possibly a class mirror), so it cannot be held as an address.
+    let mut scope = NativeHandleScope::new(ctx);
+    let arr_obj = scope.new_ref_array(ste_cid, len);
+    let arr_h = scope.root(arr_obj);
     // stored trace is outermost-first; getStackTrace() wants index 0 = the
     // throw site (innermost), so fill the array reversed.
     for (i, (cls_slashed, meth, file, line)) in trace_data.iter().rev().enumerate() {
-        let ste = crate::try_alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4)?;
+        let ste =
+            crate::try_alloc_concurrent_synthetic(&mut *scope, "java/lang/StackTraceElement", 4)?;
+        // The element itself crosses `fill_stack_trace_element`, which
+        // allocates three strings and possibly a mirror.
+        let ste_h = scope.root(ste);
         // Reuse the dotted-name cache shared with `Class.getName()` so
         // repeat frames in the same trace (recursion) hit the cached
         // Arc<str> instead of re-allocating.
-        let cls_dotted = match ctx.class_id_by_name(cls_slashed) {
-            Some(cid) => crate::lang_class::dotted_class_name(ctx.vm_identity(), cid, cls_slashed),
+        let cls_dotted = match scope.class_id_by_name(cls_slashed) {
+            Some(cid) => {
+                crate::lang_class::dotted_class_name(scope.vm_identity(), cid, cls_slashed)
+            }
             None => std::sync::Arc::from(cls_slashed.replace('/', ".")),
         };
         fill_stack_trace_element(
-            ctx,
+            &mut *scope,
             ste,
             cls_slashed,
             &cls_dotted,
@@ -2528,13 +2565,16 @@ pub(crate) fn native_throwable_get_stack_trace_array(
             file.as_deref(),
             *line,
         );
-        ctx.set_array_element(arr, i, Value::Object(Some(ste)));
+        let arr = scope.get(&arr_h);
+        let ste = scope.get(&ste_h);
+        scope.set_array_element(arr, i, Value::Object(Some(ste)));
     }
+    let arr = scope.get(&arr_h);
     if crate::nbflags().dbg_sttrace {
-        let n = ctx.array_length(arr);
+        let n = scope.array_length(arr);
         for i in 0..n {
-            if let Value::Object(Some(e)) = ctx.get_array_element(arr, i) {
-                let cn = ctx.get_field_by_name(e, "declaringClass");
+            if let Value::Object(Some(e)) = scope.get_array_element(arr, i) {
+                let cn = scope.get_field_by_name(e, "declaringClass");
                 eprintln!("[STTRACE materialized] [{i}] declaringClass={cn:?}");
             } else {
                 eprintln!("[STTRACE materialized] [{i}] = NULL ELEMENT");
