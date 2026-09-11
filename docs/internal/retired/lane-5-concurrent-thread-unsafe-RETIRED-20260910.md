@@ -15,7 +15,7 @@ byte offsets, `ScopedMemoryAccess` settled jointly with L4, and every cited
 delta backed by a noise floor from the same probe.* That is what this page
 records, so the page it replaces can go.
 
-**The headline is not the retirement.** 81 rows moved; three defects were
+**The headline is not the retirement.** 100 rows moved; three defects were
 found, and two of them were live in shipped `--jdk-only` behaviour rather than
 in the retirement:
 
@@ -161,7 +161,7 @@ task classes alone, `apps/probes/L5ExecutorSweep.java` hangs at
 `invokeAll(t1, t2)` — 178 rows before the arm, 92 after, and the missing tail
 is what `diff` reports as 86 differing rows.
 
-## 4. What was retired: 81 rows over 9 classes
+## 4. What was retired: 100 rows over 11 classes
 
 | class | rows | what the whole-tree arm measured |
 |---|---|---|
@@ -174,6 +174,8 @@ is what `diff` reports as 86 differing rows.
 | `Thread$State` | 2 | fixes a defect — see below |
 | `ScheduledThreadPoolExecutor` | 2 | 0 worse |
 | `Thread$FieldHolder` | 1 | 0 worse |
+| `jdk/internal/misc/Unsafe` | 16 | see below — a subset, not the class |
+| `jdk/internal/misc/VM` | 3 | whole-tree arm moved one probe, which timed out in BOTH arms |
 
 Each row also carries a dispatch observed per triple, from a probe run's
 `--dump-native-registry` or from one of the 132 `--jdk-only` corpus reports.
@@ -209,47 +211,79 @@ and that is why one family retires and the other cannot.
 
 ## 5. What was held, with the blocker
 
-324 rows. Every one has a measurement, not a judgement.
+305 rows. Every one has a measurement, not a judgement.
 
-### 143 rows: the class's whole arm moves the VM AWAY from HotSpot
+### 127 rows: the class's whole arm moves the VM AWAY from HotSpot
 
 | class | rows | measured |
 |---|---|---|
-| `jdk/internal/misc/Unsafe` | 91 | 8 probes worse, 5 truncated. `L4BridgeSweep` 499 rows → 0, `L4ByteBufferSweep` 406 → 111, `L4TailSweep2` 189 → 26, `SecuritySurfaceSweep` +380 |
+| `jdk/internal/misc/Unsafe` | 75 | 8 probes worse, 5 truncated. `L4BridgeSweep` 499 rows → 0, `L4ByteBufferSweep` 406 → 111, `L4TailSweep2` 189 → 26, `SecuritySurfaceSweep` +380 |
 | `java/lang/Thread` | 33 | 9 worse, 5 truncated. `ThreadShadowSweep` 122 rows → 54, `ConcurrentStressSweep` +54 |
 | `ForkJoinPool` | 19 | §3 |
 
 `Unsafe`'s blast radius is `java.nio`, and that is the shape to expect: the
 class is a memory-access API, so its users are every buffer in the image.
 
-### 105 rows: no instrument in this tree dispatches them
+**Sixteen of its 91 rows are retired anyway, and the line is not a judgement
+call.** An atomic or a fence that DELEGATES to an `ACC_NATIVE` primitive at the
+SAME offset is retirable, because the JDK's Java body is then a loop over calls
+this VM already serves:
+
+```java
+    public final int getAndAddInt(Object o, long offset, int delta) {
+        int v;
+        do { v = getIntVolatile(o, offset); }
+        while (!weakCompareAndSetInt(o, offset, v, v + delta));
+        return v;
+    }
+```
+
+Every term in that is one of ours, and the offset is passed through untouched.
+Anything that does ARITHMETIC on the offset is not retirable, for the reason in
+§5's structural blocker. So `getAndSetReference` retires and `getAndSetByte`
+cannot, though they are neighbours in the same file with the same shape — and
+`ScopedMemoryAccess.getIntUnaligned` retires while `Unsafe.getIntUnaligned`
+cannot, though they share a name, because one is handed a real byte offset into
+a `MemorySegment` and the other a slot index.
+
+The sixteen: `getAndAddInt`, `getAndAddLong`, `getAndSetInt`, `getAndSetLong`,
+`getAndSetReference`, `getReferenceAcquire`, `putReferenceRelease`,
+`putReferenceOpaque`, `putIntOpaque`, `loadFence`, `storeFence`,
+`storeStoreFence`, `weakCompareAndSetInt`, `weakCompareAndSetIntPlain`,
+`weakCompareAndSetLong`, `weakCompareAndSetReference`.
+
+### 133 rows: one unit with a held class
+
+| class | rows | why it is one unit |
+|---|---|---|
+| `sun/misc/Unsafe` | 82 | the legacy façade over `jdk/internal/misc/Unsafe`; retire them together or the two disagree about the same memory |
+| `ForkJoinTask` | 25 | §3 — a retired task class waits on the held pool |
+| `RecursiveTask` | 14 | §3 |
+| `RecursiveAction` | 12 | §3 |
+
+`sun/misc/Unsafe` is the one to read twice, because it has a second and
+stronger reason. **The probe tree cannot ask about it at all**: 121 of 121
+probes report the dial VACUOUS on that scope, and the 132 corpus reports reach
+18 of the 82. Precondition 1 fails by measurement rather than by omission, and
+a future wave has to bring a workload that uses the legacy façade before it can
+say anything at all about these rows.
+
+### 40 rows: no instrument in this tree dispatches them
 
 | class | rows | measured |
 |---|---|---|
-| `sun/misc/Unsafe` | 82 | **121 of 121 probes report the dial VACUOUS** on this scope. The corpus reaches 18 of the 82 |
-| `jdk/internal/misc/ScopedMemoryAccess` | 14 | the aligned accessors and their twins; 0 dispatches in probes or corpus |
+| `jdk/internal/misc/ScopedMemoryAccess` | 14 | the aligned accessors and their `…Internal` twins; 0 dispatches in probes or corpus |
 | `jdk/internal/vm/Continuation` | 8 | 0 dispatches |
+| `jdk/internal/misc/VM` | 6 | 0 dispatches; the other 3 are retired |
 | `sun/misc/Signal` | 5 | 0 dispatches |
 | `jdk/internal/misc/Signal` | 4 | 0 dispatches |
 | `jdk/internal/vm/ContinuationScope` | 3 | 0 dispatches |
 
-`sun/misc/Unsafe` is the one to read twice. The lane page called it "bucket B,
-one unit" with `jdk/internal/misc/Unsafe` — *retire them together or the two
-disagree about the same memory* — and that is still right; but the reason it is
-not retired is independent and stronger. **The probe tree cannot ask about it
-at all.** Precondition 1 fails by measurement rather than by omission, and a
-future wave has to bring a workload that uses the legacy façade before it can
-say anything.
+### The structural blocker inside `Unsafe`'s 75
 
-### 51 rows: one unit with a held class
-
-`ForkJoinTask` (25), `RecursiveTask` (14), `RecursiveAction` (12) — see §3.
-
-### 22 rows: structurally unretirable over this object model
-
-Inside `jdk/internal/misc/Unsafe`'s 91, and counted there. Recorded separately
-because the blocker is different in kind: these cannot be retired by any future
-wave that does not change what `objectFieldOffset` returns.
+Counted in the 127 above, and recorded separately because the blocker is
+different in kind: 22 of those rows cannot be retired by any future wave that
+does not change what `objectFieldOffset` returns.
 
 **`objectFieldOffset` answers a SLOT INDEX, and the JDK's sub-word atomics are
 byte arithmetic.** `compareAndSetByte` and its relatives are implemented in
@@ -303,11 +337,75 @@ agrees: arming `java/util/concurrent/CopyOnWrite` empties the set out —
 `IoSystemSweep` reads `cow set sorted |[]|` — while arming
 `CopyOnWriteArrayList` alone is 0 worse over the whole tree.
 
-### 9 rows: `jdk/internal/misc/VM`
+## 6. The acceptance measurement
 
-See §7 — the arm is recorded there.
+Three binaries, all from this branch, so the arithmetic is about the change and
+not about a revision:
 
-## 6. The two probes the lane page named, and their noise floor
+```text
+  a   the Unsafe atomicity fix, no table
+  b   + the executor fix, + 81 table rows
+  c   + 19 more table rows (the delegating Unsafe atomics/fences, three VM rows)
+```
+
+**The refusal census first, because a wave can be a no-op that looks clean.**
+A table entry retires a triple only when nothing already owns it —
+`JdkOnlyViolation::SyntheticNativeRegistered` carries a `survivor`, and a
+non-null one means an earlier registration is still serving and every probe
+reads exactly as it did before. On binary c:
+
+```text
+  105 refusals, 0 with a survivor
+```
+
+105 rather than 100 because five triples are registered more than once
+(`CopyOnWriteArrayList` 19 refusals for 16 rows, `ThreadPoolExecutor` 16 for
+15, `jdk/internal/misc/Unsafe` 17 for 16).
+
+**Whole probe tree, a against c, arms concurrent, 123 probes:**
+
+```text
+  worse   0
+  better  5   L5ExecutorSweep -4, L5TpeCount -4, NullArgMsgProbe -2
+              L4FilesSweep -307   <- an instrument artefact, see below
+              VtHandoffProbe -4   <- the known-flaky row, not claimed
+```
+
+**Corpus, binary c:**
+
+```text
+  CRATONVM_ARGS=--jdk-only    132 passed, 0 failed
+  SUITE=all                   132 passed, 0 failed
+  SUITE=core                  see the commit message
+```
+
+### The instrument lesson: two arms of a filesystem probe collide
+
+`L4FilesSweep` moved by 294 in the first A/B and by −307 in the second. It is
+neither. Run alone, both binaries produce 397 rows and **0 diffs** against
+HotSpot, four pairs out of four. Run as concurrent arms, six pairs read:
+
+```text
+  pair   control d(hs)   trial d(hs)
+   1          6              141
+   2        126              397
+   3        104              397
+   4         84              119
+   5        129              184
+   6        119               17     <- the trial is BETTER here
+```
+
+Both arms fail, in both directions. The probe writes into the JDK's own temp
+directory, so two of it in flight collide with each other — and setting
+`TMPDIR` per arm does not fix it, because the path comes from
+`java.io.tmpdir`. **A/B arms must be concurrent on this host** (ABBA read 1.9×
+for a flag that costs nothing), so the remedy is to score a filesystem probe
+sequentially and say so, not to sequentialise the battery.
+
+The tell was there without the re-runs: `rc=1` on BOTH arms. A row where the
+control also failed is not a row about the trial.
+
+## 7. The two probes the lane page named, and their noise floor
 
 The lane page said `JdkOnlyPlatformProbe` and `VtHandoffProbe` are unusable and
 that a delta from either is a coin flip. This session produced the cleanest
@@ -330,7 +428,7 @@ binary with nothing armed. **No delta from either probe is cited anywhere in
 this record**, and the two of them account for four of the "worse" rows in the
 summaries above.
 
-## 7. Instruments added, and what each was for
+## 8. Instruments added, and what each was for
 
 | probe | rows | what it asks that nothing else did |
 |---|---|---|
@@ -352,7 +450,7 @@ The remaining 24 are the four dead `AbstractExecutorService` rows and the
 twenty `ScopedMemoryAccess` aligned accessors — both cases where the probe
 would have to construct a receiver shape the image does not otherwise produce.
 
-## 8. What the next wave should do, in order
+## 9. What the next wave should do, in order
 
 1. **`ForkJoinPool`'s external submission.** §3 localises it to the submitter's
    help path racing a worker, with the `Unsafe` primitives underneath proven

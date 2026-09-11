@@ -2288,14 +2288,15 @@ static RETIRED_SHADOW_PHASE3_TRIPLES: &[(&str, &str, &str)] = &[
 
 /// Lane 5 — `java/util/concurrent/`, `Thread`, `Unsafe`, retired 2026-09-10.
 ///
-/// `docs/known-issues/jdk-only-lanes/lane-5-concurrent-thread-unsafe.md` is the
-/// page; this is the table it fills. The lane's population is **405 bucket-A/B
-/// rows over 22 classes**, which is not the 659 a prefix filter over
-/// `--dump-native-registry --explain-jdk-only` reports. Two subtractions get
-/// from one to the other, and both are lane-0 rules rather than this lane's
+/// `docs/internal/retired/lane-5-concurrent-thread-unsafe-RETIRED-20260910.md`
+/// is the page; this is the table it fills. The lane's population is
+/// **405 bucket-A/B rows over 23 classes**, which is not the 516 a prefix
+/// filter over `--dump-native-registry --explain-jdk-only` reports, and not
+/// the 659 a binary that predates the Phase 3 wave reports. One subtraction
+/// gets from 516 to 405, and it is a lane-0 rule rather than this lane's
 /// choice:
 ///
-///   * 155 rows come from a registrar whose classes span more than one lane
+///   * 111 rows come from a registrar whose classes span more than one lane
 ///     (`register_throwable_subclass_natives` and the `native-collections`
 ///     collection-family loops). Lane 0 §3: **the unit of work for a
 ///     cross-cutting registrar is the registrar, and lane T owns it whole** —
@@ -2303,8 +2304,12 @@ static RETIRED_SHADOW_PHASE3_TRIPLES: &[(&str, &str, &str)] = &[
 ///     `native-collections/src/lib.rs` line as `HashSet.equals` and
 ///     `LinkedHashSet.equals`, is not this lane's row to retire even though the
 ///     receiver is;
-///   * 99 are the `ConcurrentHashMap` family, retired by the 2026-09-09 Phase 3
-///     wave and already in [`RETIRED_SHADOW_PHASE3_TRIPLES`].
+///
+/// (The `ConcurrentHashMap` family's 99 rows are the difference between 659 and
+/// 516: they were retired by the 2026-09-09 Phase 3 wave and are already in
+/// [`RETIRED_SHADOW_PHASE3_TRIPLES`], so a dump from a binary that carries that
+/// wave does not report them at all. **Take the dump from the binary you are
+/// about to change.**)
 ///
 /// # 100 of 405, and the other 305 are classified rather than deferred
 ///
@@ -2312,8 +2317,8 @@ static RETIRED_SHADOW_PHASE3_TRIPLES: &[(&str, &str, &str)] = &[
 /// |---|---|
 /// | retired here | **100** |
 /// | held: the class's whole arm moves the VM AWAY from HotSpot | 127 |
-/// | held: no instrument in this tree dispatches the row | 102 |
-/// | held: one unit with a held class | 71 |
+/// | held: one unit with a held class | 133 |
+/// | held: no instrument in this tree dispatches the row | 40 |
 /// | dead registration — a door that never opens | 4 |
 /// | held: a partial with evidence against it | 1 |
 ///
