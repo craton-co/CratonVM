@@ -402,6 +402,46 @@ size/isEmpty native calls is a separate blast radius that deserves its own
 control and its own trial. It is §10's own item now, with the trace above as
 its evidence.
 
+### Waves 3 and 4 — the acceptance, one binary pair, whole probe tree
+
+Control `cratonvm-l1hm-base-20260911` is `origin/dev` at `1d9c00029`,
+untouched. Trial `cratonvm-l1hm-trial2-20260911` is the same tree plus wave
+3's 21 triples, wave 4's 29, and one inert bounds check. Arms concurrent, each
+in its own working directory, absolute classpath.
+
+```text
+  128 probes   0 worse   2 better
+    L1JarTextSweep    13 diffs -> 4    (-9)
+    L1MapFieldProbe    5 diffs -> 1    (-4)
+    VtHandoffProbe     0 diffs -> 5    — NOT a regression, see below
+  2 probes time out at 180s on both arms (FjpStress, HibfixComposeProbe2).
+```
+
+**`VtHandoffProbe` is a coin flip and this is what that looks like.** Six
+sequential runs of each binary, same probe, same host:
+
+```text
+  control  5 0 5 5 5 5
+  trial    5 7 5 5 0 5
+```
+
+Both binaries take every value in {0, 5, 7}. The A/B caught the control on its
+one `0` and the trial on a `5`, and reading that pair as a regression would
+have cost a day. Measure a flaky vector's floor before explaining it — this
+lane has now done that twice on this same probe.
+
+The per-family instruments agree with the tree:
+
+```text
+  L1MapFamilySweep  142 rows   control 0   DIAL-ARMED 9   trial 0
+  L1JarTextSweep     87 rows   control 13  DIAL-ARMED 4   trial 4
+  L1MapFieldProbe               control 5                 trial 1
+```
+
+The four `L1JarTextSweep` rows that survive are named in §10 item 5 and in
+`RETIRED_SHADOW_L1_JT_TRIPLES`: one is `JarFile`'s, one is the helpful-NPE
+-message gap, and two are `Throwable`'s.
+
 ## 4. The finding this lane would most like the next lane to have: a retired PRODUCER makes a zero-invocation CONSUMER reachable
 
 Precondition 4 asks for `invocations > 0` per triple in your own instrument's
