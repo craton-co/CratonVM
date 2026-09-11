@@ -21,7 +21,8 @@ preconditions and the landing protocol are in
 | disposition | rows | what decided it |
 |---|---:|---|
 | **RETIRED** — `RETIRED_SHADOW_L1_TRIPLES` | **329** | waves 1 and 2, §3 |
-| **RETIRED** — `RETIRED_SHADOW_L1_HM_TRIPLES` | **98** | wave 3, `HashMap` + views, §3 |
+| **RETIRED** — `RETIRED_SHADOW_L1_HM_TRIPLES` | **21** | wave 3, `HashMap`'s own map surface, §3 |
+| HELD — `HashMap`'s views, iterators, `$Node` and 8 inherited methods | 77 | **wave 3 retired all 98 and measured 12 probes worse** — §3 |
 | HELD — `TreeMap`/`TreeSet` | 157 | state is `tm_array_table()`, a Rust side table; 9 probes worse armed |
 | HELD — `LinkedHashMap` + its four views + iterators | 102 | state is `lhm_overlay()`, a Rust side table; 11 probes worse |
 | HELD — `Hashtable` + views + `$Entry` | 79 | 4 probes worse |
@@ -40,16 +41,15 @@ preconditions and the landing protocol are in
 the tests beside them pin every HELD verdict, so changing one means changing a
 test.
 
-**Wave 3 changed what a RED dial arm means, and that is the lane's most
-transferable result.** `java/util/HashMap` sat in the HELD column for two
-revisions of this page on the strength of nine probe rows that moved when the
-dial was armed on it. Those nine rows were a DIAL ARTEFACT: the native that
-answered them is registered on `java/util/AbstractCollection`, and the question
-it falls back on is asked from inside a native, where there is no dispatch door
-to decline at. The trial binary — which removes the registration rather than
-declining at a door — is **0 diffs on all 142 rows**. §3's wave 3 has the
-trace. The ops page already says an armed sweep is a candidate and not a
-verdict when it is green; it is not a verdict when it is red either.
+**Wave 3 is the lane's most transferable result, and it cuts twice.**
+`java/util/HashMap` sat in the HELD column for two revisions of this page on
+nine probe rows that moved when the dial was armed on it. Those nine rows were
+a DIAL ARTEFACT — the trial binary reads 0 on all 142 — so **a red dial arm is
+a candidate and not a verdict, exactly as a green one is not**. And then the
+same trial binary, run against the whole probe tree rather than the one family,
+came back **12 worse**: the dial had also been SILENT about two real blockers
+it structurally cannot see. Both readings are in §3, and the second is why 77
+of the 98 are still held.
 
 ## 2. How to re-take the 959, because the headline number will rot
 
@@ -261,16 +261,89 @@ Java-level `entrySet().size()` answers 3 the whole time, because THAT call
 passes a door. The two answers to one question, four frames apart, are the
 whole defect.
 
-**What the trial binary says.** Retirement does not decline at a door; it
-removes the registration, so step 4's question reaches real bytecode.
-Control `cratonvm-l1hm-base-20260911` (`1d9c00029`, untouched), trial
-`cratonvm-l1hm-trial1-20260911` (the same tree plus this table):
+**What the first trial binary says about those nine rows.** Retirement
+does not decline at a door; it removes the registration, so step 4's question
+reaches real bytecode. Control `cratonvm-l1hm-base-20260911` (`1d9c00029`,
+untouched), trial `cratonvm-l1hm-trial1-20260911` (the same tree plus all 98):
 
 ```text
   L1MapFamilySweep  142 rows   control 0 diffs   DIAL-ARMED 9   trial 0
   L1MapFieldProbe              control 5 diffs                  trial 1
   L1EntrySetRouteProbe         control 1 diff                   trial 1
 ```
+
+So the nine were a dial artefact and the family's own surface is clean. **And
+then the whole probe tree said 12 worse, 1 better** — which is the other half
+of the lesson, and the more expensive half: the dial was not merely wrong about
+the nine, it was SILENT about two blockers it structurally cannot see, because
+both of them are about what a SURVIVING native does to an object real bytecode
+just built.
+
+```text
+  trial1, 127 probes, control cratonvm-l1hm-base-20260911:
+    12 worse   1 better
+      MethodRefDoorProbe    0 -> 10   rc 0 -> 1   the NPE below
+      L4CensusTail          0 -> 51   rc 0 -> 1   truncated by it
+      LocaleDateTzShadowSweep 2 -> 29  rc 0 -> 1  truncated by it
+      L4FilesSweep          0 -> 18   rc 0 -> 1   truncated by it
+      L1TailSweep          13 -> 49               truncated by it
+      JcaGapSizer          67 -> 262
+      LinkedSequencedShadowSweep 0 -> 8           the overlay below
+      SunJceServices        5 -> 9
+      SingleByteCharsets    0 -> 4
+      JdkOnlyBreadthProbe   0 -> 2
+      ItrCarrierCensus      0 -> 1
+      L4Reach               0 -> 1
+      L1MapFieldProbe       5 -> 1    (better)
+```
+
+**Blocker 1 — the three iterator carriers are not this family's to move.**
+
+```text
+  NullPointerException: Cannot read field "modCount" because "this.this$0" is null
+        at java/util/HashMap$HashIterator.nextNode(HashMap.java:1604)
+        at java/util/HashMap$KeyIterator.next(HashMap.java:1628)
+```
+
+and the row it killed is `MethodRefDoorProbe`'s **HashSet** row, not its
+HashMap row. `key_itr_carrier_for` mints `java/util/HashMap$KeyIterator` for
+every receiver that is not LinkedHashMap-shaped — `java/util/HashSet`'s views
+and `java/util/Hashtable`'s among them — and those producers are lane T's and
+the Hashtable family's, both still `Bridge`. Retire the carrier's natives and
+the live producer keeps minting it, so the image's own `HashIterator` bytecode
+runs on an object no bytecode built and no constructor filled in. Four more
+probes are truncated behind that one throw.
+
+The cluster note on `register_set_view_carrier_natives` predicted this in
+prose on 2026-08-20 — *"the four `MAP_KEY_ITR_CARRIERS` cannot be refused while
+any `SET_VIEW_CARRIERS` entry outside the moving family is still `Bridge`"* —
+and wave 3 is its first measurement. The view CLASSES go with the iterators for
+the same reason one class along: retire `HashMap.entrySet()` and real bytecode
+mints a real `HashMap$EntrySet` whose own surviving natives then find no
+backing, which is the defect this whole section is about, moved sideways.
+
+**Blocker 2 — `LinkedHashMap` inherits eight of these methods.**
+
+```text
+  LinkedSequencedShadowSweep
+    44 merge counts as an access   {b=22, c=33, a=2}  ->  {a=2}
+```
+
+`java/util/LinkedHashMap` is a `HashMap` SUBCLASS. The registry gives it its
+own native for 33 of this surface but not for `compute`,
+`computeIfPresent`, `equals`, `hashCode`, `merge`, `readObject`, `replaceAll`
+or `writeObject` — those dispatch to `java/util/HashMap`'s registration. Retire
+them and a LinkedHashMap receiver runs real `HashMap` bytecode over a `table`
+its entries are not in: they are in `lhm_overlay()`, which is §10 item 2's
+whole problem. The eight are exactly the eight, computed from the registry and
+not guessed, and `wave_three_refused_the_iterators_the_views_and_lhm_s_
+inherited_eight` is the test that keeps them out.
+
+**What wave 3 therefore retires: 21, not 98.** `java/util/HashMap`'s own map
+surface — the four constructors, `put`, `get`, `remove` ×2, `size`, `isEmpty`,
+`clear`, `containsKey`, `containsValue`, `putAll`, `putIfAbsent`, `replace`
+×2, `computeIfAbsent`, `getOrDefault`, `forEach` and `toString` — and nothing
+that produces, carries or is shared with another family's object.
 
 The four `L1MapFieldProbe` rows the wave repairs are unarmed defects the
 control has and HotSpot does not: `new HashMap<>()` plus three puts leaves
@@ -285,16 +358,18 @@ nobody re-derives them:
 - `F.hashSet.backing.fields` — `new HashSet<>(List.of("a","b","c"))` gives its
   backing map `threshold = 16` where HotSpot has 12. That is
   `java/util/HashSet`'s own constructor, which lane T holds
-  (`register_hashset_natives`), and it is §10's HashSet item;
+  (`register_hashset_natives`), and it is §10 item 7;
 - `D.treeMap.map.keySetField` — `new TreeMap<>(m)` leaves the map's `keySet`
   field populated where HotSpot leaves it null, in BOTH arms. §10 item 1.
 
-**Precondition 4 is measured, not waived.** Three earlier probe runs reached 29
-of the 98 triples. `apps/probes/L1MapFamilySweep.java` reaches the rest through
-ordinary Java: every constructor including the three that throw, every
-default-method override on all three views, both iterator `remove()`
-contracts, `Node.setValue` through a detached entry, a serialization
-round-trip, comodification on each view, a resize and a collision chain.
+**Precondition 4 is measured, not waived.** Three earlier probe runs reached
+29 of the 98 triples. `apps/probes/L1MapFamilySweep.java` — 142 rows — reaches
+the rest through ordinary Java: every constructor including the three that
+throw, every default-method override on all three views, both iterator
+`remove()` contracts, `Node.setValue` through a detached entry, a
+serialization round-trip, comodification on each view, a resize and a collision
+chain. It is the instrument that measured all three of wave 3's readings, and
+it is checked in so the next attempt on the other 77 starts from it.
 
 **One provably-inert repair went in beside the table.** `hs_backing_map` now
 bounds the slot against the OBJECT (`object_num_fields`) rather than the class.
@@ -481,7 +556,7 @@ Fixed in `normalizer_reject_nulls`, called from **both** registrars —
 `phases_late/text_intl.rs` serves synthetic mode, and a duplicate pair that
 sits half-fixed is exactly what `owns_slot` exists to catch.
 
-## 10. What is left, as seven VM changes rather than more measurement
+## 10. What is left, as eight VM changes rather than more measurement
 
 Every remaining HELD family has a named blocker. In rough order of rows:
 
@@ -491,21 +566,33 @@ Every remaining HELD family has a named blocker. In rough order of rows:
    exists. The remedy is `Properties`' `replace_real_map` for a red-black tree:
    build the real node graph, make it the authority, then retire. Retiring
    first hands real bytecode an empty map.
-2. **`LinkedHashMap` + views (102).** `lhm_overlay()`, same shape, same remedy.
-3. **`Hashtable` + views + `$Entry` (79).** Four probes worse armed, and
+2. **`LinkedHashMap` + views (102).** `lhm_overlay()`, same shape, same
+   remedy — and now also a BLOCKER on someone else's table: wave 3 could not
+   retire eight `java/util/HashMap` methods because LinkedHashMap inherits
+   this VM's registration for them and its entries are in the overlay. Fixing
+   item 2 unblocks those eight for free.
+3. **`HashMap`'s views, iterators, `$Node` and its three view accessors
+   (77).** Wave 3 measured these and put them back; §3 has the two throws.
+   The iterators need **a Hashtable-family iterator carrier of its own** —
+   `java/util/Hashtable$Enumerator` is what HotSpot answers and
+   `deprecated_util.rs` already names it — so that `key_itr_carrier_for`
+   stops minting `HashMap$KeyIterator` for receivers outside the family. Do
+   that, and the views, the accessors and the iterators can move as one set.
+   Until then any subset of them is a half-retirement.
+4. **`Hashtable` + views + `$Entry` (79).** Four probes worse armed, and
    NOT the same answer as `HashMap` was: its fields already match HotSpot
    unarmed and its views survive arming byte-identically
    (`L1EntrySetRouteProbe`'s `C.hashtable.*` rows are clean in all three
    columns). Its own question, unbisected.
-4. **`java/util/jar/` (45)** and **`java/text/` (12)**: both red only under
+5. **`java/util/jar/` (45)** and **`java/text/` (12)**: both red only under
    `L1TailSweep`; neither has been bisected to a method. Start by splitting the
    scope — `JarFile` alone, `Manifest`/`Attributes` alone —
    `/data/l1hm/bisect.sh`'s shape is the loop, and after wave 3 the rule for
    reading it is "a red arm is a candidate, not a verdict" (see below).
-5. **`Date`/`TimeZone`/`sun/util/calendar/` (40)** and **`Locale` + providers
+6. **`Date`/`TimeZone`/`sun/util/calendar/` (40)** and **`Locale` + providers
    (35)**: read §6 of the previous revision of this page, preserved as the
    locale-provider trap below, before pricing either.
-6. **`HashSet`/`LinkedHashSet` (13 + lane T's 42)**: blocked on lane T
+7. **`HashSet`/`LinkedHashSet` (13 + lane T's 42)**: blocked on lane T
    releasing `register_hashset_natives`. Nothing for L1 to do until then —
    except that wave 3 left it one measured row to start from:
    `new HashSet<>(List.of("a","b","c"))` gives its backing map
@@ -513,8 +600,8 @@ Every remaining HELD family has a named blocker. In rough order of rows:
    `F.hashSet.backing.fields`). HotSpot's `HashSet(Collection)` sizes the map
    at `max((int)(c.size()/.75f)+1, 16)` and lets `HashMap` derive the
    threshold from it; this VM writes the capacity into the threshold.
-7. **`ResourceBundle` (12)**: §8. Blocked on the same locale-provider
-   lookup as item 5's `Locale`, and it is the cheapest probe into it —
+8. **`ResourceBundle` (12)**: §8. Blocked on the same locale-provider
+   lookup as item 6's `Locale`, and it is the cheapest probe into it —
    `TimeZone.getDisplayName` is one call and the answer is one string.
 
 ### And one that is not a family at all

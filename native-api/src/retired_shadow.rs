@@ -3170,6 +3170,246 @@ static RETIRED_SHADOW_L1_HM_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/util/HashMap", "toString", "()Ljava/lang/String;"),
 ];
 
+/// Lane 1 wave 4 — the `java/util/jar/` and `java/text/` rows that a dial
+/// BISECTION cleared, once the whole-prefix red was traced to one class each.
+///
+/// ## §7's two vacuous greens were also two unbisected reds
+///
+/// The 2026-09-10 revision of the lane page held both families because
+/// `apps/probes/L1TailSweep.java` turned each prefix red — jar `+28`, text
+/// `+11` — after a 44-probe subset had called both `0 worse` with the dial
+/// never engaging. That was the right call and it stopped there: "neither has
+/// been bisected to a method".
+///
+/// Bisected on 2026-09-11 against `cratonvm-l1hm-base-20260911`, one class at
+/// a time, scored on `L1TailSweep` (base 13 diffs), with the dial's own
+/// engagement printed beside each row so a vacuous arm cannot pass as a green:
+///
+/// ```text
+///   java/util/jar/                 +34 WORSE   reached=146
+///     java/util/jar/JarFile        +34 WORSE   reached=4    <- the whole red
+///     java/util/jar/JarEntry        +0 same    reached=16
+///     java/util/jar/Manifest        +0 same    reached=23
+///     java/util/jar/Attributes      +0 same    reached=156
+///     java/util/jar/Attributes$Name +0 same    reached=127
+///   java/text/                     +16 WORSE   reached=4
+///     java/text/BreakIterator      +16 WORSE   reached=4    <- the whole red
+///     java/text/ParseException      +0 same    reached=1
+///     java/text/Normalizer          +0 same    reached=10
+///     java/text/DateFormat          +0 same    reached=0    <- VACUOUS
+/// ```
+///
+/// Each family's red is ONE class, and `java/util/jar/JarFile` is the same
+/// class wave 2 already had to retire three defect rows out of. Those two
+/// stay `Bridge` and keep their prefixes off this table; `DateFormat`'s single
+/// registration is excluded for the reason §7 exists — its green said nothing.
+///
+/// ## What yielding REPAIRS: thirteen rows, measured
+///
+/// `apps/probes/L1JarTextSweep.java` (87 rows, written for this wave) is
+/// byte-identical to HotSpot 25.0.4+7 on the trial binary and thirteen rows
+/// out on the control. Every one of them is a §1.4 defect — the native
+/// answers where the image's own body throws, or throws where it answers:
+///
+/// ```text
+///   A.getValue.nullName    HotSpot NullPointerException   control null
+///   A.put.rejectsString    HotSpot ClassCastException     control null
+///   N.ctor.empty           HotSpot IllegalArgumentException  control ""
+///   N.ctor.null            HotSpot NullPointerException   control null
+///   N.ctor.illegalChar     HotSpot IllegalArgumentException  control "bad name"
+///   N.ctor.tooLong         HotSpot IllegalArgumentException  control 71
+///   M.ctorStream.garbage   HotSpot 0                      control IOException
+///   M.ctorStream.null      HotSpot NPE "this.in is null"  control NPE, own text
+///   M.ctorCopy.null        HotSpot NullPointerException   control 0
+///   E.ctorName.null        HotSpot NullPointerException   control null
+///   E.attributesFromJar    HotSpot "section-value"        control null
+///   P.printStackTrace.writer / .stream   two more, same shape
+/// ```
+///
+/// `Attributes$Name`'s constructor is the sharpest of them: the image
+/// validates the header name (non-empty, ≤ 70 characters, `[0-9A-Za-z_-]`
+/// only) and this VM validated nothing at all, so `new Attributes.Name("bad
+/// name")` produced a Name that can never appear in a real manifest.
+/// `E.attributesFromJar` is the only one that is a wrong VALUE rather than a
+/// missing throw: a jar's per-entry manifest section was invisible.
+///
+/// ## Why these six and not the prefix
+///
+/// `java/util/jar/JarFile` is the family's producer and it stays; that is not
+/// a half-retirement of the kind wave 3 hit, because `JarEntry`, `Manifest`
+/// and `Attributes` are VALUES a `JarFile` hands out rather than carriers the
+/// VM mints under a borrowed class name. The discriminator is whether a
+/// SURVIVING native can be handed an object real bytecode built: for wave 3's
+/// `HashMap$KeyIterator` it could, and did; here the natives that survive are
+/// `JarFile`'s own and they are handed `JarFile`s.
+static RETIRED_SHADOW_L1_JT_TRIPLES: &[(&str, &str, &str)] = &[
+    (
+        "java/text/Normalizer",
+        "isNormalized",
+        "(Ljava/lang/CharSequence;Ljava/text/Normalizer$Form;)Z",
+    ),
+    (
+        "java/text/Normalizer",
+        "normalize",
+        "(Ljava/lang/CharSequence;Ljava/text/Normalizer$Form;)Ljava/lang/String;",
+    ),
+    (
+        "java/text/ParseException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/text/ParseException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/text/ParseException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/text/ParseException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/text/ParseException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/text/ParseException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/text/ParseException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/text/ParseException", "printStackTrace", "()V"),
+    (
+        "java/text/ParseException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/text/ParseException",
+        "printStackTrace",
+        "(Ljava/io/PrintWriter;)V",
+    ),
+    (
+        "java/text/ParseException",
+        "setStackTrace",
+        "([Ljava/lang/StackTraceElement;)V",
+    ),
+    (
+        "java/text/ParseException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/util/jar/Attributes", "<init>", "()V"),
+    ("java/util/jar/Attributes", "<init>", "(I)V"),
+    (
+        "java/util/jar/Attributes",
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/jar/Attributes",
+        "entrySet",
+        "()Ljava/util/Set;",
+    ),
+    (
+        "java/util/jar/Attributes",
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/jar/Attributes",
+        "getValue",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+    ),
+    (
+        "java/util/jar/Attributes",
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/jar/Attributes",
+        "putValue",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+    ),
+    ("java/util/jar/Attributes", "size", "()I"),
+    (
+        "java/util/jar/Attributes$Name",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/util/jar/Attributes$Name",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+    ),
+    ("java/util/jar/Attributes$Name", "hashCode", "()I"),
+    (
+        "java/util/jar/Attributes$Name",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/jar/JarEntry",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/util/jar/JarEntry",
+        "getComment",
+        "()Ljava/lang/String;",
+    ),
+    ("java/util/jar/JarEntry", "getCompressedSize", "()J"),
+    ("java/util/jar/JarEntry", "getMethod", "()I"),
+    (
+        "java/util/jar/JarEntry",
+        "getName",
+        "()Ljava/lang/String;",
+    ),
+    ("java/util/jar/JarEntry", "getSize", "()J"),
+    ("java/util/jar/JarEntry", "isDirectory", "()Z"),
+    ("java/util/jar/Manifest", "<init>", "()V"),
+    (
+        "java/util/jar/Manifest",
+        "<init>",
+        "(Ljava/io/InputStream;)V",
+    ),
+    (
+        "java/util/jar/Manifest",
+        "<init>",
+        "(Ljava/io/InputStream;Ljava/lang/String;)V",
+    ),
+    (
+        "java/util/jar/Manifest",
+        "<init>",
+        "(Ljava/util/jar/JarVerifier;Ljava/io/InputStream;Ljava/lang/String;)V",
+    ),
+    (
+        "java/util/jar/Manifest",
+        "<init>",
+        "(Ljava/util/jar/Manifest;)V",
+    ),
+    (
+        "java/util/jar/Manifest",
+        "getEntries",
+        "()Ljava/util/Map;",
+    ),
+    (
+        "java/util/jar/Manifest",
+        "getMainAttributes",
+        "()Ljava/util/jar/Attributes;",
+    ),
+];
+
 /// Is this exact triple a retired §1.4 shadow?
 ///
 /// The class-name prefix test is a cheap discriminator: every entry is under
@@ -3200,11 +3440,125 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
         || RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_L1_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_L1_HM_TRIPLES.binary_search(&key).is_ok()
+        || RETIRED_SHADOW_L1_JT_TRIPLES.binary_search(&key).is_ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_l1_jar_text_table_is_sorted_and_unique() {
+        for w in RETIRED_SHADOW_L1_JT_TRIPLES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "lane 1 wave 4's table is binary-searched, so it must be \
+                 sorted and unique: {:?} does not precede {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn every_l1_jar_text_entry_is_reachable_through_the_predicate() {
+        for (c, m, d) in RETIRED_SHADOW_L1_JT_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is in lane 1 wave 4's table but answers false — \
+                 the prefix list does not admit it, so the entry is inert and \
+                 silent."
+            );
+        }
+    }
+
+    /// Wave 4 is six classes, and the two that carry each family's red are
+    /// NOT among them.
+    ///
+    /// `java/util/jar/JarFile` is the whole of `java/util/jar/`'s `+34` and
+    /// `java/text/BreakIterator` is the whole of `java/text/`'s `+16`;
+    /// `java/text/DateFormat`'s one registration is excluded because its
+    /// green was VACUOUS (`reached == 0`), which is §7's trap and not a
+    /// result. Adding any of the three back means re-running the bisection,
+    /// not editing this list.
+    #[test]
+    fn wave_four_is_six_classes_and_refuses_jarfile_breakiterator_dateformat() {
+        for (c, _, _) in RETIRED_SHADOW_L1_JT_TRIPLES {
+            assert!(
+                matches!(
+                    *c,
+                    "java/util/jar/JarEntry"
+                        | "java/util/jar/Manifest"
+                        | "java/util/jar/Attributes"
+                        | "java/util/jar/Attributes$Name"
+                        | "java/text/ParseException"
+                        | "java/text/Normalizer"
+                ),
+                "{c} is in wave 4's table and is not one of the six classes \
+                 the 2026-09-11 bisection cleared."
+            );
+        }
+        for (c, m, d) in [
+            ("java/util/jar/JarFile", "getManifest", "()Ljava/util/jar/Manifest;"),
+            (
+                "java/util/jar/JarFile",
+                "getJarEntry",
+                "(Ljava/lang/String;)Ljava/util/jar/JarEntry;",
+            ),
+            ("java/text/BreakIterator", "next", "()I"),
+            (
+                "java/text/DateFormat",
+                "getInstance",
+                "()Ljava/text/DateFormat;",
+            ),
+        ] {
+            assert!(
+                !triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is retired. `JarFile` and `BreakIterator` each \
+                 carry their family's whole regression and `DateFormat`'s arm \
+                 was vacuous — none of the three has a measurement behind it."
+            );
+        }
+    }
+
+    /// The thirteen rows wave 4 exists to repair, by the triple that repairs
+    /// each. A later edit that drops one of these fails here rather than in a
+    /// probe nobody runs.
+    #[test]
+    fn the_thirteen_jar_text_defect_rows_are_retired() {
+        for (c, m, d) in [
+            (
+                "java/util/jar/Attributes",
+                "getValue",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+            ),
+            (
+                "java/util/jar/Attributes",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            ("java/util/jar/Attributes$Name", "<init>", "(Ljava/lang/String;)V"),
+            (
+                "java/util/jar/Manifest",
+                "<init>",
+                "(Ljava/io/InputStream;)V",
+            ),
+            ("java/util/jar/Manifest", "<init>", "(Ljava/util/jar/Manifest;)V"),
+            ("java/util/jar/JarEntry", "<init>", "(Ljava/lang/String;)V"),
+            (
+                "java/util/jar/JarEntry",
+                "getAttributes",
+                "()Ljava/util/jar/Attributes;",
+            ),
+        ] {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is not retired, and `apps/probes/\
+                 L1JarTextSweep.java` measured the control answering where \
+                 the image's own body throws."
+            );
+        }
+    }
 
     #[test]
     fn the_l1_hashmap_table_is_sorted_and_unique() {
