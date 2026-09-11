@@ -113,12 +113,23 @@ regenerate](#how-to-regenerate):
 
 ```bash
 # row 1 — identifiers anywhere in Rust source
-grep -rhoE 'CRATONVM_[A-Z0-9_]+' --include='*.rs' . | sort -u | wc -l
+find . -mindepth 1 \( -name target -o -name vendor -o -name node_modules \
+  -o -name '.*' \) -prune -o -name '*.rs' -print0 \
+  | xargs -0 grep -hoE 'CRATONVM_[A-Z0-9_]+' | sort -u | wc -l
 # row 2 — exact string literals under <crate>/src
 for d in $(sed -n 's/^members = \[//p' Cargo.toml | tr -d '"[],'); do
   [ -d "$d/src" ] && grep -rhoE '"CRATONVM_[A-Z0-9_]+"' "$d/src"
 done | tr -d '"' | sort -u | wc -l
 ```
+
+The row-1 command prunes rather than globbing `--exclude-dir`, and the
+`-mindepth 1` is load-bearing. `--exclude-dir` globs match without
+`FNM_PATHNAME`, so `*` crosses `/` and `--exclude-dir='.*'` prunes `./types`
+along with `.git` — the form this file and
+`types/tests/doc_numeric_claims.rs` carried until 2026-09-11 printed **0** for
+the whole repository from `.`, and 1,390 only when given an absolute path. The
+bare `-name '.*'` has the same trap: it matches the starting `.`. A regeneration
+recipe that answers 0 is worse than no recipe, because 0 looks like a finding.
 
 **What the three rows together say about the surface.** Grouping was a renaming,
 not a retirement: 995 declared knobs reached through 15 variables is still 995
