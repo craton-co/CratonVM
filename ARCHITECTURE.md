@@ -109,14 +109,19 @@ Rough size distribution, largest first, so newcomers know where the mass
 actually is:
 
 Measured 2026-09-09 with the command above, one directory at a time;
-`native-api` re-measured 2026-09-10, when lane L1's retirement table took
-it from 37k to 38,923.
+`native-api` re-measured 2026-09-11 at **41,715**. It has now moved twice for
+the same reason: lane L1's retirement table took it from 37k to 38,923 on
+2026-09-10, and the six-lane merge of 2026-09-11 (L0's 19 and L3's 24 rows,
+plus L1's waves 3-4 and L7's table arriving from `dev`) took it past the 5%
+tolerance to 41,715. The retirement tables in `retired_shadow.rs` are the
+single largest source of growth in this crate, and each is a row per retired
+triple plus the account that justifies it.
 
 | Crate | LoC | Crate | LoC |
 |-------|----:|-------|----:|
 | `native-builtins` | 753,000 | `native-awt` | 18,000 |
 | `vm` | 480,000 | `types` | 44,000 |
-| `jit` | 269,000 | `native-api` | 39,000 |
+| `jit` | 269,000 | `native-api` | 42,000 |
 | `gc` | 190,000 | `reader` | 17,000 |
 | `native-collections` | 88,000 | `jfr` | 20,000 |
 | `native-io` | 85,000 | `jit-cuda` | 14,000 |
