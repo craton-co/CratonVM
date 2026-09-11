@@ -1233,6 +1233,21 @@ const RETIRED_SHADOW_PREFIXES: &[&str] = &[
     // see `RETIRED_SHADOW_PHASE2_TRIPLES`. A prefix admits a package to the
     // binary search; the table decides what is retired, and it retires one row.
     "sun/nio/ch/",
+    // 2026-09-10, lane 5 (`java/util/concurrent/`, `jdk/internal/misc/`,
+    // `sun/misc/`, `java/lang/Thread*`, `jdk/internal/vm/`). `java/util/`
+    // above already admits `java/util/concurrent/`; these four are the rest of
+    // that lane's prefix set.
+    //
+    // Adding a prefix while its table is empty is PROVABLY INERT: the list is
+    // only an early-out in front of the binary searches, so a wider list plus
+    // an empty table answers `false` for exactly the same inputs. That is what
+    // makes it safe to land the prefixes and the table in one commit —
+    // `the_l5_prefixes_retire_nothing_on_their_own` is the guard that says so
+    // for every triple this lane declined.
+    "jdk/internal/misc/",
+    "jdk/internal/vm/",
+    "java/lang/Thread",
+    "sun/misc/",
     // 2026-09-10, L1 wave 2. **This is L0's cell and L1 edited it**, because
     // L0's skeleton commit (lane-0 §4: nine empty tables, nine chain arms,
     // every lane's prefixes pre-added) never landed, and `java/time/` is in
@@ -2290,6 +2305,256 @@ static RETIRED_SHADOW_PHASE3_TRIPLES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Lane 5 — `java/util/concurrent/`, `Thread`, `Unsafe`, retired 2026-09-10.
+///
+/// `docs/internal/retired/lane-5-concurrent-thread-unsafe-RETIRED-20260910.md`
+/// is the page; this is the table it fills. The lane's population is
+/// **405 bucket-A/B rows over 23 classes**, which is not the 516 a prefix
+/// filter over `--dump-native-registry --explain-jdk-only` reports, and not
+/// the 659 a binary that predates the Phase 3 wave reports. One subtraction
+/// gets from 516 to 405, and it is a lane-0 rule rather than this lane's
+/// choice:
+///
+///   * 111 rows come from a registrar whose classes span more than one lane
+///     (`register_throwable_subclass_natives` and the `native-collections`
+///     collection-family loops). Lane 0 §3: **the unit of work for a
+///     cross-cutting registrar is the registrar, and lane T owns it whole** —
+///     so `CopyOnWriteArraySet.equals`, registered by the same
+///     `native-collections/src/lib.rs` line as `HashSet.equals` and
+///     `LinkedHashSet.equals`, is not this lane's row to retire even though the
+///     receiver is;
+///
+/// (The `ConcurrentHashMap` family's 99 rows are the difference between 659 and
+/// 516: they were retired by the 2026-09-09 Phase 3 wave and are already in
+/// [`RETIRED_SHADOW_PHASE3_TRIPLES`], so a dump from a binary that carries that
+/// wave does not report them at all. **Take the dump from the binary you are
+/// about to change.**)
+///
+/// # 98 of 405, and the other 307 are classified rather than deferred
+///
+/// | disposition | rows |
+/// |---|---|
+/// | retired here | **98** |
+/// | held: the class's whole arm moves the VM AWAY from HotSpot | 127 |
+/// | held: one unit with a held class | 133 |
+/// | held: no instrument in this tree dispatches the row | 40 |
+/// | dead registration — a door that never opens | 4 |
+/// | held: a real-JDK keep arm this table would disarm | 2 |
+/// | held: a partial with evidence against it | 1 |
+///
+/// # A retirement is mode-blind and a keep arm is not
+///
+/// This wave was 100 rows for most of a day. The two that came back out are
+/// worth the paragraph, because the mechanism that removed them is general and
+/// nothing in the four preconditions asks about it.
+///
+/// [`crate::registry::NativeMethodRegistry::register`] re-tags a retired triple
+/// `Bridge` -> `SyntheticStub` **before** calling `register_inner`, and it does
+/// so in every mode — the table is per-triple, not per-mode. Inside
+/// `register_inner`, real-JDK mode (`drop_real_layout_synthetic`) keeps a small
+/// number of natives it cannot safely execute as bytecode, and each of those
+/// keeps is written as a predicate over `effective_category()`:
+///
+/// ```text
+///   keep_real_scheduled_executor_bridge = effective_category() == Bridge && ...
+///   keep_real_forkjoinpool_bridge       = effective_category() == Bridge && ...
+///   keep_real_forkjointask_bridge       = effective_category() == Bridge && ...
+/// ```
+///
+/// By the time those run, the re-tag has already made the answer
+/// `SyntheticStub`. **A triple in this table can therefore lose its native in
+/// REAL-JDK mode**, which is not what a §1.4 shadow retirement is for and is
+/// not a mode this lane measured. `ScheduledThreadPoolExecutor.<init>(I,
+/// ThreadFactory, RejectedExecutionHandler)` and `getCorePoolSize()I` are
+/// exactly the two triples `keep_real_scheduled_executor_bridge` names — kept
+/// for Spring's `ThreadPoolTaskScheduler` anonymous subclass — so they are out.
+///
+/// The instrument that caught it was
+/// `registry::tests::real_layout_mode_drops_enumset_native_surface`, whose one
+/// `Bridge`-survives control happened to BE the 3-arg constructor. That was
+/// luck; `registry::tests::real_layout_bridge_keeps_are_not_retired_shadows`
+/// now covers all three keep arms on purpose, by registering each protected
+/// triple through the real code path rather than restating the predicate.
+///
+/// The other nine classes in this table are named nowhere in `registry.rs`
+/// except a hash-test fixture (`jdk/internal/misc/Unsafe`) and one comment
+/// (`java/util/concurrent/ThreadPoolExecutor`), so the sweep that found these
+/// two found no others.
+///
+/// # The `Unsafe` subset that IS retired, and the line it is drawn on
+///
+/// Sixteen `jdk/internal/misc/Unsafe` rows are here and seventy-five are not,
+/// and the line is not a judgement call: **an atomic or a fence that delegates
+/// to an `ACC_NATIVE` primitive at the SAME offset** is retirable, because the
+/// JDK's Java body is then a loop over calls this VM already serves correctly
+/// — `getAndAddInt` is `do { v = getIntVolatile(o, offset); } while
+/// (!weakCompareAndSetInt(o, offset, v, v + delta));` and every term in it is
+/// one of ours. Anything that does ARITHMETIC on the offset is not, because
+/// this VM's offsets are slot indices.
+///
+/// That is why `getAndSetReference` retires and `getAndSetByte` cannot, though
+/// they are neighbours in the same file with the same shape.
+///
+/// The per-class record, with the measurement behind each blocker, is on the
+/// lane page. Three of the blockers are properties of this VM rather than of
+/// any one method, and are restated here because a future wave will re-derive
+/// them otherwise:
+///
+///   * **`objectFieldOffset` returns a SLOT INDEX, not a byte offset.** The
+///     JDK implements the whole sub-word atomic family in Java over a 4-byte
+///     CAS — `long wordOffset = offset & ~3; int shift = (int)(offset & 3) << 3`
+///     — so retiring `compareAndSetByte` and its relatives hands that
+///     arithmetic a number it does not describe: `offset & ~3` names a
+///     DIFFERENT FIELD. `unsafe_natives_ext.rs` says the same from the other
+///     side and carries the HotSpot comparison that established it, and
+///     `apps/probes/L5SubwordAtomics.java` scores the family at all four byte
+///     positions of a word, on a field and on an array element, for
+///     `byte`/`boolean`/`short`/`char`: **132 rows, 0 diffs, unarmed.** The
+///     natives are right; it is the retirement that would be wrong.
+///   * the `get*Unaligned` / `put*Unaligned` rows on `Unsafe` are the same
+///     defect in a different family: they decompose a byte range, and a slot
+///     index has no bytes. (The identically-named `ScopedMemoryAccess` rows
+///     ARE retired — they take a `MemorySegment` base and a real byte offset,
+///     which is a different number.)
+///   * **`sun/misc/Unsafe`'s 82 rows are dispatched by nothing here.** All 121
+///     probes report the dial VACUOUS on that scope, and the 132 `--jdk-only`
+///     corpus reports reach 18 of the 82. Precondition 1 fails by measurement,
+///     not by omission.
+///
+/// # The `*Internal` twin rule, which is why 16 `ScopedMemoryAccess` rows
+///
+/// Eight `ScopedMemoryAccess` rows were dispatched (`L4ByteBufferSweep` and
+/// `L4TypedBufferSweep`, 518 dial yields between them, delta 0). Each is a
+/// public wrapper whose only body calls its own `@ForceInline` `…Internal`
+/// twin, and the twin is registered too — so retiring the wrapper alone would
+/// produce a configuration NOBODY measured: real outer, native inner. The
+/// class-wide arm that measured clean yielded both. So each retired wrapper
+/// brings its twin, and the fourteen rows with no dispatch on either half stay
+/// out.
+///
+/// # `AbstractExecutorService`'s four rows are a door that never opens
+///
+/// `submit` ×3 and `invokeAny` are registered on `AbstractExecutorService`,
+/// which is abstract. A dispatch door asks the registry about the DECLARING
+/// class of the resolved method, and every concrete executor in the image —
+/// `ThreadPoolExecutor`, `ForkJoinPool` — carries its own registration of the
+/// same names, so the abstract one is never the answer.
+/// `apps/probes/L5ExecutorSweep.java` builds the one receiver shape that could
+/// reach it (a direct subclass declaring only `execute`) and the rows still
+/// read `invocations: 0`. Lane 0 §1: deleting these is worth doing and is
+/// **not** a retirement, so they are not in this table.
+static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/lang/Thread$FieldHolder", "<init>", "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;JIZ)V"),
+    ("java/lang/Thread$State", "valueOf", "(Ljava/lang/String;)Ljava/lang/Thread$State;"),
+    ("java/lang/Thread$State", "values", "()[Ljava/lang/Thread$State;"),
+    ("java/util/concurrent/CompletableFuture", "allOf", "([Ljava/util/concurrent/CompletableFuture;)Ljava/util/concurrent/CompletableFuture;"),
+    ("java/util/concurrent/CompletableFuture", "anyOf", "([Ljava/util/concurrent/CompletableFuture;)Ljava/util/concurrent/CompletableFuture;"),
+    ("java/util/concurrent/CompletableFuture", "complete", "(Ljava/lang/Object;)Z"),
+    ("java/util/concurrent/CompletableFuture", "completeExceptionally", "(Ljava/lang/Throwable;)Z"),
+    ("java/util/concurrent/CompletableFuture", "completeValue", "(Ljava/lang/Object;)Z"),
+    ("java/util/concurrent/CompletableFuture", "isCompletedExceptionally", "()Z"),
+    ("java/util/concurrent/CompletableFuture", "thenAcceptAsync", "(Ljava/util/function/Consumer;)Ljava/util/concurrent/CompletableFuture;"),
+    ("java/util/concurrent/CompletableFuture", "thenApplyAsync", "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;"),
+    ("java/util/concurrent/CompletableFuture", "thenCombine", "(Ljava/util/concurrent/CompletionStage;Ljava/util/function/BiFunction;)Ljava/util/concurrent/CompletableFuture;"),
+    ("java/util/concurrent/CompletableFuture", "thenComposeAsync", "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;"),
+    ("java/util/concurrent/CompletableFuture", "thenRunAsync", "(Ljava/lang/Runnable;)Ljava/util/concurrent/CompletableFuture;"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "add", "(ILjava/lang/Object;)V"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "add", "(Ljava/lang/Object;)Z"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "addAll", "(Ljava/util/Collection;)Z"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "addIfAbsent", "(Ljava/lang/Object;)Z"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "bulkRemove", "(Ljava/util/function/Predicate;)Z"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "clear", "()V"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "contains", "(Ljava/lang/Object;)Z"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "get", "(I)Ljava/lang/Object;"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "indexOf", "(Ljava/lang/Object;)I"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "isEmpty", "()Z"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "iterator", "()Ljava/util/Iterator;"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "remove", "(I)Ljava/lang/Object;"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "remove", "(Ljava/lang/Object;)Z"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "set", "(ILjava/lang/Object;)Ljava/lang/Object;"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "size", "()I"),
+    ("java/util/concurrent/CopyOnWriteArrayList", "toArray", "()[Ljava/lang/Object;"),
+    ("java/util/concurrent/PriorityBlockingQueue", "<init>", "()V"),
+    ("java/util/concurrent/PriorityBlockingQueue", "isEmpty", "()Z"),
+    ("java/util/concurrent/PriorityBlockingQueue", "offer", "(Ljava/lang/Object;)Z"),
+    ("java/util/concurrent/PriorityBlockingQueue", "peek", "()Ljava/lang/Object;"),
+    ("java/util/concurrent/PriorityBlockingQueue", "poll", "()Ljava/lang/Object;"),
+    ("java/util/concurrent/PriorityBlockingQueue", "poll", "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;"),
+    ("java/util/concurrent/PriorityBlockingQueue", "put", "(Ljava/lang/Object;)V"),
+    ("java/util/concurrent/PriorityBlockingQueue", "size", "()I"),
+    ("java/util/concurrent/PriorityBlockingQueue", "take", "()Ljava/lang/Object;"),
+    // `ScheduledThreadPoolExecutor.<init>(I,ThreadFactory,RejectedExecutionHandler)`
+    // and `getCorePoolSize()I` WERE here and were REMOVED on 2026-09-10, before
+    // this table ever landed. They are the two triples
+    // `keep_real_scheduled_executor_bridge` (`registry.rs`) deliberately keeps
+    // in REAL-JDK mode for Spring's `ThreadPoolTaskScheduler` anonymous
+    // subclass — and that predicate reads `effective_category()`, which the
+    // re-tag in `register` has already turned into `SyntheticStub` by the time
+    // it runs. Retiring them therefore does not only retire a `--jdk-only`
+    // shadow; it drops the native in real-JDK mode too, which is a mode this
+    // lane never measured. See this module's header, "a retirement is
+    // mode-blind and a keep arm is not".
+    ("java/util/concurrent/ThreadPoolExecutor", "awaitTermination", "(JLjava/util/concurrent/TimeUnit;)Z"),
+    ("java/util/concurrent/ThreadPoolExecutor", "getActiveCount", "()I"),
+    ("java/util/concurrent/ThreadPoolExecutor", "getCompletedTaskCount", "()J"),
+    ("java/util/concurrent/ThreadPoolExecutor", "getCorePoolSize", "()I"),
+    ("java/util/concurrent/ThreadPoolExecutor", "getMaximumPoolSize", "()I"),
+    ("java/util/concurrent/ThreadPoolExecutor", "getPoolSize", "()I"),
+    ("java/util/concurrent/ThreadPoolExecutor", "getTaskCount", "()J"),
+    ("java/util/concurrent/ThreadPoolExecutor", "invokeAny", "(Ljava/util/Collection;)Ljava/lang/Object;"),
+    ("java/util/concurrent/ThreadPoolExecutor", "isShutdown", "()Z"),
+    ("java/util/concurrent/ThreadPoolExecutor", "isTerminated", "()Z"),
+    ("java/util/concurrent/ThreadPoolExecutor", "shutdown", "()V"),
+    ("java/util/concurrent/ThreadPoolExecutor", "shutdownNow", "()Ljava/util/List;"),
+    ("java/util/concurrent/ThreadPoolExecutor", "submit", "(Ljava/lang/Runnable;)Ljava/util/concurrent/Future;"),
+    ("java/util/concurrent/ThreadPoolExecutor", "submit", "(Ljava/lang/Runnable;Ljava/lang/Object;)Ljava/util/concurrent/Future;"),
+    ("java/util/concurrent/ThreadPoolExecutor", "submit", "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;"),
+    ("java/util/concurrent/TimeUnit", "convert", "(JLjava/util/concurrent/TimeUnit;)J"),
+    ("java/util/concurrent/TimeUnit", "sleep", "(J)V"),
+    ("java/util/concurrent/TimeUnit", "toDays", "(J)J"),
+    ("java/util/concurrent/TimeUnit", "toHours", "(J)J"),
+    ("java/util/concurrent/TimeUnit", "toMicros", "(J)J"),
+    ("java/util/concurrent/TimeUnit", "toMillis", "(J)J"),
+    ("java/util/concurrent/TimeUnit", "toMinutes", "(J)J"),
+    ("java/util/concurrent/TimeUnit", "toNanos", "(J)J"),
+    ("java/util/concurrent/TimeUnit", "toSeconds", "(J)J"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "copyMemory", "(Ljdk/internal/foreign/MemorySessionImpl;Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JLjava/lang/Object;JJ)V"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "copyMemoryInternal", "(Ljdk/internal/foreign/MemorySessionImpl;Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JLjava/lang/Object;JJ)V"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "getIntUnaligned", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)I"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "getIntUnalignedInternal", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)I"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "getLongUnaligned", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)J"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "getLongUnalignedInternal", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)J"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "getShortUnaligned", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)S"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "getShortUnalignedInternal", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JZ)S"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "putInt", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JI)V"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "putIntInternal", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JI)V"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "putIntUnaligned", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JIZ)V"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "putIntUnalignedInternal", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JIZ)V"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "putLongUnaligned", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JJZ)V"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "putLongUnalignedInternal", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JJZ)V"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "putShortUnaligned", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JSZ)V"),
+    ("jdk/internal/misc/ScopedMemoryAccess", "putShortUnalignedInternal", "(Ljdk/internal/foreign/MemorySessionImpl;Ljava/lang/Object;JSZ)V"),
+    ("jdk/internal/misc/Unsafe", "getAndAddInt", "(Ljava/lang/Object;JI)I"),
+    ("jdk/internal/misc/Unsafe", "getAndAddLong", "(Ljava/lang/Object;JJ)J"),
+    ("jdk/internal/misc/Unsafe", "getAndSetInt", "(Ljava/lang/Object;JI)I"),
+    ("jdk/internal/misc/Unsafe", "getAndSetLong", "(Ljava/lang/Object;JJ)J"),
+    ("jdk/internal/misc/Unsafe", "getAndSetReference", "(Ljava/lang/Object;JLjava/lang/Object;)Ljava/lang/Object;"),
+    ("jdk/internal/misc/Unsafe", "getReferenceAcquire", "(Ljava/lang/Object;J)Ljava/lang/Object;"),
+    ("jdk/internal/misc/Unsafe", "loadFence", "()V"),
+    ("jdk/internal/misc/Unsafe", "putIntOpaque", "(Ljava/lang/Object;JI)V"),
+    ("jdk/internal/misc/Unsafe", "putReferenceOpaque", "(Ljava/lang/Object;JLjava/lang/Object;)V"),
+    ("jdk/internal/misc/Unsafe", "putReferenceRelease", "(Ljava/lang/Object;JLjava/lang/Object;)V"),
+    ("jdk/internal/misc/Unsafe", "storeFence", "()V"),
+    ("jdk/internal/misc/Unsafe", "storeStoreFence", "()V"),
+    ("jdk/internal/misc/Unsafe", "weakCompareAndSetInt", "(Ljava/lang/Object;JII)Z"),
+    ("jdk/internal/misc/Unsafe", "weakCompareAndSetIntPlain", "(Ljava/lang/Object;JII)Z"),
+    ("jdk/internal/misc/Unsafe", "weakCompareAndSetLong", "(Ljava/lang/Object;JJJ)Z"),
+    ("jdk/internal/misc/Unsafe", "weakCompareAndSetReference", "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z"),
+    ("jdk/internal/misc/VM", "getSavedProperty", "(Ljava/lang/String;)Ljava/lang/String;"),
+    ("jdk/internal/misc/VM", "isBooted", "()Z"),
+    ("jdk/internal/misc/VM", "maxDirectMemory", "()J"),
+];
+
 /// Lane 2 (`java/lang/` remainder, `java/math/`), 2026-09-10.
 ///
 /// Lane 2's own population is **390 shadows over 57 classes**, once lane T's
@@ -3009,12 +3274,81 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
         || RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_L2_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(&key).is_ok()
+        || RETIRED_SHADOW_L5_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_L1_TRIPLES.binary_search(&key).is_ok()
 }
+
+/// Every retired-shadow table, in one slice, so a gate can walk the whole
+/// population instead of naming one wave.
+///
+/// Added 2026-09-10 for
+/// `registry::tests::real_layout_bridge_keeps_are_not_retired_shadows`. That
+/// test needs the ROWS, not the predicate: it asks, of each retired triple,
+/// whether real-JDK mode would have KEPT it had the `Bridge` -> `SyntheticStub`
+/// re-tag in [`crate::registry::NativeMethodRegistry::register`] not run first.
+/// A `yes` means the table is silently disarming a `keep_real_*_bridge` arm in
+/// a mode the retiring lane never measured — see the "a retirement is
+/// mode-blind and a keep arm is not" section on [`RETIRED_SHADOW_L5_TRIPLES`],
+/// which is the case that prompted this.
+///
+/// **Add every new table here.** Forgetting is not caught by the sorted/unique
+/// tests, which are per-table; the cost of the omission is that the new wave is
+/// simply not asked the question.
+pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
+    RETIRED_SHADOW_TRIPLES,
+    RETIRED_SHADOW_STATELESS_TRIPLES,
+    RETIRED_SHADOW_PHASE2_TRIPLES,
+    RETIRED_SHADOW_L2_TRIPLES,
+    RETIRED_SHADOW_PHASE3_TRIPLES,
+    RETIRED_SHADOW_L5_TRIPLES,
+    // Added here by the 2026-09-11 merge of lane 1's wave 2, NOT by lane 1:
+    // this const and lane 1's table were written on branches that never saw
+    // each other, so `git merge` resolved both files without a conflict and
+    // left the new 325-row table off the list. That is the exact drift
+    // `the_tables_const_lists_every_table_the_predicate_consults` exists to
+    // catch, and it is what caught it.
+    RETIRED_SHADOW_L1_TRIPLES,
+];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`RETIRED_SHADOW_TABLES`] must list every table the predicate consults.
+    ///
+    /// It is a hand-maintained second list of the same tables, which is the
+    /// shape that drifts. Nothing catches the omission by behaviour: a wave
+    /// left out of the const is simply never asked whether it disarms a
+    /// real-JDK keep arm, and the gate that asks
+    /// (`registry::tests::real_layout_bridge_keeps_are_not_retired_shadows`)
+    /// passes on a smaller population without saying so.
+    ///
+    /// So count the arms in the predicate's own source instead of trusting the
+    /// two lists to stay in step. A source-scanning check is a parser and is
+    /// wrong in both directions — here it can only be wrong if someone renames
+    /// the tables or consults one without a `binary_search`, and either is a
+    /// change to this file that should be reading this comment.
+    #[test]
+    fn the_tables_const_lists_every_table_the_predicate_consults() {
+        let src = include_str!("retired_shadow.rs");
+        let body = src
+            .split("pub fn triple_is_retired_shadow(")
+            .nth(1)
+            .expect("the predicate is in this file");
+        let body = body.split("
+}
+").next().expect("the predicate has a body");
+        let consulted = body
+            .matches("RETIRED_SHADOW_")
+            .count()
+            .saturating_sub(body.matches("RETIRED_SHADOW_PREFIXES").count());
+        assert_eq!(
+            consulted,
+            RETIRED_SHADOW_TABLES.len(),
+            "`triple_is_retired_shadow` consults {consulted} tables but `RETIRED_SHADOW_TABLES` lists {}. Add the new table to the const — see its doc comment for what is skipped otherwise.",
+            RETIRED_SHADOW_TABLES.len()
+        );
+    }
 
     #[test]
     fn the_l2_table_is_sorted_and_unique() {
@@ -3267,6 +3601,93 @@ mod tests {
                 triple_is_retired_shadow(c, m, d),
                 "unreachable entry: {c}.{m}{d}"
             );
+        }
+    }
+
+    /// Sorted and duplicate-free, for the reason every sibling table is: the
+    /// predicate binary-searches it, so an out-of-order entry answers `false`
+    /// for a row that is present -- which reads as "not retired" and is
+    /// invisible in a workload.
+    #[test]
+    fn the_l5_table_is_sorted_and_unique() {
+        for w in RETIRED_SHADOW_L5_TRIPLES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "out of order or duplicated: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    /// Every L5 entry is asked through the REAL predicate, not through the
+    /// table it lives in. Lane 5 added four prefixes
+    /// (`jdk/internal/misc/`, `jdk/internal/vm/`, `java/lang/Thread`,
+    /// `sun/misc/`) and inherited `java/util/`, so this is exactly the wave
+    /// where a missing one would go unnoticed for the rows under the prefix
+    /// that was already there.
+    #[test]
+    fn every_l5_entry_is_reachable() {
+        for (c, m, d) in RETIRED_SHADOW_L5_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "unreachable entry: {c}.{m}{d}"
+            );
+        }
+    }
+
+    /// No triple may be claimed by two waves. Harmless to the predicate, which
+    /// ORs; NOT harmless to the record, because two waves would each report
+    /// having retired it and the next reader cannot tell which measurement
+    /// backs the decision.
+    #[test]
+    fn the_l5_table_is_disjoint_from_the_earlier_four() {
+        for t in RETIRED_SHADOW_L5_TRIPLES {
+            assert!(
+                RETIRED_SHADOW_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(t).is_err(),
+                "{t:?} is in the L5 table and an earlier one"
+            );
+        }
+    }
+
+    /// The four prefixes lane 5 added are an EARLY-OUT, not a licence.
+    ///
+    /// This is the gate on scope creep for this lane, and it is written as a
+    /// list of rows the lane measured and DECLINED rather than as a count.
+    /// Each one is a live `Bridge` on a receiver whose prefix is now admitted
+    /// to the binary search, so "not in the table" has to be checkable rather
+    /// than inferred from absence.
+    ///
+    /// The sub-word atomics are here because their refusal is structural: this
+    /// VM's `objectFieldOffset` answers a SLOT INDEX, and the JDK's Java-level
+    /// implementation of these methods computes `offset & ~3` and
+    /// `(offset & 3) << 3` over what it believes is a byte offset. Retiring one
+    /// does not produce a wrong answer at the margin; it names a different
+    /// field.
+    #[test]
+    fn the_l5_prefixes_retire_nothing_on_their_own() {
+        for (c, m, d) in [
+            // The sub-word CAS layer -- see this table's doc comment.
+            ("jdk/internal/misc/Unsafe", "compareAndSetByte", "(Ljava/lang/Object;JBB)Z"),
+            ("jdk/internal/misc/Unsafe", "compareAndSetShort", "(Ljava/lang/Object;JSS)Z"),
+            ("jdk/internal/misc/Unsafe", "compareAndExchangeByte", "(Ljava/lang/Object;JBB)B"),
+            ("jdk/internal/misc/Unsafe", "compareAndExchangeShort", "(Ljava/lang/Object;JSS)S"),
+            ("jdk/internal/misc/Unsafe", "getAndAddByte", "(Ljava/lang/Object;JB)B"),
+            ("jdk/internal/misc/Unsafe", "getAndAddShort", "(Ljava/lang/Object;JS)S"),
+            // The unaligned family: a slot index has no bytes to address.
+            ("jdk/internal/misc/Unsafe", "getIntUnaligned", "(Ljava/lang/Object;J)I"),
+            ("jdk/internal/misc/Unsafe", "getLongUnaligned", "(Ljava/lang/Object;J)J"),
+            ("jdk/internal/misc/Unsafe", "getShortUnaligned", "(Ljava/lang/Object;J)S"),
+            ("jdk/internal/misc/Unsafe", "getCharUnaligned", "(Ljava/lang/Object;J)C"),
+            ("jdk/internal/misc/Unsafe", "putIntUnaligned", "(Ljava/lang/Object;JI)V"),
+            ("jdk/internal/misc/Unsafe", "putLongUnaligned", "(Ljava/lang/Object;JJ)V"),
+            ("jdk/internal/misc/Unsafe", "putShortUnaligned", "(Ljava/lang/Object;JS)V"),
+            ("jdk/internal/misc/Unsafe", "putCharUnaligned", "(Ljava/lang/Object;JC)V"),
+        ] {
+            assert!(!triple_is_retired_shadow(c, m, d), "wrongly retired: {c}.{m}{d}");
         }
     }
 
