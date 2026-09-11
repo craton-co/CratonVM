@@ -2728,6 +2728,203 @@ pub fn unroll_enabled() -> bool {
     })
 }
 
+/// Why each candidate loop header did or did not unroll.
+///
+/// # Why this exists
+///
+/// `docs/JIT_OPTIMIZATION.md` has said since 2026-09-03 that *"the optimizing
+/// tier does not unroll"*, and priced that at about 1.12x on a counted loop.
+/// Both halves needed checking before anything was built, and only one of them
+/// survived: this pass EXISTS, is correct, and recognises a javac counted loop
+/// (`analyze_counted_loop` returns `trip=5 init=0 stride=1` on one). What it
+/// then does is refuse it.
+///
+/// A bare "it did not fire" cannot distinguish the two reasons that matter,
+/// and they call for opposite work:
+///
+///   * [`Self::runtime_bound`] — a counted loop whose bound is a VALUE rather
+///     than a constant, which is most Java loops and every one this pass was
+///     never meant to serve. Full unrolling can never apply to it; PARTIAL
+///     unrolling is the thing that would, and it is unbuilt. This counter is
+///     how big that prize is.
+///   * [`Self::safepoint_named`] — a loop this pass fully models and declines
+///     anyway, because `SafepointSnapshot` is keyed by one bci and an unrolled
+///     body has several copies of each. That refusal has an escape hatch for a
+///     trap-free graph, and the hatch is gated on
+///     `CRATONVM_JIT_IR_DROP_UNREACHABLE_HOMES`, which is **default OFF** — so
+///     on a default run this pass refuses essentially every loop it
+///     understands. This counter is how much is being left on the floor by a
+///     flag that is off for an unrelated reason.
+///
+/// Every candidate header falls into exactly one bucket, which
+/// [`Self::closes`] checks and `unroll` debug-asserts, for the reason
+/// `c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md` §10.1
+/// gives: a census that computes its own answer instead of reading the one the
+/// code used will drift, and it drifts towards zero.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct UnrollCensus {
+    /// Two-input control merges examined — **not** a count of loops.
+    ///
+    /// `unroll` scans every `Region`/`Merge` with at least two control inputs,
+    /// and most of those are if/else joins rather than loop headers. They land
+    /// in [`Self::not_single_backedge`], which is therefore mostly "not a loop"
+    /// rather than "a loop of a shape this pass declines". The count of loops
+    /// actually FOUND is `headers - not_single_backedge`, and the honest
+    /// denominator for anything about unrolling is that, not this.
+    pub headers: usize,
+    /// Unrolled.
+    pub unrolled: usize,
+    /// Not a single-back-edge loop, or no entry predecessor. **Mostly not a
+    /// loop at all** — see [`Self::headers`].
+    pub not_single_backedge: usize,
+    /// No constant-stride induction phi, or no single loop-exit `If`.
+    pub not_counted: usize,
+    /// A counted loop whose BOUND is a runtime value. The partial-unroll
+    /// population, and the one thing on this list that is a missing feature
+    /// rather than a refusal.
+    pub runtime_bound: usize,
+    /// Constant trip count above `UNROLL_MAX_TRIP`.
+    pub trip_over_cap: usize,
+    /// Not a single-block loop (region/if/proj shape).
+    pub control_shape: usize,
+    /// A store, call, allocation or array access in the loop.
+    pub side_effect: usize,
+    /// A body node this pass cannot clone, or a body over `UNROLL_MAX_BODY`.
+    pub body_unclonable: usize,
+    /// A safepoint snapshot names the body, and the trap-free escape was not
+    /// available. **On a default run this is the dominant refusal.**
+    pub safepoint_named: usize,
+    /// A body value escapes the loop, or an invariant load is pinned to the
+    /// header.
+    pub escapes_or_pinned: usize,
+    /// Of [`Self::runtime_bound`], how many sit in a graph NOTHING can deopt
+    /// from. **Not part of the closing identity** — it is a sub-count of
+    /// `runtime_bound`, not a bucket of its own.
+    ///
+    /// This is the number that decides whether a partial unroller is worth
+    /// building, and it is the only honest denominator for one. A partial
+    /// unroll clones the body, a deopt out of copy `k` needs a frame state
+    /// naming copy `k`'s values, and `SafepointSnapshot` is keyed by one bci —
+    /// so on a graph that CAN deopt, partial unrolling needs the same
+    /// per-iteration snapshot index the full unroller's own comment calls "a
+    /// lowerer change". On a trap-free graph no snapshot can ever be consulted
+    /// and that whole obligation is discharged by construction.
+    pub runtime_bound_trap_free: usize,
+    /// Of [`Self::runtime_bound`], how many have a body a partial unroller
+    /// could clone whose clones can none of them DEOPT. **Not part of the
+    /// closing identity.**
+    ///
+    /// The honest denominator for a partial unroller, and a different question
+    /// from [`Self::runtime_bound_trap_free`]: that one asks whether the whole
+    /// METHOD is trap-free, this one whether the cloned NODES are. See
+    /// [`partial_unroll_body_is_pure`].
+    pub runtime_bound_pure_body: usize,
+}
+
+impl UnrollCensus {
+    /// Does every candidate header fall into exactly one bucket?
+    pub fn closes(&self) -> bool {
+        self.unrolled
+            + self.not_single_backedge
+            + self.not_counted
+            + self.runtime_bound
+            + self.trip_over_cap
+            + self.control_shape
+            + self.side_effect
+            + self.body_unclonable
+            + self.safepoint_named
+            + self.escapes_or_pinned
+            == self.headers
+    }
+}
+
+/// Process-wide unroll totals, in [`UnrollCensus`] field order.
+///
+/// Unconditional and cheap -- at most one relaxed add per candidate loop
+/// header per compile. A census you have to switch on is one nobody has for
+/// the run they already did.
+static IR_UNROLL_CENSUS: [std::sync::atomic::AtomicU64; 13] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Index into [`IR_UNROLL_CENSUS`], in [`UnrollCensus`] field order.
+mod unroll_bucket {
+    pub const HEADERS: usize = 0;
+    pub const UNROLLED: usize = 1;
+    pub const NOT_SINGLE_BACKEDGE: usize = 2;
+    pub const NOT_COUNTED: usize = 3;
+    pub const RUNTIME_BOUND: usize = 4;
+    pub const TRIP_OVER_CAP: usize = 5;
+    pub const CONTROL_SHAPE: usize = 6;
+    pub const SIDE_EFFECT: usize = 7;
+    pub const BODY_UNCLONABLE: usize = 8;
+    pub const SAFEPOINT_NAMED: usize = 9;
+    pub const ESCAPES_OR_PINNED: usize = 10;
+    /// A sub-count of `RUNTIME_BOUND`, deliberately outside the identity.
+    pub const RUNTIME_BOUND_TRAP_FREE: usize = 11;
+    /// Also a sub-count of `RUNTIME_BOUND`, also outside the identity.
+    pub const RUNTIME_BOUND_PURE_BODY: usize = 12;
+}
+
+/// Add one compile's tally to the process-wide totals.
+///
+/// Published once per `unroll` call rather than per header, so the identity
+/// below can be asserted on a tally no other thread is touching: background
+/// compilation is default-ON, and a process-wide check would race a sibling
+/// thread that has counted a header and not yet its bucket.
+fn publish_unroll_census(local: &[usize; 13]) {
+    debug_assert!(
+        {
+            // `RUNTIME_BOUND_TRAP_FREE` is a sub-count of `RUNTIME_BOUND`, so
+            // it is excluded rather than summed.
+            let total: usize = local[1..unroll_bucket::RUNTIME_BOUND_TRAP_FREE]
+                .iter()
+                .sum();
+            total == local[unroll_bucket::HEADERS]
+        },
+        "UnrollCensus does not close: {local:?} -- a `continue` in `unroll` has          no counter",
+    );
+    for (slot, v) in IR_UNROLL_CENSUS.iter().zip(local.iter()) {
+        slot.fetch_add(*v as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The process-wide unroll census since process start.
+pub fn ir_unroll_census() -> UnrollCensus {
+    use std::sync::atomic::Ordering::Relaxed;
+    let v: Vec<usize> = IR_UNROLL_CENSUS
+        .iter()
+        .map(|a| a.load(Relaxed) as usize)
+        .collect();
+    UnrollCensus {
+        headers: v[0],
+        unrolled: v[1],
+        not_single_backedge: v[2],
+        not_counted: v[3],
+        runtime_bound: v[4],
+        trip_over_cap: v[5],
+        control_shape: v[6],
+        side_effect: v[7],
+        body_unclonable: v[8],
+        safepoint_named: v[9],
+        escapes_or_pinned: v[10],
+        runtime_bound_trap_free: v[11],
+        runtime_bound_pure_body: v[12],
+    }
+}
+
 /// Only fully unroll loops whose constant trip count is at most this (bounds
 /// code growth; larger counted loops are left rolled).
 const UNROLL_MAX_TRIP: i64 = 8;
@@ -2750,6 +2947,25 @@ fn eval_cmp_i64(op: CmpOp, x: i64, y: i64) -> bool {
         CmpOp::Gt => x > y,
         CmpOp::Ge => x >= y,
     }
+}
+
+/// Why [`analyze_counted_loop`] declined, when it did.
+///
+/// `RuntimeBound` is split out from every other refusal because it is the only
+/// one that is a MISSING FEATURE rather than a shape this pass does not model:
+/// the loop is a textbook counted loop in every respect except that its bound
+/// is a value. Full unrolling can never serve it — the trip count is not known
+/// until the loop runs — and partial unrolling is what would. Counting the two
+/// together would hide the entire partial-unroll population inside "not a
+/// counted loop", which is how a census reports a prize as a non-event.
+enum NotCounted {
+    /// No constant-stride induction phi, no single exit test, or a shape this
+    /// pass does not model.
+    Shape,
+    /// A counted loop against a NON-CONSTANT bound.
+    RuntimeBound,
+    /// A counted loop whose constant trip count exceeds `UNROLL_MAX_TRIP`.
+    TripOverCap,
 }
 
 /// A recognised constant-trip counted loop suitable for full unrolling.
@@ -2789,7 +3005,11 @@ fn build_users(graph: &Graph) -> Vec<Vec<NodeId>> {
 /// `back_ctrl`). Conservative: `None` on any shape we don't fully model
 /// (non-constant init/stride/bound, induction tested against a non-constant,
 /// multiple header tests, …).
-fn analyze_counted_loop(graph: &Graph, region: NodeId, back_ctrl: NodeId) -> Option<CountedLoop> {
+fn analyze_counted_loop(
+    graph: &Graph,
+    region: NodeId,
+    back_ctrl: NodeId,
+) -> Result<CountedLoop, NotCounted> {
     let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNROLL").is_some();
     let n = graph.nodes.len();
     // Induction phi: Phi anchored at `region`, inputs [region, init(Const), next],
@@ -2835,7 +3055,7 @@ fn analyze_counted_loop(graph: &Graph, region: NodeId, back_ctrl: NodeId) -> Opt
             if dbg {
                 eprintln!("[DBG_UNROLL] region {region}: bail — no constant-stride induction phi");
             }
-            return None;
+            return Err(NotCounted::Shape);
         }
     };
 
@@ -2855,7 +3075,7 @@ fn analyze_counted_loop(graph: &Graph, region: NodeId, back_ctrl: NodeId) -> Opt
                 if dbg {
                     eprintln!("[DBG_UNROLL] region {region}: bail — multiple loop tests");
                 }
-                return None;
+                return Err(NotCounted::Shape);
             }
             if_node = id as NodeId;
         }
@@ -2866,38 +3086,62 @@ fn analyze_counted_loop(graph: &Graph, region: NodeId, back_ctrl: NodeId) -> Opt
                 "[DBG_UNROLL] region {region}: bail — no loop exit If (ctrl==region/back_ctrl)"
             );
         }
-        return None;
+        return Err(NotCounted::Shape);
     }
-    let cond = *graph.nodes[if_node as usize].inputs.get(1)?;
-    let op = match graph.nodes.get(cond as usize)?.op {
+    let cond = *graph
+        .nodes[if_node as usize]
+        .inputs
+        .get(1)
+        .ok_or(NotCounted::Shape)?;
+    let op = match graph.nodes.get(cond as usize).ok_or(NotCounted::Shape)?.op {
         Op::Cmp(o) => o,
-        _ => return None,
+        _ => return Err(NotCounted::Shape),
     };
     let ci = &graph.nodes[cond as usize].inputs;
     if ci.len() != 2 {
-        return None;
+        return Err(NotCounted::Shape);
     }
-    // Compare the induction phi against a constant bound.
-    let (iv_on_left, bound) = if ci[0] == iv_phi {
-        (true, const_i64(graph, ci[1])?)
+    // Compare the induction phi against a bound. A NON-CONSTANT bound is a
+    // counted loop this pass simply cannot serve -- the trip count is not known
+    // until the loop runs -- and is reported as such rather than as "not a
+    // counted loop", because the two call for different work.
+    let (iv_on_left, other) = if ci[0] == iv_phi {
+        (true, ci[1])
     } else if ci[1] == iv_phi {
-        (false, const_i64(graph, ci[0])?)
+        (false, ci[0])
     } else {
-        return None;
+        return Err(NotCounted::Shape);
+    };
+    let bound = match const_i64(graph, other) {
+        Some(b) => b,
+        None => {
+            if dbg {
+                eprintln!("[DBG_UNROLL] region {region}: bail — bound is a runtime value");
+            }
+            return Err(NotCounted::RuntimeBound);
+        }
     };
 
     // Which If projection re-enters the loop (the "continue" edge)?
-    if graph.nodes.get(back_ctrl as usize)?.inputs.first().copied() != Some(if_node) {
-        return None;
+    if graph
+        .nodes
+        .get(back_ctrl as usize)
+        .ok_or(NotCounted::Shape)?
+        .inputs
+        .first()
+        .copied()
+        != Some(if_node)
+    {
+        return Err(NotCounted::Shape);
     }
     let back_is_true = match graph.nodes[back_ctrl as usize].op {
         Op::Proj(0) => true,
         Op::Proj(1) => false,
-        _ => return None,
+        _ => return Err(NotCounted::Shape),
     };
     let exit_ctrl = proj_user(graph, if_node, if back_is_true { 1 } else { 0 });
     if exit_ctrl == NO_NODE {
-        return None;
+        return Err(NotCounted::Shape);
     }
 
     // Concrete trip count by simulation (init/stride/bound all constant).
@@ -2916,10 +3160,11 @@ fn analyze_counted_loop(graph: &Graph, region: NodeId, back_ctrl: NodeId) -> Opt
         i = i.wrapping_add(iv_stride);
         trip += 1;
         if trip > UNROLL_MAX_TRIP {
-            return None; // too large / non-terminating within the cap
+            // Too large, or non-terminating within the cap.
+            return Err(NotCounted::TripOverCap);
         }
     }
-    Some(CountedLoop {
+    Ok(CountedLoop {
         iv_phi,
         iv_init,
         iv_stride,
@@ -2969,6 +3214,102 @@ fn forward_control_closure(
         }
     }
     set
+}
+
+/// Would a partial unroller be able to clone this loop's body, and would the
+/// clones be DEOPT-FREE?
+///
+/// # Census only — it transforms nothing
+///
+/// `unroll` answers this question for a loop it is about to unroll, as a side
+/// effect of building the clone set. A loop refused earlier for
+/// [`NotCounted::RuntimeBound`] never reaches that code, so the population a
+/// PARTIAL unroller would serve is invisible in the census. This mirrors the
+/// same walk to size it.
+///
+/// # The gate that matters is per-BODY, not per-graph
+///
+/// `unroll`'s existing escape from the safepoint refusal asks
+/// `graph_cannot_deopt` — a WHOLE-METHOD property, false for any method
+/// containing a single call, field access or array access anywhere. Measured
+/// across CratonBench, CratonBenchC2 and the probe set, it is true for **zero**
+/// of the counted loops found, so a partial unroller gated on it would fire on
+/// nothing.
+///
+/// The obligation it stands in for is narrower. Cloning a body duplicates its
+/// bcis, and `build_deopt_points` anchors a point at `bci_native[bci]`, which
+/// keeps only the EARLIEST native offset for a bci — so copy 1..U-1 get no
+/// deopt point at all, and a trap inside them has no frame to reconstruct.
+/// That objection is about the CLONED NODES. If none of them can deopt, no
+/// copy needs a point and the obligation is discharged whatever the rest of
+/// the method does.
+///
+/// So this asks the narrow question, and [`UnrollCensus::runtime_bound_pure_body`]
+/// is the answer.
+fn partial_unroll_body_is_pure(
+    graph: &Graph,
+    users: &[Vec<NodeId>],
+    region: NodeId,
+    back_ctrl: NodeId,
+    if_node: NodeId,
+) -> bool {
+    let mut carried: Vec<NodeId> = Vec::new();
+    for id in 0..graph.nodes.len() {
+        let node = &graph.nodes[id];
+        if node.op == Op::Phi && node.inputs.first().copied() == Some(region) {
+            if node.inputs.len() < 3 {
+                return false;
+            }
+            carried.push(id as NodeId);
+        }
+    }
+    if carried.is_empty() {
+        return false;
+    }
+    let carried_set: FxHashSet<NodeId> = carried.iter().copied().collect();
+    let mut variant: FxHashSet<NodeId> = carried_set.clone();
+    let mut vw: Vec<NodeId> = carried.clone();
+    while let Some(c) = vw.pop() {
+        for &u in &users[c as usize] {
+            if variant.insert(u) {
+                vw.push(u);
+            }
+        }
+    }
+    // The same seeds the transform uses: the loop condition and each carried
+    // phi's back-edge value.
+    let cond = match graph.nodes[if_node as usize].inputs.get(1) {
+        Some(&c) => c,
+        None => return false,
+    };
+    let mut work: Vec<NodeId> = vec![cond];
+    for &c in &carried {
+        work.push(graph.nodes[c as usize].inputs[2]);
+    }
+    let mut seen: FxHashSet<NodeId> = FxHashSet::default();
+    while let Some(c) = work.pop() {
+        if c == NO_NODE
+            || c as usize >= graph.nodes.len()
+            || carried_set.contains(&c)
+            || !variant.contains(&c)
+        {
+            continue;
+        }
+        if graph.nodes[c as usize].op.is_control() || !seen.insert(c) {
+            continue;
+        }
+        // PURE ONLY. `unroll` also admits `Op::Load`, because a full unroll
+        // deletes the loop and its bcis with it; a PARTIAL unroll keeps them
+        // and a cloned `Op::Load` can NPE at a bci whose only deopt point
+        // belongs to copy 0.
+        if !graph.nodes[c as usize].op.is_pure() {
+            return false;
+        }
+        for &inp in &graph.nodes[c as usize].inputs {
+            work.push(inp);
+        }
+    }
+    !seen.is_empty() && seen.len() <= UNROLL_MAX_BODY
 }
 
 /// Fully unroll small constant-trip counted loops (gated by [`unroll_enabled`]).
@@ -3025,6 +3366,8 @@ fn unroll_over_unreachable_frames() -> bool {
 
 fn unroll(graph: &mut Graph) -> bool {
     let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNROLL").is_some();
+    // Per-call, in `UnrollCensus` field order. See `publish_unroll_census`.
+    let mut census = [0usize; 13];
     // Computed ONCE for the whole graph, before any header is transformed:
     // unrolling only clones pure nodes and `Op::Load`s, so it cannot introduce
     // a trapping op, and re-deriving it per header would give the same answer
@@ -3052,8 +3395,10 @@ fn unroll(graph: &mut Graph) -> bool {
         if !matches!(graph.nodes[region as usize].op, Op::Region | Op::Merge) {
             continue; // killed by an earlier unroll in this pass
         }
+        census[unroll_bucket::HEADERS] += 1;
         let rin = graph.nodes[region as usize].inputs.clone();
         if rin.len() != 2 {
+            census[unroll_bucket::NOT_SINGLE_BACKEDGE] += 1;
             continue; // single back-edge only
         }
         let users = build_users(graph);
@@ -3069,6 +3414,7 @@ fn unroll(graph: &mut Graph) -> bool {
             if dbg {
                 eprintln!("[DBG_UNROLL] header {region}: bail — not a single-back-edge loop (back={back_inputs:?})");
             }
+            census[unroll_bucket::NOT_SINGLE_BACKEDGE] += 1;
             continue;
         }
         let back_ctrl = back_inputs[0];
@@ -3078,11 +3424,40 @@ fn unroll(graph: &mut Graph) -> bool {
             .find(|&i| i != back_ctrl)
             .unwrap_or(NO_NODE);
         if entry_pred == NO_NODE {
+            census[unroll_bucket::NOT_SINGLE_BACKEDGE] += 1;
             continue;
         }
         let info = match analyze_counted_loop(graph, region, back_ctrl) {
-            Some(i) => i,
-            None => continue,
+            Ok(i) => i,
+            Err(NotCounted::Shape) => {
+                census[unroll_bucket::NOT_COUNTED] += 1;
+                continue;
+            }
+            Err(NotCounted::RuntimeBound) => {
+                census[unroll_bucket::RUNTIME_BOUND] += 1;
+                if trap_free {
+                    census[unroll_bucket::RUNTIME_BOUND_TRAP_FREE] += 1;
+                }
+                // The single loop-exit `If` is what the probe seeds from, and
+                // `analyze_counted_loop` found one before it reached the bound.
+                let if_node = (0..graph.nodes.len() as NodeId).find(|&i| {
+                    graph.nodes[i as usize].op == Op::If
+                        && matches!(
+                            graph.nodes[i as usize].inputs.first().copied(),
+                            Some(c) if c == region || c == back_ctrl
+                        )
+                });
+                if let Some(if_node) = if_node {
+                    if partial_unroll_body_is_pure(graph, &users, region, back_ctrl, if_node) {
+                        census[unroll_bucket::RUNTIME_BOUND_PURE_BODY] += 1;
+                    }
+                }
+                continue;
+            }
+            Err(NotCounted::TripOverCap) => {
+                census[unroll_bucket::TRIP_OVER_CAP] += 1;
+                continue;
+            }
         };
 
         // Control simplicity: the loop must be a single block —
@@ -3098,6 +3473,7 @@ fn unroll(graph: &mut Graph) -> bool {
             if dbg {
                 eprintln!("[DBG_UNROLL] region {region}: bail — region control users {region_ctrl_users:?} != [if {}]", info.if_node);
             }
+            census[unroll_bucket::CONTROL_SHAPE] += 1;
             continue;
         }
         let mut if_users = users[info.if_node as usize].clone();
@@ -3108,6 +3484,7 @@ fn unroll(graph: &mut Graph) -> bool {
             if dbg {
                 eprintln!("[DBG_UNROLL] region {region}: bail — if users {if_users:?} != projs {expect_projs:?}");
             }
+            census[unroll_bucket::CONTROL_SHAPE] += 1;
             continue;
         }
         let back_ctrl_users: Vec<NodeId> = users[back_ctrl as usize]
@@ -3119,6 +3496,7 @@ fn unroll(graph: &mut Graph) -> bool {
             if dbg {
                 eprintln!("[DBG_UNROLL] region {region}: bail — back_ctrl control users {back_ctrl_users:?} != [region {region}]");
             }
+            census[unroll_bucket::CONTROL_SHAPE] += 1;
             continue;
         }
 
@@ -3136,6 +3514,7 @@ fn unroll(graph: &mut Graph) -> bool {
             }
         }
         if !ok {
+            census[unroll_bucket::CONTROL_SHAPE] += 1;
             continue;
         }
         let carried_set: FxHashSet<NodeId> = carried.iter().copied().collect();
@@ -3187,6 +3566,7 @@ fn unroll(graph: &mut Graph) -> bool {
             }
         }
         if !ok {
+            census[unroll_bucket::SIDE_EFFECT] += 1;
             continue;
         }
 
@@ -3229,9 +3609,11 @@ fn unroll(graph: &mut Graph) -> bool {
             }
         }
         if !ok {
+            census[unroll_bucket::BODY_UNCLONABLE] += 1;
             continue;
         }
         if to_clone.len() > UNROLL_MAX_BODY {
+            census[unroll_bucket::BODY_UNCLONABLE] += 1;
             continue;
         }
         // Refuse a loop whose body (or carried phi) is named by a safepoint
@@ -3285,6 +3667,7 @@ fn unroll(graph: &mut Graph) -> bool {
                 && trap_free
                 && crate::ir_lower::ir_drop_unreachable_homes_enabled())
             {
+                census[unroll_bucket::SAFEPOINT_NAMED] += 1;
                 continue;
             }
             UNROLL_USED_UNREACHABLE_FRAMES.with(|c| c.set(true));
@@ -3305,6 +3688,7 @@ fn unroll(graph: &mut Graph) -> bool {
             if dbg {
                 eprintln!("[DBG_UNROLL] region {region}: bail — invariant load pinned to header");
             }
+            census[unroll_bucket::ESCAPES_OR_PINNED] += 1;
             continue;
         }
 
@@ -3327,6 +3711,7 @@ fn unroll(graph: &mut Graph) -> bool {
             if dbg {
                 eprintln!("[DBG_UNROLL] region {region}: bail — a body value escapes the loop");
             }
+            census[unroll_bucket::ESCAPES_OR_PINNED] += 1;
             continue;
         }
 
@@ -3431,8 +3816,10 @@ fn unroll(graph: &mut Graph) -> bool {
                 to_clone.len()
             );
         }
+        census[unroll_bucket::UNROLLED] += 1;
         changed = true;
     }
+    publish_unroll_census(&census);
     changed
 }
 

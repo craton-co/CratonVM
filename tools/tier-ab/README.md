@@ -52,6 +52,43 @@ bash tools/tier-ab/flag-ab.sh \
 witness — an A/B between two configurations that compiled the same body is a
 measurement of nothing, and it looks exactly like a null result.
 
+## On Windows, and on a busy host: `cpu-ab.ps1`
+
+`cpu-ab.sh` measures USER CPU instead of wall clock, because a descheduled
+process stops accumulating user CPU and therefore stops charging other tenants
+to the result. It is the instrument that resolved a 1.009x effect at a 0.1%
+floor after `flag-ab.sh` had reported UNMEASURABLE twice with the sign flipping
+(`c2-one-carry-slot-is-the-frame-traffic-ceiling-FIXED-20260910.md` section 8).
+
+**It cannot run on Windows**, and it does not say so — it reads user CPU through
+`/usr/bin/time -f '%U'`, which is GNU coreutils and is absent from Git Bash, so
+every sample becomes a `RUNFAIL` and the script reports nothing rather than
+failing loudly. `cpu-ab.ps1` is the same method through
+`System.Diagnostics.Process.UserProcessorTime`, which needs no coreutils:
+
+```powershell
+# Which tier is faster on this loop?
+powershell -File tools/tier-ab/cpu-ab.ps1 -Exe .\cratonvm.exe -Cp .\pc `
+    -Class FieldLoop -Tier -Rounds 8 -D probe.reps=25000,probe.n=20000
+
+# Does one flag pay, inside the optimizing tier?
+powershell -File tools/tier-ab/cpu-ab.ps1 -Exe .\cratonvm.exe -Cp .\pc `
+    -Class FieldLoop -Flag CRATONVM_JIT_IR_GP_WIDE -Rounds 8 -D probe.reps=25000
+```
+
+`-D` is an array parameter: several properties go in ONE comma-separated
+argument, because `powershell -File` binds a repeated switch as an error rather
+than as a second value.
+
+That gap mattered more than a missing convenience. `CRATONVM_JIT_IR_GP_WIDE` is
+a silent no-op on System V — `IR_GP_LINEAR_SCAN` is five registers there and
+`IR_GP_LINEAR_SCAN_NARROW` is five — so the register-file question can only be
+asked on Win64, which was the one platform with no user-CPU instrument.
+
+The warning `cpu-ab.sh` carries applies to both: user CPU cannot see anything
+that shows up as a STALL rather than as instructions retired, so a wall-clock
+number on a quiet host is still the better instrument when one is available.
+
 ## What these CANNOT do, stated here rather than discovered later
 
 * **One timed unit per run**, so there is no per-class sign test and no
