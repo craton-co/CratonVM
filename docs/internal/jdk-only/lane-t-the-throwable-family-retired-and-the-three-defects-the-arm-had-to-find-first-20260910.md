@@ -556,11 +556,34 @@ the table, never on a dial arm.
 * **The JKS half of the keystore defect is in `sun/security/`** (§4.1) and
   survives the arm, so it is lane 6's, not this registrar's.
 * **`registrar_drift`'s `the_drift_baseline_has_no_stale_rows` is RED on
-  `origin/dev` `39a90d2f4`** and not from this branch: one recorded pair,
+  `origin/dev`** and not from this branch: one recorded pair,
   `java/lang/Class.getModule`, no longer drifts because commit `0b2791ac7`
   tagged it `Intrinsic` without the four-edit remedy `lane-0` §7 describes.
-  Verified by reverting this branch's `retired_shadow.rs` to `HEAD` and
-  re-running: the same one stale pair. It is L0's row and L0's remedy.
+  It is L0's row and L0's remedy.
+
+  **Re-measured on the merged tree rather than re-cited**, because dev had
+  moved 40 commits since the first attribution and a cited verdict decays. The
+  gate scans SOURCE, and its own header documents a standalone build, so the
+  same question can be put to two revisions for the price of two `rustc`
+  invocations and no workspace build:
+
+  ```bash
+  git archive origin/dev native-builtins native-collections native-io       native-awt vm native-builtins-crypto native-builtins-security | tar -x -C "$D"
+  CARGO_MANIFEST_DIR="$D/native-builtins"       rustc --edition 2021 --test -O -o drift-dev.exe       "$D/native-builtins/tests/registrar_drift.rs"
+  ./drift-dev.exe the_drift_baseline_has_no_stale_rows --test-threads=1
+  ```
+
+  Pristine `origin/dev` fails with the SAME single pair, from the same
+  `register_p59_module` at the same `reflect_invoke.rs:3616`. No commit on this
+  branch touches `registrar_drift.rs` or `reflect_invoke.rs`, and no lane-T
+  table entry names `java/lang/Class` — the 42 `java/lang/` classes in
+  `RETIRED_SHADOW_LT_TRIPLES` are all throwables.
+
+  One consequence for every lane reading a workspace run: `cargo test
+  --workspace` is FAIL-FAST, so this red truncates the run. The `89 ok / 1
+  FAILED` it prints is a PREFIX of the suite, not a summary of it, and a lane
+  that reads it as "everything else passed" is reading a run that stopped.
+  `--no-fail-fast` is what answers the question.
 * **CI's BLOCKING `Clippy` step is RED on `origin/dev`**, and this is worth a
   line because a gate nobody can go green through is the shape `H3-1` found
   once already. `cargo clippy --workspace --all-targets -- -D warnings` fails

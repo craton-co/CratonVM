@@ -1461,7 +1461,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// The per-file breakdown this run prints says the same from the other side:
 /// `native-builtins/src/lang_misc.rs` goes to 907 stub rows, which is
 /// `register_throwable_subclass_natives`' whole output.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2915;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2928;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1519,7 +1519,39 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2915;
 /// The per-file breakdown this run prints says the same from the other side:
 /// `native-builtins/src/lang_misc.rs` goes to 907 stub rows, which is
 /// `register_throwable_subclass_natives`' whole output.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2904;
+///
+/// # Second account, 2026-09-11: +13, and they are lane 2's
+///
+/// Merging `origin/dev` moved all three arms again, by the same amount:
+///
+/// ```text
+///   management       2915 -> 2928   +13
+///   no-management    2904 -> 2917   +13
+///   synthetic-jdk    2904 -> 2917   +13
+/// ```
+///
+/// `RETIRED_SHADOW_L2_TRIPLES` holds exactly 13 triples, and
+/// `dump_synthetic_stubs` names all 13 of the added rows as its:
+///
+/// ```text
+///   java/lang/Character.isJavaLetter(C)Z, .isJavaLetterOrDigit(C)Z, .isSpace(C)Z
+///   java/math/BigInteger.bitCount()I, .bitLength()I, .intValueExact()I,
+///     .isProbablePrime(I)Z, .longValueExact()J, .not()…, .shiftLeft(I)…,
+///     .shiftRight(I)…, .testBit(I)Z, .toByteArray()[B
+/// ```
+///
+/// One-for-one with that table, so this is the FIRST of the two causes the
+/// panic message distinguishes — an existing Bridge re-tagged by a retirement,
+/// which is the ratchet moving as designed — and not a new stub registration,
+/// which would want the opposite response.
+///
+/// **`origin/dev` is red on this gate on its own**, and this re-freeze is what
+/// clears it: lane 2 landed those 13 triples without moving any of the three
+/// constants, which on dev's own numbers is 1883 + 13 against a frozen 1883.
+/// Recorded here rather than left for the next lane to rediscover, because a
+/// blocking gate that is red before you start is the one thing that makes
+/// every lane's own red unreadable.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2917;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1605,7 +1637,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2904;
 /// The per-file breakdown this run prints says the same from the other side:
 /// `native-builtins/src/lang_misc.rs` goes to 907 stub rows, which is
 /// `register_throwable_subclass_natives`' whole output.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2904;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2917;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
