@@ -563,6 +563,60 @@ is an `armed == base` row, which is exactly the shape a leak produces. A green
 corpus on a binary whose table does not contain them is not evidence about
 them.
 
+### 8d. Wave 3 is prepared and blocked on two preconditions, not on a decision
+
+The six candidates from §8b, with descriptors, sorted as the table wants them:
+
+```text
+java/lang/reflect/Constructor  getExceptionTypes  ()[Ljava/lang/Class;
+java/lang/reflect/Constructor  isSynthetic        ()Z
+java/lang/reflect/Constructor  isVarArgs          ()Z
+java/lang/reflect/Field        isSynthetic        ()Z
+java/lang/reflect/Method       isBridge           ()Z
+java/lang/reflect/Method       isSynthetic        ()Z
+```
+
+None is in `RETIRED_SHADOW_L3_TRIPLES` today, so wave 3 takes it **24 -> 30**.
+All six read `bridge` with `kind_stated 0` in the kind map, and
+`Method.getExceptionTypes` beside them already reads `synthetic-stub` — the
+sibling a previous wave retired, which is why `Constructor`'s is the candidate
+and `Method`'s is not.
+
+**Of the four preconditions, two are discharged and two are not:**
+
+| # | precondition | state |
+|---|---|---|
+| 1 | dial ASKED | discharged by wave 2 (§8b) |
+| 2 | whole probe tree no worse | discharged by wave 2, 271 lines, four arms |
+| 3 | image target carries `Code` | **NOT verified** |
+| 4 | `invocations > 0` per TRIPLE | **NOT verified** |
+
+**Precondition 3 cannot be read off the kind map, and it is worth saying why,
+because the file looks like it answers.** Its trailing columns are ordinal,
+kind, `kind_stated` and slot ownership — ownership, not image `Code`. The image
+columns come only from `--dump-native-registry --explain-jdk-only`; without the
+flag every row reports blank and a reader who does not know that sees a
+confident-looking `1`. Same trap the lane already recorded for the census.
+
+**Precondition 4 must be measured on the CONTROL binary**, not on a binary
+carrying wave 3, because a retired producer can make a zero-invocation consumer
+reachable — the finding that brought six of seven excluded rows back in an
+earlier wave.
+
+Both are single-launch checks (seconds), and they gate a build, not a decision.
+The mechanical edit is written and checked for control bytes; it applies the
+six in sorted position and writes LF. Sequence, exploiting the fact that lane
+0's verification binary is this wave's control:
+
+1. `p20` — the merged tree, **without** the six. Lane 0's §7.3 binary, and this
+   wave's control. Run the dump on it for preconditions 3 and 4.
+2. apply the six, `p21` — the retired arm.
+3. A/B `p20` vs `p21`: probe tree, then the three corpus arms.
+
+A dial arm cannot substitute for step 3 here and §8b says why: with
+`leaked=126` every one of these six is an `armed == base` row, which is exactly
+the shape a leak produces.
+
 ## 9. Done
 
 Every bucket-A/B row in the prefix set is retired, classified as C/D/E/F, a
