@@ -3186,7 +3186,38 @@ fn essential_registry_is_populated() {
 /// `MIN_TOTAL_REGISTRATIONS`, the floor takes the SMALLER configuration and
 /// keeps the same ~300 rows of deliberate headroom, so it survives the next
 /// re-tag of that size while still detecting a shed module.
-const STRICT_MIN_TOTAL_REGISTRATIONS: usize = 10_900;
+/// # 10,900 -> 10,600, 2026-09-11
+///
+/// Lowered by 300 for a strict registry of 10,878, and the cause is one wave:
+/// `RETIRED_SHADOW_L5R_TRIPLES`, 67 `sun/misc/Unsafe` triples over 87
+/// registrations. Strict mode refuses a re-tagged row by design — which is the
+/// second reason the 2026-08-10 entry above gives — so a retirement wave lowers
+/// this total by exactly its registration count, and this one did.
+///
+/// **This detector exists to make lowering it suspicious, so here is the
+/// evidence it cannot see.** By SUBSTITUTION on the same tree, emptying that
+/// one table and re-running:
+///
+/// ```text
+///   table present   compatible 13609 (2728 stubs) -> strict 10878
+///   table emptied   compatible 13609 (2641 stubs) -> strict 10965
+///   difference                          87 stubs            87 rows
+/// ```
+///
+/// 10,965 clears the old floor, and the shortfall is 87 — the wave, to the row.
+/// A registry shedding whole modules does not move by exactly the size of one
+/// table and restore itself when that table is emptied. The corpus agrees:
+/// 133/133 on `--jdk-only`, 133/133 on `SUITE=all` and 93/93 on `SUITE=core`,
+/// on a release build of the merged tree.
+///
+/// The headroom stays at ~300, per the note above, and the maintenance cost is
+/// worth naming: this floor is in ABSOLUTE rows while the thing it guards
+/// against is a module-sized loss of hundreds, so every retirement wave of any
+/// size walks it down and every wave has to re-justify it. A floor expressed as
+/// a FRACTION of the compatible total would not need touching for a wave of
+/// tens — that is lane 0's call, not this lane's, and it is recorded here
+/// because this is the third entry in a row doing the same arithmetic by hand.
+const STRICT_MIN_TOTAL_REGISTRATIONS: usize = 10_600;
 
 /// Build the default native registry the way `--jdk-only` does: set the
 /// VM-scoped strict policy *first*, then run the same boot sequence
