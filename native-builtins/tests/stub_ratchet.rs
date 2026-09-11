@@ -1432,7 +1432,59 @@ use cratonvm_types::compat::CompatibilityMode;
 /// removes the slack, and it is why this wave's delta reads +251 against the
 /// tree and +237/+248/+251 against the constants.
 ///
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1894;
+/// # Re-frozen 2026-09-11: +176, of which 163 are lane 4 wave 1 and 13 are not
+///
+/// `native-api`'s `RETIRED_SHADOW_L4_TRIPLES` retires 140 triples over ten
+/// classes of `java/io/` and `java/nio/` as a §1.4 shadow wave -- the same
+/// mechanism as the 2026-09-09 phase-3 entry above, and the same reason it
+/// moves a COMPATIBLE-mode census: `NativeMethodRegistry::register` re-tags a
+/// retired triple `SyntheticStub` wherever `effective_category()` is `Bridge`,
+/// and that re-tag is not gated on mode. The body is untouched; only
+/// `allowed_in(JdkOnly)` reads the new kind.
+///
+/// The account, measured with the paired ratchet rather than derived. Both
+/// halves are this tree, scored twice, once with the L4 arm of
+/// `triple_is_retired_shadow` short-circuited and once live:
+///
+/// ```text
+///                              L4 OFF   L4 ON    delta
+///   registrations, management     1907    2070     +163
+///   registrations, no-management  1896    2059     +163
+///   registrations, synthetic-jdk  1896    2059     +163
+///   distinct triples (all arms)   1718    1856     +138
+///   TOTAL registrations, mgmt    13978   13978        0
+///   TOTAL registrations, no-mgmt 13610   13610        0
+///   TOTAL registrations, syn-jdk 13645   13645        0
+/// ```
+///
+/// **The total does not move, so this is case one of the three below:**
+/// existing fakes relabelled, not new ones written. Which rows: all 138 are in
+/// the L4 table and nothing outside it moved --
+/// `java/io/File` 51, `java/nio/ByteBuffer` 32, `java/io/DataInputStream` 18,
+/// `java/io/DataOutputStream` 15, `java/io/ByteArrayOutputStream` 13,
+/// `java/io/FilterOutputStream` 5, and one `order()` on each of the four
+/// `java/nio/ByteBufferAsCharBuffer{B,L,RB,RL}` views.
+///
+/// 138 distinct and +163 registrations, because this gate counts REGISTRATIONS:
+/// 25 of those triples are registered at more than one ordinal and the re-tag
+/// flips each one.
+///
+/// **140 rows in the table, 138 in the delta.** `ByteBuffer.allocate(I)` and
+/// `allocateDirect(I)` were ALREADY `SyntheticStub` before this wave -- both
+/// appear in the arm-OFF dump -- so retiring them changes their strict-mode
+/// admission and not their kind. Two rows of the table costing zero here is
+/// the correct reading, not a missing pair.
+///
+/// # The 13 that are NOT this wave
+///
+/// With the L4 arm off this tree observes 1896 / 1907 / 1896 against constants
+/// of 1883 / 1894 / 1883. That +13 landed on `dev` between the 2026-09-09
+/// freeze and this one, and the equal-in-every-arm shape is the drift this
+/// comment records three times already. It is re-frozen here because a `<=`
+/// gate cannot see slack, and folding it in silently is how 3/12/3 accumulated
+/// the last time.
+///
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2070;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1461,7 +1513,10 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1894;
 /// unowned for three days before it had a constant at all.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1883;
+/// **Re-frozen 2026-09-11 to 2059** with the other two; the account is on
+/// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]. +163 lane-4 wave-1 retirements and
+/// +13 of pre-existing drift, both identical in all three arms.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2059;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1518,7 +1573,13 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1883;
 /// re-freeze ALL THREE — see the pointer on both siblings.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1883;
+/// **Re-frozen 2026-09-11 to 2059**, in the same commit as the other two as
+/// the note above demands; the account is on
+/// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]. This arm took the same +163 and the
+/// same +13 as `no-management`, and its count is still IDENTICAL to that
+/// resolve -- the feature compiles registrars the others do not, and none of
+/// them is a stub.
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2059;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -1568,13 +1629,24 @@ const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1883;
 /// `cratonvm/internal/ArrayListViewItr` rows), and the other three accumulated
 /// across merges nobody had to re-freeze for. An ungated constant used to
 /// classify a gated one is worth only as much as its last refresh.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13879;
+/// **REFRESHED 2026-09-11: 13879 -> 13978, 13511 -> 13610, +99 each.** None of
+/// it is the lane-4 wave-1 retirement beside it: with that wave's arm disabled
+/// this tree reports the SAME 13978 / 13610, which is precisely how the wave
+/// was classified as a relabel. The +99 accumulated on `dev` across merges
+/// nobody had to re-freeze for -- the equal-in-both-arms drift this comment
+/// records each time it is visited.
+///
+/// The `synthetic-jdk` resolve observes **13645** and still has no constant of
+/// its own, so it is classified against `NO_MANAGEMENT` and reads 134 high by
+/// construction. Giving it one is a change of its own; until then, subtract the
+/// 35 extra registrations its registrars bring before reading that arm.
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13978;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
 /// for the reason given on [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].**
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13511;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13610;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;
