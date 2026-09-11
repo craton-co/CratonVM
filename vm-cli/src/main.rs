@@ -6080,6 +6080,18 @@ fn run() -> Result<()> {
             "[cratonvm]   of which VarHandle instance-field reads served directly: {}",
             cratonvm_vm::jit::helpers::varhandle_field_read_hit_count()
         );
+        // Compiled `newarray` sites that bump the TLAB inline instead of
+        // calling `jit_newarray`. BOTH halves, always: a workload whose arrays
+        // all took the helper says nothing about the bump, so a zero on the
+        // left has to be distinguishable from "emitted and refused". The
+        // decline reasons are the work list.
+        let (array_bump, array_stub) = cratonvm_jit::x64::inline_array_site_counts();
+        eprintln!(
+            "[cratonvm] compiled newarray sites: inline_tlab_bump={array_bump} stub_only={array_stub}"
+        );
+        for (why, n) in cratonvm_jit::x64::inline_array_declines() {
+            eprintln!("[cratonvm]   inline newarray declined {n}x: {why}");
+        }
         // The same read, reached WITHOUT the funnel — a thin direct call baked
         // into compiled code by `VARHANDLE_READ_DIRECT_FNS`. The pair is the
         // engagement evidence for that bind: `served` counts calls that never
