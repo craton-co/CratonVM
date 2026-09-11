@@ -1577,7 +1577,50 @@ use cratonvm_types::compat::CompatibilityMode;
 /// worth only as much as its last refresh, and this is the first time one of
 /// them would have had something to say.
 ///
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2339;
+/// # Re-frozen 2026-09-11 on the L0+L5 merge: +45 in all three arms
+///
+/// ```text
+/// dev's constants        2328 / 2339 / 2328
+/// + lane L3's table        24      (this branch, measured 2026-09-10)
+/// + lane L0 wave 2         21      (this branch, measured today pre-merge)
+/// = this merged tree     2373 / 2384 / 2373   (measured, forced failure)
+/// ```
+///
+/// The decomposition is not arithmetic on one reading: `24` and `21` were each
+/// measured on their own tree from their own forced failure before the merge,
+/// and the merged tree was then measured independently. Three readings, and
+/// the two halves sum to the third.
+///
+/// Case ONE -- **existing fakes relabelled.** Both waves are retirement
+/// tables, and a table re-tags `Bridge` -> `SyntheticStub` in
+/// `NativeMethodRegistry::register` before insertion: it moves the KIND and
+/// never the count of registrations. Which is what the second column shows.
+///
+/// # The second column localises dev's staleness, and it is not this branch's
+///
+/// Totals here read **13623 / 13991 / 13658**, against dev's constants of
+/// 13610 / 13978 / (none) -- a +13 on two arms that has nothing to do with
+/// either wave. It is attributable without building `dev`, because this branch
+/// measured its OWN totals twice, once before this merge and once after:
+///
+/// ```text
+/// before the merge   13623 / 13991 / 13658
+/// after  the merge   13623 / 13991 / 13658
+/// ```
+///
+/// Byte-identical. So dev's 29 commits added **no registrations** to this
+/// tree, and the 13 cannot have arrived with them -- dev's totals were already
+/// 13 stale against dev's own tree. Same species as the +101 stub drift this
+/// file recorded yesterday, and invisible for the same reason: nothing asserts
+/// on these two, so only a FAILURE prints them, and by then the reader is
+/// being asked to classify a real movement against a number that has quietly
+/// stopped describing anything.
+///
+/// The `synthetic-jdk` total needed no correction: **13658 both times**, which
+/// is the first reading this arm has ever had of its own, because until today
+/// it had no constant. See
+/// [`MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK`].
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2384;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1719,7 +1762,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2339;
 /// owns, +327 is lane 1's wave 2 and +101 is this branch; the decomposition
 /// and the three measurements behind the classification are all on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2328;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2373;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1781,7 +1824,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2328;
 /// [`BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT`] again, as it has every time, and
 /// that is still a measurement each time rather than a rule. The account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2328;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2373;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -1841,12 +1884,20 @@ const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2328;
 /// was the only trace a real defect left in this gate, and staleness meant
 /// nobody could have read it. The `synthetic-jdk` arm has no constant here and
 /// measured 13645 on the same tree.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13978;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13991;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
 /// for the reason given on [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].**
+///
+/// **REFRESHED 2026-09-10, lane 5: 13511 -> 13610**, the same +99 and for the
+/// same reason; see [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
+///
+/// **RE-FROZEN 2026-09-11 on the L0+L5 merge: 13610 -> 13623**, and the 13 is
+/// dev's staleness rather than either wave's — the localisation is on
+/// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
 #[allow(dead_code)]
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13623;
 
 /// The `--features synthetic-jdk` total, which had no constant at all.
 ///
@@ -1863,25 +1914,14 @@ const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13978;
 /// The gap is the point: `synthetic-jdk` compiles registrars neither other arm
 /// does, so a shared total was never going to be right for it. It read as
 /// right because nothing asserts on it and only a failure prints it.
-#[allow(dead_code)]
-/// **REFRESHED 2026-09-10, lane 5: 13511 -> 13610**, the same +99 and for the
-/// same reason; see [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13610;
-/// The `--features synthetic-jdk` total, which had no constant at all.
 ///
-/// **Found 2026-09-11 while re-freezing for lane L0's wave 2.** The three
-/// baselines, [`MEASURED_CONFIG`] and [`BASELINE_CONST`] all branch three
-/// ways; [`MEASURED_TOTAL_REGISTRATIONS`] branched TWO, so the synthetic-jdk
-/// arm classified its own failure against the no-management total. Measured
-/// side by side, that arm carries **13658** against no-management's **13623**
-/// — a 35-registration gap, which is larger than a typical stub delta. So the
-/// second column could report a clean relabel (total flat, stubs up) as "new
-/// fakes were registered, do not re-freeze", which is the one conclusion in
-/// the three-case table that stops work.
-///
-/// The gap is the point: `synthetic-jdk` compiles registrars neither other arm
-/// does, so a shared total was never going to be right for it. It read as
-/// right because nothing asserts on it and only a failure prints it.
+/// **Corroborated from the other side on the same day.** Lane 5's re-freeze
+/// note reached the same observation and stopped one step short of the fix —
+/// "the `synthetic-jdk` arm has no constant here and measured 13645 on the
+/// same tree". Two lanes noticing independently is the argument for a constant
+/// rather than a sentence: a sentence has to be re-derived by every reader,
+/// and 13645 on that tree against 13658 on this one is exactly the drift a
+/// sentence cannot track.
 #[allow(dead_code)]
 const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13658;
 
