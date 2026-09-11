@@ -1432,7 +1432,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// removes the slack, and it is why this wave's delta reads +251 against the
 /// tree and +237/+248/+251 against the constants.
 ///
-/// # Re-frozen 2026-09-11 (second time today): 2339 -> 2397, +58 stubs and -3 total
+/// # Re-frozen 2026-09-11 (second time today): 2339 -> 2426, +87 stubs and -3 total
 ///
 /// The lane-5 RESIDUAL wave. Both numbers moved and they moved in OPPOSITE
 /// directions, which is two of the three cases on
@@ -1441,15 +1441,22 @@ use cratonvm_types::compat::CompatibilityMode;
 ///
 /// ```text
 ///   arm             before    after     stubs    total before -> after
-///   no-management     2328     2386      +58        13610 -> 13607   (-3)
-///   management        2339     2397      +58        13978 -> 13975   (-3)
-///   synthetic-jdk     2328     2386      +58        13645 -> 13642   (-3)
+///   no-management     2328     2415      +87        13610 -> 13607   (-3)
+///   management        2339     2426      +87        13978 -> 13975   (-3)
+///   synthetic-jdk     2328     2415      +87        13645 -> 13642   (-3)
 /// ```
 ///
-/// **The +58 is case ONE** — existing registrations relabelled `Bridge` ->
-/// `SyntheticStub`. It is `RETIRED_SHADOW_L5R_TRIPLES`: 48 `sun/misc/Unsafe`
-/// triples, ten of them registered at more than one ordinal, and the re-tag
-/// flips every ordinal. 48 -> 58 is the same arithmetic as this morning's
+/// The +87 arrived in TWO SITTINGS on the same day and the split is worth
+/// keeping, because it is the clearest demonstration this file has that the
+/// stub count tracks a TABLE rather than a guess: 58 rows when the workload
+/// reached 48 triples, then 29 more when widening the workload reached 19
+/// more. Each sitting's row count was derived independently in the kind-map
+/// freeze and agreed both times.
+///
+/// **The +87 is case ONE** — existing registrations relabelled `Bridge` ->
+/// `SyntheticStub`. It is `RETIRED_SHADOW_L5R_TRIPLES`: 67 `sun/misc/Unsafe`
+/// triples, twenty of them registered at more than one ordinal, and the re-tag
+/// flips every ordinal. 67 -> 87 is the same arithmetic as this morning's
 /// 98 -> 101, and it reproduces the count in the kind-map freeze
 /// (`scripts/baselines/jdk-only-kind-map-25-linux.tsv`) which was derived by a
 /// different route.
@@ -1571,7 +1578,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// worth only as much as its last refresh, and this is the first time one of
 /// them would have had something to say.
 ///
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2397;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2426;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1604,7 +1611,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2397;
 /// owns, +327 is lane 1's wave 2 and +101 is this branch; the decomposition
 /// and the three measurements behind the classification are all on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2386;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2415;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1666,7 +1673,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2386;
 /// [`BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT`] again, as it has every time, and
 /// that is still a measurement each time rather than a rule. The account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2386;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2415;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///

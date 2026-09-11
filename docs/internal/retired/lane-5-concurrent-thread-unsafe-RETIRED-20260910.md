@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Retired 2026-09-10. A RESIDUAL wave on 2026-09-11 took four of §10's five items: see §3a (a correction to this page's own §3) and §9a. Table count is now 98 + 48. |
+| **Status** | Retired 2026-09-10. A RESIDUAL wave on 2026-09-11 took four of §10's five items: see §3a (a correction to this page's own §3) and §9a. Table count is now 98 + 67. |
 | **Was** | `docs/known-issues/jdk-only-lanes/lane-5-concurrent-thread-unsafe.md` |
 | **Table** | [`RETIRED_SHADOW_L5_TRIPLES`](../../../native-api/src/retired_shadow.rs) |
 | **Ownership authority** | [`lane-0-integration-and-gates.md`](../../known-issues/jdk-only-lanes/lane-0-integration-and-gates.md) |
@@ -751,7 +751,7 @@ on its sibling `submit`'s policy and on the keep-list.
 no task to join, so nothing can double, and real bytecode puts it on a real
 worker — closer to HotSpot than this pool's borrow-the-caller model.
 
-**`sun.misc.Unsafe`: 48 rows retired, and the blocker was a missing
+**`sun.misc.Unsafe`: 67 rows retired, and the blocker was a missing
 instrument.** §5 held all 82 with "precondition 1 fails by measurement" — 121
 probes reported the dial vacuous on that scope. §9.2 said what that was worth:
 *until a workload exists, the count is not evidence of anything.*
@@ -762,9 +762,20 @@ probes reported the dial vacuous on that scope. §9.2 said what that was worth:
   2. whole probe tree no worse       134 measured: 0 toward, 1 away and that
                                      row is y/r=0/0 VACUOUS with a line count
                                      that moved -- not the dial
-  3. the image target carries Code   outcome=bytecode-won on all 48
-  4. a per-triple dispatch observed  48 distinct triples, one row each
+  3. the image target carries Code   outcome=bytecode-won on all 67, and
+                                     `javap -p sun.misc.Unsafe` reports ZERO
+                                     native methods on the class -- all 99
+                                     carry Code and delegate to
+                                     `theInternalUnsafe`
+  4. a per-triple dispatch observed  67 distinct triples, one row each
 ```
+
+It took two sittings, and the second one is the page taking its own advice.
+The first workload reached 48 triples; §9a said the way to the rest is *a probe
+edit, not a build*, and adding the volatile twins, the long atomics and the
+bulk-memory trio reached 19 more. Armed, the widened probe reads
+`d(base,armed) = 0` on 50 rows -- arming the prefix changes nothing about its
+output at all.
 
 The probe is **byte-identical armed and unarmed**, 36 rows. A wave that refuses
 48 natives and changes no answer is the definition of a shadow.
