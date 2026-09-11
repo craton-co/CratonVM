@@ -163,8 +163,46 @@ def functions(lines):
             if started and depth <= 0:
                 break
             j += 1
-        out.append((m.group(2), i, lines[i:j + 1]))
+        out += split_closures(m.group(2), i, lines[i:j + 1])
         i = j + 1
+    return out
+
+
+CLOSURE = re.compile(r"\|\s*[A-Za-z_&\s,:<>'\w]*\|\s*(->[^{]*)?\{\s*$")
+
+
+def split_closures(name, start, body):
+    """Split a body into the outer body and each multi-line closure body.
+
+    A `register_*` function is a hundred `r.register(cls, m, sig, |ctx, args| {
+    … })` blocks that share nothing but the registry. Scanning them as one flat
+    line pairs an allocation in one closure with a use in another and reports a
+    defect that cannot happen — two of the three survivors of the 2026-09-11
+    triage were exactly that. Each closure is its own body, and the lines it
+    occupies are blanked out of the parent so nothing is scanned twice.
+    """
+    kept = list(body)
+    out = []
+    k = 0
+    while k < len(kept):
+        c = strip_code(kept[k])
+        if not CLOSURE.search(c):
+            k += 1
+            continue
+        depth, j = 0, k
+        while j < len(kept):
+            cc = strip_code(kept[j])
+            depth += cc.count("{") - cc.count("}")
+            if depth <= 0 and j > k:
+                break
+            j += 1
+        if j - k >= 3:
+            out.append(("%s{closure@%d}" % (name, start + k + 1), start + k,
+                        kept[k:j + 1]))
+            for z in range(k, min(j + 1, len(kept))):
+                kept[z] = ""
+        k = j + 1
+    out.append((name, start, kept))
     return out
 
 

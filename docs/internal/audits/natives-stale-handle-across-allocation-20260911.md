@@ -91,26 +91,36 @@ a heap defect, so it can survive indefinitely.
 conventions: `--detail`, `--update`, `--selftest`, baseline in
 `scripts/baselines/`, exit `1` when the population grows.
 
-It reports **573 sites in 260 functions** after this sweep. That number is a
+It reports **283 sites in 202 functions** after this sweep. That number is a
 RATCHET, not a target, and the page has to be honest about why it is not a
 defect count:
 
 * the receiver may be an old-generation singleton, which never moves;
 * the "allocating" call may be on a path that cannot allocate in practice;
-* the scanner reads a function as a flat line, so a hazard in one closure of a
-  big `register_*` function pairs with a use in another closure, and both
-  survivors of this sweep's triage are exactly that.
+* the scanner does not follow calls, so a helper that allocates two frames down
+  is invisible unless its own name is in `HAZARD` — the count is a floor as
+  well as an overcount.
+
+The first version of the scanner said 573, and 290 of those were one bug in the
+scanner rather than in the tree: a `register_*` function is a hundred
+`|ctx, args| { … }` closures that share nothing, and reading them as one flat
+line pairs an allocation in one closure with a use in another. Closures are
+scanned as their own bodies now. That correction is worth recording because the
+uncorrected number would have made the next tranche look twice its real size,
+and a triage queue nobody believes is a queue nobody works.
 
 What the number IS good for is the derivative. A new native that reuses a local
 across an allocation now trips a gate instead of waiting for a GC-stress run on
 a workload nobody has written yet.
 
-The hazard mix across those 573 sites says where the next tranche is:
-`try_alloc*` 193, `create_string` 120, `invoke_virtual` 90, `new_array` 67,
-`ensure_class_initialized` 21. The `invoke_virtual` ones are the most
-interesting and the least mechanical — a native that calls back into Java and
-then keeps using anything it read beforehand — and they are the natural next
-unit of work.
+The hazard mix across those 283 sites says where the next tranche is:
+`create_string` 77, `invoke*` 74, `new_array` 43, `try_alloc*` 30,
+`new_ref_array` 12. The `invoke*` ones are the most interesting and the least
+mechanical — a native that calls back into Java and then keeps using anything it
+read beforehand, which is the `apps_h2`/`x509_manager`/`util_concurrent_ext`
+cluster — and they are the natural next unit of work. By file, the queue's head
+is `lang_invoke.rs` (25), `phases_late/nio_file.rs` (18),
+`phases_late/ssl_security.rs` (14), `jmx.rs` (10).
 
 The selftest is not decoration. Its sibling's docstring records three hazard
 tokens that matched NOTHING in the tree for months, which reads exactly like a

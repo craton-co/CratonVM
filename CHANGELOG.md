@@ -35,10 +35,12 @@ Two screens close behind them:
   pre-move copy held.
 * `scripts/stale-handle-across-alloc-audit.py` is the static half, a sibling of
   `stale-receiver-audit.py` (which screens a callee shape and structurally
-  cannot see a body that reuses its own local). Baseline: 573 sites in 260
-  functions — a ratchet, not a target, since a match is not a defect. It ships
-  with a selftest that fails if a hazard token stops matching, because a dead
-  token looks exactly like a clean tree.
+  cannot see a body that reuses its own local). Baseline: 283 sites in 202
+  functions — a ratchet, not a target, since a match is not a defect. It scans
+  each closure of a `register_*` function as its own body (without that, 290 of
+  an apparent 573 sites were an allocation in one closure paired with a use in
+  another), and it ships with a selftest that fails if a hazard token stops
+  matching, because a dead token looks exactly like a clean tree.
 
 `docs/internal/audits/natives-stale-handle-across-allocation-20260911.md` has
 the site table, the triage rules and the honest limits.
