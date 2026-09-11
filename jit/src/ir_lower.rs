@@ -3618,6 +3618,63 @@ impl<'a> Lowerer<'a> {
         // home word go stale at the same point, and an order that protects one
         // protects the other. A cycle's `Save` copies the pre-value out at the
         // same instant either way.
+        // ── Which register STAGES the value ──────────────────────────
+        //
+        // RAX was the staging register for every phi copy, and the publish
+        // below then copied RAX into the phi's own register. When the phi has
+        // one, that register is a strictly better temporary: the read lands
+        // there directly and the publish disappears, because the value is
+        // already where the publish was going to put it.
+        //
+        // Worth one instruction per phi per edge, i.e. per loop-carried value
+        // per iteration. On `probes/FieldLoop.java` `sum` the back edge was
+        //
+        //     mov rax,r15 / mov r12,rax          ; the `sum` phi
+        //     mov rax,[rbp-98h] / mov rbx,rax    ; the `i` phi
+        //
+        // which is four instructions in a 26-instruction loop body to move two
+        // values that are already in a register or a word.
+        //
+        // # Why it is the same program
+        //
+        // The write to the phi's register moves EARLIER inside this one
+        // `CopyOp` — from after the home store to before it — and nothing in
+        // between reads anything: the only instruction it crosses is this
+        // copy's own store, whose source it now is. Relative to every OTHER
+        // copy on this edge the ordering is unchanged, because the old publish
+        // was already inside this op and therefore already ahead of the next
+        // op's read. `resolve_parallel_copy`'s invariant (every source is read
+        // before anything writes it) is a statement about that cross-op order
+        // and is untouched.
+        //
+        // # What still goes through RAX, and why
+        //
+        // * a phi with no GP register — an FP phi publishes from its home word
+        //   in `emit_phi_copies`'s later loop, and a non-resident phi has
+        //   nowhere else to stage;
+        // * a DEFERRED publish — the home store is the only thing carrying the
+        //   value to the end of the edge, so writing the register here would
+        //   publish it at the wrong point;
+        // * `CopyOp::Save`, whose destination is the scratch word and has no
+        //   phi at all;
+        // * **a phi whose home store SURVIVES.** That one is a deliberate
+        //   restriction rather than an obstacle, and the reason is in
+        //   `a_phi_copy_that_keeps_its_home_is_byte_identical`: staging there
+        //   would also have to write the home from the staged register, and no
+        //   test in this crate can separate a right store from a wrong one on
+        //   that path — nothing reads a resident phi's home word back, so
+        //   `store_abi_reg(RAX, dst)` in place of the value produces identical
+        //   answers. Requiring the drop keeps every remaining path one this
+        //   suite can fail. It costs the home-keeping case one instruction, on
+        //   a path a `panic!` proved the whole crate never reaches.
+        let stage = phi_of_dst
+            .get(&dst)
+            .copied()
+            .filter(|_| ir_phi_copy_regs_enabled() && ir_phi_copy_direct_enabled())
+            .filter(|phi| !defer_publish.contains(phi))
+            .filter(|phi| self.home_dropped.get(*phi as usize).copied().unwrap_or(false))
+            .and_then(|phi| self.assigned_gpr(phi).map(|reg| (phi, reg)));
+        let stage_reg = stage.map_or(RAX, |(_, reg)| reg);
         let mut from_reg = false;
         if ir_phi_copy_regs_enabled() {
             if let Some(&sid) = src_node_of.get(&src) {
@@ -3636,7 +3693,10 @@ impl<'a> Lowerer<'a> {
                 };
                 match src_reg {
                     Some(r) => {
-                        self.emit_mov_reg_reg64(RAX, r);
+                        // A no-op when the source already sits in the phi's
+                        // register, which `emit_mov_reg_reg64` drops rather
+                        // than encoding `mov r,r`.
+                        self.emit_mov_reg_reg64(stage_reg, r);
                         from_reg = true;
                         self.phi_copy_reg_reads += 1;
                     }
@@ -3655,7 +3715,7 @@ impl<'a> Lowerer<'a> {
             }
         }
         if !from_reg {
-            self.load_to_rax(src);
+            self.load_reg_from_frame(stage_reg, src);
         }
         // ── The store, when anything could read it ───────────────────
         //
@@ -3673,6 +3733,16 @@ impl<'a> Lowerer<'a> {
         if drop_home {
             self.home_stores_dropped += 1;
         } else {
+            // Reached only with `stage_reg == RAX`: `stage` requires the phi's
+            // home to be dropped and `drop_home` is that same fact, so the two
+            // are the same condition read from the two directions. The
+            // `debug_assert` is what stops a future widening of `stage` from
+            // silently storing the wrong register here.
+            debug_assert_eq!(
+                stage_reg, RAX,
+                "a staged phi copy reached the home store; `stage` and \
+                 `drop_home` have come apart",
+            );
             self.store_rax(dst);
         }
         // ── Publish: from RAX, which provably holds the value ─────────
@@ -3682,7 +3752,15 @@ impl<'a> Lowerer<'a> {
         // `mov reg, [dst]` — the same word, written and read back across a
         // store-forwarding stall, once per phi per edge, i.e. once per loop
         // iteration for every loop-carried value.
-        if ir_phi_copy_regs_enabled() {
+        if let Some((phi, _)) = stage {
+            // Staged straight into the phi's register above: the value is
+            // already published, and the bookkeeping is the same either way so
+            // that `emit_phi_copies`'s `published` check cannot tell the two
+            // routes apart.
+            self.mark_gp_reg_live(phi);
+            published.push(phi);
+            self.phi_copy_reg_publishes += 1;
+        } else if ir_phi_copy_regs_enabled() {
             if let Some(&phi) = phi_of_dst.get(&dst) {
                 if let Some(dst_reg) = self.assigned_gpr(phi) {
                     if !defer_publish.contains(&phi) {
@@ -14327,6 +14405,62 @@ fn note_deferred_census(candidates: usize, taken: usize, mid_rcx: usize, foldabl
 /// both operands are register-resident the two `MOV`s ahead of it are pure
 /// overhead, and on a counted loop they are two of the seventeen instructions
 /// in the body.
+/// `CRATONVM_JIT_IR_PHI_COPY_DIRECT=0` — stage every phi edge copy through RAX
+/// and publish the phi's register from there, the shape that predates
+/// 2026-09-11.
+///
+/// Default ON. A phi copy whose destination has a register reads straight into
+/// it, which removes the `mov <phi reg>, rax` that followed every one — one
+/// instruction per loop-carried value per iteration. See
+/// [`Lowerer::emit_copy_op`] for why the two emissions are the same program.
+///
+/// Off restores the previous bytes exactly: RAX stages, the home store comes
+/// from RAX, and the publish is a separate move.
+#[cfg(test)]
+thread_local! {
+    /// Test-only override of [`ir_phi_copy_direct_enabled`], the same shape as
+    /// `LS_FORCE` and for the same reason: a differential lane has to hold both
+    /// of its arms in one process, and the production answer latches in a
+    /// `OnceLock`.
+    static PHI_COPY_DIRECT_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only RAII override of [`ir_phi_copy_direct_enabled`] on this thread.
+#[cfg(test)]
+struct PhiCopyDirectForce;
+
+#[cfg(test)]
+impl PhiCopyDirectForce {
+    fn set(on: bool) -> PhiCopyDirectForce {
+        PHI_COPY_DIRECT_FORCE.with(|c| c.set(Some(on)));
+        PhiCopyDirectForce
+    }
+}
+
+#[cfg(test)]
+impl Drop for PhiCopyDirectForce {
+    fn drop(&mut self) {
+        PHI_COPY_DIRECT_FORCE.with(|c| c.set(None));
+    }
+}
+
+fn ir_phi_copy_direct_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(forced) = PHI_COPY_DIRECT_FORCE.with(|c| c.get()) {
+            return forced;
+        }
+    }
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PHI_COPY_DIRECT").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
 fn ir_cmp_in_place_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -18166,6 +18300,24 @@ pub(crate) fn lower_inner_with_scopes(
         eprintln!(
             "[ir-ls] alu immediates folded: {} add_lea={}+{}",
             lowerer.alu_imms_folded, lowerer.add_lea, lowerer.add_lea_acc,
+        );
+        // The SCHEDULER's half of the same question. `carry skips:
+        // operand_position` above says how often the emitter wanted a triple
+        // the scheduler had not formed; this says why it had not.
+        let pc = schedule.pairing;
+        eprintln!(
+            "[ir-ls] operand pairing: candidates={} paired={} | declined: \
+             multi_use={} producer_arm={} other_block={} after_consumer={} \
+             already_adjacent={} deopt_between={} no_node={}",
+            pc.candidates,
+            pc.paired,
+            pc.multi_use,
+            pc.producer_arm,
+            pc.other_block,
+            pc.after_consumer,
+            pc.already_adjacent,
+            pc.deopt_between,
+            pc.no_node,
         );
         eprintln!(
             "[ir-ls] carried homes dropped: {}",
@@ -26518,6 +26670,153 @@ mod tests {").next().unwrap_or(src);
                  into RAX outside the fold guard",
             );
         }
+    }
+
+    /// A phi copy staged in the phi's own register computes the same integers
+    /// as one staged in RAX, and emits fewer bytes.
+    ///
+    /// The two halves are both needed and neither can stand in for the other.
+    ///
+    /// **Correctness** is the half no source audit can do: `emit_copy_op` moves
+    /// the write of the phi's register EARLIER inside one `CopyOp`, which is an
+    /// argument about `resolve_parallel_copy`'s ordering invariant, and an
+    /// argument is what this project keeps discovering was wrong about a
+    /// register it could not see (`op_preserves_rcx` claimed six arms that all
+    /// wrote RCX, and both suites passed). Both bodies come from ONE graph and
+    /// ONE schedule, so a divergence is attributable to the staging register
+    /// and to nothing else.
+    ///
+    /// **Engagement** is the half that stops it passing vacuously. A body whose
+    /// phis got no register emits identical bytes in both arms, and the
+    /// correctness half would then be comparing a body with itself and
+    /// reporting a pass. `direct < plain` is the assertion that the arms really
+    /// differ: each converted copy drops one three-byte `mov <phi reg>, rax`.
+    ///
+    /// The shape is a counted loop with two loop-carried values —
+    /// `for (i = 0; i < n; i++) a += i;` — because a phi copy only exists on a
+    /// back edge, and two of them is what `probes/FieldLoop.java` `sum` has.
+    #[test]
+    fn a_phi_copy_staged_in_its_own_register_computes_the_same_and_is_smaller() {
+        // int f(int n) { int a = 0; for (int i = 0; i < n; i++) a += i; return a; }
+        //  0 iconst_0     3 istore_2     6 if_icmpge +13   c istore_1
+        //  1 istore_1     4 iload_2      9 iload_1         d iinc 2,1
+        //  2 iconst_0     5 iload_0      a iload_2        10 goto -12
+        //                                b iadd           13 iload_1  14 ireturn
+        let code = [
+            0x03, 0x3C, 0x03, 0x3D, 0x1C, 0x1A, 0xA2, 0x00, 0x0D, 0x1B, 0x1C, 0x60, 0x3C, 0x84,
+            0x02, 0x01, 0xA7, 0xFF, 0xF4, 0x1B, 0xAC, 0, 0,
+        ];
+        let mut graph = IrBuilder::new(1, 3).build(&code, 21).expect("IR build");
+        ir_optimize::optimize(&mut graph);
+        let schedule = ir_schedule::schedule(&graph);
+
+        let (direct_cm, plain_cm) = {
+            let _f = super::PhiCopyDirectForce::set(true);
+            let direct = lower(&graph, &schedule, 1, 3, &no_helpers()).expect("direct body lowers");
+            drop(_f);
+            let _f = super::PhiCopyDirectForce::set(false);
+            let plain = lower(&graph, &schedule, 1, 3, &no_helpers()).expect("plain body lowers");
+            (direct, plain)
+        };
+
+        // Engagement. Read `ir_phi_copy_regs_enabled` too: with THAT kill switch
+        // off there is no register publish to fold away and the two arms are
+        // legitimately identical, which is a configuration the suite is allowed
+        // to run in.
+        if super::ir_phi_copy_regs_enabled() {
+            assert!(
+                direct_cm.code_len() < plain_cm.code_len(),
+                "staging in the phi's own register emitted no fewer bytes \
+                 ({} against {}) — either no phi on this loop got a register, \
+                 or the fold is not firing and the comparison below is a body \
+                 against itself",
+                direct_cm.code_len(),
+                plain_cm.code_len(),
+            );
+        }
+
+        // `ireturn` defines the low 32 bits of RAX and nothing above them.
+        for n in [0i32, 1, 2, 7, 100, -3] {
+            let want: i32 = (0..n.max(0)).fold(0i32, |acc, i| acc.wrapping_add(i));
+            let got_direct = unsafe { direct_cm.try_call(&[i64::from(n)]) }
+                .expect("the direct body runs");
+            let got_plain =
+                unsafe { plain_cm.try_call(&[i64::from(n)]) }.expect("the plain body runs");
+            assert_eq!(
+                got_direct as u32, got_plain as u32,
+                "the two staging registers disagree for n={n}",
+            );
+            assert_eq!(got_direct as u32 as i32, want, "direct body wrong for n={n}");
+        }
+    }
+
+    /// A phi whose home store SURVIVES is emitted byte for byte as before.
+    ///
+    /// # This test is the shape of a mutation that did not fail
+    ///
+    /// The first version of `stage` did not ask whether the home was dropped,
+    /// so a phi that kept its home staged in its register and then wrote the
+    /// home FROM that register. Replacing `store_abi_reg(stage_reg, dst)` with
+    /// `store_abi_reg(RAX, dst)` — a store of whatever was last in RAX instead
+    /// of the value — left every test green, and so did replacing it with a
+    /// `panic!`: the branch was unreachable from the whole `cratonvm-jit`
+    /// suite, 2356 unit tests and 145 differential tests included.
+    ///
+    /// Both facts have the same cause. `stage` and `drop_home` ask overlapping
+    /// questions, and on every loop small enough to write as a fixture a
+    /// resident phi owns its register exclusively, so `phi_home_droppable`
+    /// clears it and the store never runs. Forcing the store to run (with
+    /// `CRATONVM_JIT_IR_DROP_PHI_HOME=0`, below) does not help the first
+    /// problem: **nothing reads a resident phi's home word back**, so a store
+    /// of the wrong register is unobservable from any answer the body can
+    /// produce.
+    ///
+    /// A path this crate cannot fail is a path that should not ship, so `stage`
+    /// now requires the home to be dropped and this test pins the exclusion the
+    /// only way that is decisive: with the home kept, the two arms must be
+    /// **byte-identical**. The saving given up is one instruction on a path
+    /// nothing here reaches.
+    #[test]
+    fn a_phi_copy_that_keeps_its_home_is_byte_identical() {
+        // int f(int n) { int a = 0; for (int i = 0; i < n; i++) a += i; return a; }
+        let code = [
+            0x03, 0x3C, 0x03, 0x3D, 0x1C, 0x1A, 0xA2, 0x00, 0x0D, 0x1B, 0x1C, 0x60, 0x3C, 0x84,
+            0x02, 0x01, 0xA7, 0xFF, 0xF4, 0x1B, 0xAC, 0, 0,
+        ];
+        let mut graph = IrBuilder::new(1, 3).build(&code, 21).expect("IR build");
+        ir_optimize::optimize(&mut graph);
+        let schedule = ir_schedule::schedule(&graph);
+
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_JIT_IR_DROP_PHI_HOME", Some("0"))],
+            || {
+                let direct = {
+                    let _f = super::PhiCopyDirectForce::set(true);
+                    lower(&graph, &schedule, 1, 3, &no_helpers()).expect("direct body lowers")
+                };
+                let plain = {
+                    let _f = super::PhiCopyDirectForce::set(false);
+                    lower(&graph, &schedule, 1, 3, &no_helpers()).expect("plain body lowers")
+                };
+                assert_eq!(
+                    direct.code_len(),
+                    plain.code_len(),
+                    "with every phi home kept, direct staging must emit exactly \
+                     the bytes it did before — a difference here means `stage` \
+                     has been widened past what the tests can check",
+                );
+                // …and the sibling test's `direct < plain` must still be the
+                // live assertion, so this pair cannot both pass vacuously:
+                // one demands a difference, this one demands none, and they
+                // differ in exactly the switch named above.
+                for n in [0i32, 1, 7, 100] {
+                    let want: i32 = (0..n).fold(0i32, |acc, i| acc.wrapping_add(i));
+                    let got = unsafe { direct.try_call(&[i64::from(n)]) }
+                        .expect("the body runs");
+                    assert_eq!(got as u32 as i32, want, "wrong for n={n}");
+                }
+            },
+        );
     }
 
     /// The deferred carry EXECUTES correctly when it fires, with a folded
