@@ -2561,7 +2561,7 @@ static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
 /// boundary-crossing registrars are carved out of the 992 rows under its prefix
 /// set. This table holds the rows that earned a retirement; every other row in
 /// that population is dispositioned in
-/// `docs/known-issues/jdk-only-lanes/lane-2-lang-values.md`.
+/// `docs/internal/jdk-only/lane-2-lang-values-RETIRED-20260911.md`.
 ///
 /// # `java/lang/Character` — three deprecated statics, and nothing to argue
 ///
