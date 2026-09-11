@@ -13847,6 +13847,30 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         self.shared.mem.heap.element_type_of(obj)
     }
 
+    /// One membership walk and one forwarding barrier for all three answers.
+    ///
+    /// `object_is_array` + `heap_element_type_of` + `array_length` repeat both
+    /// per call, and `array_length`'s walk alone was measurable on the
+    /// `String/Regex` row: `is_object_address` is 5% of its builder phase, and
+    /// `sb_view` asks all three of these questions about the same payload
+    /// array on every `append`. The KINDOF-SENTINEL guard comes first for the
+    /// reason `array_length` documents — an invalid `obj` must not reach
+    /// `load_and_forward`, whose first read dereferences it unconditionally.
+    fn array_shape(&self, obj: ObjectRef) -> Option<(ArrayElementType, usize)> {
+        self.shared
+            .mem
+            .heap
+            .is_object_address(obj.as_ptr() as usize)?;
+        let obj = self.shared.mem.heap.load_and_forward_validated(obj);
+        if self.shared.mem.heap.kind_of_validated(obj) != ObjectKind::Array {
+            return None;
+        }
+        Some((
+            self.shared.mem.heap.element_type_of_validated(obj),
+            self.shared.mem.heap.array_length(obj),
+        ))
+    }
+
     fn create_string(&mut self, text: &str) -> ObjectRef {
         super::create_java_string(self.shared, text)
     }

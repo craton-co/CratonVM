@@ -310,6 +310,16 @@ static LAYOUT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// Coarse and correct beats precise and absent.
 /// **On the Rust heap, deliberately, and not in this image's `.data`.**
 ///
+/// > **Superseded 2026-09-11, and the paragraph below is kept because its
+/// > reasoning is still the reason this cell is not a plain `static`.** The
+/// > heap is no longer where this counter ends up on a real VM boot:
+/// > [`install_layout_epoch_cell`] moves it into a cell from the JIT code
+/// > cache's own allocator, which puts the guard in `disp32` reach **by
+/// > construction on every platform** instead of by which allocator the
+/// > counter happened to share with the code. The "leave the poll behind"
+/// > objection that blocked exactly this refactor is answered in that
+/// > function's doc. `CRATONVM_JIT_EPOCH_CELL=0` selects the heap arm.
+///
 /// A JIT site guards on this counter by baking its ADDRESS, and the cheapest
 /// encoding for that is `CMP dword [rip+disp32], imm32` — one 10-byte
 /// instruction against `MOV R11, imm64` + `MOV ECX, [R11]` + `CMP ECX, imm32`,
@@ -353,13 +363,152 @@ static LAYOUT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// `CRATONVM_JIT_LAYOUT_EPOCH_STATIC=1` puts it back in `.data`
 /// ([`LAYOUT_REPLACE_EPOCH_IMAGE`]) — the arm that makes the move itself
 /// measurable rather than merely argued.
+/// `CRATONVM_JIT_EPOCH_CELL=0` puts it back on the Rust heap — the kill
+/// switch for the cell below, and the arm the 2026-09-11 A/B was taken
+/// against.
 static LAYOUT_REPLACE_EPOCH: LazyLock<&'static std::sync::atomic::AtomicU32> =
     LazyLock::new(|| {
         if layout_epoch_static_enabled() {
+            // The diagnosis lever wins over everything, including an installed
+            // cell: its whole purpose is to hold the LOCATION fixed at `.data`.
+            *EPOCH_CELL.lock().unwrap_or_else(|e| e.into_inner()) =
+                EpochCell::Resolved(EpochCellOrigin::Image);
             return &LAYOUT_REPLACE_EPOCH_IMAGE;
         }
+        let mut state = EPOCH_CELL.lock().unwrap_or_else(|e| e.into_inner());
+        if let EpochCell::Installed(addr) = *state {
+            *state = EpochCell::Resolved(EpochCellOrigin::CodeAdjacent);
+            // SAFETY: the only way to reach `Installed` is
+            // [`install_layout_epoch_cell`], whose contract is a 4-byte-aligned
+            // cell that is zero, never unmapped, never recycled, and named by
+            // no other reference. Publishing it as `&'static` is exactly that
+            // contract, and the `Mutex` is what makes "installed before the
+            // first resolution" a fact rather than a hope.
+            return unsafe { &*(addr as *const std::sync::atomic::AtomicU32) };
+        }
+        *state = EpochCell::Resolved(EpochCellOrigin::Heap);
+        drop(state);
         Box::leak(Box::new(std::sync::atomic::AtomicU32::new(0)))
     });
+
+/// Where [`LAYOUT_REPLACE_EPOCH`] ended up, for the diagnostic line and for
+/// tests that would otherwise be unable to tell the arms apart.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EpochCellOrigin {
+    /// `CRATONVM_JIT_LAYOUT_EPOCH_STATIC=1` — the `.data` cell.
+    Image,
+    /// The historical default: a leaked `Box` from the VM's own allocator.
+    Heap,
+    /// A cell from the code cache's allocator, installed before first use.
+    CodeAdjacent,
+}
+
+/// The decision [`LAYOUT_REPLACE_EPOCH`]'s initializer makes, once.
+///
+/// A `Mutex` and not two atomics, and that is the whole design. With atomics,
+/// an installer that reads "not resolved yet" can still lose the race to the
+/// `LazyLock` and have its cell silently ignored — and then
+/// [`install_layout_epoch_cell`] returns `true` having done nothing, which is
+/// the one outcome this must never produce. The lock is taken twice per
+/// process on a cold path.
+#[derive(Clone, Copy)]
+enum EpochCell {
+    Unset,
+    Installed(usize),
+    Resolved(EpochCellOrigin),
+}
+
+static EPOCH_CELL: std::sync::Mutex<EpochCell> = std::sync::Mutex::new(EpochCell::Unset);
+
+/// Give the replacement epoch a cell from the JIT code cache's own allocator,
+/// so `CMP dword [rip+disp32], imm32` is in reach **by construction** rather
+/// than by which allocator the counter happened to land in.
+///
+/// # Why this exists, and why it did not before
+///
+/// `docs/internal/performance/c2-the-layout-epoch-guard-was-unreachable-by-rip-20260910.md`
+/// spent a whole page moving the CODE to this counter, behind
+/// `CRATONVM_JIT_CODE_NEAR_GLOBALS`, because the obvious direction — move the
+/// COUNTER to the code — was refused: `near_globals` anchors on this address
+/// and the safepoint flag was only in reach for being a few hundred megabytes
+/// away in the same allocator. Taking the counter out of that band would have
+/// left the poll behind.
+///
+/// `safepoint-poll-flag-was-on-the-rust-heap-FIXED-20260910.md` gave the poll a
+/// cell of its own, and the objection expired with it. The poll no longer needs
+/// an anchor, so the anchor is free to move.
+///
+/// # The hazard this signature exists to prevent
+///
+/// Compiled code BAKES this address, and `register_class_layout` bumps
+/// whatever cell the `LazyLock` resolved to. Swapping cells after the first
+/// bake would leave every compiled guard reading a word nobody increments —
+/// the stale-offset hazard the guard exists to prevent, reintroduced by the fix
+/// for it. So this **fails closed**: once the counter has been read, bumped or
+/// baked even once, the cell is refused and the caller keeps whatever it had.
+///
+/// Returns `true` only when the cell is now the one every future reader,
+/// writer and JIT site will use. A `false` is a missed optimization and never
+/// a correctness problem — but it does mean the call site is too late, which
+/// is why it is worth asserting in a test rather than ignoring.
+///
+/// # Safety
+///
+/// `cell` must point to at least 4 zeroed, 4-byte-aligned bytes that live for
+/// the rest of the process, are never recycled, and are named by no other
+/// reference. `jit::platform::alloc_code_adjacent_cell` returns exactly that.
+///
+/// # Composition with `CRATONVM_JIT_CODE_NEAR_GLOBALS`
+///
+/// Not handled here, and it does not need to be: that flag makes
+/// `alloc_code_adjacent_cell` return `None` for the whole process, so a caller
+/// sourcing its cell from there simply never calls this. Exactly one strategy
+/// owns placement, and that property is preserved by where the cell comes
+/// from rather than by a second check.
+pub unsafe fn install_layout_epoch_cell(cell: *mut u32) -> bool {
+    if cell.is_null() || (cell as usize) % 4 != 0 || !layout_epoch_cell_enabled() {
+        return false;
+    }
+    let mut state = EPOCH_CELL.lock().unwrap_or_else(|e| e.into_inner());
+    match *state {
+        EpochCell::Unset => {
+            *state = EpochCell::Installed(cell as usize);
+            true
+        }
+        // Already installed, or already resolved: fail closed either way.
+        _ => false,
+    }
+}
+
+/// Where the counter actually is, forcing the choice if nothing has yet.
+///
+/// The diagnostic line and the tests both need this, and both need it to
+/// report what the EMISSION will read rather than recomputing the rule — the
+/// lesson §10.1 of the companion page paid for.
+pub fn layout_epoch_cell_origin() -> EpochCellOrigin {
+    let _ = layout_replace_epoch_guard();
+    match *EPOCH_CELL.lock().unwrap_or_else(|e| e.into_inner()) {
+        EpochCell::Resolved(o) => o,
+        // Unreachable: the line above forces the `LazyLock`. Reported as the
+        // historical default rather than panicking in a diagnostic.
+        _ => EpochCellOrigin::Heap,
+    }
+}
+
+/// `CRATONVM_JIT_EPOCH_CELL=0` — refuse the code-adjacent cell and keep the
+/// leaked `Box`.
+///
+/// The kill switch exists so the change is A/B-able inside ONE binary, which
+/// is the only way the 2026-09-10 heap move could be priced and the only way
+/// this one can be. Read inside [`install_layout_epoch_cell`], which runs
+/// before the `LazyLock` resolves, so the choice cannot change under a compile
+/// that already baked an address.
+fn layout_epoch_cell_enabled() -> bool {
+    !matches!(
+        crate::flags::runtime_var("CRATONVM_JIT_EPOCH_CELL").as_deref(),
+        Ok("0") | Ok("false") | Ok("off") | Ok("no")
+    )
+}
 
 /// The `.data` counter [`LAYOUT_REPLACE_EPOCH`] used to be, kept for one
 /// purpose: making the MOVE to the heap A/B-able inside one binary.
@@ -1823,6 +1972,17 @@ mod tests {
     /// cell, and the choice is latched by the `LazyLock` before any test could
     /// flip it, so that arm belongs to a separate process and not to an
     /// assertion here.
+    ///
+    /// **2026-09-11: the second bullet has expired and the first has grown a
+    /// better answer.** `near_globals` no longer needs this cell as an anchor
+    /// for the poll — the poll has a cell of its own — and on a real VM boot
+    /// this counter is not in the heap at all but in one from the code cache's
+    /// allocator ([`install_layout_epoch_cell`]). What this test still pins is
+    /// the arm a process with no VM in it gets, which is every unit test: no
+    /// caller installed anything, so the `LazyLock` must fall back to the
+    /// leaked `Box` and must NOT quietly become the `.data` static. The
+    /// installed arm is pinned by
+    /// `an_installed_cell_is_what_a_jit_site_bakes` below.
     #[test]
     fn the_baked_epoch_address_is_the_heap_cell_by_default() {
         if layout_epoch_static_enabled() {

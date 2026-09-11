@@ -1,8 +1,12 @@
 # Hibernate ORM — `HqlParserMemoryUsageTest`: the 2.5x allocation multiplier, and the two counter bugs that hid it
 
-**Status:** 1 confirmed CratonVM-specific FAIL, root cause **partially**
-identified (2.5x allocation vs HotSpot; the mechanism is not yet fully
-attributed). Two measurement defects found underneath it are **fixed** — before
+**Status:** 1 confirmed CratonVM-specific FAIL. **The "2.5x" in this title is
+no longer believed — see "Addendum 2026-09-11", which shows it is a reading of a
+process-wide allocation counter that over-reports by 2-3x on every collector, and
+that on the faithful per-thread counter CratonVM allocates LESS than HotSpot on
+this parse. Read that addendum before acting on anything below it**, in
+particular before starting the `ATNConfig` next-step. Root cause of the FAIL is
+now believed to be the counter itself rather than an allocation multiplier. Two measurement defects found underneath it are **fixed** — before
 them, no allocation figure this VM reported was trustworthy, including the one
 this record was originally opened with. 0 HANGs on the default collector; the 3
 previously-flagged classes rechecked earlier still do not reproduce (see
@@ -187,6 +191,80 @@ Not chased further here per this triage's scope (this is a data-quality note on 
 already-open item, not a new investigation): worth a follow-up rerun of
 `probes/AllocCounterFidelity.java` split out by collector before trusting any
 Gen/G1 allocation figure from this test again.
+
+## Addendum 2026-09-11 — the counter is STILL wrong, on all three collectors, and ZGC is the worst of them
+
+This answers the action item the 2026-09-06 addendum left open ("worth a follow-up
+rerun of `probes/AllocCounterFidelity.java` split out by collector before trusting
+any Gen/G1 allocation figure from this test again"). The answer is not the one that
+addendum expected.
+
+**Its guess was backwards.** It reasoned that ZGC's 627,717 KB was the sound figure
+— because it lands inside this doc's own verified 626-629 MB range — and that
+Generational and G1 were the outliers. Measured directly: **all three collectors
+over-report, and ZGC over-reports the most.** Allocating 1,000,000 retained
+`long[8]` (80.0 bytes each by retained heap, the ground truth):
+
+| bytes/object | HotSpot | CratonVM ZGC | CratonVM G1 | CratonVM Gen |
+|---|---|---|---|---|
+| retained heap (ground truth) | 80.0 | 80.0 | 80.0 | 80.0 |
+| `getCurrentThreadAllocatedBytes` (per-thread) | 80.4 | **80.0** | 80.0 | 80.0 |
+| `getTotalThreadAllocatedBytes` (process-wide) | 80.4 | **239.7 (3.00x)** | 159.9 (2.00x) | 159.4 (2.00x) |
+
+The **per-thread** counter is exact on CratonVM — 1.00x of retained heap across
+`byte[256]`, `byte[4 KiB]`, `byte[64 KiB]` and `byte[1 MiB]`. The **process-wide**
+one, which is the counter `MemoryUsageUtil` prefers and therefore the one this
+whole record is built on, reports 2-3x. Identical with `--nojit`, so not a JIT
+effect, and real object layout matches HotSpot exactly.
+
+**What this does to this record's headline.** The "2.5x allocation multiplier" in
+the title, and the 627 MB in the failure table, are readings of the process-wide
+accumulator — the same class of error as the two counter bugs this record was
+opened to fix, one layer further down. A probe reproducing the test's own
+measurement window byte-for-byte (627,662 KB / 628,174 KB, 3/3 runs, matching the
+suite's own figure) reads both counters at once:
+
+| cold parse | process-wide | per-thread (exact) |
+|---|---|---|
+| HotSpot | 248,314 KB | 248,311 KB (ratio 1.00) |
+| CratonVM | **627,662 KB** | **72,423 KB** (ratio 8.67) |
+
+Read on the counter that is faithful, CratonVM allocates *less* than HotSpot on
+this parse, not 2.5x more. The "roughly 2.3x unattributed" that the "What was
+ruled OUT" section hands to `ATNConfig` may therefore be substantially an artifact
+of the instrument rather than a real allocation gap — **the `ATNConfig` next-step
+should not be started until the counter is fixed and the gap re-measured.**
+
+**What is NOT established.** Stated plainly so the next reader does not
+over-credit this:
+
+* The 8.67x process-wide/per-thread ratio on the real parse is much larger than
+  the 2-3x measured synthetically, so the inflation is **not** a single constant
+  multiplier — there is an additive component too (warm-parse ratios alternate
+  2.00x / 5.28x). That mechanism was not chased.
+* "CratonVM allocates ~72 MB where HotSpot allocates ~248 MB" rests on CratonVM's
+  own per-thread counter. It was validated at 1.00x of retained heap across four
+  size classes but **not** corroborated by an independent instrument (e.g. an
+  allocation profiler). The direction of the correction is solid; treat the exact
+  72 MB as one instrument's reading.
+* No older VM binary existed on the host, so it was not possible to A/B when the
+  process-wide counter started over-reporting.
+
+**The actionable target** is the process-wide accumulator introduced by
+`077d46ed7` (`native-builtins/src/jmx.rs` ~line 6218, fed from `Tlab::retire` plus
+`note_external_allocation`) — reconciled against the per-thread counter, which is
+already correct. Not touched here.
+
+**Harness disposition, decided and not deferred:** no `class-overrides.tsv` or
+`known-benign-aborts.tsv` entry was added for this class. No override can make a
+byte-budget assertion pass, and `known-benign-aborts.tsv` never reclassifies
+`failed>0`; any accommodation would only mask a live VM bug. The class stays as
+the one known CratonVM-specific FAIL in the ORM suite.
+
+**Verified on:** Windows 11, JDK 25 Temurin, CratonVM `dev@1d9c00029` built
+2026-09-11 (`target-hiborm-c1c2-20260911`), classpath
+`C:/craton/CratonVM1/apps/hibernate-orm`. HotSpot 3/3 PASS (248,123 / 248,418 /
+248,603 KB); CratonVM 3/3 FAIL at a byte-identical 627,662 KB.
 
 ## Repro
 
