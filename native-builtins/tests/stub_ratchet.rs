@@ -1432,6 +1432,49 @@ use cratonvm_types::compat::CompatibilityMode;
 /// removes the slack, and it is why this wave's delta reads +251 against the
 /// tree and +237/+248/+251 against the constants.
 ///
+/// # Re-frozen 2026-09-11 (second time today): 2339 -> 2397, +58 stubs and -3 total
+///
+/// The lane-5 RESIDUAL wave. Both numbers moved and they moved in OPPOSITE
+/// directions, which is two of the three cases on
+/// [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`] happening in one commit range.
+/// Measured on the merged tree, all three arms:
+///
+/// ```text
+///   arm             before    after     stubs    total before -> after
+///   no-management     2328     2386      +58        13610 -> 13607   (-3)
+///   management        2339     2397      +58        13978 -> 13975   (-3)
+///   synthetic-jdk     2328     2386      +58        13645 -> 13642   (-3)
+/// ```
+///
+/// **The +58 is case ONE** — existing registrations relabelled `Bridge` ->
+/// `SyntheticStub`. It is `RETIRED_SHADOW_L5R_TRIPLES`: 48 `sun/misc/Unsafe`
+/// triples, ten of them registered at more than one ordinal, and the re-tag
+/// flips every ordinal. 48 -> 58 is the same arithmetic as this morning's
+/// 98 -> 101, and it reproduces the count in the kind-map freeze
+/// (`scripts/baselines/jdk-only-kind-map-25-linux.tsv`) which was derived by a
+/// different route.
+///
+/// **The -3 is case THREE** — registrations DELETED — and it is a different set
+/// of rows entirely:
+///
+/// ```text
+///   -4   java/util/concurrent/AbstractExecutorService {submit x3, invokeAny}
+///        deleted: registered on an abstract class no dispatch door resolves
+///        to, invocations:0 on every probe run and all 132 corpus reports
+///   +1   java/util/concurrent/ForkJoinPool.execute(ForkJoinTask)V
+///        added: `is_forkjoin_native_override` had listed it with nothing
+///        registered behind it, so the interpreter was forcing a native that
+///        did not exist
+///   ---
+///   -3   net, in all three arms
+/// ```
+///
+/// Case three is the one direction in which re-freezing RECORDS work rather
+/// than absorbing it, as the classification note says, and this is the first
+/// time both directions have appeared together. They are separable because
+/// each has its own arithmetic: the stub delta matches a table, the total delta
+/// matches a registration count, and neither explains the other.
+///
 /// # Re-frozen 2026-09-11: 1894 -> 2339, and only 101 of the +445 is lane 5
 ///
 /// All three constants move together and the account is here, as always. This
@@ -1528,7 +1571,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// worth only as much as its last refresh, and this is the first time one of
 /// them would have had something to say.
 ///
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2339;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2397;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1561,7 +1604,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2339;
 /// owns, +327 is lane 1's wave 2 and +101 is this branch; the decomposition
 /// and the three measurements behind the classification are all on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2328;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2386;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1623,7 +1666,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2328;
 /// [`BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT`] again, as it has every time, and
 /// that is still a measurement each time rather than a rule. The account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2328;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2386;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -1683,7 +1726,7 @@ const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2328;
 /// was the only trace a real defect left in this gate, and staleness meant
 /// nobody could have read it. The `synthetic-jdk` arm has no constant here and
 /// measured 13645 on the same tree.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13978;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13975;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
@@ -1691,7 +1734,7 @@ const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13978;
 #[allow(dead_code)]
 /// **REFRESHED 2026-09-10, lane 5: 13511 -> 13610**, the same +99 and for the
 /// same reason; see [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13610;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13607;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;
