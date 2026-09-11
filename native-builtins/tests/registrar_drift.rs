@@ -237,6 +237,66 @@ const MAX_BLIND_SITES: usize = 1_000;
 /// `the_baseline_is_well_formed` fails. Both are regenerated together by the
 /// printer in `retake`.
 ///
+/// # Re-taken 2026-09-11, +51 triples / +54 pairs: the scanner now reads `register_with_kind(`
+///
+/// Not one new drifting triple. **Fifty-four pairs that were drifting all
+/// along and that the scanner had stopped being able to see**, restored in one
+/// move, plus the row that going blind had already deleted.
+///
+/// `NativeMethodRegistry` has exactly two registration entry points
+/// (`native-api/src/registry.rs`): `register` and `register_with_kind`, which
+/// sets the ambient kind, calls `register`, and restores it. Its first three
+/// arguments are the same triple. The site matcher in `build_analysis`
+/// required a `(` immediately after `register`, so every
+/// `register_with_kind(` call — 747 of them in the scanned crates — was
+/// skipped, and *not counted* either, so it did not even show up in the blind
+/// region `MAX_BLIND_SITES` bounds.
+///
+/// The consequence is the failure mode this whole file exists to catch, run
+/// backwards: **a kind adjudication deleted a drift row and read as good
+/// news.** `0b2791ac7` (*"jdk-only: Class.getModule is a shadow the contract
+/// cannot remedy, so review it"*) moved the shipping half of
+/// `java/lang/Class.getModule()Ljava/lang/Module;` from `register(` to
+/// `register_with_kind(`. Both registrations still exist —
+/// `register_p59_module` (`phases_late/reflect_invoke.rs`) and
+/// `register_essential_natives_with_shims` (`lib.rs`), two canonical-Module
+/// caches for one identity invariant — but the census could see only one, so
+/// `the_drift_baseline_has_no_stale_rows` reported the pair as FIXED. It was
+/// not fixed; it was unwatched. That is the third recurrence of this shape,
+/// and the reason the fix here is the matcher rather than the row.
+///
+/// The 54 restored pairs, by synthetic-only pass — every one of them a
+/// synthetic-only body against a shipping twin that is now spelled
+/// `register_with_kind(`, none of them a new registration:
+///
+/// * `register_synthetic_overrides` 27 — the `java.lang` core against
+///   `register_essential_natives_with_shims`: `Object.{clone,getClass,hashCode,
+///   notify,notifyAll}`, `Class.{registerNatives,desiredAssertionStatus0,
+///   getPrimitiveClass,getSuperclass,isAssignableFrom,isInstance}`,
+///   `System.{arraycopy,currentTimeMillis,nanoTime,identityHashCode,
+///   registerNatives}`, `String.{intern,matches,replaceAll,replaceFirst}`,
+///   `Thread.{currentThread,start0,registerNatives}`,
+///   `Throwable.fillInStackTrace`, `Double.{doubleToRawLongBits,
+///   longBitsToDouble}`, `Float.floatToRawIntBits`. These are the oldest
+///   twins in the tree and the ones a mode split hurts most.
+/// * `register_core_stdlib_extras` 16 — `ClassLoader.registerNatives`,
+///   `String.replace(CharSequence,CharSequence)`,
+///   `MethodHandleNatives.registerNatives`, `{List,Map,Set}.copyOf`,
+///   six `jdk/internal/misc/CDS` entries, `ScopedMemoryAccess.registerNatives`,
+///   `Unsafe.{ensureClassInitialized0,fullFence}`, `VM.initialize`.
+/// * `register_classloader_define_class` 3 — `ClassLoader.defineClass{0,1,2}`.
+/// * `register_p69_misc` 3 — `{List,Map,Set}.copyOf`, the same three
+///   `register_core_stdlib_extras` carries, which is why the pair count moves
+///   by 54 while the triple count moves by 51.
+/// * `register_object_stream_class` 2 —
+///   `ObjectStreamClass.{hasStaticInitializer,initNative}`.
+/// * `register_enterprise_final_natives` 1 — `Class.isHidden`.
+/// * `register_java_lang_extras_natives` 1 — `Thread.holdsLock`.
+/// * `register_unsafe_define_class` 1 — `Unsafe.defineClass0`.
+///
+/// Nothing was removed. Every row is a debt, as the header says; these are
+/// fifty-four debts that had been taken off the books without being paid.
+///
 /// **Re-taken 2026-08-20, +1: `javax/net/ssl/SSLContext.getProvider
 /// ()Ljava/security/Provider;`.** That method had no registration at all until
 /// then, so the real bytecode answered it -- `return provider;`, slot 0, which
@@ -266,12 +326,12 @@ const MAX_BLIND_SITES: usize = 1_000;
 /// both names; this change did not create it, does not answer it, and would
 /// have left it asymmetric (watched on one carrier, unwatched on the other) if
 /// this row were not added.
-const BASELINE_TOTAL_DRIFT: usize = 1224;
+const BASELINE_TOTAL_DRIFT: usize = 1275;
 
 /// `(synthetic-only pass, triple)` PAIRS in [`DRIFT_TRIPLES`] -- larger than
 /// [`BASELINE_TOTAL_DRIFT`] because one triple can be registered by several
 /// synthetic-only passes (`AtomicBoolean.get` has two).
-const BASELINE_TOTAL_PAIRS: usize = 1357;
+const BASELINE_TOTAL_PAIRS: usize = 1411;
 
 /// Two triples that pin BOTH answers.
 ///
@@ -914,6 +974,9 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
     (
         "register_classloader_define_class",
         &[
+            ("java/lang/ClassLoader", "defineClass0", "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BIILjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;"),
+            ("java/lang/ClassLoader", "defineClass1", "(Ljava/lang/ClassLoader;Ljava/lang/String;[BIILjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;"),
+            ("java/lang/ClassLoader", "defineClass2", "(Ljava/lang/ClassLoader;Ljava/lang/String;Ljava/nio/ByteBuffer;IILjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;"),
             ("java/lang/System$1", "defineClass", "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BLjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;"),
             ("java/lang/System$2", "defineClass", "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BLjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;"),
         ],
@@ -1020,6 +1083,7 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/lang/Boolean", "toString", "()Ljava/lang/String;"),
             ("java/lang/Byte", "toString", "()Ljava/lang/String;"),
             ("java/lang/Character", "toString", "()Ljava/lang/String;"),
+            ("java/lang/ClassLoader", "registerNatives", "()V"),
             ("java/lang/Double", "toString", "()Ljava/lang/String;"),
             ("java/lang/Float", "toString", "()Ljava/lang/String;"),
             ("java/lang/Integer", "compare", "(II)I"),
@@ -1028,6 +1092,8 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/lang/Long", "compare", "(JJ)I"),
             ("java/lang/Long", "toString", "()Ljava/lang/String;"),
             ("java/lang/Short", "toString", "()Ljava/lang/String;"),
+            ("java/lang/String", "replace", "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;"),
+            ("java/lang/invoke/MethodHandleNatives", "registerNatives", "()V"),
             ("java/nio/charset/Charset", "defaultCharset", "()Ljava/nio/charset/Charset;"),
             ("java/nio/charset/Charset", "displayName", "()Ljava/lang/String;"),
             ("java/nio/charset/Charset", "forName", "(Ljava/lang/String;)Ljava/nio/charset/Charset;"),
@@ -1067,6 +1133,8 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/util/HashMap", "forEach", "(Ljava/util/function/BiConsumer;)V"),
             ("java/util/HashMap", "getOrDefault", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
             ("java/util/HashMap", "putIfAbsent", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
+            ("java/util/List", "copyOf", "(Ljava/util/Collection;)Ljava/util/List;"),
+            ("java/util/Map", "copyOf", "(Ljava/util/Map;)Ljava/util/Map;"),
             ("java/util/Optional", "empty", "()Ljava/util/Optional;"),
             ("java/util/Optional", "get", "()Ljava/lang/Object;"),
             ("java/util/Optional", "ifPresent", "(Ljava/util/function/Consumer;)V"),
@@ -1085,20 +1153,31 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/util/Properties", "setProperty", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;"),
             ("java/util/Properties", "size", "()I"),
             ("java/util/Properties", "stringPropertyNames", "()Ljava/util/Set;"),
+            ("java/util/Set", "copyOf", "(Ljava/util/Collection;)Ljava/util/Set;"),
             ("java/util/StringJoiner", "<init>", "(Ljava/lang/CharSequence;)V"),
             ("java/util/StringJoiner", "<init>", "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;Ljava/lang/CharSequence;)V"),
             ("java/util/StringJoiner", "add", "(Ljava/lang/CharSequence;)Ljava/util/StringJoiner;"),
             ("java/util/StringJoiner", "length", "()I"),
             ("java/util/StringJoiner", "toString", "()Ljava/lang/String;"),
             ("java/util/stream/Stream", "toList", "()Ljava/util/List;"),
+            ("jdk/internal/misc/CDS", "defineArchivedModules", "(Ljava/lang/ClassLoader;Ljava/lang/ClassLoader;)V"),
+            ("jdk/internal/misc/CDS", "dumpClassList", "(Ljava/lang/String;)V"),
+            ("jdk/internal/misc/CDS", "dumpDynamicArchive", "(Ljava/lang/String;)V"),
+            ("jdk/internal/misc/CDS", "getRandomSeedForDumping", "()J"),
+            ("jdk/internal/misc/CDS", "initializeFromArchive", "(Ljava/lang/Class;)V"),
             ("jdk/internal/misc/CDS", "isDumpingArchive0", "()Z"),
             ("jdk/internal/misc/CDS", "isDumpingClassList0", "()Z"),
             ("jdk/internal/misc/CDS", "isSharingEnabled0", "()Z"),
+            ("jdk/internal/misc/CDS", "logLambdaFormInvoker", "(Ljava/lang/String;)V"),
+            ("jdk/internal/misc/ScopedMemoryAccess", "registerNatives", "()V"),
+            ("jdk/internal/misc/Unsafe", "ensureClassInitialized0", "(Ljava/lang/Class;)V"),
+            ("jdk/internal/misc/Unsafe", "fullFence", "()V"),
             ("jdk/internal/misc/Unsafe", "loadFence", "()V"),
             ("jdk/internal/misc/Unsafe", "storeFence", "()V"),
             ("jdk/internal/misc/VM", "awaitInitLevel", "(I)V"),
             ("jdk/internal/misc/VM", "getSavedProperty", "(Ljava/lang/String;)Ljava/lang/String;"),
             ("jdk/internal/misc/VM", "initLevel", "()I"),
+            ("jdk/internal/misc/VM", "initialize", "()V"),
         ],
     ),
     (
@@ -1128,6 +1207,7 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/lang/Class", "getPackageName", "()Ljava/lang/String;"),
             ("java/lang/Class", "getTypeName", "()Ljava/lang/String;"),
             ("java/lang/Class", "isEnum", "()Z"),
+            ("java/lang/Class", "isHidden", "()Z"),
         ],
     ),
     (
@@ -1298,6 +1378,7 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/lang/Short", "intValue", "()I"),
             ("java/lang/Short", "longValue", "()J"),
             ("java/lang/System", "gc", "()V"),
+            ("java/lang/Thread", "holdsLock", "(Ljava/lang/Object;)Z"),
         ],
     ),
     (
@@ -1383,7 +1464,9 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
     (
         "register_object_stream_class",
         &[
+            ("java/io/ObjectStreamClass", "hasStaticInitializer", "(Ljava/lang/Class;)Z"),
             ("java/io/ObjectStreamClass", "hasStaticInitializer", "(Ljava/lang/Class;Z)Z"),
+            ("java/io/ObjectStreamClass", "initNative", "()V"),
         ],
     ),
     (
@@ -1738,6 +1821,14 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/lang/reflect/TypeVariable", "getName", "()Ljava/lang/String;"),
             ("java/lang/reflect/WildcardType", "getLowerBounds", "()[Ljava/lang/reflect/Type;"),
             ("java/lang/reflect/WildcardType", "getUpperBounds", "()[Ljava/lang/reflect/Type;"),
+        ],
+    ),
+    (
+        "register_p69_misc",
+        &[
+            ("java/util/List", "copyOf", "(Ljava/util/Collection;)Ljava/util/List;"),
+            ("java/util/Map", "copyOf", "(Ljava/util/Map;)Ljava/util/Map;"),
+            ("java/util/Set", "copyOf", "(Ljava/util/Collection;)Ljava/util/Set;"),
         ],
     ),
     (
@@ -2457,6 +2548,7 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/io/PrintStream", "write", "([BII)V"),
             ("java/io/PrintWriter", "println", "()V"),
             ("java/io/PrintWriter", "println", "(Ljava/lang/String;)V"),
+            ("java/lang/Class", "desiredAssertionStatus0", "(Ljava/lang/Class;)Z"),
             ("java/lang/Class", "forName", "(Ljava/lang/Module;Ljava/lang/String;)Ljava/lang/Class;"),
             ("java/lang/Class", "forName", "(Ljava/lang/String;)Ljava/lang/Class;"),
             ("java/lang/Class", "forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;"),
@@ -2476,15 +2568,28 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/lang/Class", "getMethods", "()[Ljava/lang/reflect/Method;"),
             ("java/lang/Class", "getModifiers", "()I"),
             ("java/lang/Class", "getName", "()Ljava/lang/String;"),
+            ("java/lang/Class", "getPrimitiveClass", "(Ljava/lang/String;)Ljava/lang/Class;"),
             ("java/lang/Class", "getSimpleName", "()Ljava/lang/String;"),
+            ("java/lang/Class", "getSuperclass", "()Ljava/lang/Class;"),
             ("java/lang/Class", "getTypeParameters", "()[Ljava/lang/reflect/TypeVariable;"),
             ("java/lang/Class", "isArray", "()Z"),
+            ("java/lang/Class", "isAssignableFrom", "(Ljava/lang/Class;)Z"),
             ("java/lang/Class", "isEnum", "()Z"),
+            ("java/lang/Class", "isInstance", "(Ljava/lang/Object;)Z"),
             ("java/lang/Class", "isInterface", "()Z"),
             ("java/lang/Class", "isPrimitive", "()Z"),
             ("java/lang/Class", "newInstance", "()Ljava/lang/Object;"),
+            ("java/lang/Class", "registerNatives", "()V"),
+            ("java/lang/Double", "doubleToRawLongBits", "(D)J"),
+            ("java/lang/Double", "longBitsToDouble", "(J)D"),
+            ("java/lang/Float", "floatToRawIntBits", "(F)I"),
+            ("java/lang/Object", "clone", "()Ljava/lang/Object;"),
             ("java/lang/Object", "equals", "(Ljava/lang/Object;)Z"),
             ("java/lang/Object", "finalize", "()V"),
+            ("java/lang/Object", "getClass", "()Ljava/lang/Class;"),
+            ("java/lang/Object", "hashCode", "()I"),
+            ("java/lang/Object", "notify", "()V"),
+            ("java/lang/Object", "notifyAll", "()V"),
             ("java/lang/Object", "toString", "()Ljava/lang/String;"),
             ("java/lang/Object", "wait", "()V"),
             ("java/lang/Object", "wait", "(J)V"),
@@ -2503,6 +2608,7 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/lang/String", "indexOf", "(I)I"),
             ("java/lang/String", "indexOf", "(II)I"),
             ("java/lang/String", "indexOf", "(Ljava/lang/String;)I"),
+            ("java/lang/String", "intern", "()Ljava/lang/String;"),
             ("java/lang/String", "isBlank", "()Z"),
             ("java/lang/String", "isEmpty", "()Z"),
             ("java/lang/String", "join", "(Ljava/lang/CharSequence;[Ljava/lang/CharSequence;)Ljava/lang/String;"),
@@ -2511,10 +2617,13 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/lang/String", "lastIndexOf", "(Ljava/lang/String;)I"),
             ("java/lang/String", "length", "()I"),
             ("java/lang/String", "lines", "()Ljava/util/stream/Stream;"),
+            ("java/lang/String", "matches", "(Ljava/lang/String;)Z"),
             ("java/lang/String", "regionMatches", "(ILjava/lang/String;II)Z"),
             ("java/lang/String", "regionMatches", "(ZILjava/lang/String;II)Z"),
             ("java/lang/String", "repeat", "(I)Ljava/lang/String;"),
             ("java/lang/String", "replace", "(CC)Ljava/lang/String;"),
+            ("java/lang/String", "replaceAll", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"),
+            ("java/lang/String", "replaceFirst", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"),
             ("java/lang/String", "startsWith", "(Ljava/lang/String;)Z"),
             ("java/lang/String", "startsWith", "(Ljava/lang/String;I)Z"),
             ("java/lang/String", "substring", "(I)Ljava/lang/String;"),
@@ -2529,11 +2638,16 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/lang/String", "valueOf", "(J)Ljava/lang/String;"),
             ("java/lang/String", "valueOf", "(Ljava/lang/Object;)Ljava/lang/String;"),
             ("java/lang/String", "valueOf", "(Z)Ljava/lang/String;"),
+            ("java/lang/System", "arraycopy", "(Ljava/lang/Object;ILjava/lang/Object;II)V"),
+            ("java/lang/System", "currentTimeMillis", "()J"),
             ("java/lang/System", "exit", "(I)V"),
             ("java/lang/System", "gc", "()V"),
             ("java/lang/System", "getenv", "()Ljava/util/Map;"),
             ("java/lang/System", "getenv", "(Ljava/lang/String;)Ljava/lang/String;"),
+            ("java/lang/System", "identityHashCode", "(Ljava/lang/Object;)I"),
             ("java/lang/System", "lineSeparator", "()Ljava/lang/String;"),
+            ("java/lang/System", "nanoTime", "()J"),
+            ("java/lang/System", "registerNatives", "()V"),
             ("java/lang/System", "setProperty", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"),
             ("java/lang/Thread", "<init>", "()V"),
             ("java/lang/Thread", "<init>", "(Ljava/lang/Runnable;)V"),
@@ -2544,6 +2658,7 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/lang/Thread", "<init>", "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;J)V"),
             ("java/lang/Thread", "<init>", "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;JZ)V"),
             ("java/lang/Thread", "<init>", "(Ljava/lang/ThreadGroup;Ljava/lang/String;)V"),
+            ("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;"),
             ("java/lang/Thread", "getName", "()Ljava/lang/String;"),
             ("java/lang/Thread", "getPriority", "()I"),
             ("java/lang/Thread", "getState", "()Ljava/lang/Thread$State;"),
@@ -2552,12 +2667,15 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/lang/Thread", "isAlive", "()Z"),
             ("java/lang/Thread", "isDaemon", "()Z"),
             ("java/lang/Thread", "isInterrupted", "()Z"),
+            ("java/lang/Thread", "registerNatives", "()V"),
             ("java/lang/Thread", "run", "()V"),
             ("java/lang/Thread", "setDaemon", "(Z)V"),
             ("java/lang/Thread", "setName", "(Ljava/lang/String;)V"),
             ("java/lang/Thread", "sleep", "(J)V"),
             ("java/lang/Thread", "start", "()V"),
+            ("java/lang/Thread", "start0", "()V"),
             ("java/lang/Thread", "threadState", "()Ljava/lang/Thread$State;"),
+            ("java/lang/Throwable", "fillInStackTrace", "(I)Ljava/lang/Throwable;"),
             ("java/lang/Throwable", "getStackTraceDepth", "()I"),
             ("java/lang/Throwable", "getStackTraceElement", "(I)Ljava/lang/StackTraceElement;"),
             ("java/lang/Throwable", "initCause", "(Ljava/lang/Throwable;)Ljava/lang/Throwable;"),
@@ -2713,6 +2831,7 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
         "register_unsafe_define_class",
         &[
             ("jdk/internal/misc/Unsafe", "defineClass", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;"),
+            ("jdk/internal/misc/Unsafe", "defineClass0", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;"),
         ],
     ),
 ];
@@ -4051,10 +4170,24 @@ fn build_analysis() -> Analysis {
                 i += 1;
                 continue;
             }
-            let after = p + 8;
+            // `register(` and `register_with_kind(` are the ONLY two
+            // registration entry points `NativeMethodRegistry` offers
+            // (`native-api/src/registry.rs`), and the second sets the ambient
+            // kind, calls the first, and restores it — so its first three
+            // arguments are the same triple. Skipping it made a kind
+            // adjudication read as a FIX: `0b2791ac7` moved the shipping half
+            // of `java/lang/Class.getModule` from `register(` to
+            // `register_with_kind(`, and the drift pair left the census with
+            // both registrations still in place. Anything else that begins
+            // with `register` (`registered_by`, `register_thread`,
+            // `register_var_handle_root`, …) is not a registration and is
+            // still neither matched nor counted.
+            let mut after = p + 8;
+            if t[after..].starts_with(b"_with_kind") {
+                after += 10;
+            }
             let q = skip_ws(t, after);
             if q >= n || t[q] != b'(' {
-                // `register_with_kind(`, `registered_by`, …
                 i += 1;
                 continue;
             }
