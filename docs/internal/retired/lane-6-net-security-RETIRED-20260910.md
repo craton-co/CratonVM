@@ -509,25 +509,31 @@ and differing only in `native-api/src/retired_shadow.rs`.
 ### The three arms
 
 ```text
-  --jdk-only corpus    trial 132/132     ctrl 132/132    (paired, each arm ALONE)
-  SUITE=all            132/132
-  SUITE=core            92/92
+  --jdk-only corpus    trial 133/133     ctrl 133/133    (paired, each arm ALONE)
+  SUITE=all            133/133
+  SUITE=core            93/93
 ```
+
+(133, not the 132 quoted elsewhere on this page: the corpus gained a vector
+between the wave's first acceptance and its last. Both arms ran the same list.)
 
 ### The probe tree, two binaries
 
 ```text
   measured 125 probes
-  moved AWAY from HotSpot:   1      VtHandoffProbe, +4
+  moved AWAY from HotSpot:   0
   moved TOWARD HotSpot:      1      L6HttpLogicSweep, 64 diff lines -> 20
   one side did not finish:   0
 ```
 
-`VtHandoffProbe` is the campaign's named noise floor: it counts virtual-thread
-handoffs and `allJoined`, both nondeterministic on this VM, and the operations
-page records six successive A/Bs scoring its sibling at `0, -2, 0, 0, +2, +2`.
-Within this wave alone it scored **−14** in one arm and **+4** in another, on
-tables that share not one row. Nothing here touches virtual threads.
+An earlier pass of the same A/B, on the previous merge base, scored
+`VtHandoffProbe` at **+4** — and the pass before that scored it at **−14**, on
+tables that share not one row. It is the campaign's named noise floor: it
+counts virtual-thread handoffs and `allJoined`, both nondeterministic on this
+VM, and the operations page records six successive A/Bs scoring its sibling at
+`0, -2, 0, 0, +2, +2`. On the final base it did not move at all. Nothing in
+this wave touches virtual threads, and no version of this wave ever claimed
+that row either way.
 
 ### The gate set of `jdk-only-lane-operations.md` §5
 
