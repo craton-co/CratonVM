@@ -3261,6 +3261,127 @@ static RETIRED_SHADOW_L1_TRIPLES: &[(&str, &str, &str)] = &[
 /// rest of the package tree to one extra binary search each, which is the whole
 /// cost, and `the_held_collection_families_are_not_retired` is the test that
 /// says admitting them changes no answer.
+/// The 2026-09-11 lane-5 RESIDUAL wave: 48 `sun/misc/Unsafe` rows, and the
+/// reason they were held until now was a missing INSTRUMENT, not a blocker.
+///
+/// The retired lane page held all 82 `sun/misc/Unsafe` registrations with
+/// "precondition 1 fails by measurement" — 121 probes reported the dial VACUOUS
+/// on that scope and the 132 `--jdk-only` corpus reports reached 18 of the 82.
+/// Its own §9 said what that was worth: **until a workload exists, the count is
+/// not evidence of anything.** It is not evidence the rows are right, not
+/// evidence they are retirable, and not evidence they are dead.
+///
+/// `apps/probes/L5SunMiscUnsafe.java` is that workload, and with it the four
+/// preconditions read:
+///
+/// ```text
+///   1. the dial was asked              y/r = 76/76 on the workload
+///   2. whole probe tree no worse       134 measured: 0 toward, 1 away, and
+///                                      that row is y/r=0/0 VACUOUS with a
+///                                      line count that moved — not the dial
+///   3. the image target carries Code   outcome=bytecode-won on all 48
+///   4. a per-triple dispatch observed  48 distinct triples, one row each
+/// ```
+///
+/// Precondition 3 is not read off a `javap` here: `outcome=bytecode-won` in the
+/// `--jdk-only-report` IS the image's bytecode having run and produced the
+/// answer. And the answer is the same one: the probe is **byte-identical armed
+/// and unarmed**, 36 rows, including the two lines that differ from HotSpot for
+/// an unrelated reason (see below). A retirement that changes no answer while
+/// refusing 48 natives is the definition of a shadow.
+///
+/// # What `sun.misc.Unsafe` actually is on JDK 25, measured
+///
+/// Fully functional. Every field accessor and its volatile twin, all three
+/// `compareAndSwap*`, `getAndAdd`/`getAndSet`, the static-field pair,
+/// `allocateMemory`/`setMemory`/`freeMemory`, `allocateInstance`,
+/// `getLoadAverage`, `park`/`unpark` and `throwException` answer on HotSpot 25
+/// and on CratonVM alike — only a terminal-deprecation WARNING is printed, on
+/// stderr, which the A/B harness drops. The class being deprecated for removal
+/// says nothing about whether it works today.
+///
+/// # The 34 rows NOT here, and why each is out
+///
+///   * **`getUnsafe()Lsun/misc/Unsafe;`, `ensureClassInitialized(Ljava/lang/Class;)V`
+///     and `shouldBeInitialized(Ljava/lang/Class;)Z` are ABSENT from the JDK 25
+///     image** — the workload gets `NoSuchMethodException` for all three on
+///     HotSpot. Nothing can dispatch them on a supported image, so they are
+///     bucket-F DELETIONS rather than retirements, the same verdict
+///     `AbstractExecutorService`'s four rows got. Left for a deletion commit
+///     with its own census: a retirement table entry would claim a dispatch
+///     nobody has observed, which is the rule this table is under.
+///
+///     `getUnsafe` is also the ONE row where the two VMs disagree:
+///     `SecurityException` here against `NoSuchMethodException` on HotSpot.
+///     That is CratonVM answering for a method the image does not declare, and
+///     it is a defect — a small one, and not this wave's, because retiring a
+///     triple the image lacks does nothing.
+///   * **the rest were not dispatched by this workload.** Thirty-one more
+///     registrations exist on the class and the probe does not reach them
+///     (`reallocateMemory`, `copyMemory`, the remaining volatile put/get
+///     shapes, `getAndAddLong`/`getAndSetLong`, `getCharVolatile` and
+///     friends). Precondition 4 is per-triple and this table honours that: a
+///     row with no observed dispatch stays out however obvious its sibling
+///     looks. Extending the workload is how the next wave takes them, and it
+///     is a probe edit, not a build.
+///
+/// # Why this is a separate table from `RETIRED_SHADOW_L5_TRIPLES`
+///
+/// Same reason the Phase 2 table gives for existing: these were adjudicated by
+/// a different instrument, on a different day, against a measurement the
+/// earlier wave explicitly did not have. Merging them would make the earlier
+/// table's account cover rows it never saw.
+static RETIRED_SHADOW_L5R_TRIPLES: &[(&str, &str, &str)] = &[
+    ("sun/misc/Unsafe", "addressSize", "()I"),
+    ("sun/misc/Unsafe", "allocateInstance", "(Ljava/lang/Class;)Ljava/lang/Object;"),
+    ("sun/misc/Unsafe", "allocateMemory", "(J)J"),
+    ("sun/misc/Unsafe", "arrayBaseOffset", "(Ljava/lang/Class;)I"),
+    ("sun/misc/Unsafe", "arrayIndexScale", "(Ljava/lang/Class;)I"),
+    ("sun/misc/Unsafe", "compareAndSwapInt", "(Ljava/lang/Object;JII)Z"),
+    ("sun/misc/Unsafe", "compareAndSwapLong", "(Ljava/lang/Object;JJJ)Z"),
+    ("sun/misc/Unsafe", "compareAndSwapObject", "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z"),
+    ("sun/misc/Unsafe", "freeMemory", "(J)V"),
+    ("sun/misc/Unsafe", "fullFence", "()V"),
+    ("sun/misc/Unsafe", "getAndAddInt", "(Ljava/lang/Object;JI)I"),
+    ("sun/misc/Unsafe", "getAndSetInt", "(Ljava/lang/Object;JI)I"),
+    ("sun/misc/Unsafe", "getAndSetObject", "(Ljava/lang/Object;JLjava/lang/Object;)Ljava/lang/Object;"),
+    ("sun/misc/Unsafe", "getBoolean", "(Ljava/lang/Object;J)Z"),
+    ("sun/misc/Unsafe", "getByte", "(J)B"),
+    ("sun/misc/Unsafe", "getByte", "(Ljava/lang/Object;J)B"),
+    ("sun/misc/Unsafe", "getChar", "(Ljava/lang/Object;J)C"),
+    ("sun/misc/Unsafe", "getDouble", "(Ljava/lang/Object;J)D"),
+    ("sun/misc/Unsafe", "getFloat", "(Ljava/lang/Object;J)F"),
+    ("sun/misc/Unsafe", "getInt", "(Ljava/lang/Object;J)I"),
+    ("sun/misc/Unsafe", "getIntVolatile", "(Ljava/lang/Object;J)I"),
+    ("sun/misc/Unsafe", "getLoadAverage", "([DI)I"),
+    ("sun/misc/Unsafe", "getLong", "(J)J"),
+    ("sun/misc/Unsafe", "getLong", "(Ljava/lang/Object;J)J"),
+    ("sun/misc/Unsafe", "getObject", "(Ljava/lang/Object;J)Ljava/lang/Object;"),
+    ("sun/misc/Unsafe", "getObjectVolatile", "(Ljava/lang/Object;J)Ljava/lang/Object;"),
+    ("sun/misc/Unsafe", "getShort", "(Ljava/lang/Object;J)S"),
+    ("sun/misc/Unsafe", "loadFence", "()V"),
+    ("sun/misc/Unsafe", "objectFieldOffset", "(Ljava/lang/reflect/Field;)J"),
+    ("sun/misc/Unsafe", "pageSize", "()I"),
+    ("sun/misc/Unsafe", "park", "(ZJ)V"),
+    ("sun/misc/Unsafe", "putBoolean", "(Ljava/lang/Object;JZ)V"),
+    ("sun/misc/Unsafe", "putByte", "(Ljava/lang/Object;JB)V"),
+    ("sun/misc/Unsafe", "putChar", "(Ljava/lang/Object;JC)V"),
+    ("sun/misc/Unsafe", "putDouble", "(Ljava/lang/Object;JD)V"),
+    ("sun/misc/Unsafe", "putFloat", "(Ljava/lang/Object;JF)V"),
+    ("sun/misc/Unsafe", "putInt", "(Ljava/lang/Object;JI)V"),
+    ("sun/misc/Unsafe", "putIntVolatile", "(Ljava/lang/Object;JI)V"),
+    ("sun/misc/Unsafe", "putLong", "(JJ)V"),
+    ("sun/misc/Unsafe", "putLong", "(Ljava/lang/Object;JJ)V"),
+    ("sun/misc/Unsafe", "putObject", "(Ljava/lang/Object;JLjava/lang/Object;)V"),
+    ("sun/misc/Unsafe", "putObjectVolatile", "(Ljava/lang/Object;JLjava/lang/Object;)V"),
+    ("sun/misc/Unsafe", "putShort", "(Ljava/lang/Object;JS)V"),
+    ("sun/misc/Unsafe", "staticFieldBase", "(Ljava/lang/reflect/Field;)Ljava/lang/Object;"),
+    ("sun/misc/Unsafe", "staticFieldOffset", "(Ljava/lang/reflect/Field;)J"),
+    ("sun/misc/Unsafe", "storeFence", "()V"),
+    ("sun/misc/Unsafe", "throwException", "(Ljava/lang/Throwable;)V"),
+    ("sun/misc/Unsafe", "unpark", "(Ljava/lang/Object;)V"),
+];
+
 pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor: &str) -> bool {
     if !RETIRED_SHADOW_PREFIXES
         .iter()
@@ -3276,6 +3397,7 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
         || RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_L5_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_L1_TRIPLES.binary_search(&key).is_ok()
+        || RETIRED_SHADOW_L5R_TRIPLES.binary_search(&key).is_ok()
 }
 
 /// Every retired-shadow table, in one slice, so a gate can walk the whole
@@ -3308,6 +3430,7 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // `the_tables_const_lists_every_table_the_predicate_consults` exists to
     // catch, and it is what caught it.
     RETIRED_SHADOW_L1_TRIPLES,
+    RETIRED_SHADOW_L5R_TRIPLES,
 ];
 
 #[cfg(test)]
@@ -3600,6 +3723,68 @@ mod tests {
             assert!(
                 triple_is_retired_shadow(c, m, d),
                 "unreachable entry: {c}.{m}{d}"
+            );
+        }
+    }
+
+    /// The 2026-09-11 residual table: sorted, unique, reachable, and disjoint
+    /// from every earlier wave.
+    #[test]
+    fn the_l5r_table_is_sorted_unique_reachable_and_disjoint() {
+        for w in RETIRED_SHADOW_L5R_TRIPLES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "out of order or duplicated: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
+        }
+        for &(c, m, d) in RETIRED_SHADOW_L5R_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "unreachable through the predicate: {c}.{m}{d} — is `sun/misc/`                  still in RETIRED_SHADOW_PREFIXES?"
+            );
+            assert_eq!(
+                c, "sun/misc/Unsafe",
+                "this wave is one class; {c} does not belong in it"
+            );
+        }
+        for other in [
+            RETIRED_SHADOW_TRIPLES,
+            RETIRED_SHADOW_STATELESS_TRIPLES,
+            RETIRED_SHADOW_PHASE2_TRIPLES,
+            RETIRED_SHADOW_L2_TRIPLES,
+            RETIRED_SHADOW_PHASE3_TRIPLES,
+            RETIRED_SHADOW_L5_TRIPLES,
+            RETIRED_SHADOW_L1_TRIPLES,
+        ] {
+            for e in RETIRED_SHADOW_L5R_TRIPLES {
+                assert!(
+                    other.binary_search(e).is_err(),
+                    "{e:?} is already retired by an earlier wave; a second table                      entry hides which wave owns the account"
+                );
+            }
+        }
+    }
+
+    /// The three `sun/misc/Unsafe` triples the JDK 25 image does NOT declare
+    /// must stay OUT of the table.
+    ///
+    /// `getUnsafe`, `ensureClassInitialized` and `shouldBeInitialized` answer
+    /// `NoSuchMethodException` on HotSpot 25 — nothing can dispatch them, so
+    /// they are deletions rather than retirements, and a table entry would
+    /// claim a dispatch nobody has observed. This is the guard that says the
+    /// distinction was kept, since it is invisible in the count.
+    #[test]
+    fn the_l5r_wave_excludes_the_triples_no_supported_image_declares() {
+        for (m, d) in [
+            ("getUnsafe", "()Lsun/misc/Unsafe;"),
+            ("ensureClassInitialized", "(Ljava/lang/Class;)V"),
+            ("shouldBeInitialized", "(Ljava/lang/Class;)Z"),
+        ] {
+            assert!(
+                !triple_is_retired_shadow("sun/misc/Unsafe", m, d),
+                "sun/misc/Unsafe.{m}{d} is absent from the JDK 25 image; it is a                  DELETION, not a retirement"
             );
         }
     }
