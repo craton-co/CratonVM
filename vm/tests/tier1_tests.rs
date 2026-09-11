@@ -2303,11 +2303,26 @@ fn t9c_synthetic_field_tables_cover_their_factories() {
 
     let mut short: Vec<String> = Vec::new();
     for (class_name, (requested, site)) in &wanted {
-        let declared = cratonvm_classloading::synthetic_stub_instance_field_count(class_name);
-        // A class with NO entry declares zero and is not exposed: the table is
-        // consulted only for classes CratonVM synthesizes, and a name with no
-        // arm has no synthesized form for `new` to size. Only a class that HAS
-        // an entry can be too short.
+        // The CHAIN total, not the class's own contribution. `n` in
+        // `alloc_concurrent_synthetic(ctx, name, n)` is an absolute slot
+        // extent: the natives that write such an object index it from 0,
+        // through the inherited prefix. `LinkedHashMap` keeps
+        // `LHM_FIELD_HEAD = 3` / `TAIL = 4` -- its own two fields, after
+        // `HashMap`'s three -- so an own-count of 2 covers an extent of 5.
+        //
+        // Comparing the own-count reported a three-slot shortfall that does
+        // not exist, and the only way to silence it was to over-declare the
+        // table. That is where `LinkedHashMap`'s claim of five OWN fields came
+        // from, and in real-JDK mode an over-declared floor pads a real class
+        // past its declared width, which costs it the compact layout outright
+        // (`ClassStore::build_compact_layout` refuses any padded class). A
+        // gate that can only be satisfied by making objects bigger is worth
+        // fixing rather than working around.
+        let declared = cratonvm_classloading::synthetic_stub_total_field_count(class_name);
+        // A class with NO entry anywhere in its chain declares zero and is not
+        // exposed: the table is consulted only for classes CratonVM
+        // synthesizes, and a name with no arm has no synthesized form for
+        // `new` to size. Only a class that HAS an entry can be too short.
         if declared == 0 {
             continue;
         }
