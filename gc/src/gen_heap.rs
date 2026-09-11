@@ -2984,6 +2984,52 @@ pub fn dead_young_ref_reason_global(addr: usize) -> Option<&'static str> {
     None
 }
 
+/// Which young semispace, if either, contains `addr` — asked WITHOUT reading a
+/// single byte of the heap.
+///
+/// This is the half of [`dead_young_ref_reason_global`] that survives
+/// `CRATONVM_GEN_UNCOMMIT`. That function's `ZERO-HEADER-IN-YOUNG` arm
+/// dereferences the header, so it cannot be asked about an address in a granule
+/// the give-back has released — and a released granule is precisely the state
+/// this generational defect's victims are found in
+/// (`GenerationalHeap::uncommit_evacuated_young`, which the crash handler names
+/// `site=unbumped-middle`). Range compares against the published geometry touch
+/// nothing, so this answers whether or not the page is mapped.
+///
+/// `None` before the first `publish_young_geometry`, which a caller must read as
+/// "no answer", not as "not young".
+///
+/// On its own this says only "a young address". It becomes a verdict when the
+/// caller has ALREADY established that no object starts at `addr` — see
+/// `is_object_address`, which screens through the commit bitmap and the arena's
+/// object-start bitmap and is likewise dereference-free for a released granule.
+/// A live young reference always names an object start, so "in young and not an
+/// object start" names no live object.
+pub fn young_geometry_span(addr: usize) -> Option<&'static str> {
+    let g = |i: usize| YOUNG_GEO[i].load(Ordering::Relaxed);
+    young_geometry_span_in((g(0), g(1), g(2), g(3)), addr)
+}
+
+/// [`young_geometry_span`] against an explicit geometry rather than the
+/// published one. Split out so the classification is testable without writing
+/// a process-global that every collection in the suite republishes.
+fn young_geometry_span_in(geo: (usize, usize, usize, usize), addr: usize) -> Option<&'static str> {
+    if addr == 0 || addr % 8 != 0 {
+        return None;
+    }
+    let (alo, ahi, ilo, ihi) = geo;
+    if ahi == 0 && ihi == 0 {
+        return None;
+    }
+    if addr >= ilo && addr < ihi {
+        return Some("INACTIVE-SEMISPACE");
+    }
+    if addr >= alo && addr < ahi {
+        return Some("ACTIVE-SEMISPACE");
+    }
+    None
+}
+
 /// See `GenerationalHeap::note_objstart_walk`./// See `GenerationalHeap::note_objstart_walk`.
 static LAST_OBJSTART_WALK: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
 
@@ -25623,6 +25669,41 @@ mod tests {
 
         let r2 = heap.collect_garbage(&stw(), &mut roots, &monitors);
         assert_eq!(r2.stats.objects_copied, 2);
+    }
+
+    #[test]
+    /// `young_geometry_span` is the verdict `CRATONVM_DBG_DEADRECV` asks at the
+    /// receiver, one instruction before the load that faults, and it has to
+    /// answer for a granule `CRATONVM_GEN_UNCOMMIT` has already returned to the
+    /// OS. So it must classify from the geometry ALONE — no header read, no
+    /// commit probe — and it must classify BOTH semispaces: which of the two a
+    /// vacated address lands in depends only on the parity of the cycle that
+    /// vacated it, so an arm that knew only the inactive one would answer every
+    /// second case and miss the rest.
+    fn young_geometry_span_classifies_both_semispaces() {
+        // active [0x1000, 0x2000), inactive [0x2000, 0x3000)
+        let geo = (0x1000usize, 0x2000usize, 0x2000usize, 0x3000usize);
+        assert_eq!(
+            young_geometry_span_in(geo, 0x1800),
+            Some("ACTIVE-SEMISPACE"),
+        );
+        assert_eq!(
+            young_geometry_span_in(geo, 0x2800),
+            Some("INACTIVE-SEMISPACE"),
+        );
+        // Ends are exclusive, bases inclusive.
+        assert_eq!(
+            young_geometry_span_in(geo, 0x1000),
+            Some("ACTIVE-SEMISPACE")
+        );
+        assert_eq!(young_geometry_span_in(geo, 0x3000), None);
+        // Outside both, and the two addresses no reference ever has.
+        assert_eq!(young_geometry_span_in(geo, 0x800), None);
+        assert_eq!(young_geometry_span_in(geo, 0), None);
+        assert_eq!(young_geometry_span_in(geo, 0x1804), None, "not 8-aligned");
+        // Before the first `publish_young_geometry` the answer is "no answer",
+        // not "not young" — a caller must not read `None` here as a clean bill.
+        assert_eq!(young_geometry_span_in((0, 0, 0, 0), 0x1800), None);
     }
 
     #[test]
