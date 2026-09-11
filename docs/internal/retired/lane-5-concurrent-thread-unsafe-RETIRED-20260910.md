@@ -15,9 +15,9 @@ byte offsets, `ScopedMemoryAccess` settled jointly with L4, and every cited
 delta backed by a noise floor from the same probe.* That is what this page
 records, so the page it replaces can go.
 
-**The headline is not the retirement.** 100 rows moved; three defects were
-found, and two of them were live in shipped `--jdk-only` behaviour rather than
-in the retirement:
+**The headline is not the retirement.** 98 rows moved; four defects were
+found, and three of them were live in shipped behaviour rather than in the
+retirement:
 
 - **`Unsafe.getAndSet*` / `getAndAdd*` on an ARRAY ELEMENT was a read-then-write.**
   Not atomic, and the reason `RJdkForkJoin` reported `CountedCompleter leaves:
@@ -27,6 +27,9 @@ in the retirement:
   `ThreadPoolExecutor` never saw it.
 - **`Thread.State.valueOf("NOPE")` returned an enum constant** instead of
   throwing — fixed by the retirement rather than by an edit.
+- **A retired shadow disarms a real-JDK keep arm**, because the re-tag runs
+  before the keep predicate reads the kind. Two rows came back out of the table
+  because of it, and the mechanism is general — §4a.
 
 ---
 
@@ -168,7 +171,7 @@ task classes alone, `apps/probes/L5ExecutorSweep.java` hangs at
 `invokeAll(t1, t2)` — 178 rows before the arm, 92 after, and the missing tail
 is what `diff` reports as 86 differing rows.
 
-## 4. What was retired: 100 rows over 11 classes
+## 4. What was retired: 98 rows over 10 classes
 
 | class | rows | what the whole-tree arm measured |
 |---|---|---|
@@ -179,7 +182,6 @@ is what `diff` reports as 86 differing rows.
 | `PriorityBlockingQueue` | 9 | 0 worse |
 | `TimeUnit` | 9 | 0 worse |
 | `Thread$State` | 2 | fixes a defect — see below |
-| `ScheduledThreadPoolExecutor` | 2 | 0 worse |
 | `Thread$FieldHolder` | 1 | 0 worse |
 | `jdk/internal/misc/Unsafe` | 16 | see below — a subset, not the class |
 | `jdk/internal/misc/VM` | 3 | whole-tree arm moved one probe, which timed out in BOTH arms |
@@ -216,9 +218,82 @@ NOT the `Unsafe` rows of the same name — these take a `MemorySegment` base and
 a real byte offset, which is a different number from an `Unsafe` slot index,
 and that is why one family retires and the other cannot.
 
+## 4a. The two rows that came back out: a retirement is mode-blind, a keep arm is not
+
+This wave was 100 rows for most of a day. The two that came back out are the
+most transferable thing on this page, because nothing in the four retirement
+preconditions asks the question that removed them.
+
+`NativeMethodRegistry::register` re-tags a retired triple `Bridge` ->
+`SyntheticStub` and *then* calls `register_inner`:
+
+```rust
+if self.effective_category() == NativeKind::Bridge
+    && (receiver_declared_by_no_supported_image(class_name)
+        || triple_is_retired_shadow(class_name, method_name, descriptor))
+{
+    self.current_category = Some(NativeKind::SyntheticStub);
+    self.register_inner(..);          // <- keep arms run HERE
+    return;
+}
+```
+
+Inside `register_inner`, real-JDK mode (`drop_real_layout_synthetic`) keeps a
+small set of natives it cannot safely execute as bytecode, and every keep is
+written as a predicate over the kind:
+
+```text
+  keep_real_scheduled_executor_bridge = effective_category() == Bridge && ...
+  keep_real_forkjoinpool_bridge       = effective_category() == Bridge && ...
+  keep_real_forkjointask_bridge       = effective_category() == Bridge && ...
+```
+
+By the time those run the answer is already `SyntheticStub`, so **a triple in a
+retirement table loses its native in REAL-JDK mode as well.** That is not what
+a §1.4 shadow retirement is for, and real-JDK is a mode no lane page asks you to
+measure.
+
+`ScheduledThreadPoolExecutor.<init>(I, ThreadFactory, RejectedExecutionHandler)`
+and `getCorePoolSize()I` are exactly the two triples
+`keep_real_scheduled_executor_bridge` names — kept, with a comment, for Spring's
+`ThreadPoolTaskScheduler` anonymous subclass, because the constructor delegates
+to `ThreadPoolExecutor`'s real constructor and the getter resolves the inherited
+field by name. Both are bucket-A rows with a clean whole-tree arm and an
+observed dispatch, so all four preconditions passed. They are still not
+retirable.
+
+**There is no flag to branch the re-tag on.** `drop_real_layout_synthetic` is
+set in real-JDK mode *and* in `--jdk-only` (`vm_init.rs` sets it whenever
+`!config.use_synthetic_jdk`), so "skip the re-tag in real-JDK mode" is not
+expressible at the registration site. The remedy is to take the row out of the
+table, which is what happened.
+
+**What caught it was a unit test, and by luck.**
+`registry::tests::real_layout_mode_drops_enumset_native_surface` has exactly one
+`Bridge`-survives control, and that control happened to be the 3-arg
+constructor. Had it been any other triple this would have landed. So the fix
+includes the gate that asks on purpose:
+
+```text
+  registry::tests::real_layout_bridge_keeps_are_not_retired_shadows
+```
+
+It walks `RETIRED_SHADOW_TABLES` — every wave, not this one — and for each
+triple registers it through `register_inner` under `Bridge`, which is the state
+`register` would have been in without the re-tag, then requires real-layout mode
+to drop it anyway. Anything that survives is keep-listed and must leave its
+table. It reads the real code path rather than restating the predicates, so a
+new keep arm is covered the day it is written.
+
+The sweep for others was cheap and is worth recording as the method: of the ten
+remaining classes in this table, `registry.rs` names only two at all —
+`jdk/internal/misc/Unsafe` in a hash-test fixture and
+`java/util/concurrent/ThreadPoolExecutor` in a comment. No other collision
+exists in this wave.
+
 ## 5. What was held, with the blocker
 
-305 rows. Every one has a measurement, not a judgement.
+307 rows. Every one has a measurement, not a judgement.
 
 ### 127 rows: the class's whole arm moves the VM AWAY from HotSpot
 
@@ -333,6 +408,13 @@ names, so the abstract one is never the answer.
 reach it (a direct subclass declaring only `execute`) and the rows still read
 `invocations: 0`. Lane 0 §1: **deleting these is worth doing and is not a
 retirement**, so they are not in the table and must not be counted as one.
+
+### 2 rows: a real-JDK keep arm this table would have disarmed
+
+`ScheduledThreadPoolExecutor.<init>(I, ThreadFactory, RejectedExecutionHandler)`
+and `getCorePoolSize()I`. All four preconditions pass and they are still not
+retirable, for a reason that belongs to the retirement MECHANISM rather than to
+these rows — §4a has it, and the gate that now asks the question of every wave.
 
 ### 1 row: a partial that has evidence against it
 
@@ -482,8 +564,9 @@ Writing the caller is what moved them:
   Thread$State                      0 -> 2
 ```
 
-Thirty-two rows, all of them in the table, and one live defect found on the
-way. Twenty-six more of the 84 are the `ForkJoinTask`/`RecursiveTask`/
+Thirty-two rows, thirty of them in the table, and one live defect found on the
+way. (The `ScheduledThreadPoolExecutor` pair is dispatched and measured like
+the rest; what keeps it out of the table is §4a, not this probe.) Twenty-six more of the 84 are the `ForkJoinTask`/`RecursiveTask`/
 `RecursiveAction` rows — the probe reaches those too, and §3 holds them for a
 different reason. The last twenty-six are the four dead
 `AbstractExecutorService` rows and twenty-two `ScopedMemoryAccess` aligned

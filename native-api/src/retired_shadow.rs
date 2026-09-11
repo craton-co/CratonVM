@@ -2321,16 +2321,56 @@ static RETIRED_SHADOW_PHASE3_TRIPLES: &[(&str, &str, &str)] = &[
 /// wave does not report them at all. **Take the dump from the binary you are
 /// about to change.**)
 ///
-/// # 100 of 405, and the other 305 are classified rather than deferred
+/// # 98 of 405, and the other 307 are classified rather than deferred
 ///
 /// | disposition | rows |
 /// |---|---|
-/// | retired here | **100** |
+/// | retired here | **98** |
 /// | held: the class's whole arm moves the VM AWAY from HotSpot | 127 |
 /// | held: one unit with a held class | 133 |
 /// | held: no instrument in this tree dispatches the row | 40 |
 /// | dead registration — a door that never opens | 4 |
+/// | held: a real-JDK keep arm this table would disarm | 2 |
 /// | held: a partial with evidence against it | 1 |
+///
+/// # A retirement is mode-blind and a keep arm is not
+///
+/// This wave was 100 rows for most of a day. The two that came back out are
+/// worth the paragraph, because the mechanism that removed them is general and
+/// nothing in the four preconditions asks about it.
+///
+/// [`crate::registry::NativeMethodRegistry::register`] re-tags a retired triple
+/// `Bridge` -> `SyntheticStub` **before** calling `register_inner`, and it does
+/// so in every mode — the table is per-triple, not per-mode. Inside
+/// `register_inner`, real-JDK mode (`drop_real_layout_synthetic`) keeps a small
+/// number of natives it cannot safely execute as bytecode, and each of those
+/// keeps is written as a predicate over `effective_category()`:
+///
+/// ```text
+///   keep_real_scheduled_executor_bridge = effective_category() == Bridge && ...
+///   keep_real_forkjoinpool_bridge       = effective_category() == Bridge && ...
+///   keep_real_forkjointask_bridge       = effective_category() == Bridge && ...
+/// ```
+///
+/// By the time those run, the re-tag has already made the answer
+/// `SyntheticStub`. **A triple in this table can therefore lose its native in
+/// REAL-JDK mode**, which is not what a §1.4 shadow retirement is for and is
+/// not a mode this lane measured. `ScheduledThreadPoolExecutor.<init>(I,
+/// ThreadFactory, RejectedExecutionHandler)` and `getCorePoolSize()I` are
+/// exactly the two triples `keep_real_scheduled_executor_bridge` names — kept
+/// for Spring's `ThreadPoolTaskScheduler` anonymous subclass — so they are out.
+///
+/// The instrument that caught it was
+/// `registry::tests::real_layout_mode_drops_enumset_native_surface`, whose one
+/// `Bridge`-survives control happened to BE the 3-arg constructor. That was
+/// luck; `registry::tests::real_layout_bridge_keeps_are_not_retired_shadows`
+/// now covers all three keep arms on purpose, by registering each protected
+/// triple through the real code path rather than restating the predicate.
+///
+/// The other nine classes in this table are named nowhere in `registry.rs`
+/// except a hash-test fixture (`jdk/internal/misc/Unsafe`) and one comment
+/// (`java/util/concurrent/ThreadPoolExecutor`), so the sweep that found these
+/// two found no others.
 ///
 /// # The `Unsafe` subset that IS retired, and the line it is drawn on
 ///
@@ -2434,8 +2474,17 @@ static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/util/concurrent/PriorityBlockingQueue", "put", "(Ljava/lang/Object;)V"),
     ("java/util/concurrent/PriorityBlockingQueue", "size", "()I"),
     ("java/util/concurrent/PriorityBlockingQueue", "take", "()Ljava/lang/Object;"),
-    ("java/util/concurrent/ScheduledThreadPoolExecutor", "<init>", "(ILjava/util/concurrent/ThreadFactory;Ljava/util/concurrent/RejectedExecutionHandler;)V"),
-    ("java/util/concurrent/ScheduledThreadPoolExecutor", "getCorePoolSize", "()I"),
+    // `ScheduledThreadPoolExecutor.<init>(I,ThreadFactory,RejectedExecutionHandler)`
+    // and `getCorePoolSize()I` WERE here and were REMOVED on 2026-09-10, before
+    // this table ever landed. They are the two triples
+    // `keep_real_scheduled_executor_bridge` (`registry.rs`) deliberately keeps
+    // in REAL-JDK mode for Spring's `ThreadPoolTaskScheduler` anonymous
+    // subclass — and that predicate reads `effective_category()`, which the
+    // re-tag in `register` has already turned into `SyntheticStub` by the time
+    // it runs. Retiring them therefore does not only retire a `--jdk-only`
+    // shadow; it drops the native in real-JDK mode too, which is a mode this
+    // lane never measured. See this module's header, "a retirement is
+    // mode-blind and a keep arm is not".
     ("java/util/concurrent/ThreadPoolExecutor", "awaitTermination", "(JLjava/util/concurrent/TimeUnit;)Z"),
     ("java/util/concurrent/ThreadPoolExecutor", "getActiveCount", "()I"),
     ("java/util/concurrent/ThreadPoolExecutor", "getCompletedTaskCount", "()J"),
@@ -2674,9 +2723,70 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
         || RETIRED_SHADOW_L5_TRIPLES.binary_search(&key).is_ok()
 }
 
+/// Every retired-shadow table, in one slice, so a gate can walk the whole
+/// population instead of naming one wave.
+///
+/// Added 2026-09-10 for
+/// `registry::tests::real_layout_bridge_keeps_are_not_retired_shadows`. That
+/// test needs the ROWS, not the predicate: it asks, of each retired triple,
+/// whether real-JDK mode would have KEPT it had the `Bridge` -> `SyntheticStub`
+/// re-tag in [`crate::registry::NativeMethodRegistry::register`] not run first.
+/// A `yes` means the table is silently disarming a `keep_real_*_bridge` arm in
+/// a mode the retiring lane never measured — see the "a retirement is
+/// mode-blind and a keep arm is not" section on [`RETIRED_SHADOW_L5_TRIPLES`],
+/// which is the case that prompted this.
+///
+/// **Add every new table here.** Forgetting is not caught by the sorted/unique
+/// tests, which are per-table; the cost of the omission is that the new wave is
+/// simply not asked the question.
+pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
+    RETIRED_SHADOW_TRIPLES,
+    RETIRED_SHADOW_STATELESS_TRIPLES,
+    RETIRED_SHADOW_PHASE2_TRIPLES,
+    RETIRED_SHADOW_L2_TRIPLES,
+    RETIRED_SHADOW_PHASE3_TRIPLES,
+    RETIRED_SHADOW_L5_TRIPLES,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`RETIRED_SHADOW_TABLES`] must list every table the predicate consults.
+    ///
+    /// It is a hand-maintained second list of the same tables, which is the
+    /// shape that drifts. Nothing catches the omission by behaviour: a wave
+    /// left out of the const is simply never asked whether it disarms a
+    /// real-JDK keep arm, and the gate that asks
+    /// (`registry::tests::real_layout_bridge_keeps_are_not_retired_shadows`)
+    /// passes on a smaller population without saying so.
+    ///
+    /// So count the arms in the predicate's own source instead of trusting the
+    /// two lists to stay in step. A source-scanning check is a parser and is
+    /// wrong in both directions — here it can only be wrong if someone renames
+    /// the tables or consults one without a `binary_search`, and either is a
+    /// change to this file that should be reading this comment.
+    #[test]
+    fn the_tables_const_lists_every_table_the_predicate_consults() {
+        let src = include_str!("retired_shadow.rs");
+        let body = src
+            .split("pub fn triple_is_retired_shadow(")
+            .nth(1)
+            .expect("the predicate is in this file");
+        let body = body.split("
+}
+").next().expect("the predicate has a body");
+        let consulted = body
+            .matches("RETIRED_SHADOW_")
+            .count()
+            .saturating_sub(body.matches("RETIRED_SHADOW_PREFIXES").count());
+        assert_eq!(
+            consulted,
+            RETIRED_SHADOW_TABLES.len(),
+            "`triple_is_retired_shadow` consults {consulted} tables but `RETIRED_SHADOW_TABLES` lists {}. Add the new table to the const — see its doc comment for what is skipped otherwise.",
+            RETIRED_SHADOW_TABLES.len()
+        );
+    }
 
     #[test]
     fn the_l2_table_is_sorted_and_unique() {

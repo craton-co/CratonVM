@@ -143,15 +143,22 @@
 #   sweep is checked in and goes red when it is fixed or when this answer
 #   drifts. Nothing else on java/lang/Module moves; this is one triple.
 # amended: 2026-09-10, lane 5 (java.util.concurrent / Thread / Unsafe).
-#   103 rows edited by hand and ONE row added, not re-measured:
+#   101 rows edited by hand and ONE row added, not re-measured:
 #   bridge -> synthetic-stub, kind_stated 0 -> 1.
 #
 #   The value is DERIVED, not guessed, by the same deterministic rule the
 #   2026-09-09 Phase 3 amendment above uses: the retag in
 #   NativeMethodRegistry::register fires on (effective category Bridge +
 #   triple_is_retired_shadow) and lands on SyntheticStub with kind_stated
-#   true. So 100 table triples produce 103 rows here, because three of them
+#   true. So 98 table triples produce 101 rows here, because three of them
 #   are registered at more than one ordinal and the retag flips every one.
+#
+#   IT WAS 103 ROWS FOR 100 TRIPLES until the two
+#   ScheduledThreadPoolExecutor rows came back out of the table on the same
+#   day -- they are the pair keep_real_scheduled_executor_bridge holds in
+#   REAL-JDK mode, and the retag, which runs first, would have disarmed it.
+#   See RETIRED_SHADOW_L5_TRIPLES, "a retirement is mode-blind and a keep arm
+#   is not". Those two rows are therefore UNCHANGED from the freeze here.
 #
 #   THE ADDED ROW is the exception worth naming:
 #   PriorityBlockingQueue.poll(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;
@@ -7877,8 +7884,8 @@ java/util/concurrent/RejectedExecutionException	toString	()Ljava/lang/String;	0	
 java/util/concurrent/RejectedExecutionException	toString	()Ljava/lang/String;	1	bridge	0	1
 java/util/concurrent/ScheduledExecutorService	isShutdown	()Z	0	intrinsic	0	1
 java/util/concurrent/ScheduledExecutorService	shutdown	()V	0	intrinsic	0	1
-java/util/concurrent/ScheduledThreadPoolExecutor	<init>	(ILjava/util/concurrent/ThreadFactory;Ljava/util/concurrent/RejectedExecutionHandler;)V	0	synthetic-stub	1	1
-java/util/concurrent/ScheduledThreadPoolExecutor	getCorePoolSize	()I	0	synthetic-stub	1	1
+java/util/concurrent/ScheduledThreadPoolExecutor	<init>	(ILjava/util/concurrent/ThreadFactory;Ljava/util/concurrent/RejectedExecutionHandler;)V	0	bridge	0	1
+java/util/concurrent/ScheduledThreadPoolExecutor	getCorePoolSize	()I	0	bridge	0	1
 java/util/concurrent/ThreadPoolExecutor	awaitTermination	(JLjava/util/concurrent/TimeUnit;)Z	0	synthetic-stub	1	1
 java/util/concurrent/ThreadPoolExecutor	execute	(Ljava/lang/Runnable;)V	0	synthetic-stub	1	1
 java/util/concurrent/ThreadPoolExecutor	getActiveCount	()I	0	synthetic-stub	1	1

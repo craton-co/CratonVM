@@ -10220,6 +10220,73 @@ mod tests {
             .is_none());
     }
 
+    /// A retirement must not silently disarm a real-JDK `keep_real_*_bridge`.
+    ///
+    /// `register` re-tags a retired triple `Bridge` -> `SyntheticStub` BEFORE
+    /// calling `register_inner`, and it does so in every mode, because the
+    /// table is per-triple. Inside `register_inner`, real-JDK mode keeps a
+    /// small number of natives it cannot safely run as bytecode, and each keep
+    /// is a predicate over `effective_category() == NativeKind::Bridge` — which
+    /// the re-tag has already falsified. A triple that is BOTH retired and
+    /// keep-listed therefore loses its native in real-JDK mode, which is not
+    /// what a §1.4 shadow retirement is for and is a mode no retiring lane
+    /// measures.
+    ///
+    /// This asks the question of the whole retired population rather than of
+    /// one wave, and it asks it through the real code path: for each retired
+    /// triple, register it with `register_inner` under `Bridge` — the state
+    /// `register` would have been in had the re-tag not run — and require that
+    /// real-layout mode drops it anyway. Anything that survives is keep-listed,
+    /// and the retirement of it is the bug.
+    ///
+    /// On 2026-09-10 this caught two: `ScheduledThreadPoolExecutor`'s 3-arg
+    /// constructor and `getCorePoolSize()I`, which
+    /// `keep_real_scheduled_executor_bridge` holds for Spring's
+    /// `ThreadPoolTaskScheduler` anonymous subclass. They were removed from
+    /// `RETIRED_SHADOW_L5_TRIPLES` before it landed.
+    ///
+    /// A failure here does NOT mean "delete the keep arm". It means the triple
+    /// cannot be retired by the table, because the table cannot tell the two
+    /// modes apart: `drop_real_layout_synthetic` is set in real-JDK AND in
+    /// `--jdk-only` (`vm_init.rs`), so there is no flag to branch the re-tag
+    /// on. Take the row out of the table.
+    #[test]
+    fn real_layout_bridge_keeps_are_not_retired_shadows() {
+        let mut offenders: Vec<String> = Vec::new();
+        for table in crate::retired_shadow::RETIRED_SHADOW_TABLES {
+            for (class_name, method_name, descriptor) in table.iter() {
+                // Sanity: every row here must actually be reachable through the
+                // predicate, or this gate is scoring rows the VM never retires.
+                assert!(
+                    crate::retired_shadow::triple_is_retired_shadow(
+                        class_name,
+                        method_name,
+                        descriptor
+                    ),
+                    "{class_name}.{method_name}{descriptor} is in a retired-shadow table but `triple_is_retired_shadow` says no — the class is outside `RETIRED_SHADOW_PREFIXES`"
+                );
+
+                let mut real_layout = NativeMethodRegistry::new();
+                real_layout.set_drop_real_layout_synthetic(true);
+                real_layout.set_category(NativeKind::Bridge);
+                // `register_inner`, not `register`: the point is to observe
+                // `register_inner`'s own decision with the category the re-tag
+                // would have replaced.
+                real_layout.register_inner(class_name, method_name, descriptor, dummy_native);
+                if real_layout.find(class_name, method_name, descriptor).is_some() {
+                    offenders.push(format!("{class_name}.{method_name}{descriptor}"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these retired-shadow triples are ALSO kept by a real-JDK `keep_real_*_bridge` arm, so retiring them drops the native in real-JDK mode too — a mode the retiring lane did not measure. Remove them from the table (see this test's doc comment; do not touch the keep arm):
+  {}",
+            offenders.join("
+  ")
+        );
+    }
+
     #[test]
     fn deferred_native_ring_name_flush_resolves() {
         // PERF (native-ring lazy name map): with the ring disabled (the test
