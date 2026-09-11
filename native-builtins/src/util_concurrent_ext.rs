@@ -5025,7 +5025,6 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
     let es = "java/util/concurrent/ExecutorService";
     let exec = "java/util/concurrent/Executors";
     let tp = "java/util/concurrent/ThreadPoolExecutor";
-    let aes = "java/util/concurrent/AbstractExecutorService";
     let tf = "java/util/concurrent/ThreadFactory";
 
     // Executors factory methods — return synthetic executor objects
@@ -5067,18 +5066,32 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;",
         native_es_submit_callable,
     );
-    registry.register(
-        aes,
-        "submit",
-        "(Ljava/lang/Runnable;)Ljava/util/concurrent/Future;",
-        native_es_submit_runnable,
-    );
-    registry.register(
-        aes,
-        "submit",
-        "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;",
-        native_es_submit_callable,
-    );
+    // 2026-09-11, lane 5 residual §9.3 — the four
+    // `java/util/concurrent/AbstractExecutorService` registrations that stood
+    // here are DELETED, not retired.
+    //
+    // `submit(Runnable)`, `submit(Callable)`, `submit(Runnable, T)` and
+    // `invokeAny(Collection)` were registered on an ABSTRACT class. A dispatch
+    // door asks the registry about the DECLARING class of the resolved method,
+    // and every concrete executor in the image — `ThreadPoolExecutor`,
+    // `ForkJoinPool` — carries its own registration of the same names, so the
+    // abstract one is never the answer. `apps/probes/L5ExecutorSweep.java`
+    // builds the one receiver shape that could reach it (a direct subclass
+    // declaring only `execute`) and the rows still read `invocations: 0`, on
+    // every probe run and in all 132 `--jdk-only` corpus reports.
+    //
+    // Lane 0 §1: a door that never opens is dead weight, not a §1.4 shadow, so
+    // this is a deletion and the triples are deliberately NOT in
+    // `RETIRED_SHADOW_L5_TRIPLES` — a retirement table entry would claim a
+    // dispatch nobody has ever observed.
+    //
+    // What still names this class: `native_es_submit_runnable` and
+    // `native_es_submit_callable` (`lucene_es.rs`) and the two closures below
+    // pass it to `invoke_special_bytecode_only` as the class whose BYTECODE to
+    // run for a genuinely-real executor. That call does not consult the
+    // registry, so it is unaffected by these deletions — and with them gone it
+    // is now the only way this class name reaches dispatch, which is the state
+    // those guards were written assuming.
     // JDK-ONLY-WAVE2 (2026-08-06): `native_es_execute` is adjudicated a
     // `SyntheticStub`, not the ambient kind this registrar would otherwise give
     // it. It is a compatibility stand-in for CratonVM's synthetic 2-field
@@ -5247,12 +5260,8 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Runnable;Ljava/lang/Object;)Ljava/util/concurrent/Future;",
         submit_rt_closure,
     );
-    registry.register(
-        aes,
-        "submit",
-        "(Ljava/lang/Runnable;Ljava/lang/Object;)Ljava/util/concurrent/Future;",
-        submit_rt_closure,
-    );
+    // See the §9.3 note above: the `AbstractExecutorService` copy of this
+    // overload was deleted with the other three.
 
     // RD.6: invokeAll(Collection<Callable>) -> List<Future> — run sequentially.
     let invoke_all_closure = |ctx: &mut dyn NativeContext, args: &[Value]| -> MethodCallResult {
@@ -5352,12 +5361,8 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/Collection;)Ljava/lang/Object;",
         invoke_any_closure,
     );
-    registry.register(
-        aes,
-        "invokeAny",
-        "(Ljava/util/Collection;)Ljava/lang/Object;",
-        invoke_any_closure,
-    );
+    // See the §9.3 note above: the `AbstractExecutorService` copy of
+    // `invokeAny` was deleted with the other three.
 }
 
 /// Bug D (kafka-suite-0617) — submit a `Runnable` to a real, **bounded** pool of

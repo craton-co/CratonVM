@@ -170,6 +170,16 @@
 #
 #   The measurement is in
 #   docs/internal/retired/lane-5-concurrent-thread-unsafe-RETIRED-20260910.md.
+#
+# amended: 2026-09-11, lane 5 residuals. FOUR rows REMOVED, not edited:
+#   java/util/concurrent/AbstractExecutorService {submit x3, invokeAny}.
+#   Those registrations were DELETED from native-builtins (they sat on an
+#   abstract class no dispatch door ever resolves to; L5ExecutorSweep reads
+#   invocations:0 even with a purpose-built direct subclass). A freeze row for
+#   a registration that no longer exists is worse than a stale one -- it is a
+#   row nothing can ever re-measure -- so the rows go with the code. This is
+#   the first amendment here that REMOVES rather than edits; the count of
+#   bridge rows for that class is now zero, and the class is absent entirely.
 # class	name	descriptor	ordinal	kind	kind_stated	kind_chosen
 CratonVM$HttpServerLoop	run	()V	0	bridge	0	1
 brave/internal/collect/WeakConcurrentMap$WeakKey	equals	(Ljava/lang/Object;)Z	0	bridge	0	1
@@ -7495,10 +7505,6 @@ java/util/Vector	setElementAt	(Ljava/lang/Object;I)V	0	bridge	0	1
 java/util/Vector	size	()I	0	bridge	0	1
 java/util/Vector	toArray	()[Ljava/lang/Object;	0	bridge	0	1
 java/util/Vector	toString	()Ljava/lang/String;	0	bridge	0	1
-java/util/concurrent/AbstractExecutorService	invokeAny	(Ljava/util/Collection;)Ljava/lang/Object;	0	bridge	0	1
-java/util/concurrent/AbstractExecutorService	submit	(Ljava/lang/Runnable;)Ljava/util/concurrent/Future;	0	bridge	0	1
-java/util/concurrent/AbstractExecutorService	submit	(Ljava/lang/Runnable;Ljava/lang/Object;)Ljava/util/concurrent/Future;	0	bridge	0	1
-java/util/concurrent/AbstractExecutorService	submit	(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;	0	bridge	0	1
 java/util/concurrent/BrokenBarrierException	<init>	()V	0	bridge	0	1
 java/util/concurrent/BrokenBarrierException	<init>	()V	1	bridge	0	1
 java/util/concurrent/BrokenBarrierException	<init>	(Ljava/lang/String;)V	0	bridge	0	1
