@@ -4072,12 +4072,22 @@ pub(crate) fn native_unsafe_get_and_add_int(
             Some(i) => i,
             None => return Ok(Some(Value::Int(0))),
         };
-        let current = ctx.get_array_element(obj, idx);
-        if let Value::Int(old) = current {
-            ctx.set_array_element(obj, idx, Value::Int(old.wrapping_add(delta)));
-            return Ok(Some(Value::Int(old)));
+        // ATOMIC -- see the note in `native_unsafe_get_and_set_object`. A
+        // read-modify-write on an array element loses concurrent increments;
+        // the field arm below has always been a CAS loop.
+        for attempt in 0.. {
+            let current = ctx.get_array_element(obj, idx);
+            let Value::Int(old) = current else {
+                return Ok(Some(Value::Int(0)));
+            };
+            if ctx.compare_and_swap_field(obj, idx, current, Value::Int(old.wrapping_add(delta))) {
+                return Ok(Some(Value::Int(old)));
+            }
+            if attempt > 0 && attempt % CAS_MAX_RETRIES == 0 {
+                std::thread::yield_now();
+            }
         }
-        return Ok(Some(Value::Int(0)));
+        unreachable!();
     }
     // CAS loop with bounded retries and yield on contention
     for attempt in 0.. {
@@ -4135,9 +4145,36 @@ fn native_unsafe_get_and_set_int(ctx: &mut dyn NativeContext, args: &[Value]) ->
             Some(i) => i,
             None => return Ok(Some(Value::Int(0))),
         };
-        let prev = ctx.get_array_element(obj, idx);
-        ctx.set_array_element(obj, idx, new_val);
-        return Ok(Some(prev));
+        // ATOMIC, and it was not until 2026-09-10. A plain read-then-write
+        // here is a lost update: two threads reading the same slot both see a
+        // non-null `prev` and both report having taken it. The FIELD arm below
+        // has always been a CAS retry loop; this arm was a bare
+        // `get_array_element` + `set_array_element` pair, so the atomicity of
+        // `getAndSet*` depended on whether the receiver happened to be an
+        // array.
+        //
+        // The cost is not theoretical and not confined to `Unsafe`'s own
+        // callers. `java.util.concurrent.ForkJoinPool$WorkQueue` claims a
+        // queued task with exactly this call --
+        // `U.getAndSetReference(a, slotOffset(k), null)` -- so a doubled claim
+        // is a task EXECUTED TWICE. Measured with `apps/probes/L5CasRace.java`
+        // on the Azure host: 2000 slots, 4 threads, HotSpot 2000 claims and
+        // this VM **2035**; and with the real `ForkJoinPool` bytecode running
+        // (`CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/concurrent/ForkJoinPool,
+        // java/util/concurrent/ForkJoinTask`)
+        // `apps/probes/L5CountedCompleter.java` read 64..128 leaves for a
+        // 64-leaf tree across eight runs. That is lane 5's
+        // `RJdkForkJoin  AssertionError: CountedCompleter leaves: 128`.
+        for attempt in 0.. {
+            let prev = ctx.get_array_element(obj, idx);
+            if ctx.compare_and_swap_field(obj, idx, prev, new_val) {
+                return Ok(Some(prev));
+            }
+            if attempt > 0 && attempt % CAS_MAX_RETRIES == 0 {
+                std::thread::yield_now();
+            }
+        }
+        unreachable!();
     }
     for attempt in 0.. {
         let current = ctx.get_field_volatile(obj, offset);
@@ -4533,12 +4570,21 @@ fn native_unsafe_get_and_add_long(ctx: &mut dyn NativeContext, args: &[Value]) -
             Some(i) => i,
             None => return Ok(Some(Value::Long(0))),
         };
-        let current = ctx.get_array_element(obj, idx);
-        if let Value::Long(old) = current {
-            ctx.set_array_element(obj, idx, Value::Long(old.wrapping_add(delta)));
-            return Ok(Some(Value::Long(old)));
+        // ATOMIC -- see the note in `native_unsafe_get_and_set_object`.
+        for attempt in 0.. {
+            let current = ctx.get_array_element(obj, idx);
+            let Value::Long(old) = current else {
+                return Ok(Some(Value::Long(0)));
+            };
+            if ctx.compare_and_swap_field(obj, idx, current, Value::Long(old.wrapping_add(delta)))
+            {
+                return Ok(Some(Value::Long(old)));
+            }
+            if attempt > 0 && attempt % CAS_MAX_RETRIES == 0 {
+                std::thread::yield_now();
+            }
         }
-        return Ok(Some(Value::Long(0)));
+        unreachable!();
     }
     for attempt in 0.. {
         let current = ctx.get_field_volatile(obj, offset);
@@ -4594,9 +4640,36 @@ fn native_unsafe_get_and_set_long(ctx: &mut dyn NativeContext, args: &[Value]) -
             Some(i) => i,
             None => return Ok(Some(Value::Long(0))),
         };
-        let prev = ctx.get_array_element(obj, idx);
-        ctx.set_array_element(obj, idx, new_val);
-        return Ok(Some(prev));
+        // ATOMIC, and it was not until 2026-09-10. A plain read-then-write
+        // here is a lost update: two threads reading the same slot both see a
+        // non-null `prev` and both report having taken it. The FIELD arm below
+        // has always been a CAS retry loop; this arm was a bare
+        // `get_array_element` + `set_array_element` pair, so the atomicity of
+        // `getAndSet*` depended on whether the receiver happened to be an
+        // array.
+        //
+        // The cost is not theoretical and not confined to `Unsafe`'s own
+        // callers. `java.util.concurrent.ForkJoinPool$WorkQueue` claims a
+        // queued task with exactly this call --
+        // `U.getAndSetReference(a, slotOffset(k), null)` -- so a doubled claim
+        // is a task EXECUTED TWICE. Measured with `apps/probes/L5CasRace.java`
+        // on the Azure host: 2000 slots, 4 threads, HotSpot 2000 claims and
+        // this VM **2035**; and with the real `ForkJoinPool` bytecode running
+        // (`CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/concurrent/ForkJoinPool,
+        // java/util/concurrent/ForkJoinTask`)
+        // `apps/probes/L5CountedCompleter.java` read 64..128 leaves for a
+        // 64-leaf tree across eight runs. That is lane 5's
+        // `RJdkForkJoin  AssertionError: CountedCompleter leaves: 128`.
+        for attempt in 0.. {
+            let prev = ctx.get_array_element(obj, idx);
+            if ctx.compare_and_swap_field(obj, idx, prev, new_val) {
+                return Ok(Some(prev));
+            }
+            if attempt > 0 && attempt % CAS_MAX_RETRIES == 0 {
+                std::thread::yield_now();
+            }
+        }
+        unreachable!();
     }
     for attempt in 0.. {
         let current = ctx.get_field_volatile(obj, offset);
@@ -4654,9 +4727,36 @@ fn native_unsafe_get_and_set_object(
             Some(i) => i,
             None => return Ok(Some(Value::Object(None))),
         };
-        let prev = ctx.get_array_element(obj, idx);
-        ctx.set_array_element(obj, idx, new_val);
-        return Ok(Some(prev));
+        // ATOMIC, and it was not until 2026-09-10. A plain read-then-write
+        // here is a lost update: two threads reading the same slot both see a
+        // non-null `prev` and both report having taken it. The FIELD arm below
+        // has always been a CAS retry loop; this arm was a bare
+        // `get_array_element` + `set_array_element` pair, so the atomicity of
+        // `getAndSet*` depended on whether the receiver happened to be an
+        // array.
+        //
+        // The cost is not theoretical and not confined to `Unsafe`'s own
+        // callers. `java.util.concurrent.ForkJoinPool$WorkQueue` claims a
+        // queued task with exactly this call --
+        // `U.getAndSetReference(a, slotOffset(k), null)` -- so a doubled claim
+        // is a task EXECUTED TWICE. Measured with `apps/probes/L5CasRace.java`
+        // on the Azure host: 2000 slots, 4 threads, HotSpot 2000 claims and
+        // this VM **2035**; and with the real `ForkJoinPool` bytecode running
+        // (`CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/concurrent/ForkJoinPool,
+        // java/util/concurrent/ForkJoinTask`)
+        // `apps/probes/L5CountedCompleter.java` read 64..128 leaves for a
+        // 64-leaf tree across eight runs. That is lane 5's
+        // `RJdkForkJoin  AssertionError: CountedCompleter leaves: 128`.
+        for attempt in 0.. {
+            let prev = ctx.get_array_element(obj, idx);
+            if ctx.compare_and_swap_field(obj, idx, prev, new_val) {
+                return Ok(Some(prev));
+            }
+            if attempt > 0 && attempt % CAS_MAX_RETRIES == 0 {
+                std::thread::yield_now();
+            }
+        }
+        unreachable!();
     }
     for attempt in 0.. {
         let current = ctx.get_field_volatile(obj, offset);
