@@ -1033,6 +1033,31 @@ struct Lowerer<'a> {
     /// when it started)`. At most one is ever live, because a carry is planned
     /// only between ADJACENT nodes.
     live_carry: Option<(NodeId, NodeId, u8, usize)>,
+    /// The DEFERRED carry: a value sitting in RCX for a consumer that is two
+    /// nodes away, not one.
+    ///
+    /// `(producer, consumer, intervening nodes still permitted)`.
+    ///
+    /// [`Self::live_carry`] is the adjacent carry and can be either register;
+    /// this is the second slot, and it is RCX-only by construction — the
+    /// consumer reads its first operand from RAX, which is where the ADJACENT
+    /// producer left it, so the only value that can still be in flight across
+    /// an arm is the second operand. The allowance is 1 and is spent by the
+    /// arm in between, whose op must satisfy [`op_preserves_rcx`]; running out
+    /// of it refuses the compile rather than reading a register something else
+    /// has since written.
+    deferred_rcx: Option<(NodeId, NodeId, u8)>,
+    /// Values `plan_carries` chose to carry in the DEFERRED slot, so
+    /// `store_rax` can tell the two apart at the home write.
+    carry_deferred: Vec<bool>,
+    /// Deferred carries planned, taken and read — engagement for the census.
+    carry_deferred_planned: usize,
+    carry_deferred_read: usize,
+    /// Fused compares that read both operands where they already were.
+    cmp_in_place: usize,
+    /// Fused compares that read the second operand straight out of its frame
+    /// slot instead of loading it into RCX first.
+    cmp_in_place_frame: usize,
     /// ENGAGEMENT, and its fail-closed counterpart. A refusal is not a
     /// miscompile — the value's home is `home_dropped`, so the fallback read
     /// refuses the compile as well — but it means the contract this planned
@@ -1598,6 +1623,12 @@ impl<'a> Lowerer<'a> {
             homes_dropped_at_def: 0,
             carry_of: Vec::new(),
             live_carry: None,
+            deferred_rcx: None,
+            carry_deferred: Vec::new(),
+            carry_deferred_planned: 0,
+            carry_deferred_read: 0,
+            cmp_in_place: 0,
+            cmp_in_place_frame: 0,
             carries_taken: 0,
             carries_read: 0,
             carries_refused: 0,
@@ -1690,6 +1721,134 @@ impl<'a> Lowerer<'a> {
         for id in droppable {
             self.home_dropped[id] = true;
         }
+    }
+
+    /// Why each PROMOTED value that kept its home kept it, per cause:
+    /// `[switch, deopt, type,
+    /// op]`, in the order [`Self::value_home_droppable`] tests them.
+    ///
+    /// # Why a per-cause census and not a count
+    ///
+    /// `plan_register_residency` used to print a `home: droppable=… ` line
+    /// computed from a NAIVE rule — "some safepoint's locals or stack names
+    /// it" — that predates `ir-deopt-regs`, `ir-reg-authoritative` and
+    /// `ir-drop-phi-home`. By 2026-09-10 it read `droppable=0` on
+    /// `probes/FieldLoop.java` `sum` while the emission on the SAME compile
+    /// dropped three homes, and
+    /// `internal/performance/c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md`
+    /// quoted the zero and built an argument on it. A diagnostic that is wrong
+    /// in the direction of "nothing works" is worse than none: it retires
+    /// levers that are in fact engaged.
+    ///
+    /// This one is computed from the predicates that actually decide, at the
+    /// moment they decide, so it cannot drift from them — and the four causes
+    /// call for four different next steps, which a bare count cannot say:
+    ///
+    ///   * `switch` — a flag in the conjunction is off. Nothing to chase.
+    ///   * `deopt`  — a reachable frame state names it and the register is not
+    ///     exclusively its own. **This is the one the architecture change is
+    ///     for**: it wants a register bank the frame reconstructor can read at
+    ///     an arbitrary bci, not another heuristic.
+    ///   * `type`   — `Ref` (needs a register bank in the OOP MAP, a different
+    ///     and larger change) or FP (a different file).
+    ///   * `op`     — the defining arm does not write its home through one
+    ///     `store_rax`, so there is no single store to drop.
+    ///
+    /// Deliberately counts only values the residency plan actually promoted: a
+    /// value with no register has no home to drop and would swamp the census
+    /// with a cause nobody can act on. Called at the END of lowering, after
+    /// [`Self::extend_home_drops_to_carried_values`] has had its say, so
+    /// "kept" means what the emission really did rather than what the plan
+    /// intended.
+    ///
+    /// # The accounting identity, which is what stops this one drifting
+    ///
+    /// Every promoted value is either dropped or attributed to exactly one
+    /// cause, and the assertion at the bottom says so. That is not decoration:
+    /// the diagnostic it replaces went wrong precisely by computing its own
+    /// answer instead of reading the one the emission used, and an identity
+    /// that ties the census to `home_dropped` cannot do that. A future clause
+    /// added to `value_home_droppable` and not here fails this immediately
+    /// under `cargo test`, because `lower_inner_with_scopes` calls this on
+    /// every debug lowering and not only when the diagnostic is on.
+    fn census_home_blocks(&self) -> [usize; 4] {
+        let (mut switch, mut deopt, mut ty, mut op) = (0usize, 0, 0, 0);
+        let mut promoted = 0usize;
+        let mut dropped = 0usize;
+        for id in 0..self.home_dropped.len() {
+            if self.gp_reg_of.get(id).copied().flatten().is_none() {
+                continue;
+            }
+            promoted += 1;
+            if self.home_dropped[id] {
+                dropped += 1;
+                continue;
+            }
+            // Cast: an index into the node arena is a `NodeId`.
+            let nid = id as NodeId;
+            // No node behind a promoted index is not a shape this can
+            // attribute, and dropping it silently would break the identity
+            // below. `op` is the honest bucket: whatever it is, its home store
+            // is not one this pass can reason about.
+            let Some(node) = self.graph.nodes.get(id) else {
+                op += 1;
+                continue;
+            };
+            let is_phi = matches!(node.op, crate::ir::Op::Phi);
+            let switches_on = if is_phi {
+                ir_drop_phi_home_enabled()
+                    && ir_deopt_regs_enabled()
+                    && ir_phi_copy_regs_enabled()
+                    && ir_skip_live_republish_enabled()
+            } else {
+                ir_drop_home_enabled()
+                    && ir_publish_at_def_enabled()
+                    && ir_deopt_regs_enabled()
+                    && ir_skip_live_republish_enabled()
+                    && ir_phi_copy_regs_enabled()
+            };
+            if !switches_on {
+                switch += 1;
+                continue;
+            }
+            // The frame-state obligation, in the same widening order the
+            // predicates use: nameable in a register, or named by no deopt
+            // that can happen (a phi's own publisher makes the trap-free arm
+            // redundant for it, which is why the two spellings differ).
+            let named_reachable = self
+                .deopt_named_reachable
+                .get(id)
+                .copied()
+                .unwrap_or(true);
+            let nameable = self.deopt_nameable.get(id).copied().unwrap_or(false);
+            let frame_ok = if is_phi {
+                nameable || !named_reachable
+            } else {
+                nameable
+                    || (self.graph_cannot_deopt() && self.assigned_gpr(nid).is_some())
+                    || (!named_reachable && self.assigned_gpr(nid).is_some())
+            };
+            if !frame_ok {
+                deopt += 1;
+                continue;
+            }
+            if !matches!(node.ty, IrType::Int | IrType::Long) {
+                ty += 1;
+                continue;
+            }
+            // A phi has no defining arm to certify; reaching here means the
+            // predicate said yes, so this is unreachable for one. Ordinary
+            // values fall to the store-shape clause.
+            if is_phi || !op_home_is_one_store_rax(&node.op) {
+                op += 1;
+            }
+        }
+        debug_assert_eq!(
+            dropped + switch + deopt + ty + op,
+            promoted,
+            "the home census lost a promoted value: {dropped} dropped, [{switch}, {deopt}, {ty}, {op}] kept, against {promoted} promoted. Every clause of `value_home_droppable` / `phi_home_droppable` needs a cause here, or this line reads low for a reason nobody can chase -- which is exactly how the census it replaced came to report zero on a compile that dropped three homes."
+        );
+        [switch, deopt, ty, op]
     }
 
     /// May this phi's home word go unwritten?
@@ -2274,6 +2433,26 @@ impl<'a> Lowerer<'a> {
                 }
             }
         }
+        // The DEFERRED carry, read the same way and on the same three checks
+        // as the adjacent one, minus the `buf.pos()` proof — which is exactly
+        // what this slot cannot offer, since a whole arm was emitted in
+        // between. What stands in for it is `op_preserves_rcx`, checked when
+        // that arm was lowered (`lower_data_node_tracked`), plus the allowance
+        // running out if more than one arm ever gets between the two.
+        if let Some((prod, cons, _)) = self.deferred_rcx {
+            if prod == id {
+                if self.cur_def != Some(cons) {
+                    self.refuse_deferred("read outside its planned consumer");
+                } else if dst != RCX {
+                    self.refuse_deferred("read into a register other than RCX");
+                } else {
+                    self.deferred_rcx = None;
+                    self.carry_deferred_read += 1;
+                    self.carries_read += 1;
+                    return;
+                }
+            }
+        }
         // 2026-09-02: a constant is an IMMEDIATE, not a frame word. The
         // `Op::Const` arm still writes its home (a deopt frame may name it,
         // and some sites still read slots directly), but no reader of a
@@ -2333,6 +2512,56 @@ impl<'a> Lowerer<'a> {
         let rex = 0x48u8 | (((src >= 8) as u8) << 2) | ((dst >= 8) as u8);
         self.buf
             .emit(&[rex, 0x89, 0xC0 | ((src & 7) << 3) | (dst & 7)]);
+    }
+
+    /// `CMP a, b` — register to register, any pair, 64-bit when `wide`.
+    ///
+    /// `39 /r` is `CMP r/m, r`, so the FIRST operand goes in the ModRM `r/m`
+    /// field and the second in `reg` — the opposite nesting from the mnemonic,
+    /// and the reason this is a named helper rather than three inline literals.
+    /// The flags it sets are `a - b`, which is the order `CmpCond::x64_cc`
+    /// expects.
+    ///
+    /// The 32-bit form emits REX only when it has to name an extended register,
+    /// so a comparison of two low registers stays two bytes exactly as
+    /// `CMP EAX, ECX` did.
+    fn emit_cmp_reg_reg(&mut self, a: u8, b: u8, wide: bool) {
+        let (bytes, len) = cmp_reg_reg_bytes(a, b, wide);
+        self.buf.emit(&bytes[..len]);
+    }
+
+    /// `CMP a, [RBP - offset]` — 64-bit when `wide`.
+    ///
+    /// `3B /r` is `CMP r, r/m`, the mirror of the `39 /r` above: here the FIRST
+    /// operand is the `reg` field and the second comes from memory, which is
+    /// the direction needed to compare a resident value against one still in
+    /// its frame slot. Flags are `a - [slot]`, the same order
+    /// `CmpCond::x64_cc` expects.
+    ///
+    /// The 32-bit form reads four bytes where the `MOV` it replaces read eight.
+    /// That is the same comparison: the slot holds a sign-extended `int` in its
+    /// low word, and the `CMP EAX, ECX` this replaces only ever looked at those
+    /// four bytes either.
+    fn emit_cmp_reg_frame(&mut self, a: u8, offset: i32, wide: bool) {
+        let rex = if wide { 0x48u8 } else { 0x40u8 } | (((a >= 8) as u8) << 2);
+        if rex != 0x40 {
+            self.buf.emit_byte(rex);
+        }
+        self.buf.emit_byte(0x3B);
+        self.emit_rbp_modrm_disp(a, offset);
+    }
+
+    /// Is `id` a value some carry is holding in RAX or RCX right now?
+    ///
+    /// A carried value must be read through `gp_load_value`, which is what
+    /// takes it out of the slot; a site that reads it any other way would leave
+    /// the carry stranded and refuse the compile. `plan_carries` already
+    /// declines to carry anything the residency file assigned a register, so a
+    /// resident value is never carried — this is the belt to that braces,
+    /// because the failure is silent at the point it is made.
+    fn carry_names(&self, id: NodeId) -> bool {
+        matches!(self.live_carry, Some((prod, _, _, _)) if prod == id)
+            || matches!(self.deferred_rcx, Some((prod, _, _)) if prod == id)
     }
 
     /// Latch a structured bailout raised from an infallible legacy accessor.
@@ -3250,8 +3479,9 @@ impl<'a> Lowerer<'a> {
     /// Restore the callee-saved registers. Emitted at every exit, and it must
     /// not disturb RAX — a method's return value and the `i64::MIN`
     /// exception/deopt sentinel both travel there. `MOVUPS` into an XMM
-    /// satisfies that for free, and the GPR restores target RBX/R12–R15, which
-    /// is a set RAX could never have been in: see `IR_GP_LINEAR_SCAN`.
+    /// satisfies that for free, and the GPR restores target RBX/R12–R15 (plus
+    /// RSI/RDI on Win64), a set RAX could never have been in because every
+    /// member of it is callee-saved and RAX is not: see `IR_GP_LINEAR_SCAN`.
     fn emit_callee_saved_restore(&mut self) {
         let restores: Vec<(u8, i32)> = self.saved_xmm_regs().collect();
         for (reg, off) in restores {
@@ -3938,12 +4168,13 @@ impl<'a> Lowerer<'a> {
     /// adds 10 and not 6. The load stays a single aligned 32-bit read, so it is
     /// as atomic as the `MOV ECX` it replaces.
     ///
-    /// **Sound here and NOT in the single-pass backend**, for the reason
-    /// `emit_test_safepoint_flag_rip` gives two hundred lines below: this
-    /// lowerer never duplicates emitted bytes to a second address, so a
-    /// displacement that is right when emitted stays right. `x64`'s twin of
-    /// this guard sits inside a body its native unroller byte-copies, and is
-    /// deliberately left alone.
+    /// Sound here **for free**: this lowerer never duplicates emitted bytes to
+    /// a second address, so a displacement that is right when emitted stays
+    /// right — the reason `emit_test_safepoint_flag_rip` gives two hundred
+    /// lines below. `x64`'s twin sits inside a body its native unroller
+    /// byte-copies and needs the fixup pass to earn the same shape; it has one
+    /// (`rip_abs_disp32_patches`, declaring a 4-byte trail for the `imm32`)
+    /// and emits the same instruction since 2026-09-10.
     fn emit_cmp_layout_epoch_rip(&mut self, addr: usize, expected: u32) -> bool {
         if !ir_epoch_guard_rip_enabled() {
             return false;
@@ -4746,6 +4977,10 @@ impl<'a> Lowerer<'a> {
     /// whole poll in one 7-byte instruction, reporting whether the flag was
     /// within ±2GB RIP reach of it.
     ///
+    /// Reach only. Whether the short form is WANTED is
+    /// `jit_rip_safepoint_poll_enabled()`, and the sole caller asks that first
+    /// — see [`Self::emit_safepoint_poll`].
+    ///
     /// Mirrors `x64/emit.rs`'s `emit_test_mem8_abs_imm8`; the two backends
     /// emit the same poll and this keeps them saying the same thing. `F6 /0 ib`
     /// with ModRM `mod=00, rm=101` is the RIP-relative form, and the
@@ -4774,16 +5009,28 @@ impl<'a> Lowerer<'a> {
     /// Emit the default-on cooperative poll used at method entries and loop
     /// back-edges. The lowerer keeps all live values in frame slots, so the
     /// no-argument slow path may be called directly.
+    ///
+    /// Both gates come from `x64::licm` rather than being re-derived here, and
+    /// that is the whole point of routing through them. This function used to
+    /// parse `CRATONVM_JIT_SAFEPOINT_POLLS` inline — once per emitted poll site
+    /// rather than once per process — and never looked at
+    /// `CRATONVM_JIT_RIP_SAFEPOINT_POLL` at all, so the lever documented as
+    /// "emit the pre-2026-09-02 form so the two encodings can be priced in one
+    /// binary" reached only the single-pass backend. Measured 2026-09-10 on a
+    /// hot counted loop: with the switch set, **392 of 394** poll sites still
+    /// took the RIP form, because everything hot is compiled here and not
+    /// there.
     fn emit_safepoint_poll(&mut self) {
-        let enabled = cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SAFEPOINT_POLLS")
-            .and_then(|v| v.into_string().ok())
-            .is_none_or(|v| v != "0");
-        if !enabled || self.safepoint_flag_addr == 0 || self.safepoint_slow_path == 0 {
+        if !crate::x64::jit_safepoint_polls_enabled()
+            || self.safepoint_flag_addr == 0
+            || self.safepoint_slow_path == 0
+        {
             return;
         }
-        if !self.emit_test_safepoint_flag_rip() {
-            // Out of ±2GB RIP reach — materialize the address and read
-            // through it, the shape this poll had before 2026-09-02.
+        if !crate::x64::jit_rip_safepoint_poll_enabled() || !self.emit_test_safepoint_flag_rip() {
+            // The kill switch is set, or the flag is out of ±2GB RIP reach —
+            // materialize the address and read through it, the shape this poll
+            // had before 2026-09-02.
             self.emit_mov_reg_imm64(R11, self.safepoint_flag_addr as u64);
             self.buf.emit(&[0x41, 0xF6, 0x03, 0xFF]); // TEST byte ptr [R11], 0xff
         }
@@ -5054,7 +5301,16 @@ impl<'a> Lowerer<'a> {
             if reg != RAX {
                 self.emit_mov_reg_reg64(reg, RAX);
             }
-            self.live_carry = Some((id, cons, reg, self.buf.pos()));
+            if self.carry_deferred.get(id as usize).copied().unwrap_or(false) {
+                // The DEFERRED slot. `reg` is RCX by construction (the planner
+                // only defers a consumer's second operand), and the value has
+                // to survive exactly one arm before its consumer reads it.
+                debug_assert_eq!(reg, RCX, "a deferred carry is RCX-only");
+                self.deferred_rcx = Some((id, cons, 1));
+                self.carry_deferred_planned += 1;
+            } else {
+                self.live_carry = Some((id, cons, reg, self.buf.pos()));
+            }
             self.carries_taken += 1;
             if drop_store {
                 self.carry_stores_dropped += 1;
@@ -5083,6 +5339,22 @@ impl<'a> Lowerer<'a> {
     /// names it. The fallback is safe on its own terms too: a carried value's
     /// home is `home_dropped`, so any read that gets past here refuses in
     /// `slot_of_checked`.
+    /// Refuse the compile because the DEFERRED carry did not reach its
+    /// consumer the way it was planned to.
+    ///
+    /// The sibling of [`Self::refuse_carry`] and, like it, a coverage loss and
+    /// never a wrong answer: a deferred value's home is `home_dropped`, so any
+    /// read that gets past here refuses in `slot_of_checked`.
+    fn refuse_deferred(&mut self, why: &'static str) {
+        if let Some((prod, cons, _)) = self.deferred_rcx.take() {
+            self.carries_refused += 1;
+            self.latch_bailout(Bailout::with_context(
+                BailoutReason::UnallocatedValue { node: prod },
+                format!("n{prod}'s deferred carry to n{cons} did not hold: {why}"),
+            ));
+        }
+    }
+
     fn refuse_carry(&mut self, why: &'static str) {
         if let Some((prod, cons, _, _)) = self.live_carry.take() {
             self.carries_refused += 1;
@@ -7080,6 +7352,97 @@ impl<'a> Lowerer<'a> {
                 self.home_dropped[*id as usize] = true;
             }
         }
+        // ── The SECOND operand, one position further back ────────────────
+        //
+        // `ir_schedule::pair_single_use_operands` leaves a consumer's two
+        // single-use operands as `[input1, input0, cons]`. The loop above is
+        // strictly adjacent, so it sees `input0` and cannot see `input1` at
+        // all. This picks up that one extra position and only that one.
+        //
+        // `input1` is copied to RCX at its home store and has to survive
+        // `input0`'s arm. `op_preserves_rcx` is that promise and it is two ops
+        // long, because every binary arm loads its own second operand into RCX.
+        // The emitter re-checks it against what was actually LOWERED
+        // (`lower_data_node_tracked`) rather than trusting this plan.
+        //
+        // Everything else is the adjacent rule verbatim: one use, an `Int` or
+        // `Long`, a producer whose home store is one `store_rax`, a consumer
+        // that reads RAX then RCX, and no residency claim on the value.
+        if ir_carry_single_use_enabled() && ir_carry_second_operand_enabled() {
+            if self.carry_deferred.len() < n_nodes {
+                self.carry_deferred.resize(n_nodes, false);
+            }
+            for block in &self.schedule.blocks {
+                for w in 2..block.nodes.len() {
+                    let cons = block.nodes[w];
+                    let mid = block.nodes[w - 1];
+                    let prod = block.nodes[w - 2];
+                    // The middle node must already be carrying into THIS
+                    // consumer in RAX. That is what proves the three were put
+                    // together deliberately, rather than dependence order
+                    // happening to look the same.
+                    if carry_of.get(mid as usize).copied().flatten() != Some((RAX, cons)) {
+                        continue;
+                    }
+                    if carry_of.get(prod as usize).copied().flatten().is_some() {
+                        continue;
+                    }
+                    if use_count.get(prod as usize).copied().unwrap_or(0) != 1 {
+                        continue;
+                    }
+                    let (Some(pn), Some(cn), Some(mn)) = (
+                        self.graph.nodes.get(prod as usize),
+                        self.graph.nodes.get(cons as usize),
+                        self.graph.nodes.get(mid as usize),
+                    ) else {
+                        continue;
+                    };
+                    // RCX is the second operand's register, so this only ever
+                    // applies to a value read there.
+                    if cn.inputs.get(1) != Some(&prod) {
+                        continue;
+                    }
+                    if !matches!(pn.ty, IrType::Int | IrType::Long)
+                        || !matches!(cn.ty, IrType::Int | IrType::Long)
+                    {
+                        continue;
+                    }
+                    if !op_home_is_one_store_rax(&pn.op) || !op_reads_rax_then_rcx(&cn.op) {
+                        continue;
+                    }
+                    if !op_preserves_rcx(&mn.op) {
+                        continue;
+                    }
+                    if self.assigned_gpr(prod).is_some() {
+                        continue;
+                    }
+                    carry_of[prod as usize] = Some((RCX, cons));
+                    self.carry_deferred[prod as usize] = true;
+                    // The home STORE, on exactly the terms the adjacent case
+                    // uses.
+                    let consumer_traps = matches!(cn.op, Op::Div | Op::Rem);
+                    let named = deopt_named.get(prod as usize).copied().unwrap_or(true);
+                    if consumer_traps || (named && !graph_trap_free) {
+                        carry_named += 1;
+                    } else {
+                        if named {
+                            carry_unreachable += 1;
+                        }
+                        carry_droppable.push(prod);
+                    }
+                }
+            }
+        }
+        // A value whose home store is dropped has ONE readable location, so
+        // every other reader must refuse rather than take the word.
+        if !carry_droppable.is_empty() {
+            if self.home_dropped.len() < n_nodes {
+                self.home_dropped.resize(n_nodes, false);
+            }
+            for id in &carry_droppable {
+                self.home_dropped[*id as usize] = true;
+            }
+        }
         self.carry_skips = carry_skips;
         self.carry_named = carry_named;
         self.unreachable_homes += carry_unreachable;
@@ -7293,7 +7656,8 @@ impl<'a> Lowerer<'a> {
         // Found by flipping these switches on together: the probe this was
         // built on has a frame state naming every intermediate, so no carried
         // value's home was ever dropped there and the two mechanisms never met.
-        let started_carry = matches!(self.live_carry, Some((prod, _, _, _)) if prod == id);
+        let started_carry = matches!(self.live_carry, Some((prod, _, _, _)) if prod == id)
+            || matches!(self.deferred_rcx, Some((prod, _, _)) if prod == id);
         if self.home_dropped.get(id as usize).copied().unwrap_or(false)
             && !self.cur_def_published
             && !started_carry
@@ -7313,6 +7677,34 @@ impl<'a> Lowerer<'a> {
         if let Some((prod, _, _, _)) = self.live_carry {
             if prod != id {
                 self.refuse_carry("its consumer finished without reading it");
+            }
+        }
+        // The DEFERRED carry gets exactly one arm of grace, and that arm has to
+        // be one that leaves RCX alone. Both halves are checked here rather
+        // than trusted from the planner, because the planner reasons about the
+        // SCHEDULE and this reasons about what was actually lowered — and it is
+        // the second that the register image depends on.
+        //
+        // Three cases, in the order they occur: the producer that just started
+        // it, the one arm in between, and the consumer that was supposed to
+        // have read it.
+        if let Some((prod, cons, allowance)) = self.deferred_rcx {
+            if prod == id {
+                // Just started. Nothing to spend yet.
+            } else if id == cons {
+                // The consumer finished without taking it out of RCX.
+                self.refuse_deferred("its consumer finished without reading it");
+            } else if !self
+                .graph
+                .nodes
+                .get(id as usize)
+                .is_some_and(|n| op_preserves_rcx(&n.op))
+            {
+                self.refuse_deferred("an arm that can write RCX was lowered in between");
+            } else if allowance == 0 {
+                self.refuse_deferred("more than one arm came between it and its consumer");
+            } else {
+                self.deferred_rcx = Some((prod, cons, allowance - 1));
             }
         }
         self.cur_def = prev;
@@ -9042,10 +9434,38 @@ impl<'a> Lowerer<'a> {
                 // `ir_direct_calls` row nothing produced. Count it, split by
                 // whether the site is inside a relocated body, so that failure
                 // has a reading instead of only a wall clock.
-                note_ir_blind_dispatch(
-                    node.bytecode_pc
-                        .is_some_and(|pc| self.pc_is_in_a_spliced_body(pc)),
-                );
+                let in_splice = node
+                    .bytecode_pc
+                    .is_some_and(|pc| self.pc_is_in_a_spliced_body(pc));
+                note_ir_blind_dispatch(in_splice);
+                // The census counts these; it does not say WHICH site or why,
+                // and `c2-splice-checkcast-and-instanceof-20260909.md` closes
+                // on exactly that question ("that is the next thing to look
+                // at, and it is a bug, not a gap") with only a count to go on.
+                // Name the site and the state of every gate that could have
+                // routed it here, so the answer is read rather than guessed.
+                if crate::ir_stage_reporting() {
+                    let pc = node.bytecode_pc.unwrap_or(usize::MAX);
+                    // SAFETY: `info_ptr` is the same address this arm is
+                    // about to bake into the helper call as its `info_ptr`
+                    // argument; it points at a `JitInvokeInfo` owned by this
+                    // compile's `owned_invoke_infos` for the artifact's life.
+                    let info = unsafe { &*(*info_ptr as *const crate::JitInvokeInfo) };
+                    eprintln!(
+                        "[ir] blind-dispatch pc={pc} in_splice={in_splice} {}.{}{} kind={}                          num_args={num_args} ic_slot={} direct_row={} mic_helper={} abi_regs={}                          direct_calls_gate={}",
+                        info.class_name,
+                        info.method_name,
+                        info.descriptor,
+                        info.invoke_kind,
+                        self.ic_slots.get(&pc).map_or("none".to_string(), |&(m, p)| format!(
+                            "mic={m:#x},pic={p:#x}"
+                        )),
+                        self.direct_calls.contains_key(&pc),
+                        self.invoke_virtual_mic != 0,
+                        ENTRY_ABI_REGS.len(),
+                        crate::direct_jit_callee_calls_enabled(),
+                    );
+                }
                 // 1. Marshal each Java arg into the staging region.
                 for i in 0..num_args {
                     let arg = node.inputs[2 + i];
@@ -9746,12 +10166,66 @@ impl<'a> Lowerer<'a> {
                                 let ref_cmp =
                                     matches!(self.graph.nodes[a as usize].ty, IrType::Ref)
                                         || matches!(self.graph.nodes[b as usize].ty, IrType::Ref);
-                                self.gp_load_value(RAX, a);
-                                self.gp_load_value(RCX, b);
-                                if ref_cmp {
-                                    self.buf.emit(&[0x48, 0x39, 0xC8]); // CMP RAX, RCX
+                                // Both already in registers: compare them
+                                // there. A fused compare is the one arm that
+                                // may do this without owing anything else — it
+                                // defines no value, writes no home and
+                                // publishes no register, so the only thing that
+                                // outlives it is the flags, and those are the
+                                // same either way.
+                                //
+                                // Nothing downstream may assume RAX holds `a`:
+                                // the non-fused path below overwrites AL with
+                                // `SETcc` on the phi-copy layout, so no reader
+                                // could ever have relied on it.
+                                // Two in-place forms, in order of how much
+                                // they save. Both need the FIRST operand in a
+                                // register, and neither may touch a value some
+                                // carry is holding — that has to be read
+                                // through `gp_load_value` or the carry strands.
+                                //
+                                // `b` in a frame slot is the common case, not
+                                // the fallback: `peak_live` routinely exceeds
+                                // the five-register file, and a loop bound is
+                                // exactly the long-lived value that loses.
+                                let in_place = if ir_cmp_in_place_enabled()
+                                    && !self.carry_names(a)
+                                    && !self.carry_names(b)
+                                {
+                                    match (self.resident_gpr(a), self.resident_gpr(b)) {
+                                        (Some(ra), Some(rb)) => Some(Ok((ra, rb))),
+                                        // `slot_of_checked` rather than
+                                        // `slot_of`: a dropped home declines
+                                        // this form instead of latching a
+                                        // bailout on a path that has a perfectly
+                                        // good fallback.
+                                        (Some(ra), None) => self
+                                            .slot_of_checked(b)
+                                            .ok()
+                                            .map(|off| Err((ra, off))),
+                                        _ => None,
+                                    }
                                 } else {
-                                    self.buf.emit(&[0x39, 0xC8]); // CMP EAX, ECX
+                                    None
+                                };
+                                match in_place {
+                                    Some(Ok((ra, rb))) => {
+                                        self.emit_cmp_reg_reg(ra, rb, ref_cmp);
+                                        self.cmp_in_place += 1;
+                                    }
+                                    Some(Err((ra, off))) => {
+                                        self.emit_cmp_reg_frame(ra, off, ref_cmp);
+                                        self.cmp_in_place_frame += 1;
+                                    }
+                                    None => {
+                                        self.gp_load_value(RAX, a);
+                                        self.gp_load_value(RCX, b);
+                                        if ref_cmp {
+                                            self.buf.emit(&[0x48, 0x39, 0xC8]); // CMP RAX, RCX
+                                        } else {
+                                            self.buf.emit(&[0x39, 0xC8]); // CMP EAX, ECX
+                                        }
+                                    }
                                 }
                                 Some(cc.x64_cc())
                             }
@@ -13038,9 +13512,14 @@ const IR_LOWER_LS_GPRS: &[u8] = &crate::regalloc::xmm_roles::IR_GP_LINEAR_SCAN;
 /// ("it buys loads, not stores"), reached here by widening the file until the
 /// cost showed.
 ///
-/// The frame reserves all seven slots in BOTH arms ([`ir_gp_file`] narrows the
-/// handout, not the reservation), so the two arms have identical frame layouts
-/// and the measurement isolates residency rather than frame size.
+/// The numbers above were taken while the frame reserved all seven slots in
+/// BOTH arms, so they isolate residency rather than frame size. That is no
+/// longer how it is wired: [`ir_saved_gpr_bytes`] sizes the save area from
+/// [`ir_gp_file`], so the reservation now follows the handout and the OFF arm
+/// is byte-identical to the pre-widening tree. Re-running this A/B therefore
+/// compares seven-slot frames against five-slot ones and can only look BETTER
+/// for the OFF arm than the 4.6% above — which is why the number is recorded
+/// as the one taken under the older wiring rather than silently re-attributed.
 ///
 /// Worth re-running if home-slot elimination ever lands: the register file is
 /// not the binding constraint while the frame stays authoritative, and this
@@ -13058,12 +13537,19 @@ fn ir_gp_wide_enabled() -> bool {
 
 /// The GP registers THIS compile may allocate over.
 ///
-/// [`IR_LOWER_LS_GPRS`] is the file the frame is SIZED for (every entry gets a
-/// save slot reserved); this is the subset the allocator may hand out. They
-/// differ only when the kill switch is off, and narrowing the handout without
-/// narrowing the reservation is deliberate: the frame layout must not depend on
-/// a flag that `saved_gpr_regs` re-reads, which is the drift
-/// `saved_xmm_bytes`' own comment warns about.
+/// [`IR_LOWER_LS_GPRS`] is the widest file the platform's ABI offers; this is
+/// the subset THIS compile may hand out, and they differ only when the kill
+/// switch is off. The reservation follows the handout — [`ir_saved_gpr_bytes`]
+/// and `Lowerer::saved_gpr_regs` both size from here, not from the constant —
+/// so with the switch off the frame is byte-identical to the pre-widening tree
+/// rather than paying 16 bytes for two registers nothing can name.
+///
+/// Safe only because this is a `OnceLock`: every reader resolves the same
+/// answer for the life of the process, so the frame layout cannot drift from
+/// the handout between `Lowerer::new` and an emission site. That is exactly
+/// the hazard `saved_xmm_bytes`' own comment warns about, and the `OnceLock`
+/// is what discharges it — a per-compile or thread-local re-read here would
+/// reintroduce it.
 fn ir_gp_file() -> &'static [u8] {
     if ir_gp_wide_enabled() {
         IR_LOWER_LS_GPRS
@@ -13145,7 +13631,7 @@ const IR_LOWER_SAVED_GPRS: &[u8] = crate::regalloc::xmm_roles::IR_GP_PROLOGUE_SA
 /// "the IR lowerer keeps every live value in a frame slot, so no register file
 /// is needed". That is what makes a deopt-named value's home word mandatory,
 /// and therefore what stops a register-resident value from ever losing it --
-/// see `plan_register_residency`'s `blocked_deopt` census.
+/// see the `deopt` cause of [`Lowerer::census_home_blocks`].
 /// Drop the home-word store for a loop-carried value that a deopt frame can
 /// name in its register -- **default ON** since 2026-09-05;
 /// `CRATONVM_JIT_IR_DROP_PHI_HOME=0` is the kill switch.
@@ -13321,6 +13807,44 @@ fn ir_carry_single_use_enabled() -> bool {
     }
 }
 
+/// `CRATONVM_JIT_IR_CARRY_2ND=0` — take only the adjacent carry, the shape that
+/// predates `ir_schedule::pair_single_use_operands`.
+///
+/// Default ON. This is the arm whose soundness rests on [`op_preserves_rcx`]
+/// rather than on adjacency, and a wrong entry there produces a plausible wrong
+/// integer rather than a fault — so it is the first flag to try when an
+/// optimizing-tier result is wrong rather than absent.
+fn ir_carry_second_operand_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CARRY_2ND").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
+/// `CRATONVM_JIT_IR_CMP_IN_PLACE=0` — load both operands of a fused compare into
+/// RAX and RCX before comparing them, the shape that predates 2026-09-10.
+///
+/// Default ON. A fused compare is the one arm that can read its operands
+/// wherever they already are without any further obligation: it produces no
+/// value, writes no home, publishes no register and leaves only flags. When
+/// both operands are register-resident the two `MOV`s ahead of it are pure
+/// overhead, and on a counted loop they are two of the seventeen instructions
+/// in the body.
+fn ir_cmp_in_place_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CMP_IN_PLACE").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
 /// Does lowering `op` read its first input into RAX, and its second (if it has
 /// one) into RCX, before emitting anything else?
 ///
@@ -13421,7 +13945,7 @@ fn ir_alu_imm_enabled() -> bool {
 ///
 /// `graph.safepoints` records the FULL OPERAND STACK at every bci, so an
 /// intermediate is "deopt-named" from its definition until its consumer pops
-/// it. Both `plan_register_residency` (`blocked_deopt`) and the single-use
+/// it. Both the `deopt` cause of [`Lowerer::census_home_blocks`] and the single-use
 /// carry (`still_deopt_named`) refuse on that. Yet `OsrTierBench.kernel`
 /// reports `sentinel_free=true` — the body emits no deopt stub and no
 /// call-exception stub, so it cannot transfer to the interpreter from anywhere
@@ -13526,7 +14050,7 @@ pub fn ir_drop_unreachable_homes_enabled() -> bool {
 ///
 /// The claim is checked against the emission rather than trusted: see
 /// [`ir_drop_unreachable_homes_enabled`].
-fn op_cannot_deopt(op: &Op) -> bool {
+pub(crate) fn op_cannot_deopt(op: &Op) -> bool {
     matches!(
         op,
         Op::Start
@@ -13771,6 +14295,12 @@ static IR_BLIND_DISPATCH: [std::sync::atomic::AtomicU64; 2] = [
 
 fn note_ir_blind_dispatch(in_splice: bool) {
     IR_BLIND_DISPATCH[usize::from(in_splice)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Also charge it to THIS compile, so the acceptance gate can price the
+    // splice trade for the body in front of it. The census above is cumulative
+    // across every compile in the process and cannot answer that question.
+    if in_splice {
+        crate::ir_evidence::note_blind_dispatch_in_splice();
+    }
 }
 
 /// `(in the method's own code, inside a spliced body)`. See
@@ -13796,7 +14326,59 @@ pub fn ir_aastore_census() -> u64 {
     IR_AASTORE_LOWERED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-fn op_home_is_one_store_rax(op: &Op) -> bool {
+/// Does this op's lowering arm leave RCX untouched from entry to exit?
+///
+/// Asked of the ONE arm that runs between a deferred RCX carry's `MOV RCX, RAX`
+/// and the consumer that reads RCX — see `plan_carries`' second-operand pass
+/// and [`Lowerer::deferred_rcx`]. If the arm writes RCX, the consumer reads
+/// whatever the arm left there instead of its operand: a wrong answer, not a
+/// crash, and one no existing test would show.
+///
+/// **Two entries, and the shortness is the point.** Every BINARY arm loads its
+/// own second operand with `gp_load_value(RCX, node.inputs[1])`, so none of the
+/// `Add`/`Sub`/`And`/`Or`/`Xor` family can ever be here; `Op::Neg` writes RCX in
+/// its `IrType::Double` arm; the shift family puts the count in CL, which is
+/// RCX. What is left is the width conversions, whose arms are a load into RAX,
+/// one fixed instruction and a `store_rax`.
+///
+/// That still covers the shape this was built for — mixed `int`/`long`
+/// arithmetic, where an `I2L` widens one operand of a `long` expression — which
+/// is common enough in Java to be worth the machinery.
+///
+/// **Widening this list means reading the arm, not the op name.** The first
+/// attempt at it listed six ops that all write RCX, and both the unit suite and
+/// the `ir_vs_singlepass` differential suite passed with it in.
+/// `every_rcx_preserving_arm_leaves_rcx_alone` is what makes a wrong entry
+/// fail: it scans the claimed arms' source for any mention of RCX and pins the
+/// exact bytes they emit, because a raw `buf.emit(&[..])` can name RCX in a
+/// ModRM byte where no identifier scan would see it.
+/// The bytes of `CMP a, b` — 64-bit when `wide` — and how many of them.
+///
+/// A free function so the encoding can be tested against known-good vectors
+/// without standing up a `Lowerer`. It is worth testing: a ModRM field swapped
+/// here compares two registers that both exist, so the result is a plausible
+/// wrong branch rather than a fault.
+///
+/// `39 /r` is `CMP r/m, r`, so the FIRST operand lands in `r/m` and the second
+/// in `reg` — the opposite nesting from the mnemonic. REX.R extends the `reg`
+/// field (the second operand) and REX.B the `r/m` field (the first).
+fn cmp_reg_reg_bytes(a: u8, b: u8, wide: bool) -> ([u8; 3], usize) {
+    let rex = if wide { 0x48u8 } else { 0x40u8 } | (((b >= 8) as u8) << 2) | ((a >= 8) as u8);
+    let modrm = 0xC0 | ((b & 7) << 3) | (a & 7);
+    if rex == 0x40 {
+        // No extended register and no width prefix — two bytes, exactly the
+        // `CMP EAX, ECX` this replaced.
+        ([0x39, modrm, 0], 2)
+    } else {
+        ([rex, 0x39, modrm], 3)
+    }
+}
+
+pub(crate) fn op_preserves_rcx(op: &Op) -> bool {
+    matches!(op, Op::I2L | Op::L2I)
+}
+
+pub(crate) fn op_home_is_one_store_rax(op: &Op) -> bool {
     matches!(
         op,
         Op::Add
@@ -14611,6 +15193,11 @@ fn verify_mir_allocation(
 /// (C1 0.86/0.83 against C2 1.39/1.41, fifteen reps, controls agreeing to 3.5%
 /// and 1.4%). So this file closed the part of the gap it was built for and the
 /// remaining case is elsewhere — see `docs/JIT_OPTIMIZATION.md`.
+///
+/// **Retaken 2026-09-10** on `probes/FieldLoop.java` `sum`, after seven more
+/// register flags went default-ON: **1.594x** (503 ms against 812 ms over a
+/// 2.6% floor). Still there, and widening the GP file does not close it
+/// either — see [`ir_gp_wide_enabled`].
 ///
 /// Off is exactly the pre-change emission: no register is handed out, no save
 /// area is reserved, every read goes to its home word.
@@ -15542,54 +16129,37 @@ fn plan_register_residency(
     let gp_promoted = gp_reg_of.iter().filter(|r| r.is_some()).count();
     let promoted = fp_promoted + gp_promoted;
 
-    // ── Could the home slot be dropped? A census, before building it ──
+    // ── Could the home slot be dropped? The census that ASKED, retired ──
     //
     // `docs/feature-designs/ir-optional-home-slot.md` argues that a value which
-    // lives in a register for its whole range needs no frame word, and rests
-    // that on `LiveModel::pinned` covering every deopt-named value. **On this
-    // path it does not**: `release_deopt_pins` above deliberately releases
-    // exactly those pins, and pays for it by keeping every home the COLOURER
-    // planned. So a promoted value here may very well be named by a deopt
-    // frame, and its home is what that frame reads.
+    // lives in a register for its whole range needs no frame word, and rested
+    // that on `LiveModel::pinned` covering every deopt-named value. On this
+    // path it does not: `release_deopt_pins` above deliberately releases
+    // exactly those pins. So a promoted value here may very well be named by a
+    // deopt frame, and — as the design stood — its home was what that frame
+    // read.
     //
-    // Which makes the size of the opportunity an empirical question rather than
-    // a design one, and this counts it before anything is built:
+    // A census printed here counted that, under the only rule available at the
+    // time: "promoted, and named by NO safepoint, and not a phi". It answered
+    // `droppable=0` on real bytecode, and the answer was acted on — the next
+    // move it named, deopt metadata that can describe a REGISTER, is
+    // `ir-deopt-regs`, and `ir-reg-authoritative` / `ir-drop-phi-home` /
+    // `ir-phi-copy-regs` followed it.
     //
-    //   `home_droppable`  promoted, and named by no safepoint and not a phi
-    //   `blocked_deopt`   promoted, but some safepoint's locals/stack names it
-    //   `blocked_phi`     promoted, but its home is written by the edge copies
+    // **Which is why the line is gone.** Those flags widened the rule and the
+    // census did not follow: on 2026-09-10 it read `droppable=0` on
+    // `probes/FieldLoop.java` `sum` while the emission on that same compile
+    // dropped THREE homes, and
+    // `internal/performance/c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md`
+    // quoted the zero as evidence that home elimination "does not yet reach"
+    // this loop. It does. A stale diagnostic reading zero is not a neutral
+    // gap — it retires levers that are engaged.
     //
-    // A `home_droppable` of zero on real bytecode refutes the design as
-    // written, and says the next move is deopt metadata that can name a
-    // register — not a refactor of the lowering arms.
-    let (home_droppable, blocked_deopt, blocked_phi) = {
-        let mut deopt_named = vec![false; n];
-        for sp in &graph.safepoints {
-            for &v in sp.locals.iter().chain(sp.stack.iter()) {
-                if let Some(cell) = deopt_named.get_mut(v as usize) {
-                    *cell = true;
-                }
-            }
-        }
-        let (mut ok, mut deopt, mut phi) = (0usize, 0usize, 0usize);
-        for id in 0..n {
-            if gp_reg_of.get(id).copied().flatten().is_none() {
-                continue;
-            }
-            if graph
-                .nodes
-                .get(id)
-                .is_some_and(|node| matches!(node.op, Op::Phi))
-            {
-                phi += 1;
-            } else if deopt_named.get(id).copied().unwrap_or(false) {
-                deopt += 1;
-            } else {
-                ok += 1;
-            }
-        }
-        (ok, deopt, phi)
-    };
+    // The replacement is computed from the predicates that actually decide,
+    // where they decide, so it cannot drift from them again: `home_dropped`
+    // (`[ir-ls] homes: dropped_values=`) is the outcome, and
+    // `Lowerer::census_home_blocks` (`[ir-ls] homes kept:`) is the per-cause
+    // breakdown of what is left.
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
         eprintln!(
             "[ir-ls] nodes={n} positions={} peak_live={} deopt_pins_released={released} \
@@ -15610,10 +16180,7 @@ fn plan_register_residency(
              const={skip_const} single_use={skip_single_use} param_copies={param_copies} \
              spilled={skip_spilled} no_alloc={skip_no_alloc} carried_reserved={carried_reserved}"
         );
-        eprintln!(
-            "[ir-ls] home: droppable={home_droppable} blocked_deopt={blocked_deopt} blocked_phi={blocked_phi} safepoints={}",
-            graph.safepoints.len(),
-        );
+        eprintln!("[ir-ls] safepoints={}", graph.safepoints.len());
     }
     if promoted == 0 {
         return Ok(ls_refuse(
@@ -16863,17 +17430,38 @@ pub(crate) fn lower_inner_with_scopes(
             lowerer.reg_publishes_at_def,
             lowerer.homes_dropped_at_def,
         );
+        // The counterpart to `dropped_values`, and the line to read when it is
+        // low: of the values this compile PROMOTED, why each one still writes
+        // its home. See `Lowerer::census_home_blocks`.
+        let c = lowerer.census_home_blocks();
+        eprintln!(
+            "[ir-ls] homes kept: switch={} deopt={} type={} op={}",
+            c[0], c[1], c[2], c[3],
+        );
+    }
+    // The accounting identity inside `census_home_blocks` is the thing that
+    // keeps this census tied to `home_dropped`, and a check that only runs
+    // under a diagnostic env var is a check no test performs — which is the
+    // shape of the failure it exists to prevent. So a debug build pays for one
+    // extra pass and gets the assertion on every lowering, diagnostics or not.
+    #[cfg(debug_assertions)]
+    {
+        let _ = lowerer.census_home_blocks();
     }
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
         eprintln!(
             "[ir-ls] carries: planned={} taken={} read={} refused={} \
-             stores_dropped={} still_deopt_named={}",
+             stores_dropped={} still_deopt_named={} deferred={}/{} cmp_in_place={}+{}",
             lowerer.carry_of.iter().filter(|c| c.is_some()).count(),
             lowerer.carries_taken,
             lowerer.carries_read,
             lowerer.carries_refused,
             lowerer.carry_stores_dropped,
             lowerer.carry_named,
+            lowerer.carry_deferred_planned,
+            lowerer.carry_deferred_read,
+            lowerer.cmp_in_place,
+            lowerer.cmp_in_place_frame,
         );
         let s = lowerer.carry_skips;
         eprintln!(
@@ -24714,6 +25302,155 @@ mod tests {").next().unwrap_or(src);
     /// A failure here is not cosmetic. It says the allowlist has drifted from
     /// the arms and `CRATONVM_JIT_IR_DROP_HOME` would emit a body that never
     /// writes a value it later reads.
+    /// Every op [`op_preserves_rcx`] claims must have an arm that cannot write
+    /// RCX — checked against the arm's SOURCE, not against the op's name.
+    ///
+    /// The reason this test exists is a concrete near-miss: the first version of
+    /// that allowlist claimed `Add`, `Sub`, `And`, `Or`, `Xor` and `Neg`, and
+    /// **all six write RCX** — the binary family through
+    /// `gp_load_value(RCX, node.inputs[1])`, `Neg` through the sign mask in its
+    /// `IrType::Double` arm. The full unit suite and the `ir_vs_singlepass`
+    /// differential suite both passed with it in, because a deferred carry that
+    /// is never honoured fails CLOSED (`slot_of_checked` refuses a dropped
+    /// home) rather than miscompiling. Nothing would have said so.
+    ///
+    /// Two checks, because either alone can be fooled:
+    ///
+    ///   * no `RCX` identifier anywhere in the arm — catches every helper call
+    ///     that names the register;
+    ///   * the arm's raw `buf.emit(&[..])` byte literals are exactly the ones
+    ///     recorded here — catches a ModRM byte that encodes RCX as a
+    ///     destination, which no identifier scan can see.
+    /// `cmp_reg_reg_bytes` against hand-checked encodings.
+    ///
+    /// A swapped ModRM field here compares two registers that both exist, so
+    /// the failure is a plausible wrong branch and not a fault — which is why
+    /// the vectors are written out rather than derived by the same arithmetic
+    /// the function uses.
+    ///
+    /// The first two are the sequences this replaced, so a regression that
+    /// changes the low-register case shows up as a byte difference.
+    #[test]
+    fn cmp_reg_reg_encodes_the_known_forms() {
+        // CMP EAX, ECX — the exact two bytes the fused compare emitted before.
+        assert_eq!(cmp_reg_reg_bytes(RAX, RCX, false), ([0x39, 0xC8, 0], 2));
+        // CMP RAX, RCX — and the exact three of the ref/64-bit form.
+        assert_eq!(cmp_reg_reg_bytes(RAX, RCX, true), ([0x48, 0x39, 0xC8], 3));
+        // CMP EBX, R12D — REX.R extends the SECOND operand into r8..r15.
+        assert_eq!(cmp_reg_reg_bytes(3, 12, false), ([0x44, 0x39, 0xE3], 3));
+        // CMP R13, RBX — REX.B extends the FIRST operand.
+        assert_eq!(cmp_reg_reg_bytes(13, 3, true), ([0x49, 0x39, 0xDD], 3));
+        // Both extended, 64-bit: REX.W|REX.R|REX.B.
+        assert_eq!(cmp_reg_reg_bytes(14, 15, true), ([0x4D, 0x39, 0xFE], 3));
+    }
+
+    /// The operand ORDER must survive the r/m-versus-reg inversion: `CMP a, b`
+    /// sets the flags of `a - b`, which is what `CmpCond::x64_cc` reads.
+    ///
+    /// Stated as a distinct test because the encoding one above would still
+    /// pass if both the function and its vectors were transposed together.
+    /// `CMP EAX, ECX` is `39 C8` in every reference; `CMP ECX, EAX` is `39 C1`.
+    #[test]
+    fn cmp_reg_reg_puts_the_first_operand_in_rm() {
+        assert_eq!(cmp_reg_reg_bytes(RAX, RCX, false), ([0x39, 0xC8, 0], 2));
+        assert_eq!(cmp_reg_reg_bytes(RCX, RAX, false), ([0x39, 0xC1, 0], 2));
+    }
+
+    #[test]
+    fn every_rcx_preserving_arm_leaves_rcx_alone() {
+        let src = include_str!("ir_lower.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn lower_data_node(&mut self, id: NodeId) {")
+            .nth(1)
+            .expect("lower_data_node is in this file")
+            .split("\n    fn ")
+            .next()
+            .expect("the function ends");
+        let mut arms: Vec<(std::collections::BTreeSet<String>, String)> = Vec::new();
+        for line in body.lines() {
+            if line.starts_with("            | Op::") {
+                if let Some(last) = arms.last_mut() {
+                    collect_op_names(line, &mut last.0);
+                    continue;
+                }
+            }
+            if line.starts_with("            Op::") {
+                let mut names = std::collections::BTreeSet::new();
+                collect_op_names(line, &mut names);
+                arms.push((names, String::new()));
+                continue;
+            }
+            if let Some(last) = arms.last_mut() {
+                last.1.push_str(line);
+                last.1.push('\n');
+            }
+        }
+        assert!(
+            !arms.is_empty(),
+            "the arm scan found nothing — `lower_data_node`'s shape changed and \
+             this test would now pass vacuously"
+        );
+
+        let claimed_src = src
+            .split("pub(crate) fn op_preserves_rcx(op: &Op) -> bool {")
+            .nth(1)
+            .expect("op_preserves_rcx is in this file")
+            .split("\n}")
+            .next()
+            .expect("the function ends");
+        let mut claimed = std::collections::BTreeSet::new();
+        collect_op_names(claimed_src, &mut claimed);
+        assert!(
+            !claimed.is_empty(),
+            "the allowlist scan found nothing — `op_preserves_rcx` changed \
+             shape and this test would now pass vacuously"
+        );
+
+        // The bytes each claimed arm is allowed to emit, verified by hand
+        // against the Intel encoding. `48 63 C0` is MOVSXD RAX, EAX and
+        // `89 C0` is MOV EAX, EAX; neither names RCX in any field.
+        let permitted: &[(&str, &[&str])] = &[
+            ("I2L", &["0x48, 0x63, 0xC0"]),
+            ("L2I", &["0x89, 0xC0"]),
+        ];
+
+        for name in &claimed {
+            let arm = arms
+                .iter()
+                .find(|(names, _)| names.contains(name))
+                .unwrap_or_else(|| {
+                    panic!("`op_preserves_rcx` claims Op::{name}, which has no arm")
+                });
+            assert!(
+                !arm.1.contains("RCX"),
+                "Op::{name}'s arm names RCX, so it cannot carry a deferred \
+                 value across itself — `op_preserves_rcx` must not claim it"
+            );
+            let (_, expected) = permitted
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`op_preserves_rcx` claims Op::{name}, but this test has \
+                         no recorded byte list for it. Read the arm, verify by \
+                         hand that no emitted byte names RCX, and add it."
+                    )
+                });
+            for emitted in arm.1.match_indices("self.buf.emit(&[").map(|(i, _)| {
+                let rest = &arm.1[i + "self.buf.emit(&[".len()..];
+                rest.split(']').next().unwrap_or("").trim().to_string()
+            }) {
+                assert!(
+                    expected.iter().any(|e| *e == emitted),
+                    "Op::{name}'s arm emits `{emitted}`, which is not one of the \
+                     byte sequences this test verified. A raw encoding can name \
+                     RCX where the identifier scan cannot see it — re-verify the \
+                     arm and update the list."
+                );
+            }
+        }
+    }
+
     #[test]
     fn every_droppable_op_writes_its_home_once_through_store_rax() {
         let src = include_str!("ir_lower.rs").replace("\r\n", "\n");

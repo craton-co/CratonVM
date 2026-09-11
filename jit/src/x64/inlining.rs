@@ -82,6 +82,33 @@ pub(super) fn inline_locals_floor_disabled() -> bool {
     cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_LOCALS_FLOOR").is_some()
 }
 
+/// DIAGNOSTIC (`CRATONVM_DBG_JIT_LOCALS_FLOOR=1`): one line per reservation the
+/// open-inline-locals floor considered, while a splice is nested.
+///
+/// It prints BOTH outcomes on purpose. `BUMPED` is the guard doing its job.
+/// `KEPT` is a reservation the ONE-SIDED rule would have moved and the range
+/// rule left alone -- the population that turned out to be a miscompile, so a
+/// run can COUNT it instead of inferring it from a bug report.
+/// `inline_locals_floor_bumps()` counts only the first kind.
+pub(super) fn dbg_note_locals_floor(
+    why: super::SpillReason,
+    cursor: i32,
+    slots: usize,
+    start: i32,
+    outcome: &str,
+    compiler: &super::Compiler,
+) {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_LOCALS_FLOOR").is_none() {
+        return;
+    }
+    eprintln!(
+        "[jit-locals-floor] {outcome} {why:?} cursor={cursor} slots={slots} start={start} one_sided_floor={} scopes={} in {}",
+        compiler.open_inline_locals_floor(),
+        compiler.inline_oop_scopes.len(),
+        compiler.method_label,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The spliced direct call's oop map, keyed at the RETURN ADDRESS
 // ---------------------------------------------------------------------------
@@ -1091,7 +1118,10 @@ fn inline_frame_recording() -> bool {
 /// `CompiledMethod::method_label` uses, built from the same three strings the
 /// invalidation triple is built from.
 fn inline_site_label(site: &crate::InlineSite) -> String {
-    format!("{}.{}:{}", site.class_name, site.method_name, site.descriptor)
+    format!(
+        "{}.{}:{}",
+        site.class_name, site.method_name, site.descriptor
+    )
 }
 
 fn push_inline_frame_scope(label: String, class_id: u32, entry_bci: usize) {
@@ -3928,7 +3958,11 @@ impl Compiler {
         // ENCLOSING callee's pc -- `inline_walk_at.0`, read HERE, before
         // `try_emit_inline_body` overwrites it and does not restore it.
         let inline_frame_rows_checkpoint = inline_frame_rows_len();
-        push_inline_frame_scope(inline_site_label(site), site.class_id, self.inline_walk_at.0);
+        push_inline_frame_scope(
+            inline_site_label(site),
+            site.class_id,
+            self.inline_walk_at.0,
+        );
         let inline_ok = self.try_emit_inline_body(outer_pc, site);
         pop_inline_frame_scope();
         let published = self.deopt_stubs.len() > deopt_stubs_checkpoint

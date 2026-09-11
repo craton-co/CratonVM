@@ -585,25 +585,24 @@ pub fn type_sig_to_java(
                 // "Cannot resolve T", breaking Mockito mocks of any generic type
                 // (e.g. Gradle `RepositoryHandler`). Resolving up the scope hands
                 // back the real `TypeVariableImpl`, matching HotSpot.
-                // The loop body used to open with `let mut scope =
-                // ctx.read_native_pin(scope_pin, scope);` — a SHADOW of the
-                // binding it meant to refresh. `scope = enclosing` at the foot
-                // then wrote the shadow, which died with the iteration, so
-                // every pass re-read the SAME `decl` off the pin and the walk
-                // never climbed: only the immediate declaration was ever
-                // consulted, and every variable belonging to an enclosing scope
-                // fell through to the synthetic stand-in below. The crate
-                // allows `unused_mut`, so the dead `mut` on the outer binding
-                // raised no warning. Measured cost on 2026-09-10:
-                // `AbstractObjectAssert.returns`'s `SELF`/`ACTUAL` came back
-                // with `getGenericDeclaration()` = the METHOD (HotSpot: the
-                // CLASS), so ByteBuddy could not bind them when generating
-                // AssertJ's `SoftAssertions` proxy and threw
-                // `IllegalArgumentException: Could not create type` — 17 Spring
-                // Framework test classes.
+                // The pinned root has to FOLLOW the walk. Before 2026-09-10
+                // this loop opened with `let mut scope =
+                // ctx.read_native_pin(scope_pin, scope);`, which SHADOWED the
+                // outer binding: `scope = enclosing` at the bottom wrote the
+                // shadow, the shadow died with the iteration, and the next pass
+                // re-read the ORIGINAL `decl` out of the one pin that was ever
+                // taken. The walk therefore re-tested the immediate declaration
+                // sixteen times and never climbed once, so every method-level
+                // bound that names its CLASS's variable still fell through to
+                // the synthetic stand-in below -- exactly the case the comment
+                // above says this loop exists to handle. Re-pin on each climb
+                // so `read_native_pin` returns the CURRENT scope, and release
+                // the whole run of pins on the way out (the old code leaked one
+                // pin per conversion, and every `return` inside the loop leaked
+                // it unconditionally).
+                let pin_base = ctx.pin_native_root(decl);
+                let mut scope_pin = pin_base;
                 let mut scope = decl;
-                let base_pin = ctx.pin_native_root(scope);
-                let mut scope_pin = base_pin;
                 let mut resolved: Option<Value> = None;
                 for _ in 0..16 {
                     scope = ctx.read_native_pin(scope_pin, scope);
@@ -611,6 +610,8 @@ pub fn type_sig_to_java(
                         resolved = Some(real);
                         break;
                     }
+                    // `resolve_declared_type_variable` invokes
+                    // `getTypeParameters()`, which allocates.
                     scope = ctx.read_native_pin(scope_pin, scope);
                     // Climb one lexical level. `getDeclaringClass` is the right
                     // question for a method/constructor decl and for a MEMBER
@@ -632,14 +633,12 @@ pub fn type_sig_to_java(
                     // Only consulted when `getDeclaringClass` yields nothing, so a
                     // `Method`/`Constructor` scope (which always has a declaring
                     // class, and has no `getEnclosingClass`) never reaches it.
-                    let declaring =
-                        ctx.invoke_virtual(scope, "getDeclaringClass", "()Ljava/lang/Class;", &[]);
-                    // `invoke_virtual` can collect: re-read `scope` off the pin
-                    // BEFORE comparing it with the reference just handed back,
-                    // or a moved `scope` compares unequal to itself and the walk
-                    // climbs into its own starting point.
-                    scope = ctx.read_native_pin(scope_pin, scope);
-                    let next = match declaring {
+                    let next = match ctx.invoke_virtual(
+                        scope,
+                        "getDeclaringClass",
+                        "()Ljava/lang/Class;",
+                        &[],
+                    ) {
                         Ok(Some(Value::Object(Some(enclosing)))) if enclosing != scope => {
                             Some(enclosing)
                         }
@@ -648,14 +647,14 @@ pub fn type_sig_to_java(
                     let next = match next {
                         Some(n) => Some(n),
                         None => {
-                            let enclosing_res = ctx.invoke_virtual(
+                            // The `getDeclaringClass` call above allocates.
+                            let scope = ctx.read_native_pin(scope_pin, scope);
+                            match ctx.invoke_virtual(
                                 scope,
                                 "getEnclosingClass",
                                 "()Ljava/lang/Class;",
                                 &[],
-                            );
-                            scope = ctx.read_native_pin(scope_pin, scope);
-                            match enclosing_res {
+                            ) {
                                 Ok(Some(Value::Object(Some(enclosing)))) if enclosing != scope => {
                                     Some(enclosing)
                                 }
@@ -666,17 +665,12 @@ pub fn type_sig_to_java(
                     match next {
                         Some(enclosing) => {
                             scope = enclosing;
-                            // Pin the new scope too: the next iteration's
-                            // `getTypeParameters()` / `getDeclaringClass()` calls
-                            // can collect, and `unpin_native_roots` releases every
-                            // handle from `base_pin` onward in one go at the foot
-                            // of the walk.
                             scope_pin = ctx.pin_native_root(scope);
                         }
                         None => break,
                     }
                 }
-                ctx.unpin_native_roots(base_pin);
+                ctx.unpin_native_roots(pin_base);
                 if let Some(real) = resolved {
                     return Ok(real);
                 }

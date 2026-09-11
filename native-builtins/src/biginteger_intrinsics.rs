@@ -318,14 +318,32 @@ pub fn primitive_left_shift_inplace(a: &mut [i32], len: usize, n: u32) {
     a[len - 1] = last as i32;
 }
 
-/// `shiftLeftImplWorker` — heap-array form. Out-of-place left shift
-/// that writes into `new_arr[new_idx..new_idx+numIter-1]` from the
-/// first `numIter` words of `old_arr`. Callers are responsible for
-/// sizing `new_arr`.
+/// `shiftLeftImplWorker` — heap-array form. Out-of-place left shift that
+/// writes `numIter` words into `new_arr[new_idx..new_idx+numIter]` from
+/// `old_arr[0..=numIter]`. Callers are responsible for sizing `new_arr`.
 ///
-/// Note: this matches OpenJDK 25's intrinsic exactly, which does NOT
-/// write the final word — `primitiveLeftShift` patches `a[len-1] <<= n`
-/// itself afterwards. So we iterate `numIter - 1` times like the JDK.
+/// # It ran one iteration short until 2026-09-10, and the comment is why
+///
+/// The note that used to sit here said OpenJDK's intrinsic "does NOT write the
+/// final word — `primitiveLeftShift` patches `a[len-1] <<= n` itself
+/// afterwards. So we iterate `numIter - 1` times like the JDK." The first half
+/// is true of `primitiveLeftShift`, which passes `numIter = len - 1` precisely
+/// so that it can patch the last word itself. The second half does not follow,
+/// and OpenJDK 25's own bytecode says so:
+///
+/// ```text
+///   9: iload 6        // oldIdx
+///  11: iload 4        // numIter
+///  13: if_icmpge 42   // while (oldIdx < numIter)
+/// ```
+///
+/// `numIter` iterations, not `numIter - 1`. The worker's contract and its one
+/// caller's argument were conflated, so the subtraction was applied twice.
+/// Measured against HotSpot 25.0.4+7 by calling the method reflectively
+/// (`apps/probes/L2IntrinsicProbe.java`): **17 of the left worker's rows and 16
+/// of the right worker's differed, every one of them the top word left at
+/// zero**, while `implSquareToLen`, `implMulAdd` and `mulAdd` in the same file
+/// were 0-diff over the same run.
 pub fn shift_left_impl_worker(
     new_arr: &mut [i32],
     old_arr: &[i32],
@@ -339,9 +357,16 @@ pub fn shift_left_impl_worker(
     debug_assert!(shift_count < 32);
     let n = shift_count & 31;
     let comp = 32 - n;
+    // The last pass reads `old_arr[num_iter]`, so a caller that sized
+    // `old_arr` to exactly `num_iter` is out of contract. Return rather than
+    // index: a panic inside a native aborts the VM, and the entry point turns
+    // the same condition into the `ArrayIndexOutOfBoundsException` Java throws.
+    if old_arr.len() <= num_iter || new_arr.len() < new_idx + num_iter {
+        return;
+    }
     let mut nidx = new_idx;
     let mut oidx = 0usize;
-    while oidx < num_iter - 1 {
+    while oidx < num_iter {
         let lo = (old_arr[oidx] as u32).wrapping_shl(n);
         let hi = (old_arr[oidx + 1] as u32).wrapping_shr(comp);
         new_arr[nidx] = (lo | hi) as i32;
@@ -362,24 +387,35 @@ pub fn shift_right_impl_worker(
     shift_count: u32,
     num_iter: usize,
 ) {
-    if num_iter < 2 {
+    // OpenJDK with numIter == 0 sets nidx to -1 (newIdx == 0) or fails the
+    // loop test immediately, so it writes nothing; a usize cannot take the
+    // `num_iter - 1` step below, so the case is answered here.
+    if num_iter == 0 {
         return;
     }
     debug_assert!(shift_count < 32);
     let n = shift_count & 31;
     let comp = 32 - n;
-    let mut idx = num_iter;
     // OpenJDK: nidx = (newIdx == 0) ? numIter - 1 : numIter
-    let mut nidx = if new_idx == 0 { num_iter - 1 } else { num_iter };
-    while nidx >= new_idx + 1 {
-        let hi = (old_arr[idx - 1] as u32).wrapping_shr(n);
-        let lo_shifted = (old_arr[idx - 2] as u32).wrapping_shl(comp);
-        new_arr[nidx - 1] = (hi | lo_shifted) as i32;
-        nidx -= 1;
-        idx -= 1;
-        if idx < 2 {
+    let top = if new_idx == 0 { num_iter - 1 } else { num_iter };
+    // The FIRST pass reads `old_arr[num_iter]`. Same reasoning as the left
+    // worker: decline rather than panic.
+    if old_arr.len() <= num_iter || new_arr.len() <= top {
+        return;
+    }
+    let mut idx = num_iter;
+    let mut nidx = top;
+    while nidx >= new_idx {
+        let hi = (old_arr[idx] as u32).wrapping_shr(n);
+        let lo_shifted = (old_arr[idx - 1] as u32).wrapping_shl(comp);
+        new_arr[nidx] = (hi | lo_shifted) as i32;
+        if nidx == 0 {
+            // Java decrements to -1 here and the `nidx >= newIdx` test ends
+            // the loop. usize has no -1, so the exit moves in front.
             break;
         }
+        nidx -= 1;
+        idx -= 1;
     }
 }
 
@@ -501,11 +537,13 @@ fn native_shift_left_impl_worker(ctx: &mut dyn NativeContext, args: &[Value]) ->
 
     let new_len = ctx.array_length(new_arr);
     let old_len = ctx.array_length(old_arr);
-    if num_iter > old_len {
+    // The worker reads `oldArr[numIter]` on its last pass, so `numIter` equal
+    // to the length is already out of range, and it writes `numIter` cells
+    // from `newIdx`.
+    if num_iter > 0 && num_iter >= old_len {
         return Err(RuntimeError::aioobe_index_only(num_iter as i32).into());
     }
-    // Worker writes to (numIter - 1) cells starting at new_idx; ensure room.
-    if num_iter > 0 && new_idx + (num_iter - 1) > new_len {
+    if new_idx + num_iter > new_len {
         return Err(RuntimeError::aioobe_index_only((new_idx + num_iter) as i32).into());
     }
 
@@ -544,7 +582,14 @@ fn native_shift_right_impl_worker(ctx: &mut dyn NativeContext, args: &[Value]) -
 
     let new_len = ctx.array_length(new_arr);
     let old_len = ctx.array_length(old_arr);
-    if num_iter > old_len || num_iter > new_len {
+    // Reads `oldArr[numIter]`; writes down from `newArr[numIter]`, or from
+    // `newArr[numIter - 1]` when `newIdx` is zero.
+    let top = if new_idx == 0 {
+        num_iter.saturating_sub(1)
+    } else {
+        num_iter
+    };
+    if num_iter > 0 && (num_iter >= old_len || top >= new_len) {
         return Err(RuntimeError::aioobe_index_only(num_iter as i32).into());
     }
 
@@ -775,7 +820,15 @@ mod tests {
         assert_eq!(z, expected, "2048-bit implSquareToLen must equal naive_mul");
     }
 
-    // 6) shiftLeftImplWorker — n=1 base case covers KC16 hot path.
+    // 6) shiftLeftImplWorker - n=1 base case covers KC16 hot path.
+    //
+    //    `numIter` is 3, not 4, and that is the CONTRACT rather than a
+    //    shortened loop: `primitiveLeftShift` passes `len - 1` because it
+    //    patches `a[len - 1] <<= n` itself, and the worker reads
+    //    `oldArr[numIter]`, so `numIter == old.len()` would be out of range.
+    //    This test used to pass 4 against a 4-word array and assert the top
+    //    word stayed zero - which is also what an off-by-one in the worker
+    //    produces, so it could not tell the two apart.
     #[test]
     fn shift_left_impl_worker_n1() {
         let mut new_buf = vec![0i32; 4];
@@ -785,15 +838,13 @@ mod tests {
             0x3333_3333i32,
             0x4444_4444i32,
         ];
-        shift_left_impl_worker(&mut new_buf, &old, 0, 1, 4);
-        // For n=1, last word is patched by the wrapper, not the worker. The
-        // worker writes idx 0..2.
+        shift_left_impl_worker(&mut new_buf, &old, 0, 1, 3);
         // new_buf[i] = (old[i]<<1) | (old[i+1]>>>31)
         let expected = vec![
             ((old[0] as u32) << 1 | ((old[1] as u32) >> 31)) as i32,
             ((old[1] as u32) << 1 | ((old[2] as u32) >> 31)) as i32,
             ((old[2] as u32) << 1 | ((old[3] as u32) >> 31)) as i32,
-            0i32, // last word untouched by worker
+            0i32, // patched by primitiveLeftShift, which is why numIter is 3
         ];
         assert_eq!(new_buf, expected);
     }
@@ -803,13 +854,80 @@ mod tests {
     fn shift_left_impl_worker_n15() {
         let mut new_buf = vec![0i32; 3];
         let old = vec![0x1234_5678i32, 0x9ABC_DEF0u32 as i32, 0x1111_2222i32];
-        shift_left_impl_worker(&mut new_buf, &old, 0, 15, 3);
+        shift_left_impl_worker(&mut new_buf, &old, 0, 15, 2);
         let expected = vec![
             ((old[0] as u32) << 15 | ((old[1] as u32) >> 17)) as i32,
             ((old[1] as u32) << 15 | ((old[2] as u32) >> 17)) as i32,
             0i32,
         ];
         assert_eq!(new_buf, expected);
+    }
+
+    // 6b) Both workers, against rows MEASURED on HotSpot 25.0.4+7 rather than
+    //     recomputed from this file's own arithmetic.
+    //
+    //     A test that rebuilds its expectation from the same expression the
+    //     implementation uses agrees with the implementation by construction;
+    //     tests 6 and 7 above do exactly that, which is half of why the
+    //     off-by-one survived them. These literals come from running
+    //     `apps/probes/L2IntrinsicProbe.java` on HotSpot, which calls the two
+    //     methods reflectively so nothing else is in the answer.
+    //
+    //     The magnitude below is (2^127 - 2)'s - the value `RJdkSecurity`
+    //     asserts on when `java/math/BigInteger` yields to real bytecode.
+    #[test]
+    fn the_shift_workers_match_hotspot_on_the_m127_magnitude() {
+        let m127 = vec![
+            0x7FFF_FFFFi32,
+            0xFFFF_FFFFu32 as i32,
+            0xFFFF_FFFFu32 as i32,
+            0xFFFF_FFFEu32 as i32,
+        ];
+
+        // shiftRightImplWorker(newArr, m127, newIdx=1, shiftCount=1, numIter=3)
+        let mut r1 = vec![0i32; 4];
+        shift_right_impl_worker(&mut r1, &m127, 1, 1, 3);
+        assert_eq!(r1, vec![0, -1, -1, -1], "right worker, newIdx = 1");
+
+        // ...and with newIdx = 0, where OpenJDK starts at numIter - 1.
+        let mut r0 = vec![0i32; 4];
+        shift_right_impl_worker(&mut r0, &m127, 0, 1, 3);
+        assert_eq!(r0, vec![-1, -1, -1, 0], "right worker, newIdx = 0");
+
+        // numIter = 1 is ONE pass, not zero. The old body returned early for
+        // `num_iter < 2` and wrote nothing at all.
+        let mut r_one = vec![0i32; 4];
+        shift_right_impl_worker(&mut r_one, &m127, 1, 1, 1);
+        assert_eq!(r_one, vec![0, -1, 0, 0], "right worker, numIter = 1");
+
+        let mut l_one = vec![0i32; 4];
+        shift_left_impl_worker(&mut l_one, &m127, 0, 1, 1);
+        assert_eq!(l_one, vec![-1, 0, 0, 0], "left worker, numIter = 1");
+
+        // numIter = 0 writes nothing on both sides, and must not panic.
+        let mut r_zero = vec![0i32; 4];
+        shift_right_impl_worker(&mut r_zero, &m127, 1, 1, 0);
+        assert_eq!(r_zero, vec![0, 0, 0, 0], "right worker, numIter = 0");
+        let mut l_zero = vec![0i32; 4];
+        shift_left_impl_worker(&mut l_zero, &m127, 0, 1, 0);
+        assert_eq!(l_zero, vec![0, 0, 0, 0], "left worker, numIter = 0");
+    }
+
+    // 6c) An out-of-contract call declines instead of panicking.
+    //
+    //     A panic inside a native aborts the whole VM, so the pure helpers
+    //     bounds-check and return; the entry points raise the AIOOBE that Java
+    //     would. Reaching this is a caller bug either way - the point is which
+    //     failure the operator gets.
+    #[test]
+    fn an_undersized_array_declines_rather_than_panicking() {
+        let short = vec![1i32, 2, 3];
+        let mut out = vec![0i32; 3];
+        shift_left_impl_worker(&mut out, &short, 0, 1, 3); // would read short[3]
+        assert_eq!(out, vec![0, 0, 0]);
+        let mut out2 = vec![0i32; 3];
+        shift_right_impl_worker(&mut out2, &short, 1, 1, 3); // would read short[3]
+        assert_eq!(out2, vec![0, 0, 0]);
     }
 
     // 8) primitive_left_shift_inplace — n=1 in-place, full chain.
@@ -948,7 +1066,7 @@ mod tests {
                 Value::Object(Some(old_arr)),
                 Value::Int(0),
                 Value::Int(15),
-                Value::Int(3),
+                Value::Int(2),
             ],
         )
         .expect("ok");
@@ -960,6 +1078,30 @@ mod tests {
             0i32,
         ];
         assert_eq!(result, expected);
+    }
+
+    // 16b) The heap entry points reject `numIter == oldArr.length`, which the
+    //      corrected worker would read one past.
+    #[test]
+    fn native_shift_worker_rejects_num_iter_at_the_array_length() {
+        let mut ctx = mock_ctx();
+        let new_buf = alloc_int_arr(&mut ctx, &vec![0i32; 3]);
+        let old_arr = alloc_int_arr(&mut ctx, &vec![1i32, 2, 3]);
+        let args = [
+            Value::Object(Some(new_buf)),
+            Value::Object(Some(old_arr)),
+            Value::Int(0),
+            Value::Int(1),
+            Value::Int(3),
+        ];
+        assert!(
+            native_shift_left_impl_worker(&mut ctx, &args).is_err(),
+            "left: numIter == oldArr.length must throw"
+        );
+        assert!(
+            native_shift_right_impl_worker(&mut ctx, &args).is_err(),
+            "right: numIter == oldArr.length must throw"
+        );
     }
 
     // 17) Native shiftLeftImplWorker — out-of-range shift count rejected.

@@ -58,19 +58,40 @@ suite run that produced the original also printed `hotspot baseline: none --
 every failure will be attributed to CratonVM`, which is exactly the condition
 under which a load-gated failure becomes a VM bug on paper.
 
-## Checked and found to have already resolved itself (not filed as not-a-bug — nothing left to explain)
+## Checked, cleared once, and BACK — with a different cause (2026-09-10)
 
 `org.springframework.boot.kafka.autoconfigure.KafkaAutoConfigurationIntegrationTests`
 was flagged 2026-08-12 as `EMPTY` under CratonVM (`3 tests found, 3 skipped, 0
 started` — read at the time as an environment-gated Testcontainers/Docker
 conditional disable, not a hang or defect). Rechecked 2026-08-20 on Azure
 Linux (`20.80.105.49`) against both a fresh HotSpot run and a fresh `dev`-tip
-CratonVM build: **both now run and pass all 3 tests via Kafka's embedded
-KRaft test cluster** (`kafka-cluster-test-kit`, no Docker/Testcontainers
-involved at all — `containersFailed=0`, `3 tests successful`, `0 skipped`,
-identical on both VMs). Whatever produced the 2026-08-12 skip no longer
-applies on either the current classpath or current `dev`; there is no
-divergence left to document.
+CratonVM build: **both ran and passed all 3 tests** via Kafka's embedded KRaft
+test cluster (`kafka-cluster-test-kit`, no Docker/Testcontainers involved at
+all). That reading was correct for what it measured, and the row sat here as
+"nothing left to explain".
+
+**It is failing again as of 2026-09-10, and this time it IS a CratonVM bug.**
+2 of 3 tests fail with `AssertionFailedError: Expecting value to be true but
+was false` — a `latch.await(30, SECONDS)` that expires — while stock HotSpot
+25 on the same classpath is 2 of 2 clean and CratonVM `--nojit` is 2 of 2
+clean. The cause is a JIT miscompile of `scala.runtime.Statics.anyHash(Long)`
+in the embedded broker, filed with a twenty-line reproducer in
+[`../../internal/fixed-suite-bugs/springboot/kafka-scala-statics-anyhash-jit-miscompile-FIXED-20260910.md`](../../internal/fixed-suite-bugs/springboot/kafka-scala-statics-anyhash-jit-miscompile-FIXED-20260910.md) (FIXED the same day).
+
+Two lessons for this page, and they are why the row is being kept rather than
+deleted:
+
+* **A latch-expiry assertion looks exactly like host load and was not.** It
+  reproduces 3 of 3 alone on an idle host (load 2.9–6.4). The broker's own log
+  carried the real message — 354 `NoSuchElementException: key not found: -2`
+  from `kafka.server.ReplicaManager$.isListOffsetsTimestampUnsupported` — and
+  the consumer side only ever saw "The server experienced an unexpected error
+  when processing the request., retrying." **Read the embedded server's log,
+  not just the test's assertion.**
+* **"Resolved itself" is a statement about one day's binary.** Nothing was
+  fixed in August; the defect that bites now is nondeterministic and lives in a
+  code path (Scala hashing) the August run happened not to miscompile. A row
+  cleared without a named cause has to be re-checked, not retired.
 
 ## Checked and found to be a genuine, still-open CratonVM-side gap — NOT included above
 

@@ -1931,7 +1931,8 @@ fn lookup_known_system_library_symbol(name: &str, c_name: &std::ffi::CStr) -> Op
     static LIBZSTD_HANDLE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     let handle = *LIBZSTD_HANDLE.get_or_init(|| {
         for lib in [b"libzstd.so.1\0".as_slice(), b"libzstd.so\0".as_slice()] {
-            let handle = unsafe { libc::dlopen(lib.as_ptr() as *const libc::c_char, libc::RTLD_LAZY) };
+            let handle =
+                unsafe { libc::dlopen(lib.as_ptr() as *const libc::c_char, libc::RTLD_LAZY) };
             if !handle.is_null() {
                 return Some(handle as usize);
             }
@@ -4309,9 +4310,9 @@ fn safe_native_call_impl(
                 {
                     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                     if *ON.get_or_init(|| cratonvm_types::flags().gc.dbg_deadref_store) {
-                        if let Some(reason) = cratonvm_gc::gen_heap::dead_young_ref_reason_global(
-                            o.as_ptr() as usize,
-                        ) {
+                        if let Some(reason) =
+                            cratonvm_gc::gen_heap::dead_young_ref_reason_global(o.as_ptr() as usize)
+                        {
                             static N: std::sync::atomic::AtomicU64 =
                                 std::sync::atomic::AtomicU64::new(0);
                             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
@@ -8328,7 +8329,6 @@ struct VmNativeThreadBlocker {
     thread_id: ThreadId,
 }
 
-
 /// Payload size in bytes of a primitive array, or `None` when `arr` is
 /// not one.
 ///
@@ -10805,7 +10805,24 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         if opts.initialize {
             // Best-effort init; failures bubble back as Err.
             if let Err(e) = self.initialize_class(cid) {
-                return Err(format!("initialize after define failed for {name}: {e}"));
+                // `MethodCallFailed::ExceptionThrown`'s Display is the raw
+                // heap address, so this used to read
+                //   initialize after define failed for <name>: exception
+                //   thrown: ref(0x7b5b041c3720)
+                // which names neither the exception class nor its message. The
+                // caller turns this string into a `ClassFormatError` message,
+                // so the pointer is what an operator, a probe diff and a
+                // regression vector all end up holding. `describe_throwable`
+                // is the same reader the uncaught-exception path uses.
+                let cause = match &e {
+                    cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc) => {
+                        describe_throwable(&self.shared, *exc)
+                    }
+                    other => other.to_string(),
+                };
+                return Err(format!(
+                    "initialize after define failed for {name}: {cause}"
+                ));
             }
         }
         Ok(cid)
@@ -13514,17 +13531,14 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         n
     }
 
-    fn write_primitive_array_bytes(
-        &mut self,
-        arr: ObjectRef,
-        byte_off: usize,
-        src: &[u8],
-    ) -> bool {
-        let Some(capacity) = primitive_array_byte_capacity_of(&self.shared.mem.heap, arr)
-        else {
+    fn write_primitive_array_bytes(&mut self, arr: ObjectRef, byte_off: usize, src: &[u8]) -> bool {
+        let Some(capacity) = primitive_array_byte_capacity_of(&self.shared.mem.heap, arr) else {
             return false;
         };
-        if byte_off.checked_add(src.len()).map_or(true, |end| end > capacity) {
+        if byte_off
+            .checked_add(src.len())
+            .map_or(true, |end| end > capacity)
+        {
             return false;
         }
         if src.is_empty() {
@@ -13544,14 +13558,8 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         }
     }
 
-    fn read_primitive_array_bytes(
-        &self,
-        arr: ObjectRef,
-        byte_off: usize,
-        dst: &mut [u8],
-    ) -> usize {
-        let Some(capacity) = primitive_array_byte_capacity_of(&self.shared.mem.heap, arr)
-        else {
+    fn read_primitive_array_bytes(&self, arr: ObjectRef, byte_off: usize, dst: &mut [u8]) -> usize {
+        let Some(capacity) = primitive_array_byte_capacity_of(&self.shared.mem.heap, arr) else {
             return 0;
         };
         if byte_off >= capacity {
@@ -17551,8 +17559,17 @@ impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
             use crate::runtime::kernels::GemmKind;
             let kind = if half { GemmKind::F16 } else { GemmKind::F32 };
             Some(crate::runtime::offload::dispatch_gemm(
-                self.shared, kind, a_handle, b_handle, c_handle, m, n, k, trans_a,
-                trans_b, stream_handle,
+                self.shared,
+                kind,
+                a_handle,
+                b_handle,
+                c_handle,
+                m,
+                n,
+                k,
+                trans_a,
+                trans_b,
+                stream_handle,
             ))
         }
         #[cfg(not(feature = "gpu-offload"))]
@@ -20059,22 +20076,37 @@ pub fn invoke_or_native(
     let redefine_probe: Option<(ClassId, bool, u32)> = {
         let cm = shared.classes.class_manager.read();
         cm.get_loaded_class_id(effective_class).and_then(|cid| {
-            crate::classloading::find_method_recursive(cid, method_name, descriptor, &cm.class_store)
-                .map(|(m, declaring_id)| {
-                    (
-                        declaring_id,
-                        !m.is_native() && m.code().is_some(),
-                        cm.class_redefine_generation(declaring_id),
-                    )
-                })
+            crate::classloading::find_method_recursive(
+                cid,
+                method_name,
+                descriptor,
+                &cm.class_store,
+            )
+            .map(|(m, declaring_id)| {
+                (
+                    declaring_id,
+                    !m.is_native() && m.code().is_some(),
+                    cm.class_redefine_generation(declaring_id),
+                )
+            })
         })
+    };
+    // The ZIP arm of the immunity is receiver-aware: a Mockito inline mock of
+    // `JarFile`/`ZipFile` is not an archive this VM opened, so the native it
+    // keeps has nothing to answer from and the woven advice is the only body
+    // that can. See `zip_immunity_waived_for_receiver`.
+    let redefine_receiver = match args.first() {
+        Some(Value::Object(Some(obj))) => Some(*obj),
+        _ => None,
     };
     let native_shadow_dropped_by_redefine = crate::classloading::any_class_redefined()
         && redefine_probe.is_some_and(|(_, has_body, generation)| has_body && generation > 0)
-        && !crate::runtime::interpreter::redefine_immune_forced_native(
+        && !crate::runtime::interpreter::redefine_immune_forced_native_for_receiver(
+            shared,
             effective_class,
             method_name,
             descriptor,
+            redefine_receiver,
         );
     if crate::runtime::env_cache::dbg_native_shadow()
         && crate::classloading::any_class_redefined()
@@ -20097,10 +20129,12 @@ pub fn invoke_or_native(
         if seen.lock().insert(key) {
             eprintln!(
                 "[native-shadow] {effective_class}.{method_name}{descriptor}                  dropped={native_shadow_dropped_by_redefine} probe={redefine_probe:?}                  immune={}",
-                crate::runtime::interpreter::redefine_immune_forced_native(
+                crate::runtime::interpreter::redefine_immune_forced_native_for_receiver(
+                    shared,
                     effective_class,
                     method_name,
-                    descriptor
+                    descriptor,
+                    redefine_receiver,
                 ),
             );
         }
@@ -27737,17 +27771,24 @@ fn invoke_on_class_shared_inner(
                     let name_override_suppressed_by_redefine = name_override
                         && crate::classloading::any_class_redefined()
                         && cm.class_redefine_generation(declaring_id) > 0
-                        && !crate::runtime::interpreter::redefine_immune_forced_native(
+                        && !crate::runtime::interpreter::redefine_immune_forced_native_for_receiver(
+                            shared,
                             class_name,
                             method_name,
                             descriptor,
+                            match args.first() {
+                                Some(Value::Object(Some(obj))) => Some(*obj),
+                                _ => None,
+                            },
                         );
                     if name_override_suppressed_by_redefine {
                         CHECK_OVERRIDE_REDEFINE_SUPPRESSED
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     let check_override = method.is_abstract()
-                        || (!jdk_only_strict && name_override && !name_override_suppressed_by_redefine);
+                        || (!jdk_only_strict
+                            && name_override
+                            && !name_override_suppressed_by_redefine);
                     // A name disjunct wanted this native and strict policy said
                     // no. Record it where every other §1.4 observation goes, so
                     // `--jdk-only-report` names the triple instead of leaving a
