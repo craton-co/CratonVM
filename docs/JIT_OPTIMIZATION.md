@@ -4942,8 +4942,9 @@ moves earlier inside ONE `CopyOp`, crossing only that copy's own store, so
 
 `FieldLoop.sum`'s back edge goes from four instructions to two, its loop body
 from 26 to 24, and its body from 1071 to 1059 bytes. Measured
-(`tools/tier-ab/cpu-ab.ps1`, three invocations, all outside their own floors
-and agreeing on the sign): **−4.8% / −7.3% / −10.5%**, i.e. about **1.08x** on
+(`tools/tier-ab/cpu-ab.ps1`, four invocations, all outside their own floors and
+agreeing on the sign, the last re-taken after merging `dev`):
+**−4.8% / −7.0% / −7.3% / −10.5%**, i.e. about **1.08x** on
 that shape, and the tiering inversion there goes **1.208x → 1.11x** on this
 host. `FieldLoop.sumWide`, which folds twice as many copies, is
 **UNMEASURABLE** — four times the arithmetic per iteration, so the same two
@@ -4976,6 +4977,8 @@ isolation, and the next person reaching for "the loop-carried value round-trips
 through the frame" has a measurement to answer first.
 
 Full write-up, including the per-iteration instruction budget that says where
-the remaining gap is (no unrolling: 3 instructions; an explicit receiver null
-check where the single-pass tier's is implicit: 2), in
+the remaining gap is — **20 instructions against 26**, with the two survivors
+being that this tier does not unroll (so it pays the safepoint poll and the back
+edge every iteration rather than every fourth) and that its receiver null check
+is explicit where the single-pass tier's is implicit — in
 [`internal/performance/c2-the-phi-copy-staging-register-20260911.md`](internal/performance/c2-the-phi-copy-staging-register-20260911.md).

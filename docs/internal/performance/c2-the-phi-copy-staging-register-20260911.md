@@ -182,28 +182,47 @@ the explanation has to answer this measurement first.
 
 ## 4. What the disassembly says instead: a per-iteration instruction budget
 
-Both tiers' `FieldLoop.sum`, hot path only (the safepoint-poll slow path and
-the `getfield` helper path excluded), counted per ITERATION because the
-single-pass tier unrolls 4x and the optimizing tier does not:
+Both tiers' `FieldLoop.sum`, counted on the HOT path only — the safepoint-poll
+slow path, the `getfield` checked-helper path and the legacy-layout arm all
+excluded — and per ITERATION, because the single-pass tier unrolls 4x and the
+optimizing tier does not:
 
 | | single-pass | optimizing |
 |---|---:|---:|
-| instructions per iteration | ~19 | **26** |
-| taken branches per iteration | 2 | **3** |
+| instructions per iteration | **20** | **26** |
+| of which TAKEN branches | 1 | **4** |
+| frame loads + stores | 4 | 4 |
 
-Where the optimizing tier's extra seven go:
+Six instructions, and the measured gap is 1.208x — the right size, which is
+more than the earlier per-iteration framings in `docs/JIT_OPTIMIZATION.md` could
+say (they compared 44 against 95 and landed at 2.2x against a measured 1.6x).
 
-| cost | instructions | who else pays it |
-|---|---:|---|
-| safepoint poll + back edge | 3 | single-pass pays them once per FOUR iterations |
-| explicit `test rax,rax` / `je` receiver null check | 2 | single-pass folds it into the header read it needs anyway |
-| **phi edge copies staged through RAX** | **2** | **nobody — this is the one below** |
+**Three differences account for them, and only the third is free.** Sizing each
+one exactly is not attempted here, because the two bodies differ in more than
+one place at once and an arithmetic split would be a guess dressed as a count:
 
-The first is unrolling, which the optimizing tier does not do and which
-`docs/JIT_OPTIMIZATION.md` already prices at about 1.12x. The second is
-`CRATONVM_JIT_IR_THIS_NONNULL`, built, default OFF, and measured *slower* — a
-result that page flags as the most suspicious thing on it. The third is
-avoidable outright, and is what this page is about.
+* **The optimizing tier does not unroll.** The safepoint poll and the back edge
+  are three instructions it pays every iteration and the single-pass tier pays
+  once per four. `docs/JIT_OPTIMIZATION.md` prices unrolling at about 1.12x on
+  this shape, measured by taking it away from the fast arm.
+* **The receiver null check is explicit here and implicit there.** The
+  optimizing tier emits `test rax,rax` / `je` and then reads the header byte;
+  the single-pass tier reads the header byte first (`mov ecx,[rax+0Fh]`) and
+  lets the page fault be the null check, so the same fact costs it nothing
+  extra. Partly offset: the optimizing tier's compact test is one instruction
+  where the single-pass tier's is two. `CRATONVM_JIT_IR_THIS_NONNULL` is the
+  lever, it is built, it is default OFF, and it measured ~20% SLOWER — which
+  that document flags as the most suspicious result on it and the best handle
+  anyone has on whatever is really going on in this loop.
+* **The phi edge copies stage through RAX.** Four instructions to move two
+  values that are already in a register or already in their word. Nothing else
+  in either tier pays this, it needs no analysis to remove, and it is what §5
+  removes.
+
+The frame-traffic row is worth reading beside §3: **the two tiers touch the
+frame the same number of times per iteration**, so "the optimizing tier
+round-trips its values through memory" is not what separates them on this
+shape, which is the same conclusion §3 reaches from the other direction.
 
 ## 5. The change
 
@@ -221,9 +240,11 @@ because the value is already where the publish was going to put it. On
 `FieldLoop.sum`'s back edge:
 
 ```asm
-                            ; before                  after
-35d: mov rax,r15            ; mov rax,r15 / mov r12,rax    -> mov r12,r15
-360: mov rbx,[rbp-98h]      ; mov rax,[..] / mov rbx,rax   -> mov rbx,[rbp-98h]
+; before                              ; after
+mov rax,r15                           mov r12,r15
+mov r12,rax                           mov rbx,[rbp-98h]
+mov rax,[rbp-98h]
+mov rbx,rax
 ```
 
 **Four instructions become two**, once per iteration, and the loop preheader's
@@ -257,16 +278,23 @@ and a method's copies are its GP-resident phis times its edges into the header.
 **Three invocations, because §5.2 of the GP-register page says a few-percent
 claim needs invocations rather than a tighter floor:**
 
-| invocation | A (`=0`) | C (control) | B (`=1`) | floor | effect |
-|---|---:|---:|---:|---:|---:|
-| 1 | 1.063 s | 1.102 s | 0.969 s | 3.6% | **−10.5%** |
-| 2 | — | — | — | 0.7% | **−7.3%** |
-| 3 | — | — | — | 2.4% | **−4.8%** |
+| invocation | floor | effect |
+|---|---:|---:|
+| 1 (A 1.063 s / C 1.102 s / B 0.969 s) | 3.6% | **−10.5%** |
+| 2 | 0.7% | **−7.3%** |
+| 3 | 2.4% | **−4.8%** |
+| 4 — **re-taken after merging `origin/dev`**, different binary | 4.7% | **−7.0%** |
 
-All three agree on the sign and all three are outside their own floor; the
+(Invocation 1's medians are quoted to show the shape; the rest ran on a host
+whose absolute level had drifted, and only the within-invocation ratio is
+readable anyway — which is the whole point of the control arm. Invocation 4 is
+the merge check: a clean auto-merge is not a re-measurement, and this branch
+merged 25 commits of `dev` between invocation 3 and landing.)
+
+All four agree on the sign and all four are outside their own floor; the
 spread across invocations (5.7 points) is the quantity §5.2 says to report, and
 the honest reading is **about 1.08x, somewhere between 1.05x and 1.12x**.
-Checksums identical in every run of all three.
+Checksums identical in every run of all four.
 
 And the tier comparison, retaken with the change in, twice:
 
@@ -281,12 +309,13 @@ invocations agree to one point.
 ### The shape it does NOT help, which engages twice as hard
 
 `FieldLoop.sumWide` — the same loop with four independent accumulators —
-folds **eight** copies to `sum`'s four and measures **+1.5% against a 3.0%
+folds **eight** copies to `sum`'s four (§5) and measures **+1.5% against a 3.0%
 floor: UNMEASURABLE**. That is not a contradiction, it is the same fact from
-the other side: `sumWide` does four times the arithmetic per iteration, so two
-instructions are a quarter of the share they are in `sum`, and its independent
-accumulators overlap what is left. A per-iteration saving is worth what the
-iteration costs.
+the other side. Its body is 1.8x the size and does four times the arithmetic per
+iteration, so the instructions this removes are a much smaller share of it; and
+its four independent accumulators overlap whatever latency is left, which is the
+property `docs/JIT_OPTIMIZATION.md` introduced that probe to isolate in the
+first place. **A per-iteration saving is worth what the iteration costs.**
 
 Recorded rather than omitted, because a page that reports only the shape its
 change flatters is the failure mode this directory keeps writing down.
