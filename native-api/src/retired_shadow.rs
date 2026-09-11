@@ -1233,6 +1233,25 @@ const RETIRED_SHADOW_PREFIXES: &[&str] = &[
     // see `RETIRED_SHADOW_PHASE2_TRIPLES`. A prefix admits a package to the
     // binary search; the table decides what is retired, and it retires one row.
     "sun/nio/ch/",
+    // 2026-09-10, the `--jdk-only` loader-and-bootstrap lane. The measurement
+    // is in
+    // `docs/known-issues/jdk-only/the-builtin-classloader-could-not-link-and-getname-was-never-tagged-20260910.md`;
+    // the lane's own page retired with it.
+    // Two NARROW prefixes, for the reason the `sun/nio/ch/` note above gives: a
+    // prefix only admits a class to the binary search, and
+    // `RETIRED_SHADOW_L7_TRIPLES` retires exactly two rows under them. In
+    // particular `java/security/SecureClassLoader` is spelled out rather than
+    // `java/security/`, which is lane 6's whole prefix set and is NOT admitted
+    // here. `the_l7_prefixes_retire_only_the_two_measured_rows` is the guard.
+    //
+    // Lane 2's `java/lang/` above arrived in the SAME merge and subsumes
+    // `java/lang/ClassLoader` entirely. The entry stays anyway: it is what
+    // makes lane 7's two rows reachable on their own terms, and deleting it
+    // would silently hand that reachability to a prefix another lane owns and
+    // could re-narrow. A duplicate prefix costs one `starts_with` on a path
+    // that has already matched.
+    "java/lang/ClassLoader",
+    "java/security/SecureClassLoader",
     // 2026-09-10, lane 5 (`java/util/concurrent/`, `jdk/internal/misc/`,
     // `sun/misc/`, `java/lang/Thread*`, `jdk/internal/vm/`). `java/util/`
     // above already admits `java/util/concurrent/`; these four are the rest of
@@ -2305,6 +2324,64 @@ static RETIRED_SHADOW_PHASE3_TRIPLES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Lane 7's wave, 2026-09-10: the two triples that stop
+/// `jdk/internal/loader/BuiltinClassLoader` from linking under `--jdk-only`.
+///
+/// # The measurement
+///
+/// `BuiltinClassLoader.<clinit>` is, in JDK 25 bytecode,
+/// `if (!ClassLoader.registerAsParallelCapable()) throw new InternalError(...)`,
+/// and it threw. `CRATONVM_DBG_CLINIT_FAIL=1` named the class and the exception
+/// (the `NoClassDefFoundError` every consumer sees names only the consumer);
+/// `apps/probes/L7ParallelCapableProbe.java` then named the broken link, with
+/// no reflection and therefore no `--add-opens` requirement:
+///
+/// ```text
+///                                            HotSpot  armed  unarmed
+///   Direct       extends ClassLoader          true     true   true
+///   UnderSecure  extends SecureClassLoader    true     FALSE  true
+///   UnderUrl     extends URLClassLoader       true     FALSE  true
+/// ```
+///
+/// `ParallelLoaders.register(c)` answers `loaderTypes.contains(c.getSuperclass())`,
+/// so `BuiltinClassLoader` — whose superclass is `SecureClassLoader` — can only
+/// register once `SecureClassLoader` has. It never did, and the two
+/// registrations below are jointly why:
+///
+///  * `ClassLoader.registerAsParallelCapable()Z` was a native returning a
+///    constant `Int(1)`. It never touched the real `ParallelLoaders.loaderTypes`
+///    set, so every caller was told `true` while the SET stayed empty of
+///    everything the JDK believed it had registered.
+///  * `java/security/SecureClassLoader.<clinit>()V` was a **no-op native**
+///    (S111r9, a `--real-jdk` Spring-Boot-launcher workaround). It runs during
+///    the built-in loader allocation chain, i.e. from inside a native, where the
+///    dispatch dial cannot see it — so no arm of
+///    `CRATONVM_ENFORCE_NATIVE_SHADOW` could ever have yielded this row. Only a
+///    registration-time refusal reaches it, which is what this table is.
+///
+/// That combination is the corrupt MIXTURE `scripts/jdk-only-blast-radius.sh`
+/// caveat 4 describes rather than a partial retirement: half the chain kept the
+/// native's fictional answer and half read the real set.
+///
+/// # Why retirement rather than a faithful native
+///
+/// The native's own comment said a faithful implementation was "not
+/// implementable ... `NativeContext` exposes no caller-class / stack-walk
+/// accessor". `NativeContext::frame_class_ids` has existed since the
+/// `latestUserDefinedLoader` work, so that sentence is stale — but a native
+/// mirroring `ParallelLoaders` would still have to keep a second copy of a JDK
+/// set in step with the JDK's own, and §1.4's remedy for a shadow over concrete
+/// bytecode is to yield to it. Both rows are bucket A (the image method
+/// declares `Code`), so yielding has somewhere to go.
+///
+/// `Compatible` is untouched — a `SyntheticStub` registers and dispatches
+/// normally there — which is what keeps the S111r9 workaround intact for the
+/// `--real-jdk` fat-jar launchers it was written for.
+static RETIRED_SHADOW_L7_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/lang/ClassLoader", "registerAsParallelCapable", "()Z"),
+    ("java/security/SecureClassLoader", "<clinit>", "()V"),
+];
+
 /// Lane 5 — `java/util/concurrent/`, `Thread`, `Unsafe`, retired 2026-09-10.
 ///
 /// `docs/internal/retired/lane-5-concurrent-thread-unsafe-RETIRED-20260910.md`
@@ -3274,6 +3351,7 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
         || RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_L2_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(&key).is_ok()
+        || RETIRED_SHADOW_L7_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_L5_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_L1_TRIPLES.binary_search(&key).is_ok()
 }
@@ -3308,6 +3386,14 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // `the_tables_const_lists_every_table_the_predicate_consults` exists to
     // catch, and it is what caught it.
     RETIRED_SHADOW_L1_TRIPLES,
+    // And here by the 2026-09-11 merge of lane 7, for exactly the reason the
+    // note above gives — same shape, second occurrence in two days. Lane 7's
+    // table and this const were also written on branches that never saw each
+    // other, `git merge` resolved both files, and the omission was again
+    // invisible to every per-table test. Two in two days says the failure mode
+    // is structural: a new table is added at the bottom of a list in one file
+    // and consulted in another, and nothing textual connects them.
+    RETIRED_SHADOW_L7_TRIPLES,
 ];
 
 #[cfg(test)]
@@ -3604,6 +3690,21 @@ mod tests {
         }
     }
 
+    /// Sorted, unique and binary-searched like every sibling, and for the same
+    /// reason: an out-of-order entry makes the predicate answer `false` for a
+    /// row that is present, which reads as "not retired" and is invisible.
+    #[test]
+    fn the_l7_table_is_sorted_and_unique() {
+        for w in RETIRED_SHADOW_L7_TRIPLES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "out of order or duplicated: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
     /// Sorted and duplicate-free, for the reason every sibling table is: the
     /// predicate binary-searches it, so an out-of-order entry answers `false`
     /// for a row that is present -- which reads as "not retired" and is
@@ -3616,6 +3717,19 @@ mod tests {
                 "out of order or duplicated: {:?} then {:?}",
                 w[0],
                 w[1]
+            );
+        }
+    }
+
+    /// An entry outside every prefix in [`RETIRED_SHADOW_PREFIXES`] answers
+    /// `false`, which reads as "not retired" and retires nothing. This wave
+    /// ADDED two prefixes, which is exactly the edit that is easy to forget.
+    #[test]
+    fn every_l7_entry_is_reachable() {
+        for (c, m, d) in RETIRED_SHADOW_L7_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "unreachable entry: {c}.{m}{d}"
             );
         }
     }
@@ -3636,6 +3750,26 @@ mod tests {
         }
     }
 
+    /// No lane-7 triple may be claimed by another wave. This asks about EVERY
+    /// other table, including the two (L1, L5) that landed on `dev` after this
+    /// test was written -- a disjointness test that names a fixed list of
+    /// siblings stops being a disjointness test the day a sibling is added.
+    #[test]
+    fn the_l7_table_is_disjoint_from_the_earlier_ones() {
+        for t in RETIRED_SHADOW_L7_TRIPLES {
+            assert!(
+                RETIRED_SHADOW_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_L1_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_L2_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_L5_TRIPLES.binary_search(t).is_err(),
+                "{t:?} is in the lane-7 table and an earlier one"
+            );
+        }
+    }
+
     /// No triple may be claimed by two waves. Harmless to the predicate, which
     /// ORs; NOT harmless to the record, because two waves would each report
     /// having retired it and the next reader cannot tell which measurement
@@ -3651,6 +3785,79 @@ mod tests {
                 "{t:?} is in the L5 table and an earlier one"
             );
         }
+    }
+
+    /// The two prefixes lane 7 added are a licence for exactly two rows.
+    ///
+    /// `java/lang/ClassLoader` is a PREFIX, so it also admits
+    /// `java/lang/ClassLoader$ParallelLoaders` and `java/lang/ClassLoaderHelper`
+    /// to one extra binary search each, and `java/security/SecureClassLoader`
+    /// admits that class whole. None of their other triples is retired, and this
+    /// test is what says so — the guard
+    /// `the_phase2_wave_retires_only_the_triple_it_measured` provides for
+    /// `sun/nio/ch/`.
+    #[test]
+    fn the_l7_prefixes_retire_only_the_two_measured_rows() {
+        for (c, m, d) in [
+            (
+                "java/lang/ClassLoader",
+                "getUnnamedModule",
+                "()Ljava/lang/Module;",
+            ),
+            (
+                "java/lang/ClassLoader",
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+            ),
+            (
+                "java/lang/ClassLoader",
+                "getParent",
+                "()Ljava/lang/ClassLoader;",
+            ),
+            ("java/lang/ClassLoader", "<init>", "(Ljava/lang/ClassLoader;)V"),
+            (
+                "java/lang/ClassLoader",
+                "getSystemClassLoader",
+                "()Ljava/lang/ClassLoader;",
+            ),
+            (
+                "java/lang/ClassLoaderHelper",
+                "mapAlternativeName",
+                "(Ljava/io/File;)Ljava/io/File;",
+            ),
+            (
+                "java/security/SecureClassLoader",
+                "getPermissions",
+                "(Ljava/security/CodeSource;)Ljava/security/PermissionCollection;",
+            ),
+        ] {
+            assert!(
+                !triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} was retired by a prefix, not by a measurement"
+            );
+        }
+    }
+
+    /// Both lane-7 rows are retired AS A PAIR, and the pair is the fix.
+    ///
+    /// Retiring only `SecureClassLoader.<clinit>` would run its real bytecode
+    /// into the constant-`true` native and register nothing; retiring only
+    /// `registerAsParallelCapable` would leave the `<clinit>` a no-op, so
+    /// nothing would call it. Either half alone leaves
+    /// `BuiltinClassLoader.<clinit>` throwing `InternalError` — the same "all
+    /// four or none" shape as the `LogRecord` source pair above.
+    #[test]
+    fn the_l7_pair_is_retired_together() {
+        assert!(triple_is_retired_shadow(
+            "java/lang/ClassLoader",
+            "registerAsParallelCapable",
+            "()Z"
+        ));
+        assert!(triple_is_retired_shadow(
+            "java/security/SecureClassLoader",
+            "<clinit>",
+            "()V"
+        ));
     }
 
     /// The four prefixes lane 5 added are an EARLY-OUT, not a licence.

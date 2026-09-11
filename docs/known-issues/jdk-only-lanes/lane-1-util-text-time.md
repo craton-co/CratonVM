@@ -429,6 +429,21 @@ Every remaining HELD family has a named blocker. In rough order of rows:
   is fixed by yielding; the observation is kept because it is evidence about
   which half of the locale subsystem is wrong.
 
+The CLDR provider failures in the corpus are in this lane's territory, and the
+L7 gate on them is **lifted as of 2026-09-10**: `jdk/internal/loader/BuiltinClassLoader`
+links, and `Class.getName` is a reviewed `Intrinsic` (it was recorded as tagged
+a day earlier and was not — see the
+[`the-builtin-classloader-could-not-link-and-getname-was-never-tagged-20260910`](../jdk-only/the-builtin-classloader-could-not-link-and-getname-was-never-tagged-20260910.md) record §2).
+
+**Re-price them; do not read the pre-2026-09-10 failure text.** One CLDR symptom
+in particular is now yours to own rather than to wait on:
+`System.out.printf` -> `java.util.Formatter` -> `DecimalFormatSymbols.getInstance`
+-> `LocaleProviderAdapter.forType` throws
+`ServiceConfigurationError: Locale provider adapter "CLDR" cannot be instantiated`
+under `CRATONVM_ENFORCE_NATIVE_SHADOW=all`. That is not a loader failure; it
+takes out every armed vector and every armed PROBE that formats a string, so it
+is worth pricing before the retirement rows.
+
 ## 11. Standing warnings this lane confirmed
 
 - **A Rust side table is not the object.** §9's items 1 and 2 are the same
