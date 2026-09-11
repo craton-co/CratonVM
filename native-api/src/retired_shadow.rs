@@ -3346,14 +3346,21 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
         return false;
     }
     let key = (class_name, method_name, descriptor);
-    RETIRED_SHADOW_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_L2_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_L7_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_L5_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_L1_TRIPLES.binary_search(&key).is_ok()
+    // Driven off `RETIRED_SHADOW_TABLES` rather than one `||` arm per table.
+    // `any` short-circuits exactly as the chain did and each table is still
+    // binary-searched, so this is the same work in the same order of magnitude
+    // — what changes is that a table which is not in the const is not
+    // consulted, instead of being consulted while the const says otherwise.
+    // Both lane 1 and lane 7 shipped a table missing from that const; the
+    // arrangement below cannot reproduce it.
+    //
+    // The const's order differs from the chain's it replaces. That is
+    // immaterial and `no_triple_is_claimed_by_two_tables` is why: no triple is
+    // in two tables, so no input can reach a second table that would answer
+    // differently, and which table answers first is unobservable.
+    RETIRED_SHADOW_TABLES
+        .iter()
+        .any(|table| table.binary_search(&key).is_ok())
 }
 
 /// Every retired-shadow table, in one slice, so a gate can walk the whole
@@ -3415,24 +3422,37 @@ mod tests {
     /// the tables or consults one without a `binary_search`, and either is a
     /// change to this file that should be reading this comment.
     #[test]
-    fn the_tables_const_lists_every_table_the_predicate_consults() {
+    fn the_predicate_names_no_table_directly() {
+        // The inverse of the test this replaces, and the reason it can be an
+        // inverse: `triple_is_retired_shadow` now iterates
+        // `RETIRED_SHADOW_TABLES`, so "the const lists every table the
+        // predicate consults" is true by construction and no longer needs
+        // asserting. What DOES need asserting is that nobody reintroduces a
+        // hand-written arm beside the loop — one `|| RETIRED_SHADOW_LX_TRIPLES
+        // .binary_search(..)` would consult a table the const does not list,
+        // and every gate driven off the const would quietly stop covering it.
         let src = include_str!("retired_shadow.rs");
         let body = src
             .split("pub fn triple_is_retired_shadow(")
             .nth(1)
             .expect("the predicate is in this file");
-        let body = body.split("
-}
-").next().expect("the predicate has a body");
-        let consulted = body
-            .matches("RETIRED_SHADOW_")
-            .count()
-            .saturating_sub(body.matches("RETIRED_SHADOW_PREFIXES").count());
+        let body = body.split("\n}\n").next().expect("the predicate has a body");
+        let total = body.matches("RETIRED_SHADOW_").count();
+        let allowed = body.matches("RETIRED_SHADOW_PREFIXES").count()
+            + body.matches("RETIRED_SHADOW_TABLES").count();
         assert_eq!(
-            consulted,
-            RETIRED_SHADOW_TABLES.len(),
-            "`triple_is_retired_shadow` consults {consulted} tables but `RETIRED_SHADOW_TABLES` lists {}. Add the new table to the const — see its doc comment for what is skipped otherwise.",
-            RETIRED_SHADOW_TABLES.len()
+            total, allowed,
+            "`triple_is_retired_shadow` names a retired-shadow table directly. \
+             It must reach every table through `RETIRED_SHADOW_TABLES`, which \
+             is what makes the const the single place a new table is \
+             registered — and what makes every gate driven off the const cover \
+             it. Delete the hand-written arm and add the table to the const."
+        );
+        assert!(
+            body.contains("RETIRED_SHADOW_TABLES"),
+            "`triple_is_retired_shadow` no longer consults \
+             `RETIRED_SHADOW_TABLES` at all — it would answer `false` for every \
+             retired triple, silently un-retiring the whole population."
         );
     }
 
