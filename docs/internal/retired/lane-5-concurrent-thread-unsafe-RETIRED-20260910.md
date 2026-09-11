@@ -527,6 +527,35 @@ exactly. A failure that does not reproduce alone is a claim about the host, and
 the cheap tell was that two of the three arms disagreed with the first.
 
 
+### Re-verified after the 2026-09-11 dev merge
+
+Everything above is the A/B that ISOLATES this lane: two binaries from one
+revision, one file apart. The merge that followed brought 21 dev commits
+including lane 1's wave 2 (325 more retired triples), so the landing protocol's
+"release build of the MERGED tree" is a second, separate measurement, and it is
+this:
+
+```text
+  cratonvm-types                        6 targets, all ok (doc_numeric_claims
+                                        now 4/4 — dev fixed the flag count)
+  native-api --lib                      375 / 0
+  native-builtins --lib     x3 arms     4238 / 4270 / 4415, 0 failed
+  the other nine --test targets x3      all ok, stub_ratchet 12/0
+  regression-suite, l5e     --jdk-only  132 / 132
+                            SUITE=all   132 / 132
+                            SUITE=core   92 /  92
+```
+
+One red remains and it is dev's, checked against a pristine `origin/dev`
+worktree under both `--lib` and `--tests`:
+`registrar_drift::the_drift_baseline_has_no_stale_rows`.
+
+**`--tests` is fail-fast across targets**, and `registrar_drift` sorts before
+`registry_contracts` and `stub_ratchet`, so a red there means the two most
+relevant gates in the set never ran at all. The nine were re-run by name to get
+the table above. A gate set that stops at somebody else's red has not told you
+about yours.
+
 ### The instrument lesson: two arms of a filesystem probe collide
 
 `L4FilesSweep` moved by 294 in the first A/B and by −307 in the second. It is
