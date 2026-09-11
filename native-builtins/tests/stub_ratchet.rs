@@ -1432,7 +1432,77 @@ use cratonvm_types::compat::CompatibilityMode;
 /// removes the slack, and it is why this wave's delta reads +251 against the
 /// tree and +237/+248/+251 against the constants.
 ///
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1894;
+/// # Re-frozen 2026-09-10, lane 5: 1894 -> 2008, and 13 of the move is not this branch's
+///
+/// All three constants move together and the account is here, as always. The
+/// three arms on the merged tree:
+///
+/// ```text
+///   arm            constant   dev tip   this branch
+///   no-management      1883      1896          1997
+///   management         1894      1907          2008
+///   synthetic-jdk      1883      1896          1997
+/// ```
+///
+/// **The middle column is the part worth reading.** `origin/dev`'s own tip is
+/// +13 on every arm before this branch touches anything, and re-freezing to the
+/// right-hand column absorbs that silently unless it is said out loud. It is
+/// measured, not inferred: dev's `retired_shadow.rs` substituted into this tree
+/// reads 1896 / 1907 / 1896 in two separate runs, and a pristine `origin/dev`
+/// worktree agrees. The +13 landed after `b996b39f7`, the commit that last set
+/// this constant, and `RETIRED_SHADOW_L2_TRIPLES` (lane 2's eleven
+/// `Character`/`BigInteger` rows) is most of it.
+///
+/// **This branch's own share is +101 registrations for 98 table triples**, and
+/// it is case ONE of the three classified on
+/// [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`] — existing registrations
+/// relabelled `Bridge` -> `SyntheticStub`, which is a fake being labelled
+/// honestly so `--jdk-only` drops it and the JDK's own bytecode runs. Three
+/// independent measurements say so and none of them is arithmetic:
+///
+///   * the TOTAL registration count is IDENTICAL either side of the table —
+///     13610 / 13978 / 13645 with dev's `retired_shadow.rs` and 13610 / 13978
+///     / 13645 with this branch's. Rows up, total flat, which is what case one
+///     means and what distinguishes it from a new fake;
+///   * `dump_synthetic_stubs` on dev's tip lists 1717 distinct stub triples and
+///     on this branch 1815. The 98 added are exactly
+///     `RETIRED_SHADOW_L5_TRIPLES`, class for class: 16 `Unsafe`, 16
+///     `ScopedMemoryAccess`, 16 `CopyOnWriteArrayList`, 15 `ThreadPoolExecutor`,
+///     11 `CompletableFuture`, 9 `TimeUnit`, 9 `PriorityBlockingQueue`, 3
+///     `jdk/internal/misc/VM`, 2 `Thread$State`, 1 `Thread$FieldHolder`. The
+///     reverse direction (`comm -23`) is 0 rows: this branch removes none;
+///   * 98 distinct triples produce 101 REGISTRATIONS because three of them are
+///     registered at more than one ordinal and the re-tag flips every one —
+///     independently derived, and agreeing with, the "101 rows edited" count in
+///     the kind-map freeze `scripts/baselines/jdk-only-kind-map-25-linux.tsv`.
+///
+/// ## The ungated total is the only number that saw the defect, and it was stale
+///
+/// This wave was 100 triples for most of a day, and two of them —
+/// `ScheduledThreadPoolExecutor.<init>(I,ThreadFactory,RejectedExecutionHandler)`
+/// and `getCorePoolSize()I` — were rows `keep_real_scheduled_executor_bridge`
+/// keeps in real-JDK mode. The re-tag in `register` runs BEFORE
+/// `register_inner`, so that keep predicate read `SyntheticStub` and dropped
+/// them entirely. In this gate's numbers that appeared as:
+///
+/// ```text
+///   100-row table   1984 stubs out of 13608 / 13976 / 13643 total
+///    98-row table   1997 stubs out of 13610 / 13978 / 13645 total
+/// ```
+///
+/// The stub count did not move — a dropped registration is not a stub — so
+/// **the ONLY trace was the total falling by exactly 2**, which is case three
+/// ("registrations were DELETED") hiding inside a case-one wave. That number is
+/// `MEASURED_TOTAL_REGISTRATIONS_*`, which is not asserted and was 99 stale, so
+/// it could not have fired. What caught it was a unit test in another crate
+/// (`registry::tests::real_layout_mode_drops_enumset_native_surface`), by luck,
+/// and `registry::tests::real_layout_bridge_keeps_are_not_retired_shadows` now
+/// asks on purpose. Refreshing the totals below is part of this commit for
+/// exactly that reason: an ungated constant used to classify a gated one is
+/// worth only as much as its last refresh, and this is the first time one of
+/// them would have had something to say.
+///
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2008;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1461,7 +1531,11 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1894;
 /// unowned for three days before it had a constant at all.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1883;
+/// **Re-frozen 2026-09-10, lane 5: 1883 -> 1997.** +13 of that is `dev`'s tip
+/// before this branch and +101 is this branch; the account, the three-way
+/// table and the three measurements behind the classification are all on
+/// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1997;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1518,7 +1592,12 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1883;
 /// re-freeze ALL THREE — see the pointer on both siblings.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1883;
+/// **Re-frozen 2026-09-10, lane 5: 1883 -> 1997**, by running the third arm
+/// rather than copying its sibling — it lands on the same number as
+/// [`BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT`] again, as it has every time, and
+/// that is still a measurement each time rather than a rule. The account is on
+/// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1997;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -1568,13 +1647,23 @@ const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1883;
 /// `cratonvm/internal/ArrayListViewItr` rows), and the other three accumulated
 /// across merges nobody had to re-freeze for. An ungated constant used to
 /// classify a gated one is worth only as much as its last refresh.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13879;
+/// **REFRESHED 2026-09-10, lane 5: 13879 -> 13978.** None of the +99 is this
+/// branch: the total is identical with dev's `retired_shadow.rs` substituted
+/// in, which is how the stub movement beside it was classified as case one.
+/// The refresh matters more than usual this time — see the closing section on
+/// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`], where a 2-row fall in this number
+/// was the only trace a real defect left in this gate, and staleness meant
+/// nobody could have read it. The `synthetic-jdk` arm has no constant here and
+/// measured 13645 on the same tree.
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13978;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
 /// for the reason given on [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].**
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13511;
+/// **REFRESHED 2026-09-10, lane 5: 13511 -> 13610**, the same +99 and for the
+/// same reason; see [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13610;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;
