@@ -363,17 +363,19 @@ pub fn report_at_exit() {
             cratonvm_jit::ir_lower::ir_aastore_census(),
         );
         // The DEFERRED carry -- a consumer taking BOTH of its single-use
-        // operands in registers rather than one. Read as a pair with its
-        // refusal cause: `planned` alone says how often the shape was taken and
-        // nothing about how often it was there, and
+        // operands in registers rather than one. Read against its denominator:
+        // `taken` alone says how often the shape was TAKEN and nothing about
+        // how often it was there, and
         // `c2-one-carry-slot-is-the-frame-traffic-ceiling` closed on exactly
-        // that distinction. `declined_mid_writes_rcx` is every triple refused
-        // because the arm in between can write RCX, and `foldable` is the share
-        // of those whose second operand is a constant -- the ones
-        // `CRATONVM_JIT_IR_CARRY_RCX_FOLDED` converts.
-        let (dp, dr, dm, df) = cratonvm_jit::ir_lower::ir_carry_deferred_census();
+        // that distinction. `candidates` is every consumer already taking its
+        // first operand in RAX -- the shape the second slot exists for.
+        // `declined_mid_writes_rcx` is the share of those refused because the
+        // arm in between can write RCX, and `foldable` is the part of THAT
+        // which `CRATONVM_JIT_IR_CARRY_RCX_FOLDED` converts.
+        let (dc, dt, dm, df) = cratonvm_jit::ir_lower::ir_carry_deferred_census();
         eprintln!(
-            "[c2-supersede] ir deferred carries: planned={dp} read={dr}              declined_mid_writes_rcx={dm} (foldable={df})"
+            "[c2-supersede] ir deferred carries: candidates={dc} taken={dt} \
+             declined_mid_writes_rcx={dm} (foldable={df})"
         );
         // Block-exit shape. Read as a RATIO: `elided` alone cannot separate a
         // layout that is working from a method whose blocks were already in

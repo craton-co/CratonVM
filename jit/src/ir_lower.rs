@@ -1054,16 +1054,27 @@ struct Lowerer<'a> {
     carry_deferred_planned: usize,
     carry_deferred_read: usize,
     /// Why a `[input1, input0, cons]` triple was NOT deferred, per cause:
-    /// [no-RAX-carry-on-the-middle, producer, consumer, operand-position,
-    ///  middle-arm-can-write-RCX].
+    /// [0 no-RAX-carry-on-the-middle, 1 producer-already-carrying,
+    ///  2 producer-multi-use, 3 producer-type-or-arm, 4 producer-resident,
+    ///  5 operand-position, 6 consumer, 7 middle-arm-can-write-RCX].
     ///
-    /// A bare `deferred=N/M` says how often the shape was taken and nothing
-    /// about how often it was there. The last cause is the one that prices the
-    /// next increment, and `deferred_mid_foldable` splits it: how many of those
-    /// middle arms fold their own second operand into an immediate and so never
-    /// reach `gp_load_value(RCX, ..)` at all.
-    deferred_skips: [usize; 5],
+    /// A bare `deferred=N/M` says how often the shape was TAKEN and nothing
+    /// about how often it was there — the distinction
+    /// `c2-one-carry-slot-is-the-frame-traffic-ceiling` closed on — so the
+    /// causes are split finely enough to name the next increment rather than
+    /// merely to record that there was one.
+    ///
+    /// Cause 0 is every other triple of scheduled nodes and is not a candidate;
+    /// [`Self::deferred_candidates`] is the denominator the rest divide into.
+    /// `deferred_mid_foldable` splits cause 7: how many of those middle arms
+    /// fold their own second operand into an immediate and so never reach
+    /// `gp_load_value(RCX, ..)` at all.
+    deferred_skips: [usize; 8],
     deferred_mid_foldable: usize,
+    /// Windows in which the consumer already takes its FIRST operand in RAX —
+    /// the shape the second slot exists for, and the only honest denominator
+    /// for the causes above.
+    deferred_candidates: usize,
     /// Writes to RCX this lowering has emitted, through every route in this
     /// file that reaches the register. Snapshotted around each node so a
     /// deferred carry's survival is OBSERVED rather than predicted — see
@@ -1638,8 +1649,9 @@ impl<'a> Lowerer<'a> {
             carry_deferred: Vec::new(),
             carry_deferred_planned: 0,
             carry_deferred_read: 0,
-            deferred_skips: [0; 5],
+            deferred_skips: [0; 8],
             deferred_mid_foldable: 0,
+            deferred_candidates: 0,
             rcx_writes: 0,
             carries_taken: 0,
             carries_read: 0,
@@ -7458,8 +7470,9 @@ impl<'a> Lowerer<'a> {
         // Everything else is the adjacent rule verbatim: one use, an `Int` or
         // `Long`, a producer whose home store is one `store_rax`, a consumer
         // that reads RAX then RCX, and no residency claim on the value.
-        let mut deferred_skips = [0usize; 5];
+        let mut deferred_skips = [0usize; 8];
         let mut deferred_mid_foldable = 0usize;
+        let mut deferred_candidates = 0usize;
         if ir_carry_single_use_enabled() && ir_carry_second_operand_enabled() {
             if self.carry_deferred.len() < n_nodes {
                 self.carry_deferred.resize(n_nodes, false);
@@ -7477,12 +7490,13 @@ impl<'a> Lowerer<'a> {
                         deferred_skips[0] += 1;
                         continue;
                     }
-                    if carry_of.get(prod as usize).copied().flatten().is_some()
-                        || use_count.get(prod as usize).copied().unwrap_or(0) != 1
-                    {
-                        deferred_skips[1] += 1;
-                        continue;
-                    }
+                    // From here the window IS the shape the second slot exists
+                    // for — a consumer already taking its first operand in RAX
+                    // — so everything below is a CANDIDATE declined, and the
+                    // causes are split finely enough to be acted on. Above it is
+                    // every other triple of scheduled nodes, which is a
+                    // denominator no decision depends on.
+                    deferred_candidates += 1;
                     let (Some(pn), Some(cn)) = (
                         self.graph.nodes.get(prod as usize),
                         self.graph.nodes.get(cons as usize),
@@ -7490,22 +7504,36 @@ impl<'a> Lowerer<'a> {
                         continue;
                     };
                     // RCX is the second operand's register, so this only ever
-                    // applies to a value read there.
+                    // applies to a value read there. When the node two back is
+                    // not that operand, the operand is somewhere the pairing
+                    // pass could not bring it — another block, a phi, a
+                    // parameter, or behind a node it may not cross.
                     if cn.inputs.get(1) != Some(&prod) {
-                        deferred_skips[3] += 1;
+                        deferred_skips[5] += 1;
+                        continue;
+                    }
+                    if carry_of.get(prod as usize).copied().flatten().is_some() {
+                        deferred_skips[1] += 1;
+                        continue;
+                    }
+                    if use_count.get(prod as usize).copied().unwrap_or(0) != 1 {
+                        deferred_skips[2] += 1;
                         continue;
                     }
                     if !matches!(pn.ty, IrType::Int | IrType::Long)
                         || !op_home_is_one_store_rax(&pn.op)
-                        || self.assigned_gpr(prod).is_some()
                     {
-                        deferred_skips[1] += 1;
+                        deferred_skips[3] += 1;
+                        continue;
+                    }
+                    if self.assigned_gpr(prod).is_some() {
+                        deferred_skips[4] += 1;
                         continue;
                     }
                     if !matches!(cn.ty, IrType::Int | IrType::Long)
                         || !op_reads_rax_then_rcx(&cn.op)
                     {
-                        deferred_skips[2] += 1;
+                        deferred_skips[6] += 1;
                         continue;
                     }
                     // The one arm in between has to leave RCX alone. Asked of
@@ -7513,7 +7541,7 @@ impl<'a> Lowerer<'a> {
                     // through the register form of its own second operand, and
                     // a folded operand never takes that branch.
                     if !self.node_preserves_rcx(mid) {
-                        deferred_skips[4] += 1;
+                        deferred_skips[7] += 1;
                         // …and how many of those are the folded shape, so a run
                         // with the widening switched OFF still prices it.
                         if self.mid_would_fold(mid) {
@@ -7550,6 +7578,7 @@ impl<'a> Lowerer<'a> {
         }
         self.deferred_skips = deferred_skips;
         self.deferred_mid_foldable = deferred_mid_foldable;
+        self.deferred_candidates = deferred_candidates;
         self.carry_skips = carry_skips;
         self.carry_named = carry_named;
         self.unreachable_homes += carry_unreachable;
@@ -13930,8 +13959,12 @@ const RCX_FREE_WHEN_FOLDED: &[&str] = &[
     "Add", "Sub", "Mul", "And", "Or", "Xor", "Shl", "Shr", "UShr",
 ];
 
-/// Deferred carries, process-wide: `(planned, read, declined because the arm in
-/// between can write RCX, of which that arm folds its own second operand)`.
+/// Deferred carries, process-wide: `(candidate windows, taken, declined because
+/// the arm in between can write RCX, of which that arm folds its own second
+/// operand)`.
+///
+/// A CANDIDATE is a consumer already taking its first operand in RAX, which is
+/// the only honest denominator: the shape the second slot exists for.
 ///
 /// A per-compile census answers "did it fire on THIS method", which is the
 /// question a kernel asks. Retiring
@@ -13945,7 +13978,7 @@ static IR_CARRY_DEFERRED: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
-/// `(planned, read, mid_writes_rcx, of_which_foldable)` since process start.
+/// `(candidates, taken, mid_writes_rcx, of_which_foldable)` since process start.
 pub fn ir_carry_deferred_census() -> (u64, u64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (
@@ -13956,10 +13989,10 @@ pub fn ir_carry_deferred_census() -> (u64, u64, u64, u64) {
     )
 }
 
-fn note_deferred_census(planned: usize, read: usize, mid_rcx: usize, foldable: usize) {
+fn note_deferred_census(candidates: usize, taken: usize, mid_rcx: usize, foldable: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    IR_CARRY_DEFERRED[0].fetch_add(planned as u64, Relaxed);
-    IR_CARRY_DEFERRED[1].fetch_add(read as u64, Relaxed);
+    IR_CARRY_DEFERRED[0].fetch_add(candidates as u64, Relaxed);
+    IR_CARRY_DEFERRED[1].fetch_add(taken as u64, Relaxed);
     IR_CARRY_DEFERRED[2].fetch_add(mid_rcx as u64, Relaxed);
     IR_CARRY_DEFERRED[3].fetch_add(foldable as u64, Relaxed);
 }
@@ -17550,9 +17583,9 @@ pub(crate) fn lower_inner_with_scopes(
     // probe-set census reads, and a census you have to switch on is one nobody
     // has for the run they already did.
     note_deferred_census(
+        lowerer.deferred_candidates,
         lowerer.carry_deferred_planned,
-        lowerer.carry_deferred_read,
-        lowerer.deferred_skips[4],
+        lowerer.deferred_skips[7],
         lowerer.deferred_mid_foldable,
     );
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
@@ -17576,9 +17609,15 @@ pub(crate) fn lower_inner_with_scopes(
         );
         let d = lowerer.deferred_skips;
         eprintln!(
-            "[ir-ls] deferred skips: no_rax_carry={} producer={} consumer={} \
-             operand_position={} mid_writes_rcx={} (of which foldable={})",
-            d[0], d[1], d[2], d[3], d[4], lowerer.deferred_mid_foldable,
+            "[ir-ls] deferred candidates={} taken={} | declined: \
+             prod_carrying={} prod_multi_use={} prod_type_or_arm={} \
+             prod_resident={} operand_position={} consumer={} \
+             mid_writes_rcx={} (of which foldable={}) | non_candidate_windows={}",
+            lowerer.deferred_candidates,
+            lowerer.carry_deferred_planned,
+            d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+            lowerer.deferred_mid_foldable,
+            d[0],
         );
         eprintln!("[ir-ls] alu immediates folded: {}", lowerer.alu_imms_folded);
         eprintln!(
