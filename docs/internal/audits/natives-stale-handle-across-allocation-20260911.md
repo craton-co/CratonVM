@@ -169,6 +169,25 @@ six are this family is exactly what the next unit has to establish rather than
 assume — and with a reproducer per class, `[deadref-recv]`'s three new arms are
 finally being pointed at a workload that fails.
 
+One measurement to start that unit with, taken here and not chased further:
+re-running `BannerTests` at the same stress with `--nojit` and
+`CRATONVM_DBG_DEADREF_STORE=1` turns the FAIL into a **SIGSEGV**, and the
+handler is specific about it —
+
+```
+#  fault addr is inside a RECENTLY DECOMMITTED heap span:
+#     base=0x77021b000000 len=0x200000 site=unbumped-middle
+#    *** and NOT re-committed since. Something TOUCHED a span the collector
+#        proved dead ***
+```
+
+A stale pointer, one severity up from the silent version this page is about:
+the same wrong address, into a span the collector had already given back. Every
+`[deadref-*]` arm still reads zero on that run, and the eight
+`[field-by-name-dropped]` shapes are the benign ones — so whatever holds that
+pointer is not going through `set_field_by_name`, and the receiver arms did not
+see it either. That is the first question for the next unit, not an answer.
+
 The honest limit, restated from the predecessor page because it did not change:
 these fixes are not each demonstrated by a failing test. The species produces a
 plausible wrong answer at one exact instant, so a green suite is weak evidence
