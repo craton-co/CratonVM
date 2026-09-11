@@ -1226,13 +1226,12 @@ const RETIRED_SHADOW_PREFIXES: &[&str] = &[
     // 2026-09-10, lane L6. The whole adjudication, all 1,414 rows of it, is in
     // `docs/internal/retired/lane-6-net-security-RETIRED-20260910.md`.
     // ONE prefix for a lane that owns nine, and deliberately the NARROW
-    // spelling: `javax/security/auth/x500/` and not `javax/security/`.
+    // spelling: `java/net/` and not `java/`.
     //
-    // `java/net/` is NOT here. It was, through four narrowing rounds, and
-    // every class under it was measured out by a corpus vector -- the table's
-    // header names each vector beside the class it refused. A prefix whose
-    // table is empty is provably inert, but it reads to the next lane as a
-    // claim that something under it was retired.
+    // The lane's other eight prefixes carry no table, and `javax/security/`
+    // is absent even though `X500Principal` reached the last build of this
+    // wave: it was measured out by `RSslLiveSession`, like every other class
+    // this lane tried. The table's header is the ladder.
     //
     // Only these two have a table. The lane's other seven prefixes were each
     // armed on the whole probe tree and each either moved a probe AWAY from
@@ -1247,7 +1246,7 @@ const RETIRED_SHADOW_PREFIXES: &[&str] = &[
     // style: arming `javax/security/` whole is untested, and arming
     // `java/security/` + `sun/security/` + `javax/crypto/` + `javax/security/`
     // together took `SecuritySurfaceSweep` from 0 diffs to 2,594.
-    "javax/security/auth/x500/",
+    "java/net/",
 ];
 
 /// The 2026-08-30 Phase 2 wave: ONE triple, and the size is the finding.
@@ -2465,16 +2464,21 @@ static RETIRED_SHADOW_PHASE3_TRIPLES: &[(&str, &str, &str)] = &[
 /// of this table appears in the refusal set and ZERO refusals carry a
 /// survivor.**
 static RETIRED_SHADOW_L6_TRIPLES: &[(&str, &str, &str)] = &[
-    ("javax/security/auth/x500/X500Principal", "<init>", "(Ljava/io/InputStream;)V"),
-    ("javax/security/auth/x500/X500Principal", "<init>", "(Ljava/lang/String;)V"),
-    ("javax/security/auth/x500/X500Principal", "<init>", "(Ljava/lang/String;Ljava/util/Map;)V"),
-    ("javax/security/auth/x500/X500Principal", "<init>", "([B)V"),
-    ("javax/security/auth/x500/X500Principal", "equals", "(Ljava/lang/Object;)Z"),
-    ("javax/security/auth/x500/X500Principal", "getEncoded", "()[B"),
-    ("javax/security/auth/x500/X500Principal", "getName", "()Ljava/lang/String;"),
-    ("javax/security/auth/x500/X500Principal", "getName", "(Ljava/lang/String;)Ljava/lang/String;"),
-    ("javax/security/auth/x500/X500Principal", "hashCode", "()I"),
-    ("javax/security/auth/x500/X500Principal", "toString", "()Ljava/lang/String;"),
+    ("java/net/HttpURLConnection", "<init>", "(Ljava/net/URL;)V"),
+    ("java/net/HttpURLConnection", "addRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V"),
+    ("java/net/HttpURLConnection", "getHeaderFieldDate", "(Ljava/lang/String;J)J"),
+    ("java/net/HttpURLConnection", "getInstanceFollowRedirects", "()Z"),
+    ("java/net/HttpURLConnection", "getRequestMethod", "()Ljava/lang/String;"),
+    ("java/net/HttpURLConnection", "getRequestProperties", "()Ljava/util/Map;"),
+    ("java/net/HttpURLConnection", "getRequestProperty", "(Ljava/lang/String;)Ljava/lang/String;"),
+    ("java/net/HttpURLConnection", "setChunkedStreamingMode", "(I)V"),
+    ("java/net/HttpURLConnection", "setConnectTimeout", "(I)V"),
+    ("java/net/HttpURLConnection", "setDoOutput", "(Z)V"),
+    ("java/net/HttpURLConnection", "setFixedLengthStreamingMode", "(I)V"),
+    ("java/net/HttpURLConnection", "setReadTimeout", "(I)V"),
+    ("java/net/HttpURLConnection", "setRequestMethod", "(Ljava/lang/String;)V"),
+    ("java/net/HttpURLConnection", "setRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V"),
+    ("java/net/ProxySelector", "getDefault", "()Ljava/net/ProxySelector;"),
 ];
 
 /// Is this exact triple a retired §1.4 shadow?
@@ -2627,13 +2631,13 @@ mod tests {
     #[test]
     fn the_lane_l6_security_and_tls_prefixes_are_not_admitted() {
         for p in [
-            "java/net/",
             "javax/net/",
             "sun/net/",
             "java/security/",
             "sun/security/",
             "javax/crypto/",
             "javax/security/",
+            "javax/security/auth/x500/",
             "jdk/net/",
             "jdk/internal/net/",
         ] {
@@ -2648,7 +2652,7 @@ mod tests {
         // measured and refused, the narrow one was measured and taken.
         for (c, _, _) in RETIRED_SHADOW_L6_TRIPLES {
             assert!(
-                c.starts_with("javax/security/auth/x500/"),
+                c.starts_with("java/net/"),
                 "{c} is in the L6 table but outside the prefix that admits it"
             );
         }
