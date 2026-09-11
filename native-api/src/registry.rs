@@ -10232,12 +10232,30 @@ mod tests {
     /// what a §1.4 shadow retirement is for and is a mode no retiring lane
     /// measures.
     ///
-    /// This asks the question of the whole retired population rather than of
-    /// one wave, and it asks it through the real code path: for each retired
-    /// triple, register it with `register_inner` under `Bridge` — the state
-    /// `register` would have been in had the re-tag not run — and require that
-    /// real-layout mode drops it anyway. Anything that survives is keep-listed,
-    /// and the retirement of it is the bug.
+    /// # The discriminator, because "kept" alone does not mean "keep-listed"
+    ///
+    /// Real-layout mode drops by CLASS+METHOD arms that are hand-written for
+    /// the classes it knows about. Most retired triples — `CopyOnWriteArrayList`
+    /// and friends — are named by no arm at all and are simply KEPT in real-JDK
+    /// mode; they are refused only in `--jdk-only`, by `allowed_in(JdkOnly)`,
+    /// which is exactly what their retirement is for. So `find(..).is_some()`
+    /// catches all of those and says nothing. **The first version of this test
+    /// asserted that and was red on the whole population.**
+    ///
+    /// What identifies a collision is that the KIND decides the outcome.
+    /// Register the same triple twice under real-layout mode:
+    ///
+    /// ```text
+    ///   category        no arm names it   class-wide drop arm   keep-listed
+    ///   Bridge          kept              dropped               KEPT
+    ///   SyntheticStub   kept              dropped               dropped
+    /// ```
+    ///
+    /// Only the third column disagrees with itself, and disagreeing is the
+    /// defect: the re-tag turns the left cell into the right one. So the
+    /// offender condition is **kept as `Bridge`, dropped as `SyntheticStub`**,
+    /// which reads the real arms rather than restating their triple lists, and
+    /// covers a keep arm written tomorrow on the day it lands.
     ///
     /// On 2026-09-10 this caught two: `ScheduledThreadPoolExecutor`'s 3-arg
     /// constructor and `getCorePoolSize()I`, which
@@ -10252,11 +10270,31 @@ mod tests {
     /// on. Take the row out of the table.
     #[test]
     fn real_layout_bridge_keeps_are_not_retired_shadows() {
+        // One registration into a fresh real-layout registry, under `kind`,
+        // reporting whether the native survived.
+        fn survives_real_layout(
+            kind: NativeKind,
+            class_name: &str,
+            method_name: &str,
+            descriptor: &str,
+        ) -> bool {
+            let mut real_layout = NativeMethodRegistry::new();
+            real_layout.set_drop_real_layout_synthetic(true);
+            real_layout.set_category(kind);
+            // `register_inner`, not `register`: the point is to observe
+            // `register_inner`'s own decision under a category of our
+            // choosing, without the re-tag replacing it first.
+            real_layout.register_inner(class_name, method_name, descriptor, dummy_native);
+            real_layout.find(class_name, method_name, descriptor).is_some()
+        }
+
         let mut offenders: Vec<String> = Vec::new();
+        let mut population = 0usize;
         for table in crate::retired_shadow::RETIRED_SHADOW_TABLES {
             for (class_name, method_name, descriptor) in table.iter() {
-                // Sanity: every row here must actually be reachable through the
-                // predicate, or this gate is scoring rows the VM never retires.
+                population += 1;
+                // Every row must be reachable through the predicate, or this
+                // gate is scoring rows the VM never retires.
                 assert!(
                     crate::retired_shadow::triple_is_retired_shadow(
                         class_name,
@@ -10266,21 +10304,26 @@ mod tests {
                     "{class_name}.{method_name}{descriptor} is in a retired-shadow table but `triple_is_retired_shadow` says no — the class is outside `RETIRED_SHADOW_PREFIXES`"
                 );
 
-                let mut real_layout = NativeMethodRegistry::new();
-                real_layout.set_drop_real_layout_synthetic(true);
-                real_layout.set_category(NativeKind::Bridge);
-                // `register_inner`, not `register`: the point is to observe
-                // `register_inner`'s own decision with the category the re-tag
-                // would have replaced.
-                real_layout.register_inner(class_name, method_name, descriptor, dummy_native);
-                if real_layout.find(class_name, method_name, descriptor).is_some() {
+                let as_bridge =
+                    survives_real_layout(NativeKind::Bridge, class_name, method_name, descriptor);
+                let as_stub = survives_real_layout(
+                    NativeKind::SyntheticStub,
+                    class_name,
+                    method_name,
+                    descriptor,
+                );
+                if as_bridge && !as_stub {
                     offenders.push(format!("{class_name}.{method_name}{descriptor}"));
                 }
             }
         }
         assert!(
+            population > 400,
+            "the retired population collapsed to {population} — `RETIRED_SHADOW_TABLES` is probably missing a table, which would make this gate quietly vacuous"
+        );
+        assert!(
             offenders.is_empty(),
-            "these retired-shadow triples are ALSO kept by a real-JDK `keep_real_*_bridge` arm, so retiring them drops the native in real-JDK mode too — a mode the retiring lane did not measure. Remove them from the table (see this test's doc comment; do not touch the keep arm):
+            "these retired-shadow triples are KEPT by real-layout mode as a `Bridge` and DROPPED as a `SyntheticStub`, so they are named by a `keep_real_*_bridge` arm and the re-tag in `register` disarms it — the native goes away in real-JDK mode too, which the retiring lane did not measure. Remove them from the table (see this test's doc comment; do not touch the keep arm):
   {}",
             offenders.join("
   ")
