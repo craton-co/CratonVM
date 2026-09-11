@@ -442,6 +442,41 @@ The four `L1JarTextSweep` rows that survive are named in §10 item 5 and in
 `RETIRED_SHADOW_L1_JT_TRIPLES`: one is `JarFile`'s, one is the helpful-NPE
 -message gap, and two are `Throwable`'s.
 
+**The three corpus arms, both binaries, STRICTLY SEQUENTIAL behind a load
+gate** (`load < 55 && MemAvailable >= 4G`) — the opposite of the probe A/B's
+rule, for the reason §3 already gives: the probe tree compares exact stdout
+and does not care about load, `regression-suite/run.sh` is pass/fail with
+per-vector timeouts.
+
+```text
+  control  --jdk-only 40/40   SUITE=all 132/132   SUITE=core 92/92
+  trial2   --jdk-only 40/40   SUITE=all 132/132   SUITE=core 91/92
+```
+
+**`SUITE=core`'s one failure is `RMapGcStress`, and it is the control's.**
+Run alone, four times each, under the same gate:
+
+```text
+  control  pass pass pass FAIL
+  trial2   pass
+```
+
+A one-in-four vector inside a 92-vector arm will show up about a fifth of the
+time; it did. That is the second flaky instrument this acceptance had to
+disarm, after `VtHandoffProbe`, and both were disarmed the same way — run the
+CONTROL alone until it disagrees with itself.
+
+```text
+  jdk-only census, union over the 40 vectors:
+    native-shadows-bytecode  native-won  915 -> 903
+    synthetic-native-registered         2202 -> 2254   (+52)
+    interpreter_shadow_unenforced       3838 -> 3700
+```
+
+The `+52` is the retirement: a `Bridge` re-tagged `SyntheticStub` is what
+makes `--jdk-only` drop it. 50 of the 52 are wave 3's 21 and wave 4's 29; the
+other two are the same triples counted again under a second feature arm.
+
 ## 4. The finding this lane would most like the next lane to have: a retired PRODUCER makes a zero-invocation CONSUMER reachable
 
 Precondition 4 asks for `invocations > 0` per triple in your own instrument's
