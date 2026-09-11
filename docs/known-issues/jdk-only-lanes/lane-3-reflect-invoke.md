@@ -283,6 +283,29 @@ across the board: 105 destroyed reads, per
 The second is a native handing back an instance of an ABSTRACT class, which no
 bytecode could have produced.
 
+### Wave 1 is CORPUS-CLEAN, and that is the number that counts
+
+```text
+--jdk-only, 132 vectors, lane L3's 24 the only retirements in the binary
+    132 passed, 0 failed
+```
+
+Worth stating plainly because the route here was expensive. Lane **L0**'s wave
+shipped 54 retirements validated only by the shadow dial, and the same arm came
+back **97 of 132**. Two withdrawal rounds (-16, then the whole
+`java/lang/Module` family) got it to 127 and four vectors still failed, so L0's
+table was emptied outright. With it gone and lane 3's 24 the only retirements
+left, the arm is 132/0 — which attributes every one of those failures to L0's
+`Class` family and none to this lane.
+
+**The lesson this lane inherited, and the reason its own table survived
+contact with the corpus:** a dial arm is a screening instrument, not evidence.
+Wave 1's 24 were each required to pass four rejection rules (`invocations > 0`,
+no `OK -> BAD` row, no `BAD -> BAD` row, and at least one row whose correct
+answer differs from the family's default), and 48 (class, name) pairs were
+rejected by them. L0's wave applied none of the last three. See the ops page's
+new "what skipping the two-binary step actually cost" section.
+
 ### The armed arm, and wave 1: 24 retired of 242
 
 With the descriptor panic fixed, all three arms complete on one run of the
