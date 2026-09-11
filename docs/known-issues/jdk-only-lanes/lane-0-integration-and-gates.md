@@ -475,16 +475,46 @@ binary from `CV`, not from the tree — so the numbers are comparable. Recorded
 because the headers show three revisions and a reader should not have to work
 out which difference it was.
 
-**A fourth `origin/dev` merge landed AFTER these arms, and they were not
-re-run. The reason is a measurement, not a shortcut.** Those 37 commits add no
-retirements: every table matches `dev`'s except L0's 19 and L3's 24, which are
-this branch's own unpushed work, so the population these arms score is
-byte-identical before and after. What the merge does change is `dev`'s JIT/GC
-and a natives receiver fix — `dev`'s own work, verified by `dev`'s lanes and
-CI, and not what this section claims. Re-running a 52-minute build and two
-hours of arms on every push to a branch this active does not terminate; the
-population check is what makes stopping defensible, and it is why that check is
-recorded here rather than asserted.
+#### What these arms cover, and what they do not
+
+Two more `origin/dev` merges landed after they were taken, and the two are not
+the same case. Stating the scope precisely matters more than the numbers.
+
+**The fourth merge (37 commits) does not affect them.** It adds no
+retirements — every table matched `dev`'s except L0's 19 and L3's 24, which are
+this branch's own — so the population these arms score is identical before and
+after. What it changes is `dev`'s JIT/GC and a natives receiver fix: `dev`'s
+work, verified by `dev`'s lanes and CI, and not what this section claims.
+
+**The fifth merge (19 commits) DOES affect them, and they were not re-run.**
+Lane 4 landed `RETIRED_SHADOW_L4_TRIPLES` — 163 registrations' worth, measured
+by the paired ratchet — so the shipping population is now **larger than the one
+p20 carried**. Therefore, plainly:
+
+```text
+verified on p20   L0's 19 + L3's 24, inside an eight-lane binary, three arms
+NOT verified      the same rows beside lane 4's table
+```
+
+Nobody has run the corpus with lane 4's wave and this branch's together. Lane 4
+measured its 163 against a `dev` without L0/L3; this branch measured its 43
+against a `dev` without lane 4. **That combination is this lane's job**, and it
+is the one piece of it that cannot be closed by waiting: `dev` moved three
+times during the session that produced these numbers — 44, 37 and 19 commits —
+and each wave invalidates the previous binary. A sixth would invalidate a fifth
+lap.
+
+So the arms are recorded for the population they measured, with the boundary
+named, rather than implying a verification of the population that ships. **The
+next integration pass owes the corpus one run on a binary carrying L0, L3 and
+L4 together**; everything it needs is here — the build takes 52 minutes, the
+three arms two hours, and §7.3's method is unchanged.
+
+What the fifth merge did NOT weaken: the ratchets were re-measured on it
+(2592/2603/2592, both decompositions landing on the measured value), the whole
+gate set was re-run on it, and lane 4's rows go through the same
+`RETIRED_SHADOW_TABLES` loop as everyone's, so they face the real-JDK keep-arm
+gate automatically.
 
 **Gate set: all five arms `rc=0`.** `cargo test -p cratonvm-types`;
 `-p cratonvm-native-api`; and `-p cratonvm-native-builtins --tests` under each
