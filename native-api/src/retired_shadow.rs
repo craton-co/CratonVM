@@ -1243,7 +1243,13 @@ const RETIRED_SHADOW_PREFIXES: &[&str] = &[
     // to the binary search, the TABLE decides what is retired, and none of
     // those classes appear in any table. `java/lang/ref/` is still absent, so
     // the belt-and-braces guard in `a_prefix_alone_retires_nothing` is intact.
-    "java/lang/Class",
+    // `java/lang/Class` AND `java/lang/Module` were both here and are both
+    // GONE. The L0 table is empty, so neither prefix covers a single entry, and
+    // a prefix with no table entry behind it keeps every test green while
+    // removing the second guard `a_prefix_alone_retires_nothing` provides --
+    // the trap §4 of the lane page warns about. The prefixes leave with their
+    // rows. `java/lang/module/` (lowercase, predating this wave) stays: it
+    // still covers earlier waves' entries.
     // `java/lang/Module` was here and is GONE: the wave withdrew all nine
     // `java/lang/Module` triples after the corpus arm, so the prefix covered
     // nothing. A prefix with no table entry behind it keeps every test green
@@ -1696,123 +1702,12 @@ static RETIRED_SHADOW_L3_TRIPLES: &[(&str, &str, &str)] = &[
 /// all, read its `leaked` counter first: `leaked > 0` means some rows in that
 /// arm never yielded and cannot be cited.
 static RETIRED_SHADOW_L0_TRIPLES: &[(&str, &str, &str)] = &[
-    (
-        "java/lang/Class",
-        "asSubclass",
-        "(Ljava/lang/Class;)Ljava/lang/Class;",
-    ),
-    (
-        "java/lang/Class",
-        "cast",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-    ),
-    ("java/lang/Class", "desiredAssertionStatus", "()Z"),
-    (
-        "java/lang/Class",
-        "forName",
-        "(Ljava/lang/Module;Ljava/lang/String;)Ljava/lang/Class;",
-    ),
-    (
-        "java/lang/Class",
-        "forName",
-        "(Ljava/lang/String;)Ljava/lang/Class;",
-    ),
-    (
-        "java/lang/Class",
-        "forName",
-        "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;",
-    ),
-    (
-        "java/lang/Class",
-        "getConstructor",
-        "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
-    ),
-    (
-        "java/lang/Class",
-        "getConstructors",
-        "()[Ljava/lang/reflect/Constructor;",
-    ),
-    (
-        "java/lang/Class",
-        "getDeclaredConstructor",
-        "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
-    ),
-    (
-        "java/lang/Class",
-        "getDeclaredConstructors",
-        "()[Ljava/lang/reflect/Constructor;",
-    ),
-    (
-        "java/lang/Class",
-        "getDeclaredMethod",
-        "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
-    ),
-    (
-        "java/lang/Class",
-        "getDeclaredMethods",
-        "()[Ljava/lang/reflect/Method;",
-    ),
-    (
-        "java/lang/Class",
-        "getEnclosingClass",
-        "()Ljava/lang/Class;",
-    ),
-    (
-        "java/lang/Class",
-        "getEnclosingConstructor",
-        "()Ljava/lang/reflect/Constructor;",
-    ),
-    (
-        "java/lang/Class",
-        "getEnclosingMethod",
-        "()Ljava/lang/reflect/Method;",
-    ),
-    (
-        "java/lang/Class",
-        "getEnumConstants",
-        "()[Ljava/lang/Object;",
-    ),
-    (
-        "java/lang/Class",
-        "getMethod",
-        "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
-    ),
-    (
-        "java/lang/Class",
-        "getMethods",
-        "()[Ljava/lang/reflect/Method;",
-    ),
-    ("java/lang/Class", "getPackageName", "()Ljava/lang/String;"),
-    ("java/lang/Class", "getSigners", "()[Ljava/lang/Object;"),
-    (
-        "java/lang/Class",
-        "getTypeParameters",
-        "()[Ljava/lang/reflect/TypeVariable;",
-    ),
-    ("java/lang/Class", "isAnnotation", "()Z"),
-    ("java/lang/Class", "isEnum", "()Z"),
-    ("java/lang/Class", "isInterface", "()Z"),
-    ("java/lang/Class", "isPrimitive", "()Z"),
-    (
-        "java/lang/module/ModuleDescriptor$Version",
-        "equals",
-        "(Ljava/lang/Object;)Z",
-    ),
-    (
-        "java/lang/module/ModuleDescriptor$Version",
-        "hashCode",
-        "()I",
-    ),
-    (
-        "java/lang/module/ModuleDescriptor$Version",
-        "parse",
-        "(Ljava/lang/String;)Ljava/lang/module/ModuleDescriptor$Version;",
-    ),
-    (
-        "java/lang/module/ModuleDescriptor$Version",
-        "toString",
-        "()Ljava/lang/String;",
-    ),
+    // EMPTIED 2026-09-10. See this table's doc comment: two corpus
+    // rounds withdrew 25 of 54 and the arm still failed four vectors,
+    // and lane L0's retirement cannot be attributed per triple without
+    // a build per hypothesis. The measurement stands and is recorded;
+    // the TABLE does not ship until a wave can name which triples the
+    // corpus accepts. Lane L3's table is unaffected and stays.
 ];
 
 /// The 2026-09-09 Phase 3 wave: `ConcurrentHashMap` and `Properties`, as ONE
@@ -3067,6 +2962,16 @@ Ljava/nio/channels/FileChannel;"
     /// Binary-searched like every sibling, so ordering is correctness.
     #[test]
     fn the_l0_table_is_sorted_and_unique() {
+        // The table is EMPTY, and this assertion is why the test still earns
+        // its place: `windows(2)` over an empty slice iterates zero times, so
+        // without this line the test would pass while checking nothing, which
+        // is the failure mode this module's own §4 warns about for
+        // placeholder tables. When a later wave refills L0, delete this line
+        // and the loop below becomes real again.
+        assert!(
+            RETIRED_SHADOW_L0_TRIPLES.is_empty(),
+            "L0's table has entries again -- drop the is_empty assertion here              and in every_l0_entry_is_reachable, and re-read the table's doc              comment on what the corpus rejected"
+        );
         for w in RETIRED_SHADOW_L0_TRIPLES.windows(2) {
             assert!(
                 w[0] < w[1],

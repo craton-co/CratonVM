@@ -1481,7 +1481,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// the defect this file's header describes, where two such ratchets disagreed
 /// by 364 registrations for weeks. Here it is a units difference, not a
 /// measurement error -- but only enumerating the added set showed which.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1949;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1918;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1532,12 +1532,24 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1949;
 /// 25.0.3+9. Nothing was removed. The equality of the three deltas is the
 /// useful part of the check: a table that moved one configuration and not
 /// another would mean a `#[cfg]`-gated registrar was in the wave, and none is.
-/// # Re-frozen DOWNWARD TWICE: 1963 -> 1947 -> 1938, 25 L0 retirements withdrawn
+/// # Re-frozen DOWNWARD THREE TIMES: 1963 -> 1947 -> 1938 -> 1907
 ///
 /// ```text
-/// NO_MANAGEMENT   1963 -> 1947 -> 1938    MANAGEMENT  1974 -> 1958 -> 1949
-/// SYNTHETIC_JDK   1963 -> 1947 -> 1938
+/// NO_MANAGEMENT   1963 -> 1947 -> 1938 -> 1907
+/// MANAGEMENT      1974 -> 1958 -> 1949 -> 1918
+/// SYNTHETIC_JDK   1963 -> 1947 -> 1938 -> 1907
 /// ```
+///
+/// **The third movement empties lane L0's table entirely** (-31 registrations
+/// for its last 29 triples; the two extra are the `ModuleDescriptor$Version`
+/// `equals`/`hashCode` pair registered at two ordinals each, the same units
+/// difference L0's own account recorded as 54 triples / 56 registrations).
+///
+/// And it cross-checks: the pre-L0 baseline was **1883**, lane L3's table is
+/// **24**, and 1883 + 24 = **1907**. With L0 empty the census must equal the
+/// old baseline plus L3's wave exactly, and it does -- which is a cheap,
+/// independent confirmation that emptying one table did not disturb the
+/// other.
 ///
 /// Two rounds: minus 16, then minus 9 more for the whole `java/lang/Module`
 /// family once the arm went 97 -> 127 -> and still failed five vectors. Minus
@@ -1557,7 +1569,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1949;
 /// A ratchet that only guards one direction cannot be used to detect that
 /// work was UNDONE. If a wave withdraws entries, re-freeze from a forced
 /// failure, never from arithmetic on the old constant.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1938;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1907;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1614,7 +1626,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1938;
 /// re-freeze ALL THREE — see the pointer on both siblings.
 /// **+1 on 2026-09-02**; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1938;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1907;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
