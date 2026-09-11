@@ -558,7 +558,7 @@ fn populate_boot_layer_modules_body(
 /// it does not support `de-DE`, and `LocaleProviderAdapter.getAdapter` fell
 /// through to `FallbackLocaleProviderAdapter` -- whose root/English data IS the
 /// US separators every non-English locale was answering with.
-/// See docs/known-issues/serviceloader-loadinstalled-finds-nothing-so-every-platform-loader-service-is-empty-20260909.md
+/// See docs/internal/retired/serviceloader-loadinstalled-finds-nothing-so-every-platform-loader-service-is-empty-FIXED-20260909.md
 ///
 /// The boot loader is NOT `getServicesCatalog(null)`. `ServiceLoader` reads
 /// boot-module providers from `BootLoader.getServicesCatalog()` specifically
