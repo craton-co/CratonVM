@@ -27674,37 +27674,43 @@ fn invoke_on_class_shared_inner(
                                     | "copyMemory"
                                     | "copyMemoryInternal"
                             ))
-                        // BREAKITER: `java.text.BreakIterator.getWordInstance` /
-                        // `getLineInstance` / `getSentenceInstance` / `getCharacterInstance`
-                        // are concrete static factories whose JDK 25 bytecode walks
-                        // `LocaleProviderAdapter.forJRE().getBreakIteratorProvider()`,
-                        // then `BreakIteratorProviderImpl.getBreakInstance(...)` which
-                        // reads `LocaleResources.getBreakIteratorInfo("BreakIteratorClasses")`.
-                        // That cache lookup returns null in our partial locale-data
-                        // bootstrap (jdk.localedata's class-based resource bundles are
-                        // not surfaced through our jimage path), producing
-                        //   "Cannot load from null array"
-                        // at `BreakIteratorProviderImpl.getBreakInstance pc=21`.
-                        // Tripwire: JUnit Platform's `--help` formatter uses
-                        // `BreakIterator.getLineInstance(Locale.US)` for text wrapping
-                        // and aborts on the NPE under `CRATONVM_DISABLE_JIT=1`.
+                        // BREAKITER, REMOVED 2026-09-11 (lane 1 wave 6). The four
+                        // static factories were pinned here from 2026-07 because the
+                        // real chain died at
+                        // `BreakIteratorProviderImpl.getBreakInstance pc=21` with
+                        // "Cannot load from null array" -- `LocaleResources
+                        // .getBreakIteratorInfo("BreakIteratorClasses")` answered null.
+                        // Tripwire: JUnit Platform's `--help` formatter wraps text with
+                        // `BreakIterator.getLineInstance(Locale.US)`.
                         //
-                        // Fix: pin our native overrides (registered in
-                        // `phases_late.rs::register_p66_break_iterator`) ahead of the
-                        // JDK bytecode. The natives return a synthetic
-                        // `java/text/BreakIterator` whose instance methods
-                        // (`setText`/`first`/`next`/`previous`/`last`) are abstract on
-                        // the real class — those route via the `method.is_abstract()`
-                        // branch automatically, so only the static factories need an
-                        // allow-list entry here.
-                        || (class_name == "java/text/BreakIterator"
-                            && matches!(
-                                method_name,
-                                "getWordInstance"
-                                | "getLineInstance"
-                                | "getSentenceInstance"
-                                | "getCharacterInstance"
-                            ))
+                        // Both halves of that are now fixed and MEASURED, by
+                        // `apps/probes/L1BreakIterRealProbe`, whose `P.*` rows reach
+                        // `BreakIteratorProviderImpl` WITHOUT these factories and so
+                        // could be measured while the pin was still here:
+                        //
+                        //   wave 5  the two `LocaleResources` readers answer from the
+                        //           image (`non_cldr_packages`), so the bundle and the
+                        //           `*BreakIteratorData` blob are found and
+                        //           `new sun.text.RuleBasedBreakIterator(name, bytes)`
+                        //           validates the rule data.
+                        //   wave 6  `setText(String)` and `preceding(int)` -- the only
+                        //           two of the seventeen registrations CONCRETE on the
+                        //           abstract class, and therefore the only two a real
+                        //           subclass receiver could not escape -- step aside
+                        //           for a receiver this VM did not fabricate. Before
+                        //           that, every real BreakIterator in the VM had its
+                        //           text written into slot 0 of an object whose slot 0
+                        //           is `charCategoryTable`, and the walks answered
+                        //           `[0]`.
+                        //
+                        // With the pin gone the factories run their own bytecode and
+                        // answer `sun.text.RuleBasedBreakIterator`,
+                        // `sun.text.DictionaryBasedBreakIterator` (th) and
+                        // `GraphemeBreakIterator` like HotSpot, offset for offset on
+                        // every walk the probe takes. The synthetic natives stay
+                        // registered for synthetic-JDK mode, where there is no bytecode
+                        // to prefer, and are retired under `--jdk-only`
+                        // (`RETIRED_SHADOW_L1_BI_TRIPLES`).
                         // BUG-15: `LocaleResources.getDateTimePattern(int,int,
                         // Calendar)` returns null in our partial locale-data
                         // bootstrap (jdk.localedata class-based bundles not
@@ -27731,11 +27737,17 @@ fn invoke_on_class_shared_inner(
                         // readers `BreakIteratorProviderImpl.getBreakInstance`
                         // needs, answered from the image's own
                         // `BreakIteratorInfo` bundle class and
-                        // `*BreakIteratorData` binary rather than null. This is
-                        // the gate the BREAKITER arm above is waiting on: once
-                        // the real chain builds a `sun.text.RuleBasedBreakIterator`,
-                        // `java/text/BreakIterator`'s 17 registrations can be
-                        // retired instead of pinned (lane 1 §10 item 5).
+                        // `*BreakIteratorData` binary rather than null.
+                        //
+                        // This arm is what the pin above was waiting on, and
+                        // as of wave 6 that pin is GONE: the real chain builds
+                        // a `sun.text.RuleBasedBreakIterator` and walks it
+                        // like HotSpot, and `java/text/BreakIterator`'s 17
+                        // registrations are retired rather than pinned. These
+                        // two entries are therefore load-bearing for the whole
+                        // family now, not a step towards it -- remove them and
+                        // `getBreakInstance` is back to "Cannot load from null
+                        // array" with nothing pinned behind it.
                         || (class_name == "sun/util/locale/provider/LocaleResources"
                             && matches!(
                                 method_name,
