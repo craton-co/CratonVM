@@ -705,6 +705,62 @@ Nothing in the local gate set sees this. It is a shell gate over a census, so
 `cargo test` is green on a tree that fails CI — which is why every other lane's
 wave left an `amended:` note in that baseline's header and this one did not.
 
+### Correction: it is 581 rows across many waves, not lane 1's 50
+
+Written an hour after the section above, and it narrows what that section got
+right while widening the finding. I checked lane 1's two new tables, found 50
+stale rows, and stopped there — a classic case of measuring the thing I had
+just been reading about. Asking the PREDICATE against every baseline row
+instead gives:
+
+```text
+kind column, for retired triples present in the baseline
+   bridge           581      <- should be synthetic-stub
+   synthetic-stub   422
+   intrinsic          5      <- legitimately not stub; see the LogRecord note
+                                in the baseline's own header
+
+the 581, attributed to the table that retires them
+   RETIRED_SHADOW_L1_TRIPLES        261
+   RETIRED_SHADOW_STATELESS_TRIPLES 234
+   RETIRED_SHADOW_L1_JT_TRIPLES      30
+   RETIRED_SHADOW_TRIPLES            22
+   RETIRED_SHADOW_L1_HM_TRIPLES      22
+   RETIRED_SHADOW_L2_TRIPLES         16
+   RETIRED_SHADOW_PHASE2_TRIPLES      1
+```
+
+The bulk is in the OLD, large tables — L1's main 329 and STATELESS's 235 — not
+in the waves that landed this week. Lane 1's waves 3-4 are 52 of 581.
+
+**Confirmed against a real census, not just the predicate.** The `p19` gate run
+left `target/bridge-ratchet/census.json` (`mode: compatible`, schema 5, 12,889
+rows). For `java/util/ArrayList`:
+
+```text
+census   38 synthetic-stub,  0 bridge
+baseline 37 bridge,          1 synthetic-stub
+```
+
+`ArrayList`'s registrations are not platform-conditional, so the
+Windows/Linux difference cannot account for that. The baseline disagrees with
+what the VM actually registers.
+
+**What I still cannot determine from this host, stated rather than guessed:**
+whether CI is currently red. The comparison that decides it is a LINUX census
+against the linux baseline, and this host can only produce a Windows census
+(`sun/nio/fs/WindowsFileAttributes` shows up in the stale list, which is the
+platform difference being visible). The retirement tables themselves are
+platform-independent, so a Linux census should also report `synthetic-stub` for
+`ArrayList` — which points at CI being red — but that is an inference and the
+measurement is one `ubuntu-latest` run away. **Check it before acting on the
+581.**
+
+So the §7.4 above is right about the mechanism and wrong about the blame. The
+gate cannot run where the work happens; the baseline has drifted behind many
+waves as a result; and the fix is one `--update-baseline` on Linux with a note,
+not 581 hand-edits by anyone.
+
 ### The root cause, MEASURED: this gate cannot run on Windows
 
 Running it here, `CV=p19 JAVA_HOME=<jdk25> sh regression-suite/bridge-ratchet.sh`:
