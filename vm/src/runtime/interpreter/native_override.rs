@@ -4517,6 +4517,23 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // BREAKITER, the real data (2026-09-11): the two `LocaleResources`
+    // readers `BreakIteratorProviderImpl.getBreakInstance` needs. Both
+    // answered null, which is why the BREAKITER allow-list below pins a
+    // synthetic iterator over `java.text.BreakIterator`'s four factories;
+    // the natives registered in `locale_resources::register` read the
+    // `BreakIteratorInfo` bundle class and the `*BreakIteratorData` binary
+    // out of the image instead. A registration on a concrete JDK-library
+    // method is SILENT without a gate entry, which is the whole reason
+    // this arm exists.
+    if class_name == "sun/util/locale/provider/LocaleResources"
+        && matches!(
+            method_name,
+            "getBreakIteratorInfo" | "getBreakIteratorResources"
+        )
+    {
+        return true;
+    }
     // java.time text names: `sun.util.locale.provider.CalendarDataUtility
     // .retrieveJavaTimeFieldValueName(s)` feed `DateTimeTextProvider`'s
     // `EEE`/`MMM`/`a`/`G` lookups. The real-JDK bodies walk the same

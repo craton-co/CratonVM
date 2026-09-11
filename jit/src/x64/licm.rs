@@ -963,6 +963,23 @@ pub fn inline_tlab_new_enabled() -> bool {
     })
 }
 
+/// Inline TLAB `newarray` — the array twin of [`inline_tlab_new_enabled`].
+///
+/// Default-ON. A separate lever from the object one because the two emitters
+/// are separate, land at different times, and have to be priced apart: with
+/// one flag, "turn the array bump off" also turns off the object bump that has
+/// been shipping since 2024, and the A/B measures both at once.
+///
+/// Opt out: `CRATONVM_NO_JIT_INLINE_TLAB_NEWARRAY=1` routes every compiled
+/// `newarray` through the always-correct `jit_newarray` helper.
+pub fn inline_tlab_newarray_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_INLINE_TLAB_NEWARRAY").is_none()
+    })
+}
+
 /// Default-on removal of redundant per-object zero stores from inline TLAB
 /// allocation.
 ///

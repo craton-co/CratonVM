@@ -590,10 +590,27 @@ pub(crate) fn register_p61_charset(r: &mut NativeMethodRegistry) {
     });
     r.register(cs, "aliases", "()Ljava/util/Set;", |ctx, _args| {
         // Return empty HashSet
-        let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?;
-        ctx.set_field(set, 0, Value::Object(None));
-        ctx.set_field(set, 1, Value::Int(0));
-        ctx.set_field(set, 2, Value::Int(16));
+        // Built through the REAL `HashSet.<init>`, not by writing raw slots.
+        // The three slots this used to write (bucket array, size, capacity)
+        // are the MAP layout, on a class whose one real field is `map`
+        // (`Ljava/util/HashMap;`) -- so a reader resolving `map` by name, which
+        // is what `hs_map_slot` and any surviving JDK bytecode both do, found
+        // an `Object[]` where a map belongs. It is the same shape
+        // `publish_map_table` records fixing on the map side.
+        //
+        // It also pinned the class's synthetic slot floor at 3 against one
+        // real field, which pads `java/util/HashSet` (and `LinkedHashSet`,
+        // which declares none of its own) out of the compact layout entirely.
+        let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1)?;
+        let set_pin = ctx.pin_native_root(set);
+        let _ = ctx.invoke(
+            "java/util/HashSet",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(set))],
+        );
+        let set = ctx.read_native_pin(set_pin, set);
+        ctx.unpin_native_roots(set_pin);
         Ok(Some(Value::Object(Some(set))))
     });
     r.register(cs, "displayName", "()Ljava/lang/String;", |ctx, args| {
