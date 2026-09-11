@@ -1066,6 +1066,42 @@ pub struct Node {
     pub inputs: Inputs,
     /// Bytecode PC that produced this node (for OSR / debug).
     pub bytecode_pc: Option<usize>,
+    /// Index into [`Graph::safepoints`] of the snapshot describing the
+    /// interpreter frame at THIS node's program point, when that cannot be
+    /// found by searching for [`Self::bytecode_pc`].
+    ///
+    /// # Why a bci is not enough
+    ///
+    /// `ir_lower` resolves a deopt frame by scanning `graph.safepoints` for the
+    /// first snapshot whose `bci` matches the trapping node's `bytecode_pc`.
+    /// That is exact while a bci appears once in the graph — which it does,
+    /// until a pass COPIES a region. A cloned node keeps the original's
+    /// `bytecode_pc` (it must: the pc is also the site key for the compact
+    /// field offset, the direct-call entry and the inline-cache pair, and
+    /// rewriting it makes a copy read another site's metadata). So after an
+    /// unroll there are `trip` nodes at one bci, the by-bci scan finds copy 0's
+    /// snapshot for every one of them, and copies `1..trip` deopt into a frame
+    /// describing values they do not hold.
+    ///
+    /// That is the shape of the defect
+    /// `internal/fixed-bugs/` records against the deopt metadata — a frame slot
+    /// read from a word nothing had written, surfacing as an H2 `GROUP BY` that
+    /// returned 3 rows of 5. It does not announce itself; it returns a wrong
+    /// answer.
+    ///
+    /// `None` on every node the builder makes and on every clone a pass makes
+    /// without opting in, which is every compile that does not unroll — the
+    /// by-bci scan is then the only path and its behaviour is unchanged. A
+    /// producer that clones a region sets this on each copy's nodes through
+    /// [`Graph::set_node_frame_snapshot`]; see `ir_optimize::unroll`.
+    ///
+    /// # It is a program point, not a value
+    ///
+    /// Two nodes that compute the same value at different program points have
+    /// different snapshots, so this participates in GVN's identity: merging
+    /// across it would hand one copy's code another copy's frame. See
+    /// `ir_optimize::gvn`.
+    pub frame_snapshot: Option<u32>,
 }
 
 impl Node {
@@ -2047,6 +2083,9 @@ impl Graph {
             ty,
             inputs,
             bytecode_pc: pc,
+            // A new node belongs to no COPY until a producer says so: the
+            // by-bci scan is the whole story for everything the builder makes.
+            frame_snapshot: None,
         });
         if current {
             if self.uses.dangling {
@@ -2710,6 +2749,37 @@ impl Graph {
             self.uses.sp_len = self.safepoints.len();
             self.uses.stamp();
         }
+    }
+
+    /// Bind `id` to the snapshot at `graph.safepoints[snapshot]` as the frame
+    /// describing ITS program point, overriding `ir_lower`'s by-bci scan.
+    ///
+    /// `false` when `id` is not a node of this graph, or when `snapshot` names
+    /// no entry in [`Self::safepoints`] — both are producer bugs, and both are
+    /// refused here rather than installed and discovered at a deopt.
+    ///
+    /// # Fail closed on a bci disagreement
+    ///
+    /// The snapshot's `bci` must equal the node's `bytecode_pc`. A node whose
+    /// frame resumes at a different bytecode index than the node itself sits at
+    /// is not a copy identity — it is a mis-substitution, and the interpreter
+    /// would resume in the wrong instruction with a frame that looks plausible.
+    /// Refused. A node carrying no `bytecode_pc` has no program point to agree
+    /// with and is refused too.
+    ///
+    /// See [`Node::frame_snapshot`] for what this is for.
+    pub fn set_node_frame_snapshot(&mut self, id: NodeId, snapshot: u32) -> bool {
+        let Some(sp_bci) = self.safepoints.get(snapshot as usize).map(|s| s.bci) else {
+            return false;
+        };
+        let Some(node) = self.nodes.get_mut(id as usize) else {
+            return false;
+        };
+        if node.bytecode_pc != Some(sp_bci) {
+            return false;
+        }
+        node.frame_snapshot = Some(snapshot);
+        true
     }
 
     /// Overwrite one snapshot slot. `false` when the snapshot or slot does not
