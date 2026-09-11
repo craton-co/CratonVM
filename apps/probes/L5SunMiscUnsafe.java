@@ -258,6 +258,95 @@ public class L5SunMiscUnsafe {
             return prev + "/" + h.o;
         });
 
+        // ---- the VOLATILE twins, added 2026-09-11 ----
+        //
+        // Every accessor above has a `*Volatile` sibling and the first version
+        // of this file exercised only two of them. Precondition 4 is
+        // per-triple, so a sibling nobody calls is a row nobody can retire
+        // however obvious it looks -- which is the whole reason these are
+        // here rather than assumed from the plain accessor beside them.
+        probe("booleanVolatile roundTrip", () -> {
+            long o = off("z");
+            m("putBooleanVolatile", Object.class, long.class, boolean.class).invoke(U, h, o, true);
+            boolean v = (Boolean) m("getBooleanVolatile", Object.class, long.class).invoke(U, h, o);
+            return v && h.z;
+        });
+        probe("byteVolatile roundTrip", () -> {
+            long o = off("b");
+            m("putByteVolatile", Object.class, long.class, byte.class).invoke(U, h, o, (byte) 0x3c);
+            byte v = (Byte) m("getByteVolatile", Object.class, long.class).invoke(U, h, o);
+            return v == (byte) 0x3c && h.b == (byte) 0x3c;
+        });
+        probe("charVolatile roundTrip", () -> {
+            long o = off("c");
+            m("putCharVolatile", Object.class, long.class, char.class).invoke(U, h, o, 'Z');
+            char v = (Character) m("getCharVolatile", Object.class, long.class).invoke(U, h, o);
+            return v == 'Z' && h.c == 'Z';
+        });
+        probe("shortVolatile roundTrip", () -> {
+            long o = off("s");
+            m("putShortVolatile", Object.class, long.class, short.class).invoke(U, h, o, (short) 999);
+            short v = (Short) m("getShortVolatile", Object.class, long.class).invoke(U, h, o);
+            return v == (short) 999 && h.s == (short) 999;
+        });
+        probe("longVolatile roundTrip", () -> {
+            long o = off("j");
+            m("putLongVolatile", Object.class, long.class, long.class).invoke(U, h, o, -7L);
+            long v = (Long) m("getLongVolatile", Object.class, long.class).invoke(U, h, o);
+            return v == -7L && h.j == -7L;
+        });
+        probe("floatVolatile roundTrip", () -> {
+            long o = off("f");
+            m("putFloatVolatile", Object.class, long.class, float.class).invoke(U, h, o, 1.5f);
+            float v = (Float) m("getFloatVolatile", Object.class, long.class).invoke(U, h, o);
+            return v == 1.5f && h.f == 1.5f;
+        });
+        probe("doubleVolatile roundTrip", () -> {
+            long o = off("d");
+            m("putDoubleVolatile", Object.class, long.class, double.class).invoke(U, h, o, 3.75d);
+            double v = (Double) m("getDoubleVolatile", Object.class, long.class).invoke(U, h, o);
+            return v == 3.75d && h.d == 3.75d;
+        });
+
+        // ---- the long atomics, the twins of the int pair above ----
+        probe("getAndAddLong", () -> {
+            long o = off("j");
+            m("putLong", Object.class, long.class, long.class).invoke(U, h, o, 100L);
+            long prev = (Long) m("getAndAddLong", Object.class, long.class, long.class).invoke(U, h, o, 5L);
+            return prev + "/" + h.j;
+        });
+        probe("getAndSetLong", () -> {
+            long o = off("j");
+            m("putLong", Object.class, long.class, long.class).invoke(U, h, o, 101L);
+            long prev = (Long) m("getAndSetLong", Object.class, long.class, long.class).invoke(U, h, o, 102L);
+            return prev + "/" + h.j;
+        });
+
+        // ---- bulk memory: the three shapes the accessors above do not reach ----
+        probe("copyMemory object->object", () -> {
+            byte[] src = new byte[] { 1, 2, 3, 4 };
+            byte[] dst = new byte[4];
+            long base = (Integer) m("arrayBaseOffset", Class.class).invoke(U, byte[].class);
+            m("copyMemory", Object.class, long.class, Object.class, long.class, long.class)
+                    .invoke(U, src, base, dst, base, 4L);
+            return dst[0] + "," + dst[1] + "," + dst[2] + "," + dst[3];
+        });
+        probe("setMemory object form", () -> {
+            byte[] a = new byte[4];
+            long base = (Integer) m("arrayBaseOffset", Class.class).invoke(U, byte[].class);
+            m("setMemory", Object.class, long.class, long.class, byte.class)
+                    .invoke(U, a, base, 4L, (byte) 9);
+            return a[0] + "," + a[1] + "," + a[2] + "," + a[3];
+        });
+        probe("reallocateMemory", () -> {
+            long addr = (Long) m("allocateMemory", long.class).invoke(U, 8L);
+            m("putLong", long.class, long.class).invoke(U, addr, 0x1234L);
+            long bigger = (Long) m("reallocateMemory", long.class, long.class).invoke(U, addr, 64L);
+            long back = (Long) m("getLong", long.class).invoke(U, bigger);
+            m("freeMemory", long.class).invoke(U, bigger);
+            return back == 0x1234L;
+        });
+
         // ---- the static-field pair ----
         probe("staticFieldRoundTrip", () -> {
             Field f = Holder.class.getDeclaredField("sInt");

@@ -3261,7 +3261,7 @@ static RETIRED_SHADOW_L1_TRIPLES: &[(&str, &str, &str)] = &[
 /// rest of the package tree to one extra binary search each, which is the whole
 /// cost, and `the_held_collection_families_are_not_retired` is the test that
 /// says admitting them changes no answer.
-/// The 2026-09-11 lane-5 RESIDUAL wave: 48 `sun/misc/Unsafe` rows, and the
+/// The 2026-09-11 lane-5 RESIDUAL wave: 67 `sun/misc/Unsafe` rows, and the
 /// reason they were held until now was a missing INSTRUMENT, not a blocker.
 ///
 /// The retired lane page held all 82 `sun/misc/Unsafe` registrations with
@@ -3279,9 +3279,26 @@ static RETIRED_SHADOW_L1_TRIPLES: &[(&str, &str, &str)] = &[
 ///   2. whole probe tree no worse       134 measured: 0 toward, 1 away, and
 ///                                      that row is y/r=0/0 VACUOUS with a
 ///                                      line count that moved — not the dial
-///   3. the image target carries Code   outcome=bytecode-won on all 48
-///   4. a per-triple dispatch observed  48 distinct triples, one row each
+///   3. the image target carries Code   outcome=bytecode-won on all 67, and
+///                                      `javap -p sun.misc.Unsafe` reports
+///                                      ZERO native methods on the class —
+///                                      all 99 carry Code and delegate to
+///                                      `theInternalUnsafe`
+///   4. a per-triple dispatch observed  67 distinct triples, one row each
 /// ```
+///
+/// **The wave was 48 rows for an afternoon.** The first workload reached 48 of
+/// them; widening it to the volatile twins, the long atomics and the bulk
+/// memory trio reached 19 more, and this page's own account had said that is
+/// what takes them — *a probe edit, not a build*. It cost one probe edit and
+/// two runs.
+///
+/// Precondition 2 was measured on the 36-row workload and is NOT re-run for
+/// the 19: the battery's question is whether arming this prefix disturbs the
+/// OTHER 133 probes, and widening one probe cannot change their answer. The
+/// row that did change is this probe's own, and it was re-measured directly —
+/// `d(base,armed) = 0` on 50 rows, so arming the prefix changes nothing about
+/// its output at all.
 ///
 /// Precondition 3 is not read off a `javap` here: `outcome=bytecode-won` in the
 /// `--jdk-only-report` IS the image's bytecode having run and produced the
@@ -3334,14 +3351,11 @@ static RETIRED_SHADOW_L1_TRIPLES: &[(&str, &str, &str)] = &[
 ///     on what reflection answers.** A census built from class files cannot see
 ///     this defect, and a `javap` check would have prevented the wrong claim —
 ///     which is what eventually caught it.
-///   * **the rest were not dispatched by this workload.** Thirty-one more
-///     registrations exist on the class and the probe does not reach them
-///     (`reallocateMemory`, `copyMemory`, the remaining volatile put/get
-///     shapes, `getAndAddLong`/`getAndSetLong`, `getCharVolatile` and
-///     friends). Precondition 4 is per-triple and this table honours that: a
-///     row with no observed dispatch stays out however obvious its sibling
-///     looks. Extending the workload is how the next wave takes them, and it
-///     is a probe edit, not a build.
+///   * **the rest were not dispatched by this workload.** Precondition 4 is
+///     per-triple and this table honours that: a row with no observed dispatch
+///     stays out however obvious its sibling looks. The registered surface on
+///     this class is larger than the workload reaches, and closing the gap is
+///     more probe rows rather than a weaker rule.
 ///
 /// # Why this is a separate table from `RETIRED_SHADOW_L5_TRIPLES`
 ///
@@ -3358,41 +3372,60 @@ static RETIRED_SHADOW_L5R_TRIPLES: &[(&str, &str, &str)] = &[
     ("sun/misc/Unsafe", "compareAndSwapInt", "(Ljava/lang/Object;JII)Z"),
     ("sun/misc/Unsafe", "compareAndSwapLong", "(Ljava/lang/Object;JJJ)Z"),
     ("sun/misc/Unsafe", "compareAndSwapObject", "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z"),
+    ("sun/misc/Unsafe", "copyMemory", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V"),
     ("sun/misc/Unsafe", "freeMemory", "(J)V"),
     ("sun/misc/Unsafe", "fullFence", "()V"),
     ("sun/misc/Unsafe", "getAndAddInt", "(Ljava/lang/Object;JI)I"),
+    ("sun/misc/Unsafe", "getAndAddLong", "(Ljava/lang/Object;JJ)J"),
     ("sun/misc/Unsafe", "getAndSetInt", "(Ljava/lang/Object;JI)I"),
+    ("sun/misc/Unsafe", "getAndSetLong", "(Ljava/lang/Object;JJ)J"),
     ("sun/misc/Unsafe", "getAndSetObject", "(Ljava/lang/Object;JLjava/lang/Object;)Ljava/lang/Object;"),
     ("sun/misc/Unsafe", "getBoolean", "(Ljava/lang/Object;J)Z"),
+    ("sun/misc/Unsafe", "getBooleanVolatile", "(Ljava/lang/Object;J)Z"),
     ("sun/misc/Unsafe", "getByte", "(J)B"),
     ("sun/misc/Unsafe", "getByte", "(Ljava/lang/Object;J)B"),
+    ("sun/misc/Unsafe", "getByteVolatile", "(Ljava/lang/Object;J)B"),
     ("sun/misc/Unsafe", "getChar", "(Ljava/lang/Object;J)C"),
+    ("sun/misc/Unsafe", "getCharVolatile", "(Ljava/lang/Object;J)C"),
     ("sun/misc/Unsafe", "getDouble", "(Ljava/lang/Object;J)D"),
+    ("sun/misc/Unsafe", "getDoubleVolatile", "(Ljava/lang/Object;J)D"),
     ("sun/misc/Unsafe", "getFloat", "(Ljava/lang/Object;J)F"),
+    ("sun/misc/Unsafe", "getFloatVolatile", "(Ljava/lang/Object;J)F"),
     ("sun/misc/Unsafe", "getInt", "(Ljava/lang/Object;J)I"),
     ("sun/misc/Unsafe", "getIntVolatile", "(Ljava/lang/Object;J)I"),
     ("sun/misc/Unsafe", "getLoadAverage", "([DI)I"),
     ("sun/misc/Unsafe", "getLong", "(J)J"),
     ("sun/misc/Unsafe", "getLong", "(Ljava/lang/Object;J)J"),
+    ("sun/misc/Unsafe", "getLongVolatile", "(Ljava/lang/Object;J)J"),
     ("sun/misc/Unsafe", "getObject", "(Ljava/lang/Object;J)Ljava/lang/Object;"),
     ("sun/misc/Unsafe", "getObjectVolatile", "(Ljava/lang/Object;J)Ljava/lang/Object;"),
     ("sun/misc/Unsafe", "getShort", "(Ljava/lang/Object;J)S"),
+    ("sun/misc/Unsafe", "getShortVolatile", "(Ljava/lang/Object;J)S"),
     ("sun/misc/Unsafe", "loadFence", "()V"),
     ("sun/misc/Unsafe", "objectFieldOffset", "(Ljava/lang/reflect/Field;)J"),
     ("sun/misc/Unsafe", "pageSize", "()I"),
     ("sun/misc/Unsafe", "park", "(ZJ)V"),
     ("sun/misc/Unsafe", "putBoolean", "(Ljava/lang/Object;JZ)V"),
+    ("sun/misc/Unsafe", "putBooleanVolatile", "(Ljava/lang/Object;JZ)V"),
     ("sun/misc/Unsafe", "putByte", "(Ljava/lang/Object;JB)V"),
+    ("sun/misc/Unsafe", "putByteVolatile", "(Ljava/lang/Object;JB)V"),
     ("sun/misc/Unsafe", "putChar", "(Ljava/lang/Object;JC)V"),
+    ("sun/misc/Unsafe", "putCharVolatile", "(Ljava/lang/Object;JC)V"),
     ("sun/misc/Unsafe", "putDouble", "(Ljava/lang/Object;JD)V"),
+    ("sun/misc/Unsafe", "putDoubleVolatile", "(Ljava/lang/Object;JD)V"),
     ("sun/misc/Unsafe", "putFloat", "(Ljava/lang/Object;JF)V"),
+    ("sun/misc/Unsafe", "putFloatVolatile", "(Ljava/lang/Object;JF)V"),
     ("sun/misc/Unsafe", "putInt", "(Ljava/lang/Object;JI)V"),
     ("sun/misc/Unsafe", "putIntVolatile", "(Ljava/lang/Object;JI)V"),
     ("sun/misc/Unsafe", "putLong", "(JJ)V"),
     ("sun/misc/Unsafe", "putLong", "(Ljava/lang/Object;JJ)V"),
+    ("sun/misc/Unsafe", "putLongVolatile", "(Ljava/lang/Object;JJ)V"),
     ("sun/misc/Unsafe", "putObject", "(Ljava/lang/Object;JLjava/lang/Object;)V"),
     ("sun/misc/Unsafe", "putObjectVolatile", "(Ljava/lang/Object;JLjava/lang/Object;)V"),
     ("sun/misc/Unsafe", "putShort", "(Ljava/lang/Object;JS)V"),
+    ("sun/misc/Unsafe", "putShortVolatile", "(Ljava/lang/Object;JS)V"),
+    ("sun/misc/Unsafe", "reallocateMemory", "(JJ)J"),
+    ("sun/misc/Unsafe", "setMemory", "(Ljava/lang/Object;JJB)V"),
     ("sun/misc/Unsafe", "staticFieldBase", "(Ljava/lang/reflect/Field;)Ljava/lang/Object;"),
     ("sun/misc/Unsafe", "staticFieldOffset", "(Ljava/lang/reflect/Field;)J"),
     ("sun/misc/Unsafe", "storeFence", "()V"),
