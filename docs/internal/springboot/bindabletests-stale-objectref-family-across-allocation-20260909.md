@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | **TEN ROOT-CAUSED AND FIXED**, 2026-09-09. The crash is gone; what remains is a different symptom, filed separately — see [What is left](#what-is-left). |
+| **Status** | **TEN ROOT-CAUSED AND FIXED**, 2026-09-09. The residual this page left behind is ALSO fixed, 2026-09-11 — it was an eleventh member, receiver-side; see [What is left](#what-is-left). |
 | **Was** | `docs/known-issues/springboot/bindabletests-local-holds-an-interior-word-of-a-retired-tlab-filler-20260909.md` |
 | **Scope** | `--XX:UseGc Generational`, `CRATONVM_DBG_GC_STRESS <= 262144`. Passes at every threshold `>= 393216`, and unset. |
 | **Reproducer** | `org.springframework.boot.context.properties.bind.BindableTests`, Linux x86-64 |
@@ -213,16 +213,28 @@ exactly the window a stale reference is read in. The heal is not wrong, it is
 simply blind in the one case that matters, the same blind spot `was_vacated`
 has.
 
-## What is left
+## What is left — nothing, as of 2026-09-11
 
-The crash is gone. At `<= 262144` one of the 27 tests now fails an ordinary
-AssertJ assertion (`AbstractAssert.objects` reads null), and **every
-stale-reference probe reads zero** in both `--nojit` and JIT runs, as does
-`CRATONVM_GC_VERIFY_RSET` and `CRATONVM_DBG_HEAP_STALE`. It is a different shape
-and it is filed as its own page:
-[`bindabletests-assertj-objects-field-null-under-gc-stress-20260909.md`](../../known-issues/springboot/bindabletests-assertj-objects-field-null-under-gc-stress-20260909.md).
+The crash is gone. At `<= 262144` one of the 27 tests then failed an ordinary
+AssertJ assertion (`AbstractAssert.objects` reads null), with **every
+stale-reference probe reading zero** in both `--nojit` and JIT runs, as did
+`CRATONVM_GC_VERIFY_RSET` and `CRATONVM_DBG_HEAP_STALE`. The threshold moved with
+it: 524 288 → 393 216.
 
-The threshold moved with it: 524 288 → **393 216**.
+That residual is now root-caused and fixed, and it was an ELEVENTH member of this
+family rather than a different shape:
+[`bindabletests-assertj-objects-receiver-stale-across-clinit-20260911.md`](bindabletests-assertj-objects-receiver-stale-across-clinit-20260911.md).
+
+The reason it survived the sweep that fixed the ten is worth carrying back here.
+Every instrument in the table above screens a **value**: `note_deadref_store`
+opens with `if let Value::Object(Some(p)) = value` and asks
+`dead_young_ref_reason(p)`. The eleventh defect stored a live value through a
+**dead receiver** — `native_assertj_lightweight_comparable_assert` reused an
+assertion handle taken before `org/assertj/core/internal/Objects`'s `<clinit>`
+ran — so there was nothing wrong with any value anywhere and the whole family
+read zero, correctly. `[deadref-recv]`, added with that fix, is the missing arm.
+
+The threshold after it: BindableTests passes at 262 144, 131 072 and 65 536.
 
 ## A standing audit, from the same shape
 
@@ -233,6 +245,18 @@ each needs the same treatment — read the function, confirm the value is used
 after the allocation, apply the `rooted_across` idiom. `[deadref-pin]` is the
 screen: it fires on exactly this mistake, and it fires at the pin rather than at
 the eventual crash.
+
+**Two corrections to that audit, from the eleventh defect (2026-09-11).**
+
+* It named ONE FILE. `native-builtins/src/test_frameworks.rs` was never in it,
+  and it held the residual plus three more instances of the same shape.
+* `[deadref-pin]` is not a sufficient screen. It fires when `pin_native_root` is
+  handed an already-dead value; it says nothing about a value that was pinned
+  correctly and then USED through a handle read before an allocation. That is
+  what the eleventh defect did, and it is why the screen has to be
+  `[deadref-store]` + `[deadref-recv]` at the STORE, not `[deadref-pin]` at the
+  pin. Stated as an invariant: **a pin is a fact about an object, not about a
+  variable — only `read_native_pin` produces an address that is valid now.**
 
 ## Repro
 

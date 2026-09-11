@@ -3305,6 +3305,93 @@ struct NativeDiagState {
 /// Cheap and confined: this is the native boundary, not the interpreter's
 /// `putfield`, and the barrier short-circuits on anything that is not a moved
 /// object.
+/// Stores `NativeContext::set_field_by_name` DROPPED because the receiver's
+/// class does not declare the named field.
+static FIELD_BY_NAME_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many `set_field_by_name` calls named a field their receiver does not
+/// have. Always counted; see [`note_field_by_name_dropped`] for what a non-zero
+/// value does and does not mean.
+pub fn field_by_name_dropped_count() -> u64 {
+    FIELD_BY_NAME_DROPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The silent arm of `set_field_by_name`, made audible under
+/// `CRATONVM_DBG_DEADREF_STORE`.
+///
+/// # Why this is where a stale receiver actually surfaces
+///
+/// `set_field_by_name` resolves the field against the class of whatever object
+/// is AT the address it is handed. A native that kept a receiver across an
+/// allocation hands it a vacated address — and a young semispace is re-served
+/// from the same base every cycle, so that address is usually occupied by some
+/// unrelated object by the time the store runs. The field name then does not
+/// resolve, and the store disappears **before** it reaches the heap: no
+/// `set_field`, so no `[deadref-store]`, no `[deadref-recv]`, no
+/// `[CELLWATCH]`, no `[PUTFIELD-WATCH]`. Nothing in the VM said anything.
+///
+/// That is exactly how `native_assertj_lightweight_comparable_assert`'s
+/// `objects` store vanished (see
+/// `docs/internal/springboot/bindabletests-assertj-objects-receiver-stale-across-clinit-20260911.md`),
+/// and it is why the heap-side screens could not have found it however many
+/// arms they grew.
+///
+/// # Why it is counted always and printed only under the flag
+///
+/// A miss is not always a defect: several natives set a field that only some
+/// subclasses declare (`strings` and `failures` on the AssertJ assertions are
+/// the local example), so an unconditional warning would be noise — MEASURED, a
+/// single `BindableTests` run drops 2 710 stores and ~2 700 of them are one
+/// benign shape, `StringBuilder.toStringCache`. The COUNT is free and makes
+/// "did this happen at all" answerable; the line with its backtrace is behind
+/// the same switch as the rest of the stale-reference family, because that is
+/// when someone is asking this question, and it is deduped by
+/// `(receiver class, field name)` so that population cannot crowd out the one
+/// row a reader opened the log for.
+#[cold]
+#[inline(never)]
+fn note_field_by_name_dropped(
+    class_id: ClassId,
+    class_name: &str,
+    field_name: &str,
+    obj: ObjectRef,
+    value: Value,
+) {
+    FIELD_BY_NAME_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !cratonvm_types::flags().gc.dbg_deadref_store {
+        return;
+    }
+    // DEDUPE BY SHAPE, not by occurrence count. A plain "first N" cap is worse
+    // than useless here and was measured to be: a BindableTests run drops 2 710
+    // stores, ~2 700 of them one benign shape (`StringBuilder.toStringCache`),
+    // so a 32-line cap spends every line on the noise and never reaches the
+    // one that matters. One line per distinct `(receiver class, field name)`
+    // turns the same population into a handful of rows, and a stale receiver is
+    // a shape nothing else in the run produces.
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(u32, String)>>> =
+        std::sync::Mutex::new(None);
+    let mut guard = match SEEN.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let seen = guard.get_or_insert_with(std::collections::HashSet::new);
+    if seen.len() >= 256 || !seen.insert((class_id.as_u32(), field_name.to_string())) {
+        return;
+    }
+    let n = seen.len() - 1;
+    drop(guard);
+    eprintln!(
+        "[field-by-name-dropped] #{n} obj=0x{:x} recv_class={class_name} \
+         recv_class_id={} field={field_name:?} value={value:?} — the receiver's class does not \
+         declare this field, so the store was DROPPED. Either the caller named a field only some \
+         subclasses have, or the receiver is a stale address now occupied by a different object.\n{:?}",
+        obj.as_ptr() as usize,
+        class_id.as_u32(),
+        std::backtrace::Backtrace::force_capture(),
+    );
+}
+
 #[inline]
 fn forward_boundary_value(heap: &crate::memory::VmHeap, value: Value) -> Value {
     match value {
@@ -13030,6 +13117,13 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             drop(cm);
             self.shared.mem.heap.set_field(obj, index, value);
             // write_barrier fires automatically inside set_field
+        } else {
+            let class_name = cm
+                .get_class(class_id)
+                .map(|c| c.name.to_string())
+                .unwrap_or_else(|| "<unresolved>".to_string());
+            drop(cm);
+            note_field_by_name_dropped(class_id, &class_name, field_name, obj, value);
         }
     }
 
