@@ -613,6 +613,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "ir-bailout", on_key: Some("CRATONVM_DBG_IR_BAILOUT"), off_key: None, off_word: None, since: "2026-07-31" },
     E { group: Group::DBG, token: "ir-call", on_key: Some("CRATONVM_DBG_IR_CALL"), off_key: None, off_word: None, since: "2026-06-20" },
     E { group: Group::DBG, token: "ir-bufsize", on_key: Some("CRATONVM_DBG_IR_BUFSIZE"), off_key: None, off_word: None, since: "2026-08-01" },
+    // The witness half of `jit/code-near-globals`: one line per placement
+    // decision. That flag is a HINT to `mmap`, so "set" and "engaged" are
+    // different facts and only this line separates them.
+    E { group: Group::DBG, token: "code-near-globals", on_key: Some("CRATONVM_DBG_CODE_NEAR_GLOBALS"), off_key: None, off_word: None, since: "2026-09-10" },
     E { group: Group::DBG, token: "ir-compiles", on_key: Some("CRATONVM_DBG_IR_COMPILES"), off_key: None, off_word: None, since: "2026-07-31" },
     // The trace half of `jit/ir-linear-scan`; same token name in the group that
     // owns tracing, exactly like `ir-long` and `xt-jit-root-scan` below.
@@ -1658,6 +1662,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-bce-range", on_key: Some("CRATONVM_JIT_IR_BCE_RANGE"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "ir-hot-layout", on_key: Some("CRATONVM_JIT_IR_HOT_LAYOUT"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "ir-list-sched", on_key: Some("CRATONVM_JIT_IR_LIST_SCHED"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::JIT, token: "ir-carry-rcx-folded", on_key: Some("CRATONVM_JIT_IR_CARRY_RCX_FOLDED"), off_key: None, off_word: Some("0"), since: "2026-09-10" },
     E { group: Group::JIT, token: "ir-unroll-unreachable-frames", on_key: Some("CRATONVM_JIT_IR_UNROLL_UNREACHABLE_FRAMES"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "c2-accept", on_key: Some("CRATONVM_C2_ACCEPT"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "c2-accept-memo", on_key: Some("CRATONVM_C2_ACCEPT_MEMO"), off_key: None, off_word: None, since: "2026-09-06" },

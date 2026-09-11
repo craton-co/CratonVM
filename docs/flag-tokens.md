@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-543 tokens.
+544 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -277,6 +277,7 @@ export inherited from a parent shell.
 | `ir-bailout` | `CRATONVM_DBG_IR_BAILOUT` |
 | `ir-call` | `CRATONVM_DBG_IR_CALL` |
 | `ir-bufsize` | `CRATONVM_DBG_IR_BUFSIZE` |
+| `code-near-globals` | `CRATONVM_DBG_CODE_NEAR_GLOBALS` |
 | `ir-compiles` | `CRATONVM_DBG_IR_COMPILES` |
 | `ir-isel` | `CRATONVM_DBG_IR_ISEL` |
 | `ir-linear-scan` | `CRATONVM_DBG_IR_LINEAR_SCAN` |
@@ -609,7 +610,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-430 tokens.
+431 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -813,6 +814,7 @@ export inherited from a parent shell.
 | `ir-bce-range` | `CRATONVM_JIT_IR_BCE_RANGE` |
 | `ir-hot-layout` | `CRATONVM_JIT_IR_HOT_LAYOUT` |
 | `ir-list-sched` | `CRATONVM_JIT_IR_LIST_SCHED` |
+| `ir-carry-rcx-folded` | `CRATONVM_JIT_IR_CARRY_RCX_FOLDED` |
 | `ir-unroll-unreachable-frames` | `CRATONVM_JIT_IR_UNROLL_UNREACHABLE_FRAMES` |
 | `c2-accept` | `CRATONVM_C2_ACCEPT` |
 | `c2-accept-memo` | `CRATONVM_C2_ACCEPT_MEMO` |

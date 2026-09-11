@@ -248,7 +248,7 @@ any sweep summary.
 
 A concurrent session reached the same verdict the same day from the HotSpot
 baseline alone and moved the class to
-`docs/known-issues/spring/not-cratonvm-bugs-consolidated.md`; that page is the
+`docs/internal/fixed-suite-bugs/spring/not-cratonvm-bugs-consolidated.md`; that page is the
 one to keep, and its entry now carries the mechanism above (it had recorded
 `Unexpected: comment` as a comment token inside a JSON fixture, which is the
 right conclusion from the wrong cause — JSONAssert says `Unexpected: <name>`
