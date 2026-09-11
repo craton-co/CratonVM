@@ -4195,6 +4195,13 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
     RETIRED_SHADOW_TABLES
         .iter()
         .any(|table| table.binary_search(&key).is_ok())
+        // `CRATONVM_UNRETIRE_NATIVE_SHADOW` turns named rows back off, so a
+        // wave can be bisected in RUNS rather than one build per hypothesis.
+        // Unset -- every shipping configuration -- this is `false` without
+        // consulting anything; see [`crate::unretire`], whose
+        // `the_default_is_inert_across_every_retired_row` asserts it against
+        // every row of every table above.
+        && !crate::unretire::is_excluded(class_name, method_name, descriptor)
 }
 
 /// Every retired-shadow table, in one slice, so a gate can walk the whole
