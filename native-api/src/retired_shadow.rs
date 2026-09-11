@@ -3002,6 +3002,8 @@ static RETIRED_SHADOW_L1_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/util/zip/ZipFile", "getName", "()Ljava/lang/String;"),
     ("java/util/zip/ZipFile", "size", "()I"),
     ("java/util/zip/ZipFile", "stream", "()Ljava/util/stream/Stream;"),
+];
+
 /// The 2026-09-11 lane-L6 wave: `java/net/HttpURLConnection` and
 /// `ProxySelector.getDefault` -- 15 rows of a lane of 966, after the corpus
 /// refused 109 that the probe tree had cleared.
@@ -3488,10 +3490,17 @@ mod tests {
                 "{p} is admitted, but no L6 table retires anything under it"
             );
         }
-        // ...and the one that IS admitted carries every row of the table.
-        // `javax/security/auth/x500/` is a SUBTREE of the `javax/security/`
-        // this test forbids, which is the whole point: the wide prefix was
-        // measured and refused, the narrow one was measured and taken.
+        // `javax/security/auth/x500/` is in that list for a reason worth
+        // stating: it was ADMITTED through the fifth of this wave's six builds
+        // and came back out, because `X500Principal` alone breaks
+        // `RSslLiveSession`. A future lane that re-admits it has to delete the
+        // line above, which is the point.
+        //
+        // ...and the one prefix that IS admitted carries every row of the
+        // table. `java/net/` is wider than the table under it: two classes of
+        // the package are retired and six more were measured out by a corpus
+        // vector each. A prefix admits a package to the binary search; the
+        // table decides what is retired.
         for (c, _, _) in RETIRED_SHADOW_L6_TRIPLES {
             assert!(
                 c.starts_with("java/net/"),
