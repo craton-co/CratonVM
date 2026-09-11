@@ -467,6 +467,29 @@ struct Lowerer<'a> {
     /// for that bci. Populated as nodes are lowered; used to anchor each
     /// safepoint snapshot to a native offset for `DeoptimizationPoint`.
     bci_native: HashMap<usize, usize>,
+    /// `Graph::safepoints` index → earliest native offset emitted for a node
+    /// that names it through [`crate::ir::Node::frame_snapshot`].
+    ///
+    /// The per-COPY counterpart of [`Self::bci_native`]. A cloned loop body has
+    /// `trip` nodes at each of its bcis, so `bci_native` holds one offset for
+    /// all of them (copy 0's) and the other copies have no anchor of their own.
+    /// A snapshot that belongs to a specific copy anchors here instead, at an
+    /// offset inside that copy's code.
+    ///
+    /// EMPTY on every compile that does not unroll over a named body, which
+    /// makes `build_deopt_points` fall through to `bci_native` for every
+    /// snapshot exactly as it always did.
+    snapshot_native: HashMap<u32, usize>,
+    /// `Graph::safepoints` index the node currently being lowered names as its
+    /// own frame, or `None` when it names none — which is every node of every
+    /// graph that did not unroll over a named body.
+    ///
+    /// Read by [`Self::resolve_frame_state_for_site`], which is what every
+    /// guard's boxed deopt point goes through. Set beside [`Self::cur_node_pc`]
+    /// and reset the same way, for the same reason: a stale copy identity
+    /// attributed to a later node is a frame from the wrong iteration, and this
+    /// area's rule is that no frame is better than a wrong one.
+    cur_node_frame: Option<u32>,
     /// Bytecode pc of the node currently being lowered — the throw-site bci
     /// every exceptional exit emitted while lowering it belongs to.
     ///
@@ -1557,6 +1580,8 @@ impl<'a> Lowerer<'a> {
             num_locals,
             frame_size,
             bci_native: HashMap::new(),
+            snapshot_native: HashMap::new(),
+            cur_node_frame: None,
             cur_bci: 0,
             deopt_stub_patches: Vec::new(),
             transfer_bcis: std::collections::HashSet::new(),
@@ -7347,6 +7372,22 @@ impl<'a> Lowerer<'a> {
                 })
                 .or_insert(here);
         }
+        // Per-copy deopt metadata: a node belonging to a specific copy of a
+        // cloned body anchors its OWN snapshot, at an offset inside that copy.
+        // `None` (every node of every graph that did not unroll) leaves both
+        // the map and every frame resolution exactly as they were.
+        self.cur_node_frame = self.graph.nodes[id as usize].frame_snapshot;
+        if let Some(si) = self.cur_node_frame {
+            let here = self.buf.pos();
+            self.snapshot_native
+                .entry(si)
+                .and_modify(|e| {
+                    if here < *e {
+                        *e = here;
+                    }
+                })
+                .or_insert(here);
+        }
         let slot = self.alloc_slot(id);
         // The encoder wrote its store against `planned_slot_off`; if the
         // allocating path just disagreed, the artifact is already wrong and no
@@ -8256,6 +8297,22 @@ impl<'a> Lowerer<'a> {
             self.cur_bci = pc;
             self.bci_native
                 .entry(pc)
+                .and_modify(|e| {
+                    if here < *e {
+                        *e = here;
+                    }
+                })
+                .or_insert(here);
+        }
+        // Per-copy deopt metadata: a node belonging to a specific copy of a
+        // cloned body anchors its OWN snapshot, at an offset inside that copy.
+        // `None` (every node of every graph that did not unroll) leaves both
+        // the map and every frame resolution exactly as they were.
+        self.cur_node_frame = self.graph.nodes[id as usize].frame_snapshot;
+        if let Some(si) = self.cur_node_frame {
+            let here = self.buf.pos();
+            self.snapshot_native
+                .entry(si)
                 .and_modify(|e| {
                     if here < *e {
                         *e = here;
@@ -9326,7 +9383,7 @@ impl<'a> Lowerer<'a> {
                 // A fence and an asymmetry is one fence away from the bug;
                 // agreeing with the other emitters costs nothing.
                 let bci = self.resume_bci(bci);
-                let frame_state = self.resolve_frame_state_for_bci(bci);
+                let frame_state = self.resolve_frame_state_for_site(bci);
                 let reason = DeoptReason::UncommonTrap;
                 let point = Box::new(DeoptimizationPoint {
                     native_offset: self.buf.pos() as u32,
@@ -10622,6 +10679,10 @@ impl<'a> Lowerer<'a> {
         if let Some(pc) = self.graph.nodes[term as usize].bytecode_pc {
             self.cur_bci = pc;
         }
+        // Same reset discipline as `cur_node_pc`: a terminator carries no copy
+        // identity of its own (the unroller clones no control node), so this
+        // clears rather than inheriting the last data node's.
+        self.cur_node_frame = self.graph.nodes[term as usize].frame_snapshot;
         let node = &self.graph.nodes[term as usize];
         match &node.op {
             // ── cov-07: athrow ─────────────────────────────────────────
@@ -11238,6 +11299,39 @@ impl<'a> Lowerer<'a> {
             .any(|&(start, end, _)| pc >= start && pc < end)
     }
 
+    /// The frame state for a deopt emitted while lowering the CURRENT node,
+    /// resuming at `bci`.
+    ///
+    /// [`Self::resolve_frame_state_for_bci`] with one thing added: when the
+    /// node being lowered names its own snapshot
+    /// ([`crate::ir::Node::frame_snapshot`]), that snapshot wins over the
+    /// by-bci scan. After an unroll there are `trip` nodes at each body bci and
+    /// the scan finds copy 0's snapshot for every one of them; this is what
+    /// makes copy `k`'s guard resume into copy `k`'s values.
+    ///
+    /// # Fail closed on a bci disagreement
+    ///
+    /// The named snapshot is used only when its `bci` is the one being resumed
+    /// at. It should always be — `Graph::set_node_frame_snapshot` refuses to
+    /// install a snapshot whose bci differs from the node's — but the bci
+    /// reaching here has been through [`Self::resume_bci`], which rewrites a
+    /// combined-buffer pc inside a spliced body to the enclosing `invoke`. A
+    /// node that was both spliced and cloned would arrive with the two
+    /// disagreeing, and the honest answer there is the caller's `invoke` frame
+    /// the splice contract promises, not a callee frame from some iteration.
+    /// Falling back rather than asserting keeps that a missed optimization
+    /// instead of a refused compile.
+    fn resolve_frame_state_for_site(&self, bci: usize) -> FrameState {
+        if let Some(si) = self.cur_node_frame {
+            if let Some(sp) = self.graph.safepoints.get(si as usize) {
+                if sp.bci == bci {
+                    return self.resolve_frame_state(sp, si as usize);
+                }
+            }
+        }
+        self.resolve_frame_state_for_bci(bci)
+    }
+
     fn resolve_frame_state_for_bci(&self, bci: usize) -> FrameState {
         match self.graph.safepoints.iter().position(|s| s.bci == bci) {
             Some(idx) => self.resolve_frame_state(&self.graph.safepoints[idx], idx),
@@ -11434,7 +11528,7 @@ impl<'a> Lowerer<'a> {
         let bci = self.resume_bci(bci);
         // This bci CAN transfer. See `transfer_bcis`.
         self.transfer_bcis.insert(bci);
-        let frame_state = self.resolve_frame_state_for_bci(bci);
+        let frame_state = self.resolve_frame_state_for_site(bci);
         let point = Box::new(DeoptimizationPoint {
             native_offset: self.buf.pos() as u32,
             bci: bci as u32,
@@ -12641,7 +12735,16 @@ impl<'a> Lowerer<'a> {
         let at_traps_only = ir_deopt_points_at_traps_enabled();
         let mut points: Vec<DeoptimizationPoint> = Vec::with_capacity(self.graph.safepoints.len());
         for (index, sp) in self.graph.safepoints.iter().enumerate() {
-            let native_offset = match self.bci_native.get(&sp.bci) {
+            // A snapshot a copy's nodes claim anchors inside THAT copy;
+            // `bci_native` holds one offset per bci (the earliest, i.e. copy
+            // 0's) and would give every copy of an unrolled body the same
+            // point. `snapshot_native` is empty unless something cloned a
+            // region, so this is `bci_native` verbatim on every other compile.
+            let native_offset = match self
+                .snapshot_native
+                .get(&(index as u32))
+                .or_else(|| self.bci_native.get(&sp.bci))
+            {
                 Some(&off) => off as u32,
                 // bci produced no node / no machine code — nothing to anchor.
                 None => continue,
@@ -27024,6 +27127,86 @@ mod tests {").next().unwrap_or(src);
             );
             assert_eq!(got_laid as u32 as i32, want, "laid-out body wrong for n={n}");
         }
+    }
+
+    /// A loop unrolled over per-copy deopt frames computes the same answer,
+    /// and each copy's frame is anchored inside that copy's own code.
+    ///
+    /// The half `ir_optimize`'s tests cannot do. Those assert the GRAPH: five
+    /// snapshots at bci 11, each holding its own `(accumulator, induction)`
+    /// pair. This asserts the two things only the lowerer decides.
+    ///
+    /// **The answer.** The unrolled body is the arm that only exists with the
+    /// flag on, so nothing else in the suite executes it. Ten is
+    /// `0 + 1 + 2 + 3 + 4`, and the rolled arm is right there to disagree with.
+    ///
+    /// **The anchor.** `bci_native` keeps ONE native offset per bci — the
+    /// earliest, i.e. copy 0's — so a table built through it gives all five
+    /// copies one deopt point and `dedup_by_key` throws four of them away.
+    /// `snapshot_native` is what makes each copy's frame anchor inside that
+    /// copy, and five distinct offsets at one bci is exactly what it produces
+    /// and what nothing else in this file can.
+    #[test]
+    fn an_unrolled_body_carries_a_deopt_point_per_copy() {
+        // int f() { int a = 0; for (int i = 0; i < 5; i++) a += i; return a; }
+        let code = [
+            0x03u8, 0x3B, 0x03, 0x3C, 0x1B, 0x08, 0xA2, 0x00, 0x0D, 0x1A, 0x1B, 0x60, 0x3B, 0x84,
+            0x01, 0x01, 0xA7, 0xFF, 0xF4, 0x1A, 0xAC,
+        ];
+        let compile = |per_copy: bool| {
+            cratonvm_types::flags::with_thread_overrides(
+                &[(
+                    "CRATONVM_JIT_IR_PER_COPY_FRAMES",
+                    Some(if per_copy { "1" } else { "0" }),
+                )],
+                || {
+                    let mut graph = IrBuilder::new(0, 2).build(&code, 21).expect("IR build");
+                    ir_optimize::optimize(&mut graph);
+                    let schedule = ir_schedule::schedule(&graph);
+                    lower(&graph, &schedule, 0, 2, &no_helpers()).expect("the body lowers")
+                },
+            )
+        };
+
+        let rolled = compile(false);
+        let unrolled = compile(true);
+
+        for (what, cm) in [("rolled", &rolled), ("unrolled", &unrolled)] {
+            let got = unsafe { cm.try_call(&[]) }.expect("the body runs");
+            assert_eq!(got as u32 as i32, 10, "the {what} body summed 0..4 wrong");
+        }
+
+        // One deopt point per copy of the `iadd`'s bci, each at its own native
+        // offset. `dedup_by_key(native_offset)` runs after the sort, so a
+        // shared anchor cannot survive as five entries even by accident.
+        let at_iadd: Vec<u32> = unrolled
+            .deopt_points
+            .iter()
+            .filter(|p| p.bci == 11)
+            .map(|p| p.native_offset)
+            .collect();
+        let found = at_iadd.len();
+        assert_eq!(
+            found,
+            5,
+            "expected one deopt point per unrolled copy of bci 11, got {found} \
+             ({at_iadd:?}) -- `snapshot_native` is what anchors a copy's frame \
+             inside that copy's code, and `bci_native` alone gives all five the \
+             same offset",
+        );
+        let mut sorted = at_iadd.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 5, "two copies share a native offset: {at_iadd:?}");
+
+        // The rolled arm has one, which is what says the five above are the
+        // mechanism and not something this fixture would have produced anyway.
+        let rolled_at_iadd = rolled.deopt_points.iter().filter(|p| p.bci == 11).count();
+        assert!(
+            rolled_at_iadd <= 1,
+            "the rolled body already has {rolled_at_iadd} points at bci 11, so \
+             the count above is not evidence of anything",
+        );
     }
 
     /// A phi copy staged in the phi's own register computes the same integers
