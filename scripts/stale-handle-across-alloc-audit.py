@@ -184,6 +184,7 @@ def split_closures(name, start, body):
     kept = list(body)
     out = []
     k = 0
+    nth = 0
     while k < len(kept):
         c = strip_code(kept[k])
         if not CLOSURE.search(c):
@@ -197,7 +198,12 @@ def split_closures(name, start, body):
                 break
             j += 1
         if j - k >= 3:
-            out.append(("%s{closure@%d}" % (name, start + k + 1), start + k,
+            # Keyed by ORDINAL, not by line: a baseline keyed on a line number
+            # renames every closure in a file the moment anything above it
+            # grows a line, and the gate then reports a tree that did not
+            # change as a tree that grew.
+            nth += 1
+            out.append(("%s{closure#%d}" % (name, nth), start + k,
                         kept[k:j + 1]))
             for z in range(k, min(j + 1, len(kept))):
                 kept[z] = ""
