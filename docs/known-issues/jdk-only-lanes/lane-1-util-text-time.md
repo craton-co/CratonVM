@@ -515,10 +515,16 @@ anything any run produced:
 All three arms are re-frozen, each from its own printed line:
 
 ```text
-  BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT   2328 -> 2380   (+52)
-  BASELINE_SYNTHETIC_STUBS_MANAGEMENT      2339 -> 2391   (+52)
-  BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK   2328 -> 2380   (+52)
+  BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT   2332 -> 2384   (+52)
+  BASELINE_SYNTHETIC_STUBS_MANAGEMENT      2343 -> 2395   (+52)
+  BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK   2332 -> 2384   (+52)
 ```
+
+Measured twice, because `origin/dev` re-froze these constants underneath this
+branch between the two runs — lane 7's wave moved every baseline by `+4`. The
+BASELINE moved and this branch's `+52` did not, which is what it means for a
+delta to belong to the branch rather than to the tree. The first pair was
+`2328/2339 -> 2380/2391`.
 
 and `+52` is the same `+52` the jdk-only census reports for
 `synthetic-native-registered` (2202 → 2254). **Two instruments, one number**,
