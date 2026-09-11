@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-544 tokens.
+545 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -278,6 +278,7 @@ export inherited from a parent shell.
 | `ir-call` | `CRATONVM_DBG_IR_CALL` |
 | `ir-bufsize` | `CRATONVM_DBG_IR_BUFSIZE` |
 | `code-near-globals` | `CRATONVM_DBG_CODE_NEAR_GLOBALS` |
+| `epoch-cell` | `CRATONVM_DBG_EPOCH_CELL` |
 | `ir-compiles` | `CRATONVM_DBG_IR_COMPILES` |
 | `ir-isel` | `CRATONVM_DBG_IR_ISEL` |
 | `ir-linear-scan` | `CRATONVM_DBG_IR_LINEAR_SCAN` |
@@ -610,7 +611,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-432 tokens.
+433 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -753,6 +754,7 @@ export inherited from a parent shell.
 | `sp-epoch-guard-rip` | `CRATONVM_JIT_SP_EPOCH_GUARD_RIP` |
 | `sp-field-layout-guard` | `CRATONVM_JIT_SP_FIELD_LAYOUT_GUARD` |
 | `layout-epoch-static` | `CRATONVM_JIT_LAYOUT_EPOCH_STATIC` |
+| `epoch-cell` | `CRATONVM_JIT_EPOCH_CELL` |
 | `code-near-globals` | `CRATONVM_JIT_CODE_NEAR_GLOBALS` |
 | `ir-speculate` | `CRATONVM_JIT_IR_SPECULATE` |
 | `band-skip` | `CRATONVM_JIT_BAND_SKIP` |
