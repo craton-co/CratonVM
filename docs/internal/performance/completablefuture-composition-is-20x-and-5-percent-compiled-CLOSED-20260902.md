@@ -16,8 +16,8 @@ number:
 Composition is **1.20x faster** and the four refutations the page opened with
 still stand. What it was ABOUT — that composition is ~20x — is not fixed, for
 the reason the page itself gave: the cost is flat and structural. The part of
-that which is now newly askable has its own page:
-[`../../known-issues/perf/composition-native-callback-and-the-promotion-question-20260902.md`](../../known-issues/perf/composition-native-callback-and-the-promotion-question-20260902.md).
+that which is now newly askable had its own page, closed 2026-09-11:
+[`composition-native-callback-and-the-promotion-question-CLOSED-20260911.md`](composition-native-callback-and-the-promotion-question-CLOSED-20260911.md).
 
 Everything below is measured on this branch unless stated.
 
@@ -309,8 +309,26 @@ crate. Recorded because the correction is worth more than the row.
   `invokes(general)` is still 2.52 per chain after this change, and
   `find_with_kind` still runs about once per general invoke.
 
-The last two are the successor page:
-[`../../known-issues/perf/composition-native-callback-and-the-promotion-question-20260902.md`](../../known-issues/perf/composition-native-callback-and-the-promotion-question-20260902.md).
+The last two were the successor page, and both are now answered —
+[`composition-native-callback-and-the-promotion-question-CLOSED-20260911.md`](composition-native-callback-and-the-promotion-question-CLOSED-20260911.md),
+closed 2026-09-11. Two corrections it makes to the rows above belong here:
+
+* **"Every other native->Java callback in the VM still resolves by name" is
+  true and is not what this page's `invokes(general)` counts.** A
+  door-labelled dispatch tally puts **99 428 of the 100 805 at
+  `jit_mic_tail jdk/internal/misc/Unsafe.compareAndSetInt`** — a COMPILED
+  method calling a registered native by name, 2.49 per chain — against ~1 400
+  native->Java callbacks, 0.035 per chain. The general callback memo the
+  successor built is 1.92x where it engages and 1.00x here, for exactly that
+  reason; removing the `Unsafe` resolution took `invokes(general)` to **1 421**
+  and is worth 1.05-1.08x.
+* **"`getNow` is still one interpreted frame per chain … by design" was not by
+  design.** Its site is served by `execute_invokevirtual_fast_door`, which
+  carried a second copy of the `java/util/` exclusion that neither
+  `CRATONVM_JIT_VIRTUAL_NOMINATE_ALWAYS` nor
+  `CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL` reached, and which gated the counter
+  on it as well. With both doors wired the same way, promotion takes `getNow`
+  to 510 interpreted frames and the workload's total from 58 805 to 18 848.
 
 ## Still excluded, with the evidence
 

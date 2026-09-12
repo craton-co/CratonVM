@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-548 tokens.
+550 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -610,11 +610,13 @@ export inherited from a parent shell.
 | `interp-frames` | `CRATONVM_DBG_INTERP_FRAMES` |
 | `tierup-decline` | `CRATONVM_DBG_TIERUP_DECLINE` |
 | `direct-binds` | `CRATONVM_DBG_DIRECT_BINDS` |
+| `callback-memo` | `CRATONVM_DBG_CALLBACK_MEMO` |
+| `promote-refuse` | `CRATONVM_DBG_PROMOTE_REFUSE` |
 | `g1-dbg-rset` | `CRATONVM_G1_DBG_RSET` |
 
 ## `CRATONVM_JIT`
 
-445 tokens.
+447 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1062,6 +1064,8 @@ export inherited from a parent shell.
 | `virtual-promote-java-util` | `CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL` |
 | `native-cf-postcomplete-skip` | `CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP` |
 | `native-cf-postcomplete-direct` | `CRATONVM_NATIVE_CF_POSTCOMPLETE_DIRECT` |
+| `native-callback-memo` | `CRATONVM_NATIVE_CALLBACK_MEMO` |
+| `site-cache-capability` | `CRATONVM_JIT_SITE_CACHE_CAPABILITY` |
 | `ffm-verdict-ways` | `CRATONVM_FFM_VERDICT_WAYS` |
 
 ## `CRATONVM_GC`

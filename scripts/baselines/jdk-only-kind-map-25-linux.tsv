@@ -346,6 +346,30 @@
 # rows of lane 3's population NOT amended here each have a recorded reason --
 # 88 held, 24 wrong both ways, 92 never dispatched, 12 agreeing only at a
 # default value -- see RETIRED_SHADOW_L3_TRIPLES' doc comment.
+# amended: 2026-09-11, lane 4 wave 2. ONE HUNDRED AND ONE rows edited by hand,
+#   not re-measured: the nine `jdk/internal/foreign/layout/ValueLayouts$Of*Impl`
+#   carriers, `bridge 0 1` -> `synthetic-stub 1 1`, which is the re-tag in
+#   `NativeMethodRegistry::register` reading `RETIRED_SHADOW_L4_FFM_TRIPLES`.
+#
+#   `--update-baseline` was NOT used and must not be. A census taken on this
+#   branch flips 971 rows against this file; one taken on the binary built from
+#   the commit it forks from (`aba314446`) flips 870 of the same rows. The 870
+#   are `dev`'s own drift against this baseline, they are identical in both
+#   arms, and blessing them here would record them as this wave's work and
+#   silence whatever they are. So the control census is the filter: a row is
+#   edited only where the wave's census disagrees with this file AND the
+#   control's still agrees with it AND the triple is in the table. That is
+#   exactly 101 rows, every one of them `bridge -> synthetic-stub`, and none of
+#   them outside the table.
+#
+#   The table has 137 rows and only 101 appear here. The other 36 --
+#   `byteSize`, `byteAlignment`, `byteOffset` and `toString` on the nine
+#   classes -- have no row in this file at all, in EITHER arm. They are absent
+#   from the baseline rather than changed by this wave, so they are not added:
+#   adding them would be a re-freeze wearing an amendment's clothes.
+#
+#   After this amendment the gate reports 870 on this branch, which is what it
+#   reports on the control. It is still red, and it was red before this wave.
 CratonVM$HttpServerLoop	run	()V	0	bridge	0	1
 brave/internal/collect/WeakConcurrentMap$WeakKey	equals	(Ljava/lang/Object;)Z	0	bridge	0	1
 com/carrotsearch/randomizedtesting/RandomizedContext	context	(Ljava/lang/Thread;)Lcom/carrotsearch/randomizedtesting/RandomizedContext;	0	bridge	0	1
@@ -9524,107 +9548,107 @@ jdk/internal/foreign/NativeMemorySegmentImpl	isNative	()Z	0	bridge	0	1
 jdk/internal/foreign/NativeMemorySegmentImpl	isReadOnly	()Z	0	bridge	0	1
 jdk/internal/foreign/NativeMemorySegmentImpl	scope	()Ljava/lang/foreign/MemorySegment$Scope;	0	bridge	0	1
 jdk/internal/foreign/SegmentFactories	fromArray	([F)Ljdk/internal/foreign/HeapMemorySegmentImpl$OfFloat;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	carrier	()Ljava/lang/Class;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	name	()Ljava/util/Optional;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	order	()Ljava/nio/ByteOrder;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	targetLayout	()Ljava/util/Optional;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	withByteAlignment	(J)Ljava/lang/foreign/AddressLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	withByteAlignment	(J)Ljava/lang/foreign/MemoryLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/AddressLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/AddressLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	withTargetLayout	(Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/AddressLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl	carrier	()Ljava/lang/Class;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl	name	()Ljava/util/Optional;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl	order	()Ljava/nio/ByteOrder;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl	withByteAlignment	(J)Ljava/lang/foreign/MemoryLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout$OfBoolean;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfBoolean;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfBoolean;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfByteImpl	carrier	()Ljava/lang/Class;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfByteImpl	name	()Ljava/util/Optional;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfByteImpl	order	()Ljava/nio/ByteOrder;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfByteImpl	withByteAlignment	(J)Ljava/lang/foreign/MemoryLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfByteImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout$OfByte;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfByteImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfByteImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfByteImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfByte;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfByteImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfByteImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfByte;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfByteImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfCharImpl	carrier	()Ljava/lang/Class;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfCharImpl	name	()Ljava/util/Optional;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfCharImpl	order	()Ljava/nio/ByteOrder;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfCharImpl	withByteAlignment	(J)Ljava/lang/foreign/MemoryLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfCharImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout$OfChar;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfCharImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfCharImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfCharImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfChar;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfCharImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfCharImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfChar;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfCharImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl	carrier	()Ljava/lang/Class;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl	name	()Ljava/util/Optional;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl	order	()Ljava/nio/ByteOrder;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl	withByteAlignment	(J)Ljava/lang/foreign/MemoryLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout$OfDouble;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfDouble;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfDouble;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl	carrier	()Ljava/lang/Class;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl	name	()Ljava/util/Optional;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl	order	()Ljava/nio/ByteOrder;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl	withByteAlignment	(J)Ljava/lang/foreign/MemoryLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout$OfFloat;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfFloat;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfFloat;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfIntImpl	carrier	()Ljava/lang/Class;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfIntImpl	name	()Ljava/util/Optional;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfIntImpl	order	()Ljava/nio/ByteOrder;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfIntImpl	withByteAlignment	(J)Ljava/lang/foreign/MemoryLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfIntImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout$OfInt;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfIntImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfIntImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfIntImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfInt;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfIntImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfIntImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfInt;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfIntImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfLongImpl	carrier	()Ljava/lang/Class;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfLongImpl	name	()Ljava/util/Optional;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfLongImpl	order	()Ljava/nio/ByteOrder;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfLongImpl	withByteAlignment	(J)Ljava/lang/foreign/MemoryLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfLongImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout$OfLong;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfLongImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfLongImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfLongImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfLong;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfLongImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfLongImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfLong;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfLongImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfShortImpl	carrier	()Ljava/lang/Class;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfShortImpl	name	()Ljava/util/Optional;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfShortImpl	order	()Ljava/nio/ByteOrder;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfShortImpl	withByteAlignment	(J)Ljava/lang/foreign/MemoryLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfShortImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout$OfShort;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfShortImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfShortImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfShortImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfShort;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfShortImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfShortImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfShort;	0	bridge	0	1
-jdk/internal/foreign/layout/ValueLayouts$OfShortImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;	0	bridge	0	1
+jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	carrier	()Ljava/lang/Class;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	name	()Ljava/util/Optional;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	order	()Ljava/nio/ByteOrder;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	targetLayout	()Ljava/util/Optional;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	withByteAlignment	(J)Ljava/lang/foreign/AddressLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	withByteAlignment	(J)Ljava/lang/foreign/MemoryLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/AddressLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/AddressLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl	withTargetLayout	(Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/AddressLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl	carrier	()Ljava/lang/Class;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl	name	()Ljava/util/Optional;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl	order	()Ljava/nio/ByteOrder;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl	withByteAlignment	(J)Ljava/lang/foreign/MemoryLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout$OfBoolean;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfBoolean;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfBoolean;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfByteImpl	carrier	()Ljava/lang/Class;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfByteImpl	name	()Ljava/util/Optional;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfByteImpl	order	()Ljava/nio/ByteOrder;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfByteImpl	withByteAlignment	(J)Ljava/lang/foreign/MemoryLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfByteImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout$OfByte;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfByteImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfByteImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfByteImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfByte;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfByteImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfByteImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfByte;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfByteImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfCharImpl	carrier	()Ljava/lang/Class;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfCharImpl	name	()Ljava/util/Optional;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfCharImpl	order	()Ljava/nio/ByteOrder;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfCharImpl	withByteAlignment	(J)Ljava/lang/foreign/MemoryLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfCharImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout$OfChar;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfCharImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfCharImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfCharImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfChar;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfCharImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfCharImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfChar;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfCharImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl	carrier	()Ljava/lang/Class;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl	name	()Ljava/util/Optional;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl	order	()Ljava/nio/ByteOrder;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl	withByteAlignment	(J)Ljava/lang/foreign/MemoryLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout$OfDouble;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfDouble;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfDouble;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl	carrier	()Ljava/lang/Class;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl	name	()Ljava/util/Optional;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl	order	()Ljava/nio/ByteOrder;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl	withByteAlignment	(J)Ljava/lang/foreign/MemoryLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout$OfFloat;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfFloat;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfFloat;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfIntImpl	carrier	()Ljava/lang/Class;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfIntImpl	name	()Ljava/util/Optional;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfIntImpl	order	()Ljava/nio/ByteOrder;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfIntImpl	withByteAlignment	(J)Ljava/lang/foreign/MemoryLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfIntImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout$OfInt;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfIntImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfIntImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfIntImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfInt;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfIntImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfIntImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfInt;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfIntImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfLongImpl	carrier	()Ljava/lang/Class;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfLongImpl	name	()Ljava/util/Optional;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfLongImpl	order	()Ljava/nio/ByteOrder;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfLongImpl	withByteAlignment	(J)Ljava/lang/foreign/MemoryLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfLongImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout$OfLong;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfLongImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfLongImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfLongImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfLong;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfLongImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfLongImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfLong;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfLongImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfShortImpl	carrier	()Ljava/lang/Class;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfShortImpl	name	()Ljava/util/Optional;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfShortImpl	order	()Ljava/nio/ByteOrder;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfShortImpl	withByteAlignment	(J)Ljava/lang/foreign/MemoryLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfShortImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout$OfShort;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfShortImpl	withByteAlignment	(J)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfShortImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfShortImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfShort;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfShortImpl	withName	(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfShortImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfShort;	0	synthetic-stub	1	1
+jdk/internal/foreign/layout/ValueLayouts$OfShortImpl	withOrder	(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;	0	synthetic-stub	1	1
 jdk/internal/io/JdkConsoleImpl	echo	(Z)Z	0	bridge	1	1
 jdk/internal/jimage/NativeImageBuffer	getNativeMap	(Ljava/lang/String;)Ljava/nio/ByteBuffer;	0	bridge	1	1
 jdk/internal/loader/AbstractClassLoaderValue	computeIfAbsent	(Ljava/lang/ClassLoader;Ljava/util/function/BiFunction;)Ljava/lang/Object;	0	bridge	0	1

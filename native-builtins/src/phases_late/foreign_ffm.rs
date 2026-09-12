@@ -39,8 +39,11 @@ pub(crate) fn p67_layout_object(
     // `probes/W2ValueLayoutProbe` the moment that preseed stopped running:
     // every constant reported `order() == BIG_ENDIAN` while
     // `ByteOrder.nativeOrder()` two lines above answered LITTLE_ENDIAN.
-    ctx.set_field(obj, slots.name, Value::Object(None));
-    // LAST, because the real arm allocates and can move `obj`.
+    // Each of the three below can ALLOCATE and so can move `obj`; each hands
+    // back the current reference and none of them may be reordered above a
+    // plain `set_field` that uses a stale one.
+    let obj = p67_layout_set_name(ctx, obj, Value::Object(None))?;
+    let obj = p67_layout_set_carrier(ctx, obj, minted)?;
     let obj = p67_layout_set_order(ctx, obj, cfg!(target_endian = "little"))?;
     Ok(obj)
 }
@@ -95,6 +98,16 @@ pub(crate) struct P67LayoutSlots {
     /// A sequence's stored element count (`elemCount`), 4 on the fabricated
     /// carrier.
     pub(crate) element_count: usize,
+    /// True when this carrier IS the real JDK class -- it declares
+    /// `byteSize`, `byteAlignment` and `name` itself, so every index above is
+    /// a real field index and every field must hold what the real bytecode
+    /// reads there. False for the carriers this file fabricates, whose slots
+    /// mean only what this file says they mean.
+    ///
+    /// The two differ in CONTENT as well as in indices, which is the whole
+    /// reason this flag exists: `AbstractLayout.name` is an
+    /// `Optional<String>`, not a `String`. See [`p67_layout_set_name`].
+    pub(crate) real: bool,
 }
 
 /// How a carrier records byte order -- the one place the two conventions are
@@ -138,6 +151,7 @@ fn p67_layout_slots_inner(
         ctx.resolve_field_index_by_class_id(class_id, "name"),
     ) {
         return P67LayoutSlots {
+            real: true,
             byte_size,
             byte_alignment,
             name,
@@ -176,6 +190,7 @@ fn p67_layout_slots_inner(
         }
     };
     P67LayoutSlots {
+        real: false,
         byte_size: 0,
         byte_alignment: 1,
         name,
@@ -250,13 +265,90 @@ pub(crate) fn p67_layout_set_order(
     }
 }
 
+/// The layout's name as a bare `String` reference, or null.
+///
+/// **The field does not hold the same thing on both carriers.** A real
+/// `jdk.internal.foreign.layout.AbstractLayout` declares
+/// `Optional<String> name`, and the carriers this file fabricates keep the bare
+/// reference. Every reader in this file wants the bare one, so the unwrap lives
+/// here -- one place -- and [`p67_layout_set_name`] is its inverse.
 pub(crate) fn p67_layout_name_value(ctx: &dyn NativeContext, layout: ObjectRef) -> Value {
     let slots = p67_layout_slots(ctx, layout);
-    if ctx.object_num_fields(layout) > slots.name {
-        ctx.get_field(layout, slots.name)
-    } else {
-        Value::Object(None)
+    if ctx.object_num_fields(layout) <= slots.name {
+        return Value::Object(None);
     }
+    let stored = ctx.get_field(layout, slots.name);
+    if !slots.real {
+        return stored;
+    }
+    match stored {
+        // A real carrier minted by REAL bytecode holds an `Optional`; one
+        // minted here holds whatever `p67_layout_set_name` put there, which is
+        // also an `Optional`. Either way the value is its slot 0.
+        Value::Object(Some(opt)) if ctx.object_num_fields(opt) > 0 => ctx.get_field(opt, 0),
+        _ => Value::Object(None),
+    }
+}
+
+/// Write `name` in the convention THIS carrier's class declares, and return the
+/// layout -- which the real arm can MOVE, because it allocates an `Optional`.
+///
+/// A real `AbstractLayout.name` is an `Optional<String>` and every real reader
+/// calls `Optional.isPresent()` on it straight away, so a bare `String` there
+/// is not merely unread -- it is a `NullPointerException` out of
+/// `AbstractLayout.name()`, and a null there is one out of `equals`, which is
+/// what `ValueLayout.JAVA_INT.withName("k").equals(...)` threw in BOTH modes
+/// before this existed. The same shape as `java.io.File`'s `prefixLength` in
+/// lane 4 wave 1: the VM writes the slot it reads and nothing else, and the
+/// defect is invisible until real bytecode reads the field.
+pub(crate) fn p67_layout_set_name(
+    ctx: &mut dyn NativeContext,
+    layout: ObjectRef,
+    raw: Value,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let slots = p67_layout_slots(ctx, layout);
+    if ctx.object_num_fields(layout) <= slots.name {
+        return Ok(layout);
+    }
+    if !slots.real {
+        ctx.set_field(layout, slots.name, raw);
+        return Ok(layout);
+    }
+    let pin = ctx.pin_native_root(layout);
+    let opt = p67_optional(ctx, raw)?;
+    let layout = ctx.read_native_pin(pin, layout);
+    ctx.unpin_native_roots(pin);
+    ctx.set_field(layout, slots.name, Value::Object(Some(opt)));
+    Ok(layout)
+}
+
+/// Write `carrier`, the `Class` a real value layout keeps on
+/// `ValueLayouts$AbstractValueLayout`, when the carrier class declares one.
+///
+/// Nothing wrote it before, and the native `carrier()` derives its answer from
+/// the class NAME instead -- so the method answered correctly while the field
+/// behind it was null, and the first real bytecode to read it
+/// (`AbstractValueLayout.equals`, `toString`, `varHandle`) got a
+/// `NullPointerException`. Returns the layout because the class mirror can be
+/// allocated and the allocation can move it.
+pub(crate) fn p67_layout_set_carrier(
+    ctx: &mut dyn NativeContext,
+    layout: ObjectRef,
+    class_name: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let class_id = ctx.class_id_of_object(layout);
+    let Some(slot) = ctx.resolve_field_index_by_class_id(class_id, "carrier") else {
+        return Ok(layout);
+    };
+    if ctx.object_num_fields(layout) <= slot {
+        return Ok(layout);
+    }
+    let pin = ctx.pin_native_root(layout);
+    let mirror = p67_class_mirror(ctx, p67_layout_carrier_name(class_name))?;
+    let layout = ctx.read_native_pin(pin, layout);
+    ctx.unpin_native_roots(pin);
+    ctx.set_field(layout, slot, Value::Object(Some(mirror)));
+    Ok(layout)
 }
 
 pub(crate) fn p67_layout_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -355,8 +447,8 @@ pub(crate) fn p67_layout_with_name(
         }
         None => Value::Object(None),
     };
-    ctx.set_field(cloned, name_slot, name);
     ctx.unpin_native_roots(this_pin);
+    let cloned = p67_layout_set_name(ctx, cloned, name)?;
     Ok(Some(Value::Object(Some(cloned))))
 }
 
@@ -423,8 +515,15 @@ pub(crate) fn p67_layout_with_byte_alignment(
         _ => 0,
     };
     if alignment <= 0 || (alignment & (alignment - 1)) != 0 {
+        // MEASURED, not guessed: `AbstractLayout.withByteAlignment(3)` on
+        // Temurin 25 throws `IllegalArgumentException: Invalid alignment: 3`.
+        // The longer "alignment constraint" spelling belongs to
+        // `Arena.allocate(8, 3)`, which is a different refusal in a different
+        // class and keeps its own wording (see `panama.rs`, where the JDK's
+        // odd " : " spacing is also preserved). The KIND is the contract and
+        // was already right; the text is what a log reader diffs.
         return Err(RuntimeError::IllegalArgumentException {
-            message: format!("Invalid alignment constraint: {alignment}"),
+            message: format!("Invalid alignment: {alignment}"),
         }
         .into());
     }
@@ -859,8 +958,7 @@ pub(crate) fn p67_layout_with_order(
     // `p67_layout_object` has already stamped the HOST's order; this is the
     // caller's, which is the whole point of `withOrder`.
     let obj = p67_layout_set_order(ctx, obj, little)?;
-    let name_slot = p67_layout_slots(ctx, obj).name;
-    ctx.set_field(obj, name_slot, inherited_name);
+    let obj = p67_layout_set_name(ctx, obj, inherited_name)?;
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -1911,7 +2009,36 @@ pub(crate) fn p67_layout_render(ctx: &dyn NativeContext, layout: ObjectRef) -> S
             "java/lang/foreign/MemorySegment" => "a",
             _ => "?",
         };
-        format!("{letter}{size}")
+        // THE CASE IS THE BYTE ORDER. `ValueLayouts$AbstractValueLayout`
+        // uppercases the letter for a big-endian layout and leaves it lower
+        // for little -- so `JAVA_INT` prints `i4` on this host and
+        // `JAVA_INT.withOrder(BIG_ENDIAN)` prints `I4`. This rendered the
+        // lower-case letter for both, which made a layout REPORT AN ORDER IT
+        // DOES NOT HAVE while `order()` beside it answered correctly: the
+        // silent-wrong-answer shape lane 4 owns, in the one method a caller
+        // reads to find out what it is holding. Groups, sequences and padding
+        // have no order and never reach here.
+        let letter = if p67_layout_is_little(ctx, layout) {
+            letter.to_string()
+        } else {
+            letter.to_uppercase()
+        };
+        // An ADDRESS layout with a target renders it after a colon --
+        // `ADDRESS.withTargetLayout(JAVA_INT)` is `a8:i4`, not `a8`. The target
+        // is part of the string `decorateLayoutString` then wraps, so it goes
+        // in here rather than beside the `%` prefix or the `(name)` suffix.
+        let target = match ctx
+            .resolve_field_index_by_class_id(ctx.class_id_of_object(layout), "targetLayout")
+        {
+            Some(slot) if ctx.object_num_fields(layout) > slot => {
+                match ctx.get_field(layout, slot) {
+                    Value::Object(Some(t)) => format!(":{}", p67_layout_render(ctx, t)),
+                    _ => String::new(),
+                }
+            }
+            _ => String::new(),
+        };
+        format!("{letter}{size}{target}")
     };
 
     // A VALUE layout whose alignment is not its size prints an `<align>%`
@@ -4045,8 +4172,8 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             ctx.set_field(obj, slots.byte_size, Value::Long(size));
             ctx.set_field(obj, slots.byte_alignment, Value::Long(max_align));
             ctx.set_field(obj, slots.payload, Value::Object(Some(members)));
-            ctx.set_field(obj, slots.name, Value::Object(None));
             ctx.unpin_native_roots(members_pin);
+            let obj = p67_layout_set_name(ctx, obj, Value::Object(None))?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4178,9 +4305,9 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             ctx.set_field(obj, slots.byte_alignment, Value::Long(elem_align.max(1)));
             let element = ctx.read_native_pin(element_pin, element);
             ctx.set_field(obj, slots.payload, Value::Object(Some(element)));
-            ctx.set_field(obj, slots.name, Value::Object(None));
             ctx.set_field(obj, slots.element_count, Value::Long(count));
             ctx.unpin_native_roots(element_pin);
+            let obj = p67_layout_set_name(ctx, obj, Value::Object(None))?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4252,8 +4379,8 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             ctx.set_field(obj, slots.byte_size, Value::Long(size));
             ctx.set_field(obj, slots.byte_alignment, Value::Long(max_align));
             ctx.set_field(obj, slots.payload, Value::Object(Some(members)));
-            ctx.set_field(obj, slots.name, Value::Object(None));
             ctx.unpin_native_roots(members_pin);
+            let obj = p67_layout_set_name(ctx, obj, Value::Object(None))?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4306,7 +4433,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             // member decode fell back to "alignment = size".
             ctx.set_field(obj, slots.byte_alignment, Value::Long(1));
             ctx.set_field(obj, slots.payload, Value::Object(None));
-            ctx.set_field(obj, slots.name, Value::Object(None));
+            let obj = p67_layout_set_name(ctx, obj, Value::Object(None))?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );

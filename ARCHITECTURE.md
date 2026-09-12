@@ -109,20 +109,22 @@ Rough size distribution, largest first, so newcomers know where the mass
 actually is:
 
 Measured 2026-09-09 with the command above, one directory at a time;
-`native-api` re-measured 2026-09-11 at **42429**, on the merge of lane 4's
-table with this branch's L0 and L3. It has moved three times in two days and
-always for one reason: every retirement table lives in `retired_shadow.rs`,
-one row per retired triple plus the account justifying it. L1's wave took it
-from 37k to 38,923; L0+L3+L1's waves 3-4+L7 took it to 41,715; lane 4 and
-`file_layout.rs` bring it here. **The 5% tolerance on the row below is roughly
-two waves wide**, so expect to re-measure it about every second wave rather
-than treating a red here as a surprise.
+`native-api` re-measured 2026-09-11 at **44636**, on the merge of lane 4 wave 2
+with `origin/dev` at `e240573a8`. It has moved four times in two days and always
+for one reason: every retirement table lives in `retired_shadow.rs`, one row per
+retired triple plus the account justifying it. L1's wave took it from 37k to
+38,923; L0+L3+L1's waves 3-4+L7 took it to 41,715; lane 4 wave 1 and
+`file_layout.rs` took it to 42,429; `dev` then reached 43,734 on its own and
+lane 4 wave 2's 137-row table adds the last 902. **The 5% tolerance on the row
+below is roughly two waves wide**, so expect to re-measure it about every second
+wave rather than treating a red here as a surprise — the row below was at 4.13%
+before this wave and the wave is what crossed it.
 
 | Crate | LoC | Crate | LoC |
 |-------|----:|-------|----:|
 | `native-builtins` | 753,000 | `native-awt` | 18,000 |
 | `vm` | 480,000 | `types` | 44,000 |
-| `jit` | 269,000 | `native-api` | 42,000 |
+| `jit` | 269,000 | `native-api` | 45,000 |
 | `gc` | 190,000 | `reader` | 17,000 |
 | `native-collections` | 88,000 | `jfr` | 20,000 |
 | `native-io` | 85,000 | `jit-cuda` | 14,000 |
