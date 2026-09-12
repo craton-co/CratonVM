@@ -212,6 +212,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
     let mut indy_ops: Vec<(usize, u16)> = Vec::new(); // (pc, cp_index) for `invokedynamic` (0xba)
     let mut has_athrow = false; // RBC.6 — method contains 0xbf
     let mut has_newarray = false; // Primitive array allocation (0xbc)
+    let mut has_putstatic = false;
                                   // RBC.6 local-handler-safety fix — every `*load`/`*store`/`iinc`
                                   // instruction's (bytecode_pc, local_slot). Populated inline in the
                                   // existing, already-correct per-opcode arms below (zero new pc-
@@ -552,6 +553,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             }
             // putstatic — static field write (needs vm context)
             0xb3 => {
+                has_putstatic = true;
                 if pc + 2 >= code_len {
                     return None;
                 }
@@ -931,6 +933,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
         indy_ops,
         has_athrow,
         has_newarray,
+        has_putstatic,
         local_slot_ops,
     })
 }
@@ -979,6 +982,10 @@ pub struct JitScanResult {
     pub has_athrow: bool,
     /// The method contains primitive `newarray` (0xbc).
     pub has_newarray: bool,
+    /// Whether the method contains a `putstatic` (0xb3). `static_field_ops`
+    /// lists reads and writes together, and only a write is refused by
+    /// `ir::ir_compatible`.
+    pub has_putstatic: bool,
     /// RBC.6 local-handler-safety fix — every `*load`/`*store`/`iinc`
     /// instruction's `(bytecode_pc, is_store, local_slot)`, in bytecode
     /// order. See the field's push sites in `jit_scan` and

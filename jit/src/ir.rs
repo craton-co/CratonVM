@@ -7451,6 +7451,49 @@ impl IrBuilder {
                     self.push(r);
                     pc += 1;
                 }
+                // wide — the 16-bit-index forms of the local loads, local
+                // stores and `iinc`. Same node-graph mechanics as the narrow
+                // arms (a load pushes the local's node, a store replaces it,
+                // `iinc` adds an `Int` constant); only the operand width
+                // differs. `jit_scan` accepted `wide`, so `ir_compatible`
+                // admitted its methods and the build refused them at the
+                // catch-all. `wide ret` stays refused, like `ret`.
+                0xc4 => {
+                    if pc + 3 >= code.len() {
+                        return ir_build_bail(line!(), pc);
+                    }
+                    let sub = code[pc + 1];
+                    let idx = u16::from_be_bytes([code[pc + 2], code[pc + 3]]) as usize;
+                    if idx >= self.locals.len() {
+                        return ir_build_bail(line!(), pc);
+                    }
+                    match sub {
+                        // iload lload fload dload aload
+                        0x15..=0x19 => {
+                            self.push(self.locals[idx]);
+                            pc += 4;
+                        }
+                        // istore lstore fstore dstore astore
+                        0x36..=0x3a => {
+                            let val = self.pop();
+                            self.locals[idx] = val;
+                            pc += 4;
+                        }
+                        // iinc with a 16-bit signed increment
+                        0x84 => {
+                            if pc + 5 >= code.len() {
+                                return ir_build_bail(line!(), pc);
+                            }
+                            let inc = i64::from(i16::from_be_bytes([code[pc + 4], code[pc + 5]]));
+                            let old = self.locals[idx];
+                            let c = self.iconst(inc);
+                            let r = self.add_data(Op::Add, IrType::Int, vec![old, c], pc);
+                            self.locals[idx] = r;
+                            pc += 6;
+                        }
+                        _ => return ir_build_bail(line!(), pc),
+                    }
+                }
                 // iinc
                 0x84 => {
                     let idx = code[pc + 1] as usize;
@@ -8805,6 +8848,136 @@ impl IrBuilder {
                         self.push(v1);
                         self.push(v2);
                         self.push(v1);
+                    }
+                    pc += 1;
+                }
+
+                // pop2, swap, dup_x2, dup2_x1, dup2_x2 — the rest of the JVMS
+                // stack shuffles, on the same one-entry-per-VALUE model as
+                // `dup_x1` and `dup2` above: a category-2 value is one entry,
+                // its category is read from the node's type, and a shape the
+                // verifier cannot produce (a category-2 value where the form
+                // needs category 1) is refused, never guessed.
+                //
+                // `jit_scan` accepted all five, so `ir_compatible` admitted
+                // their methods and the build then refused them at the
+                // catch-all after doing the partial work.
+                0x58 | 0x5f | 0x5b | 0x5d | 0x5e => {
+                    macro_rules! is_cat2 {
+                        ($v:expr) => {
+                            matches!(self.graph.nodes[$v as usize].ty, IrType::Long | IrType::Double)
+                        };
+                    }
+                    macro_rules! pop_value {
+                        () => {
+                            match self.pop_opt() {
+                                Some(v) => v,
+                                None => return ir_build_bail(line!(), pc),
+                            }
+                        };
+                    }
+                    macro_rules! pop_cat1 {
+                        () => {{
+                            let v = pop_value!();
+                            if is_cat2!(v) {
+                                return ir_build_bail(line!(), pc);
+                            }
+                            v
+                        }};
+                    }
+                    match op {
+                        // pop2: one category-2 value, or two category-1 values.
+                        0x58 => {
+                            let v1 = pop_value!();
+                            if !is_cat2!(v1) {
+                                let _ = pop_cat1!();
+                            }
+                        }
+                        // swap: `.., v2, v1` -> `.., v1, v2`, both category 1.
+                        0x5f => {
+                            let v1 = pop_cat1!();
+                            let v2 = pop_cat1!();
+                            self.push(v1);
+                            self.push(v2);
+                        }
+                        // dup_x2: v1 is category 1.
+                        //   form 1: `.., v3, v2, v1` -> `.., v1, v3, v2, v1`
+                        //   form 2: `.., v2(cat2), v1` -> `.., v1, v2, v1`
+                        0x5b => {
+                            let v1 = pop_cat1!();
+                            let v2 = pop_value!();
+                            if is_cat2!(v2) {
+                                self.push(v1);
+                                self.push(v2);
+                                self.push(v1);
+                            } else {
+                                let v3 = pop_cat1!();
+                                self.push(v1);
+                                self.push(v3);
+                                self.push(v2);
+                                self.push(v1);
+                            }
+                        }
+                        // dup2_x1:
+                        //   form 1: `.., v3, v2, v1` -> `.., v2, v1, v3, v2, v1`
+                        //   form 2: `.., v2, v1(cat2)` -> `.., v1, v2, v1`
+                        0x5d => {
+                            let v1 = pop_value!();
+                            if is_cat2!(v1) {
+                                let v2 = pop_cat1!();
+                                self.push(v1);
+                                self.push(v2);
+                                self.push(v1);
+                            } else {
+                                let v2 = pop_cat1!();
+                                let v3 = pop_cat1!();
+                                self.push(v2);
+                                self.push(v1);
+                                self.push(v3);
+                                self.push(v2);
+                                self.push(v1);
+                            }
+                        }
+                        // dup2_x2:
+                        //   form 1: `.., v4, v3, v2, v1` -> `.., v2, v1, v4, v3, v2, v1`
+                        //   form 2: `.., v3, v2, v1(cat2)` -> `.., v1, v3, v2, v1`
+                        //   form 3: `.., v3(cat2), v2, v1` -> `.., v2, v1, v3, v2, v1`
+                        //   form 4: `.., v2(cat2), v1(cat2)` -> `.., v1, v2, v1`
+                        _ => {
+                            let v1 = pop_value!();
+                            if is_cat2!(v1) {
+                                let v2 = pop_value!();
+                                if is_cat2!(v2) {
+                                    self.push(v1);
+                                    self.push(v2);
+                                    self.push(v1);
+                                } else {
+                                    let v3 = pop_cat1!();
+                                    self.push(v1);
+                                    self.push(v3);
+                                    self.push(v2);
+                                    self.push(v1);
+                                }
+                            } else {
+                                let v2 = pop_cat1!();
+                                let v3 = pop_value!();
+                                if is_cat2!(v3) {
+                                    self.push(v2);
+                                    self.push(v1);
+                                    self.push(v3);
+                                    self.push(v2);
+                                    self.push(v1);
+                                } else {
+                                    let v4 = pop_cat1!();
+                                    self.push(v2);
+                                    self.push(v1);
+                                    self.push(v4);
+                                    self.push(v3);
+                                    self.push(v2);
+                                    self.push(v1);
+                                }
+                            }
+                        }
                     }
                     pc += 1;
                 }
@@ -11352,6 +11525,14 @@ pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
     if scan.invoke_ops.len() > IR_MAX_INVOKES {
         return ir_reject("scan.invoke_ops.len() > IR_MAX_INVOKES");
     }
+    // `putstatic` has no IR lowering, and deliberately: a static reference
+    // write owes the SATB pre-barrier the single-pass `jit_putstatic_*` path
+    // carries. The builder refused it at its catch-all AFTER the partial graph
+    // build (and `c2_upgrade_would_engage` still answered yes); refuse it
+    // here instead.
+    if scan.has_putstatic {
+        return ir_reject("scan.has_putstatic");
+    }
     // getfield/putfield. Raised 5 -> 64. Instance field access lowers to
     // `Op::Load`/`Op::Store` (optionally via the checked `jit_getfield`
     // helper); nothing about it scales worse than the single-pass backend, so
@@ -12386,6 +12567,7 @@ mod tests {
             has_athrow: false,
             local_slot_ops: vec![],
             has_newarray: false,
+            has_putstatic: false,
             ldc_ops: vec![],
         };
         assert!(ir_compatible(&scan));
@@ -12411,6 +12593,7 @@ mod tests {
             has_athrow: false,
             local_slot_ops: vec![],
             has_newarray: false,
+            has_putstatic: false,
             ldc_ops: vec![],
         };
         assert!(ir_compatible(&scan));
@@ -12436,6 +12619,7 @@ mod tests {
             has_athrow: false,
             local_slot_ops: vec![],
             has_newarray: false,
+            has_putstatic: false,
             ldc_ops: vec![],
         };
         // Invokes: 5 -> 32 (direct-call slice) -> IR_MAX_INVOKES once inline
@@ -12479,6 +12663,9 @@ mod tests {
             .collect();
         assert!(!ir_compatible(&scan));
         scan.static_field_ops.clear();
+        scan.has_putstatic = true;
+        assert!(!ir_compatible(&scan), "putstatic has no IR lowering; refuse it up front");
+        scan.has_putstatic = false;
 
         // Object allocations stay the most conservative budget: a surviving
         // `Op::New` lowers through the shared stub, so the cap bounds real
@@ -12568,6 +12755,7 @@ mod tests {
             has_athrow: false,
             local_slot_ops: vec![],
             has_newarray: false,
+            has_putstatic: false,
             ldc_ops: vec![],
         };
         // jit-inlining-and-ir-calls: the bytecode budget rose from 200 — which
@@ -12605,6 +12793,7 @@ mod tests {
             has_athrow: false,
             local_slot_ops: vec![],
             has_newarray: false,
+            has_putstatic: false,
             ldc_ops: vec![],
         };
         // 2026-09-06: this assertion was inverted, deliberately. The IR
@@ -14270,5 +14459,79 @@ mod tests {
         ] {
             assert_eq!(op.memory_shape(), None, "{op:?}");
         }
+    }
+}
+
+/// The JVMS stack shuffles and `wide` forms the builder used to refuse at its
+/// catch-all after `ir_compatible` had admitted the method.
+#[cfg(test)]
+mod stack_shuffle_and_wide_tests {
+    use super::*;
+
+    fn builds(params: usize, locals: usize, code: &[u8], len: usize) -> bool {
+        IrBuilder::new(params, locals).build(code, len).is_some()
+    }
+
+    #[test]
+    fn every_category1_and_category2_shuffle_form_builds() {
+        // iload_0 iload_1 swap isub ireturn
+        assert!(builds(2, 2, &[0x1a, 0x1b, 0x5f, 0x64, 0xac, 0, 0], 5), "swap");
+        // iconst_1 iconst_2 pop2 iload_0 ireturn
+        assert!(builds(1, 1, &[0x04, 0x05, 0x58, 0x1a, 0xac, 0, 0], 5), "pop2 of two cat-1");
+        // lconst_1 pop2 iload_0 ireturn
+        assert!(builds(1, 1, &[0x0a, 0x58, 0x1a, 0xac, 0, 0], 4), "pop2 of one cat-2");
+        // iconst_1 iconst_2 iconst_3 dup_x2 pop pop pop ireturn
+        assert!(
+            builds(0, 0, &[0x04, 0x05, 0x06, 0x5b, 0x57, 0x57, 0x57, 0xac, 0, 0], 8),
+            "dup_x2 form 1"
+        );
+        // lconst_1 iconst_2 dup_x2 pop pop2 ireturn
+        assert!(
+            builds(0, 0, &[0x0a, 0x05, 0x5b, 0x57, 0x58, 0xac, 0, 0], 6),
+            "dup_x2 form 2"
+        );
+        // iconst_1 iconst_2 iconst_3 dup2_x1 pop2 pop pop2 iconst_0 ireturn
+        assert!(
+            builds(0, 0, &[0x04, 0x05, 0x06, 0x5d, 0x58, 0x57, 0x58, 0x03, 0xac, 0, 0], 9),
+            "dup2_x1 form 1"
+        );
+        // iconst_1 lconst_1 dup2_x1 pop2 pop pop2 iconst_0 ireturn
+        assert!(
+            builds(0, 0, &[0x04, 0x0a, 0x5d, 0x58, 0x57, 0x58, 0x03, 0xac, 0, 0], 8),
+            "dup2_x1 form 2"
+        );
+        // lconst_0 lconst_1 dup2_x2 pop2 pop2 pop2 iconst_0 ireturn
+        assert!(
+            builds(0, 0, &[0x09, 0x0a, 0x5e, 0x58, 0x58, 0x58, 0x03, 0xac, 0, 0], 8),
+            "dup2_x2 form 4"
+        );
+        // iconst_1 iconst_2 lconst_1 dup2_x2 pop2 pop2 pop pop iconst_0 ireturn
+        assert!(
+            builds(
+                0,
+                0,
+                &[0x04, 0x05, 0x0a, 0x5e, 0x58, 0x57, 0x57, 0x58, 0x03, 0xac, 0, 0],
+                10
+            ),
+            "dup2_x2 form 2"
+        );
+    }
+
+    /// A category-2 value where the form needs category 1 is not a shape the
+    /// verifier produces; the builder refuses rather than shuffling a guess.
+    #[test]
+    fn an_illegal_shuffle_shape_is_refused() {
+        // iconst_1 lconst_1 swap ...
+        assert!(!builds(0, 0, &[0x04, 0x0a, 0x5f, 0x57, 0x57, 0x03, 0xac, 0, 0], 7));
+    }
+
+    #[test]
+    fn wide_loads_stores_and_iinc_build() {
+        // wide iinc 0, +256 ; iload_0 ; ireturn
+        assert!(builds(1, 1, &[0xc4, 0x84, 0x00, 0x00, 0x01, 0x00, 0x1a, 0xac, 0, 0], 8));
+        // wide iload 0 ; wide istore 1 ; iload_1 ; ireturn
+        assert!(builds(1, 2, &[0xc4, 0x15, 0x00, 0x00, 0xc4, 0x36, 0x00, 0x01, 0x1b, 0xac, 0, 0], 10));
+        // wide iload 7 with only one local: out of range, refused.
+        assert!(!builds(1, 1, &[0xc4, 0x15, 0x00, 0x07, 0xac, 0, 0], 5));
     }
 }
