@@ -3435,13 +3435,23 @@ fn handshake_listeners(
 /// algorithm and the client-auth flags — the caller could not read back what
 /// it had just set. MEASURED, `L6TlsParamSweep` row 83.
 ///
-/// LOCK LEVEL (lock-discipline ratchet): the same `parking_lot::Mutex` shape
-/// and the same one-operation-under-the-guard discipline as the auth table
-/// above.
-fn ssl_sock_endpoint_alg() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, String>> {
-    static T: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, String>>> =
-        std::sync::OnceLock::new();
-    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0). Both acquisition sites do
+/// one map operation on an `i32` key computed ABOVE the acquisition, so the
+/// guard is never held across a re-entry into the VM. A raw `parking_lot`
+/// lock here would be a new unordered global in the one crate whose natives
+/// call back into Java; the ratchet in
+/// `native-builtins/tests/lock_discipline_ratchet.rs` says so and is right.
+fn ssl_sock_endpoint_alg(
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<i32, String>> {
+    static T: std::sync::OnceLock<
+        cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<i32, String>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            rustc_hash::FxHashMap::default(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 fn ssl_sock_auth_update<F: FnOnce(&mut (i32, i32, i32))>(
@@ -4934,10 +4944,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // `ssl_sock_endpoint_alg`.
             let params_pin = ctx.pin_native_root(params);
             let (_, need, want) = ssl_sock_auth_get(ctx, this);
-            let alg = ssl_sock_endpoint_alg()
-                .lock()
-                .get(&ctx.identity_hash_code(this))
-                .cloned();
+            let alg_key = ctx.identity_hash_code(this);
+            let alg = ssl_sock_endpoint_alg().lock().get(&alg_key).cloned();
             let params = ctx.read_native_pin(params_pin, params);
             if need != 0 {
                 let _ = ctx.invoke_virtual(params, "setNeedClientAuth", "(Z)V", &[Value::Int(1)]);
