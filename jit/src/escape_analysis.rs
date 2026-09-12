@@ -37,13 +37,14 @@
 //!
 //! # What is actually consumed
 //!
-//! [`EscapeAnalysisResult`] has four outputs; `jit/src/lib.rs` reads only two:
+//! [`EscapeAnalysisResult`] has several outputs; production code in
+//! `jit/src/lib.rs` (`apply_ea_to_ir_pinned`) reads only two:
 //!
 //! | Field | Consumer | Status |
 //! |---|---|---|
-//! | `scalar_replaceable` | IR scalar replacement | live |
-//! | `elide_locks` | IR lock elision | live |
-//! | `lock_elisions` | — | the *correct* granularity of `elide_locks` |
+//! | `scalar_replaceable` | IR scalar replacement (`plan_scalar_replacement`) | live |
+//! | `lock_elisions` | IR lock elision, applied all-or-nothing per object | live |
+//! | `elide_locks` | tests + diagnostics | the flat view of `lock_elisions`; no production reader |
 //! | `lock_coarsening` | — | offered, no consumer yet |
 //! | `lock_refusals` | tests + diagnostics | informational |
 //! | `stack_allocatable` | — | **computed, never read** |
@@ -57,9 +58,13 @@
 //!
 //! * **elision** removes every monitor operation on a confined object. It is
 //!   offered per object ([`LockElisionPlan`]) because removing a strict subset
-//!   of a balanced monitor sequence is wrong code, and the consumer that reads
-//!   the flat [`EscapeAnalysisResult::elide_locks`] list can refuse individual
-//!   nodes.
+//!   of a balanced monitor sequence is wrong code. The production consumer
+//!   (`apply_ea_to_ir_pinned` in `jit/src/lib.rs`) reads those per-object plans
+//!   and refuses a whole object when any one of its monitors cannot be removed;
+//!   the flat [`EscapeAnalysisResult::elide_locks`] list is kept for tests and
+//!   diagnostics. A method that had monitors before elision is marked unable to
+//!   deopt-resume precisely (`had_monitors`, see
+//!   `docs/jit/lock-elimination.md` §8).
 //! * **coarsening** merges two adjacent lock regions on a confined object by
 //!   deleting the inner `monitorexit`/`monitorenter` pair
 //!   ([`LockCoarseningPlan`]). It depends on no elision having landed, so it is
@@ -115,11 +120,14 @@
 //! edges**. Without them there is no CFG here to build a dominator tree from.
 //!
 //! So the analysis uses program order — ascending [`NodeId`], which is creation
-//! order — as a stand-in, and gates that stand-in on
-//! [`program_order_proves_dominance`]: it is only sound in a graph with no
-//! branch, no join and no multi-input φ. Everything else resolves to
-//! [`LoadResolution::Unknown`] and the object is refused. Recovering precision
-//! means giving the EA graph real control edges — see `docs/jit/escape-analysis.md`.
+//! order — as a stand-in, and gates that stand-in per candidate on either
+//! [`program_order_proves_dominance`] (a graph with no branch, no join and no
+//! multi-input φ) or `one_block_proves_dominance` (the allocation and every
+//! access it folds share one basic block, as recorded in `Graph::blocks`, with
+//! no φ alias). Anything else with a store to a loaded field resolves to
+//! [`LoadResolution::Unknown`] and the object is refused. Recovering more
+//! precision means giving the EA graph real control edges — see
+//! `docs/jit/escape-analysis.md`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 

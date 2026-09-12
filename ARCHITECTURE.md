@@ -399,24 +399,70 @@ active, so `getfield`/`putfield` fall back to the always-correct helpers.
 
 ### JIT Compiler (`jit/` crate)
 
-Custom x86-64 / AArch64 JIT compiler (~105,000 LoC; `x64.rs` alone is ~42,600).
-Extracted into the `cratonvm-jit` crate, with shared API types in
-`cratonvm-jit-api`.
+Custom JIT compiler: a single-pass x86-64 emitter, a sea-of-nodes IR tier that
+also lowers to x86-64, and an AArch64 backend. It lives in the `cratonvm-jit`
+crate (about 268,000 lines of Rust under `jit/src/`, including `jit/src/x64/`).
+Shared API types, including the runtime helper table `JitRuntimeHelpers`, are in
+`cratonvm-jit-api`; see [docs/jit/helper-abi.md](docs/jit/helper-abi.md).
 
-- **`lib.rs`** — JIT infrastructure: compiled code cache, OSR entry points.
-- **`x64.rs`** — x86-64 machine code emitter with 26 optimization rounds.
-- **`aarch64.rs`** — AArch64 machine code backend (partial coverage).
-- **`ir.rs`, `ir_optimize.rs`, `ir_schedule.rs`, `ir_lower.rs`** — optional
-  sea-of-nodes IR pipeline (build, optimize, schedule, lower to x64).
+**Layout.**
 
-**Compilation pipeline:** the JIT has two paths. The default is a
-single-pass emitter that lowers bytecode directly to x86-64 native code
-(`x64::compile`). Methods that pass `ir_compatible()` instead go through
-an optional sea-of-nodes IR pipeline
-(`bytecode -> IrBuilder -> Graph -> optimize -> schedule -> lower -> x64`,
-in `ir.rs`, `ir_optimize.rs`, `ir_schedule.rs`, `ir_lower.rs`), which
-decouples optimization from instruction selection; others fall back to the
-direct single-pass path.
+| Area | Files | Role |
+|---|---|---|
+| Crate root | `jit/src/lib.rs` | `CompiledMethod`, `JitCache`, `try_compile` / `try_compile_with_invokespecial_resolver` / `try_compile_inner` (the IR orchestration and its fall-through), the inlining planner, the escape-analysis bridge, OSR entry (`osr_enter`, `osr_trampoline`, `ir_osr_enter`) |
+| Admission | `jit/src/compile_gate.rs` | `compile_gate::admit`, the door every backend entry passes (`CompileDoor::{MethodEntry, EagerFirstCall, Osr}`); returns the `CompileAdmission` the backends require |
+| Single-pass x64 emitter | `jit/src/x64.rs` (module root) and `jit/src/x64/*` | `x64/driver.rs` `compile_with_param_slots` (production entry; `x64::compile` is the legacy test/AOT wrapper) → `x64/bytecode_walk.rs` `Compiler::compile_bytecode`, the per-opcode walk. Frames in `frames.rs`, safepoints/shadow stack/oop maps in `safepoint.rs`, deopt stubs in `deopt_stubs.rs`, OSR exit maps in `osr.rs`, plus inlining, LICM, BCE, instruction patterns, SIMD and a bytecode-level escape analysis |
+| IR tier | `ir.rs` → `ir_optimize.rs` → `ir_verify.rs` → `ir_schedule.rs` → `ir_lower.rs`, accepted through `ir_evidence.rs` | `IrBuilder` and `ir_compatible`; optimization passes; the always-on verifier; block placement; lowering to x86-64, which runs the `regalloc.rs` linear-scan allocator itself. Supporting analyses: `escape_analysis.rs`, `ir_check_elim.rs`, `range_analysis.rs`, `scev.rs`, `loop_analysis.rs` |
+| Shared lowering | `jit/src/runtime_lowering.rs` | allocation, monitor (`emit_monitor_stub`) and hashed-vtable stubs used by both x64 front ends |
+| Register allocation | `jit/src/regalloc.rs` | Chaitin-Briggs colouring of bytecode locals for the single-pass emitter; `allocate_linear_scan` / `verify_allocation` for the IR lowerer |
+| AArch64 | `aarch64.rs`, `aarch64_backend.rs` | see [docs/jit/aarch64-parity.md](docs/jit/aarch64-parity.md) |
+| Deopt / OSR | `deopt.rs`, `osr_contract.rs`, `osr_coords.rs`, `osr_exit.rs`, `x64/osr.rs`, `x64/deopt_stubs.rs` | frame states and deopt points; OSR entry and exit contracts |
+| Tiering and profiles | `tiered.rs`, `profile.rs`, `pgo.rs` | `TieredCompilationManager`, compilation queue and background compiler; interpreter-collected profiles |
+| VM glue | `vm/src/jit/*`, `vm/src/runtime/interpreter/jit_bridge.rs`, `vm/src/runtime/interpreter/deopt_resume.rs` | runtime helpers and `build_helpers` (`vm/src/jit/helpers.rs`), JIT-frame GC roots, code-cache lifecycle; every place the interpreter asks for, enters or leaves compiled code; rebuilding interpreter frames after a deopt |
+
+**Flow: interpreter → tier-up → compile → install → deopt / OSR.**
+
+1. **Interpret and count.** Dispatch sites report invocations to
+   `TieredCompilationManager::on_method_invocation_observed`. A taken back edge
+   reaches `try_osr_with_backoff` (`vm/src/runtime/interpreter.rs`), which asks
+   `TieredCompilationManager::request_osr`. The first-tier threshold is
+   `CRATONVM_JIT_THRESHOLD` (default 500; see `vm/src/runtime/env_cache.rs`).
+   Tier policy lives in `jit/src/tiered.rs`.
+2. **Tier up.** The manager yields a `CompilationTask`. Codegen runs
+   **off-thread by default**: `jit_bridge::background_compile_task` compiles and
+   publishes while the mutator keeps interpreting (`CRATONVM_BG_COMPILE=0`
+   restores inline compilation). The interpreter also has an eager first-call
+   single-pass door.
+3. **Compile.** Every door passes `compile_gate::admit`.
+   * The **single-pass** path is `x64::compile_with_param_slots` →
+     `Compiler::compile_bytecode`.
+   * The **IR** path runs inside `try_compile_inner` when the caller asked for
+     the optimizing backend and `ir::ir_compatible` holds. The background worker
+     asks for it when `tiered::tier_uses_optimized_backend` says so, which is the
+     `C2` and `FullProfile` tiers. The steps are: `IrBuilder` → the
+     `IR_MAX_GRAPH_NODES` (20,000) cap → `ir_optimize::optimize` → `ir_verify` →
+     `ir_schedule::schedule_with_options` → `ir_lower::lower_inner` →
+     `ir_evidence::accept`. `accept` publishes the IR body only when the
+     recorded transforms justify replacing the baseline
+     (`CRATONVM_C2_ACCEPT=always|evidence|never`, default `evidence`).
+   * Any IR refusal, at any step, falls through to the single-pass path.
+4. **Install.** The artifact goes into the VM's `JitCache` (`JitCache::put`, or
+   `JitCache::put_osr` for OSR artifacts). Lifecycle:
+   [docs/jit/code-cache-lifecycle.md](docs/jit/code-cache-lifecycle.md).
+5. **Enter.** `jit_bridge::execute_jit_call` (and its decoded / one-shot
+   variants) calls the compiled body.
+6. **Deopt.** A failing guard or uncommon trap calls `jit_uncommon_trap`
+   (`vm/src/jit/helpers.rs`). That stashes a reconstructed frame, which the sink
+   takes with `deopt::take_last_deopt`, and returns `i64::MIN`. The sink then
+   either resumes precisely in the interpreter (`deopt_resume.rs`) or re-runs
+   the whole method.
+7. **OSR.** `try_osr` compiles or reuses an OSR artifact
+   (`compile_osr_artifact`, or `compile_optimizing_artifact` for the IR door),
+   admits the entry (`CompiledMethod::validate_osr_entry` for single-pass
+   artifacts), and enters through `osr_enter_planned` or `ir_osr_enter`. A mid-loop
+   exit is transferred into the live frame by
+   `transfer_osr_exit_into_live_frame_checked`. See
+   [docs/jit/on-stack-replacement.md](docs/jit/on-stack-replacement.md).
 
 **The two front ends now share one runtime-sensitive lowering library.**
 `jit/src/runtime_lowering.rs` owns the x86-64 contracts for allocation,
@@ -424,19 +470,29 @@ megamorphic dispatch, and live monitor calls. The single-pass emitter and IR
 lowerer may differ in optimization and scheduling, but both emit those
 stateful operations through the same ABI.
 
-`ir_compatible()` admits up to 64 invokes, 64 instance-field operations, 64
-static-field operations, and 16 allocation sites; `ir_compatible_sized` uses
-an 8,000-byte method cap and a 20,000-node graph cap. Static calls lower
-directly, virtual/interface calls use the same MIC/four-entry PIC plus compact
-eight-set/two-way hashed tail, and escaping `Op::New` nodes lower through the
-class-initializing, TLAB-aware allocation helper. Live monitor bytecodes call
-the thin-lock runtime path; only an exact per-PC scalar-replacement proof may
-elide a lock.
+`ir_compatible()` admits up to 64 invokes (`IR_MAX_INVOKES`), 64
+instance-field operations, 64 static-field operations, 64 `new` sites
+(`IR_MAX_ALLOCATIONS`) and 16 array-allocation sites
+(`IR_MAX_ARRAY_ALLOCATIONS`), in methods of at most 8,000 bytes
+(`IR_MAX_BYTECODE_SIZE`, the only cap `ir_compatible_sized` applies). The
+20,000-node cap (`IR_MAX_GRAPH_NODES`) is checked in `try_compile_inner` after
+the graph is built. Static calls lower directly, virtual/interface calls use the
+same MIC/four-entry PIC plus compact eight-set/two-way hashed tail, and escaping
+`Op::New` nodes lower through the class-initializing, TLAB-aware allocation
+helper. Live monitor bytecodes lower through `runtime_lowering::emit_monitor_stub`
+to the `monitor_enter` / `monitor_exit` helpers. The IR tier elides the monitors
+of an object escape analysis proves confined, all-or-nothing per object, and a
+method that had monitors elided cannot deopt-resume precisely
+([docs/jit/lock-elimination.md](docs/jit/lock-elimination.md)).
 
-Coverage gaps such as unsupported `invokedynamic`, `multianewarray`, or
-exception-frame shapes remain fail-closed admission boundaries: the method
-uses another tier or the interpreter rather than receiving different runtime
-semantics.
+Coverage gaps remain fail-closed admission boundaries: the method uses another
+tier or the interpreter rather than receiving different runtime semantics.
+`invokedynamic` is no longer one of them for the method as a whole. Both
+backends lower an `invokedynamic` site to an uncommon trap, and an OSR entry
+into such an artifact is refused (`osr-entry-unconditional-trap`).
+`multianewarray` compiles in the single-pass emitter only for two dimensions
+(the `multianewarray_2d` helper); the IR tier refuses the opcode, and such a
+method falls back to the single-pass path.
 
 Key optimizations: register allocation for locals, magic division,
 LICM, bounds check elimination, AVX2 SIMD, on-stack replacement (OSR).
@@ -446,13 +502,10 @@ or 2,000 bytes (hot). There is still no general cross-call register allocation
 and no bounded-depth recursion inlining; see [BENCHMARK.md](BENCHMARK.md) for
 what that costs on recursion-bound rows.
 
-Methods are compiled after `CRATONVM_JIT_THRESHOLD` invocations (default 500;
-see `vm/src/runtime/env_cache.rs`). Codegen runs **off-thread by default** — the
-tiered manager enqueues a `CompilationTask` and a background worker publishes
-into `shared.jit_cache`, while the mutator keeps interpreting until the entry
-appears (`CRATONVM_BG_COMPILE=0` restores inline compilation). Two calling
-conventions: **pure** methods (direct call) and **context** methods (receive
-`SharedVm` pointer as hidden first argument).
+Two calling conventions (`CompiledMethod::needs_context`): **pure** methods
+(direct call) and **context** methods, which receive the `SharedVm` pointer as a
+hidden first argument. Whether a method needs the context is an output of
+optimization: escape analysis can remove its last heap use.
 
 ### Native Methods (`native-api/` and `native-*` crates)
 
@@ -581,12 +634,17 @@ pointer.
    one-byte kind only to disambiguate raw `long`/`double` patterns and preserve
    JVM category-2 slot semantics.
 
-4. **Direct bytecode-to-x86-64, with an optional IR.** The JIT's default
-   path compiles bytecode directly to machine code in a single pass, which
-   keeps that path simple at the cost of limiting cross-instruction
-   optimizations. Methods that qualify (`ir_compatible()`) are instead
-   routed through an optional sea-of-nodes IR that enables broader
-   optimization before instruction selection.
+4. **Direct bytecode-to-x86-64 first, a sea-of-nodes IR for the hot tier.**
+   Every door into compiled code can take the single-pass emitter
+   (`x64::compile_with_param_slots`), which compiles bytecode directly to
+   machine code. That keeps the path simple, at the cost of limiting
+   cross-instruction optimization. The eager first-call compile is always
+   single-pass. The sea-of-nodes IR is the backend of the optimizing tiers:
+   compiles for the `C2` and `FullProfile` tiers
+   (`tiered::tier_uses_optimized_backend`) and optimizing OSR entries try it
+   when `ir::ir_compatible` admits the method. Its body replaces the baseline
+   only if `ir_evidence::accept` finds the recorded transforms worth it; any
+   refusal falls back to the single-pass body.
 
 5. **Dense, memoized native dispatch.** Name resolution hashes the
    `(class, method, descriptor)` triple and verifies the full strings on every
@@ -747,12 +805,25 @@ the single cheapest defence against this whole class of drift.
     v
   interpreter::execute()   run bytecode
     |   ^
-    |   | (hot method threshold)
+    |   | invocation / back-edge counts (TieredCompilationManager)
     v   |
-  jit::compile()           emit x86-64, cache
+  jit_bridge               try_jit_upgrade_with_gate / try_osr
+    |                      (background_compile_task by default)
+    v
+  compile_gate::admit      one door for every backend entry
     |
     v
-  native call              compiled code calls back into VM
+  try_compile_with_invokespecial_resolver     IR tier, falling back to
+  x64::compile_with_param_slots               the single-pass emitter
+    |
+    v
+  JitCache::put / put_osr  install
+    |
+    v
+  execute_jit_call         run compiled code; helpers call back into the VM
+    |
+    +--> i64::MIN deopt:  deopt_resume  -> interpreter (precise resume or re-run)
+    +--> OSR exit:        transfer_osr_exit_into_live_frame_checked -> interpreter
 ```
 
 ## Testing Strategy

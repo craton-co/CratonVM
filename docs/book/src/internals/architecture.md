@@ -68,12 +68,23 @@ cratonvm-embed → vm  (curated, semver-stable Rust embedding facade)
     ▼
   interpreter::execute()      run bytecode
     │   ▲
-    │   │ (hot-method threshold)
+    │   │ invocation / back-edge counts (TieredCompilationManager)
     ▼   │
-  jit::compile()              emit x86-64, cache the compiled method
+  jit_bridge                  request a compile (background by default)
     │
     ▼
-  compiled code               calls back into the VM for slow paths / natives
+  compile_gate::admit         the one admission door
+    │
+    ▼
+  IR tier or single-pass      try_compile_with_invokespecial_resolver /
+    │                         x64::compile_with_param_slots
+    ▼
+  JitCache::put / put_osr     install the compiled method
+    │
+    ▼
+  compiled code               calls back into the VM for slow paths / natives;
+                              deopt (i64::MIN) and OSR exits return to the
+                              interpreter
 ```
 
 ## Subsystem map

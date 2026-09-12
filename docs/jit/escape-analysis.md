@@ -61,10 +61,13 @@ It orders below `ArgEscape` because that is the direction a future
 partial-escape applier moves it in. The predicate for "escapes" is therefore
 `EscapeState::may_escape()` (`!= NoEscape`), **not** `>= ArgEscape`.
 
-`Graph::cold_nodes` is empty by default and has no producer, so today no
-allocation is ever classified partial and behaviour is byte-identical to before.
-`PartialEscapeInfo::escape_sites` names the nodes at which a future applier
-would have to materialize.
+`Graph::cold_nodes` is empty by default. *As written:* it had no producer.
+**Since then** `try_compile_inner` feeds it: `ea_mark_cold_from_branch_hints`
+(`jit/src/lib.rs`) calls `ea.mark_cold` for the nodes `ea_cold_control_nodes`
+derives from the IR branch hints. The classification stays **report-only**: no
+acting consumer reads `PartialEscape`, so this changes `partial_escapes` and the
+stats, not the generated code. `PartialEscapeInfo::escape_sites` names the nodes
+at which a future applier would have to materialize.
 
 ### What each state means
 
@@ -161,6 +164,22 @@ is used as a stand-in, gated on `program_order_proves_dominance(graph)`:
   at a join; a single-input φ is a degenerate copy (the transparent-alias shape
   `find_scalar_replacements` already accepts) and implies no divergence.
 
+**The per-allocation escape (added after this section was written).**
+`find_scalar_replacements` computes the graph-wide answer once and then, for
+each candidate, uses
+`dominance_proved || one_block_proves_dominance(graph, id, &transparent,
+&field_stores, &replaced_loads)`. The second disjunct holds when the allocation
+and **every** store and load the candidate folds are in one basic block
+(`Graph::blocks`, filled by the bridge), and the reference has no φ alias
+(`transparent` is the allocation alone). Within a straight-line block ascending
+`NodeId` is execution order. Because the allocation is in the same block, each
+execution of the block makes a fresh object, so a store from an earlier loop
+iteration wrote a different object. This is what lets an object allocated,
+filled and read inside a loop body be replaced, even though the loop's own
+back-edge `Merge` makes `program_order_proves_dominance` false. A node with no
+recorded block, or accesses in different blocks, answers `false`.
+`Graph::blocks` is empty by default, and a `Guard` is not a block boundary.
+
 **Exceptions are deliberately not on the list.** A `catch`/`finally` handler body
 is never built into the IR: `ir::IrBuilder::build` skips handler bytecode
 outright (the "STUB-S8" skip), because a JIT frame never takes an exception edge
@@ -190,10 +209,11 @@ same last-write-wins bug) and to be all-or-nothing.
 
 **Yes, end-to-end too.** §6.1's edit landed: the production
 applier's planner `plan_scalar_replacement` consumes `info.load_value` per load
-and refuses on `Unknown` (`jit/src/lib.rs:10353`), and the id-comparison
+and refuses on `Unknown` (the `LoadResolution::Unknown => return None` arm in
+`plan_scalar_replacement`, `jit/src/lib.rs`), and the id-comparison
 heuristic is gone. The end-to-end witness is
 `ea_load_before_a_later_store_forwards_the_pre_store_value`
-(`jit/src/lib.rs:17228`), which asserts the pre-store value is forwarded *and*
+(`jit/src/lib.rs`), which asserts the pre-store value is forwarded *and*
 pins the precondition that `field_values[0]` — the source the applier used to
 read — still holds the wrong (later) value, so the test cannot pass by
 accident.
@@ -238,7 +258,21 @@ covers both halves.
 
 ### Producer status
 
-`Op::RefCompare` and `Op::IdentityHash` are new variants with **no producer**.
+> **Since, verified 2026-09-12: both variants have a producer.** The first pass
+> of `escape_analysis_from_ir` (`jit/src/lib.rs`) maps an `ir::Op::Cmp(_)` to
+> `escape_analysis::Op::RefCompare` when `ir_cmp_is_ref_compare` holds. That is
+> a reference compare, and only the null literal (`Op::Const(0)`) is excluded,
+> not `Const` in general. It maps an `ir::Op::Call` to
+> `escape_analysis::Op::IdentityHash` when `ir_call_is_identity_hash` holds:
+> `java/lang/System.identityHashCode(Ljava/lang/Object;)I` as a static call
+> (`invoke_kind == 3`), or `java/lang/Object.hashCode()I` as an `invokespecial`
+> (`invoke_kind == 1`, i.e. `super.hashCode()`). A *virtual* `hashCode()` stays
+> `Op::Call`, because the bridge has no class hierarchy to rule out an override.
+> The observed reference is re-packed from IR input 2 to EA input 0.
+> `ir_op_to_ea_op`, the graph-free fallback, still maps `Cmp` to `Other` and
+> calls to `Call`. The paragraph below is the pre-wiring state.
+
+`Op::RefCompare` and `Op::IdentityHash` were new variants with **no producer**.
 `ir_op_to_ea_op` maps `ir::Op::Cmp(_)` to `Op::Other` and an identity-hash call
 to `Op::Call`. The *outcome* is already fail-closed — `Op::Other` hits the
 catch-all and `Op::Call` escapes the object — but it is incidental,
@@ -248,25 +282,166 @@ wiring edit.
 
 ---
 
-## 5. Arrays and exceptions
+## 5. Arrays, aliases, and the production planner
 
-**Arrays are out of scope by construction, not by omission.**
-`find_scalar_replacements` only accepts `Op::New`; `field_in_range` returns
-`false` for every `Op::NewArray`, so an array never resolves a field edge; and
-`ir_op_to_ea_op` maps `ir::Op::ArrayLoad`/`ArrayStore` to `Op::Call`, which
-escapes the array reference to `ArgEscape`. That is correct today because the IR
-lowerer has no scalar-array path at all and a live `Op::NewArray` makes the
-optimizing tier decline the method outright. Scalar-replacing a
-constant-length array needs a lowerer change first, not an analysis change.
+> **Rewritten 2026-09-12 against `jit/src/escape_analysis.rs` and
+> `jit/src/lib.rs`.** The earlier text of this section said arrays were out of
+> scope. That stopped being true when small constant-length arrays became
+> scalar-replaceable.
 
-**Exceptions** are covered in §3: handler bodies are not compiled, so there is no
-intra-method exception control flow for the analysis to model. This is a
-*dependency*, not a proof — it is recorded here so that whoever enables handler
-compilation knows to revisit `program_order_proves_dominance`.
+### 5.1 Small constant-length primitive arrays are replaceable
+
+`find_scalar_replacements` accepts an `Op::NewArray` as well as an `Op::New`,
+when all of the following hold:
+
+* The length is a compile-time constant. The bridge
+  (`escape_analysis_from_ir`) fills `escape_analysis::Op::NewArray { length }`
+  from `ir_new_array_const_length`; otherwise the refusal is
+  `ArrayRefusal::LengthNotConstant`.
+* The length is at most `MAX_SCALAR_ARRAY_LEN` (8); otherwise
+  `ArrayRefusal::LengthTooLarge(n)`.
+* The elements are primitive. A reference-element array (`anewarray`) is
+  refused with `ArrayRefusal::ReferenceElements`.
+* No `arraylength` use of the array survives. That refusal is
+  `ArrayRefusal::LengthReadNotFolded`.
+
+The element slots are the "fields". `field_in_range` answers
+`length.is_some_and(|n| field < n)` for a `NewArray`. The bridge maps an
+`ir::Op::ArrayLoad` / `ArrayStore` whose index is a constant
+(`ir_array_const_index`) to `escape_analysis::Op::Load(idx)` / `Store(idx)`,
+re-packed into the same `[holder]` / `[holder, value]` layout as a field access.
+A non-constant index still maps to `Op::Call` (the graph-free fallback
+`ir_op_to_ea_op`), which escapes the array.
+
+### 5.2 The narrow-array forwarding rule
+
+A field store keeps its value whole. A narrow array element does not: `bastore`,
+`sastore` and `castore` truncate, and the matching load re-extends. Forwarding
+the stored value straight to the load is therefore only correct when it already
+fits. `plan_scalar_replacement` checks every forwarded array value with
+`narrow_array_value_fits(graph, value, load_kind, array_element_type)` and
+refuses the **whole object** when it does not fit. The rule:
+
+| Element kind | A forwarded value fits when it is |
+| --- | --- |
+| `boolean[]` (newarray atype 4, which stores `value & 1`) | `Op::Const(0)` or `Op::Const(1)`, or an `Op::Cmp(_)` result |
+| `byte[]` | an `Op::Const` in `i8` range, an `ArrayLoad(MemKind::Byte)`, or `(x << 24) >> 24` (`Shr` of `Shl` by the constant 24) |
+| `short[]` | an `Op::Const` in `i16` range, an `ArrayLoad(MemKind::Short)`, or `(x << 16) >> 16` |
+| `char[]` | an `Op::Const` in `0..=u16::MAX`, an `ArrayLoad(MemKind::Char)`, or `x & 0xFFFF` (constant on either side) |
+| `int`, `long`, `float`, `double` | anything |
+
+The shift and mask shapes are the builder's own `i2b` / `i2s` / `i2c` lowering.
+Any other value refuses. The commit that added the rule gives the example
+`sipush 300; bastore; baload`, which forwarded 300 where the JVM reads 44. Tests:
+`narrow_array_forwarding_tests` in `jit/src/lib.rs`.
+
+### 5.3 The φ alias rule
+
+A φ that uses the allocation is accepted as a *transparent alias* (its uses are
+followed as if they were the allocation's) only when all three hold. This is the
+`Op::Phi` arm of `find_scalar_replacements`:
+
+1. the φ itself is `NoEscape`;
+2. its points-to set is exactly `{alloc}`;
+3. **every** input except a control anchor (`Start`, `Merge`, `If`) has a
+   points-to set of exactly `{alloc}`.
+
+Anything else refuses the object with `ScalarRefusal::PhiNotTransparentCopy`.
+Condition 2 alone is not enough. An input of unknown provenance (a `Param`, a
+`Call` result, a field `Load`) contributes nothing to a points-to set, so
+`φ(alloc, param)` still resolves to `{alloc}` while carrying the parameter on
+one path.
+
+**`Const` is not treated as producing no reference.** Condition 3 used to skip
+any input that `is_ref_producer` did not list. But the EA graph is untyped, and
+the bridge maps the `aconst_null` literal to `Op::Const(0)` and a `checkcast` to
+`Op::Other`. `p = c ? new Foo() : null; p.x` then folded to `0` instead of
+throwing an NPE. Now the only skipped inputs are control anchors, so a
+`Const(0)` input fails the singleton test and refuses. The lock side makes the
+same decision in `produces_no_reference`, which deliberately omits `Op::Const`:
+`synchronized (c ? new Object() : null)` had its lock elided and lost the NPE on
+the null path. The identity-compare bridge `ir_cmp_is_ref_compare` excludes only
+the null literal (`Op::Const(0)` on a `Ref` compare), not `Op::Const` in general.
+
+A multi-input φ whose inputs all resolve to the allocation passes this arm.
+Such a graph fails `program_order_proves_dominance`, so any loaded field with a
+store resolves to `Unknown` and the object is refused anyway.
+`one_block_proves_dominance` (§3) cannot rescue it, because it requires
+`transparent` to be the allocation alone.
+
+### 5.4 The production planner: `plan_scalar_replacement`
+
+`apply_ea_to_ir_pinned` (`jit/src/lib.rs`) runs `plan_scalar_replacement` per
+candidate. The planner is pure and returns `None` to refuse the whole object:
+
+* the node kind must match: `Op::New` for an object, `Op::NewArray` for an
+  array (`info.array_element_type.is_some()`), and loads and stores must be
+  `Load` / `Store` or `ArrayLoad` / `ArrayStore` to match. The slot index must be
+  recoverable (`ir_array_const_index` for arrays);
+* each load takes `info.load_value(ea_load)`. `Value(v)` needs a live IR
+  counterpart, and an array value must also pass `narrow_array_value_fits`.
+  `ZeroDefault` gets one shared zero constant per `IrType` (`Const(0)` for
+  `Int`/`Long`, `ConstF(0)` for `Float`/`Double`; any other type drops the plan).
+  `Unknown` refuses. Every load must also pass `ea_splice_feasible`;
+* `elide_alloc` starts `true` and is cleared when an earlier EA round's
+  descriptor pins the allocation, or when a snapshot names the allocation or a
+  store, in each case unless `deopt_descriptor_available &&
+  virtual_object_info_for(...)` yields a descriptor. It is also cleared when a
+  store or the allocation fails `ea_splice_feasible`, or when another live node
+  still reads the allocation or a store. `deopt_descriptor_available` is
+  `scalar_deopt_enabled() && deopt_real_enabled()`. With no loads and
+  `!elide_alloc`, there is nothing to do and the plan is `None`.
+
+`try_compile_inner` runs escape analysis up to `MAX_EA_ROUNDS` (3) times,
+because one replacement can expose another (a wrapper holding an array). When
+any `Op::New` or `Op::NewArray` survives lowering, the artifact is marked
+`has_dispatch` so its failure path is handled.
+
+### 5.5 The loop-hoist refusal
+
+Hoisting interacts with value forwarding, and the refusal lives in LICM
+(`jit/src/ir_optimize.rs`), not in this module:
+
+* `loop_has_hard_barrier` is true when the loop body contains any node that is
+  neither pure nor control, other than `Load`, `Store`, `Phi` or `Dead`. That
+  covers calls, allocations, guards, **monitors**, and `ArrayLoad` /
+  **`ArrayStore`** / `ArrayLength`. Such a loop gets **no** load hoisting at
+  all.
+* An in-loop **field** `Store` is not a hard barrier. `loop_store_clobber` /
+  `load_safe_past_clobber` block exactly the loads it could alias, and a store
+  through an opaque base blocks every load.
+* The restricted read-hoist (on unless `CRATONVM_JIT_NO_LICM_READ_HOIST=1`)
+  handles a loop that only reads and guards disqualify. It requires
+  `loop_has_hard_barrier && !loop_writes_memory`. `loop_writes_memory` exempts
+  `Guard`, `ArrayLoad` and `ArrayLength` but **not** `Store`, so any field
+  write, array write, call, allocation, `LoadStatic` or monitor in the body
+  refuses it.
+
+The same fact bounds §3's per-block dominance proof. Its clause 2 needs the
+allocation in the block, because a hoisted allocation is one object reused
+across iterations, and then a load can see the previous iteration's store.
+
+### 5.6 Exceptions
+
+Handler bodies are not compiled (§3), so there is no intra-method exception
+control flow for the analysis to model. This is a *dependency*, not a proof. It
+is recorded here so that whoever enables handler compilation knows to revisit
+`program_order_proves_dominance`.
 
 ---
 
 ## 6. Edits required outside `jit/src/escape_analysis.rs`
+
+> **Status, verified 2026-09-12.** 6.1 **landed** (see §3). 6.2 **landed** for
+> the identity ops (§4) and for `MonitorEnter` / `MonitorExit` (see
+> `docs/jit/lock-elimination.md` §0). 6.3 **landed as a producer**:
+> `ea_mark_cold_from_branch_hints` feeds `Graph::cold_nodes` from the IR branch
+> hints, but `PartialEscape` still has no acting consumer (§2). 6.4 was not
+> re-verified for this update. Separately, §7 step 5's "`FrameState::caller`
+> is hard-coded `None` in both backends" is no longer true of the single-pass
+> backend, whose deopt-point publisher records `inline_caller_chain()`. The IR
+> lowerer's `caller_chain_for` still yields `None`, because IR-tier splicing
+> registers no inline scope. §8 item 1 is resolved by 6.1.
 
 All in `jit/src/lib.rs`, which is another agent's file. Cited by symbol, not
 line, because that file is being edited concurrently.

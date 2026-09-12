@@ -204,6 +204,19 @@ ir_lower::lower_inner_with_scopes(
 snapshots stay unbound and the deopt points stay flat — the same conservative
 outcome as not inlining.
 
+> **Status, verified 2026-09-12.** Both halves of the note below have moved.
+> `IrBuilder` now inlines by splicing callee bytecode (`IrInlineSite`; gated by
+> `CRATONVM_JIT_IR_INLINE`, **default on** since 2026-09-06, `=0` is the kill
+> switch). It still registers **no** scope, deliberately: a spliced region
+> carries the caller's `invoke` bci with re-execute semantics instead of a
+> scope chain (the reasoning is at `IrInlineSite` in `jit/src/ir.rs`). So the
+> `InlineScopeTable` stays empty on every compile, and
+> `Lowerer::caller_chain_for` yields `None`. The single-pass backend's scope
+> stack has landed: its deopt-point publisher (`jit/src/x64/deopt_stubs.rs`) sets
+> `frame_state.caller = self.inline_caller_chain()` inside a spliced body. The
+> single-pass production entry is `x64::compile_with_param_slots`;
+> `x64::compile` is the legacy test wrapper.
+
 **Note the ordering constraint the IR path does not have yet:** the IR builder
 (`ir.rs`, `IrBuilder::build`) does not inline at all — `inline_sites` is
 consumed by the *single-pass* backend (`x64::compile`). So until an IR-path
