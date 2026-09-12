@@ -11801,6 +11801,166 @@ static RETIRED_SHADOW_L4_BACKED_OUT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Lane 4 wave 6, the `java/io/PrintWriter` half: seven rows, one registrar,
+/// and a verdict that was measured a month before it could be landed.
+///
+/// # The record this table is cashing
+///
+/// `register_printstream_fallback_natives` in
+/// `native-builtins/src/logging_shims.rs` holds BOTH `java/io/PrintWriter` and
+/// `java/io/PrintStream`, and on 2026-08-11 the two halves were measured
+/// triple by triple with `CRATONVM_ENFORCE_NATIVE_SHADOW` scoped to one class
+/// at a time against HotSpot 25. `PrintWriter` came out retirable in four
+/// arms, `PrintStream` blocked. The write-up is
+/// `docs/known-issues/jdk-only/W7-22-shadow-retirement-logging-and-time.md`,
+/// which carries the table entries below verbatim and a landing recipe -- and
+/// says why it was never taken: all three frozen artefacts are keyed
+/// `<jdk-feature>/<os>`, the measuring lane was on Windows, and the gates
+/// there exit 2 rather than pass or fail. **The blocker was a platform, not a
+/// question.** This wave is on linux/x86_64 with the JDK 25 image, so the
+/// blocker is simply absent.
+///
+/// A recorded verdict is still a hypothesis -- lane 4 has now been wrong about
+/// a backed-out family's cause three times in three different ways -- so every
+/// row below was re-censused and re-measured here rather than copied.
+///
+/// # Why the receiver makes this half retirable and the other half not
+///
+/// `native_printwriter_init_outputstream` ends in an `invoke_special` chain
+/// into the real `PrintWriter(OutputStream, boolean)`, which is registered
+/// nowhere and so always runs as bytecode: `lock`, `out`, `charOut` and
+/// `textOut` are populated by the JDK whichever path built the receiver. A
+/// `PrintWriter` over a `Writer` never enters a native at all. Both
+/// construction paths therefore leave a receiver real bytecode can use, which
+/// is what the four arms show and what the `PrintStream` half does not have.
+///
+/// # `println(String)` also carries an observation, and that was checked
+///
+/// Four of these seven route to `native_println_*`, which call
+/// `ctx.record_printed_line` -- the side table `vm/tests/differential.rs` and
+/// twenty-two assertions in `vm/src/vm/tests.rs` read. That is the shape §9.19
+/// of the lane page found on `ByteArrayInputStream`, where a correct row was
+/// unretirable because its native also carried the VM's only observation of an
+/// event. It does not bite here, and the reason is mechanical rather than
+/// lucky: a retirement re-tags `Bridge` -> `SyntheticStub`, and a
+/// `SyntheticStub` still DISPATCHES in compatible mode. Only strict mode drops
+/// it. Every reader of `printed_lines` runs compatible.
+///
+/// Measured on **linux/x86_64 against JDK 25**.
+static RETIRED_SHADOW_L4_PRINTWRITER_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/io/PrintWriter", "<init>", "(Ljava/io/OutputStream;)V"),
+    ("java/io/PrintWriter", "println", "()V"),
+    ("java/io/PrintWriter", "println", "(I)V"),
+    ("java/io/PrintWriter", "println", "(Ljava/lang/Object;)V"),
+    ("java/io/PrintWriter", "println", "(Ljava/lang/String;)V"),
+    ("java/io/PrintWriter", "write", "(Ljava/lang/String;)V"),
+    ("java/io/PrintWriter", "write", "(Ljava/lang/String;II)V"),
+];
+
+/// Lane 4 wave 6, the `java/io/PrintStream` half: twenty-nine rows, and the
+/// blast radius §5 of the lane page requires this commit to name.
+///
+/// **`System.out` and `System.err` are how every lane reads its probes.** A
+/// regression in this table does not read as a `PrintStream` bug; it reads as
+/// all nine lanes' probes failing at once, and the first instinct will be to
+/// blame the harness. Worse, the documented failure mode here is SILENT:
+/// `writeln` catches its own `IOException` and sets `trouble = true`, so a
+/// broken stream discards rather than throws, and a suite that asserts only on
+/// exit codes reads green while the VM prints nothing. That is why the probe
+/// for this wave reports through a `FileOutputStream` as well as through
+/// `System.out`, and why this half is a table of its own that
+/// `CRATONVM_UNRETIRE_NATIVE_SHADOW` can disarm at run time without a rebuild.
+///
+/// # The 2026-08-11 blocked list, re-read
+///
+/// W7-22 §3 blocked this class on five things, the first of which it called
+/// "the whole job": `System.out`/`System.err` are fabricated rather than
+/// constructed, with `FilterOutputStream.out`, `charOut`, `textOut`,
+/// `closeLock` all null and `charset` an instance of the ABSTRACT
+/// `java.nio.charset.Charset`. Re-measured by reflection on this wave's
+/// control binary, that is no longer the state:
+///
+/// ```text
+///   System.out field   2026-08-11        2026-09-12 (control)   HotSpot 25
+///   out                null              FileOutputStream       BufferedOutputStream
+///   charOut            null              OutputStreamWriter     OutputStreamWriter
+///   textOut            null              BufferedWriter         BufferedWriter
+///   charset            abstract Charset  sun.nio.cs.UTF_8       sun.nio.cs.UTF_8
+///   closeLock          null              null                   Object
+/// ```
+///
+/// `install_real_stream_fields` in `native-builtins/src/lang_system.rs` now
+/// constructs a real `FileOutputStream`/`OutputStreamWriter`/`BufferedWriter`
+/// chain and publishes all three at once, with a comment saying exactly why a
+/// half-wired stream would be worse than the discard. Items 1 and 2 of the
+/// blocked list are therefore spent. **This is the third time in this lane
+/// that a family's recorded blocker turned out to have been fixed somewhere
+/// else in the meantime** (§9.4, §9.17), and the first two were found by
+/// re-reading rather than by re-measuring.
+///
+/// What the re-read did NOT clear:
+///
+/// * `closeLock` is still null on every receiver in compatible mode, including
+///   one built by the real three-argument constructor. It is a `final` field
+///   with an initialiser, so something is skipping instance initialisers;
+///   strict mode gets it right, which is what says the native path is the one
+///   dropping it.
+/// * `native_printstream_init_outputstream` still does NOT chain to a real
+///   constructor -- blocked-list item 3, and the doc comment above it claims
+///   the chain in a paragraph that belongs to the PrintWriter function it sits
+///   next to (a code-move artefact of the `lib.rs` -> `logging_shims.rs`
+///   split). A receiver it builds has `charOut` and `textOut` null, which is
+///   the `close()` NPE W7-22 measured. This table retires BOTH constructors
+///   with the methods, so in strict mode nothing of this class is native and
+///   the question does not arise; in compatible mode the native still runs and
+///   the defect is untouched by this wave.
+///
+/// # What is deliberately NOT here
+///
+/// * `write(Ljava/lang/String;II)V` -- registered, but **no supported image
+///   declares it** (`javap -p` on 17, 21 and 25: absent from all three).
+///   Retiring it replaces a working native with a `NoSuchMethodError`. It is
+///   the E/F row of the class and is held back by name.
+/// * `charset()Ljava/nio/charset/Charset;` -- registered as `Intrinsic`, so
+///   the `Bridge` -> `SyntheticStub` re-tag does not fire on it and a table
+///   row would be inert. Left to whoever adjudicates that kind.
+/// * `write(Ljava/lang/String;)V` IS here: `private` in all three images, so
+///   only the class's own bytecode can reach it, which is precisely the caller
+///   that exists in strict mode.
+///
+/// Measured on **linux/x86_64 against JDK 25**.
+static RETIRED_SHADOW_L4_PRINTSTREAM_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/io/PrintStream", "<init>", "(Ljava/io/OutputStream;)V"),
+    ("java/io/PrintStream", "<init>", "(Ljava/io/OutputStream;Z)V"),
+    ("java/io/PrintStream", "append", "(Ljava/lang/CharSequence;)Ljava/io/PrintStream;"),
+    ("java/io/PrintStream", "close", "()V"),
+    ("java/io/PrintStream", "flush", "()V"),
+    ("java/io/PrintStream", "format", "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;"),
+    ("java/io/PrintStream", "format", "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;"),
+    ("java/io/PrintStream", "print", "(C)V"),
+    ("java/io/PrintStream", "print", "(D)V"),
+    ("java/io/PrintStream", "print", "(F)V"),
+    ("java/io/PrintStream", "print", "(I)V"),
+    ("java/io/PrintStream", "print", "(J)V"),
+    ("java/io/PrintStream", "print", "(Ljava/lang/Object;)V"),
+    ("java/io/PrintStream", "print", "(Ljava/lang/String;)V"),
+    ("java/io/PrintStream", "print", "(Z)V"),
+    ("java/io/PrintStream", "printf", "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;"),
+    ("java/io/PrintStream", "printf", "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;"),
+    ("java/io/PrintStream", "println", "()V"),
+    ("java/io/PrintStream", "println", "(C)V"),
+    ("java/io/PrintStream", "println", "(D)V"),
+    ("java/io/PrintStream", "println", "(F)V"),
+    ("java/io/PrintStream", "println", "(I)V"),
+    ("java/io/PrintStream", "println", "(J)V"),
+    ("java/io/PrintStream", "println", "(Ljava/lang/Object;)V"),
+    ("java/io/PrintStream", "println", "(Ljava/lang/String;)V"),
+    ("java/io/PrintStream", "println", "(Z)V"),
+    ("java/io/PrintStream", "write", "(I)V"),
+    ("java/io/PrintStream", "write", "(Ljava/lang/String;)V"),
+    ("java/io/PrintStream", "write", "([BII)V"),
+];
+
 /// Every retired-shadow table, in one slice, so a gate can walk the whole
 /// population instead of naming one wave.
 ///
@@ -11941,6 +12101,14 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // both admitted by wave 1, and every class in this table is under one of
     // them. The table is the whole of the decision.
     RETIRED_SHADOW_L4_BACKED_OUT_TRIPLES,
+    // Lane 4 wave 6, in TWO tables for one registrar. `java/io/` was admitted
+    // as a prefix by wave 1, so neither needs a new one. They are separate
+    // because their recorded verdicts were opposite and because
+    // `CRATONVM_UNRETIRE_NATIVE_SHADOW` disarms a TABLE: one build can then be
+    // scored with either half off, which is the only way to attribute a
+    // corpus failure to a half without a second build.
+    RETIRED_SHADOW_L4_PRINTWRITER_TRIPLES,
+    RETIRED_SHADOW_L4_PRINTSTREAM_TRIPLES,
 ];
 
 #[cfg(test)]
@@ -12193,6 +12361,98 @@ mod tests {
             ),
             "the enum's <clinit> is unreached by the wave's funnel"
         );
+    }
+
+    /// Wave 6's two tables, and the three rows the `PrintStream` half leaves
+    /// out. The absences are the part worth a test: a row that is simply not
+    /// in a table is invisible to the sorted/unique guards, to the reachability
+    /// guard and to the kind map, so the only place a deliberate omission can
+    /// be distinguished from an oversight is here, by name, with its reason.
+    #[test]
+    fn wave_six_is_seven_print_writer_rows_and_twenty_nine_print_stream_rows() {
+        assert_eq!(RETIRED_SHADOW_L4_PRINTWRITER_TRIPLES.len(), 7);
+        assert_eq!(RETIRED_SHADOW_L4_PRINTSTREAM_TRIPLES.len(), 29);
+        for (c, m, d) in RETIRED_SHADOW_L4_PRINTWRITER_TRIPLES {
+            assert_eq!(*c, "java/io/PrintWriter", "{c}.{m}{d} is not this table's class");
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is in the wave-6 PrintWriter table and the predicate cannot see it"
+            );
+        }
+        for (c, m, d) in RETIRED_SHADOW_L4_PRINTSTREAM_TRIPLES {
+            assert_eq!(*c, "java/io/PrintStream", "{c}.{m}{d} is not this table's class");
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is in the wave-6 PrintStream table and the predicate cannot see it"
+            );
+        }
+
+        // NOT declared by ANY supported image -- `javap -p java.io.PrintStream`
+        // on 17, 21 and 25 lists `write(int)`, `write(byte[],int,int)`,
+        // `write(byte[])`, `write(char[])` and `write(String)`, and no
+        // `write(String,int,int)`. The registered native is the only
+        // implementation that exists; retiring it is a `NoSuchMethodError`, and
+        // the registrar's own comment records that JUnit's ConsoleLauncher is
+        // a caller.
+        assert!(
+            !triple_is_retired_shadow("java/io/PrintStream", "write", "(Ljava/lang/String;II)V"),
+            "no supported image declares PrintStream.write(String,int,int); a table row              for it replaces a working native with a NoSuchMethodError"
+        );
+
+        // Registered as `Intrinsic`, so the `Bridge` -> `SyntheticStub` re-tag
+        // in `register` never fires on it and a table row would be INERT --
+        // present, sorted, reachable, and doing nothing. Two waves have shipped
+        // inert rows in this campaign already.
+        assert!(
+            !triple_is_retired_shadow("java/io/PrintStream", "charset", "()Ljava/nio/charset/Charset;"),
+            "PrintStream.charset() is registered Intrinsic; a retirement row on it is inert"
+        );
+
+        // `PrintWriter` has its own `write(String,int,int)` and that one IS
+        // declared by the image. The two classes' same-named rows have opposite
+        // verdicts, which is exactly the pair a copy-paste would collapse.
+        assert!(
+            triple_is_retired_shadow("java/io/PrintWriter", "write", "(Ljava/lang/String;II)V"),
+            "PrintWriter.write(String,int,int) is declared with Code in all three images"
+        );
+    }
+
+    /// The blast-radius guard §5 of the lane page asks this commit to name,
+    /// written so it outlives the wave that wrote it.
+    ///
+    /// `System.out` and `System.err` are how every lane reads its probes, and
+    /// the failure mode is silent: real `writeln` catches its own
+    /// `IOException` and sets `trouble = true`, so a stream whose state is not
+    /// real DISCARDS rather than throws. Nine lanes' probes then read as empty
+    /// and the harness gets the blame.
+    ///
+    /// The classes below are the ones `System.out`'s own write path runs
+    /// through once `PrintStream` is retired -- measured from
+    /// `install_real_stream_fields`, which builds exactly this chain:
+    /// `FileOutputStream` -> `OutputStreamWriter` -> `BufferedWriter`. A
+    /// retirement row on any of them is not forbidden, but it must not arrive
+    /// as a by-product of some other wave's table: it needs the console arm of
+    /// a probe that reports through a `FileOutputStream`, because a probe that
+    /// reports through `System.out` cannot report on `System.out`.
+    #[test]
+    fn the_console_write_path_is_retired_only_by_the_wave_that_measures_it() {
+        const CONSOLE_PATH: &[&str] = &[
+            "java/io/OutputStreamWriter",
+            "java/io/BufferedWriter",
+            "java/io/Writer",
+        ];
+        for table in RETIRED_SHADOW_TABLES {
+            for (c, m, d) in *table {
+                assert!(
+                    !CONSOLE_PATH.contains(c),
+                    "{c}.{m}{d} is on System.out's write path \
+                     (install_real_stream_fields builds FileOutputStream -> \
+                     OutputStreamWriter -> BufferedWriter). Retiring it is allowed, but \
+                     only from a wave whose probe reports through a FileOutputStream -- \
+                     a broken System.out discards silently and takes the evidence with it."
+                );
+            }
+        }
     }
 
     /// The FOURTH backed-out family is retired by NO table, and that is a

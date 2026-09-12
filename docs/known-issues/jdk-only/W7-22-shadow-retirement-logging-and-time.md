@@ -1,5 +1,36 @@
 # W7-22 — the next shadow-retirement increment: logging and date/time
 
+> **§2 AND §3 WERE BOTH TAKEN ON 2026-09-12** as lane 4 wave 6 —
+> `docs/known-issues/jdk-only-lanes/lane-4-io-nio-foreign.md` §9.21–§9.26.
+> Read this box before trusting anything below it.
+>
+> * **§2 (`java/io/PrintWriter`, 7 rows) landed as measured.** Re-censused and
+>   re-measured on Linux/JDK 25; verdict-neutral, exactly as recorded here.
+>   §2.1's landing recipe is spent. The blocker it names in its first line —
+>   "the blocker is a platform, not a question", the `<jdk>/<os>`-keyed gates
+>   exiting 2 on Windows — was the whole of why this waited a month.
+> * **§3 (`java/io/PrintStream`, 29 rows) landed too, and its blocked list had
+>   decayed in four of five places.** Items 1 and 2 (`System.out` fabricated;
+>   `charset` abstract) were repaired in between by `install_real_stream_fields`
+>   in `native-builtins/src/lang_system.rs` — except `closeLock`, which wave 6
+>   fixed. Item 3 (`native_printstream_init_outputstream` does not chain) is
+>   **still true** and was made irrelevant by retiring BOTH constructors with
+>   the methods. Item 4 says `write(String)` is package-private; it is
+>   `private`, which did not change its disposition. **Only item 5 survived
+>   intact**, and it is the one that says a row must NOT be retired:
+>   `write(String,int,int)` is declared by no supported image.
+> * **§3's verdict is inverted by the measurement.** The half this document
+>   blocked is the half that FIXED things: retiring the constructors took the
+>   carrier probe from 24 differing lines against HotSpot to 4, because
+>   `charOut`, `textOut`, `charset` and `closeLock` on a user-constructed
+>   stream were null.
+> * The `native_printstream_init_outputstream` doc comment that claims an
+>   `invoke_special` chain describes the `PrintWriter` function below it — a
+>   code-move artefact, and the reason item 3 reads as already done to anyone
+>   who greps for the chain.
+> * §4's own correction box (its named cause is wrong, its repair dead) still
+>   stands and is unaffected.
+
 > **RECONCILED 2026-08-12 (W7-55-record-reconciliation.md).** §4's named cause
 > is superseded and its prescribed repair is DEAD — see the marker at the head
 > of that section, and W7-25-jul-getlogger-regression.md for the mechanism that
