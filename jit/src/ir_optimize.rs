@@ -446,16 +446,89 @@ fn combine_affine(op: &Op, is_int: bool, a: Affine, b: Affine, opaque: Affine) -
     }
 }
 
-/// Get an existing `Const(val)` node of type `ty`, or create one.
-fn get_or_add_const(graph: &mut Graph, val: i64, ty: IrType) -> NodeId {
-    if let Some(i) = graph
+/// `(value, type)` → the lowest-id `Op::Const` node of that value and type.
+/// It replaces a `get_or_add_const` that scanned the whole arena on every call,
+/// and mirrors `IrBuilder::interned_const` in `ir.rs`.
+///
+/// # Why a hit can be trusted
+///
+/// * **New nodes**, including a constant added through `graph` directly, are
+///   indexed on the next call. Everything from `upto` to the end of the arena
+///   is scanned once, and `or_insert` keeps the LOWEST id per key, which is
+///   what the scan's first match returned.
+/// * **A killed or rewritten node** fails the re-check on a hit. The full scan
+///   [`const_node_by_scan`] then decides and repairs the entry.
+/// * **A shorter arena** than has been indexed is rebuilt from scratch rather
+///   than trusted.
+///
+/// What it cannot see is an OLDER node turned INTO a constant after it was
+/// indexed. So one is made per pass invocation and never kept across passes:
+/// constant folding rewrites ops in place, but the two passes that use this
+/// only add nodes, redirect uses and kill.
+struct ConstIntern {
+    map: FxHashMap<(i64, IrType), NodeId>,
+    /// How far into `graph.nodes` `map` has indexed.
+    upto: usize,
+}
+
+impl ConstIntern {
+    fn new() -> Self {
+        ConstIntern {
+            map: FxHashMap::default(),
+            upto: 0,
+        }
+    }
+
+    /// The lowest-id live `Op::Const(val)` typed `ty`, or `None`. Always the
+    /// same answer as [`const_node_by_scan`].
+    fn find(&mut self, graph: &Graph, val: i64, ty: IrType) -> Option<NodeId> {
+        if graph.nodes.len() < self.upto {
+            self.map.clear();
+            self.upto = 0;
+        }
+        for id in self.upto..graph.nodes.len() {
+            let node = &graph.nodes[id];
+            if let Op::Const(v) = node.op {
+                self.map.entry((v, node.ty)).or_insert(id as NodeId);
+            }
+        }
+        self.upto = graph.nodes.len();
+
+        let id = *self.map.get(&(val, ty))?;
+        if matches!(graph.nodes.get(id as usize), Some(n) if n.op == Op::Const(val) && n.ty == ty)
+        {
+            return Some(id);
+        }
+        match const_node_by_scan(graph, val, ty) {
+            Some(found) => {
+                self.map.insert((val, ty), found);
+                Some(found)
+            }
+            None => {
+                self.map.remove(&(val, ty));
+                None
+            }
+        }
+    }
+
+    /// Get an existing `Const(val)` node of type `ty`, or create one.
+    fn get_or_add(&mut self, graph: &mut Graph, val: i64, ty: IrType) -> NodeId {
+        if let Some(id) = self.find(graph, val, ty) {
+            return id;
+        }
+        graph.add(Op::Const(val), ty, vec![], None)
+    }
+}
+
+/// The lowest-id `Op::Const(val)` node typed `ty`, by scanning the arena. This
+/// is what [`ConstIntern`] answers without the scan, and its fallback when a
+/// map entry has gone stale.
+fn const_node_by_scan(graph: &Graph, val: i64, ty: IrType) -> Option<NodeId> {
+    graph
         .nodes
         .iter()
         .position(|n| n.op == Op::Const(val) && n.ty == ty)
-    {
-        return i as NodeId;
-    }
-    graph.add(Op::Const(val), ty, vec![], None)
+        .map(|i| i as NodeId)
 }
 
 /// Materialize `k*root + c` as IR nodes, reusing `root` directly when possible.
@@ -467,25 +540,26 @@ fn get_or_add_const(graph: &mut Graph, val: i64, ty: IrType) -> NodeId {
 /// become reachable.
 fn build_affine(
     graph: &mut Graph,
+    consts: &mut ConstIntern,
     root: Option<NodeId>,
     k: i64,
     c: i64,
     ty: IrType,
 ) -> Option<NodeId> {
     if k == 0 {
-        return Some(get_or_add_const(graph, c, ty));
+        return Some(consts.get_or_add(graph, c, ty));
     }
     let root = root?;
     let base = if k == 1 {
         root
     } else {
-        let kc = get_or_add_const(graph, k, ty);
+        let kc = consts.get_or_add(graph, k, ty);
         graph.add(Op::Mul, ty, vec![root, kc], None)
     };
     Some(if c == 0 {
         base
     } else {
-        let cc = get_or_add_const(graph, c, ty);
+        let cc = consts.get_or_add(graph, c, ty);
         graph.add(Op::Add, ty, vec![base, cc], None)
     })
 }
@@ -566,6 +640,7 @@ fn reassociate_affine(graph: &mut Graph) {
         aff[id] = Some(res);
     }
 
+    let mut consts = ConstIntern::new();
     for id in 0..len {
         if !materialize[id] {
             continue;
@@ -579,7 +654,7 @@ fn reassociate_affine(graph: &mut Graph) {
         // with no root). `materialize[id]` is only set for a form with a real
         // root, so this is unreachable today; leaving the node untouched is
         // the safe answer if that ever stops holding.
-        let mat = match build_affine(graph, a.root, a.k, a.c, ty) {
+        let mat = match build_affine(graph, &mut consts, a.root, a.k, a.c, ty) {
             Some(m) => m,
             None => continue,
         };
@@ -803,6 +878,7 @@ enum Simplified {
 /// Simplify expressions using algebraic identities.
 fn algebraic_simplify(graph: &mut Graph) {
     let len = graph.nodes.len();
+    let mut consts = ConstIntern::new();
     for id in 0..len {
         if graph.nodes[id].op == Op::Dead {
             continue;
@@ -814,7 +890,7 @@ fn algebraic_simplify(graph: &mut Graph) {
             // literal or a zero of the other integer width, and every
             // consumer (lowering width, oop maps, deopt frame values, φ joins)
             // reads `node.ty`.
-            Some(Simplified::Zero(ty)) => get_or_add_const(graph, 0, ty),
+            Some(Simplified::Zero(ty)) => consts.get_or_add(graph, 0, ty),
             None => continue,
         };
         graph.replace_all_uses(id as NodeId, replacement);
@@ -954,13 +1030,6 @@ fn try_simplify(nodes: &[Node], id: NodeId) -> Option<Simplified> {
 
 fn is_const_val(nodes: &[Node], id: NodeId, val: i64) -> bool {
     matches!(nodes[id as usize].op, Op::Const(v) if v == val)
-}
-
-fn find_const(nodes: &[Node], val: i64) -> Option<NodeId> {
-    nodes
-        .iter()
-        .position(|n| n.op == Op::Const(val))
-        .map(|i| i as NodeId)
 }
 
 // ── Global Value Numbering (GVN) ─────────────────────────────────────
@@ -5453,6 +5522,59 @@ mod tests {
         let mut graph = builder.build(code, code_len).expect("build failed");
         optimize(&mut graph);
         graph
+    }
+
+    /// `ConstIntern` returns, on every call, the node the arena scan it replaced
+    /// returned. That holds through constants it adds itself, constants added to
+    /// the graph behind its back, and constants killed after it indexed them.
+    #[test]
+    fn const_intern_returns_the_node_the_arena_scan_returns() {
+        // iconst_1; ireturn: a real builder graph with a constant of its own.
+        let code = [0x04, 0xac, 0, 0];
+        let mut graph = IrBuilder::new(0, 0).build(&code, 2).expect("build failed");
+        let mut consts = ConstIntern::new();
+        let values = [0i64, 1, -1, 7];
+        let types = [IrType::Int, IrType::Long, IrType::Ref];
+        // Constants this test created, so it can kill them without orphaning
+        // a user.
+        let mut ours: Vec<NodeId> = Vec::new();
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = |bound: usize| -> usize {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) as usize) % bound.max(1)
+        };
+        for step in 0..2000 {
+            let val = values[next(values.len())];
+            let ty = types[next(types.len())];
+            match next(4) {
+                0 => {
+                    ours.push(graph.add(Op::Const(val), ty, vec![], None));
+                }
+                1 => {
+                    if !ours.is_empty() {
+                        let victim = ours.swap_remove(next(ours.len()));
+                        graph.kill(victim);
+                    }
+                }
+                _ => {
+                    let len_before = graph.nodes.len();
+                    let want = const_node_by_scan(&graph, val, ty);
+                    let got = consts.get_or_add(&mut graph, val, ty);
+                    match want {
+                        Some(id) => assert_eq!(got, id, "step {step}: Const({val})"),
+                        None => {
+                            assert_eq!(
+                                got as usize, len_before,
+                                "step {step}: a miss must add a new node"
+                            );
+                            ours.push(got);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
