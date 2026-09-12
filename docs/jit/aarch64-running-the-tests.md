@@ -127,3 +127,23 @@ So the state is: the VM is portable, the collector runs, and the remaining
 blocker is a single named refusal. **The next step is to find why `work` is
 abandoned** — `CRATONVM_JIT_METRICS_OUT`'s record for it is where to start, and
 that is a much smaller question than "does any of this work on AArch64".
+
+## Since 2026-09-12: the backend is opt-in, and the execution tests assert Java semantics
+
+A review of the backend (see `docs/jit/aarch64-parity.md`) found it miscompiled
+ordinary leaf methods: deep expressions, `float` arithmetic, `freturn`/`dreturn`,
+32-bit `int` wrapping, NaN compares, and parameters after a `long`/`double`.
+Those are fixed in code, **but none of the fixes has run on an AArch64 host
+yet.** Two consequences for anyone running this:
+
+* **The VM no longer uses the backend unless `CRATONVM_JIT_ARM64=1` is set.**
+  A whole-VM run like the one above must set it, or the JIT is simply off and
+  the run proves nothing about compiled code.
+* `arm64_execution` grew. The two tests that pinned the 64-bit `iadd`/`ishl`
+  answers now assert the JVMS ones (`iadd_wraps_at_32_bits_as_the_jvms_requires`,
+  `ishl_masks_the_shift_to_five_bits`), and new ones execute the
+  `a - (b+1+2+3+4)` repro, a `double` parameter through `dreturn`, and
+  `fcmpg`/`fcmpl` of NaN. The three tests the CI job names are unchanged. The
+  host-independent tests in the same module include `eval_int_method`, a small
+  pseudo-op evaluator that checks VALUES on any host -- a stopgap, not a
+  substitute for running these.
