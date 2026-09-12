@@ -1369,6 +1369,10 @@ fn huc_real_perform_inner(
             }
         }
     }
+    // The carrier's CURRENT address, taken while the pin is still live: the
+    // success arm below writes its `connected` field, and nothing between here
+    // and that write allocates.
+    let this_settled = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
     let resp = final_resp.unwrap_or_else(|| Ok((310, Vec::new(), Vec::new())));
     match resp {
@@ -1386,6 +1390,21 @@ fn huc_real_perform_inner(
                     },
                 );
             }
+            // The carrier IS connected now, and `URLConnection`'s own bytecode
+            // is what enforces the consequences: `setRequestProperty`,
+            // `addRequestProperty`, `getRequestProperties`, `setDoOutput`,
+            // `setDoInput` and `setUseCaches` all begin with `checkConnected()`
+            // and raise `IllegalStateException("Already connected")`.
+            //
+            // Those methods are declared on `URLConnection`, which this file
+            // does not register, so they run as inherited JDK bytecode against
+            // this VM's carrier — and the carrier's `connected` field was
+            // written 0 at mint and never again. MEASURED
+            // (`L6HttpLoopbackSweep` rows 41, 71, 73): every one of them
+            // succeeded after `getResponseCode()`, took the caller's value, and
+            // dropped it. Setting the field is the fix; a guard inside a native
+            // the dispatch never consults is not.
+            ctx.set_field_by_name(this_settled, "connected", Value::Int(1));
             Ok(status)
         }
         // A read timeout maps to java.net.SocketTimeoutException (real-JDK
@@ -1559,8 +1578,73 @@ fn huc_real_headers(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(String, St
         .unwrap_or_default()
 }
 
-/// Drop all identity-keyed side-table state for a real carrier (on disconnect).
-fn real_forget(ctx: &dyn NativeContext, this: ObjectRef) {
+/// True once this real carrier has performed its request.
+///
+/// `URLConnection`'s setters are contracted to raise `IllegalStateException`
+/// after connect, and every one of them here accepted the change silently and
+/// dropped it: `setRequestProperty` after `getResponseCode()` looked like it
+/// worked, `getRequestProperty` read the value back, and the header was never
+/// sent. Measured (`L6HttpLoopbackSweep` rows 41, 71, 73).
+fn real_is_connected(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let key = ctx.identity_hash_code(this);
+    real_results()
+        .lock()
+        .ok()
+        .is_some_and(|t| t.contains_key(&key))
+}
+
+/// The response headers as the JDK INDEXES them: element 0 is the status line,
+/// whose key is null, and the real headers follow from index 1.
+///
+/// `URLConnection.getHeaderField(int)` and `getHeaderFieldKey(int)` walk
+/// `sun.net.www.MessageHeader`, whose first entry is the status line stored
+/// under a null key. This VM indexed the header list directly, so every index
+/// was one too low and index 0 answered the `Date` header where HotSpot
+/// answers `HTTP/1.1 200 OK`. MEASURED (`L6HttpLoopbackSweep` rows 15-17).
+///
+/// The same null key appears in `getHeaderFields()`, which is why callers can
+/// read the status line out of the map.
+fn huc_real_indexed_headers(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+) -> Vec<(Option<String>, String)> {
+    let key = ctx.identity_hash_code(this);
+    let Some((status, reason, headers)) = real_results()
+        .lock()
+        .ok()
+        .and_then(|t| t.get(&key).map(|r| (r.status, r.reason.clone(), r.headers.clone())))
+    else {
+        return Vec::new();
+    };
+    let reason = if reason.is_empty() {
+        status_reason(status)
+    } else {
+        reason
+    };
+    let mut out: Vec<(Option<String>, String)> = Vec::with_capacity(headers.len() + 1);
+    out.push((None, format!("HTTP/1.1 {status} {reason}")));
+    for (k, v) in headers {
+        out.push((Some(k), v));
+    }
+    out
+}
+
+/// Drop all identity-keyed side-table state for a real carrier.
+///
+/// Called on `disconnect()` and — the reason it is `pub(crate)` — on every
+/// carrier `URL.openConnection()` mints. These tables are keyed by identity
+/// hash, which this VM derives per object and REUSES once the first object is
+/// collected, so a fresh connection allocated where an old one died inherits
+/// its method, its headers and its streaming mode. MEASURED
+/// (`L6HttpLoopbackSweep`): a fresh connection's `setFixedLengthStreamingMode`
+/// threw `IllegalStateException: Chunked encoding streaming mode set` naming a
+/// mode nobody had set on it, and `setRequestMethod("PUT")` sent POST.
+///
+/// The mint site is the one moment a carrier is known to be new. The
+/// constructor is NOT that moment: `URL.openConnection()` allocates the
+/// carrier directly and never calls it, which is where the first attempt at
+/// this fix went and why it changed nothing.
+pub(crate) fn real_forget(ctx: &dyn NativeContext, this: ObjectRef) {
     let key = ctx.identity_hash_code(this);
     if let Ok(mut t) = real_results().lock() {
         t.remove(&key);
@@ -1675,9 +1759,20 @@ fn make_byte_array_input_stream(
 /// `resHead` out-parameter is filled from. Every `create_string`/`invoke` can
 /// allocate and move objects, so the map/list/key refs are pinned and re-read
 /// across each re-entrant call (see the manifest-builder idiom in phases_late).
+/// `getHeaderFields()`'s map.
+///
+/// Two properties of the JDK's that this used to miss, both measured on
+/// HotSpot 25.0.4+7 (`L6HttpLoopbackSweep` rows 27-28):
+///
+/// * the STATUS LINE is in the map under a **null key**, and callers read it
+///   from there;
+/// * the map is **unmodifiable** — `Collections.unmodifiableMap` in the JDK,
+///   and a bare `HashMap` here, so a caller could edit the response headers of
+///   a connection and see its own edits back.
 fn build_header_map(
     ctx: &mut dyn NativeContext,
     headers: &[(String, String)],
+    status_line: Option<&str>,
 ) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
     for (k, v) in headers {
@@ -1729,9 +1824,53 @@ fn build_header_map(
             ],
         )?;
     }
+    if let Some(line) = status_line {
+        let vs = ctx.create_string(line);
+        let vs_pin = ctx.pin_native_root(vs);
+        let list = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[])? {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                ctx.unpin_native_roots(map_pin);
+                return Err(ioex("getHeaderFields: could not allocate ArrayList"));
+            }
+        };
+        let list_pin = ctx.pin_native_root(list);
+        let vs = ctx.read_native_pin(vs_pin, vs);
+        let list = ctx.read_native_pin(list_pin, list);
+        ctx.invoke(
+            "java/util/ArrayList",
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(list)), Value::Object(Some(vs))],
+        )?;
+        let map = ctx.read_native_pin(map_pin, map);
+        let list = ctx.read_native_pin(list_pin, list);
+        ctx.invoke(
+            "java/util/HashMap",
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[
+                Value::Object(Some(map)),
+                Value::Object(None),
+                Value::Object(Some(list)),
+            ],
+        )?;
+    }
+    let map = ctx.read_native_pin(map_pin, map);
+    // `Collections.unmodifiableMap` is real bytecode and allocates, so the
+    // map stays pinned across it.
+    let wrapped = ctx.invoke(
+        "java/util/Collections",
+        "unmodifiableMap",
+        "(Ljava/util/Map;)Ljava/util/Map;",
+        &[Value::Object(Some(map))],
+    );
     let map = ctx.read_native_pin(map_pin, map);
     ctx.unpin_native_roots(map_pin);
-    Ok(map)
+    match wrapped {
+        Ok(Some(Value::Object(Some(view)))) => Ok(view),
+        _ => Ok(map),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4247,6 +4386,32 @@ fn huc_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             if let Some(full) = ctx.read_string(s) {
                 if full.contains("://") {
                     ctx.set_field(this, HUC_CONN_ID, Value::Object(Some(url_obj)));
+                    // A brand-new carrier must not inherit a DEAD one's request
+                    // state. `real_reqs` is keyed by identity hash, which the
+                    // VM derives per object and reuses once the first object is
+                    // collected — so a fresh connection allocated where an old
+                    // one died read back the old one's method, headers and
+                    // streaming mode. MEASURED (`L6HttpLoopbackSweep`): a fresh
+                    // connection's `setFixedLengthStreamingMode` threw
+                    // `IllegalStateException: Chunked encoding streaming mode
+                    // set` naming a mode nobody had set ON IT, and the next row
+                    // threw the mirror-image message for the same reason.
+                    //
+                    // The constructor is the one moment we KNOW the carrier is
+                    // new, so it is where the stale row has to go.
+                    let key = ctx.identity_hash_code(this);
+                    if let Ok(mut t) = real_reqs().lock() {
+                        t.remove(&key);
+                    }
+                    // The same argument applies to every other table keyed the
+                    // same way: a stale `live_fixed_streams` row is read as
+                    // "already connected" by both streaming setters.
+                    if let Ok(mut t) = live_fixed_streams().lock() {
+                        t.remove(&key);
+                    }
+                    if let Ok(mut t) = real_body_streams().lock() {
+                        t.remove(&key);
+                    }
                     return Ok(None);
                 }
             }
@@ -4388,7 +4553,26 @@ fn huc_get_input_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         // appear as zero-byte streams (Hazelcast's filtered-loader XML config).
         if let Some(full) = huc_real_object_url(ctx, &mut this) {
             if full.starts_with("http://") || full.starts_with("https://") {
-                huc_real_perform(ctx, &mut this, &full)?;
+                let status = huc_real_perform(ctx, &mut this, &full)?;
+                // An error response has NO input stream: the JDK raises and
+                // points the caller at `getErrorStream()` for the body. This
+                // VM handed the error body back from `getInputStream()`, so
+                // every `try { getInputStream() } catch (FileNotFoundException)`
+                // — the standard way to test for a 404 — read the error page as
+                // if it were the resource.
+                if status >= 400 {
+                    let class = if status == 404 || status == 410 {
+                        "java/io/FileNotFoundException"
+                    } else {
+                        "java/io/IOException"
+                    };
+                    let message = if status == 404 || status == 410 {
+                        full.clone()
+                    } else {
+                        format!("Server returned HTTP response code: {status} for URL: {full}")
+                    };
+                    return Err(crate::phases_early::throw_jca_exc(ctx, class, &message));
+                }
                 let body = huc_real_body(ctx, this);
                 let truncated = huc_real_truncated(ctx, this);
                 return make_response_input_stream(ctx, &body, truncated, Some(this));
@@ -4437,6 +4621,13 @@ fn huc_get_input_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
 fn huc_get_error_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let mut this = obj_arg(args, 0)?;
+    // `getErrorStream()` NEVER connects. Its javadoc is explicit that it
+    // answers null when the connection was not made, and callers rely on that
+    // to ask "did this already fail?" without performing the request. This
+    // VM's version performed it, so the question answered itself.
+    if is_real_carrier(ctx, this) && !real_is_connected(ctx, this) {
+        return Ok(Some(Value::Object(None)));
+    }
     // Real-JDK carrier: serve the cached body when the response was an error.
     if let Some(url_str) = huc_real_object_url(ctx, &mut this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
@@ -4483,7 +4674,13 @@ fn huc_get_output_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         let do_output = with_real_req(ctx, this, |r| r.do_output)
             || matches!(ctx.get_field_by_name(this, "doOutput"), Value::Int(1));
         if !do_output {
-            return Err(ioex("HttpURLConnection.getOutputStream: doOutput=false"));
+            // `ProtocolException` (an `IOException` subclass) with the JDK's own
+            // wording, which names the fix. A bare `IOException` reads as a
+            // transport failure and sends the caller looking at the network.
+            return Err(protocol_ex(
+                "cannot write to a URLConnection if doOutput=false - call setDoOutput(true)"
+                    .to_string(),
+            ));
         }
         // JDK semantics: opening the output stream promotes a still-default GET
         // to POST (see sun.net.www...HttpURLConnection.getOutputStream:
@@ -4606,7 +4803,7 @@ fn huc_get_header_field_indexed(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     if let Some(url_str) = huc_real_object_url(ctx, &mut this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
             huc_real_perform(ctx, &mut this, &url_str)?;
-            let v = huc_real_headers(ctx, this).get(idx as usize).cloned();
+            let v = huc_real_indexed_headers(ctx, this).get(idx as usize).cloned();
             return Ok(Some(match v {
                 Some((_k, val)) => Value::Object(Some(ctx.create_string(&val))),
                 None => Value::Object(None),
@@ -4636,10 +4833,13 @@ fn huc_get_header_field_key_indexed(
     if let Some(url_str) = huc_real_object_url(ctx, &mut this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
             huc_real_perform(ctx, &mut this, &url_str)?;
-            let v = huc_real_headers(ctx, this).get(idx as usize).cloned();
+            let v = huc_real_indexed_headers(ctx, this).get(idx as usize).cloned();
             return Ok(Some(match v {
-                Some((k, _)) => Value::Object(Some(ctx.create_string(&k))),
-                None => Value::Object(None),
+                // Index 0 is the status line, and its key is null — not the
+                // empty string, which a caller comparing with `equals` would
+                // read as a header named "".
+                Some((Some(k), _)) => Value::Object(Some(ctx.create_string(&k))),
+                _ => Value::Object(None),
             }));
         }
     }
@@ -4681,7 +4881,12 @@ fn huc_get_header_fields(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             let mut this = ctx.read_native_pin(this_pin, this);
             with_state(ctx, this, |s| s.response_headers.clone()).unwrap_or_default()
         };
-        let map = build_header_map(ctx, &headers)?;
+        let this = ctx.read_native_pin(this_pin, this);
+        let status_line = huc_real_indexed_headers(ctx, this)
+            .first()
+            .filter(|(k, _)| k.is_none())
+            .map(|(_, v)| v.clone());
+        let map = build_header_map(ctx, &headers, status_line.as_deref())?;
         Ok(Some(Value::Object(Some(map))))
     })();
     ctx.unpin_native_roots(this_pin);
@@ -4705,12 +4910,20 @@ fn huc_get_header_fields(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// `addHeader("Content-Length", "6")` on both HotSpot and CratonVM — HotSpot
 /// reads 6, so must we.
 fn content_length_of(headers: &[(String, String)], body_len: usize) -> i64 {
+    let _ = body_len;
     headers
         .iter()
         .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
         .last()
         .and_then(|(_, v)| v.trim().parse::<i64>().ok())
-        .unwrap_or(body_len as i64)
+        // NO header, no length: `getContentLength()` is `-1`, which is how a
+        // caller learns the length is unknown and it must read to EOF. The
+        // buffered body size used to stand in for it, so a chunked response
+        // reported the length this VM happened to have received (5 for the
+        // sweep's `abc`+`de`) and a `204 No Content` reported 0 where HotSpot
+        // reports -1 — an answer indistinguishable from a real zero-length
+        // entity.
+        .unwrap_or(-1)
 }
 
 pub(crate) fn huc_get_content_length(
@@ -4835,6 +5048,12 @@ fn huc_get_request_method(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 
 fn huc_set_request_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if is_real_carrier(ctx, this) && real_is_connected(ctx, this) {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "Already connected".into(),
+        }
+        .into());
+    }
     let key = match args.get(1) {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => return Err(iae("setRequestProperty: null key")),
@@ -4887,6 +5106,12 @@ fn huc_set_request_property(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 fn huc_add_request_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if is_real_carrier(ctx, this) && real_is_connected(ctx, this) {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "Already connected".into(),
+        }
+        .into());
+    }
     let key = match args.get(1) {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => return Err(iae("addRequestProperty: null key")),
@@ -4982,6 +5207,12 @@ fn huc_get_request_property(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 /// Silent, and wrong in the direction that reads as "no headers were set".
 fn huc_get_request_properties(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if is_real_carrier(ctx, this) && real_is_connected(ctx, this) {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "Already connected".into(),
+        }
+        .into());
+    }
     let headers: Vec<(String, String)> = if is_real_carrier(ctx, this) {
         with_real_req(ctx, this, |r| r.headers.clone())
     } else if let Value::Object(Some(arr)) = ctx.get_field(this, HUC_REQ_HEADERS) {
@@ -5002,7 +5233,7 @@ fn huc_get_request_properties(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     } else {
         Vec::new()
     };
-    let map = build_header_map(ctx, &headers)?;
+    let map = build_header_map(ctx, &headers, None)?;
     Ok(Some(Value::Object(Some(map))))
 }
 
@@ -5038,6 +5269,12 @@ fn huc_set_do_input(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
 fn huc_set_do_output(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if is_real_carrier(ctx, this) && real_is_connected(ctx, this) {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "Already connected".into(),
+        }
+        .into());
+    }
     let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
     if is_real_carrier(ctx, this) {
         with_real_req(ctx, this, |r| r.do_output = v != 0);
