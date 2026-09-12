@@ -166,6 +166,20 @@ struct CipherState {
     pbe_salt: Vec<u8>,
     /// PBES2 iteration count, paired with `pbe_salt`. Zero for non-PBES2.
     pbe_iterations: u32,
+    /// The GCM authentication-tag length in BITS, from the
+    /// `GCMParameterSpec` the cipher was initialised with. Zero means "no GCM
+    /// spec was supplied", which the tag-length reader turns into the JDK's
+    /// default of 128.
+    ///
+    /// This engine used to ignore `getTLen()` entirely and always emit a
+    /// 16-byte tag, so `new GCMParameterSpec(96, iv)` produced a ciphertext
+    /// four bytes longer than SunJCE's and a tag no conforming peer accepted.
+    gcm_tag_bits: i32,
+    /// Digest of the (key, nonce) this Cipher last GCM-ENCRYPT-initialised
+    /// under. GCM is catastrophically broken by nonce reuse — two messages
+    /// under one (key, IV) leak the authentication subkey — which is why
+    /// SunJCE refuses the second `init` rather than trusting the caller.
+    gcm_last_encrypt: Option<[u8; 32]>,
     /// Digest of the (key, nonce) this Cipher last ENCRYPT-initialised under,
     /// for the ChaCha20 nonce-reuse refusal. `None` until the first such init.
     /// See `chacha20_check_nonce_reuse` for why this is per-instance.
@@ -760,7 +774,27 @@ fn cipher_init_record_with_counter(
     iv_bytes: Vec<u8>,
     chacha_counter: u32,
 ) -> MethodCallResult {
+    // `Cipher.init`'s own argument checks, in the JDK's order and with its
+    // messages. MEASURED (`L6JcaSweep` rows 107, 108): an opmode outside
+    // 1..=4 and a null key were both ACCEPTED here, so the cipher reported
+    // success and failed later — the null key as an
+    // `Aes::key_expansion` complaint at `doFinal`, the bad opmode as a
+    // DECRYPT (every mode that is not 1 or 3 decrypts).
+    if !(1..=4).contains(&mode) {
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/security/InvalidParameterException",
+            "Invalid operation mode",
+        ));
+    }
     let key_bytes = extract_key_bytes(ctx, key);
+    if key_bytes.is_empty() && !is_rsa_transformation(&cipher_algorithm_of(ctx, this)) {
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/security/InvalidKeyException",
+            "No installed provider supports this key: (null)",
+        ));
+    }
     let tkey = obj_key(ctx, this);
     let algo = with_table_read(|t| {
         t.get(&tkey)
@@ -857,11 +891,45 @@ fn cipher_init_record_with_counter(
     } else {
         iv_bytes
     };
+    // DECRYPT/UNWRAP with no IV, on a mode that needs one, cannot be
+    // completed and SunJCE says so at `init`: `InvalidKeyException:
+    // Parameters missing`. This engine recorded the empty IV and produced
+    // plaintext under an all-zero IV at `doFinal` — a wrong answer rather
+    // than a refusal.
+    if (mode == 2 || mode == 4) && iv_bytes.is_empty() && auto_generated_iv_len(&algo).is_some() {
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/security/InvalidKeyException",
+            "Parameters missing",
+        ));
+    }
     let previous = with_table_read(|t| t.get(&tkey).and_then(|s| s.chacha_last_encrypt));
     let last_encrypt =
         chacha20_check_nonce_reuse(ctx, &algo, mode, &key_bytes, &iv_bytes, previous)?;
+    // The same rule for GCM, which needs it more: reusing a (key, IV) pair to
+    // encrypt twice recovers the GHASH subkey and forges arbitrary messages.
+    // SunJCE refuses the second `init(ENCRYPT_MODE, ...)`; this engine
+    // accepted it silently.
+    let gcm_previous = with_table_read(|t| t.get(&tkey).and_then(|s| s.gcm_last_encrypt));
+    let gcm_last_encrypt = if parse_transformation(&algo).1 == "GCM"
+        && (mode == 1 || mode == 3)
+        && !iv_bytes.is_empty()
+    {
+        let fingerprint = chacha20_key_nonce_fingerprint(&key_bytes, &iv_bytes);
+        if gcm_previous == Some(fingerprint) {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "java/security/InvalidAlgorithmParameterException",
+                "Cannot reuse iv for GCM encryption",
+            ));
+        }
+        Some(fingerprint)
+    } else {
+        gcm_previous
+    };
     with_table_write(|t| {
         let s = t.entry(tkey).or_default();
+        s.gcm_last_encrypt = gcm_last_encrypt;
         s.mode = mode;
         s.key_bytes = key_bytes;
         s.iv_bytes = iv_bytes;
@@ -1598,12 +1666,19 @@ fn classify_transformation(transformation: &str) -> TransformVerdict {
                 "ECB" | "CBC" | "CFB" | "OFB" => {
                     aes_padding_verdict(p, &named_padding, &["NOPADDING", "PKCS5PADDING"], family)
                 }
+                // CTR is a STREAM mode: SunJCE ships `AES/CTR/NoPadding` and
+                // offers no padded spelling of it, because there is no block
+                // to pad. This engine refused the whole mode until the counter
+                // arm below was written, so `Cipher.getInstance` raised
+                // `NoSuchAlgorithmException` for a transformation every other
+                // JCA provider has.
+                "CTR" => aes_padding_verdict(p, &named_padding, &["NOPADDING"], family),
                 // Everything else is a mode this engine does not compute:
-                // CTR, CTS, PCBC, KWP, the numbered CFB8/OFB8 variants, and
-                // CCM (which SunJCE does not ship either). Each of these used
-                // to reach `cipher_do_final_impl` and die there on an
-                // UNCHECKED `IllegalStateException` naming "WP6.3 dispatch",
-                // which no `catch (GeneralSecurityException)` matches.
+                // CTS, PCBC, the numbered CFB8/OFB8 variants, and CCM (which
+                // SunJCE does not ship either). Each of these used to reach
+                // `cipher_do_final_impl` and die there on an UNCHECKED
+                // `IllegalStateException` naming "WP6.3 dispatch", which no
+                // `catch (GeneralSecurityException)` matches.
                 _ => TransformVerdict::NoSuchAlgorithm,
             }
         }
@@ -2772,6 +2847,91 @@ fn cipher_init_pbes2_from_spec(
     Some(())
 }
 
+/// Refuse an operation on a `Cipher` nobody has initialised.
+///
+/// `Cipher.checkCipherState()` is the JDK's own guard and it raises
+/// `IllegalStateException("Cipher not initialized")`. Every accessor that
+/// needs a key has to ask: an unguarded `update` buffers into a state row that
+/// `doFinal` then rejects, which reports the failure one call too late and
+/// names the wrong operation.
+fn cipher_require_initialized(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    let tkey = obj_key(ctx, this);
+    let mode = with_table_read(|t| t.get(&tkey).map(|s| s.mode).unwrap_or(0));
+    if mode == 0 {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "Cipher not initialized".into(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Add one to a 128-bit big-endian counter block, in place.
+fn increment_counter_block(block: &mut [u8; 16]) {
+    for byte in block.iter_mut().rev() {
+        let (next, carry) = byte.overflowing_add(1);
+        *byte = next;
+        if !carry {
+            break;
+        }
+    }
+}
+
+/// The GCM tag lengths SunJCE accepts, in BITS.
+const GCM_VALID_TAG_BITS: [i32; 5] = [128, 120, 112, 104, 96];
+
+/// The tag length a `GCMParameterSpec` carries, in bits.
+///
+/// Field-slot read rather than an `invoke_virtual`: every `GCMParameterSpec`
+/// in this VM is built by the `<init>(I[B)V` native a few hundred lines below,
+/// which writes the IV at slot 0 and the tag length at slot 1, and a read
+/// cannot move the heap where a virtual call can.
+fn gcm_tag_bits_of(ctx: &mut dyn NativeContext, spec: Option<ObjectRef>) -> Option<i32> {
+    let spec = spec?;
+    let is_gcm = ctx
+        .class_name_of_id(ctx.class_id_of_object(spec))
+        .is_some_and(|n| n == "javax/crypto/spec/GCMParameterSpec");
+    if !is_gcm {
+        return None;
+    }
+    match ctx.get_field(spec, 1) {
+        Value::Int(bits) => Some(bits),
+        _ => None,
+    }
+}
+
+/// Record a GCM cipher's tag length, refusing one SunJCE would not accept.
+///
+/// The check belongs at `init`, which is where SunJCE raises it: a tag length
+/// only discovered at `doFinal` would surface as the wrong exception at the
+/// wrong moment, and an unchecked one at that.
+fn record_gcm_tag_bits(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    spec: Option<ObjectRef>,
+) -> Result<(), MethodCallFailed> {
+    let Some(bits) = gcm_tag_bits_of(ctx, spec) else {
+        return Ok(());
+    };
+    if !GCM_VALID_TAG_BITS.contains(&bits) {
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/security/InvalidAlgorithmParameterException",
+            "Unsupported TLen value.  Must be one of {128, 120, 112, 104, 96}",
+        ));
+    }
+    let key = obj_key(ctx, this);
+    with_table_write(|t| {
+        if let Some(state) = t.get_mut(&key) {
+            state.gcm_tag_bits = bits;
+        }
+    });
+    Ok(())
+}
+
 fn extract_iv_bytes(ctx: &mut dyn NativeContext, spec: ObjectRef) -> Vec<u8> {
     match ctx.get_field(spec, 0) {
         Value::Object(Some(arr)) => read_bytes(ctx, arr),
@@ -3047,13 +3207,13 @@ fn cipher_wrap_impl(
     let state = with_table_read(|t| t.get(&table_key).cloned());
     let Some(state) = state else {
         return Err(RuntimeError::IllegalStateException {
-            message: "Cipher state missing (init never called or stale post-GC)".into(),
+            message: "Cipher not initialized".into(),
         }
         .into());
     };
     if state.mode != 3 {
         return Err(RuntimeError::IllegalStateException {
-            message: "Cipher not initialized for wrapping".into(),
+            message: "Cipher not initialized for wrapping keys".into(),
         }
         .into());
     }
@@ -3133,7 +3293,7 @@ fn cipher_unwrap_impl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let state = with_table_read(|t| t.get(&table_key).cloned());
     let Some(state) = state else {
         return Err(RuntimeError::IllegalStateException {
-            message: "Cipher state missing (init never called or stale post-GC)".into(),
+            message: "Cipher not initialized".into(),
         }
         .into());
     };
@@ -3757,7 +3917,7 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
     // propagating silent NULLs through the user's pipeline.
     let Some(state) = state else {
         return Err(RuntimeError::IllegalStateException {
-            message: "Cipher state missing (init never called or stale post-GC)".into(),
+            message: "Cipher not initialized".into(),
         }
         .into());
     };
@@ -3765,7 +3925,7 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
     let mode = state.mode;
     if mode == 0 {
         return Err(RuntimeError::IllegalStateException {
-            message: "Cipher state missing (init never called or stale post-GC)".into(),
+            message: "Cipher not initialized".into(),
         }
         .into());
     }
@@ -3776,6 +3936,7 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
     let data = state.accumulated.clone();
     let aad = state.aad.clone();
     let state_counter = state.chacha_counter;
+    let gcm_tag_bits = state.gcm_tag_bits;
     let rsa_n = state.rsa_n.clone();
     let rsa_exp = state.rsa_exp.clone();
     let rsa_key_id = state.rsa_key_id;
@@ -4015,7 +4176,24 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
     // the AES family alone, and every other family has already returned above
     // (RSA, PBES2 and DES/DESede each route earlier in this function).
     let (cipher_name, parsed_mode, pad) = parse_transformation(&algo);
-    let encrypt = mode == 1;
+    // WRAP encrypts and UNWRAP decrypts. Five other direction decisions in
+    // this file spell that `mode == 1 || mode == 3`; this one said `mode == 1`,
+    // so a `WRAP_MODE` cipher ran the DECRYPT block and `Cipher.wrap` produced
+    // an AES *decryption* of the key material.
+    //
+    // MEASURED (`L6JcaSweep` row 114, `AES/ECB/NoPadding`, all-zero key
+    // wrapping an all-zero key):
+    //
+    // ```text
+    //   HotSpot   66e94bd4ef8a2c3b884cfa59ca342b2e -> 00000000000000000000000000000000
+    //   CratonVM  140f0f1011b5223d79587717ffd9ec3a -> af65bb470269ecd7af01f68f1a2b7b78
+    // ```
+    //
+    // `140f0f10…` is the AES decryption of a zero block under a zero key, which
+    // is how the direction was identified. The wrap did not round-trip because
+    // BOTH ends were inverted: `unwrap` encrypted what `wrap` had decrypted,
+    // and two inversions of a block cipher are not the identity.
+    let encrypt = mode == 1 || mode == 3;
 
     let family = cipher_family(&cipher_name);
     match family {
@@ -4094,12 +4272,19 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
             } else {
                 let mut nonce = [0u8; 12];
                 nonce.copy_from_slice(&iv_bytes);
+                // `GCMParameterSpec.getTLen()`, in bytes. SunJCE emits exactly
+                // this many tag bytes and verifies exactly this many; the
+                // engine used to emit sixteen whatever the caller asked for.
+                let tag_len = match gcm_tag_bits {
+                    0 => 16usize,
+                    bits => (bits / 8) as usize,
+                };
                 if encrypt {
                     let out = AesGcm::encrypt(&aes_key, &nonce, &data, &aad);
                     let mut buf = out.ciphertext;
-                    buf.extend_from_slice(&out.tag);
+                    buf.extend_from_slice(&out.tag[..tag_len]);
                     Ok(buf)
-                } else if data.len() < 16 {
+                } else if data.len() < tag_len {
                     // A truncated AEAD ciphertext is an AUTHENTICATION
                     // failure, not a VM state error. SunJCE:
                     // `AEADBadTagException("Input too short - need tag")`.
@@ -4108,6 +4293,41 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
                         "javax/crypto/AEADBadTagException",
                         "Input too short - need tag",
                     ));
+                } else if tag_len < 16 {
+                    // A TRUNCATED tag: recover the plaintext with the CTR
+                    // keystream GCM itself uses (counter block `IV || 00000002`
+                    // — J0+1), then recompute the full tag over that plaintext
+                    // and compare the prefix the caller supplied. The AEAD
+                    // crate's detached decrypt takes a 16-byte tag and cannot
+                    // express this, and rejecting truncated tags outright would
+                    // make the tag length settable and unusable.
+                    let split = data.len() - tag_len;
+                    let (ct, supplied) = data.split_at(split);
+                    let mut counter = [0u8; 16];
+                    counter[..12].copy_from_slice(&nonce);
+                    counter[15] = 2;
+                    let mut plaintext = Vec::with_capacity(ct.len());
+                    for chunk in ct.chunks(16) {
+                        let keystream = Aes::encrypt_block(&aes_key, &counter);
+                        for (i, byte) in chunk.iter().enumerate() {
+                            plaintext.push(byte ^ keystream[i]);
+                        }
+                        increment_counter_block(&mut counter);
+                    }
+                    let expected = AesGcm::encrypt(&aes_key, &nonce, &plaintext, &aad);
+                    let matches = expected.tag[..tag_len]
+                        .iter()
+                        .zip(supplied.iter())
+                        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                        == 0;
+                    if !matches {
+                        return Err(crate::phases_early::throw_jca_exc(
+                            ctx,
+                            "javax/crypto/AEADBadTagException",
+                            "Tag mismatch",
+                        ));
+                    }
+                    Ok(plaintext)
                 } else {
                     let split = data.len() - 16;
                     let ct = &data[..split];
@@ -4136,6 +4356,30 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
                     }
                 }
             }
+        }
+        "CTR" => {
+            // AES-CTR. The keystream is `E(K, counter)` for a counter block
+            // that starts at the IV and increments as one 128-bit big-endian
+            // integer — SunJCE's `CounterMode`, and the reason encrypt and
+            // decrypt are the same operation here.
+            if iv_bytes.len() != 16 {
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/security/InvalidAlgorithmParameterException",
+                    &format!("Wrong IV length: must be 16 bytes long, got {}", iv_bytes.len()),
+                ));
+            }
+            let mut counter = [0u8; 16];
+            counter.copy_from_slice(&iv_bytes);
+            let mut out = Vec::with_capacity(data.len());
+            for chunk in data.chunks(16) {
+                let keystream = Aes::encrypt_block(&aes_key, &counter);
+                for (i, byte) in chunk.iter().enumerate() {
+                    out.push(byte ^ keystream[i]);
+                }
+                increment_counter_block(&mut counter);
+            }
+            Ok(out)
         }
         "ECB" | "" => {
             // AES/ECB. `pad` is the transformation's padding, which this arm
@@ -4916,6 +5160,10 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 Some(spec) => extract_iv_bytes(ctx, spec),
                 None => Vec::new(),
             };
+            // The tag length is validated BEFORE the state is written, so a
+            // refused `init` leaves the cipher uninitialised rather than
+            // half-initialised.
+            record_gcm_tag_bits(ctx, this, spec)?;
             cipher_init_record(ctx, this, mode, key, iv_bytes)
         },
     );
@@ -4959,6 +5207,10 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 Some(spec) => extract_iv_bytes(ctx, spec),
                 None => Vec::new(),
             };
+            // The tag length is validated BEFORE the state is written, so a
+            // refused `init` leaves the cipher uninitialised rather than
+            // half-initialised.
+            record_gcm_tag_bits(ctx, this, spec)?;
             cipher_init_record(ctx, this, mode, key, iv_bytes)
         },
     );
@@ -5156,14 +5408,32 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
             let len = input.map_or(0, |b| ctx.array_length(b) as i32);
             return cipher_delegate_bytes(ctx, this, "engineUpdate", input, 0, len);
         }
-        if let Some(Value::Object(Some(input))) = args.get(1) {
-            let bytes = read_bytes(ctx, *input);
-            let tkey = obj_key(ctx, this);
-            with_table_write(|t| {
-                if let Some(s) = t.get_mut(&tkey) {
-                    s.accumulated.extend_from_slice(&bytes);
-                }
-            });
+        // `update` on a cipher nobody initialised is
+        // `IllegalStateException`, and a null buffer is
+        // `IllegalArgumentException` — both from `Cipher.checkCipherState` /
+        // `engineUpdate`. This buffered silently and returned an empty array,
+        // so the caller's bytes went nowhere and `doFinal` produced a result
+        // computed over a shorter message than the one it was handed.
+        cipher_require_initialized(ctx, this)?;
+        let Some(Value::Object(Some(input))) = args.get(1) else {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "Null input buffer".into(),
+            }
+            .into());
+        };
+        let bytes = read_bytes(ctx, *input);
+        let empty_input = bytes.is_empty();
+        let tkey = obj_key(ctx, this);
+        with_table_write(|t| {
+            if let Some(s) = t.get_mut(&tkey) {
+                s.accumulated.extend_from_slice(&bytes);
+            }
+        });
+        // `update` with nothing in it returns NULL, not a zero-length array:
+        // `Cipher.update` documents "null if the underlying cipher is a block
+        // cipher and the input data is too short to result in a new block".
+        if empty_input {
+            return Ok(Some(Value::Object(None)));
         }
         let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         Ok(Some(Value::Object(Some(empty))))
@@ -5195,7 +5465,30 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
             let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
             return cipher_delegate_bytes(ctx, this, "engineUpdate", input, off, len);
         }
+        cipher_require_initialized(ctx, this)?;
+        let Some(Value::Object(Some(input))) = args.get(1) else {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "Null input buffer".into(),
+            }
+            .into());
+        };
+        // The offsets are the caller's and are checked before anything is
+        // read: `update(b, 0, 999)` and `update(b, -1, 1)` are
+        // `IllegalArgumentException("Bad arguments")` on SunJCE, and were
+        // silently clamped here.
+        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+        let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+        let capacity = ctx.array_length(*input) as i64;
+        if off < 0 || len < 0 || i64::from(off) + i64::from(len) > capacity {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "Bad arguments".into(),
+            }
+            .into());
+        }
         accumulate_slice(ctx, this, args.get(1), args.get(2), args.get(3));
+        if len == 0 {
+            return Ok(Some(Value::Object(None)));
+        }
         let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         Ok(Some(Value::Object(Some(empty))))
     });
@@ -5715,6 +6008,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 return ctx.invoke_virtual(spi, "engineGetOutputSize", "(I)I", &[Value::Int(n)]);
             }
         }
+        cipher_require_initialized(ctx, this)?;
         let input_len = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
         let tkey = obj_key(ctx, this);
         let (algo, mode, acc) = with_table_read(|t| {
@@ -5987,6 +6281,17 @@ fn register_param_specs(r: &mut NativeMethodRegistry) {
     let ivps = "javax/crypto/spec/IvParameterSpec";
     r.register(ivps, "<init>", "([B)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // The JDK's NPE for this comes from the helpful-NPE machinery reading
+        // `iv.length`, so it names the parameter. `obj_arg`'s generic "null
+        // object argument" says nothing about which one.
+        if !matches!(args.get(1), Some(Value::Object(Some(_)))) {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some(
+                    "Cannot read the array length because \"iv\" is null".into(),
+                ),
+            }
+            .into());
+        }
         let iv_arr = obj_arg(args, 1)?;
         let len = ctx.array_length(iv_arr);
         let copy = ctx.new_array(cratonvm_types::ArrayElementType::Byte, len);
@@ -6012,6 +6317,25 @@ fn register_param_specs(r: &mut NativeMethodRegistry) {
     r.register(gcmps, "<init>", "(I[B)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let t_len = args[1].as_int().unwrap_or(128);
+        // The constructor's own two checks, both `IllegalArgumentException` and
+        // both measured on HotSpot 25.0.4+7. The VALUE check (must be one of
+        // 128/120/112/104/96) is NOT here — the JDK defers that to
+        // `Cipher.init`, and doing it here would raise the right complaint at
+        // the wrong moment and with the wrong exception type.
+        if t_len < 0 {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "java/lang/IllegalArgumentException",
+                "Length argument is negative",
+            ));
+        }
+        if !matches!(args.get(2), Some(Value::Object(Some(_)))) {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "java/lang/IllegalArgumentException",
+                "src array is null",
+            ));
+        }
         let iv_arr = obj_arg(args, 2)?;
         let len = ctx.array_length(iv_arr);
         let copy = ctx.new_array(cratonvm_types::ArrayElementType::Byte, len);
@@ -6778,7 +7102,6 @@ mod tests {
     #[test]
     fn unimplemented_modes_are_refused_at_getinstance() {
         for t in [
-            "AES/CTR/NoPadding",
             "AES/CTS/NoPadding",
             "AES/PCBC/PKCS5Padding",
             "AES/CFB8/NoPadding",
@@ -6786,6 +7109,30 @@ mod tests {
         ] {
             assert!(refuses_algorithm(t), "{t} must be refused at getInstance");
         }
+        // `AES/CTR/NoPadding` was on this list until 2026-09-11 and is now
+        // COMPUTED — the same move `DESede` made below. SunJCE ships it, so
+        // refusing it was this engine disclaiming a transformation every other
+        // JCA provider has: `L6JcaSweep` rows 6 and 91 measured
+        // `NoSuchAlgorithmException: Cannot find any provider supporting
+        // AES/CTR/NoPadding` here against a keystream on HotSpot 25.0.4+7.
+        //
+        // The padded spelling stays refused: CTR is a stream mode and SunJCE
+        // offers no padded form of it.
+        assert!(
+            !refuses_algorithm("AES/CTR/NoPadding"),
+            "AES/CTR/NoPadding is computed now"
+        );
+        // The padded spelling is refused as a PADDING, not as an algorithm:
+        // `aes_padding_verdict` names the padding it will not take, and
+        // `classify_transformation` turns that into
+        // `NoSuchPaddingException`. That is the JDK's distinction too — the
+        // transformation exists, the padding does not go with it — and this
+        // assertion said `refuses_algorithm` on the first attempt, which is
+        // the wrong half of it.
+        assert!(
+            refuses_padding("AES/CTR/PKCS5Padding"),
+            "CTR is a stream mode: the padding is what is refused, not the mode"
+        );
         // `DESede` and `DESede/ECB/PKCS5Padding` were on this list until
         // 2026-08-27 and are now COMPUTED, by the same rule that put
         // `AES/KWP/NoPadding` on the other side: the admission table and
@@ -7086,14 +7433,83 @@ mod tests {
 
     // MUST STILL WORK — the guard is RSA-scoped; a symmetric init has no RSA
     // components by design and must not be refused.
+    //
+    // The key now carries sixteen bytes. It did not, and the test passed
+    // anyway, because `Cipher.init` accepted a key with no material at all —
+    // which `L6JcaSweep` row 108 measured as `InvalidKeyException: No
+    // installed provider supports this key: (null)` on HotSpot 25.0.4+7. A
+    // key-less AES init is not the thing this test is about, and giving it a
+    // real key keeps it about the RSA guard.
     #[test]
     fn non_rsa_cipher_init_is_unaffected_by_the_rsa_key_guard() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
         let cipher_obj = cipher_for(&mut ctx, "AES/GCM/NoPadding");
         let key = key_with_handle(&mut ctx, 0);
+        let bytes = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
+        for i in 0..16 {
+            ctx.set_array_element(bytes, i, Value::Int(i as i32));
+        }
+        ctx.set_field(key, 0, Value::Object(Some(bytes)));
         cipher_init_record(&mut ctx, cipher_obj, 1, key, vec![0u8; 12])
             .expect("an AES init must not be caught by the RSA key guard");
         let tkey = obj_key(&mut ctx, cipher_obj);
         assert_eq!(with_table_read(|t| t.get(&tkey).map(|s| s.mode)), Some(1));
+    }
+
+    /// A key with NO material is refused, which is the other half of the same
+    /// contract and had no test at all.
+    #[test]
+    fn a_cipher_init_with_a_key_that_has_no_material_is_refused() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let cipher_obj = cipher_for(&mut ctx, "AES/GCM/NoPadding");
+        let key = key_with_handle(&mut ctx, 0);
+        assert!(
+            cipher_init_record(&mut ctx, cipher_obj, 1, key, vec![0u8; 12]).is_err(),
+            "a key whose getEncoded() yields nothing cannot initialise a cipher"
+        );
+    }
+
+    /// The CTR counter is one 128-bit big-endian integer, and its CARRY is
+    /// the part no probe row reaches: the sweep encrypts 20 bytes, which is
+    /// two blocks, so a carry bug would first show at block 256 — four
+    /// kilobytes in, in somebody's file.
+    #[test]
+    fn the_ctr_counter_carries_across_every_byte() {
+        let mut block = [0u8; 16];
+        increment_counter_block(&mut block);
+        assert_eq!(block[15], 1, "the low byte increments");
+
+        let mut block = [0u8; 16];
+        block[15] = 0xff;
+        increment_counter_block(&mut block);
+        assert_eq!(block[15], 0x00);
+        assert_eq!(block[14], 0x01, "the carry reaches the next byte");
+
+        // The all-ones block wraps to zero rather than doing anything else.
+        let mut block = [0xffu8; 16];
+        increment_counter_block(&mut block);
+        assert_eq!(block, [0u8; 16]);
+
+        // A carry that has to cross the whole width.
+        let mut block = [0u8; 16];
+        block[0] = 0x01;
+        for b in block.iter_mut().skip(1) {
+            *b = 0xff;
+        }
+        increment_counter_block(&mut block);
+        assert_eq!(block[0], 0x02);
+        assert!(block[1..].iter().all(|b| *b == 0));
+    }
+
+    /// And an opmode outside 1..=4, which used to be taken as DECRYPT.
+    #[test]
+    fn a_cipher_init_with_a_bad_opmode_is_refused() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let cipher_obj = cipher_for(&mut ctx, "AES/GCM/NoPadding");
+        let key = key_with_handle(&mut ctx, 0);
+        assert!(
+            cipher_init_record(&mut ctx, cipher_obj, 99, key, vec![0u8; 12]).is_err(),
+            "opmode 99 is InvalidParameterException, not a silent DECRYPT"
+        );
     }
 }

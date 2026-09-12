@@ -1211,7 +1211,152 @@ fn host_input_is_numeric_literal(input: &str) -> bool {
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(input);
     let unscoped = bare.split('%').next().unwrap_or(bare);
-    !unscoped.is_empty() && unscoped.parse::<IpAddr>().is_ok()
+    if unscoped.is_empty() {
+        return false;
+    }
+    // `Ipv4Addr::from_str` is STRICTER than the JDK: it takes four decimal
+    // octets and nothing else, so `1.2.3`, `1.2`, `16909060` and `01.2.3.4`
+    // all failed here and were remembered as host NAMES — HotSpot prints
+    // `/1.2.0.3` for `getByName("1.2.3")` and this VM printed `1.2.3/1.2.0.3`.
+    jdk_numeric_format_v4(unscoped).is_some() || unscoped.parse::<IpAddr>().is_ok()
+}
+
+/// `sun.net.util.IPAddressUtil.textToNumericFormatV4`, which is the JDK's own
+/// answer to "is this text an IPv4 literal".
+///
+/// It is neither `Ipv4Addr::from_str` (too strict: no 1-, 2- or 3-part forms)
+/// nor `inet_aton` (too lax: hex and octal). The rules, all four of them:
+///
+/// * at most 15 characters, and only decimal digits and `.`;
+/// * one to four parts, none empty;
+/// * every part but the last is an octet (`< 256`);
+/// * the last part fills the REMAINING bytes, so `1.2.3` is `1.2.0.3` and
+///   `16909060` is `1.2.3.4`.
+///
+/// A leading zero is not octal here — `01.2.3.4` is `1.2.3.4` — because the
+/// digits are accumulated base 10. That is measured, not assumed: HotSpot
+/// 25.0.4+7 answers `/1.2.3.4` for it.
+pub(crate) fn jdk_numeric_format_v4(src: &str) -> Option<Ipv4Addr> {
+    if src.is_empty() || src.len() > 15 {
+        return None;
+    }
+    let mut res = [0u8; 4];
+    let mut tmp: u64 = 0;
+    let mut cur = 0usize;
+    let mut new_octet = true;
+    for c in src.chars() {
+        if c == '.' {
+            if new_octet || tmp > 0xff || cur == 3 {
+                return None;
+            }
+            res[cur] = (tmp & 0xff) as u8;
+            cur += 1;
+            tmp = 0;
+            new_octet = true;
+        } else {
+            let digit = c.to_digit(10)?;
+            tmp = tmp * 10 + u64::from(digit);
+            new_octet = false;
+        }
+    }
+    if new_octet || tmp >= (1u64 << ((4 - cur) * 8)) {
+        return None;
+    }
+    match cur {
+        0 => res = (tmp as u32).to_be_bytes(),
+        1 => {
+            let b = (tmp as u32).to_be_bytes();
+            res[1] = b[1];
+            res[2] = b[2];
+            res[3] = b[3];
+        }
+        2 => {
+            let b = (tmp as u32).to_be_bytes();
+            res[2] = b[2];
+            res[3] = b[3];
+        }
+        _ => res[3] = (tmp & 0xff) as u8,
+    }
+    Some(Ipv4Addr::from(res))
+}
+
+/// True for the text `inet_aton(3)` accepts and the JDK deliberately does not:
+/// hexadecimal (`0x7f.0.0.1`) and octal (`0177.0.0.1`) parts.
+///
+/// This matters because the fallback for "not a literal" is a NAME lookup, and
+/// `getaddrinfo` runs `inet_aton` first — so without this check the C library
+/// resolves `0x7f.0.0.1` to 127.0.0.1 and the VM answers where HotSpot raises.
+/// The JDK raises `UnknownHostException` carrying the BARE host text (no
+/// resolver suffix), which is how this case is told apart from a DNS miss.
+pub(crate) fn bsd_parsable_v4(src: &str) -> bool {
+    if src.is_empty() {
+        return false;
+    }
+    let parts: Vec<&str> = src.split('.').collect();
+    if parts.len() > 4 {
+        return false;
+    }
+    let mut saw_alternate_radix = false;
+    for part in &parts {
+        let (digits, radix) = if let Some(hex) = part
+            .strip_prefix("0x")
+            .or_else(|| part.strip_prefix("0X"))
+        {
+            saw_alternate_radix = true;
+            (hex, 16)
+        } else if part.len() > 1 && part.starts_with('0') {
+            saw_alternate_radix = true;
+            (&part[1..], 8)
+        } else {
+            (*part, 10)
+        };
+        if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+            return false;
+        }
+    }
+    saw_alternate_radix
+}
+
+/// The JDK's `UnknownHostException` text for a failed NAME lookup is
+/// `"<host>: <resolver message>"`. Rust's `io::Error` for the same call reads
+/// `"failed to lookup address information: Name or service not known"`, so the
+/// VM printed a message with an extra clause in the middle of it. The resolver
+/// text is the part after the last `": "`.
+pub(crate) fn resolver_message(err: &std::io::Error) -> String {
+    let text = err.to_string();
+    match text.rfind(": ") {
+        Some(i) => text[i + 2..].to_string(),
+        None => text,
+    }
+}
+
+/// `getByName`'s literal screen, shared by every resolving entry point.
+///
+/// Returns `Ok(Some(ip))` for a literal, `Ok(None)` when the text is a name to
+/// look up, and `Err` when the JDK rejects it as a malformed literal WITHOUT
+/// consulting the resolver — the two cases being a BSD-only IPv4 form and
+/// anything carrying a colon that is not a valid IPv6 literal.
+pub(crate) fn literal_screen(host: &str) -> Result<Option<IpAddr>, MethodCallFailed> {
+    if let Some(v4) = jdk_numeric_format_v4(host) {
+        return Ok(Some(IpAddr::V4(v4)));
+    }
+    let bracketed = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(v6) = bracketed.parse::<Ipv6Addr>() {
+        return Ok(Some(IpAddr::V6(v6)));
+    }
+    if bsd_parsable_v4(host) {
+        return Err(uhex(host.to_string()));
+    }
+    // A colon cannot appear in a host NAME, so the JDK never falls through to
+    // the resolver for one: `1::2::3` and `1:2:3:4:5:6:7` are malformed
+    // literals, not names that happen not to resolve.
+    if host.contains(':') && host_input_scope(host).is_none() {
+        return Err(uhex(format!("{host}: invalid IPv6 address literal")));
+    }
+    Ok(None)
 }
 
 /// The `%scope` of a textual address literal, if it carries one.
@@ -2508,7 +2653,7 @@ fn native_inet_get_by_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // this VM NullPointerException, in BOTH modes. `obj_arg` raises the NPE for
     // every one of its ~3900 call sites, so the check has to be here.
     let Some(Value::Object(Some(arr))) = args.first() else {
-        return Err(uhex("addr is of illegal length: null".to_string()));
+        return Err(uhex("addr is of illegal length".to_string()));
     };
     let arr = *arr;
     let len = ctx.array_length(arr);
@@ -2525,7 +2670,11 @@ fn native_inet_get_by_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         // (`InetAddress.getByAddress` declares `throws UnknownHostException` and
         // uses it for the bad-length case). Real callers catch it by that type;
         // an IAE escapes their catch and propagates as an unrelated failure.
-        return Err(uhex(format!("addr is of illegal length: {len}")));
+        // MEASURED on HotSpot 25.0.4+7 (`L6InetSweep`): the message carries NO
+        // length. `InetAddress.getByAddress` throws a constant string, and the
+        // six rows that reach it here differed on the `: {len}` this VM added.
+        let _ = len;
+        return Err(uhex("addr is of illegal length".to_string()));
     };
     // Normalize to HotSpot's numeric text before storing anything, or a caller
     // that reads the address (such as Jetty's connector setup) observes Rust's
@@ -2631,11 +2780,12 @@ fn resolve_host(host: &str) -> Result<IpAddr, cratonvm_types::error::MethodCallF
     if host.is_empty() || host == "localhost" {
         return Ok(IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
-    if let Ok(v4) = host.parse::<Ipv4Addr>() {
-        return Ok(IpAddr::V4(v4));
-    }
-    if let Ok(v6) = host.parse::<Ipv6Addr>() {
-        return Ok(IpAddr::V6(v6));
+    // The JDK's literal rules, ahead of the resolver: `getaddrinfo` runs
+    // `inet_aton` on numeric-looking text and accepts forms the JDK dropped,
+    // so a screen that runs AFTER it cannot see what it swallowed.
+    match literal_screen(host)? {
+        Some(ip) => return Ok(ip),
+        None => {}
     }
     // A SCOPED IPv6 literal — `fe80::1%14`, `fe80::1%eth0`,
     // `fe80::1%{04C70698-…}` on Windows, where our interface names are the
@@ -2664,7 +2814,7 @@ fn resolve_host(host: &str) -> Result<IpAddr, cratonvm_types::error::MethodCallF
     }
     let lookup = format!("{host}:0");
     let mut iter = std::net::ToSocketAddrs::to_socket_addrs(&lookup.as_str())
-        .map_err(|e| uhex(format!("{host}: {e}")))?;
+        .map_err(|e| uhex(format!("{host}: {}", resolver_message(&e))))?;
     match iter.next() {
         Some(sa) => Ok(sa.ip()),
         None => Err(uhex(format!("{host}"))),
@@ -7625,14 +7775,24 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
                 format!("{host}:0")
             };
             let mut addrs: Vec<String> = Vec::new();
-            match std::net::ToSocketAddrs::to_socket_addrs(&lookup.as_str()) {
-                Ok(iter) => {
-                    for sa in iter {
-                        addrs.push(sa.ip().to_string());
-                    }
+            // Same literal screen as `getByName`; without it this entry point
+            // answers for `0x7f.0.0.1` and reports a resolver failure in the
+            // wrong words for `1::2::3`.
+            if !(host.is_empty() || host == "localhost") {
+                if let Some(ip) = literal_screen(&host)? {
+                    addrs.push(ip.to_string());
                 }
-                Err(e) => {
-                    return Err(uhex(format!("{host}: {e}")));
+            }
+            if addrs.is_empty() {
+                match std::net::ToSocketAddrs::to_socket_addrs(&lookup.as_str()) {
+                    Ok(iter) => {
+                        for sa in iter {
+                            addrs.push(sa.ip().to_string());
+                        }
+                    }
+                    Err(e) => {
+                        return Err(uhex(format!("{host}: {}", resolver_message(&e))));
+                    }
                 }
             }
             // Test servers bind their loopback listener on IPv4. Prefer that
@@ -10894,6 +11054,11 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // that inherited one-`getfield` body — and a fresh connection that
             // answers `false` is reporting a value the caller never chose.
             ctx.set_field_by_name(conn, "useCaches", Value::Int(1));
+            // A carrier this call just minted inherits nothing. See
+            // `http_url_connection::real_forget`: its side tables are keyed by
+            // identity hash and this address may have belonged to a connection
+            // that died with a streaming mode, a method and headers set.
+            crate::http_url_connection::real_forget(ctx, conn);
             ctx.unpin_native_roots(p_this);
             Ok(Some(Value::Object(Some(conn))))
         },
