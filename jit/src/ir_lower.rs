@@ -24680,6 +24680,52 @@ mod tests {",
         (combined, CALLER_LEN, sites)
     }
 
+    /// A callee whose loop ECJ rotated, spliced into its caller: built, optimized,
+    /// lowered and run. `f(n) = sumTo(n) + 1`, `sumTo(n) = 0 + 1 + … + (n-1)`.
+    #[test]
+    fn a_spliced_callee_with_a_rotated_loop_runs() {
+        let caller = [0x1a, 0xb8, 0x00, 0x01, 0x04, 0x60, 0xac];
+        // sumTo: 0: s = 0; 2: i = 0; 4: goto 14; 7: s += i; 11: iinc 2, 1;
+        // 14: iload_2; 15: iload_0; 16: if_icmplt 7; 19: iload_1; 20: ireturn
+        let callee = [
+            0x03, 0x3c, 0x03, 0x3d, 0xa7, 0x00, 0x0a, 0x1b, 0x1c, 0x60, 0x3c, 0x84, 0x02, 0x01,
+            0x1c, 0x1a, 0xa1, 0xff, 0xf7, 0x1b, 0xac,
+        ];
+        let mut combined = caller.to_vec();
+        let base = combined.len();
+        combined.extend_from_slice(&callee);
+        combined.extend_from_slice(&[0, 0]);
+        let mut sites = HashMap::new();
+        sites.insert(
+            1,
+            crate::ir::IrInlineSite {
+                base,
+                code_len: callee.len(),
+                num_args: 1,
+                max_locals: 3,
+                arg_local_slots: vec![0],
+                returns_value: true,
+                receiver_is_arg0: false,
+                method_key: "P.sumTo:(I)I".to_string(),
+                class_id: 0,
+            },
+        );
+        let mut builder = IrBuilder::new(1, 1);
+        builder.set_inline_sites(sites);
+        let mut graph = builder
+            .build(&combined, caller.len())
+            .expect("a callee body with a rotated loop must splice");
+        ir_optimize::optimize(&mut graph);
+        let schedule = ir_schedule::schedule(&graph);
+        let cm = lower(&graph, &schedule, 1, 1, &no_helpers()).expect("the graph must lower");
+        // SAFETY: the body was compiled by this test for one `int` argument and runs on this thread with no helper calls.
+        let f = |n: i64| unsafe { cm.try_call(&[n]).expect("test JIT call") };
+        assert_eq!(f(0), 1, "an empty loop sums to zero");
+        assert_eq!(f(1), 1);
+        assert_eq!(f(5), 11, "0+1+2+3+4, plus one");
+        assert_eq!(f(100), 4951);
+    }
+
     #[test]
     fn a_spliced_body_may_branch_and_its_phi_carries_a_combined_pc() {
         let (combined, caller_len, sites) = splice_branch_fixture();
@@ -24842,7 +24888,7 @@ mod tests {",
         let code = [0x1a, 0x06, 0x64, 0x3b, 0x1a, 0x9d, 0xff, 0xfb, 0x1a, 0xac, 0, 0];
         let cm = compile_via_ir(&code, 10, 1, 1).expect("a do/while at pc 0 compiles via IR");
         // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
-        let f = |n: i64| unsafe { cm.try_call(&[n]).expect("call") };
+        let f = |n: i64| unsafe { cm.try_call(&[n]).expect("call") } as i32 as i64;
         for (n, want) in [(10i64, -2i64), (0, -3), (3, 0), (1, -2), (-5, -8)] {
             assert_eq!(f(n), want, "f({n})");
         }
@@ -24877,7 +24923,7 @@ mod tests {",
         ];
         let cm = compile_via_ir(&code, 33, 1, 3).expect("a rotated loop with an if/else compiles via IR");
         // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
-        let f = |n: i64| unsafe { cm.try_call(&[n]).expect("call") };
+        let f = |n: i64| unsafe { cm.try_call(&[n]).expect("call") } as i32 as i64;
         for (n, want) in [(0i64, 0i64), (1, 0), (2, -1), (3, 1), (5, 4), (6, 3)] {
             assert_eq!(f(n), want, "f({n})");
         }
