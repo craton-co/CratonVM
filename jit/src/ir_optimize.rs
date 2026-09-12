@@ -5008,8 +5008,11 @@ fn unroll(graph: &mut Graph) -> bool {
         }
 
         // No side effects in the loop: a Store/Call/alloc/ArrayLength/Guard/array
-        // element access that is loop-variant or control-pinned to the loop is a
-        // side effect we do not model → bail. (`ArrayLoad`/`ArrayStore` can throw
+        // element access that is control-pinned to the loop, or floating and
+        // loop-variant, is a side effect we do not model → bail. A node pinned
+        // to control OUTSIDE the loop runs after it, however much it depends on
+        // the carried values: `for (…) acc += i; println(acc);` is not a loop
+        // with a side effect. (Reading plain variance used to refuse it.) (`ArrayLoad`/`ArrayStore` can throw
         // NPE/AIOOBE and `ArrayStore` mutates the heap, so unrolling a loop that
         // contains one would duplicate/reorder those effects — conservatively
         // decline.)
@@ -5032,8 +5035,24 @@ fn unroll(graph: &mut Graph) -> bool {
                     | Op::ArrayStore(_)
                     | Op::Guard { .. }
             ) {
-                let ctrl = graph.nodes[id].inputs.first().copied().unwrap_or(NO_NODE);
-                if variant.contains(&(id as NodeId)) || ctrl == region || ctrl == back_ctrl {
+                let inputs = &graph.nodes[id].inputs;
+                // The documented `[ctrl, …]` form; a compact hand-built node has
+                // no control input and floats.
+                let pinned = match op.memory_shape() {
+                    Some(shape) => inputs.len() >= shape.min_full_arity,
+                    None => matches!(op, Op::Guard { .. }),
+                };
+                let ctrl = if pinned {
+                    inputs.first().copied().unwrap_or(NO_NODE)
+                } else {
+                    NO_NODE
+                };
+                let in_loop = if ctrl == NO_NODE {
+                    variant.contains(&(id as NodeId))
+                } else {
+                    ctrl == region || ctrl == back_ctrl || ctrl == info.if_node
+                };
+                if in_loop {
                     if dbg {
                         eprintln!("[DBG_UNROLL] region {region}: bail — loop side effect {:?} (node {id})", graph.nodes[id].op);
                     }
@@ -6811,6 +6830,18 @@ mod tests {
             !g.nodes.iter().any(|n| n.op == Op::Region),
             "no loop region should remain after a full unroll"
         );
+    }
+
+    #[test]
+    fn a_side_effect_after_the_loop_does_not_block_the_unroll() {
+        // for (i=0; i<5; i++) acc += i;  then a guard on `acc` at the exit.
+        let (mut g, ret) = reduction_loop(0, 5, 1);
+        let exit = g.nodes[ret as usize].inputs[0];
+        let acc = g.nodes[ret as usize].inputs[1];
+        let limit = g.add(Op::Const(100), IrType::Int, vec![], None);
+        let cond = g.add(Op::Cmp(CmpOp::Lt), IrType::Int, vec![acc, limit], None);
+        g.add(Op::Guard { bci: 0 }, IrType::Void, vec![exit, cond], None);
+        assert!(unroll(&mut g), "a post-loop effect is not a loop side effect");
     }
 
     #[test]
