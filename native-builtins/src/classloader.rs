@@ -4406,8 +4406,36 @@ pub(crate) fn define_class_via_full(
             // wildfly-parallel-boot-stale-objectref-residual.md.
             let mirror_pin = ctx.pin_native_root(mirror);
             if initialize {
-                if let Err(msg) = ctx.initialize_class(cid) {
-                    tracing::warn!("defineClass0 initialize: <clinit> for {name} failed: {msg}");
+                // `initialize = true` is a CONTRACT, not a hint. HotSpot's
+                // `JVM_LookupDefineClass` links AND initializes before handing the
+                // class back, and an initialization failure reaches the caller:
+                // the original `Error`, or `ExceptionInInitializerError` wrapping
+                // anything else (JVMS 5.5).
+                //
+                // This used to `tracing::warn!` and fall through, returning the
+                // mirror as though `<clinit>` had succeeded. The caller then held
+                // an UNINITIALIZED class and the real failure surfaced later,
+                // somewhere with no visible connection to the define — the
+                // silent-wrong-result shape this file's own error contract
+                // (`cl_unsafe_define_class`'s note) argues against.
+                //
+                // Propagating `MethodCallFailed` unchanged is deliberate: it
+                // carries the exception the initializer actually raised, so the
+                // caller sees what HotSpot would have thrown rather than a
+                // `ClassFormatError` about the define step. The sibling body in
+                // `lang_system.rs` wraps instead, and that wrapping is a separate
+                // deviation with three consumers keyed on its message text — see
+                // `docs/internal/jdk-only/lane-2-system1-hidden-class-self-reference-FIXED-20260912.md`.
+                //
+                // `safe_native_call_impl` truncates `native_pin_roots` when the
+                // native returns, so the unmatched `mirror_pin` above costs
+                // nothing on this path — the same reasoning the pin's own comment
+                // records for the other error arms.
+                if let Err(e) = ctx.initialize_class(cid) {
+                    tracing::warn!(
+                        "defineClass0 initialize: <clinit> for {name} failed; propagating"
+                    );
+                    return Err(e);
                 }
             }
             let mirror = ctx.read_native_pin(mirror_pin, mirror);
