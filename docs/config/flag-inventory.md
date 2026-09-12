@@ -1911,8 +1911,10 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_THREADS` | THREADS | `CRATONVM_THREADS=…` | group | unset | — | snapshot | types |
 | `CRATONVM_THREAD_CONTAINERS` | THREADS | `CRATONVM_THREADS=thread-containers` | default-on | on | behaviour | snapshot | native-builtins |
 | `CRATONVM_THREAD_START_GRACE_MS` | THREADS | `CRATONVM_THREADS=thread-start-grace-ms` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_TIER_C1_THREADS` | JIT | `CRATONVM_JIT=tier-c1-threads` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_TIER_C1_THRESHOLD` | JIT | `CRATONVM_JIT=tier-c1-threshold` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_TIER_C2_MIN_INVOCATIONS` | JIT | `CRATONVM_JIT=tier-c2-min-invocations` | opt-in | off | behaviour | snapshot | jit |
+| `CRATONVM_TIER_C2_THREADS` | JIT | `CRATONVM_JIT=tier-c2-threads` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_TIER_C2_THRESHOLD` | JIT | `CRATONVM_JIT=tier-c2-threshold` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_TIER_ENABLED` | JIT | `CRATONVM_JIT=tiered` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_TIER_OSR_BACKEDGE` | JIT | `CRATONVM_JIT=tier-osr-backedge` | opt-in | off | behaviour | snapshot | difftest, vm |
