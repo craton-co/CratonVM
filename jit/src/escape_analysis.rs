@@ -62,9 +62,10 @@
 //!   (`apply_ea_to_ir_pinned` in `jit/src/lib.rs`) reads those per-object plans
 //!   and refuses a whole object when any one of its monitors cannot be removed;
 //!   the flat [`EscapeAnalysisResult::elide_locks`] list is kept for tests and
-//!   diagnostics. A method that had monitors before elision is marked unable to
-//!   deopt-resume precisely (`had_monitors`, see
-//!   `docs/jit/lock-elimination.md` §8).
+//!   diagnostics. A deopt inside an elided region resumes precisely: the IR
+//!   frame state records the builder's monitor stack, and the lowerer marks a
+//!   monitor whose ops were elided `relock`, which the resume re-acquires (see
+//!   `lock-elimination.md` §8).
 //! * **coarsening** merges two adjacent lock regions on a confined object by
 //!   deleting the inner `monitorexit`/`monitorenter` pair
 //!   ([`LockCoarseningPlan`]). It depends on no elision having landed, so it is

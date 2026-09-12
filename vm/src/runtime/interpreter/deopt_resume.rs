@@ -187,8 +187,11 @@ pub(super) fn resume_from_ir_deopt(
             Err(why) => bail(&format!("inlined caller chain: {why}")),
         };
     }
-    if !rframe.monitors.is_empty() {
-        return bail("held monitors");
+    // This sink has no relock path. A monitor the compiled code took itself
+    // (`relock == false`) is still held by this thread and the resumed frame's
+    // own `monitorexit` releases it, so only an elided one refuses.
+    if rframe.monitors.iter().any(|m| m.relock) {
+        return bail("held monitors that must be re-acquired");
     }
     // Locals use the cat-2-aware compactor (a `long` is two JVM slots, re-expanded
     // by copy_args_to_locals); the operand stack is compact (one slot per value).
@@ -338,11 +341,14 @@ pub(super) fn caller_frame_values(
     rf: &cratonvm_jit::deopt::ReconstructedFrame,
 ) -> Result<(Vec<Value>, Vec<Value>), String> {
     use cratonvm_jit::deopt::FrameValue;
-    if !rf.monitors.is_empty() {
+    // A materialised caller frame has no relock path; only a monitor the resume
+    // would have to acquire (`relock`) refuses. One the compiled code took is
+    // still held by this thread.
+    if rf.monitors.iter().any(|m| m.relock) {
         return Err(format!(
-            "caller scope {} holds {} monitor(s)",
+            "caller scope {} holds {} monitor(s) that must be re-acquired",
             rf.method_key,
-            rf.monitors.len()
+            rf.monitors.iter().filter(|m| m.relock).count()
         ));
     }
     if let Some(i) = rf
@@ -951,11 +957,16 @@ pub(crate) fn build_deopt_frame_inner(
     stress: bool,
 ) -> Option<crate::runtime::frame::Frame> {
     // Single non-inlined frame (inlined-caller chains stay out of scope). Held
-    // monitors are NO LONGER a blanket bail: Phase C records `synchronized(obj)`
-    // blocks over scalar-replaced objects as `MonitorInfo` and re-acquires them on
-    // resume (below). The x64 producer only emits monitors over scalar objects
-    // (a non-scalar elision sets `has_elided_monitor` → `can_deopt_resume=false`),
-    // so every monitor here is materializable + relockable.
+    // monitors are NO LONGER a blanket bail. Each `MonitorInfo` says whether the
+    // resume must acquire it:
+    //   * `relock == true` — an ELIDED lock. The single-pass backend's Phase C
+    //     records `synchronized(scalarObj)` blocks this way, and the optimizing
+    //     tier marks every monitor whose ops lock elision deleted. The object is
+    //     materialized (if virtual) and locked `lock_depth` times below.
+    //   * `relock == false` — a lock the compiled code took through the monitor
+    //     helper (optimizing tier only). The thread still holds it; the resumed
+    //     frame's `monitorexit` releases it. It is pinned and checked like any
+    //     reference and otherwise left alone.
     if !rframe.caller_frames.is_empty() {
         note_deopt_frame_bail(DeoptFrameBail::InlinedChain, rframe);
         return None;
@@ -1015,12 +1026,19 @@ pub(crate) fn build_deopt_frame_inner(
     // roots them. On any materialization failure (unsupported field / unknown
     // id) the pins are released and we fall back to re-run (`?` → `None`).
     use cratonvm_jit::deopt::FrameValue;
-    let has_virtual = rframe.locals.iter().chain(rframe.stack.iter()).any(|v| {
-        matches!(
-            v,
-            FrameValue::VirtualObject(_) | FrameValue::VirtualObjectRef(_)
-        )
-    });
+    // Monitors included: an elided lock on an object no local or stack slot
+    // still names carries the object's only definition in its monitor entry.
+    let has_virtual = rframe
+        .locals
+        .iter()
+        .chain(rframe.stack.iter())
+        .chain(rframe.monitors.iter().map(|m| &m.object))
+        .any(|v| {
+            matches!(
+                v,
+                FrameValue::VirtualObject(_) | FrameValue::VirtualObjectRef(_)
+            )
+        });
     if has_virtual && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
         eprintln!(
             "[DBG_SCALAR_DEOPT] build_deopt_frame_inner: materializing virtual object(s) at bci={}",
@@ -1033,24 +1051,17 @@ pub(crate) fn build_deopt_frame_inner(
         // non-escaping objects (`jit::escape_analysis::find_lock_elisions`): a
         // scalar-replaced object may have had its `monitorenter`/`monitorexit`
         // elided, so a resumed frame that later runs `monitorexit` would hit an
-        // un-entered monitor. Two layers protect against this:
-        //   1. A frame *holding* a monitor already bailed above (`rframe.threads.monitors`).
-        //   2. `ACC_SYNCHRONIZED` methods bail here (the method monitor is elided
-        //      under scalar replacement of `this`/the receiver).
-        // The residual case — a `synchronized(obj)` *block* over a scalar-replaced
-        // object in a non-synchronized method — is NOT detectable from the
-        // reconstructed frame alone (an elided monitor leaves no trace). The IR
-        // guard-surviving-SR producer (`ir_lower::frame_value_for_object`, gated by
-        // `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL`) now DOES write
-        // `VirtualObject` deopt slots, so `has_virtual` can be true under that gate.
-        // The two layers above (a monitor-holding frame and an `ACC_SYNCHRONIZED`
-        // method both bail) cover the elision cases the IR path can produce today:
-        // the IR escape analysis does not emit `synchronized`-block lock elision on
-        // this path, so the residual block-elision case does not arise. A future
-        // emitter that elides a `synchronized(obj)` block over a scalar-replaced
-        // object MUST carry an "elided monitor present" flag on the deopt point for
-        // this sink to bail on. This whole path is `CRATONVM_DEOPT_REAL`-gated
-        // (default-off).
+        // un-entered monitor.
+        //
+        // A `synchronized(obj)` BLOCK over such an object is described: both
+        // producers record the elided lock as a `relock` `MonitorInfo` (the
+        // optimizing tier from the builder's monitor stack since 2026-09-12), and
+        // the relock below re-acquires it on the materialized object.
+        //
+        // What stays refused is an `ACC_SYNCHRONIZED` method: its method monitor
+        // is not a frame-state entry at all (the invoke path takes it, not a
+        // `monitorenter`), so an elision of it under scalar replacement of the
+        // receiver would leave no trace here.
         if cached.is_synchronized {
             note_deopt_frame_bail(DeoptFrameBail::SynchronizedWithVirtuals, rframe);
             return None;
@@ -1109,20 +1120,22 @@ pub(crate) fn build_deopt_frame_inner(
             thread.native_pin_roots.push(*obj);
         }
     }
-    // Phase C: pin the held-monitor objects too (materialized shells), so the
-    // refill GC forwards them in place and the relock below uses live addresses.
-    // `monitor_objs` keeps (pin-relative position implied by push order, depth);
-    // a non-Object monitor (an unresolved virtual ref — shouldn't occur, the
-    // materializer rewrote them) bails to safe re-run.
-    let mut monitor_depths: Vec<u32> = Vec::with_capacity(rframe.monitors.len());
+    // Phase C: pin the held-monitor objects too (materialized shells, or the
+    // real object a compiled lock holds), so the refill GC forwards them in
+    // place and the relock below uses live addresses. `monitor_plan` keeps
+    // (depth, relock) in push order; a non-Object monitor (an unresolved
+    // virtual ref — shouldn't occur, the materializer rewrote them) or a null
+    // one bails to safe re-run.
+    let mut monitor_plan: Vec<(u32, bool)> = Vec::with_capacity(rframe.monitors.len());
     for m in &rframe.monitors {
         match &m.object {
-            FrameValue::Object(addr) => {
-                // SAFETY: materialization produced this raw oop and the frame is
-                // pinned before any allocation or GC can make the address stale.
+            FrameValue::Object(addr) if *addr != 0 => {
+                // SAFETY: `addr` is a non-null reference the deopt resolved from
+                // the trapped frame (or materialization produced), and it is
+                // pinned here before any allocation or GC can make it stale.
                 let obj = unsafe { ObjectRef::from_raw(*addr as usize as *mut u8) };
                 thread.native_pin_roots.push(obj);
-                monitor_depths.push(m.lock_depth);
+                monitor_plan.push((m.lock_depth, m.relock));
             }
             // Null monitor or an unresolved form — refuse rather than relock a
             // bogus object (would corrupt the monitor table). Release nothing
@@ -1176,12 +1189,12 @@ pub(crate) fn build_deopt_frame_inner(
         }
     }
     // Phase C: re-read the forwarded monitor objects (pushed after locals+stack),
-    // pairing each with its lock depth for the relock below.
-    let mut monitors_fwd: Vec<(ObjectRef, u32)> = Vec::with_capacity(monitor_depths.len());
-    for &depth in &monitor_depths {
+    // pairing each with its lock depth and relock marker for the relock below.
+    let mut monitors_fwd: Vec<(ObjectRef, u32, bool)> = Vec::with_capacity(monitor_plan.len());
+    for &(depth, relock) in &monitor_plan {
         let fwd = thread.native_pin_roots[k];
         k += 1;
-        monitors_fwd.push((fwd, depth));
+        monitors_fwd.push((fwd, depth, relock));
     }
 
     // Build the Frame as a LOCAL (never pushed onto thread.frames), so the
@@ -1213,13 +1226,22 @@ pub(crate) fn build_deopt_frame_inner(
     }
     // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
     frame.pc = rframe.bci as usize;
-    // Phase C: re-acquire each elided monitor on the re-materialized (thread-local,
-    // uncontended) object, `lock_depth` times, so the resumed frame's eventual
-    // `monitorexit` (and any nested exits) balance via the MonitorTable. Done after
-    // every fallible step so a bail never leaves a stray lock. `monitors.enter` is
-    // the recursive uncontended enter (the object is fresh thread-local — no
-    // contention, no GC).
-    for &(obj, depth) in &monitors_fwd {
+    // Phase C: re-acquire each ELIDED monitor (`relock`) on its object,
+    // `lock_depth` times, so the resumed frame's eventual `monitorexit` (and any
+    // nested exits) balance via the MonitorTable. Done after every fallible step
+    // so a bail never leaves a stray lock. `monitors.enter` is the recursive
+    // uncontended enter: an elided lock's object never escaped this thread, so
+    // there is no contention and no GC.
+    //
+    // A monitor with `relock == false` is one the compiled code acquired through
+    // the monitor helper. This thread still holds it — the MonitorTable IS the
+    // interpreter's record of block monitors, there is no per-frame list — so
+    // the resumed frame already holds it and entering again would leave it one
+    // level too deep after the frame's own `monitorexit`.
+    for &(obj, depth, relock) in &monitors_fwd {
+        if !relock {
+            continue;
+        }
         for _ in 0..depth {
             shared.threads.monitors.enter(obj, thread.thread_id);
         }
@@ -1260,12 +1282,15 @@ pub(crate) fn build_deopt_frame_inner(
 /// names:
 ///
 /// * an **`ACC_SYNCHRONIZED`** method — the method monitor is not in the frame;
-/// * a body that **takes a monitor at all**. Every `FrameState` `ir_lower`
-///   builds hard-codes `monitors: Vec::new()`, so a resumed frame for such a
-///   body believes it holds no lock. That is also what covers the one thing
-///   `can_deopt_resume` really protected: an elided monitor FORCES the flag
-///   false, so such a body reaches this predicate — and eliding is a codegen
-///   decision, not a bytecode rewrite, so the ops are still there to see;
+/// * a body that **takes a monitor at all**. The optimizing tier's frame states
+///   have recorded the monitor stack since 2026-09-12 (with a `relock` marker
+///   for elided locks), but the SINGLE-PASS backend still describes only the
+///   monitors it scalar-replaced: a non-scalar elision sets
+///   `has_elided_monitor` and leaves no trace in the frame. This arm cannot
+///   tell the two backends' artifacts apart, and eliding is a codegen
+///   decision, not a bytecode rewrite, so the ops are still there to see —
+///   which is why the refusal stays. An optimizing-tier body with monitors
+///   resumes precisely through the `can_deopt_resume` arm instead;
 /// * a **resume bci past the method's code**.
 ///
 /// # Additive by construction
@@ -1462,8 +1487,10 @@ pub(super) fn transfer_osr_exit_into_live_frame_checked(
             shared, thread, frame_idx, rframe, artifact,
         );
     }
-    if !rframe.monitors.is_empty() {
-        return Err("held monitors".to_string());
+    // The in-place transfer has no relock path; a lock the compiled code took
+    // (`relock == false`) is still held and stays with the live frame.
+    if rframe.monitors.iter().any(|m| m.relock) {
+        return Err("held monitors that must be re-acquired".to_string());
     }
     if rframe.locals.iter().chain(rframe.stack.iter()).any(|v| {
         matches!(
@@ -1719,8 +1746,9 @@ pub(super) fn transfer_osr_exception_exit_into_live_frame(
     if !rframe.caller_frames.is_empty() {
         return Err("inlined caller chain".to_string());
     }
-    if !rframe.monitors.is_empty() {
-        return Err("held monitors".to_string());
+    // As in the sibling: only a monitor the transfer would have to acquire.
+    if rframe.monitors.iter().any(|m| m.relock) {
+        return Err("held monitors that must be re-acquired".to_string());
     }
     if rframe.locals.iter().any(|v| {
         matches!(
@@ -2748,6 +2776,7 @@ mod deopt_step3_tests {
             monitors: vec![MonitorInfo {
                 object: FrameValue::VirtualObjectRef(0),
                 lock_depth: 2,
+                relock: true,
             }],
             caller_frames: Vec::new(),
         };
@@ -2774,6 +2803,113 @@ mod deopt_step3_tests {
         assert!(
             shared.threads.monitors.exit(obj, thread.thread_id).is_err(),
             "exit 3 must fail — monitor no longer held"
+        );
+    }
+
+    /// A lock the COMPILED code took (`relock == false`, the optimizing tier's
+    /// description of a live `synchronized` block) is still held by the thread
+    /// when the frame deoptimizes. The rebuilt interpreter frame must go on
+    /// holding it exactly once: not released, and not taken a second time,
+    /// which would leave it held after the frame's own `monitorexit`.
+    #[test]
+    fn resumed_frame_keeps_a_monitor_the_compiled_code_holds_without_relocking() {
+        use cratonvm_jit::deopt::MonitorInfo;
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+
+        let obj = shared
+            .mem
+            .heap
+            .alloc_object(cratonvm_types::ClassId::new(7), 0);
+        // Cast: object/code pointer to integer address
+        let addr = obj.as_ptr() as usize as u64;
+        // What the compiled body's `jit_monitor_enter` did before it trapped.
+        shared.threads.monitors.enter(obj, thread.thread_id);
+
+        let rf = ReconstructedFrame {
+            method_key: "T.m:()V".to_string(),
+            bci: 4,
+            locals: vec![FrameValue::Object(addr)],
+            stack: vec![],
+            monitors: vec![MonitorInfo {
+                object: FrameValue::Object(addr),
+                lock_depth: 1,
+                relock: false,
+            }],
+            caller_frames: Vec::new(),
+        };
+
+        let pin_base = thread.native_pin_roots.len();
+        let r = resume_real_ir_deopt(&shared, &mut thread, &cached, &rf)
+            .expect("a frame holding a compiled lock must resume");
+        assert!(matches!(r, CachedCallResult::FramePushed));
+        assert_eq!(thread.native_pin_roots.len(), pin_base);
+
+        let held = match thread.frames.last().unwrap().get_local(0) {
+            Value::Object(Some(o)) => o,
+            other => panic!("local 0 must be the locked object, got {other:?}"),
+        };
+        assert!(
+            shared.threads.monitors.holds(held, thread.thread_id),
+            "the resumed frame must still hold the compiled code's lock"
+        );
+        assert!(
+            shared.threads.monitors.exit(held, thread.thread_id).is_ok(),
+            "the frame's own monitorexit releases it"
+        );
+        assert!(
+            shared.threads.monitors.exit(held, thread.thread_id).is_err(),
+            "held exactly once: the resume must not have entered it again"
+        );
+    }
+
+    /// An ELIDED lock on an allocation that escape analysis kept (the object is
+    /// a real reference, not a virtual one) must be acquired by the resume:
+    /// the compiled code never locked it, and the interpreter frame will run
+    /// the matching `monitorexit`.
+    #[test]
+    fn resumed_frame_relocks_an_elided_monitor_on_a_real_object() {
+        use cratonvm_jit::deopt::MonitorInfo;
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+
+        let obj = shared
+            .mem
+            .heap
+            .alloc_object(cratonvm_types::ClassId::new(7), 0);
+        // Cast: object/code pointer to integer address
+        let addr = obj.as_ptr() as usize as u64;
+        assert!(!shared.threads.monitors.holds(obj, thread.thread_id));
+
+        let rf = ReconstructedFrame {
+            method_key: "T.m:()V".to_string(),
+            bci: 4,
+            locals: vec![FrameValue::Object(addr)],
+            stack: vec![],
+            monitors: vec![MonitorInfo {
+                object: FrameValue::Object(addr),
+                lock_depth: 1,
+                relock: true,
+            }],
+            caller_frames: Vec::new(),
+        };
+
+        let r = resume_real_ir_deopt(&shared, &mut thread, &cached, &rf)
+            .expect("an elided-lock frame must resume");
+        assert!(matches!(r, CachedCallResult::FramePushed));
+        let held = match thread.frames.last().unwrap().get_local(0) {
+            Value::Object(Some(o)) => o,
+            other => panic!("local 0 must be the object, got {other:?}"),
+        };
+        assert!(
+            shared.threads.monitors.exit(held, thread.thread_id).is_ok(),
+            "the resume acquired the elided lock"
+        );
+        assert!(
+            shared.threads.monitors.exit(held, thread.thread_id).is_err(),
+            "exactly once"
         );
     }
 

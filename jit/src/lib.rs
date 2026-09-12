@@ -5183,13 +5183,18 @@ impl OsrEntryPlan {
                 ),
             ));
         }
-        if !rframe.monitors.is_empty() {
+        // Only a monitor the resume would have to ACQUIRE refuses: the in-place
+        // transfer has no re-lock path. A lock the compiled code took itself
+        // (`relock == false`) is still held by this thread and the live frame
+        // releases it with its own `monitorexit`, exactly as before IR frame
+        // states recorded monitors at all.
+        if rframe.monitors.iter().any(|m| m.relock) {
             return Err(osr_refusal(
                 OSR_REFUSE_EXIT_REPLAY,
                 format!(
-                    "exit at bci {} holds {} monitor(s)",
+                    "exit at bci {} holds {} monitor(s) that must be re-acquired",
                     rframe.bci,
-                    rframe.monitors.len()
+                    rframe.monitors.iter().filter(|m| m.relock).count()
                 ),
             ));
         }
@@ -5427,10 +5432,15 @@ impl CompiledMethod {
                     ),
                 ));
             }
-            if !fs.monitors.is_empty() {
+            // See `resume_after_exit`: only an elided (`relock`) monitor has no
+            // path through the in-place transfer.
+            if fs.monitors.iter().any(|m| m.relock) {
                 return Err(osr_refusal(
                     OSR_REFUSE_UNRESUMABLE_EXIT,
-                    format!("deopt point at bci {} holds monitors", p.bci),
+                    format!(
+                        "deopt point at bci {} holds monitors that must be re-acquired",
+                        p.bci
+                    ),
                 ));
             }
             // A RETHROW point is asked a NARROWER question, because it is
@@ -5776,10 +5786,15 @@ impl CompiledMethod {
                     format!("{}: entry contract has an inlined caller scope", label()),
                 ));
             }
-            if !fs.monitors.is_empty() {
+            // A lock the compiled body takes itself is taken by the
+            // interpreter before the entry and released by the body's own
+            // `monitorexit`. An ELIDED one (`relock`) would be held by the
+            // interpreter and released by nobody: the body has no monitor op
+            // for it. Refuse only that.
+            if fs.monitors.iter().any(|m| m.relock) {
                 return Err(osr_refusal(
                     OSR_REFUSE_UNRESUMABLE_EXIT,
-                    format!("{}: entry contract holds monitors", label()),
+                    format!("{}: entry contract holds an elided monitor", label()),
                 ));
             }
             // `osr-01` item 4. The precise contract is what the loop below
@@ -19769,12 +19784,16 @@ fn ea_splice_feasible(ir_graph: &ir::Graph, victim: ir::NodeId) -> bool {
         .is_some()
 }
 
-/// True when some safepoint snapshot slot names `id`.
+/// True when some safepoint snapshot slot names `id` — a local, an operand-stack
+/// entry, or a held monitor.
 fn ea_snapshot_names(ir_graph: &ir::Graph, id: ir::NodeId) -> bool {
-    ir_graph
-        .safepoints
-        .iter()
-        .any(|sp| sp.locals.iter().chain(sp.stack.iter()).any(|&v| v == id))
+    ir_graph.safepoints.iter().any(|sp| {
+        sp.locals
+            .iter()
+            .chain(sp.stack.iter())
+            .chain(sp.monitors.iter())
+            .any(|&v| v == id)
+    })
 }
 
 /// How [`apply_ea_to_ir`] retires one node.
@@ -20446,7 +20465,12 @@ fn apply_ea_to_ir_pinned(
         if let EaVictimKind::Forwarded(v) = kind {
             forwarded.insert(victim, v);
             for sp in ir_graph.safepoints.iter_mut() {
-                for slot in sp.locals.iter_mut().chain(sp.stack.iter_mut()) {
+                for slot in sp
+                    .locals
+                    .iter_mut()
+                    .chain(sp.stack.iter_mut())
+                    .chain(sp.monitors.iter_mut())
+                {
                     if *slot == victim {
                         *slot = v;
                     }
@@ -25491,20 +25515,18 @@ pub fn bytecode_commits_side_effect(code: &[u8], code_len: usize) -> bool {
 
 /// Does this method body enter or exit a monitor anywhere?
 ///
-/// Asked by the deopt sinks, not by the compiler. Every `FrameState` the
-/// optimizing IR lowerer builds hard-codes `monitors: Vec::new()` — an empty
-/// list by construction, not a measurement — so a frame reconstructed from a
-/// body that had taken a lock before it trapped describes a frame that believes
-/// it holds none. `build_deopt_frame_inner` re-acquires exactly the monitors the
-/// frame names, which for such a body is nothing, and the resumed interpreter
-/// frame then runs a `monitorexit` against a lock its own bookkeeping never
-/// recorded.
+/// Asked by the deopt sinks, not by the compiler. Written when every
+/// `FrameState` the optimizing IR lowerer built hard-coded `monitors:
+/// Vec::new()`, so a frame reconstructed from a body that had taken a lock
+/// described a frame that believed it held none. The optimizing tier now
+/// records the builder's monitor stack, with a `relock` marker on elided locks
+/// (`ir-frame-states-carry-no-monitor-stack-FIXED-20260912.md`).
 ///
-/// `ir_lower`'s own comment says the same thing from the emission side ("the
-/// interpreter's own sink refuses a frame that holds monitors — but it cannot
-/// fire on information that was never recorded, so the omission defeats the
-/// guard rather than tripping it"). This is the predicate that lets the sink
-/// fire on something it CAN see: the callee's bytecode.
+/// The predicate is still needed by the sinks' additive arm, which cannot tell
+/// which backend produced an artifact: the SINGLE-PASS backend describes only
+/// the monitors it scalar-replaced, and a non-scalar elision there
+/// (`has_elided_monitor`) leaves no trace in the frame. This is the check that
+/// fires on something the sink CAN see for both: the callee's bytecode.
 ///
 /// Whole-body and conservative, for the reason
 /// [`ir_unresumable_protected_trap`]'s side-effect scan is: pc order is not
@@ -28987,18 +29009,16 @@ fn try_compile_inner(
                     })
                     .unwrap_or_default();
 
-                // Latched BEFORE escape analysis, because lock elision deletes
-                // the evidence. `lower_inner` refuses precise deopt resume for a
-                // graph that still holds a `MonitorEnter`/`MonitorExit` (frame
-                // states carry no monitor stack), but elision marks the monitors
-                // `Op::Dead` first, so the check saw none: a guard deopt inside
-                // `synchronized (new Object()) { ... }` resumed precisely with no
-                // lock held and the interpreter's `monitorexit` threw
-                // IllegalMonitorStateException. See the use below.
-                let had_monitors = graph
-                    .nodes
-                    .iter()
-                    .any(|n| matches!(n.op, ir::Op::MonitorEnter | ir::Op::MonitorExit));
+                // No "had monitors" latch any more. It existed because frame
+                // states carried no monitor stack, so a guard deopt inside
+                // `synchronized (new Object()) { ... }` whose monitors lock
+                // elision had deleted resumed precisely with no lock held and the
+                // interpreter's `monitorexit` threw
+                // IllegalMonitorStateException. Snapshots now record the monitor
+                // stack, and `ir_lower::Lowerer::resolve_monitors` marks an
+                // elided lock `relock`, which the resume re-acquires on the
+                // materialized object. See
+                // `ir-frame-states-carry-no-monitor-stack-FIXED-20260912.md`.
 
                 // --- Escape analysis (Phase 41 + G46 wiring) ---
                 // Convert IR graph to escape analysis graph, run analysis,
@@ -29413,12 +29433,6 @@ fn try_compile_inner(
                         other => other,
                     };
                     if let Some(mut compiled) = lowered {
-                        // A method that had monitors before lock elision may not
-                        // resume precisely, whatever the post-elision graph
-                        // shows; see `had_monitors`.
-                        if had_monitors {
-                            compiled.can_deopt_resume = false;
-                        }
                         // cov-06 residual: a surviving `Op::New` or
                         // `Op::NewArray` allocation call can fail (OOM, or a
                         // negative length for an array) and stash a pending
@@ -35853,6 +35867,7 @@ mod tests {
             bci: 3,
             locals: vec![NO_NODE],
             stack: vec![f.newobj],
+            monitors: Vec::new(),
         });
         run_ea(&mut f.g);
 
@@ -35907,6 +35922,7 @@ mod tests {
             bci: 3,
             locals: vec![NO_NODE],
             stack: vec![f.val],
+            monitors: Vec::new(),
         });
         run_ea(&mut f.g);
 
@@ -35934,6 +35950,7 @@ mod tests {
             bci: 13,
             locals: vec![f.load],
             stack: vec![NO_NODE],
+            monitors: Vec::new(),
         });
         run_ea(&mut f.g);
 
@@ -36060,6 +36077,7 @@ mod tests {
             bci: 3,
             locals: vec![NO_NODE],
             stack: vec![m_exit],
+            monitors: Vec::new(),
         });
         (g, newobj, m_enter, m_exit)
     }

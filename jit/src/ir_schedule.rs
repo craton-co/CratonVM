@@ -659,7 +659,12 @@ fn safepoints_dominate_anchors(
             // no native anchor for it and emits no point at all.
             continue;
         };
-        for &v in sp.locals.iter().chain(sp.stack.iter()) {
+        for &v in sp
+            .locals
+            .iter()
+            .chain(sp.stack.iter())
+            .chain(sp.monitors.iter())
+        {
             if v == NO_NODE {
                 continue;
             }

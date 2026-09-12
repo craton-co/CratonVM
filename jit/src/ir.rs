@@ -1154,6 +1154,23 @@ pub struct SafepointSnapshot {
     pub locals: Vec<NodeId>,
     /// `NodeId` for each operand-stack slot (index 0 = bottom of stack).
     pub stack: Vec<NodeId>,
+    /// The builder's abstract MONITOR stack at this bci, outermost first: one
+    /// entry per `monitorenter` that has executed and whose `monitorexit` has
+    /// not, naming the locked reference. A re-entrant lock on one object is two
+    /// entries; `ir_lower` coalesces them into one `deopt::MonitorInfo` whose
+    /// `lock_depth` is the count.
+    ///
+    /// A slot here is a node reference exactly like a local: it follows a value
+    /// through [`Graph::replace_all_uses`] ([`SafepointSlotKind::Monitor`]), it
+    /// is a DCE root, and it pins its value's home. Whether the lock was ELIDED
+    /// is not recorded here — escape analysis decides that after the build — and
+    /// the lowerer recovers it from whether any live monitor op still names the
+    /// object.
+    ///
+    /// Before 2026-09-12 the builder kept no monitor stack, so every lowered
+    /// `FrameState` claimed "holds no lock" by construction
+    /// (`ir-frame-states-carry-no-monitor-stack-FIXED-20260912.md`).
+    pub monitors: Vec<NodeId>,
 }
 
 impl SafepointSnapshot {
@@ -1169,6 +1186,7 @@ impl SafepointSnapshot {
     pub fn stack_opt(&self, idx: usize) -> Option<NodeId> {
         self.stack.get(idx).copied().and_then(node_id_opt)
     }
+    monitors: Vec::new(),
 }
 
 // ── Inlined scopes (deopt caller chains) ─────────────────────────────
@@ -1872,6 +1890,8 @@ pub enum SafepointSlotKind {
     Local,
     /// `SafepointSnapshot::stack`
     Stack,
+    /// `SafepointSnapshot::monitors`
+    Monitor,
 }
 
 /// One safepoint snapshot slot: `graph.safepoints[snapshot].locals[slot]` (or
@@ -2196,6 +2216,7 @@ impl Graph {
             let cell = match r.kind {
                 SafepointSlotKind::Local => sp.locals.get_mut(r.slot as usize),
                 SafepointSlotKind::Stack => sp.stack.get_mut(r.slot as usize),
+                SafepointSlotKind::Monitor => sp.monitors.get_mut(r.slot as usize),
             };
             match cell {
                 Some(v) if *v == old => {
@@ -2276,6 +2297,27 @@ impl Graph {
                             kind: SafepointSlotKind::Stack,
                             slot: (k - locals) as u32,
                         }
+                    };
+                    if (def as usize) < num_nodes {
+                        sp_users[def as usize].push(slot);
+                    } else {
+                        dangling = true;
+                    }
+                }
+            }
+            for (k, v) in sp.monitors.iter_mut().enumerate() {
+                if *v == old {
+                    *v = new_id;
+                }
+                if track {
+                    let def = *v;
+                    if def == NO_NODE {
+                        continue;
+                    }
+                    let slot = SafepointSlot {
+                        snapshot: si as u32,
+                        kind: SafepointSlotKind::Monitor,
+                        slot: k as u32,
                     };
                     if (def as usize) < num_nodes {
                         sp_users[def as usize].push(slot);
@@ -2529,6 +2571,17 @@ impl Graph {
                         num_nodes,
                     );
                 }
+                for (k, &v) in sp.monitors.iter().enumerate() {
+                    uses.record_slot(
+                        v,
+                        SafepointSlot {
+                            snapshot: si as u32,
+                            kind: SafepointSlotKind::Monitor,
+                            slot: k as u32,
+                        },
+                        num_nodes,
+                    );
+                }
             }
         }
         self.uses.sp_len = self.safepoints.len();
@@ -2609,6 +2662,7 @@ impl Graph {
                         match r.kind {
                             SafepointSlotKind::Local => sp.locals.get(r.slot as usize),
                             SafepointSlotKind::Stack => sp.stack.get(r.slot as usize),
+                            SafepointSlotKind::Monitor => sp.monitors.get(r.slot as usize),
                         }
                         .copied()
                     });
@@ -2634,6 +2688,15 @@ impl Graph {
                     out.push(SafepointSlot {
                         snapshot: si as u32,
                         kind: SafepointSlotKind::Stack,
+                        slot: k as u32,
+                    });
+                }
+            }
+            for (k, &v) in sp.monitors.iter().enumerate() {
+                if v == id {
+                    out.push(SafepointSlot {
+                        snapshot: si as u32,
+                        kind: SafepointSlotKind::Monitor,
                         slot: k as u32,
                     });
                 }
@@ -2754,6 +2817,17 @@ impl Graph {
                     num_nodes,
                 );
             }
+            for (k, &v) in snap.monitors.iter().enumerate() {
+                uses.record_slot(
+                    v,
+                    SafepointSlot {
+                        snapshot: si,
+                        kind: SafepointSlotKind::Monitor,
+                        slot: k as u32,
+                    },
+                    num_nodes,
+                );
+            }
             self.uses.sp_len = self.safepoints.len();
             self.uses.stamp();
         }
@@ -2812,6 +2886,7 @@ impl Graph {
         let cell = match kind {
             SafepointSlotKind::Local => sp.locals.get_mut(slot),
             SafepointSlotKind::Stack => sp.stack.get_mut(slot),
+            SafepointSlotKind::Monitor => sp.monitors.get_mut(slot),
         };
         let cell = match cell {
             Some(c) => c,
@@ -2890,6 +2965,7 @@ impl Graph {
             let halves = [
                 (SafepointSlotKind::Local, &sp.locals),
                 (SafepointSlotKind::Stack, &sp.stack),
+                (SafepointSlotKind::Monitor, &sp.monitors),
             ];
             for (kind, values) in halves {
                 for (k, &v) in values.iter().enumerate() {
@@ -4224,6 +4300,11 @@ struct MergeState {
     stack_snapshots: Vec<Vec<NodeId>>,
     /// Memory token from each predecessor.
     mem_inputs: Vec<NodeId>,
+    /// Abstract monitor stack from each FORWARD predecessor. Structured locking
+    /// (JVMS §2.11.10) makes these identical on every edge into a join, and the
+    /// builder refuses the method when they are not — see
+    /// [`IrBuilder::unstructured_monitors`].
+    monitor_snapshots: Vec<Vec<NodeId>>,
     /// Whether this merge has been visited (target reached during forward walk).
     visited: bool,
 }
@@ -4648,6 +4729,16 @@ pub struct IrBuilder {
     ctrl: NodeId,
     /// Current memory token.
     mem: NodeId,
+    /// Abstract monitor stack, outermost first: the reference each executed
+    /// `monitorenter` locked, popped by its `monitorexit`. Copied into every
+    /// [`SafepointSnapshot::monitors`], which is how a lowered deopt frame
+    /// learns which locks the interpreter must hold when it resumes.
+    monitors: Vec<NodeId>,
+    /// Set when the monitor stacks on two edges into one join disagree. Such a
+    /// method has no single monitor state at the join to describe, so the build
+    /// is refused (the single-pass backend still compiles it). Checked at the
+    /// top of every instruction and once more at the end of [`Self::build`].
+    unstructured_monitors: bool,
     /// Number of JVM locals (including params).
     _num_locals: usize,
     /// Merge-point state, keyed by bytecode PC.
@@ -5078,6 +5169,8 @@ impl IrBuilder {
             locals,
             ctrl,
             mem,
+            monitors: Vec::new(),
+            unstructured_monitors: false,
             _num_locals: num_locals,
             merges: HashMap::new(),
             loop_headers: HashSet::new(),
@@ -6708,10 +6801,69 @@ impl IrBuilder {
                     local_snapshots: Vec::new(),
                     stack_snapshots: Vec::new(),
                     mem_inputs: Vec::new(),
+                    monitor_snapshots: Vec::new(),
                     visited: false,
                 },
             );
         }
+    }
+
+    /// Follow `id` through φs that merge a single value (every value input is
+    /// either that value or the φ itself) to the value they stand for.
+    ///
+    /// A loop header gives EVERY entry-initialised local an eager φ, so the
+    /// `aload` that feeds a `monitorexit` after a loop reads `phi(x, x)` while
+    /// the monitor stack recorded `x` at the `monitorenter`. Both name the same
+    /// reference; this is what lets [`Self::same_monitor_object`] say so.
+    /// Bounded, and stops at anything that is not a single-value φ.
+    fn strip_trivial_phis(&self, id: NodeId) -> NodeId {
+        let mut cur = id;
+        for _ in 0..32 {
+            let Some(node) = self.graph.node_opt(cur) else {
+                return cur;
+            };
+            if node.op != Op::Phi || node.ty == IrType::Memory {
+                return cur;
+            }
+            let mut only: Option<NodeId> = None;
+            for v in node.phi_value_inputs() {
+                let Some(v) = v else {
+                    return cur;
+                };
+                if v == cur {
+                    continue;
+                }
+                match only {
+                    None => only = Some(v),
+                    Some(o) if o == v => {}
+                    Some(_) => return cur,
+                }
+            }
+            match only {
+                Some(next) => cur = next,
+                None => return cur,
+            }
+        }
+        cur
+    }
+
+    /// Do `a` and `b` provably name the same locked reference?
+    ///
+    /// Identity, or identity after [`Self::strip_trivial_phis`]. Anything else
+    /// is answered `false`, which makes the caller refuse the method: a
+    /// `monitorexit` whose operand cannot be matched to the innermost held
+    /// monitor is either unstructured locking or a shape this builder cannot
+    /// describe in a frame state.
+    fn same_monitor_object(&self, a: NodeId, b: NodeId) -> bool {
+        a == b || self.strip_trivial_phis(a) == self.strip_trivial_phis(b)
+    }
+
+    /// Do two abstract monitor stacks describe the same held-lock sequence?
+    fn monitor_stacks_agree(&self, a: &[NodeId], b: &[NodeId]) -> bool {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b.iter())
+                .all(|(&x, &y)| self.same_monitor_object(x, y))
     }
 
     /// Record the current state as a predecessor of the merge at `target_pc`.
@@ -6727,11 +6879,28 @@ impl IrBuilder {
             self.patch_loop_backedge(target_pc);
             return;
         }
+        let monitors = self.monitors.clone();
         let state = self.merges.get_mut(&target_pc).unwrap();
         state.ctrl_inputs.push(self.ctrl);
         state.local_snapshots.push(self.locals.clone());
         state.stack_snapshots.push(self.stack.clone());
         state.mem_inputs.push(self.mem);
+        state.monitor_snapshots.push(monitors);
+    }
+
+    /// Adopt the monitor stack every forward predecessor of a join carries, or
+    /// latch [`Self::unstructured_monitors`] when two of them disagree.
+    fn join_monitor_stacks(&mut self, snapshots: &[Vec<NodeId>]) {
+        let Some(first) = snapshots.first() else {
+            return;
+        };
+        if snapshots[1..]
+            .iter()
+            .any(|other| !self.monitor_stacks_agree(first, other))
+        {
+            self.unstructured_monitors = true;
+        }
+        self.monitors = first.clone();
     }
 
     /// Activate a loop header: create a loop-carried phi for every live local
@@ -6757,6 +6926,9 @@ impl IrBuilder {
         // back-edge ctrl is appended in patch_loop_backedge.
         self.graph.set_inputs(region, state.ctrl_inputs.clone());
         self.ctrl = region;
+        // The monitor stack is NOT φ'd: a held lock is the same reference on
+        // every edge, and `patch_loop_backedge` checks the back edge agrees.
+        self.join_monitor_stacks(&state.monitor_snapshots);
 
         // Memory phi: [region, entry_mem_0, …]; back-edge mem appended later.
         let mem_phi = {
@@ -6828,6 +7000,16 @@ impl IrBuilder {
         let region = self.merges[&target_pc].merge_id;
         let back_ctrl = self.ctrl;
         self.graph.push_input(region, back_ctrl);
+        // Structured locking: the back edge must arrive holding exactly the
+        // monitors the header was entered with.
+        let back_edge_monitors_disagree = self
+            .merges
+            .get(&target_pc)
+            .and_then(|s| s.monitor_snapshots.first())
+            .is_some_and(|entry| !self.monitor_stacks_agree(entry, &self.monitors));
+        if back_edge_monitors_disagree {
+            self.unstructured_monitors = true;
+        }
 
         // Appending the back-edge value completes the φ's input list, so its
         // type is re-derived from the *whole* merge (`retype_phi`): the type
@@ -6871,6 +7053,7 @@ impl IrBuilder {
         let merge_id = state.merge_id;
         self.graph.set_inputs(merge_id, state.ctrl_inputs.clone());
         self.ctrl = merge_id;
+        self.join_monitor_stacks(&state.monitor_snapshots);
 
         // Create phi for memory
         if state.mem_inputs.len() > 1 {
@@ -7171,6 +7354,11 @@ impl IrBuilder {
             if self.ctrl_opt().is_none() {
                 return ir_build_bail(line!(), pc);
             }
+            // Two edges into a join held different monitors: there is no one
+            // monitor state to record for this bci. See `unstructured_monitors`.
+            if self.unstructured_monitors {
+                return ir_build_bail(line!(), pc);
+            }
 
             // Step 1 of real-frame-deopt: record the abstract interpreter
             // state at this bytecode boundary so a precise deopt frame can be
@@ -7193,10 +7381,20 @@ impl IrBuilder {
                     bci: pc,
                     locals: self.locals.clone(),
                     stack: self.stack.clone(),
+                    monitors: self.monitors.clone(),
                 });
             }
 
             let op = code[pc];
+            // A method-exit `return` while this frame still holds a monitor is
+            // unstructured locking (JVMS §2.11.10): the interpreter would throw
+            // `IllegalMonitorStateException` there, and no frame state this
+            // builder records could describe the lock being dropped. Refuse.
+            // Inside a splice a return hands a value back to the caller, whose
+            // monitors are legitimately still held.
+            if self.splice.is_empty() && matches!(op, 0xac..=0xb1) && !self.monitors.is_empty() {
+                return ir_build_bail(line!(), pc);
+            }
             match op {
                 // aconst_null — push the null reference.
                 //
@@ -8422,8 +8620,32 @@ impl IrBuilder {
                 // `ir_lower` refuses the graph when the helper table carries no
                 // monitor entry, so a backend that cannot lower these declines
                 // the method rather than silently emitting nothing.
+                //
+                // Both also maintain the abstract monitor stack every snapshot
+                // copies. `monitorenter` pushes the locked reference;
+                // `monitorexit` must release the innermost one, and the build is
+                // refused when it names anything else (unstructured locking, or
+                // a shape the frame state could not describe). A splice never
+                // takes a monitor: the resolver admits no callee body with
+                // `monitorenter`, and a spliced region's frame is the caller's
+                // snapshot at the `invoke`, which could not describe one.
                 0xc2 | 0xc3 => {
                     let obj = self.pop();
+                    if obj == NO_NODE || !self.splice.is_empty() {
+                        return ir_build_bail(line!(), pc);
+                    }
+                    if code[pc] == 0xc2 {
+                        self.monitors.push(obj);
+                    } else {
+                        let matches_innermost = self
+                            .monitors
+                            .last()
+                            .is_some_and(|&held| self.same_monitor_object(held, obj));
+                        if !matches_innermost {
+                            return ir_build_bail(line!(), pc);
+                        }
+                        self.monitors.pop();
+                    }
                     let op = if code[pc] == 0xc2 {
                         Op::MonitorEnter
                     } else {
@@ -9608,6 +9830,11 @@ impl IrBuilder {
         }
         // See `splice_guard_seen`.
         if self.splice_guard_seen {
+            return ir_build_bail(line!(), code_len);
+        }
+        // A join the walk activated at the very end of the method (no
+        // instruction after it to trip the per-instruction check).
+        if self.unstructured_monitors {
             return ir_build_bail(line!(), code_len);
         }
         if self.splices_done > 0 && ir_bail_reporting() {
@@ -12665,6 +12892,91 @@ mod tests {
         assert_eq!(graph.nodes[l1 as usize].op, Op::Add);
     }
 
+    /// The snapshots inside a `synchronized` block carry the locked reference
+    /// on their monitor stack, and the ones outside it carry none.
+    ///
+    /// Before 2026-09-12 the builder kept no monitor stack, so every lowered
+    /// frame state said "holds no lock".
+    #[test]
+    fn a_synchronized_blocks_snapshots_carry_its_monitor() {
+        // javac shape for `synchronized (o) { }` with `o` in local 0:
+        //   0: aload_0  1: dup  2: astore_1  3: monitorenter
+        //   4: aload_1  5: monitorexit  6: return
+        let code = [0x2a, 0x59, 0x4c, 0xc2, 0x2b, 0xc3, 0xb1, 0, 0];
+        let graph = build_ir(&code, 7, 1, 2);
+        let at = |bci: usize| graph.safepoints.iter().find(|s| s.bci == bci).unwrap();
+        let obj = at(0).locals[0];
+        assert_ne!(obj, NO_NODE);
+
+        // Up to and including the monitorenter itself (resuming there
+        // re-executes the enter), nothing is held.
+        for bci in [0, 1, 2, 3] {
+            assert!(at(bci).monitors.is_empty(), "bci {bci} holds nothing yet");
+        }
+        // Between the enter and the exit — the exit included, since resuming
+        // there re-executes it — the lock on `o` is held.
+        for bci in [4, 5] {
+            assert_eq!(at(bci).monitors, vec![obj], "bci {bci} holds the lock on o");
+        }
+        // After the exit, released.
+        assert!(at(6).monitors.is_empty());
+    }
+
+    /// A loop inside the block gives local 1 an eager header φ, so the
+    /// `monitorexit`'s operand is `phi(o, o)` while the monitor stack recorded
+    /// `o`. Those name the same reference and the build must accept it; the
+    /// header snapshot carries the monitor too.
+    #[test]
+    fn a_monitor_held_across_a_loop_is_matched_through_the_header_phi() {
+        //  0: aload_0  1: dup  2: astore_1  3: monitorenter
+        //  4: iload_2 (loop header)  5: ifeq +6 -> 11
+        //  8: goto -4 -> 4
+        // 11: aload_1  12: monitorexit  13: return
+        let code = [
+            0x2a, 0x59, 0x4c, 0xc2, 0x1c, 0x99, 0x00, 0x06, 0xa7, 0xff, 0xfc, 0x2b, 0xc3, 0xb1,
+            0, 0,
+        ];
+        let graph = IrBuilder::new(3, 3)
+            .build(&code, 14)
+            .expect("a structured lock around a loop must build");
+        let at = |bci: usize| graph.safepoints.iter().find(|s| s.bci == bci).unwrap();
+        let obj = at(0).locals[0];
+        assert_eq!(at(4).monitors, vec![obj], "the loop header holds the lock");
+        assert_eq!(at(12).monitors, vec![obj], "the monitorexit holds the lock");
+        assert!(at(13).monitors.is_empty());
+    }
+
+    /// Unstructured locking is refused rather than described wrongly: a
+    /// `monitorexit` on a reference other than the innermost held one, a
+    /// `monitorexit` with nothing held, and a `return` that leaves a monitor
+    /// held. The single-pass backend still compiles such a method.
+    #[test]
+    fn unstructured_locking_refuses_the_ir_build() {
+        // aload_0; monitorenter; aload_1; monitorexit; return — exits `b`, holds `a`.
+        let wrong_object = [0x2a, 0xc2, 0x2b, 0xc3, 0xb1, 0, 0];
+        assert!(IrBuilder::new(2, 2).build(&wrong_object, 5).is_none());
+        // aload_0; monitorexit; return — nothing held.
+        let nothing_held = [0x2a, 0xc3, 0xb1, 0, 0];
+        assert!(IrBuilder::new(1, 1).build(&nothing_held, 3).is_none());
+        // aload_0; monitorenter; return — still held at the method exit.
+        let held_at_return = [0x2a, 0xc2, 0xb1, 0, 0];
+        assert!(IrBuilder::new(1, 1).build(&held_at_return, 3).is_none());
+        // The structured control still builds.
+        let structured = [0x2a, 0xc2, 0x2a, 0xc3, 0xb1, 0, 0];
+        assert!(IrBuilder::new(1, 1).build(&structured, 5).is_some());
+    }
+
+    /// Two edges into one join that hold different monitors have no single
+    /// monitor state to record at the join: refused.
+    #[test]
+    fn a_join_whose_edges_hold_different_monitors_refuses_the_build() {
+        //  0: iload_1  1: ifeq +7 -> 8
+        //  4: aload_0  5: monitorenter  6: goto +2 -> 8     (holds `a` on this edge)
+        //  8: return                                        (join: held vs not held)
+        let code = [0x1b, 0x99, 0x00, 0x07, 0x2a, 0xc2, 0xa7, 0x00, 0x02, 0xb1, 0, 0];
+        assert!(IrBuilder::new(2, 2).build(&code, 10).is_none());
+    }
+
     #[test]
     fn test_replace_all_uses_rewrites_safepoints() {
         let mut graph = Graph {
@@ -12681,6 +12993,7 @@ mod tests {
             bci: 0,
             locals: vec![a],
             stack: vec![a, b],
+            monitors: Vec::new(),
         });
         graph.replace_all_uses(a, b);
         // Every `a` reference in the snapshot must now point at `b`.
@@ -13512,6 +13825,7 @@ mod tests {
             bci: 0,
             locals: vec![a, NO_NODE],
             stack: vec![NO_NODE, b],
+            monitors: Vec::new(),
         };
         assert_eq!(snap.local_opt(0), Some(a));
         assert_eq!(snap.local_opt(1), None);
@@ -13666,6 +13980,7 @@ mod tests {
                 bci: s,
                 locals,
                 stack,
+                monitors: Vec::new(),
             });
         }
         g
@@ -13769,6 +14084,7 @@ mod tests {
             bci: 0,
             locals: vec![a, NO_NODE],
             stack: vec![a, b],
+            monitors: Vec::new(),
         });
         assert!(
             g.use_lists_valid(),
@@ -13804,6 +14120,7 @@ mod tests {
             bci: 1,
             locals: vec![b],
             stack: vec![],
+            monitors: Vec::new(),
         });
         assert!(!g.use_lists_valid());
         g.replace_all_uses(b, a);
@@ -13840,6 +14157,7 @@ mod tests {
             bci: 0,
             locals: vec![5],
             stack: vec![],
+            monitors: Vec::new(),
         });
         assert_eq!(g.verify_use_lists(), Ok(()));
         g.uses.sp_users[5].clear();

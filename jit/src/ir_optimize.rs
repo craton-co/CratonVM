@@ -3025,7 +3025,13 @@ fn kill_store_splicing_memory_chain(graph: &mut Graph, store: NodeId) -> bool {
         }
     }
     for sp in &graph.safepoints {
-        if sp.locals.iter().chain(sp.stack.iter()).any(|&v| v == store) {
+        if sp
+            .locals
+            .iter()
+            .chain(sp.stack.iter())
+            .chain(sp.monitors.iter())
+            .any(|&v| v == store)
+        {
             // A frame state naming a store is already nonsense — a store
             // produces no value an interpreter frame can be rebuilt from — but
             // it is not this pass's business to silently retarget it.
@@ -3390,7 +3396,12 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
     if !graph.safepoints.is_empty() {
         let node_is_live: Vec<bool> = graph.nodes.iter().map(|n| n.op != Op::Dead).collect();
         for sp in &mut graph.safepoints {
-            for slot in sp.locals.iter_mut().chain(sp.stack.iter_mut()) {
+            for slot in sp
+                .locals
+                .iter_mut()
+                .chain(sp.stack.iter_mut())
+                .chain(sp.monitors.iter_mut())
+            {
                 if *slot == NO_NODE {
                     continue;
                 }
@@ -3467,8 +3478,15 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
     // deopt sites (guard bcis, call returns), or recompute snapshot liveness
     // after optimization. Narrowing what is *recorded* is safe; dropping what
     // is recorded but not rooted is not.
+    // The monitor stack is rooted with the locals: a resumed frame re-acquires
+    // or keeps holding the lock on exactly the reference it names.
     for sp in &graph.safepoints {
-        for &slot in sp.locals.iter().chain(sp.stack.iter()) {
+        for &slot in sp
+            .locals
+            .iter()
+            .chain(sp.stack.iter())
+            .chain(sp.monitors.iter())
+        {
             // Stale slots were normalised to `NO_NODE` above, so anything that
             // survives `is_valid_id` here names a real, live node.
             if graph.is_valid_id(slot) {
@@ -4443,6 +4461,7 @@ fn plan_copy_frames(
             .locals
             .iter()
             .chain(sp.stack.iter())
+            .chain(sp.monitors.iter())
             .any(|slot| to_clone.contains(slot));
         if names_body && node_bcis.contains(&sp.bci) {
             return Err(());
@@ -4488,6 +4507,7 @@ fn install_copy_frames(
         let rename = |n: &NodeId| subst.get(n).copied().unwrap_or(*n);
         let locals: Vec<NodeId> = orig.locals.iter().map(rename).collect();
         let stack: Vec<NodeId> = orig.stack.iter().map(rename).collect();
+        let monitors: Vec<NodeId> = orig.monitors.iter().map(rename).collect();
         let si = if first_iteration {
             // Through `set_safepoint_slot`, not a direct write: installing a
             // reference is the one snapshot edit the def-use edges cannot
@@ -4499,6 +4519,9 @@ fn install_copy_frames(
             for (k, &v) in stack.iter().enumerate() {
                 graph.set_safepoint_slot(*orig_si as usize, SafepointSlotKind::Stack, k, v);
             }
+            for (k, &v) in monitors.iter().enumerate() {
+                graph.set_safepoint_slot(*orig_si as usize, SafepointSlotKind::Monitor, k, v);
+            }
             *orig_si
         } else {
             let si = graph.safepoints.len() as u32;
@@ -4506,6 +4529,7 @@ fn install_copy_frames(
                 bci: orig.bci,
                 locals,
                 stack,
+                monitors,
             });
             si
         };
@@ -5139,9 +5163,13 @@ fn unroll(graph: &mut Graph) -> bool {
         // represent per-iteration frames with one snapshot. Representing them
         // needs a per-iteration snapshot index, which is a lowerer change.
         let body_named_by_safepoint = graph.safepoints.iter().any(|sp| {
-            sp.locals.iter().chain(sp.stack.iter()).any(|&slot| {
-                slot != NO_NODE && (to_clone.contains(&slot) || carried_set.contains(&slot))
-            })
+            sp.locals
+                .iter()
+                .chain(sp.stack.iter())
+                .chain(sp.monitors.iter())
+                .any(|&slot| {
+                    slot != NO_NODE && (to_clone.contains(&slot) || carried_set.contains(&slot))
+                })
         });
         // ...unless NOTHING in this graph can transfer to the interpreter, in
         // which case no snapshot can ever be consulted and the objection does
@@ -6017,6 +6045,7 @@ mod tests {
             bci: 4,
             locals: vec![x, y],
             stack: vec![],
+            monitors: Vec::new(),
         });
 
         eliminate_dead_nodes(&mut g);
@@ -6056,6 +6085,7 @@ mod tests {
             bci: 4,
             locals: vec![x, stale],
             stack: vec![NO_NODE],
+            monitors: Vec::new(),
         });
         // Stand in for the earlier pass that removed the node without routing
         // its safepoint references.
@@ -8500,11 +8530,13 @@ mod per_copy_frames_tests {
             bci: 7,
             locals: vec![here],
             stack: vec![],
+            monitors: Vec::new(),
         });
         g.push_safepoint(SafepointSnapshot {
             bci: 9,
             locals: vec![here],
             stack: vec![],
+            monitors: Vec::new(),
         });
 
         assert!(g.set_node_frame_snapshot(here, 0), "bci 7 == bci 7");
