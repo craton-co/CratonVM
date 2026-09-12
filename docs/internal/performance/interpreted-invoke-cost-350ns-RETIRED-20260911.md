@@ -1669,16 +1669,23 @@ from JMX that the lock came back free), `probes/JmxMonitorOwnership.java`.
 Both oracles pass on HotSpot and on both settings of the switch, under the JIT
 and under `--nojit`.
 
-## The sixth pass (2026-09-11): the census was reading one row late, and the registered native was never priced
+## The sixth pass (2026-09-11): the registered native was never priced, and the census that ranked it was reading one row late
 
 The fifth pass closed by ranking what the doors still refuse and naming the
 top of that list — "**69% of what is left is a registered native**" — as the
-next structural item. This pass takes it. It also found that the instrument
-which produced that ranking was mislabelling its own rows, which is recorded
-first because every number the fifth pass published from the virtual door has
-to be re-read through it.
+next structural item. This pass takes it, and it also takes the last two exit
+criteria.
+
+It begins with the instrument, because every number the fifth pass published
+from the virtual door has to be re-read through a defect in it — one that a
+second branch found and fixed the same night, independently.
 
 ### The census was one row late, and its largest row did not exist
+
+(**Landed on `dev` in parallel by `d41ffd4db` while this pass was running** —
+see the note at the end of this section. The diagnosis below is recorded
+because the tally it corrects is quoted three sections above, not because this
+branch is where the repair came from.)
 
 `execute_invokevirtual_fast_door` gained decline counters in the fifth pass.
 Eleven of them were paired with the reason belonging to the **next** refusal
@@ -1717,12 +1724,26 @@ What the table is missing is the door's commonest refusal of all, which had no
 counter to appear under — and what any *future* virtual row would have been
 is one reason late until now.
 
-The repair is mechanical — re-pair each site with its own reason, give the
-cache-shape arm a note, and add the four missing ones — and the lesson is the
-one this page keeps re-learning from the other side: *a census is an
-instrument, and an instrument nobody checked against the code it measures is
-not evidence.* The fifth pass built this census precisely because the door
-"had no counters at all"; it then trusted the counters it had just written.
+**Two branches found this at the same time, which is itself the finding.**
+`d41ffd4db` — "both of the composition residuals, and the doors they were at
+the wrong end of", 2026-09-11 23:07, on an unrelated line of work — landed the
+identical re-pairing, with the same strings in the same order and the same
+note on the cache-shape arm, hours before this branch merged. Its author
+arrived from the composition page's item 2, which "could not read its own arm";
+this one arrived from the fifth pass's decline ranking. A census that reports
+the wrong row is not a niche defect: it misleads everyone who reads it, and it
+misled two people independently within a day. This branch keeps `d41ffd4db`'s
+version wholesale and adds only what it did not cover — the **four refusals
+that still recorded nothing at all** (the `java.util` bitmap, the inline
+tier-up, the over-wide compiled callee, the argument slot needing coercion),
+taking the door's decline sites from 18 to 22 — plus teaching its new
+four-state tier-up census about the handler-callee switch below.
+
+The lesson is the one this page keeps re-learning from the other side: *a
+census is an instrument, and an instrument nobody checked against the code it
+measures is not evidence.* The fifth pass built this census precisely because
+the door "had no counters at all"; it then trusted the counters it had just
+written.
 
 ### What the doors refuse, priced
 
@@ -1847,6 +1868,28 @@ beats the BEST `OFF` pass (285 against 344, 213 against 263, 543 against 551)
 wins more than 5 of 6 either way. Roughly **85 ns off a static registered
 native, 62 ns off a leaf one and 70 ns off a virtual one**, against calls that
 cost 260–590 ns.
+
+**Repeated on the merged binary, on a quieter host.** After `origin/dev` was
+merged in — which brought another branch's rework of the same door — four more
+interleaved passes, same probe, same switch, ns/iteration:
+
+| arm | ON | OFF | pairwise |
+|---|---|---|---:|
+| `nocall` (control) | 32.6 32.0 32.6 33.5 | 32.0 32.1 32.7 33.9 | 3/4 |
+| `bcStatic` (control) | 117 117 113 114 | 111 112 114 114 | 1/4 |
+| `bcVirtual` (control) | 140 140 139 141 | 137 141 136 140 | 1/4 |
+| eight more controls | — overlapping, 1–2/4 — | | |
+| **`identityHashCode`** | **207 215 204 208** | 272 277 277 276 | **4/4** |
+| **`nanoTime`** | **170 176 171 174** | 207 208 215 210 | **4/4** |
+| **`sbCharAt`** | **406 421 399 409** | 444 435 435 458 | **4/4** |
+
+4/4 with no overlap again, on all three, with every control flat. The
+**absolute** figures are ~30% lower than the table above because that host was
+busier — `nocall` reads 32 ns here against 40 — and the deltas shrink with
+them, to ~67 / ~37 / ~33 ns. That is the expected shape for removing a fixed
+quantity of work from a call whose other costs also shrank, and it is why the
+claim is "6/6 and 4/4 against flat controls" rather than a nanosecond figure
+quoted out of its host.
 
 **What is NOT measured here, and is not claimed.** No arm of this probe is a
 *leaf* virtual native — `sbCharAt` reports `leaf=1`, i.e. startup only — so
