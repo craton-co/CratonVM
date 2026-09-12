@@ -124,10 +124,28 @@ pins that the flag is read live rather than through a `OnceLock`, which is the
 trap `ir_per_copy_frames_enabled` documents and which makes both arms report
 byte-identical code.
 
+## 3a. A third shape, measured the same day: 1.024x — SLOWER
+
+`fib` is the shape this rule most obviously fits, and it was tried there the
+same day. `FibCall.fib` computes BOTH recursive arguments before testing its
+base case, so four instructions run on roughly half of all calls for nothing;
+the flag removes them exactly as designed, and the entry block goes straight
+from `mov rbx,rax` to `cmp ebx,1`.
+
+It is **2.4% slower** — fifteen interleaved rounds, control arm, effect +2.4%
+over a 2.1% floor. The body grows **788 → 823 bytes**: what leaves the base-case
+path reappears, larger, on the recursive path.
+
+So the flag has three measurements on three shapes — **1.000x**, **0.974x**,
+**1.024x** — and they average to nothing. §4 left it OFF for want of evidence;
+this is the second and better reason, and it is the one a soak on the first two
+shapes would have missed.
+[`c2-fib-per-call-budget-20260912.md`](c2-fib-per-call-budget-20260912.md) §4.
+
 ## 4. Why it is default OFF
 
-Because the wall-clock evidence for it is one 2.6% arm over a 2.0% floor, on one
-shape, on a loaded host. The allocator counters are unambiguous and the
+Because the wall-clock evidence for it is one 2.6% arm over a 2.0% floor on one
+shape, nothing on a second, and a 2.4% REGRESSION on a third (§3a). The allocator counters are unambiguous and the
 correctness evidence is broad, but this repo's convention is that a flag flips on
 a measurement and not on an argument, and the measurement here is "the schedule
 got better and the clock did not move".

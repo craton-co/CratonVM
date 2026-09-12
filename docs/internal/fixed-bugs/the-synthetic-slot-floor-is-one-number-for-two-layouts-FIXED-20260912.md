@@ -5,7 +5,12 @@
 itself the successor to
 `docs/internal/fixed-bugs/jdk-collection-classes-are-padded-to-a-synthetic-stub-floor-FIXED-20260911.md`
 §6. All seven rows are closed, the six factories it listed as still pinning
-`HashSet` are converted, and the screen it asked for is a gate.
+`HashSet` are converted, and the screen it asked for is a gate. The seventh row
+took a second change the page did not predict and §5 records: once the floor
+came off `CopyOnWriteArraySet`, what was left was not padding but a
+`LinkedHashMap` standing in the slot the real class declares as
+`CopyOnWriteArrayList al` -- and `removeIf`, the one method of that class's
+surface this VM does not register, had been raising `NoSuchMethodError` on it.
 
 **Verified on:** Windows 11, JDK 25 Temurin `25.0.3+9`, branch
 `claude/synthetic-slot-floor-fix-8e9672`, with a baseline worktree built from
@@ -24,16 +29,18 @@ java.base/java.util=ALL-UNNAMED`, same probe, same run.
 |---|---|---|---|---|---|
 | `java.util.Properties` | 120.3 | **544.0** | **224.0** | 4.52x | 1.86x |
 | `java.util.concurrent.ConcurrentLinkedDeque` | 48.0 | **120.0** | **72.0** | 2.50x | 1.50x |
-| `java.util.concurrent.CopyOnWriteArraySet` | 56.1 | **136.0** | **112.0** | 2.42x | 2.00x |
+| `java.util.concurrent.CopyOnWriteArraySet` | 56.1 | **136.0** | **72.0** | 2.42x | 1.28x |
 | `java.util.concurrent.ConcurrentLinkedQueue` | 48.0 | **112.0** | **64.0** | 2.33x | 1.33x |
 | `java.util.ArrayDeque` | 112.1 | **232.0** | **184.0** | 2.07x | 1.64x |
 | `java.util.HashSet` | 64.0 | **128.0** | **88.0** | 2.00x | 1.38x |
 | `java.util.LinkedHashSet` | 80.1 | **152.0** | **112.0** | 1.90x | 1.40x |
 
-Six of the seven land inside the 1.2x-1.7x band the rest of the collections
-already occupy, which is reference width and a separate subject.
-`CopyOnWriteArraySet` does not, and §5 says exactly why — the remainder there is
-not padding and was never going to move with the floor.
+All seven land inside the 1.2x-1.7x band the rest of the collections already
+occupy, which is reference width and a separate subject.
+
+`CopyOnWriteArraySet` took two changes to get there, and §5 is the second one:
+the floor took it from 136 to 112, and the remaining 112 was not padding at all
+but the wrong BACKING OBJECT — a defect the floor work found and did not cause.
 
 Every OTHER row of that table is byte-identical before and after: `ArrayList`
 32.0, `HashMap` 64.0, `LinkedHashMap` 88.0, `TreeMap` 80.0, `TreeSet` 24.0,
@@ -41,7 +48,9 @@ Every OTHER row of that table is byte-identical before and after: `ArrayList`
 `CopyOnWriteArrayList` 48.0, `LinkedBlockingQueue` 440.0, and the rest. The
 four-entry table moves with the empty one and nowhere else: `ArrayDeque+4`
 232 -> 184, `HashSet+4` 464 -> 424, `LinkedHashSet+4` 552 -> 512,
-`ConcurrentLinkedQueue+4` 240 -> 192.
+`ConcurrentLinkedQueue+4` 240 -> 192 — and `CopyOnWriteArraySet+4`
+**512 -> 120** against HotSpot's 88.3, which is §5 and is the largest single
+number on this page.
 
 `CRATONVM_DBG_LAYOUT=1` now reports a compact layout for all seven, where it
 used to report the refusal:
@@ -199,22 +208,81 @@ builds.
 `array_deque_synthetic_table_matches_the_real_class` freezes the §2 narrowing at
 three, so it cannot grow back by accident the way `LinkedHashMap`'s floor did.
 
-## 5. `CopyOnWriteArraySet` stays at 2.0x, and it is not the floor
+## 5. `CopyOnWriteArraySet` was backed by the wrong OBJECT, and `removeIf` said so
 
-Its object is compact now (`body=8 refs=1 fields=1`), so the padding is gone and
-136 -> 112 is real. What remains is a backing-structure choice:
+Taking the floor off left this one class at 2.0x when the other six landed in
+the 1.2x-1.7x band, and the reason was not padding. Its object was already
+compact (`body=8 refs=1 fields=1`); what it RETAINED was wrong:
 
 ```text
   HotSpot   COWAS 56.1  = 16 (object) + 40.1 (CopyOnWriteArrayList + Object[0])
   CratonVM  COWAS 112.0 = 24 (object) + 88.0 (LinkedHashMap)
 ```
 
-`register_hashset_natives` mirrors the whole `HashSet` surface onto
-`CopyOnWriteArraySet`, `<init>` included, so `new CopyOnWriteArraySet<>()`
-retains a `LinkedHashMap` — and 88.0 is exactly this VM's empty `LinkedHashMap`
-from the same table. The JDK retains a `CopyOnWriteArrayList`, which this VM
-prices at 48.0. Changing which structure backs that Set surface is a different
-change from this one and is not attempted here.
+`register_hashset_natives` mirrors the whole `java.util.HashSet` surface onto
+`CopyOnWriteArraySet`, on the stated premise that it is one of "HashSet's
+real-JDK subclasses that share the same `field 0 = backing map` layout". It is
+neither. It does not extend `HashSet`, and the ONE instance field the real class
+declares is `private final CopyOnWriteArrayList<E> al` — sitting at exactly that
+slot 0. So `native_hs_init` stored a `LinkedHashMap` in a slot declared to hold
+a list.
+
+**That is a live defect, not a size one, and the class library itself found it.**
+`CopyOnWriteArraySet` declares nineteen methods and this registrar registers
+twenty triples; `removeIf` is one it does NOT register, so its real body ran:
+
+```text
+  cowSet.removeIf(p)
+    -> NoSuchMethodError:
+       java.util.LinkedHashMap.removeIf(java.util.function.Predicate)
+```
+
+The other eighteen looked correct only because a native stood in front of each
+of them. Which methods are silent is therefore a function of which triples this
+registrar happens to carry — which is why the guard for it (§6) is the whole
+declared surface rather than the one method that broke.
+
+### The fix: the class is served by its own bytecode
+
+`cow_set_route` (`native-collections/src/lib.rs`) sits at the top of each of the
+twenty natives — the placement `ksv_route` already uses, so the INTERFACE-level
+registrations (`java/util/Set.size()` and friends) are guarded by the same test
+as the exact-class ones. When the receiver is a real `CopyOnWriteArraySet` it
+runs that receiver's own method, bytecode-only, on its own class.
+
+Real, not a mode flag: `is_real_cow_array_set` asks whether the receiver's class
+resolves the field NAME `al`. A fabricated stub declares `_f0`/`_f1` and keeps
+the map surface, because there the map surface IS the implementation. It is the
+same question `hs_map_slot` and `props_defaults_slot` ask about their own
+receivers, and `hs_map_slot` now declines a real one for the same reason —
+answering `HS_FIELD_MAP` for it would hand every reader in that file a list to
+call `native_map_*` on.
+
+Delegation rather than a second implementation, because the object underneath is
+already right: `CopyOnWriteArrayList` writes `lock` and `array` BY NAME
+(`cowal_ensure_lock_and_array`), had its `<init>` override deliberately removed
+so the JDK constructor runs, and measures 48.0 against HotSpot's 40.0 — the best
+ratio in the collection table. The JDK's own `CopyOnWriteArraySet` bodies are
+thin forwards to `al`, so they already had a working object to forward to.
+
+One method could not go that way. `stream()` is a `Collection` DEFAULT method
+whose body builds a real `java.util.stream` pipeline over a real `Spliterator`,
+and this VM's streams are a synthetic carrier — so it takes the ELEMENTS (via
+`toArray()`, which IS delegated) and builds the carrier, which is what every
+other `*_stream` native in that file does.
+
+### What it bought
+
+```text
+  empty         112.0 -> 72.0    against HotSpot 56.1   (2.00x -> 1.28x)
+  four entries  512.0 -> 120.0   against HotSpot 88.3   (5.80x -> 1.36x)
+```
+
+The filled row is the bigger half and was not visible before this work:
+`CollectionShapeCause`'s four-entry table had no `CopyOnWriteArraySet` row at
+all, so the class's worst number — a `LinkedHashMap` with four entries, 488
+bytes, where HotSpot holds a six-element `Object[]` — had never been measured.
+It has a row now.
 
 ## 6. How it was validated
 
@@ -247,6 +315,23 @@ exist for. Both arms were run, against binaries built from the same commit.
   `CopyOnWriteArraySet` and four `ERROR` rows that the new `section` wrapper
   makes visible for the first time in BOTH builds) and the same **127** `field
   index OOB` warnings. Verdict-neutral is the acceptance criterion, not green.
+  `CowSetBacking` was run the same way against the same pair and is likewise
+  verdict-identical: the same 15 outcomes, which are the fabricated
+  `CopyOnWriteArraySet` stub's own gaps and have nothing to do with §5 —
+  `cow_set_route` declines a fabricated receiver by construction.
+* **`probes/CowSetBacking.java` is new, and is the §5 half.** Every method
+  `javap -p java.util.concurrent.CopyOnWriteArraySet` lists, plus the four it
+  inherits, against values a wrong backing cannot produce — insertion ORDER
+  throughout, because that is the observable separating a list-backed set from a
+  hash-backed one. `CollectionSlotFloor` drives this class through `setFamily`,
+  eight checks that a wrong backing passes; this is the file that does not.
+  HotSpot passes it unchanged.
+* **`vm/tests/cow_array_set_backing.rs`** drives that probe as a gate, and was
+  MUTATION-CHECKED rather than assumed: against the pre-§5 binary it FAILS with
+  exactly the diagnostic its message describes
+  (`NoSuchMethodError: java.util.LinkedHashMap.removeIf`), and against the
+  current one it passes. A probe-driving test that has never been seen to fail
+  is the vacuous-pass shape `probe_compile_guard.rs` exists about.
 * **`t9d_floor_exempt_classes_have_no_oversized_factories`:** RED (4 rows) on
   `dev` once the two `HashSet` factories were converted, green here.
   `t9c_synthetic_field_tables_cover_their_factories` stays green throughout.
@@ -255,9 +340,17 @@ exist for. Both arms were run, against binaries built from the same commit.
   `nio_selector_build_set_gc` (under `CRATONVM_GC_STRESS`), `wave3_c_selector`,
   `collection_view_gated_surface`, `cluster_b_collection_tostring`,
   `map_view_remove_if`, `stub_ratchet`, `synthetic_diff` — all pass.
-* **Crate tests:** `cratonvm-classloading` + `cratonvm-native-collections`, 1179
-  passed / 0 failed over 26 targets; `cratonvm-native-builtins` 4258 / 0.
-* **`regression-suite/run.sh`:** see §7.
+* **Crate tests:** `cratonvm-classloading` 804 / 0,
+  `cratonvm-native-collections` 375 / 0 over 15 targets,
+  `cratonvm-native-builtins` 4254 / 0.
+* **`regression-suite/run.sh`:** 95 passed, 0 failed, of 95 scheduled.
+
+One gate is RED and was red before this work: `raw_lock_constructions_do_not_grow`
+(`native-builtins/tests/lock_discipline_ratchet.rs`) reports 429 raw lock
+constructions against a baseline of 428. Reproduced on a pristine worktree at
+`dev@2405991d1` and `dev@3e8442e5f` with no local changes, and its own message
+forbids the easy disposition ("Do NOT raise the baseline"), so it is filed rather
+than touched here.
 
 One test had to change, and the change is the point rather than an accommodation:
 `jboss_jdkspecific::tests::module_get_packages_returns_populated_set_for_java_base`
@@ -286,7 +379,14 @@ cratonvm --synthetic-jdk --Xmx 2g -c out CollectionSlotFloor    # expect the 14
 ```
 
 ```bash
+javac -d out probes/CowSetBacking.java
+java -cp out CowSetBacking                                      # the oracle
+cratonvm --Xmx 2g -c out CowSetBacking                          # real-JDK: PASS
+```
+
+```bash
 cargo test -p cratonvm-vm --test tier1_tests -- t9c_ t9d_ array_deque_synthetic
+cargo test -p cratonvm-vm --test cow_array_set_backing
 CV=<binary> JDK=$(cygpath -m "$JAVA_HOME") bash regression-suite/run.sh
 ```
 
