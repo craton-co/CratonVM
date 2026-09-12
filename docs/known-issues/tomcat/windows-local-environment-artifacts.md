@@ -44,8 +44,15 @@ Confirmed via HotSpot cross-check on `TestDeployTask` in an earlier session
 turn: HotSpot gets `NOSUMMARY` (can't even load the test class) with the
 identical classpath. `org.apache.tools.ant.Task` genuinely isn't on this
 fixture's classpath. Same category as the EasyMock/ByteBuddy gap
-(`easymock-bytebuddy-classpath-version-gap-not-a-cratonvm-bug.md`) —
+(`docs/internal/tomcat/easymock-bytebuddy-classpath-version-gap-FIXED-20260912.md`) —
 a fixture dependency gap.
+
+**RESOLVED 2026-09-12.** The `ant-1.10.11.jar` entry was one of the six dead
+Gradle-cache paths in
+`docs/internal/tomcat/cp-txt-stale-gradle-module-cache-paths-FIXED-20260912.md`.
+With the rebuilt, pinned classpath (`ant{,-launcher}-1.10.17`) both classes
+pass on both VMs: `TestDeployTask` OK (5), `TestJspC` OK (11), HotSpot and
+CratonVM alike.
 
 ## `TestResponsePerformance.testToAbsolutePerformance`, `TestAsyncMessagesPerformance.testAsyncTiming` — relative-timing races
 

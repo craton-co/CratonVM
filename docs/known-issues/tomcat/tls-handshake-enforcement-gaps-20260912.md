@@ -39,13 +39,17 @@ mismatch (cipher availability, key-type/cert compatibility, protocol version
 overlap) apparently not being enforced at all. Not yet traced into
 `native-builtins-crypto`/the rustls config-building path to find which
 config knob (`ClientHello` cipher/version offer filtering, or the host's
-`ServerConfig` acceptance) is too permissive, or whether these are actually a
-symptom of the same keystore-generation classpath gap in
-`cp-txt-stale-gradle-module-cache-paths-20260912.md` producing a fallback
-keystore/cert that unintentionally satisfies the handshake (not confirmed —
-`TestSSLHostConfigCompat`/`Cipher`/`Protocol` don't call
-`TesterKeystoreGenerator`'s BouncyCastle path in their stack traces, so this
-looks independent, but the two haven't been separated with certainty).
+`ServerConfig` acceptance) is too permissive.
+
+**Not the classpath gap — separated 2026-09-12.** This page used to leave open
+whether the 8 sub-tests were a side effect of the stale BouncyCastle/UnboundID
+classpath (`docs/internal/tomcat/cp-txt-stale-gradle-module-cache-paths-FIXED-20260912.md`).
+With that classpath restored, the three classes were rerun one process each,
+same JVM arguments as the suite: HotSpot **OK (12) / OK (78) / OK (12)** for
+`Cipher`/`Compat`/`Protocol`, CratonVM the same **2 / 4 / 2** sub-tests
+failing with the same `Expected exception: javax.net.ssl.SSLHandshakeException`.
+Group 1 is therefore also past its HotSpot control: HotSpot enforces all 8
+refusals on this fixture and CratonVM does not.
 
 ## Group 2 — a handshake fails when it's expected to succeed (1 class, 5 sub-tests)
 
