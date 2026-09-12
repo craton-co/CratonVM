@@ -2026,11 +2026,20 @@ use cratonvm_types::compat::CompatibilityMode;
 ///   e240573a8       2728    2755      2728       2761 / 2788 / 2761
 ///   +L4 w2          2865    2892      2865       2898 / 2925 / 2898
 ///   da7cc2da6       2884    2911      2884       2917 / 2944 / 2917
+///   bdb02d94e       2915    2942      2915       2948 / 2975 / 2948
 /// ```
 ///
-/// **+33 every time, over controls 189 rows apart**, and the total flat beside
-/// each one. Three independent derivations, none of them arithmetic — the same
+/// **+33 every time, over controls 220 rows apart**, and the total flat beside
+/// each one. Four independent derivations, none of them arithmetic — the same
 /// standard lane 1 wave 6 states three lines above.
+///
+/// The fourth pair is also this file's classifier catching a real mistake.
+/// A `git add -A` before a merge commit swept an in-progress DELETION of 22
+/// registrations into this branch, and the pair read `total DOWN by 11` where
+/// a relabel moves it not at all — the third of the three cases below,
+/// "registrations were DELETED". The deletions were backed out to their own
+/// commit and the pair retaken; it reads +33 / +11 like its three siblings.
+/// The second column is not decoration.
 ///
 /// The totals below move with the controls (13622 -> 13630, 13990 -> 13998,
 /// 13657 -> 13665): that +8 is lane 1 wave 6's non-stub registrations, not this
@@ -2124,7 +2133,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// `native-builtins/src/lang_class.rs|java/lang/Package.getPackages|()[Ljava/lang/Package;`
 /// -- and none the other way. Record:
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2942;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2975;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2405,7 +2414,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2942;
 /// `native-builtins/src/lang_class.rs|java/lang/Package.getPackages|()[Ljava/lang/Package;`
 /// -- and none the other way. Record:
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2915;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2948;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2608,7 +2617,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2915;
 /// `native-builtins/src/lang_class.rs|java/lang/Package.getPackages|()[Ljava/lang/Package;`
 /// -- and none the other way. Record:
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2915;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2948;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -2668,7 +2677,7 @@ const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2915;
 /// was the only trace a real defect left in this gate, and staleness meant
 /// nobody could have read it. The `synthetic-jdk` arm has no constant here and
 /// measured 13645 on the same tree.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13985;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13996;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
@@ -2681,7 +2690,7 @@ const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13985;
 /// dev's staleness rather than either wave's — the localisation is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13617;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13628;
 
 /// The `--features synthetic-jdk` total, which had no constant at all.
 ///
@@ -2707,7 +2716,7 @@ const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13617;
 /// and 13645 on that tree against 13658 on this one is exactly the drift a
 /// sentence cannot track.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13652;
+const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13663;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;
