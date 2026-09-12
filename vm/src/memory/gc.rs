@@ -194,7 +194,6 @@ pub fn unload_dead_class_metadata(
             .jit_cache
             .invalidate_unloaded_class(class.id, class.name.as_ref());
     }
-    shared.jit.invalidation_manager.lock().clear_all();
     // Same reason as `jit_alloc_class_cache` above: the multianewarray
     // per-site plans are keyed by a class id and hold component class ids,
     // and a recycled id would hand a site the wrong component classes.

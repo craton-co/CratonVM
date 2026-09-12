@@ -117,10 +117,6 @@ pub struct JitRealm {
     /// per-method epoch table reaches capacity.
     pub(crate) method_epoch_overflow: std::sync::atomic::AtomicU64,
 
-    /// Invalidation manager — tracks class-hierarchy assumptions and invalidates
-    /// dependent compiled methods when class loading breaks those assumptions.
-    pub invalidation_manager: parking_lot::Mutex<cratonvm_jit::deopt::InvalidationManager>,
-
     /// Per-class allocation-init cache for the JIT slow-path allocators
     /// (`jit_new_object` + the guarded TLAB-refill arm): primitive-field
     /// default-init recipe + `has_finalizer`, computed once per class and

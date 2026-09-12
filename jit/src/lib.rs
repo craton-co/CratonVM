@@ -3336,6 +3336,18 @@ pub struct CompiledMethod {
     /// the compile-wide thread-local witness [`open_compile_epoch_witness`]
     /// opens (so the stamp is the epoch at compile START, not at finalize).
     pub install_epoch: u64,
+    /// Value of the process invalidation epoch when this artifact's
+    /// COMPILATION began, stamped through the same witness as
+    /// [`Self::install_epoch`].
+    ///
+    /// The dependency-side half of the same hole. A background compile that
+    /// inlined or devirtualised `Base.m()` can finish after
+    /// `invalidate_for_class_change("Base")` has scanned a cache that did not
+    /// contain it yet; nothing would ever withdraw it. [`JitCache::put`] /
+    /// [`put_osr`](JitCache::put_osr) check every invalidation that cache logged
+    /// after this stamp against the body's `inlined_methods` and key, and
+    /// refuse on a match.
+    pub invalidation_epoch: u64,
     /// Process-unique identity for this artifact.
     ///
     /// Neither the entry ADDRESS nor the `CompiledMethod`'s own address
@@ -3534,6 +3546,7 @@ impl CompiledMethod {
             owner_class_id: cratonvm_types::jit_activation::NO_OWNER_CLASS,
             compile_id: 0,
             install_epoch: current_compile_install_epoch(),
+            invalidation_epoch: current_compile_invalidation_epoch(),
             artifact_id: next_artifact_id(),
             retired: std::sync::atomic::AtomicBool::new(false),
         }
@@ -3621,6 +3634,7 @@ impl CompiledMethod {
             owner_class_id: cratonvm_types::jit_activation::NO_OWNER_CLASS,
             compile_id: 0,
             install_epoch: current_compile_install_epoch(),
+            invalidation_epoch: current_compile_invalidation_epoch(),
             artifact_id: next_artifact_id(),
             retired: std::sync::atomic::AtomicBool::new(false),
         }
@@ -16036,6 +16050,10 @@ pub struct JitCache {
     /// on eviction — only [`Self::clear_all`] empties it, alongside the maps it
     /// summarises.
     inlined_class_names: parking_lot::Mutex<std::collections::HashSet<Arc<str>>>,
+    /// Every dependency invalidation of this cache, logged BEFORE its scan, so
+    /// a publication whose compilation began earlier can be checked against it
+    /// (see [`Self::dependencies_are_current`]).
+    invalidations: parking_lot::Mutex<InvalidationLog>,
 }
 
 static JIT_ENTRY_OWNERS: std::sync::OnceLock<
@@ -17168,6 +17186,12 @@ pub static UNROOTED_DIRECT_CALLEES: std::sync::atomic::AtomicUsize =
 pub static REBOUND_DIRECT_CALLEES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Publications refused because a baked direct-call target had already been
+/// retired by an invalidation. `UNROOTED_DIRECT_CALLEES` cannot see these: the
+/// pin succeeds, on a body the invalidation withdrew.
+pub static RETIRED_DIRECT_CALLEES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// `CRATONVM_JIT_STRICT_CALLEE_ROOTS=1` refuses to publish a compiled body whose
 /// baked direct-call targets cannot all be kept alive.
 /// Whether an unrootable baked direct-call target blocks publication.
@@ -17273,10 +17297,28 @@ pub fn bump_jit_install_epoch() -> u64 {
     JIT_INSTALL_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1
 }
 
+/// Monotonic process-wide *invalidation* epoch.
+///
+/// Advanced by every dependency invalidation of a [`JitCache`]
+/// (`invalidate_for_class_change`, `invalidate_for_class`,
+/// `invalidate_unloaded_class`, `remove`) as it logs the invalidation, and read
+/// at the START of every compilation through the same witness that stamps the
+/// install epoch ([`CompiledMethod::invalidation_epoch`]). Like
+/// [`JIT_INSTALL_EPOCH`] it is a counter, not a gate: the gate is each cache's
+/// own invalidation log, so one VM's invalidation cannot refuse another VM's
+/// unrelated publication.
+static JIT_INVALIDATION_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Current invalidation epoch (one acquire load).
+#[inline]
+fn jit_invalidation_epoch() -> u64 {
+    JIT_INVALIDATION_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
 thread_local! {
-    /// The install epoch the compilation running on this thread began at, or
-    /// `None` when no compilation is open.
-    static COMPILE_INSTALL_EPOCH: std::cell::Cell<Option<u64>> =
+    /// The `(install, invalidation)` epochs the compilation running on this
+    /// thread began at, or `None` when no compilation is open.
+    static COMPILE_INSTALL_EPOCH: std::cell::Cell<Option<(u64, u64)>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -17288,7 +17330,7 @@ thread_local! {
 /// if the outer one is, and an outer stamp can only refuse more.
 #[must_use = "the witness must stay alive for the whole compilation"]
 pub struct CompileEpochWitness {
-    prev: Option<u64>,
+    prev: Option<(u64, u64)>,
 }
 
 impl Drop for CompileEpochWitness {
@@ -17310,7 +17352,7 @@ pub fn open_compile_epoch_witness() -> CompileEpochWitness {
     COMPILE_INSTALL_EPOCH.with(|c| {
         let prev = c.get();
         if prev.is_none() {
-            c.set(Some(jit_install_epoch()));
+            c.set(Some((jit_install_epoch(), jit_invalidation_epoch())));
         }
         CompileEpochWitness { prev }
     })
@@ -17322,7 +17364,96 @@ pub fn open_compile_epoch_witness() -> CompileEpochWitness {
 fn current_compile_install_epoch() -> u64 {
     COMPILE_INSTALL_EPOCH
         .with(|c| c.get())
-        .unwrap_or_else(jit_install_epoch)
+        .map_or_else(jit_install_epoch, |(install, _)| install)
+}
+
+/// The invalidation epoch a `CompiledMethod` built right now must be stamped
+/// with: the open compilation's start epoch, or (no compilation open) the live
+/// epoch.
+#[inline]
+fn current_compile_invalidation_epoch() -> u64 {
+    COMPILE_INSTALL_EPOCH
+        .with(|c| c.get())
+        .map_or_else(jit_invalidation_epoch, |(_, invalidation)| invalidation)
+}
+
+/// What one [`JitCache`] invalidation withdrew, kept in that cache's
+/// invalidation log so a publication whose compilation began earlier can be
+/// checked against it.
+enum InvalidationRecord {
+    /// `invalidate_for_class_change` / `invalidate_for_class`: every body whose
+    /// `inlined_methods` names this class — a callee it inlined, or the
+    /// receiver class a guarded speculation relied on.
+    InlinedClass(Arc<str>),
+    /// `invalidate_unloaded_class`: bodies the class declares, and bodies that
+    /// inlined from it.
+    UnloadedClass {
+        class_id: cratonvm_types::ClassId,
+        class_name: Arc<str>,
+    },
+    /// `remove`: one method key.
+    Key {
+        class_name: Arc<str>,
+        method_name: Arc<str>,
+        descriptor: Arc<str>,
+        declaring_class_id: cratonvm_types::ClassId,
+    },
+}
+
+impl InvalidationRecord {
+    /// Whether this invalidation withdraws a body published under `key`.
+    fn withdraws(&self, key: &JitKey, compiled: &CompiledMethod) -> bool {
+        let inlined_from = |class: &str| {
+            compiled
+                .inlined_methods
+                .iter()
+                .any(|(cls, _, _)| cls == class)
+        };
+        match self {
+            Self::InlinedClass(class) => inlined_from(class.as_ref()),
+            Self::UnloadedClass {
+                class_id,
+                class_name,
+            } => key.declaring_class_id == *class_id || inlined_from(class_name.as_ref()),
+            Self::Key {
+                class_name,
+                method_name,
+                descriptor,
+                declaring_class_id,
+            } => {
+                key.class_name == *class_name
+                    && key.method_name == *method_name
+                    && key.descriptor == *descriptor
+                    && key.declaring_class_id == *declaring_class_id
+            }
+        }
+    }
+}
+
+/// A bounded log of one cache's invalidations, oldest first.
+#[derive(Default)]
+struct InvalidationLog {
+    records: std::collections::VecDeque<(u64, InvalidationRecord)>,
+    /// The newest epoch that has fallen off the front of `records`. A
+    /// compilation stamped below it can no longer be checked, so it is refused.
+    dropped_through: u64,
+}
+
+/// Records one [`JitCache`] keeps before the oldest falls off. A compilation
+/// that stays in flight across more invalidations than this is refused and
+/// recompiles.
+const INVALIDATION_LOG_CAPACITY: usize = 16_384;
+
+/// Publications refused because an invalidation that began after their
+/// compilation withdrew something they depend on.
+static STALE_DEPENDENCY_REFUSALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of artifacts refused publication because a later invalidation of the
+/// same cache withdrew a class they inlined or speculated on, their own key, or
+/// their unloaded declaring class.
+pub fn stale_dependency_refusals() -> u64 {
+    STALE_DEPENDENCY_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Publications refused because the compilation predated a cache flush.
@@ -17371,6 +17502,7 @@ impl JitCache {
             // Never flushed: every artifact is at or above epoch 1.
             flush_barrier: std::sync::atomic::AtomicU64::new(0),
             inlined_class_names: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            invalidations: parking_lot::Mutex::new(InvalidationLog::default()),
         }
     }
 
@@ -17532,6 +17664,66 @@ flushed at epoch {barrier}",
         !strict_install_epoch_enabled()
     }
 
+    /// Log a dependency invalidation of this cache BEFORE it scans.
+    ///
+    /// A publication then either reads the record in
+    /// [`Self::dependencies_are_current`], or published before the log was
+    /// written and is found by the scan that follows. The epoch is advanced
+    /// under the log lock so log order is epoch order.
+    fn log_invalidation(&self, record: InvalidationRecord) {
+        let mut log = self.invalidations.lock();
+        let epoch = JIT_INVALIDATION_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        if log.records.len() >= INVALIDATION_LOG_CAPACITY {
+            if let Some((dropped, _)) = log.records.pop_front() {
+                log.dropped_through = dropped;
+            }
+        }
+        log.records.push_back((epoch, record));
+    }
+
+    /// Returns `false` when an invalidation of THIS cache logged after
+    /// `compiled`'s compilation began withdraws what it depends on, in which
+    /// case it must not be published.
+    ///
+    /// `put` used to check only the install epoch against the flush barrier.
+    /// A background compile that inlined or devirtualised `Base.m()` could
+    /// therefore publish after `invalidate_for_class_change("Base")` had scanned
+    /// a cache that did not contain it yet, and nothing would ever withdraw it.
+    ///
+    /// Callers hold `mutation` and have already recorded the body's inlined
+    /// classes in `inlined_class_names`: an invalidation's early-out then either
+    /// sees the name (and scans after this publication), or logged its record
+    /// before this reads the log.
+    fn dependencies_are_current(&self, key: &JitKey, compiled: &CompiledMethod) -> bool {
+        let log = self.invalidations.lock();
+        let stamp = compiled.invalidation_epoch;
+        let Some(&(newest, _)) = log.records.back() else {
+            return true;
+        };
+        if stamp >= newest {
+            return true;
+        }
+        let withdrawn = stamp < log.dropped_through
+            || log
+                .records
+                .iter()
+                .rev()
+                .take_while(|(epoch, _)| *epoch > stamp)
+                .any(|(_, record)| record.withdraws(key, compiled));
+        if !withdrawn {
+            return true;
+        }
+        STALE_DEPENDENCY_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if dbg_jit_pin_enabled() {
+            eprintln!(
+                "[jit-stale-dependency] refusing {}.{}{} compiled at invalidation epoch \
+{stamp}: a later invalidation withdrew something it depends on",
+                key.class_name, key.method_name, key.descriptor,
+            );
+        }
+        false
+    }
+
     /// Returns `false` when a baked direct-call target could not be pinned, in
     /// which case this body must NOT be published — its emitted code contains a
     /// `call` to an address nothing keeps alive.
@@ -17552,11 +17744,22 @@ flushed at epoch {barrier}",
                 .find(|(e, _)| *e == entry)
                 .map(|(_, id)| *id)
         };
+        // A callee an invalidation has already retired is alive only because
+        // something still holds it — typically the retirement queue. Baking a
+        // call to it would publish a body that runs code the invalidation
+        // withdrew. Refused whatever `CRATONVM_JIT_STRICT_CALLEE_ROOTS` says:
+        // that switch is about a callee that could not be pinned, and this is
+        // a correctness refusal.
+        let mut retired_callee = false;
         compiled._direct_callee_roots = compiled
             ._direct_callee_entries
             .iter()
             .filter_map(|&entry| {
                 let owner = resolve_jit_entry_owner(entry)?;
+                if owner.retired.load(std::sync::atomic::Ordering::SeqCst) {
+                    retired_callee = true;
+                    return None;
+                }
                 match expected_of(entry) {
                     // Baked with no recorded identity (a synthetic range): keep
                     // the historical liveness-only answer rather than refuse a
@@ -17577,6 +17780,16 @@ publication"
                 }
             })
             .collect();
+        if retired_callee {
+            RETIRED_DIRECT_CALLEES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if dbg_jit_pin_enabled() {
+                eprintln!(
+                    "[jit-retired-callee] a baked direct-call target was retired by an \
+invalidation before this body's publication"
+                );
+            }
+            return false;
+        }
         let got = compiled._direct_callee_roots.len();
         if got == wanted {
             return true;
@@ -17620,6 +17833,19 @@ publication"
             descriptor,
             declaring_class_id,
         };
+        // Record what this body inlined BEFORE checking the invalidation log
+        // (and before it is shared). A class definition racing this publication
+        // then either finds the name and scans after this publication, or
+        // logged its invalidation before the check below reads the log. Both
+        // run under `mutation` on this side.
+        self.note_inlined_classes(&compiled);
+        if !self.dependencies_are_current(&key, &compiled) {
+            // An invalidation of this cache that began after this compilation
+            // withdrew something the body depends on. Dropping it leaves the
+            // method interpreted; it recompiles against the current hierarchy.
+            // See `CompiledMethod::invalidation_epoch`.
+            return;
+        }
         // CRATONVM_DBG_JIT_COMPILED: one line per successfully published
         // compilation. The cheapest way to answer "is this method actually
         // running compiled?" -- an A/B whose only visible difference is
@@ -17638,11 +17864,6 @@ publication"
             // later invocation, by which time the callee has a live body.
             return;
         }
-        // Record what this body inlined BEFORE it is shared, so a class
-        // definition racing this publication cannot conclude "nobody inlined
-        // from me" against a set that does not yet name it. Both run under
-        // `mutation`, so the ordering here is what makes the early-out sound.
-        self.note_inlined_classes(&compiled);
         // Stamp the declaring class before the artifact is shared: it is what
         // `JitEntryGuard` reads to keep this class's defining loader alive
         // while one of these frames is on a stack.
@@ -17723,6 +17944,19 @@ publication"
             descriptor,
             declaring_class_id,
         };
+        // Record what this body inlined BEFORE checking the invalidation log
+        // (and before it is shared). A class definition racing this publication
+        // then either finds the name and scans after this publication, or
+        // logged its invalidation before the check below reads the log. Both
+        // run under `mutation` on this side.
+        self.note_inlined_classes(&compiled);
+        if !self.dependencies_are_current(&key, &compiled) {
+            // An invalidation of this cache that began after this compilation
+            // withdrew something the body depends on. Dropping it leaves the
+            // method interpreted; it recompiles against the current hierarchy.
+            // See `CompiledMethod::invalidation_epoch`.
+            return;
+        }
         // CRATONVM_DBG_JIT_COMPILED: one line per successfully published
         // compilation. The cheapest way to answer "is this method actually
         // running compiled?" -- an A/B whose only visible difference is
@@ -17742,7 +17976,6 @@ publication"
             return;
         }
         // See the matching notes in `put`.
-        self.note_inlined_classes(&compiled);
         compiled.owner_class_id = declaring_class_id.as_u32();
         compiled._buffer.mark_published();
         let arc = Arc::new(compiled);
@@ -17802,6 +18035,12 @@ publication"
         descriptor: &str,
         declaring_class_id: cratonvm_types::ClassId,
     ) {
+        self.log_invalidation(InvalidationRecord::Key {
+            class_name: Arc::from(class_name),
+            method_name: Arc::from(method_name),
+            descriptor: Arc::from(descriptor),
+            declaring_class_id,
+        });
         self.invalidate_matching(|key, _| {
             &*key.class_name == class_name
                 && &*key.method_name == method_name
@@ -17820,6 +18059,10 @@ publication"
     ///
     /// Returns the number of evicted entries.
     pub fn invalidate_for_class_change(&self, changed_class: &str) -> usize {
+        // Log first, even when nothing published names the class: a compile
+        // that inlined from it may still be running, and the log is the only
+        // thing that will stop it publishing. See `dependencies_are_current`.
+        self.log_invalidation(InvalidationRecord::InlinedClass(Arc::from(changed_class)));
         // See `inlined_class_names`: nobody inlined it, so nothing can match,
         // and the scan below would walk every shard to say 0.
         if !self.any_body_inlined_from(changed_class) {
@@ -17835,6 +18078,8 @@ publication"
     /// Invalidate all compiled methods that inlined code from `class_name`.
     /// Returns the number of methods evicted.
     pub fn invalidate_for_class(&self, class_name: &str) -> usize {
+        // Log first — see `invalidate_for_class_change`.
+        self.log_invalidation(InvalidationRecord::InlinedClass(Arc::from(class_name)));
         if !self.any_body_inlined_from(class_name) {
             return 0;
         }
@@ -17854,6 +18099,10 @@ publication"
         class_id: cratonvm_types::ClassId,
         class_name: &str,
     ) -> usize {
+        self.log_invalidation(InvalidationRecord::UnloadedClass {
+            class_id,
+            class_name: Arc::from(class_name),
+        });
         self.invalidate_matching(|key, compiled| {
             key.declaring_class_id == class_id
                 || compiled
@@ -18037,6 +18286,9 @@ publication"
             .fetch_max(barrier, std::sync::atomic::Ordering::AcqRel);
         // The maps this set summarises are about to be emptied.
         self.inlined_class_names.lock().clear();
+        // A compilation that began before this flush is refused by the barrier
+        // above, so no later publication can need a record older than it.
+        self.invalidations.lock().records.clear();
         // Every body is retired before ANY inline cache is cleared — a full
         // pass first, because the per-shard loop below clears one shard's slots
         // before it has reached the bodies of the next. See
@@ -42241,6 +42493,115 @@ mod code_cache_lifetime_tests {
             Arc::from("()V"),
             cratonvm_types::ClassId::new(1),
         )
+    }
+
+    /// A compilation that inlined from `Base` and began before
+    /// `invalidate_for_class_change("Base")` must not publish afterwards. The
+    /// invalidation scanned a cache that did not contain the body yet, so
+    /// nothing else would ever withdraw it.
+    #[test]
+    fn a_body_compiled_before_an_invalidation_of_its_inlined_class_is_refused() {
+        let cache = JitCache::new();
+        let (class, method, desc, cid) = key();
+
+        let witness = open_compile_epoch_witness();
+        let mut stale = ret_body();
+        stale
+            .inlined_methods
+            .push(("cclt/Base".to_string(), "m".to_string(), "()V".to_string()));
+        // The hierarchy changes while this compile is still running; nothing
+        // published names `cclt/Base` yet, so the scan itself finds nothing.
+        assert_eq!(cache.invalidate_for_class_change("cclt/Base"), 0);
+        // An invalidation of an unrelated class must not refuse it.
+        let mut unrelated = ret_body();
+        unrelated
+            .inlined_methods
+            .push(("cclt/Other".to_string(), "m".to_string(), "()V".to_string()));
+        drop(witness);
+
+        cache.put(class.clone(), method.clone(), desc.clone(), cid, stale);
+        assert!(
+            cache.get(&class, &method, &desc, cid).is_none(),
+            "a body compiled against the hierarchy an invalidation retired must not publish"
+        );
+
+        let other_method: Arc<str> = Arc::from("other");
+        cache.put(class.clone(), other_method.clone(), desc.clone(), cid, unrelated);
+        assert!(
+            cache.get(&class, &other_method, &desc, cid).is_some(),
+            "an invalidation of a class the body does not depend on must not refuse it"
+        );
+
+        // The same dependency compiled AFTER the invalidation publishes.
+        let mut fresh = ret_body();
+        fresh
+            .inlined_methods
+            .push(("cclt/Base".to_string(), "m".to_string(), "()V".to_string()));
+        cache.put(class.clone(), method.clone(), desc.clone(), cid, fresh);
+        assert!(cache.get(&class, &method, &desc, cid).is_some());
+    }
+
+    /// `remove` is an invalidation of one key: a compile of that key that began
+    /// before the removal must not publish after it.
+    #[test]
+    fn a_body_compiled_before_its_key_was_removed_is_refused() {
+        let cache = JitCache::new();
+        let (class, method, desc, cid) = key();
+        let witness = open_compile_epoch_witness();
+        let stale = ret_body();
+        cache.remove(&class, &method, &desc, cid);
+        drop(witness);
+        cache.put(class.clone(), method.clone(), desc.clone(), cid, stale);
+        assert!(cache.get(&class, &method, &desc, cid).is_none());
+    }
+
+    /// A callee an invalidation already retired may still be alive — held by
+    /// the retirement queue, or here by the test — so the owner pin succeeds.
+    /// Baking a call to it must still refuse the caller.
+    #[test]
+    fn a_retired_direct_callee_is_never_baked_into_a_publication() {
+        let cache = JitCache::new();
+        let desc: Arc<str> = Arc::from("()V");
+        let cid = cratonvm_types::ClassId::new(4731);
+        let callee_class: Arc<str> = Arc::from("cclt/RetiredCallee");
+        let callee_method: Arc<str> = Arc::from("target");
+        cache.put(
+            callee_class.clone(),
+            callee_method.clone(),
+            desc.clone(),
+            cid,
+            ret_body(),
+        );
+        let callee = cache
+            .get(&callee_class, &callee_method, &desc, cid)
+            .expect("callee published");
+        cache.remove(&callee_class, &callee_method, &desc, cid);
+        assert!(
+            callee.retired.load(std::sync::atomic::Ordering::SeqCst),
+            "an invalidated body is marked retired"
+        );
+
+        let mut caller = ret_body();
+        caller._direct_callee_entries.push(callee.entry_ptr() as usize);
+        caller
+            ._direct_callee_expected
+            .push((callee.entry_ptr() as usize, callee.artifact_id));
+        let caller_class: Arc<str> = Arc::from("cclt/RetiredCaller");
+        let caller_method: Arc<str> = Arc::from("call");
+        cache.put(
+            caller_class.clone(),
+            caller_method.clone(),
+            desc.clone(),
+            cid,
+            caller,
+        );
+        assert!(
+            cache
+                .get(&caller_class, &caller_method, &desc, cid)
+                .is_none(),
+            "a caller baking a call to a retired callee must not publish"
+        );
+        drop(callee);
     }
 
     /// Read the name registry past a transient `Locked`.

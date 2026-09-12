@@ -407,7 +407,13 @@ depth and computed once per class *define*, not per call.
 
 ### The second channel
 
-`deopt::InvalidationManager` models this properly —
+> **Deleted 2026-09-12.** The manager described below never received an
+> assumption from any compile path and has been removed. The name-keyed
+> channel above is the only listener, and `JitCache::put` now refuses a body
+> whose compilation began before an invalidation that withdraws one of its
+> `inlined_methods` classes. Kept for history:
+
+`deopt::InvalidationManager` modelled this —
 `CompilationAssumption::StableType { bci, expected_class }` is exactly a
 guarded receiver speculation. It now has a reverse index and a query:
 `on_class_loaded_with_supertypes(class_id, supertypes)` returns every method
@@ -652,7 +658,7 @@ relied on.
    This item used to say "turning it on is a soak decision with a measurement
    behind it, not a code change". The measurement has now been run and it is
    negative: there IS a code change to make first. See §11.
-4. **Nothing registers `StableType` assumptions from the compiler.** The
+4. **(Closed 2026-09-12: the manager was deleted; see §5.)** Nothing registered `StableType` assumptions from the compiler. The
    channel is wired and tested on the manager side (§5); using it needs
    `InvalidationManager` threaded out from behind `jit_realm`'s mutex. The
    name-keyed channel now has the reach that motivated this, so it would buy

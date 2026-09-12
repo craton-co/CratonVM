@@ -8456,7 +8456,6 @@ impl<'a> NativeContextImpl<'a> {
                 "JIT: fully invalidated {evicted} method(s) due to redefineClass: {name}"
             );
         }
-        let _ = self.shared.invalidate_jit_for_class(&name);
         // Bump the broker's per-class epoch so a queued or in-flight
         // compilation of the PREVIOUS bytecode is dropped rather than
         // installed. Deliberately here and not beside the install-epoch
@@ -10822,9 +10821,8 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         let mut cm = self.shared.classes.class_manager_write();
         match cm.define_class(name, bytes, ClassLoaderId::Application) {
             Ok(cid) => {
-                // Release the ClassManager write lock before calling
-                // `invalidate_jit_for_class` (which takes a read lock on
-                // the same manager).
+                // Release the ClassManager write lock before invalidating:
+                // nothing below needs it.
                 drop(cm);
                 // Invalidate JIT-compiled methods that inlined from this class (Session 31)
                 let evicted = self.shared.jit.jit_cache.write().invalidate_for_class(name);
@@ -10833,19 +10831,11 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
                         "JIT: invalidated {evicted} method(s) due to class reload: {name}"
                     );
                 }
-                // T5.4.4 вЂ” additionally consult the InvalidationManager's
-                // LeafClass/class_dependencies entries.
-                let cha_evicted = self.shared.invalidate_jit_for_class(name);
                 // A define over an already-loaded name replaces that class's
                 // bytecode, so a queued compilation of the previous body is stale.
                 let _ = self.shared.jit.compilation_broker.lock().invalidate(
                     &cratonvm_jit::tiered::InvalidationEvent::ClassRedefined(name.to_string()),
                 );
-                if cha_evicted > 0 {
-                    tracing::debug!(
-                        "JIT: invalidated {cha_evicted} method(s) via CHA listener for class: {name}"
-                    );
-                }
                 Some(cid)
             }
             Err(e) => {
@@ -10913,18 +10903,11 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
                         "JIT: invalidated {evicted} method(s) due to class reload: {name}"
                     );
                 }
-                // T5.4.4 вЂ” CHA-listener invalidation
-                let cha_evicted = self.shared.invalidate_jit_for_class(name);
                 // A define over an already-loaded name replaces that class's
                 // bytecode, so a queued compilation of the previous body is stale.
                 let _ = self.shared.jit.compilation_broker.lock().invalidate(
                     &cratonvm_jit::tiered::InvalidationEvent::ClassRedefined(name.to_string()),
                 );
-                if cha_evicted > 0 {
-                    tracing::debug!(
-                        "JIT: invalidated {cha_evicted} method(s) via CHA listener for class: {name}"
-                    );
-                }
                 Some(cid)
             }
             Err(e) => {
@@ -11053,15 +11036,11 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         if evicted > 0 {
             tracing::debug!("JIT: invalidated {evicted} method(s) due to defineClass: {name}");
         }
-        let cha_evicted = self.shared.invalidate_jit_for_class(name);
         // A define over an already-loaded name replaces that class's
         // bytecode, so a queued compilation of the previous body is stale.
         let _ = self.shared.jit.compilation_broker.lock().invalidate(
             &cratonvm_jit::tiered::InvalidationEvent::ClassRedefined(name.to_string()),
         );
-        if cha_evicted > 0 {
-            tracing::debug!("JIT: CHA-invalidated {cha_evicted} method(s) for: {name}");
-        }
 
         if opts.initialize {
             // Best-effort init; failures bubble back as Err.

@@ -2182,8 +2182,8 @@ pub fn execute(
         // from redefining with *byte-identical* bytecode.
         //
         // It was also protecting nothing. `redefine_class` already evicts
-        // every compiled artifact — `jit_cache.write().clear_all()` plus
-        // `invalidate_jit_for_class` in `vm_exec.rs` — so no code compiled
+        // every compiled artifact — `jit_cache.write().clear_all()` in
+        // `vm_exec.rs` — so no code compiled
         // from the old body can survive the redefinition, and a later
         // compilation necessarily reads the current (agent-woven) bytecode
         // out of the class store. Blocking recompilation on top of a full

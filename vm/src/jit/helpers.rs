@@ -23676,19 +23676,6 @@ impl DeoptimizationController {
             vm.bump_compilation_epoch(&method_key);
         }
 
-        // For class-check or receiver-type failures, also check the
-        // invalidation manager for dependent methods.
-        if matches!(
-            reason,
-            cratonvm_jit::deopt::DeoptReason::ReceiverTypeChanged
-                | cratonvm_jit::deopt::DeoptReason::ClassCheck
-                | cratonvm_jit::deopt::DeoptReason::ClassLoading
-        ) {
-            let mut inv_mgr = vm.jit.invalidation_manager.lock();
-            // Clear stale assumptions for the deoptimized method
-            inv_mgr.clear_assumptions(&method_key);
-        }
-
         // If the deopt log recommends giving up, add to the JIT skip set.
         // Also mark it bail-listed in the SEPARATE cratonvm_jit registry
         // (`is_jit_bail_listed`/`mark_jit_bail_listed`, RBC.4) -- `jit_skip_set`

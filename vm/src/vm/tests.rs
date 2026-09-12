@@ -47,9 +47,8 @@ use cratonvm_native_api::{
 use cratonvm_reader::attribute::LazyAttribute;
 use std::sync::Arc;
 
-/// `ClassId` that `SharedVm::invalidate_jit_for_class` and
-/// `DeoptimizationController::deoptimize` fall back to when a class name
-/// is not registered with the class manager. The `JitCache` fixtures below
+/// `ClassId` that `DeoptimizationController::deoptimize` falls back to when a
+/// class name is not registered with the class manager. The `JitCache` fixtures below
 /// own their cache end-to-end and never register their fake classes, so
 /// keying on this id is what makes a later name-driven eviction match.
 const CID0: cratonvm_types::ClassId = cratonvm_types::ClassId::new(0);
@@ -76540,44 +76539,6 @@ fn s36_deopt_repeated_deopts_escalate_to_blacklist() {
 }
 
 #[test]
-fn s36_deopt_receiver_type_changed_clears_assumptions() {
-    let config = crate::config::VmConfig {
-        use_synthetic_jdk: true,
-        ..Default::default()
-    };
-    let vm = std::sync::Arc::new(crate::vm::vm_init::SharedVm::new(config));
-    *vm.self_arc.write() = Some(std::sync::Arc::downgrade(&vm));
-
-    // Register an assumption in the invalidation manager
-    {
-        let mut inv = vm.jit.invalidation_manager.lock();
-        inv.register_assumption(
-            "MyClass.myMethod:()V",
-            cratonvm_jit::deopt::CompilationAssumption::LeafClass(42),
-        );
-    }
-
-    // Deopt with ReceiverTypeChanged should clear assumptions for that method
-    crate::jit::helpers::DeoptimizationController::deoptimize(
-        &vm,
-        "MyClass",
-        "myMethod",
-        "()V",
-        cratonvm_jit::deopt::DeoptReason::ReceiverTypeChanged,
-        10,
-    );
-
-    // After deopt, assumptions for that method key should be cleared
-    let inv = vm.jit.invalidation_manager.lock();
-    let invalidated = inv.on_class_loaded(42);
-    // The assumption was cleared so no methods should be invalidated
-    assert!(
-        !invalidated.contains(&"MyClass.myMethod:()V".to_string()),
-        "assumptions should have been cleared by deopt"
-    );
-}
-
-#[test]
 fn s36_deopt_tiered_manager_gets_notified() {
     let config = crate::config::VmConfig {
         use_synthetic_jdk: true,
@@ -76656,50 +76617,22 @@ fn s36_deopt_count_based_escalation_lifecycle() {
         .contains(&("C".into(), "m".into(), "()V".into())));
 }
 
-#[test]
-fn s36_invalidation_manager_tracks_class_dependencies() {
-    let config = crate::config::VmConfig {
-        use_synthetic_jdk: true,
-        ..Default::default()
-    };
-    let vm = std::sync::Arc::new(crate::vm::vm_init::SharedVm::new(config));
-    *vm.self_arc.write() = Some(std::sync::Arc::downgrade(&vm));
-
-    // Register multiple assumptions from different compiled methods
-    {
-        let mut inv = vm.jit.invalidation_manager.lock();
-        inv.register_assumption(
-            "A.foo:()V",
-            cratonvm_jit::deopt::CompilationAssumption::LeafClass(100),
-        );
-        inv.register_assumption(
-            "B.bar:()V",
-            cratonvm_jit::deopt::CompilationAssumption::LeafClass(100),
-        );
-        inv.register_assumption(
-            "C.baz:()V",
-            cratonvm_jit::deopt::CompilationAssumption::LeafClass(200),
-        );
-    }
-
-    // Loading class 100 should invalidate A.foo and B.bar but not C.baz
-    let inv = vm.jit.invalidation_manager.lock();
-    let invalidated = inv.on_class_loaded(100);
-    assert!(invalidated.contains(&"A.foo:()V".to_string()));
-    assert!(invalidated.contains(&"B.bar:()V".to_string()));
-    assert!(!invalidated.contains(&"C.baz:()V".to_string()));
-}
-
 // -----------------------------------------------------------------------
 // T5.4.4 — CHA listener eviction (cha_invalidation)
 // -----------------------------------------------------------------------
+//
+// A compiled body's class-hierarchy dependency record is its own
+// `inlined_methods`, filled from `InlinePlan::invalidation_triples`: an inlined
+// callee, and the receiver class a guarded speculation relied on. The class
+// define path runs `invalidate_for_class_change` over the new class and every
+// supertype. These tests pin that listener. They used to drive an
+// `InvalidationManager` no compile path ever registered an assumption with.
 
 #[test]
 fn cha_invalidation_evicts_matching_jit_entry() {
-    // Scenario: compile method `Animal.speak:()V` under the assumption
-    // that `Animal` (class_id=K) is a leaf class. When `Dog extends
-    // Animal` is loaded, the LeafClass(K) assumption is broken and the
-    // compiled entry must be evicted.
+    // Scenario: `Zoo.feed:()V` inlined `Animal.speak:()V` on the evidence that
+    // `Animal` was the only receiver. When `Dog extends Animal` is loaded the
+    // listener runs for the supertype `Animal`, and the body must be evicted.
     let config = crate::config::VmConfig {
         use_synthetic_jdk: true,
         ..Default::default()
@@ -76707,30 +76640,28 @@ fn cha_invalidation_evicts_matching_jit_entry() {
     let vm = std::sync::Arc::new(crate::vm::vm_init::SharedVm::new(config));
     *vm.self_arc.write() = Some(std::sync::Arc::downgrade(&vm));
 
-    // Register `Animal` as a loaded class so the InvalidationManager
-    // has a ClassId to key off of.
     let animal_id = vm
         .classes
         .class_manager
         .write()
         .try_ensure_synthetic_class("Animal", 0)
         .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
-    let animal_cid_u32 = animal_id.as_u32();
 
-    // Install a compiled entry for `Animal.speak:()V`. The JitCache
-    // key is (Class, method, descriptor).
     let buf =
         cratonvm_jit::ExecutableBuffer::new(64).expect("failed to allocate executable buffer");
-    let compiled = cratonvm_jit::CompiledMethod::new(buf);
+    let mut compiled = cratonvm_jit::CompiledMethod::new(buf);
+    compiled
+        .inlined_methods
+        .push(("Animal".to_string(), "speak".to_string(), "()V".to_string()));
     vm.jit.jit_cache.write().put(
-        "Animal".into(),
-        "speak".into(),
+        "Zoo".into(),
+        "feed".into(),
         "()V".into(),
         animal_id,
         compiled,
     );
-    let cn: std::sync::Arc<str> = "Animal".into();
-    let mn: std::sync::Arc<str> = "speak".into();
+    let cn: std::sync::Arc<str> = "Zoo".into();
+    let mn: std::sync::Arc<str> = "feed".into();
     let desc: std::sync::Arc<str> = "()V".into();
     assert!(
         vm.jit
@@ -76741,21 +76672,11 @@ fn cha_invalidation_evicts_matching_jit_entry() {
         "JIT entry must be present before invalidation"
     );
 
-    // Register a LeafClass(animal_id) assumption under the key the
-    // cache uses. The InvalidationManager stores method keys in
-    // `<class>.<method>:<descriptor>` form.
-    {
-        let mut inv = vm.jit.invalidation_manager.lock();
-        inv.register_assumption(
-            "Animal.speak:()V",
-            cratonvm_jit::deopt::CompilationAssumption::LeafClass(animal_cid_u32),
-        );
-    }
-
-    // Simulate loading a subclass `Dog` — this is the CHA-breaking
-    // event. We simulate it by calling the public listener directly:
-    // in production this is invoked from `load_class_concurrent`.
-    let evicted = vm.invalidate_jit_for_class("Animal");
+    let evicted = vm
+        .jit
+        .jit_cache
+        .write()
+        .invalidate_for_class_change("Animal");
     assert_eq!(
         evicted, 1,
         "CHA listener must evict exactly one matching entry"
@@ -76772,8 +76693,8 @@ fn cha_invalidation_evicts_matching_jit_entry() {
 
 #[test]
 fn cha_invalidation_no_assumption_is_noop() {
-    // Loading an unrelated class with no LeafClass assumption on it
-    // must not evict anything.
+    // Loading an unrelated class that no compiled body inlined from must not
+    // evict anything.
     let config = crate::config::VmConfig {
         use_synthetic_jdk: true,
         ..Default::default()
@@ -76798,10 +76719,14 @@ fn cha_invalidation_no_assumption_is_noop() {
         .put("Other".into(), "run".into(), "()V".into(), CID0, compiled);
     assert_eq!(vm.jit.jit_cache.read().len(), 1);
 
-    let evicted = vm.invalidate_jit_for_class("Unrelated");
+    let evicted = vm
+        .jit
+        .jit_cache
+        .write()
+        .invalidate_for_class_change("Unrelated");
     assert_eq!(
         evicted, 0,
-        "no assumptions on `Unrelated` — nothing to evict"
+        "nothing inlined from `Unrelated` — nothing to evict"
     );
     assert_eq!(
         vm.jit.jit_cache.read().len(),
@@ -76821,7 +76746,11 @@ fn cha_invalidation_unknown_class_returns_zero() {
     let vm = std::sync::Arc::new(crate::vm::vm_init::SharedVm::new(config));
     *vm.self_arc.write() = Some(std::sync::Arc::downgrade(&vm));
 
-    let evicted = vm.invalidate_jit_for_class("NeverLoaded");
+    let evicted = vm
+        .jit
+        .jit_cache
+        .write()
+        .invalidate_for_class_change("NeverLoaded");
     assert_eq!(evicted, 0);
 }
 

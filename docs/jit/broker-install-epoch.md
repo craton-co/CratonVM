@@ -231,6 +231,10 @@ that falsify a queued request's assumptions:
 
 ### 4.2 The exact insertions (sites 1-4)
 
+> 2026-09-12: `SharedVm::invalidate_jit_for_class` was deleted with the
+> `InvalidationManager` it queried. The anchor lines quoted below name it;
+> the broker insertions stand on their own.
+
 Each is one line, in the existing invalidation block, with the name already in
 scope. Add `use cratonvm_jit::tiered::InvalidationEvent;` to each file's imports
 (or spell it fully, as written below).

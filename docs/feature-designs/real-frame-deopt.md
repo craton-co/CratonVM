@@ -10,8 +10,8 @@ rather than re-running the whole method from its entry.
 - **Metadata.** `jit/src/deopt.rs` carries `DeoptimizationPoint`, `FrameState`
   and `FrameValue`, including the typed slot locations `StackSlotRef`,
   `StackSlotLong`, `StackSlotFloat`, `StackSlotDouble`, plus `VirtualObject`
-  and `MaterializationRequired`, and the `DeoptVerifier` / `InvalidationManager`
-  pair.
+  and `MaterializationRequired`, and the `DeoptVerifier` (the `InvalidationManager` that
+  used to sit beside it was deleted 2026-09-12).
 - **Production codegen sets the per-method gate.** The single-pass x64 driver
   (`jit/src/x64/driver.rs`) sets `can_deopt_resume` from
   `!deopt_points.is_empty() && !has_elided_monitor`, and `can_osr_exit`
@@ -134,7 +134,7 @@ path or decline the optimization:
   in `deopt.rs:36`).
 - **Aggressive inlining**: inline a callee speculatively (CHA / single
   implementor), and when `ClassLoading` (`deopt.rs:38`) invalidates the
-  assumption, deopt every affected frame. The `InvalidationManager` named in
+  assumption, deopt every affected frame. The `InvalidationManager` (deleted 2026-09-12) named in
   the module doc (`deopt.rs:13`) is the hook.
 - **Scalar replacement that survives** (`jit/src/escape_analysis.rs`): an object
   proven non-escaping *along the fast path* can be scalar-replaced even if a
