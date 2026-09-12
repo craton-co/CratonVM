@@ -4675,9 +4675,6 @@ extern "C" fn jni_define_class(
         if let Some(n) = class_name.as_deref() {
             let _ = shared.jit.jit_cache.write().invalidate_for_class(n);
             let _ = shared.invalidate_jit_for_class(n);
-            let _ = shared.jit.compilation_broker.lock().invalidate(
-                &cratonvm_jit::tiered::InvalidationEvent::ClassRedefined(n.to_string()),
-            );
         }
         Some(class_id_to_jclass(cid))
     })

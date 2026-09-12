@@ -73,23 +73,6 @@ pub struct JitRealm {
     /// Tiered compilation manager — decides when and at which tier to compile.
     pub tiered_manager: crate::jit::tiered::TieredCompilationManager,
 
-    /// Compilation policy — admission, tier selection, and the per-class
-    /// invalidation epoch. See `docs/jit/compilation-broker.md` and
-    /// `docs/jit/broker-install-epoch.md`.
-    ///
-    /// This field exists so the class epoch has PRODUCERS. The broker's own
-    /// doc comment says a redefine "also bumps the class's epoch" — true of
-    /// the broker and false of the process, because nothing held one. An epoch
-    /// nobody bumps reads as protection and is not. The bumps are wired at the
-    /// four events that falsify a queued request's assumptions: JVMTI
-    /// redefine, class unload, `defineClass` over an already-loaded name, and
-    /// JNI `DefineClass`.
-    ///
-    /// `Mutex` because the broker is `&mut self`-driven and carries no
-    /// interior locking — deliberately, so the integration owns the
-    /// concurrency decision rather than inheriting one.
-    pub compilation_broker: parking_lot::Mutex<crate::jit::tiered::CompilationBroker>,
-
     /// Deoptimization log — records deopt events and drives adaptive recompilation.
     pub deopt_log: parking_lot::Mutex<crate::jit::deopt::DeoptimizationLog>,
 

@@ -179,15 +179,6 @@ pub fn unload_dead_class_metadata(
             .jit
             .tiered_manager
             .invalidate_class(class.name.as_ref());
-        // And purge the broker: an unloaded class must lose its tracked
-        // requests as well as its epoch, so `purge_class` rather than
-        // `invalidate`. In-flight records are deliberately KEPT by that
-        // call so their pre-unload epoch refuses the body coming back.
-        let _ = shared
-            .jit
-            .compilation_broker
-            .lock()
-            .purge_class(class.name.as_ref());
         shared.jit.deopt_log.lock().clear_class(class.name.as_ref());
         jit_entries_retired += shared
             .jit

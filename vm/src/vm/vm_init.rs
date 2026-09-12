@@ -4492,9 +4492,6 @@ impl SharedVm {
                 // overrides (c1/c2/osr/c2_min/enabled). Identical to the default
                 // policy when the environment is unset.
                 tiered_manager: crate::jit::tiered::TieredCompilationManager::with_env_policy(),
-                compilation_broker: parking_lot::Mutex::new(
-                    crate::jit::tiered::CompilationBroker::with_default_policy(),
-                ),
                 deopt_log: parking_lot::Mutex::new(crate::jit::deopt::DeoptimizationLog::new()),
                 method_epochs: parking_lot::RwLock::new(FxHashMap::default()),
                 method_epoch_overflow: std::sync::atomic::AtomicU64::new(0),

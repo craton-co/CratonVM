@@ -8457,15 +8457,6 @@ impl<'a> NativeContextImpl<'a> {
             );
         }
         let _ = self.shared.invalidate_jit_for_class(&name);
-        // Bump the broker's per-class epoch so a queued or in-flight
-        // compilation of the PREVIOUS bytecode is dropped rather than
-        // installed. Deliberately here and not beside the install-epoch
-        // bump above: that pairing has its own ordering comment and the two
-        // epochs answer different questions — global "was the cache flushed"
-        // versus per-class "was THIS class replaced".
-        let _ = self.shared.jit.compilation_broker.lock().invalidate(
-            &cratonvm_jit::tiered::InvalidationEvent::ClassRedefined(name.to_string()),
-        );
         Ok(())
     }
 }
@@ -10836,11 +10827,6 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
                 // T5.4.4 вЂ” additionally consult the InvalidationManager's
                 // LeafClass/class_dependencies entries.
                 let cha_evicted = self.shared.invalidate_jit_for_class(name);
-                // A define over an already-loaded name replaces that class's
-                // bytecode, so a queued compilation of the previous body is stale.
-                let _ = self.shared.jit.compilation_broker.lock().invalidate(
-                    &cratonvm_jit::tiered::InvalidationEvent::ClassRedefined(name.to_string()),
-                );
                 if cha_evicted > 0 {
                     tracing::debug!(
                         "JIT: invalidated {cha_evicted} method(s) via CHA listener for class: {name}"
@@ -10915,11 +10901,6 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
                 }
                 // T5.4.4 вЂ” CHA-listener invalidation
                 let cha_evicted = self.shared.invalidate_jit_for_class(name);
-                // A define over an already-loaded name replaces that class's
-                // bytecode, so a queued compilation of the previous body is stale.
-                let _ = self.shared.jit.compilation_broker.lock().invalidate(
-                    &cratonvm_jit::tiered::InvalidationEvent::ClassRedefined(name.to_string()),
-                );
                 if cha_evicted > 0 {
                     tracing::debug!(
                         "JIT: invalidated {cha_evicted} method(s) via CHA listener for class: {name}"
@@ -11054,11 +11035,6 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             tracing::debug!("JIT: invalidated {evicted} method(s) due to defineClass: {name}");
         }
         let cha_evicted = self.shared.invalidate_jit_for_class(name);
-        // A define over an already-loaded name replaces that class's
-        // bytecode, so a queued compilation of the previous body is stale.
-        let _ = self.shared.jit.compilation_broker.lock().invalidate(
-            &cratonvm_jit::tiered::InvalidationEvent::ClassRedefined(name.to_string()),
-        );
         if cha_evicted > 0 {
             tracing::debug!("JIT: CHA-invalidated {cha_evicted} method(s) for: {name}");
         }

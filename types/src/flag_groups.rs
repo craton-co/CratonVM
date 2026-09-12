@@ -4164,8 +4164,8 @@ mod tests {
     /// Two knobs that were asked for and are deliberately **not** here.
     ///
     /// `CRATONVM_TIER_BROKER`: `jit/src/tiered.rs` reads no such key — the
-    /// broker is additive and still unwired, and the row exists only as a
-    /// proposal in `docs/jit/compilation-broker.md`.
+    /// standalone `CompilationBroker` it would have gated was deleted
+    /// 2026-09-12 without ever being wired (`docs/jit/compilation-broker.md`).
     /// `CRATONVM_JIT_BYTECODE_UNROLL`: the loop rewriter is armed by a
     /// thread-local (`x64::set_bytecode_loop_rewriter_armed`) and reads no
     /// environment at all.
