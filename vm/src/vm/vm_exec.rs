@@ -8458,7 +8458,7 @@ impl<'a> NativeContextImpl<'a> {
         }
         // Every tiering verdict recorded against the old bytecode (ineligible,
         // c2_bailout, trap counts, OSR denials) says nothing about the new one.
-        self.shared.jit.tiered_manager.on_class_redefined(&name);
+        self.shared.jit.tiered_manager.on_class_redefined(class_id, &name);
         Ok(())
     }
 }
@@ -10827,7 +10827,7 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
                 }
                 // A define over an already-loaded name replaces that class's
                 // bytecode, and with it every tiering verdict about the old one.
-                self.shared.jit.tiered_manager.on_class_redefined(name);
+                self.shared.jit.tiered_manager.on_class_redefined(cid, name);
                 Some(cid)
             }
             Err(e) => {
@@ -10897,7 +10897,7 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
                 }
                 // A define over an already-loaded name replaces that class's
                 // bytecode, and with it every tiering verdict about the old one.
-                self.shared.jit.tiered_manager.on_class_redefined(name);
+                self.shared.jit.tiered_manager.on_class_redefined(cid, name);
                 Some(cid)
             }
             Err(e) => {
@@ -11028,7 +11028,7 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         }
         // A define over an already-loaded name replaces that class's bytecode,
         // and with it every tiering verdict about the old one.
-        self.shared.jit.tiered_manager.on_class_redefined(name);
+        self.shared.jit.tiered_manager.on_class_redefined(cid, name);
 
         if opts.initialize {
             // Best-effort init; failures bubble back as Err.

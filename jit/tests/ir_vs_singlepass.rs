@@ -7438,6 +7438,7 @@ fn compile_inline_arm(
                 false,                     // 26 jdk_only
                 None,                      // 27 intrinsic_resolver
                 None,                      // 28 despec
+                None,                      // 29 cp_invoke_declaring_class_resolver
             )
         },
     )

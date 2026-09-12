@@ -2035,6 +2035,7 @@ pub fn dump_method_stats_to_stderr() {
                                 state.method_key.descriptor
                             ),
                             crate::jit_bail_reason_for(
+                                state.method_key.class_id,
                                 &state.method_key.class_name,
                                 &state.method_key.method_name,
                                 &state.method_key.descriptor,
@@ -2456,8 +2457,9 @@ impl TieredCompilationManager {
             .retain(|key, _| !key.belongs_to(class_id, class_name));
         // And the process-wide compile verdicts about the class (bail list,
         // refusal reasons, OSR entry rejects): a class that is gone must not
-        // leave refusals behind for the next class loaded under its name.
-        crate::forget_jit_verdicts_for_class(class_name);
+        // leave refusals behind for the next class loaded under its id or name.
+        // By identity, so a same-named class in another loader keeps its own.
+        crate::forget_jit_verdicts_for_class(class_id, class_name);
         for _ in 0..windows_to_close {
             self.core.close_branch_window();
         }
@@ -2479,14 +2481,15 @@ impl TieredCompilationManager {
     /// requests are left to the install-epoch gate, which the redefinition has
     /// already moved.
     ///
-    /// Keyed by name, for every loader: the call sites that know a class was
-    /// replaced have the name in hand, and resetting a same-named class in
-    /// another loader costs at most a recompile.
-    pub fn on_class_redefined(&self, class_name: &str) {
+    /// Keyed like [`Self::invalidate_class`]: by identity when both the key and
+    /// `class_id` carry one, so a same-named class in another loader keeps its
+    /// verdicts; by name when either side has none (`ClassId(0)`), which errs
+    /// towards resetting too much and costs at most a recompile.
+    pub fn on_class_redefined(&self, class_id: ClassId, class_name: &str) {
         {
             let mut methods = self.core.methods.lock();
             for (key, state) in methods.iter_mut() {
-                if &*key.class_name != class_name {
+                if !key.belongs_to(class_id, class_name) {
                     continue;
                 }
                 state.current_tier = CompilationTier::Interpreter;
@@ -2501,11 +2504,11 @@ impl TieredCompilationManager {
         self.core
             .osr_denied
             .write()
-            .retain(|key, _| &*key.class_name != class_name);
+            .retain(|key, _| !key.belongs_to(class_id, class_name));
         // The compile verdicts were measured on the old bytecode too. They
         // already stop counting once the redefine epoch moves; dropping them
         // also releases the memory.
-        crate::forget_jit_verdicts_for_class(class_name);
+        crate::forget_jit_verdicts_for_class(class_id, class_name);
         self.core.bump_settled_generation();
     }
 
@@ -3590,7 +3593,7 @@ mod tests {
 
         let redefined = MethodKey::new("craton/test/OsrRedefined", "loop", "()V");
         mgr.mark_osr_denied(redefined.clone());
-        mgr.on_class_redefined("craton/test/OsrRedefined");
+        mgr.on_class_redefined(ClassId::new(0), "craton/test/OsrRedefined");
         assert!(
             !mgr.is_osr_denied(&redefined),
             "a redefinition forgets the class's denials"
@@ -5435,6 +5438,31 @@ mod tests {
         assert_eq!(mgr.queue_size(), 1, "the plugin's queued request survives");
     }
 
+    /// A redefinition resets the redefined class's state by identity: a
+    /// same-named class in another loader keeps its OSR denials.
+    #[test]
+    fn redefining_one_loaders_class_leaves_a_same_named_class_alone() {
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mgr = epoch_driven_manager(&epoch);
+        let app = MethodKey::with_class_id(ClassId::new(7), "com/example/Bar", "run", "()V");
+        let plugin = MethodKey::with_class_id(ClassId::new(9), "com/example/Bar", "run", "()V");
+        mgr.mark_osr_denied(app.clone());
+        mgr.mark_osr_denied(plugin.clone());
+        assert!(mgr.is_osr_denied(&app));
+        assert!(mgr.is_osr_denied(&plugin));
+
+        mgr.on_class_redefined(ClassId::new(7), "com/example/Bar");
+        assert!(!mgr.is_osr_denied(&app), "the redefined class forgets its denials");
+        assert!(
+            mgr.is_osr_denied(&plugin),
+            "the other loader's same-named class keeps its denials"
+        );
+
+        // With no identity to go on, a redefinition falls back to the name.
+        mgr.on_class_redefined(ClassId::new(0), "com/example/Bar");
+        assert!(!mgr.is_osr_denied(&plugin));
+    }
+
     // ── Branch-profile windows: armed once, closed once ──────────────────
 
     #[test]
@@ -5514,7 +5542,7 @@ mod tests {
         );
 
         // Anything that could unsettle a method expires every stamp.
-        mgr.on_class_redefined("java/lang/String");
+        mgr.on_class_redefined(ClassId::new(0), "java/lang/String");
         assert!(!mgr.tiering_settled(banned.settled_generation));
         assert_eq!(
             mgr.on_method_invocation_settling(&key, 0).recommended,

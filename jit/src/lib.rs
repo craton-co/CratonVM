@@ -5154,17 +5154,33 @@ impl OsrEntryPlan {
     ///    instruction to be routed through the exception table. Refused.
     ///
     /// **`Unsupported` vs `MaterializationRequired` in a local.** An
-    /// `Unsupported` local is tolerated: the 1-pass backend's
-    /// `classify_local_kinds` is a coarse whole-method scan that marks a slot
-    /// `Ambiguous` at *every* bci if it is accessed as two kinds *anywhere*, so
-    /// the live frame's current value is left in place. Refusing instead is
-    /// not the safe direction: it discards the exit's committed side effects
-    /// and replays them from pre-entry state, which is the defect recorded in
-    /// `jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md`. The
-    /// tolerance still rests on "dead or re-stored before read", which
-    /// whole-method classification does not prove for a slot reused as two
-    /// kinds; the precise answer is bytecode liveness at the exit bci. See
-    /// `jit-resume-tolerates-unsupported-locals-without-liveness-20260912.md`.
+    /// `Unsupported` local is tolerated, and the live frame's current value is
+    /// left in place. Refusing here is not the safe direction: it discards the
+    /// exit's committed side effects and replays them from pre-entry state,
+    /// which is the defect recorded in
+    /// `jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md`.
+    ///
+    /// The tolerance is sound because liveness is decided at COMPILE time,
+    /// where the deopt point is published, and not here:
+    ///
+    ///  * a local that is not live-in at the point's bci is published
+    ///    `Undefined`, whatever its whole-method kind
+    ///    (`x64::deopt_stubs::build_frame_state_at`, handler-aware
+    ///    `regalloc::live_locals_per_pc_all`);
+    ///  * a live local is described through its per-bci kind where the
+    ///    whole-method kind is `Ambiguous`, and published `Unsupported` only when
+    ///    it cannot be;
+    ///  * any `Unsupported` local in any deopt point makes
+    ///    [`CompiledMethod::validate_osr_entry`] refuse the entry
+    ///    (`osr_exit_policy`, `OSR_REFUSE_UNRESUMABLE_EXIT`) before the body
+    ///    runs.
+    ///
+    /// So an admitted artifact never carries a live `Unsupported` local.
+    /// `deopt::resolve_value` can still produce one at exit time from a
+    /// metadata defect (a register index outside the spilled file), and that
+    /// is left in place too rather than refused after side effects. See
+    /// `jit-resume-tolerates-unsupported-locals-without-liveness-FIXED-20260912.md`.
+    ///
     /// `MaterializationRequired` is **not** tolerated: it means a value that
     /// *was* live got deleted by an optimization with no rebuild recipe, so the
     /// live frame's stale pre-entry word is genuinely wrong, not merely
@@ -5277,8 +5293,10 @@ impl OsrEntryPlan {
         }
         for (i, v) in rframe.locals.iter().enumerate() {
             match v {
-                // See the doc comment: coarse-classifier noise, left at the
-                // live frame's current value.
+                // See the doc comment: never a live slot of an admitted
+                // artifact (dead slots are published `Undefined`, live
+                // undescribable ones refuse the entry), so the live frame's
+                // current value is left in place.
                 FV::Unsupported => {}
                 FV::MaterializationRequired(ev) => {
                     return Err(osr_refusal(
@@ -14028,17 +14046,19 @@ pub fn atomic_intrinsic_site_class_matches(
 /// for when that is admitted.
 ///
 /// `resolved_declaring_class` is the class that declares the method the invoke
-/// resolves to. Every registration site passes `None` today — no resolver that
-/// `try_compile` receives answers that question — so production behaviour is
-/// the exact constant-pool match until one is threaded through.
+/// resolves to. `try_compile_inner` fills it from the VM's
+/// `cp_invoke_declaring_class_resolver` (see
+/// `atomic_intrinsic_for_invoke_site`), and the OSR door in
+/// `vm/src/runtime/interpreter/jit_bridge.rs` resolves it through the
+/// class-manager guard it already holds.
 ///
 /// `guard_class_id` stays the SITE's class id for a subclass site: the emitted
 /// guard is an exact class-id compare, so only receivers of exactly that class
-/// take the inline path. The layout is still slot 0, which is `value` on a
-/// subclass instance only while inherited fields precede declared ones — the
-/// same assumption the registered native's `get_field_volatile(this, 0)` makes
-/// for every receiver, but one to confirm against the VM's field layout before
-/// a resolver is wired.
+/// take the inline path. The layout is slot 0 resolved through that class id.
+/// Slot 0 is `value` on every subclass instance, because `compute_field_layout`
+/// (`classloading/src/class_manager.rs`) gives superclass instance fields the
+/// slots `0..N` and starts a class's own fields at `N`. The compact offset is
+/// read from the subclass's own registered layout.
 pub fn try_resolve_atomic_intrinsic_for_site(
     class: &str,
     resolved_declaring_class: Option<&str>,
@@ -14111,6 +14131,82 @@ pub fn try_resolve_atomic_intrinsic_for_site(
         b'I'
     };
     Some((intrinsic.as_entry(), num_params, ret, layout.class_id))
+}
+
+/// Could an invoke site naming `cp_class` reach the `jdk_class` `Atomic*`
+/// intrinsic family at all? (review #80)
+///
+/// Yes for the JDK class itself. For any other class, only when
+/// `name descriptor` is a method `final` in `jdk_class`: that is the one case
+/// [`atomic_intrinsic_site_class_matches`] admits through a resolved declaring
+/// class. The answer is the cheap pre-filter a registration site applies
+/// BEFORE it asks the VM which class declares the resolved method. That lookup
+/// takes the class-manager lock and walks the hierarchy, and a method named
+/// `get()I` on some unrelated class must not pay it.
+pub fn atomic_intrinsic_site_may_match(
+    jdk_class: &str,
+    cp_class: &str,
+    name: &str,
+    descriptor: &str,
+) -> bool {
+    cp_class == jdk_class || atomic_intrinsic_method_is_final_in_jdk(jdk_class, name, descriptor)
+}
+
+/// The ATOMIC_INT (`jdk_class` = `AtomicInteger`) or ATOMIC_LONG (`AtomicLong`)
+/// registration for one `invokevirtual` site, as `try_compile_inner` performs
+/// it: `(entry, num_params, return tag, guard class id)`, or `None` to keep
+/// ordinary dispatch.
+///
+/// - `guard_class_id` comes from `cp_invoke_class_id_resolver`: the class the
+///   constant pool names at the site. For `class Counter extends AtomicInteger`
+///   that is `Counter`. The emitted guard is an exact header class-id compare,
+///   so only receivers of exactly that class take the inline path, and any
+///   other subclass falls back. The field layout (`AtomicIntFieldLayout::new(0,
+///   guard_class_id)`) is resolved through that same class id, so a subclass's
+///   own compact layout supplies the offset of `value`. The slot is 0 in every
+///   subclass, because `compute_field_layout` in `classloading` places
+///   superclass instance fields first.
+/// - `cp_invoke_declaring_class_resolver` answers which class declares the
+///   method the site resolves to. It is asked only for a non-JDK constant-pool
+///   class calling a method that is `final` in the JDK class
+///   ([`atomic_intrinsic_site_may_match`]), and its answer admits the site only
+///   when it names the JDK class ([`atomic_intrinsic_site_class_matches`]).
+fn atomic_intrinsic_for_invoke_site(
+    jdk_class: &str,
+    cp_idx: u16,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    cp_invoke_class_id_resolver: Option<&dyn Fn(u16) -> Option<u32>>,
+    cp_invoke_declaring_class_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+) -> Option<(usize, usize, u8, u32)> {
+    if !atomic_intrinsic_site_may_match(jdk_class, class_name, method_name, descriptor) {
+        return None;
+    }
+    let class_id_resolver = cp_invoke_class_id_resolver?;
+    let guard_class_id = class_id_resolver(cp_idx)?;
+    let declaring_class = if class_name == jdk_class {
+        None
+    } else {
+        cp_invoke_declaring_class_resolver.and_then(|resolve| resolve(cp_idx))
+    };
+    match jdk_class {
+        "java/util/concurrent/atomic/AtomicInteger" => try_resolve_atomic_intrinsic_for_site(
+            class_name,
+            declaring_class.as_deref(),
+            method_name,
+            descriptor,
+            guard_class_id,
+        ),
+        "java/util/concurrent/atomic/AtomicLong" => try_resolve_atomic_long_intrinsic_for_site(
+            class_name,
+            declaring_class.as_deref(),
+            method_name,
+            descriptor,
+            guard_class_id,
+        ),
+        _ => None,
+    }
 }
 
 /// Call sites the single-pass backend has EMITTED as `AtomicLong` intrinsics
@@ -14906,6 +15002,132 @@ mod atomic_accessor_intrinsic_tests {
             "longValue",
             "()J"
         ));
+    }
+
+    /// Review #80, the registration `try_compile_inner` performs. A subclass
+    /// site reaches the intrinsic through `cp_invoke_declaring_class_resolver`,
+    /// guarded on the site's OWN class id. Without that resolver, or when it
+    /// names any class other than the JDK one, the site keeps ordinary dispatch.
+    #[test]
+    fn a_subclass_site_registers_through_the_declaring_class_resolver() {
+        const AI: &str = "java/util/concurrent/atomic/AtomicInteger";
+        const AL: &str = "java/util/concurrent/atomic/AtomicLong";
+        const SITE_CID: u32 = 23456;
+        const CP_IDX: u16 = 7;
+        let site_class_id = |_cp_idx: u16| -> Option<u32> { Some(SITE_CID) };
+        let no_class_id = |_cp_idx: u16| -> Option<u32> { None };
+        let asked = std::cell::Cell::new(0u32);
+        let declared_by_ai = |cp_idx: u16| -> Option<String> {
+            asked.set(asked.get() + 1);
+            assert_eq!(cp_idx, CP_IDX, "asked about the site's own constant-pool entry");
+            Some(AI.to_string())
+        };
+        let declared_by_al = |_cp_idx: u16| -> Option<String> { Some(AL.to_string()) };
+        let declared_by_base = |_cp_idx: u16| -> Option<String> { Some("pkg/Base".to_string()) };
+
+        let (entry, num_params, ret, guard) = atomic_intrinsic_for_invoke_site(
+            AI,
+            CP_IDX,
+            "pkg/Counter",
+            "incrementAndGet",
+            "()I",
+            Some(&site_class_id),
+            Some(&declared_by_ai),
+        )
+        .expect("a subclass site of a final AtomicInteger method registers through the resolver");
+        assert_eq!(entry, JitIntrinsic::AtomicIntIncrementAndGet.as_entry());
+        assert_eq!((num_params, ret), (0, b'I'));
+        assert_eq!(
+            guard, SITE_CID,
+            "the guard is the subclass site's own class id, so another subclass falls back"
+        );
+        assert_eq!(asked.get(), 1);
+
+        let (entry, num_params, ret, guard) = atomic_intrinsic_for_invoke_site(
+            AL,
+            CP_IDX,
+            "pkg/LongCounter",
+            "getAndAdd",
+            "(J)J",
+            Some(&site_class_id),
+            Some(&declared_by_al),
+        )
+        .expect("the long family registers through the resolver too");
+        assert_eq!(entry, JitIntrinsic::AtomicLongGetAndAdd.as_entry());
+        assert_eq!((num_params, ret, guard), (1, b'J', SITE_CID));
+
+        // No resolver: the exact constant-pool match, which a subclass misses.
+        assert!(atomic_intrinsic_for_invoke_site(
+            AI,
+            CP_IDX,
+            "pkg/Counter",
+            "incrementAndGet",
+            "()I",
+            Some(&site_class_id),
+            None,
+        )
+        .is_none());
+        // Declared by an intermediate class, which could have overridden it.
+        assert!(atomic_intrinsic_for_invoke_site(
+            AI,
+            CP_IDX,
+            "pkg/Counter",
+            "incrementAndGet",
+            "()I",
+            Some(&site_class_id),
+            Some(&declared_by_base),
+        )
+        .is_none());
+        // An overridable method (`longValue()`) on a subclass site.
+        assert!(atomic_intrinsic_for_invoke_site(
+            AL,
+            CP_IDX,
+            "pkg/LongCounter",
+            "longValue",
+            "()J",
+            Some(&site_class_id),
+            Some(&declared_by_al),
+        )
+        .is_none());
+        // No class id to guard on: nothing registers.
+        assert!(atomic_intrinsic_for_invoke_site(
+            AI,
+            CP_IDX,
+            "pkg/Counter",
+            "incrementAndGet",
+            "()I",
+            Some(&no_class_id),
+            Some(&declared_by_ai),
+        )
+        .is_none());
+
+        // The resolver is not consulted where its answer cannot matter: an
+        // exact JDK site, and a method the JDK class does not declare final.
+        asked.set(0);
+        assert!(atomic_intrinsic_for_invoke_site(
+            AI,
+            CP_IDX,
+            AI,
+            "incrementAndGet",
+            "()I",
+            Some(&site_class_id),
+            Some(&declared_by_ai),
+        )
+        .is_some());
+        assert!(atomic_intrinsic_for_invoke_site(
+            AI,
+            CP_IDX,
+            "pkg/Other",
+            "size",
+            "()I",
+            Some(&site_class_id),
+            Some(&declared_by_ai),
+        )
+        .is_none());
+        assert_eq!(asked.get(), 0, "the declaring-class lookup was paid for nothing");
+        assert!(!atomic_intrinsic_site_may_match(AI, "pkg/Other", "size", "()I"));
+        assert!(atomic_intrinsic_site_may_match(AI, "pkg/Counter", "get", "()I"));
+        assert!(!atomic_intrinsic_site_may_match(AL, "pkg/LongCounter", "longValue", "()J"));
     }
 }
 
@@ -20691,11 +20913,14 @@ fn ir_verify_reject(
 //   * `forget_jit_verdicts_for_class` drops a class's entries outright; the
 //     tiered manager calls it on class unload and on redefinition.
 //
-// There is no `ClassId` in the key: every caller of this API holds names only.
-// Two same-named classes in different loaders therefore share verdicts. That
-// errs in the safe direction -- one of them may be compiled later than it
-// could have been, never compiled wrongly -- and an unload or redefinition of
-// either clears both.
+// Every entry is keyed by the declaring class's `ClassId` as well as its names,
+// and a hit verifies both. Two same-named classes in different loaders (two
+// webapps, a devtools restart loader, Groovy or JSR-223 scripts) therefore keep
+// separate verdicts: one copy being bail-listed no longer keeps the other
+// interpreted, and unloading or redefining one copy leaves the other's verdicts
+// alone. `ClassId(0)` is the "no resolved identity" sentinel; a caller that
+// passes it shares its entries with every other id-less caller of the same
+// names, which is the old behaviour.
 
 static JIT_BAIL_SHORTCIRCUITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -20726,8 +20951,10 @@ impl VerdictStamp {
     }
 }
 
-/// Every compile verdict recorded about one method.
+/// Every compile verdict recorded about one method of one loaded class.
 struct MethodVerdicts {
+    /// The declaring class's identity; `ClassId(0)` when the recorder had none.
+    class_id: cratonvm_types::ClassId,
     class_name: Box<str>,
     method_name: Box<str>,
     descriptor: Box<str>,
@@ -20740,8 +20967,14 @@ struct MethodVerdicts {
 }
 
 impl MethodVerdicts {
-    fn new(class_name: &str, method_name: &str, descriptor: &str) -> Self {
+    fn new(
+        class_id: cratonvm_types::ClassId,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Self {
         Self {
+            class_id,
             class_name: Box::from(class_name),
             method_name: Box::from(method_name),
             descriptor: Box::from(descriptor),
@@ -20751,10 +20984,29 @@ impl MethodVerdicts {
         }
     }
 
-    fn names(&self, class_name: &str, method_name: &str, descriptor: &str) -> bool {
-        &*self.class_name == class_name
+    /// Whether this entry is about exactly this method of exactly this class.
+    fn is_for(
+        &self,
+        class_id: cratonvm_types::ClassId,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> bool {
+        self.class_id == class_id
+            && &*self.class_name == class_name
             && &*self.method_name == method_name
             && &*self.descriptor == descriptor
+    }
+
+    /// Whether this entry is about a method of the class `(class_id,
+    /// class_name)`, by the rule `tiered::MethodKey::belongs_to` uses: identity
+    /// decides when both sides carry one, the name decides otherwise.
+    fn belongs_to_class(&self, class_id: cratonvm_types::ClassId, class_name: &str) -> bool {
+        if self.class_id.as_u32() != 0 && class_id.as_u32() != 0 {
+            self.class_id == class_id
+        } else {
+            &*self.class_name == class_name
+        }
     }
 }
 
@@ -20766,31 +21018,34 @@ fn jit_verdicts() -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<u64, Met
     JIT_VERDICTS.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()))
 }
 
-fn verdict_key(class_name: &str, method_name: &str, descriptor: &str) -> u64 {
-    compute_jit_key_hash(
-        class_name,
-        method_name,
-        descriptor,
-        cratonvm_types::ClassId::new(0),
-    )
+fn verdict_key(
+    class_id: cratonvm_types::ClassId,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> u64 {
+    compute_jit_key_hash(class_name, method_name, descriptor, class_id)
 }
 
-/// Read a method's verdicts, if any are recorded under its exact names.
+/// Read a method's verdicts, if any are recorded under its exact class
+/// identity and names.
 fn read_verdicts<R>(
+    class_id: cratonvm_types::ClassId,
     class_name: &str,
     method_name: &str,
     descriptor: &str,
     read: impl FnOnce(&MethodVerdicts) -> R,
 ) -> Option<R> {
     let verdicts = jit_verdicts().read();
-    let entry = verdicts.get(&verdict_key(class_name, method_name, descriptor))?;
+    let entry = verdicts.get(&verdict_key(class_id, class_name, method_name, descriptor))?;
     entry
-        .names(class_name, method_name, descriptor)
+        .is_for(class_id, class_name, method_name, descriptor)
         .then(|| read(entry))
 }
 
 /// Update a method's verdicts, creating its entry on first use.
 fn write_verdicts(
+    class_id: cratonvm_types::ClassId,
     class_name: &str,
     method_name: &str,
     descriptor: &str,
@@ -20798,48 +21053,60 @@ fn write_verdicts(
 ) {
     let mut verdicts = jit_verdicts().write();
     let entry = verdicts
-        .entry(verdict_key(class_name, method_name, descriptor))
-        .or_insert_with(|| MethodVerdicts::new(class_name, method_name, descriptor));
-    if !entry.names(class_name, method_name, descriptor) {
+        .entry(verdict_key(class_id, class_name, method_name, descriptor))
+        .or_insert_with(|| MethodVerdicts::new(class_id, class_name, method_name, descriptor));
+    if !entry.is_for(class_id, class_name, method_name, descriptor) {
         // A genuine 64-bit collision between two different methods: the newer
         // one takes the slot. Losing the older verdicts costs that method one
         // more compile attempt, which is the safe direction.
-        *entry = MethodVerdicts::new(class_name, method_name, descriptor);
+        *entry = MethodVerdicts::new(class_id, class_name, method_name, descriptor);
     }
     write(entry);
 }
 
-/// Forget every compile verdict recorded about methods of `class_name` -- the
-/// bail list, refusal reasons and OSR entry rejects. Called by the tiered
-/// manager when the class is unloaded or redefined. Returns the number of
-/// methods whose verdicts were dropped.
-pub fn forget_jit_verdicts_for_class(class_name: &str) -> usize {
+/// Forget every compile verdict recorded about methods of the loaded class
+/// `(class_id, class_name)` -- the bail list, refusal reasons and OSR entry
+/// rejects. Called by the tiered manager when the class is unloaded or
+/// redefined. Returns the number of methods whose verdicts were dropped.
+///
+/// Identity decides when both the entry and the argument carry a non-zero id,
+/// so another loader's same-named class keeps its verdicts. An id-less side
+/// falls back to the name, which errs towards forgetting too much -- a
+/// forgotten verdict costs one more compile attempt, never a wrong answer.
+pub fn forget_jit_verdicts_for_class(
+    class_id: cratonvm_types::ClassId,
+    class_name: &str,
+) -> usize {
     let mut verdicts = jit_verdicts().write();
     let before = verdicts.len();
-    verdicts.retain(|_, entry| &*entry.class_name != class_name);
+    verdicts.retain(|_, entry| !entry.belongs_to_class(class_id, class_name));
     before - verdicts.len()
 }
 
-/// Whether the given method has been added to the JIT bail-list by a
-/// prior permanent-bail compilation attempt of the bytecode loaded now.
-/// Checked at the top of `try_compile` to short-circuit re-attempts.
-pub fn is_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str) -> bool {
-    read_verdicts(class_name, method_name, descriptor, |entry| {
+/// Whether the given method of the loaded class `class_id` has been added to
+/// the JIT bail-list by a prior permanent-bail compilation attempt of the
+/// bytecode loaded now. Checked at the top of `try_compile` to short-circuit
+/// re-attempts.
+pub fn is_jit_bail_listed(
+    class_id: cratonvm_types::ClassId,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    read_verdicts(class_id, class_name, method_name, descriptor, |entry| {
         entry.bail_listed.is_some_and(VerdictStamp::is_current)
     })
     .unwrap_or(false)
 }
 
-/// Mark the method as permanently bail-listed.  Called when the heavy
-/// `x64::compile` path returns None (typically because of an unsupported
-/// backend pattern that won't change on retry).
-/// The key the IR-tier memos are hashed under.
+/// The key the IR-tier site-trap registry is hashed under.
 ///
-/// The same `ClassId::new(0)` sentinel `mark_jit_bail_listed` and
-/// `try_compile_inner`'s `ir_method_hash` use, exposed so the runtime can look
-/// a method up in `ir::method_has_site_trap` and `ir_evidence`'s refusal memo
-/// without the raw hash function becoming public. Three callers agreeing on a
-/// hash is exactly the kind of thing that silently stops agreeing.
+/// `ClassId::new(0)` on purpose: exposed so the runtime can look a method up
+/// in `ir::method_has_site_trap` by the names a trapped frame carries, without
+/// the raw hash function becoming public. `try_compile_inner`'s
+/// `ir_method_hash` uses the same sentinel, and two callers agreeing on a hash
+/// is exactly the kind of thing that silently stops agreeing. The IR refusal
+/// memo is NOT keyed by this alone; see `ir_refusal_memo_key`.
 pub fn ir_method_memo_hash(class_name: &str, method_name: &str, descriptor: &str) -> u64 {
     compute_jit_key_hash(
         class_name,
@@ -20849,26 +21116,41 @@ pub fn ir_method_memo_hash(class_name: &str, method_name: &str, descriptor: &str
     )
 }
 
-pub fn mark_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str) {
-    write_verdicts(class_name, method_name, descriptor, |entry| {
+/// Mark the method of the loaded class `class_id` as permanently bail-listed.
+/// Called when the heavy `x64::compile` path returns None (typically because of
+/// an unsupported backend pattern that won't change on retry).
+pub fn mark_jit_bail_listed(
+    class_id: cratonvm_types::ClassId,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) {
+    write_verdicts(class_id, class_name, method_name, descriptor, |entry| {
         entry.bail_listed = Some(VerdictStamp::now(false));
     });
 }
 
 /// The IR refusal memo's key: the method's IR memo hash re-keyed by the
-/// redefine epoch.
+/// declaring class's identity and the redefine epoch.
 ///
 /// That memo (`ir_evidence::note_method_refused`) records "a previous compile
 /// carried no evidence the optimizing tier helps" and skips the IR attempt ever
 /// after. The verdict was about the bytecode compiled at the time, and after a
 /// redefinition it went on skipping the new body's IR attempt. Mixing in the
 /// epoch grants every method one fresh attempt per redefinition, a retry
-/// bounded by the number of redefinitions. The site-trap registry keeps the
-/// un-keyed [`ir_method_memo_hash`] on purpose: the runtime looks it up for
-/// frames of code that is already installed.
-fn ir_refusal_memo_key(ir_method_hash: u64, redefine_epoch: u32) -> u64 {
+/// bounded by the number of redefinitions. Mixing in the class id keeps a
+/// same-named class in another loader, whose bytecode may differ, from
+/// inheriting the verdict. The site-trap registry keeps the un-keyed
+/// [`ir_method_memo_hash`] on purpose: the runtime looks it up for frames of
+/// code that is already installed.
+fn ir_refusal_memo_key(
+    ir_method_hash: u64,
+    class_id: cratonvm_types::ClassId,
+    redefine_epoch: u32,
+) -> u64 {
     let mut h = FxHasher::default();
     h.write_u64(ir_method_hash);
+    h.write_u32(class_id.as_u32());
     h.write_u32(redefine_epoch);
     h.finish()
 }
@@ -20887,10 +21169,15 @@ fn ir_refusal_memo_key(ir_method_hash: u64, redefine_epoch: u32) -> u64 {
 /// exhaustive loops (osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md).
 ///
 /// Consumes the thread-local site, like `try_compile`'s own recorder.
-pub fn mark_jit_bail_listed_with_site(class_name: &str, method_name: &str, descriptor: &str) {
-    mark_jit_bail_listed(class_name, method_name, descriptor);
+pub fn mark_jit_bail_listed_with_site(
+    class_id: cratonvm_types::ClassId,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) {
+    mark_jit_bail_listed(class_id, class_name, method_name, descriptor);
     let site = take_jit_bail_site().unwrap_or((take_jit_pipeline_stage(), 0, 0));
-    record_jit_bail_reason(class_name, method_name, descriptor, site);
+    record_jit_bail_reason(class_id, class_name, method_name, descriptor, site);
     if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
         eprintln!(
             "[cratonvm-jitc] OSR-bail site={} pc={} opcode={:#04x} {class_name}.{method_name}{descriptor}",
@@ -20962,13 +21249,17 @@ pub fn mark_jit_bail_listed_with_site(class_name: &str, method_name: &str, descr
 /// `HibfixComposeProbe2`: `CompletableFuture$UniCompose.tryFire` (97 716
 /// invocations) and `UniRelay.tryFire` (58 612) both retired this way, and they
 /// ARE `CompletableFuture` composition.
+///
+/// `class_id` is the loaded class the refusal is about, or `ClassId(0)` when
+/// the refusal is that no such class could be found.
 pub fn record_compile_refusal(
+    class_id: cratonvm_types::ClassId,
     class_name: &str,
     method_name: &str,
     descriptor: &str,
     why: &'static str,
 ) {
-    record_jit_bail_reason(class_name, method_name, descriptor, (why, 0, 0));
+    record_jit_bail_reason(class_id, class_name, method_name, descriptor, (why, 0, 0));
 }
 /// Diagnostic: number of methods currently bail-listed.
 pub fn jit_bail_list_size() -> usize {
@@ -20990,24 +21281,27 @@ pub fn jit_bail_list_size() -> usize {
 /// worker has moved on — so the reason has to outlive the compile. It expires
 /// with the bytecode it describes, like every other verdict.
 fn record_jit_bail_reason(
+    class_id: cratonvm_types::ClassId,
     class_name: &str,
     method_name: &str,
     descriptor: &str,
     site: (&'static str, u32, u32),
 ) {
-    write_verdicts(class_name, method_name, descriptor, |entry| {
+    write_verdicts(class_id, class_name, method_name, descriptor, |entry| {
         entry.bail_site = Some((VerdictStamp::now(false), site));
     });
 }
 
-/// The refusal site last recorded for this method, rendered for a report
-/// line, or `None` if no compile of the currently loaded bytecode bailed.
+/// The refusal site last recorded for this method of the loaded class
+/// `class_id`, rendered for a report line, or `None` if no compile of the
+/// currently loaded bytecode bailed.
 pub fn jit_bail_reason_for(
+    class_id: cratonvm_types::ClassId,
     class_name: &str,
     method_name: &str,
     descriptor: &str,
 ) -> Option<String> {
-    let site = read_verdicts(class_name, method_name, descriptor, |entry| {
+    let site = read_verdicts(class_id, class_name, method_name, descriptor, |entry| {
         entry
             .bail_site
             .filter(|(stamp, _)| stamp.is_current())
@@ -21848,12 +22142,13 @@ fn format_jit_bail_site(site: Option<(&'static str, u32, u32)>) -> String {
 /// body that refused to OSR-enter at `entry_pc`. Checked before re-running the
 /// OSR pipeline.
 pub fn is_osr_entry_rejected(
+    class_id: cratonvm_types::ClassId,
     class_name: &str,
     method_name: &str,
     descriptor: &str,
     entry_pc: usize,
 ) -> bool {
-    read_verdicts(class_name, method_name, descriptor, |entry| {
+    read_verdicts(class_id, class_name, method_name, descriptor, |entry| {
         entry
             .osr_rejects
             .iter()
@@ -21868,18 +22163,20 @@ pub fn is_osr_entry_rejected(
 /// use [`mark_osr_entry_rejected_by`], which also lets the memo expire when the
 /// refusal depended on compile-time state.
 pub fn mark_osr_entry_rejected(
+    class_id: cratonvm_types::ClassId,
     class_name: &str,
     method_name: &str,
     descriptor: &str,
     entry_pc: usize,
 ) {
-    record_osr_entry_reject(class_name, method_name, descriptor, entry_pc, false);
+    record_osr_entry_reject(class_id, class_name, method_name, descriptor, entry_pc, false);
 }
 
 /// [`mark_osr_entry_rejected`] for a refusal the compiler explained. A refusal
 /// in [`OSR_COMPILE_STATE_REFUSAL_TAGS`] is stamped with the JIT install epoch
 /// and stops counting when that moves.
 pub fn mark_osr_entry_rejected_by(
+    class_id: cratonvm_types::ClassId,
     class_name: &str,
     method_name: &str,
     descriptor: &str,
@@ -21887,6 +22184,7 @@ pub fn mark_osr_entry_rejected_by(
     refusal: &bailout::Bailout,
 ) {
     record_osr_entry_reject(
+        class_id,
         class_name,
         method_name,
         descriptor,
@@ -21896,13 +22194,14 @@ pub fn mark_osr_entry_rejected_by(
 }
 
 fn record_osr_entry_reject(
+    class_id: cratonvm_types::ClassId,
     class_name: &str,
     method_name: &str,
     descriptor: &str,
     entry_pc: usize,
     depends_on_compile_state: bool,
 ) {
-    write_verdicts(class_name, method_name, descriptor, |entry| {
+    write_verdicts(class_id, class_name, method_name, descriptor, |entry| {
         let stamp = VerdictStamp::now(depends_on_compile_state);
         match entry.osr_rejects.iter_mut().find(|(pc, _)| *pc == entry_pc) {
             Some(slot) => slot.1 = stamp,
@@ -24182,6 +24481,9 @@ pub fn try_compile(
         None,
         // No VM, so no per-VM de-spec registry: nothing is de-spec'd.
         None,
+        // No VM method resolution: `Atomic*` intrinsics match the exact
+        // constant-pool class only.
+        None,
     )
 }
 
@@ -24369,6 +24671,15 @@ pub fn try_compile_with_invokespecial_resolver(
     // 2026-09-12, which let one VM's despeculation verdicts strip speculations
     // from every other VM's compiles. `None` (no VM in scope) consults nothing.
     despec: Option<&std::sync::Arc<crate::deopt::DespecRegistry>>,
+    // Review #80: maps an invoke constant-pool index to the name of the class
+    // that DECLARES the method the site resolves to. It sits beside
+    // `cp_invokespecial_owner_resolver` but asks a different question: that one
+    // answers only when a site binds statically (a private or final owner that
+    // no native screen refuses). This one answers for any resolvable
+    // `Methodref`. Consumed by the ATOMIC_INT / ATOMIC_LONG registration, so a
+    // `Counter extends AtomicInteger` site can reach the intrinsic. `None`
+    // keeps the exact constant-pool class match.
+    cp_invoke_declaring_class_resolver: Option<&dyn Fn(u16) -> Option<String>>,
 ) -> Option<CompiledMethod> {
     // The admission gate. Four checks and two side effects, all of which used
     // to live inline here and NONE of which the other two backend doors (the
@@ -24386,6 +24697,7 @@ pub fn try_compile_with_invokespecial_resolver(
     // scan/IR/lowering work per re-attempt (every 2000 invocations
     // under the default interpreter warmup gate).
     let admission = match compile_gate::admit(
+        cached.declaring_class_id,
         &cached.class_name,
         &cached.method_name,
         &cached.method_descriptor,
@@ -24486,6 +24798,7 @@ pub fn try_compile_with_invokespecial_resolver(
         jdk_only,
         intrinsic_resolver,
         despec,
+        cp_invoke_declaring_class_resolver,
     );
 
     // ── The compiled-local-handler safety net ───────────────────────────
@@ -24542,6 +24855,7 @@ pub fn try_compile_with_invokespecial_resolver(
                 jdk_only,
                 intrinsic_resolver,
                 despec,
+                cp_invoke_declaring_class_resolver,
             );
             backend_attempted |= retry_backend_attempted;
             if retried.is_some() && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
@@ -24684,6 +24998,7 @@ pub fn try_compile_with_invokespecial_resolver(
         // permanent.  Future try_compile calls for this method
         // short-circuit immediately at the check above.
         mark_jit_bail_listed(
+            cached.declaring_class_id,
             &cached.class_name,
             &cached.method_name,
             &cached.method_descriptor,
@@ -24692,6 +25007,7 @@ pub fn try_compile_with_invokespecial_resolver(
     if result.is_none() {
         if let Some(site) = site {
             record_jit_bail_reason(
+                cached.declaring_class_id,
                 &cached.class_name,
                 &cached.method_name,
                 &cached.method_descriptor,
@@ -25978,6 +26294,9 @@ fn try_compile_inner(
     // The compiling VM's per-bci de-spec registry — see the same parameter on
     // `try_compile_with_invokespecial_resolver`. `None` consults nothing.
     despec: Option<&std::sync::Arc<crate::deopt::DespecRegistry>>,
+    // Review #80: the declaring class of each invoke's resolved method — see
+    // the same parameter on `try_compile_with_invokespecial_resolver`.
+    cp_invoke_declaring_class_resolver: Option<&dyn Fn(u16) -> Option<String>>,
 ) -> Option<CompiledMethod> {
     // One compile, one verdict: the fall-through signal describes THIS call.
     reset_ir_fall_through_signal();
@@ -26548,10 +26867,12 @@ fn try_compile_inner(
         &cached.method_descriptor,
         cratonvm_types::ClassId::new(0),
     );
-    // The refusal memo is keyed per redefine epoch, so a verdict about replaced
-    // bytecode does not skip the new body's IR attempt. See
+    // The refusal memo is keyed per declaring class identity and per redefine
+    // epoch, so neither a same-named class in another loader nor a verdict
+    // about replaced bytecode skips this body's IR attempt. See
     // `ir_refusal_memo_key`.
-    let ir_refusal_key = ir_refusal_memo_key(ir_method_hash, redefine_epoch());
+    let ir_refusal_key =
+        ir_refusal_memo_key(ir_method_hash, cached.declaring_class_id, redefine_epoch());
     let ir_refused_before = ir_evidence::method_already_refused(ir_refusal_key);
     if ir_refused_before {
         ir_evidence::note_memo_skip();
@@ -31838,18 +32159,22 @@ fn try_compile_inner(
                 // without one the site must keep ordinary dispatch (which runs
                 // any subclass override).
                 //
-                // Matched on the constant-pool class only (review #80): a
-                // `Counter extends AtomicInteger` site would need the class that
-                // DECLARES the resolved method, which no resolver handed to
-                // `try_compile` supplies. `try_resolve_atomic_intrinsic_for_site`
-                // takes that answer; wiring it needs a hook such as
-                // `Fn(u16) -> Option<String>` (cp index -> declaring class of the
-                // resolved method), analogous to `cp_invokespecial_owner_resolver`.
-                if let Some((entry, num_params, ret, guard_class_id)) = cp_invoke_class_id_resolver
-                    .and_then(|r| r(cp_idx))
-                    .and_then(|cid| {
-                        try_resolve_atomic_intrinsic(&class_name, &method_name, &descriptor, cid)
-                    })
+                // A site naming a subclass (`Counter extends AtomicInteger`,
+                // review #80) matches through the class that DECLARES the
+                // resolved method, which `cp_invoke_declaring_class_resolver`
+                // supplies, and only for a method `final` in the JDK. The guard
+                // is the site's own class id. See
+                // `atomic_intrinsic_for_invoke_site`.
+                if let Some((entry, num_params, ret, guard_class_id)) =
+                    atomic_intrinsic_for_invoke_site(
+                        "java/util/concurrent/atomic/AtomicInteger",
+                        cp_idx,
+                        &class_name,
+                        &method_name,
+                        &descriptor,
+                        cp_invoke_class_id_resolver,
+                        cp_invoke_declaring_class_resolver,
+                    )
                 {
                     needs_heap = true;
                     direct_calls.push((
@@ -31870,17 +32195,18 @@ fn try_compile_inner(
                 // The 64-bit twin, on exactly the same terms: registered only
                 // with a resolved receiver class id, because `AtomicLong` is
                 // not final and a subclass override must keep ordinary
-                // dispatch.
-                if let Some((entry, num_params, ret, guard_class_id)) = cp_invoke_class_id_resolver
-                    .and_then(|r| r(cp_idx))
-                    .and_then(|cid| {
-                        try_resolve_atomic_long_intrinsic(
-                            &class_name,
-                            &method_name,
-                            &descriptor,
-                            cid,
-                        )
-                    })
+                // dispatch. Subclass sites match through the declaring class,
+                // as above.
+                if let Some((entry, num_params, ret, guard_class_id)) =
+                    atomic_intrinsic_for_invoke_site(
+                        "java/util/concurrent/atomic/AtomicLong",
+                        cp_idx,
+                        &class_name,
+                        &method_name,
+                        &descriptor,
+                        cp_invoke_class_id_resolver,
+                        cp_invoke_declaring_class_resolver,
+                    )
                 {
                     needs_heap = true;
                     direct_calls.push((
@@ -38705,22 +39031,23 @@ mod tests {
     #[test]
     fn jit_verdicts_are_cleared_with_their_class_and_expire_with_their_epoch() {
         let class = "craton/test/VerdictClearing";
-        mark_jit_bail_listed(class, "bailed", "()V");
-        record_compile_refusal(class, "bailed", "()V", "test-refusal");
-        mark_osr_entry_rejected(class, "loop", "()V", 12);
-        assert!(is_jit_bail_listed(class, "bailed", "()V"));
-        assert!(jit_bail_reason_for(class, "bailed", "()V").is_some());
-        assert!(is_osr_entry_rejected(class, "loop", "()V", 12));
-        assert!(!is_osr_entry_rejected(class, "loop", "()V", 13), "per pc");
+        let id = cratonvm_types::ClassId::new(0);
+        mark_jit_bail_listed(id, class, "bailed", "()V");
+        record_compile_refusal(id, class, "bailed", "()V", "test-refusal");
+        mark_osr_entry_rejected(id, class, "loop", "()V", 12);
+        assert!(is_jit_bail_listed(id, class, "bailed", "()V"));
+        assert!(jit_bail_reason_for(id, class, "bailed", "()V").is_some());
+        assert!(is_osr_entry_rejected(id, class, "loop", "()V", 12));
+        assert!(!is_osr_entry_rejected(id, class, "loop", "()V", 13), "per pc");
         assert!(
-            !is_jit_bail_listed(class, "notBailed", "()V"),
+            !is_jit_bail_listed(id, class, "notBailed", "()V"),
             "a verdict is looked up by its exact names"
         );
 
-        assert_eq!(forget_jit_verdicts_for_class(class), 2);
-        assert!(!is_jit_bail_listed(class, "bailed", "()V"));
-        assert!(jit_bail_reason_for(class, "bailed", "()V").is_none());
-        assert!(!is_osr_entry_rejected(class, "loop", "()V", 12));
+        assert_eq!(forget_jit_verdicts_for_class(id, class), 2);
+        assert!(!is_jit_bail_listed(id, class, "bailed", "()V"));
+        assert!(jit_bail_reason_for(id, class, "bailed", "()V").is_none());
+        assert!(!is_osr_entry_rejected(id, class, "loop", "()V", 12));
 
         // Epoch expiry, checked on the stamp itself: bumping the real epochs
         // would expire every other test's verdicts in this binary.
@@ -38742,6 +39069,77 @@ mod tests {
         assert!(
             !about_compile_state.is_current_at(3, 101),
             "a compile-state verdict expires with the install epoch"
+        );
+    }
+
+    /// Two same-named classes in different loaders keep separate verdicts, and
+    /// forgetting one class's verdicts leaves the other's alone.
+    #[test]
+    fn same_named_classes_with_different_ids_keep_separate_verdicts() {
+        let class = "craton/test/VerdictPerLoader";
+        // Ids far above anything a unit test's fixtures allocate, so a forget
+        // by id cannot reach another test's entries.
+        let app = cratonvm_types::ClassId::new(0x7A00_0001);
+        let plugin = cratonvm_types::ClassId::new(0x7A00_0002);
+        let no_id = cratonvm_types::ClassId::new(0);
+
+        mark_jit_bail_listed(app, class, "m", "()V");
+        record_compile_refusal(app, class, "m", "()V", "test-refusal");
+        mark_osr_entry_rejected(app, class, "loop", "()V", 7);
+        assert!(is_jit_bail_listed(app, class, "m", "()V"));
+        assert!(jit_bail_reason_for(app, class, "m", "()V").is_some());
+        assert!(is_osr_entry_rejected(app, class, "loop", "()V", 7));
+        assert!(
+            !is_jit_bail_listed(plugin, class, "m", "()V"),
+            "one loader's bail-list verdict must not refuse the other loader's class"
+        );
+        assert!(jit_bail_reason_for(plugin, class, "m", "()V").is_none());
+        assert!(!is_osr_entry_rejected(plugin, class, "loop", "()V", 7));
+        assert!(
+            !is_jit_bail_listed(no_id, class, "m", "()V"),
+            "an id-less lookup does not see an identified class's verdict"
+        );
+
+        mark_jit_bail_listed(plugin, class, "other", "()V");
+        mark_osr_entry_rejected(plugin, class, "loop", "()V", 9);
+
+        // Forgetting the app's class drops its two methods' entries only.
+        assert_eq!(forget_jit_verdicts_for_class(app, class), 2);
+        assert!(!is_jit_bail_listed(app, class, "m", "()V"));
+        assert!(jit_bail_reason_for(app, class, "m", "()V").is_none());
+        assert!(!is_osr_entry_rejected(app, class, "loop", "()V", 7));
+        assert!(
+            is_jit_bail_listed(plugin, class, "other", "()V"),
+            "forgetting one loader's class must leave the other's verdicts"
+        );
+        assert!(is_osr_entry_rejected(plugin, class, "loop", "()V", 9));
+
+        // An id-less forget falls back to the name and errs towards forgetting.
+        assert_eq!(forget_jit_verdicts_for_class(no_id, class), 2);
+        assert!(!is_jit_bail_listed(plugin, class, "other", "()V"));
+        assert!(!is_osr_entry_rejected(plugin, class, "loop", "()V", 9));
+    }
+
+    /// The IR refusal memo is per declaring class identity as well as per
+    /// redefine epoch.
+    #[test]
+    fn the_ir_refusal_memo_key_separates_same_named_classes() {
+        let hash = ir_method_memo_hash("craton/test/IrMemoPerLoader", "m", "()V");
+        let app = cratonvm_types::ClassId::new(11);
+        let plugin = cratonvm_types::ClassId::new(12);
+        assert_ne!(
+            ir_refusal_memo_key(hash, app, 0),
+            ir_refusal_memo_key(hash, plugin, 0),
+            "the class id is part of the key"
+        );
+        assert_ne!(
+            ir_refusal_memo_key(hash, app, 0),
+            ir_refusal_memo_key(hash, app, 1),
+            "the redefine epoch is part of the key"
+        );
+        assert_eq!(
+            ir_refusal_memo_key(hash, app, 3),
+            ir_refusal_memo_key(hash, app, 3)
         );
     }
 

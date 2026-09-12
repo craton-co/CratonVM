@@ -24320,7 +24320,7 @@ impl DeoptimizationController {
         if action == cratonvm_jit::deopt::DeoptAction::MakeNotCompilable {
             let mut skip = vm.jit.jit_skip_set.write();
             skip.insert((class_name.into(), method_name.into(), descriptor.into()));
-            cratonvm_jit::mark_jit_bail_listed(class_name, method_name, descriptor);
+            cratonvm_jit::mark_jit_bail_listed(class_id, class_name, method_name, descriptor);
         }
 
         // deopt-osr Step 9 follow-up (b): eager recompile re-queue. On a
