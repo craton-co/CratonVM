@@ -4546,6 +4546,38 @@ mod tests {
         assert_eq!(d.idom(5), None, "nor does an out-of-range index");
     }
 
+    // ── The sink pass's answers around unreachable blocks, pinned ────────
+
+    /// What the sink pass's common-dominator query answers when a use sits in
+    /// a block the entry does not reach.
+    ///
+    /// In this model every block dominates an unreachable one, so an
+    /// unreachable use constrains nothing. When EVERY use is unreachable,
+    /// every block qualifies, and the "deeper wins" rule settles on the
+    /// highest-numbered unreachable block. The block scan that answered this
+    /// was replaced by a dominator-tree walk; these are the answers the walk
+    /// must keep.
+    #[test]
+    fn sink_common_dominator_treats_an_unreachable_use_as_dominated_by_every_block() {
+        // 0 -> 1 -> 2 is reachable; 3 -> 4 is not.
+        let blocks = cfg(5, &[(0, 1), (1, 2), (3, 4)]);
+        let dom = Dominators::compute(&blocks);
+        for a in 0..5 {
+            assert!(dom.dominates(a, 3), "{a} must dominate the unreachable 3");
+            assert!(dom.dominates(a, 4), "{a} must dominate the unreachable 4");
+        }
+        assert!(!dom.dominates(3, 1), "an unreachable block dominates no reachable one");
+
+        // Every use unreachable: the last unreachable block.
+        assert_eq!(deepest_common_dominator(&dom, &[3], 5), Some(4));
+        assert_eq!(deepest_common_dominator(&dom, &[4, 3], 5), Some(4));
+        // A reachable use decides on its own.
+        assert_eq!(deepest_common_dominator(&dom, &[2, 3], 5), Some(2));
+        assert_eq!(deepest_common_dominator(&dom, &[1, 2, 4], 5), Some(1));
+        // No block dominates an out-of-range use.
+        assert_eq!(deepest_common_dominator(&dom, &[2, 9], 5), None);
+    }
+
     // ── Step 4 placement order ───────────────────────────────────────────
 
     /// An old node rewired to read a NEWER one is placed where that input is
