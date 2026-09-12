@@ -11711,13 +11711,12 @@ impl Compiler {
                         // intrinsics (Phase 4c). Both classes hold a single
                         // `private int crc` at instance field slot 0 — the
                         // running (uncomplemented) CRC state — see
-                        // crc_layout_contract.md. The four
-                        // sentinels handled here:
+                        // crc_layout_contract.md. The two
+                        // sentinels handled here (the IEEE `CRC32` variants
+                        // were never registered and were deleted 2026-09-12):
                         //
                         //   Crc32cUpdateByte  : CRC32C.update(I)V
                         //   Crc32cUpdateBytes : CRC32C.update([BII)V
-                        //   Crc32UpdateByte   : CRC32.update(I)V
-                        //   Crc32UpdateBytes  : CRC32.update([BII)V
                         //
                         // Every variant:
                         //   1. pops the operand stack (receiver is the
@@ -11747,18 +11746,12 @@ impl Compiler {
                         {
                             let crc32c_byte = crate::JitIntrinsic::Crc32cUpdateByte.as_entry();
                             let crc32c_bytes = crate::JitIntrinsic::Crc32cUpdateBytes.as_entry();
-                            let crc32_byte = crate::JitIntrinsic::Crc32UpdateByte.as_entry();
-                            let crc32_bytes = crate::JitIntrinsic::Crc32UpdateBytes.as_entry();
                             let is_crc32c =
                                 callee_entry == crc32c_byte || callee_entry == crc32c_bytes;
-                            let is_crc32_ieee =
-                                callee_entry == crc32_byte || callee_entry == crc32_bytes;
-                            let is_byte_form =
-                                callee_entry == crc32c_byte || callee_entry == crc32_byte;
-                            let is_bytes_form =
-                                callee_entry == crc32c_bytes || callee_entry == crc32_bytes;
+                            let is_byte_form = callee_entry == crc32c_byte;
+                            let is_bytes_form = callee_entry == crc32c_bytes;
 
-                            if is_crc32c || is_crc32_ieee {
+                            if is_crc32c {
                                 // The matcher only registers a CRC32 family
                                 // intrinsic with a resolved class id (it
                                 // skips registration when guard_class_id
@@ -11769,11 +11762,6 @@ impl Compiler {
                                     "CRC32 intrinsic reached codegen without a guard class id",
                                 );
 
-                                // Reflected polynomial for the IEEE bit loop.
-                                // Castagnoli uses the hardware instruction,
-                                // so this constant is only consumed when
-                                // `is_crc32_ieee`.
-                                const CRC32_IEEE_REVERSED_POLY: u32 = 0xEDB8_8320;
                                 // Instance field cell for the `int crc` at
                                 // slot 0: HEADER_SIZE + 0*SLOT_SIZE, then the
                                 // tag word at +0 and the 32-bit payload at
@@ -11880,11 +11868,6 @@ impl Compiler {
                                 // folding helper consumes the former, so the
                                 // CRC32 path complements on either side.
                                 self.emit_mov_r32_mem_disp32(RCX, RAX, pay_off);
-                                if is_crc32_ieee {
-                                    // NOT ECX — public CRC32 value -> running
-                                    // reflected-CRC state before the fold.
-                                    self.buf.emit(&[0xF7, 0xD1]);
-                                }
 
                                 if is_byte_form {
                                     // --- update(I)V: fold one byte ---
@@ -11892,14 +11875,10 @@ impl Compiler {
                                     self.emit_load_local(RDX, s_a);
                                     // MOVZX EDX, DL  (0F B6 D2) — low 8 bits.
                                     self.buf.emit(&[0x0F, 0xB6, 0xD2]);
-                                    if is_crc32c {
-                                        // CRC32 ECX, DL — hardware Castagnoli
-                                        // fold of one byte. F2 0F 38 F0 /r,
-                                        // ModRM 0xCA = reg=ECX rm=EDX(=DL).
-                                        self.buf.emit(&[0xF2, 0x0F, 0x38, 0xF0, 0xCA]);
-                                    } else {
-                                        self.emit_crc32_ieee_fold_byte(CRC32_IEEE_REVERSED_POLY);
-                                    }
+                                    // CRC32 ECX, DL — hardware Castagnoli
+                                    // fold of one byte. F2 0F 38 F0 /r,
+                                    // ModRM 0xCA = reg=ECX rm=EDX(=DL).
+                                    self.buf.emit(&[0xF2, 0x0F, 0x38, 0xF0, 0xCA]);
                                 } else {
                                     // --- update([BII)V: fold a range ---
                                     // Guards (all bail to the deopt stub,
@@ -11955,41 +11934,24 @@ impl Compiler {
                                     let loop_label = self.buf.pos();
                                     self.buf.emit(&[0x4D, 0x39, 0xD9]); // CMP R9,R11
                                     let done_patch = self.emit_jcc_rel32_patch(0x8D); // JGE
-                                    if is_crc32c {
-                                        // EAX = byte = arr[R9].
-                                        // MOVZX EAX, BYTE [R8 + R9 + HDR]
-                                        //   43 0F B6 44 08 dd
-                                        //   (REX.X for R9 index, REX.B for
-                                        //    R8 base → 0x43; SIB scale=1).
-                                        self.buf.emit(&[
-                                            0x43,
-                                            0x0F,
-                                            0xB6,
-                                            0x44,
-                                            0x08,
-                                            // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
-                                            HEADER_SIZE as u8,
-                                        ]);
-                                        // CRC32 ECX, AL — hardware Castagnoli
-                                        // fold. F2 0F 38 F0 /r, ModRM 0xC8 =
-                                        // reg=ECX rm=EAX(=AL).
-                                        self.buf.emit(&[0xF2, 0x0F, 0x38, 0xF0, 0xC8]);
-                                    } else {
-                                        // EDX = byte = arr[R9] — the IEEE
-                                        // bit loop consumes the byte in EDX.
-                                        // MOVZX EDX, BYTE [R8 + R9 + HDR]
-                                        //   43 0F B6 54 08 dd
-                                        self.buf.emit(&[
-                                            0x43,
-                                            0x0F,
-                                            0xB6,
-                                            0x54,
-                                            0x08,
-                                            // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
-                                            HEADER_SIZE as u8,
-                                        ]);
-                                        self.emit_crc32_ieee_fold_byte(CRC32_IEEE_REVERSED_POLY);
-                                    }
+                                    // EAX = byte = arr[R9].
+                                    // MOVZX EAX, BYTE [R8 + R9 + HDR]
+                                    //   43 0F B6 44 08 dd
+                                    //   (REX.X for R9 index, REX.B for
+                                    //    R8 base → 0x43; SIB scale=1).
+                                    self.buf.emit(&[
+                                        0x43,
+                                        0x0F,
+                                        0xB6,
+                                        0x44,
+                                        0x08,
+                                        // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
+                                        HEADER_SIZE as u8,
+                                    ]);
+                                    // CRC32 ECX, AL — hardware Castagnoli
+                                    // fold. F2 0F 38 F0 /r, ModRM 0xC8 =
+                                    // reg=ECX rm=EAX(=AL).
+                                    self.buf.emit(&[0xF2, 0x0F, 0x38, 0xF0, 0xC8]);
                                     // INC R9 ; JMP .loop
                                     self.buf.emit(&[0x49, 0xFF, 0xC1]); // INC R9
                                     self.buf.emit_byte(0xE9); // JMP rel32
@@ -12004,11 +11966,6 @@ impl Compiler {
                                     self.patch_rel32_to_here(done_patch);
                                 }
 
-                                if is_crc32_ieee {
-                                    // NOT ECX — running reflected-CRC state
-                                    // back to real JDK CRC32's public value.
-                                    self.buf.emit(&[0xF7, 0xD1]);
-                                }
 
                                 // --- write CRC state back to slot 0 ---
                                 // RAX = receiver again (reload — RAX was

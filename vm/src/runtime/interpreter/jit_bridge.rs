@@ -9380,12 +9380,25 @@ pub fn supersede_census() -> (u64, u64, u64) {
 
 pub(super) fn fetch_osr_compile_inputs(
     shared: &SharedVm,
+    class_id: ClassId,
     class_name: &str,
     method_name: &str,
     descriptor: &str,
 ) -> Option<(ClassId, std::sync::Arc<[u8]>, u16)> {
     let cm = shared.classes.class_manager.read();
-    let class_id = cm.get_loaded_class_id(class_name)?;
+    // The task's own class identity first: resolving by name alone returns
+    // `None` when two loaders define the name, and would otherwise compile
+    // whichever copy the name lookup picked. The name is the fallback for a
+    // key built without an id.
+    let class_id = if class_id.as_u32() != 0
+        && cm
+            .get_class(class_id)
+            .is_some_and(|class| class.name.as_ref() == class_name)
+    {
+        class_id
+    } else {
+        cm.get_loaded_class_id(class_name)?
+    };
     let class = cm.get_class(class_id)?;
     let method = class
         .methods
@@ -9417,7 +9430,7 @@ pub(super) fn promote_scalar_selfrec_to_ir(
     key: &crate::jit::tiered::MethodKey,
 ) -> bool {
     let Some((class_id, padded, _)) =
-        fetch_osr_compile_inputs(shared, &key.class_name, &key.method_name, &key.descriptor)
+        fetch_osr_compile_inputs(shared, key.class_id, &key.class_name, &key.method_name, &key.descriptor)
     else {
         return false;
     };
@@ -9487,7 +9500,11 @@ pub(super) fn background_compile_task(
         // about this method. Charge it to neither counter.
         None => return fail(0),
     };
-    if named_class_was_redefined(&shared, &task.method_key.class_name) {
+    if crate::runtime::redefine_state::class_id_or_name_was_redefined(
+        &shared,
+        task.method_key.class_id.as_u32(),
+        &task.method_key.class_name,
+    ) {
         // A retransformed target remains interpreted for now. This is a
         // per-class decline; unrelated background tasks continue compiling.
         return declined(0);
@@ -9533,6 +9550,7 @@ pub(super) fn background_compile_task(
         let start = std::time::Instant::now();
         let published = if let Some((class_id, padded, max_locals)) = fetch_osr_compile_inputs(
             &shared,
+            task.method_key.class_id,
             &task.method_key.class_name,
             &task.method_key.method_name,
             &task.method_key.descriptor,
@@ -9642,6 +9660,7 @@ pub(super) fn background_compile_task(
         .then(|| {
             let (class_id, _, _) = fetch_osr_compile_inputs(
                 &shared,
+                task.method_key.class_id,
                 &task.method_key.class_name,
                 &task.method_key.method_name,
                 &task.method_key.descriptor,
@@ -9727,6 +9746,7 @@ pub(super) fn background_compile_task(
             let jit_cache = shared.jit.jit_cache.read();
             fetch_osr_compile_inputs(
                 &shared,
+                task.method_key.class_id,
                 &task.method_key.class_name,
                 &task.method_key.method_name,
                 &task.method_key.descriptor,
@@ -9835,6 +9855,7 @@ pub(super) fn background_compile_task(
         && crate::runtime::env_cache::c2_supersede()
         && fetch_osr_compile_inputs(
             &shared,
+            task.method_key.class_id,
             &task.method_key.class_name,
             &task.method_key.method_name,
             &task.method_key.descriptor,

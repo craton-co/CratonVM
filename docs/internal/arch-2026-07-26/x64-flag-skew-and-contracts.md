@@ -462,6 +462,10 @@ Totals: **35** `HEADER_SIZE` disp8 sites, **13** `HEADER_SIZE` disp32 sites, **1
 compile-time-arithmetic uses, **30** `ARRAY_LENGTH_OFFSET` sites, **23** other named
 header-offset sites. **118 sites** in this file.
 
+2026-09-12: the raw `HEADER_SIZE as u8` total fell 22 -> 21. The IEEE `CRC32` range fold in
+`bytecode_walk.rs` was deleted along with the intrinsic variants that were never registered, and
+its `byte[]` element load was one of these sites.
+
 2026-09-02: the raw-narrowing row fell 23 -> 22 and the checked row appeared. The array
 bounds check's length load moved from the fast path into its cold stub — the fast path is
 now `CMP ECX, [RAX+len]`, one instruction and four bytes fewer on **every** emitted bounds

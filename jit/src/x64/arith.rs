@@ -1372,48 +1372,6 @@ impl Compiler {
         self.buf.emit(&[0x63, 0xC0]);
     }
 
-    /// Emit the CRC-32 (reflected) inner fold of ONE byte for the
-    /// `java.util.zip.CRC32` intrinsic — IEEE 802.3, which the hardware
-    /// `CRC32` instruction (Castagnoli) cannot compute.
-    ///
-    /// Contract:
-    ///   * `ECX` holds the running (uncomplemented) CRC state — read and
-    ///     overwritten with the folded result.
-    ///   * `EDX` holds the input byte; the caller MUST have zero-extended it
-    ///     (a `MOVZX r32, m8`), so `EDX[31:8] == 0`. `EDX` is consumed.
-    ///   * `EAX` is used as scratch and clobbered.
-    ///
-    /// No other register is touched — in particular the `update([BII)V`
-    /// loop's index (`R9`), end (`R11`) and array base (`R8`) are preserved.
-    /// No memory is accessed and no `CALL` is emitted (roadmap §8).
-    ///
-    /// The folded value is bit-identical to `native-builtins/src/zip_real.rs`
-    /// `crc32_step` / the branchless reflected-CRC step: for each of the 8
-    /// bits, `mask = -(crc & 1)` then `crc = (crc >> 1) ^ (poly & mask)`.
-    /// `poly` is the reflected IEEE polynomial `0xEDB88320`.
-    pub(super) fn emit_crc32_ieee_fold_byte(&mut self, reversed_poly: u32) {
-        // crc ^= byte:  XOR ECX, EDX  (31 D1).
-        self.buf.emit(&[0x31, 0xD1]);
-        // Eight identical reflected-CRC bit steps. Unrolled (a fixed count)
-        // so the loop body has no branch and no loop counter register.
-        for _ in 0..8 {
-            // EAX = ECX:        MOV EAX, ECX        (89 C8)
-            self.buf.emit(&[0x89, 0xC8]);
-            // EAX &= 1:         AND EAX, 1          (83 E0 01)
-            self.buf.emit(&[0x83, 0xE0, 0x01]);
-            // EAX = -EAX:       NEG EAX             (F7 D8)
-            //   → mask is 0xFFFFFFFF iff the low bit was set, else 0.
-            self.buf.emit(&[0xF7, 0xD8]);
-            // ECX >>= 1 (logical):  SHR ECX, 1      (D1 E9)
-            self.buf.emit(&[0xD1, 0xE9]);
-            // EAX &= reversed_poly:  AND EAX, imm32 (25 imm32)
-            self.buf.emit_byte(0x25);
-            self.buf.emit(&reversed_poly.to_le_bytes());
-            // ECX ^= EAX:       XOR ECX, EAX        (31 C1)
-            self.buf.emit(&[0x31, 0xC1]);
-        }
-    }
-
     /// Emit a JVMS-compliant signed integer division or remainder.
     ///
     /// Assumes the dividend is in RAX and the divisor in RCX. Leaves the

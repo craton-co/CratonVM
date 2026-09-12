@@ -11094,14 +11094,12 @@ pub enum JitIntrinsic {
     //   * Crc32cUpdate* — Castagnoli CRC-32C (reflected poly 0x82F63B78).
     //     Emitted with the hardware `CRC32` instruction, which computes
     //     exactly this polynomial. Gated on `x64::has_sse42()`.
-    //   * Crc32Update* — IEEE 802.3 CRC-32 (reflected poly 0xEDB88320). The
-    //     hardware `CRC32` instruction is the WRONG polynomial, so these emit
-    //     a tight inline reflected-CRC bit loop (8 shifts/byte, no table, no
-    //     CALL) — the exact algorithm of `crc32_step` / `crc32c_step`.
+    //   * The IEEE `CRC32` class has no variant: its matcher arm registers no
+    //     intrinsic (real JDK CRC32 keeps its public value in `crc`, not the
+    //     running state), so the variants and their bit-loop codegen were
+    //     never produced and were deleted on 2026-09-12.
     Crc32cUpdateByte,  // CRC32C.update(I)V
     Crc32cUpdateBytes, // CRC32C.update([BII)V
-    Crc32UpdateByte,   // CRC32.update(I)V
-    Crc32UpdateBytes,  // CRC32.update([BII)V
     // ===== INTRINSIC REGION END: CRC32 =====
 
     // ===== INTRINSIC REGION BEGIN: FP_BITS =====
@@ -11240,10 +11238,7 @@ impl JitIntrinsic {
     pub const fn is_crc32_family(self) -> bool {
         matches!(
             self,
-            JitIntrinsic::Crc32cUpdateByte
-                | JitIntrinsic::Crc32cUpdateBytes
-                | JitIntrinsic::Crc32UpdateByte
-                | JitIntrinsic::Crc32UpdateBytes
+            JitIntrinsic::Crc32cUpdateByte | JitIntrinsic::Crc32cUpdateBytes
         )
     }
 
@@ -11255,7 +11250,7 @@ impl JitIntrinsic {
         // The sentinel space is `usize::MAX - (variant as usize)`. The last
         // declared variant bounds the valid offset range.
         let offset = usize::MAX.checked_sub(entry)?;
-        if offset > JitIntrinsic::Crc32UpdateBytes as usize {
+        if offset > JitIntrinsic::Crc32cUpdateBytes as usize {
             return None;
         }
         // Exhaustive map — keeps this in lockstep with the enum so a new
@@ -11263,8 +11258,6 @@ impl JitIntrinsic {
         Some(match offset {
             x if x == JitIntrinsic::Crc32cUpdateByte as usize => JitIntrinsic::Crc32cUpdateByte,
             x if x == JitIntrinsic::Crc32cUpdateBytes as usize => JitIntrinsic::Crc32cUpdateBytes,
-            x if x == JitIntrinsic::Crc32UpdateByte as usize => JitIntrinsic::Crc32UpdateByte,
-            x if x == JitIntrinsic::Crc32UpdateBytes as usize => JitIntrinsic::Crc32UpdateBytes,
             // Non-CRC32 intrinsic — the resolution loop only needs CRC32
             // classification, so any other in-range sentinel is reported as
             // "not a CRC32 intrinsic" via the `is_crc32_family` check below.
@@ -32489,44 +32482,11 @@ pub fn compute_param_jvm_slots(descriptor: &str, is_static: bool) -> (Vec<usize>
         slots.push(slot);
         slot += 1; // implicit `this`
     }
-    let b = descriptor.as_bytes();
-    let mut i = 1;
-    while i < b.len() && b[i] != b')' {
+    // Every tag, an unrecognised one included, takes a slot: the hand walk
+    // this replaced counted a stray byte as one wide, and so does this.
+    for tag in DescriptorParamIter::new(descriptor) {
         slots.push(slot);
-        match b[i] {
-            b'J' | b'D' => {
-                slot += 2;
-                i += 1;
-            }
-            b'L' => {
-                slot += 1;
-                i += 1;
-                while i < b.len() && b[i] != b';' {
-                    i += 1;
-                }
-                i += 1;
-            }
-            b'[' => {
-                slot += 1;
-                i += 1;
-                while i < b.len() && b[i] == b'[' {
-                    i += 1;
-                }
-                if i < b.len() && b[i] == b'L' {
-                    i += 1;
-                    while i < b.len() && b[i] != b';' {
-                        i += 1;
-                    }
-                    i += 1;
-                } else if i < b.len() {
-                    i += 1;
-                }
-            }
-            _ => {
-                slot += 1;
-                i += 1;
-            }
-        }
+        slot += if matches!(tag, b'J' | b'D') { 2 } else { 1 };
     }
     (slots, slot)
 }
@@ -32884,43 +32844,8 @@ fn fp_in_body(code: &[u8], code_len: usize) -> bool {
 /// off the FP IR path (a follow-on). Mirrors `method_uses_double`'s descriptor
 /// walk but matches both `F` and `D`.
 fn fp_in_descriptor(descriptor: &str) -> bool {
-    let b = descriptor.as_bytes();
-    let mut i = 1;
-    while i < b.len() && b[i] != b')' {
-        match b[i] {
-            b'F' | b'D' => return true,
-            b'L' => {
-                i += 1;
-                while i < b.len() && b[i] != b';' {
-                    i += 1;
-                }
-                i += 1;
-            }
-            b'[' => {
-                // Skip the whole array type — arrays are references (cat-1).
-                i += 1;
-                while i < b.len() && b[i] == b'[' {
-                    i += 1;
-                }
-                if i < b.len() && b[i] == b'L' {
-                    i += 1;
-                    while i < b.len() && b[i] != b';' {
-                        i += 1;
-                    }
-                    i += 1;
-                } else if i < b.len() {
-                    i += 1;
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    if let Some(rp) = b.iter().position(|&c| c == b')') {
-        if matches!(b.get(rp + 1), Some(b'F') | Some(b'D')) {
-            return true;
-        }
-    }
-    false
+    DescriptorParamIter::new(descriptor).any(|tag| matches!(tag, b'F' | b'D'))
+        || matches!(return_type(descriptor), b'F' | b'D')
 }
 
 /// inc 30: the method uses `float`/`double` anywhere — signature OR body. Used by
@@ -33130,55 +33055,20 @@ pub fn count_param_slots_jvm_spec(descriptor: &str) -> usize {
 /// matching JVM-spec local slot (instead of the compact-index slot
 /// `i`, which silently wrote longs into the wrong slot).
 pub fn param_spec_slot_indices(descriptor: &str) -> Vec<usize> {
-    let bytes = descriptor.as_bytes();
     let mut out = Vec::new();
-    if bytes.is_empty() || bytes[0] != b'(' {
+    if !descriptor.starts_with('(') {
         return out;
     }
-    let mut i = 1;
     let mut slot = 0usize;
-    while i < bytes.len() && bytes[i] != b')' {
-        match bytes[i] {
-            b'I' | b'F' | b'B' | b'C' | b'S' | b'Z' => {
-                out.push(slot);
-                slot += 1;
-                i += 1;
-            }
-            b'J' | b'D' => {
-                out.push(slot);
-                slot += 2;
-                i += 1;
-            }
-            b'L' => {
-                out.push(slot);
-                while i < bytes.len() && bytes[i] != b';' {
-                    i += 1;
-                }
-                i += 1;
-                slot += 1;
-            }
-            b'[' => {
-                out.push(slot);
-                i += 1;
-                while i < bytes.len() && bytes[i] == b'[' {
-                    i += 1;
-                }
-                if i < bytes.len() {
-                    if bytes[i] == b'L' {
-                        while i < bytes.len() && bytes[i] != b';' {
-                            i += 1;
-                        }
-                        i += 1;
-                    } else {
-                        i += 1;
-                    }
-                }
-                slot += 1;
-            }
-            _ => {
-                i += 1;
-            }
-        }
+    for tag in DescriptorParamIter::new(descriptor) {
+        // An unrecognised byte is skipped without a slot, as before.
+        let width = match tag {
+            b'J' | b'D' => 2,
+            b'I' | b'F' | b'B' | b'C' | b'S' | b'Z' | b'L' | b'[' => 1,
+            _ => continue,
+        };
+        out.push(slot);
+        slot += width;
     }
     out
 }
