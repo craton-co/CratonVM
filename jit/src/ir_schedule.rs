@@ -1463,18 +1463,70 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
     // relation over the block CFG and use it to pick a dominated home block,
     // falling back to the entry block (which dominates everything) when no such
     // block exists. See `find_best_block`.
+    //
+    // Inputs are placed BEFORE their users. `find_best_block` only sees inputs
+    // that already have a block, and this step used to visit nodes in id order
+    // — so an input with a HIGHER id than its user was silently ignored. Every
+    // graph the builder makes defines before it uses, but a pass that rewires
+    // an old node to a newer input does not (`reassociate_affine` is one), and
+    // the ignored input let the user land in a block the input's block does
+    // not dominate: a value read before its definition, which
+    // `verify_data_locations` then refuses. So each node is placed on the way
+    // OUT of a depth-first walk over its still-unplaced data inputs. On a graph
+    // whose inputs all have lower ids the walk never descends, and the
+    // placement — block and push order both — is exactly the id-order one.
     let dom = Dominators::compute(&blocks);
-    for (id, node) in graph.nodes.iter().enumerate() {
-        if node_to_block[id] != usize::MAX || node.op == Op::Dead {
-            continue; // already placed or dead
+    let mut entered = vec![false; num_nodes];
+    let mut walk: Vec<(NodeId, usize)> = Vec::new();
+    for root in 0..num_nodes {
+        // Already placed, dead, or a control node (a block boundary, handled
+        // above) — or placed by an earlier root's walk.
+        if entered[root] || !awaits_placement(graph, &node_to_block, root) {
+            continue;
         }
-        if node.op.is_control() {
-            continue; // control nodes are block boundaries, already handled
+        entered[root] = true;
+        walk.push((root as NodeId, 0));
+        // Iterative, like `topo_sort_block`: a long operand chain must not
+        // recurse. Each frame is a node and the index of its next input edge.
+        while let Some(&(id, cursor)) = walk.last() {
+            let node = &graph.nodes[id as usize];
+            let mut next = cursor;
+            let mut descend: Option<NodeId> = None;
+            // A phi is pinned to its merge and reads its value inputs on the
+            // incoming edges, so `find_best_block` never consults them — and
+            // following them would walk a loop's back edge into its own body.
+            if !matches!(node.op, Op::Phi) {
+                while next < node.inputs.len() {
+                    let inp = node.inputs[next];
+                    next += 1;
+                    if inp == NO_NODE {
+                        continue;
+                    }
+                    let i = inp as usize;
+                    // An input already `entered` but not yet placed is on the
+                    // walk above this frame: a cycle through non-phi data
+                    // nodes, which well-formed SSA does not have. It is left
+                    // unplaced for this user, exactly as id order left it.
+                    if i < num_nodes && !entered[i] && awaits_placement(graph, &node_to_block, i) {
+                        entered[i] = true;
+                        descend = Some(inp);
+                        break;
+                    }
+                }
+            }
+            let top = walk.len() - 1;
+            walk[top].1 = next;
+            match descend {
+                Some(inp) => walk.push((inp, 0)),
+                None => {
+                    walk.pop();
+                    // Find a block dominated by all of this node's inputs' blocks.
+                    let block = find_best_block(graph, id, &node_to_block, &blocks, &dom);
+                    node_to_block[id as usize] = block;
+                    blocks[block].nodes.push(id);
+                }
+            }
         }
-        // Find a block dominated by all of this node's inputs' blocks.
-        let block = find_best_block(graph, id as NodeId, &node_to_block, &blocks, &dom);
-        node_to_block[id] = block;
-        blocks[block].nodes.push(id as NodeId);
     }
 
     // Step 4b: Sink pure nodes out of loops they are only used outside of.
@@ -1636,6 +1688,18 @@ fn is_start(graph: &Graph, id: NodeId) -> bool {
 
 fn is_if(graph: &Graph, id: NodeId) -> bool {
     matches!(graph.nodes.get(id as usize), Some(n) if n.op == Op::If)
+}
+
+/// Does Step 4 of [`schedule_with_options`] still owe node `id` a block?
+///
+/// True for a data node — not dead, not a control node — that has no block
+/// yet: exactly the nodes that step placed when it walked ids in order. An
+/// out-of-range id is never owed anything.
+fn awaits_placement(graph: &Graph, node_to_block: &[usize], id: usize) -> bool {
+    match (graph.nodes.get(id), node_to_block.get(id)) {
+        (Some(n), Some(&b)) => b == usize::MAX && n.op != Op::Dead && !n.op.is_control(),
+        _ => false,
+    }
 }
 
 /// Compute, for every block, the set of blocks that dominate it, as the dense
@@ -4480,5 +4544,107 @@ mod tests {
         assert_eq!(d.idom(3), Some(0), "a join's idom is the branch, not an arm");
         assert_eq!(d.idom(4), None, "an unreachable block has none");
         assert_eq!(d.idom(5), None, "nor does an out-of-range index");
+    }
+
+    // ── Step 4 placement order ───────────────────────────────────────────
+
+    /// An old node rewired to read a NEWER one is placed where that input is
+    /// available, not where id order happened to leave it.
+    ///
+    /// Step 4 used to place nodes in id order, and `find_best_block` ignores
+    /// inputs that have no block yet. So `user` below — created first, then
+    /// pointed at `input` — saw only the parameter, went to the entry block,
+    /// and was emitted before the merge block that computes `input`: exactly
+    /// the def-after-use `verify_data_locations` refuses, and the shape
+    /// `reassociate_affine` leaves behind when it rewires an operand to a node
+    /// it just materialised.
+    #[test]
+    fn an_old_node_rewired_to_a_newer_input_is_placed_after_that_input() {
+        let mut g = bare_graph();
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let entry = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let p = g.add(Op::Param(0), IrType::Int, vec![], None);
+        // The OLD node, created before the value it will end up reading.
+        let user = g.add(Op::Add, IrType::Int, vec![p, p], None);
+        let if_node = g.add(Op::If, IrType::Control, vec![entry, p], Some(0));
+        let t = g.add(Op::Proj(0), IrType::Control, vec![if_node], Some(0));
+        let f = g.add(Op::Proj(1), IrType::Control, vec![if_node], Some(0));
+        let merge = g.add(Op::Merge, IrType::Control, vec![t, f], Some(1));
+        let one = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let two = g.add(Op::Const(2), IrType::Int, vec![], None);
+        let phi = g.add(Op::Phi, IrType::Int, vec![merge, one, two], Some(1));
+        // The NEW input: it reads the phi, so it can only live in the merge.
+        let input = g.add(Op::Mul, IrType::Int, vec![phi, p], Some(1));
+        assert!(g.set_input(user, 0, input), "fixture: rewire the old node");
+        let ret = g.add(Op::Return, IrType::Void, vec![merge, user], Some(2));
+        g.entry = start;
+        g.exit = ret;
+        assert!(input > user, "fixture: the input must have the higher id");
+
+        let sched = schedule(&g);
+        let merge_block = sched.node_to_block[merge as usize];
+        let input_block = sched.node_to_block[input as usize];
+        let user_block = sched.node_to_block[user as usize];
+        assert_eq!(
+            input_block, merge_block,
+            "the input is placed with the phi it reads"
+        );
+        assert!(
+            dominates(&sched.dom, input_block, user_block),
+            "the input's block {input_block} must dominate the user's block {user_block}"
+        );
+        // Emission order: blocks in index order, then position in the block.
+        let emitted_at = |id: NodeId| -> (usize, usize) {
+            let b = sched.node_to_block[id as usize];
+            let pos = sched.blocks[b]
+                .nodes
+                .iter()
+                .position(|&x| x == id)
+                .expect("a placed node is listed in its block");
+            (b, pos)
+        };
+        assert!(
+            emitted_at(input) < emitted_at(user),
+            "the input {:?} must be emitted before its user {:?}",
+            emitted_at(input),
+            emitted_at(user),
+        );
+    }
+
+    /// The input-first walk is iterative: a chain whose every link reads a
+    /// HIGHER id — the walk's worst case, 20 000 frames deep — neither
+    /// overflows the stack nor places a link before its input.
+    #[test]
+    fn input_first_placement_survives_a_long_forward_chain() {
+        let mut g = bare_graph();
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let entry = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let depth = 20_000usize;
+        // Created with a placeholder input, then each link pointed at the next.
+        let links: Vec<NodeId> = (0..depth)
+            .map(|_| g.add(Op::Neg, IrType::Int, vec![NO_NODE], None))
+            .collect();
+        let p = g.add(Op::Param(0), IrType::Int, vec![], None);
+        for k in 0..depth {
+            let target = if k + 1 < depth { links[k + 1] } else { p };
+            assert!(g.set_input(links[k], 0, target));
+        }
+        let ret = g.add(Op::Return, IrType::Void, vec![entry, links[0]], None);
+        g.entry = start;
+        g.exit = ret;
+
+        let sched = schedule_with_options(&g, &ScheduleOptions::default());
+        let b0 = sched.node_to_block[links[0] as usize];
+        let mut pos = vec![usize::MAX; g.nodes.len()];
+        for (i, &id) in sched.blocks[b0].nodes.iter().enumerate() {
+            pos[id as usize] = i;
+        }
+        for k in 0..depth - 1 {
+            assert_eq!(sched.node_to_block[links[k] as usize], b0);
+            assert!(
+                pos[links[k + 1] as usize] < pos[links[k] as usize],
+                "link {k} is listed before the link it reads"
+            );
+        }
     }
 }
