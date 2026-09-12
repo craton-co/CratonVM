@@ -502,14 +502,24 @@ floor 10,900 -> 10,600 for its own wave, and 137 rows now read:
 ```
 
 Exactly the table's row count in every column that moves, zero in the one that
-must not, and a corpus that does not move at all. 10,741 clears 10,600, so what
-this wave leaves behind is the CORRECTION rather than a second relaxation of the
-same gate in one day.
+must not, and a corpus that does not move at all.
 
-**What is left is 141 rows of headroom where the design wants ~300, so the next
-wave crosses this floor.** Every lane after this one should expect to, and the
-thing that makes lowering it safe is the paired OFF/ON measurement above --
-never the number alone, and never a re-freeze taken from one column.
+**And then the gate stopped being a level.** While this wave was landing, the
+stub-ratchet lane replaced `STRICT_MIN_TOTAL_REGISTRATIONS` with
+`STRICT_UNEXPLAINED_DROP_MAX` -- *"bound the strict registry's SHORTFALL, not
+its level: the number it guarded is designed to fall"* -- which is the same
+conclusion from the other end, and a better instrument than the correction this
+wave was going to leave behind. This wave is its confirmation:
+
+```text
+  shortfall = compatible - stubs - strict
+  OFF   13609 - 2728 - 10878 = 3
+  ON    13609 - 2865 - 10741 = 3
+```
+
+**Invariant across 137 retirements**, where the level moved by exactly 137.
+A campaign-wide quantity wants a gate on what should NOT change, not on what
+every lane is paid to reduce.
 
 ### 9.10 The residual, in the terms §9.5 uses
 

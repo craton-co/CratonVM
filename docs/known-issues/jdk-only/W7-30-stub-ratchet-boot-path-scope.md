@@ -654,3 +654,155 @@ path), and the correct end state is deleting them once the `StackWalker$Option`
 `<clinit>` registration is made conditional on the runtime mode (W7-93 §7.1).
 Re-freezing them in is right; re-freezing them in **silently** would spend the
 one signal that says so.
+
+---
+
+## 12. Third instance, 2026-09-11 — the DUMP could not attribute what the ratchet could
+
+Lane 2's wave 2 retired 50 triples under `java/lang` and `java/math`. **The
+ratchet saw it.** Measured against a binary built from `origin/dev` (`6d16472f5`,
+which sits exactly on its own baseline in all three arms), so the whole delta is
+the branch's:
+
+```text
+  arm              dev    branch   delta   total registrations
+  no-management   2547     2577     +30    13610 -> 13610
+  management      2558     2604     +46    13978 -> 13978
+  synthetic-jdk   2547     2577     +30    13645 -> 13645
+```
+
+30 added registrations in the boot arm, **0 removed**, every one a lane-2 triple,
+taken with `CRATONVM_RATCHET_ROWS=1` on both binaries and `comm`-diffed. Totals
+unmoved: case (b), exactly as the second-column rule says.
+
+**What could NOT see it is `dump_synthetic_stubs`**, which is byte-identical
+between the two binaries — 2167 rows, `comm` reporting zero either side. That is
+not a contradiction, and the reason is the finding:
+
+> The ratchet counts **registrations**; the dump prints **distinct triples**.
+> These triples are registered more than once —
+> `ExceptionInInitializerError.<init>()V` from both `lang_misc.rs` and `lib.rs`,
+> `Throwable.initCause` from both `lang_misc.rs` and `reflect_annotations.rs` —
+> one registration was already a `SyntheticStub`, and the table re-tags the
+> other. **+1 registration, +0 distinct rows.**
+
+### 12.1 So the failure message's own advice can come back empty
+
+The panic text says: *"Run `dump_synthetic_stubs` here and at the commit that
+last set `BASELINE_…`, and diff the sorted `@@STUB` lines."* For a delta of this
+shape that diff is **empty**, while the number it is meant to explain has moved
+by 30. A reader who follows the instruction and finds nothing has two readings
+available and the wrong one is more natural: *"the number moved for no reason I
+can find"*, or worse, going the other way — *"my retirement changed nothing."*
+
+Lane 2 nearly abandoned its own 50-row table on the strength of that silence, and
+only the VM disagreed: `--jdk-only-report` refusals under the two prefixes go
+**95 → 144** with zero survivors.
+
+`CRATONVM_RATCHET_ROWS=1` is the instrument that answers it — per-registration,
+keyed by registering file, so a duplicate shows up as the two rows it is. It
+existed and the failure text did not name it. §13.2 fixes that.
+
+### 12.2 Two measurement errors, and they are the reusable part
+
+Both produced confident wrong numbers, and neither was caught by the gate.
+
+**Cross-tree.** The census on `dev`'s sources was first compared against a
+`--dump-native-registry` from a binary built weeks earlier: **452** rows where
+the census said `SyntheticStub` and the VM dispatched a `Bridge`. Same-tree the
+number is **2**. A census on one tree against a registry dump from another is a
+measurement of neither.
+
+**A shared `CARGO_TARGET_DIR`.** With `/data` at 95% both arms were built into
+one target dir. The second build printed `Finished in 0.18s`, compiled nothing,
+and scored the branch with **dev's binary** — so the two trees read as identical
+and the first write-up of this section said the ratchet was blind. Cargo decides
+freshness by **mtime**, and a `git merge` writes sources OLDER than artefacts
+built after it. Every number in the table above comes from a build asserted by a
+non-zero `Compiling` count, with each binary copied out and its sha256 printed
+and differing.
+
+### 12.3 Boot census vs the registry the VM dispatches, same tree
+
+A separate and still-valid finding, both sides from one commit:
+
+| | rows |
+|---|---|
+| boot census `SyntheticStub` | 2167 |
+| registry the VM dispatches, `SyntheticStub` | 2296 |
+| agree | 2164 |
+| boot says stub, the VM dispatches a bridge | 2 |
+| **stub the VM dispatches, outside the boot census** | **132** |
+| boot stub the VM never registers | 1 |
+
+The 132 by registering file: 54 `native-awt/src/natives.rs`, 25
+`native-builtins/src/jmx.rs`, 21 `native-collections/src/lib.rs`, 15
+`phases_late/jar_manifest.rs`, 12 `native-builtins/src/lib.rs`, 2
+`classloader_real.rs`, 2 `locale_resources.rs`, 1 `vm/src/vm/vm_init.rs`.
+
+That last row is a check on the instrument, not a finding: it is
+`INLINE_SYNTHETIC_STUBS_IN_VM_INIT`, which the boot-path module declares as
+exactly **1** for `io/quarkus/bootstrap/runner/RunnerClassLoader.close()V`. An
+independent census reproducing a constant derived by reading is the cheapest
+evidence both are right.
+
+### 12.4 Fourteen of lane 2's rows are a CONFIGURATION boundary, not a scope one
+
+The management arm's delta is +46 against +30. The extra 16 are
+`java/lang/management/*` registrations — 14 distinct triples, two registered
+twice — from `jmx.rs`, the "ten jmx registrars short of shipping" that
+`MEASURED_CONFIG` names. In the no-management arm they are invisible **by
+construction**, and no widening of the boot-path replay would change it. Their
+configuration has its own constant and that is where they show.
+
+## 13. What was added, 2026-09-11
+
+Two changes, both about the silence rather than the number.
+
+### 13.1 The replay is no longer checked "by review"
+
+The boot-path module header lists, first under *"What this witness still does
+not assert"*: **"That the replay CALLS every name in `VM_INIT_SEQUENCE`. Rust
+has no reflection over a function body. The list is checked against `vm_init`;
+the replay is checked against the list by review."**
+
+Review is not a gate, and the cost of it being wrong is silence of exactly the
+kind §1 describes: a registrar named in the sequence and absent from the replay
+leaves whatever registered the triple earlier in place, so the census reports
+the kind of a row the shipping VM overwrites.
+
+`the_replay_calls_every_name_in_the_sequence` closes it. It reads this file off
+disk — the trick `vm_init_source` already plays on `vm_init.rs` — strips comment
+lines (this file names registrars in prose on purpose, and the §9 locator defect
+was a comment read as source), and asserts every sequence name is called, in the
+sequence's order. Order is asserted because registration is last-write-wins: the
+right calls in the wrong order replay a different VM.
+
+**It passes as written — 46 of 46, in order.** That is the point worth stating:
+the review had in fact held, and the assertion is here so the next merge does
+not need it to hold again. Both `RETIRED_SHADOW_TABLES` and this list were
+broken by clean `git merge`s the same week, in each case because a name is
+declared in one file and consumed in another with nothing textual joining them.
+
+### 13.2 The panic text now names an instrument that can answer it
+
+`synthetic_stub_count_does_not_regress` told a reader to attribute a delta by
+diffing `dump_synthetic_stubs`. §12.1 is a delta for which that diff is empty, so
+the instruction could send a reader away with nothing and no hint that a stronger
+tool existed. It now names `CRATONVM_RATCHET_ROWS=1` first — per-registration,
+keyed by registering file — and says in the message itself why the dump can be
+silent: it prints DISTINCT triples while the count is REGISTRATIONS.
+
+A second line, `stub-ratchet(scope):`, prints on **every** run, pass or fail. It
+carries the boot-path scope and the 132. The failure message was the wrong place
+for that: a motionless count reaches no failure message at all, which is exactly
+the case that misled lane 2.
+
+### 13.3 Not done
+
+Widening the census to the dispatched registry. §7 already nominates the shape
+— the gate moving to `vm/tests/` on a registration-only helper extracted from
+`SharedVm::new` — and §12.3 shows it would not recover lane 2's fourteen anyway,
+which are a configuration boundary rather than a scope one. The 54 `native-awt`
+and 15 `jar_manifest` rows are the ones such a move would actually buy, and
+nobody has priced them.
