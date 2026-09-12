@@ -7,7 +7,10 @@
 # jdk_version: 25.0.4
 # mode: compatible
 # workload: generated BridgeRatchetCensusProbe (boot + one println); -cp is its own directory only
-# rows: 11636
+# rows: 11611
+# rows-note: the `rows:` field above was 11636 while the file held 11633, i.e.
+#   three rows out, before the 2026-09-12 deletion amendment below touched it.
+#   Nothing enforces this field; it is set here to the real count.
 # unchosen: 0
 # note: Re-measured on the merge of fix/jdk-only-precedence-and-bridge-wave-20260811 with origin/dev b240353e1. Two independent movements: this branch (census schema 4 with hierarchy resolution, three new ratchets, and the java.util.logging shadow retirement) and dev (fc7d9c9f0 / c2391d63b / acb43cf4b, the openmbean carrier and java.io directory-open natives). Neither side baseline described the merged tree, so both were re-taken from one census here.
 # amended: 2026-08-12, W7-56-infercaller-strict.md. FIVE rows edited by hand,
@@ -293,6 +296,32 @@
 #   registration away from two of the three supported images. getUnsafe is
 #   declared on all three and is out for its own reason (the core-reflection
 #   member filter). The rows stay unedited either way; the REASON changes.
+# amended: 2026-09-12, lane 5's DELETION wave. TWENTY-TWO rows REMOVED, not
+#   edited, for nineteen triples: registrations whose method is declared by NONE
+#   of the 17, 21 and 25 images, so nothing on any supported image can dispatch
+#   them. `javap -p` on all three, with the pipeline control-checked against a
+#   name known to be there (`objectFieldOffset0`, a PRIVATE native, prints).
+#
+#     jdk/internal/misc/Unsafe  acquireFence, releaseFence, addressSize0,
+#                               isBigEndian0, unalignedAccess0,
+#                               weakCompareAndExchange{Int,Long}{,Acquire,Release},
+#                               weakCompareAndExchangeReference{,Acquire,Release},
+#                               weakCompareAndExchangeObject
+#     sun/misc/Unsafe           acquireFence, releaseFence,
+#                               compareAndExchangeObject, weakCompareAndExchangeObject
+#
+#   `compareAndExchangeObject` is removed on sun/misc ONLY. It is declared on
+#   jdk.internal.misc.Unsafe for 17 and 21 (25 renamed it to `...Reference`) and
+#   on sun.misc.Unsafe on none of the three, and one registration loop was
+#   producing both rows from a single `name` via `ends_with("Object")`.
+#
+#   THIS AMENDMENT IS DERIVED FROM THE BINARY, not from this file. The file's
+#   own answer to "which registrations does no image declare" is 29, because it
+#   still carries rows for five deleted on 2026-08-29 (getReferencePlain,
+#   putReferencePlain, monitorEnter, monitorExit, defineAnonymousClass). Those
+#   seven rows are deliberately LEFT here rather than swept up in this wave:
+#   removing them is a separate correction with a separate measurement, and
+#   folding it in would make this amendment's count unverifiable.
 # amended: 2026-09-11, lane 5 SECOND residual wave. THIRTY-THREE rows edited by
 #   hand for thirty-three triples: bridge -> synthetic-stub, kind_stated 0 -> 1.
 #
@@ -9766,10 +9795,7 @@ jdk/internal/misc/Signal	raise	(Ljdk/internal/misc/Signal;)V	0	bridge	0	1
 jdk/internal/misc/Signal	raise	(Ljdk/internal/misc/Signal;)V	1	bridge	0	1
 jdk/internal/misc/Signal	raise0	(I)V	0	bridge	1	1
 jdk/internal/misc/Unsafe	<clinit>	()V	0	bridge	0	1
-jdk/internal/misc/Unsafe	acquireFence	()V	0	bridge	0	1
 jdk/internal/misc/Unsafe	addressSize	()I	0	bridge	0	1
-jdk/internal/misc/Unsafe	addressSize0	()I	0	bridge	0	1
-jdk/internal/misc/Unsafe	addressSize0	()I	1	bridge	0	1
 jdk/internal/misc/Unsafe	allocateInstance	(Ljava/lang/Class;)Ljava/lang/Object;	0	bridge	1	1
 jdk/internal/misc/Unsafe	allocateMemory	(J)J	0	bridge	0	1
 jdk/internal/misc/Unsafe	allocateMemory	(J)J	1	bridge	0	1
@@ -9888,8 +9914,6 @@ jdk/internal/misc/Unsafe	getShortVolatile	(Ljava/lang/Object;J)S	0	bridge	1	1
 jdk/internal/misc/Unsafe	getUncompressedObject	(J)Ljava/lang/Object;	0	bridge	1	1
 jdk/internal/misc/Unsafe	getUnsafe	()Ljdk/internal/misc/Unsafe;	0	bridge	0	1
 jdk/internal/misc/Unsafe	invokeCleaner	(Ljava/nio/ByteBuffer;)V	0	bridge	0	1
-jdk/internal/misc/Unsafe	isBigEndian0	()Z	0	bridge	0	1
-jdk/internal/misc/Unsafe	isBigEndian0	()Z	1	bridge	0	1
 jdk/internal/misc/Unsafe	loadFence	()V	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	loadLoadFence	()V	0	bridge	0	1
 jdk/internal/misc/Unsafe	loadLoadFence	()V	1	bridge	0	1
@@ -9959,7 +9983,6 @@ jdk/internal/misc/Unsafe	reallocateMemory0	(JJ)J	1	bridge	1	1
 jdk/internal/misc/Unsafe	reallocateMemory0	(JJ)J	2	bridge	1	1
 jdk/internal/misc/Unsafe	reallocateMemory0	(JJ)J	3	bridge	1	1
 jdk/internal/misc/Unsafe	registerNatives	()V	0	bridge	1	1
-jdk/internal/misc/Unsafe	releaseFence	()V	0	bridge	0	1
 jdk/internal/misc/Unsafe	setMemory	(Ljava/lang/Object;JJB)V	0	bridge	0	1
 jdk/internal/misc/Unsafe	setMemory	(Ljava/lang/Object;JJB)V	1	bridge	0	1
 jdk/internal/misc/Unsafe	setMemory	(Ljava/lang/Object;JJB)V	2	bridge	0	1
@@ -9977,19 +10000,7 @@ jdk/internal/misc/Unsafe	storeFence	()V	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	storeStoreFence	()V	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	storeStoreFence	()V	1	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	throwException	(Ljava/lang/Throwable;)V	0	bridge	1	1
-jdk/internal/misc/Unsafe	unalignedAccess0	()Z	0	bridge	0	1
-jdk/internal/misc/Unsafe	unalignedAccess0	()Z	1	bridge	0	1
 jdk/internal/misc/Unsafe	unpark	(Ljava/lang/Object;)V	0	bridge	1	1
-jdk/internal/misc/Unsafe	weakCompareAndExchangeInt	(Ljava/lang/Object;JII)I	0	bridge	0	1
-jdk/internal/misc/Unsafe	weakCompareAndExchangeIntAcquire	(Ljava/lang/Object;JII)I	0	bridge	0	1
-jdk/internal/misc/Unsafe	weakCompareAndExchangeIntRelease	(Ljava/lang/Object;JII)I	0	bridge	0	1
-jdk/internal/misc/Unsafe	weakCompareAndExchangeLong	(Ljava/lang/Object;JJJ)J	0	bridge	0	1
-jdk/internal/misc/Unsafe	weakCompareAndExchangeLongAcquire	(Ljava/lang/Object;JJJ)J	0	bridge	0	1
-jdk/internal/misc/Unsafe	weakCompareAndExchangeLongRelease	(Ljava/lang/Object;JJJ)J	0	bridge	0	1
-jdk/internal/misc/Unsafe	weakCompareAndExchangeObject	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
-jdk/internal/misc/Unsafe	weakCompareAndExchangeReference	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
-jdk/internal/misc/Unsafe	weakCompareAndExchangeReferenceAcquire	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
-jdk/internal/misc/Unsafe	weakCompareAndExchangeReferenceRelease	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
 jdk/internal/misc/Unsafe	weakCompareAndSetInt	(Ljava/lang/Object;JII)Z	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	weakCompareAndSetIntAcquire	(Ljava/lang/Object;JII)Z	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	weakCompareAndSetIntPlain	(Ljava/lang/Object;JII)Z	0	synthetic-stub	1	1
@@ -11211,7 +11222,6 @@ sun/misc/URLClassPath	findResource	(Ljava/lang/String;Z)Ljava/net/URL;	0	synthet
 sun/misc/URLClassPath	getURLs	()[Ljava/net/URL;	0	synthetic-stub	1	1
 sun/misc/URLClassPath	getURLs	(Z)[Ljava/net/URL;	0	synthetic-stub	1	1
 sun/misc/Unsafe	<clinit>	()V	0	bridge	0	1
-sun/misc/Unsafe	acquireFence	()V	0	bridge	0	1
 sun/misc/Unsafe	addressSize	()I	0	synthetic-stub	1	1
 sun/misc/Unsafe	allocateInstance	(Ljava/lang/Class;)Ljava/lang/Object;	0	synthetic-stub	1	1
 sun/misc/Unsafe	allocateMemory	(J)J	0	synthetic-stub	1	1
@@ -11221,7 +11231,6 @@ sun/misc/Unsafe	allocateMemory	(J)J	3	synthetic-stub	1	1
 sun/misc/Unsafe	allocateMemory	(J)J	4	synthetic-stub	1	1
 sun/misc/Unsafe	arrayBaseOffset	(Ljava/lang/Class;)I	0	synthetic-stub	1	1
 sun/misc/Unsafe	arrayIndexScale	(Ljava/lang/Class;)I	0	synthetic-stub	1	1
-sun/misc/Unsafe	compareAndExchangeObject	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
 sun/misc/Unsafe	compareAndSwapInt	(Ljava/lang/Object;JII)Z	0	synthetic-stub	1	1
 sun/misc/Unsafe	compareAndSwapLong	(Ljava/lang/Object;JJJ)Z	0	synthetic-stub	1	1
 sun/misc/Unsafe	compareAndSwapObject	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z	0	synthetic-stub	1	1
@@ -11306,7 +11315,6 @@ sun/misc/Unsafe	reallocateMemory	(JJ)J	0	synthetic-stub	1	1
 sun/misc/Unsafe	reallocateMemory	(JJ)J	1	synthetic-stub	1	1
 sun/misc/Unsafe	reallocateMemory	(JJ)J	2	synthetic-stub	1	1
 sun/misc/Unsafe	reallocateMemory	(JJ)J	3	synthetic-stub	1	1
-sun/misc/Unsafe	releaseFence	()V	0	bridge	0	1
 sun/misc/Unsafe	setMemory	(Ljava/lang/Object;JJB)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	setMemory	(Ljava/lang/Object;JJB)V	1	synthetic-stub	1	1
 sun/misc/Unsafe	setMemory	(Ljava/lang/Object;JJB)V	2	synthetic-stub	1	1
@@ -11319,7 +11327,6 @@ sun/misc/Unsafe	staticFieldOffset	(Ljava/lang/reflect/Field;)J	0	synthetic-stub	
 sun/misc/Unsafe	storeFence	()V	0	synthetic-stub	1	1
 sun/misc/Unsafe	throwException	(Ljava/lang/Throwable;)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	unpark	(Ljava/lang/Object;)V	0	synthetic-stub	1	1
-sun/misc/Unsafe	weakCompareAndExchangeObject	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
 sun/net/PortConfig	getLower0	()I	0	bridge	1	1
 sun/net/PortConfig	getUpper0	()I	0	bridge	1	1
 sun/net/dns/ResolverConfigurationImpl	init0	()V	0	bridge	1	1

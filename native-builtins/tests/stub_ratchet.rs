@@ -2621,6 +2621,23 @@ const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2948;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
+/// **REFRESHED 2026-09-12, lane 5's DELETION wave: -22 in ALL THREE arms**
+/// (13628 -> 13606, 13996 -> 13974, 13663 -> 13641), with the stub counts
+/// beside them UNMOVED at 2948 / 2975 / 2948.
+///
+/// That is the THIRD of the three cases set out below — *"total DOWN by about
+/// the stub delta means registrations were DELETED, which is the only case
+/// where re-freezing records work rather than absorbing it"* — in its purest
+/// form: the stub delta is ZERO, because every deleted row was a `Bridge`.
+/// Nothing in this gate fails for a deletion, which is exactly why the number
+/// has to be refreshed by hand or the next wave's classification is 22 out.
+///
+/// The rows are 22 registrations for 19 `Unsafe` triples that NO supported
+/// image declares (`javap -p` on 17, 21 and 25). Confirmed independently
+/// against the binary: a `--dump-native-registry` in compatible mode reads
+/// 12881 natives before and 12859 after, and all 22 of the difference are on
+/// `sun/misc/Unsafe` and `jdk/internal/misc/Unsafe`.
+///
 /// **REFRESHED 2026-08-24: 13753 -> 13766 (management), 13385 -> 13398
 /// (default).** Both were stale by 13 in BOTH arms, and the 13 is NOT the
 /// 2026-08-24 `java/util/Objects` relabel that prompted the visit -- that
@@ -2677,7 +2694,7 @@ const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2948;
 /// was the only trace a real defect left in this gate, and staleness meant
 /// nobody could have read it. The `synthetic-jdk` arm has no constant here and
 /// measured 13645 on the same tree.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13996;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13974;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
@@ -2690,7 +2707,7 @@ const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13996;
 /// dev's staleness rather than either wave's — the localisation is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13628;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13606;
 
 /// The `--features synthetic-jdk` total, which had no constant at all.
 ///
@@ -2716,7 +2733,7 @@ const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13628;
 /// and 13645 on that tree against 13658 on this one is exactly the drift a
 /// sentence cannot track.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13663;
+const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13641;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;
