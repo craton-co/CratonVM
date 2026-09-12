@@ -5523,6 +5523,10 @@ impl<'a> Lowerer<'a> {
         // runs. `CRATONVM_JIT_IR_POLL_OUTLINE=1`; default OFF.
         if ir_poll_outline_enabled() {
             IR_POLLS_OUTLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            IR_POLLS_LOCAL.with(|c| {
+                let (o, i) = c.get();
+                c.set((o + 1, i));
+            });
             self.buf.emit(&[0x0F, 0x85]); // JNZ .slow (outlined, after the body)
             let slow_patch = self.buf.pos();
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
@@ -5536,6 +5540,10 @@ impl<'a> Lowerer<'a> {
             return;
         }
         IR_POLLS_INLINE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        IR_POLLS_LOCAL.with(|c| {
+            let (o, i) = c.get();
+            c.set((o, i + 1));
+        });
         self.buf.emit(&[0x0F, 0x84]); // JZ .clear
         let clear_patch = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
@@ -15471,6 +15479,34 @@ pub fn ir_poll_census() -> (u64, u64) {
     )
 }
 
+thread_local! {
+    /// Per-thread mirror of the two counters above, bumped at the same sites.
+    ///
+    /// The process-global pair is what the reporting wants; it is the wrong
+    /// instrument for a TEST, and the difference is a flake rather than a
+    /// theory. `CRATONVM_JIT_IR_POLL_OUTLINE` is set through
+    /// `with_thread_overrides`, so only the testing thread can outline a poll
+    /// -- but every other thread in a parallel `cargo test` is compiling
+    /// fixtures that emit INLINE polls into the same global counter. A delta
+    /// read around one compile therefore measures this thread's outlined polls
+    /// and the whole suite's inline ones.
+    ///
+    /// `an_outlined_safepoint_poll_stops_when_the_inline_one_does_and_not_otherwise`
+    /// already excused this on its first assertion ("the census is
+    /// PROCESS-global and the suite runs in parallel, so the INLINE count picks
+    /// up whatever else is compiling on another thread") and then asserted
+    /// `out_census.1 == 0` anyway -- which failed **two runs in three** on an
+    /// unmodified tree, measured 2026-09-12.
+    static IR_POLLS_LOCAL: std::cell::Cell<(u64, u64)> = const {
+        std::cell::Cell::new((0, 0))
+    };
+}
+
+/// This THREAD's `(outlined, inline)` poll counts. See [`IR_POLLS_LOCAL`].
+pub fn ir_poll_census_local() -> (u64, u64) {
+    IR_POLLS_LOCAL.with(std::cell::Cell::get)
+}
+
 fn ir_poll_outline_enabled() -> bool {
     matches!(
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_POLL_OUTLINE").as_deref(),
@@ -17164,12 +17200,19 @@ fn plan_register_residency(
                 // twice as often as the single publish. It reduces exactly to
                 // `use_count >= 2` when everything sits at depth 0, so a
                 // method with no loop is byte-identical.
+                // The single-use refusal, and the one population it must not
+                // refuse: a value the carry window cannot reach. See
+                // `ir_residency_crossblock_enabled` -- for those the
+                // alternative to a register is a home store AND a reload, not
+                // the free RAX hand-off the refusal assumes.
                 _ if !ir_residency_pays_here(
                     &live,
                     schedule,
                     id,
                     use_count.get(id).copied().unwrap_or(0),
-                ) =>
+                ) && !(ir_residency_crossblock_enabled()
+                    && use_count.get(id).copied().unwrap_or(0) == 1
+                    && !single_use_is_in_the_carry_window(graph, schedule, id)) =>
                 {
                     skip_single_use += 1;
                     continue;
@@ -19240,6 +19283,107 @@ fn ir_residency_pays_enabled() -> bool {
     }
 }
 
+/// Let a SINGLE-USE value be register-resident when the carry window cannot
+/// reach it -- **default OFF**, opt in with
+/// `CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK=1`.
+///
+/// `ir_residency_pays_here` reduces to `static_uses >= 2` in a default build
+/// (`ir_residency_loop_weight_enabled` is off), so a value read ONCE never gets
+/// a register. The reasoning behind that rule is sound where it applies: a
+/// single-use value costs one publish and saves one reload, which is a wash --
+/// **and `plan_carries` already serves those, for free, by handing the
+/// producer's RAX straight to the consumer.**
+///
+/// But `plan_carries` scans a window exactly one node wide:
+///
+/// ```text
+/// for w in 1..block.nodes.len() {
+///     let prod = block.nodes[w - 1];
+///     let cons = block.nodes[w];
+/// ```
+///
+/// so it reaches a single-use value only when its consumer is the very next
+/// node in the same block. For every other single-use value the trade is not a
+/// wash at all: the alternative to a register is a home STORE and a RELOAD, two
+/// memory operations, and the publish that replaces them is a register move.
+///
+/// `FibCall.fib` is the shape that names it. `n-1` and `n-2` are computed in
+/// the entry block and read at call sites blocks later, so neither can be
+/// carried and neither is resident:
+///
+/// ```asm
+/// lea eax,[rbx-1] ; mov [rbp-50h],rax    ; … stored in the entry block
+/// mov rdx,[rbp-50h]                      ; … and reloaded at the call
+/// ```
+///
+/// Four memory operations per call for two values a callee-saved register would
+/// have held across it, which is what the single-pass tier does and what
+/// `c2-fib-per-call-budget-20260912.md` counts as the largest term in that
+/// method's per-call budget.
+///
+/// This admits exactly the complement of the carry window, so the two
+/// mechanisms partition the single-use population instead of competing for it:
+/// `plan_carries` already declines a value residency took
+/// (`assigned_gpr(prod).is_some()`, `carry_skips[3]`).
+///
+/// **MEASURED** (2026-09-12, one binary, arms interleaved with a control arm;
+/// `c2-the-per-frame-contract-residency-20260912.md`):
+///
+/// ```text
+/// FieldLoop.sum  reps=3000 n=20000   A 99.0 | C 99.0 | B 91.5 ms
+///                floor 0.0%   effect -7.6%   ratio 0.924x   FASTER
+/// FibCall.fib    n=30                A 179.0 | C 177.0 | B 178.0 ms
+///                floor 1.1%   effect +0.0%   ratio 1.000x   UNMEASURABLE
+/// ```
+///
+/// The loop win is one value: `i + 1` is read exactly once, by the phi at the
+/// back edge, so it was stored to its home and reloaded on every iteration.
+/// The optimizing body SHRINKS there, 1052 -> 1039 bytes.
+///
+/// `fib` is the cost side, and it is why this is default OFF rather than on.
+/// It admits four more values (`single_use` 13 -> 6, `resident` 2 -> 6) and
+/// grows the body 788 -> 883, because every register in [`ir_gp_file`] is
+/// callee-saved and `fib` has FOUR epilogues, each restoring the whole set:
+/// twelve added restores against three removed reloads. That costs nothing
+/// measurable only because all of it is once-per-call and `fib` has no loop.
+///
+/// So the trade is `1 save + N_epilogues restores` against `reloads removed x
+/// how often they execute`, and `static_uses >= 2` counts neither side. A
+/// loop-free method with more than four epilogues is where this should lose;
+/// that shape is not yet measured, hence OFF.
+fn ir_residency_crossblock_enabled() -> bool {
+    matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
+}
+
+/// Is `id`'s single use the node immediately after it in its own block -- the
+/// window [`Lowerer::plan_carries`] scans?
+///
+/// Mirrors that scan deliberately, including its "consumer is `nodes[w]`,
+/// producer is `nodes[w - 1]`" shape, so the two cannot drift into either
+/// double-serving a value or leaving one to neither. It does NOT re-check the
+/// carry's type and arm conditions: a value that clears this window but fails
+/// those is one the carry declines and residency would then have to serve, and
+/// answering `true` here would leave it with nothing. Erring toward `false`
+/// hands it to residency, which is the side that always has an answer.
+fn single_use_is_in_the_carry_window(graph: &Graph, schedule: &Schedule, id: usize) -> bool {
+    for block in &schedule.blocks {
+        let Some(w) = block.nodes.iter().position(|&n| n as usize == id) else {
+            continue;
+        };
+        let Some(&cons) = block.nodes.get(w + 1) else {
+            return false;
+        };
+        return graph
+            .nodes
+            .get(cons as usize)
+            .is_some_and(|cn| cn.inputs.iter().any(|&i| i != NO_NODE && i as usize == id));
+    }
+    false
+}
+
 /// A constant is read as an immediate rather than from its home word --
 /// **default ON**, opt out with `CRATONVM_JIT_IR_CONST_IMM=0`.
 fn ir_const_imm_enabled() -> bool {
@@ -19472,6 +19616,97 @@ mod tests {").next().unwrap_or(src);
             "patch sites must swallow the error and let `lower_inner`'s \
              `buf.overflowed()` bail fall back to single-pass, not panic \
              (use `.ok()`); offenders: {offenders:?}",
+        );
+    }
+
+    /// The flag must be read LIVE, not cached in a `OnceLock`.
+    ///
+    /// Same hazard `equal_depth_flag_is_read_live` pins: an A/B that runs both
+    /// arms in one process reports byte-identical code when a scheduling flag
+    /// is memoised, and the result looks like "the transform does nothing"
+    /// rather than "the flag was never re-read".
+    #[test]
+    fn crossblock_flag_is_read_live() {
+        let read = |v: Option<&str>| {
+            cratonvm_types::flags::with_thread_overrides(
+                &[("CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK", v)],
+                ir_residency_crossblock_enabled,
+            )
+        };
+        assert!(read(Some("1")));
+        assert!(!read(Some("0")));
+        assert!(!read(None), "default is OFF");
+        assert!(read(Some("1")), "a second read must still see the override");
+    }
+
+    /// `single_use_is_in_the_carry_window` must answer for the window
+    /// [`Lowerer::plan_carries`] actually scans -- the node immediately after
+    /// the producer, in the producer's own block -- and not for "some later
+    /// node reads it".
+    ///
+    /// The fixture is `fib`'s shape reduced to its essential: a value computed
+    /// in the entry block whose only reader sits past a branch. That value is
+    /// the entire population the flag exists for, so a test that could not
+    /// produce one would not be testing anything. The assertion is therefore
+    /// two-sided: the cross-block value reads `false`, and the value whose
+    /// consumer IS adjacent reads `true`.
+    #[test]
+    fn the_carry_window_is_exactly_the_next_node_in_the_same_block() {
+        // int f(int a) { int t = a + a; if (a != 0) return t; return 1; }
+        //   0: iload_0  1: iload_0  2: iadd  3: istore_1
+        //   4: iload_0  5: ifeq 10  8: iload_1  9: ireturn
+        //  10: iconst_1 11: ireturn
+        let code = [
+            0x1a, 0x1a, 0x60, 0x3c, 0x1a, 0x99, 0x00, 0x05, 0x1b, 0xac, 0x04, 0xac,
+        ];
+        let mut graph = IrBuilder::new(1, 2).build(&code, 12).expect("IR build");
+        ir_optimize::optimize(&mut graph);
+        let schedule = ir_schedule::schedule(&graph);
+
+        // Recompute the window independently of the helper, so the two cannot
+        // agree by sharing a bug.
+        let adjacent_consumer = |id: usize| -> bool {
+            schedule.blocks.iter().any(|b| {
+                b.nodes
+                    .iter()
+                    .position(|&n| n as usize == id)
+                    .and_then(|w| b.nodes.get(w + 1))
+                    .is_some_and(|&c| {
+                        graph.nodes[c as usize]
+                            .inputs
+                            .iter()
+                            .any(|&i| i != NO_NODE && i as usize == id)
+                    })
+            })
+        };
+
+        let mut agreed = 0usize;
+        let mut outside_the_window = 0usize;
+        for id in 0..graph.nodes.len() {
+            if !schedule
+                .blocks
+                .iter()
+                .any(|b| b.nodes.contains(&(id as u32)))
+            {
+                continue;
+            }
+            let helper = single_use_is_in_the_carry_window(&graph, &schedule, id);
+            assert_eq!(
+                helper,
+                adjacent_consumer(id),
+                "node {id} ({:?}): helper and the independent recomputation disagree",
+                graph.nodes[id].op
+            );
+            agreed += 1;
+            if !helper {
+                outside_the_window += 1;
+            }
+        }
+
+        assert!(agreed > 0, "the fixture scheduled no nodes at all");
+        assert!(
+            outside_the_window > 0,
+            "this shape must contain at least one value the carry window cannot              reach -- otherwise the flag's target population is empty and the              test proves nothing"
         );
     }
 
@@ -19815,7 +20050,7 @@ mod tests {").next().unwrap_or(src);
         // when the switch does NOTHING — the inline poll is correct, so
         // "correct" is not evidence that the outlined one ran.
         let build = |outline: Option<&'static str>, flag: &'static u8| {
-            let before = ir_poll_census();
+            let before = ir_poll_census_local();
             let cm = cratonvm_types::flags::with_thread_overrides(
                 &[("CRATONVM_JIT_IR_POLL_OUTLINE", outline)],
                 || {
@@ -19828,7 +20063,7 @@ mod tests {").next().unwrap_or(src);
                     lower(&graph, &schedule, 1, 3, &helpers).expect("the loop must lower")
                 },
             );
-            let after = ir_poll_census();
+            let after = ir_poll_census_local();
             (cm, (after.0 - before.0, after.1 - before.1))
         };
         // SAFETY (all four calls): the lowered body takes one `int` and returns
