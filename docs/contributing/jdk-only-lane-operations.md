@@ -178,9 +178,54 @@ assuming it did.
 * `regression-suite/run.sh` DELETES its per-vector `--jdk-only-report` files
   after printing the census. Pass `KEEP_JDK_ONLY_REPORTS=<dir>` when you need
   them — the census is their summary, not a substitute, and adjudication reads
-  the files.
+  the files;
+* **a filter stage on ONE arm of a cross-VM diff strips CR and every row becomes
+  a disagreement.** Both HotSpot and CratonVM write CRLF to a file on this host;
+  MSYS `grep` in a pipe strips it. Measured 2026-09-11: 9 CRs direct to a file,
+  0 through `| grep`, and an ad-hoc comparison then read **9 of 9** rows
+  differing where **4** do. Send both arms straight to a file and filter after
+  the diff, never before and never on one side only. The lane's `arm3.sh` and
+  `l3w2run.sh` are safe for exactly that reason, and it was verified rather than
+  assumed — raw diff 52 == normalised diff 52 on the wave-2 arms. Same species
+  as the NUL trap two bullets down in §1: the instrument reported a number, and
+  the number was about the pipeline.
 
 ---
+
+### 4.4 Bisecting a wave costs RUNS, not builds
+
+`CRATONVM_UNRETIRE_NATIVE_SHADOW` turns named rows of the retirement tables back
+off at runtime. Unset — every shipping configuration and every CI arm — it is
+inert, and `the_default_is_inert_across_every_retired_row` asserts that against
+every row of every table rather than a sample.
+
+```text
+  CRATONVM_UNRETIRE_NATIVE_SHADOW=all
+  CRATONVM_UNRETIRE_NATIVE_SHADOW=java/io/
+  CRATONVM_UNRETIRE_NATIVE_SHADOW=java/io/File
+  CRATONVM_UNRETIRE_NATIVE_SHADOW=java/io/File.isAbsolute()Z
+```
+
+Comma-separated; `all`, a package prefix (trailing `/`), a class, a
+class+method, or an exact triple. Also reachable as
+`CRATONVM_LOADER=unretire-native-shadow=...`.
+
+**It is not the dial, and the difference is the point.**
+`CRATONVM_ENFORCE_NATIVE_SHADOW` declines a native at DISPATCH and its decline
+is CONDITIONAL — with no concrete body on the receiver it runs the native
+anyway (`declined_no_bytecode`). This edits the TABLE, so what it turns off is
+off unconditionally. That is why the dial can only bound a wave (§4.2) while
+this can bisect one.
+
+**Read the arm report before believing a green run.** Each rule is resolved
+against the tables before any dispatch and its row count printed; a rule
+matching zero rows is called out by name. A mistyped rule that silently matched
+nothing would exonerate a triple it never tested — a false negative
+manufactured by the instrument, which is the trap §4 exists to list.
+
+It un-retires and cannot re-retire, so the worst it can do is restore the
+pre-wave behaviour. It is a diagnostic: **no acceptance run may set it**, and a
+measurement taken with it armed is not one of the numbers §5 asks for.
 
 ## 5. Landing protocol
 
@@ -409,6 +454,105 @@ dispatched was retired — and nothing moved, because the probe exercises
 Convert a dial result into a table entry only via a registry dump **from a run
 of the very probe whose improvement you are citing**, then rebuild and
 re-measure on two binaries.
+
+### What skipping the two-binary step actually cost, 2026-09-10
+
+The paragraph above already said "rebuild and re-measure on two binaries", and
+lane L0 shipped a 54-triple table without doing it. The `--jdk-only` arm came
+back **97 of 132** where the four previous binaries had scored 132/0. Two
+withdrawal rounds later the table is **29**. Nothing reached `dev`, and the only
+instrument that caught it was the arm.
+
+Three things that round taught, none of which is on this page yet.
+
+**1. Read the dial's `leaked` counter before citing a dial arm at all.** The
+armed run prints it:
+
+```text
+[DIAL_DOOR_CENSUS] armed=true reached=3680 yielded=3593 leaked=87
+```
+
+87 dispatches reached the dial and were **not** yielded. A leaked row reports
+the NATIVE's answer while reading, in a three-arm diff, as "the bytecode is fine
+here". `Class.isArray` was one: the armed arm printed `true/false`, matching
+HotSpot exactly, and the real retirement answers `false/false`. **`leaked > 0`
+means some rows in that arm are not evidence, and the arm does not say which.**
+
+**2. An agreement at the value a blanket yield returns anyway is not
+evidence.** This trap fired three times in one session and it is the single
+biggest source of wrong table entries:
+
+```text
+Module.getName        probed on an UNNAMED module -> null   yield returns null
+Module.getDescriptor  probed on an UNNAMED module -> null   yield returns null
+Module.canRead        probed only in its TRUE direction     yield returns true
+Module.getClassLoader probed as "java.base's is null"       yield returns null
+```
+
+All four read as clean agreements. A retirement answering `null`/`true` for
+everything satisfies every one of them, and `Module.getClassLoader` does
+exactly that — it answers `null` for a PLATFORM-loaded module, which is what
+`RLoaderIdentity` asserts and what cost five vectors in the second round.
+**Before banking an agreement, ask what the yield returns for the whole family
+and whether this row's correct answer differs from it.** If it does not, the row
+is untested; write the discriminating row (a NAMED module, the FALSE direction,
+a non-null loader) or hold the triple.
+
+**3. An invocation that is not the harness's own is not a control.** Run
+directly with `-cp regression-suite/build`, four of the five second-round
+failures failed on the CONTROL binary too and read as "not mine" — they need a
+`--module-path` that `run.sh` supplies. Re-run through the harness with
+`ONLY="..."`, the control scored 5/0 and all five were mine. Always A/B with
+`ONLY=` through `run.sh`, never with a hand-written classpath.
+
+**And re-freeze a withdrawal from a forced failure.** `stub_ratchet`'s
+assertion is `<=`, so removing entries passes silently: the constants sat 16
+above the tree with every arm green. Set each baseline to `1`, run, and read the
+failure's own paste-ready line. Arithmetic on the old constant is not a
+measurement.
+
+### When the arm fails and nothing says WHICH row: the census attributes it
+
+Added 2026-09-11 after lane L0 used it to go from an empty table back to 19
+retirements in an afternoon. The situation it is for: `OK -> BAD == 0` holds on
+your probe, the corpus arm still loses vectors, and a bisection over the table
+is one build per hypothesis at ~65 minutes each.
+
+The per-vector census answers a **weaker** question for free, and the weaker
+question is usually enough — *which of my table's triples does this failing
+vector dispatch at all?* A registration a vector never consults cannot be the
+row that broke it.
+
+```bash
+env CRATONVM_ARGS=--jdk-only CV=<CONTROL binary, table EMPTY>     ONLY="RFailing1 RFailing2 RFailing3"     KEEP_JDK_ONLY_REPORTS=$SP/rep bash regression-suite/run.sh
+```
+
+Each kept `<Vector>.json` holds one-line-JSON `native-shadows-bytecode` rows
+with `class`/`method`/`descriptor`. Intersect with your table: the **union over
+the failing vectors** is what you withdraw, and the complement is untouched by
+every vector that failed.
+
+Four things that make it sound rather than suggestive, and each is a way to get
+it wrong:
+
+* **Run it on the CONTROL binary.** With the table in, your retired rows are
+  refused and never appear in the census at all — you would measure an empty
+  intersection and conclude everything is safe.
+* **Check the run's own `saturation:` line.** `none` means the counts are
+  totals. Anything else makes them floors, and a floor cannot support "this
+  vector never dispatches that triple".
+* **Close over the whole corpus, not just the vectors you ran.** Pair the
+  attribution with an arm that already PASSED with those rows in the table.
+  L0's round-1 arm scored 127 passed / 5 failed with the 19 among its 38 rows,
+  so those 127 are measured rather than assumed; 127 exonerated + 5 attributed
+  away = all 132.
+* **It over-collects on purpose.** It names every row that *could* be
+  responsible, never the one that *is*. Withdraw them "as touched, not as
+  convicted", and pin them out with a test so a later wave has to do the
+  bisection instead of re-adding one by hand.
+
+And it does not replace the arm: "not dispatched in these five" is not "not
+dispatched anywhere". The wave still gets the three arms on its own binary.
 
 ### After the build: prove the retirement is not INERT before reading a probe
 

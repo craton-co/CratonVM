@@ -9167,13 +9167,30 @@ mod jit_counter_block_tests {
     /// A site index past the end of the block is ignored, exactly as the
     /// `MEMBERSHIP_WALK_BY_SITE.get(site)` it replaced ignored it — this is
     /// the arm that kept an out-of-range site from panicking a release build.
+    ///
+    /// Read through THIS THREAD'S OWN block, not through
+    /// `leaf_native_hit_count()`, which sums every registered block in the
+    /// process. `cargo test` runs tests concurrently and several of them reach
+    /// compiled-dispatch code, so the global sum moves under this test for
+    /// reasons that have nothing to do with the out-of-range site — it failed
+    /// that way at 8121 against an expected 8072. A thread's own counter is the
+    /// only reading no other test can perturb, and it is the reading this test
+    /// always meant: the question is whether a bad index lands on a
+    /// NEIGHBOURING FIELD of the same block.
     #[test]
     fn an_out_of_range_site_is_ignored_rather_than_panicking() {
-        let before = leaf_native_hit_count();
+        fn my_leaf_hits() -> u64 {
+            JIT_COUNTERS.with(|block| {
+                block
+                    .leaf_native_hits
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+        }
+        let before = my_leaf_hits();
         note_membership_walk(MEMBERSHIP_WALK_SITE_NAMES.len());
         note_membership_walk(usize::MAX);
         assert_eq!(
-            leaf_native_hit_count(),
+            my_leaf_hits(),
             before,
             "an out-of-range site must not land on a neighbouring counter"
         );

@@ -602,6 +602,37 @@ fn cldr_packages(base_name: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// The bundle families that genuinely live OUTSIDE the `cldr` packages.
+///
+/// [`cldr_packages`] maps EVERY `sun.text.resources.*` base name onto the CLDR
+/// package pair on purpose, and its own doc comment says why: this VM's
+/// adapter selection asks for the legacy JRE name where HotSpot's CLDR default
+/// asks for the `cldr` one, and HotSpot's answer is the oracle. That is right
+/// for the families CLDR re-generated.
+///
+/// A few were never re-generated, because their data is not CLDR's, and for
+/// those the blanket mapping makes every candidate miss and the family read as
+/// absent. Verified against a JDK 25.0.3 image with `jimage list`, not assumed:
+///
+/// ```text
+///   java.base       sun/text/resources/BreakIteratorInfo.class
+///                   sun/text/resources/{Word,Line,Sentence}BreakIteratorData
+///   jdk.localedata  sun/text/resources/ext/BreakIteratorInfo_th.class
+///                   sun/text/resources/ext/{Word,Line}BreakIteratorData_th
+/// ```
+///
+/// and no `sun/text/resources/cldr/BreakIteratorInfo` of either. `CollationData`
+/// is the same shape and is the reason [`cldr_collation_rule`] had to hand-roll
+/// its own probe rather than call [`load_cldr_table`]; it is left alone here so
+/// that working reader keeps its cache and its most-specific-first order, which
+/// differ from this one's merge.
+fn non_cldr_packages(simple: &str) -> Option<(&'static str, &'static str)> {
+    match simple {
+        "BreakIteratorInfo" => Some(("sun/text/resources", "sun/text/resources/ext")),
+        _ => None,
+    }
+}
+
 /// Class-name suffixes for a locale, LEAST specific first, so a later merge
 /// overrides an earlier one — the JDK parent chain flattened into one map, the
 /// same shape `build_locale_chain` uses for `.properties`.
@@ -716,11 +747,16 @@ fn load_cldr_table(
     lang: &str,
     country: &str,
 ) -> Option<CldrTable> {
-    let (root_pkg, ext_pkg) = cldr_packages(base_name)?;
     let simple = base_name.rsplit('.').next().unwrap_or_default();
     if simple.is_empty() {
         return None;
     }
+    // The non-CLDR families first: for them `cldr_packages`' blanket mapping
+    // names two packages the image does not have.
+    let (root_pkg, ext_pkg) = match non_cldr_packages(simple) {
+        Some(pair) => pair,
+        None => cldr_packages(base_name)?,
+    };
     let cache_key = format!("{simple}|{lang}|{country}");
     if let Ok(cache) = cldr_cache().lock() {
         if let Some(hit) = cache.get(&cache_key) {
@@ -752,12 +788,26 @@ fn load_cldr_table(
     let table: Option<CldrTable> = if loaded_any {
         Some(std::sync::Arc::new(merged))
     } else {
-        // Warn only for the families CLDR is expected to answer. The other
-        // `sun.*.resources.*` base names (`BreakIteratorInfo`, `CollationData`,
-        // …) legitimately have no `cldr` package at all, and a warning on those
-        // would be crying wolf — which is how a real fallback notice gets
-        // filtered out of a log.
-        if matches!(simple, "FormatData" | "CurrencyNames" | "LocaleNames") {
+        // Warn only for the families that are expected to answer. The other
+        // `sun.*.resources.*` base names (`CollationData`, …) legitimately have
+        // no `cldr` package at all, and a warning on those would be crying
+        // wolf — which is how a real fallback notice gets filtered out of a
+        // log.
+        //
+        // `BreakIteratorInfo` USED to be the first example in that sentence and
+        // is now in the list below instead, because `non_cldr_packages` routes
+        // it to the packages the image actually has. The sentence was right
+        // about the old behaviour and would now suppress the warning for the
+        // one family whose miss means the probe is broken.
+        // `BreakIteratorInfo` is in the list because its ROOT bundle is in
+        // `java.base`: unlike the `cldr` families, a jlinked image that dropped
+        // `jdk.localedata` still has it, so a total miss is not the ordinary
+        // degradation this warning exists to announce — it means the probe is
+        // wrong.
+        if matches!(
+            simple,
+            "FormatData" | "CurrencyNames" | "LocaleNames" | "BreakIteratorInfo"
+        ) {
             tracing::warn!(
                 family = simple,
                 language = lang,
@@ -977,6 +1027,21 @@ fn cldr_collation_rule_uncached(
 
 /// The FormatData table for a locale. One name for the base string so the six
 /// call sites cannot drift apart on it.
+/// The merged `BreakIteratorInfo` bundle for a locale.
+///
+/// Root + `_<lang>` + `_<lang>_<country>`, least specific first, so `_th`'s
+/// `WordData = WordBreakIteratorData_th` overrides the root's while the root's
+/// `BreakIteratorClasses` still resolves for a locale that has no override.
+/// That merge is [`load_cldr_table`]'s, and it is the right one here for the
+/// same reason it is right for `FormatData`: the JDK's own parent chain.
+fn break_iterator_info(
+    ctx: &mut dyn NativeContext,
+    lang: &str,
+    country: &str,
+) -> Option<CldrTable> {
+    load_cldr_table(ctx, "sun.text.resources.BreakIteratorInfo", lang, country)
+}
+
 fn cldr_format_data(ctx: &mut dyn NativeContext, lang: &str, country: &str) -> Option<CldrTable> {
     load_cldr_table(ctx, "sun.text.resources.cldr.FormatData", lang, country)
 }
@@ -3794,6 +3859,129 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "getJavaTimeDateTimePattern",
         "(IILjava/lang/String;)Ljava/lang/String;",
         |ctx, args| Ok(Some(locale_datetime_pattern(ctx, args))),
+    );
+
+    // ---------------------------------------------------------------------
+    // BREAKITER, the real data. `java.text.BreakIterator`'s three bundle-fed
+    // factories walk
+    //
+    //   BreakIteratorProviderImpl.getBreakInstance(locale, idx, dataKey, dictKey)
+    //     LocaleResources.getBreakIteratorInfo("BreakIteratorClasses")  -> String[]
+    //     LocaleResources.getBreakIteratorInfo(dataKey)                 -> String
+    //     LocaleResources.getBreakIteratorResources(dataKey)            -> byte[]
+    //     new sun.text.RuleBasedBreakIterator(name, bytes)
+    //
+    // (`getCharacterInstance` is not here: JDK 25 answers it with an inline
+    // `GraphemeBreakIterator` and asks no bundle at all. Read from the image's
+    // own bytecode, not assumed — the other three pass indices 0/1/2 and the
+    // root bundle's `BreakIteratorClasses` has exactly three entries.)
+    //
+    // Both readers returned null, so `classNames[type]` threw
+    // `NullPointerException: Cannot load from null array` and this VM had to
+    // pin a synthetic iterator over the whole family (the BREAKITER allow-list
+    // in `vm/src/vm/vm_exec.rs`). The comments there and in
+    // `reflect_annotations.rs` blame "jdk.localedata's class-based resource
+    // bundles are not surfaced through our jimage path" — which W7-80 showed
+    // was STALE for the CLDR families and is stale here too. The classes and
+    // the binary data are both in the image this VM already boots from; the
+    // reason the lookup missed is that `cldr_packages` sent it to a `cldr`
+    // package that does not exist for this family. See `non_cldr_packages`.
+    //
+    // Answering these two from the image is what lets `java/text/BreakIterator`'s
+    // 17 registrations be retired rather than pinned — lane 1 §10 item 5.
+    registry.register(
+        "sun/util/locale/provider/LocaleResources",
+        "getBreakIteratorInfo",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        |ctx, args| {
+            let Some(Value::Object(Some(k))) = args.get(1).copied() else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let Some(key) = ctx.read_string(k) else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let (lang, country) = receiver_locale(ctx, args.first());
+            let Some(table) = break_iterator_info(ctx, &lang, &country) else {
+                return Ok(Some(Value::Object(None)));
+            };
+            match table.get(&key) {
+                Some(CldrValue::Arr(v)) => {
+                    let refs: Vec<&str> = v.iter().map(String::as_str).collect();
+                    let arr = make_string_array(ctx, &refs);
+                    Ok(Some(Value::Object(Some(arr))))
+                }
+                Some(CldrValue::Str(sv)) => {
+                    let sv = sv.clone();
+                    let o = ctx.create_string(&sv);
+                    Ok(Some(Value::Object(Some(o))))
+                }
+                // ABSENT KEY. HotSpot's body ends in `ResourceBundle.getObject`,
+                // which throws `MissingResourceException` rather than answering
+                // null. Answering null is a deliberate, narrower divergence: it
+                // is what this method did for EVERY key before this native, and
+                // the three keys `getBreakInstance` asks for are all present in
+                // the root bundle, so no caller reaches this arm. Throwing here
+                // would turn a silent wrong answer into a new abort on a path
+                // that has never been exercised.
+                None => Ok(Some(Value::Object(None))),
+            }
+        },
+    );
+
+    registry.register(
+        "sun/util/locale/provider/LocaleResources",
+        "getBreakIteratorResources",
+        "(Ljava/lang/String;)[B",
+        |ctx, args| {
+            let Some(Value::Object(Some(k))) = args.get(1).copied() else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let Some(key) = ctx.read_string(k) else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let (lang, country) = receiver_locale(ctx, args.first());
+            // The data file's NAME is a value in the same bundle, exactly as
+            // `BreakIteratorResourceBundle.handleGetObject` reads it:
+            // `getPackageName().replace('.','/') + "/" + info.getString(key)`.
+            // So `WordData` -> `WordBreakIteratorData` in the root bundle and
+            // `WordBreakIteratorData_th` in `_th`'s, and the package is the
+            // bundle's own — which is why both are probed below rather than
+            // the root one only.
+            let Some(table) = break_iterator_info(ctx, &lang, &country) else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let Some(CldrValue::Str(file)) = table.get(&key).cloned() else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let mut bytes = None;
+            for pkg in ["sun/text/resources/ext", "sun/text/resources"] {
+                if let Some(b) = ctx.find_resource(&format!("{pkg}/{file}")) {
+                    bytes = Some(b);
+                    break;
+                }
+            }
+            let Some(bytes) = bytes else {
+                tracing::warn!(
+                    key = %key,
+                    file = %file,
+                    "BREAKITER: the bundle names a data file the image does not                      carry; the real RuleBasedBreakIterator cannot be built."
+                );
+                return Ok(Some(Value::Object(None)));
+            };
+            // No pin/re-read pair: `new_array` is the only allocation and
+            // `write_byte_array_from` is a bulk write into it, so nothing can
+            // move between them.
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+            if !ctx.write_byte_array_from(arr, 0, &bytes) {
+                // A refused bulk write leaves a zero-filled array, which the
+                // real `RuleBasedBreakIterator` would parse as a corrupt table
+                // rather than reject. Null is the answer this method already
+                // gave for everything, and it keeps the failure at the caller
+                // that can see it.
+                return Ok(Some(Value::Object(None)));
+            }
+            Ok(Some(Value::Object(Some(arr))))
+        },
     );
 
     // sun.util.locale.provider.CalendarDataUtility.retrieveJavaTimeFieldValueNames(

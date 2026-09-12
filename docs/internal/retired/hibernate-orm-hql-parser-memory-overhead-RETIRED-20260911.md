@@ -240,7 +240,7 @@ unconfirmed** mechanism, and reference width, which is the largest single driver
 left.
 
 Both, with the measurements, the mechanism and how the fix was validated, in
-[`docs/known-issues/perf/jdk-collection-classes-are-padded-to-a-synthetic-stub-floor-20260911.md`](../../known-issues/perf/jdk-collection-classes-are-padded-to-a-synthetic-stub-floor-20260911.md).
+[`docs/internal/fixed-bugs/jdk-collection-classes-are-padded-to-a-synthetic-stub-floor-FIXED-20260911.md`](../fixed-bugs/jdk-collection-classes-are-padded-to-a-synthetic-stub-floor-FIXED-20260911.md).
 
 ---
 
