@@ -14025,17 +14025,19 @@ pub fn atomic_intrinsic_site_class_matches(
 /// for when that is admitted.
 ///
 /// `resolved_declaring_class` is the class that declares the method the invoke
-/// resolves to. Every registration site passes `None` today — no resolver that
-/// `try_compile` receives answers that question — so production behaviour is
-/// the exact constant-pool match until one is threaded through.
+/// resolves to. `try_compile_inner` fills it from the VM's
+/// `cp_invoke_declaring_class_resolver` (see
+/// `atomic_intrinsic_for_invoke_site`), and the OSR door in
+/// `vm/src/runtime/interpreter/jit_bridge.rs` resolves it through the
+/// class-manager guard it already holds.
 ///
 /// `guard_class_id` stays the SITE's class id for a subclass site: the emitted
 /// guard is an exact class-id compare, so only receivers of exactly that class
-/// take the inline path. The layout is still slot 0, which is `value` on a
-/// subclass instance only while inherited fields precede declared ones — the
-/// same assumption the registered native's `get_field_volatile(this, 0)` makes
-/// for every receiver, but one to confirm against the VM's field layout before
-/// a resolver is wired.
+/// take the inline path. The layout is slot 0 resolved through that class id.
+/// Slot 0 is `value` on every subclass instance, because `compute_field_layout`
+/// (`classloading/src/class_manager.rs`) gives superclass instance fields the
+/// slots `0..N` and starts a class's own fields at `N`. The compact offset is
+/// read from the subclass's own registered layout.
 pub fn try_resolve_atomic_intrinsic_for_site(
     class: &str,
     resolved_declaring_class: Option<&str>,
@@ -14108,6 +14110,82 @@ pub fn try_resolve_atomic_intrinsic_for_site(
         b'I'
     };
     Some((intrinsic.as_entry(), num_params, ret, layout.class_id))
+}
+
+/// Could an invoke site naming `cp_class` reach the `jdk_class` `Atomic*`
+/// intrinsic family at all? (review #80)
+///
+/// Yes for the JDK class itself. For any other class, only when
+/// `name descriptor` is a method `final` in `jdk_class`: that is the one case
+/// [`atomic_intrinsic_site_class_matches`] admits through a resolved declaring
+/// class. The answer is the cheap pre-filter a registration site applies
+/// BEFORE it asks the VM which class declares the resolved method. That lookup
+/// takes the class-manager lock and walks the hierarchy, and a method named
+/// `get()I` on some unrelated class must not pay it.
+pub fn atomic_intrinsic_site_may_match(
+    jdk_class: &str,
+    cp_class: &str,
+    name: &str,
+    descriptor: &str,
+) -> bool {
+    cp_class == jdk_class || atomic_intrinsic_method_is_final_in_jdk(jdk_class, name, descriptor)
+}
+
+/// The ATOMIC_INT (`jdk_class` = `AtomicInteger`) or ATOMIC_LONG (`AtomicLong`)
+/// registration for one `invokevirtual` site, as `try_compile_inner` performs
+/// it: `(entry, num_params, return tag, guard class id)`, or `None` to keep
+/// ordinary dispatch.
+///
+/// - `guard_class_id` comes from `cp_invoke_class_id_resolver`: the class the
+///   constant pool names at the site. For `class Counter extends AtomicInteger`
+///   that is `Counter`. The emitted guard is an exact header class-id compare,
+///   so only receivers of exactly that class take the inline path, and any
+///   other subclass falls back. The field layout (`AtomicIntFieldLayout::new(0,
+///   guard_class_id)`) is resolved through that same class id, so a subclass's
+///   own compact layout supplies the offset of `value`. The slot is 0 in every
+///   subclass, because `compute_field_layout` in `classloading` places
+///   superclass instance fields first.
+/// - `cp_invoke_declaring_class_resolver` answers which class declares the
+///   method the site resolves to. It is asked only for a non-JDK constant-pool
+///   class calling a method that is `final` in the JDK class
+///   ([`atomic_intrinsic_site_may_match`]), and its answer admits the site only
+///   when it names the JDK class ([`atomic_intrinsic_site_class_matches`]).
+fn atomic_intrinsic_for_invoke_site(
+    jdk_class: &str,
+    cp_idx: u16,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    cp_invoke_class_id_resolver: Option<&dyn Fn(u16) -> Option<u32>>,
+    cp_invoke_declaring_class_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+) -> Option<(usize, usize, u8, u32)> {
+    if !atomic_intrinsic_site_may_match(jdk_class, class_name, method_name, descriptor) {
+        return None;
+    }
+    let class_id_resolver = cp_invoke_class_id_resolver?;
+    let guard_class_id = class_id_resolver(cp_idx)?;
+    let declaring_class = if class_name == jdk_class {
+        None
+    } else {
+        cp_invoke_declaring_class_resolver.and_then(|resolve| resolve(cp_idx))
+    };
+    match jdk_class {
+        "java/util/concurrent/atomic/AtomicInteger" => try_resolve_atomic_intrinsic_for_site(
+            class_name,
+            declaring_class.as_deref(),
+            method_name,
+            descriptor,
+            guard_class_id,
+        ),
+        "java/util/concurrent/atomic/AtomicLong" => try_resolve_atomic_long_intrinsic_for_site(
+            class_name,
+            declaring_class.as_deref(),
+            method_name,
+            descriptor,
+            guard_class_id,
+        ),
+        _ => None,
+    }
 }
 
 /// Call sites the single-pass backend has EMITTED as `AtomicLong` intrinsics
@@ -14903,6 +14981,132 @@ mod atomic_accessor_intrinsic_tests {
             "longValue",
             "()J"
         ));
+    }
+
+    /// Review #80, the registration `try_compile_inner` performs. A subclass
+    /// site reaches the intrinsic through `cp_invoke_declaring_class_resolver`,
+    /// guarded on the site's OWN class id. Without that resolver, or when it
+    /// names any class other than the JDK one, the site keeps ordinary dispatch.
+    #[test]
+    fn a_subclass_site_registers_through_the_declaring_class_resolver() {
+        const AI: &str = "java/util/concurrent/atomic/AtomicInteger";
+        const AL: &str = "java/util/concurrent/atomic/AtomicLong";
+        const SITE_CID: u32 = 23456;
+        const CP_IDX: u16 = 7;
+        let site_class_id = |_cp_idx: u16| -> Option<u32> { Some(SITE_CID) };
+        let no_class_id = |_cp_idx: u16| -> Option<u32> { None };
+        let asked = std::cell::Cell::new(0u32);
+        let declared_by_ai = |cp_idx: u16| -> Option<String> {
+            asked.set(asked.get() + 1);
+            assert_eq!(cp_idx, CP_IDX, "asked about the site's own constant-pool entry");
+            Some(AI.to_string())
+        };
+        let declared_by_al = |_cp_idx: u16| -> Option<String> { Some(AL.to_string()) };
+        let declared_by_base = |_cp_idx: u16| -> Option<String> { Some("pkg/Base".to_string()) };
+
+        let (entry, num_params, ret, guard) = atomic_intrinsic_for_invoke_site(
+            AI,
+            CP_IDX,
+            "pkg/Counter",
+            "incrementAndGet",
+            "()I",
+            Some(&site_class_id),
+            Some(&declared_by_ai),
+        )
+        .expect("a subclass site of a final AtomicInteger method registers through the resolver");
+        assert_eq!(entry, JitIntrinsic::AtomicIntIncrementAndGet.as_entry());
+        assert_eq!((num_params, ret), (0, b'I'));
+        assert_eq!(
+            guard, SITE_CID,
+            "the guard is the subclass site's own class id, so another subclass falls back"
+        );
+        assert_eq!(asked.get(), 1);
+
+        let (entry, num_params, ret, guard) = atomic_intrinsic_for_invoke_site(
+            AL,
+            CP_IDX,
+            "pkg/LongCounter",
+            "getAndAdd",
+            "(J)J",
+            Some(&site_class_id),
+            Some(&declared_by_al),
+        )
+        .expect("the long family registers through the resolver too");
+        assert_eq!(entry, JitIntrinsic::AtomicLongGetAndAdd.as_entry());
+        assert_eq!((num_params, ret, guard), (1, b'J', SITE_CID));
+
+        // No resolver: the exact constant-pool match, which a subclass misses.
+        assert!(atomic_intrinsic_for_invoke_site(
+            AI,
+            CP_IDX,
+            "pkg/Counter",
+            "incrementAndGet",
+            "()I",
+            Some(&site_class_id),
+            None,
+        )
+        .is_none());
+        // Declared by an intermediate class, which could have overridden it.
+        assert!(atomic_intrinsic_for_invoke_site(
+            AI,
+            CP_IDX,
+            "pkg/Counter",
+            "incrementAndGet",
+            "()I",
+            Some(&site_class_id),
+            Some(&declared_by_base),
+        )
+        .is_none());
+        // An overridable method (`longValue()`) on a subclass site.
+        assert!(atomic_intrinsic_for_invoke_site(
+            AL,
+            CP_IDX,
+            "pkg/LongCounter",
+            "longValue",
+            "()J",
+            Some(&site_class_id),
+            Some(&declared_by_al),
+        )
+        .is_none());
+        // No class id to guard on: nothing registers.
+        assert!(atomic_intrinsic_for_invoke_site(
+            AI,
+            CP_IDX,
+            "pkg/Counter",
+            "incrementAndGet",
+            "()I",
+            Some(&no_class_id),
+            Some(&declared_by_ai),
+        )
+        .is_none());
+
+        // The resolver is not consulted where its answer cannot matter: an
+        // exact JDK site, and a method the JDK class does not declare final.
+        asked.set(0);
+        assert!(atomic_intrinsic_for_invoke_site(
+            AI,
+            CP_IDX,
+            AI,
+            "incrementAndGet",
+            "()I",
+            Some(&site_class_id),
+            Some(&declared_by_ai),
+        )
+        .is_some());
+        assert!(atomic_intrinsic_for_invoke_site(
+            AI,
+            CP_IDX,
+            "pkg/Other",
+            "size",
+            "()I",
+            Some(&site_class_id),
+            Some(&declared_by_ai),
+        )
+        .is_none());
+        assert_eq!(asked.get(), 0, "the declaring-class lookup was paid for nothing");
+        assert!(!atomic_intrinsic_site_may_match(AI, "pkg/Other", "size", "()I"));
+        assert!(atomic_intrinsic_site_may_match(AI, "pkg/Counter", "get", "()I"));
+        assert!(!atomic_intrinsic_site_may_match(AL, "pkg/LongCounter", "longValue", "()J"));
     }
 }
 
@@ -24256,6 +24460,9 @@ pub fn try_compile(
         None,
         // No VM, so no per-VM de-spec registry: nothing is de-spec'd.
         None,
+        // No VM method resolution: `Atomic*` intrinsics match the exact
+        // constant-pool class only.
+        None,
     )
 }
 
@@ -24443,6 +24650,15 @@ pub fn try_compile_with_invokespecial_resolver(
     // 2026-09-12, which let one VM's despeculation verdicts strip speculations
     // from every other VM's compiles. `None` (no VM in scope) consults nothing.
     despec: Option<&std::sync::Arc<crate::deopt::DespecRegistry>>,
+    // Review #80: maps an invoke constant-pool index to the name of the class
+    // that DECLARES the method the site resolves to. It sits beside
+    // `cp_invokespecial_owner_resolver` but asks a different question: that one
+    // answers only when a site binds statically (a private or final owner that
+    // no native screen refuses). This one answers for any resolvable
+    // `Methodref`. Consumed by the ATOMIC_INT / ATOMIC_LONG registration, so a
+    // `Counter extends AtomicInteger` site can reach the intrinsic. `None`
+    // keeps the exact constant-pool class match.
+    cp_invoke_declaring_class_resolver: Option<&dyn Fn(u16) -> Option<String>>,
 ) -> Option<CompiledMethod> {
     // The admission gate. Four checks and two side effects, all of which used
     // to live inline here and NONE of which the other two backend doors (the
@@ -24561,6 +24777,7 @@ pub fn try_compile_with_invokespecial_resolver(
         jdk_only,
         intrinsic_resolver,
         despec,
+        cp_invoke_declaring_class_resolver,
     );
 
     // ── The compiled-local-handler safety net ───────────────────────────
@@ -24617,6 +24834,7 @@ pub fn try_compile_with_invokespecial_resolver(
                 jdk_only,
                 intrinsic_resolver,
                 despec,
+                cp_invoke_declaring_class_resolver,
             );
             backend_attempted |= retry_backend_attempted;
             if retried.is_some() && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
@@ -26055,6 +26273,9 @@ fn try_compile_inner(
     // The compiling VM's per-bci de-spec registry — see the same parameter on
     // `try_compile_with_invokespecial_resolver`. `None` consults nothing.
     despec: Option<&std::sync::Arc<crate::deopt::DespecRegistry>>,
+    // Review #80: the declaring class of each invoke's resolved method — see
+    // the same parameter on `try_compile_with_invokespecial_resolver`.
+    cp_invoke_declaring_class_resolver: Option<&dyn Fn(u16) -> Option<String>>,
 ) -> Option<CompiledMethod> {
     // One compile, one verdict: the fall-through signal describes THIS call.
     reset_ir_fall_through_signal();
@@ -31917,18 +32138,22 @@ fn try_compile_inner(
                 // without one the site must keep ordinary dispatch (which runs
                 // any subclass override).
                 //
-                // Matched on the constant-pool class only (review #80): a
-                // `Counter extends AtomicInteger` site would need the class that
-                // DECLARES the resolved method, which no resolver handed to
-                // `try_compile` supplies. `try_resolve_atomic_intrinsic_for_site`
-                // takes that answer; wiring it needs a hook such as
-                // `Fn(u16) -> Option<String>` (cp index -> declaring class of the
-                // resolved method), analogous to `cp_invokespecial_owner_resolver`.
-                if let Some((entry, num_params, ret, guard_class_id)) = cp_invoke_class_id_resolver
-                    .and_then(|r| r(cp_idx))
-                    .and_then(|cid| {
-                        try_resolve_atomic_intrinsic(&class_name, &method_name, &descriptor, cid)
-                    })
+                // A site naming a subclass (`Counter extends AtomicInteger`,
+                // review #80) matches through the class that DECLARES the
+                // resolved method, which `cp_invoke_declaring_class_resolver`
+                // supplies, and only for a method `final` in the JDK. The guard
+                // is the site's own class id. See
+                // `atomic_intrinsic_for_invoke_site`.
+                if let Some((entry, num_params, ret, guard_class_id)) =
+                    atomic_intrinsic_for_invoke_site(
+                        "java/util/concurrent/atomic/AtomicInteger",
+                        cp_idx,
+                        &class_name,
+                        &method_name,
+                        &descriptor,
+                        cp_invoke_class_id_resolver,
+                        cp_invoke_declaring_class_resolver,
+                    )
                 {
                     needs_heap = true;
                     direct_calls.push((
@@ -31949,17 +32174,18 @@ fn try_compile_inner(
                 // The 64-bit twin, on exactly the same terms: registered only
                 // with a resolved receiver class id, because `AtomicLong` is
                 // not final and a subclass override must keep ordinary
-                // dispatch.
-                if let Some((entry, num_params, ret, guard_class_id)) = cp_invoke_class_id_resolver
-                    .and_then(|r| r(cp_idx))
-                    .and_then(|cid| {
-                        try_resolve_atomic_long_intrinsic(
-                            &class_name,
-                            &method_name,
-                            &descriptor,
-                            cid,
-                        )
-                    })
+                // dispatch. Subclass sites match through the declaring class,
+                // as above.
+                if let Some((entry, num_params, ret, guard_class_id)) =
+                    atomic_intrinsic_for_invoke_site(
+                        "java/util/concurrent/atomic/AtomicLong",
+                        cp_idx,
+                        &class_name,
+                        &method_name,
+                        &descriptor,
+                        cp_invoke_class_id_resolver,
+                        cp_invoke_declaring_class_resolver,
+                    )
                 {
                     needs_heap = true;
                     direct_calls.push((

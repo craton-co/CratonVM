@@ -410,6 +410,66 @@ fn narrow_int_return(ret_type: u8, raw: i64) -> i32 {
     }
 }
 
+/// Review #80: the name of the class that DECLARES the method the `Methodref`
+/// at `cp_idx` in `holder`'s constant pool resolves to. It backs the
+/// `cp_invoke_declaring_class_resolver` each
+/// `try_compile_with_invokespecial_resolver` door hands the JIT, which admits a
+/// `Counter extends AtomicInteger` site to the `Atomic*` intrinsics only when
+/// this names the JDK class.
+///
+/// The constant-pool class is resolved in `holder`'s loader, and the method is
+/// found with `find_method_recursive`, the walk `try_jit_compile_callee_slow`
+/// uses to find a callee's declaring class. An `InterfaceMethodref` is not
+/// answered: the intrinsics this feeds are class methods.
+///
+/// Takes its own class-manager read, like the other resolver closures handed
+/// to `try_compile_with_invokespecial_resolver`. It must NOT be called from
+/// `compile_osr_artifact`'s invoke loop, which already holds the guard; that
+/// door resolves through `cm_lock` instead.
+fn cp_method_ref_declaring_class_name(
+    shared: &SharedVm,
+    holder: ClassId,
+    cp_idx: u16,
+) -> Option<String> {
+    let cm = shared.classes.class_manager.read();
+    let class = cm.get_class(holder)?;
+    let (class_idx, nat_idx) = match class.constant_pool.get(cp_idx) {
+        Some(ConstantPoolEntry::MethodReference {
+            class_index,
+            name_and_type_index,
+            ..
+        }) => (*class_index, *name_and_type_index),
+        _ => return None,
+    };
+    let target_class = class.constant_pool.get_class_name(class_idx)?;
+    let (method_name, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+    site_class_and_declaring_class_name(&cm, holder, target_class, method_name, descriptor)
+        .map(|(_, declaring_class)| declaring_class)
+}
+
+/// For an invoke site in `holder` that names `cp_class`, returns two things.
+/// The first is the id of `cp_class` resolved in `holder`'s loader, which is
+/// the class an exact receiver guard compares against. The second is the name
+/// of the class that declares `name descriptor` as resolved from `cp_class`.
+///
+/// Reads through a class-manager guard the caller already holds and takes no
+/// lock of its own. That is what lets `compile_osr_artifact`'s invoke loop,
+/// which holds `cm_lock` for its whole body, ask it without a recursive read.
+fn site_class_and_declaring_class_name(
+    cm: &crate::classloading::ClassManager,
+    holder: ClassId,
+    cp_class: &str,
+    name: &str,
+    descriptor: &str,
+) -> Option<(u32, String)> {
+    let cp_class_id = cm.find_class_by_name_for_class(cp_class, holder)?;
+    let store = cm.class_store();
+    let (_, declaring_id) =
+        crate::classloading::find_method_recursive(cp_class_id, name, descriptor, store)?;
+    let declaring_class = store.get(declaring_id)?.name.to_string();
+    Some((cp_class_id.as_u32(), declaring_class))
+}
+
 pub(super) fn compile_osr_artifact(
     shared: &SharedVm,
     class_id: ClassId,
@@ -2059,18 +2119,43 @@ pub(super) fn compile_osr_artifact(
                     // the_osr_door_takes_no_recursive_class_manager_lock` is the
                     // guard that now names the families rather than waiting for
                     // one to turn up in an unrelated probe.
+                    //
+                    // Review #80: a site naming a SUBCLASS (`Counter extends
+                    // AtomicInteger`) matches only through the class that
+                    // declares the resolved method, and only for a method `final`
+                    // in the JDK. Its guard is the subclass's own id, so any
+                    // other receiver class falls back. Both answers come off
+                    // `cm_lock` too (`site_class_and_declaring_class_name`).
                     if invoke_kind == 0
-                        && target_class == "java/util/concurrent/atomic/AtomicInteger"
+                        && cratonvm_jit::atomic_intrinsic_site_may_match(
+                            "java/util/concurrent/atomic/AtomicInteger",
+                            &target_class,
+                            &mn,
+                            &desc,
+                        )
                     {
-                        let atomic_cid = cm_lock
-                            .find_bootstrap_class_by_name(
-                                "java/util/concurrent/atomic/AtomicInteger",
-                            )
-                            .map(|id| id.as_u32());
-                        if let Some((entry, num_params, ret, guard_class_id)) =
-                            atomic_cid.and_then(|cid| {
-                                cratonvm_jit::try_resolve_atomic_intrinsic(
+                        let atomic_site: Option<(u32, Option<String>)> =
+                            if target_class == "java/util/concurrent/atomic/AtomicInteger" {
+                                cm_lock
+                                    .find_bootstrap_class_by_name(
+                                        "java/util/concurrent/atomic/AtomicInteger",
+                                    )
+                                    .map(|id| (id.as_u32(), None))
+                            } else {
+                                site_class_and_declaring_class_name(
+                                    &cm_lock,
+                                    class_id,
                                     &target_class,
+                                    &mn,
+                                    &desc,
+                                )
+                                .map(|(cid, declaring_class)| (cid, Some(declaring_class)))
+                            };
+                        if let Some((entry, num_params, ret, guard_class_id)) =
+                            atomic_site.and_then(|(cid, declaring_class)| {
+                                cratonvm_jit::try_resolve_atomic_intrinsic_for_site(
+                                    &target_class,
+                                    declaring_class.as_deref(),
                                     &mn,
                                     &desc,
                                     cid,
@@ -2104,17 +2189,40 @@ pub(super) fn compile_osr_artifact(
                     // loop. `HashedWheelTimer`'s worker is that shape, and its
                     // `pendingTimeouts` is an `AtomicLong` incremented once per
                     // scheduled timeout and decremented once per expiry.
-                    if invoke_kind == 0 && target_class == "java/util/concurrent/atomic/AtomicLong"
+                    // Subclass sites match through the declaring class, on the
+                    // AtomicInteger arm's terms (which excludes `longValue()`).
+                    if invoke_kind == 0
+                        && cratonvm_jit::atomic_intrinsic_site_may_match(
+                            "java/util/concurrent/atomic/AtomicLong",
+                            &target_class,
+                            &mn,
+                            &desc,
+                        )
                     {
                         // Through `cm_lock` — see the AtomicInteger arm above for
                         // why a fresh `.read()` here is a recursive acquisition.
-                        let atomic_long_cid = cm_lock
-                            .find_bootstrap_class_by_name("java/util/concurrent/atomic/AtomicLong")
-                            .map(|id| id.as_u32());
-                        if let Some((entry, num_params, ret, guard_class_id)) = atomic_long_cid
-                            .and_then(|cid| {
-                                cratonvm_jit::try_resolve_atomic_long_intrinsic(
+                        let atomic_long_site: Option<(u32, Option<String>)> =
+                            if target_class == "java/util/concurrent/atomic/AtomicLong" {
+                                cm_lock
+                                    .find_bootstrap_class_by_name(
+                                        "java/util/concurrent/atomic/AtomicLong",
+                                    )
+                                    .map(|id| (id.as_u32(), None))
+                            } else {
+                                site_class_and_declaring_class_name(
+                                    &cm_lock,
+                                    class_id,
                                     &target_class,
+                                    &mn,
+                                    &desc,
+                                )
+                                .map(|(cid, declaring_class)| (cid, Some(declaring_class)))
+                            };
+                        if let Some((entry, num_params, ret, guard_class_id)) = atomic_long_site
+                            .and_then(|(cid, declaring_class)| {
+                                cratonvm_jit::try_resolve_atomic_long_intrinsic_for_site(
+                                    &target_class,
+                                    declaring_class.as_deref(),
                                     &mn,
                                     &desc,
                                     cid,
@@ -6136,6 +6244,11 @@ pub(super) fn compile_optimizing_artifact(
                 .as_u32(),
         )
     };
+    // Review #80: the class that DECLARES each invoke's resolved method, for
+    // the `Atomic*` intrinsics' subclass sites.
+    let invoke_declaring_class_resolver = |cp_idx: u16| -> Option<String> {
+        cp_method_ref_declaring_class_name(shared, class_id, cp_idx)
+    };
 
     let ldc2w_resolver = |cp_idx: u16| -> Option<(i64, bool)> {
         let cm = shared.classes.class_manager.read();
@@ -6679,6 +6792,10 @@ pub(super) fn compile_optimizing_artifact(
                     .as_u32(),
             )
         };
+        // Review #80: the declaring class of each invoke's resolved method.
+        let c_invoke_declaring_class_resolver = |cp_idx: u16| -> Option<String> {
+            cp_method_ref_declaring_class_name(shared, callee_cid, cp_idx)
+        };
 
         let c_ldc2w_resolver = |cp_idx: u16| -> Option<(i64, bool)> {
             let cm = shared.classes.class_manager.read();
@@ -6811,6 +6928,7 @@ pub(super) fn compile_optimizing_artifact(
             Some(&intrinsic_resolver),
             // This VM's per-bci de-spec registry.
             Some(&shared.jit.despec_registry),
+            Some(&c_invoke_declaring_class_resolver),
         )?;
         let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
         let needs_ctx = compiled.needs_context();
@@ -7049,6 +7167,7 @@ pub(super) fn compile_optimizing_artifact(
         Some(&intrinsic_resolver),
         // This VM's per-bci de-spec registry.
         Some(&shared.jit.despec_registry),
+        Some(&invoke_declaring_class_resolver),
     )?;
     Some(compiled)
 }
@@ -8545,6 +8664,11 @@ pub(super) fn try_jit_compile_callee_slow(
         let target_class = class.constant_pool.get_class_name(class_idx)?;
         Some(cm.find_class_by_name_for_class(target_class, cid)?.as_u32())
     };
+    // Review #80: the declaring class of each invoke's resolved method, for the
+    // `Atomic*` intrinsics' subclass sites.
+    let invoke_declaring_class_resolver = |cp_idx: u16| -> Option<String> {
+        cp_method_ref_declaring_class_name(shared, cid, cp_idx)
+    };
     let ldc2w_resolver = |cp_idx: u16| -> Option<(i64, bool)> {
         let cm = shared.classes.class_manager.read();
         let class = cm.get_class(cid)?;
@@ -8987,6 +9111,7 @@ pub(super) fn try_jit_compile_callee_slow(
         Some(&intrinsic_resolver),
         // This VM's per-bci de-spec registry.
         Some(&shared.jit.despec_registry),
+        Some(&invoke_declaring_class_resolver),
     )?;
     if crate::runtime::env_cache::dbg_jitc() {
         eprintln!(

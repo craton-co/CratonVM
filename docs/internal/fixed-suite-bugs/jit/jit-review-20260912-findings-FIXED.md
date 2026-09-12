@@ -1,6 +1,6 @@
 # FIXED: the 2026-09-12 JIT code review, finding by finding
 
-**Status: 88 FIXED, 3 PARTIAL, 6 OPEN** across 97 findings. The ledger has
+**Status: 89 FIXED, 2 PARTIAL, 6 OPEN** across 97 findings. The ledger has
 95 lines, because #10/#11 and #18/#19 each share one fix and one line. Every
 commit is on `fix/jit-review-20260912`, merged into `dev`. Each PARTIAL and
 OPEN finding names the known-issue record that tracks what is left.
@@ -133,7 +133,7 @@ the review are the gate that does that.
 | 77 | iushr breaks the sign-extended-int invariant | FIXED 7335f4c73 |
 | 78 | lookupswitch assumes sorted keys | FIXED 7335f4c73 |
 | 79 | Bail-list keys XOR field hashes | FIXED 24e98eed4 |
-| 80 | Intrinsics: layout twice, exact CP class, env read per call | PARTIAL 7335f4c73, e9838de83; `atomic-intrinsics-miss-subclass-call-sites-20260912.md` |
+| 80 | Intrinsics: layout twice, exact CP class, env read per call | FIXED 7335f4c73, e9838de83, then the subclass resolver on `fix/jit-review-r2-20260912-verdicts`; `atomic-intrinsics-miss-subclass-call-sites-FIXED-20260912.md` |
 | 81 | Dead intrinsic variants and hand descriptor walkers | FIXED 7335f4c73, c9cf67009, efcc72e7e |
 | 82 | Unresolved checkcast returns null | FIXED 7335f4c73 |
 | 83 | Helper ABI self-check skips callable slots | FIXED 7335f4c73 |
