@@ -21,7 +21,7 @@ one process per arm, checksums identical on every row. Read the ratios.
 | stringregex | 30 ms | 232 ms | 7.7x |
 | **bintrees (d=18)** | 549 ms | 19,133 ms | **35x** |
 
-## 2. The two worst rows are the COLLECTOR, not the compiler
+## 2. The two worst rows are the collector — and that is a KNOWN, DELIBERATE default, not a lane
 
 The same binary, the same classes, the same checksum, one flag apart:
 
@@ -42,12 +42,30 @@ very large volume of short-lived nodes, which is precisely the shape a
 whole-heap non-generational sweep serves worst and a generational or regional
 collector serves best.
 
-**Nothing is changed here.** The default is a policy decision with a blast
-radius far wider than a perf page, and it is recorded rather than taken. What
-this page does claim is narrower and firm: **any CPU comparison that quotes
-`bintrees` or `hashmap` from a default run is measuring the collector**, and
-attributing those rows to the JIT — as the shape of the table in §1 invites —
-is a mis-attribution of about 7x.
+**Nothing is changed here, and — corrected the same day — nothing should be.**
+
+The first draft of this section filed the default as the largest available win
+and put it at the top of §4's ordering. That was wrong twice over, and both
+corrections come from the project's own history rather than from a new
+measurement:
+
+* **The published numbers were always taken under G1.** `README.md`'s and
+  `BENCHMARK.md`'s `bintrees` row is the 2,127 ms arm, not the 15,086 ms one.
+  There was never a 31x figure on record for anyone to be surprised by; the
+  surprise was this page measuring a default that the benchmark methodology
+  does not use and then reporting the difference as news.
+* **The default is chosen for real applications, where G1 is slower and less
+  accurate.** A synthetic allocation kernel is exactly the workload that
+  flatters a regional evacuating collector, and it is exactly the workload the
+  default is *not* tuned for. Ranking a default by `bintrees` optimises the
+  benchmark against the applications.
+
+So the durable content of this section is one sentence, and it is a warning
+rather than a lane: **`bintrees` and `hashmap` are collector-dominated, so a
+default-configuration run of either says nothing about the JIT.** Quote them
+under `-XX:+UseG1GC`, as the published table already does, or do not quote them
+when the subject is compilation. §4's ordering is renumbered accordingly — the
+collector is not on it.
 
 ## 3. And the optimizing tier is 4.5% of the framework-shaped workload
 
@@ -94,17 +112,19 @@ of which optimise the bodies it already produces.
 
 Sized by what the numbers above support, not by what is interesting:
 
-1. **The collector default** (§2). 7x on two of seven phases, a flag already
-   exists, and the only work is deciding and soaking. Nothing about the JIT.
-2. **`fib` at 3.7x** (§1) — recursive invocation, and the one kernel row with a
-   large gap that is neither collector nor collections.
-3. **Optimizer strength / coverage in C2** (§3): ten of twenty-five candidates
+**The collector is not on this list** — see §2 for why it was struck from it.
+
+1. **`fib` at 3.7x** (§1) — recursive invocation. The largest gap on any row
+   that is pure compilation: no allocation, no collections, no collector
+   involvement, one arithmetic expression and two calls. Whatever it is, it is
+   the JIT's.
+2. **Optimizer strength / coverage in C2** (§3): ten of twenty-five candidates
    refused `inert`. Until the optimizer changes something on a typical method,
    improving the code it emits for the few it does change is bounded by 4.5%.
-4. **The allocation gate** (§3) — unblocking `ir_inline_tlab_enabled`'s defect
+3. **The allocation gate** (§3) — unblocking `ir_inline_tlab_enabled`'s defect
    is the prerequisite for C2 taking any method containing a `new`, which is
    most of them.
-5. Everything the recent `c2-*` pages are about — per-iteration instruction
+4. Everything the recent `c2-*` pages are about — per-iteration instruction
    budget, spills, unrolling, phi copies. Real, correct, and worth low single
    digits each on the bodies this tier already emits.
 
