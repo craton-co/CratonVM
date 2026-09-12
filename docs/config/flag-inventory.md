@@ -1368,6 +1368,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_ARM64_SAFEPOINTS` | JIT | `CRATONVM_JIT=arm64-safepoints` | default-on | on | behaviour | snapshot | jit, vm |
 | `CRATONVM_JIT_BAND_SKIP` | JIT | `CRATONVM_JIT=band-skip` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_BISECT_ONLY` | DBG | `CRATONVM_DBG=jit-bisect-only` | opt-in | off | diag | snapshot | jit |
+| `CRATONVM_JIT_BUFFER_SESSION_DIRECT` | JIT | `CRATONVM_JIT=buffer-session-direct` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_BULK_BYTE_LOOPS` | JIT | `CRATONVM_JIT=bulk-byte-loops` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_BYTECODE_LOOP_XFORM` | JIT | `CRATONVM_JIT=bytecode-loop-xform` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_C1_VECTOR_VETO` | JIT | `CRATONVM_JIT=c1-vector-veto` | default-on | on | behaviour | snapshot | jit |

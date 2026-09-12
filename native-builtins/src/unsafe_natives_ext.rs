@@ -3358,15 +3358,44 @@ pub(crate) fn native_unsafe_put_object(
 /// `jdk.internal.util.ArraysSupport.vectorizedMismatch` and therefore
 /// `Arrays.equals(char[]/long[])` (e.g. ecj's `CharOperation.equals`
 /// mis-comparing `"Signature"` vs `"Synthetic"`).
-fn unsafe_read_bytes_from_array(
+/// Widest `Unsafe` scalar access, and so the size of the stack buffer
+/// [`unsafe_read_bytes_into`] fills. `getLongUnaligned` / `getDouble` are the
+/// only 8-byte shapes; nothing in the family is wider.
+const UNSAFE_MAX_ACCESS_WIDTH: usize = 8;
+
+/// Non-allocating core of [`unsafe_read_bytes_from_array`]: fills
+/// `out[..width]` and returns `true`, or returns `false` and leaves `out`
+/// unspecified.
+///
+/// # Why a `byte[]` fast path exists here
+///
+/// `byte[]` is not one element type among six on this path — it is the backing
+/// store of every `HeapByteBuffer`, so it is what `ByteBuffer.getInt` /
+/// `getLong` / `getShort` reach, which is the hot shape in any binary-header
+/// or HTTP-codec workload. The generic loop below costs `width` VIRTUAL
+/// `get_array_element` calls plus, in the old shape, a `Vec` allocation, for a
+/// read the heap can serve with one `memcpy`: `read_byte_array_into` is
+/// overridden in the VM to `copy_nonoverlapping` from the array payload (with
+/// a per-element fallback of its own for a G1 humongous array, so the fast
+/// path does not have to know about that case).
+///
+/// The generic loop is unchanged and still covers `char[]` / `int[]` / `long[]`
+/// and friends, which a multi-byte read may legitimately SPAN — the property
+/// `ArraysSupport.vectorizedMismatch` depends on and the reason this function
+/// is not simply a `byte[]` reader.
+fn unsafe_read_bytes_into(
     ctx: &dyn NativeContext,
     obj: cratonvm_types::ObjectRef,
     offset: usize,
     width: usize,
-) -> Option<Vec<u8>> {
+    out: &mut [u8; UNSAFE_MAX_ACCESS_WIDTH],
+) -> bool {
     use cratonvm_types::ArrayElementType as Aet;
+    if width > UNSAFE_MAX_ACCESS_WIDTH {
+        return false;
+    }
     if ctx.heap_kind_of(obj) != cratonvm_types::ObjectKind::Array {
-        return None;
+        return false;
     }
     let elem_type = ctx.heap_element_type_of(obj);
     let elem_size: usize = match elem_type {
@@ -3375,22 +3404,34 @@ fn unsafe_read_bytes_from_array(
         Aet::Int | Aet::Float => 4,
         Aet::Long | Aet::Double => 8,
         // Reference arrays have no byte-addressable element storage.
-        Aet::Reference => return None,
+        Aet::Reference => return false,
     };
     // Array byte offsets always start at ABASE (16); see
     // `unsafe_array_index_from_offset` / `native_unsafe_array_base_offset`.
     const ABASE: usize = 16;
     if offset < ABASE {
-        return None;
+        return false;
     }
     let rel = offset - ABASE; // bytes from element 0
     let len = ctx.array_length(obj); // element COUNT
-    let total_bytes = len.checked_mul(elem_size)?;
-    if rel.checked_add(width)? > total_bytes {
-        return None;
+    let Some(total_bytes) = len.checked_mul(elem_size) else {
+        return false;
+    };
+    match rel.checked_add(width) {
+        Some(end) if end <= total_bytes => {}
+        _ => return false,
     }
-    let mut bytes = Vec::with_capacity(width);
-    for k in 0..width {
+    if elem_size == 1 {
+        // One `memcpy`. `rel` IS the element index when elements are one byte
+        // wide, and the range was bounds-checked against `total_bytes` above,
+        // so a short return can only mean the heap declined the bulk route —
+        // in which case fall through to the generic loop rather than answer
+        // with a partly filled buffer.
+        if ctx.read_byte_array_into(obj, rel, &mut out[..width]) == width {
+            return true;
+        }
+    }
+    for (k, slot) in out.iter_mut().enumerate().take(width) {
         let byte_pos = rel + k;
         let elem_idx = byte_pos / elem_size;
         let byte_in_elem = byte_pos % elem_size;
@@ -3401,11 +3442,24 @@ fn unsafe_read_bytes_from_array(
             Value::Long(v) => v as u64,
             Value::Float(f) => f.to_bits() as u64,
             Value::Double(d) => d.to_bits(),
-            _ => return None,
+            _ => return false,
         };
-        bytes.push(((elem_bits >> (8 * byte_in_elem)) & 0xFF) as u8);
+        *slot = ((elem_bits >> (8 * byte_in_elem)) & 0xFF) as u8;
     }
-    Some(bytes)
+    true
+}
+
+fn unsafe_read_bytes_from_array(
+    ctx: &dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+    offset: usize,
+    width: usize,
+) -> Option<Vec<u8>> {
+    let mut buf = [0u8; UNSAFE_MAX_ACCESS_WIDTH];
+    if !unsafe_read_bytes_into(ctx, obj, offset, width, &mut buf) {
+        return None;
+    }
+    Some(buf[..width].to_vec())
 }
 
 /// Decode the trailing `bigEndian` boolean of an `*Unaligned` call.
@@ -3441,9 +3495,13 @@ macro_rules! unsafe_multibyte_get {
                 }
             }
             if let Some(obj) = unsafe_obj(args, 1) {
-                if let Some(bytes) = unsafe_read_bytes_from_array(ctx, obj, offset, $width) {
+                // Stack buffer, not a `Vec`: this is the per-accessor path
+                // under every `HeapByteBuffer.getShort`/`getInt`, so the
+                // allocation was one malloc per scalar read.
+                let mut buf = [0u8; UNSAFE_MAX_ACCESS_WIDTH];
+                if unsafe_read_bytes_into(ctx, obj, offset, $width, &mut buf) {
                     let big_endian = unsafe_big_endian_arg(args);
-                    let v: i64 = $assemble(&bytes, big_endian);
+                    let v: i64 = $assemble(&buf[..$width], big_endian);
                     return Ok(Some(Value::Int(v as i32)));
                 }
             }
@@ -3480,12 +3538,15 @@ pub(crate) fn native_unsafe_get_long_mb(
         }
     }
     if let Some(obj) = unsafe_obj(args, 1) {
-        if let Some(b) = unsafe_read_bytes_from_array(ctx, obj, offset, 8) {
+        // As the multi-byte `get` macro: a stack buffer, because this is the
+        // body of `HeapByteBuffer.getLong`.
+        let mut b = [0u8; UNSAFE_MAX_ACCESS_WIDTH];
+        if unsafe_read_bytes_into(ctx, obj, offset, 8, &mut b) {
             let big_endian = unsafe_big_endian_arg(args);
             let v = if big_endian {
-                i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+                i64::from_be_bytes(b)
             } else {
-                i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+                i64::from_le_bytes(b)
             };
             return Ok(Some(Value::Long(v)));
         }
@@ -3517,6 +3578,20 @@ fn unsafe_write_bytes_to_byte_array(
     let len = ctx.array_length(obj);
     if start + bytes.len() > len {
         return false;
+    }
+    // One `memcpy` where the heap can give one — the store twin of
+    // `unsafe_read_bytes_into`'s fast path, and the same reason: this is the
+    // body of `HeapByteBuffer.putInt`/`putLong`, so the per-element loop below
+    // was `width` virtual calls per scalar write.
+    //
+    // Falling through on `false` is safe even though the override's G1
+    // humongous arm can stop partway: the loop below rewrites the WHOLE range
+    // from `start`, and a byte store is idempotent, so partial progress is
+    // overwritten rather than compounded. The bounds were checked above and
+    // `write_byte_array_from` re-checks them itself, so neither path can run
+    // off the end.
+    if ctx.write_byte_array_from(obj, start, bytes) {
+        return true;
     }
     for (i, &b) in bytes.iter().enumerate() {
         // Byte-array elements round-trip as sign-extended Int.
@@ -7237,5 +7312,106 @@ mod arena_zero_length_copy_tests {
             !unsafe_arena_copy_in(end, &[9]),
             "a 1-byte write past the end must still be refused"
         );
+    }
+}
+
+#[cfg(test)]
+mod unsafe_unaligned_read_tests {
+    use super::{unsafe_read_bytes_into, UNSAFE_MAX_ACCESS_WIDTH};
+    use cratonvm_native_api::test_mock::MockNativeContext;
+    use cratonvm_native_api::NativeHeapAccess;
+    use cratonvm_types::ArrayElementType as Aet;
+
+    /// `unsafe_read_bytes_from_array`'s ABASE, restated so a test failure names
+    /// the offset convention rather than a bare number.
+    const ABASE: usize = 16;
+
+    /// **The `byte[]` bulk route and the per-element loop must answer
+    /// identically, at every width and every alignment.**
+    ///
+    /// The bulk route is the one `HeapByteBuffer.getInt`/`getLong` take, and it
+    /// is selected by element size rather than by anything the caller says — so
+    /// nothing at the call site would notice if it disagreed with the loop it
+    /// replaced. `short[]` is the control: same bytes, same expected answer,
+    /// but two-byte elements, so it can only reach the generic loop.
+    #[test]
+    fn the_byte_array_bulk_route_agrees_with_the_per_element_loop() {
+        let mut ctx = MockNativeContext::new();
+        let bytes = ctx.new_array(Aet::Byte, 64);
+        let shorts = ctx.new_array(Aet::Short, 32);
+        for i in 0..64usize {
+            // Cast: a byte element round-trips as a sign-extended int.
+            ctx.set_array_element(
+                bytes,
+                i,
+                cratonvm_types::Value::Int(i32::from((i as u8 * 7 + 1) as i8)),
+            );
+        }
+        for i in 0..32usize {
+            // The same 64 bytes, little-endian, two per element.
+            let lo = u16::from(i as u8 * 2 * 7 + 1);
+            let hi = u16::from((i as u8 * 2 + 1) * 7 + 1);
+            ctx.set_array_element(
+                shorts,
+                i,
+                cratonvm_types::Value::Int(i32::from((lo | (hi << 8)) as i16)),
+            );
+        }
+        for width in [2usize, 4, 8] {
+            for off in 0..8usize {
+                let mut from_bytes = [0u8; UNSAFE_MAX_ACCESS_WIDTH];
+                let mut from_shorts = [0u8; UNSAFE_MAX_ACCESS_WIDTH];
+                assert!(
+                    unsafe_read_bytes_into(&ctx, bytes, ABASE + off, width, &mut from_bytes),
+                    "byte[] read refused at width {width} off {off}"
+                );
+                assert!(
+                    unsafe_read_bytes_into(&ctx, shorts, ABASE + off, width, &mut from_shorts),
+                    "short[] read refused at width {width} off {off}"
+                );
+                assert_eq!(
+                    from_bytes[..width],
+                    from_shorts[..width],
+                    "bulk byte[] route disagrees with the spanning loop at width {width} off {off}"
+                );
+            }
+        }
+    }
+
+    /// **A read that runs off the end is refused, on both routes.**
+    ///
+    /// The fast path is entered only after the same `rel + width <=
+    /// total_bytes` check the loop uses, so this pins that the check was not
+    /// moved behind it. An offset below ABASE is refused too: it is not an
+    /// array-element offset at all.
+    #[test]
+    fn an_out_of_range_read_is_refused_rather_than_truncated() {
+        let mut ctx = MockNativeContext::new();
+        let bytes = ctx.new_array(Aet::Byte, 8);
+        let mut out = [0u8; UNSAFE_MAX_ACCESS_WIDTH];
+        assert!(unsafe_read_bytes_into(&ctx, bytes, ABASE, 8, &mut out));
+        assert!(
+            !unsafe_read_bytes_into(&ctx, bytes, ABASE + 1, 8, &mut out),
+            "one byte past the end must be refused"
+        );
+        assert!(
+            !unsafe_read_bytes_into(&ctx, bytes, ABASE - 1, 2, &mut out),
+            "an offset below ABASE is not an element offset"
+        );
+        assert!(
+            !unsafe_read_bytes_into(&ctx, bytes, ABASE, UNSAFE_MAX_ACCESS_WIDTH + 1, &mut out),
+            "a width wider than the buffer must be refused, not truncated"
+        );
+    }
+
+    /// **A reference array has no byte-addressable storage and is refused.**
+    /// The fast path keys on element SIZE, so this pins that the element-type
+    /// match still rejects `Reference` before any size is derived.
+    #[test]
+    fn a_reference_array_is_refused() {
+        let mut ctx = MockNativeContext::new();
+        let refs = ctx.new_array(Aet::Reference, 8);
+        let mut out = [0u8; UNSAFE_MAX_ACCESS_WIDTH];
+        assert!(!unsafe_read_bytes_into(&ctx, refs, ABASE, 4, &mut out));
     }
 }
