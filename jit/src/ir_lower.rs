@@ -953,6 +953,13 @@ struct Lowerer<'a> {
     /// ([`Lowerer::deopt_block_for_bci`]), which a method near the node cap
     /// paid as nodes × divisions.
     safepoint_bcis: std::collections::HashSet<usize>,
+    /// For each bci, the index of the FIRST `graph.safepoints` entry at that
+    /// bci. That is the entry the by-bci scans
+    /// (`safepoints.iter().position(|s| s.bci == bci)`) found. Read by
+    /// [`Lowerer::resolve_frame_state_for_bci`], which ran that scan once per
+    /// deopt site, and by the per-block OSR entry planner, which ran it once
+    /// per block. See [`Lowerer::first_safepoint_index_by_bci`].
+    safepoint_first_by_bci: HashMap<usize, usize>,
     /// Bytecode indices an `Op::Guard { bci }` is anchored at.
     guard_bcis: std::collections::HashSet<usize>,
     /// Every node a deopt at a bci can fire from, in node-id order: each
@@ -1711,6 +1718,7 @@ impl<'a> Lowerer<'a> {
             spliced_ranges,
             sr_map,
             safepoint_bcis: graph.safepoints.iter().map(|s| s.bci).collect(),
+            safepoint_first_by_bci: Self::first_safepoint_index_by_bci(graph),
             guard_bcis: graph
                 .nodes
                 .iter()
@@ -11559,8 +11567,20 @@ impl<'a> Lowerer<'a> {
         self.resolve_frame_state_for_bci(bci)
     }
 
+    /// For each bci, the index of the first `graph.safepoints` entry at that
+    /// bci. For every bci this is the answer
+    /// `graph.safepoints.iter().position(|s| s.bci == bci)` gives; it is
+    /// built once in [`Lowerer::new`] as [`Lowerer::safepoint_first_by_bci`].
+    fn first_safepoint_index_by_bci(graph: &Graph) -> HashMap<usize, usize> {
+        let mut first: HashMap<usize, usize> = HashMap::with_capacity(graph.safepoints.len());
+        for (idx, sp) in graph.safepoints.iter().enumerate() {
+            first.entry(sp.bci).or_insert(idx);
+        }
+        first
+    }
+
     fn resolve_frame_state_for_bci(&self, bci: usize) -> FrameState {
-        match self.graph.safepoints.iter().position(|s| s.bci == bci) {
+        match self.safepoint_first_by_bci.get(&bci).copied() {
             Some(idx) => self.resolve_frame_state(&self.graph.safepoints[idx], idx),
             None => FrameState {
                 method_key: String::new(),
@@ -12073,7 +12093,11 @@ impl<'a> Lowerer<'a> {
                 refusals.push("block control carries no bci");
                 continue;
             };
-            let Some(sp) = self.graph.safepoints.iter().find(|s| s.bci == bci) else {
+            let Some(sp) = self
+                .safepoint_first_by_bci
+                .get(&bci)
+                .and_then(|&idx| self.graph.safepoints.get(idx))
+            else {
                 refusals.push("no safepoint snapshot at this block start");
                 continue;
             };
@@ -24757,6 +24781,35 @@ mod tests {",
         );
         // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         assert_eq!(unsafe { cm.try_call(&[10]).expect("call") }, 45);
+    }
+
+    /// `Lowerer::first_safepoint_index_by_bci` gives, for every bci, the answer
+    /// of the by-bci scan it replaced: the FIRST snapshot at that bci. That
+    /// holds when several snapshots share a bci, as an unrolled body's copies
+    /// do, and for a bci with no snapshot at all.
+    #[test]
+    fn the_safepoint_index_names_the_first_snapshot_at_each_bci() {
+        // iconst_0; istore_1; iload_1; ireturn
+        let code = [0x03, 0x3c, 0x1b, 0xac, 0, 0];
+        let mut graph = IrBuilder::new(1, 2).build(&code, 4).expect("builds");
+        for bci in [2usize, 0, 2, 7, 3, 7] {
+            graph.safepoints.push(crate::ir::SafepointSnapshot {
+                bci,
+                locals: Vec::new(),
+                stack: Vec::new(),
+            });
+        }
+        let index = Lowerer::first_safepoint_index_by_bci(&graph);
+        for bci in 0..10usize {
+            assert_eq!(
+                index.get(&bci).copied(),
+                graph.safepoints.iter().position(|s| s.bci == bci),
+                "bci {bci}"
+            );
+        }
+        let distinct: std::collections::HashSet<usize> =
+            graph.safepoints.iter().map(|s| s.bci).collect();
+        assert_eq!(index.len(), distinct.len(), "one entry per distinct bci");
     }
 
     // do-while: the back-edge is an `if_icmplt` (not a goto), and the loop
