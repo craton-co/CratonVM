@@ -7437,6 +7437,7 @@ fn compile_inline_arm(
                 Some(&ir_inline_resolver), // 25 ir_inline_resolver  <- the point
                 false,                     // 26 jdk_only
                 None,                      // 27 intrinsic_resolver
+                None,                      // 28 despec
             )
         },
     )

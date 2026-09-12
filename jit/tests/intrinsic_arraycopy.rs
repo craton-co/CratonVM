@@ -400,6 +400,7 @@ fn compile_arraycopy() -> impl Fn(i64, i32, i64, i32, i32) {
 
 fn compile_despec_arraycopy_with_dispatch(
     method_key: &str,
+    despec: &std::sync::Arc<cratonvm_jit::deopt::DespecRegistry>,
     info: &JitInvokeInfo,
     helpers: &JitRuntimeHelpers,
 ) -> CompiledMethod {
@@ -461,6 +462,7 @@ fn compile_despec_arraycopy_with_dispatch(
         0,
         Vec::new(),
         method_key,
+        Some(despec),
         Vec::new(), // indy_info
         // elidable_init_pcs: hand-built bytecode with no constant pool, so
         // nothing is PROVEN to be an empty `<init>` and nothing may be elided.
@@ -492,9 +494,11 @@ fn arraycopy_matcher_registers_only_the_erased_descriptor() {
 #[test]
 fn arraycopy_despec_uses_dispatch_not_intrinsic_sentinel() {
     let _g = deopt_lock();
-    cratonvm_jit::deopt::despec_clear_for_test();
     let method_key = "ArraycopyDespec.wrapper:(Ljava/lang/Object;ILjava/lang/Object;II)V";
-    cratonvm_jit::deopt::despec_insert(method_key, 6);
+    // This compile's own registry, standing in for one VM's: nothing another
+    // test records can reach it, so there is nothing to clear afterwards.
+    let despec = std::sync::Arc::new(cratonvm_jit::deopt::DespecRegistry::new());
+    despec.insert(method_key, 6);
     {
         let mut record = DISPATCH_RECORD
             .lock()
@@ -512,7 +516,7 @@ fn arraycopy_despec_uses_dispatch_not_intrinsic_sentinel() {
         declaring_class_id: 0,
     };
     let helpers = helpers_with_dispatch(recording_invoke_dispatch as *const () as usize);
-    let compiled = compile_despec_arraycopy_with_dispatch(method_key, &info, &helpers);
+    let compiled = compile_despec_arraycopy_with_dispatch(method_key, &despec, &info, &helpers);
 
     let before = clear_deopt_signals();
     let vm_ptr = 0x1234_5678_i64;
@@ -533,8 +537,6 @@ fn arraycopy_despec_uses_dispatch_not_intrinsic_sentinel() {
     assert_eq!(record.args, [11, 22, 33, 44, 55]);
     assert_eq!(record.return_type, b'V');
     assert_eq!(record.invoke_kind, 3);
-
-    cratonvm_jit::deopt::despec_clear_for_test();
 }
 
 #[test]

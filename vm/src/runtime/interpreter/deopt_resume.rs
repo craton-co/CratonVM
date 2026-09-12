@@ -2284,8 +2284,8 @@ pub(super) fn real_frame_deopt_resume_and_despeculate(
     // whole-method blacklist. Before that escalation can fire, give the SINGLE
     // speculation site that keeps failing a chance to be dropped on its own: once
     // THIS bci has deopted `PER_BCI_DESPEC_LIMIT` times, record `(method, bci)` in
-    // the de-spec registry the optimizing backend consults
-    // (`despec_contains`), so the next compilation suppresses just that
+    // THIS VM's de-spec registry (`shared.jit.despec_registry`), which every
+    // compile this VM requests consults, so the next compilation suppresses just that
     // speculative guard (falling back to per-access bounds checks) and the method
     // stays compiled. A method whose deopts are spread across many bcis still
     // hits the per-method backstop; a method with one pathological site gets
@@ -2308,7 +2308,10 @@ pub(super) fn real_frame_deopt_resume_and_despeculate(
             .lock()
             .deopt_count_at_bci(&method_key, rframe.bci);
         if bci_deopts >= PER_BCI_DESPEC_LIMIT {
-            cratonvm_jit::deopt::despec_insert(&method_key, rframe.bci);
+            shared
+                .jit
+                .despec_registry
+                .insert(&method_key, rframe.bci);
             if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
                 eprintln!(
                     "[cratonvm-deopt] per-bci de-spec: {} bci={} ({} deopts ≥ {}) — \
@@ -2884,13 +2887,12 @@ mod deopt_step3_tests {
     /// deopt-osr Step 9 follow-up (c): per-bci de-spec. After
     /// `PER_BCI_DESPEC_LIMIT` deopts at the SAME bci, the sink records
     /// `(method, bci)` in the de-spec registry the optimizing backend consults
-    /// (`despec_contains`) — so that ONE speculation is suppressed on the next
-    /// compile instead of the whole method being blacklisted. Fewer deopts, or a
-    /// different bci, do not de-spec.
+    /// (`DespecRegistry::contains`) — so that ONE speculation is suppressed on
+    /// the next compile instead of the whole method being blacklisted. Fewer
+    /// deopts, or a different bci, do not de-spec. The registry is this test's
+    /// own `SharedVm`'s, so no other test can see or perturb it.
     #[test]
     fn step9_fuc_per_bci_despec_after_limit() {
-        // A test-unique method key so the process-global de-spec registry cannot
-        // collide with other parallel tests.
         let cached = Arc::new(CachedBytecodeMethod {
             declaring_class_id: cratonvm_types::ClassId::new(0),
             class_name: Arc::from("DespecFuC"),
@@ -2915,7 +2917,6 @@ mod deopt_step3_tests {
             quickened: std::sync::OnceLock::new(),
         });
         let key = "DespecFuC.loop:()V";
-        cratonvm_jit::deopt::despec_clear_for_test();
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
@@ -2937,7 +2938,7 @@ mod deopt_step3_tests {
             };
             let _ =
                 real_frame_deopt_resume_and_despeculate(&shared, &mut thread, &cm, &cached, &rf);
-            let despec_now = cratonvm_jit::deopt::despec_contains(key, 5);
+            let despec_now = shared.jit.despec_registry.contains(key, 5);
             if n < 4 {
                 assert!(
                     !despec_now,
@@ -2948,8 +2949,13 @@ mod deopt_step3_tests {
             }
         }
         // A different bci on the same method is unaffected — de-spec is per-site.
-        assert!(!cratonvm_jit::deopt::despec_contains(key, 9));
-        cratonvm_jit::deopt::despec_clear_for_test();
+        assert!(!shared.jit.despec_registry.contains(key, 9));
+        // And a second VM in the same process inherits none of it.
+        let other = SharedVm::new(VmConfig::default());
+        assert!(
+            !other.jit.despec_registry.contains(key, 5),
+            "a second VM must not inherit the first VM's despeculation"
+        );
     }
 
     /// jit-invokedynamic-groovy-regression fix — the frame-identity parser:

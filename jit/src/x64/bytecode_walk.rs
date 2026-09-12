@@ -1110,7 +1110,7 @@ impl Compiler {
             // (throwing NPE/AIOOBE only if the access is actually reached).
             // Repeated guard failures at this header cross the per-bci
             // de-spec threshold and the recompile drops the hoist entirely
-            // (see the `despec_contains` filter on `hoist_info` in
+            // (see the `DespecRegistry::contains` filter on `hoist_info` in
             // `compile_with_param_slots`). Before these guards the hoist was
             // a raw MOV — a null/OOB row index crashed the VM or fed a
             // garbage row pointer to the loop body (test_classes/
@@ -6601,7 +6601,10 @@ impl Compiler {
                         if *entry != crate::JitIntrinsic::ArraycopyPrimitive.as_entry() {
                             return true;
                         }
-                        !crate::deopt::despec_contains(&self.method_key, pc as u32)
+                        !self
+                            .despec
+                            .as_ref()
+                            .is_some_and(|registry| registry.contains(&self.method_key, pc as u32))
                     });
                     // E27-1 N2b: `indexOf(I)` is intrinsified ONLY where the
                     // needle is a compile-time constant in `0..=0xFFFF`, which
@@ -7469,12 +7472,14 @@ impl Compiler {
                         // records this bci in the de-spec registry after
                         // `PER_BCI_DESPEC_LIMIT` deopts, exactly like the
                         // loop-header speculative-BCE guards (see
-                        // `despec_contains` above); this intrinsic just needs
-                        // to honor it on recompile — bail to the generic
+                        // `DespecRegistry::contains` above); this intrinsic just
+                        // needs to honor it on recompile — bail to the generic
                         // (non-speculative) call dispatch below instead of
                         // re-emitting a guard proven to always fail.
                         else if callee_entry == crate::JitIntrinsic::ArraycopyPrimitive.as_entry()
-                            && !crate::deopt::despec_contains(&self.method_key, pc as u32)
+                            && !self.despec.as_ref().is_some_and(|registry| {
+                                registry.contains(&self.method_key, pc as u32)
+                            })
                         {
                             // Phase 2 — System.arraycopy(src, srcPos, dst,
                             // dstPos, len). The descriptor is type-erased;

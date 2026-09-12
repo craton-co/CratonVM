@@ -23997,6 +23997,8 @@ pub fn try_compile(
         // No registry in scope from this wrapper. `None` refuses, which is
         // what the blanket strict refusal did before §4.
         None,
+        // No VM, so no per-VM de-spec registry: nothing is de-spec'd.
+        None,
     )
 }
 
@@ -24179,6 +24181,11 @@ pub fn try_compile_with_invokespecial_resolver(
     // fail-closed direction — a compile with no way to ask cannot bake a
     // native in front of real bytes.
     intrinsic_resolver: Option<&dyn Fn(&str, &str, &str) -> bool>,
+    // The compiling VM's per-bci de-spec registry (`JitRealm::despec_registry`
+    // on the VM side). Was the process-global `deopt.rs` `DESPEC_SET` until
+    // 2026-09-12, which let one VM's despeculation verdicts strip speculations
+    // from every other VM's compiles. `None` (no VM in scope) consults nothing.
+    despec: Option<&std::sync::Arc<crate::deopt::DespecRegistry>>,
 ) -> Option<CompiledMethod> {
     // The admission gate. Four checks and two side effects, all of which used
     // to live inline here and NONE of which the other two backend doors (the
@@ -24295,6 +24302,7 @@ pub fn try_compile_with_invokespecial_resolver(
         &admission,
         jdk_only,
         intrinsic_resolver,
+        despec,
     );
 
     // ── The compiled-local-handler safety net ───────────────────────────
@@ -24350,6 +24358,7 @@ pub fn try_compile_with_invokespecial_resolver(
                 &admission,
                 jdk_only,
                 intrinsic_resolver,
+                despec,
             );
             backend_attempted |= retry_backend_attempted;
             if retried.is_some() && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
@@ -25783,6 +25792,9 @@ fn try_compile_inner(
     // fail-closed direction — a compile with no way to ask cannot bake a
     // native in front of real bytes.
     intrinsic_resolver: Option<&dyn Fn(&str, &str, &str) -> bool>,
+    // The compiling VM's per-bci de-spec registry — see the same parameter on
+    // `try_compile_with_invokespecial_resolver`. `None` consults nothing.
+    despec: Option<&std::sync::Arc<crate::deopt::DespecRegistry>>,
 ) -> Option<CompiledMethod> {
     // One compile, one verdict: the fall-through signal describes THIS call.
     reset_ir_fall_through_signal();
@@ -31739,13 +31751,15 @@ fn try_compile_inner(
                     // it gets its MIC like any other invoke.
                     let by_profile = !supported
                         || receiver_profile_rejects_guard(profile, pc, guard_class_id);
-                    let by_despec = crate::deopt::despec_contains(
-                        &format!(
-                            "{}.{}:{}",
-                            cached.class_name, cached.method_name, cached.method_descriptor
-                        ),
-                        pc as u32,
-                    );
+                    let by_despec = despec.is_some_and(|registry| {
+                        registry.contains(
+                            &format!(
+                                "{}.{}:{}",
+                                cached.class_name, cached.method_name, cached.method_descriptor
+                            ),
+                            pc as u32,
+                        )
+                    });
                     if by_profile {
                         crate::metrics::note_receiver_despec(
                             crate::metrics::RECEIVER_DESPEC_PROFILE_DECLINED,
@@ -32135,8 +32149,8 @@ fn try_compile_inner(
 
     // deopt-osr Step 9 follow-up (c): the per-bci de-spec key for this method
     // (same `"<class>.<method>:<descriptor>"` form the deopt log / method_epochs
-    // use). Lets the optimizing backend skip a loop-header speculative-BCE guard
-    // recorded in the de-spec registry. Empty registry in production ⇒ no effect.
+    // use). Lets the backend skip a loop-header speculative-BCE guard recorded
+    // in this VM's de-spec registry (`despec`). Nothing recorded ⇒ no effect.
     let despec_method_key = format!(
         "{}.{}:{}",
         cached.class_name, cached.method_name, cached.method_descriptor
@@ -32326,6 +32340,7 @@ fn try_compile_inner(
         param_oop_mask,
         compact_field_info,
         &despec_method_key,
+        despec,
         indy_info,
         elidable_init_pcs,
     )?;

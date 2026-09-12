@@ -4493,6 +4493,7 @@ impl SharedVm {
                 // policy when the environment is unset.
                 tiered_manager: crate::jit::tiered::TieredCompilationManager::with_env_policy(),
                 deopt_log: parking_lot::Mutex::new(crate::jit::deopt::DeoptimizationLog::new()),
+                despec_registry: Arc::new(crate::jit::deopt::DespecRegistry::new()),
                 method_epochs: parking_lot::RwLock::new(FxHashMap::default()),
                 method_epoch_overflow: std::sync::atomic::AtomicU64::new(0),
                 // JIT slow-path allocation: per-class init recipe cache.
@@ -7971,7 +7972,8 @@ impl SharedVm {
             // The bci-aware policy: a method whose only failing speculation has
             // already been de-spec'd is recompiled, not blacklisted. See
             // `DeoptimizationLog::recommend_action_at_bci`.
-            let action = log.recommend_action_at_bci(method_key, reason, bci);
+            let action =
+                log.recommend_action_at_bci(method_key, reason, bci, &self.jit.despec_registry);
             log.record_deopt(method_key, event);
             action
         };

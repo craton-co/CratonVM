@@ -714,23 +714,82 @@ pub type VirtualObjectMaterializationResult =
 // Per-bci de-speculation registry (deopt-osr Step 9 follow-up c)
 // ---------------------------------------------------------------------------
 
-/// Process-global set of `(method_key, bci)` speculation sites that have
-/// deopted past the per-bci give-up threshold and must NOT be re-speculated on
-/// the next compilation — "only de-spec the speculation that failed instead of
+/// One VM's set of `(method_key, bci)` speculation sites that have deopted past
+/// the per-bci give-up threshold and must NOT be re-speculated on the next
+/// compilation — "only de-spec the speculation that failed instead of
 /// whole-method eviction." The VM's real-frame-deopt de-spec path
-/// (`vm/.../interpreter.rs`) inserts into it (only under `deopt_real_enabled()`);
-/// the optimizing compiler reads it when deciding whether to emit a speculative
-/// guard at a loop header (see `compile_with_param_slots`).
+/// (`vm/src/runtime/interpreter/deopt_resume.rs`) inserts into it; the compiler
+/// reads it when deciding whether to emit a speculative guard (loop-header BCE
+/// guards and LICM hoists in `x64::compile_with_param_slots`, the arraycopy
+/// intrinsic in `x64::bytecode_walk`, and the guarded String receiver
+/// intrinsics in `try_compile_inner` and the VM's OSR door).
 ///
-/// Empty on every production VM (nothing inserts unless the deopt-resume feature
-/// is on), so `despec_contains` always returns `false` there and codegen is
-/// byte-identical. Keyed by the same `"<class>.<method>:<descriptor>"` string
-/// the deopt log / `method_epochs` use.
-static DESPEC_SET: std::sync::OnceLock<std::sync::RwLock<FxHashSet<(String, u32)>>> =
-    std::sync::OnceLock::new();
+/// # Per VM, not per process
+///
+/// This was a process-global `static` until 2026-09-12. A despeculation is a
+/// verdict about what ONE VM's program did at a bci, so a second VM in the same
+/// process (an embedded VM, or a test building two) inherited verdicts it never
+/// earned and compiled without speculations its own profile supported. The VM
+/// now owns one registry (`JitRealm::despec_registry`, behind an `Arc` so a
+/// compile can hold it for its whole duration) and threads it into every
+/// compile request as `Option<&Arc<DespecRegistry>>`. `None` — the legacy
+/// `try_compile` / `x64::compile` wrappers and crate fixtures with no VM —
+/// consults nothing, which is what the empty process registry answered for
+/// them. See `jit-compatibility-and-despec-state-per-vm-FIXED.md`.
+///
+/// The data structure and its locking discipline are unchanged: one
+/// `std::sync::RwLock` over an `FxHashSet`, a poisoned lock reads as "not
+/// de-spec'd". Keyed by the same `"<class>.<method>:<descriptor>"` string the
+/// deopt log / `method_epochs` use.
+#[derive(Debug, Default)]
+pub struct DespecRegistry {
+    set: std::sync::RwLock<FxHashSet<(String, u32)>>,
+}
 
-fn despec_set() -> &'static std::sync::RwLock<FxHashSet<(String, u32)>> {
-    DESPEC_SET.get_or_init(|| std::sync::RwLock::new(FxHashSet::default()))
+impl DespecRegistry {
+    /// An empty registry: nothing is de-spec'd.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record `(method_key, bci)` as a failed speculation site that must not be
+    /// re-speculated. Idempotent.
+    pub fn insert(&self, method_key: &str, bci: u32) {
+        if let Ok(mut s) = self.set.write() {
+            s.insert((method_key.to_string(), bci));
+        }
+    }
+
+    /// `true` if `(method_key, bci)` was recorded as a failed speculation site.
+    /// Consulted by the compiler at speculative-guard emission. An empty
+    /// `method_key` never matches (the `x64::compile()` legacy/test wrapper
+    /// passes `""`).
+    ///
+    /// Fast path: when the registry is empty (nothing ever de-spec'd) this
+    /// returns `false` after a cheap `is_empty` check, WITHOUT the
+    /// `method_key.to_string()` lookup allocation, so consulting it per
+    /// speculative guard during normal compilation is allocation-free.
+    pub fn contains(&self, method_key: &str, bci: u32) -> bool {
+        if method_key.is_empty() {
+            return false;
+        }
+        let set = match self.set.read() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        if set.is_empty() {
+            return false;
+        }
+        set.contains(&(method_key.to_string(), bci))
+    }
+
+    /// Number of recorded de-spec sites for `method_key` (diagnostics / tests).
+    pub fn count_for(&self, method_key: &str) -> usize {
+        self.set
+            .read()
+            .map(|s| s.iter().filter(|(m, _)| m == method_key).count())
+            .unwrap_or(0)
+    }
 }
 
 /// How many times `max_deopts_per_method` a de-spec'd method may keep
@@ -749,53 +808,6 @@ pub fn despec_spare_factor() -> usize {
             .filter(|&f| f > 0)
             .unwrap_or(2)
     })
-}
-
-/// Record `(method_key, bci)` as a failed speculation site that must not be
-/// re-speculated. Idempotent. See [`DESPEC_SET`].
-pub fn despec_insert(method_key: &str, bci: u32) {
-    if let Ok(mut s) = despec_set().write() {
-        s.insert((method_key.to_string(), bci));
-    }
-}
-
-/// `true` if `(method_key, bci)` was recorded as a failed speculation site.
-/// Consulted by the optimizing compiler at speculative-guard emission. An empty
-/// `method_key` never matches (the `compile()` legacy/test wrapper passes `""`).
-///
-/// Production fast path: when the registry is empty (nothing ever de-spec'd —
-/// the case unless the deopt-resume feature is on) this returns `false` after a
-/// cheap `is_empty` check, WITHOUT the `method_key.to_string()` lookup
-/// allocation, so consulting it per speculative guard during normal compilation
-/// is allocation-free.
-pub fn despec_contains(method_key: &str, bci: u32) -> bool {
-    if method_key.is_empty() {
-        return false;
-    }
-    let set = match despec_set().read() {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    if set.is_empty() {
-        return false;
-    }
-    set.contains(&(method_key.to_string(), bci))
-}
-
-/// Number of recorded de-spec sites for `method_key` (diagnostics / tests).
-pub fn despec_count_for(method_key: &str) -> usize {
-    despec_set()
-        .read()
-        .map(|s| s.iter().filter(|(m, _)| m == method_key).count())
-        .unwrap_or(0)
-}
-
-/// Clear the entire de-spec registry. Test-only (process-global state leaks
-/// across in-process tests otherwise).
-pub fn despec_clear_for_test() {
-    if let Ok(mut s) = despec_set().write() {
-        s.clear();
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,8 +1054,8 @@ impl DeoptimizationLog {
     /// wrong when one call site speculates on a receiver class the program never
     /// produces. The second case is not fixed by recompiling and is not the
     /// method's fault: the per-bci de-spec registry exists precisely to drop
-    /// that ONE guard on the next compile (see `despec_insert`'s caller,
-    /// `real_frame_deopt_resume_and_despeculate`), and since the emitter now
+    /// that ONE guard on the next compile (see [`DespecRegistry::insert`]'s
+    /// caller, `real_frame_deopt_resume_and_despeculate`), and since the emitter now
     /// honours it (`x64::bytecode_walk`'s invoke ladder) the recompile really
     /// does come back without the guard. Blacklisting the method anyway retires
     /// it to the interpreter for a speculation that no longer exists.
@@ -1054,11 +1066,16 @@ impl DeoptimizationLog {
     /// "de-spec'd" is a claim about the NEXT compile and a site that keeps
     /// trapping past that point is evidence the claim is wrong. Deopts at any
     /// OTHER bci are untouched and still escalate on the ordinary schedule.
+    ///
+    /// `despec` is the VM's own registry (`JitRealm::despec_registry`) — the
+    /// same one its compiles consult, so "already de-spec'd" means de-spec'd for
+    /// THIS VM's next compile.
     pub fn recommend_action_at_bci(
         &self,
         method: &str,
         reason: DeoptReason,
         bci: u32,
+        despec: &DespecRegistry,
     ) -> DeoptAction {
         let action = self.recommend_action(method, reason);
         if action != DeoptAction::MakeNotCompilable
@@ -1067,7 +1084,7 @@ impl DeoptimizationLog {
                 DeoptReason::ReceiverTypeChanged | DeoptReason::ClassCheck
             )
             || !crate::receiver_despec_enabled()
-            || !despec_contains(method, bci)
+            || !despec.contains(method, bci)
             || self.deopt_count(method)
                 >= despec_spare_factor() * self.max_deopts_per_method as usize
         {
@@ -6258,26 +6275,41 @@ mod tests {
 
     // -- per-bci de-spec registry (Step 9 follow-up c) ---------------------
 
-    /// `despec_insert`/`despec_contains`/`despec_count_for` are per-(method, bci):
+    /// `DespecRegistry::{insert, contains, count_for}` are per-(method, bci):
     /// a recorded site matches only its own key+bci, an empty key never matches,
-    /// and inserts are idempotent. Uses a test-unique method key so it does not
-    /// race the shared process-global set with other parallel tests.
+    /// and inserts are idempotent.
     #[test]
     fn despec_registry_is_per_method_bci() {
+        let registry = DespecRegistry::new();
         let m = "DespecTest$Unique.loop:(I)I";
-        assert!(!despec_contains(m, 7));
-        despec_insert(m, 7);
-        despec_insert(m, 7); // idempotent
-        despec_insert(m, 12);
-        assert!(despec_contains(m, 7));
-        assert!(despec_contains(m, 12));
-        assert!(!despec_contains(m, 8), "a different bci must not match");
+        assert!(!registry.contains(m, 7));
+        registry.insert(m, 7);
+        registry.insert(m, 7); // idempotent
+        registry.insert(m, 12);
+        assert!(registry.contains(m, 7));
+        assert!(registry.contains(m, 12));
+        assert!(!registry.contains(m, 8), "a different bci must not match");
         assert!(
-            !despec_contains("OtherClass.m:()V", 7),
+            !registry.contains("OtherClass.m:()V", 7),
             "a different method must not match"
         );
-        assert!(!despec_contains("", 7), "an empty key never matches");
-        assert_eq!(despec_count_for(m), 2);
+        assert!(!registry.contains("", 7), "an empty key never matches");
+        assert_eq!(registry.count_for(m), 2);
+    }
+
+    /// Two VMs, two registries: a verdict recorded by one is invisible to the
+    /// other. This is the property the process-global set did not have.
+    #[test]
+    fn despec_registries_do_not_share_verdicts() {
+        let first_vm = DespecRegistry::new();
+        let second_vm = DespecRegistry::new();
+        first_vm.insert("Shared.m:()V", 3);
+        assert!(first_vm.contains("Shared.m:()V", 3));
+        assert!(
+            !second_vm.contains("Shared.m:()V", 3),
+            "a second VM must not inherit the first VM's despeculation"
+        );
+        assert_eq!(second_vm.count_for("Shared.m:()V"), 0);
     }
 
     // -- helpers -----------------------------------------------------------

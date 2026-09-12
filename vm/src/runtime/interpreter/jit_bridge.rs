@@ -1150,7 +1150,7 @@ pub(super) fn compile_osr_artifact(
                 shared.jit.profile_store.get_profile(&profile_key)
             };
             // Same `"<class>.<method>:<descriptor>"` key the deopt log and
-            // `method_epochs` use; see `despec_contains`.
+            // `method_epochs` use; see `DespecRegistry::contains`.
             let osr_despec_key = format!("{class_name}.{method_name}:{method_descriptor}");
 
             // Resolve invokes — collect info under lock, then compile callees after release
@@ -1472,7 +1472,7 @@ pub(super) fn compile_osr_artifact(
                                         pc,
                                         guard_class_id,
                                     );
-                                let by_despec = cratonvm_jit::deopt::despec_contains(
+                                let by_despec = shared.jit.despec_registry.contains(
                                     &osr_despec_key,
                                     pc as u32,
                                 );
@@ -3279,9 +3279,10 @@ pub(super) fn compile_osr_artifact(
                 // this method's identity (the resume sinks verify a stashed
                 // frame's `method_key` before resuming it; an empty key would
                 // force every OSR-frame deopt onto the imprecise safe-reject
-                // path). Also enables the per-bci de-spec consult, which is
-                // inert in production (empty registry).
+                // path). Also enables the per-bci de-spec consult below.
                 &format!("{class_name}.{method_name}:{method_descriptor}"),
+                // This VM's de-spec registry — per VM, never another VM's.
+                Some(&shared.jit.despec_registry),
                 indy_info,
                 Some(elidable_init_pcs),
             );
@@ -6787,6 +6788,8 @@ pub(super) fn compile_optimizing_artifact(
 
             // whether a thin direct-call helper may shadow real bytecode.
             Some(&intrinsic_resolver),
+            // This VM's per-bci de-spec registry.
+            Some(&shared.jit.despec_registry),
         )?;
         let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
         let needs_ctx = compiled.needs_context();
@@ -7023,6 +7026,8 @@ pub(super) fn compile_optimizing_artifact(
 
         // whether a thin direct-call helper may shadow real bytecode.
         Some(&intrinsic_resolver),
+        // This VM's per-bci de-spec registry.
+        Some(&shared.jit.despec_registry),
     )?;
     Some(compiled)
 }
@@ -8907,6 +8912,8 @@ pub(super) fn try_jit_compile_callee_slow(
 
         // whether a thin direct-call helper may shadow real bytecode.
         Some(&intrinsic_resolver),
+        // This VM's per-bci de-spec registry.
+        Some(&shared.jit.despec_registry),
     )?;
     if crate::runtime::env_cache::dbg_jitc() {
         eprintln!(

@@ -688,6 +688,7 @@ fn every_unrolled_copy_of_an_implicit_null_check_is_registered() {
                     1, // param_oop_mask: local 0 is a reference parameter
                     compact_field_info.clone(),
                     "UT3.walk:(LUT3$N;)I",
+                    None, // despec: fixture has no VM
                     Vec::new(),
                     None,
                 )
@@ -1400,6 +1401,7 @@ fn compile_indy_fixture(code: &[u8]) -> Option<CompiledMethod> {
         0,
         Vec::new(),
         "T.f:(I)I",
+        None, // despec: fixture has no VM
         // (pc, arg_slots, ret_type, arg_type_tags, concat_site)
         vec![(19, 0, b'I', Vec::new(), 0)],
         // elidable_init_pcs: fixture resolves no constant pool.
