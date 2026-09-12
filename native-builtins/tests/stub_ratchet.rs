@@ -1997,6 +1997,75 @@ use cratonvm_types::compat::CompatibilityMode;
 /// time. Three independent derivations of one delta is what makes it a property
 /// of this branch rather than of a tree, which is the claim a re-freeze makes.
 ///
+/// # 2026-09-11, lane 5's SECOND residual wave: +33 in every arm, total FLAT
+///
+/// `RETIRED_SHADOW_L5S_TRIPLES` re-tags 33 `Unsafe` triples from `Bridge` to
+/// `SyntheticStub` — 13 `sun/misc/Unsafe` address-form accessors and 20
+/// `jdk/internal/misc/Unsafe` delegating accessors. No registration is added or
+/// removed; 33 change kind.
+///
+/// Measured with the PAIRED ratchet rather than by arithmetic:
+/// `CRATONVM_UNRETIRE_NATIVE_SHADOW` set to the 33 triples turns the table off
+/// at runtime, so the before-number comes from the SAME tree and the same test
+/// binary:
+///
+/// ```text
+///   arm             stubs OFF -> ON           total OFF -> ON
+///   no-management       2728 -> 2761             13622 -> 13622   (branch)
+///   management          2755 -> 2788             13990 -> 13990   (branch)
+///   synthetic-jdk       2728 -> 2761             13657 -> 13657   (branch)
+/// ```
+///
+/// RE-MEASURED on every merge that moved these constants, because a delta is
+/// only a property of the branch if it survives the tree moving under it. Lane
+/// 4 wave 2 (+137), lane 6's net residuals and lane 1 wave 6 (+19) all landed
+/// while this wave was in its acceptance runs:
+///
+/// ```text
+///   control       no-mgmt   mgmt    syn-jdk      this wave gives
+///   e240573a8       2728    2755      2728       2761 / 2788 / 2761
+///   +L4 w2          2865    2892      2865       2898 / 2925 / 2898
+///   da7cc2da6       2884    2911      2884       2917 / 2944 / 2917
+///   bdb02d94e       2915    2942      2915       2948 / 2975 / 2948
+/// ```
+///
+/// **+33 every time, over controls 220 rows apart**, and the total flat beside
+/// each one. Four independent derivations, none of them arithmetic — the same
+/// standard lane 1 wave 6 states three lines above.
+///
+/// The fourth pair is also this file's classifier catching a real mistake.
+/// A `git add -A` before a merge commit swept an in-progress DELETION of 22
+/// registrations into this branch, and the pair read `total DOWN by 11` where
+/// a relabel moves it not at all — the third of the three cases below,
+/// "registrations were DELETED". The deletions were backed out to their own
+/// commit and the pair retaken; it reads +33 / +11 like its three siblings.
+/// The second column is not decoration.
+///
+/// The totals below move with the controls (13622 -> 13630, 13990 -> 13998,
+/// 13657 -> 13665): that +8 is lane 1 wave 6's non-stub registrations, not this
+/// wave's, and the OFF arm is what says so.
+///
+/// +33 in all three, total FLAT in all three — this gate's own first case,
+/// "existing fakes were relabelled (welcome; re-freeze with the list)". The
+/// list is the 33 `@@STUB` lines `dump_synthetic_stubs` gains, with none lost.
+///
+/// ## The paired run found the TOTALS 13 low again — the same recurring drift
+///
+/// Every `MEASURED_TOTAL_REGISTRATIONS_*` read 13 LOW against the tree it was
+/// measured on (13609 vs 13622, 13977 vs 13990, 13644 vs 13657), and the OFF
+/// arm of the pair is what proves that is not this wave's doing: it reads the
+/// higher number with the table turned off.
+///
+/// **This is not a new finding.** The note on those constants already records
+/// "REFRESHED 2026-08-24 ... both were stale by 13 in BOTH arms", and calls it
+/// "the same equal-in-both-arms drift this doc comment already records twice".
+/// It is now recorded four times, which is the point: an UNGATED constant whose
+/// only reader is the classification message drifts every time `dev` gains a
+/// `Bridge`, and the wave that finally moves the stub count is told its clean
+/// relabel is "new fakes were registered — the regression this gate exists
+/// for". Re-frozen to the measured values here.
+///
+/// # Lane 4 wave 2, 2026-09-11 — the paired ratchet, both columns PRINTED
 /// # 2943 -> 2942, 2026-09-12 — one triple LEFT the stub population
 ///
 /// `java/lang/Package.getPackages()[Ljava/lang/Package;` is no longer registered
@@ -2008,6 +2077,52 @@ use cratonvm_types::compat::CompatibilityMode;
 /// A DECREASE is re-frozen in the same change, because this ratchet asserts `<=`:
 /// a baseline left above the tree silently re-admits that many new stubs.
 ///
+/// **The OFF column was PRINTED, not inferred from a `<=` pass**, and it
+/// reproduces every constant this wave found in this file — all three stub
+/// baselines AND all three totals — so there is no inherited drift to
+/// disentangle from the delta. It was taken with
+/// `CRATONVM_UNRETIRE_NATIVE_SHADOW=jdk/internal/foreign/layout/`, so one
+/// binary answered both halves and nothing about the comparison depends on two
+/// checkouts being otherwise identical, which is what that switch exists for.
+///
+/// Measured on the MERGE with `origin/dev`, not on the branch before it: the
+/// three baselines moved twice while this wave was in flight (2609 -> 2728 and
+/// 2620 -> 2755), and the `+137` is identical each time only because it was
+/// re-measured each time rather than subtracted.
+///
+/// ## The strict registry, and the gate that used to guard it by LEVEL
+///
+/// This wave crossed `STRICT_MIN_TOTAL_REGISTRATIONS` on its own branch —
+/// 10,998 -> 10,861 against a floor of 10,900 — because under `JdkOnly`
+/// `register_inner` REFUSES a `SyntheticStub`, so a retired triple is one row
+/// FEWER in the strict registry and that floor was guarding a number the
+/// campaign is deliberately driving down. `STRICT_UNEXPLAINED_DROP_MAX`
+/// replaced it on `dev` the same day, bounding the SHORTFALL instead, and this
+/// wave is the confirmation that the new shape is the right one: the shortfall
+/// is `13609 - 2865 - 10741 = 3` with the wave armed and `13609 - 2728 -
+/// 10878 = 3` with it un-armed. **Invariant across 137 retirements**, where the
+/// level moved by exactly 137.
+/// **Re-frozen 2026-09-12 (lane 1 wave 6, on the SECOND merge): 2892 -> 2911.**
+/// `+19`, and the account is nineteen rows in two tables: all seventeen of
+/// `java/text/BreakIterator` (retired WHOLE -- the class is abstract, so
+/// every instance the JDK hands back is a real subclass answering its own
+/// bytecode) plus one registration each on `sun/util/resources/LocaleData`
+/// and `JRELocaleProviderAdapter`.
+///
+/// THREE INDEPENDENT DERIVATIONS OF ONE DELTA, none of them arithmetic. dev
+/// re-froze these constants twice while this wave was in its acceptance
+/// runs, and the arms were re-run against each new tip rather than
+/// incremented:
+///
+/// ```text
+///   control          no-mgmt   mgmt   syn-jdk     trial gives
+///   8f09c89b9  GREEN    2611    2622     2611     2630 / 2641 / 2630
+///   d9fe011ff  GREEN    2728    2755     2728     2747 / 2774 / 2747
+///   fa891c6c6  GREEN    2865    2892     2865     2884 / 2911 / 2884
+/// ```
+///
+/// +19 every time, over controls 254 rows apart. That is what makes the
+/// delta a property of this branch rather than of a tree.
 /// RE-MEASURED ON EACH MERGE, never carried across one. This branch measured
 /// `2728 -> 2727`, then `2865 -> 2864` after lane 4 wave 2, then this line after
 /// lane 4 wave 3 and lane 1 wave 6 — three waves re-froze these constants while
@@ -2047,7 +2162,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// documentation rather than assertions, which is exactly why they go stale, so
 /// they are re-frozen here with the stub baselines rather than left to drift
 /// another wave. Same shape as wave 3's 8.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2959;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2975;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2316,6 +2431,8 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2959;
 /// A DECREASE is re-frozen in the same change, because this ratchet asserts `<=`:
 /// a baseline left above the tree silently re-admits that many new stubs.
 ///
+/// +19 every time, over controls 254 rows apart. That is what makes the
+/// delta a property of this branch rather than of a tree.
 /// RE-MEASURED ON EACH MERGE, never carried across one. This branch measured
 /// `2728 -> 2727`, then `2865 -> 2864` after lane 4 wave 2, then this line after
 /// lane 4 wave 3 and lane 1 wave 6 — three waves re-froze these constants while
@@ -2326,7 +2443,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2959;
 /// `native-builtins/src/lang_class.rs|java/lang/Package.getPackages|()[Ljava/lang/Package;`
 /// -- and none the other way. Record:
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2932;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2948;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2517,6 +2634,8 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2932;
 /// A DECREASE is re-frozen in the same change, because this ratchet asserts `<=`:
 /// a baseline left above the tree silently re-admits that many new stubs.
 ///
+/// +19 every time, over controls 254 rows apart. That is what makes the
+/// delta a property of this branch rather than of a tree.
 /// RE-MEASURED ON EACH MERGE, never carried across one. This branch measured
 /// `2728 -> 2727`, then `2865 -> 2864` after lane 4 wave 2, then this line after
 /// lane 4 wave 3 and lane 1 wave 6 — three waves re-froze these constants while
@@ -2527,9 +2646,26 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2932;
 /// `native-builtins/src/lang_class.rs|java/lang/Package.getPackages|()[Ljava/lang/Package;`
 /// -- and none the other way. Record:
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2932;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2948;
 
 /// The TOTAL registration count each baseline above was measured beside.
+///
+/// **REFRESHED 2026-09-12, lane 5's DELETION wave: -22 in ALL THREE arms**
+/// (13628 -> 13606, 13996 -> 13974, 13663 -> 13641), with the stub counts
+/// beside them UNMOVED at 2948 / 2975 / 2948.
+///
+/// That is the THIRD of the three cases set out below — *"total DOWN by about
+/// the stub delta means registrations were DELETED, which is the only case
+/// where re-freezing records work rather than absorbing it"* — in its purest
+/// form: the stub delta is ZERO, because every deleted row was a `Bridge`.
+/// Nothing in this gate fails for a deletion, which is exactly why the number
+/// has to be refreshed by hand or the next wave's classification is 22 out.
+///
+/// The rows are 22 registrations for 19 `Unsafe` triples that NO supported
+/// image declares (`javap -p` on 17, 21 and 25). Confirmed independently
+/// against the binary: a `--dump-native-registry` in compatible mode reads
+/// 12881 natives before and 12859 after, and all 22 of the difference are on
+/// `sun/misc/Unsafe` and `jdk/internal/misc/Unsafe`.
 ///
 /// **REFRESHED 2026-08-24: 13753 -> 13766 (management), 13385 -> 13398
 /// (default).** Both were stale by 13 in BOTH arms, and the 13 is NOT the
@@ -2587,7 +2723,7 @@ const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2932;
 /// was the only trace a real defect left in this gate, and staleness meant
 /// nobody could have read it. The `synthetic-jdk` arm has no constant here and
 /// measured 13645 on the same tree.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13983;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13974;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
@@ -2600,7 +2736,7 @@ const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13983;
 /// dev's staleness rather than either wave's — the localisation is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13615;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13606;
 
 /// The `--features synthetic-jdk` total, which had no constant at all.
 ///
@@ -2626,7 +2762,7 @@ const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13615;
 /// and 13645 on that tree against 13658 on this one is exactly the drift a
 /// sentence cannot track.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13650;
+const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13641;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;

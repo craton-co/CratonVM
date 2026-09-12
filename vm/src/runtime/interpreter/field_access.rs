@@ -177,7 +177,7 @@ pub(crate) fn resolve_field_ref(
 ///
 /// That reproduces the Azure figures the lever was accepted on
 /// (1.9-2.7x per pass, and 12.7% off the real Tomcat annotation scan; see
-/// known-issues/perf/interpreted-invoke-cost-350ns-20260825.md),
+/// docs/internal/performance/interpreted-invoke-cost-350ns-RETIRED-20260911.md),
 /// which is why the default moved rather than the measurement being retaken.
 ///
 /// The correctness argument is unchanged and lives in `site_cache`'s module
@@ -1276,6 +1276,90 @@ pub(super) fn pop_coerced_invoke_args_virtual(
     }
     refresh_stale_object_args(shared, &mut args);
     Ok((args, method_descriptor))
+}
+
+/// The widest argument list the facts-driven pops below will serve, receiver
+/// included. `DescriptorFacts` holds eight parameter tags inline, so nine is
+/// already more than either helper can use; the round number keeps the buffer
+/// one cache-line pair and leaves headroom if `INLINE_PARAMS` ever grows.
+pub(super) const MAX_CACHED_NATIVE_ARGS: usize = 16;
+
+/// Whether a cached-native call site may answer its descriptor questions from
+/// the [`DescriptorFacts`](cratonvm_jit_api::DescriptorFacts) its inline-cache
+/// entry was filled with, rather than re-resolving the constant pool.
+///
+/// `facts` is tokenised from the SAME `resolve_method_metadata` result that
+/// `resolve_method_ref` returns on the hit path, and an inline-cache entry is
+/// keyed by `(caller class, cp index)` — so the answer is a constant of the
+/// entry. What this guards is the two shapes the tag array cannot describe: a
+/// descriptor with more parameters than `INLINE_PARAMS`, and any disagreement
+/// between the entry's `num_params` and the tokenised tag count. Either falls
+/// back to the general helper, which re-derives everything.
+#[inline]
+pub(super) fn native_site_facts_usable(
+    facts: &cratonvm_jit_api::DescriptorFacts,
+    num_params: usize,
+    with_receiver: bool,
+) -> bool {
+    !crate::runtime::env_cache::no_cached_native_facts()
+        && !cratonvm_jit_api::descriptor_facts_disabled()
+        && !facts.param_tags_overflow
+        && facts.param_tag_len as usize == num_params
+        && num_params + usize::from(with_receiver) <= MAX_CACHED_NATIVE_ARGS
+}
+
+/// [`pop_coerced_invoke_args_virtual`] answered from a call site's cached
+/// [`DescriptorFacts`]: no constant-pool re-resolution, no descriptor scan and
+/// no heap allocation.
+///
+/// Byte-for-byte the same arguments as the general helper. The receiver is
+/// decoded with `decode_by_descriptor(b'L')` — NOT `decode_arg_kind_aware` —
+/// because that is what the general helper does, and the two differ for a slot
+/// carrying a category-2 kind mark.
+///
+/// Returns how many slots of `buf` were filled. On a mid-pop error the stack is
+/// left exactly as the general helper leaves it: partially popped, which is
+/// the caller's existing contract for a stack that was too shallow.
+#[inline]
+pub(super) fn pop_coerced_invoke_args_virtual_facts(
+    shared: &SharedVm,
+    frame_idx: usize,
+    thread: &mut JvmThread,
+    facts: &cratonvm_jit_api::DescriptorFacts,
+    num_params: usize,
+    buf: &mut [Value; MAX_CACHED_NATIVE_ARGS],
+) -> Result<usize, MethodCallFailed> {
+    for i in (0..num_params).rev() {
+        let (cv, kind) = thread.frames[frame_idx].stack.pop_with_kind()?;
+        let pd_byte = facts.param_tags[i];
+        buf[i + 1] =
+            coerce_invoke_arg_for_descriptor(pd_byte, decode_arg_kind_aware(cv, kind, pd_byte));
+    }
+    let (recv_cv, _) = thread.frames[frame_idx].stack.pop_with_kind()?;
+    buf[0] = coerce_invoke_arg_for_descriptor(b'L', recv_cv.decode_by_descriptor(b'L'));
+    refresh_stale_object_args(shared, &mut buf[..num_params + 1]);
+    Ok(num_params + 1)
+}
+
+/// [`pop_coerced_invoke_args_static`] answered from a call site's cached
+/// [`DescriptorFacts`]. See [`pop_coerced_invoke_args_virtual_facts`].
+#[inline]
+pub(super) fn pop_coerced_invoke_args_static_facts(
+    shared: &SharedVm,
+    frame_idx: usize,
+    thread: &mut JvmThread,
+    facts: &cratonvm_jit_api::DescriptorFacts,
+    num_params: usize,
+    buf: &mut [Value; MAX_CACHED_NATIVE_ARGS],
+) -> Result<usize, MethodCallFailed> {
+    for i in (0..num_params).rev() {
+        let (cv, kind) = thread.frames[frame_idx].stack.pop_with_kind()?;
+        let pd_byte = facts.param_tags[i];
+        buf[i] =
+            coerce_invoke_arg_for_descriptor(pd_byte, decode_arg_kind_aware(cv, kind, pd_byte));
+    }
+    refresh_stale_object_args(shared, &mut buf[..num_params]);
+    Ok(num_params)
 }
 
 /// Pop `invokestatic` arguments (no receiver) with the same JNI handle fix.

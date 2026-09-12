@@ -7435,7 +7435,23 @@ fn system_properties_object(ctx: &mut dyn NativeContext) -> Result<ObjectRef, Me
     match crate::lang_system::system_props_singleton(ctx.vm_identity()) {
         Some(cached) => Ok(cached),
         None => {
-            let p = crate::try_alloc_concurrent_synthetic(ctx, "java/util/Properties", 16)?;
+            // ZERO slots requested, not sixteen. `alloc_concurrent_synthetic`
+            // takes `max(n, real)`, so this asks for whatever the class
+            // declares in the mode it is running in -- the fabricated model's
+            // sixteen, or the real chain's ten -- and this factory writes NONE
+            // of them: `mark_system_props` records the singleton in an
+            // identity-keyed side table, and every `Properties` native that
+            // serves it resolves its slot on the RECEIVER
+            // (`props_defaults_slot` by name, `publish_map_table` through
+            // `receiver_table_slot`).
+            //
+            // The sixteen was bookkeeping, and it was load-bearing bookkeeping
+            // in the wrong direction: `java/util/Properties` is floor-exempt
+            // (`FLOOR_EXEMPT_CLASSES`), so a literal sixteen here is a factory
+            // declaring a fabricated shape on a receiver that is real in
+            // real-JDK mode -- which is exactly what
+            // `t9d_floor_exempt_classes_have_no_oversized_factories` refuses.
+            let p = crate::try_alloc_concurrent_synthetic(ctx, "java/util/Properties", 0)?;
             crate::properties_sidetable::mark_system_props(ctx, p);
             Ok(crate::lang_system::set_system_props_singleton(
                 ctx.vm_identity(),
@@ -34082,15 +34098,100 @@ fn convert_time_unit_to_millis(value: i64, ordinal: i32) -> i64 {
     }
 }
 
+/// Build a `java.util.HashSet` holding `elems`, through the class's own
+/// `<init>` and `add` bytecode -- the ONE shape that is correct in both
+/// compatibility modes.
+///
+/// # Why this exists rather than a raw-slot factory
+///
+/// The shape it replaces allocated two or three slots and wrote an element
+/// array at absolute 0, a count at 1 and a capacity at 2. That is the MAP
+/// layout, on a class whose one real instance field is
+/// `map` (`Ljava/util/HashMap;`):
+///
+/// * on a real `java.util.HashSet` every `Set` method dereferences `map`, so
+///   the object came back with an `Object[]` where a `HashMap` belongs and
+///   `size()`/`iterator()`/`contains()` answered for an EMPTY set whatever the
+///   array held (the TC0622 defect);
+/// * the elements went into the array in insertion order rather than into hash
+///   buckets, so the set was findable only by an implementation that agreed to
+///   look there;
+/// * and it pinned `java/util/HashSet`'s synthetic slot floor at 2-3 against
+///   one real field, which pads the class -- and `LinkedHashSet`, which
+///   declares none of its own -- out of the compact layout entirely
+///   (`ClassStore::build_compact_layout` refuses any padded class, so the
+///   padding costs every slot, not just itself).
+///
+/// Going through `<init>` costs nothing in synthetic-JDK mode: `native_hs_init`
+/// allocates the backing map and `hs_set_backing_map` places it at the slot
+/// `hs_map_slot` names, which is absolute 0 in both modes.
+///
+/// GC-safe: the elements are parked in one heap array and the set is pinned
+/// across the `<init>` and every `add`, each of which allocates.
+pub(crate) fn build_real_hash_set(
+    ctx: &mut dyn NativeContext,
+    elems: &[ObjectRef],
+) -> Result<ObjectRef, MethodCallFailed> {
+    // Pin the elements BEFORE the first allocation, then park them in one heap
+    // array we can re-read across each `add`. `new_ref_array` is itself a
+    // collection point, so a bare `elems` slice read after it is the
+    // native-stale-local shape; `pin_native_root` allocates nothing, so taking
+    // the pins first is free.
+    let elem_pins: Vec<usize> = elems.iter().map(|&e| ctx.pin_native_root(e)).collect();
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), elems.len());
+    let arr_pin = ctx.pin_native_root(arr);
+    for (i, e) in elems.iter().enumerate() {
+        let e = ctx.read_native_pin(elem_pins[i], *e);
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        ctx.set_array_element(arr, i, Value::Object(Some(e)));
+    }
+    // The pin stack unwinds to a BASE, so releasing the earliest handle
+    // releases every one taken after it.
+    let pin_base = elem_pins.first().copied().unwrap_or(arr_pin);
+    // ONE slot requested, which is what the real class declares. The
+    // allocator takes `max(n, real)`, so a fabricated 3-slot stub still gets
+    // its three.
+    let set = match try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1) {
+        Ok(set) => set,
+        Err(e) => {
+            // Release the region before propagating: a native that returns
+            // through `?` with pins still on the stack leaves them there for
+            // the rest of the thread's life.
+            ctx.unpin_native_roots(pin_base);
+            return Err(e);
+        }
+    };
+    let set_pin = ctx.pin_native_root(set);
+    let _ = ctx.invoke(
+        "java/util/HashSet",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(set))],
+    );
+    for i in 0..elems.len() {
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        let elem = ctx.get_array_element(arr, i);
+        let set = ctx.read_native_pin(set_pin, set);
+        let _ = ctx.invoke_virtual(set, "add", "(Ljava/lang/Object;)Z", &[elem]);
+    }
+    let set = ctx.read_native_pin(set_pin, set);
+    ctx.unpin_native_roots(pin_base);
+    Ok(set)
+}
+
 /// Build a `java.util.HashSet` with a real-layout `java.util.HashMap` inside,
 /// populated with the supplied String keys (each mapped to the canonical
 /// `HashSet.PRESENT` singleton — represented here as the same `Boolean.TRUE`
 /// substitute / null sentinel: JDK code only ever does `containsKey`, never
 /// reads the value).
 ///
-/// Falls back to the legacy synthetic-2-field layout (data_array, size) when
-/// the real `HashMap` / `HashMap$Node` field layout cannot be resolved (i.e.
-/// classes not yet loaded). This matches the pattern S111r7 introduced in
+/// Falls back to [`build_real_hash_set`] -- the class's own `<init>` and `add`
+/// -- when the real `HashMap` / `HashMap$Node` field layout cannot be resolved
+/// (i.e. classes not yet loaded, or a fabricated stub). It used to fall back to
+/// a legacy synthetic 2-field `(data_array, size)` shape instead, which was the
+/// last unconditional raw-slot write on `java/util/HashSet` in the tree and the
+/// last thing pinning its synthetic slot floor. This matches the pattern S111r7
+/// introduced in
 /// `lang_system::native_system_getenv_all` so JDK bytecode for
 /// `HashSet.spliterator()` (which constructs a `HashMap.KeySpliterator` from
 /// the wrapped HashMap and later does `getfield m.table`) reads valid slots
@@ -34214,16 +34315,21 @@ pub(crate) fn build_real_layout_string_hashset(
         return Ok(set);
     }
 
-    // Fallback: legacy synthetic-2-field (data_array, size) layout used by
-    // older callers that don't go through the JDK spliterator/stream path.
-    let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2)?;
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, keys.len());
-    for (i, &k) in keys.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Object(Some(k)));
-    }
-    ctx.set_field(set, 0, Value::Object(Some(arr)));
-    ctx.set_field(set, 1, Value::Int(keys.len() as i32));
-    Ok(set)
+    // Fallback: the real `HashSet.<init>` and `add`, through
+    // [`build_real_hash_set`].
+    //
+    // This arm is reached when the real `HashMap`/`HashMap$Node`/`HashSet`
+    // field layout cannot be resolved -- classes not loaded yet, or a
+    // fabricated stub. It used to write an element array to absolute slot 0
+    // and a count to slot 1, the legacy synthetic `(data_array, size)` shape.
+    // That shape has no mode left in which it is right: on a real `HashSet`
+    // slot 0 is `map` and every `Set` method dereferences it, and on the
+    // fabricated stub `native_hs_init` builds a proper backing map at the slot
+    // `hs_map_slot` names -- which is the same absolute 0. Going through
+    // `<init>` is therefore correct wherever this lands, and it is what takes
+    // the last unconditional raw-slot write off `java/util/HashSet`, which is
+    // what lets `FLOOR_EXEMPT_CLASSES` carry the class at all.
+    build_real_hash_set(ctx, keys)
 }
 
 // ---------------------------------------------------------------------------

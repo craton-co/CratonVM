@@ -315,4 +315,4 @@ prescribes `TIMEOUT=600` for.
   composition 1.19x. Its own successor closed on 2026-09-11:
   [`composition-native-callback-and-the-promotion-question-CLOSED-20260911.md`](composition-native-callback-and-the-promotion-question-CLOSED-20260911.md).
   Nothing on this line is open.
-- [`../../known-issues/perf/interpreted-invoke-cost-350ns-20260825.md`](../../known-issues/perf/interpreted-invoke-cost-350ns-20260825.md)
+- [`interpreted-invoke-cost-350ns-RETIRED-20260911.md`](interpreted-invoke-cost-350ns-RETIRED-20260911.md)

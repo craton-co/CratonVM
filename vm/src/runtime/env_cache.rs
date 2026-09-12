@@ -1328,6 +1328,57 @@ pub fn jit_virtual_promote_java_util() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_VIRTUAL_PROMOTE_HANDLER_CALLEE` — default-OFF, `=1` opts in.
+///
+/// Admits a callee that DECLARES A LOCAL EXCEPTION TABLE to the cached-virtual
+/// PROMOTION, i.e. lets `execute_invokevirtual_cached` enter its compiled body
+/// through `execute_jit_call_decoded`.
+///
+/// # Why this is a switch and not simply a deletion
+///
+/// The bar was added by `7952e8370` (2026-07-30) on the reasoning that a
+/// direct compiled entry "has no interpreter boundary at which the callee's
+/// own exception table can be resumed". That commit's own message records
+/// what the bar is worth:
+///
+/// > NOT proven, and recorded as such in the docs: the original stranding
+/// > could not be reproduced, so the new gate is correct by construction
+/// > rather than demonstrated against the symptom — a deliberately un-gated
+/// > control binary also matches HotSpot on the routing probe.
+///
+/// And the premise has since stopped holding. `execute_jit_call_decoded`
+/// drains `sig.exception`, `sig.npe`, `sig.aioobe` and `sig.arithmetic`
+/// through `route_jit_signal_exception(.., cached, ..)` — with `cached` the
+/// CALLEE — which prefers a precise exceptional frame published by the callee's
+/// own deopt stub, falls back to the callee's stamped athrow bci, and enters
+/// the callee's handler through `route_jit_exception_through_method`. That is
+/// the RBC.6 machinery (`docs/feature-designs/jit-local-exception-handlers.md`),
+/// and `handler_resume_needs_precise_locals` is its refusal: a handler that
+/// reads a local the fallback cannot supply propagates rather than entering
+/// with zeroed locals.
+///
+/// This gate is the fourth of four routes, and the only one still refusing on
+/// the callee's table alone. The inline machine-code MIC/PIC cascade
+/// (`mic_callee_has_exception_table`) keeps its refusal for a different reason
+/// and is NOT relaxed by this: it `CALL`s the raw entry pointer from compiled
+/// code and has no Rust frame at which to route anything.
+///
+/// The oracle is `probes/CalleeHandlerRoutingProbe.java`: a handler-bearing
+/// instance callee driven past the tier-up threshold on its non-throwing path
+/// and only THEN given its implicit exception — the promotion-then-throw
+/// ordering. It must print the same nine lines on HotSpot and on both settings
+/// of this switch.
+#[inline]
+pub fn jit_virtual_promote_handler_callee() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_VIRTUAL_PROMOTE_HANDLER_CALLEE") {
+            Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+            Err(_) => false,
+        }
+    })
+}
+
 /// `CRATONVM_DBG_SHADOW` — one-shot shadow-stack trace in `set_jit_thread`.
 ///
 /// Cached because it is read on EVERY interpreter->JIT boundary crossing.
@@ -2061,6 +2112,16 @@ cached_is_set!(no_frame_slot_reuse, "CRATONVM_JIT_NO_FRAME_SLOT_REUSE");
 /// and every call under `CRATONVM_JIT_NO_FRAME_SLOT_REUSE`. Token:
 /// `CRATONVM_JIT=-frame-emplace`.
 cached_is_set!(no_frame_emplace, "CRATONVM_JIT_NO_FRAME_EMPLACE");
+
+/// `CRATONVM_JIT_NO_CACHED_NATIVE_FACTS` -- make every cached-native invoke
+/// recover its call site's descriptor with `resolve_method_ref` again (a
+/// resolution-cache `RwLock` read, a hash probe and three `Arc<str>`
+/// clone/drop pairs), then scan the string it returns for the parameter tags
+/// and once more for the return tag, and materialise the arguments through two
+/// heap `Vec`s. On, the inline-cache entry answers all of that from the
+/// `DescriptorFacts` it was filled with. Token:
+/// `CRATONVM_JIT=-cached-native-facts`.
+cached_is_set!(no_cached_native_facts, "CRATONVM_JIT_NO_CACHED_NATIVE_FACTS");
 /// `CRATONVM_DBG_BYTECODE_DUMP` -- temporary raw-bytecode + mnemonic
 /// disassembly dump (2026-07-15, JRubyScriptTemplateTests round 3): see
 /// `push_frame_and_fire_entry`'s own doc comment for the full story --

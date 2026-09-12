@@ -1274,6 +1274,20 @@ pub enum CachedInvokeTarget<JitMethod = ()> {
         /// Strict-mode hits revalidate it from `native_id` before dispatch.
         native_kind: NativeKind,
         num_params: u16,
+        /// The CALL SITE's descriptor, tokenised once at fill time.
+        ///
+        /// The dispatch arm used to recover the same two facts — each
+        /// parameter's tag, and the return tag — by calling
+        /// `resolve_method_ref(caller_class_id, cp_index)` on **every** call,
+        /// which is a resolution-cache `RwLock` read, a hash probe and three
+        /// `Arc<str>` clone/drop pairs, and then scanning the string it
+        /// returned twice (`ParamTags::of`, `jit::return_type`). An inline
+        /// cache entry is keyed by `(caller class, cp index)` and the promoted
+        /// cross-thread entry by the same triple, so the call site's
+        /// descriptor is a constant of the entry; this is that constant,
+        /// built from the identical `resolve_method_metadata` result the fill
+        /// already holds.
+        facts: cratonvm_jit_api::DescriptorFacts,
         /// WP2.4-F1 — redefine staleness gate; bound to the resolved
         /// declaring class. A redefine that swaps a native method body for
         /// bytecode (or vice versa) must evict this entry.
@@ -1298,6 +1312,9 @@ pub enum CachedInvokeTarget<JitMethod = ()> {
         /// Strict-mode hits revalidate it from `native_id` before dispatch.
         native_kind: NativeKind,
         num_params: u16,
+        /// The CALL SITE's descriptor, tokenised once at fill time. See the
+        /// same field on [`CachedInvokeTarget::Native`].
+        facts: cratonvm_jit_api::DescriptorFacts,
         /// WP2.4-F1 — redefine staleness gate.
         gate: RedefineGate,
     },
@@ -2489,3 +2506,4 @@ mod tests {
         );
     }
 }
+

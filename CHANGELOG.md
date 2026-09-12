@@ -7,6 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 2026-09-12 The synthetic slot floor was ONE number for TWO layouts, and six collection classes paid for it
+
+`synthetic_stub_fields` is read in two places that mean different things. It
+DEFINES the layout of a fabricated stub, and it FLOORS the layout of a class
+defined from real class-file bytes. The second reading is load-bearing for
+`java.net.InetSocketAddress` — one declared field, and a native `<init>` that
+writes raw synthetic indices on the real class. It was a fiction for six
+collection classes, and padding them by even one slot costs the WHOLE object:
+`ClassStore::build_compact_layout` refuses any padded class, because a padded
+slot has no descriptor and its oop-map entry would be a guess, so every slot
+falls back to the legacy uniform 16-byte tagged cell.
+
+Retained heap per empty instance, against HotSpot on the same probe:
+
+```text
+  java.util.Properties                          544 -> 224   (4.5x -> 1.9x)
+  java.util.concurrent.ConcurrentLinkedQueue    112 ->  64   (2.3x -> 1.3x)
+  java.util.concurrent.ConcurrentLinkedDeque    120 ->  72   (2.5x -> 1.5x)
+  java.util.ArrayDeque                          232 -> 184   (2.1x -> 1.6x)
+  java.util.LinkedHashSet                       152 -> 112   (1.9x -> 1.4x)
+  java.util.HashSet                             128 ->  88   (2.0x -> 1.4x)
+  java.util.concurrent.CopyOnWriteArraySet      136 -> 112   (2.4x -> 2.0x)
+```
+
+Six of the seven land in the 1.2x-1.7x band the rest of the collections occupy,
+which is reference width and a separate subject. `CopyOnWriteArraySet` does not,
+and its object IS compact now — the remainder is that this VM's Set surface
+backs it with a `LinkedHashMap` (88 B) where the JDK backs it with a
+`CopyOnWriteArrayList` (48 B). That is a different change.
+
+`ClassManager::apply_synthetic_floor` is now the one place the floor is applied;
+both callers used to open-code the same `max`. `FLOOR_EXEMPT_CLASSES` beside it
+carries the six with the real extent each was screened against, and a class
+whose loaded shape disagrees with that number is reported rather than silently
+exempted. `java.util.ArrayDeque` is NOT in that list: it needed a correction,
+not an exemption — its fourth slot held a count `ad_state` stopped reading on
+2026-08-30, so the table now declares the three the real class declares.
+
+**Six factories had to be converted first, and each was a live defect on its
+own.** They built an array-backed set by writing absolute slots 0/1/2 on a real
+`HashSet` receiver — the MAP layout, on a class whose one real field is
+`map` — so every real `Set` method dereferenced an `Object[]` and answered for
+an EMPTY set: `Selector.selectedKeys()` and `.keys()` (twice, in `net_channels`
+and in `servlet`), `ModuleLayer.modules()` (the twin of the registrar whose
+identical shape NPE'd Tomcat's web-fragment scan),
+`ZoneId.getAvailableZoneIds()`, and the JMX `queryNames`/`queryMBeans`
+fallback. All six now go through one helper that allocates the real width and
+runs the class's own `<init>` and `add`, which is correct in both modes.
+
+**A screen, so the population is a list rather than an argument.**
+`t9d_floor_exempt_classes_have_no_oversized_factories` is T9C run the other way:
+T9C asserts a fabricated table is at least as wide as its own factories, T9D
+asserts a floor-EXEMPT class has no factory wider than its real layout. A site
+that has already asked `is_class_synthetic_stub` is excused, because it knows
+its receiver is fabricated. It also refuses a stale exemption — one that no
+longer pads anything is a claim about a class, not a live exemption.
+
+**`probes/CollectionSlotFloor.java` had been hiding its own tail.** In the
+synthetic-JDK arm — the arm that matters when a floor moves — a missing
+`LinkedList.indexOf` threw at section six of fourteen, so the eight sections
+after it were never reached and their silence read as agreement. Each section
+now runs under a wrapper that records an ERROR row instead of ending the run,
+and the file grew the coverage these six classes needed: deque and FIFO ORDER
+(which `size`/`contains` cannot see), `ArrayDeque` past its ring-buffer wrap,
+and the `Properties` `defaults` chain.
+
+Validated on both arms against binaries built from the same commit: real-JDK
+`CollectionSlotFloor` PASS with the extended sections and an identical
+descriptor-coercion census; synthetic-JDK **verdict-identical** to an unchanged
+tree (the same 14 outcomes, the same 127 `field index OOB` warnings), which is
+the acceptance criterion rather than green. `regression-suite` 93/93, tier1
+58/58, `cratonvm-native-builtins` 4253/0, `cratonvm-classloading` +
+`cratonvm-native-collections` 1179/0.
+
 ### 2026-09-11 The receiver species is mostly ARRAYS: 20 more fixed, and a screen so the population cannot grow quietly
 
 The BindableTests residual fixed earlier today was one native holding a

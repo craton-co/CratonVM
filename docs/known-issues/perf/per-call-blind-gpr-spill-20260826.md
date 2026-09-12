@@ -381,7 +381,7 @@ CRATONVM_DBG_JIT_DISASM=CallArgCostProbe.armInt1 cratonvm --java-home <jdk> -cp 
   oop-free frames and, as measured above, not for theirs.
 * [`../netty/fastthreadlocal-2e9-iteration-throughput-wall-20260812.md`](../netty/fastthreadlocal-2e9-iteration-throughput-wall-20260812.md)
   — the family page for the same wall.
-* [`interpreted-invoke-cost-350ns-20260825.md`](interpreted-invoke-cost-350ns-20260825.md)
+* [`interpreted-invoke-cost-350ns-RETIRED-20260911.md`](interpreted-invoke-cost-350ns-RETIRED-20260911.md)
   — the same question one tier down, for calls that never reach compiled code.
 * `a-compiled-call-goes-out-to-rust-two-causes-RETIRED-20260817.md`
   (internal) — the previous per-call cost to be measured and closed.
