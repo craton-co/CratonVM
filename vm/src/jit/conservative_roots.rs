@@ -123,6 +123,15 @@ pub(crate) struct JitFrameChainEntry {
     /// has no `JvmThread` to ask, but no interpreter frame can have been pushed
     /// since the entry it nests inside, so the enclosing depth is exact.
     pub interp_depth: u32,
+    /// The `GLOBAL_JIT_DEPTH` stripe this entry's push incremented, filled by
+    /// [`push_entry_full`]. The pop decrements exactly that stripe, so an entry
+    /// released during thread teardown cannot land on stripe 0 and cancel a
+    /// live peer's depth. Constructors pass `StripeToken::UNSET`.
+    pub depth_stripe: cratonvm_types::striped_counter::StripeToken,
+    /// The executable-code quiescence token this entry's push took, filled by
+    /// [`push_entry_full`] and handed back to `jit_execution_leave` by the pop.
+    /// Constructors pass `JitExecutionToken::UNSET`.
+    pub exec_token: cratonvm_jit::JitExecutionToken,
 }
 
 /// Sentinel for [`JitFrameChainEntry::interp_depth`]: resolve at push time from
@@ -1018,6 +1027,8 @@ pub fn push_jit_entry_at(sp: usize) -> usize {
         entry_sp: sp,
         precise: None,
         interp_depth: INTERP_DEPTH_INHERIT,
+        depth_stripe: cratonvm_types::striped_counter::StripeToken::UNSET,
+        exec_token: cratonvm_jit::JitExecutionToken::UNSET,
     })
 }
 
@@ -1053,6 +1064,12 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
                 info.exact_cm_id = published_compile_id();
             }
         }
+        // Both process-wide counts are raised here, with their stripes kept in
+        // the entry the matching pop consumes. A few instructions earlier than
+        // the push they describe is the over-approximating direction for
+        // "is anyone in JIT?".
+        entry.depth_stripe = GLOBAL_JIT_DEPTH.inc_token();
+        entry.exec_token = cratonvm_jit::jit_execution_enter();
         v.push(entry);
         let n = v.len();
         top_rbp_set(0);
@@ -1065,7 +1082,6 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
         }
         n
     });
-    GLOBAL_JIT_DEPTH.inc();
     publish_self_jit_depth(depth);
     // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
     // this is the ONLY point at which a thread becomes
@@ -1076,7 +1092,6 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
         ThreadExecState::CompiledUninterruptible,
         "jit::conservative_roots::push_entry_full",
     );
-    cratonvm_jit::jit_execution_enter();
     // Mirror into the GC-side quiescence flag so the GC can defer
     // compaction whenever any thread is inside a JIT call. NEW-12's
     // precise root walk removes false positives from the root set,
@@ -1151,14 +1166,14 @@ pub fn pop_jit_entry() -> Option<usize> {
         (p, v.len())
     });
     if let Some(entry) = popped {
-        GLOBAL_JIT_DEPTH.dec();
+        GLOBAL_JIT_DEPTH.dec_token(entry.depth_stripe);
         publish_self_jit_depth(remaining);
         thread_state::record_transition(
             leaving_compiled_state(remaining),
             "jit::conservative_roots::pop_jit_entry",
         );
         cratonvm_gc::gc_quiescence::leave();
-        cratonvm_jit::jit_execution_leave();
+        cratonvm_jit::jit_execution_leave(entry.exec_token);
         // P1 code-cache retirement: leaving a compiled frame is one of the two
         // moments `GLOBAL_JIT_DEPTH` can reach zero, and therefore one of the
         // two moments an unpublished body can become reclaimable. The sweep
@@ -1205,6 +1220,13 @@ pub fn pop_jit_entry() -> Option<usize> {
 /// engaged. Returns the number of stale entries reclaimed.
 pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
     let mut remaining = 0usize;
+    // The counter tokens of every pruned entry, so each decrement lands on the
+    // stripe its push raised. `Vec::new` does not allocate until a prune
+    // actually removes something, which is the rare case.
+    let mut pruned_tokens: Vec<(
+        cratonvm_types::striped_counter::StripeToken,
+        cratonvm_jit::JitExecutionToken,
+    )> = Vec::new();
     let pruned = JIT_ENTRY_CHAIN.with(|c| {
         let mut v = c.borrow_mut();
         let before = v.len();
@@ -1212,6 +1234,7 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
         // above the scanner SP). Entries below it have provably returned.
         for e in v.iter().filter(|e| e.entry_sp < scanner_sp) {
             note_jit_residue(e.entry_sp);
+            pruned_tokens.push((e.depth_stripe, e.exec_token));
         }
         v.retain(|e| e.entry_sp >= scanner_sp);
         let pruned = before - v.len();
@@ -1251,10 +1274,10 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
             "jit::conservative_roots::prune_returned_jit_entries",
         );
     }
-    for _ in 0..pruned {
-        GLOBAL_JIT_DEPTH.dec();
+    for (depth_stripe, exec_token) in pruned_tokens {
+        GLOBAL_JIT_DEPTH.dec_token(depth_stripe);
         cratonvm_gc::gc_quiescence::leave();
-        cratonvm_jit::jit_execution_leave();
+        cratonvm_jit::jit_execution_leave(exec_token);
     }
     if pruned > 0 {
         publish_self_jit_depth(remaining);
@@ -1374,6 +1397,8 @@ impl JitEntryGuard {
         let sp = current_stack_pointer();
         let entry = JitFrameChainEntry {
             entry_sp: sp,
+            depth_stripe: cratonvm_types::striped_counter::StripeToken::UNSET,
+            exec_token: cratonvm_jit::JitExecutionToken::UNSET,
             interp_depth: match interp_depth {
                 Some(d) => u32::try_from(d).unwrap_or(u32::MAX - 1),
                 None => INTERP_DEPTH_INHERIT,
@@ -11670,6 +11695,8 @@ mod tests {
         let entry_sp = current_stack_pointer() + 4096;
         push_entry_full(JitFrameChainEntry {
             entry_sp,
+            depth_stripe: cratonvm_types::striped_counter::StripeToken::UNSET,
+            exec_token: cratonvm_jit::JitExecutionToken::UNSET,
             // No interpreter stack in this unit test; `INTERP_DEPTH_INHERIT`
             // is what a site that cannot name its depth pushes, and with an
             // empty chain it resolves to 0.

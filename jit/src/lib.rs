@@ -16173,14 +16173,37 @@ fn defer_jit_owner(owner: Option<Arc<CompiledMethod>>) {
     drain_deferred_jit_owners_if_quiescent();
 }
 
-/// Enter/leave the process-wide executable-code quiescence epoch. VM JIT entry
-/// guards call these at the same boundaries as their precise frame chain.
-pub fn jit_execution_enter() {
-    ACTIVE_JIT_EXECUTIONS.inc();
+/// What one [`jit_execution_enter`] recorded, for the matching
+/// [`jit_execution_leave`].
+///
+/// Carries the striped counter's stripe so the decrement lands where the
+/// increment did even when the leave runs during thread teardown, after the
+/// thread's stripe thread-local is gone (see
+/// [`cratonvm_types::striped_counter::StripeToken`]).
+#[derive(Clone, Copy, Debug)]
+pub struct JitExecutionToken {
+    stripe: cratonvm_types::striped_counter::StripeToken,
 }
 
-pub fn jit_execution_leave() {
-    ACTIVE_JIT_EXECUTIONS.dec();
+impl JitExecutionToken {
+    /// A token no `enter` produced; leaving with it changes no count.
+    pub const UNSET: JitExecutionToken = JitExecutionToken {
+        stripe: cratonvm_types::striped_counter::StripeToken::UNSET,
+    };
+}
+
+/// Enter/leave the process-wide executable-code quiescence epoch. VM JIT entry
+/// guards call these at the same boundaries as their precise frame chain, and
+/// keep the returned token beside the entry it describes.
+#[must_use = "the token must be passed to the matching jit_execution_leave"]
+pub fn jit_execution_enter() -> JitExecutionToken {
+    JitExecutionToken {
+        stripe: ACTIVE_JIT_EXECUTIONS.inc_token(),
+    }
+}
+
+pub fn jit_execution_leave(token: JitExecutionToken) {
+    ACTIVE_JIT_EXECUTIONS.dec_token(token.stripe);
     // The retirement drain only needs to run when this was the last activation
     // anywhere. `is_zero` short-circuits on the first live stripe, so the
     // common "some other thread is still in JIT" case costs one load.
@@ -33061,8 +33084,7 @@ mod tests {
             if cond() {
                 return true;
             }
-            jit_execution_enter();
-            jit_execution_leave();
+            jit_execution_leave(jit_execution_enter());
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         cond()
@@ -38282,7 +38304,7 @@ mod tests {
         drop(old);
         assert!(lookup_jit_code_range(old_entry).is_some());
 
-        jit_execution_enter();
+        let execution = jit_execution_enter();
         let mut new_buf = ExecutableBuffer::new(64).expect("alloc failed");
         new_buf.emit(&[0xC3]); // RET
         cache.put(
@@ -38296,7 +38318,7 @@ mod tests {
             lookup_jit_code_range(old_entry).is_some(),
             "a tier-up must not release the body a thread is executing"
         );
-        jit_execution_leave();
+        jit_execution_leave(execution);
 
         assert!(
             eventually_drained(|| lookup_jit_code_range(old_entry).is_none()),
@@ -38366,13 +38388,13 @@ mod tests {
         let (cm, entry) = sole_owner_of_a_published_body(&cache, &class, &method, &desc, cid);
 
         let held = RetainedCode::new(cm);
-        jit_execution_enter();
+        let execution = jit_execution_enter();
         drop(held);
         assert!(
             lookup_jit_code_range(entry).is_some(),
             "the last owner must not unmap a published body while a thread is inside compiled code"
         );
-        jit_execution_leave();
+        jit_execution_leave(execution);
 
         assert!(
             eventually_drained(|| lookup_jit_code_range(entry).is_none()),
@@ -38725,14 +38747,14 @@ mod tests {
         let slot = JitMICSlot::new();
         slot.update(cid.as_u32(), &class, entry as u64, false, false);
 
-        jit_execution_enter();
+        let execution = jit_execution_enter();
         slot.clear_compiled_entry();
         cache.remove(&class, &method, &desc, cid);
         assert!(
             lookup_jit_code_range(entry).is_some(),
             "a raw cache reader may still be between load and call"
         );
-        jit_execution_leave();
+        jit_execution_leave(execution);
         // `eventually_drained`, not a bare assertion: `ACTIVE_JIT_EXECUTIONS`
         // is process-global, so this thread's `leave` is the final transition
         // only if no sibling test is inside its own execution epoch. What is
