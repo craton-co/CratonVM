@@ -1206,6 +1206,45 @@ fn jre_adapter_get_locale_service_provider(
             }
         }
     }
+    if spi.as_deref() == Some("java.util.spi.TimeZoneNameProvider") {
+        // 2026-09-12: the THIRD arm, for Tomcat's
+        // `TestConcurrentDateFormat.testFormatReturnsGMTAfterParseCET`.
+        //
+        // With a null here `LocaleProviderAdapter.getAdapter(TimeZoneNameProvider,
+        // loc)` fell through to FALLBACK, whose plain `TimeZoneNameProviderImpl`
+        // serves the raw CLDR rows. CLDR leaves a name it inherits EMPTY (the
+        // `GMT` row is `[GMT, Greenwich Mean Time, GMT, "", GMT, "", GMT]`), and
+        // only `CLDRTimeZoneNameProviderImpl` derives those. So
+        // `DateFormatSymbols.getZoneStrings()` kept the `""`,
+        // `SimpleDateFormat.matchZoneString` asked
+        // `TimeZoneNameUtility.retrieveDisplayName` to fill it -- and that walks
+        // `LocaleServiceProviderPool`, which reaches providers through THIS
+        // method, so it answered null and the parse threw
+        // `NullPointerException: ... "zoneName" is null`. Measured on HotSpot
+        // 25.0.3: adapter CLDR, the GMT row fully derived, parse succeeds.
+        //
+        // The getter was measured to work on this VM before the arm was added
+        // (`cldr.getTimeZoneNameProvider().getDisplayName("GMT", true, LONG,
+        // US)` = `Greenwich Mean Time`); only the SPI lookup refused it.
+        match ctx.invoke_virtual(
+            this,
+            "getTimeZoneNameProvider",
+            "()Ljava/util/spi/TimeZoneNameProvider;",
+            &[],
+        ) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                // Same DEGRADE contract as the two arms above.
+                tracing::warn!(
+                    error = ?e,
+                    "getTimeZoneNameProvider threw; falling back to the legacy \
+                     null. Zone names then come from the FALLBACK adapter, which \
+                     does not derive CLDR's inherited (empty) names."
+                );
+                return Ok(Some(Value::Object(None)));
+            }
+        }
+    }
     Ok(Some(Value::Object(None)))
 }
 
@@ -2081,6 +2120,10 @@ mod locale_service_provider_delegation_tests {
             && descriptor == "()Ljava/util/spi/CalendarDataProvider;"
         {
             Some(Ok(Some(Value::Int(0x0CDA))))
+        } else if method_name == "getTimeZoneNameProvider"
+            && descriptor == "()Ljava/util/spi/TimeZoneNameProvider;"
+        {
+            Some(Ok(Some(Value::Int(0x07A7))))
         } else {
             None
         }
@@ -2130,6 +2173,32 @@ mod locale_service_provider_delegation_tests {
             "the CalendarDataProvider arm did not delegate; a null here makes \
              the pool find no provider at all, and every locale then gets \
              CalendarDataUtility's own 1/1 defaults"
+        );
+    }
+
+    /// 2026-09-12's arm. With a null here `getAdapter(TimeZoneNameProvider,
+    /// loc)` fell through to FALLBACK, whose provider does not derive CLDR's
+    /// inherited (empty) zone names, and `SimpleDateFormat.parse("... CET")`
+    /// threw `NullPointerException: "zoneName" is null` (Tomcat
+    /// `TestConcurrentDateFormat.testFormatReturnsGMTAfterParseCET`).
+    #[test]
+    fn the_time_zone_name_provider_is_delegated_to_the_real_getter() {
+        let mut ctx = MockNativeContext::new();
+        let (adapter, mirror) =
+            adapter_and_spi_mirror(&mut ctx, "java/util/spi/TimeZoneNameProvider");
+        ctx.set_invoke_virtual_hook(record_call);
+
+        let got = jre_adapter_get_locale_service_provider(
+            &mut ctx,
+            &[Value::Object(Some(adapter)), Value::Object(Some(mirror))],
+        );
+
+        assert_eq!(
+            got.ok().flatten(),
+            Some(Value::Int(0x07A7)),
+            "the TimeZoneNameProvider arm did not delegate; a null here leaves \
+             zone names to the FALLBACK adapter, which keeps CLDR's empty \
+             inherited names and lets SimpleDateFormat NPE on them"
         );
     }
 
