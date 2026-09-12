@@ -230,6 +230,16 @@ audit.
 > and pinned.
 >
 > [`c2-the-partial-unroller-20260911.md`](c2-the-partial-unroller-20260911.md).
+>
+> **CORRECTED 2026-09-12.** "Not faster" was an artefact of the instrument. The
+> ±8% spread came from blocked runs with no control arm; measured the way the
+> rest of this repo measures — `tools/tier-ab/flag-ab.sh`, nine rounds,
+> interleaved, a control arm whose spread IS the floor — the floor is 0.7–1.0%
+> and the partial unroller is **0.980–0.983x, above it**. It was worth ~2% the
+> day it landed. The spill diagnosis in that page's §5 is still correct about the
+> schedule and was fixed on 2026-09-12; fixing it changed the counters and not
+> the clock, because the spilled values are off the probe's dependency chain. See
+> [`c2-schedule-late-at-equal-depth-20260912.md`](c2-schedule-late-at-equal-depth-20260912.md).
 
 ## 6. What was landed
 

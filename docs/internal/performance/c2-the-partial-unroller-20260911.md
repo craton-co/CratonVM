@@ -244,10 +244,23 @@ exact trap. Read a scheduling flag live.
 Ordered by what §5 says stands between this and a win, which is **not** the same
 as ordered by size.
 
-* **Schedule-late at equal depth** (§5). Until the copies stop being computed
+* ~~**Schedule-late at equal depth** (§5). Until the copies stop being computed
   above the first test, this transform trades back edges for spills and the
   trade is even. Everything else on this list widens reach, and widening the
-  reach of a transform that pays nothing is worth nothing.
+  reach of a transform that pays nothing is worth nothing.~~
+  **BUILT 2026-09-12**, behind `CRATONVM_JIT_IR_SINK_EQUAL_DEPTH` (default OFF),
+  and it moved the schedule exactly as predicted — `scan_spills` 7→5,
+  `scan_reloads` 7→5, `peak_live` 15→13, frame references in the emitted body
+  −24%. **It bought no time, and the premise of the sentence above is what was
+  wrong**: this transform was never paying nothing. §5's 0.98 was measured
+  against a ±8% spread; with a control arm and nine rounds the floor is 0.7–1.0%
+  and the same 0.98 is *above* it. The unroller was already worth ~2%, the
+  spills it was blamed for are off the probe's dependency chain, and removing
+  them changes nothing anyone can time. Two more things had to be fixed to make
+  the copies move at all — a phi's value input is used on its EDGE, and the
+  safepoint anchor was keyed by bci so every copy's frame claimed every copy's
+  blocks. Write-up, including the throughput-bound arm that is still unreported:
+  [`c2-schedule-late-at-equal-depth-20260912.md`](c2-schedule-late-at-equal-depth-20260912.md).
 * **The clone set is still pure-plus-`Op::Load`.** The shared side-effect scan
   refuses a loop containing an `ArrayLoad`, `ArrayStore`, `Call`, `New` or
   `Guard` that is loop-variant or pinned to the loop. For the full unroller that
