@@ -51,17 +51,15 @@
 //!   helpers use for NPE, CCE and OOM (`set_jit_pending_exception`). If it
 //!   cannot be built (no JIT thread, no VM, heap exhausted), only the sentinel
 //!   is returned, the same fallback `jit_alloc_oom` has.
-//! * [`OnPanic::Deopt`]: for LEAF helpers whose call sites publish no oop map
-//!   (array loads, `getfield`, the throw stubs, `tlab_post_init`,
-//!   `uncommon_trap`). Allocating a throwable there could move an object that
+//! * [`OnPanic::Deopt`]: for `uncommon_trap`, a leaf call site that publishes
+//!   no oop map and whose answer is already "reinterpret". Allocating a
+//!   throwable there could move an object that
 //!   the compiled frame still names from an unpublished slot, so this policy
 //!   allocates nothing. It raises the out-of-band deopt flag
 //!   (`set_jit_deopt_pending`), which is what tells the interpreter that an
 //!   `i64::MIN` return is a sentinel and not a real `Long.MIN_VALUE`.
-//! * [`OnPanic::Record`]: counter and stderr only. It is for helpers with no
-//!   failure channel whose established answer to trouble is "drop and count"
-//!   (`bastore`, `iastore`, the primitive `putfield_*`), and for fast paths
-//!   whose failure answer is "declined" (`ffm_segment_get` / `_set`). There the
+//! * [`OnPanic::Record`]: counter and stderr only, for fast paths whose
+//!   failure answer is "declined" (`ffm_segment_get` / `_set`). There the
 //!   caller runs the authoritative slow path, which surfaces its own errors, so
 //!   a stashed throwable would be a second, unrelated report.
 //!
@@ -69,7 +67,7 @@
 //! The stashed `InternalError` is delivered at the next pending-exception drain
 //! on that thread, not at the faulting instruction.
 //!
-//! # Guarded helpers (65)
+//! # Guarded helpers (49)
 //!
 //! `Throw`, sentinel `i64::MIN`: `service_callee_deopt`, `monitor_enter`,
 //! `monitor_exit`, `aastore_type_check`, `getstatic`, `putstatic_int`,
@@ -94,21 +92,25 @@
 //! and `aastore`, `varhandle_write_direct` and `safepoint_slow_path` return
 //! `()`.
 //!
-//! `Deopt`: `baload`, `iaload`, `aaload`, `arraylength`, `getfield`,
-//! `throw_aioobe`, `throw_arithmetic` and `throw_exception` (`i64::MIN`);
-//! `npe_with_action` (`()`, its stub loads `i64::MIN` itself); `tlab_post_init`
-//! (`0`, which the inline-TLAB arm's `emit_post_alloc_oom_check` routes); and
-//! `uncommon_trap` (`DEOPT_ACTION_REINTERPRET`).
+//! `Deopt`: `uncommon_trap` (`DEOPT_ACTION_REINTERPRET`).
 //!
-//! `Record`: `bastore`, `iastore`, `putfield_int`, `putfield_long`,
-//! `putfield_float` and `putfield_double` (`()`); `ffm_segment_get` and
-//! `ffm_segment_set` (`0`, declined).
+//! `Record`: `ffm_segment_get` and `ffm_segment_set` (`0`, declined).
 //!
 //! # Deliberately NOT guarded
 //!
 //! These must stay panic-free. A new helper that cannot meet that bar must be
 //! guarded instead.
 //!
+//! * The leaf readers `baload`, `iaload`, `aaload`, `arraylength` and
+//!   `getfield`; the throw stubs `throw_aioobe`, `throw_arithmetic`,
+//!   `throw_exception` and `npe_with_action`; `tlab_post_init`; and the
+//!   primitive stores `bastore`, `iastore` and `putfield_int` / `_long` /
+//!   `_float` / `_double`. Their call sites publish no oop map, so a guard
+//!   could only return a deopt sentinel or drop the call. The sentinel's resume
+//!   is not proven to land at the faulting bytecode (a replay from earlier
+//!   re-runs committed side effects), and a dropped store is silent corruption.
+//!   They abort, as before, until each site has a precise failure exit
+//!   (`jit-leaf-helper-panics-still-abort-20260912.md`).
 //! * `jit_set_deopt_pending`, `jit_set_throw_bci`, `jit_get_current_thread`
 //!   and `jit_dispatch_threw` touch one thread-local each. `dispatch_threw` is
 //!   also the peek every `J`/`D` sentinel check relies on, and must never stash
@@ -275,10 +277,16 @@ pub fn jit_helper_last_panic() -> Option<&'static str> {
 
 /// Up to the last eight helpers that panicked, oldest first. A name repeats
 /// when that helper panicked more than once.
+///
+/// Never blocks: the crash report reads this, possibly on a thread that
+/// faulted while holding the log's lock, so a contended lock yields an empty
+/// list instead.
 pub fn jit_helper_recent_panics() -> Vec<&'static str> {
-    let log = PANIC_LOG
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let log = match PANIC_LOG.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return Vec::new(),
+    };
     (0..RECENT_CAPACITY)
         .filter_map(|i| log.recent[(log.next + i) % RECENT_CAPACITY])
         .collect()

@@ -422,8 +422,8 @@ same return type fail differently.
    | Policy | Used for | Effect |
    |---|---|---|
    | `Throw { vm_ptr }` | Helpers whose normal path already allocates, runs Java or parks, so the call site is already a GC safepoint | Stash `java.lang.InternalError: JIT runtime helper <name> panicked: <payload>` with `set_jit_pending_exception` (`vm_ptr == 0` uses the process VM). If that cannot be built, only the sentinel is returned. |
-   | `Deopt` | Leaf helpers whose call sites publish no oop map | Allocate nothing. Call `set_jit_deopt_pending()`, so an `i64::MIN` return reads as a sentinel. |
-   | `Record` | Void helpers whose answer to trouble is already "drop and count", and fast paths whose failure answer is "declined" | Count and report only. |
+   | `Deopt` | `uncommon_trap`, whose answer is already to reinterpret | Allocate nothing. Call `set_jit_deopt_pending()`, so an `i64::MIN` return reads as a sentinel. |
+   | `Record` | Fast paths whose failure answer is "declined" | Count and report only. |
 
 4. Return the sentinel.
 
@@ -435,15 +435,11 @@ Each guarded helper returns the failure answer its call site already handles
 | Sentinel | Helpers |
 |---|---|
 | `i64::MIN`, `Throw` | `invoke_dispatch`, `invoke_virtual_mic`, `service_callee_deopt`, `indy_bridge`, `lambda_int_to_double`, `varhandle_read_direct`, `varhandle_cas_direct`, the `integer_*`, `long_*`, `dbb_*`, `md_update_byte`, `preconditions_check_index`, `buffer_session`, `thread_current_thread`, `concurrent_hashmap_get`, `hashmap_get`, `hashmap_put` and `string_latin1_to_lower` direct intrinsics, `monitor_enter`, `monitor_exit`, `checkcast`, `aastore_type_check`, `getstatic`, `putstatic_*`, `self_call_stack_guard` |
-| `i64::MIN`, `Deopt` | `baload`, `iaload`, `aaload`, `arraylength`, `getfield`, `throw_aioobe`, `throw_arithmetic`, `throw_exception` |
 | `0` / null, `Throw` | `newarray`, `new_object`, `new_object_cp`, `anewarray_object`, `anewarray_object_cp`, `multianewarray_2d`, `ldc_class_cp`, `ldc_string_cp`, `ldc_string`, `instanceof` |
-| `0`, `Deopt` | `tlab_post_init` (the inline-TLAB arm's `emit_post_alloc_oom_check` routes it) |
 | `0`, `Record` | `ffm_segment_get`, `ffm_segment_set` (declined; the native path runs) |
 | `-1`, `Throw` | `local_handler_lookup` (propagate) |
 | `DEOPT_ACTION_REINTERPRET`, `Deopt` | `uncommon_trap` |
 | `()`, `Throw` | `aastore`, `varhandle_write_direct`, `safepoint_slow_path` |
-| `()`, `Deopt` | `npe_with_action` (its stub loads `i64::MIN` itself) |
-| `()`, `Record` | `bastore`, `iastore`, `putfield_int`, `putfield_long`, `putfield_float`, `putfield_double` |
 
 A void helper has no failure channel. A `Throw` stash is delivered at the
 thread's next pending-exception drain, not at the faulting instruction, and a
@@ -457,6 +453,12 @@ These are not wrapped:
 * `native_stack_floor`, `frame_record`, `verify_inline_frame_record`
 * `math_fma_double`, `math_fma_float`, `jit_frem`, `jit_drem`
 * `reachability_fence_direct`, `resolve_static_base`
+* the leaf readers `baload`, `iaload`, `aaload`, `arraylength` and `getfield`;
+  the throw stubs `throw_aioobe`, `throw_arithmetic`, `throw_exception` and
+  `npe_with_action`; `tlab_post_init`; and the primitive stores `bastore`,
+  `iastore` and `putfield_int` / `_long` / `_float` / `_double`. A guard there
+  could only return a deopt sentinel whose resume is not yet precise, or drop
+  a write, so they still abort (`jit-leaf-helper-panics-still-abort-20260912.md`)
 * the savebase watch: `arm_savebase_watch` is `#[naked]`, and its inner half
   belongs to the crash handler
 
@@ -466,8 +468,9 @@ silently drop a card mark, remembered-set entry or SATB record, which is a
 latent use-after-free, so the abort is preferred.
 
 Any change to an unguarded helper must keep it free of panics. A new helper
-that cannot be shown panic-free must be guarded, and it chooses `Throw` or
-`Deopt` by whether its call site is a GC safepoint.
+that cannot be shown panic-free must be guarded, and it uses `Throw`, which
+needs a GC-safepoint call site. `Deopt` is reserved for sites whose answer is
+already a reinterpretation.
 
 ### Crash reporting and limits
 

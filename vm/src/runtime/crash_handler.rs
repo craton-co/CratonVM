@@ -363,6 +363,17 @@ pub fn jit_state_lines(fault_pc: Option<usize>) -> Vec<String> {
             }
         }
     }
+    // A contained helper panic leaves the process running on a declined or
+    // thrown answer; a crash that follows one should say so. Both readers are
+    // non-blocking (an atomic load and a `try_lock`).
+    let contained = crate::jit::helper_guard::jit_helper_panic_count();
+    if contained > 0 {
+        let recent = crate::jit::helper_guard::jit_helper_recent_panics();
+        lines.push(format!(
+            "jit: runtime helper panics contained: {contained} (recent: {})",
+            if recent.is_empty() { "unavailable".to_string() } else { recent.join(", ") }
+        ));
+    }
     lines
 }
 

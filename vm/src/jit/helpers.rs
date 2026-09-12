@@ -1747,11 +1747,10 @@ pub extern "C" fn jit_dispatch_threw() -> i64 {
 /// `code` is truncated to `u8`; an out-of-range value maps to no message
 /// (`jit_action_message` returns `None`), never a panic.
 pub extern "C" fn jit_npe_with_action(code: i64) {
-    let f = || jit_npe_with_action_body(code);
-    contain("jit_npe_with_action", OnPanic::Deopt, (), f)
+    jit_npe_with_action_body(code)
 }
 
-/// Body of [`jit_npe_with_action`], run under its panic guard.
+/// Body of [`jit_npe_with_action`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
 fn jit_npe_with_action_body(code: i64) {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache,
     // matching every other array/field helper's entry (the next GC must
@@ -5485,11 +5484,10 @@ pub unsafe extern "C" fn jit_post_tlab_init(
     class_id_raw: i64,
     num_fields: i64,
 ) -> i64 {
-    let f = || jit_post_tlab_init_body(vm_ptr, obj_ptr, class_id_raw, num_fields);
-    contain("jit_post_tlab_init", OnPanic::Deopt, 0, f)
+    jit_post_tlab_init_body(vm_ptr, obj_ptr, class_id_raw, num_fields)
 }
 
-/// Body of [`jit_post_tlab_init`], run under its panic guard.
+/// Body of [`jit_post_tlab_init`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
 unsafe fn jit_post_tlab_init_body(
     vm_ptr: i64,
     obj_ptr: i64,
@@ -6899,11 +6897,10 @@ unsafe fn jit_anewarray_object_body(vm_ptr: i64, component_class_id_raw: i64, le
 // pointer to a byte/boolean array object. Null triggers a pending NPE + `i64::MIN`
 // deopt sentinel; out-of-bounds is handled gracefully by the bounds check below.
 pub unsafe extern "C" fn jit_baload(array_ptr: i64, index: i64) -> i64 {
-    let f = || jit_baload_body(array_ptr, index);
-    contain("jit_baload", OnPanic::Deopt, i64::MIN, f)
+    jit_baload_body(array_ptr, index)
 }
 
-/// Body of [`jit_baload`], run under its panic guard.
+/// Body of [`jit_baload`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
 unsafe fn jit_baload_body(array_ptr: i64, index: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
@@ -6964,11 +6961,10 @@ unsafe fn jit_baload_body(array_ptr: i64, index: i64) -> i64 {
 // on the null path. The fragile "zeroed-by-happenstance argument register" ABI
 // coupling the previous comment described is gone with the shared-stub call.
 pub unsafe extern "C" fn jit_bastore(array_ptr: i64, index: i64, val: i64) {
-    let f = || jit_bastore_body(array_ptr, index, val);
-    contain("jit_bastore", OnPanic::Record, (), f)
+    jit_bastore_body(array_ptr, index, val)
 }
 
-/// Body of [`jit_bastore`], run under its panic guard.
+/// Body of [`jit_bastore`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
 unsafe fn jit_bastore_body(array_ptr: i64, index: i64, val: i64) {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
@@ -7045,11 +7041,10 @@ unsafe fn jit_bastore_body(array_ptr: i64, index: i64, val: i64) {
 // pointer to an int array object. Null triggers a pending NPE + `i64::MIN` deopt
 // sentinel; out-of-bounds is handled gracefully by the bounds check below.
 pub unsafe extern "C" fn jit_iaload(array_ptr: i64, index: i64) -> i64 {
-    let f = || jit_iaload_body(array_ptr, index);
-    contain("jit_iaload", OnPanic::Deopt, i64::MIN, f)
+    jit_iaload_body(array_ptr, index)
 }
 
-/// Body of [`jit_iaload`], run under its panic guard.
+/// Body of [`jit_iaload`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
 unsafe fn jit_iaload_body(array_ptr: i64, index: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
@@ -7093,11 +7088,10 @@ unsafe fn jit_iaload_body(array_ptr: i64, index: i64) -> i64 {
 // pointer to an int array object. Null aborts the process — see `jit_bastore` for
 // the rationale. Out-of-bounds is handled gracefully.
 pub unsafe extern "C" fn jit_iastore(array_ptr: i64, index: i64, val: i64) {
-    let f = || jit_iastore_body(array_ptr, index, val);
-    contain("jit_iastore", OnPanic::Record, (), f)
+    jit_iastore_body(array_ptr, index, val)
 }
 
-/// Body of [`jit_iastore`], run under its panic guard.
+/// Body of [`jit_iastore`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
 unsafe fn jit_iastore_body(array_ptr: i64, index: i64, val: i64) {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
@@ -7965,11 +7959,10 @@ unsafe fn jit_load_ref_slot(
 // pinned together by `let _: HelperFnAaload = jit_aaload;` further down this
 // file, which is why this change could not land half done.
 pub unsafe extern "C" fn jit_aaload(vm_ptr: i64, array_ptr: i64, index: i64) -> i64 {
-    let f = || jit_aaload_body(vm_ptr, array_ptr, index);
-    contain("jit_aaload", OnPanic::Deopt, i64::MIN, f)
+    jit_aaload_body(vm_ptr, array_ptr, index)
 }
 
-/// Body of [`jit_aaload`], run under its panic guard.
+/// Body of [`jit_aaload`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
 unsafe fn jit_aaload_body(vm_ptr: i64, array_ptr: i64, index: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
@@ -8450,11 +8443,10 @@ unsafe fn jit_multianewarray_2d_body(vm_ptr: i64, site: i64, dim1: i64, dim2: i6
 // pointer to any array object. Null triggers a pending NPE + `i64::MIN` deopt
 // sentinel (JVMS §arraylength requires NullPointerException on null).
 pub unsafe extern "C" fn jit_arraylength(array_ptr: i64) -> i64 {
-    let f = || jit_arraylength_body(array_ptr);
-    contain("jit_arraylength", OnPanic::Deopt, i64::MIN, f)
+    jit_arraylength_body(array_ptr)
 }
 
-/// Body of [`jit_arraylength`], run under its panic guard.
+/// Body of [`jit_arraylength`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
 unsafe fn jit_arraylength_body(array_ptr: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
@@ -9466,11 +9458,10 @@ pub fn membership_walks_by_site() -> Vec<(&'static str, u64)> {
 }
 
 pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i64) -> i64 {
-    let f = || jit_getfield_body(vm_ptr, obj_ptr, field_index);
-    contain("jit_getfield", OnPanic::Deopt, i64::MIN, f)
+    jit_getfield_body(vm_ptr, obj_ptr, field_index)
 }
 
-/// Body of [`jit_getfield`], run under its panic guard.
+/// Body of [`jit_getfield`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
 unsafe fn jit_getfield_body(vm_ptr: i64, obj_ptr: i64, field_index: i64) -> i64 {
     // The JIT may set `GETFIELD_RECEIVER_PROVEN_OOP` to say it has already
     // proven this receiver is an oop; see that constant for why that is sound
@@ -10193,11 +10184,10 @@ unsafe fn jit_putfield_slot_in_bounds(obj_ptr: i64, field_index: i64) -> bool {
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
 // to a live object. field_index was resolved at JIT compile time to a valid slot.
 pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i64) {
-    let f = || jit_putfield_int_body(obj_ptr, field_index, val);
-    contain("jit_putfield_int", OnPanic::Record, (), f)
+    jit_putfield_int_body(obj_ptr, field_index, val)
 }
 
-/// Body of [`jit_putfield_int`], run under its panic guard.
+/// Body of [`jit_putfield_int`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
 unsafe fn jit_putfield_int_body(obj_ptr: i64, field_index: i64, val: i64) {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
@@ -10274,11 +10264,10 @@ unsafe fn jit_putfield_int_body(obj_ptr: i64, field_index: i64, val: i64) {
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
 // to a live object. field_index was resolved at JIT compile time to a valid slot.
 pub unsafe extern "C" fn jit_putfield_long(obj_ptr: i64, field_index: i64, val: i64) {
-    let f = || jit_putfield_long_body(obj_ptr, field_index, val);
-    contain("jit_putfield_long", OnPanic::Record, (), f)
+    jit_putfield_long_body(obj_ptr, field_index, val)
 }
 
-/// Body of [`jit_putfield_long`], run under its panic guard.
+/// Body of [`jit_putfield_long`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
 unsafe fn jit_putfield_long_body(obj_ptr: i64, field_index: i64, val: i64) {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
@@ -10317,11 +10306,10 @@ unsafe fn jit_putfield_long_body(obj_ptr: i64, field_index: i64, val: i64) {
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
 // to a live object. field_index was resolved at JIT compile time to a valid slot.
 pub unsafe extern "C" fn jit_putfield_float(obj_ptr: i64, field_index: i64, val: i64) {
-    let f = || jit_putfield_float_body(obj_ptr, field_index, val);
-    contain("jit_putfield_float", OnPanic::Record, (), f)
+    jit_putfield_float_body(obj_ptr, field_index, val)
 }
 
-/// Body of [`jit_putfield_float`], run under its panic guard.
+/// Body of [`jit_putfield_float`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
 unsafe fn jit_putfield_float_body(obj_ptr: i64, field_index: i64, val: i64) {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
@@ -10361,11 +10349,10 @@ unsafe fn jit_putfield_float_body(obj_ptr: i64, field_index: i64, val: i64) {
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
 // to a live object. field_index was resolved at JIT compile time to a valid slot.
 pub unsafe extern "C" fn jit_putfield_double(obj_ptr: i64, field_index: i64, val: i64) {
-    let f = || jit_putfield_double_body(obj_ptr, field_index, val);
-    contain("jit_putfield_double", OnPanic::Record, (), f)
+    jit_putfield_double_body(obj_ptr, field_index, val)
 }
 
-/// Body of [`jit_putfield_double`], run under its panic guard.
+/// Body of [`jit_putfield_double`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
 unsafe fn jit_putfield_double_body(obj_ptr: i64, field_index: i64, val: i64) {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
@@ -12702,11 +12689,10 @@ pub unsafe extern "C" fn jit_throw_aioobe(
     array_ptr: i64,
     bytecode_pc: i64,
 ) -> i64 {
-    let f = || jit_throw_aioobe_body(index, length, array_ptr, bytecode_pc);
-    contain("jit_throw_aioobe", OnPanic::Deopt, i64::MIN, f)
+    jit_throw_aioobe_body(index, length, array_ptr, bytecode_pc)
 }
 
-/// Body of [`jit_throw_aioobe`], run under its panic guard.
+/// Body of [`jit_throw_aioobe`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
 unsafe fn jit_throw_aioobe_body(index: i64, length: i64, array_ptr: i64, bytecode_pc: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
@@ -12810,11 +12796,10 @@ pub(crate) fn rbc6_dbg() -> bool {
 // SAFETY: Called from JIT-compiled code at a div-by-zero guard. Sets two
 // thread-locals and returns a sentinel; no pointer dereferences.
 pub unsafe extern "C" fn jit_throw_arithmetic() -> i64 {
-    let f = || jit_throw_arithmetic_body();
-    contain("jit_throw_arithmetic", OnPanic::Deopt, i64::MIN, f)
+    jit_throw_arithmetic_body()
 }
 
-/// Body of [`jit_throw_arithmetic`], run under its panic guard.
+/// Body of [`jit_throw_arithmetic`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
 unsafe fn jit_throw_arithmetic_body() -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
@@ -12893,11 +12878,10 @@ pub unsafe extern "C" fn jit_set_throw_bci(bci: i64) {
 }
 
 pub unsafe extern "C" fn jit_throw_exception(exc_ptr: i64, bci: i64) -> i64 {
-    let f = || jit_throw_exception_body(exc_ptr, bci);
-    contain("jit_throw_exception", OnPanic::Deopt, i64::MIN, f)
+    jit_throw_exception_body(exc_ptr, bci)
 }
 
-/// Body of [`jit_throw_exception`], run under its panic guard.
+/// Body of [`jit_throw_exception`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
 unsafe fn jit_throw_exception_body(exc_ptr: i64, bci: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
