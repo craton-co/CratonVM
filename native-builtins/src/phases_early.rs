@@ -14259,10 +14259,39 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         "getDefault",
         "()Ljavax/net/ServerSocketFactory;",
         |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ServerSocketFactory", 0)?;
+            // The class name is observable: on HotSpot
+            // `ServerSocketFactory.getDefault().getClass().getName()` is
+            // `javax.net.DefaultServerSocketFactory`, and this answered the
+            // ABSTRACT base `javax.net.ServerSocketFactory` — a class the JDK
+            // never instantiates. MEASURED, `L6TlsParamSweep` row 74.
+            //
+            // Minting the concrete class is safe because
+            // `register_plain_server_socket_factory` below registers the four
+            // `createServerSocket` bodies on it as well, so no JDK bytecode
+            // runs against a carrier whose `impl` was never constructed. That
+            // is also what keeps `tls_deny::deny_plaintext_fallback` in the
+            // path: `DefaultServerSocketFactory`'s own bytecode would build
+            // the same plain `java.net.ServerSocket` without consulting the
+            // guard at all.
+            let obj =
+                try_alloc_concurrent_synthetic(ctx, "javax/net/DefaultServerSocketFactory", 0)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    // The abstract base, for a caller that holds one another way, and the
+    // concrete default the getter above hands out.
+    register_plain_server_socket_factory(r, ssf);
+    register_plain_server_socket_factory(r, "javax/net/DefaultServerSocketFactory");
+    r.set_category(__prev_cat);
+}
+
+/// The four `createServerSocket` overloads of a PLAINTEXT server-socket
+/// factory, registered on one class.
+///
+/// Two classes get them: `javax.net.ServerSocketFactory` and the concrete
+/// `javax.net.DefaultServerSocketFactory` its `getDefault()` returns. See that
+/// getter for why the concrete class is what is minted.
+fn register_plain_server_socket_factory(r: &mut NativeMethodRegistry, ssf: &str) {
     r.register(
         ssf,
         "createServerSocket",
@@ -14333,7 +14362,6 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
             )
         },
     );
-    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

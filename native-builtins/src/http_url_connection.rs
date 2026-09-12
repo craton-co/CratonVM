@@ -829,6 +829,67 @@ fn real_reqs() -> &'static Mutex<HashMap<i32, RealReq>> {
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The request method a real carrier will actually send.
+///
+/// **Why this is not just `RealReq::method`.** On 2026-09-11 lane L6 retired
+/// `setRequestMethod`/`getRequestMethod` on `java/net/HttpURLConnection` — the
+/// class `URL.openConnection()` mints — so on that carrier the JDK's own
+/// bytecode runs and it writes the object's `method` FIELD. Our side table
+/// never sees the call. The wire went on reading the side table, so:
+///
+/// ```text
+///   setRequestMethod("PUT")   field=PUT   table=""     wire sent POST
+///   setDoOutput(true) only    field=GET   table=POST   getRequestMethod() said GET
+/// ```
+///
+/// — MEASURED, `L6HttpLoopbackSweep` rows 67 and 69, in opposite directions on
+/// the same disagreement. One reader, field first, is what makes the two
+/// agree; the writers below ([`huc_set_request_method`] and
+/// `getOutputStream`'s GET→POST promotion) keep both copies in step so the
+/// `sun.*` carriers — whose setter IS ours — are unaffected.
+fn real_method(ctx: &dyn NativeContext, this: ObjectRef) -> Option<String> {
+    if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "method") {
+        if let Some(m) = ctx.read_string(s).filter(|m| !m.is_empty()) {
+            return Some(m);
+        }
+    }
+    let key = ctx.identity_hash_code(this);
+    real_reqs()
+        .lock()
+        .ok()
+        .and_then(|t| t.get(&key).map(|r| r.method.clone()))
+        .filter(|m| !m.is_empty())
+}
+
+/// The streaming mode a real carrier is in — the JDK's own fields first, for
+/// the same reason as [`real_method`].
+///
+/// `setChunkedStreamingMode(I)` and `setFixedLengthStreamingMode(I)` are in the
+/// same retirement table, so on the minted carrier those three fields are the
+/// only record of the call. `-1` is each one's "not set" sentinel; the mint
+/// site in `net_phase_e` writes them, because an ALLOCATED carrier arrives
+/// with 0 there and 0 means "set to zero".
+fn real_streaming_mode(ctx: &dyn NativeContext, this: ObjectRef) -> StreamingMode {
+    let field_int = |name: &str| ctx.get_field_by_name(this, name).as_int();
+    if let Some(chunk) = field_int("chunkLength").filter(|n| *n >= 0) {
+        return StreamingMode::Chunked(chunk);
+    }
+    if let Some(fixed) = field_int("fixedContentLength").filter(|n| *n >= 0) {
+        return StreamingMode::Fixed(fixed as u64);
+    }
+    if let Value::Long(fixed) = ctx.get_field_by_name(this, "fixedContentLengthLong") {
+        if fixed >= 0 {
+            return StreamingMode::Fixed(fixed as u64);
+        }
+    }
+    let key = ctx.identity_hash_code(this);
+    real_reqs()
+        .lock()
+        .ok()
+        .and_then(|t| t.get(&key).map(|r| r.streaming))
+        .unwrap_or_default()
+}
+
 /// Real-carrier buffered request-body stream (the `ByteArrayOutputStream`
 /// returned by `getOutputStream`), keyed by `identity_hash_code(this)`. We
 /// cannot park it in a synthetic slot on a real object, so we track the object
@@ -1094,11 +1155,8 @@ fn start_live_fixed_stream(
         .ok()
         .and_then(|reqs| reqs.get(&conn_key).cloned())
         .unwrap_or_default();
-    let method = if req.method.is_empty() {
-        "POST"
-    } else {
-        req.method.as_str()
-    };
+    let method_owned = real_method(ctx, this).unwrap_or_else(|| "POST".to_string());
+    let method = method_owned.as_str();
     let connect_timeout = match req.connect_timeout_ms {
         Some(v) if v > 0 => Duration::from_millis(v as u64),
         _ => Duration::from_secs(30),
@@ -1224,17 +1282,46 @@ fn huc_real_perform_inner(
     // buffered BAOS).  Redirect replay is intentionally not attempted here:
     // the JDK likewise cannot transparently replay a streamed request body.
     if let Some(mut live) = take_live_fixed_stream(key)? {
+        // The head is already on the wire with `Content-Length: expected`, and
+        // the peer is waiting for exactly that many bytes. If the live stream
+        // did not see them, the body is not lost — it is in the request BAOS,
+        // which is what every OTHER path sends. Push the remainder rather than
+        // abandoning a request whose body this VM is holding.
+        //
+        // This is not a rare corner. In real-JDK mode `getOutputStream()`
+        // hands back a genuine `java.io.ByteArrayOutputStream` and its writes
+        // are the JDK's OWN bytecode, which dispatches no `BaosEvent` — so the
+        // live stream observes NOTHING and `written` is 0 for every
+        // fixed-length request. MEASURED: `L6HttpLoopbackSweep` row 64 read
+        // "fixed-length stream has 0 bytes; expected 4" on a connection that
+        // had been handed all four.
+        if live.written < live.expected {
+            let body = real_body_bytes(ctx, this);
+            if body.len() as u64 == live.expected {
+                use std::io::Write as _;
+                let from = live.written as usize;
+                ctx.begin_blocking_region();
+                let pushed = live
+                    .tcp
+                    .write_all(&body[from..])
+                    .and_then(|()| live.tcp.flush());
+                ctx.end_blocking_region();
+                pushed.map_err(|e| {
+                    ioex(format!("HttpURLConnection fixed-length body write failed: {e}"))
+                })?;
+                live.written = live.expected;
+            }
+        }
         if live.written != live.expected {
             return Err(ioex(format!(
                 "HttpURLConnection fixed-length stream has {} bytes; expected {} before reading the response",
                 live.written, live.expected
             )));
         }
-        let method = real_reqs()
-            .lock()
-            .ok()
-            .and_then(|reqs| reqs.get(&key).map(|req| req.method.clone()))
-            .unwrap_or_default();
+        // `real_method`, not the side table alone — see its note: on the
+        // carrier `URL.openConnection()` mints, `setRequestMethod` is the
+        // JDK's own retired bytecode and writes the FIELD.
+        let method = real_method(ctx, this).unwrap_or_default();
         ctx.begin_blocking_region();
         let response = read_response(&mut live.tcp, method.eq_ignore_ascii_case("HEAD"));
         ctx.end_blocking_region();
@@ -1285,11 +1372,7 @@ fn huc_real_perform_inner(
         .ok()
         .and_then(|t| t.get(&key).cloned())
         .unwrap_or_default();
-    let mut method = if req.method.is_empty() {
-        "GET".to_string()
-    } else {
-        req.method.clone()
-    };
+    let mut method = real_method(ctx, this).unwrap_or_else(|| "GET".to_string());
     // Honor the caller's setConnectTimeout/setReadTimeout (ms). Java treats 0
     // as "infinite"; an unbounded blocking read would hang a worker forever,
     // so 0/unset keeps the historical 30s/60s sane defaults while an explicit
@@ -4450,6 +4533,23 @@ fn huc_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                     if let Ok(mut t) = real_body_streams().lock() {
                         t.remove(&key);
                     }
+                    // This native REPLACES `HttpURLConnection(URL u)`, so
+                    // everything that constructor's field initialisers would
+                    // have written has to be written here — including the
+                    // four `-1` sentinels. Without them a user subclass's
+                    // `super(u)` produced a carrier whose
+                    // `setFixedLengthStreamingMode` refused with "Chunked
+                    // encoding streaming mode set". It runs AFTER the
+                    // side-table eviction above and BEFORE the subclass's own
+                    // initialisers, which is where the JDK puts it.
+                    let url_keep = ctx.pin_native_root(url_obj);
+                    let this = huc_write_declared_field_defaults(ctx, this);
+                    let url_obj = ctx.read_native_pin(url_keep, url_obj);
+                    ctx.unpin_native_roots(url_keep);
+                    // `url` again: the helper does not touch it, and the
+                    // write above happened before a `create_string` that can
+                    // move either reference.
+                    ctx.set_field(this, HUC_CONN_ID, Value::Object(Some(url_obj)));
                     return Ok(None);
                 }
             }
@@ -4485,6 +4585,15 @@ fn huc_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     // would (a) misread the synthetic slots `ensure_connected` consults and
     // (b) prematurely fix the request before the body/headers are fully staged.
     if is_real_carrier(ctx, this) {
+        // Deferred, but not INVISIBLE. `URLConnection.connect()` sets
+        // `connected = true`, and the inherited bytecode for
+        // `setDoOutput`/`setDoInput`/`setUseCaches`/`setRequestProperty`
+        // reads that field to refuse a late change — all of them retired onto
+        // the JDK's own bodies on 2026-09-11, so the field is the only thing
+        // they consult. Leaving it 0 made `connect(); setDoOutput(true)`
+        // succeed (`L6HttpLoopbackSweep` row 73) on a connection that had
+        // announced itself connected.
+        ctx.set_field_by_name(this, "connected", Value::Int(1));
         return Ok(None);
     }
     ensure_connected(ctx, this)
@@ -4728,11 +4837,15 @@ fn huc_get_output_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         // relies on this — it sets only `setDoOutput(true)`, never the method —
         // so without this promotion the body is sent as a GET and the servlet
         // replies 405 Method Not Allowed.
-        with_real_req(ctx, this, |r| {
-            if r.method.is_empty() || r.method == "GET" {
-                r.method = "POST".to_string();
-            }
-        });
+        // The promotion has to land on the FIELD too, or `getRequestMethod()`
+        // — the JDK's own retired bytecode on this carrier — keeps answering
+        // GET for a request that goes out as a POST (`L6HttpLoopbackSweep`
+        // row 67). See [`real_method`].
+        if real_method(ctx, this).is_none_or(|m| m == "GET") {
+            let post = ctx.create_string("POST");
+            ctx.set_field_by_name(this, "method", Value::Object(Some(post)));
+            with_real_req(ctx, this, |r| r.method = "POST".to_string());
+        }
         let key = ctx.identity_hash_code(this);
         if let Some((vkey, stored)) = real_body_streams()
             .lock()
@@ -4757,11 +4870,7 @@ fn huc_get_output_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         if let Ok(mut t) = real_body_streams().lock() {
             t.insert(key, (vkey, baos));
         }
-        let streaming = real_reqs()
-            .lock()
-            .ok()
-            .and_then(|reqs| reqs.get(&key).map(|req| req.streaming))
-            .unwrap_or_default();
+        let streaming = real_streaming_mode(ctx, this);
         if let StreamingMode::Fixed(expected) = streaming {
             start_live_fixed_stream(ctx, this, baos, expected)?;
         }
@@ -5062,6 +5171,13 @@ fn huc_set_request_method(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         return Err(protocol_ex(format!("Invalid HTTP method: {m}")));
     }
     if is_real_carrier(ctx, this) {
+        // BOTH copies. `real_method` reads the field first because on the
+        // `java/net/HttpURLConnection` carrier only the JDK's own retired
+        // bytecode writes it; on the `sun.*` carriers this native is the only
+        // writer there is, and leaving the field behind would make the same
+        // reader answer the stale default.
+        let s = ctx.create_string(&normalized);
+        ctx.set_field_by_name(this, "method", Value::Object(Some(s)));
         with_real_req(ctx, this, |r| r.method = normalized);
         return Ok(None);
     }
@@ -5073,13 +5189,7 @@ fn huc_set_request_method(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 fn huc_get_request_method(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     if is_real_carrier(ctx, this) {
-        let m = with_real_req(ctx, this, |r| {
-            if r.method.is_empty() {
-                "GET".to_string()
-            } else {
-                r.method.clone()
-            }
-        });
+        let m = real_method(ctx, this).unwrap_or_else(|| "GET".to_string());
         let s = ctx.create_string(&m);
         return Ok(Some(Value::Object(Some(s))));
     }
@@ -5384,33 +5494,42 @@ fn huc_set_fixed_length_streaming_mode(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    let long_overload = matches!(args.get(1), Some(Value::Long(_)));
     let length = match args.get(1) {
         Some(Value::Int(v)) => *v as i64,
         Some(Value::Long(v)) => *v,
-        _ => return Err(iae("setFixedLengthStreamingMode: invalid length")),
+        _ => return Err(iae("invalid content length")),
     };
-    if length < 0 {
-        return Err(iae("setFixedLengthStreamingMode: negative length"));
-    }
     if !is_real_carrier(ctx, this) {
         // Synthetic carriers retain their historical buffered implementation.
         return Ok(None);
     }
-    let key = ctx.identity_hash_code(this);
-    if live_fixed_streams()
-        .lock()
-        .ok()
-        .is_some_and(|streams| streams.contains_key(&key))
-    {
-        return Err(ise("setFixedLengthStreamingMode: already connected"));
+    // The JDK's three refusals, in the JDK's ORDER and with the JDK's words.
+    // Order is observable: `setFixedLengthStreamingMode(-1)` on a chunked
+    // connection is "Chunked encoding streaming mode set", not "invalid
+    // content length". The wording was observable too — HotSpot says
+    // "invalid content length" where this said "setFixedLengthStreamingMode:
+    // negative length" (`L6HttpLogicSweep` row 22).
+    if huc_field_connected(ctx, this) {
+        return Err(ise("Already connected"));
     }
-    with_real_req(ctx, this, |req| match req.streaming {
-        StreamingMode::Chunked(_) => Err(ise("Chunked encoding streaming mode set")),
-        _ => {
-            req.streaming = StreamingMode::Fixed(length as u64);
-            Ok(())
-        }
-    })?;
+    if matches!(real_streaming_mode(ctx, this), StreamingMode::Chunked(_)) {
+        return Err(ise("Chunked encoding streaming mode set"));
+    }
+    if length < 0 {
+        return Err(iae("invalid content length"));
+    }
+    // Both copies, for the reason [`real_method`] gives: the field is what
+    // the JDK's own retired bytecode would have written, and it is what
+    // `real_streaming_mode` reads first.
+    if long_overload {
+        ctx.set_field_by_name(this, "fixedContentLengthLong", Value::Long(length));
+    } else {
+        ctx.set_field_by_name(this, "fixedContentLength", Value::Int(length as i32));
+    }
+    with_real_req(ctx, this, |req| {
+        req.streaming = StreamingMode::Fixed(length as u64)
+    });
     Ok(None)
 }
 
@@ -5420,22 +5539,195 @@ fn huc_set_chunked_streaming_mode(ctx: &mut dyn NativeContext, args: &[Value]) -
     if !is_real_carrier(ctx, this) {
         return Ok(None);
     }
-    let key = ctx.identity_hash_code(this);
-    if live_fixed_streams()
-        .lock()
-        .ok()
-        .is_some_and(|streams| streams.contains_key(&key))
-    {
-        return Err(ise("setChunkedStreamingMode: already connected"));
+    if huc_field_connected(ctx, this) {
+        return Err(ise("Already connected"));
     }
-    with_real_req(ctx, this, |req| match req.streaming {
-        StreamingMode::Fixed(_) => Err(ise("Fixed length streaming mode set")),
-        _ => {
-            req.streaming = StreamingMode::Chunked(chunk_length);
-            Ok(())
-        }
-    })?;
+    if matches!(real_streaming_mode(ctx, this), StreamingMode::Fixed(_)) {
+        return Err(ise("Fixed length streaming mode set"));
+    }
+    // `chunkLength = chunklen <= 0 ? DEFAULT_CHUNK_SIZE : chunklen` — the
+    // JDK accepts a non-positive size and substitutes its own default rather
+    // than refusing, which is why `setChunkedStreamingMode(-1)` and `(0)`
+    // are both legal.
+    let stored = if chunk_length <= 0 {
+        HUC_DEFAULT_CHUNK_SIZE
+    } else {
+        chunk_length
+    };
+    ctx.set_field_by_name(this, "chunkLength", Value::Int(stored));
+    with_real_req(ctx, this, |req| {
+        req.streaming = StreamingMode::Chunked(stored)
+    });
     Ok(None)
+}
+
+/// `sun.net.www.protocol.http.HttpURLConnection.DEFAULT_CHUNK_SIZE`.
+const HUC_DEFAULT_CHUNK_SIZE: i32 = 4096;
+
+/// The connection carrier classes this VM MINTS.
+///
+/// `URL.openConnection()` allocates one of the first three; the last two are
+/// the real JDK classes an application can reach directly, and both are
+/// registered here on purpose (`register_one`'s "some apps use the abstract
+/// base class directly via reflection").
+///
+/// Anything else with these natives in its dispatch chain is a USER SUBCLASS,
+/// and [`subclass_runs_its_own_bytecode`] is what keeps them out of it.
+pub(crate) const VM_CONNECTION_CARRIERS: [&str; 6] = [
+    "java/net/HttpURLConnection",
+    "java/net/JarURLConnection",
+    "java/net/URLConnection",
+    "javax/net/ssl/HttpsURLConnection",
+    "sun/net/www/protocol/http/HttpURLConnection",
+    "sun/net/www/protocol/https/HttpsURLConnectionImpl",
+];
+
+/// `Some(result)` when the receiver is a user subclass and the call has been
+/// handed to the JDK's own bytecode; `None` when this native should run.
+///
+/// **The defect.** `register_one(r, "java/net/HttpURLConnection")` exists so
+/// applications that use the abstract base class through reflection work, and
+/// dispatch probes the RECEIVER's class chain — so a test double that extends
+/// `HttpURLConnection` and overrides `getHeaderField(String)` had its
+/// `getContentLength()`, `getContentLengthLong()`, `getLastModified()`,
+/// `setDoInput()` and `setUseCaches()` answered by natives that never
+/// consulted the override. `L6HttpLogicSweep`'s `Fixture` is exactly that
+/// shape and rows 87, 88, 101, 115 and 117 are exactly that: 87 and 88 opened
+/// a socket to `fixture.invalid`, on an object that had already been given
+/// every header it was going to be asked about.
+///
+/// **The discriminator is cheap.** This VM mints five carrier classes and a
+/// subclass is none of them; the receiver's own class name settles it in one
+/// lookup.
+///
+/// **The fallback has to be bytecode, not a hand-written body.**
+/// `invoke_virtual_bytecode_only` resolves from the RECEIVER, so
+/// `getContentLength()` reaches `java.net.URLConnection.getContentLength`,
+/// which calls `getContentLengthLong()`, which this guard forwards again,
+/// which calls `getHeaderFieldLong`, which calls `getHeaderField(String)` —
+/// and THAT resolves to the subclass's override. Every step is the JDK's own
+/// algorithm; nothing here re-implements `getHeaderFieldDate`'s date parsing
+/// or the `content-length` fallbacks.
+pub(crate) fn subclass_runs_its_own_bytecode(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    name: &str,
+    descriptor: &str,
+) -> Option<MethodCallResult> {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return None;
+    };
+    let class_id = ctx.class_id_of_object(this);
+    let cls = ctx.class_name_of_id(class_id)?;
+    if VM_CONNECTION_CARRIERS.contains(&cls.as_str()) {
+        return None;
+    }
+    // A JDK class is never "a user subclass", whatever its name. The
+    // `java/net/URLConnection` registrations are inherited by every connection
+    // impl in the image — `sun.net.www.protocol.file.FileURLConnection`,
+    // `sun.net.www.protocol.jrt.JavaRuntimeURLConnection`, the jar ones — and
+    // several of those carriers ARE this VM's own, minted elsewhere in
+    // `net_phase_e`. Stepping aside for them would change behaviour this
+    // wave has not measured. Loader 0/1 are Bootstrap and Extension.
+    if ctx.loader_id_of_class(class_id) <= 1 {
+        return None;
+    }
+    Some(ctx.invoke_virtual_bytecode_only(this, name, descriptor, &args[1..]))
+}
+
+/// Wrap each `(name, descriptor, body)` in [`subclass_runs_its_own_bytecode`]
+/// and register the wrapper.
+///
+/// One generated `fn` per triple, because `NativeCallback` is a bare `fn`
+/// pointer with no captures: the wrapper has to know its own name and
+/// descriptor at runtime, and a closure that captured them could not be
+/// registered.
+macro_rules! subclass_aware_registrations {
+    ($r:expr, $cls:expr, [ $( ($fname:ident, $name:expr, $desc:expr, $inner:expr) ),+ $(,)? ]) => {
+        $(
+            fn $fname(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                if let Some(forwarded) = subclass_runs_its_own_bytecode(ctx, args, $name, $desc) {
+                    return forwarded;
+                }
+                let inner: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult = $inner;
+                inner(ctx, args)
+            }
+            $r.register($cls, $name, $desc, $fname);
+        )+
+    };
+}
+
+/// Write the declared initial state of `java.net.URLConnection` and
+/// `java.net.HttpURLConnection` onto a carrier that never ran their
+/// constructors.
+///
+/// **Why a carrier needs this at all.** `URL.openConnection()` ALLOCATES its
+/// carrier and returns it; no `<init>` runs. Every field therefore arrives
+/// zeroed, and for four of them zero is a legal value that means the opposite
+/// of "unset":
+///
+/// ```text
+///   chunkLength            = -1   0 reads as "chunked mode is set"
+///   fixedContentLength     = -1   0 reads as "fixed length 0 is set"
+///   fixedContentLengthLong = -1   ditto
+///   responseCode           = -1   0 reads as "HTTP 0"
+/// ```
+///
+/// That went unnoticed while natives answered these methods. It became
+/// visible the moment lane L6 retired thirteen of them onto the JDK's own
+/// bodies (2026-09-11): the real `setChunkedStreamingMode` refuses when
+/// `fixedContentLength != -1`, and the real `setFixedLengthStreamingMode`
+/// refuses when `chunkLength != -1`, so BOTH refused, each naming the mode
+/// the other had supposedly set, on connections where nobody had set either.
+/// MEASURED — `L6HttpLoopbackSweep` rows 64, 65, 66 and `L6HttpLogicSweep`
+/// row 155.
+///
+/// **By name, never by slot.** These are real JDK fields; this file's `HUC_*`
+/// constants are a synthetic map that does not match their layout. See the
+/// mint site in `net_phase_e`, whose comment tabulates what writing four of
+/// them by index actually hit.
+///
+/// One list, two callers — the mint site and [`huc_init`], which is the
+/// constructor a user subclass reaches through `super(u)`. A subclass carrier
+/// has the same hole for the same reason.
+pub(crate) fn huc_write_declared_field_defaults(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> ObjectRef {
+    // `create_string` allocates, so it can move `this`; do it first, behind a
+    // pin, and write everything afterwards.
+    let pin = ctx.pin_native_root(this);
+    let get = ctx.create_string("GET");
+    let this = ctx.read_native_pin(pin, this);
+    ctx.unpin_native_roots(pin);
+    ctx.set_field_by_name(this, "method", Value::Object(Some(get)));
+    ctx.set_field_by_name(this, "doInput", Value::Int(1));
+    ctx.set_field_by_name(this, "doOutput", Value::Int(0));
+    ctx.set_field_by_name(this, "allowUserInteraction", Value::Int(0));
+    // `URLConnection`'s initialiser is `useCaches = defaultUseCaches`, i.e.
+    // true, and `HttpURLConnection`'s is `instanceFollowRedirects =
+    // followRedirects`, also true. A carrier that answered `false` to either
+    // was reporting a value the caller never chose.
+    ctx.set_field_by_name(this, "useCaches", Value::Int(1));
+    ctx.set_field_by_name(this, "instanceFollowRedirects", Value::Int(1));
+    ctx.set_field_by_name(this, "ifModifiedSince", Value::Long(0));
+    ctx.set_field_by_name(this, "connected", Value::Int(0));
+    ctx.set_field_by_name(this, "chunkLength", Value::Int(-1));
+    ctx.set_field_by_name(this, "fixedContentLength", Value::Int(-1));
+    ctx.set_field_by_name(this, "fixedContentLengthLong", Value::Long(-1));
+    ctx.set_field_by_name(this, "responseCode", Value::Int(-1));
+    this
+}
+
+/// The carrier's OWN `connected` field — the one `URLConnection`'s inherited
+/// bytecode reads and this file's response path writes.
+///
+/// The streaming setters used to ask `live_fixed_streams` instead, which is a
+/// record of "a fixed-length body is mid-flight", not of "this connection is
+/// connected": a plain buffered GET that had already fetched its response
+/// answered false and let a caller set a streaming mode on it.
+fn huc_field_connected(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    matches!(ctx.get_field_by_name(this, "connected"), Value::Int(v) if v != 0)
 }
 
 fn huc_set_instance_follow_redirects(
@@ -5509,146 +5801,180 @@ fn huc_using_proxy(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallR
 fn register_one(r: &mut NativeMethodRegistry, cls: &str) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // `<init>` is the one pair that is NOT subclass-guarded, and deliberately.
+    // A constructor is never dispatched virtually: a subclass reaches this
+    // through `super(u)`, and forwarding by RECEIVER would resolve back to the
+    // subclass's own `<init>` and recurse. `huc_init` handles that caller
+    // explicitly instead — it detects a real `java.net.URL` argument, keeps it
+    // in the `url` field, and writes the field defaults the constructor it
+    // replaces would have written.
     r.register(cls, "<init>", "(Ljava/net/URL;)V", huc_init);
     r.register(cls, "<init>", "()V", huc_init);
-    r.register(cls, "connect", "()V", huc_connect);
-    r.register(cls, "getResponseCode", "()I", huc_get_response_code);
-    r.register(
+    // Everything below runs for a carrier this VM minted and steps aside for a
+    // user subclass — see `subclass_runs_its_own_bytecode`. The wrapper is
+    // uniform on purpose: guarding only the five triples a probe happened to
+    // catch would leave the same defect in the other twenty-four.
+    //
+    // The streaming setters now carry the JDK's own refusals, in the JDK's
+    // order, and write the JDK's own fields. They used to be documented here
+    // as unavoidable no-ops because "our synthetically constructed carrier
+    // never runs URLConnection's field initializers, so those fields are 0
+    // (not -1)". The premise was right and the conclusion was avoidable:
+    // `huc_write_declared_field_defaults` writes the -1s.
+    subclass_aware_registrations!(
+        r,
         cls,
-        "getResponseMessage",
-        "()Ljava/lang/String;",
-        huc_get_response_message,
-    );
-    r.register(
-        cls,
-        "getInputStream",
-        "()Ljava/io/InputStream;",
-        huc_get_input_stream,
-    );
-    r.register(
-        cls,
-        "getErrorStream",
-        "()Ljava/io/InputStream;",
-        huc_get_error_stream,
-    );
-    r.register(
-        cls,
-        "getOutputStream",
-        "()Ljava/io/OutputStream;",
-        huc_get_output_stream,
-    );
-    r.register(
-        cls,
-        "getHeaderField",
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        huc_get_header_field_named,
-    );
-    r.register(
-        cls,
-        "getHeaderField",
-        "(I)Ljava/lang/String;",
-        huc_get_header_field_indexed,
-    );
-    r.register(
-        cls,
-        "getHeaderFieldKey",
-        "(I)Ljava/lang/String;",
-        huc_get_header_field_key_indexed,
-    );
-    r.register(
-        cls,
-        "getHeaderFields",
-        "()Ljava/util/Map;",
-        huc_get_header_fields,
-    );
-    r.register(cls, "getContentLength", "()I", huc_get_content_length);
-    r.register(
-        cls,
-        "getContentLengthLong",
-        "()J",
-        huc_get_content_length_long,
-    );
-    r.register(cls, "disconnect", "()V", huc_disconnect);
-    r.register(
-        cls,
-        "setRequestMethod",
-        "(Ljava/lang/String;)V",
-        huc_set_request_method,
-    );
-    r.register(
-        cls,
-        "getRequestMethod",
-        "()Ljava/lang/String;",
-        huc_get_request_method,
-    );
-    r.register(
-        cls,
-        "setRequestProperty",
-        "(Ljava/lang/String;Ljava/lang/String;)V",
-        huc_set_request_property,
-    );
-    r.register(
-        cls,
-        "addRequestProperty",
-        "(Ljava/lang/String;Ljava/lang/String;)V",
-        huc_add_request_property,
-    );
-    r.register(
-        cls,
-        "getRequestProperty",
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        huc_get_request_property,
-    );
-    r.register(cls, "setDoInput", "(Z)V", huc_set_do_input);
-    r.register(cls, "setDoOutput", "(Z)V", huc_set_do_output);
-    r.register(cls, "setConnectTimeout", "(I)V", huc_set_connect_timeout);
-    r.register(cls, "setReadTimeout", "(I)V", huc_set_read_timeout);
-    // Streaming-mode setters are no-ops: our `perform` buffers the request body
-    // (via the overridden `getOutputStream` BAOS) and derives `Content-Length`
-    // from the body / the converter's own header, so the JDK's fixed-length /
-    // chunked streaming machinery is bypassed. The real setters guard on
-    // `chunkLength != -1` / `fixedContentLengthLong != -1`, but our synthetically
-    // constructed carrier never runs URLConnection's field initializers, so those
-    // fields are 0 (not -1) and `setFixedLengthStreamingMode` would throw
-    // `IllegalStateException("Chunked encoding streaming mode set")`. Spring's
-    // `SimpleClientHttpRequest.executeInternal` calls this once `getDoOutput()` is
-    // true — so it only surfaced after the doOutput fix let the body path run.
-    r.register(
-        cls,
-        "setFixedLengthStreamingMode",
-        "(I)V",
-        huc_set_fixed_length_streaming_mode,
-    );
-    r.register(
-        cls,
-        "setFixedLengthStreamingMode",
-        "(J)V",
-        huc_set_fixed_length_streaming_mode,
-    );
-    r.register(
-        cls,
-        "setChunkedStreamingMode",
-        "(I)V",
-        huc_set_chunked_streaming_mode,
-    );
-    r.register(
-        cls,
-        "setInstanceFollowRedirects",
-        "(Z)V",
-        huc_set_instance_follow_redirects,
-    );
-    r.register(
-        cls,
-        "getInstanceFollowRedirects",
-        "()Z",
-        huc_get_instance_follow_redirects,
-    );
-    r.register(cls, "usingProxy", "()Z", huc_using_proxy);
-    r.register(
-        cls,
-        "getRequestProperties",
-        "()Ljava/util/Map;",
-        huc_get_request_properties,
+        [
+            (sa_connect, "connect", "()V", huc_connect),
+            (
+                sa_get_response_code,
+                "getResponseCode",
+                "()I",
+                huc_get_response_code
+            ),
+            (
+                sa_get_response_message,
+                "getResponseMessage",
+                "()Ljava/lang/String;",
+                huc_get_response_message
+            ),
+            (
+                sa_get_input_stream,
+                "getInputStream",
+                "()Ljava/io/InputStream;",
+                huc_get_input_stream
+            ),
+            (
+                sa_get_error_stream,
+                "getErrorStream",
+                "()Ljava/io/InputStream;",
+                huc_get_error_stream
+            ),
+            (
+                sa_get_output_stream,
+                "getOutputStream",
+                "()Ljava/io/OutputStream;",
+                huc_get_output_stream
+            ),
+            (
+                sa_get_header_field_named,
+                "getHeaderField",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+                huc_get_header_field_named
+            ),
+            (
+                sa_get_header_field_indexed,
+                "getHeaderField",
+                "(I)Ljava/lang/String;",
+                huc_get_header_field_indexed
+            ),
+            (
+                sa_get_header_field_key,
+                "getHeaderFieldKey",
+                "(I)Ljava/lang/String;",
+                huc_get_header_field_key_indexed
+            ),
+            (
+                sa_get_header_fields,
+                "getHeaderFields",
+                "()Ljava/util/Map;",
+                huc_get_header_fields
+            ),
+            (
+                sa_get_content_length,
+                "getContentLength",
+                "()I",
+                huc_get_content_length
+            ),
+            (
+                sa_get_content_length_long,
+                "getContentLengthLong",
+                "()J",
+                huc_get_content_length_long
+            ),
+            (sa_disconnect, "disconnect", "()V", huc_disconnect),
+            (
+                sa_set_request_method,
+                "setRequestMethod",
+                "(Ljava/lang/String;)V",
+                huc_set_request_method
+            ),
+            (
+                sa_get_request_method,
+                "getRequestMethod",
+                "()Ljava/lang/String;",
+                huc_get_request_method
+            ),
+            (
+                sa_set_request_property,
+                "setRequestProperty",
+                "(Ljava/lang/String;Ljava/lang/String;)V",
+                huc_set_request_property
+            ),
+            (
+                sa_add_request_property,
+                "addRequestProperty",
+                "(Ljava/lang/String;Ljava/lang/String;)V",
+                huc_add_request_property
+            ),
+            (
+                sa_get_request_property,
+                "getRequestProperty",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+                huc_get_request_property
+            ),
+            (sa_set_do_input, "setDoInput", "(Z)V", huc_set_do_input),
+            (sa_set_do_output, "setDoOutput", "(Z)V", huc_set_do_output),
+            (
+                sa_set_connect_timeout,
+                "setConnectTimeout",
+                "(I)V",
+                huc_set_connect_timeout
+            ),
+            (
+                sa_set_read_timeout,
+                "setReadTimeout",
+                "(I)V",
+                huc_set_read_timeout
+            ),
+            (
+                sa_set_fixed_length_i,
+                "setFixedLengthStreamingMode",
+                "(I)V",
+                huc_set_fixed_length_streaming_mode
+            ),
+            (
+                sa_set_fixed_length_j,
+                "setFixedLengthStreamingMode",
+                "(J)V",
+                huc_set_fixed_length_streaming_mode
+            ),
+            (
+                sa_set_chunked,
+                "setChunkedStreamingMode",
+                "(I)V",
+                huc_set_chunked_streaming_mode
+            ),
+            (
+                sa_set_instance_follow_redirects,
+                "setInstanceFollowRedirects",
+                "(Z)V",
+                huc_set_instance_follow_redirects
+            ),
+            (
+                sa_get_instance_follow_redirects,
+                "getInstanceFollowRedirects",
+                "()Z",
+                huc_get_instance_follow_redirects
+            ),
+            (sa_using_proxy, "usingProxy", "()Z", huc_using_proxy),
+            (
+                sa_get_request_properties,
+                "getRequestProperties",
+                "()Ljava/util/Map;",
+                huc_get_request_properties
+            ),
+        ]
     );
     r.set_category(__prev_cat);
 }
