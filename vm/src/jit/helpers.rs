@@ -5,6 +5,12 @@
 //!
 //! These functions need access to `SharedVm` and other VM internals, so they
 //! live in the VM crate rather than the standalone JIT crate.
+//!
+//! Most helpers are a thin `extern "C"` shell around a `*_body` function run
+//! under [`crate::jit::helper_guard::contain`], so a panic in the body becomes
+//! the helper's failure sentinel instead of a process abort. That module lists
+//! which helpers are guarded, with which sentinel and policy, and which are
+//! deliberately not.
 
 use std::cell::Cell;
 
@@ -17,6 +23,7 @@ use cratonvm_types::{
     REF_ELEMENT_SIZE, SLOT_SIZE,
 };
 
+use crate::jit::helper_guard::{contain, OnPanic};
 use crate::memory::vm_heap::VmHeap;
 use crate::runtime::redefine_state::{
     class_id_or_name_was_redefined, class_was_redefined, hierarchy_was_redefined,
@@ -1240,6 +1247,53 @@ fn set_jit_pending_exception_with_bci(thread: &mut JvmThread, exc: ObjectRef, bc
 /// newly-precise case.
 pub(crate) fn stash_jit_pending_exception(thread: &mut JvmThread, exc: ObjectRef) {
     set_jit_pending_exception(thread, exc);
+}
+
+/// Stash a `java.lang.InternalError` naming a JIT runtime helper whose body
+/// panicked, for [`crate::jit::helper_guard::OnPanic::Throw`].
+///
+/// Returns whether a throwable was stashed. `vm_ptr` is the helper's own
+/// `SharedVm` argument, or `0` for a helper that takes none, in which case the
+/// process VM is used when exactly one is published. Nothing is stashed when no
+/// JIT thread is installed or the throwable cannot be built, and the guard then
+/// returns the bare sentinel: the same fallback [`jit_alloc_oom`] has.
+///
+/// Replaces an exception that was already pending. The helper that panicked did
+/// not finish whatever it was doing with that exception, and the panic is the
+/// report that has to reach Java.
+#[cold]
+pub(crate) fn stash_jit_helper_panic(vm_ptr: i64, helper: &'static str, detail: &str) -> bool {
+    // SAFETY: called only from `helper_guard::contain` on the thread that ran
+    // the guarded helper, after the helper's body has fully unwound, so every
+    // `JitThreadGuard` that body took has already been dropped.
+    let Some((thread, _guard)) = (unsafe { jit_thread_mut() }) else {
+        return false;
+    };
+    let process_vm = if vm_ptr == 0 {
+        crate::native::jni::process_vm_strict()
+    } else {
+        None
+    };
+    let vm: &SharedVm = match process_vm.as_deref() {
+        Some(vm) => vm,
+        // SAFETY: a non-zero `vm_ptr` is the `SharedVm` pointer compiled code
+        // handed the guarded helper, under that helper's own caller contract.
+        None if vm_ptr != 0 => unsafe { &*(vm_ptr as *const SharedVm) },
+        None => return false,
+    };
+    let message = format!("JIT runtime helper {helper} panicked: {detail}");
+    match crate::runtime::exceptions::create_exception_object(
+        vm,
+        thread,
+        "java/lang/InternalError",
+        Some(&message),
+    ) {
+        Ok(exc) => {
+            set_jit_pending_exception(thread, exc);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Forget the `athrow` bci carried by the pending exception, keeping the
