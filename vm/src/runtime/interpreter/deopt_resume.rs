@@ -1564,18 +1564,23 @@ pub(super) fn transfer_osr_exit_into_live_frame_checked(
     //
     // FIX (jit-osr-loop-duplicate-execution, silent data corruption): a LOCAL
     // slot's `FrameValue::Unsupported` must NOT reject the whole transfer the
-    // way an unmappable STACK slot does. `classify_local_kinds` (jit/src/x64.rs)
-    // is a coarse WHOLE-METHOD scan: a slot accessed as more than one JVM kind
-    // ANYWHERE in the method (e.g. an `int` loop counter whose slot is later
-    // reused, after the loop's scope ends, for an unrelated `long`) is always
-    // `Ambiguous` → `Unsupported`, at EVERY bci in that method, even ones where
-    // the reused slot provably cannot be read yet. The bytecode we're resuming
-    // already passed verification, which requires a fresh `store` before any
-    // `load` of a given logical local — so at the resume bci, an `Unsupported`
-    // slot is either genuinely dead (its old value is never read before being
-    // overwritten) or belongs to a not-yet-live disjoint reuse of the slot;
-    // either way its CURRENT value in the live frame is safe to leave in
-    // place. Previously this fell through to `bail("unmappable local")` on
+    // way an unmappable STACK slot does, and it never refuses here: refusing
+    // after the OSR'd body ran is the double execution described below.
+    //
+    // What makes leaving the live value in place sound is decided at COMPILE
+    // time, where the deopt point is published
+    // (`jit/src/x64/deopt_stubs.rs::build_frame_state_at`). A local that is not
+    // live-in at the point's bci (handler-aware bytecode liveness) is published
+    // `Undefined`, however the whole-method classifier typed it. A live local
+    // of a slot reused as two kinds is described through its per-bci kind.
+    // Only a live local that cannot be described is published `Unsupported`,
+    // and one of those anywhere in the artifact makes `validate_osr_entry`
+    // refuse the ENTRY (`osr_exit_policy`) before any iteration runs. An
+    // `Unsupported` local that still reaches an admitted transfer comes from a
+    // resolve-time metadata defect (`deopt::resolve_value`), not from a slot
+    // the classifier could not type. See
+    // `jit-resume-tolerates-unsupported-locals-without-liveness-FIXED-20260912.md`.
+    // Previously this fell through to `bail("unmappable local")` on
     // every method with any such slot, which discarded the whole transfer —
     // even after the OSR'd loop had already run to completion with real,
     // committed side effects (e.g. `ArrayList.add`) — and let the interpreter
@@ -1783,10 +1788,10 @@ pub(super) fn transfer_osr_exception_exit_into_live_frame(
     // ── Map, then write ───────────────────────────────────────────────────
     //
     // `Unsupported` in a LOCAL leaves the live frame's current value alone, for
-    // exactly the argument the sibling makes: `classify_local_kinds` is a coarse
-    // whole-method scan that marks a slot ambiguous at EVERY bci if it is
-    // accessed as two kinds anywhere, and the already-verified bytecode
-    // guarantees such a slot is dead or re-stored before it is read.
+    // exactly the argument the sibling makes: a slot that is dead at the
+    // throwing bci is published `Undefined` at compile time, and a live slot
+    // that cannot be described refuses the OSR entry at admission, so an
+    // admitted artifact never carries one here.
     let mut locals: Vec<Option<Value>> = Vec::with_capacity(rframe.locals.len());
     for (i, v) in rframe.locals.iter().enumerate() {
         if matches!(v, FrameValue::Unsupported) {
@@ -3393,18 +3398,20 @@ mod deopt_step3_tests {
     }
 
     /// FIX (jit-osr-loop-duplicate-execution): an `Unsupported` LOCAL slot must
-    /// NOT reject the whole transfer. `classify_local_kinds` marks a slot
-    /// `Ambiguous` (→ `Unsupported`) whenever it is used as more than one JVM
-    /// kind ANYWHERE in the method — including a slot legally reused, after its
-    /// original local's scope ends, for an unrelated local (e.g. an `int` loop
-    /// counter's slot later reused for a `long`). The bytecode being resumed
-    /// already passed verification, which requires a fresh `store` before any
-    /// `load` of a given logical local, so an `Unsupported` slot's CURRENT live
-    /// value is always safe to leave untouched. Before this fix, ANY such slot
-    /// rejected the entire transfer — discarding real, already-committed OSR
-    /// side effects and forcing the interpreter to silently re-execute them
-    /// from stale pre-OSR state (the root cause documented in
+    /// NOT reject the whole transfer. Before this fix, ANY such slot rejected
+    /// the entire transfer — discarding real, already-committed OSR side effects
+    /// and forcing the interpreter to silently re-execute them from stale
+    /// pre-OSR state (the root cause documented in
     /// jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md).
+    ///
+    /// The fixture hands the transfer a reconstructed frame directly, with a
+    /// hand-built plan whose deopt point describes no locals, so slot 1 is
+    /// neither live nor dead in any bytecode sense; the test pins the transfer's
+    /// no-refusal rule, not a liveness verdict. In compiled code a slot dead at
+    /// the exit bci is published `Undefined` and a live undescribable one refuses
+    /// the OSR entry at admission — see
+    /// jit-resume-tolerates-unsupported-locals-without-liveness-FIXED-20260912.md
+    /// and the jit tests it names.
     #[test]
     fn osr_exit_transfer_tolerates_unmappable_local() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -3638,8 +3645,9 @@ mod deopt_step3_tests {
     }
 
     /// `Unsupported` and `MaterializationRequired` are NOT the same verdict: the
-    /// first is tolerated (coarse-classifier noise, the live value stays), the
-    /// second refuses. That asymmetry is the entire reason for the split variant.
+    /// first is tolerated (the live value stays; compile-time liveness and the
+    /// admission veto keep a live one out of an admitted artifact), the second
+    /// refuses. That asymmetry is the entire reason for the split variant.
     #[test]
     fn unsupported_is_tolerated_where_materialization_required_refuses() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));

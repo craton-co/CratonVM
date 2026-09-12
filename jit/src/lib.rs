@@ -5151,17 +5151,33 @@ impl OsrEntryPlan {
     ///    instruction to be routed through the exception table. Refused.
     ///
     /// **`Unsupported` vs `MaterializationRequired` in a local.** An
-    /// `Unsupported` local is tolerated: the 1-pass backend's
-    /// `classify_local_kinds` is a coarse whole-method scan that marks a slot
-    /// `Ambiguous` at *every* bci if it is accessed as two kinds *anywhere*, so
-    /// the live frame's current value is left in place. Refusing instead is
-    /// not the safe direction: it discards the exit's committed side effects
-    /// and replays them from pre-entry state, which is the defect recorded in
-    /// `jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md`. The
-    /// tolerance still rests on "dead or re-stored before read", which
-    /// whole-method classification does not prove for a slot reused as two
-    /// kinds; the precise answer is bytecode liveness at the exit bci. See
-    /// `jit-resume-tolerates-unsupported-locals-without-liveness-20260912.md`.
+    /// `Unsupported` local is tolerated, and the live frame's current value is
+    /// left in place. Refusing here is not the safe direction: it discards the
+    /// exit's committed side effects and replays them from pre-entry state,
+    /// which is the defect recorded in
+    /// `jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md`.
+    ///
+    /// The tolerance is sound because liveness is decided at COMPILE time,
+    /// where the deopt point is published, and not here:
+    ///
+    ///  * a local that is not live-in at the point's bci is published
+    ///    `Undefined`, whatever its whole-method kind
+    ///    (`x64::deopt_stubs::build_frame_state_at`, handler-aware
+    ///    `regalloc::live_locals_per_pc_all`);
+    ///  * a live local is described through its per-bci kind where the
+    ///    whole-method kind is `Ambiguous`, and published `Unsupported` only when
+    ///    it cannot be;
+    ///  * any `Unsupported` local in any deopt point makes
+    ///    [`CompiledMethod::validate_osr_entry`] refuse the entry
+    ///    (`osr_exit_policy`, `OSR_REFUSE_UNRESUMABLE_EXIT`) before the body
+    ///    runs.
+    ///
+    /// So an admitted artifact never carries a live `Unsupported` local.
+    /// `deopt::resolve_value` can still produce one at exit time from a
+    /// metadata defect (a register index outside the spilled file), and that
+    /// is left in place too rather than refused after side effects. See
+    /// `jit-resume-tolerates-unsupported-locals-without-liveness-FIXED-20260912.md`.
+    ///
     /// `MaterializationRequired` is **not** tolerated: it means a value that
     /// *was* live got deleted by an optimization with no rebuild recipe, so the
     /// live frame's stale pre-entry word is genuinely wrong, not merely
@@ -5274,8 +5290,10 @@ impl OsrEntryPlan {
         }
         for (i, v) in rframe.locals.iter().enumerate() {
             match v {
-                // See the doc comment: coarse-classifier noise, left at the
-                // live frame's current value.
+                // See the doc comment: never a live slot of an admitted
+                // artifact (dead slots are published `Undefined`, live
+                // undescribable ones refuse the entry), so the live frame's
+                // current value is left in place.
                 FV::Unsupported => {}
                 FV::MaterializationRequired(ev) => {
                     return Err(osr_refusal(

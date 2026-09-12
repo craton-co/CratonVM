@@ -1,6 +1,6 @@
 # FIXED: the 2026-09-12 JIT code review, finding by finding
 
-**Status: 89 FIXED, 2 PARTIAL, 6 OPEN** across 97 findings. The ledger has
+**Status: 90 FIXED, 2 PARTIAL, 5 OPEN** across 97 findings. The ledger has
 95 lines, because #10/#11 and #18/#19 each share one fix and one line. Every
 commit is on `fix/jit-review-20260912`, merged into `dev`. Each PARTIAL and
 OPEN finding names the known-issue record that tracks what is left.
@@ -141,7 +141,7 @@ the review are the gate that does that.
 | 85 | `jit_anewarray_object` missed its siblings' fixes | FIXED 7335f4c73 |
 | 86 | Peer takeover root scan reads GPRs only | FIXED 7335f4c73 (no-oops-in-XMM invariant documented) |
 | 87 | OSR trampoline cache keyed by address only | FIXED add815189 |
-| 88 | Resume tolerates Unsupported locals on a wrong argument | OPEN `jit-resume-tolerates-unsupported-locals-without-liveness-20260912.md` |
+| 88 | Resume tolerates Unsupported locals on a wrong argument | FIXED on `fix/jit-review-r2-20260912-verdicts` (compile-time liveness contract pinned, argument rewritten); `jit-resume-tolerates-unsupported-locals-without-liveness-FIXED-20260912.md` |
 | 89 | Scheduler places nodes in id order | FIXED 7335f4c73, merge 44f2aedf4 |
 | 90 | Quadratic scheduler and lowering scans | PARTIAL merge 44f2aedf4; `ir-scheduler-and-lowering-remaining-quadratic-scans-20260912.md` |
 | 91 | DCE roots omit throwing ops | FIXED 9b8cbce45 |
