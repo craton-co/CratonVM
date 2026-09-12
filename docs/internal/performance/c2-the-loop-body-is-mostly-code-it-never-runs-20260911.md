@@ -5,7 +5,8 @@ because they measured as nothing. §7 adds the `sumWide` arm §6 left open; §8
 answers why its four hoisted reads stayed four and gives the tier the
 redundant-load elimination it turned out not to have; §9 takes §6's other open
 item; §10 closes the rest of the list, two of them with reasons rather than
-work.
+work; §11 takes three of §10's own follow-ups, and corrects §8's reading of
+its own zero.
 **Shape:** `probes/FieldLoop.java` `sum` — `for (i…) a += this.fx;`
 **Predecessor:** `c2-the-phi-copy-staging-register-20260911.md`, whose §4 asked
 the question this answers.
@@ -618,12 +619,9 @@ one less: what moved this loop was deleting work, not moving bytes.
 
 ### What is actually left
 
-* **The chain walk admits only reads.** One `Op::Store` between two reads of a
-  DIFFERENT cell stops the merge (§8's second test is exactly that shape). LICM
-  next door already has the alias oracle — `resolve_ref_points_to`,
-  `load_safe_past_clobber` — and letting the walk consult it for a provably
-  non-aliasing store is the obvious next increment. It is a widening of a
-  soundness argument, so it needs its own tests before its own measurement.
+* ~~**The chain walk admits only reads.**~~ **Done — see §11.4**, and measured
+  as changing nothing on every workload here. Not with LICM's private oracle
+  either: `ir.rs` carries the canonical alias model and the walk asks that.
 * **The merge is within one block.** `A` and `B` must share a control anchor,
   which costs every redundant read whose first copy is in a dominating block —
   the pattern `if (c) { … o.f … } … o.f …`. Lifting it needs a dominance query
@@ -638,3 +636,115 @@ one less: what moved this loop was deleting work, not moving bytes.
 * **The worst rows in `BENCHMARK.md` are not codegen.** String/Regex, HashMap
   and Binary Trees are allocation- and GC-bound. Nothing in this document or
   its predecessor touches them, and no amount of loop-body work will.
+
+---
+
+## 11. Three follow-ups, two censuses, and one number that changes what §8 means
+
+§10 listed what was left. Three of its items were taken up; the interesting
+part is that the first two answered each other, and the answer corrects §8.
+
+### 11.1 The guard that repeats is not the one I said
+
+The claim, made from an instruction count rather than a disassembly: four reads
+of one receiver in one block carry four full guard sequences, and
+`CRATONVM_JIT_IR_RECEIVER_GUARD_CSE` is default-ON and documented as "once per
+receiver per block", so something is not reaching this shape.
+
+Wrong. Reads 2, 3 and 4 have no `test rax, rax` at all — the receiver CSE works
+exactly as documented. What repeats is two OTHER guards, and neither has a CSE:
+
+```
+1fc  cmp dword [rel ...],0      layout epoch guard   — per site
+206  jne  ...
+20c  mov rax,[rbp-70h]          receiver frame load  — per site
+210  test rax,rax               null test  — ELIDED at sites 2, 3, 4
+213  je   ...
+219  test byte [rax+0Fh],4      per-object compact test — per site
+220  je   ...
+226  movsxd rax,[rax+10h]       the read
+22d  jmp  ...                   over the legacy and helper arms
+```
+
+Site 1 executes 9 instructions and sites 2-4 execute 7 each: **30 per iteration
+for four reads of one field**, where 12 would do.
+`emit_cmp_layout_epoch_rip`'s own comment says the epoch guard is "emitted once
+per INLINE FIELD ACCESS SITE and executed on every one of them", which is the
+defect stated plainly in the place it happens.
+
+**And eliding them is not the small change the count suggests.** Each guard
+branches to THAT SITE's slow path — the checked helper for that field — and
+then rejoins the fast path. So a later site cannot assume an earlier guard
+passed: on the epoch-stale path, site 1 takes its helper, rejoins, and site 2
+would then do an unguarded inline read at a stale offset. A real CSE needs a
+block-level guard whose failure routes every site to a slow path, or a
+duplicated tail. That is a different size of change, which is why the next
+thing done was to size the population rather than start writing it.
+
+### 11.2 The population, and why the answer is "not yet"
+
+Two censuses were added for this, both process-global and monotone:
+`ir_field_site_census` splits inline field-read sites by whether they were the
+first in their block, and the existing `metrics::ir_getfield_declines` — which
+nothing printed — now reports beside it.
+
+| workload | inline field sites | later-in-block | null checks elided |
+|---|---:|---:|---:|
+| CratonBench | 4 | 2 | 2 |
+| CratonBenchC2 | 18 | 7 | 7 |
+| BinTreesClassic | 4 | 2 | 2 |
+
+Two things fall out. **`elided` equals `later-in-block` in every row**, which
+confirms 11.1 from a second direction: every repeat site does get its null check
+elided. And the absolute numbers are 2 to 7 sites per workload, which does not
+pay for block-level slow-path restructuring. **Not doing it**, on numbers rather
+than on the guess that opened 11.1.
+
+### 11.3 The number that changes what §8 means
+
+§8 recorded load-CSE firing zero times on CratonBench and read that as "no
+method in those kernels reads one cell twice out of one heap state in one
+block". True, and misleading. The table above says the tier emits **4 to 18
+inline field sites per workload** — there is barely any field-reading code
+reaching the inline path at all, so the zero is a fact about how little of this
+corpus the optimizing tier compiles with fields in it, not about redundancy.
+
+The decline census is what rules out the other explanation: `ir getfield inline
+declines` prints nothing on any workload, so **zero** sites were refused. The
+inline path is not turning work away; the work is not there.
+
+So §8's conclusion survives — the switch stays OFF — but its *reason* is
+narrower than written: **this corpus cannot answer whether load-CSE matters for
+real Java.** A field-dense workload (H2, Hibernate) would, and neither corpus is
+in this tree; `tools/h2-ab/h2-ab.sh` exists and its own header records that the
+H2 corpus it was written for is gone too. That is the measurement to take before
+anything else is built on this pass.
+
+### 11.4 The alias widening, implemented and measured as nothing
+
+§10 proposed letting the chain walk step over a store that provably cannot
+alias the cell being read. `CRATONVM_JIT_IR_LOAD_CSE_ALIAS`, default OFF.
+
+It does not need LICM's private oracle, which is what §10 pointed at: `ir.rs`
+carries the canonical model — `AliasClass`, `AccessOffset::provably_distinct`,
+`Graph::may_alias`, `effect_of_node` — and the walk now asks it directly. Two
+different field indices are two different cells whatever the bases are: one
+object cannot hold one cell at two indices, and two objects have disjoint
+storage. Three things still stop the walk regardless: a safepoint (a relocating
+collector may run there, and this pass DELETES a read and hands an older value
+forward, which is a different claim from `MemEffect`'s "a load may cross a
+safepoint freely"), an allocation, and any ordering stronger than
+`MemOrder::Plain`.
+
+One implementation note worth keeping, because the failure mode is silent. The
+first version used the bare `effect_of_node`, which leaves an offset operand as
+`AccessOffset::Dynamic`; `provably_distinct` only ever answers `true` for a pair
+of unequal CONSTANTS, so nothing was ever disjoint and the widening did exactly
+nothing. Its negative test passed and its positive test failed, which is the
+right way round to find out. `Graph::memory_effect` is the graph-aware form that
+folds constant offsets, and it is the one to call.
+
+**Measured delta: zero.** Same reads removed in both arms on every workload —
+0, 0, 0 and 9. It is a correct widening with no demonstrated target in this
+corpus, kept OFF and recorded, for the same reason
+`CRATONVM_JIT_IR_POLL_OUTLINE` was.

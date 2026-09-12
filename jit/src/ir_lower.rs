@@ -1222,6 +1222,17 @@ struct Lowerer<'a> {
     /// read-bounds compares): receivers already proven in the block being
     /// lowered. Cleared at every block entry (`ir_receiver_guard_cse_enabled`).
     guarded_receivers: Vec<NodeId>,
+    /// Inline field-read sites emitted so far in the block being lowered.
+    ///
+    /// Census only — nothing branches on it. Every site past the first emits a
+    /// layout-epoch guard and a per-object compactness test that the site
+    /// before it already executed, and neither has a CSE the way the receiver
+    /// null test does. This counter is what says how large that population is
+    /// on a given workload, which is the question to answer before building
+    /// the CSE: the elision is not free to write, because each guard branches
+    /// to ITS OWN slow path and then rejoins, so a later site cannot simply
+    /// assume an earlier one passed.
+    block_inline_field_sites: usize,
     /// Receivers proven merely NON-NULL in the block being lowered — a weaker
     /// fact than [`Self::guarded_receivers`], and kept apart from it for that
     /// reason.
@@ -1747,6 +1758,7 @@ impl<'a> Lowerer<'a> {
             deopt_named_reachable: Vec::new(),
             carried_homes_dropped: 0,
             guarded_receivers: Vec::new(),
+            block_inline_field_sites: 0,
             null_proven_receivers: Vec::new(),
             ls_spills: 0,
             ls_reloads: 0,
@@ -5115,6 +5127,14 @@ impl<'a> Lowerer<'a> {
 
         let cell_off = (HEADER_SIZE + c_off as usize) as i32;
         let mut slow: Vec<usize> = Vec::new();
+        // Past every decline: this site is now certainly emitting. Census the
+        // guards it is about to repeat (see `block_inline_field_sites`).
+        if self.block_inline_field_sites == 0 {
+            IR_FIELD_SITE_FIRST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            IR_FIELD_SITE_LATER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.block_inline_field_sites += 1;
         // `cell_off` is a compile-time claim about this class's compact layout.
         slow.extend(self.emit_layout_epoch_guard());
 
@@ -6164,6 +6184,7 @@ impl<'a> Lowerer<'a> {
         // predecessor that never proved it.
         self.guarded_receivers.clear();
         self.null_proven_receivers.clear();
+        self.block_inline_field_sites = 0;
         self.seed_block_null_proofs();
 
         let block = &self.schedule.blocks[block_idx];
@@ -15409,6 +15430,23 @@ static BLOCK_JMPS_EMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// Read LIVE on every call rather than cached in a `OnceLock`, so an in-process
 /// A/B can see both arms.
 /// Safepoint polls emitted with their slow path AFTER the body.
+/// Inline field-read sites that were the FIRST in their block.
+static IR_FIELD_SITE_FIRST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Inline field-read sites that were NOT — each one repeats a layout-epoch
+/// guard and a per-object compactness test the site before it already ran.
+static IR_FIELD_SITE_LATER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(first_in_block, later_in_block)` over every inline field read this process
+/// emitted. The closing identity: the two sum to the number of inline
+/// `getfield` sites emitted, which is the `getfield` total minus the declines
+/// `metrics::IR_GETFIELD_DECLINE_NAMES` itemises.
+pub fn ir_field_site_census() -> (u64, u64) {
+    (
+        IR_FIELD_SITE_FIRST.load(std::sync::atomic::Ordering::Relaxed),
+        IR_FIELD_SITE_LATER.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 static IR_POLLS_OUTLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Safepoint polls emitted with their slow path inline, the historical shape.
 static IR_POLLS_INLINE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

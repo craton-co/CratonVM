@@ -4793,6 +4793,40 @@ pub(crate) fn execute_prebuilt_frame(
     run_pushed_frame_to_completion(shared, thread, frames_depth_before_push)
 }
 
+/// [`execute_prebuilt_frame`] for a caller that holds the callee's
+/// `CachedBytecodeMethod` and its decoded arguments rather than a `Frame` it
+/// built itself.
+///
+/// # Why this exists
+///
+/// `execute_prebuilt_frame` takes a `Frame` by value and hands it to
+/// `push_frame_and_fire_entry`, which **harvests and trims the retired slot**
+/// before pushing. So a caller that builds its own frame does not merely miss
+/// the in-place install — it destroys the slot the next interpreted call at
+/// that depth would have rebuilt itself in, once per call. That is the same
+/// shape the general dispatchers were in before `install_cached_frame`, where
+/// it measured ~70 cycles a call, and the JIT's three interpreted-callee
+/// helpers (`jit::helpers`' static / virtual / special bytecode callees) were
+/// the population left in it: every JIT-to-interpreter call undid frame-slot
+/// reuse for the interpreter frames beneath it.
+///
+/// Nothing about the callee's execution changes — `install_cached_frame`
+/// produces a frame indistinguishable field for field from
+/// `Frame::new_pooled_cached`'s (four unit tests in `runtime::frame` assert
+/// exactly that across all three install shapes), and
+/// `run_pushed_frame_to_completion` is `execute_prebuilt_frame`'s own tail.
+pub(crate) fn install_and_run_cached_frame(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    cached: Arc<CachedBytecodeMethod>,
+    args: &[Value],
+    trace_tag: Option<&str>,
+) -> MethodCallResult {
+    let frames_depth_before_push = thread.frames.len();
+    install_cached_frame(shared, thread, cached, args, None, trace_tag, false);
+    run_pushed_frame_to_completion(shared, thread, frames_depth_before_push)
+}
+
 /// The tail of [`execute_prebuilt_frame`], for a caller that has ALREADY
 /// pushed the frame it wants run.
 ///
@@ -5367,7 +5401,7 @@ pub(crate) fn try_osr_with_backoff(
     // Measured: with the stock thresholds this workload reports `osr=0` — not a
     // single OSR body in the entire scan — while the per-constant methods it
     // calls (`Constant.readConstant`, `ConstantUtf8.getInstance`) compile fine.
-    // See docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md.
+    // See docs/internal/performance/interpreted-invoke-cost-350ns-RETIRED-20260911.md.
     //
     // Credit loop work towards that same invocation counter, the way HotSpot
     // sums its invocation and back-edge counters against a single threshold.
@@ -6052,7 +6086,7 @@ fn execute_frame_from_index(
         // burned the wall clock).
         //
         // What the sample POSITION means, because three profiles on
-        // docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md
+        // docs/internal/performance/interpreted-invoke-cost-350ns-RETIRED-20260911.md
         // were read wrong: this hook is the first thing a loop iteration does,
         // and an invoke pushes the callee frame and `continue`s. So the time
         // an expensive INVOKE burns is reported against the callee at
