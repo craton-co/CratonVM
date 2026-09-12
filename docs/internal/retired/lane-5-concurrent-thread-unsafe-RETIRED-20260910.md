@@ -1187,6 +1187,27 @@ control-checked first: `javap -p` prints `private native long
 objectFieldOffset0(...)` on 21, so a name missing from the output is missing
 from the image rather than from the parser.
 
+### The deletion's acceptance
+
+Two binaries from `3e8442e5f`, differing only in the deletion commit:
+
+```text
+  the registry     --dump-native-registry, COMPATIBLE mode
+                   12881 natives before, 12859 after — exactly -22, and all 22
+                   of the difference are on the two `Unsafe` classes
+  the stub ratchet stubs UNMOVED at 2948 / 2975 / 2948 in the three arms;
+                   totals -22 in each (13628 -> 13606, 13996 -> 13974,
+                   13663 -> 13641). Every deleted row was a `Bridge`, so the
+                   stub delta is zero and the gate passes green either way —
+                   the totals are refreshed by hand or the next wave's
+                   classification is 22 out.
+  the gate set     the whole `cargo test` set in all three feature arms
+  the corpus       --jdk-only, SUITE=all, SUITE=core
+```
+
+Three independent routes to 22: the source sites, the kind map's removed rows,
+and the binary's own registry count.
+
 **The kind-map baseline answers this question wrongly and was not used.** It
 reports 29 rows where the binary has 22, because it still carries rows for five
 registrations (`getReferencePlain`, `putReferencePlain`, `monitorEnter`,
