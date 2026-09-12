@@ -19340,17 +19340,36 @@ fn ir_residency_pays_enabled() -> bool {
 /// back edge, so it was stored to its home and reloaded on every iteration.
 /// The optimizing body SHRINKS there, 1052 -> 1039 bytes.
 ///
-/// `fib` is the cost side, and it is why this is default OFF rather than on.
-/// It admits four more values (`single_use` 13 -> 6, `resident` 2 -> 6) and
-/// grows the body 788 -> 883, because every register in [`ir_gp_file`] is
-/// callee-saved and `fib` has FOUR epilogues, each restoring the whole set:
-/// twelve added restores against three removed reloads. That costs nothing
-/// measurable only because all of it is once-per-call and `fib` has no loop.
+/// `fib` is the cost side. It admits four more values (`single_use` 13 -> 6,
+/// `resident` 2 -> 6) and grows the body 788 -> 883, because every register in
+/// [`ir_gp_file`] is callee-saved and `fib` has FOUR epilogues, each restoring
+/// the whole set -- twelve restores EMITTED against three removed reloads.
 ///
-/// So the trade is `1 save + N_epilogues restores` against `reloads removed x
-/// how often they execute`, and `static_uses >= 2` counts neither side. A
-/// loop-free method with more than four epilogues is where this should lose;
-/// that shape is not yet measured, hence OFF.
+/// That static count is not the cost, and `probes/ManyExits.java` was written
+/// to prove it was: loop-free with SIX exits, the shape an epilogue-scaled cost
+/// would have to lose on. It is neutral twice (1.007x, 1.002x). **Exactly one
+/// epilogue executes per call**, so the file is saved once and restored once
+/// whatever the static exit count:
+///
+/// ```text
+///   dynamic cost = 2 memory ops per promoted register, PER CALL
+///                  (one save, one restore) -- NOT scaled by exit count
+///   static cost  = 1 + N_epilogues per register  (code size only)
+///   benefit      = reloads/stores removed, TIMES how often they execute
+/// ```
+///
+/// All three probes follow from that: `fib` and `ManyExits` each pay ~6 ops and
+/// recover ~6 (a wash, at four exits and at six alike), while `FieldLoop` pays
+/// ZERO -- its body already saves all five registers in both arms -- and
+/// recovers a load and a store on each of 20 000 iterations.
+///
+/// `static_uses >= 2` misses both sides: it counts static edges rather than
+/// executions, and it prices a register-to-register publish as costing what a
+/// memory reload costs. Default OFF because the register file is five deep and
+/// shared with `ir_reserve_carried_enabled`, and no probe here has real
+/// register pressure -- not because a losing shape is known. Correctness
+/// evidence in that page's section 6b: `jit-flag-soak` divergent=0, and every
+/// `CratonBench` / `CratonBenchC2` checksum bit-identical.
 fn ir_residency_crossblock_enabled() -> bool {
     matches!(
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK").as_deref(),
