@@ -10030,7 +10030,8 @@ impl IrBuilder {
                 // goes to the default target. Reuses the existing If/Cmp/merge
                 // machinery — no dedicated multi-way node.
                 0xaa | 0xab => {
-                    let (len, default_target, cases) = parse_switch(code, code_len, pc)?;
+                    let (len, default_target, cases) = crate::bytecode_analysis::switch_table(code, code_len, pc)
+                        .map(|t| (t.len, t.default, t.cases))?;
                     let key = self.pop();
                     for (match_val, target) in &cases {
                         let cval = self.iconst(*match_val as i64);
@@ -10344,312 +10345,6 @@ impl BlockWalk {
         }
         Some(BlockWalk { ranges, headers })
     }
-}
-
-/// Parse a `tableswitch` (0xaa) / `lookupswitch` (0xab) at opcode offset
-/// `op_pc`. Returns `(instruction_len, default_target, cases)` where each case
-/// is `(match_value, target_pc)`; all targets are absolute bytecode offsets
-/// (JVMS switch branch offsets are relative to the opcode pc). Returns `None`
-/// if the table is malformed, exceeds the dense/sparse caps shared with the
-/// single-pass scanner, or any target is out of range — callers treat that as
-/// "not IR-compilable" (the single-pass backend still handles it).
-fn parse_switch(
-    code: &[u8],
-    code_len: usize,
-    op_pc: usize,
-) -> Option<(usize, usize, Vec<(i32, usize)>)> {
-    let op = *code.get(op_pc)?;
-    // 0-3 bytes of padding so the table starts 4-byte aligned from method start.
-    let mut p = op_pc + 1;
-    while p % 4 != 0 {
-        p += 1;
-    }
-    let read_i32 =
-        |at: usize| i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]);
-    let target_of = |off: i32| -> Option<usize> {
-        let t = op_pc as i64 + off as i64;
-        (t >= 0 && (t as usize) < code_len).then_some(t as usize)
-    };
-    match op {
-        0xaa => {
-            if p + 12 > code_len {
-                return None;
-            }
-            let default = read_i32(p);
-            let low = read_i32(p + 4);
-            let high = read_i32(p + 8);
-            let num = crate::x64::checked_tableswitch_count(low, high)?;
-            let end = p + 12 + num * 4;
-            if end > code_len {
-                return None;
-            }
-            let mut cases = Vec::with_capacity(num);
-            for i in 0..num {
-                let off = read_i32(p + 12 + i * 4);
-                cases.push((low + i as i32, target_of(off)?));
-            }
-            Some((end - op_pc, target_of(default)?, cases))
-        }
-        0xab => {
-            if p + 8 > code_len {
-                return None;
-            }
-            let default = read_i32(p);
-            let npairs = crate::x64::checked_lookupswitch_npairs(read_i32(p + 4))?;
-            let end = p + 8 + npairs * 8;
-            if end > code_len {
-                return None;
-            }
-            let mut cases = Vec::with_capacity(npairs);
-            for i in 0..npairs {
-                let pair = p + 8 + i * 8;
-                cases.push((read_i32(pair), target_of(read_i32(pair + 4))?));
-            }
-            Some((end - op_pc, target_of(default)?, cases))
-        }
-        _ => None,
-    }
-}
-
-/// Scan bytecode for branch targets (PCs that are jumped to).
-#[cfg(test)]
-fn find_branch_targets(code: &[u8], code_len: usize) -> Vec<usize> {
-    let mut targets = Vec::new();
-    let mut pc = 0;
-    while pc < code_len {
-        let op = code[pc];
-        match op {
-            // ifeq..ifle, if_icmpeq..if_icmple
-            0x99..=0xa4 => {
-                if pc + 2 < code_len {
-                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
-                    let target_i32 = pc as i32 + offset;
-                    // Validate: target must be non-negative and within code bounds.
-                    if target_i32 >= 0 && (target_i32 as usize) < code_len {
-                        targets.push(target_i32 as usize);
-                    }
-                    // Also the fall-through PC after the branch
-                    if pc + 3 < code_len {
-                        targets.push(pc + 3);
-                    }
-                }
-                pc += 3;
-            }
-            // goto
-            0xa7 => {
-                if pc + 2 < code_len {
-                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
-                    let target_i32 = pc as i32 + offset;
-                    if target_i32 >= 0 && (target_i32 as usize) < code_len {
-                        targets.push(target_i32 as usize);
-                    }
-                }
-                pc += 3;
-            }
-            // tableswitch / lookupswitch — register the default + every case
-            // target (each case body is a merge target). A malformed switch is
-            // left for the builder to bail on; just step past the opcode.
-            0xaa | 0xab => {
-                if let Some((len, default_target, cases)) = parse_switch(code, code_len, pc) {
-                    targets.push(default_target);
-                    for (_, target) in cases {
-                        targets.push(target);
-                    }
-                    pc += len;
-                } else {
-                    pc += 1;
-                }
-            }
-            // 1-byte opcodes
-            0x02..=0x0a
-            | 0x1a..=0x21
-            | 0x3b..=0x42
-            | 0x57
-            | 0x59
-            | 0x60
-            | 0x61
-            | 0x64
-            | 0x65
-            | 0x68
-            | 0x69
-            | 0x6c
-            | 0x70
-            | 0x74
-            | 0x75
-            | 0x78
-            | 0x7a
-            | 0x7c
-            | 0x7e
-            | 0x80
-            | 0x82
-            | 0x85
-            | 0x88
-            | 0x91..=0x93
-            | 0x2a..=0x2d
-            | 0x4b..=0x4e
-            | 0xac
-            | 0xad
-            | 0xb1 => {
-                pc += 1;
-            }
-            // 2-byte opcodes (inc 26: + 0x16 lload, 0x37 lstore; inc 30: + the
-            // wide FP load/store forms 0x17 fload, 0x18 dload, 0x38 fstore,
-            // 0x39 dstore — each is opcode + 1-byte local index).
-            0x10 | 0x15 | 0x16 | 0x17 | 0x18 | 0x19 | 0x36 | 0x37 | 0x38 | 0x39 | 0x3a => {
-                pc += 2;
-            }
-            // 3-byte opcodes (the 3-byte method invokes: invokevirtual 0xb6,
-            // invokespecial 0xb7, invokestatic 0xb8; inc 26: + 0x14 ldc2_w)
-            0x11 | 0x14 | 0x84 | 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xbb => {
-                pc += 3;
-            }
-            // 5-byte opcodes: invokeinterface (0xb9) — opcode, cp_hi, cp_lo,
-            // count, 0. invokedynamic (0xba) — opcode, cp_hi, cp_lo, 0, 0. The
-            // trailing operand bytes MUST be skipped or a later branch target
-            // would be mis-located (the builder lowers 0xb9; it bails cleanly
-            // on 0xba via the main loop's `_ => return None`, but this PRE-scan
-            // must still step over 0xba's operand bytes correctly — otherwise
-            // it misreads them as up to 4 phantom opcodes, which can fabricate
-            // or miss real branch targets before the main loop ever reaches the
-            // real 0xba byte and bails. `jit_scan` no longer rejects 0xba
-            // upstream, so this function must handle it explicitly rather than
-            // falling into the "unknown opcode" catch-all below.
-            0xb9 | 0xba => {
-                pc += 5;
-            }
-            // wide (0xc4) — JVMS §6.5. `wide iinc` is SIX bytes (prefix,
-            // opcode, 2-byte index, 2-byte signed constant); every other
-            // widened form is four. Without this arm the prefix fell to the
-            // 1-byte catch-all below and the walk desynced by two bytes,
-            // reading operand bytes as phantom opcodes — the same failure the
-            // `0xb9`/`0xba` arms above are written for.
-            //
-            // The tables in `x64/licm.rs` and `regalloc.rs` that DO carry this
-            // arm described it for months as "currently latent — `jit_scan`
-            // rejects `wide`". That stopped being true when the widened forms
-            // were implemented: `x64/bytecode_compat.rs::jit_scan` accepts
-            // `wide` load/store and `wide iinc` today, so compiled methods DO
-            // contain the prefix and every PC-stepping consumer is
-            // load-bearing. This walker is reached only for a method the
-            // builder then refuses — its own main loop has no `0xc4` arm, so
-            // `wide` still bails to single-pass — which is why this is
-            // insurance rather than a fix for anything measured.
-            0xc4 => {
-                if pc + 1 < code_len && code[pc + 1] == 0x84 {
-                    pc += 6;
-                } else {
-                    pc += 4;
-                }
-            }
-            _ => {
-                // Unknown opcode — skip (builder will also bail)
-                pc += 1;
-            }
-        }
-    }
-    targets.sort_unstable();
-    targets.dedup();
-    targets
-}
-
-/// Identify loop headers: bytecode PCs reached by a *backward* branch
-/// (`target <= source`). These must be activated with eager loop-carried phis
-/// (see `activate_loop_header`) so the back-edge value can be back-patched.
-/// Mirrors `find_branch_targets`' opcode-length walk exactly.
-#[cfg(test)]
-fn find_loop_headers(code: &[u8], code_len: usize) -> HashSet<usize> {
-    let mut headers = HashSet::new();
-    let mut pc = 0;
-    while pc < code_len {
-        let op = code[pc];
-        match op {
-            // ifeq..ifle, if_icmpeq..if_icmple, goto — all 2-byte signed offset.
-            0x99..=0xa4 | 0xa7 => {
-                if pc + 2 < code_len {
-                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
-                    let target = pc as i32 + offset;
-                    if target >= 0 && (target as usize) <= pc && (target as usize) < code_len {
-                        headers.insert(target as usize);
-                    }
-                }
-                pc += 3;
-            }
-            // tableswitch / lookupswitch — a backward case/default target is a
-            // loop header (same rule as a backward branch).
-            0xaa | 0xab => {
-                if let Some((len, default_target, cases)) = parse_switch(code, code_len, pc) {
-                    if default_target <= pc {
-                        headers.insert(default_target);
-                    }
-                    for (_, target) in cases {
-                        if target <= pc {
-                            headers.insert(target);
-                        }
-                    }
-                    pc += len;
-                } else {
-                    pc += 1;
-                }
-            }
-            // 1-byte opcodes
-            0x02..=0x0a
-            | 0x1a..=0x21
-            | 0x3b..=0x42
-            | 0x57
-            | 0x59
-            | 0x60
-            | 0x61
-            | 0x64
-            | 0x65
-            | 0x68
-            | 0x69
-            | 0x6c
-            | 0x70
-            | 0x74
-            | 0x75
-            | 0x78
-            | 0x7a
-            | 0x7c
-            | 0x7e
-            | 0x80
-            | 0x82
-            | 0x85
-            | 0x88
-            | 0x91..=0x93
-            | 0x2a..=0x2d
-            | 0x4b..=0x4e
-            | 0xac
-            | 0xad
-            | 0xb1 => pc += 1,
-            // 2-byte opcodes (inc 26: + 0x16 lload, 0x37 lstore; inc 30: + the
-            // wide FP load/store forms 0x17 fload, 0x18 dload, 0x38 fstore,
-            // 0x39 dstore).
-            0x10 | 0x15 | 0x16 | 0x17 | 0x18 | 0x19 | 0x36 | 0x37 | 0x38 | 0x39 | 0x3a => pc += 2,
-            // 3-byte opcodes (invokevirtual 0xb6 / invokespecial 0xb7 /
-            // invokestatic 0xb8 — the 3-byte method invokes; inc 26: + 0x14 ldc2_w)
-            0x11 | 0x14 | 0x84 | 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xbb => pc += 3,
-            // 5-byte: invokeinterface (0xb9) — skip its count/0 trailer so a
-            // backward branch target after it is located correctly.
-            // invokedynamic (0xba) — same 5-byte shape (opcode, cp_hi, cp_lo,
-            // 0, 0); must be stepped explicitly for the same reason as
-            // `find_branch_targets` above — `jit_scan` no longer rejects it
-            // upstream, so falling into the 1-byte catch-all would desync
-            // every subsequent PC in this pre-scan.
-            0xb9 | 0xba => pc += 5,
-            // wide (0xc4) — see the twin in `find_branch_targets` above for
-            // why this arm exists and why the "currently latent" wording on
-            // the other length tables was stale.
-            0xc4 => {
-                if pc + 1 < code_len && code[pc + 1] == 0x84 {
-                    pc += 6
-                } else {
-                    pc += 4
-                }
-            }
-            _ => pc += 1,
-        }
-    }
-    headers
 }
 
 /// Report the exact [`IrBuilder::build`] site that refused a method.
@@ -12294,7 +11989,7 @@ pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
     // slips through), but decline it explicitly here rather than relying
     // solely on that later bail — this keeps the scope boundary self-
     // documenting and avoids running the (now 0xba-aware, but still only
-    // IR-builder-adjacent) `find_branch_targets`/`find_loop_headers`
+    // IR-builder-adjacent) `bytecode_analysis::branch_target_map`/`bytecode_analysis::back_edges`
     // pre-scans on a method the IR path was never going to lower anyway.
     // Methods containing invokedynamic always fall back to the x64
     // single-pass backend, which lowers it directly.
@@ -13963,7 +13658,7 @@ mod tests {
     }
 
     /// invokedynamic-uncommon-trap fix — regression test for a PC-desync bug
-    /// caught during review: `find_branch_targets`/`find_loop_headers` (the
+    /// caught during review: `bytecode_analysis::branch_target_map`/`bytecode_analysis::back_edges` (the
     /// two bytecode pre-scans `IrBuilder::build()` runs before its main
     /// opcode loop) must step over invokedynamic's full 5-byte encoding
     /// (opcode, cp_hi, cp_lo, 0, 0), exactly like `invokeinterface` (0xb9).
@@ -13976,7 +13671,7 @@ mod tests {
     /// this is defense-in-depth: these two pre-scan functions must stay
     /// correct on their own terms regardless of that caller-side gate.)
     #[test]
-    fn test_find_branch_targets_steps_over_invokedynamic() {
+    fn the_shared_branch_target_map_steps_over_invokedynamic() {
         // pc0: invokedynamic #1 (5 bytes: 0xba 0x00 0x01 0x11 0x00). The 4th
         // operand byte is 0x11 (sipush, a 3-byte op in this walker's table)
         // so that a mis-step which treats invokedynamic as 1 byte overshoots
@@ -13992,7 +13687,8 @@ mod tests {
             0xa7, 0x00, 0x03, // 5: goto +3 -> pc 8
             0xac, // 8: ireturn
         ];
-        let targets = find_branch_targets(&code, code.len());
+        let map = crate::bytecode_analysis::branch_target_map(&code, code.len());
+        let targets: Vec<usize> = (0..code.len()).filter(|&p| map[p]).collect();
         assert_eq!(
             targets,
             vec![8],
@@ -14003,25 +13699,28 @@ mod tests {
         );
     }
 
-    /// Sibling of the above for `find_loop_headers`: a BACKWARD branch to
+    /// Sibling of the above for `bytecode_analysis::back_edges`: a BACKWARD branch to
     /// pc=0 (a `goto` after the invokedynamic, jumping back to it) must be
     /// recognized as a loop header at exactly pc=0 — which only happens if
     /// invokedynamic's 5-byte length is stepped correctly so the `goto` at
     /// pc=5 is decoded from the right bytes.
     #[test]
-    fn test_find_loop_headers_steps_over_invokedynamic() {
+    fn the_shared_back_edges_step_over_invokedynamic() {
         // pc0: invokedynamic #1 (5 bytes: 0xba 0x00 0x01 0x11 0x00). The 4th
         // operand byte is 0x11 (sipush, a 3-byte op in this walker's table)
         // so a mis-step that treats invokedynamic as 1 byte overshoots past
         // the real pc=5 `goto` instead of coincidentally realigning on it
-        // (see the sibling `find_branch_targets` test above for the same
+        // (see the sibling `bytecode_analysis::branch_target_map` test above for the same
         // reasoning) — a genuine regression guard, not a lucky bytestring.
         // pc5: goto -5 (3 bytes: 0xa7 0xff 0xfb) -> target pc0 (backward)
         let code: Vec<u8> = vec![
             0xba, 0x00, 0x01, 0x11, 0x00, // 0: invokedynamic #1
             0xa7, 0xff, 0xfb, // 5: goto -5 -> pc 0
         ];
-        let headers = find_loop_headers(&code, code.len());
+        let headers: Vec<usize> = crate::bytecode_analysis::back_edges(&code, code.len())
+            .into_iter()
+            .map(|(header, _)| header)
+            .collect();
         assert!(
             headers.contains(&0),
             "the backward goto's target (pc=0) must be recognized as a loop \

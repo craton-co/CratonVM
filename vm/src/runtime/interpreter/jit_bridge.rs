@@ -11861,70 +11861,12 @@ fn class_is_assignable_to(
     false
 }
 
-/// Get the bytecode length of an instruction from its opcode ALONE (for the
-/// inline eligibility scan).
-///
-/// NOTE: this is correct for every fixed-length opcode but CANNOT decide the
-/// length of `wide` (0xc4): a `wide` instruction's length depends on the
-/// FOLLOWING opcode (`wide iinc` is 6 bytes; every other `wide` form is 4). The
-/// `0xc4 => 4` arm here is a lower-bound default; byte-walk loops MUST use
-/// [`inline_instr_length`] (which peeks the next byte) so the walk stays in sync
-/// across a `wide iinc`. `tableswitch`/`lookupswitch` (0xaa/0xab) are also
-/// variable-length and are rejected up front by the eligibility scan, so they
-/// never reach a length query.
-pub(super) fn inline_bytecode_length(opcode: u8) -> usize {
-    match opcode {
-        0x00..=0x0f
-        | 0x1a..=0x35
-        | 0x3b..=0x83
-        | 0x85..=0x98
-        | 0xac..=0xb1
-        | 0xbe
-        | 0xbf
-        | 0xc2
-        | 0xc3 => 1,
-        0x10 | 0x12 | 0x15..=0x19 | 0x36..=0x3a | 0xbc | 0xa9 => 2,
-        0x11
-        | 0x13
-        | 0x14
-        | 0x99..=0xa8
-        | 0xb2..=0xb8
-        | 0xbd
-        | 0xc0
-        | 0xc1
-        | 0xc6
-        | 0xc7
-        | 0xbb => 3,
-        0x84 => 3, // iinc
-        0xb9 | 0xba | 0xc8 | 0xc9 => 5,
-        0xc4 => 4, // wide: lower bound — see inline_instr_length for the real length
-        _ => 1,
-    }
-}
-
-/// `wide`-aware instruction length for the inline-eligibility byte-walk.
-///
-/// Returns the full encoded length of the instruction at `code[pc]`. For the
-/// `wide` prefix (0xc4) the length is determined by the FOLLOWING opcode:
-///   - `wide iinc` (0xc4 0x84 idx1 idx2 const1 const2)               → 6 bytes
-///   - `wide <iload|…|ret>` (0xc4 <op> idx1 idx2)                     → 4 bytes
-/// Every other opcode delegates to [`inline_bytecode_length`]. This keeps the
-/// byte-walk in lock-step over a `wide iinc`, which the bare opcode-only length
-/// (fixed `4`) would land 2 bytes short of — then mis-read the iinc constant's
-/// trailing byte as an opcode.
+/// Instruction length for the inline-eligibility byte walk: the JIT's shared
+/// decoder, `wide` forms included. The eligibility scan refuses
+/// `tableswitch`/`lookupswitch` before it ever asks for a length.
 #[inline]
 pub(super) fn inline_instr_length(code: &[u8], pc: usize) -> usize {
-    if code[pc] == 0xc4 {
-        // The modified opcode follows the 0xc4 prefix. `wide iinc` carries an
-        // extra 2-byte signed constant; all other wide forms (the *load/*store
-        // family and `ret`) are 4 bytes. If the prefix is truncated at the end
-        // of the code array, fall back to the 4-byte minimum.
-        return match code.get(pc + 1) {
-            Some(0x84) => 6, // wide iinc
-            _ => 4,          // wide iload/lload/.../ret
-        };
-    }
-    inline_bytecode_length(code[pc])
+    cratonvm_jit::bytecode_insn_len(code, pc)
 }
 
 /// Extract the array index from an AIOOBE panic message.

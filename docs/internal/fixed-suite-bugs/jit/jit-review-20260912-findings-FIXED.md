@@ -1,6 +1,6 @@
 # FIXED: the 2026-09-12 JIT code review, finding by finding
 
-**Status: 94 FIXED, 1 PARTIAL, 2 OPEN** across 97 findings. The ledger has
+**Status: 94 FIXED, 2 PARTIAL, 1 OPEN** across 97 findings. The ledger has
 95 lines, because #10/#11 and #18/#19 each share one fix and one line. Every
 commit is on `fix/jit-review-20260912`, merged into `dev`. Each PARTIAL and
 OPEN finding names the known-issue record that tracks what is left.
@@ -116,7 +116,7 @@ the review are the gate that does that.
 | # | Finding | Status |
 |---|---|---|
 | 67 | CI never runs the JIT's differential modes | FIXED ed2b278b2, 3432a0d6c, f1afaaf37 (merge 8e9372d97) |
-| 68 | Two optimizing front ends, duplicated analyses | OPEN `two-optimizing-front-ends-duplicate-bytecode-analyses-20260912.md` |
+| 68 | Two optimizing front ends, duplicated analyses | PARTIAL: one bytecode decoder for both tiers, 5 length and 17 CFG decoders deleted, ratchet `single_bytecode_decoder_ratchet.rs` (`two-optimizing-front-ends-duplicate-bytecode-analyses-FIXED-20260912.md`); the optimizing passes still exist in both tiers: `optimizing-passes-still-exist-in-both-tiers-20260912.md` |
 | 69 | God functions and request side channels | OPEN `jit-god-functions-and-request-side-channels-20260912.md` |
 | 70 | Presence-based flag parsing makes `=0` mean on | FIXED 0b3c07451 (merge 092d601fd); `jit-presence-only-flag-reads-FIXED.md` |
 | 71 | 620 process-global statics, some of them compatibility state | FIXED merge 708cc7866; `jit-compatibility-and-despec-state-per-vm-FIXED.md` |

@@ -20304,19 +20304,10 @@ fn decode_for_local_liveness(code: &[u8], code_len: usize) -> Option<Vec<IrLiven
     };
     let u16_at =
         |p: usize| -> Option<usize> { Some(usize::from(u16::from_be_bytes([byte(p)?, byte(p + 1)?]))) };
-    let i16_at =
-        |p: usize| -> Option<i64> { Some(i64::from(i16::from_be_bytes([byte(p)?, byte(p + 1)?]))) };
-    let i32_at = |p: usize| -> Option<i64> {
-        Some(i64::from(i32::from_be_bytes([
-            byte(p)?,
-            byte(p + 1)?,
-            byte(p + 2)?,
-            byte(p + 3)?,
-        ])))
-    };
-    let target = |pc: usize, off: i64| -> Option<usize> {
-        let t = i64::try_from(pc).ok()?.checked_add(off)?;
-        usize::try_from(t).ok().filter(|&t| t < code_len)
+    // The explicit target of an offset branch, inside the method.
+    let branch_target = |pc: usize| -> Option<usize> {
+        crate::bytecode_analysis::offset_branch_target(&code[..code_len.min(code.len())], pc)
+            .filter(|&t| t < code_len)
     };
     let mut out: Vec<IrLivenessInsn> = Vec::new();
     let mut pc = 0usize;
@@ -20380,43 +20371,18 @@ fn decode_for_local_liveness(code: &[u8], code_len: usize) -> Option<Vec<IrLiven
                     _ => return None,
                 }
             }
-            0x99..=0xa6 | 0xc6 | 0xc7 => succs.push(target(pc, i16_at(pc + 1)?)?),
-            0xa7 => {
-                succs.push(target(pc, i16_at(pc + 1)?)?);
-                falls_through = false;
-            }
-            0xc8 => {
-                succs.push(target(pc, i32_at(pc + 1)?)?);
+            0x99..=0xa6 | 0xc6 | 0xc7 => succs.push(branch_target(pc)?),
+            0xa7 | 0xc8 => {
+                succs.push(branch_target(pc)?);
                 falls_through = false;
             }
             // Subroutines make local liveness path-dependent.
             0xa8 | 0xa9 | 0xc9 => return None,
             0xaa | 0xab => {
-                let mut p = pc + 1;
-                while p % 4 != 0 {
-                    p += 1;
-                }
-                succs.push(target(pc, i32_at(p)?)?);
-                if op == 0xaa {
-                    let low = i32_at(p + 4)?;
-                    let high = i32_at(p + 8)?;
-                    if high < low || high - low >= 65_536 {
-                        return None;
-                    }
-                    let count = usize::try_from(high - low + 1).ok()?;
-                    for k in 0..count {
-                        succs.push(target(pc, i32_at(p + 12 + 4 * k)?)?);
-                    }
-                } else {
-                    let npairs = i32_at(p + 4)?;
-                    if !(0..=65_536).contains(&npairs) {
-                        return None;
-                    }
-                    let npairs = usize::try_from(npairs).ok()?;
-                    for k in 0..npairs {
-                        succs.push(target(pc, i32_at(p + 12 + 8 * k)?)?);
-                    }
-                }
+                // Strict: a malformed table, or one with a target outside the
+                // method, makes the whole method unmodelled.
+                let table = crate::bytecode_analysis::switch_table(code, code_len, pc)?;
+                succs.extend(table.targets());
                 falls_through = false;
             }
             0xac..=0xb1 | 0xbf => falls_through = false,
@@ -21794,6 +21760,15 @@ pub fn ir_method_memo_hash(class_name: &str, method_name: &str, descriptor: &str
         descriptor,
         cratonvm_types::ClassId::new(0),
     )
+}
+
+/// Byte length of the bytecode instruction at `pc`, from the JIT's one
+/// decoder (`bytecode_analysis::step`): `wide` forms, both switch paddings,
+/// the 5-byte invokes and wide branches. An undecodable instruction steps one
+/// byte, so a walk always terminates. For crates outside the JIT that walk
+/// bytecode, so they need no length table of their own.
+pub fn bytecode_insn_len(code: &[u8], pc: usize) -> usize {
+    bytecode_analysis::step(code, pc)
 }
 
 /// Mark a method refused in the IR tier's refusal memo under the key the

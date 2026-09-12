@@ -9,7 +9,7 @@
 //! to derive them with a private copy. The copies drifted: one length table
 //! lacked `ldc`, another lacked `jsr`/`ret`, a successor function dropped
 //! switch edges, and a loop finder saw only 16-bit branches. Every drift was a
-//! latent miscompile (see `two-optimizing-front-ends-duplicate-bytecode-analyses-FIXED.md`).
+//! latent miscompile (see `two-optimizing-front-ends-duplicate-bytecode-analyses-FIXED-20260912.md`).
 //!
 //! This module is now the only place those facts are decoded:
 //!
