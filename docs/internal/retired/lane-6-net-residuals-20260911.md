@@ -179,9 +179,9 @@ text does not imply it, and preserves the order the DER discards.
 let encrypt = mode == 1;            // five sibling sites say `mode == 1 || mode == 3`
 ```
 
-`WRAP_MODE` is 3. A `WRAP`-initialised cipher therefore ran the DECRYPT block,
-and `UNWRAP` (4) ran ENCRYPT — so the round trip inverted a block cipher twice
-in the same direction and returned neither the JDK's ciphertext nor the
+`WRAP_MODE` is 3, so a `WRAP`-initialised cipher ran the DECRYPT block.
+`UNWRAP` is 4 and already decrypted — correctly, and by accident — so the round
+trip **decrypted twice** and returned neither the JDK's ciphertext nor the
 original key:
 
 ```text
@@ -189,10 +189,11 @@ original key:
   CratonVM  140f0f1011b5223d79587717ffd9ec3a -> af65bb470269ecd7af01f68f1a2b7b78
 ```
 
-`140f0f10…` is the AES *decryption* of a zero block under a zero key, which is
-what identified the direction. **A wrong ciphertext is a readable statement
-about which operation ran** — worth an hour of arithmetic before an hour of
-reading.
+`140f0f10…` is the AES *decryption* of a zero block under a zero key, and
+`af65bb47…` is the decryption of THAT — so the two ciphertexts say, between
+them, exactly which operation each end ran. **A wrong ciphertext is a readable
+statement about which operation ran**, and reading it is faster than reading
+the code that produced it.
 
 ### 4.2 `AES/CTR/NoPadding` resolved to no provider
 
@@ -337,10 +338,49 @@ rest — for all six methods it guards, not just the three the sweep asked.
   perform loop tracks the final URL and does not write it back to the carrier.
 * **The `java.net.URI` and `java.net.URL` families** (40 and 7 differing rows)
   are the retirement record's §8 items 1 and 3, untouched here.
+* **The literal screen is in `getByName`/`getAllByName`, not in
+  `inet_address.rs::resolve_addrs`**, which serves
+  `Inet*AddressImpl.lookupAllHostAddr` directly. That is where the JDK puts it
+  too — `InetAddress.getAllByName` screens the text and calls the resolver only
+  for a NAME, so the deeper native never sees a literal — but it does mean a
+  caller reaching that native directly still gets `getaddrinfo`'s more
+  permissive answer. No probe row reaches it.
 
 ---
 
 ## 7. The gates
 
-*(filled in from the acceptance run — see the commit message for the run's own
-numbers)*
+Two runs, because `dev` moved 40+ commits under this wave (lane 2 retired,
+lane 5's residuals, four stub-ratchet re-freezes).
+
+**Run 1 — isolation, on the pre-merge tree.** Base and trial built from one
+worktree, so they differ only by this wave:
+
+```text
+  --jdk-only corpus, trial   133 passed, 0 failed
+  --jdk-only corpus, control 133 passed, 0 failed
+  SUITE=all                  133 passed, 0 failed
+  SUITE=core                 PENDING
+  gate set, five configs     PENDING
+  probe tree A/B             PENDING
+```
+
+**Run 2 — the merged tree**, which is what actually lands: the gate set and
+the three arms again, on a binary built from the merge. The isolation run is
+what tells run 2's red from this wave's.
+
+### Why the ordering changed mid-run
+
+The first acceptance ran the 426-probe A/B first and managed four probes in
+fifteen minutes: the host was carrying four other lanes at load 40+, and
+`FjpStress` alone is three runs of a stress probe. The corpus is both the
+faster instrument and the stronger one — 133 vectors diffed against HotSpot,
+against a probe's own printed rows — so it was re-ordered to run first and the
+A/B put behind it.
+
+That is an ordering change, not a scope change. Every check still runs. The
+A/B's per-probe design is what makes it safe to run under load at all: each
+probe's HotSpot, base and trial runs are back to back, so load inflates all
+three equally and the DELTA survives — only a timeout striking one arm and not
+the others can lie, and the runner flags those as a line-count or exit-code
+move rather than folding them into the delta.

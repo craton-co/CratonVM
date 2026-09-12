@@ -7102,7 +7102,6 @@ mod tests {
     #[test]
     fn unimplemented_modes_are_refused_at_getinstance() {
         for t in [
-            "AES/CTR/NoPadding",
             "AES/CTS/NoPadding",
             "AES/PCBC/PKCS5Padding",
             "AES/CFB8/NoPadding",
@@ -7110,6 +7109,23 @@ mod tests {
         ] {
             assert!(refuses_algorithm(t), "{t} must be refused at getInstance");
         }
+        // `AES/CTR/NoPadding` was on this list until 2026-09-11 and is now
+        // COMPUTED — the same move `DESede` made below. SunJCE ships it, so
+        // refusing it was this engine disclaiming a transformation every other
+        // JCA provider has: `L6JcaSweep` rows 6 and 91 measured
+        // `NoSuchAlgorithmException: Cannot find any provider supporting
+        // AES/CTR/NoPadding` here against a keystream on HotSpot 25.0.4+7.
+        //
+        // The padded spelling stays refused: CTR is a stream mode and SunJCE
+        // offers no padded form of it.
+        assert!(
+            !refuses_algorithm("AES/CTR/NoPadding"),
+            "AES/CTR/NoPadding is computed now"
+        );
+        assert!(
+            refuses_algorithm("AES/CTR/PKCS5Padding"),
+            "there is no padded CTR"
+        );
         // `DESede` and `DESede/ECB/PKCS5Padding` were on this list until
         // 2026-08-27 and are now COMPUTED, by the same rule that put
         // `AES/KWP/NoPadding` on the other side: the admission table and
@@ -7410,14 +7426,83 @@ mod tests {
 
     // MUST STILL WORK — the guard is RSA-scoped; a symmetric init has no RSA
     // components by design and must not be refused.
+    //
+    // The key now carries sixteen bytes. It did not, and the test passed
+    // anyway, because `Cipher.init` accepted a key with no material at all —
+    // which `L6JcaSweep` row 108 measured as `InvalidKeyException: No
+    // installed provider supports this key: (null)` on HotSpot 25.0.4+7. A
+    // key-less AES init is not the thing this test is about, and giving it a
+    // real key keeps it about the RSA guard.
     #[test]
     fn non_rsa_cipher_init_is_unaffected_by_the_rsa_key_guard() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
         let cipher_obj = cipher_for(&mut ctx, "AES/GCM/NoPadding");
         let key = key_with_handle(&mut ctx, 0);
+        let bytes = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
+        for i in 0..16 {
+            ctx.set_array_element(bytes, i, Value::Int(i as i32));
+        }
+        ctx.set_field(key, 0, Value::Object(Some(bytes)));
         cipher_init_record(&mut ctx, cipher_obj, 1, key, vec![0u8; 12])
             .expect("an AES init must not be caught by the RSA key guard");
         let tkey = obj_key(&mut ctx, cipher_obj);
         assert_eq!(with_table_read(|t| t.get(&tkey).map(|s| s.mode)), Some(1));
+    }
+
+    /// A key with NO material is refused, which is the other half of the same
+    /// contract and had no test at all.
+    #[test]
+    fn a_cipher_init_with_a_key_that_has_no_material_is_refused() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let cipher_obj = cipher_for(&mut ctx, "AES/GCM/NoPadding");
+        let key = key_with_handle(&mut ctx, 0);
+        assert!(
+            cipher_init_record(&mut ctx, cipher_obj, 1, key, vec![0u8; 12]).is_err(),
+            "a key whose getEncoded() yields nothing cannot initialise a cipher"
+        );
+    }
+
+    /// The CTR counter is one 128-bit big-endian integer, and its CARRY is
+    /// the part no probe row reaches: the sweep encrypts 20 bytes, which is
+    /// two blocks, so a carry bug would first show at block 256 — four
+    /// kilobytes in, in somebody's file.
+    #[test]
+    fn the_ctr_counter_carries_across_every_byte() {
+        let mut block = [0u8; 16];
+        increment_counter_block(&mut block);
+        assert_eq!(block[15], 1, "the low byte increments");
+
+        let mut block = [0u8; 16];
+        block[15] = 0xff;
+        increment_counter_block(&mut block);
+        assert_eq!(block[15], 0x00);
+        assert_eq!(block[14], 0x01, "the carry reaches the next byte");
+
+        // The all-ones block wraps to zero rather than doing anything else.
+        let mut block = [0xffu8; 16];
+        increment_counter_block(&mut block);
+        assert_eq!(block, [0u8; 16]);
+
+        // A carry that has to cross the whole width.
+        let mut block = [0u8; 16];
+        block[0] = 0x01;
+        for b in block.iter_mut().skip(1) {
+            *b = 0xff;
+        }
+        increment_counter_block(&mut block);
+        assert_eq!(block[0], 0x02);
+        assert!(block[1..].iter().all(|b| *b == 0));
+    }
+
+    /// And an opmode outside 1..=4, which used to be taken as DECRYPT.
+    #[test]
+    fn a_cipher_init_with_a_bad_opmode_is_refused() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let cipher_obj = cipher_for(&mut ctx, "AES/GCM/NoPadding");
+        let key = key_with_handle(&mut ctx, 0);
+        assert!(
+            cipher_init_record(&mut ctx, cipher_obj, 99, key, vec![0u8; 12]).is_err(),
+            "opmode 99 is InvalidParameterException, not a silent DECRYPT"
+        );
     }
 }

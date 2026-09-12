@@ -6783,8 +6783,15 @@ mod http_url_connection_tests {
         // no body — the header must win (ResourceTests.remoteResourceExists).
         let headers = vec![("Content-Length".to_string(), "6".to_string())];
         assert_eq!(content_length_of(&headers, 0), 6);
-        // No header → fall back to the buffered body size.
-        assert_eq!(content_length_of(&[], 5), 5);
+        // NO header → -1, and the buffered body size is not a substitute for
+        // it. This line asserted `5` — the body size — until 2026-09-11, when
+        // `L6HttpLoopbackSweep` measured HotSpot 25.0.4+7 against a loopback
+        // server: a chunked 200 answers -1 (rows 59) and a `204 No Content`
+        // answers -1 (row 50), where this VM answered the bytes it happened to
+        // have buffered and 0. Zero is the answer that matters: it is
+        // indistinguishable from a real zero-length entity, and -1 is how the
+        // JDK says "unknown, read to EOF".
+        assert_eq!(content_length_of(&[], 5), -1);
         // Duplicate headers: the LAST wins (MessageHeader.findValue iterates
         // backwards). MockWebServer emits its bodiless "Content-Length: 0"
         // default before the test's addHeader("Content-Length", "6").
