@@ -1401,24 +1401,28 @@ pub(crate) fn register_biginteger_arithmetic_overrides(registry: &mut NativeMeth
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     let bi = "java/math/BigInteger";
-    registry.register(
-        bi,
-        "add",
-        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
-        native_bi_add,
-    );
-    registry.register(
-        bi,
-        "subtract",
-        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
-        native_bi_subtract,
-    );
-    registry.register(
-        bi,
-        "multiply",
-        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
-        native_bi_multiply,
-    );
+    // `add`, `subtract` and `multiply` are NOT registered here -- deleted
+    // 2026-09-12, and the reason is the same shape as the `and`/`or`/`xor`/
+    // `not`/`bitLength`/`bitCount`/`testBit`/`toByteArray` note below: a limb
+    // twin is already registered, LATER, by
+    // `phases_late::register_p71_biginteger_extras`, so these three never owned
+    // the slot in any of the three feature arms. MEASURED via
+    // `NativeMethodRegistry::census()` in all three:
+    //
+    //   add/subtract/multiply  Intrinsic here  dead    Bridge in phases_late  OWNER
+    //
+    // Dead is not harmless. `--jdk-only` refuses the retired `Bridge`, and a
+    // refusal declines to insert THAT registration rather than emptying the
+    // slot -- so with these three present the strict registry fell back to
+    // them, and they answer **null** for a null argument where the real body
+    // throws `NullPointerException`. Lane 2 could not retire the three rows for
+    // exactly this reason, and the wave still MEASURED as accepted because the
+    // probe rows moved. `stub_ratchet.rs`'s
+    // `no_retired_triple_survives_the_strict_boot` is the gate that now makes
+    // the arrangement impossible to ship again.
+    //
+    // The bodies stay: `register_biginteger_natives` below still registers all
+    // three for synthetic-jdk mode, where no real bytecode exists to fall to.
     registry.register(bi, "negate", "()Ljava/math/BigInteger;", native_bi_negate);
     registry.register(bi, "signum", "()I", native_bi_signum);
     registry.register(bi, "toString", "()Ljava/lang/String;", native_bi_to_string);

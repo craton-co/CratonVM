@@ -2018,7 +2018,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// `native-builtins/src/lang_class.rs|java/lang/Package.getPackages|()[Ljava/lang/Package;`
 /// -- and none the other way. Record:
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2942;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2956;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2297,7 +2297,18 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2942;
 /// `native-builtins/src/lang_class.rs|java/lang/Package.getPackages|()[Ljava/lang/Package;`
 /// -- and none the other way. Record:
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2915;
+// 2026-09-12, lane 2 wave 3: +14 in every arm. The fourteen `java/math/BigInteger`
+// triples lane 2 held back joined `RETIRED_SHADOW_L2_TRIPLES`, and a table entry
+// re-tags the triple's `Bridge` to `SyntheticStub` in COMPATIBLE mode too --
+// `register` applies the retag before `register_inner`, and only `--jdk-only`
+// goes on to refuse it. So this count rising by exactly the number of rows added
+// is what an accepted wave looks like here; it is not a regression.
+//
+// TAKEN, not computed: 2929/2956/2929 are the values
+// `synthetic_stub_count_does_not_regress` printed on the run that failed against
+// the old ones, and the same +14 shows in the `--jdk-only-report` as 3036
+// refusals against the control's 3022.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2929;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2498,7 +2509,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2915;
 /// `native-builtins/src/lang_class.rs|java/lang/Package.getPackages|()[Ljava/lang/Package;`
 /// -- and none the other way. Record:
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2915;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2929;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -3366,6 +3377,62 @@ fn strict_rows() -> Vec<(String, String, String, NativeKind)> {
         .into_iter()
         .map(|(c, m, d, k)| (c.to_string(), m.to_string(), d.to_string(), k))
         .collect()
+}
+
+/// **A retirement is INERT when a second native sits underneath the bridge it
+/// refuses**, and until this test existed nothing could see it.
+///
+/// `register()` re-tags a retired triple's `Bridge` to `SyntheticStub` and
+/// `--jdk-only` then refuses it. A refusal is not a removal: it declines to
+/// insert THAT registration and leaves whatever is already in the slot. So a
+/// triple registered twice -- an older `Intrinsic` first, the honest bridge
+/// second -- keeps dispatching to the older body after the refusal, and the real
+/// JDK bytecode the table exists to reach never runs. The row is in the table,
+/// the census reports zero surviving stubs, the wave measures as accepted, and
+/// nothing changed.
+///
+/// Two waves shipped that way and each was found by hand, months apart:
+///
+/// ```text
+///   java/util/logging  5 triples  an Intrinsic in phases_early.rs   2026-08-11
+///   java/math/BigInteger  3       an Intrinsic in math_bignum.rs    2026-09-10
+/// ```
+///
+/// The instrument is one line of set arithmetic and it needed no new data: the
+/// strict boot's own registry, asked which of its surviving rows the retirement
+/// tables claim. Both waves above are exactly what it prints on the commit
+/// before this one.
+///
+/// Note what this does NOT need: a running VM, a probe, or a refusal report. The
+/// 2026-08-11 wave was diagnosed from a 2029-refusal `--jdk-only-report` and the
+/// 2026-09-10 one from a probe whose rows moved for the wrong reason; both are
+/// answered here by `cargo test`.
+#[test]
+fn no_retired_triple_survives_the_strict_boot() {
+    let mut inert: Vec<String> = strict_rows()
+        .into_iter()
+        .filter(|(c, m, d, _)| {
+            cratonvm_native_api::retired_shadow::triple_is_retired_shadow(c, m, d)
+        })
+        .map(|(c, m, d, k)| format!("  {c}.{m}{d} still dispatches as {k:?}"))
+        .collect();
+    inert.sort();
+    inert.dedup();
+    assert!(
+        inert.is_empty(),
+        "{} retired triple(s) are INERT: a native survives the refusal and the \
+         real JDK bytecode never runs, so the retirement changed nothing.\n{}\n\
+         Fix the REGISTRATION, not this test. Each of these is a second \
+         registration of a triple whose honest bridge is refused; find it with \
+         `NativeMethodRegistry::census()`, which lists every registration with \
+         its site and kind (the last row for a triple owns the slot, every \
+         earlier one is dead code in compatible mode). If the survivor is dead \
+         in compatible mode -- proven by running that census in all three \
+         feature arms -- delete it. If it OWNS the slot in compatible mode, \
+         re-tag it `Bridge` instead so the refusal reaches it.",
+        inert.len(),
+        inert.join("\n")
+    );
 }
 
 /// **A fake must not outlive `--jdk-only` because a SECOND file called it a
