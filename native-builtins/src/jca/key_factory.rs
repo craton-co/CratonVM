@@ -2799,10 +2799,31 @@ fn kpg_initialize_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // generator. Carried over from the retired `phases_early` KeyPairGenerator
     // stub, which was the only place this check lived.
     if bits <= 0 {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: format!("Invalid key size: {bits}"),
-        }
-        .into());
+        // The JDK does not phrase this as a key-size complaint. RSA keygen
+        // validates the PUBLIC EXPONENT against the modulus size, and the
+        // default exponent F4 (65537, seventeen bits) does not fit in a
+        // zero-bit modulus, so `RSAKeyFactory.checkKeyLengths` refuses with
+        // "Public exponent must be no longer than <keysize> bits".
+        // `KeyPairGenerator.initialize(int)` cannot throw the CHECKED
+        // `InvalidAlgorithmParameterException` that carries it, so it
+        // rewraps that exception's `toString` -- type prefix and all -- in
+        // the unchecked `InvalidParameterException`, which is why the
+        // message reads the way it does.
+        //
+        // `InvalidParameterException` EXTENDS `IllegalArgumentException`, so
+        // the previous answer was a superclass of the right one: a caller
+        // catching the specific type saw nothing at all.
+        //
+        // Only `bits <= 0` is rerouted. 512 is refused identically by both
+        // VMs today and is deliberately left alone.
+        // MEASURED, `L6JcaSweep` row 160.
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/security/InvalidParameterException",
+            &format!(
+                "java.security.InvalidAlgorithmParameterException: Public exponent must be no longer than {bits} bits"
+            ),
+        ));
     }
     set_kpg_keysize(ctx, this, bits);
     ctx.set_field(this, base + KPG_OFF_KEYSIZE, Value::Int(bits));
@@ -3108,6 +3129,20 @@ fn kpg_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 // ---------------------------------------------------------------------------
 
 fn kf_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // `getInstance(null)` is `NullPointerException: null algorithm name` --
+    // `Objects.requireNonNull(algorithm, "null algorithm name")`, which
+    // `GetInstance` runs before any provider is consulted. It is NOT
+    // `NoSuchAlgorithmException`, which is what this VM answered by reading
+    // the null as `""` and letting the empty name fall through to the
+    // is-it-offered check. `Cipher` is the exception to this contract and has
+    // its own guard -- see `cipher_require_transformation`.
+    if matches!(args.first(), None | Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("null algorithm name".to_string()),
+        }
+        .into());
+    }
+    // MEASURED, `L6JcaSweep` row 80.
     // All three `getInstance` overloads share this native, so the
     // `(algorithm, String provider)` form's provider argument has to be
     // validated here — real JDK resolves the provider before the algorithm.
@@ -3208,6 +3243,43 @@ fn kf_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 /// `InvalidKeySpecException` (generatePublic's declared checked exception)
 /// rather than returning a `key_id == 0` key that silently fails every later
 /// verify (no-synthetic-stubs policy).
+/// The message `KeyFactory.generate{Public,Private}` uses when an ENCODED spec
+/// could not be decoded.
+///
+/// SunRsaSign wraps the parse failure and its `InvalidKeySpecException` reads
+/// `java.security.InvalidKeyException: Unable to decode key` -- the cause's
+/// `toString`, cause text and all. This VM answered its own sentence
+/// ("cannot generate a usable RSA public key from the given KeySpec"), which
+/// says the same thing in different words and so fails a differential that is
+/// checking exactly the words.
+///
+/// Scoped to RSA and to the two ENCODED spec classes on purpose. The other
+/// algorithms reach the same site for a different reason -- no implementation
+/// rather than a bad encoding -- and their JDK wording has not been measured;
+/// widening this would trade one measured row for several unmeasured ones.
+///
+/// MEASURED, `L6JcaSweep` rows 156 and 157.
+fn encoded_spec_decode_message(
+    ctx: &mut dyn NativeContext,
+    algo: i32,
+    args: &[Value],
+    encoded_spec_class: &str,
+    fallback: String,
+) -> String {
+    if algo != ALGO_RSA {
+        return fallback;
+    }
+    let Some(Value::Object(Some(spec))) = args.get(1) else {
+        return fallback;
+    };
+    match ctx.class_name_of_id(ctx.class_id_of_object(*spec)) {
+        Some(n) if n == encoded_spec_class => {
+            "java.security.InvalidKeyException: Unable to decode key".to_string()
+        }
+        _ => fallback,
+    }
+}
+
 fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     // A third-party provider's factory generates its own keys — see
@@ -3220,6 +3292,15 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             "(Ljava/security/spec/KeySpec;)Ljava/security/PublicKey;",
             &[spec],
         );
+    }
+    // `generatePublic(null)` / `generatePrivate(null)` are
+    // `InvalidKeySpecException: keySpec must not be null` -- a null-argument
+    // check that runs before any decoding is attempted. This VM fell through
+    // to the decode path and answered its decode-failure message, which tells
+    // the caller its encoding was bad when it supplied no encoding at all.
+    // MEASURED, `L6JcaSweep` row 158.
+    if matches!(args.get(1), None | Some(Value::Object(None))) {
+        return Err(throw_invalid_key_spec(ctx, "keySpec must not be null"));
     }
     let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
     let algo =
@@ -3484,13 +3565,12 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // or PQC with routing disabled). Throw generatePublic's declared
     // `InvalidKeySpecException` rather than returning a `key_id == 0` key that
     // silently fails every later verify (no-synthetic-stubs policy).
-    Err(throw_invalid_key_spec(
-        ctx,
-        &format!(
-            "cannot generate a usable {} public key from the given KeySpec",
-            algo_name(algo)
-        ),
-    ))
+    let fallback = format!(
+        "cannot generate a usable {} public key from the given KeySpec",
+        algo_name(algo)
+    );
+    let msg = encoded_spec_decode_message(ctx, algo, args, "java/security/spec/X509EncodedKeySpec", fallback);
+    Err(throw_invalid_key_spec(ctx, &msg))
 }
 
 /// generatePrivate(KeySpec) -> PrivateKey.  Only the real SunEC EC path can
@@ -3509,6 +3589,15 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             "(Ljava/security/spec/KeySpec;)Ljava/security/PrivateKey;",
             &[spec],
         );
+    }
+    // `generatePublic(null)` / `generatePrivate(null)` are
+    // `InvalidKeySpecException: keySpec must not be null` -- a null-argument
+    // check that runs before any decoding is attempted. This VM fell through
+    // to the decode path and answered its decode-failure message, which tells
+    // the caller its encoding was bad when it supplied no encoding at all.
+    // MEASURED, `L6JcaSweep` row 158.
+    if matches!(args.get(1), None | Some(Value::Object(None))) {
+        return Err(throw_invalid_key_spec(ctx, "keySpec must not be null"));
     }
     let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
     let algo =
@@ -3677,13 +3766,12 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             }
         }
     }
-    Err(throw_invalid_key_spec(
-        ctx,
-        &format!(
-            "cannot generate a usable {} private key from the given KeySpec",
-            algo_name(algo)
-        ),
-    ))
+    let fallback = format!(
+        "cannot generate a usable {} private key from the given KeySpec",
+        algo_name(algo)
+    );
+    let msg = encoded_spec_decode_message(ctx, algo, args, "java/security/spec/PKCS8EncodedKeySpec", fallback);
+    Err(throw_invalid_key_spec(ctx, &msg))
 }
 
 /// Number of bytes occupied by a DER length field at `der[pos]`.
