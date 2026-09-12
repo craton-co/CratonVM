@@ -2331,6 +2331,7 @@ pub extern "C" fn x64_deopt_entry(
     }
     // SAFETY: contract documented above.
     let point = unsafe { &*point };
+    // SAFETY: contract documented above; `regs` was checked non-null.
     let regs = unsafe { &*regs };
     let frame = reconstruct_frame_from_machine_state(point, regs, rbp);
     if point.reason == DeoptReason::PendingException {

@@ -1421,6 +1421,7 @@ pub fn jit_thread_tls_disp() -> usize {
         }
         const TLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
         const TEB_TLS_SLOTS_OFF: usize = 0x1480;
+        // SAFETY: `TlsAlloc`/`TlsSetValue` are plain kernel32 calls, and every gs read indexes this thread's TEB TLS slot array (64 slots from `TEB_TLS_SLOTS_OFF`), which is mapped for the life of the thread.
         unsafe {
             let slot = TlsAlloc();
             if slot == TLS_OUT_OF_INDEXES {
@@ -1500,6 +1501,7 @@ pub fn publish_jit_thread_mirror(ptr: usize) {
     {
         let disp = jit_thread_tls_disp();
         if disp != 0 {
+            // SAFETY: `disp` came from the startup probe, which proved `gs:[disp]` is this thread's JIT-thread mirror slot.
             unsafe { write_gs_qword(disp, ptr) };
         }
     }
@@ -1523,6 +1525,7 @@ pub fn jit_thread_mirror_read() -> Option<usize> {
     }
     #[cfg(windows)]
     {
+        // SAFETY: `disp` came from the startup probe, which proved `gs:[disp]` is this thread's JIT-thread mirror slot.
         Some(unsafe { read_gs_qword(disp) })
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

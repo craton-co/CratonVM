@@ -7605,6 +7605,7 @@ mod tests {
     #[test]
     fn the_frame_base_is_published_before_the_first_poll() {
         let mut b = poll_backend();
+        // SAFETY: `JitRuntimeHelpers` is `#[repr(C)]` and every field is a `usize`, so all-zero is a valid value; the test wires only the slots it exercises.
         let mut h: crate::JitRuntimeHelpers = unsafe { std::mem::zeroed() };
         h.safepoint_flag_addr = 0x1234_5678_9AB0;
         h.safepoint_slow_path = 0x7FFF_0000_1000;

@@ -1421,6 +1421,7 @@ fn compiled_entry_accepts_stack_passed_java_arguments() {
     .expect("four-argument context method should compile");
     // SAFETY: `with_context` was compiled from the valid method above.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { with_context.try_call_with_context(0, &[1, 2, 3, 44]) },
         Ok(44)
     );
@@ -1647,6 +1648,7 @@ fn test_compile_branch() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[0]).expect("test JIT call") },
         0
     );
@@ -1654,6 +1656,7 @@ fn test_compile_branch() {
     // SAFETY: `compiled` is executable JIT code from valid bytecode; the single
     // i64 argument matches the compiled method's one-parameter ABI.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[1]).expect("test JIT call") },
         1
     );
@@ -1661,6 +1664,7 @@ fn test_compile_branch() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[5]).expect("test JIT call") },
         6
     );
@@ -1811,22 +1815,26 @@ fn test_compile_fib() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[0]).expect("test JIT call") },
         0
     );
     // SAFETY: `compiled` is executable JIT code from valid bytecode; each call below
     // passes a single i64 matching the compiled method's one-parameter ABI.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[1]).expect("test JIT call") },
         1
     );
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[10]).expect("test JIT call") },
         55
     );
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[20]).expect("test JIT call") },
         6765
     );
@@ -1921,10 +1929,12 @@ fn test_compile_iinc() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[5]).expect("test JIT call") },
         15
     );
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[-3]).expect("test JIT call") },
         7
     );
@@ -1973,11 +1983,13 @@ fn test_compile_idiv_irem() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[17, 5]).expect("test JIT call") },
         5
     );
     // -7 / 2 = -3, -7 % 2 = -1, total = -4
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[-7, 2]).expect("test JIT call") },
         -4
     );
@@ -2384,11 +2396,13 @@ fn test_compile_i2b() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[42]).expect("test JIT call") },
         42
     );
     // Truncation: 0x1FF → (byte) = -1
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[0x1FF]).expect("test JIT call") },
         -1
     );
@@ -2396,11 +2410,13 @@ fn test_compile_i2b() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[300]).expect("test JIT call") },
         44
     );
     // Negative: -128
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[-128]).expect("test JIT call") },
         -128
     );
@@ -2443,11 +2459,13 @@ fn test_compile_i2c() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[65]).expect("test JIT call") },
         65
     ); // 'A'
        // 0xFFFF stays as 65535 (unsigned)
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[0xFFFF]).expect("test JIT call") },
         65535
     );
@@ -2455,11 +2473,13 @@ fn test_compile_i2c() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[0x10041]).expect("test JIT call") },
         65
     );
     // Negative: -1 → 0xFFFF = 65535
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[-1]).expect("test JIT call") },
         65535
     );
@@ -2502,11 +2522,13 @@ fn test_compile_i2s() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[1000]).expect("test JIT call") },
         1000
     );
     // Truncation: 0x18000 → (short) = -32768
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[0x18000]).expect("test JIT call") },
         -32768
     );
@@ -2514,11 +2536,13 @@ fn test_compile_i2s() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[32767]).expect("test JIT call") },
         32767
     );
     // -32768 stays
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[-32768]).expect("test JIT call") },
         -32768
     );
@@ -2688,11 +2712,13 @@ fn test_compile_swap_arithmetic() {
     .expect("swap must JIT-compile");
     // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[10, 3]).expect("test JIT call") },
         7
     );
     // SAFETY: same as above.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[-4, 6]).expect("test JIT call") },
         -10
     );
@@ -2737,6 +2763,7 @@ fn test_swap_frame_frame_single() {
     .expect("single swap must JIT-compile");
     // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[0]).expect("test JIT call") },
         -3
     );
@@ -2780,6 +2807,7 @@ fn test_swap_then_push_no_live_slot_reuse() {
     .expect("swap+push must JIT-compile");
     // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[0]).expect("test JIT call") },
         -2
     );
@@ -2821,11 +2849,13 @@ fn test_swap_mixed_reg_frame() {
     .expect("mixed swap must JIT-compile");
     // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[10]).expect("test JIT call") },
         -7
     );
     // SAFETY: same as above.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[-4]).expect("test JIT call") },
         7
     );
@@ -2889,11 +2919,13 @@ fn test_if_icmp_canonicalize_preserves_popped_operands() {
     // compare read k itself as val1: k < k+3 is true → 9 arm.
     // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[10]).expect("test JIT call") },
         17
     );
     // SAFETY: same as above.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[-2]).expect("test JIT call") },
         5
     );
@@ -2950,11 +2982,13 @@ fn test_ifxx_canonicalize_preserves_popped_operand() {
     // (≤ 0) → 9 arm → 8.
     // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[-1]).expect("test JIT call") },
         6
     );
     // SAFETY: same as above.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[5]).expect("test JIT call") },
         12
     );
@@ -3002,10 +3036,12 @@ fn test_compile_dup2_form2_long() {
     // f(5) = 10, f(-7) = -14
     // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[5]).expect("test JIT call") },
         10
     );
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[-7]).expect("test JIT call") },
         -14
     );
@@ -4038,6 +4074,7 @@ fn test_compile_i2f_i2d() {
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     let result = unsafe { compiled.try_call(&[42]).expect("test JIT call") };
     assert_eq!(f32::from_bits(result as u32), 42.0f32); // Cast: JIT ABI convention
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
     let result = unsafe { compiled.try_call(&[-7]).expect("test JIT call") };
     assert_eq!(f32::from_bits(result as u32), -7.0f32); // Cast: JIT ABI convention
 
@@ -4073,6 +4110,7 @@ fn test_compile_i2f_i2d() {
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     let result = unsafe { compiled.try_call(&[42]).expect("test JIT call") };
     assert_eq!(f64::from_bits(result as u64), 42.0f64); // Cast: JIT ABI convention
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
     let result = unsafe { compiled.try_call(&[-100]).expect("test JIT call") };
     assert_eq!(f64::from_bits(result as u64), -100.0f64); // Cast: JIT ABI convention
 }
@@ -4396,6 +4434,7 @@ fn test_compile_fcmpl() {
                                      // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                      // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
         1
     );
@@ -4406,6 +4445,7 @@ fn test_compile_fcmpl() {
                                      // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                      // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
         0
     );
@@ -4416,6 +4456,7 @@ fn test_compile_fcmpl() {
                                      // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                      // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
         -1
     );
@@ -4426,10 +4467,12 @@ fn test_compile_fcmpl() {
                                      // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                      // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[nan, b]).expect("test JIT call") },
         -1
     );
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[b, nan]).expect("test JIT call") },
         -1
     );
@@ -4472,6 +4515,7 @@ fn test_compile_fcmpg() {
                                      // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                      // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
         1
     );
@@ -4481,6 +4525,7 @@ fn test_compile_fcmpg() {
                                      // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                      // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
         -1
     );
@@ -4490,10 +4535,12 @@ fn test_compile_fcmpg() {
                                          // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                          // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[nan, b]).expect("test JIT call") },
         1
     );
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[b, nan]).expect("test JIT call") },
         1
     );
@@ -4535,6 +4582,7 @@ fn test_compile_dcmpl_dcmpg() {
                                      // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                      // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
         1
     );
@@ -4543,6 +4591,7 @@ fn test_compile_dcmpl_dcmpg() {
                                      // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                      // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
         0
     );
@@ -4551,6 +4600,7 @@ fn test_compile_dcmpl_dcmpg() {
                                      // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                      // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
         -1
     );
@@ -4560,6 +4610,7 @@ fn test_compile_dcmpl_dcmpg() {
                                          // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                          // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[nan, b]).expect("test JIT call") },
         -1
     );
@@ -4595,10 +4646,12 @@ fn test_compile_dcmpl_dcmpg() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[nan, b]).expect("test JIT call") },
         1
     );
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[b, nan]).expect("test JIT call") },
         1
     );
@@ -7461,6 +7514,7 @@ fn detects_and_executes_canonical_strided_byte_set_loop() {
     // particular stride never reaches the invalid index, so it still
     // completes normally and demonstrates that guard failure preserves
     // the bytecode's exact store sequence.
+    // SAFETY: `ARRAY_DATA_OFFSET + byte_len` bytes lie inside `words`, which is live and sized for the array header plus data.
     unsafe {
         std::ptr::write_bytes(array_ptr.add(ARRAY_DATA_OFFSET), 0, byte_len);
     }
@@ -16166,6 +16220,7 @@ fn test_unroll_with_getfield_helper_call() {
     );
 
     // Smaller trip count: 7 * 3 = 21.
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
     let result = unsafe {
         compiled
             // Cast: object/array pointer to i64 for the JIT calling convention
@@ -16176,6 +16231,7 @@ fn test_unroll_with_getfield_helper_call() {
 
     // n = 0 → loop body never executes. Still must compile + run
     // (verifying the unrolled copies don't fault on cold entry).
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
     let result = unsafe {
         compiled
             // Cast: object/array pointer to i64 for the JIT calling convention
@@ -16305,6 +16361,7 @@ fn test_unroll_nbody_pattern_getfield_double() {
 
     // n=0 → 0.0 (cold loop body, copies never executed but must
     // still be valid code).
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
     let result = unsafe {
         compiled
             // Cast: object/array pointer to i64 for the JIT calling convention
@@ -16635,6 +16692,7 @@ fn test_unroll_with_two_getfields_per_body() {
     // n=4 (matches the 4x unroll factor exactly): one full
     // unrolled block, zero spillover. Exercises the case where
     // every copy + the original execute exactly once.
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
     let result = unsafe {
         compiled
             // Cast: object/array pointer to i64 for the JIT calling convention

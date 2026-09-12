@@ -9805,6 +9805,7 @@ impl Compiler {
                                 if p.is_null() {
                                     None
                                 } else {
+                                    // SAFETY: `p` is non-null here and owned by this compile's `_jit_invoke_infos` arena, which outlives the code.
                                     crate::ffm_kind_for_descriptor(unsafe { (*p).descriptor })
                                 }
                             });

@@ -19829,6 +19829,7 @@ mod tests {",
     /// is ever dereferenced). SAFETY: `JitRuntimeHelpers` is `#[repr(C)]` with
     /// all-integer (usize) fields, so an all-zero bit pattern is a valid value.
     fn no_helpers() -> JitRuntimeHelpers {
+        // SAFETY: `JitRuntimeHelpers` is `#[repr(C)]` and every field is a `usize`, so all-zero is a valid value; the test wires only the slots it exercises.
         unsafe { std::mem::zeroed() }
     }
 
@@ -20104,6 +20105,7 @@ mod tests {",
         let compiled = lower(&graph, &schedule, 0, 0, &helpers).expect("live allocation");
         // SAFETY: helper ignores the synthetic context.
         assert_eq!(
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             unsafe { compiled.try_call_with_context(1, &[]) },
             Ok(i64::MIN)
         );
@@ -20253,6 +20255,7 @@ mod tests {",
         let compiled = lower(&graph, &schedule, 1, 1, &helpers).expect("live allocation");
         // SAFETY: helper ignores the synthetic context/length.
         assert_eq!(
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             unsafe { compiled.try_call_with_context(1, &[-1]) },
             Ok(i64::MIN)
         );
@@ -20384,6 +20387,7 @@ mod tests {",
         // one; `slow_poll` is `extern "C"` and touches only its own counter.
         let run = |cm: &CompiledMethod| -> (i64, usize) {
             HITS.store(0, Ordering::SeqCst);
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             let got = unsafe { cm.try_call(&[7]) }.expect("call");
             (got, HITS.load(Ordering::SeqCst))
         };
@@ -20607,6 +20611,7 @@ mod tests {",
         // body, and the census cannot tell the difference.
         // SAFETY: one int parameter, no context, no helpers reachable.
         for (arg, want) in [(0i64, 2i64), (1, 1), (-7, 1)] {
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             let got = unsafe { compiled.try_call(&[arg]).expect("call") };
             assert_eq!(got, want, "f({arg})");
         }
@@ -22482,6 +22487,7 @@ mod tests {",
 
         // Guard passes (cond != 0): normal return of `val`.
         let _ = take_last_deopt(); // clear any stale state
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let ok = unsafe { method.try_call(&[1, 777]).expect("call (guard ok)") };
         assert_eq!(ok, 777, "guard passes → returns val");
         assert!(take_last_deopt().is_none(), "no deopt when guard passes");
@@ -22489,6 +22495,7 @@ mod tests {",
         // Guard fails (cond == 0): deopt sentinel returned, frame reconstructed
         // from the LIVE machine frame — locals resolved to the actual argument
         // values sitting in their spill slots.
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let sentinel = unsafe { method.try_call(&[0, 777]).expect("call (guard fail)") };
         assert_eq!(sentinel, i64::MIN, "guard fails → deopt sentinel");
         let frame = take_last_deopt().expect("deopt reconstructed a frame");
@@ -23231,6 +23238,7 @@ mod tests {",
         assert!(compiled.is_some());
         let method = compiled.unwrap();
         // Execute the compiled code
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let result = unsafe { method.try_call(&[]).expect("test JIT call") };
         assert_eq!(result, 42, "Should return 42");
     }
@@ -23242,6 +23250,7 @@ mod tests {",
         let compiled = compile_via_ir(&code, 4, 0, 0);
         assert!(compiled.is_some());
         let method = compiled.unwrap();
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let result = unsafe { method.try_call(&[]).expect("test JIT call") };
         assert_eq!(result, 7, "Should return 7 after constant folding");
     }
@@ -23843,6 +23852,7 @@ mod tests {",
         let compiled = compile_via_ir(&code, 4, 2, 2);
         assert!(compiled.is_some());
         let method = compiled.unwrap();
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let result = unsafe { method.try_call(&[10, 20]).expect("test JIT call") };
         assert_eq!(result, 30, "10 + 20 = 30");
     }
@@ -23854,6 +23864,7 @@ mod tests {",
         let compiled = compile_via_ir(&code, 4, 2, 2);
         assert!(compiled.is_some());
         let method = compiled.unwrap();
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let result = unsafe { method.try_call(&[30, 12]).expect("test JIT call") };
         assert_eq!(result, 18, "30 - 12 = 18");
     }
@@ -23865,6 +23876,7 @@ mod tests {",
         let compiled = compile_via_ir(&code, 4, 2, 2);
         assert!(compiled.is_some());
         let method = compiled.unwrap();
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let result = unsafe { method.try_call(&[6, 7]).expect("test JIT call") };
         assert_eq!(result, 42, "6 * 7 = 42");
     }
@@ -23908,11 +23920,14 @@ mod tests {",
         let method = lower(&graph, &schedule, 2, 2, &no_helpers()).expect("lower cmp graph");
 
         // a < b  → 1
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let r_true = unsafe { method.try_call(&[3, 7]).expect("test JIT call") };
         assert_eq!(r_true, 1, "3 < 7 should set the boolean to 1");
         // a >= b → 0
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let r_false = unsafe { method.try_call(&[7, 3]).expect("test JIT call") };
         assert_eq!(r_false, 0, "7 < 3 is false → 0");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let r_eq = unsafe { method.try_call(&[5, 5]).expect("test JIT call") };
         assert_eq!(r_eq, 0, "5 < 5 is false → 0");
     }
@@ -23948,10 +23963,13 @@ mod tests {",
         assert!(compiled.is_some(), "ternary should compile via IR path");
         let method = compiled.unwrap();
 
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let r_true = unsafe { method.try_call(&[3, 7]).expect("test JIT call") };
         assert_eq!(r_true, 1, "3 < 7 → 1");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let r_false = unsafe { method.try_call(&[7, 3]).expect("test JIT call") };
         assert_eq!(r_false, 0, "7 < 3 → 0");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let r_eq = unsafe { method.try_call(&[5, 5]).expect("test JIT call") };
         assert_eq!(r_eq, 0, "5 == 5, not < → 0");
     }
@@ -23976,6 +23994,7 @@ mod tests {",
             0x1a, 0x10, 0x08, 0x7e, 0x99, 0x00, 0x07, 0x04, 0xa7, 0x00, 0x04, 0x03, 0xac, 0, 0,
         ];
         let cm = compile_via_ir(&code, 13, 1, 1).expect("branchy predicate compiles via IR");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let f = |m: i64| unsafe { cm.try_call(&[m]).expect("call") };
         assert_eq!(f(8), 1, "8 & 8 != 0 → true");
         assert_eq!(f(0), 0, "0 & 8 == 0 → false");
@@ -24000,6 +24019,7 @@ mod tests {",
             0x1a, 0x1b, 0xa1, 0x00, 0x07, 0x1a, 0xa7, 0x00, 0x04, 0x1b, 0xac, 0, 0,
         ];
         let cm = compile_via_ir(&code, 11, 2, 2).expect("max compiles via IR");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let max = |a: i64, b: i64| unsafe { cm.try_call(&[a, b]).expect("call") };
         assert_eq!(max(3, 7), 7, "max(3,7)=7");
         assert_eq!(max(7, 3), 7, "max(7,3)=7");
@@ -24024,6 +24044,7 @@ mod tests {",
             0x02, 0x01, 0xa7, 0xff, 0xf4, 0x1b, 0xac, 0, 0,
         ];
         let cm = compile_via_ir(&code, 21, 1, 3).expect("loop compiles via IR");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let sum = |n: i64| unsafe { cm.try_call(&[n]).expect("call") };
         assert_eq!(sum(5), 10, "0+1+2+3+4 = 10");
         assert_eq!(sum(0), 0, "empty loop = 0");
@@ -24077,6 +24098,7 @@ mod tests {",
         );
 
         // Cast: the low 32 bits of RAX are this method's `int` result.
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let sum = |n: i64| unsafe { cm.try_call(&[n]).expect("call") } as i32;
         for n in 0..24i64 {
             let want: i32 = (0..n as i32).sum();
@@ -24111,6 +24133,7 @@ mod tests {",
         // means adding 3..n-1 and nothing else.
         for n in [4i64, 7, 12, 24] {
             let want: i32 = 1000 + (3..n as i32).sum::<i32>();
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             let got = unsafe { cm.ir_osr_enter(4, 0, &[n, 1000, 3]) }
                 .expect("the header door accepts three locals");
             assert_eq!(
@@ -24149,6 +24172,7 @@ mod tests {",
         ];
         let cm = compile_via_ir(&code, 21, 1, 3).expect("loop compiles via IR");
         // The ordinary entry still works, unchanged.
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         assert_eq!(unsafe { cm.try_call(&[10]).expect("call") }, 45);
 
         let Some((_addr, _needed)) = cm.ir_osr_entry_addr(4) else {
@@ -24227,6 +24251,7 @@ mod tests {",
         // The ordinary entry, which never skipped the constants and was always
         // right. `i < 3` on three iterations, `i >= 3` on two.
         assert_eq!(
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             unsafe { cm.try_call(&[5]).expect("test JIT call") },
             3 * 100 + 2 * 900,
             "the method-entry door: 100,100,100,900,900",
@@ -24362,6 +24387,7 @@ mod tests {",
         // `int` result; the upper half is not sign-extended, so the comparison
         // is made on the 32 bits the body actually wrote.
         assert_eq!(
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             unsafe { cm.try_call(&[5]).expect("test JIT call") } as i32,
             expect(5, 5.0, 0, 0),
             "the method-entry door",
@@ -24376,6 +24402,7 @@ mod tests {",
             return;
         };
         // Cast: as above.
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let entered = |l: &[i64]| unsafe { cm.ir_osr_enter(8, 0, l) }.map(|v| v as i32);
         // Enter at the header in a state the method could not have reached
         // from its own entry -- `a` is 2.5, which `(double) n` never produces,
@@ -24590,6 +24617,7 @@ mod tests {",
             lower(&graph, &schedule, 1, 3, &no_helpers()).expect("the spliced graph must lower");
 
         // The method-entry door. `clamp(i)` is 100 for every i below 100.
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let f = |n: i64| unsafe { cm.try_call(&[n]).expect("test JIT call") };
         assert_eq!(f(5), 500, "clamp(0..4) is 100 each");
         assert_eq!(f(0), 0, "an empty loop sums to zero");
@@ -24648,6 +24676,7 @@ mod tests {",
             cm.ir_osr_entries.is_empty(),
             "with the kill switch set an artifact must carry no entry stub",
         );
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         assert_eq!(unsafe { cm.try_call(&[10]).expect("call") }, 45);
     }
 
@@ -24665,6 +24694,7 @@ mod tests {",
             0xff, 0xf7, 0x1b, 0xac, 0, 0,
         ];
         let cm = compile_via_ir(&code, 18, 1, 3).expect("do-while compiles via IR");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let f = |n: i64| unsafe { cm.try_call(&[n]).expect("call") };
         assert_eq!(f(5), 10, "runs i=0..4 → 0+1+2+3+4 = 10");
         assert_eq!(f(1), 0, "runs once (i=0) → 0");
@@ -24714,6 +24744,7 @@ mod tests {",
             0, 0,
         ];
         let cm = compile_via_ir(&code, 33, 1, 4).expect("nested loops compile via IR");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let f = |n: i64| unsafe { cm.try_call(&[n]).expect("call") };
         assert_eq!(f(3), 9, "3*3 = 9");
         assert_eq!(f(5), 25, "5*5 = 25");
@@ -24735,11 +24766,13 @@ mod tests {",
 
         let _ = take_last_deopt(); // clear any stale state
                                    // divisor != 0 → normal result, no deopt.
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let ok = unsafe { cm.try_call(&[20, 4]).expect("call (b != 0)") };
         assert_eq!(ok, 5, "20 / 4 = 5");
         assert!(take_last_deopt().is_none(), "no deopt when divisor != 0");
 
         // divisor == 0 → deopt (sentinel + reconstructed frame), NOT a #DE fault.
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let sentinel = unsafe { cm.try_call(&[20, 0]).expect("call (b == 0)") };
         assert_eq!(sentinel, i64::MIN, "div by zero → deopt sentinel");
         let frame = take_last_deopt().expect("deopt reconstructed a frame");
@@ -24772,6 +24805,7 @@ mod tests {",
         let _ = take_last_deopt(); // clear any stale state
                                    // divisor != 0 → normal full-64-bit result, no deopt. A 32-bit IDIV
                                    // would mishandle this dividend (> i32::MAX).
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let ok = unsafe { cm.try_call(&[0x1_0000_0000, 2]).expect("call (b != 0)") };
         assert_eq!(ok, 0x8000_0000, "0x1_0000_0000 / 2 (genuinely 64-bit)");
         assert!(take_last_deopt().is_none(), "no deopt when divisor != 0");
@@ -24779,6 +24813,7 @@ mod tests {",
         // divisor == 0 → deopt; the reconstructed frame must carry the two LONG
         // operands as FrameValue::Long (full 64 bits) so the interpreter resumes
         // at the ldiv bci and re-executes it (throwing ArithmeticException).
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let sentinel = unsafe { cm.try_call(&[0x7_0000_0000, 0]).expect("call (b == 0)") };
         assert_eq!(sentinel, i64::MIN, "ldiv by zero → deopt sentinel");
         let frame = take_last_deopt().expect("deopt reconstructed a frame");
@@ -24876,6 +24911,7 @@ mod tests {",
              value-returning exit does not (void={void_zeroes}, value={value_zeroes})",
         );
         assert_eq!(
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             unsafe { void_method.try_call(&[41]) },
             Ok(0),
             "a void method must not hand its caller the deopt sentinel",
@@ -24889,6 +24925,7 @@ mod tests {",
         let (graph, schedule) = add_one_graph();
         assert!(verify_data_locations(&graph, &schedule).is_ok());
         let method = lower(&graph, &schedule, 1, 1, &no_helpers()).expect("a+1 must lower");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         assert_eq!(unsafe { method.try_call(&[41]) }, Ok(42));
     }
 
@@ -25240,7 +25277,9 @@ mod tests {",
 
         // End to end, the code still computes a + (a + b).
         let cm = lower(&graph, &schedule, 2, 2, &no_helpers()).expect("lowers");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         assert_eq!(unsafe { cm.try_call(&[3, 4]) }, Ok(10));
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         assert_eq!(unsafe { cm.try_call(&[-1, 5]) }, Ok(3));
     }
 
@@ -25697,7 +25736,9 @@ mod tests {",
 
         // And it really compiles and really runs.
         let cm = lower(&graph, &schedule, 1, 1, &no_helpers()).expect("a 5 000-node method lowers");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         assert_eq!(unsafe { cm.try_call(&[0]) }, Ok(5_000));
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         assert_eq!(unsafe { cm.try_call(&[42]) }, Ok(5_042));
     }
 
@@ -26107,6 +26148,7 @@ mod tests {",
         // reads as its u32 bit pattern (-4 as 0xFFFF_FFFC). Sign-extend before
         // comparing, or a correct swap reports as a failure.
         let f = |a: i64, b: i64, n: i64| {
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             let raw = unsafe { cm.try_call(&[a, b, n]).expect("call") };
             raw as i32 as i64
         };
@@ -28196,8 +28238,10 @@ mod tests {",
         for n in [0i32, 1, 2, 7, 100, -3] {
             let want: i32 = (0..n.max(0)).fold(0i32, |acc, i| acc.wrapping_add(i));
             let got_laid =
+                // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
                 unsafe { laid_out.try_call(&[i64::from(n)]) }.expect("the laid-out body runs");
             let got_hint =
+                // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
                 unsafe { hinted.try_call(&[i64::from(n)]) }.expect("the hinted body runs");
             assert_eq!(
                 got_laid as u32, got_hint as u32,
@@ -28253,6 +28297,7 @@ mod tests {",
         let unrolled = compile(true);
 
         for (what, cm) in [("rolled", &rolled), ("unrolled", &unrolled)] {
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             let got = unsafe { cm.try_call(&[]) }.expect("the body runs");
             assert_eq!(got as u32 as i32, 10, "the {what} body summed 0..4 wrong");
         }
@@ -28360,8 +28405,10 @@ mod tests {",
         for n in [0i32, 1, 2, 7, 100, -3] {
             let want: i32 = (0..n.max(0)).fold(0i32, |acc, i| acc.wrapping_add(i));
             let got_direct =
+                // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
                 unsafe { direct_cm.try_call(&[i64::from(n)]) }.expect("the direct body runs");
             let got_plain =
+                // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
                 unsafe { plain_cm.try_call(&[i64::from(n)]) }.expect("the plain body runs");
             assert_eq!(
                 got_direct as u32, got_plain as u32,
@@ -28435,6 +28482,7 @@ mod tests {",
                 // differ in exactly the switch named above.
                 for n in [0i32, 1, 7, 100] {
                     let want: i32 = (0..n).fold(0i32, |acc, i| acc.wrapping_add(i));
+                    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
                     let got = unsafe { direct.try_call(&[i64::from(n)]) }.expect("the body runs");
                     assert_eq!(got as u32 as i32, want, "wrong for n={n}");
                 }
@@ -28515,7 +28563,9 @@ mod tests {",
         for (a, b) in [(3i32, 4i32), (-1, 5), (0, 0), (7, -9), (i32::MAX, 2)] {
             let want = a.wrapping_add(1) ^ b.wrapping_mul(3);
             let args = [i64::from(a), i64::from(b)];
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             let got_paired = unsafe { paired_cm.try_call(&args) }.expect("the paired body runs");
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             let got_plain = unsafe { plain_cm.try_call(&args) }.expect("the plain body runs");
             assert_eq!(
                 got_paired, got_plain,

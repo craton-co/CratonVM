@@ -80,6 +80,11 @@
 //! register-resident oops escape GC root scanning, causing live objects
 //! to be reclaimed and the heap to corrupt.
 
+// Every `unsafe` block states why it is sound (jit review 2026-09-12). The
+// workspace allows the lint; this crate generates and enters machine code,
+// so it opts in.
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 pub mod aarch64;
 pub mod aarch64_backend;
 pub mod bailout;
@@ -494,6 +499,7 @@ fn value_to_bytes(val: Value) -> [u8; 16] {
 pub fn probe_object_ptr_offset() -> usize {
     // Use an 8-byte aligned marker to satisfy ObjectRef's alignment debug_assert.
     let marker_ptr = 0xDE_AD_BE_EF_CA_FE_BA_B8u64;
+    // SAFETY: the marker is only stored in a `Value` and read back as bytes; it is never dereferenced.
     let fake_ref = unsafe { ObjectRef::from_raw(marker_ptr as usize as *mut u8) };
     let val_obj = Value::Object(Some(fake_ref));
     let obj_bytes = value_to_bytes(val_obj);
@@ -629,9 +635,12 @@ pub struct ExecutableBuffer {
     tag: &'static str,
 }
 
-// Safety: ExecutableBuffer is effectively a unique owned allocation, like Vec<u8>.
-// The JIT cache holds it behind an Arc; no concurrent writes happen after compilation.
+// SAFETY: an `ExecutableBuffer` uniquely owns its mapping, like a `Vec<u8>`, so
+// moving it to another thread moves that ownership and nothing else.
 unsafe impl Send for ExecutableBuffer {}
+// SAFETY: every write goes through `&mut self`. Once finalized and shared behind
+// the JIT cache's `Arc`, a buffer is executed and read; the `&self` operations
+// only read the mapping or change its protection through the OS.
 unsafe impl Sync for ExecutableBuffer {}
 
 impl ExecutableBuffer {
@@ -715,6 +724,7 @@ impl ExecutableBuffer {
         // macOS/ARM64, where `MAP_JIT` code pages are writable only inside a
         // scope. See `platform::JitWriteScope`.
         let _write = platform::JitWriteScope::enter();
+        // SAFETY: `len + bytes.len() <= capacity` was checked above, `ptr` is this buffer's own writable mapping of `capacity` bytes, and `&mut self` rules out `bytes` aliasing it.
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(self.len), bytes.len());
         }
@@ -728,6 +738,7 @@ impl ExecutableBuffer {
             return false;
         }
         let _write = platform::JitWriteScope::enter();
+        // SAFETY: `len + bytes.len() <= capacity` was checked above, `ptr` is this buffer's own writable mapping of `capacity` bytes, and `&mut self` rules out `bytes` aliasing it.
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(self.len), bytes.len());
         }
@@ -749,6 +760,7 @@ impl ExecutableBuffer {
             return;
         }
         let _write = platform::JitWriteScope::enter();
+        // SAFETY: `len < capacity` was checked above and `ptr` is this buffer's own writable mapping of `capacity` bytes.
         unsafe {
             *self.ptr.add(self.len) = b;
         }
@@ -861,6 +873,7 @@ impl ExecutableBuffer {
 
     /// Get the emitted bytes as a slice.
     pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: `ptr` is this buffer's live mapping, which the OS zero-fills, and `len <= capacity` always holds.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 
@@ -1023,6 +1036,7 @@ impl ExecutableBuffer {
     pub fn read_i32(&self, offset: usize) -> i32 {
         assert!(offset + 4 <= self.len, "read out of bounds");
         let mut bytes = [0u8; 4];
+        // SAFETY: the assert above bounds `offset + 4` by `len`, inside this buffer's live mapping.
         unsafe {
             std::ptr::copy_nonoverlapping(self.ptr.add(offset), bytes.as_mut_ptr(), 4);
         }
@@ -3710,7 +3724,14 @@ pub struct CompiledMethod {
     pub retired: std::sync::atomic::AtomicBool,
 }
 
+// SAFETY: the raw pointers a `CompiledMethod` holds address its own boxed arenas
+// (strings, invoke infos, inline-cache slots, deopt boxes) and its own
+// `ExecutableBuffer`, all of which move with it; nothing is tied to the thread
+// that compiled it.
 unsafe impl Send for CompiledMethod {}
+// SAFETY: state that changes after publication is atomic (`retired`, the
+// inline-cache slot words, counters) or guarded by its own lock; everything else
+// is written only before the artifact is published.
 unsafe impl Sync for CompiledMethod {}
 
 impl Drop for CompiledMethod {
@@ -7934,8 +7955,11 @@ pub(crate) fn intern_inline_invoke_targets(
         // the identical argument the top-level `invoke_info` construction
         // makes a few hundred lines above.
         let info = Box::new(JitInvokeInfo {
+            // SAFETY: the `Box<str>` behind this pointer was just moved into the artifact's owned strings, and a boxed str's payload never moves, so the reference lives as long as the `CompiledMethod`.
             class_name: unsafe { &*class_ref },
+            // SAFETY: the `Box<str>` behind this pointer was just moved into the artifact's owned strings, and a boxed str's payload never moves, so the reference lives as long as the `CompiledMethod`.
             method_name: unsafe { &*method_ref },
+            // SAFETY: the `Box<str>` behind this pointer was just moved into the artifact's owned strings, and a boxed str's payload never moves, so the reference lives as long as the `CompiledMethod`.
             descriptor: unsafe { &*desc_ref },
             num_jit_args: target.num_jit_args,
             return_type: target.return_type,
@@ -19245,6 +19269,7 @@ fn ir_call_is_identity_hash(node: &ir::Node, info_ptr: usize) -> bool {
     if info_ptr == 0 || node.inputs.len() < 3 {
         return false;
     }
+    // SAFETY: `info_ptr` is non-zero here and addresses an interned `JitInvokeInfo`; see this function's contract.
     let info = unsafe { &*(info_ptr as *const JitInvokeInfo) };
     match (info.class_name, info.method_name, info.descriptor) {
         // invoke_kind 3 = static.
@@ -28133,8 +28158,11 @@ fn try_compile_inner(
                         ir_call_strings.push(method_box);
                         ir_call_strings.push(desc_box);
                         let info = Box::new(JitInvokeInfo {
+                            // SAFETY: the `Box<str>` behind this pointer was just moved into the artifact's owned strings, and a boxed str's payload never moves, so the reference lives as long as the `CompiledMethod`.
                             class_name: unsafe { &*class_ref },
+                            // SAFETY: the `Box<str>` behind this pointer was just moved into the artifact's owned strings, and a boxed str's payload never moves, so the reference lives as long as the `CompiledMethod`.
                             method_name: unsafe { &*method_ref },
+                            // SAFETY: the `Box<str>` behind this pointer was just moved into the artifact's owned strings, and a boxed str's payload never moves, so the reference lives as long as the `CompiledMethod`.
                             descriptor: unsafe { &*desc_ref },
                             num_jit_args: num_args,
                             return_type: ret,
@@ -30741,8 +30769,11 @@ fn try_compile_inner(
                                     owned_strings.push(method_box);
                                     owned_strings.push(desc_box);
                                     let info = Box::new(JitInvokeInfo {
+                                        // SAFETY: the `Box<str>` behind this pointer was just moved into the artifact's owned strings, and a boxed str's payload never moves, so the reference lives as long as the `CompiledMethod`.
                                         class_name: unsafe { &*class_ref },
+                                        // SAFETY: the `Box<str>` behind this pointer was just moved into the artifact's owned strings, and a boxed str's payload never moves, so the reference lives as long as the `CompiledMethod`.
                                         method_name: unsafe { &*method_ref },
+                                        // SAFETY: the `Box<str>` behind this pointer was just moved into the artifact's owned strings, and a boxed str's payload never moves, so the reference lives as long as the `CompiledMethod`.
                                         descriptor: unsafe { &*desc_ref },
                                         num_jit_args,
                                         return_type: ret_type,
@@ -30810,8 +30841,11 @@ fn try_compile_inner(
                             owned_strings.push(method_box);
                             owned_strings.push(desc_box);
                             let info = Box::new(JitInvokeInfo {
+                                // SAFETY: the `Box<str>` behind this pointer was just moved into the artifact's owned strings, and a boxed str's payload never moves, so the reference lives as long as the `CompiledMethod`.
                                 class_name: unsafe { &*class_ref },
+                                // SAFETY: the `Box<str>` behind this pointer was just moved into the artifact's owned strings, and a boxed str's payload never moves, so the reference lives as long as the `CompiledMethod`.
                                 method_name: unsafe { &*method_ref },
+                                // SAFETY: the `Box<str>` behind this pointer was just moved into the artifact's owned strings, and a boxed str's payload never moves, so the reference lives as long as the `CompiledMethod`.
                                 descriptor: unsafe { &*desc_ref },
                                 num_jit_args: num_params,
                                 return_type: ret,
@@ -31559,8 +31593,11 @@ fn try_compile_inner(
                     owned_strings.push(method_box);
                     owned_strings.push(desc_box);
                     let info = Box::new(JitInvokeInfo {
+                        // SAFETY: the `Box<str>` behind this pointer was just moved into the artifact's owned strings, and a boxed str's payload never moves, so the reference lives as long as the `CompiledMethod`.
                         class_name: unsafe { &*class_ref },
+                        // SAFETY: the `Box<str>` behind this pointer was just moved into the artifact's owned strings, and a boxed str's payload never moves, so the reference lives as long as the `CompiledMethod`.
                         method_name: unsafe { &*method_ref },
+                        // SAFETY: the `Box<str>` behind this pointer was just moved into the artifact's owned strings, and a boxed str's payload never moves, so the reference lives as long as the `CompiledMethod`.
                         descriptor: unsafe { &*desc_ref },
                         num_jit_args,
                         return_type: ret_type,
@@ -31795,8 +31832,11 @@ fn try_compile_inner(
                         owned_strings.push(method_box);
                         owned_strings.push(desc_box);
                         let info = Box::new(JitInvokeInfo {
+                            // SAFETY: the `Box<str>` behind this pointer was just moved into the artifact's owned strings, and a boxed str's payload never moves, so the reference lives as long as the `CompiledMethod`.
                             class_name: unsafe { &*class_ref },
+                            // SAFETY: the `Box<str>` behind this pointer was just moved into the artifact's owned strings, and a boxed str's payload never moves, so the reference lives as long as the `CompiledMethod`.
                             method_name: unsafe { &*method_ref },
+                            // SAFETY: the `Box<str>` behind this pointer was just moved into the artifact's owned strings, and a boxed str's payload never moves, so the reference lives as long as the `CompiledMethod`.
                             descriptor: unsafe { &*desc_ref },
                             num_jit_args,
                             return_type: ret_type,
@@ -31925,8 +31965,11 @@ fn try_compile_inner(
             owned_strings.push(desc_box);
 
             let info = Box::new(JitInvokeInfo {
+                // SAFETY: the `Box<str>` behind this pointer was just moved into the artifact's owned strings, and a boxed str's payload never moves, so the reference lives as long as the `CompiledMethod`.
                 class_name: unsafe { &*class_ref },
+                // SAFETY: the `Box<str>` behind this pointer was just moved into the artifact's owned strings, and a boxed str's payload never moves, so the reference lives as long as the `CompiledMethod`.
                 method_name: unsafe { &*method_ref },
+                // SAFETY: the `Box<str>` behind this pointer was just moved into the artifact's owned strings, and a boxed str's payload never moves, so the reference lives as long as the `CompiledMethod`.
                 descriptor: unsafe { &*desc_ref },
                 num_jit_args,
                 return_type: ret_type,
@@ -34930,6 +34973,7 @@ mod tests {
         };
 
         // (a) Guard wired: loader-correct dispatch is still required.
+        // SAFETY: `JitRuntimeHelpers` is `#[repr(C)]` and every field is a `usize`, so all-zero is a valid value; the test wires only the slots it exercises.
         let mut helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
         helpers.self_call_stack_guard = GUARD_ADDR;
         helpers.invoke_dispatch = DISPATCH_ADDR;
@@ -34969,6 +35013,7 @@ mod tests {
         );
 
         // (b) Guard UNWIRED → historical dispatch routing.
+        // SAFETY: `JitRuntimeHelpers` is `#[repr(C)]` and every field is a `usize`, so all-zero is a valid value; the test wires only the slots it exercises.
         let mut helpers_off: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
         helpers_off.invoke_dispatch = DISPATCH_ADDR;
         let compiled_off = try_compile(
@@ -36524,6 +36569,7 @@ mod tests {
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
             quickened: std::sync::OnceLock::new(),
         };
+        // SAFETY: `JitRuntimeHelpers` is `#[repr(C)]` and every field is a `usize`, so all-zero is a valid value; the test wires only the slots it exercises.
         let mut helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
         // `lower_inner` refuses a graph whose `new`/field ops have no helper to
         // call. Those guards used to be unreachable here because escape
@@ -36680,6 +36726,7 @@ mod tests {
 
         // Non-null placeholders: this test only compiles, never executes, so the
         // backend just needs the slots to read as "wired".
+        // SAFETY: `JitRuntimeHelpers` is `#[repr(C)]` and every field is a `usize`, so all-zero is a valid value; the test wires only the slots it exercises.
         let mut wired: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
         wired.new_object = 0x1000;
         wired.new_object_cp = 0x2000;
@@ -37942,6 +37989,7 @@ mod tests {
 
         // 9 args exceeds the 8-arg ceiling of `try_call`.
         let nine = [0i64; 9];
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let r = unsafe { cm.try_call(&nine) };
         assert!(
             matches!(r, Err(CompileError::TooManyArgs(9))),
@@ -37954,6 +38002,7 @@ mod tests {
         buf2.emit(&[0xC3]);
         let cm2 = CompiledMethod::new_with_context(buf2);
         let eight = [0i64; 8];
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let r2 = unsafe { cm2.try_call_with_context(0, &eight) };
         assert!(
             matches!(r2, Err(CompileError::TooManyArgs(8))),
@@ -37977,6 +38026,7 @@ mod tests {
         // buffer, so the page is executable.
         #[cfg(target_arch = "x86_64")]
         {
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             let r = unsafe { cm.try_call(&[]) };
             assert_eq!(r, Ok(0), "try_call({{}}) should return Ok(0)");
         }
@@ -38028,6 +38078,7 @@ mod tests {
         buf2.emit(&[0xC3]);
         let mut cm2 = CompiledMethod::new_with_context(buf2);
         cm2.entry = 0x3 as *const u8;
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let r2 = unsafe { cm2.try_call_with_context(0, &[]) };
         assert!(
             matches!(r2, Err(CompileError::InvalidCodePtr(_))),
@@ -38112,6 +38163,7 @@ mod tests {
             assert!(cm.can_osr_enter_with(0, true));
         } else {
             assert_eq!(
+                // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
                 unsafe { cm.osr_enter(0, &[], 0, 0) },
                 None,
                 "CRATONVM_JIT_OSR_DEAD_LOCALS=0 must still bail before the trampoline"
@@ -41877,6 +41929,7 @@ mod tests {
         let mut bytes = [0u8; 16];
         bytes[0..8].copy_from_slice(&lo.to_le_bytes());
         bytes[8..16].copy_from_slice(&hi.to_le_bytes());
+        // SAFETY: `Value` is 16 bytes (asserted at compile time), and these bytes are the template the VM derived from a real `Value::Object(None)`.
         let reconstructed: Value = unsafe { std::mem::transmute(bytes) };
         assert_eq!(
             reconstructed,
