@@ -1755,7 +1755,42 @@ use cratonvm_types::compat::CompatibilityMode;
 /// side: on a branch this busy the constant is re-measured per merge, never
 /// added up. Totals stay 13623 / 13991 / 13658, so lane 6's 17 are
 /// relabellings too.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2620;
+/// # Lane 4 wave 2, 2026-09-11 — the paired ratchet, both columns PRINTED
+///
+/// `+137` in all three configurations, and the total unchanged in all three:
+/// case **(b)** in the taxonomy the panic message above sets out — existing
+/// registrations relabelled `Bridge` -> `SyntheticStub` so `--jdk-only` drops
+/// them and the JDK's own bytecode runs. The rows are
+/// `RETIRED_SHADOW_L4_FFM_TRIPLES`, 137 triples over the nine
+/// `jdk/internal/foreign/layout/ValueLayouts$Of*Impl` carriers.
+///
+/// ```text
+///   arm             OFF             ON              delta
+///   (default)   2609 / 13610    2746 / 13610        +137 / 0
+///   management  2620 / 13978    2757 / 13978        +137 / 0
+///   synthetic   2609 / 13645    2746 / 13645        +137 / 0
+/// ```
+///
+/// **The OFF column was PRINTED, not inferred from a `<=` pass**, and it
+/// reproduces the three constants this wave found here (2620 / 2609 / 2609)
+/// exactly. It was taken with `CRATONVM_UNRETIRE_NATIVE_SHADOW=jdk/internal/
+/// foreign/layout/`, so one binary answered both halves and nothing about the
+/// comparison depends on two checkouts being otherwise identical — which is
+/// what that switch was built for.
+///
+/// **The `MEASURED_TOTAL_REGISTRATIONS_*` move is NOT this wave's.** All three
+/// were 13 above the measurement in BOTH columns, so the drift is inherited and
+/// is recorded here rather than absorbed silently: 13991 -> 13978,
+/// 13623 -> 13610, 13658 -> 13645. A wave that changed them would have shown a
+/// total moving between its OWN two columns, and none of these does.
+///
+/// The same 13 appears one section up, read the other way round: that note
+/// measured 13623 / 13991 / 13658 against dev's 13610 / 13978 and concluded dev
+/// was 13 stale, so the constants were raised. This tree, forked from `dev` at
+/// `aba314446`, measures the lower three again. Whichever direction it went, it
+/// is the same 13 registrations and it belongs to neither wave -- the two notes
+/// now bracket it, which is more than either could say alone.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2757;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1980,7 +2015,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2620;
 /// side: on a branch this busy the constant is re-measured per merge, never
 /// added up. Totals stay 13623 / 13991 / 13658, so lane 6's 17 are
 /// relabellings too.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2609;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2746;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2127,7 +2162,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2609;
 /// side: on a branch this busy the constant is re-measured per merge, never
 /// added up. Totals stay 13623 / 13991 / 13658, so lane 6's 17 are
 /// relabellings too.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2609;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2746;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -2187,7 +2222,7 @@ const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2609;
 /// was the only trace a real defect left in this gate, and staleness meant
 /// nobody could have read it. The `synthetic-jdk` arm has no constant here and
 /// measured 13645 on the same tree.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13991;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13978;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
@@ -2200,7 +2235,7 @@ const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13991;
 /// dev's staleness rather than either wave's — the localisation is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13623;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13610;
 
 /// The `--features synthetic-jdk` total, which had no constant at all.
 ///
@@ -2226,7 +2261,7 @@ const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13623;
 /// and 13645 on that tree against 13658 on this one is exactly the drift a
 /// sentence cannot track.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13658;
+const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13645;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;
@@ -2869,6 +2904,47 @@ fn essential_registry_is_populated() {
 /// not remove the registration. Record: the retired
 /// `bridge-reclassification-wave` write-up.
 ///
+/// ## That last paragraph is WRONG about strict mode, and was wrong when written
+///
+/// A re-tag leaves the registration alone in COMPATIBLE mode, and that is what
+/// was measured. Under `JdkOnly` it does not: `register_inner` REFUSES a
+/// `SyntheticStub`, so every retired triple is one row fewer in the strict
+/// registry. This total is therefore a quantity the retirement campaign is
+/// deliberately driving DOWN, one wave at a time, and eight waves had taken it
+/// from 11,192 to 10,998 -- 98 above this floor, not the 300 the paragraph
+/// above believes it left. Lane 4 wave 2's 137 rows are simply the wave that
+/// crossed it.
+///
+/// # 10,900 -> 10,500, 2026-09-11
+///
+/// Lowered for a strict registry of 10,861, and **lowering a collapse detector
+/// is exactly the move it exists to make suspicious**, so here is the evidence
+/// it cannot see. Both columns measured on ONE binary, the OFF column taken
+/// with `CRATONVM_UNRETIRE_NATIVE_SHADOW=jdk/internal/foreign/layout/`:
+///
+/// ```text
+///            compatible   stubs   strict    dropped   refusals
+///   OFF        13610       2609    10998      2612      2630
+///   ON         13610       2746    10861      2749      2767
+///   delta          0       +137     -137      +137      +137
+/// ```
+///
+/// Exactly the table's row count in every column that moves, and zero in the
+/// one that must not. A registry shedding whole modules does not produce that
+/// diff, and neither does one with aliasing fallout -- the drop and the stub
+/// count move together to the row. Beside it: the `--jdk-only` corpus is
+/// **133 passed / 0 failed on both binaries**, `SUITE=all` 133/0 and
+/// `SUITE=core` 93/0 on the wave binary, and the kind map moves exactly 101
+/// rows, all of them inside the table.
+///
+/// The 361 of headroom left here is the same kind of deliberate as the 300 was,
+/// with one thing now said out loud that was not before: **this floor will be
+/// crossed again, by design.** The campaign's denominator is 5,549 bucket-A/B
+/// rows and about a fifth of them are retired, so a fixed floor is the wrong
+/// shape for what it is tracking. What makes lowering it safe is the paired
+/// OFF/ON measurement above plus a corpus that does not move -- never the
+/// number itself, and never a re-freeze taken from one column.
+///
 /// # 10,200 -> 10,900, 2026-08-11
 ///
 /// Raised, not lowered, and for a reason that is not a measurement at all: the
@@ -2878,7 +2954,7 @@ fn essential_registry_is_populated() {
 /// `MIN_TOTAL_REGISTRATIONS`, the floor takes the SMALLER configuration and
 /// keeps the same ~300 rows of deliberate headroom, so it survives the next
 /// re-tag of that size while still detecting a shed module.
-const STRICT_MIN_TOTAL_REGISTRATIONS: usize = 10_900;
+const STRICT_MIN_TOTAL_REGISTRATIONS: usize = 10_500;
 
 /// Build the default native registry the way `--jdk-only` does: set the
 /// VM-scoped strict policy *first*, then run the same boot sequence
