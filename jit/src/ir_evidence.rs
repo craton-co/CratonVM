@@ -215,6 +215,44 @@ pub fn begin_compile() {
     STACK.with(|s| s.borrow_mut().push(CompileRecord::default()));
 }
 
+/// An armed compile that disarms itself if it is left without reaching
+/// [`take`].
+///
+/// [`begin_compile`] alone leaked: every bail between arming and the
+/// acceptance `take()` left its entry on the stack, and the next OUTER compile
+/// on the thread then popped that stale inner entry as its own, and was judged
+/// — and possibly memoised as refused — on another method's evidence. The
+/// scope records the stack depth it armed at and truncates back to it on drop;
+/// after a normal `take()` the stack is already there, so the drop does nothing.
+#[must_use = "dropping the scope immediately disarms the compile"]
+pub struct CompileScope {
+    depth: usize,
+}
+
+/// [`begin_compile`], returning the scope that disarms it on every exit.
+pub fn begin_compile_scope() -> CompileScope {
+    let depth = STACK.with(|s| {
+        let mut v = s.borrow_mut();
+        let depth = v.len();
+        v.push(CompileRecord::default());
+        depth
+    });
+    CompileScope { depth }
+}
+
+impl Drop for CompileScope {
+    fn drop(&mut self) {
+        // `try_with`: a scope dropped during thread teardown must not panic.
+        let _ = STACK.try_with(|s| {
+            if let Ok(mut v) = s.try_borrow_mut() {
+                if v.len() > self.depth {
+                    v.truncate(self.depth);
+                }
+            }
+        });
+    }
+}
+
 /// Record that `t` was applied to the compile running on this thread.
 ///
 /// A call with the slot un-armed is IGNORED rather than armed implicitly: the

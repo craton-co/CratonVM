@@ -3357,7 +3357,7 @@ impl Drop for CompiledMethod {
             let start = entry;
             let end = start.saturating_add(self._buffer.pos());
             let mut cache = osr_trampoline_cache().lock();
-            cache.retain(|&target, _| !(target >= start && target < end));
+            cache.retain(|&(target, _), _| !(target >= start && target < end));
         }
     }
 }
@@ -4204,6 +4204,8 @@ impl CompiledMethod {
             self.shadow_thread_slot_off,
             self.shadow_savetop_slot_off,
             self.shadow_off_in_thread,
+            self.compile_id,
+            self.sp_id_slot_off,
             thread_ptr,
         )
     }
@@ -5637,8 +5639,19 @@ fn osr_dead_local_entry_allowed() -> bool {
 /// re-entry. Entries are never evicted during a VM run; they're released when the
 /// process exits (or, if the cache is ever cleared, after no thread can hold a
 /// transient `Arc` clone).
-fn osr_trampoline_cache() -> &'static parking_lot::Mutex<FxHashMap<usize, Arc<ExecutableBuffer>>> {
-    static CACHE: std::sync::OnceLock<parking_lot::Mutex<FxHashMap<usize, Arc<ExecutableBuffer>>>> =
+/// Emitted OSR trampolines, keyed by `(target_addr, dead_mask)`.
+///
+/// NOT by `target_addr` alone: the body bakes in the per-pc dead-local skip
+/// set, and two OSR pcs share a native target whenever the instruction between
+/// them emits no bytes. A cache hit for the second then reused the first pc's
+/// skip set — skipping a live local, or seeding a dead one over a coalesced
+/// live register.
+#[allow(clippy::type_complexity)]
+fn osr_trampoline_cache(
+) -> &'static parking_lot::Mutex<FxHashMap<(usize, u64), Arc<ExecutableBuffer>>> {
+    static CACHE: std::sync::OnceLock<
+        parking_lot::Mutex<FxHashMap<(usize, u64), Arc<ExecutableBuffer>>>,
+    > =
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| parking_lot::Mutex::new(FxHashMap::default()))
 }
@@ -5677,6 +5690,8 @@ unsafe fn emit_osr_trampoline(
     shadow_thread_slot_off: i32,
     shadow_savetop_slot_off: i32,
     shadow_off_in_thread: i32,
+    compile_id: u32,
+    sp_id_slot_off: i32,
 ) -> Option<ExecutableBuffer> {
     use crate::x64::LOCAL_REGS;
 
@@ -5705,10 +5720,41 @@ unsafe fn emit_osr_trampoline(
     tramp.set_tag("osr-trampoline");
 
     // === JIT Prologue ===
+    //
+    // Every step `x64::Compiler::emit_prologue` performs that the body entered
+    // past it relies on must be mirrored here. Three were not: the stack bang,
+    // the safepoint-id sentinel, and the compile-id half of the TLS frame
+    // record. See each below.
     tramp.emit_byte(0x55); // push rbp
     tramp.emit(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
+    // Stack bang: probe every page the frame crosses before moving RSP. An OSR
+    // entry near the end of the stack otherwise skipped the guard page, and its
+    // first writes access-violated instead of raising StackOverflowError.
+    // MOV EAX, [RSP + disp32]  (8B 84 24 disp32); RAX is not an argument.
+    let bang = crate::x64::jit_stack_bang_enabled();
+    if bang {
+        for disp in crate::x64::stack_bang_frame_probe_disps(frame_size)? {
+            tramp.emit(&[0x8B, 0x84, 0x24]);
+            tramp.emit(&disp.to_le_bytes());
+        }
+    }
     tramp.emit(&[0x48, 0x81, 0xEC]); // sub rsp, imm32
     tramp.emit(&frame_size.to_le_bytes());
+    if bang {
+        // The one-page headroom probe below the final RSP.
+        tramp.emit(&[0x8B, 0x84, 0x24]);
+        tramp.emit(&(-crate::x64::STACK_BANG_PAGE_SIZE).to_le_bytes());
+    }
+    // Safepoint-id sentinel: until the body's first safepoint the slot held
+    // whatever the previous frame at this depth left, and a stack walk could
+    // match a real oop map on it. MOV RAX, imm32 (sx); MOV [rbp - off], RAX.
+    if sp_id_slot_off != 0 && sp_id_slot_init_enabled() {
+        tramp.emit(&[0x48, 0xC7, 0xC0]);
+        // Cast: the sentinel is `u32::MAX - 1`; see the prologue's store.
+        tramp.emit(&(crate::x64::safepoint::SP_ID_UNSET_BC_PC as u32 as i32).to_le_bytes());
+        tramp.emit(&[0x48, 0x89, 0x85]);
+        tramp.emit(&(-sp_id_slot_off).to_le_bytes());
+    }
 
     // Stash arg0 (locals_ptr) into R10 immediately, before any subsequent emission
     // could clobber the caller-saved arg register. R10 is itself caller-saved and
@@ -5851,6 +5897,18 @@ unsafe fn emit_osr_trampoline(
         tramp.emit_byte(0x2C);
         tramp.emit_byte(0x25);
         tramp.emit(&(inline_rbp_disp as u32).to_le_bytes());
+        // …and the identity half of the pair, as the prologue writes it. Only
+        // RBP was published, so the id read 0 until the body's first compiled
+        // call returned; the collector then fell back to stack decode, which
+        // fails for a frame whose return address is this trampoline.
+        // MOV dword ptr <gs|fs>:[disp32], imm32
+        let cm_disp = crate::x64::inline_cm_tls_disp();
+        if compile_id != 0 && cm_disp != 0 {
+            tramp.emit_byte(crate::x64::inline_rbp_tls_segment_prefix());
+            tramp.emit(&[0xC7, 0x04, 0x25]);
+            tramp.emit(&(cm_disp as u32).to_le_bytes());
+            tramp.emit(&compile_id.to_le_bytes());
+        }
     }
     let call_frame_record = frame_record != 0
         && (inline_rbp_disp == 0 || crate::x64::verify_inline_frame_record_enabled());
@@ -6040,16 +6098,17 @@ unsafe fn osr_trampoline(
     shadow_thread_slot_off: i32,
     shadow_savetop_slot_off: i32,
     shadow_off_in_thread: i32,
+    compile_id: u32,
+    sp_id_slot_off: i32,
     thread_ptr: i64,
 ) -> Option<i64> {
     // Look up (or emit and insert) the cached trampoline body for this target.
-    // `dead_mask` is a deterministic function of `target_addr` (both encode the
-    // OSR PC), so the cached body for a `target_addr` is unique and correct.
-    // `target_addr` already encodes (compiled-method, OSR PC): it is
-    // `CompiledMethod.entry + native_offset`, both stable for the method's life.
-    // All other parameters except `vm_ptr` and `locals_ptr` are functions of
-    // `target_addr` (frame layout, register assignments, etc.), so the same
-    // emitted body is correct for every call at this PC.
+    // `target_addr` encodes the compiled method and native offset, both stable
+    // for the method's life, and the frame layout, register assignments and
+    // compile id are functions of the method. `dead_mask` is NOT a function of
+    // `target_addr` — two OSR pcs can share a native offset — so it is part of
+    // the key; see `osr_trampoline_cache`.
+    let cache_key = (target_addr, dead_mask);
     let tramp_arc: Arc<ExecutableBuffer> = {
         let cache = osr_trampoline_cache();
         // Fast path: read-only lookup. The result is bound to a local so the
@@ -6058,7 +6117,7 @@ unsafe fn osr_trampoline(
         // scrutinee stays live through the `else` arm, so the `cache.lock()`
         // in the slow path below would re-lock the same non-reentrant
         // `parking_lot::Mutex` on this thread and deadlock.
-        let existing = cache.lock().get(&target_addr).cloned();
+        let existing = cache.lock().get(&cache_key).cloned();
         if let Some(existing) = existing {
             existing
         } else {
@@ -6084,11 +6143,13 @@ unsafe fn osr_trampoline(
                 shadow_thread_slot_off,
                 shadow_savetop_slot_off,
                 shadow_off_in_thread,
+                compile_id,
+                sp_id_slot_off,
             )?;
             let fresh_arc = Arc::new(fresh);
             let mut guard = cache.lock();
             guard
-                .entry(target_addr)
+                .entry(cache_key)
                 .or_insert_with(|| fresh_arc.clone())
                 .clone()
         }
@@ -24701,7 +24762,13 @@ fn try_compile_inner(
             std::collections::HashMap::new();
         // Arm the per-compile evidence slot. Everything between here and the
         // acceptance check below runs on this thread; see `ir_evidence`.
-        ir_evidence::begin_compile();
+        //
+        // Scoped: every IR bail between here and the acceptance `take()` (a
+        // builder refusal, the graph-size cap, a verifier or schedule failure)
+        // used to leave this entry armed on the thread's stack. The next outer
+        // compile then popped the stale inner entry instead of its own and was
+        // judged — and possibly memoised as refused — on the wrong evidence.
+        let _evidence_scope = ir_evidence::begin_compile_scope();
         let mut builder = ir::IrBuilder::new(num_params, cached.max_locals as usize);
         // The one fact the optimizing tier cannot derive for itself: whether
         // parameter 0 is a receiver. `num_params` above already counts the

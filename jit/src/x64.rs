@@ -401,6 +401,12 @@ pub const LOCAL_XMMS: [u8; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
 /// Rust caller with its non-volatile state destroyed. The pool is the
 /// volatile subset on Windows; exhaustion falls back to a frame spill in
 /// `flush_xmm0_slots`, so the smaller pool costs a store, never correctness.
+// The OSR trampoline in `lib.rs` hand-builds a prologue and must probe the
+// stack exactly as `emit_prologue` does.
+pub(crate) use reg_encoding::{
+    jit_stack_bang_enabled, stack_bang_frame_probe_disps, STACK_BANG_PAGE_SIZE,
+};
+
 /// Bytes in one callee-saved XMM save slot: the whole 128-bit register.
 ///
 /// Win64 preserves all of XMM6-XMM15, not their low quadword. The single-pass
