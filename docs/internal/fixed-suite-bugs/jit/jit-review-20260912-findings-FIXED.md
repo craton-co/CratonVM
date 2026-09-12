@@ -143,7 +143,7 @@ the review are the gate that does that.
 | 87 | OSR trampoline cache keyed by address only | FIXED add815189 |
 | 88 | Resume tolerates Unsupported locals on a wrong argument | OPEN `jit-resume-tolerates-unsupported-locals-without-liveness-20260912.md` |
 | 89 | Scheduler places nodes in id order | FIXED 7335f4c73, merge 44f2aedf4 |
-| 90 | Quadratic scheduler and lowering scans | PARTIAL merge 44f2aedf4; `ir-scheduler-and-lowering-remaining-quadratic-scans-20260912.md` |
+| 90 | Quadratic scheduler and lowering scans | FIXED merge 44f2aedf4, e3735e523, 4dea5a91f, 1d08b8eff, 12419fded, b37c73722; `ir-scheduler-and-lowering-remaining-quadratic-scans-FIXED-20260912.md` |
 | 91 | DCE roots omit throwing ops | FIXED 9b8cbce45 |
 | 92 | Unroll refused on any side effect after the loop | FIXED 5092d22aa |
 | 93 | Dead loop machinery costs compile time | FIXED 7335f4c73; unrouted emitter: `vec-emit-vector-loop-emitter-is-not-routed-20260912.md` |
