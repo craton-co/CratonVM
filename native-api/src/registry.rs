@@ -7519,6 +7519,31 @@ impl NativeMethodRegistry {
                     // entry-for-entry — a name present in only one of them is
                     // silently inert.
                     | ("awaitQuiescence", "(JLjava/util/concurrent/TimeUnit;)Z")
+                    // 2026-09-11, lane 5 residual §9.1 — and it is the very
+                    // failure the paragraph above describes, sitting in this
+                    // file the whole time. `is_forkjoin_native_override`
+                    // ALREADY lists `execute` under BOTH descriptors; this
+                    // list had neither and nothing registered either, so the
+                    // interpreter was told to force a native that did not
+                    // exist and the call fell through to the concrete JDK
+                    // bytecode. `pool.execute(task)` then put the task in a
+                    // real `WorkQueue` for a real worker to run through the
+                    // JDK's own `doExec()`, which never touches the side
+                    // table — so the caller's `join()`/`get()`, which reads
+                    // it, saw `done == false` and ran the body a SECOND time,
+                    // on a second thread. `apps/probes/L5FjDouble.java`
+                    // measures it per shape.
+                    //
+                    // Only the `ForkJoinTask` descriptor is added.
+                    // `execute(Runnable)V` stays off this list ON PURPOSE and
+                    // its override entry stays inert: a `Runnable` hands the
+                    // caller no task to join, so there is nothing to double,
+                    // and real bytecode puts it on a real worker thread —
+                    // which is CLOSER to HotSpot than this pool's
+                    // borrow-the-caller model, not further. Retiring that
+                    // asymmetry means moving the whole pool off the side
+                    // table, which is the next wave's item and not this one's.
+                    | ("execute", "(Ljava/util/concurrent/ForkJoinTask;)V")
                     // BULK SUBMISSION — see the matching block in
                     // `is_forkjoin_native_override`. `invokeAll(Collection)` is
                     // the overload Weld's `ConcurrentBeanDeployer` calls and was

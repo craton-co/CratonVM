@@ -1560,10 +1560,19 @@ pub(crate) fn register_p63_resource_bundle(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(e))))
     });
     r.register(rb, "keySet", "()Ljava/util/Set;", |ctx, _args| {
-        let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?;
-        ctx.set_field(set, 0, Value::Object(None));
-        ctx.set_field(set, 1, Value::Int(0));
-        ctx.set_field(set, 2, Value::Int(16));
+        // Through the real `HashSet.<init>`: the three slots this used to
+        // write are the MAP layout on a class whose one real field is `map`.
+        // See `phases_late::collections`'s `Collections.singleton`.
+        let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1)?;
+        let set_pin = ctx.pin_native_root(set);
+        let _ = ctx.invoke(
+            "java/util/HashSet",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(set))],
+        );
+        let set = ctx.read_native_pin(set_pin, set);
+        ctx.unpin_native_roots(set_pin);
         Ok(Some(Value::Object(Some(set))))
     });
     r.set_category(__prev_cat);

@@ -6,7 +6,7 @@ closed the same day. The two floors it fixed are unchanged; its four open rows
 are resolved, and **three of the four had a cause the page did not name**.
 
 One residual is filed separately rather than left here:
-`docs/known-issues/perf/hashset-is-built-map-shaped-by-three-factories-20260911.md`.
+`docs/known-issues/perf/the-synthetic-slot-floor-is-one-number-for-two-layouts-20260911.md`.
 
 **Verified on:** Windows 11, JDK 25 Temurin `25.0.3+9`, branch
 `claude/collections-real-jdk-20260911` off `dev@f5a67c0f6`.
@@ -151,10 +151,14 @@ this work, on the strength of `HS_FIELD_MAP = 0` being the only index the
 
 `Collections.singleton`, `WeakHashMap.keySet` and a charset factory build a
 HashSet by writing absolute slots 0/1/2 with a bucket array, a size and a
-capacity: a MAP-shaped object of a class whose one real field is `map`. The
-floor is load-bearing for a shape that is itself wrong, so the place to fix it
-is those three factories. Filed as
-`docs/known-issues/perf/hashset-is-built-map-shaped-by-three-factories-20260911.md`.
+capacity: a MAP-shaped object of a class whose one real field is `map`.
+
+Those three were fixed on 2026-09-11 (they build through the real
+`HashSet.<init>` now), and it did NOT let the floor move -- which is the part
+this section got wrong. The floor is a single number consulted in BOTH modes,
+and in synthetic-JDK mode `HashSet` really is map-shaped, so 3 is correct there.
+Six other classes are padded by the same thing. Superseded by
+`docs/known-issues/perf/the-synthetic-slot-floor-is-one-number-for-two-layouts-20260911.md`.
 `LinkedHashSet` declares no instance fields of its own and inherits the same
 floor, so it is padded for the same reason and moves with it.
 

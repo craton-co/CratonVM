@@ -59205,8 +59205,21 @@ fn chm_segment_for_mut(
         // absence, not an uninitialised receiver, so leave it alone.
         return None;
     }
+    // `CHM_DEFAULT_INIT_SEGMENTS`, not `CHM_DEFAULT_SEGMENTS`: this is the
+    // shape `native_chm_init_default` used to build eagerly, and since that
+    // constructor now defers to this path it is the shape every ordinary
+    // `new ConcurrentHashMap<>()` gets. The two disagreed -- 16 segments here
+    // against the constructor's 4 -- which mattered for nothing while this
+    // arm served only receivers no constructor had run on, and would have
+    // quadrupled every default map's first table the moment it served them
+    // all.
+    //
+    // It also makes two numbers agree that never did: `chm_total_capacity`
+    // sums the live segment arrays (4 * 4 = 16) and `chm_initial_table`
+    // reports 16 for an unrecorded receiver, and `chm_reorder_by_virtual_bucket`
+    // reads both.
     let this_pin = ctx.pin_native_root(this);
-    chm_init_segments(ctx, this, CHM_DEFAULT_SEGMENTS, CHM_DEFAULT_SEGMENT_CAP);
+    chm_init_segments(ctx, this, CHM_DEFAULT_INIT_SEGMENTS, CHM_DEFAULT_SEGMENT_CAP);
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
     chm_segment_for(&*ctx, this, hash)
@@ -60322,13 +60335,23 @@ fn native_chm_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    chm_init_segments(
-        ctx,
-        this,
-        CHM_DEFAULT_INIT_SEGMENTS,
-        CHM_DEFAULT_SEGMENT_CAP,
-    );
-    // A real default map allocates its first table at DEFAULT_CAPACITY = 16.
+    // The segments are NOT allocated here. `chm_segment_for_mut` installs them
+    // on the first insert, and every inserting entry point goes through it
+    // (`put`, `putIfAbsent`, `merge`, `compute`, `computeIfAbsent`, `replace`);
+    // the read-only paths treat a segment-less receiver as an empty map, which
+    // it is. HotSpot does exactly this -- `table` is null until the first
+    // `put`, and the constructor only sets `sizeCtl`.
+    //
+    // MEASURED (probes/CollectionShapeCause.java, retained heap per empty
+    // instance, Temurin 25.0.3+9): 600 B against HotSpot's 64.1, the worst
+    // ratio of any collection in that table by a factor of four. The 536 B was
+    // an `Object[4]` of segments, four 3-slot segment objects and four
+    // `Object[4]` bucket arrays -- all of it for a map that may never be
+    // written.
+    //
+    // `sizeCtl` is still recorded: a real default map's first table is
+    // DEFAULT_CAPACITY = 16, and `chm_reorder_by_virtual_bucket` needs that
+    // number whether or not a table exists yet.
     chm_record_initial_table(ctx, this, 16);
     Ok(None)
 }
