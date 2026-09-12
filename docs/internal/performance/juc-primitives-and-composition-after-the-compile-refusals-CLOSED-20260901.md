@@ -314,4 +314,4 @@ prescribes `TIMEOUT=600` for.
   — the successor. CLOSED 2026-09-02: all three of its residuals discharged,
   composition 1.19x. What is still open from this line is
   [`../../known-issues/perf/composition-native-callback-and-the-promotion-question-20260902.md`](../../known-issues/perf/composition-native-callback-and-the-promotion-question-20260902.md).
-- [`../../known-issues/perf/interpreted-invoke-cost-350ns-20260825.md`](../../known-issues/perf/interpreted-invoke-cost-350ns-20260825.md)
+- [`docs/internal/performance/interpreted-invoke-cost-350ns-RETIRED-20260911.md`](docs/internal/performance/interpreted-invoke-cost-350ns-RETIRED-20260911.md)

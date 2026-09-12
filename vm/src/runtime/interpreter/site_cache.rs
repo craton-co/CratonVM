@@ -572,7 +572,38 @@ pub mod site_stats {
     /// three-way cold decode owns it.
     pub const REFARR_MISS_WORD: usize = 45;
 
-    const N: usize = 48;
+    /// Cached-native dispatch answered from the call site's own
+    /// `DescriptorFacts` (`facts`) against the general helper that re-resolves
+    /// the constant pool and allocates two `Vec`s (`resolve`), split by the
+    /// two arms that serve it.
+    ///
+    /// The clock cannot tell "the facts path is no faster" from "the facts
+    /// path never ran", and this page has shipped a change that measured
+    /// nothing for the second reason twice — the field fast path's first
+    /// version (`get hit=0 miss=1801267`) and the `invokespecial` door's
+    /// (`special hit=0 miss=997`). Read this before reading a clock.
+    pub const NATFACTS_STATIC: usize = 48;
+    pub const NATFACTS_VIRTUAL: usize = 49;
+    pub const NATFACTS_RESOLVE: usize = 50;
+    /// A cached-native dispatch that went through the leaf funnel.
+    pub const NATFACTS_LEAF: usize = 51;
+
+    /// A cached-virtual PROMOTION that entered a compiled callee which
+    /// DECLARES A LOCAL EXCEPTION TABLE, i.e. the population
+    /// `CRATONVM_JIT_VIRTUAL_PROMOTE_HANDLER_CALLEE` admits.
+    ///
+    /// Without this the switch is unfalsifiable from the outside: a probe can
+    /// print the right answers with the gate relaxed and prove nothing,
+    /// because a callee that never compiled is never promoted either. This
+    /// counter is what separates "the relaxed path is correct" from "the
+    /// relaxed path never ran" — the failure mode this page has recorded
+    /// twice (`fast-field: get hit=0`, `door: special hit=0`).
+    pub const HANDLER_CALLEE_DIRECT: usize = 52;
+    /// The same promotion for a callee with no handlers — the control, so the
+    /// counter above can be read as a share rather than a bare count.
+    pub const PLAIN_CALLEE_DIRECT: usize = 53;
+
+    const N: usize = 54;
 
     #[allow(clippy::declare_interior_mutable_const)]
     const ZERO: AtomicU64 = AtomicU64::new(0);
@@ -598,7 +629,7 @@ pub mod site_stats {
 
     fn report(when: &str) {
         eprintln!(
-            "[site-cache] {when} slots={} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={} | new: hit={} miss={} fill={} reject_loader={} | cast: hit={} miss={} fill={} reject_loader={} unusable={} | ldc: hit={} miss={} fill={} | jit-ldc: hit={} miss={} fill={} | iface-select: hit={} miss={} fill={} trivial={} | fast-field: get hit={} miss={} fill={} put hit={} miss={} fill={} unusable={} | door: static hit={} miss={} special hit={} miss={} | install: reuse={} emplace={} byvalue={} | arraylength: hit={} miss={} | aaload: hit={} miss_barrier={} miss_wrapper={} miss_shape={} miss_word={}",
+            "[site-cache] {when} slots={} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={} | new: hit={} miss={} fill={} reject_loader={} | cast: hit={} miss={} fill={} reject_loader={} unusable={} | ldc: hit={} miss={} fill={} | jit-ldc: hit={} miss={} fill={} | iface-select: hit={} miss={} fill={} trivial={} | fast-field: get hit={} miss={} fill={} put hit={} miss={} fill={} unusable={} | door: static hit={} miss={} special hit={} miss={} | install: reuse={} emplace={} byvalue={} | arraylength: hit={} miss={} | aaload: hit={} miss_barrier={} miss_wrapper={} miss_shape={} miss_word={} | cached-native: facts_static={} facts_virtual={} resolve={} leaf={} | virtual-promote: handler-bearing={} plain={}",
             super::field_site_slots(),
             COUNTS[FIELD_HIT].load(Ordering::Relaxed),
             COUNTS[FIELD_MISS].load(Ordering::Relaxed),
@@ -647,6 +678,12 @@ pub mod site_stats {
             COUNTS[REFARR_MISS_WRAPPER].load(Ordering::Relaxed),
             COUNTS[REFARR_MISS_SHAPE].load(Ordering::Relaxed),
             COUNTS[REFARR_MISS_WORD].load(Ordering::Relaxed),
+            COUNTS[NATFACTS_STATIC].load(Ordering::Relaxed),
+            COUNTS[NATFACTS_VIRTUAL].load(Ordering::Relaxed),
+            COUNTS[NATFACTS_RESOLVE].load(Ordering::Relaxed),
+            COUNTS[NATFACTS_LEAF].load(Ordering::Relaxed),
+            COUNTS[HANDLER_CALLEE_DIRECT].load(Ordering::Relaxed),
+            COUNTS[PLAIN_CALLEE_DIRECT].load(Ordering::Relaxed),
         );
     }
 

@@ -389,5 +389,5 @@ load when unarmed.
   measurement that refused to narrow the `java/util/` prefix. It priced
   admitting the PROMOTION; #1 above separates nomination from it and prices the
   other half.
-- [`../../known-issues/perf/interpreted-invoke-cost-350ns-20260825.md`](../../known-issues/perf/interpreted-invoke-cost-350ns-20260825.md)
+- [`docs/internal/performance/interpreted-invoke-cost-350ns-RETIRED-20260911.md`](docs/internal/performance/interpreted-invoke-cost-350ns-RETIRED-20260911.md)
 - [`../../known-issues/perf/bigdecimal-arithmetic-is-50-60x-slower-than-hotspot-20260817.md`](../../known-issues/perf/bigdecimal-arithmetic-is-50-60x-slower-than-hotspot-20260817.md)

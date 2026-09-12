@@ -153,4 +153,4 @@ six reps minimum, and quote the ranges.
   (internal).
 - `aqs-thread-handoff-latency-RETIRED-20260805.md` (internal) — item 3,
   the measurement item 2 re-opens.
-- [`interpreted-invoke-cost-350ns-20260825.md`](interpreted-invoke-cost-350ns-20260825.md)
+- [`interpreted-invoke-cost-350ns-RETIRED-20260911.md`](interpreted-invoke-cost-350ns-RETIRED-20260911.md)

@@ -2180,7 +2180,7 @@ pub(super) fn execute_invokevirtual_cached(
                     // `OrderedPlRwLock<ClassManager>::try_read` at 1.67% and
                     // `::read` at 1.38% of the interpreted-invoke arm, both
                     // attributed straight to this function. See
-                    // known-issues/perf/interpreted-invoke-cost-350ns-20260825.md.
+                    // docs/internal/performance/interpreted-invoke-cost-350ns-RETIRED-20260911.md.
                     //
                     // Called in place in the `&&` chain they inherit its
                     // short-circuit, which is what the ordering of that chain
@@ -2241,7 +2241,9 @@ pub(super) fn execute_invokevirtual_cached(
                             "registered_native"
                         } else if receiver_is_java_util() {
                             "receiver_is_java_util"
-                        } else if !cached.exception_table.is_empty() {
+                        } else if !crate::runtime::env_cache::jit_virtual_promote_handler_callee()
+                            && !cached.exception_table.is_empty()
+                        {
                             "callee_exception_table"
                         } else if !crate::runtime::env_cache::jit_virtual_tierup() {
                             "virtual_tierup_off"
@@ -2320,7 +2322,9 @@ pub(super) fn execute_invokevirtual_cached(
                             // `receiver_is_java_util` is evaluated only when it
                             // can still change the answer, so the promotion arm
                             // does not pay its class-manager `try_read` either.
-                            promotion_barred = !cached.exception_table.is_empty()
+                            promotion_barred = (!crate::runtime::env_cache::
+                                jit_virtual_promote_handler_callee()
+                                && !cached.exception_table.is_empty())
                                 || (!crate::runtime::env_cache::jit_virtual_promote_java_util()
                                     && receiver_is_java_util());
                             crate::runtime::env_cache::jit_virtual_nominate_always()
@@ -2403,6 +2407,14 @@ pub(super) fn execute_invokevirtual_cached(
                             None
                         });
                         if let Some(compiled) = compiled_opt {
+                            // Engagement, not a clock: which population this
+                            // direct compiled call belongs to. See
+                            // `site_stats::HANDLER_CALLEE_DIRECT`.
+                            site_stats::bump(if cached.exception_table.is_empty() {
+                                site_stats::PLAIN_CALLEE_DIRECT
+                            } else {
+                                site_stats::HANDLER_CALLEE_DIRECT
+                            });
                             let ret = cached.return_tag();
                             let heap = compiled.needs_heap();
                             // total_args = receiver + declared params; the decoded
@@ -2482,6 +2494,7 @@ pub(super) fn execute_invokevirtual_cached(
             native_id,
             native_kind,
             num_params,
+            facts,
             gate: _,
         } => {
             let num_params_usize = num_params as usize; // Widening: parameter count conversion
@@ -2609,6 +2622,38 @@ pub(super) fn execute_invokevirtual_cached(
                         return Ok(CachedCallResult::CacheMiss);
                     }
 
+                    // THE LEAF QUESTION WAS NEVER ASKED HERE. Both `Native`
+                    // arms have gone through `invoke_cached_native_callback_
+                    // leaf_aware` since the leaf funnel landed; this one --
+                    // the arm that serves every `invokevirtual` and
+                    // `invokeinterface` on a registered native, which is the
+                    // largest single population the fast doors decline -- still
+                    // paid the full funnel for a body that cannot block. The
+                    // id is the one the cache already resolved, so the question
+                    // is one bounds-checked index.
+                    if native_site_facts_usable(&facts, num_params_usize, true) {
+                        site_stats::bump(site_stats::NATFACTS_VIRTUAL);
+                        let mut buf = [Value::Uninitialized; MAX_CACHED_NATIVE_ARGS];
+                        let n = pop_coerced_invoke_args_virtual_facts(
+                            shared, frame_idx, thread, &facts, num_params_usize, &mut buf,
+                        )?;
+                        invoke_cached_native_callback_leaf_aware(
+                            shared,
+                            thread,
+                            frame_idx,
+                            callback,
+                            native_id,
+                            &buf[..n],
+                            RetTag::Known(facts.ret_tag),
+                        )?;
+                        return Ok(CachedCallResult::Handled);
+                    }
+                    // The kill switch has to restore the OLD path whole, and
+                    // the old path here was not leaf-aware -- so this arm asks
+                    // the full funnel exactly as it always did. A control that
+                    // keeps half the change is not a control; see this page's
+                    // own note on the first `iface-select` A/B.
+                    site_stats::bump(site_stats::NATFACTS_RESOLVE);
                     let (args, method_descriptor) = pop_coerced_invoke_args_virtual(
                         shared,
                         caller_class_id,
@@ -3029,6 +3074,7 @@ pub(super) fn execute_invokevirtual_cached(
             native_id,
             native_kind,
             num_params,
+            facts,
             gate: _,
         } => {
             // NULL-RECEIVER-CACHED-20260801: same guard as the `Bytecode` arm
@@ -3054,6 +3100,28 @@ pub(super) fn execute_invokevirtual_cached(
                     .evict(caller_class_id, cp_index, is_special);
                 return Ok(CachedCallResult::CacheMiss);
             };
+            // See the matching arm in `execute_invokestatic_cached`: the
+            // call site's descriptor is a constant of this entry, so ask
+            // `facts` rather than re-resolving the constant pool per call.
+            let num_params = num_params as usize;
+            if native_site_facts_usable(&facts, num_params, true) {
+                site_stats::bump(site_stats::NATFACTS_VIRTUAL);
+                let mut buf = [Value::Uninitialized; MAX_CACHED_NATIVE_ARGS];
+                let n = pop_coerced_invoke_args_virtual_facts(
+                    shared, frame_idx, thread, &facts, num_params, &mut buf,
+                )?;
+                invoke_cached_native_callback_leaf_aware(
+                    shared,
+                    thread,
+                    frame_idx,
+                    callback,
+                    native_id,
+                    &buf[..n],
+                    RetTag::Known(facts.ret_tag),
+                )?;
+                return Ok(CachedCallResult::Handled);
+            }
+            site_stats::bump(site_stats::NATFACTS_RESOLVE);
             let (args, method_descriptor) = pop_coerced_invoke_args_virtual(
                 shared,
                 caller_class_id,
@@ -3068,7 +3136,7 @@ pub(super) fn execute_invokevirtual_cached(
                 callback,
                 native_id,
                 &args,
-                &method_descriptor,
+                RetTag::Scan(&method_descriptor),
             )?;
             Ok(CachedCallResult::Handled)
         }
@@ -3455,6 +3523,7 @@ pub(super) fn populate_virtual_invoke_cache(
                 native_kind,
                 // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
                 num_params: num_params as u16,
+                facts: cratonvm_jit_api::DescriptorFacts::of(&descriptor),
                 gate,
             };
             // T10.4 — promote so sibling threads skip the class_manager walk.
@@ -3570,6 +3639,7 @@ pub(super) fn populate_virtual_invoke_cache(
                                 native_kind,
                                 // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
                                 num_params: num_params as u16,
+                                facts: cratonvm_jit_api::DescriptorFacts::of(&descriptor),
                                 gate,
                             };
                             shared
@@ -3610,6 +3680,7 @@ pub(super) fn populate_virtual_invoke_cache(
                             native_kind,
                             // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
                             num_params: num_params as u16,
+                            facts: cratonvm_jit_api::DescriptorFacts::of(&descriptor),
                             gate,
                         };
                         shared
@@ -3661,6 +3732,7 @@ pub(super) fn populate_virtual_invoke_cache(
                 native_id,
                 native_kind,
                 num_params: num_params as u16, // Widening: parameter count conversion
+                facts: cratonvm_jit_api::DescriptorFacts::of(&descriptor),
                 gate,
             };
             // T10.4 — promote so sibling threads skip this walk.
@@ -3756,6 +3828,7 @@ pub(super) fn populate_virtual_invoke_cache(
                     native_kind,
                     // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
                     num_params: num_params as u16,
+                    facts: cratonvm_jit_api::DescriptorFacts::of(&descriptor),
                     gate,
                 };
                 shared
@@ -3804,6 +3877,7 @@ pub(super) fn populate_virtual_invoke_cache(
                     native_id,
                     native_kind,
                     num_params: num_params as u16,
+                    facts: cratonvm_jit_api::DescriptorFacts::of(&descriptor),
                     gate,
                 };
                 shared
@@ -3848,6 +3922,7 @@ pub(super) fn populate_virtual_invoke_cache(
                     native_id,
                     native_kind,
                     num_params: num_params as u16,
+                    facts: cratonvm_jit_api::DescriptorFacts::of(&descriptor),
                     gate,
                 };
                 shared
@@ -3896,6 +3971,7 @@ pub(super) fn populate_virtual_invoke_cache(
             native_kind,
             // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
             num_params: num_params as u16,
+            facts: cratonvm_jit_api::DescriptorFacts::of(&descriptor),
             gate,
         };
         shared
@@ -4189,11 +4265,13 @@ pub(super) fn execute_invokevirtual_fast_door(
     use std::sync::atomic::Ordering;
     if crate::classloading::any_class_redefined() {
         crate::runtime::interpreter::invoke_fast::note_virtual_decline("a class was redefined");
-            return None;
+        return None;
     }
     if crate::runtime::env_cache::loader_aware_resolution() && adapt_isin_seen() {
-        crate::runtime::interpreter::invoke_fast::note_virtual_decline("loader-aware resolution and adapt-isin seen");
-            return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline(
+            "loader-aware resolution and adapt-isin seen",
+        );
+        return None;
     }
     let caller_class_id = thread.frames[frame_idx].class_id;
     let (receiver_class_id, cached, gate_generation) =
@@ -4203,7 +4281,12 @@ pub(super) fn execute_invokevirtual_fast_door(
                 cached,
                 gate,
             }) => (*receiver_class_id, Arc::clone(cached), gate.generation),
-            _ => return None,
+            _ => {
+                crate::runtime::interpreter::invoke_fast::note_virtual_decline(
+                    "cached target is not VirtualBytecode",
+                );
+                return None;
+            }
         };
     // A synchronized callee is decided at the push, by `door_monitor_acquire`:
     // this door serves it whenever the monitor is free. See `door_sync_enabled`.
@@ -4223,12 +4306,16 @@ pub(super) fn execute_invokevirtual_fast_door(
     let total_args = num_params + 1;
     let stack = &thread.frames[frame_idx].stack;
     if stack.len() < total_args {
-        crate::runtime::interpreter::invoke_fast::note_virtual_decline("cached target is not VirtualBytecode");
-            return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline(
+            "operand stack shallower than the argument count",
+        );
+        return None;
     }
     let Some(recv_ptr) = stack.peek_compact_at(num_params).as_object_ptr() else {
-        crate::runtime::interpreter::invoke_fast::note_virtual_decline("operand stack shallower than the argument count");
-            return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline(
+            "receiver slot is not an object pointer",
+        );
+        return None;
     };
     if shared
         .mem
@@ -4236,25 +4323,31 @@ pub(super) fn execute_invokevirtual_fast_door(
         .is_object_address(recv_ptr as usize)
         .is_none()
     {
-        crate::runtime::interpreter::invoke_fast::note_virtual_decline("receiver slot is not an object pointer");
-            return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline(
+            "receiver is not a heap object address",
+        );
+        return None;
     }
     // SAFETY: `recv_ptr` is a registered object start on this heap.
     let header = unsafe { &*(recv_ptr as *const cratonvm_gc::ObjectHeader) };
     if header.kind() == cratonvm_types::ObjectKind::Array {
-        crate::runtime::interpreter::invoke_fast::note_virtual_decline("receiver is not a heap object address");
-            return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline("receiver is an array");
+        return None;
     }
     let actual_class_id = header.class_id;
     if actual_class_id != receiver_class_id {
-        crate::runtime::interpreter::invoke_fast::note_virtual_decline("receiver is an array");
-            return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline(
+            "receiver class differs from the cached one (site went polymorphic)",
+        );
+        return None;
     }
     if shared.classes.is_lambda_proxy_class(actual_class_id)
         || shared.classes.is_annotation_proxy_class(actual_class_id)
     {
-        crate::runtime::interpreter::invoke_fast::note_virtual_decline("receiver class differs from the cached one (site went polymorphic)");
-            return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline(
+            "receiver is a lambda or annotation proxy",
+        );
+        return None;
     }
     // RECORD THE RECEIVER, exactly as `execute_invokevirtual_cached` does at
     // its own Step 5.
@@ -4292,7 +4385,9 @@ pub(super) fn execute_invokevirtual_fast_door(
                     recv == actual_class_id && decl == cached.declaring_class_id
                 });
         if !memo_hit {
-            crate::runtime::interpreter::invoke_fast::note_virtual_decline("receiver is a lambda or annotation proxy");
+            crate::runtime::interpreter::invoke_fast::note_virtual_decline(
+                "interface receiver-selection memo miss",
+            );
             return None;
         }
         site_stats::bump(site_stats::IFACE_SELECT_HIT);
@@ -4308,30 +4403,34 @@ pub(super) fn execute_invokevirtual_fast_door(
         )
     });
     if shape != 0 {
-        crate::runtime::interpreter::invoke_fast::note_virtual_decline("interface receiver-selection memo miss");
-            return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline("callee is intercepted");
+        return None;
     }
     // `force_native_cache` is filled by the general path; until it has
     // answered `false` once, or if it answered `true`, this is not our call.
     if cached.force_native_cache.get() != Some(&false) {
-        crate::runtime::interpreter::invoke_fast::note_virtual_decline("callee is intercepted");
-            return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline(
+            "force-native cache has not answered false",
+        );
+        return None;
     }
     if thread.frames.len() >= shared.config.max_stack_depth {
-        crate::runtime::interpreter::invoke_fast::note_virtual_decline("force-native cache has not answered false");
-            return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline("frame stack is full");
+        return None;
     }
     if cratonvm_jit_api::descriptor_facts_disabled() {
-        crate::runtime::interpreter::invoke_fast::note_virtual_decline("frame stack is full");
-            return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline("descriptor facts are disabled");
+        return None;
     }
     let facts = cached.descriptor_facts();
     if facts.param_tags_overflow
         || num_params > cratonvm_jit_api::DescriptorFacts::INLINE_PARAMS
         || facts.param_tag_len as usize != num_params
     {
-        crate::runtime::interpreter::invoke_fast::note_virtual_decline("descriptor facts are disabled");
-            return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline(
+            "descriptor has more parameters than the inline tag array",
+        );
+        return None;
     }
     dbg_invoke_stats_record(0);
 
@@ -4374,7 +4473,8 @@ pub(super) fn execute_invokevirtual_fast_door(
     let mut compiled_call: Option<cratonvm_jit::RetainedCode> = None;
     if gate_generation == 0
         && !crate::runtime::env_cache::disable_jit()
-        && cached.exception_table.is_empty()
+        && (cached.exception_table.is_empty()
+            || crate::runtime::env_cache::jit_virtual_promote_handler_callee())
         && crate::runtime::env_cache::jit_virtual_tierup()
     {
         let has_native = cached
@@ -4388,7 +4488,12 @@ pub(super) fn execute_invokevirtual_fast_door(
             .is_some();
         let java_util = match crate::classloading::class_is_java_util(receiver_class_id) {
             Some(b) => b,
-            None => return None,
+            None => {
+                crate::runtime::interpreter::invoke_fast::note_virtual_decline(
+                    "the java.util bitmap has no answer for the receiver class",
+                );
+                return None;
+            }
         };
         if !has_native && !java_util {
             let jit_generation = cratonvm_jit::jit_cache_generation();
@@ -4442,7 +4547,12 @@ pub(super) fn execute_invokevirtual_fast_door(
                                 Some(CachedInvokeTarget::VirtualBytecode { gate, .. }) => {
                                     gate.clone()
                                 }
-                                _ => return None,
+                                _ => {
+                                    crate::runtime::interpreter::invoke_fast::note_virtual_decline(
+                                        "an inline tier-up attempt is due",
+                                    );
+                                    return None;
+                                }
                             };
                             if let Some(CachedInvokeTarget::Jit { compiled, .. }) =
                                 try_jit_upgrade_with_gate(shared, &cached, gate)
@@ -4458,10 +4568,19 @@ pub(super) fn execute_invokevirtual_fast_door(
     }
 
     if let Some(compiled) = compiled_call {
+        // Same engagement split as the general dispatcher's promotion arm.
+        site_stats::bump(if cached.exception_table.is_empty() {
+            site_stats::PLAIN_CALLEE_DIRECT
+        } else {
+            site_stats::HANDLER_CALLEE_DIRECT
+        });
         // Compiled callee: the direct call wants `Value` arguments, so this
         // is the one shape that still decodes them.
         const MAX_INLINE_ARGS: usize = 16;
         if total_args > MAX_INLINE_ARGS {
+            crate::runtime::interpreter::invoke_fast::note_virtual_decline(
+                "compiled callee with more arguments than the inline buffer",
+            );
             return None;
         }
         let param_tags = ParamTags::for_method(&cached);
@@ -4524,6 +4643,7 @@ pub(super) fn execute_invokevirtual_fast_door(
                 _ => false,
             };
             if !ok {
+                invoke_fast::note_virtual_decline("an argument slot needs coercion");
                 return None;
             }
             slots[i] = (cv, tag);

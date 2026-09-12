@@ -16255,14 +16255,17 @@ unsafe fn try_jit_static_bytecode_callee(
         cached.max_locals as usize,
         (cached.max_stack as usize).max(16) + 8,
     );
-    let frame = crate::runtime::frame::Frame::new_pooled_cached(
+    // In-place install, not a by-value build: `execute_prebuilt_frame` pushes
+    // through `push_frame_and_fire_entry`, which harvests and trims the
+    // retired slot, so this helper used to undo frame-slot reuse for the
+    // interpreter frames beneath it once per call. See
+    // `install_and_run_cached_frame`.
+    Some(crate::runtime::interpreter::install_and_run_cached_frame(
+        vm,
+        thread,
         cached,
         values,
-        &mut thread.locals_pool,
-        &mut thread.stacks_pool,
-    );
-    Some(crate::runtime::interpreter::execute_prebuilt_frame(
-        vm, thread, frame,
+        Some("jit-static-bc"),
     ))
 }
 
@@ -16451,14 +16454,17 @@ unsafe fn try_jit_virtual_bytecode_callee(
         cached.max_locals as usize,
         (cached.max_stack as usize).max(16) + 8,
     );
-    let frame = crate::runtime::frame::Frame::new_pooled_cached(
+    // In-place install, not a by-value build: `execute_prebuilt_frame` pushes
+    // through `push_frame_and_fire_entry`, which harvests and trims the
+    // retired slot, so this helper used to undo frame-slot reuse for the
+    // interpreter frames beneath it once per call. See
+    // `install_and_run_cached_frame`.
+    Some(crate::runtime::interpreter::install_and_run_cached_frame(
+        vm,
+        thread,
         cached,
         values,
-        &mut thread.locals_pool,
-        &mut thread.stacks_pool,
-    );
-    Some(crate::runtime::interpreter::execute_prebuilt_frame(
-        vm, thread, frame,
+        Some("jit-virtual-bc"),
     ))
 }
 
@@ -16632,14 +16638,17 @@ unsafe fn try_jit_special_bytecode_callee(
         cached.max_locals as usize,
         (cached.max_stack as usize).max(16) + 8,
     );
-    let frame = crate::runtime::frame::Frame::new_pooled_cached(
+    // In-place install, not a by-value build: `execute_prebuilt_frame` pushes
+    // through `push_frame_and_fire_entry`, which harvests and trims the
+    // retired slot, so this helper used to undo frame-slot reuse for the
+    // interpreter frames beneath it once per call. See
+    // `install_and_run_cached_frame`.
+    Some(crate::runtime::interpreter::install_and_run_cached_frame(
+        vm,
+        thread,
         cached,
         values,
-        &mut thread.locals_pool,
-        &mut thread.stacks_pool,
-    );
-    Some(crate::runtime::interpreter::execute_prebuilt_frame(
-        vm, thread, frame,
+        Some("jit-special-bc"),
     ))
 }
 

@@ -15,6 +15,7 @@
 //! the arguments are popped and coerced once, then either handed to the
 //! Rust intrinsic or pushed into a real frame.
 
+use super::site_cache::site_stats;
 use super::*;
 
 pub(super) fn execute_invokestatic(
@@ -1120,6 +1121,7 @@ pub(super) fn populate_invoke_cache(
             native_id,
             native_kind,
             num_params: num_params as u16, // Widening: parameter count conversion
+            facts: cratonvm_jit_api::DescriptorFacts::of(&descriptor),
             gate,
         };
         shared
@@ -1224,6 +1226,7 @@ pub(super) fn populate_invoke_cache(
                     native_kind,
                     // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
                     num_params: num_params as u16,
+                    facts: cratonvm_jit_api::DescriptorFacts::of(&descriptor),
                     gate,
                 };
                 shared
@@ -1253,6 +1256,7 @@ pub(super) fn populate_invoke_cache(
                 native_id,
                 native_kind,
                 num_params: num_params as u16, // Widening: parameter count conversion
+                facts: cratonvm_jit_api::DescriptorFacts::of(&descriptor),
                 gate,
             };
             shared
@@ -1412,6 +1416,7 @@ pub(super) fn execute_invokestatic_cached(
             native_id,
             native_kind,
             num_params,
+            facts,
             gate: _,
         } => {
             let Some(callback) = revalidate_cached_native(shared, native_id, callback, native_kind)
@@ -1419,6 +1424,33 @@ pub(super) fn execute_invokestatic_cached(
                 thread.invoke_cache.evict(caller_class_id, cp_index, false);
                 return Ok(CachedCallResult::CacheMiss);
             };
+            // The call site's descriptor is a constant of this entry, and
+            // `facts` IS it -- tokenised at fill time from the same
+            // `resolve_method_metadata` result the hit path used to re-fetch.
+            // Recovering it per call cost a resolution-cache `RwLock` read, a
+            // hash probe, three `Arc<str>` clone/drop pairs and two scans of
+            // the string, plus two heap `Vec`s for the arguments. A registered
+            // native is 69% of everything the fast doors decline, and the
+            // commonest one is a leaf whose whole body is a field read.
+            let num_params = num_params as usize;
+            if native_site_facts_usable(&facts, num_params, false) {
+                site_stats::bump(site_stats::NATFACTS_STATIC);
+                let mut buf = [Value::Uninitialized; MAX_CACHED_NATIVE_ARGS];
+                let n = pop_coerced_invoke_args_static_facts(
+                    shared, frame_idx, thread, &facts, num_params, &mut buf,
+                )?;
+                invoke_cached_native_callback_leaf_aware(
+                    shared,
+                    thread,
+                    frame_idx,
+                    callback,
+                    native_id,
+                    &buf[..n],
+                    RetTag::Known(facts.ret_tag),
+                )?;
+                return Ok(CachedCallResult::Handled);
+            }
+            site_stats::bump(site_stats::NATFACTS_RESOLVE);
             let (args, method_descriptor) = pop_coerced_invoke_args_static(
                 shared,
                 caller_class_id,
@@ -1433,7 +1465,7 @@ pub(super) fn execute_invokestatic_cached(
                 callback,
                 native_id,
                 &args,
-                &method_descriptor,
+                RetTag::Scan(&method_descriptor),
             )?;
             Ok(CachedCallResult::Handled)
         }
