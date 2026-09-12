@@ -12100,7 +12100,11 @@ mod tests {
         // The lane's three named blockers, each with a measurement behind it.
         // `StringBuilder` is the JIT intrinsic door (2026-08-28, N2);
         // `System.getProperty` is the property-store inversion; `System$1` is
-        // the hidden-class `defineClass0` failure found on 2026-09-10.
+        // ~~the hidden-class `defineClass0` failure found on 2026-09-10~~ FIXED
+        // 2026-09-12 (a hidden class could not refer to itself; the ENFORCE arm
+        // over the whole --jdk-only corpus is 136/0 now, was 39/1). It stays out
+        // of the table anyway: a clean dial arm is not a retirement score, and
+        // the dial cannot promote. These 28 rows need the two-binary score.
         for (c, m, d) in [
             ("java/lang/StringBuilder", "append", "(I)Ljava/lang/StringBuilder;"),
             ("java/lang/AbstractStringBuilder", "charAt", "(I)C"),
