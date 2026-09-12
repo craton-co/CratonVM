@@ -2246,6 +2246,20 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "virtual-promote-java-util", on_key: Some("CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "native-cf-postcomplete-skip", on_key: Some("CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "native-cf-postcomplete-direct", on_key: Some("CRATONVM_NATIVE_CF_POSTCOMPLETE_DIRECT"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // --- composition residuals, part two: 2026-09-11 -------------------------
+    // `composition-native-callback-and-the-promotion-question-20260902.md`.
+    // Item 1's mechanism and its engagement census; item 2's second census,
+    // the one that names why a NOMINATED site still refuses to promote.
+    E { group: Group::JIT, token: "native-callback-memo", on_key: Some("CRATONVM_NATIVE_CALLBACK_MEMO"), off_key: None, off_word: Some("0"), since: "2026-09-11" },
+    E { group: Group::DBG, token: "callback-memo", on_key: Some("CRATONVM_DBG_CALLBACK_MEMO"), off_key: None, off_word: None, since: "2026-09-11" },
+    E { group: Group::DBG, token: "promote-refuse", on_key: Some("CRATONVM_DBG_PROMOTE_REFUSE"), off_key: None, off_word: None, since: "2026-09-11" },
+    // The JIT per-call-site native cache used to refuse every
+    // capability-classified triple outright, which since 836631dcc (leaf-only
+    // -> every registered native) has meant refusing `jdk/internal/misc/Unsafe`
+    // -- 99 428 of the 100 805 general-resolver calls on the composition probe.
+    // The gate now runs on the dispatch side instead, where the funnel runs it;
+    // `=0` restores the refusal.
+    E { group: Group::JIT, token: "site-cache-capability", on_key: Some("CRATONVM_JIT_SITE_CACHE_CAPABILITY"), off_key: None, off_word: Some("0"), since: "2026-09-11" },
     // `CRATONVM_JIT_IR_COLD_ARG_STAGE` was declared here too, as a courtesy,
     // and dev declared it concurrently -- both rows merged with no conflict,
     // which is the append-anywhere hazard. Dev's row is kept; this note is the

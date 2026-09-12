@@ -12259,7 +12259,26 @@ pub(super) fn execute_jit_call_decoded(
     let max_java_params = JIT_ABI_MAX_JAVA_ARGS - if needs_heap { 1 } else { 0 };
     // Too many args for the register-only JIT ABI, or a mismatch between the
     // decoded args and the declared count → interpreter fallback (Ok(None)).
+    //
+    // This is the LAST place a site that passed every tier-up condition and
+    // found a compiled body can still be interpreted, and until the second
+    // census (`CRATONVM_DBG_PROMOTE_REFUSE`) nothing named it: the site falls
+    // through to the interpreted frame push with the operand stack untouched,
+    // indistinguishable from never having been admitted at all. See
+    // `interp_census::promote_refuse_enabled`.
     if np > max_java_params || args_slice.len() != np {
+        if crate::runtime::interp_census::promote_refuse_enabled() {
+            crate::runtime::interp_census::record_decoded_call_refusal(
+                if np > max_java_params {
+                    "decoded_call_abi_too_many_args"
+                } else {
+                    "decoded_call_arg_count_mismatch"
+                },
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            );
+        }
         return Ok(None);
     }
     // Decode each Java arg to its raw JIT-ABI bit pattern (Int → sign-extended
@@ -12597,6 +12616,14 @@ pub(super) fn execute_jit_call_decoded(
     // (the previous "same result" claim is false for any method with side
     // effects). With the flag clear we fall through and push the real value.
     if result == i64::MIN && deopt_signaled {
+        if crate::runtime::interp_census::promote_refuse_enabled() {
+            crate::runtime::interp_census::record_decoded_call_refusal(
+                "decoded_call_deopt",
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            );
+        }
         return Ok(None);
     }
 
