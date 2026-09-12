@@ -500,7 +500,7 @@ impl Compiler {
                 .entry(handler_pc)
                 .or_insert_with(|| vec![true]);
         }
-        let reachable = compute_reachable_pcs_with_roots(code, code_len, &local_handler_pcs);
+        let reachable = bytecode_analysis::reachable_pcs(code, code_len, &local_handler_pcs);
         // Which pcs became live ONLY because of a handler root.
         //
         // Those must not be published as OSR entry points. An OSR entry is
@@ -517,7 +517,7 @@ impl Compiler {
         let handler_only_pcs: Vec<bool> = if local_handler_pcs.is_empty() {
             Vec::new()
         } else {
-            let normal = compute_reachable_pcs(code, code_len);
+            let normal = bytecode_analysis::reachable_pcs(code, code_len, &[]);
             match (&reachable, &normal) {
                 (Some(all), Some(norm)) => all
                     .iter()

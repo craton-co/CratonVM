@@ -115,30 +115,12 @@ pub struct InvariantLoad {
 pub fn detect_loops(code: &[u8], code_len: usize) -> Vec<LoopInfo> {
     use std::collections::BTreeMap;
     let mut by_header: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    let mut pc = 0;
-    while pc < code_len {
-        let op = code[pc];
-        let len = bytecode_analysis::step(code, pc);
-        match op {
-            // goto / conditional branches: signed i16 offset at pc+1..=pc+2.
-            0xa7 | 0x99..=0xa6 | 0xc6 | 0xc7 => {
-                if pc + 2 < code_len {
-                    // JVM branch offsets are big-endian signed i16.
-                    // Use `from_be_bytes` to avoid the debug overflow
-                    // panic that `(byte_hi as i16) << 8` triggers when
-                    // the high bit is set.
-                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
-                    let target_opt = pc.checked_add_signed(offset as isize);
-                    if let Some(target) = target_opt {
-                        if target < code_len && target <= pc {
-                            by_header.entry(target).or_default().push(pc);
-                        }
-                    }
-                }
-            }
-            _ => {}
+    // Only the 16-bit `goto` / `if*` / `ifnull` back edges: `body_end` below
+    // assumes a three-byte branch.
+    for (target, src) in bytecode_analysis::back_edges(code, code_len) {
+        if matches!(code[src], 0xa7 | 0x99..=0xa6 | 0xc6 | 0xc7) {
+            by_header.entry(target).or_default().push(src);
         }
-        pc += len;
     }
     by_header
         .into_iter()
@@ -669,10 +651,10 @@ fn branch_targets(code: &[u8], code_len: usize) -> Option<Vec<usize>> {
         match code[pc] {
             0xaa | 0xab | 0xa8 | 0xa9 | 0xc8 | 0xc9 => return None,
             op if matches!(op, 0x99..=0xa7 | 0xc6 | 0xc7) && pc + 2 < code_len => {
-                let off = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
-                let target = pc as i32 + off;
-                if target >= 0 && (target as usize) < code_len {
-                    targets.push(target as usize);
+                if let Some(target) = bytecode_analysis::offset_branch_target(&code[..code_len], pc)
+                    .filter(|&t| t < code_len)
+                {
+                    targets.push(target);
                 }
             }
             _ => {}
@@ -792,65 +774,21 @@ fn loop_has_other_exit(
     exit_pc: usize,
     back_edge_pc: usize,
 ) -> bool {
-    let outside = |pc: usize, rel: i64| {
-        let target = pc as i64 + rel;
-        target < header_pc as i64 || target >= end as i64
-    };
-    let read_i32 = |at: usize| -> Option<i64> {
-        let b = code.get(at..at + 4)?;
-        Some(i64::from(i32::from_be_bytes([b[0], b[1], b[2], b[3]])))
-    };
+    let inside = |t: usize| t >= header_pc && t < end;
     let mut pc = header_pc;
     while pc < end {
         let op = code[pc];
         if pc != exit_pc && pc != back_edge_pc {
             match op {
-                0x99..=0xa7 | 0xc6 | 0xc7 => {
-                    let Some(b) = code.get(pc + 1..pc + 3) else {
-                        return true;
-                    };
-                    if outside(pc, i64::from(i16::from_be_bytes([b[0], b[1]]))) {
+                0x99..=0xa7 | 0xc6 | 0xc7 | 0xc8 => {
+                    if !bytecode_analysis::offset_branch_target(code, pc).is_some_and(inside) {
                         return true;
                     }
                 }
-                0xc8 => match read_i32(pc + 1) {
-                    Some(rel) if !outside(pc, rel) => {}
+                0xaa | 0xab => match bytecode_analysis::switch_table(code, code.len(), pc) {
+                    Some(table) if table.targets().all(inside) => {}
                     _ => return true,
                 },
-                0xaa | 0xab => {
-                    let base = pc + 1 + (4 - (pc + 1) % 4) % 4;
-                    let Some(default) = read_i32(base) else {
-                        return true;
-                    };
-                    if outside(pc, default) {
-                        return true;
-                    }
-                    let offsets: Vec<usize> = if op == 0xaa {
-                        let (Some(lo), Some(hi)) = (read_i32(base + 4), read_i32(base + 8)) else {
-                            return true;
-                        };
-                        if hi < lo || (hi - lo) as usize >= code.len() {
-                            return true;
-                        }
-                        (0..(hi - lo + 1) as usize)
-                            .map(|i| base + 12 + 4 * i)
-                            .collect()
-                    } else {
-                        let Some(n) = read_i32(base + 4) else {
-                            return true;
-                        };
-                        if n < 0 || n as usize > code.len() {
-                            return true;
-                        }
-                        (0..n as usize).map(|i| base + 12 + 8 * i).collect()
-                    };
-                    for at in offsets {
-                        match read_i32(at) {
-                            Some(rel) if !outside(pc, rel) => {}
-                            _ => return true,
-                        }
-                    }
-                }
                 0xa8 | 0xa9 | 0xc9 | 0xac..=0xb1 | 0xbf => return true,
                 _ => {}
             }

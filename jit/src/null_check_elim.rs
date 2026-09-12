@@ -206,27 +206,6 @@ fn produces_nonnull(op: u8) -> bool {
     )
 }
 
-/// 16-bit signed branch offset starting at `code[pc+1..pc+3]`.
-fn rel16(code: &[u8], pc: usize) -> Option<i32> {
-    if pc + 2 >= code.len() {
-        return None;
-    }
-    Some(i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32)
-}
-
-/// 32-bit signed branch offset starting at `code[pc+1..pc+5]`.
-fn rel32(code: &[u8], pc: usize) -> Option<i32> {
-    if pc + 4 >= code.len() {
-        return None;
-    }
-    Some(i32::from_be_bytes([
-        code[pc + 1],
-        code[pc + 2],
-        code[pc + 3],
-        code[pc + 4],
-    ]))
-}
-
 /// Compute the (fall-through PC, optional branch target PC) successor
 /// pair for the instruction at `pc`. Returns `(None, None)` when the
 /// instruction does not return (areturn/ireturn/return/athrow) — i.e.
@@ -239,98 +218,22 @@ fn successors(code: &[u8], pc: usize) -> (Option<usize>, Option<usize>) {
         return (None, None);
     }
     let op = code[pc];
-    let len = bytecode_analysis::step(code, pc);
-    let ft = pc + len;
+    let ft = pc + bytecode_analysis::step(code, pc);
+    let tgt = bytecode_analysis::offset_branch_target(code, pc);
     match op {
-        // return forms — no successor
-        0xAC..=0xB1 => (None, None),
-        // athrow — no in-method successor (handler edges intentionally skipped)
-        0xBF => (None, None),
-        // goto
-        0xA7 => {
-            let off = rel16(code, pc).unwrap_or(0);
-            let tgt = pc.checked_add_signed(off as isize);
-            (None, tgt)
-        }
-        // goto_w
-        0xC8 => {
-            let off = rel32(code, pc).unwrap_or(0);
-            let tgt = pc.checked_add_signed(off as isize);
-            (None, tgt)
-        }
+        // return forms and athrow — no in-method successor
+        0xAC..=0xB1 | 0xBF => (None, None),
+        // goto / goto_w
+        0xA7 | 0xC8 => (None, tgt),
         // jsr / jsr_w / ret — pre-JDK-7, treat as fall-through only.
         0xA8 | 0xC9 | 0xA9 => (Some(ft), None),
-        // tableswitch / lookupswitch — conservatively give up on the
-        // jump targets (consumers see IN=0 at the targets, which is
-        // sound — just less precise). Fall-through after the switch
-        // doesn't exist in JVMS terms; we record no successors.
+        // tableswitch / lookupswitch — the targets come from
+        // `bytecode_analysis::switch_targets_lenient` at the call sites.
         0xAA | 0xAB => (None, None),
-        // conditional branches with 16-bit offset (ifeq..if_acmpne,
-        // ifnull/ifnonnull, ifnull_w doesn't exist)
-        0x99..=0xA6 | 0xC6 | 0xC7 => {
-            let off = rel16(code, pc).unwrap_or(0);
-            let tgt = pc.checked_add_signed(off as isize);
-            (Some(ft), tgt)
-        }
+        // conditional branches with 16-bit offset
+        0x99..=0xA6 | 0xC6 | 0xC7 => (Some(ft), tgt),
         _ => (Some(ft), None),
     }
-}
-
-/// Every jump target of a `tableswitch`/`lookupswitch` at `pc`, the default
-/// included. Empty for any other opcode. A table that does not fit inside
-/// `len` yields the targets decoded before the overrun; verified bytecode never
-/// has one.
-fn switch_targets(code: &[u8], pc: usize, len: usize) -> Vec<usize> {
-    let mut out = Vec::new();
-    if pc >= len || pc >= code.len() || !matches!(code[pc], 0xAA | 0xAB) {
-        return out;
-    }
-    let end = len.min(code.len());
-    let read = |at: usize| -> Option<i32> {
-        (at + 4 <= end)
-            .then(|| i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]))
-    };
-    let mut push = |off: i32| {
-        if let Some(t) = pc.checked_add_signed(off as isize).filter(|&t| t < len) {
-            out.push(t);
-        }
-    };
-    let base = pc + 1 + (4 - ((pc + 1) % 4)) % 4;
-    let Some(default) = read(base) else {
-        return out;
-    };
-    push(default);
-    if code[pc] == 0xAA {
-        let (Some(low), Some(high)) = (read(base + 4), read(base + 8)) else {
-            return out;
-        };
-        let count = i64::from(high) - i64::from(low) + 1;
-        if !(0..=65_536).contains(&count) {
-            return out;
-        }
-        for k in 0..count as usize {
-            // Cast: count checked non-negative and bounded above
-            match read(base + 12 + 4 * k) {
-                Some(off) => push(off),
-                None => break,
-            }
-        }
-    } else {
-        let Some(npairs) = read(base + 4) else {
-            return out;
-        };
-        if !(0..=65_536).contains(&npairs) {
-            return out;
-        }
-        for k in 0..npairs as usize {
-            // Cast: npairs checked non-negative and bounded above
-            match read(base + 12 + 8 * k) {
-                Some(off) => push(off),
-                None => break,
-            }
-        }
-    }
-    out
 }
 
 /// Meet `out` into `IN[s]`, queueing `s` when that assigned or narrowed it.
@@ -686,14 +589,13 @@ pub fn analyze_with_receiver(
         };
         let (ft, tk) = successors(code, p);
         mark(tk);
-        for t in switch_targets(code, p, len) {
+        for t in bytecode_analysis::switch_targets_lenient(code, len, p) {
             mark(Some(t));
         }
         match code[p] {
             // `successors` models `jsr`/`jsr_w` as falling through only;
             // their subroutine entry is still a jump target.
-            0xA8 => mark(rel16(code, p).and_then(|o| p.checked_add_signed(o as isize))),
-            0xC9 => mark(rel32(code, p).and_then(|o| p.checked_add_signed(o as isize))),
+            0xA8 | 0xC9 => mark(bytecode_analysis::offset_branch_target(code, p)),
             _ => {}
         }
         // The next instruction after one that never falls through (goto,
@@ -757,7 +659,7 @@ pub fn analyze_with_receiver(
                     &mut worklist,
                 );
             }
-            for s in switch_targets(code, pc, len) {
+            for s in bytecode_analysis::switch_targets_lenient(code, len, pc) {
                 meet_into(
                     s,
                     ft_out,

@@ -884,6 +884,32 @@ impl InsnCfg {
     }
 }
 
+/// LENIENT normal successors of the instruction at `pc`, for dataflow
+/// analyses where a superset of edges is the conservative direction:
+/// the branch target when it lies in `[0, code_len)`, every decodable switch
+/// target, and the fall-through when [`falls_through`]. `jsr`/`jsr_w` give
+/// their target and the fall-through; `ret` gives nothing.
+pub(crate) fn lenient_successors(code: &[u8], code_len: usize, pc: usize) -> Vec<usize> {
+    let code_len = code_len.min(code.len());
+    let mut out = Vec::new();
+    if pc >= code_len {
+        return out;
+    }
+    let op = code[pc];
+    if matches!(op, 0xaa | 0xab) {
+        out = switch_targets_lenient(code, code_len, pc);
+    } else if let Some(t) = offset_branch_target(&code[..code_len], pc).filter(|&t| t < code_len) {
+        out.push(t);
+    }
+    if falls_through(op) {
+        let next = pc + step(code, pc);
+        if next < code_len {
+            out.push(next);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

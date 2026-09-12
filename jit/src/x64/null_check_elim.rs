@@ -45,7 +45,7 @@ use super::*;
 /// getfield's *result*, this unsoundly skipped the method's entire
 /// lazy-initialization branch, permanently returning the (still-null)
 /// field. We now validate against a forward-walked instruction-start map
-/// (`instruction_start_map`, the same one `array_receiver_local` uses) and
+/// (`bytecode_analysis::instruction_starts`, the same one `array_receiver_local` uses) and
 /// only accept a decode whose candidate instruction is a genuine boundary
 /// — never a coincidental operand byte. On any misalignment we return
 /// `None`, so the caller conservatively keeps the runtime `TEST`+`Jcc`.
@@ -57,7 +57,7 @@ pub(super) fn preceding_aload_nonnull_local(code: &[u8], pc: usize) -> Option<us
     if pc > code_len {
         return None;
     }
-    let starts = instruction_start_map(code, code_len);
+    let starts = bytecode_analysis::instruction_starts(code, code_len);
     // aload_0..aload_3 — 1-byte opcode; only trust it if the map confirms
     // `pc - 1` is a real instruction start (aload_0..3 are always exactly
     // 1 byte long, so a genuine start there necessarily ends at `pc`).
@@ -165,7 +165,7 @@ pub(super) fn array_receiver(code: &[u8], pc: usize) -> Option<(usize, usize)> {
     // `jit_scan` bounds the method size, so the per-site recompute is cheap and
     // not worth a pointer-keyed cache (which would risk an ABA stale-map hit).
     // Correctness over micro-optimization: always build a fresh, exact map.
-    let starts = instruction_start_map(code, code_len);
+    let starts = bytecode_analysis::instruction_starts(code, code_len);
 
     // The array load/store at `pc` must itself be a real instruction start
     // (it always is when reached from the codegen walk, but assert via the map).
@@ -303,7 +303,7 @@ mod magic_div64_tests {
 mod array_receiver_local_tests {
     // `super::` is the enclosing `null_check_elim` module, where these
     // helpers now live.
-    use super::{array_receiver_local, instruction_start_map};
+    use super::{array_receiver_local, bytecode_analysis};
 
     // Opcodes used below:
     //   0x2A aload_0, 0x19 aload, 0x11 sipush, 0x10 bipush, 0x03 iconst_0,
@@ -350,7 +350,7 @@ mod array_receiver_local_tests {
     fn instruction_start_map_basic() {
         // aload_0; sipush 0x0102; aaload
         let code = [0x2Au8, 0x11, 0x01, 0x02, 0x32];
-        let starts = instruction_start_map(&code, code.len());
+        let starts = bytecode_analysis::instruction_starts(&code, code.len());
         assert_eq!(starts, vec![true, true, false, false, true]);
     }
 }

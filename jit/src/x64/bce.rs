@@ -355,7 +355,7 @@ pub(super) struct AmbiguousLocalKinds {
     ///   verifier, which merges the actual states of those pcs — so a slot
     ///   the verifier types precisely can read `Ambiguous` here, and treating
     ///   it as unreadable would drop a live value.
-    /// * **`jsr`/`ret`.** [`super::licm::oop_dataflow_successors`] gives `ret`
+    /// * **`jsr`/`ret`.** [`crate::bytecode_analysis::lenient_successors`] gives `ret`
     ///   no successors at all, which makes the graph NARROWER than the
     ///   verifier's and can settle a kind the verifier would merge further.
     ///
@@ -510,7 +510,7 @@ pub(super) fn refine_ambiguous_local_kinds(
                 }
             }
         }
-        for succ in oop_dataflow_successors(code, code_len, pc) {
+        for succ in bytecode_analysis::lenient_successors(code, code_len, pc) {
             if succ >= code_len {
                 continue;
             }
@@ -948,12 +948,10 @@ pub(super) fn collect_i16_branch_targets(code: &[u8], code_len: usize) -> Option
         match code[pc] {
             0xaa | 0xab | 0xa8 | 0xa9 | 0xc8 | 0xc9 => return None,
             op if matches!(op, 0x99..=0xa7 | 0xc6 | 0xc7) && pc + 2 < code_len => {
-                // Cast: value to i32 (branch displacement arithmetic)
-                let off = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
-                let target = pc as i32 + off; // Cast: value to i32
-                if target >= 0 && (target as usize) < code_len {
-                    // Cast: non-negative index to usize
-                    targets.insert(target as usize);
+                if let Some(target) = bytecode_analysis::offset_branch_target(&code[..code_len], pc)
+                    .filter(|&t| t < code_len)
+                {
+                    targets.insert(target);
                 }
             }
             _ => {}
@@ -1215,12 +1213,10 @@ pub(super) fn branch_edges(code: &[u8], code_len: usize) -> Option<Vec<(usize, u
         match code[pc] {
             0xaa | 0xab | 0xa8 | 0xa9 | 0xc8 | 0xc9 => return None,
             op if matches!(op, 0x99..=0xa7 | 0xc6 | 0xc7) && pc + 2 < code_len => {
-                // Cast: value to i32 (branch displacement arithmetic)
-                let off = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
-                let target = pc as i32 + off; // Cast: value to i32
-                if target >= 0 && (target as usize) < code_len {
-                    // Cast: non-negative index to usize
-                    edges.push((pc, target as usize));
+                if let Some(target) = bytecode_analysis::offset_branch_target(&code[..code_len], pc)
+                    .filter(|&t| t < code_len)
+                {
+                    edges.push((pc, target));
                 }
             }
             _ => {}

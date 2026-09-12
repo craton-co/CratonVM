@@ -62,7 +62,7 @@ pub(super) fn analyze_escapes(
     // EC-SCALAR-SOUNDNESS: branch-target PCs are hard barriers (merge
     // points where the linear abstract state is not guaranteed to match
     // the real verification-time state on every incoming edge).
-    let branch_targets = compute_branch_targets(code, code_len);
+    let branch_targets = bytecode_analysis::branch_target_map(code, code_len);
 
     // Helper: mark all tracked objects currently on the stack as escaped.
     macro_rules! escape_all {
@@ -524,7 +524,7 @@ pub(super) fn plan_scalar_replacement(
     // clearing all provenance at every merge point can never strip a *valid*
     // field-op mapping — it only prevents a stale `local_prov`/`abs_stack`
     // entry from binding a post-branch field op to the wrong scalar object.
-    let branch_targets = compute_branch_targets(code, code_len);
+    let branch_targets = bytecode_analysis::branch_target_map(code, code_len);
 
     let mut pc = 0usize;
     while pc < code_len {
@@ -1169,120 +1169,34 @@ pub(super) fn find_bypassable_loop_headers(
         return bypassable;
     }
 
-    // (src_pc, target_pc) for every explicit branch edge. Decoding mirrors
-    // `compute_branch_targets` (same opcode set, same switch padding rule) but
-    // keeps the source PC so an edge can be classified as internal/external.
+    // (src_pc, target_pc) for every explicit branch edge, from the shared
+    // decoder. Control flow this scan cannot follow is OPAQUE, which marks
+    // every loop bypassable: `ret`, `jsr`/`jsr_w` (their edge is still
+    // recorded), and any switch `bytecode_analysis::switch_table` refuses.
     let mut edges: Vec<(usize, usize)> = Vec::new();
     let mut opaque = false;
     let mut pc = 0usize;
     while pc < code_len {
         let op = code[pc];
-        let mut push_edge = |src: usize, t: isize, edges: &mut Vec<(usize, usize)>| {
-            // Cast: non-negative index into the code array
-            if t >= 0 && (t as usize) < code_len {
-                edges.push((src, t as usize)); // Cast: non-negative index to usize
-            }
-        };
-        match op {
-            // ret — the return address came from a `jsr` and lives in a local;
-            // its successors are not statically known here.
-            0xA9 => opaque = true,
-            // Conditional branches + goto + jsr: 2-byte signed offset from `pc`.
-            0x99..=0xA8 | 0xC6 | 0xC7 => {
-                if op == 0xA8 {
-                    opaque = true;
-                }
-                if pc + 2 < code_len {
-                    // Cast: signed branch displacement to isize
-                    let off = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as isize;
-                    push_edge(pc, pc as isize + off, &mut edges); // Cast: pc to isize
-                }
-            }
-            // goto_w / jsr_w: 4-byte signed offset from `pc`.
-            0xC8 | 0xC9 => {
-                if op == 0xC9 {
-                    opaque = true;
-                }
-                if pc + 4 < code_len {
-                    let off = i32::from_be_bytes([
-                        code[pc + 1],
-                        code[pc + 2],
-                        code[pc + 3],
-                        code[pc + 4],
-                        // Cast: signed branch displacement to isize
-                    ]) as isize;
-                    push_edge(pc, pc as isize + off, &mut edges); // Cast: pc to isize
-                }
-            }
-            // tableswitch: default + (high-low+1) offsets, all relative to `pc`.
-            0xAA => {
-                let mut p = pc + 1;
-                while p % 4 != 0 {
-                    p += 1;
-                }
-                if p + 12 > code_len {
-                    opaque = true;
-                    break;
-                }
-                let read_off = |at: usize| -> isize {
-                    // Cast: signed branch displacement to isize
-                    i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]])
-                        as isize
-                };
-                push_edge(pc, pc as isize + read_off(p), &mut edges); // default
-                                                                      // Cast: table bound to i32
-                let low = read_off(p + 4) as i32;
-                // Cast: table bound to i32
-                let high = read_off(p + 8) as i32;
-                let count = checked_tableswitch_count(low, high).unwrap_or(0);
-                let mut jp = p + 12;
-                for _ in 0..count {
-                    if jp + 4 > code_len {
-                        opaque = true;
-                        break;
-                    }
-                    push_edge(pc, pc as isize + read_off(jp), &mut edges); // Cast: pc to isize
-                    jp += 4;
-                }
-            }
-            // lookupswitch: default + npairs (match, offset) pairs.
-            0xAB => {
-                let mut p = pc + 1;
-                while p % 4 != 0 {
-                    p += 1;
-                }
-                if p + 8 > code_len {
-                    opaque = true;
-                    break;
-                }
-                let read_off = |at: usize| -> isize {
-                    // Cast: signed branch displacement to isize
-                    i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]])
-                        as isize
-                };
-                push_edge(pc, pc as isize + read_off(p), &mut edges); // default
-                let npairs =
-                    i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]).max(0)
-                        as usize; // Cast: non-negative count to usize
-                let mut jp = p + 8;
-                for _ in 0..npairs {
-                    if jp + 8 > code_len {
-                        opaque = true;
-                        break;
-                    }
-                    // pair is (match:i32, offset:i32); the offset is at jp+4.
-                    push_edge(pc, pc as isize + read_off(jp + 4), &mut edges); // Cast: pc to isize
-                    jp += 8;
-                }
-            }
-            _ => {}
-        }
-        let len = bytecode_analysis::step(code, pc);
-        if len == 0 {
+        if bytecode_analysis::is_subroutine_op(op) {
             opaque = true;
-            break;
         }
-        pc += len;
+        if bytecode_analysis::is_offset_branch(op) {
+            if let Some(t) =
+                bytecode_analysis::offset_branch_target(&code[..code_len], pc).filter(|&t| t < code_len)
+            {
+                edges.push((pc, t));
+            }
+        } else if matches!(op, 0xaa | 0xab) {
+            match bytecode_analysis::switch_table(code, code_len, pc) {
+                Some(table) => edges.extend(table.targets().map(|t| (pc, t))),
+                None => {
+                    opaque = true;
+                    break;
+                }
+            }
+        }
+        pc += bytecode_analysis::step(code, pc);
     }
 
     if opaque {
@@ -1333,55 +1247,13 @@ pub(super) fn find_bypassable_loop_headers(
 /// Detect natural loops by finding backward branches in bytecode.
 /// Returns a list of `(header_pc, back_edge_pc)` pairs.
 pub(super) fn detect_loops(code: &[u8], code_len: usize) -> Vec<(usize, usize)> {
-    let mut loops = Vec::new();
-    let mut pc = 0;
-    while pc < code_len {
-        match code[pc] {
-            // goto — check for backward target
-            0xa7 => {
-                if pc + 2 < code_len {
-                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
-                    let target = match pc.checked_add_signed(offset as isize) {
-                        // Cast: address arithmetic
-                        Some(t) if t < code_len => t,
-                        _ => {
-                            pc += 3;
-                            continue;
-                        } // invalid target — skip
-                    };
-                    if target <= pc {
-                        loops.push((target, pc));
-                    }
-                }
-                pc += 3;
-            }
-            // Conditional branches — check for backward target (do-while loops)
-            0x99..=0xa6 | 0xc6 | 0xc7 => {
-                if pc + 2 < code_len {
-                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
-                    let target = match pc.checked_add_signed(offset as isize) {
-                        // Cast: address arithmetic
-                        Some(t) if t < code_len => t,
-                        _ => {
-                            pc += 3;
-                            continue;
-                        } // invalid target — skip
-                    };
-                    if target <= pc {
-                        loops.push((target, pc));
-                    }
-                }
-                pc += 3;
-            }
-            // Other instructions: advance by instruction length. Must use the
-            // canonical table — an ad-hoc copy here was missing ldc/ldc_w/
-            // ldc2_w (and the invoke/field/switch ops), so the walk stepped
-            // into operand bytes and could fabricate or miss backward branches
-            // (the CM-FASTMATH length-table desync family).
-            _ => pc += bytecode_analysis::step(code, pc),
-        }
-    }
-    loops
+    // The shared back-edge set, kept to the 16-bit `goto` / `if*` forms this
+    // pass has always modelled: a backward switch arm, `jsr` or `goto_w`
+    // does not describe a loop the transforms below can rewrite.
+    bytecode_analysis::back_edges(code, code_len)
+        .into_iter()
+        .filter(|&(_, src)| matches!(code[src], 0x99..=0xa7 | 0xc6 | 0xc7) && code[src] != 0xa8)
+        .collect()
 }
 
 /// A canonical javac byte/boolean-array zero-fill loop.
