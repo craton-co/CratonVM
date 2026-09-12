@@ -819,10 +819,21 @@ mod registrar_tests {
 /// call HotSpot refuses too. The failure mode of the opposite arrangement
 /// ("initialised" set, refuse when absent) is a false refusal of every
 /// context this crate did not mint, which is much worse.
-fn uninitialized_contexts() -> &'static std::sync::Mutex<std::collections::HashSet<i32>> {
-    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<i32>>> =
-        std::sync::OnceLock::new();
-    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+///
+/// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Held for one set
+/// operation, after `identity_hash_code` has produced the key, and dropped
+/// before anything re-enters Java.
+fn uninitialized_contexts(
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashSet<i32>> {
+    static T: std::sync::OnceLock<
+        cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashSet<i32>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            std::collections::HashSet::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// Called by every `SSLContext.getInstance` registration: the context exists
@@ -830,9 +841,7 @@ fn uninitialized_contexts() -> &'static std::sync::Mutex<std::collections::HashS
 pub(crate) fn mark_context_uninitialized(ctx: &dyn NativeContext, this: ObjectRef) {
     let ih = ctx.identity_hash_code(this);
     if ih != 0 {
-        if let Ok(mut t) = uninitialized_contexts().lock() {
-            t.insert(ih);
-        }
+        uninitialized_contexts().lock().insert(ih);
     }
 }
 
@@ -840,9 +849,7 @@ pub(crate) fn mark_context_uninitialized(ctx: &dyn NativeContext, this: ObjectRe
 pub(crate) fn mark_context_initialized(ctx: &dyn NativeContext, this: ObjectRef) {
     let ih = ctx.identity_hash_code(this);
     if ih != 0 {
-        if let Ok(mut t) = uninitialized_contexts().lock() {
-            t.remove(&ih);
-        }
+        uninitialized_contexts().lock().remove(&ih);
     }
 }
 
@@ -860,11 +867,7 @@ pub(crate) fn require_context_initialized(
     this: ObjectRef,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     let ih = ctx.identity_hash_code(this);
-    let uninitialized = ih != 0
-        && uninitialized_contexts()
-            .lock()
-            .map(|t| t.contains(&ih))
-            .unwrap_or(false);
+    let uninitialized = ih != 0 && uninitialized_contexts().lock().contains(&ih);
     if uninitialized {
         return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
             message: "SSLContext is not initialized".to_string(),

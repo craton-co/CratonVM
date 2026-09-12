@@ -3443,10 +3443,22 @@ fn ssl_sock_auth_update<F: FnOnce(&mut (i32, i32, i32))>(
 /// real class's `factorySpi`, which `jsse_factory_is_ours` reads and this file
 /// therefore never writes (see its note) — so the state lives beside the two
 /// id tables this module already keys the same way.
-fn jsse_factory_initialized() -> &'static parking_lot::Mutex<std::collections::HashSet<i32>> {
-    static T: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<i32>>> =
-        std::sync::OnceLock::new();
-    T.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
+///
+/// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Every acquisition takes
+/// the guard after `identity_hash_code` has produced the key, does one set
+/// operation, and drops it before anything re-enters Java — the same shape,
+/// and the same level, as this module's two id tables.
+fn jsse_factory_initialized(
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashSet<i32>> {
+    static T: std::sync::OnceLock<
+        cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashSet<i32>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            std::collections::HashSet::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 fn mark_jsse_factory_initialized(ctx: &dyn NativeContext, this: ObjectRef) {
@@ -9169,6 +9181,23 @@ pub(crate) mod new13_tests {
             Ok(Some(Value::Object(Some(o)))) => o,
             other => panic!("getInstance should return a factory, got {other:?}"),
         };
+        // `getTrustManagers()` now refuses an un-`init`ed factory, exactly as
+        // `TrustManagerFactoryImpl` does — so this test has to init one
+        // before it can ask what the manager's CLASS is, which is the only
+        // thing it was ever about. `init((KeyStore) null)` is the
+        // platform-trust-store form and needs no fixture.
+        let init = r
+            .find(
+                "javax/net/ssl/TrustManagerFactory",
+                "init",
+                "(Ljava/security/KeyStore;)V",
+            )
+            .unwrap();
+        init(
+            &mut ctx,
+            &[Value::Object(Some(factory)), Value::Object(None)],
+        )
+        .expect("init((KeyStore) null) should succeed");
         let get_tms = r
             .find(
                 "javax/net/ssl/TrustManagerFactory",
