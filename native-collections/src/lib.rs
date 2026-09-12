@@ -26394,9 +26394,16 @@ fn of_element_text(ctx: &mut dyn NativeContext, v: Value) -> String {
 ///
 /// Equality is `values_equal_deep`, which ends in the RECEIVER's `equals` — the
 /// same predicate `make_set_of`'s `native_map_put` uses, so the check and the
-/// build can never disagree about what counts as a duplicate. Quadratic, and
-/// deliberately so: every `of` overload the JDK declares takes at most ten
-/// arguments, and the array form is the only unbounded one.
+/// build can never disagree about what counts as a duplicate. It is asked only
+/// of earlier elements with the same Java `hashCode()`, which is also the only
+/// place `ImmutableCollections.SetN`/`MapN` look for one.
+///
+/// This used to compare every pair, on the reasoning that every `of` overload
+/// takes at most ten arguments. The array form does not, and it is on a hot
+/// path: `CLDRLocaleProviderAdapter.createLanguageTagSet` hands `Set.of` all
+/// 1152 CLDR language tags, so the first `Calendar.getInstance` per locale paid
+/// ~660 000 comparisons (MEASURED 2026-09-12: 199 ms for `Set.of` of 1101
+/// strings, HotSpot 0 ms).
 fn of_reject_duplicates(
     ctx: &mut dyn NativeContext,
     elems: &[Value],
@@ -26413,8 +26420,22 @@ fn of_reject_duplicates(
     // asking an unrelated `java.lang.Object` whether it equals itself.
     let (base, handles) = pin_value_slice(ctx, elems);
     let mut verdict: Result<(), MethodCallFailed> = Ok(());
-    'outer: for i in 1..elems.len() {
-        for j in 0..i {
+    // Earlier indices by `hashCode()`.
+    let mut buckets: std::collections::HashMap<i32, Vec<usize>> =
+        std::collections::HashMap::new();
+    'outer: for i in 0..elems.len() {
+        let a = read_pinned_elem(ctx, handles[i], elems[i]);
+        let hash = match element_hash_code(ctx, &a) {
+            Ok(h) => h,
+            Err(e) => {
+                verdict = Err(e);
+                break 'outer;
+            }
+        };
+        let earlier = buckets.entry(hash).or_default();
+        let candidates = earlier.clone();
+        earlier.push(i);
+        for j in candidates {
             let a = read_pinned_elem(ctx, handles[i], elems[i]);
             let b = read_pinned_elem(ctx, handles[j], elems[j]);
             match values_equal_deep(ctx, &a, &b) {
@@ -31039,25 +31060,40 @@ fn native_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let (_, elem_handles) = pin_value_slice(ctx, &elements);
     let mut unique: Vec<Value> = Vec::new();
     let mut unique_handles: Vec<usize> = Vec::new();
+    // Survivor indices into `unique`, keyed by the survivor's Java `hashCode()`.
+    //
+    // `Stream.distinct()` is specified by the `HashSet` it builds: a later
+    // element is a duplicate only when an earlier one has the SAME hash and
+    // `equals` it. This used to ask `equals` of every survivor so far, which is
+    // `n(n-1)/2` Java calls for `n` distinct elements. MEASURED 2026-09-12:
+    // `LocaleServiceProvider.isSupportedLocale` runs a `distinct()` over the
+    // 1152 CLDR language tags, so the first `Calendar.getInstance` per locale
+    // took 1.5 s against HotSpot's 11 ms — long enough that Tomcat's
+    // `TestAccessLogValve` timed out waiting for a `%{begin:...SSS}t` line.
+    // Asking only same-hash candidates is also the JDK's answer when `equals`
+    // and `hashCode` disagree (two `equals` keys with different hashes both
+    // survive), which the all-pairs scan got wrong in the other direction.
+    let mut buckets: std::collections::HashMap<i32, Vec<usize>> =
+        std::collections::HashMap::new();
     for i in 0..elements.len() {
-        // `Stream.distinct()` dedups via the element's `equals`/`hashCode`
-        // (it builds a `HashSet`). `values_equal` only recognises identity,
-        // String, enum, and unboxed primitives — for any other two distinct
-        // object instances it returns false, so value classes/records with a
-        // real `equals` override (`ResourcePatternHint`, `UUID`, user records)
-        // were never deduped and `distinct()` over-counted (Spring AOT
-        // `ResourceHintsAttributes` emitted 8 globs where HotSpot collapses to
-        // 5). Use `list_element_matches`, which takes the cheap structural
-        // check first and then falls back to the seen element's real Java
-        // `equals` — exactly as already done for `List.contains`/`indexOf` and
-        // `Collectors.groupingBy` keys.
+        let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+        let hash = element_hash_code(ctx, &elem)?;
+        // `values_equal` alone only recognises identity, String, enum and
+        // unboxed primitives, so value classes/records with a real `equals`
+        // override (`ResourcePatternHint`, `UUID`, user records) were never
+        // deduped (Spring AOT `ResourceHintsAttributes` emitted 8 globs where
+        // HotSpot collapses to 5). `list_element_matches` takes that cheap
+        // structural check first and then falls back to Java `equals`, with the
+        // NEW element as receiver — `HashMap.putVal`'s `key.equals(k)`.
         let mut dup = false;
-        for (u_idx, u) in unique.iter().enumerate() {
-            let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-            let u = read_pinned_elem(ctx, unique_handles[u_idx], *u);
-            if list_element_matches(ctx, &elem, &u)? {
-                dup = true;
-                break;
+        if let Some(candidates) = buckets.get(&hash) {
+            for &u_idx in candidates {
+                let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                let u = read_pinned_elem(ctx, unique_handles[u_idx], unique[u_idx]);
+                if list_element_matches(ctx, &u, &elem)? {
+                    dup = true;
+                    break;
+                }
             }
         }
         if !dup {
@@ -31067,6 +31103,7 @@ fn native_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             } else {
                 unique_handles.push(usize::MAX);
             }
+            buckets.entry(hash).or_default().push(unique.len());
             unique.push(elem);
         }
     }
