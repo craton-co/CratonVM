@@ -120,11 +120,16 @@ the above. **The 5% tolerance on the row below is roughly two waves wide**, so
 expect to re-measure it about every second wave rather than treating a red
 here as a surprise.
 
+The `jit` row moved the same way and for a different reason, and it is recorded
+so the next re-measure is not mistaken for drift: 269,000 -> 282,993 over the
+three days to 2026-09-12, which is the IR tier and the deopt work, not one
+lane's table. Re-measured with the command above.
+
 | Crate | LoC | Crate | LoC |
 |-------|----:|-------|----:|
 | `native-builtins` | 753,000 | `native-awt` | 18,000 |
 | `vm` | 480,000 | `types` | 44,000 |
-| `jit` | 269,000 | `native-api` | 49,000 |
+| `jit` | 283,000 | `native-api` | 50,000 |
 | `gc` | 190,000 | `reader` | 17,000 |
 | `native-collections` | 88,000 | `jfr` | 20,000 |
 | `native-io` | 85,000 | `jit-cuda` | 14,000 |

@@ -11,7 +11,9 @@
 > 10/10 withheld**, with `ClassCastException: class [B cannot be cast to class
 > [J`. §5's 32 green arms could not see it because every `MvsCreate` arm in them
 > is at `--Xmx256m`, where the control OOMs.
-> See `../../../known-issues/gc/zgc-residue-licence-relocates-under-a-conservative-root-20260908.md`.
+> See `./zgc-residue-licence-relocates-under-a-conservative-root-RESOLVED-20260912.md`
+> (retired 2026-09-12: the default flip stands, and neither of the two costs that
+> page weighs against each other reproduces any more).
 > `CRATONVM_JIT_UNREG_RESIDUE_LICENCE=1` still grants it.
 
 
