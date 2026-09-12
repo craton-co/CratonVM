@@ -1,9 +1,10 @@
 # FIXED: the 2026-09-12 JIT code review, finding by finding
 
-**Status: 87 FIXED, 4 PARTIAL, 6 OPEN** across 97 findings. The ledger has
+**Status: 89 FIXED, 4 PARTIAL, 4 OPEN** across 97 findings. The ledger has
 95 lines, because #10/#11 and #18/#19 each share one fix and one line. Every
-commit is on `fix/jit-review-20260912`, merged into `dev`. Each PARTIAL and
-OPEN finding names the known-issue record that tracks what is left.
+commit is on `fix/jit-review-20260912`, merged into `dev`, except #46 and #49,
+which are on `fix/jit-review-r2-20260912-monitors`. Each PARTIAL and OPEN
+finding names the known-issue record that tracks what is left.
 
 ## What the review covered
 
@@ -89,10 +90,10 @@ the review are the gate that does that.
 | 43 | Bottom-tested loops refuse the IR build | OPEN `ir-builder-refuses-rotated-loops-20260912.md` |
 | 44 | `ir_compatible` admits opcodes the builder refuses | FIXED f5329cdd5, 9b8cbce45 |
 | 45 | `ir_evidence` entries leak on an IR bail | FIXED add815189 |
-| 46 | IR frame states carry no monitor stack | OPEN `ir-frame-states-carry-no-monitor-stack-20260912.md` |
+| 46 | IR frame states carry no monitor stack | FIXED 9bb05f4e5; `ir-frame-states-carry-no-monitor-stack-FIXED-20260912.md` |
 | 47 | Lock elision disables the monitor precise-resume gate | FIXED 347220a6b |
 | 48 | Array scalar replacement forwards an un-narrowed int | FIXED 347220a6b |
-| 49 | Allocation elision never fires by default | OPEN `allocation-elision-never-fires-by-default-20260912.md` |
+| 49 | Allocation elision never fires by default | FIXED (`fix/jit-review-r2-20260912-monitors`); `allocation-elision-never-fires-by-default-FIXED-20260912.md` |
 | 50 | Dependencies never re-validated; CHA registry dead | FIXED 15d8f89af |
 | 51 | Invalidation clears ICs before unpublishing | FIXED c74ac7e5f, 15d8f89af |
 | 52 | O(n) copy-on-write registries rebuilt per change | FIXED fe92eb53b |
