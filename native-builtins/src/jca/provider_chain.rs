@@ -180,7 +180,15 @@ fn add(name: String, ver: f64) -> i32 {
     let mut list = provider_chain().lock();
     if let Some(idx) = list.iter().position(|(n, _, _)| *n == name) {
         list[idx].1 = ver;
-        return (idx + 1) as i32;
+        // `Security.addProvider` answers -1 when a provider of this name is
+        // already installed -- NOT its position. The position is what a
+        // SUCCESSFUL install answers, so returning it here is
+        // indistinguishable from "installed at 1", and a caller guarding on
+        // `>= 0` concludes it registered when it did not. `insert_at` below
+        // has the same shape and no probe row; it is left as it is rather
+        // than changed with nothing to measure it against.
+        // MEASURED, `L6JcaSweep` row 193.
+        return -1;
     }
     list.push((name, ver, USER_PROVIDER_COVERAGE));
     list.len() as i32
@@ -5488,6 +5496,21 @@ fn make_service(
 /// `Cipher.getInstance` then throws `NoSuchAlgorithmException`).
 fn provider_get_service_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // A null `type` is not "no such service". `Provider.getService` builds a
+    // `ServiceKey` from it and the JVM's own helpful NPE names the field it
+    // could not read. Answering null instead told the caller this provider
+    // simply does not offer the service, which is a survivable answer: a
+    // provider walk moves on to the next provider and the programming error
+    // never surfaces.
+    // MEASURED, `L6JcaSweep` row 186.
+    if matches!(args.get(1), None | Some(Value::Object(None))) {
+        return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot invoke \"String.hashCode()\" because \"this.type\" is null".to_string(),
+            ),
+        }
+        .into());
+    }
     let type_str = match args.get(1) {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(None))),
@@ -8096,7 +8119,15 @@ mod tests {
         let before = snapshot().len();
         // Adding an existing name must not duplicate.
         let pos = add("SUN".to_string(), 25.0);
-        assert_eq!(pos, 1, "SUN is at position 1 after re-add");
+        // -1, not the position. `Security.addProvider` answers the
+        // preference position it installed at, or -1 when a provider of
+        // that name is ALREADY installed -- so a position here is
+        // indistinguishable from a successful install at 1, and a caller
+        // guarding on `>= 0` concludes it registered when it did not.
+        // This assertion previously recorded what the code did rather
+        // than what the JDK does; `L6JcaSweep` row 193 measures it
+        // against a real JDK and the oracle says -1.
+        assert_eq!(pos, -1, "re-adding an installed provider answers -1");
         assert_eq!(snapshot().len(), before);
     }
 
