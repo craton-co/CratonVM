@@ -2194,7 +2194,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// `native-builtins/src/lang_class.rs|java/lang/Package.getPackages|()[Ljava/lang/Package;`
 /// -- and none the other way. Record:
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3859;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3873;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2570,16 +2570,24 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3859;
 // goes on to refuse it. So this count rising by exactly the number of rows added
 // is what an accepted wave looks like here; it is not a regression.
 //
-// TAKEN, not computed. First measured at 2929/2956/2929 on the pre-merge tree.
-// Merging 25 dev commits moved dev's own literals to 2948/2975/2948, and the
-// conflict was resolved to DEV's values and the gate re-run rather than adding 14
-// to them -- arithmetic over two baselines cannot see a row that moved in both
-// directions, and this lane has now re-frozen these three literals across four
-// dev merges. The re-run printed 2962/2989/2962, which agrees with dev's plus 14;
-// the agreement is the CROSS-CHECK, not the derivation. The same +14 shows
-// independently in the `--jdk-only-report`: 3036 refusals against the control's
-// 3022, and `java/math/BigInteger` going from 10 refused triples to 24.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3832;
+// TAKEN, not computed -- three times, because dev moved twice underneath this
+// branch and each merge conflicted on all three literals:
+//
+//   pre-merge tree            2915/2942/2915 -> measured 2929/2956/2929
+//   after 25 dev commits      dev 2948/2975/2948 -> measured 2962/2989/2962
+//   after 16 more (a +884
+//     wave from another lane) dev 3832/3859/3832 -> measured 3846/3873/3846
+//
+// Every conflict was resolved to DEV's literal and the gate re-run, never dev's
+// value plus 14: arithmetic over two baselines cannot see a row that moved in both
+// directions, which is the whole reason this lane re-measures on every merge. That
+// the measured delta came out +14 all three times -- across a wave that moved the
+// baselines by 884 -- is the CROSS-CHECK, not the derivation.
+//
+// The same +14 shows independently in the `--jdk-only-report`: 3036 refusals
+// against the control's 3022, and `java/math/BigInteger` going from 10 refused
+// triples to 24.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3846;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2817,7 +2825,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3832;
 /// `native-builtins/src/lang_class.rs|java/lang/Package.getPackages|()[Ljava/lang/Package;`
 /// -- and none the other way. Record:
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 3832;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 3846;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
