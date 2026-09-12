@@ -6696,7 +6696,7 @@ impl<'a> Lowerer<'a> {
     /// The cascade's guards touch RAX (the receiver and its class id), R10 (the
     /// cache-slot base) and R11 (the call target), and **nothing else** — no
     /// `ENTRY_ABI_REGS` member appears in `emit_cmp_eax_r10_disp`,
-    /// `emit_cmp_byte_r10_disp_zero`, `emit_cmp_qword_r10_disp_zero`, or the
+    /// `emit_load_ic_entry_word`, `emit_strip_ic_context_tag`, or the
     /// receiver null and kind checks. A layout established here therefore
     /// survives every arm of the cascade to its `CALL`.
     ///
@@ -6757,36 +6757,43 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// `CMP BYTE [R10 + disp], 0` — selects the cached target's entry ABI.
-    fn emit_cmp_byte_r10_disp_zero(&mut self, disp: u8) {
-        // REX.B + 80 /7 + ModRM(mod=01, /7, rm=R10) + disp8 + imm8
-        self.buf.emit(&[0x41, 0x80, 0x7A, disp, 0x00]);
-    }
-
-    /// `CMP QWORD [R10 + disp], 0` — rejects a profile-seeded cache
-    /// entry whose class id is known but whose compiled target is not yet
-    /// installed.
-    fn emit_cmp_qword_r10_disp_zero(&mut self, disp: u8) {
-        // REX.W+B + 83 /7 + ModRM(mod=01, /7, rm=R10) + disp8 + imm8
-        self.buf.emit(&[0x49, 0x83, 0x7A, disp, 0x00]);
-    }
-
-    /// `MOV R11, qword [R10 + disp] ; CALL R11` — the cached-entry indirect
-    /// call.
+    /// `MOV R11, qword [R10 + disp] ; TEST R11, R11` — capture an inline-cache
+    /// entry word ONCE. The caller follows with `JZ .slow` (a zero word is a
+    /// profile seed with no target, or a withdrawn one) and then
+    /// [`Self::emit_strip_ic_context_tag`].
     ///
-    /// SECURITY INVARIANT (inherited verbatim from `x64.rs`'s inline caches):
-    /// nothing may be emitted between these two instructions. R10 is a general
-    /// scratch register; keeping the call target addressed through it across
-    /// any other emitted instruction would let an R10 clobber redirect native
-    /// control flow. Loading into R11 (caller-saved, not an argument register
-    /// on either ABI, clobbered by the call anyway) immediately before the
-    /// `CALL` closes the window to a single fixed pair.
-    fn emit_call_cached_entry(&mut self, disp: u8) {
+    /// The word carries the target AND its calling convention
+    /// (`JIT_IC_NEEDS_CONTEXT_TAG` in bit 0). Loading the two separately let a
+    /// reader pair one publication's address with the next one's ABI flag, or
+    /// pass a non-zero check and then load a zero target.
+    fn emit_load_ic_entry_word(&mut self, disp: u8) {
         if disp == 0 {
             self.buf.emit(&[0x4D, 0x8B, 0x1A]); // MOV R11, [R10]
         } else {
             self.buf.emit(&[0x4D, 0x8B, 0x5A, disp]); // MOV R11, [R10+disp8]
         }
+        self.buf.emit(&[0x4D, 0x85, 0xDB]); // TEST R11, R11
+    }
+
+    /// `BTR R11, 0` — move the needs-context tag into CF and leave the bare
+    /// entry address in R11. The caller branches `JNC` to the context-free
+    /// arm.
+    fn emit_strip_ic_context_tag(&mut self) {
+        const _: () = assert!(crate::JIT_IC_NEEDS_CONTEXT_TAG == 1);
+        // REX.W+B + 0F BA /6 + ModRM(mod=11, /6, rm=R11) + imm8
+        self.buf.emit(&[0x49, 0x0F, 0xBA, 0xF3, 0x00]);
+    }
+
+    /// `CALL R11` — the cached-entry indirect call, through the target
+    /// [`Self::emit_load_ic_entry_word`] captured.
+    ///
+    /// SECURITY INVARIANT (inherited from `x64.rs`'s inline caches): the call
+    /// target must not be addressed through R10 across other emitted code, so
+    /// it lives in R11 (caller-saved, not an argument register on either ABI,
+    /// clobbered by the call anyway). Between the capture and this CALL only
+    /// the ABI marshalling runs, and it writes `ENTRY_ABI_REGS` only — nothing
+    /// that writes R11 may be emitted there.
+    fn emit_call_loaded_ic_entry(&mut self) {
         self.buf.emit(&[0x41, 0xFF, 0xD3]); // CALL R11
                                             // The callee is COMPILED JAVA, so its prologue published ITS (rbp,
                                             // compile id) into the innermost-frame mirror and nothing on the return
@@ -6847,19 +6854,21 @@ impl<'a> Lowerer<'a> {
     ///   ; ── monomorphic ──
     ///   MOV  R10, imm64 mic
     ///   CMP  EAX, [R10 + CACHED_CLASS_ID_OFFSET]     ; JNE .pic
-    ///   CMP  BYTE [R10 + CACHED_NEEDS_CONTEXT], 0    ; JE  .mic_noctx
-    ///   <marshal context ABI> ; JMP .mic_call
+    ///   MOV  R11, [R10 + CACHED_ENTRY_PTR_OFFSET]    ; tagged word, loaded ONCE
+    ///   TEST R11, R11 ; JZ .slow
+    ///   BTR  R11, 0                                  ; CF = needs-context
+    ///   JNC  .mic_noctx ; <marshal context ABI> ; JMP .mic_call
     /// .mic_noctx: <marshal context-free ABI>
-    /// .mic_call: MOV R11,[R10+8] ; CALL R11 ; JMP .done
+    /// .mic_call: CALL R11 ; JMP .done
     ///   ; ── polymorphic, 4-way ──
     /// .pic:
     ///   MOV  R10, imm64 pic
     ///   for i in 0..4:
-    ///     CMP EAX, [R10+CLASS_ID_OFFSETS[i]]  ; JNE .pic_{i+1} (last: .slow)
-    ///     CMP BYTE [R10+NEEDS_CONTEXT[i]], 0  ; JE  .entry_noctx
-    ///     <marshal context ABI> ; JMP .entry_call
+    ///     CMP EAX, [R10+CLASS_ID_OFFSETS[i]]   ; JNE .pic_{i+1} (last: .slow)
+    ///     MOV R11, [R10+ENTRY_PTR_OFFSETS[i]]  ; TEST R11,R11 ; JZ .slow
+    ///     BTR R11, 0 ; JNC .entry_noctx ; <marshal context ABI> ; JMP .entry_call
     ///   .entry_noctx: <marshal context-free ABI>
-    ///   .entry_call: MOV R11,[R10+ENTRY_PTR_OFFSETS[i]] ; CALL R11 ; JMP .done
+    ///   .entry_call: CALL R11 ; JMP .done
     ///   ; ── megamorphic / cold ──
     /// .slow:
     ///   <marshal args into the frame staging region>
@@ -6978,26 +6987,27 @@ impl<'a> Lowerer<'a> {
         self.emit_mov_reg_imm64(R10, mic as u64);
         self.emit_cmp_eax_r10_disp(JitMICSlot::CACHED_CLASS_ID_OFFSET as u8);
         let mic_miss = self.emit_jcc_rel32(0x85); // JNE .pic
-        self.emit_cmp_qword_r10_disp_zero(JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8);
-        slow_patches.push(self.emit_jcc_rel32(0x84)); // JE .slow
-        self.emit_cmp_byte_r10_disp_zero(JitMICSlot::CACHED_NEEDS_CONTEXT_OFFSET as u8);
-        // Falls THROUGH on the context case and jumps on the no-context one,
-        // because the no-context layout is already in place: the fall-through
-        // shifts it, the jump does nothing at all. That inverts the old sense of
-        // this branch, which is why the target is named for what it skips.
+        self.emit_load_ic_entry_word(JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8);
+        slow_patches.push(self.emit_jcc_rel32(0x84)); // JZ .slow
+        self.emit_strip_ic_context_tag();
+        // Falls THROUGH on the context case (carry set) and jumps on the
+        // no-context one, because the no-context layout is already in place:
+        // the fall-through shifts it, the jump does nothing at all. That
+        // inverts the old sense of this branch, which is why the target is
+        // named for what it skips.
         if premarshal {
-            let mic_noctx = self.emit_jcc_rel32(0x84); // JE .mic_ready (no shift)
+            let mic_noctx = self.emit_jcc_rel32(0x83); // JNC .mic_ready (no shift)
             self.emit_ic_shift_for_context(num_args);
             self.patch_rel32_to_here(mic_noctx);
         } else {
-            let mic_noctx = self.emit_jcc_rel32(0x84); // JE .mic_noctx
+            let mic_noctx = self.emit_jcc_rel32(0x83); // JNC .mic_noctx
             self.emit_ic_abi_marshal(inputs, num_args, true);
             let mic_call = self.emit_jmp_rel32();
             self.patch_rel32_to_here(mic_noctx);
             self.emit_ic_abi_marshal(inputs, num_args, false);
             self.patch_rel32_to_here(mic_call);
         }
-        self.emit_call_cached_entry(JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8);
+        self.emit_call_loaded_ic_entry();
         self.emit_inline_callee_deopt_service(info_ptr, num_args, inputs);
         done_patches.push(self.emit_jmp_rel32());
 
@@ -7017,23 +7027,23 @@ impl<'a> Lowerer<'a> {
             } else {
                 next_entry = Some(miss);
             }
-            self.emit_cmp_qword_r10_disp_zero(JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8);
-            slow_patches.push(self.emit_jcc_rel32(0x84)); // JE .slow
-            self.emit_cmp_byte_r10_disp_zero(JitPICSlot::NEEDS_CONTEXT_OFFSETS[i] as u8);
+            self.emit_load_ic_entry_word(JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8);
+            slow_patches.push(self.emit_jcc_rel32(0x84)); // JZ .slow
+            self.emit_strip_ic_context_tag();
             // Same inversion as the MIC arm above.
             if premarshal {
-                let noctx = self.emit_jcc_rel32(0x84); // JE .entry_ready (no shift)
+                let noctx = self.emit_jcc_rel32(0x83); // JNC .entry_ready (no shift)
                 self.emit_ic_shift_for_context(num_args);
                 self.patch_rel32_to_here(noctx);
             } else {
-                let noctx = self.emit_jcc_rel32(0x84); // JE .entry_noctx
+                let noctx = self.emit_jcc_rel32(0x83); // JNC .entry_noctx
                 self.emit_ic_abi_marshal(inputs, num_args, true);
                 let call = self.emit_jmp_rel32();
                 self.patch_rel32_to_here(noctx);
                 self.emit_ic_abi_marshal(inputs, num_args, false);
                 self.patch_rel32_to_here(call);
             }
-            self.emit_call_cached_entry(JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8);
+            self.emit_call_loaded_ic_entry();
             self.emit_inline_callee_deopt_service(info_ptr, num_args, inputs);
             done_patches.push(self.emit_jmp_rel32());
         }
@@ -21891,20 +21901,9 @@ mod tests {").next().unwrap_or(src);
         let code = lower_virtual_call_with_ic(&ic);
 
         // MIC: class id at offset 0 → `CMP EAX,[R10]` = 41 3B 02;
-        // needs_context at 16 → `CMP BYTE [R10+16],0` = 41 80 7A 10 00;
-        // entry ptr at 8 → `MOV R11,[R10+8]` = 4D 8B 5A 08.
+        // tagged entry word at 8 → `MOV R11,[R10+8]` = 4D 8B 5A 08.
         assert_eq!(JitMICSlot::CACHED_CLASS_ID_OFFSET, 0);
         assert!(contains_seq(&code, &[0x41, 0x3B, 0x02]));
-        assert!(contains_seq(
-            &code,
-            &[
-                0x41,
-                0x80,
-                0x7A,
-                JitMICSlot::CACHED_NEEDS_CONTEXT_OFFSET as u8,
-                0x00
-            ]
-        ));
         assert!(contains_seq(
             &code,
             &[
@@ -21914,21 +21913,8 @@ mod tests {").next().unwrap_or(src);
                 crate::x64::disp::disp8_const(JitMICSlot::CACHED_ENTRY_PTR_OFFSET as i64) as u8,
             ]
         ));
-        assert!(
-            contains_seq(
-                &code,
-                &[
-                    0x49,
-                    0x83,
-                    0x7A,
-                    JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8,
-                    0x00
-                ]
-            ),
-            "a class-only profiled MIC seed must miss until entry_ptr is populated"
-        );
 
-        // PIC: one guard + one needs-context gate + one entry load per entry.
+        // PIC: one guard + one entry-word load per entry.
         for i in 0..crate::JIT_PIC_ENTRIES {
             let cid = JitPICSlot::CLASS_ID_OFFSETS[i] as u8;
             if cid == 0 {
@@ -21943,19 +21929,6 @@ mod tests {").next().unwrap_or(src);
                 contains_seq(
                     &code,
                     &[
-                        0x41,
-                        0x80,
-                        0x7A,
-                        JitPICSlot::NEEDS_CONTEXT_OFFSETS[i] as u8,
-                        0x00
-                    ]
-                ),
-                "PIC entry {i} needs-context gate must be emitted"
-            );
-            assert!(
-                contains_seq(
-                    &code,
-                    &[
                         0x4D,
                         0x8B,
                         0x5A,
@@ -21963,20 +21936,32 @@ mod tests {").next().unwrap_or(src);
                             as u8,
                     ]
                 ),
-                "PIC entry {i} cached-entry load must be emitted"
+                "PIC entry {i} entry-word load must be emitted"
             );
+        }
+
+        // Every cached-entry call — the MIC, the four PIC ways and the two
+        // hashed ways — tests the word it loaded for zero (a class-only profile
+        // seed, or a withdrawn target) and strips the context tag from THAT
+        // word. One of each per `CALL R11`.
+        let calls = count_seq(&code, &[0x41, 0xFF, 0xD3]);
+        assert_eq!(calls, 1 + crate::JIT_PIC_ENTRIES + crate::JIT_MEGA_WAYS);
+        assert_eq!(
+            count_seq(&code, &[0x4D, 0x85, 0xDB]),
+            calls,
+            "every cached-entry call must reject a zero word it loaded itself"
+        );
+        assert_eq!(
+            count_seq(&code, &[0x49, 0x0F, 0xBA, 0xF3, 0x00]),
+            calls,
+            "every cached-entry call must take its ABI from the word it calls"
+        );
+        // And nothing may still read a separate needs-context byte: the MIC's
+        // old flag at offset 16, or the PIC's at 48..=51.
+        for off in [16u8, 48, 49, 50, 51] {
             assert!(
-                contains_seq(
-                    &code,
-                    &[
-                        0x49,
-                        0x83,
-                        0x7A,
-                        JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8,
-                        0x00
-                    ]
-                ),
-                "PIC entry {i} must reject a class-only profile seed"
+                !contains_seq(&code, &[0x41, 0x80, 0x7A, off, 0x00]),
+                "a separate needs-context byte at offset {off} must not be read"
             );
         }
     }
@@ -30197,7 +30182,7 @@ mod tests {").next().unwrap_or(src);
 /// `CRATONVM_JIT_NO_IC_FRAME_REPUBLISH=1` — stop republishing the
 /// innermost-frame mirror after an optimizing-tier inline-cache hit.
 ///
-/// The bisect lever for the republish folded into `emit_call_cached_entry`,
+/// The bisect lever for the republish folded into `emit_call_loaded_ic_entry`,
 /// which is default-ON. Latched: read once, because a codegen decision must not
 /// change under a running process. With it set, one binary reproduces the
 /// stale-mirror `ACTIVE_FRAME_MAP` refusals this fixed.

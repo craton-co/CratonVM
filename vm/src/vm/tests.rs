@@ -75797,12 +75797,12 @@ fn s33_mic_slot_lifecycle_new_prepopulate_update() {
     let mic = JitMICSlot::new();
     // Phase 1: new — all fields zeroed
     assert_eq!(mic.cached_class_id.load(Ordering::Relaxed), 0);
-    assert_eq!(mic.cached_entry_ptr.load(Ordering::Relaxed), 0);
+    assert_eq!(mic.cached_entry(), (0, false));
 
     // Phase 2: prepopulate with class id
     mic.prepopulate(10);
     assert_eq!(mic.cached_class_id.load(Ordering::Relaxed), 10);
-    assert_eq!(mic.cached_entry_ptr.load(Ordering::Relaxed), 0);
+    assert_eq!(mic.cached_entry(), (0, false));
 
     // Phase 3: full update after first resolution.
     //
@@ -75812,7 +75812,7 @@ fn s33_mic_slot_lifecycle_new_prepopulate_update() {
     // live `CompiledMethod` owner — which every synthetic sentinel address
     // in these tests is — is REFUSED rather than published, so the slot
     // would come back "class cached, target unresolved" and every
-    // `cached_entry_ptr` assertion here would be reading a 0. `false` is
+    // `cached_entry` assertion here would be reading a 0. `false` is
     // Compatible mode, which is the mode these lifecycle tests describe.
     // `s33_mic_update_refuses_native_entry_under_jdk_only` below covers the
     // other value, so neither one is asserted by assumption.
@@ -75822,8 +75822,12 @@ fn s33_mic_slot_lifecycle_new_prepopulate_update() {
         mic.cached_class_name.lock().as_deref(),
         Some("java/lang/String")
     );
-    assert_eq!(mic.cached_entry_ptr.load(Ordering::Acquire), 0xABCD0000);
-    assert!(mic.cached_needs_context.load(Ordering::Relaxed));
+    // The entry and its calling convention travel as ONE tagged word.
+    assert_eq!(mic.cached_entry(), (0xABCD0000, true));
+    assert_eq!(
+        mic.cached_entry_word.load(Ordering::Acquire),
+        0xABCD0000 | cratonvm_jit::JIT_IC_NEEDS_CONTEXT_TAG
+    );
 }
 
 #[test]
@@ -75839,11 +75843,10 @@ fn s33_mic_hit_rate_tracks_monomorphic_dispatch() {
     }
     assert_eq!(mic.hit_rate_pct(), 100);
     assert!(mic.is_monomorphic());
-    assert!(!mic.is_megamorphic());
 }
 
 #[test]
-fn s33_mic_megamorphic_detection_after_many_misses() {
+fn s33_mic_many_misses_is_not_monomorphic() {
     use cratonvm_jit::JitMICSlot;
 
     let mic = JitMICSlot::new();
@@ -75854,7 +75857,7 @@ fn s33_mic_megamorphic_detection_after_many_misses() {
     for _ in 0..25 {
         mic.record_miss();
     }
-    assert!(mic.is_megamorphic());
+    assert_eq!(mic.hit_rate_pct(), 16);
     assert!(!mic.is_monomorphic());
 }
 
@@ -75876,8 +75879,8 @@ fn s33_mic_megamorphic_detection_after_many_misses() {
 /// since. It now asserts what the class change actually must do: leave
 /// the installed triple COHERENT — guard, name and entry all still
 /// describing the first receiver, never a mixed pair — while the miss is
-/// still counted so the adaptive recompiler can promote the site to a PIC,
-/// which is how a second receiver eventually gets cached.
+/// still counted. A second receiver is cached by the PIC allocated beside the
+/// MIC at the same site, which the resolving helper installs into.
 #[test]
 fn s33_mic_cache_update_on_class_change() {
     use cratonvm_jit::JitMICSlot;
@@ -75902,14 +75905,11 @@ fn s33_mic_cache_update_on_class_change() {
     );
     assert_eq!(mic.cached_class_name.lock().as_deref(), Some("Dog"));
     assert_eq!(
-        mic.cached_entry_ptr.load(Ordering::Acquire),
-        0x1000,
-        "the guard and the entry pointer must still describe the SAME \
-             receiver — a mixed pair is the miscompile this protocol prevents"
-    );
-    assert!(
-        !mic.cached_needs_context.load(Ordering::Relaxed),
-        "the refused update must not leak its context flag either"
+        mic.cached_entry(),
+        (0x1000, false),
+        "the guard and the entry word must still describe the SAME \
+             receiver — a mixed pair is the miscompile this protocol prevents, \
+             and the refused update must not leak its context flag either"
     );
     // The miss is still observable, which is what drives the site to a PIC.
     assert_eq!(mic.misses.load(Ordering::Relaxed), 1);
@@ -75925,15 +75925,16 @@ fn s33_mic_entry_ptr_direct_dispatch_simulation() {
     mic.update(42, "MyClass", 0, false, false); // No entry yet
 
     // Simulate: first dispatch goes slow path (entry=0), resolves, then stores ptr
-    let entry = mic.cached_entry_ptr.load(Ordering::Acquire);
+    let (entry, _) = mic.cached_entry();
     assert_eq!(entry, 0); // Not yet compiled
 
-    // After compilation, store entry pointer
-    mic.cached_entry_ptr.store(0xFF00FF00, Ordering::Release);
+    // After compilation, store the tagged entry word
+    mic.cached_entry_word
+        .store(0xFF00FF00 | cratonvm_jit::JIT_IC_NEEDS_CONTEXT_TAG, Ordering::Release);
 
-    // Now the fast path would use this entry pointer directly
-    let fast_entry = mic.cached_entry_ptr.load(Ordering::Acquire);
-    assert_eq!(fast_entry, 0xFF00FF00);
+    // Now the fast path would use this entry pointer directly, with the ABI
+    // decoded from the same word
+    assert_eq!(mic.cached_entry(), (0xFF00FF00, true));
 }
 
 #[test]
@@ -75987,15 +75988,15 @@ fn s33_mic_polymorphic_not_mono_not_mega() {
         mic.record_miss();
     }
     assert!(!mic.is_monomorphic());
-    assert!(!mic.is_megamorphic());
 }
 
 /// `needs_context` must reach the slot from the update that INSTALLS it —
 /// and only from that one.
 ///
-/// Generated code reads `cached_needs_context` to decide whether to thread
-/// the VM context pointer through the inline dispatch, so the flag has to
-/// travel with the entry pointer it describes. The second half is the same
+/// Generated code reads the context tag in bit 0 of `cached_entry_word` to
+/// decide whether to thread the VM context pointer through the inline
+/// dispatch, so the flag travels with the entry it describes by
+/// construction. The second half is the same
 /// monomorphic-for-lifetime rule `s33_mic_cache_update_on_class_change`
 /// documents: a refused update for a different class must not flip the
 /// flag either, or the slot would call the installed entry with the OTHER
@@ -76014,31 +76015,26 @@ fn s33_mic_needs_context_flag_propagates() {
     let context_free = JitMICSlot::new();
     context_free.update(1, "Adder", 0x1000, false, false);
     assert_eq!(context_free.cached_class_id.load(Ordering::Acquire), 1);
-    assert!(!context_free.cached_needs_context.load(Ordering::Relaxed));
+    assert_eq!(context_free.cached_entry(), (0x1000, false));
 
     // Context-requiring method: the installing update carries it through.
     let context_needed = JitMICSlot::new();
     context_needed.update(2, "Allocator", 0x2000, true, false);
     assert_eq!(context_needed.cached_class_id.load(Ordering::Acquire), 2);
-    assert!(context_needed.cached_needs_context.load(Ordering::Relaxed));
+    assert_eq!(context_needed.cached_entry(), (0x2000, true));
 
     // A refused (different-class) update cannot flip the flag under the
     // entry it does not own.
     context_free.update(2, "Allocator", 0x2000, true, false);
     assert_eq!(context_free.cached_class_id.load(Ordering::Acquire), 1);
-    assert_eq!(
-        context_free.cached_entry_ptr.load(Ordering::Acquire),
-        0x1000
-    );
-    assert!(!context_free.cached_needs_context.load(Ordering::Relaxed));
+    assert_eq!(context_free.cached_entry(), (0x1000, false));
 
     // `clear_compiled_entry` is the sanctioned way to drop a compiled
-    // target, and it must clear the convention flag with it — a stale
-    // "needs context" against a zero entry would be read by the next
-    // publication attempt.
+    // target. The convention flag lives in the same word, so zeroing the word
+    // cannot leave a stale "needs context" behind for the next publication.
     context_needed.clear_compiled_entry();
-    assert_eq!(context_needed.cached_entry_ptr.load(Ordering::Acquire), 0);
-    assert!(!context_needed.cached_needs_context.load(Ordering::Relaxed));
+    assert_eq!(context_needed.cached_entry_word.load(Ordering::Acquire), 0);
+    assert_eq!(context_needed.cached_entry(), (0, false));
 }
 
 #[test]
@@ -76051,7 +76047,7 @@ fn s33_mic_zero_entry_ptr_does_not_enable_fast_path() {
 
     // Even though class_id matches, entry_ptr=0 means no direct call
     let cid = mic.cached_class_id.load(Ordering::Acquire);
-    let entry = mic.cached_entry_ptr.load(Ordering::Acquire);
+    let (entry, _) = mic.cached_entry();
     assert_eq!(cid, 5);
     assert_eq!(entry, 0);
     // The jit_invoke_virtual_mic code checks: if entry != 0 → direct call
@@ -76067,16 +76063,17 @@ fn s33_mic_update_after_prepopulate_preserves_class_id() {
     mic.prepopulate(99);
     // Class name and entry not set yet
     assert!(mic.cached_class_name.lock().is_none());
-    assert_eq!(mic.cached_entry_ptr.load(Ordering::Relaxed), 0);
+    assert_eq!(mic.cached_entry(), (0, false));
 
-    // Full update with the same class_id
-    mic.update(99, "FullyResolved", 0xBEEF, true, false);
+    // Full update with the same class_id. The sentinel is even: bit 0 of an
+    // entry word is the context tag, so an odd "address" is refused.
+    mic.update(99, "FullyResolved", 0xBEE0, true, false);
     assert_eq!(mic.cached_class_id.load(Ordering::Acquire), 99);
     assert_eq!(
         mic.cached_class_name.lock().as_deref(),
         Some("FullyResolved")
     );
-    assert_eq!(mic.cached_entry_ptr.load(Ordering::Acquire), 0xBEEF);
+    assert_eq!(mic.cached_entry(), (0xBEE0, true));
 }
 
 /// The `jdk_only` argument every `update` above passes as `false` has to
@@ -76113,11 +76110,10 @@ fn s33_mic_update_refuses_native_entry_under_jdk_only() {
     compatible.update(7, "Native", NATIVE_SENTINEL, true, false);
     assert_eq!(compatible.cached_class_id.load(Ordering::Acquire), 7);
     assert_eq!(
-        compatible.cached_entry_ptr.load(Ordering::Acquire),
-        NATIVE_SENTINEL,
+        compatible.cached_entry(),
+        (NATIVE_SENTINEL, true),
         "Compatible mode must still publish an unowned native entry"
     );
-    assert!(compatible.cached_needs_context.load(Ordering::Relaxed));
 
     // JDK-only refuses it, and the refusal is a DOWNGRADE, not a dropped
     // update: the class guard and name are still installed, so the site
@@ -76137,15 +76133,11 @@ fn s33_mic_update_refuses_native_entry_under_jdk_only() {
         "…and the class name with it"
     );
     assert_eq!(
-        jdk_only.cached_entry_ptr.load(Ordering::Acquire),
+        jdk_only.cached_entry_word.load(Ordering::Acquire),
         0,
         "JDK-only must NOT publish an unowned native entry: generated code \
-             would CALL it with no dispatch helper on the path"
-    );
-    assert!(
-        !jdk_only.cached_needs_context.load(Ordering::Relaxed),
-        "a refused entry must not leave its calling convention behind — the \
-             next publication attempt reads this flag"
+             would CALL it with no dispatch helper on the path — and a refused \
+             entry must not leave its calling convention behind either"
     );
 
     // The counter is process-global and other tests in this binary may be

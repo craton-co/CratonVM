@@ -3313,6 +3313,17 @@ pub struct CompiledMethod {
     /// "is the body at this baked address still the one it was baked for",
     /// not merely "is something alive there".
     pub artifact_id: u64,
+    /// Set once an invalidation has withdrawn this body from dispatch — the
+    /// class-hierarchy, redefinition or unloading assumptions it was compiled
+    /// under no longer hold. A body merely SUPERSEDED by a tier-up is not
+    /// retired: it is still correct code.
+    ///
+    /// Stored under the owning cache's `mutation` lock, BEFORE that cache
+    /// clears any inline cache. Every inline-cache publication re-reads it
+    /// after publishing (`JitMICSlot::update`, `JitPICSlot::install`) and rolls
+    /// the publication back, so a helper that resolved this body just before
+    /// the invalidation cannot re-install it behind the clearing pass.
+    pub retired: std::sync::atomic::AtomicBool,
 }
 
 unsafe impl Send for CompiledMethod {}
@@ -3488,6 +3499,7 @@ impl CompiledMethod {
             compile_id: 0,
             install_epoch: current_compile_install_epoch(),
             artifact_id: next_artifact_id(),
+            retired: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -3574,6 +3586,7 @@ impl CompiledMethod {
             compile_id: 0,
             install_epoch: current_compile_install_epoch(),
             artifact_id: next_artifact_id(),
+            retired: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -3973,24 +3986,24 @@ impl CompiledMethod {
     ///  * a populated, not-mid-installation `cached_class_id` — an empty slot
     ///    has seen nothing, and `INSTALLING_CLASS_ID` is what a concurrent
     ///    reader observes mid-publication;
-    ///  * a non-zero `cached_entry_ptr` — `prepopulate` seeds a class id from
+    ///  * a non-zero `cached_entry_word` — `prepopulate` seeds a class id from
     ///    profile data with the entry still 0, which is a guard HINT and not an
     ///    observation. Accepting it would launder a profile guess back in as if
     ///    it were runtime evidence;
     ///  * `misses` at or below [`MIC_TO_PIC_THRESHOLD`] — every helper entry
-    ///    after the install is a receiver this slot could not serve, which is
-    ///    the same signal `needs_pic_promotion` uses to declare the site
-    ///    polymorphic. This is the ONE thing the counters do measure honestly.
+    ///    after the install is a receiver this slot could not serve, so a site
+    ///    past it has proven polymorphic. This is the ONE thing the counters do
+    ///    measure honestly.
     ///
     /// WHAT IT PROMISES. Nothing about the future — it is speculation, and the
     /// consumer must guard on the class id it returns. A wrong answer costs the
     /// guard's miss edge, never correctness.
     pub fn dominant_receiver_at_bci(&self, bci: usize) -> Option<u32> {
         use std::sync::atomic::Ordering;
-        // A PIC at this bci means the adaptive recompiler already concluded the
-        // site is polymorphic. Its own MIC may still hold whichever receiver it
-        // installed first, and guarding on that would be guarding on the least
-        // informative of several.
+        // A PIC at this bci that has taken a miss means the site has already
+        // seen receivers its MIC could not serve. The MIC may still hold
+        // whichever receiver it installed first, and guarding on that would be
+        // guarding on the least informative of several.
         if self
             ._jit_pic_slots
             .iter()
@@ -4006,7 +4019,7 @@ impl CompiledMethod {
             if class_id == 0 || class_id == JitMICSlot::INSTALLING_CLASS_ID {
                 continue;
             }
-            if slot.cached_entry_ptr.load(Ordering::Relaxed) == 0 {
+            if slot.cached_entry_word.load(Ordering::Relaxed) == 0 {
                 continue;
             }
             if slot.misses.load(Ordering::Relaxed) > MIC_TO_PIC_THRESHOLD {
@@ -14624,24 +14637,73 @@ pub struct JitDirectCall {
     pub guard_class_id: u32,
 }
 
+/// Bit 0 of every inline-cache entry word ([`JitMICSlot::cached_entry_word`],
+/// [`JitPICSlot::entry_words`] and the PIC's hashed table): set when the cached
+/// target takes the hidden VM context pointer as its first argument.
+///
+/// The target and its calling convention used to live in two fields that
+/// generated code loaded separately, so a reader could load the address of one
+/// publication and the flag of the next and call a body with the other body's
+/// ABI — or pass a non-zero check on the address and then load a zero. Folded
+/// into one word they are one load. Every entry that can be published is the
+/// start of an executable buffer (page-aligned), so bit 0 is always free, and
+/// `jit_entry_publishable` refuses any address for which it is not.
+pub const JIT_IC_NEEDS_CONTEXT_TAG: u64 = 1;
+
+/// Encode `(entry, needs_context)` as an inline-cache entry word. A zero entry
+/// is the "no target" word whatever the flag says.
+#[inline]
+pub(crate) fn jit_ic_entry_word(entry: u64, needs_context: bool) -> u64 {
+    if entry == 0 {
+        0
+    } else {
+        entry | u64::from(needs_context)
+    }
+}
+
+/// Decode an inline-cache entry word into `(entry, needs_context)`.
+#[inline]
+pub(crate) fn jit_ic_entry_decode(word: u64) -> (u64, bool) {
+    (
+        word & !JIT_IC_NEEDS_CONTEXT_TAG,
+        word & JIT_IC_NEEDS_CONTEXT_TAG != 0,
+    )
+}
+
+/// Whether `owner` names a body an invalidation has already withdrawn
+/// ([`CompiledMethod::retired`]).
+#[inline]
+fn owner_is_retired(owner: &Option<Arc<CompiledMethod>>) -> bool {
+    owner
+        .as_ref()
+        .is_some_and(|o| o.retired.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// Inline-cache publications withdrawn again because an invalidation retired
+/// the target between its admission and the publication. Diagnostic counter.
+static IC_RETIRED_INSTALL_ROLLBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Monomorphic inline cache (MIC) slot for invokevirtual/invokeinterface call sites.
 ///
 /// Caches the receiver ClassId, class name, and resolved method entry pointer
 /// so that repeated calls with the same receiver type skip vtable dispatch entirely.
 ///
 /// On **cache hit** (receiver ClassId matches `cached_class_id`):
-///   - If `cached_entry_ptr` is non-zero → direct call to cached native function pointer
+///   - If `cached_entry_word` is non-zero → direct call to the cached entry,
+///     with the calling convention its bit 0 names
 ///   - Else → fast name-based dispatch (skip class_manager lookup)
 ///
 /// On **cache miss**:
 ///   - Full vtable dispatch via class_manager + invoke_or_native
 ///   - Update all cached fields atomically
 ///
-/// Hit/miss counters support adaptive recompilation decisions.
+/// Hit/miss counters feed [`CompiledMethod::dominant_receiver_at_bci`] and the
+/// dispatch diagnostics.
 ///
 /// # JDK-ONLY-WAVE2 — CLOSED 2026-08-06: no gap, and the prescription was wrong
 ///
-/// `cached_entry_ptr` is a raw address that generated code `CALL R11`s on a
+/// `cached_entry_word` holds a raw address that generated code `CALL R11`s on a
 /// class-id guard hit. When the target is a native/builtin trampoline the slot
 /// has kept the callback and thrown away its kind, so **nothing on the hit path
 /// can re-check policy** — the defining shape
@@ -14651,8 +14713,8 @@ pub struct JitDirectCall {
 /// `JdkOnly`, `jit_entry_publishable` declines to publish an unowned (i.e.
 /// native) entry at all, so the slot never holds one and the site keeps taking
 /// the policy-checked dispatch helper. Storing the kind was rejected for this
-/// wave because it is not free here — this struct is `#[repr(C)]` with three
-/// offsets (`0`, `8`, `16`) baked as immediates into emitted machine code in
+/// wave because it is not free here — this struct is `#[repr(C)]` with two
+/// offsets (`0`, `8`) baked as immediates into emitted machine code in
 /// `jit/src/x64.rs`, `jit/src/ir_lower.rs` and `jit/src/runtime_lowering.rs`,
 /// and the only population site ([`Self::update`]) is called from
 /// `vm/src/jit/helpers.rs`, which this wave's owner cannot edit; widening the
@@ -14712,8 +14774,8 @@ pub struct JitMICSlot {
     ///
     /// Occupies the 4 bytes that used to be pure padding at offset 4, so the
     /// slot's size and every JIT-hot offset (`cached_class_id` 0,
-    /// `cached_entry_ptr` 8, `cached_needs_context` 16) are unchanged and
-    /// generated code needs no update — it never loads offset 4.
+    /// `cached_entry_word` 8) are unchanged — generated code never loads
+    /// offset 4.
     ///
     /// Exists so a redefinition flushes each inline cache EXACTLY ONCE instead
     /// of forever. The previous gate asked "has this class ever been
@@ -14722,17 +14784,21 @@ pub struct JitMICSlot {
     /// each call. That was the bulk of the ~30 µs/call cost measured in
     /// `docs/known-issues/repros/redefine-call-cost`.
     pub redefine_epoch: std::sync::atomic::AtomicU32,
-    /// Cached method entry pointer for direct call on hit (0 = not resolved).
-    /// This is the address of a compiled native/JIT function that can be called
-    /// directly with the same calling convention as `invoke_or_native`.
-    /// **JIT-hot — offset 8.**
-    pub cached_entry_ptr: std::sync::atomic::AtomicU64,
-    /// Whether the cached entry needs the VM context pointer as first arg.
-    /// **JIT-hot — offset 16.**
-    pub cached_needs_context: std::sync::atomic::AtomicBool,
-    /// Padding so the following `AtomicU64` counters land at an 8-byte
-    /// aligned offset.
-    _pad1: [u8; 7],
+    /// The cached target as ONE word: the entry address, with
+    /// [`JIT_IC_NEEDS_CONTEXT_TAG`] set when the target takes the VM context
+    /// pointer as its first argument. `0` = not resolved. Decode with
+    /// [`Self::cached_entry`]. **JIT-hot — offset 8.**
+    ///
+    /// Generated code loads it once into R11, tests it for zero, and moves the
+    /// tag into the carry flag to choose the ABI, so the address it calls and
+    /// the convention it calls it with always come from the same publication.
+    /// When they were two fields a reader could load one publication's address
+    /// and the next one's flag.
+    pub cached_entry_word: std::sync::atomic::AtomicU64,
+    /// The bytes that held `cached_needs_context` and its padding before the
+    /// flag moved into the entry word. Reserved so the counters below keep
+    /// their offsets; nothing reads them.
+    _pad1: [u8; 8],
     /// Cache hit counter (diagnostic).
     pub hits: std::sync::atomic::AtomicU64,
     /// Cache miss counter (diagnostic).
@@ -14744,6 +14810,11 @@ pub struct JitMICSlot {
     pub cached_class_name: parking_lot::Mutex<Option<std::sync::Arc<str>>>,
     /// Keeps a compiled cache target alive while generated code can load its
     /// raw entry pointer. Native targets have no owner and leave this empty.
+    ///
+    /// Its lock is also the WRITER lock for `cached_entry_word`: the word and
+    /// the owner that keeps its body mapped are only ever changed together
+    /// with it held, so no interleaving of a publication and a withdrawal can
+    /// leave a callable word with no owner behind it.
     compiled_owner: parking_lot::Mutex<Option<Arc<CompiledMethod>>>,
     /// The bytecode index this slot's call site lives at, or `usize::MAX` for a
     /// slot with no site (tests, and the loop-unroll clones that share a site
@@ -14758,9 +14829,9 @@ pub struct JitMICSlot {
     /// `jit_inline_splice_devirt`). Recording it here costs one `usize` per
     /// slot and makes [`CompiledMethod::dominant_receiver_at_bci`] possible.
     ///
-    /// A TAIL field on purpose: `cached_class_id` (0), `cached_entry_ptr` (8)
-    /// and `cached_needs_context` (16) are read by generated code at fixed
-    /// offsets, so nothing may be inserted before them.
+    /// A TAIL field on purpose: `cached_class_id` (0) and `cached_entry_word`
+    /// (8) are read by generated code at fixed offsets, so nothing may be
+    /// inserted before them.
     pub bci: usize,
 }
 
@@ -14776,22 +14847,17 @@ impl JitMICSlot {
     /// struct. JIT codegen uses this to emit
     /// `MOV eax, [mic_ptr + CACHED_CLASS_ID_OFFSET]`.
     pub const CACHED_CLASS_ID_OFFSET: usize = 0;
-    /// Byte offset of [`Self::cached_entry_ptr`] from the start of the
-    /// struct. JIT codegen uses this to emit the indirect call target
-    /// load on a cache hit.
+    /// Byte offset of [`Self::cached_entry_word`] from the start of the
+    /// struct. JIT codegen loads the tagged target word from here on a cache
+    /// hit.
     pub const CACHED_ENTRY_PTR_OFFSET: usize = 8;
-    /// Byte offset of [`Self::cached_needs_context`] from the start of
-    /// the struct. JIT codegen reads this to decide whether to thread
-    /// the VM context pointer through the inline dispatch.
-    pub const CACHED_NEEDS_CONTEXT_OFFSET: usize = 16;
 
     pub fn new() -> Self {
         Self {
             cached_class_id: std::sync::atomic::AtomicU32::new(0),
             redefine_epoch: std::sync::atomic::AtomicU32::new(0),
-            cached_entry_ptr: std::sync::atomic::AtomicU64::new(0),
-            cached_needs_context: std::sync::atomic::AtomicBool::new(false),
-            _pad1: [0; 7],
+            cached_entry_word: std::sync::atomic::AtomicU64::new(0),
+            _pad1: [0; 8],
             hits: std::sync::atomic::AtomicU64::new(0),
             misses: std::sync::atomic::AtomicU64::new(0),
             cached_class_name: parking_lot::Mutex::new(None),
@@ -14808,6 +14874,16 @@ impl JitMICSlot {
     pub fn prepopulate(&self, class_id: u32) {
         self.cached_class_id
             .store(class_id, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The published target and whether it takes the VM context pointer,
+    /// decoded from the single entry word. `(0, false)` means no target.
+    #[inline]
+    pub fn cached_entry(&self) -> (u64, bool) {
+        jit_ic_entry_decode(
+            self.cached_entry_word
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
     }
 
     /// Update all cached fields after a cache miss.
@@ -14830,16 +14906,17 @@ impl JitMICSlot {
         // for polymorphic sites and cannot redirect native control flow.
         //
         // `prepopulate` seeds `cached_class_id` from profiling data with
-        // `cached_entry_ptr` still 0 (a guard hint, not an installed target).
+        // the entry word still 0 (a guard hint, not an installed target).
         // Treat that shape as an empty slot for THIS class id too — otherwise
         // the very first `update` for the profiled-dominant receiver would
         // match `id == class_id` and return before ever publishing an entry,
         // permanently stranding the slot at "unresolved" for its whole
-        // lifetime.
+        // lifetime. The same shape is what `clear_compiled_entry` leaves, so a
+        // withdrawn target can be re-resolved for the same receiver.
         loop {
             let current = self.cached_class_id.load(Ordering::Acquire);
             if current == class_id {
-                if self.cached_entry_ptr.load(Ordering::Acquire) != 0 {
+                if self.cached_entry_word.load(Ordering::Acquire) != 0 {
                     // Already fully installed for this class: idempotent no-op.
                     return;
                 }
@@ -14876,46 +14953,71 @@ impl JitMICSlot {
                 _ => return,
             }
         }
-        // Publish entry_ptr BEFORE class_id so the inline cache reader (which
-        // checks class_id first, then loads entry_ptr) never observes a class
-        // id paired with stale target metadata.
-        //
         // `compiled_owner` is what keeps the callee's code mapped while this
-        // slot's raw entry pointer is callable, so an entry we cannot retain is
-        // downgraded to "class cached, target unresolved" (the same shape
-        // `prepopulate` leaves) rather than published — see
-        // `jit_entry_publishable`.
+        // slot's raw entry is callable, so an entry we cannot retain — or one
+        // an invalidation has already retired — is downgraded to "class
+        // cached, target unresolved" (the same shape `prepopulate` leaves)
+        // rather than published. See `jit_entry_publishable`.
         let owner = resolve_jit_entry_owner(entry_ptr as usize);
-        let (entry_ptr, needs_context) = if jit_entry_publishable(entry_ptr, &owner, jdk_only) {
-            (entry_ptr, needs_context)
+        let word = if jit_entry_publishable(entry_ptr, &owner, jdk_only)
+            && !owner_is_retired(&owner)
+        {
+            jit_ic_entry_word(entry_ptr, needs_context)
         } else {
-            (0, false)
+            0
         };
-        *self.compiled_owner.lock() = owner;
-        self.cached_entry_ptr.store(entry_ptr, Ordering::Release);
+        // Publish the word BEFORE the class id so a reader that has not yet
+        // matched the guard cannot pair it with stale target metadata. The
+        // word is one store, so a reader already past a prepopulated guard
+        // loads either 0 or the whole new target — never an address from one
+        // publication with the ABI of another.
+        let previous = {
+            let mut slot_owner = self.compiled_owner.lock();
+            let previous = std::mem::replace(&mut *slot_owner, if word != 0 { owner } else { None });
+            self.cached_entry_word.store(word, Ordering::SeqCst);
+            previous
+        };
         *self.cached_class_name.lock() = Some(std::sync::Arc::from(class_name));
-        self.cached_needs_context
-            .store(needs_context, Ordering::Relaxed);
         self.cached_class_id.store(class_id, Ordering::Release);
+        // Never drop a replaced owner by assignment: it may be the last thing
+        // mapping a body some raw reader loaded a moment ago.
+        defer_jit_owner(previous);
+        // An invalidation marks its bodies `retired` under the cache's mutation
+        // lock and only THEN clears inline caches. If it marked this body after
+        // the admission above but visited this slot before the store, its pass
+        // missed the publication. Re-checking after the store closes that
+        // window: one of the two always observes the other.
+        if word != 0 && self.compiled_owner_retired() {
+            IC_RETIRED_INSTALL_ROLLBACKS.fetch_add(1, Ordering::Relaxed);
+            self.clear_compiled_entry();
+        }
+    }
+
+    /// Whether the owner this slot currently retains has been retired.
+    fn compiled_owner_retired(&self) -> bool {
+        owner_is_retired(&self.compiled_owner.lock())
     }
 
     /// Drop only the compiled-entry half of the MIC.
     ///
     /// The receiver class/name cache remains useful for helper-side dispatch,
-    /// but generated inline code treats a zero entry pointer as unresolved.
+    /// but generated inline code treats a zero entry word as unresolved. The
+    /// word and its owner change together under the owner lock, and the owner
+    /// is released through the retirement queue: a raw reader that loaded the
+    /// word just before the store may still be about to call it.
     pub fn clear_compiled_entry(&self) {
-        self.cached_entry_ptr
-            .store(0, std::sync::atomic::Ordering::Release);
-        defer_jit_owner(self.compiled_owner.lock().take());
-        self.cached_needs_context
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let owner = {
+            let mut slot_owner = self.compiled_owner.lock();
+            self.cached_entry_word
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+            slot_owner.take()
+        };
+        defer_jit_owner(owner);
     }
 
     fn invalidate_target(&self, targets: &std::collections::HashSet<usize>) {
-        let entry = self
-            .cached_entry_ptr
-            .load(std::sync::atomic::Ordering::Acquire) as usize;
-        if entry != 0 && targets.contains(&entry) {
+        let (entry, _) = self.cached_entry();
+        if entry != 0 && targets.contains(&(entry as usize)) {
             self.clear_compiled_entry();
         }
     }
@@ -14954,23 +15056,6 @@ impl JitMICSlot {
     pub fn is_monomorphic(&self) -> bool {
         self.total_observations() >= 10 && self.hit_rate_pct() >= 90
     }
-
-    /// Returns true if the cache is megamorphic (miss rate > 50% with enough samples).
-    pub fn is_megamorphic(&self) -> bool {
-        self.total_observations() >= 20 && self.hit_rate_pct() < 50
-    }
-
-    /// Whether this MIC should be promoted to a [`JitPICSlot`].
-    ///
-    /// Promotion triggers once the miss count exceeds
-    /// [`MIC_TO_PIC_THRESHOLD`], which indicates the site has seen at
-    /// least one receiver type the 1-entry MIC cannot cache. The
-    /// adaptive recompiler calls this during its periodic scan and
-    /// allocates a fresh PIC, seeded via [`JitPICSlot::seed_from_mic`].
-    #[inline]
-    pub fn needs_pic_promotion(&self) -> bool {
-        self.misses.load(std::sync::atomic::Ordering::Relaxed) > MIC_TO_PIC_THRESHOLD
-    }
 }
 
 impl Default for JitMICSlot {
@@ -14989,31 +15074,63 @@ impl Default for JitMICSlot {
 /// shapes (including the architecture probe's four implementations) without
 /// entering LFU eviction on every cycle.
 pub const JIT_PIC_ENTRIES: usize = 4;
-/// Megamorphic secondary cache: eight hash sets with two immutable-published
-/// ways each. Generated code probes exactly two adjacent entries.
+/// Megamorphic secondary cache: eight hash sets with two write-once ways each
+/// (same protocol as the inline ways — see [`JitPICSlot`]). Generated code
+/// probes exactly two adjacent entries.
 pub const JIT_MEGA_SETS: usize = 8;
 pub const JIT_MEGA_WAYS: usize = 2;
 pub const JIT_MEGA_ENTRIES: usize = JIT_MEGA_SETS * JIT_MEGA_WAYS;
 
-/// Polymorphic inline cache slot: a 4-way associative cache for
-/// virtual call dispatch targeting a call site that has exhibited
-/// polymorphism (more than one receiver type observed).
+/// Polymorphic inline cache slot: a 4-way associative cache for virtual call
+/// dispatch at a site that has seen more than one receiver type, backed by a
+/// compact hashed table for receivers the four ways cannot hold.
 ///
-/// # Promotion path
+/// # Allocation and population
+///
+/// Every virtual/interface site gets one of these eagerly, beside its
+/// [`JitMICSlot`], at first compile (HIGH-7). Nothing promotes or recompiles a
+/// site: the resolving helper `jit_invoke_virtual_mic` installs into both on a
+/// miss, and generated code starts hitting on the next call.
+///
+/// # Ways are write-once under lock-free readers
+///
+/// Generated code — the single-pass cascade in `x64/bytecode_walk.rs`, the
+/// optimizing tier's in `ir_lower.rs`, and the hashed stub in
+/// `runtime_lowering.rs` — reads a way with no lock:
 ///
 /// ```text
-/// uncompiled → MIC (1-entry) → PIC (4-entry) → megamorphic vtable
+///   CMP  EAX, [R10 + CLASS_ID_OFFSETS[i]]   ; JNE next way
+///   MOV  R11, [R10 + ENTRY_PTR_OFFSETS[i]]  ; ONE load: target and its ABI
+///   TEST R11, R11                           ; JZ  resolving helper
+///   BTR  R11, 0                             ; CF = needs-context, R11 = target
+///   JNC  .no_context                        ; marshal ... CALL R11
 /// ```
 ///
-/// The JIT installs a [`JitMICSlot`] at every virtual call site. On a
-/// recorded miss count > `MIC_TO_PIC_THRESHOLD` the adaptive
-/// recompiler upgrades the site to a `JitPICSlot`. If the PIC itself
-/// records > `PIC_TO_MEGA_THRESHOLD` misses after filling all 4
-/// entries, the site is deoptimized to a generic vtable dispatch.
+/// A reader past the class compare may load the entry word at any later
+/// instant, so a way whose class id can still match must never be RETARGETED:
+/// that would pair one receiver's guard with another receiver's body, which is
+/// exactly why [`JitMICSlot::update`] refuses to retarget and why the hashed
+/// table was already install-once. A published way is therefore never
+/// overwritten. It can only be *retired*: its class id is replaced by
+/// [`Self::RETIRED_WAY_CLASS_ID`], which no receiver matches, and only then is
+/// its word zeroed. A reader already past the compare loads the old word, whose
+/// body the deferred owner keeps mapped, or zero, and takes the helper.
+///
+/// A retired way is reused only once every thread has passed a quiescent point
+/// after the retirement ([`retire_generation_is_graced`]): until then some
+/// reader may still sit between that compare and its load, and a new word
+/// published under it would be called for the old receiver.
+///
+/// When all four ways hold live receivers, a fifth is served by the hashed
+/// table (same protocol) or by the helper. There is no LFU eviction — evicting
+/// a live way is the retarget above.
+///
+/// All writers (install, retire, clear, seed) serialize on `writer`; readers
+/// never take it.
 ///
 /// # JDK-ONLY-WAVE2 — CLOSED 2026-08-06, with [`JitMICSlot`]; see the note there
 ///
-/// `entry_ptrs[i]` and `mega_entry_ptrs[i]` are raw addresses with no kind
+/// `entry_words[i]` and `mega_entry_words[i]` hold raw addresses with no kind
 /// beside them, so a hit cannot re-check policy. Both install paths funnel
 /// through `jit_entry_publishable`, which under `JdkOnly` refuses unowned
 /// (native/builtin) targets, so wave 1 keeps them empty of natives rather than
@@ -15022,9 +15139,7 @@ pub const JIT_MEGA_ENTRIES: usize = JIT_MEGA_SETS * JIT_MEGA_WAYS;
 /// This used to prescribe a wave-2 `AtomicU8` kind array appended at the TAIL,
 /// checked instead of refusing outright. **Do not do that** — see the same
 /// retraction on [`JitMICSlot`], which applies here unchanged and with one
-/// extra reason: the inline 4-way probe this struct exists for is
-/// `CMP EAX,[R10+CLASS_ID_OFFSETS[i]]` / `MOV R11,[R10+ENTRY_PTR_OFFSETS[i]]` /
-/// `CALL R11`, so a kind array would need four more loads and branches inside
+/// extra reason: a kind array would need four more loads and branches inside
 /// the guard cascade, on the hottest dispatch shape in the JIT, to police a
 /// state `jit_entry_publishable`'s policy-independent `owner.is_some()` early
 /// return already makes unreachable in both modes.
@@ -15033,104 +15148,101 @@ pub const JIT_MEGA_ENTRIES: usize = JIT_MEGA_SETS * JIT_MEGA_WAYS;
 ///
 /// Hot fields use a structure-of-arrays prefix so the generated x86-64 stub
 /// can linearly probe four packed class ids at offsets 0–12, then load the
-/// matching entry pointer at offsets 16–40 and ABI flag at offsets 48–51.
-/// The entire generated-code-visible prefix fits in one cache line.
+/// matching entry word at offsets 16–40. The entire generated-code-visible
+/// prefix of the four ways fits in one cache line.
 ///
 /// # Stable layout (CRIT-8 prerequisite)
 ///
-/// Marked `#[repr(C)]` and laid out so the JIT codegen in
-/// `jit/src/x64.rs` can emit raw `MOV eax, [pic_ptr + CLASS_ID_OFFSETS[i]]`
-/// for inline 4-way PIC dispatch. The `Mutex<Option<String>>` array —
-/// whose internal representation is not guaranteed stable across
-/// `parking_lot` versions — is moved to the **tail** so its layout
-/// cannot disturb the hot-path offsets.
+/// Marked `#[repr(C)]` and laid out so the JIT codegen can emit raw
+/// `CMP eax, [pic_ptr + CLASS_ID_OFFSETS[i]]` for the inline 4-way dispatch.
+/// The `parking_lot::Mutex` arrays — whose internal representation is not
+/// guaranteed stable across `parking_lot` versions — sit at the **tail** so
+/// their layout cannot disturb the hot-path offsets.
 ///
 /// Offsets are asserted to match the constants in
 /// [`JitPICSlot::CLASS_ID_OFFSETS`] et al. via a runtime test
 /// (`test_jit_pic_slot_offsets`).
 #[repr(C)]
 pub struct JitPICSlot {
-    /// Cached ClassIds, parallel to `entry_ptrs`. `0` means the slot
-    /// is empty (ClassId 0 is reserved for `java.lang.Object`, which
-    /// cannot be a dispatch target here because invokevirtual on an
-    /// Object reference goes through the vtable directly).
+    /// Cached ClassIds, parallel to `entry_words`. `0` means the way is
+    /// empty (ClassId 0 is reserved for `java.lang.Object`, which cannot be a
+    /// dispatch target here because invokevirtual on an Object reference goes
+    /// through the vtable directly); [`Self::RETIRED_WAY_CLASS_ID`] means it
+    /// was retired and is waiting out its grace period.
     /// **JIT-hot — offsets 0, 4, 8, 12.**
     pub class_ids: [std::sync::atomic::AtomicU32; JIT_PIC_ENTRIES],
-    /// Cached method entry pointers, parallel to `class_ids`.
-    /// **JIT-hot — offsets 16, 24, 32, 40.**
-    pub entry_ptrs: [std::sync::atomic::AtomicU64; JIT_PIC_ENTRIES],
-    /// Whether the cached entry needs the VM context pointer as the
-    /// first argument. Parallel to `class_ids`.
-    /// **JIT-hot — offsets 48, 49, 50, 51.**
-    pub needs_context: [std::sync::atomic::AtomicBool; JIT_PIC_ENTRIES],
-    /// Padding so the following `AtomicU64` counters land at an 8-byte
-    /// aligned offset.
-    _pad1: [u8; 4],
-    /// Per-entry hit counter. Used to pick an eviction victim when a
-    /// fifth receiver type arrives.
+    /// Tagged target words, parallel to `class_ids`: the entry address with
+    /// [`JIT_IC_NEEDS_CONTEXT_TAG`] set when the target takes the VM context
+    /// pointer. `0` = no target. **JIT-hot — offsets 16, 24, 32, 40.**
+    pub entry_words: [std::sync::atomic::AtomicU64; JIT_PIC_ENTRIES],
+    /// Where the per-way `needs_context` flags and their padding lived before
+    /// the flag moved into the entry words. Reserved so `hits`, `misses` and
+    /// the hashed table keep the offsets generated code bakes in.
+    _pad1: [u8; 8],
+    /// Per-way hit counter (diagnostic).
     pub hits: [std::sync::atomic::AtomicU64; JIT_PIC_ENTRIES],
-    /// Total cache misses (receiver not in any entry).
+    /// Total cache misses (receiver not in any way).
     pub misses: std::sync::atomic::AtomicU64,
-    /// Compact hashed/vtable cache used after the four inline PIC guards miss.
-    /// These arrays are part of the generated-code-visible prefix. Entries are
-    /// installed once (entry/ABI first, class id last) and never evicted, so a
-    /// lock-free reader cannot pair an old class guard with a new target.
+    /// Compact hashed table used after the four inline ways miss. Part of the
+    /// generated-code-visible prefix. Same write-once protocol as the ways.
     mega_class_ids: [std::sync::atomic::AtomicU32; JIT_MEGA_ENTRIES],
-    mega_entry_ptrs: [std::sync::atomic::AtomicU64; JIT_MEGA_ENTRIES],
-    mega_needs_context: [std::sync::atomic::AtomicBool; JIT_MEGA_ENTRIES],
+    mega_entry_words: [std::sync::atomic::AtomicU64; JIT_MEGA_ENTRIES],
     /// Cached class names (mutex-protected). Parallel to `class_ids`.
-    /// Moved to the tail: `parking_lot::Mutex<Option<String>>` has an
-    /// unstable layout we must not expose to JIT codegen.
     pub class_names: [parking_lot::Mutex<Option<String>>; JIT_PIC_ENTRIES],
-    /// Strong owners for compiled `entry_ptrs`; tail-only so hot offsets stay
+    /// Strong owners for compiled `entry_words`; tail-only so hot offsets stay
     /// stable. Native targets leave the corresponding element empty.
     compiled_owners: [parking_lot::Mutex<Option<Arc<CompiledMethod>>>; JIT_PIC_ENTRIES],
-    /// Strong owners for the generated hashed table's raw entry pointers.
+    /// Strong owners for the hashed table's raw entry words.
     mega_compiled_owners: [parking_lot::Mutex<Option<Arc<CompiledMethod>>>; JIT_MEGA_ENTRIES],
+    /// The retire generation each way was stamped with when it was retired.
+    /// Meaningful only while its class id is [`Self::RETIRED_WAY_CLASS_ID`].
+    way_retired_gen: [std::sync::atomic::AtomicU64; JIT_PIC_ENTRIES],
+    /// The same, for the hashed table's ways.
+    mega_retired_gen: [std::sync::atomic::AtomicU64; JIT_MEGA_ENTRIES],
+    /// Serializes every writer of the ways and the hashed table. Generated
+    /// code never takes it.
+    writer: parking_lot::Mutex<()>,
     /// The bytecode index this slot's call site lives at, or `usize::MAX` for a
     /// slot with no site. Mirrors [`JitMICSlot::bci`]; read by
-    /// [`CompiledMethod::dominant_receiver_at_bci`] to refuse a site the
-    /// adaptive recompiler already declared polymorphic.
+    /// [`CompiledMethod::dominant_receiver_at_bci`] to refuse a site that has
+    /// already proven polymorphic.
     ///
-    /// LAST FIELD, and it has to be. Everything above it up to and including
-    /// the `mega_*` arrays is addressed by generated code at the fixed offsets
-    /// in `MEGA_CLASS_IDS_OFFSET` and friends. Putting this after `misses` —
-    /// where it reads naturally — moved `MEGA_CLASS_IDS_OFFSET` from 96 to 104
-    /// and every megamorphic-stub load with it.
+    /// Everything up to and including the `mega_*` word array is addressed by
+    /// generated code at the fixed offsets in `MEGA_CLASS_IDS_OFFSET` and
+    /// friends, so this and the other tail fields must stay after it. Putting
+    /// `bci` after `misses` — where it reads naturally — moved
+    /// `MEGA_CLASS_IDS_OFFSET` from 96 to 104 once, and
     /// `test_jit_mega_offsets_match_generated_stub_contract` caught it.
     pub bci: usize,
 }
 
-/// Miss count on a `JitMICSlot` at which the adaptive recompiler
-/// promotes the site to a `JitPICSlot`.
+/// Miss count on a `JitMICSlot` past which
+/// [`CompiledMethod::dominant_receiver_at_bci`] treats the site as
+/// polymorphic: every helper entry after the install is a receiver the slot
+/// could not serve.
 pub const MIC_TO_PIC_THRESHOLD: u64 = 3;
 
-/// Miss count on a full `JitPICSlot` (all 4 entries populated) at
-/// which the adaptive recompiler deoptimizes the site to megamorphic
-/// vtable dispatch.
-pub const PIC_TO_MEGA_THRESHOLD: u64 = 20;
-
 impl JitPICSlot {
+    /// Class id that marks a retired way (and a retired hashed-table way).
+    ///
+    /// No receiver matches it: class ids are allocated densely from zero, and
+    /// the only other reserved value is [`JitMICSlot::INSTALLING_CLASS_ID`]
+    /// (`u32::MAX`).
+    pub const RETIRED_WAY_CLASS_ID: u32 = u32::MAX - 1;
     /// Byte offsets of [`Self::class_ids`] entries from the start of
     /// the struct. JIT codegen uses these to emit
-    /// `MOV eax, [pic_ptr + CLASS_ID_OFFSETS[i]]` for the inline 4-way
+    /// `CMP eax, [pic_ptr + CLASS_ID_OFFSETS[i]]` for the inline 4-way
     /// class comparisons.
     pub const CLASS_ID_OFFSETS: [usize; JIT_PIC_ENTRIES] = [0, 4, 8, 12];
-    /// Byte offsets of [`Self::entry_ptrs`] entries from the start of
-    /// the struct. JIT codegen uses these to emit the indirect call
-    /// target load on a PIC hit.
+    /// Byte offsets of [`Self::entry_words`] entries from the start of
+    /// the struct. JIT codegen loads the tagged target word from here on a
+    /// PIC hit.
     pub const ENTRY_PTR_OFFSETS: [usize; JIT_PIC_ENTRIES] = [16, 24, 32, 40];
-    /// Byte offsets of [`Self::needs_context`] entries from the start
-    /// of the struct. JIT codegen reads these to decide whether to
-    /// thread the VM context pointer through the inline dispatch.
-    pub const NEEDS_CONTEXT_OFFSETS: [usize; JIT_PIC_ENTRIES] = [48, 49, 50, 51];
     /// Generated-code-visible offsets for the compact hashed table. The
-    /// preceding hot prefix is: ids(16), entries(32), ABI(4), pad(4),
+    /// preceding hot prefix is: ids(16), entry words(32), reserved(8),
     /// hits(32), misses(8) = 96 bytes.
     pub const MEGA_CLASS_IDS_OFFSET: usize = 96;
     pub const MEGA_ENTRY_PTRS_OFFSET: usize = Self::MEGA_CLASS_IDS_OFFSET + JIT_MEGA_ENTRIES * 4;
-    pub const MEGA_NEEDS_CONTEXT_OFFSET: usize =
-        Self::MEGA_ENTRY_PTRS_OFFSET + JIT_MEGA_ENTRIES * 8;
     pub const MEGA_HASH_MULTIPLIER: u32 = 0x9E37_79B1;
     pub const MEGA_SET_SHIFT: u8 = 29;
 
@@ -15147,154 +15259,142 @@ impl JitPICSlot {
 
     /// Create an empty PIC slot.
     pub fn new() -> Self {
-        // Can't use `Default::default()` inside a const array literal
-        // because the inner types (`parking_lot::Mutex`) don't derive
-        // `Copy`; materialize each entry explicitly.
         Self {
-            class_ids: [
-                std::sync::atomic::AtomicU32::new(0),
-                std::sync::atomic::AtomicU32::new(0),
-                std::sync::atomic::AtomicU32::new(0),
-                std::sync::atomic::AtomicU32::new(0),
-            ],
-            entry_ptrs: [
-                std::sync::atomic::AtomicU64::new(0),
-                std::sync::atomic::AtomicU64::new(0),
-                std::sync::atomic::AtomicU64::new(0),
-                std::sync::atomic::AtomicU64::new(0),
-            ],
-            needs_context: [
-                std::sync::atomic::AtomicBool::new(false),
-                std::sync::atomic::AtomicBool::new(false),
-                std::sync::atomic::AtomicBool::new(false),
-                std::sync::atomic::AtomicBool::new(false),
-            ],
-            _pad1: [0; 4],
-            hits: [
-                std::sync::atomic::AtomicU64::new(0),
-                std::sync::atomic::AtomicU64::new(0),
-                std::sync::atomic::AtomicU64::new(0),
-                std::sync::atomic::AtomicU64::new(0),
-            ],
+            class_ids: std::array::from_fn(|_| std::sync::atomic::AtomicU32::new(0)),
+            entry_words: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            _pad1: [0; 8],
+            hits: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             misses: std::sync::atomic::AtomicU64::new(0),
             mega_class_ids: std::array::from_fn(|_| std::sync::atomic::AtomicU32::new(0)),
-            mega_entry_ptrs: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
-            mega_needs_context: std::array::from_fn(|_| std::sync::atomic::AtomicBool::new(false)),
-            class_names: [
-                parking_lot::Mutex::new(None),
-                parking_lot::Mutex::new(None),
-                parking_lot::Mutex::new(None),
-                parking_lot::Mutex::new(None),
-            ],
-            compiled_owners: [
-                parking_lot::Mutex::new(None),
-                parking_lot::Mutex::new(None),
-                parking_lot::Mutex::new(None),
-                parking_lot::Mutex::new(None),
-            ],
+            mega_entry_words: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            class_names: std::array::from_fn(|_| parking_lot::Mutex::new(None)),
+            compiled_owners: std::array::from_fn(|_| parking_lot::Mutex::new(None)),
             mega_compiled_owners: std::array::from_fn(|_| parking_lot::Mutex::new(None)),
+            way_retired_gen: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            mega_retired_gen: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            writer: parking_lot::Mutex::new(()),
             bci: usize::MAX,
         }
     }
 
-    /// Seed the PIC from an existing MIC. Used during MIC → PIC
-    /// promotion so the single MIC entry lands in slot 0 of the PIC
-    /// and no cache warm-up is lost.
-    pub fn seed_from_mic(&self, mic: &JitMICSlot, jdk_only: bool) {
-        let class_id = mic
-            .cached_class_id
-            .load(std::sync::atomic::Ordering::Acquire);
-        if class_id == 0 {
-            return;
-        }
-        // Read the OWNER FIRST, then the entry pointer.
-        //
-        // `JitMICSlot::clear_compiled_entry` zeroes `cached_entry_ptr` and only
-        // then takes `compiled_owner`. Reading in the other order — as this did
-        // — admits the interleaving that copies a live raw entry into the PIC
-        // together with an owner that has already been taken: the PIC then holds
-        // a callable address with no keep-alive, and the emitted 4-way cascade
-        // `CALL`s it after the body is unmapped. Owner-then-entry makes that
-        // interleaving impossible: if the owner read lands after the take, the
-        // entry read (which follows it) necessarily lands after the zeroing.
-        let owner = mic.compiled_owner.lock().clone();
-        let entry_ptr = mic
-            .cached_entry_ptr
-            .load(std::sync::atomic::Ordering::Acquire);
-        let needs_ctx = mic
-            .cached_needs_context
-            .load(std::sync::atomic::Ordering::Relaxed);
-        // PIC slots keep `String` names; the MIC caches `Arc<str>` (cheap
-        // per-hit clones in the dispatch helper) — convert on this rare
-        // promotion path.
-        let class_name = mic.cached_class_name.lock().as_deref().map(String::from);
-        // And re-run the same admission the two other install paths run: an
-        // owner-less address that is still a `jit_entry_owners` key, or that
-        // lies inside a live JIT region, is a body we failed to retain — not a
-        // native trampoline. Copying it forward would launder a refusal the MIC
-        // itself would make today.
-        let (entry_ptr, needs_ctx) = if jit_entry_publishable(entry_ptr, &owner, jdk_only) {
-            (entry_ptr, needs_ctx)
-        } else {
-            (0, false)
-        };
-        *self.compiled_owners[0].lock() = owner;
-        // BUG-24: publish entry_ptr / needs_context / name BEFORE the class_id,
-        // exactly as `write_entry` does. The inline PIC cascade
-        // (`jit/src/x64.rs`) reads `class_ids[i]` first and, on a match, loads
-        // `entry_ptrs[i]` and `CALL`s it — all with plain (acquire-on-x86) MOVs.
-        // The previous order stored `class_ids[0]` first, so a reader that
-        // observed the new class id could still load the slot's *previous*
-        // `entry_ptrs[0]` (a stale/garbage pointer left from an earlier
-        // occupant) and call through it → the Mockito-under-JIT
-        // `EXCEPTION_ACCESS_VIOLATION at 0x0000033E…` (a packed-class-id-looking
-        // value). Storing the entry first closes the window.
-        self.entry_ptrs[0].store(entry_ptr, std::sync::atomic::Ordering::Release);
-        self.needs_context[0].store(needs_ctx, std::sync::atomic::Ordering::Relaxed);
-        *self.class_names[0].lock() = class_name;
-        self.class_ids[0].store(class_id, std::sync::atomic::Ordering::Release);
-        // Carry the hit count so adaptive recompilation keeps the
-        // cumulative picture.
-        self.hits[0].store(
-            mic.hits.load(std::sync::atomic::Ordering::Relaxed),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+    /// Whether `class_id` can name a real receiver: not an empty, installing or
+    /// retired way.
+    #[inline]
+    fn is_live_class_id(class_id: u32) -> bool {
+        class_id != 0
+            && class_id != JitMICSlot::INSTALLING_CLASS_ID
+            && class_id != Self::RETIRED_WAY_CLASS_ID
     }
 
-    /// Fast-path lookup: find a cached entry for `class_id`. Returns
-    /// `Some((entry_ptr, needs_context))` on hit, `None` on miss.
-    ///
-    /// This is the pure-Rust implementation that mirrors what the
-    /// JIT-generated dispatch stub does with `CMP` / `JE`. Tests use
-    /// it directly; the generated stub calls into a tiny shim that
-    /// invokes the same sequence of atomic loads.
-    #[inline]
-    pub fn lookup(&self, class_id: u32) -> Option<(u64, bool)> {
-        // Scan all 4 entries. Because entries never share a class_id
-        // (see `install`), at most one can match; we break out early
-        // on the first hit.
-        for i in 0..JIT_PIC_ENTRIES {
-            let cached = self.class_ids[i].load(std::sync::atomic::Ordering::Acquire);
-            if cached == class_id {
-                let ptr = self.entry_ptrs[i].load(std::sync::atomic::Ordering::Acquire);
-                let ctx = self.needs_context[i].load(std::sync::atomic::Ordering::Relaxed);
-                self.hits[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Some((ptr, ctx));
+    /// Way `i`'s class id and decoded target `(class_id, entry, needs_context)`,
+    /// for diagnostics. `None` past the last way.
+    pub fn way(&self, i: usize) -> Option<(u32, u64, bool)> {
+        use std::sync::atomic::Ordering;
+        let class_id = self.class_ids.get(i)?.load(Ordering::Acquire);
+        let (entry, needs_context) = jit_ic_entry_decode(self.entry_words[i].load(Ordering::Acquire));
+        Some((class_id, entry, needs_context))
+    }
+
+    /// Seed the PIC from an existing MIC, so a profile-seeded or already
+    /// resolved MIC entry lands in way 0 and no cache warm-up is lost. Only
+    /// ever called while the slot is being built, before generated code can
+    /// reach it; it still goes through the writer lock and the admission check
+    /// so it cannot publish anything an install would refuse.
+    pub fn seed_from_mic(&self, mic: &JitMICSlot, jdk_only: bool) {
+        use std::sync::atomic::Ordering;
+        let class_id = mic.cached_class_id.load(Ordering::Acquire);
+        if !Self::is_live_class_id(class_id) {
+            return;
+        }
+        // Read the owner and the word under the MIC's owner lock, which is the
+        // lock every MIC writer changes the two under. Reading them separately
+        // admitted the interleaving that copies a live raw word into the PIC
+        // together with an owner that has already been taken: a callable
+        // pointer with no keep-alive, which the emitted cascade `CALL`s after
+        // the body is unmapped.
+        let (owner, word) = {
+            let slot_owner = mic.compiled_owner.lock();
+            (
+                slot_owner.clone(),
+                mic.cached_entry_word.load(Ordering::Acquire),
+            )
+        };
+        let (entry, needs_context) = jit_ic_entry_decode(word);
+        // PIC slots keep `String` names; the MIC caches `Arc<str>` (cheap
+        // per-hit clones in the dispatch helper) — convert on this rare path.
+        let class_name = mic.cached_class_name.lock().as_deref().map(String::from);
+        // Re-run the same admission the install paths run: an owner-less
+        // address that is still a `jit_entry_owners` key, or that lies inside a
+        // live JIT region, is a body we failed to retain — not a native
+        // trampoline. Copying it forward would launder a refusal the MIC itself
+        // would make today.
+        let word = if jit_entry_publishable(entry, &owner, jdk_only) && !owner_is_retired(&owner) {
+            jit_ic_entry_word(entry, needs_context)
+        } else {
+            0
+        };
+        let mut deferred: Vec<Arc<CompiledMethod>> = Vec::new();
+        {
+            let _writer = self.writer.lock();
+            if self.class_ids[0].load(Ordering::Acquire) == 0 {
+                let kept = if word != 0 { owner } else { None };
+                if let Some(previous) = std::mem::replace(&mut *self.compiled_owners[0].lock(), kept) {
+                    deferred.push(previous);
+                }
+                self.entry_words[0].store(word, Ordering::SeqCst);
+                *self.class_names[0].lock() = class_name;
+                // Carry the hit count so the per-way counters keep the
+                // cumulative picture.
+                self.hits[0].store(mic.hits.load(Ordering::Relaxed), Ordering::Relaxed);
+                // Publish the class id last.
+                self.class_ids[0].store(class_id, Ordering::Release);
             }
         }
-        self.misses
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        for previous in deferred {
+            defer_jit_owner(Some(previous));
+        }
+    }
+
+    /// Fast-path lookup: find a cached way for `class_id`. Returns
+    /// `Some((entry, needs_context))` on hit, `None` on miss.
+    ///
+    /// The pure-Rust mirror of what the JIT-generated cascade does. Two ways
+    /// can briefly name the same receiver (two concurrent installs of a
+    /// recompiled target); both are valid targets for it, and the first match
+    /// wins here exactly as it does in generated code.
+    #[inline]
+    pub fn lookup(&self, class_id: u32) -> Option<(u64, bool)> {
+        use std::sync::atomic::Ordering;
+        if Self::is_live_class_id(class_id) {
+            for i in 0..JIT_PIC_ENTRIES {
+                if self.class_ids[i].load(Ordering::Acquire) == class_id {
+                    let decoded = jit_ic_entry_decode(self.entry_words[i].load(Ordering::Acquire));
+                    self.hits[i].fetch_add(1, Ordering::Relaxed);
+                    return Some(decoded);
+                }
+            }
+        }
+        self.misses.fetch_add(1, Ordering::Relaxed);
         None
     }
 
-    /// Install a new `(class_id → entry_ptr)` mapping.
+    /// Install a `(class_id → entry)` mapping into the hashed table and, if a
+    /// way is free, into the four inline ways.
     ///
-    /// - If the class is already present, refresh that entry in place.
-    /// - If an empty slot exists (class_id == 0), use it.
-    /// - Otherwise evict the entry with the fewest hits (LFU). The
-    ///   evicted entry's class_id is cleared first so concurrent
-    ///   readers can't accidentally dispatch to a stale pointer with
-    ///   a new class id.
+    /// - A way already holding exactly this target is left alone.
+    /// - A class-only way for this receiver (a profile seed) is filled in
+    ///   place: its guard already matches, and one store of the whole word
+    ///   cannot be seen half-written.
+    /// - A way holding a DIFFERENT target for this receiver (the callee was
+    ///   recompiled) is retired, and the new target is published into a free
+    ///   way.
+    /// - A free way is an empty one, or a retired one whose grace period has
+    ///   passed. With none free the hashed table or the helper serves the
+    ///   receiver: a live way is never evicted.
+    ///
+    /// Nothing is published for a target that cannot be retained or that an
+    /// invalidation has retired, and a publication that races such a
+    /// retirement is rolled back after the fact.
     pub fn install(
         &self,
         class_id: u32,
@@ -15303,185 +15403,271 @@ impl JitPICSlot {
         needs_ctx: bool,
         jdk_only: bool,
     ) {
-        self.install_megamorphic(class_id, class_name, entry_ptr, needs_ctx, jdk_only);
-        // Refresh an existing mapping in place. Re-inserting the same class in
-        // a second slot wastes associativity and, once full, causes a stable
-        // polymorphic site to evict a different receiver on every helper miss.
-        for i in 0..JIT_PIC_ENTRIES {
-            if self.class_ids[i].load(std::sync::atomic::Ordering::Acquire) == class_id {
-                self.class_ids[i].store(0, std::sync::atomic::Ordering::Release);
-                defer_jit_owner(self.compiled_owners[i].lock().take());
-                self.write_entry(i, class_id, class_name, entry_ptr, needs_ctx, jdk_only);
-                return;
+        use std::sync::atomic::Ordering;
+        if !Self::is_live_class_id(class_id) {
+            return;
+        }
+        let owner = resolve_jit_entry_owner(entry_ptr as usize);
+        if !jit_entry_publishable(entry_ptr, &owner, jdk_only) || owner_is_retired(&owner) {
+            return;
+        }
+        let word = jit_ic_entry_word(entry_ptr, needs_ctx);
+        if word == 0 {
+            return;
+        }
+        let mut deferred: Vec<Arc<CompiledMethod>> = Vec::new();
+        let mut rolled_back = false;
+        {
+            let _writer = self.writer.lock();
+            self.install_megamorphic_locked(class_id, word, &owner, &mut deferred);
+            self.install_way_locked(class_id, class_name, word, &owner, &mut deferred);
+            // See `JitMICSlot::update`: an invalidation sets `retired` before
+            // clearing inline caches, and its clearing pass takes this lock. So
+            // either that pass runs after this publication and withdraws it, or
+            // it ran before and `retired` is already visible here.
+            if owner_is_retired(&owner) {
+                let target = entry_ptr as usize;
+                self.retire_matching_locked(|entry| entry == target, &mut deferred);
+                rolled_back = true;
             }
         }
-        // First preference: reuse an empty slot so hit counters for
-        // existing entries aren't perturbed.
-        for i in 0..JIT_PIC_ENTRIES {
-            if self.class_ids[i].load(std::sync::atomic::Ordering::Relaxed) == 0 {
-                self.write_entry(i, class_id, class_name, entry_ptr, needs_ctx, jdk_only);
-                return;
-            }
+        if rolled_back {
+            IC_RETIRED_INSTALL_ROLLBACKS.fetch_add(1, Ordering::Relaxed);
         }
-        // All slots full — evict LFU.
-        let mut victim = 0usize;
-        let mut victim_hits = u64::MAX;
-        for i in 0..JIT_PIC_ENTRIES {
-            let h = self.hits[i].load(std::sync::atomic::Ordering::Relaxed);
-            if h < victim_hits {
-                victim_hits = h;
-                victim = i;
-            }
+        for previous in deferred {
+            defer_jit_owner(Some(previous));
         }
-        // Clear first so readers don't see the old ptr paired with
-        // the new class_id during the atomic update window.
-        self.class_ids[victim].store(0, std::sync::atomic::Ordering::Release);
-        defer_jit_owner(self.compiled_owners[victim].lock().take());
-        self.write_entry(victim, class_id, class_name, entry_ptr, needs_ctx, jdk_only);
     }
 
-    fn install_megamorphic(
+    fn install_way_locked(
         &self,
         class_id: u32,
         class_name: &str,
-        entry_ptr: u64,
-        needs_context: bool,
-        jdk_only: bool,
+        word: u64,
+        owner: &Option<Arc<CompiledMethod>>,
+        deferred: &mut Vec<Arc<CompiledMethod>>,
+    ) {
+        use std::sync::atomic::Ordering;
+        let mut free: Option<usize> = None;
+        for i in 0..JIT_PIC_ENTRIES {
+            let observed = self.class_ids[i].load(Ordering::Acquire);
+            if observed == class_id {
+                let current = self.entry_words[i].load(Ordering::Acquire);
+                if current == word {
+                    return;
+                }
+                if current == 0 {
+                    self.publish_way_locked(i, class_id, class_name, word, owner, deferred);
+                    return;
+                }
+                self.retire_way_locked(i, deferred);
+                continue;
+            }
+            if free.is_none() && self.way_is_free(observed, &self.way_retired_gen[i]) {
+                free = Some(i);
+            }
+        }
+        if let Some(i) = free {
+            self.publish_way_locked(i, class_id, class_name, word, owner, deferred);
+        }
+    }
+
+    /// An empty way, or a retired one no reader can still be inside.
+    #[inline]
+    fn way_is_free(&self, class_id: u32, retired_gen: &std::sync::atomic::AtomicU64) -> bool {
+        class_id == 0
+            || (class_id == Self::RETIRED_WAY_CLASS_ID
+                && retire_generation_is_graced(
+                    retired_gen.load(std::sync::atomic::Ordering::Acquire),
+                ))
+    }
+
+    fn publish_way_locked(
+        &self,
+        i: usize,
+        class_id: u32,
+        class_name: &str,
+        word: u64,
+        owner: &Option<Arc<CompiledMethod>>,
+        deferred: &mut Vec<Arc<CompiledMethod>>,
+    ) {
+        use std::sync::atomic::Ordering;
+        if let Some(previous) = std::mem::replace(&mut *self.compiled_owners[i].lock(), owner.clone()) {
+            deferred.push(previous);
+        }
+        self.entry_words[i].store(word, Ordering::SeqCst);
+        *self.class_names[i].lock() = Some(class_name.to_string());
+        self.hits[i].store(0, Ordering::Relaxed);
+        // Publish the class id last: until it lands no receiver matches, so no
+        // reader can see this way half-written.
+        self.class_ids[i].store(class_id, Ordering::Release);
+    }
+
+    /// Withdraw way `i`. Caller holds `writer`.
+    fn retire_way_locked(&self, i: usize, deferred: &mut Vec<Arc<CompiledMethod>>) {
+        use std::sync::atomic::Ordering;
+        let observed = self.class_ids[i].load(Ordering::Acquire);
+        if observed == 0 || observed == Self::RETIRED_WAY_CLASS_ID {
+            return;
+        }
+        // The guard first: a reader that has not compared yet now misses.
+        self.class_ids[i].store(Self::RETIRED_WAY_CLASS_ID, Ordering::Release);
+        // Then the target. A reader already past the guard loads the old word
+        // (whose owner is deferred, not dropped) or zero.
+        self.entry_words[i].store(0, Ordering::SeqCst);
+        self.hits[i].store(0, Ordering::Relaxed);
+        *self.class_names[i].lock() = None;
+        if let Some(previous) = self.compiled_owners[i].lock().take() {
+            deferred.push(previous);
+        }
+        // Stamp AFTER the writes, so only a quiescent instant later than them
+        // can grace a reuse of this way.
+        self.way_retired_gen[i].store(bump_retire_generation(), Ordering::Release);
+    }
+
+    fn install_megamorphic_locked(
+        &self,
+        class_id: u32,
+        word: u64,
+        owner: &Option<Arc<CompiledMethod>>,
+        deferred: &mut Vec<Arc<CompiledMethod>>,
     ) {
         use std::sync::atomic::Ordering;
         let base = Self::mega_base_index(class_id);
+        let mut free: Option<usize> = None;
         for index in base..base + JIT_MEGA_WAYS {
             let observed = self.mega_class_ids[index].load(Ordering::Acquire);
             if observed == class_id {
-                return;
-            }
-            if observed == 0
-                && self.mega_class_ids[index]
-                    .compare_exchange(
-                        0,
-                        JitMICSlot::INSTALLING_CLASS_ID,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-            {
-                let owner = resolve_jit_entry_owner(entry_ptr as usize);
-                if !jit_entry_publishable(entry_ptr, &owner, jdk_only) {
-                    // Release the reservation and leave the way empty: the
-                    // helper's own resolution path stays correct.
-                    self.mega_class_ids[index].store(0, Ordering::Release);
+                let current = self.mega_entry_words[index].load(Ordering::Acquire);
+                if current == word {
                     return;
                 }
-                *self.mega_compiled_owners[index].lock() = owner;
-                self.mega_entry_ptrs[index].store(entry_ptr, Ordering::Release);
-                self.mega_needs_context[index].store(needs_context, Ordering::Relaxed);
-                self.mega_class_ids[index].store(class_id, Ordering::Release);
-                return;
+                if current == 0 {
+                    self.publish_mega_locked(index, class_id, word, owner, deferred);
+                    return;
+                }
+                self.retire_mega_locked(index, deferred);
+                continue;
+            }
+            if free.is_none() && self.way_is_free(observed, &self.mega_retired_gen[index]) {
+                free = Some(index);
             }
         }
-        // Both ways are occupied. Do not evict: generated readers are lock-free,
-        // so mutating a live way could pair a stale guard with a new target.
-        // The resolving helper remains the correct overflow path.
-        let _ = class_name;
+        // Both ways occupied by live receivers: the resolving helper is the
+        // overflow path. Never evict a live way under lock-free readers.
+        if let Some(index) = free {
+            self.publish_mega_locked(index, class_id, word, owner, deferred);
+        }
     }
 
-    /// Lookup used by the shared helper after the generated four-entry cascade
+    fn publish_mega_locked(
+        &self,
+        index: usize,
+        class_id: u32,
+        word: u64,
+        owner: &Option<Arc<CompiledMethod>>,
+        deferred: &mut Vec<Arc<CompiledMethod>>,
+    ) {
+        use std::sync::atomic::Ordering;
+        if let Some(previous) = std::mem::replace(&mut *self.mega_compiled_owners[index].lock(), owner.clone()) {
+            deferred.push(previous);
+        }
+        self.mega_entry_words[index].store(word, Ordering::SeqCst);
+        self.mega_class_ids[index].store(class_id, Ordering::Release);
+    }
+
+    /// Withdraw hashed-table way `index`. Caller holds `writer`.
+    fn retire_mega_locked(&self, index: usize, deferred: &mut Vec<Arc<CompiledMethod>>) {
+        use std::sync::atomic::Ordering;
+        let observed = self.mega_class_ids[index].load(Ordering::Acquire);
+        if observed == 0 || observed == Self::RETIRED_WAY_CLASS_ID {
+            return;
+        }
+        self.mega_class_ids[index].store(Self::RETIRED_WAY_CLASS_ID, Ordering::Release);
+        self.mega_entry_words[index].store(0, Ordering::SeqCst);
+        if let Some(previous) = self.mega_compiled_owners[index].lock().take() {
+            deferred.push(previous);
+        }
+        self.mega_retired_gen[index].store(bump_retire_generation(), Ordering::Release);
+    }
+
+    /// Retire every way and hashed-table way whose target satisfies `matches`.
+    /// Caller holds `writer`.
+    fn retire_matching_locked(
+        &self,
+        matches: impl Fn(usize) -> bool,
+        deferred: &mut Vec<Arc<CompiledMethod>>,
+    ) {
+        use std::sync::atomic::Ordering;
+        for i in 0..JIT_PIC_ENTRIES {
+            let (entry, _) = jit_ic_entry_decode(self.entry_words[i].load(Ordering::SeqCst));
+            if entry != 0 && matches(entry as usize) {
+                self.retire_way_locked(i, deferred);
+            }
+        }
+        for index in 0..JIT_MEGA_ENTRIES {
+            let (entry, _) = jit_ic_entry_decode(self.mega_entry_words[index].load(Ordering::SeqCst));
+            if entry != 0 && matches(entry as usize) {
+                self.retire_mega_locked(index, deferred);
+            }
+        }
+    }
+
+    /// Lookup used by the shared helper after the generated four-way cascade
     /// misses. The returned entry remains executable because this slot retains
-    /// its compiled owner until invalidation or slot destruction.
+    /// its compiled owner until the way is retired, and a retired owner goes
+    /// through the retirement queue.
     #[inline]
     pub fn lookup_megamorphic(&self, class_id: u32) -> Option<(u64, bool)> {
         use std::sync::atomic::Ordering;
+        if !Self::is_live_class_id(class_id) {
+            return None;
+        }
         let base = Self::mega_base_index(class_id);
         for index in base..base + JIT_MEGA_WAYS {
             if self.mega_class_ids[index].load(Ordering::Acquire) == class_id {
-                let entry = self.mega_entry_ptrs[index].load(Ordering::Acquire);
+                let (entry, needs_context) =
+                    jit_ic_entry_decode(self.mega_entry_words[index].load(Ordering::Acquire));
                 if entry != 0 {
-                    return Some((
-                        entry,
-                        self.mega_needs_context[index].load(Ordering::Relaxed),
-                    ));
+                    return Some((entry, needs_context));
                 }
             }
         }
         None
     }
 
-    /// Core installation sequence. Writes entry_ptr before class_id
-    /// so a concurrent `lookup` can't observe a stale pointer under
-    /// the new class id. Also zeroes the hit counter.
-    #[inline]
-    fn write_entry(
-        &self,
-        i: usize,
-        class_id: u32,
-        class_name: &str,
-        entry_ptr: u64,
-        needs_ctx: bool,
-        jdk_only: bool,
-    ) {
-        // See `JitMICSlot::update`: never publish a compiled target this slot
-        // cannot keep mapped.
-        let owner = resolve_jit_entry_owner(entry_ptr as usize);
-        let (entry_ptr, needs_ctx) = if jit_entry_publishable(entry_ptr, &owner, jdk_only) {
-            (entry_ptr, needs_ctx)
-        } else {
-            (0, false)
-        };
-        *self.compiled_owners[i].lock() = owner;
-        self.entry_ptrs[i].store(entry_ptr, std::sync::atomic::Ordering::Release);
-        self.needs_context[i].store(needs_ctx, std::sync::atomic::Ordering::Relaxed);
-        *self.class_names[i].lock() = Some(class_name.to_string());
-        self.hits[i].store(0, std::sync::atomic::Ordering::Relaxed);
-        // Publish the new class_id last.
-        self.class_ids[i].store(class_id, std::sync::atomic::Ordering::Release);
-    }
-
-    /// Remove all cached compiled targets from this PIC.
+    /// Retire every cached target in this PIC.
     ///
-    /// Clear class ids first so generated inline code misses immediately, then
-    /// zero the target metadata.
+    /// Every live way and hashed-table way is retired (guard first, then word),
+    /// and every owner is released through the retirement queue.
     pub fn clear_entries(&self) {
-        for i in 0..JIT_PIC_ENTRIES {
-            self.class_ids[i].store(0, std::sync::atomic::Ordering::Release);
+        let mut deferred: Vec<Arc<CompiledMethod>> = Vec::new();
+        {
+            let _writer = self.writer.lock();
+            for i in 0..JIT_PIC_ENTRIES {
+                self.retire_way_locked(i, &mut deferred);
+            }
+            for index in 0..JIT_MEGA_ENTRIES {
+                self.retire_mega_locked(index, &mut deferred);
+            }
         }
-        for i in 0..JIT_PIC_ENTRIES {
-            self.entry_ptrs[i].store(0, std::sync::atomic::Ordering::Release);
-            self.needs_context[i].store(false, std::sync::atomic::Ordering::Relaxed);
-            self.hits[i].store(0, std::sync::atomic::Ordering::Relaxed);
-            *self.class_names[i].lock() = None;
-            defer_jit_owner(self.compiled_owners[i].lock().take());
-        }
-        for index in 0..JIT_MEGA_ENTRIES {
-            self.mega_class_ids[index].store(0, std::sync::atomic::Ordering::Release);
-            self.mega_entry_ptrs[index].store(0, std::sync::atomic::Ordering::Release);
-            self.mega_needs_context[index].store(false, std::sync::atomic::Ordering::Relaxed);
-            defer_jit_owner(self.mega_compiled_owners[index].lock().take());
+        for previous in deferred {
+            defer_jit_owner(Some(previous));
         }
     }
 
     fn invalidate_targets(&self, targets: &std::collections::HashSet<usize>) {
-        for i in 0..JIT_PIC_ENTRIES {
-            let entry = self.entry_ptrs[i].load(std::sync::atomic::Ordering::Acquire) as usize;
-            if entry != 0 && targets.contains(&entry) {
-                self.class_ids[i].store(0, std::sync::atomic::Ordering::Release);
-                self.entry_ptrs[i].store(0, std::sync::atomic::Ordering::Release);
-                self.needs_context[i].store(false, std::sync::atomic::Ordering::Relaxed);
-                defer_jit_owner(self.compiled_owners[i].lock().take());
-            }
+        let mut deferred: Vec<Arc<CompiledMethod>> = Vec::new();
+        {
+            let _writer = self.writer.lock();
+            self.retire_matching_locked(|entry| targets.contains(&entry), &mut deferred);
         }
-        for index in 0..JIT_MEGA_ENTRIES {
-            let entry =
-                self.mega_entry_ptrs[index].load(std::sync::atomic::Ordering::Acquire) as usize;
-            if entry != 0 && targets.contains(&entry) {
-                self.mega_class_ids[index].store(0, std::sync::atomic::Ordering::Release);
-                self.mega_entry_ptrs[index].store(0, std::sync::atomic::Ordering::Release);
-                self.mega_needs_context[index].store(false, std::sync::atomic::Ordering::Relaxed);
-                defer_jit_owner(self.mega_compiled_owners[index].lock().take());
-            }
+        for previous in deferred {
+            defer_jit_owner(Some(previous));
         }
     }
 
-    /// Total observed invocations (hits across all entries + misses).
+    /// Total observed invocations (hits across all ways + misses).
     pub fn total_observations(&self) -> u64 {
         let hits: u64 = self
             .hits
@@ -15491,43 +15677,13 @@ impl JitPICSlot {
         hits + self.misses.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Number of entries currently populated (0..=4).
+    /// Number of ways currently holding a live receiver (0..=4).
     pub fn entries_used(&self) -> usize {
         self.class_ids
             .iter()
-            .filter(|c| c.load(std::sync::atomic::Ordering::Relaxed) != 0)
+            .filter(|c| Self::is_live_class_id(c.load(std::sync::atomic::Ordering::Relaxed)))
             .count()
     }
-
-    /// Whether the PIC has started receiving receiver types it can no
-    /// longer cache (all 4 slots populated AND miss count exceeds the
-    /// promotion-to-megamorphic threshold).
-    pub fn is_megamorphic(&self) -> bool {
-        self.entries_used() == JIT_PIC_ENTRIES
-            && self.misses.load(std::sync::atomic::Ordering::Relaxed) >= PIC_TO_MEGA_THRESHOLD
-    }
-
-    /// Whether the call site should be deoptimized from the PIC fast
-    /// path back to a plain megamorphic vtable dispatch. Mirrors
-    /// [`Self::is_megamorphic`] but the name makes the decision point
-    /// explicit at the call site that may need to re-patch.
-    #[inline]
-    pub fn should_deopt_to_mega(&self) -> bool {
-        self.is_megamorphic()
-    }
-}
-
-/// Build a [`JitPICSlot`] from an existing MIC and return it boxed so
-/// the adaptive recompiler can install the new slot at the call site.
-///
-/// The single MIC entry lands in slot 0 of the PIC (see
-/// [`JitPICSlot::seed_from_mic`]) so no cache warm-up is lost. Cold
-/// MICs (`cached_class_id == 0`) produce an empty PIC, which is still
-/// valid — its first miss fills slot 0 naturally.
-pub fn promote_mic_to_pic(mic: &JitMICSlot, jdk_only: bool) -> Box<JitPICSlot> {
-    let pic = Box::new(JitPICSlot::new_at(mic.bci));
-    pic.seed_from_mic(mic, jdk_only);
-    pic
 }
 
 impl Default for JitPICSlot {
@@ -15862,6 +16018,41 @@ static ACTIVE_JIT_EXECUTIONS: cratonvm_types::striped_counter::StripedCounter =
 static DEFERRED_JIT_OWNERS: std::sync::OnceLock<parking_lot::Mutex<Vec<Arc<CompiledMethod>>>> =
     std::sync::OnceLock::new();
 
+/// Retirement generation: advanced AFTER every withdrawal of a raw target from
+/// a place generated code reads without a lock (an inline-cache way).
+///
+/// A withdrawal stamped `g` is graced — its way may be reused for a different
+/// receiver — once `g <= JIT_GRACED_GENERATION`, i.e. once every thread has
+/// provably been outside compiled code at some instant after the stamp, and so
+/// cannot still be between that way's class compare and its entry load.
+static JIT_RETIRE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Highest retirement generation that has been graced. See
+/// [`JIT_RETIRE_GENERATION`].
+static JIT_GRACED_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Advance the retirement generation and return the stamp for a withdrawal
+/// whose writes have just completed.
+#[inline]
+fn bump_retire_generation() -> u64 {
+    JIT_RETIRE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1
+}
+
+/// Whether a withdrawal stamped `generation` has been graced.
+#[inline]
+fn retire_generation_is_graced(generation: u64) -> bool {
+    generation <= JIT_GRACED_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Record that every thread was outside compiled code at some instant after the
+/// retirement generation read as `observed`. The caller must read `observed`
+/// BEFORE the quiescence observation it reports, so the observation postdates
+/// every withdrawal stamped at or below it.
+#[inline]
+fn note_graced_generation(observed: u64) {
+    JIT_GRACED_GENERATION.fetch_max(observed, std::sync::atomic::Ordering::AcqRel);
+}
+
 fn jit_entry_owners(
 ) -> &'static parking_lot::Mutex<FxHashMap<usize, std::sync::Weak<CompiledMethod>>> {
     JIT_ENTRY_OWNERS.get_or_init(|| parking_lot::Mutex::new(FxHashMap::default()))
@@ -15954,24 +16145,22 @@ fn report_stale_ic_holders(dying: usize) {
         }
         let mut kind: Option<&'static str> = None;
         for slot in &cm._jit_mic_slots {
-            if slot
-                .cached_entry_ptr
-                .load(std::sync::atomic::Ordering::Acquire) as usize
-                == dying
-            {
+            if slot.cached_entry().0 as usize == dying {
                 kind = Some("MIC");
             }
         }
         for slot in &cm._jit_pic_slots {
             for i in 0..JIT_PIC_ENTRIES {
-                if slot.entry_ptrs[i].load(std::sync::atomic::Ordering::Acquire) as usize == dying {
+                if slot
+                    .way(i)
+                    .is_some_and(|(_, entry, _)| entry as usize == dying)
+                {
                     kind = Some("PIC");
                 }
             }
             for i in 0..JIT_MEGA_ENTRIES {
-                if slot.mega_entry_ptrs[i].load(std::sync::atomic::Ordering::Acquire) as usize
-                    == dying
-                {
+                let word = slot.mega_entry_words[i].load(std::sync::atomic::Ordering::Acquire);
+                if jit_ic_entry_decode(word).0 as usize == dying {
                     kind = Some("MEGA");
                 }
             }
@@ -16046,7 +16235,17 @@ pub fn unowned_ic_entry_refusals() -> u64 {
 /// native trampoline ever did reach here, which is what §2 is about. The
 /// invariant, per the `JitMICSlot` note, is the refusal itself.
 fn jit_entry_publishable(entry: u64, owner: &Option<Arc<CompiledMethod>>, jdk_only: bool) -> bool {
-    if entry == 0 || owner.is_some() {
+    if entry == 0 {
+        return true;
+    }
+    // Bit 0 of an inline-cache entry word is the needs-context tag
+    // (`JIT_IC_NEEDS_CONTEXT_TAG`), so an address with it set cannot be encoded
+    // at all. A compiled body starts page-aligned and never has it; anything
+    // else that does stays on the resolving helper.
+    if entry & JIT_IC_NEEDS_CONTEXT_TAG != 0 {
+        return false;
+    }
+    if owner.is_some() {
         return true;
     }
     // No live owner. Two shapes make that fatal rather than merely unowned:
@@ -16145,9 +16344,11 @@ fn drain_deferred_jit_owners_if_quiescent() {
     // the read guarantees the witness postdates every queued body's
     // unpublication.
     let mut queue = deferred_jit_owners().lock();
+    let observed = JIT_RETIRE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
     if !ACTIVE_JIT_EXECUTIONS.is_zero() {
         return;
     }
+    note_graced_generation(observed);
     let retired = std::mem::take(&mut *queue);
     drop(queue);
     let _authorised = AuthorisedReclaim::enter();
@@ -16162,7 +16363,9 @@ fn defer_jit_owner(owner: Option<Arc<CompiledMethod>>) {
         deferred_jit_owners().lock().push(owner);
         return;
     }
+    let observed = JIT_RETIRE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
     if ACTIVE_JIT_EXECUTIONS.is_zero() {
+        note_graced_generation(observed);
         let _authorised = AuthorisedReclaim::enter();
         drop(owner);
         return;
@@ -17110,6 +17313,21 @@ publication"
         }
         crate::lambda_adapter::forget_adapters(&remove_entries);
 
+        // Mark every doomed body retired BEFORE any inline cache is cleared. A
+        // helper that resolved one of them a moment ago re-reads the flag after
+        // publishing into a slot and rolls the publication back; were the flag
+        // set after the clearing pass, that publication could land behind the
+        // pass and outlive the invalidation.
+        for shard in self.shards.iter() {
+            for map in [shard.methods.load(), shard.osr_methods.load()] {
+                for (_hash, (_key, cm)) in map.iter() {
+                    if remove_entries.contains(&(cm.entry_ptr() as usize)) {
+                        cm.retired.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+
         // Retarget dynamic inline caches before withdrawing ownership from the
         // cache. Readers that already hold an old caller snapshot either miss
         // after this release publication or keep the callee alive through the
@@ -17197,6 +17415,17 @@ publication"
             .fetch_max(barrier, std::sync::atomic::Ordering::AcqRel);
         // The maps this set summarises are about to be emptied.
         self.inlined_class_names.lock().clear();
+        // Every body is retired before ANY inline cache is cleared — a full
+        // pass first, because the per-shard loop below clears one shard's slots
+        // before it has reached the bodies of the next. See
+        // `invalidate_matching`.
+        for shard in self.shards.iter() {
+            for map in [shard.methods.load(), shard.osr_methods.load()] {
+                for (_hash, (_key, cm)) in map.iter() {
+                    cm.retired.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
         let mut count = 0;
         for shard in self.shards.iter() {
             for map in [shard.methods.load(), shard.osr_methods.load()] {
@@ -26262,7 +26491,7 @@ fn try_compile_inner(
                             }
                             let pic = Box::new(JitPICSlot::new_at(pc));
                             // `mic` was just built by `JitMICSlot::new()`, so its
-                            // `cached_entry_ptr` is 0 and `jit_entry_publishable`
+                            // `cached_entry_word` is 0 and `jit_entry_publishable`
                             // short-circuits before it reads the policy at all —
                             // `prepopulate` above sets only the class id. `false`
                             // is therefore not a policy claim, it is unreachable.
@@ -27966,11 +28195,8 @@ fn try_compile_inner(
     //     cascade starts hitting — no recompile required, which
     //     sidesteps the adaptive-recompile machinery entirely.
     //
-    // This is the "simpler approach" from the HIGH-7 design doc.
-    // The adaptive MIC→PIC promotion path
-    // (`JitMICSlot::needs_pic_promotion` → `promote_mic_to_pic`)
-    // remains available for future tiered-recompile use, but is
-    // currently unused on the hot path.
+    // This is the "simpler approach" from the HIGH-7 design doc, and the
+    // only one: there is no adaptive MIC→PIC promotion path.
     let mut pic_slots: Vec<(usize, *const JitPICSlot)> = Vec::new();
     let mut owned_pic_slots: Vec<Box<JitPICSlot>> = Vec::new();
     let mut inline_sites: HashMap<usize, InlineSite> = HashMap::new();
@@ -30115,7 +30341,7 @@ fn try_compile_inner(
                 // first dispatch still rings the helper, which
                 // installs entry_ptr; thereafter the cascade hits).
                 let pic = Box::new(JitPICSlot::new_at(pc));
-                // Fresh MIC: `cached_entry_ptr` is 0, so the seeded entry
+                // Fresh MIC: `cached_entry_word` is 0, so the seeded entry
                 // short-circuits `jit_entry_publishable` before any policy
                 // branch. See the matching note on the IR planner's seed.
                 pic.seed_from_mic(&mic, false);
@@ -30481,7 +30707,7 @@ fn try_compile_inner(
     // unrolled machine code still holds baked pointers into them → use-after-
     // free: the freed `Box<JitPICSlot>` memory gets reused by the allocator for
     // Java objects, so the inline PIC cascade later reads class-id-pair garbage
-    // out of `entry_ptrs[i]` and `CALL`s it (the Mockito-under-JIT
+    // out of `entry_words[i]` and `CALL`s it (the Mockito-under-JIT
     // `EXCEPTION_ACCESS_VIOLATION at 0x0000033E0000033B`, a packed-class-id
     // value). Extend, don't overwrite, so both the cloned and owned slots stay
     // alive for the lifetime of the compiled code.
@@ -35668,8 +35894,8 @@ mod tests {
         let slot = JitMICSlot::new();
         let base = &slot as *const JitMICSlot as usize;
         let off_class_id = (&slot.cached_class_id as *const _ as usize) - base;
-        let off_entry_ptr = (&slot.cached_entry_ptr as *const _ as usize) - base;
-        let off_needs_context = (&slot.cached_needs_context as *const _ as usize) - base;
+        let off_entry_ptr = (&slot.cached_entry_word as *const _ as usize) - base;
+        let off_hits = (&slot.hits as *const _ as usize) - base;
         assert_eq!(
             off_class_id,
             JitMICSlot::CACHED_CLASS_ID_OFFSET,
@@ -35680,25 +35906,20 @@ mod tests {
         assert_eq!(
             off_entry_ptr,
             JitMICSlot::CACHED_ENTRY_PTR_OFFSET,
-            "cached_entry_ptr offset drift: expected {}, got {}",
+            "cached_entry_word offset drift: expected {}, got {}",
             JitMICSlot::CACHED_ENTRY_PTR_OFFSET,
             off_entry_ptr
         );
-        assert_eq!(
-            off_needs_context,
-            JitMICSlot::CACHED_NEEDS_CONTEXT_OFFSET,
-            "cached_needs_context offset drift: expected {}, got {}",
-            JitMICSlot::CACHED_NEEDS_CONTEXT_OFFSET,
-            off_needs_context
-        );
+        // The needs-context byte moved into the entry word; its 8 reserved
+        // bytes keep the counters where they were.
+        assert_eq!(off_hits, 24, "hits offset drift: got {off_hits}");
     }
 
     // ── JitPICSlot layout tests (CRIT-8 prerequisite) ──────────────
     //
     // The JIT codegen emits raw `MOV` instructions against a
     // `JitPICSlot*` using the `CLASS_ID_OFFSETS` / `ENTRY_PTR_OFFSETS`
-    // / `NEEDS_CONTEXT_OFFSETS` constants for inline 4-way PIC
-    // dispatch. Pin the offsets here so any layout drift (field
+    // constants for inline 4-way PIC dispatch. Pin the offsets here so any layout drift (field
     // reorder, padding change, `parking_lot::Mutex` resize) fails
     // loudly instead of silently misreading bytes.
 
@@ -35714,21 +35935,19 @@ mod tests {
                 "CLASS_ID_OFFSETS[{i}] drift: {actual} vs {}",
                 JitPICSlot::CLASS_ID_OFFSETS[i]
             );
-            let actual = (&slot.entry_ptrs[i] as *const _ as usize) - base;
+            let actual = (&slot.entry_words[i] as *const _ as usize) - base;
             assert_eq!(
                 actual,
                 JitPICSlot::ENTRY_PTR_OFFSETS[i],
                 "ENTRY_PTR_OFFSETS[{i}] drift: {actual} vs {}",
                 JitPICSlot::ENTRY_PTR_OFFSETS[i]
             );
-            let actual = (&slot.needs_context[i] as *const _ as usize) - base;
-            assert_eq!(
-                actual,
-                JitPICSlot::NEEDS_CONTEXT_OFFSETS[i],
-                "NEEDS_CONTEXT_OFFSETS[{i}] drift: {actual} vs {}",
-                JitPICSlot::NEEDS_CONTEXT_OFFSETS[i]
-            );
         }
+        // The per-way needs-context bytes moved into the entry words; the 8
+        // reserved bytes keep the counters (and the hashed table after them)
+        // where generated code expects them.
+        assert_eq!((&slot.hits as *const _ as usize) - base, 56);
+        assert_eq!((&slot.misses as *const _ as usize) - base, 88);
     }
 
     // ── JitCodeRegion tests ─────────────────────────────────────────
@@ -37673,35 +37892,38 @@ mod tests {
         assert!(pic.lookup(2).is_none());
         assert!(pic.lookup(3).is_none());
         for i in 0..JIT_PIC_ENTRIES {
-            assert_eq!(
-                pic.entry_ptrs[i].load(std::sync::atomic::Ordering::Acquire),
-                0
+            let (class_id, entry, needs_context) = pic.way(i).expect("way exists");
+            assert_eq!(entry, 0);
+            assert!(!needs_context);
+            assert!(
+                class_id == 0 || class_id == JitPICSlot::RETIRED_WAY_CLASS_ID,
+                "a cleared way must not keep a guard a receiver can match (way {i}: {class_id})"
             );
-            assert!(!pic.needs_context[i].load(std::sync::atomic::Ordering::Relaxed));
             assert!(pic.class_names[i].lock().is_none());
         }
     }
 
+    /// A fifth receiver must NOT displace a live way. Generated code may be
+    /// between a way's class compare and its entry-word load, so overwriting
+    /// the way would pair the old receiver's guard with the new receiver's
+    /// body. The overflow receiver is served by the hashed table instead.
     #[test]
-    fn test_jit_pic_slot_lru_evicts_least_hit() {
+    fn test_jit_pic_slot_full_ways_are_never_evicted() {
         let pic = JitPICSlot::new();
         pic.install(1, "A", 0x1000, false, false);
         pic.install(2, "B", 0x2000, false, false);
         pic.install(3, "C", 0x3000, false, false);
         pic.install(4, "D", 0x4000, false, false);
-        // Hit class 1 many times so class 2 and 4 look less warm.
         for _ in 0..10 {
             pic.lookup(1);
         }
-        pic.lookup(3); // give class 3 at least one hit
-                       // Hit counters: [10, 0, 1, 0] → first LFU is class 2.
         pic.install(5, "E", 0x5000, true, false);
-        // Classes 1, 3, and 4 remain; class 2 is evicted; class 5 is installed.
         assert_eq!(pic.lookup(1), Some((0x1000, false)));
-        assert!(pic.lookup(2).is_none());
+        assert_eq!(pic.lookup(2), Some((0x2000, false)));
         assert_eq!(pic.lookup(3), Some((0x3000, false)));
         assert_eq!(pic.lookup(4), Some((0x4000, false)));
-        assert_eq!(pic.lookup(5), Some((0x5000, true)));
+        assert!(pic.lookup(5).is_none(), "no live way may be evicted for class 5");
+        assert_eq!(pic.lookup_megamorphic(5), Some((0x5000, true)));
     }
 
     #[test]
@@ -37726,33 +37948,23 @@ mod tests {
         assert_eq!(pic.entries_used(), 0);
     }
 
+    /// A recompiled target for a cached receiver is never written over the
+    /// old way. The old way is retired (guard first, then word) and the new
+    /// target goes into a different way, in both the inline ways and the
+    /// hashed table.
     #[test]
-    fn test_jit_pic_slot_megamorphic_detection() {
-        let pic = JitPICSlot::new();
-        pic.install(1, "A", 0x1000, false, false);
-        pic.install(2, "B", 0x2000, false, false);
-        pic.install(3, "C", 0x3000, false, false);
-        pic.install(4, "D", 0x4000, false, false);
-        // Not megamorphic yet — full but no misses.
-        assert!(!pic.is_megamorphic());
-        // Pound it with misses.
-        for i in 100..(100 + PIC_TO_MEGA_THRESHOLD) {
-            pic.lookup(i as u32);
-        }
-        assert!(pic.is_megamorphic());
-    }
-
-    #[test]
-    fn test_jit_pic_slot_duplicate_install_keeps_published_mega_target() {
+    fn test_jit_pic_slot_recompiled_target_retires_the_stale_way() {
         let pic = JitPICSlot::new();
         pic.install(1, "A", 0x1000, false, false);
         pic.install(1, "A2", 0x2000, true, false);
         assert_eq!(pic.entries_used(), 1);
         assert_eq!(pic.lookup(1), Some((0x2000, true)));
-        // The generated hashed table is immutable after publication: changing
-        // an entry underneath a lock-free reader could pair the old class
-        // guard with a new target. Redefinition invalidation clears it first.
-        assert_eq!(pic.lookup_megamorphic(1), Some((0x1000, false)));
+        assert_eq!(
+            pic.way(0),
+            Some((JitPICSlot::RETIRED_WAY_CLASS_ID, 0, false)),
+            "the stale way must be retired, not retargeted"
+        );
+        assert_eq!(pic.lookup_megamorphic(1), Some((0x2000, true)));
     }
 
     #[test]
@@ -37764,23 +37976,20 @@ mod tests {
             JitPICSlot::MEGA_CLASS_IDS_OFFSET
         );
         assert_eq!(
-            &pic.mega_entry_ptrs as *const _ as usize - base,
+            &pic.mega_entry_words as *const _ as usize - base,
             JitPICSlot::MEGA_ENTRY_PTRS_OFFSET
-        );
-        assert_eq!(
-            &pic.mega_needs_context as *const _ as usize - base,
-            JitPICSlot::MEGA_NEEDS_CONTEXT_OFFSET
         );
     }
 
     #[test]
-    fn test_jit_pic_secondary_cache_survives_inline_eviction_and_clear() {
+    fn test_jit_pic_secondary_cache_serves_overflow_and_clears() {
         let pic = JitPICSlot::new();
+        // Entries are even: bit 0 of a word is the context tag.
         for class_id in 1..=5 {
             pic.install(
                 class_id,
                 &format!("C{class_id}"),
-                0x1000 + u64::from(class_id),
+                0x1000 + (u64::from(class_id) << 4),
                 class_id % 2 == 0,
                 false,
             );
@@ -37789,7 +37998,7 @@ mod tests {
         for class_id in 1..=5 {
             assert_eq!(
                 pic.lookup_megamorphic(class_id),
-                Some((0x1000 + u64::from(class_id), class_id % 2 == 0))
+                Some((0x1000 + (u64::from(class_id) << 4), class_id % 2 == 0))
             );
         }
         pic.clear_entries();
@@ -37800,9 +38009,6 @@ mod tests {
 
     #[test]
     fn test_jit_pic_slot_thresholds_are_sensible() {
-        // Contract: MIC_TO_PIC < PIC_TO_MEGA. Otherwise the promotion
-        // logic would skip PIC entirely.
-        assert!(MIC_TO_PIC_THRESHOLD < PIC_TO_MEGA_THRESHOLD);
         assert!(MIC_TO_PIC_THRESHOLD >= 2);
         assert!(JIT_PIC_ENTRIES >= 2);
     }
@@ -37889,92 +38095,21 @@ mod tests {
         }
     }
 
-    /// LFU-eviction shipped earlier — re-state it under the T17
-    /// naming so the invariant is anchored in the new test set too.
+    /// A PIC seeded from its MIC keeps the seeded receiver in way 0, and a
+    /// later receiver lands in a fresh way rather than over it.
     #[test]
-    fn t17_b_pic_lfu_eviction() {
-        let pic = JitPICSlot::new();
-        pic.install(1, "A", 0x1000, false, false);
-        pic.install(2, "B", 0x2000, false, false);
-        pic.install(3, "C", 0x3000, false, false);
-        pic.install(4, "D", 0x4000, false, false);
-        // Class 1 is hot, class 2 is cold, class 3 has 1 hit.
-        for _ in 0..10 {
-            pic.lookup(1);
-        }
-        pic.lookup(3);
-        // Evict LFU → slot 1 (class 2) goes, class 5 lands there.
-        pic.install(5, "E", 0x5000, true, false);
-        assert_eq!(pic.lookup(1), Some((0x1000, false)));
-        assert!(pic.lookup(2).is_none(), "class 2 was the LFU victim");
-        assert_eq!(pic.lookup(3), Some((0x3000, false)));
-        assert_eq!(pic.lookup(4), Some((0x4000, false)));
-        assert_eq!(pic.lookup(5), Some((0x5000, true)));
-    }
-
-    /// MIC must signal PIC promotion once miss count exceeds the
-    /// threshold — the adaptive recompiler keys off this flag when it
-    /// sweeps MICs on each safepoint.
-    #[test]
-    fn t17_b_mic_needs_pic_promotion_after_threshold() {
-        let mic = JitMICSlot::new();
-        // Fresh MIC — no misses, no promotion yet.
-        assert!(!mic.needs_pic_promotion());
-        // Pump misses up through MIC_TO_PIC_THRESHOLD; one must
-        // exceed (strict >) to trigger.
-        for _ in 0..=MIC_TO_PIC_THRESHOLD {
-            mic.record_miss();
-        }
-        assert!(
-            mic.needs_pic_promotion(),
-            "miss count > MIC_TO_PIC_THRESHOLD must trigger promotion"
-        );
-    }
-
-    /// `promote_mic_to_pic` must produce a fresh PIC seeded with the
-    /// MIC's cached entry (slot 0). Any subsequent `install` lands in
-    /// a different slot.
-    #[test]
-    fn t17_b_promote_mic_to_pic_preserves_cached_entry() {
+    fn t17_b_seeded_way_is_not_overwritten_by_a_new_receiver() {
         let mic = JitMICSlot::new();
         mic.update(7, "Seven", 0x7000, true, false);
-        // Pump misses past threshold.
-        for _ in 0..=MIC_TO_PIC_THRESHOLD {
-            mic.record_miss();
-        }
-        assert!(mic.needs_pic_promotion());
-
-        let pic = promote_mic_to_pic(&mic, false);
+        let pic = JitPICSlot::new_at(mic.bci);
+        pic.seed_from_mic(&mic, false);
         assert_eq!(pic.entries_used(), 1);
         assert_eq!(pic.lookup(7), Some((0x7000, true)));
 
-        // A new receiver lands in a fresh slot, not over the seeded one.
         pic.install(8, "Eight", 0x8000, false, false);
         assert_eq!(pic.entries_used(), 2);
         assert_eq!(pic.lookup(7), Some((0x7000, true)));
         assert_eq!(pic.lookup(8), Some((0x8000, false)));
-    }
-
-    /// PIC deopt-to-megamorphic mirrors the scope's
-    /// `PIC_TO_MEGA_THRESHOLD` gate and the `should_deopt_to_mega()`
-    /// helper the adaptive recompiler uses.
-    #[test]
-    fn t17_b_pic_deopts_to_mega_on_miss_flood() {
-        let pic = JitPICSlot::new();
-        pic.install(1, "A", 0x1000, false, false);
-        pic.install(2, "B", 0x2000, false, false);
-        pic.install(3, "C", 0x3000, false, false);
-        pic.install(4, "D", 0x4000, false, false);
-        assert!(!pic.should_deopt_to_mega());
-
-        // Pound with misses until the threshold is crossed.
-        for i in 100..(100 + PIC_TO_MEGA_THRESHOLD) {
-            pic.lookup(i as u32);
-        }
-        assert!(
-            pic.should_deopt_to_mega(),
-            "PIC must request deopt once miss count ≥ PIC_TO_MEGA_THRESHOLD"
-        );
     }
 
     // ── DescriptorParamIter tests ───────────────────────────────────
@@ -38613,7 +38748,7 @@ mod tests {
     /// loads the raw pointer into R11 and `CALL R11`s it with no validation,
     /// so an entry whose last `Arc` has dropped is a call into an unmapped —
     /// or recycled — executable mapping. The virtual dispatch helper used to
-    /// publish `cached_entry_ptr` with a bare atomic store on its
+    /// publish the MIC's entry with a bare atomic store on its
     /// "class cached, target unresolved" path, taking no owner at all; that is
     /// the NodeConnectionsServiceTests SIGSEGV.
     #[test]
@@ -38646,8 +38781,7 @@ mod tests {
         let slot = JitMICSlot::new();
         slot.update(cid.as_u32(), &class, entry as u64, false, false);
         assert_eq!(
-            slot.cached_entry_ptr
-                .load(std::sync::atomic::Ordering::Acquire) as usize,
+            slot.cached_entry().0 as usize,
             entry,
             "a live entry must be published"
         );
@@ -38693,7 +38827,7 @@ mod tests {
         let slot = JitMICSlot::new();
         slot.update(21, "DeadOwner", DEAD_ENTRY as u64, false, false);
         assert_eq!(
-            slot.cached_entry_ptr
+            slot.cached_entry_word
                 .load(std::sync::atomic::Ordering::Acquire),
             0,
             "a dead artifact's entry must never be published to generated code"
@@ -38702,9 +38836,7 @@ mod tests {
         let native_slot = JitMICSlot::new();
         native_slot.update(22, "NativeOwner", NATIVE_ENTRY, false, false);
         assert_eq!(
-            native_slot
-                .cached_entry_ptr
-                .load(std::sync::atomic::Ordering::Acquire),
+            native_slot.cached_entry().0,
             NATIVE_ENTRY,
             "non-artifact targets (natives, trampolines) stay publishable"
         );
@@ -38717,7 +38849,7 @@ mod tests {
         );
         for i in 0..JIT_PIC_ENTRIES {
             assert_eq!(
-                pic.entry_ptrs[i].load(std::sync::atomic::Ordering::Acquire),
+                pic.entry_words[i].load(std::sync::atomic::Ordering::Acquire),
                 0,
                 "no PIC way may hold a dead entry"
             );
@@ -39977,14 +40109,7 @@ mod tests {
             0
         );
         assert!(mic.cached_class_name.lock().is_none());
-        assert_eq!(
-            mic.cached_entry_ptr
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
-        assert!(!mic
-            .cached_needs_context
-            .load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(mic.cached_entry(), (0, false));
         assert_eq!(mic.hits.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert_eq!(mic.misses.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert_eq!(mic.total_observations(), 0);
@@ -40000,9 +40125,9 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             42
         );
-        // Entry ptr should still be 0 (prepopulate only sets class_id)
+        // Entry word should still be 0 (prepopulate only sets class_id)
         assert_eq!(
-            mic.cached_entry_ptr
+            mic.cached_entry_word
                 .load(std::sync::atomic::Ordering::Relaxed),
             0
         );
@@ -40011,7 +40136,8 @@ mod tests {
     #[test]
     fn s33_mic_slot_update_all_fields() {
         let mic = JitMICSlot::new();
-        mic.update(7, "com/example/MyClass", 0xDEAD_BEEF, true, false);
+        // Even: bit 0 of an entry word is the context tag.
+        mic.update(7, "com/example/MyClass", 0xDEAD_BEE0, true, false);
         assert_eq!(
             mic.cached_class_id
                 .load(std::sync::atomic::Ordering::Acquire),
@@ -40021,20 +40147,27 @@ mod tests {
             mic.cached_class_name.lock().as_deref(),
             Some("com/example/MyClass")
         );
+        assert_eq!(mic.cached_entry(), (0xDEAD_BEE0, true));
         assert_eq!(
-            mic.cached_entry_ptr
+            mic.cached_entry_word
                 .load(std::sync::atomic::Ordering::Acquire),
-            0xDEAD_BEEF
+            0xDEAD_BEE0 | JIT_IC_NEEDS_CONTEXT_TAG
         );
-        assert!(mic
-            .cached_needs_context
-            .load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// An address with bit 0 set cannot be encoded next to the context tag, so
+    /// it is refused rather than published as a different address.
+    #[test]
+    fn s33_mic_slot_refuses_an_entry_with_the_tag_bit_set() {
+        let mic = JitMICSlot::new();
+        mic.update(7, "com/example/MyClass", 0xDEAD_BEEF, false, false);
+        assert_eq!(mic.cached_entry(), (0, false));
     }
 
     #[test]
     fn s33_mic_slot_clear_compiled_entry_keeps_receiver_cache() {
         let mic = JitMICSlot::new();
-        mic.update(7, "com/example/MyClass", 0xDEAD_BEEF, true, false);
+        mic.update(7, "com/example/MyClass", 0xDEAD_BEE0, true, false);
         mic.clear_compiled_entry();
 
         assert_eq!(
@@ -40046,14 +40179,7 @@ mod tests {
             mic.cached_class_name.lock().as_deref(),
             Some("com/example/MyClass")
         );
-        assert_eq!(
-            mic.cached_entry_ptr
-                .load(std::sync::atomic::Ordering::Acquire),
-            0
-        );
-        assert!(!mic
-            .cached_needs_context
-            .load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(mic.cached_entry(), (0, false));
     }
 
     #[test]
@@ -40088,20 +40214,7 @@ mod tests {
     }
 
     #[test]
-    fn s33_mic_slot_is_megamorphic() {
-        let mic = JitMICSlot::new();
-        // 5 hits, 20 misses → 20% hit rate → megamorphic
-        for _ in 0..5 {
-            mic.record_hit();
-        }
-        for _ in 0..20 {
-            mic.record_miss();
-        }
-        assert!(mic.is_megamorphic());
-    }
-
-    #[test]
-    fn s33_mic_slot_not_megamorphic_when_mostly_hits() {
+    fn s33_mic_slot_mostly_hits_is_monomorphic() {
         let mic = JitMICSlot::new();
         for _ in 0..18 {
             mic.record_hit();
@@ -40109,7 +40222,6 @@ mod tests {
         for _ in 0..2 {
             mic.record_miss();
         }
-        assert!(!mic.is_megamorphic());
         assert!(mic.is_monomorphic());
     }
 
@@ -40130,14 +40242,7 @@ mod tests {
             1
         );
         assert_eq!(mic.cached_class_name.lock().as_deref(), Some("A"));
-        assert_eq!(
-            mic.cached_entry_ptr
-                .load(std::sync::atomic::Ordering::Acquire),
-            100
-        );
-        assert!(!mic
-            .cached_needs_context
-            .load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(mic.cached_entry(), (100, false));
     }
 
     /// A re-`update` for the SAME class as already installed must stay a
@@ -40146,19 +40251,12 @@ mod tests {
     fn s33_mic_slot_update_same_class_is_idempotent() {
         let mic = JitMICSlot::new();
         mic.update(1, "A", 100, false, false);
-        mic.update(1, "A", 999, true, false);
-        assert_eq!(
-            mic.cached_entry_ptr
-                .load(std::sync::atomic::Ordering::Acquire),
-            100
-        );
-        assert!(!mic
-            .cached_needs_context
-            .load(std::sync::atomic::Ordering::Relaxed));
+        mic.update(1, "A", 998, true, false);
+        assert_eq!(mic.cached_entry(), (100, false));
     }
 
     /// `prepopulate` seeds only `cached_class_id` (a profile-derived guard
-    /// hint) with `cached_entry_ptr` still 0. The first `update` for that
+    /// hint) with `cached_entry_word` still 0. The first `update` for that
     /// SAME class id must still publish a real entry — this is the shape
     /// `mark_current_jit_compile_method_recursive_cycle`'s caller
     /// (profile-guided MIC seeding, see `try_compile_inner`) relies on.
@@ -40166,26 +40264,15 @@ mod tests {
     fn s33_mic_slot_update_resolves_prepopulated_hint() {
         let mic = JitMICSlot::new();
         mic.prepopulate(7);
-        assert_eq!(
-            mic.cached_entry_ptr
-                .load(std::sync::atomic::Ordering::Acquire),
-            0
-        );
+        assert_eq!(mic.cached_entry(), (0, false));
         mic.update(7, "Hinted", 0x4242, true, false);
         assert_eq!(
             mic.cached_class_id
                 .load(std::sync::atomic::Ordering::Acquire),
             7
         );
-        assert_eq!(
-            mic.cached_entry_ptr
-                .load(std::sync::atomic::Ordering::Acquire),
-            0x4242
-        );
+        assert_eq!(mic.cached_entry(), (0x4242, true));
         assert_eq!(mic.cached_class_name.lock().as_deref(), Some("Hinted"));
-        assert!(mic
-            .cached_needs_context
-            .load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]
@@ -40232,16 +40319,16 @@ mod tests {
     fn s33_mic_slot_entry_ptr_zero_means_unresolved() {
         let mic = JitMICSlot::new();
         mic.prepopulate(5);
-        // Even with class_id populated, entry_ptr 0 means no direct dispatch
+        // Even with class_id populated, a zero word means no direct dispatch
         assert_eq!(
-            mic.cached_entry_ptr
+            mic.cached_entry_word
                 .load(std::sync::atomic::Ordering::Relaxed),
             0
         );
         // After update with non-zero entry, it's resolved
         mic.update(5, "Foo", 0x1234, false, false);
         assert_ne!(
-            mic.cached_entry_ptr
+            mic.cached_entry_word
                 .load(std::sync::atomic::Ordering::Relaxed),
             0
         );
@@ -41619,8 +41706,8 @@ mod code_cache_lifetime_tests {
         let orphan = buf.as_ptr() as u64;
 
         let mic = JitMICSlot::new();
-        mic.cached_entry_ptr.store(orphan, Ordering::Release);
-        mic.cached_needs_context.store(true, Ordering::Relaxed);
+        mic.cached_entry_word
+            .store(orphan | JIT_IC_NEEDS_CONTEXT_TAG, Ordering::Release);
         mic.cached_class_id.store(7, Ordering::Release);
         // `compiled_owner` deliberately left empty — the residue of the race.
 
@@ -41633,14 +41720,11 @@ mod code_cache_lifetime_tests {
             "the class guard is still worth carrying forward"
         );
         assert_eq!(
-            pic.entry_ptrs[0].load(Ordering::Acquire),
+            pic.entry_words[0].load(Ordering::Acquire),
             0,
             "an entry with no live owner must be downgraded to unresolved, not \
-             copied into a slot generated code calls without validation"
-        );
-        assert!(
-            !pic.needs_context[0].load(Ordering::Relaxed),
-            "the ABI flag must be cleared alongside the refused entry"
+             copied into a slot generated code calls without validation — and \
+             the ABI flag travels in that word, so it goes with it"
         );
         drop(buf);
     }
@@ -41658,14 +41742,14 @@ mod code_cache_lifetime_tests {
         // `mod tests` use, so it is empirically clear of every real mapping this
         // suite makes.
         let sentinel = 0x7000u64;
-        mic.cached_entry_ptr.store(sentinel, Ordering::Release);
+        mic.cached_entry_word.store(sentinel, Ordering::Release);
         mic.cached_class_id.store(9, Ordering::Release);
 
         let pic = JitPICSlot::new();
         pic.seed_from_mic(&mic, false);
 
         assert_eq!(pic.class_ids[0].load(Ordering::Acquire), 9);
-        assert_eq!(pic.entry_ptrs[0].load(Ordering::Acquire), sentinel);
+        assert_eq!(pic.entry_words[0].load(Ordering::Acquire), sentinel);
     }
 
     /// A retired body must stop naming its address. The OS is free to hand that
@@ -41873,6 +41957,218 @@ mod code_cache_lifetime_tests {
 /// accessor is entirely in what it declines to answer: it feeds a class-id
 /// guard, and a guard built on a thrashing cache spends a compare and a branch
 /// to reach the ordinary call anyway.
+/// Concurrency properties of the inline-cache publication protocol.
+///
+/// Generated code reads a PIC way with no lock, in a fixed order: the class id,
+/// then ONE load of the tagged entry word. These tests model that reader in
+/// Rust and race it against every writer: concurrent installs, recompiled
+/// targets, `clear_entries`, and invalidation with a retired body.
+#[cfg(test)]
+mod inline_cache_publication_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Publish `versions` distinct bodies for each of `classes` receivers and
+    /// return `(class_id, version) -> entry` plus `entry -> class_id`.
+    fn published_bodies(
+        cache: &JitCache,
+        classes: u32,
+        versions: u32,
+    ) -> (
+        std::collections::HashMap<(u32, u32), u64>,
+        std::collections::HashMap<u64, u32>,
+    ) {
+        let mut by_key = std::collections::HashMap::new();
+        let mut class_of = std::collections::HashMap::new();
+        for class_id in 1..=classes {
+            for version in 0..versions {
+                let class: Arc<str> = Arc::from(format!("icpub/C{class_id}").as_str());
+                let method: Arc<str> = Arc::from(format!("m{version}").as_str());
+                let desc: Arc<str> = Arc::from("()V");
+                let cid = cratonvm_types::ClassId::new(class_id);
+                let mut buf = ExecutableBuffer::new(64).expect("alloc body");
+                buf.emit(&[0xC3]);
+                cache.put(class.clone(), method.clone(), desc.clone(), cid, CompiledMethod::new(buf));
+                let cm = cache.get(&class, &method, &desc, cid).expect("published");
+                let entry = cm.entry_ptr() as u64;
+                by_key.insert((class_id, version), entry);
+                class_of.insert(entry, class_id);
+            }
+        }
+        (by_key, class_of)
+    }
+
+    /// Threads missing on the same cold site with DIFFERENT receivers used to
+    /// write the same empty way unreserved, leaving (class A, entry of B) and an
+    /// owner that disagreed with the entry. Every way that ends up live must
+    /// name one class, that class's entry, and that entry's owner.
+    #[test]
+    fn concurrent_installs_of_different_receivers_never_mix_a_way() {
+        let cache = JitCache::new();
+        let (by_key, class_of) = published_bodies(&cache, 4, 1);
+        for _round in 0..64 {
+            let pic = Arc::new(JitPICSlot::new());
+            let start = Arc::new(std::sync::Barrier::new(4));
+            let workers: Vec<_> = (1..=4u32)
+                .map(|class_id| {
+                    let pic = pic.clone();
+                    let start = start.clone();
+                    let entry = by_key[&(class_id, 0)];
+                    std::thread::spawn(move || {
+                        start.wait();
+                        for _ in 0..16 {
+                            pic.install(class_id, "icpub", entry, class_id % 2 == 0, false);
+                        }
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().expect("installer finishes");
+            }
+            for class_id in 1..=4u32 {
+                let (entry, needs_context) = pic
+                    .lookup(class_id)
+                    .expect("four receivers fit four ways");
+                assert_eq!(class_of[&entry], class_id, "lookup({class_id}) returned another class's entry");
+                assert_eq!(needs_context, class_id % 2 == 0);
+            }
+            for i in 0..JIT_PIC_ENTRIES {
+                let (class_id, entry, _) = pic.way(i).expect("way exists");
+                if !JitPICSlot::is_live_class_id(class_id) {
+                    continue;
+                }
+                assert_eq!(class_of[&entry], class_id, "way {i} pairs a guard with another class's entry");
+                let owner = pic.compiled_owners[i].lock().as_ref().map(|o| o.entry_ptr() as u64);
+                assert_eq!(owner, Some(entry), "way {i}'s owner must be the body its word names");
+            }
+        }
+    }
+
+    /// Readers that follow generated code's load order — class id, then one
+    /// entry-word load, all inside one JIT execution — racing installs of
+    /// recompiled targets and `clear_entries`. A reader that matched class C
+    /// must never load a word naming a body of any other class: that is the
+    /// retarget-under-a-reader the write-once protocol exists to prevent, and
+    /// the grace period is what keeps a retired way from being reused under a
+    /// reader still between its two loads.
+    #[test]
+    fn readers_never_pair_a_guard_with_another_receivers_entry() {
+        let cache = JitCache::new();
+        let (by_key, class_of) = published_bodies(&cache, 6, 3);
+        let class_of = Arc::new(class_of);
+        let pic = Arc::new(JitPICSlot::new());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let pic = pic.clone();
+                let stop = stop.clone();
+                let class_of = class_of.clone();
+                std::thread::spawn(move || {
+                    let mut checked = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let execution = jit_execution_enter();
+                        for i in 0..JIT_PIC_ENTRIES {
+                            let class_id = pic.class_ids[i].load(Ordering::Acquire);
+                            if !JitPICSlot::is_live_class_id(class_id) {
+                                continue;
+                            }
+                            // Widen the window between the two loads.
+                            std::hint::spin_loop();
+                            let (entry, _) = jit_ic_entry_decode(pic.entry_words[i].load(Ordering::Acquire));
+                            if entry == 0 {
+                                continue;
+                            }
+                            assert_eq!(
+                                class_of.get(&entry).copied(),
+                                Some(class_id),
+                                "a reader past way {i}'s guard for class {class_id} loaded another receiver's entry"
+                            );
+                            checked += 1;
+                        }
+                        jit_execution_leave(execution);
+                    }
+                    checked
+                })
+            })
+            .collect();
+
+        for round in 0..2_000u32 {
+            let class_id = 1 + round % 6;
+            let version = round % 3;
+            pic.install(class_id, "icpub", by_key[&(class_id, version)], false, false);
+            if round % 97 == 0 {
+                pic.clear_entries();
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        let checked: u64 = readers
+            .into_iter()
+            .map(|r| r.join().expect("reader finishes"))
+            .sum();
+        assert!(checked > 0, "the readers must actually have raced a published way");
+    }
+
+    /// An invalidation marks a body retired and then clears the inline caches;
+    /// a helper that resolved the body just before must not leave it installed.
+    /// Either the install sees the flag (admission or the post-publication
+    /// re-check), or the clearing pass — which takes the same writer lock —
+    /// runs after the publication and withdraws it.
+    #[test]
+    fn a_retired_body_never_survives_a_racing_install() {
+        let cache = JitCache::new();
+        let (by_key, _) = published_bodies(&cache, 1, 1);
+        let entry = by_key[&(1, 0)];
+        let owner = resolve_jit_entry_owner(entry as usize).expect("published body is owned");
+
+        for _round in 0..200 {
+            owner.retired.store(false, Ordering::SeqCst);
+            let pic = Arc::new(JitPICSlot::new());
+            let mic = Arc::new(JitMICSlot::new());
+            let installer = {
+                let (pic, mic) = (pic.clone(), mic.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..8 {
+                        mic.update(1, "icpub", entry, false, false);
+                        pic.install(1, "icpub", entry, false, false);
+                    }
+                })
+            };
+            // The invalidation's order: retire first, then clear.
+            owner.retired.store(true, Ordering::SeqCst);
+            let targets: std::collections::HashSet<usize> = [entry as usize].into_iter().collect();
+            pic.invalidate_targets(&targets);
+            mic.invalidate_target(&targets);
+            installer.join().expect("installer finishes");
+
+            assert!(pic.lookup(1).map_or(true, |(e, _)| e != entry), "a retired body stayed in a PIC way");
+            assert!(pic.lookup_megamorphic(1).is_none(), "a retired body stayed in the hashed table");
+            assert_ne!(mic.cached_entry().0, entry, "a retired body stayed in the MIC");
+        }
+        owner.retired.store(false, Ordering::SeqCst);
+    }
+
+    /// The deterministic half: a body already retired is never published.
+    #[test]
+    fn installing_an_already_retired_body_publishes_nothing() {
+        let cache = JitCache::new();
+        let (by_key, _) = published_bodies(&cache, 1, 1);
+        let entry = by_key[&(1, 0)];
+        let owner = resolve_jit_entry_owner(entry as usize).expect("published body is owned");
+        owner.retired.store(true, Ordering::SeqCst);
+
+        let mic = JitMICSlot::new();
+        mic.update(1, "icpub", entry, true, false);
+        assert_eq!(mic.cached_entry(), (0, false));
+
+        let pic = JitPICSlot::new();
+        pic.install(1, "icpub", entry, true, false);
+        assert_eq!(pic.entries_used(), 0);
+        assert!(pic.lookup_megamorphic(1).is_none());
+        owner.retired.store(false, Ordering::SeqCst);
+    }
+}
+
 #[cfg(test)]
 mod mic_devirt_evidence {
     use super::*;
@@ -41887,7 +42183,7 @@ mod mic_devirt_evidence {
         let mut cm = CompiledMethod::new(ExecutableBuffer::new(64).unwrap());
         let slot = Box::new(JitMICSlot::new_at(bci));
         slot.cached_class_id.store(class_id, Ordering::Relaxed);
-        slot.cached_entry_ptr.store(entry, Ordering::Relaxed);
+        slot.cached_entry_word.store(entry, Ordering::Relaxed);
         slot.misses.store(misses, Ordering::Relaxed);
         cm._jit_mic_slots.push(slot);
         cm
@@ -41984,7 +42280,7 @@ mod mic_devirt_evidence {
         let mut cm = CompiledMethod::new(ExecutableBuffer::new(64).unwrap());
         let slot = Box::new(JitMICSlot::new());
         slot.cached_class_id.store(77, Ordering::Relaxed);
-        slot.cached_entry_ptr.store(ENTRY, Ordering::Relaxed);
+        slot.cached_entry_word.store(ENTRY, Ordering::Relaxed);
         cm._jit_mic_slots.push(slot);
         assert_eq!(cm.dominant_receiver_at_bci(0), None);
         assert_eq!(cm.dominant_receiver_at_bci(16), None);
