@@ -6633,6 +6633,14 @@ pub unsafe extern "C" fn jit_anewarray_object(
     crate::jit::conservative_roots::note_jit_boundary();
     // Round-7 fix (CRIT, audit §3): SATB safepoint flush.
     jit_safepoint_flush_satb(vm_ptr);
+    // ZGC / G1 concurrent-mark start, exactly as `jit_newarray` and
+    // `jit_new_object` do. This allocator was the one path that skipped it, so
+    // an `Object[]`-heavy loop never started a concurrent cycle.
+    if vm_ptr != 0 {
+        // SAFETY: same provenance as the `&*(vm_ptr as *const SharedVm)` below.
+        jit_maybe_start_zgc_concurrent_mark(&*(vm_ptr as *const SharedVm));
+        jit_drive_g1_concurrent_mark(&*(vm_ptr as *const SharedVm));
+    }
     // BUGFIX: see `jit_newarray` — narrow length to int payload and sign-extend.
     // JLS only allows `int` array lengths; defensive against JIT slot patterns
     // that carry stale upper bits (e.g. NaN-boxed CompactValue raw bits).
@@ -6658,8 +6666,13 @@ pub unsafe extern "C" fn jit_anewarray_object(
     // without the retire, the heap walker steps into TLAB tail bytes
     // and mis-decodes them as object headers when GC fires from this
     // slow path.
-    let data_size =
-        cratonvm_types::array_data_size(length as usize, ArrayElementType::Reference).unwrap_or(0);
+    // W1-vm, as in `jit_newarray`: an overflowing size is an allocation that
+    // can never succeed. `unwrap_or(0)` probed with size 0, which always
+    // passes, and handed the impossible length onward.
+    let Ok(data_size) = cratonvm_types::array_data_size(length as usize, ArrayElementType::Reference)
+    else {
+        return jit_newarray_oom(vm, length as usize);
+    };
     let total_size = cratonvm_types::ARRAY_DATA_OFFSET + data_size;
     // Lock-free TLAB bump first — see the same arm in `jit_newarray` for why
     // this is the only path a JIT-compiled array allocation has, and what the
@@ -27542,6 +27555,11 @@ const _: () = {
     let _: HelperFnPutstaticFloat = jit_putstatic_float;
     let _: HelperFnPutstaticDouble = jit_putstatic_double;
     let _: HelperFnPutstaticObject = jit_putstatic_object;
+
+    // Out-parameter helpers: the pointer argument is `*mut i64` on both sides.
+    let _: HelperFnFfmSegmentGet = jit_ffm_segment_get;
+    let _: HelperFnFfmSegmentSet = jit_ffm_segment_set;
+    let _: HelperFnLocalHandlerLookup = jit_local_handler_lookup;
 
     // Type checks.
     let _: HelperFnCheckcast = jit_checkcast;

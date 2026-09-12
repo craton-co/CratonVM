@@ -4738,15 +4738,16 @@ impl OsrEntryPlan {
     ///  * `RETHROW` — not a resume point at all; the bci names a throwing
     ///    instruction to be routed through the exception table. Refused.
     ///
-    /// **`Unsupported` vs `MaterializationRequired` in a local.** An
-    /// `Unsupported` local is tolerated: the 1-pass backend's
-    /// `classify_local_kinds` is a coarse whole-method scan that marks a slot
-    /// `Ambiguous` at *every* bci if it is accessed as two kinds *anywhere*, and
-    /// the already-verified bytecode guarantees such a slot is either dead or
-    /// re-stored before it is read — so leaving the live frame's current value
-    /// in place is safe. This mirrors the VM-side in-place transfer, which
-    /// makes the same call for the same reason.
-    /// `MaterializationRequired` is **not** tolerated: it means a value that
+    /// **`Unsupported` and `MaterializationRequired` in a local.** Both refuse.
+    /// An `Unsupported` local used to be tolerated on the argument that
+    /// `classify_local_kinds` marks a slot `Ambiguous` at every bci when it is
+    /// accessed as two kinds anywhere, and that verified bytecode keeps such a
+    /// slot dead or re-stored before it is read. The second half does not
+    /// follow: a slot reused as `int` in one region and as a reference in
+    /// another is well typed and LIVE inside each region, and the live frame's
+    /// word there is whatever the compiled code last left in it, not
+    /// necessarily the value the interpreter expects.
+    /// `MaterializationRequired` is **not** tolerated either: it means a value that
     /// *was* live got deleted by an optimization with no rebuild recipe, so the
     /// live frame's stale pre-entry word is genuinely wrong, not merely
     /// unread. Guessing it is exactly what `FrameValue::MaterializationRequired`
@@ -4858,9 +4859,13 @@ impl OsrEntryPlan {
         }
         for (i, v) in rframe.locals.iter().enumerate() {
             match v {
-                // See the doc comment: coarse-classifier noise, provably safe
-                // to leave at the live frame's current value.
-                FV::Unsupported => {}
+                // See the doc comment: not provably unread, so not a resume.
+                FV::Unsupported => {
+                    return Err(osr_refusal(
+                        OSR_REFUSE_EXIT_REPLAY,
+                        format!("exit at bci {}: local {i} is Unsupported", rframe.bci),
+                    ));
+                }
                 FV::MaterializationRequired(ev) => {
                     return Err(osr_refusal(
                         OSR_REFUSE_EXIT_REPLAY,
@@ -13175,6 +13180,16 @@ pub fn census_direct_helper_sites() -> (u64, u64) {
     )
 }
 
+/// `CRATONVM_JIT_NO_LONG_INTRINSICS`, read once. The matcher runs for every
+/// candidate call site of every compile, so an environment lookup there was a
+/// per-site cost for a switch that cannot change mid-run.
+fn no_long_intrinsics() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_LONG_INTRINSICS").is_some()
+    })
+}
+
 /// Resolve a method invocation to a JIT call-site intrinsic, if one applies.
 ///
 /// Returns `Some((entry, num_params, return_type))` where `entry` is the
@@ -13289,7 +13304,7 @@ pub fn try_resolve_intrinsic(
     //     instruction lowering and the multi-mask SWAR sequence is omitted in
     //     favour of safe fallback to normal dispatch (roadmap §3.4).
     if class == "java/lang/Long"
-        && cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_LONG_INTRINSICS").is_none()
+        && !no_long_intrinsics()
     {
         let hit: Option<(JitIntrinsic, usize, u8)> = match (name, descriptor) {
             ("bitCount", "(J)I") if x64::has_popcnt() => {
@@ -37633,16 +37648,14 @@ mod tests {
         assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_EXIT_REPLAY));
         assert!(err.to_string().contains("local 1"), "{err}");
 
-        // `Unsupported` in a LOCAL is the documented exception: the whole-method
-        // kind classifier is coarse, the verifier guarantees such a slot is dead
-        // or re-stored before it is read, so the live frame's current value
-        // stands and the resume goes ahead.
+        // `Unsupported` in a LOCAL refuses too: a slot the coarse classifier
+        // calls ambiguous can still be live at this bci, so the live frame's
+        // current word is not known to be the interpreter's value.
         let mut unsupported_local = base.clone();
         unsupported_local.locals[2] = deopt::FrameValue::Unsupported;
-        assert_eq!(
-            plan.resume_after_exit(&cm, &unsupported_local).unwrap(),
-            OSR_T_HEADER
-        );
+        let err = plan.resume_after_exit(&cm, &unsupported_local).unwrap_err();
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_EXIT_REPLAY));
+        assert!(err.to_string().contains("local 2"), "{err}");
 
         // `Unsupported` on the operand STACK has no such argument.
         let mut unsupported_stack = base.clone();

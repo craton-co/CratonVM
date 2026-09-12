@@ -1293,30 +1293,6 @@ pub fn compile_with_param_slots(
         );
     }
 
-    // Round-8 wave-3 HIGH fix (Fix 3): generic LICM scaffold for
-    // getfield/getstatic loads. The analysis is invoked here so the
-    // pipeline links against the new `loop_analysis` module and
-    // pattern surfaces during compilation; the result is currently
-    // discarded because hoisting itself requires safepoint /
-    // oop-map / regalloc participation that is intentionally
-    // deferred to a later round (see `loop_analysis.rs` module doc).
-    //
-    // TODO(round-12+): wire the returned `InvariantLoad` records
-    // into the emitter as a pre-header hoist consumer alongside the
-    // existing `LoopHoist` (aaload) and `FpLoopHoist` (dload)
-    // mechanisms.
-    {
-        let licm_loops = crate::loop_analysis::detect_loops(code, code_len);
-        let mut total = 0usize;
-        for li in &licm_loops {
-            let v = crate::loop_analysis::find_invariant_loads(li, code);
-            total += v.len();
-        }
-        // Suppress dead_code warnings on the analysis output without
-        // changing emission behavior.
-        let _ = total;
-    }
-
     // T5.2.1 — SCEV induction variable analysis.
     //
     // Produces an `InductionVar` entry per detected counted loop. The
@@ -2208,8 +2184,6 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
     if !compiler.byte_sieve_loops.is_empty() || !compiler.bulk_set_byte_stride_loops.is_empty() {
         compiler.kernel_operand_cache = false;
     }
-    // T5.2.17 — loop unswitching candidates.
-    compiler.loop_unswitch_candidates = detect_loop_unswitch_candidates(code, code_len, &loops);
 
     // MED-4 / Fix 3 — pre-build pc-indexed lookup maps for the hot
     // codegen sites (getfield/putfield/invoke*/new/anewarray/ldc/…)

@@ -1549,10 +1549,21 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
                 apply_order(&mut blocks, &mut node_to_block, &mut freq, &order);
             }
             Err(bailout) => {
-                // Not a compilation bailout: the method still compiles, it just
-                // keeps the order it already had. Recorded rather than counted,
-                // so the bailout table stays a table of *refused compiles*.
+                // Not a compilation bailout: the method still compiles.
+                // Recorded rather than counted, so the bailout table stays a
+                // table of *refused compiles*. Fall back to the plain reverse
+                // postorder before creation order, because creation order is
+                // the one that can emit a use before its definition.
                 layout.rejected = Some(bailout.to_string());
+                if rpo_layout_enabled() {
+                    if let Ok(order) = layout_blocks_rpo(&blocks, &opts.protected_regions) {
+                        layout.fallthrough_edges = count_fallthrough_edges(&blocks, &order);
+                        layout.fallthrough_weight = fallthrough_weight(&blocks, &freq, &order);
+                        layout.applied = true;
+                        RPO_LAYOUTS_APPLIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        apply_order(&mut blocks, &mut node_to_block, &mut freq, &order);
+                    }
+                }
             }
         }
     }

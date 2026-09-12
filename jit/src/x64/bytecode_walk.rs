@@ -1319,36 +1319,6 @@ impl Compiler {
                 }
             }
 
-            // === T17.Β.3 — Loop unswitch pre-header evaluation ===========
-            //
-            // The detector has already proved that `invariant_local`
-            // is never written inside the loop body and that the
-            // body size is ≤ MAX_UNSWITCH_BYTECODES. We emit a
-            // single evaluation of the invariant predicate at the
-            // preheader. The body's per-iteration branch still
-            // executes as before (so semantics are bit-identical to
-            // the scalar loop), but the early evaluation:
-            //
-            // 1. Warms the CPU branch predictor for the branch's
-            //    single outcome — because the predicate is
-            //    invariant, the per-iteration branch is always
-            //    taken the same way.
-            // 2. Serves as a hook for future body-duplication: the
-            //    pre-evaluation slot can be consumed by a specialized
-            //    code-gen variant without changing the invariant.
-            //
-            // # Correctness
-            //
-            // The emitted sequence is *additive* — it reads
-            // `invariant_local` and sets flags but never writes back
-            // to any local. Because detection rejects loops that
-            // write `invariant_local`, the value observed at the
-            // preheader matches the value observed on every
-            // iteration. Removing the emission yields identical
-            // final state, which is exactly the "bytecode-equivalent
-            // semantics" the scope requires.
-            self.emit_loop_unswitch_preheader(pc);
-
             if let Some(sieve) = self
                 .byte_sieve_loops
                 .iter()
@@ -3630,6 +3600,33 @@ impl Compiler {
                     pc += 1;
                 }
 
+                // frem / drem — JVM `%` on floating point is the truncated,
+                // dividend-signed remainder (C `fmod`), which has no single
+                // instruction. Call the same `jit_frem` / `jit_drem` helpers
+                // the IR tier lowers to: `extern "C" fn(x, y) -> x` with the
+                // operands in XMM0/XMM1 and the result in XMM0 on both ABIs.
+                // Without this arm one `%` on a float kept the whole method
+                // out of the single-pass tier.
+                0x72 | 0x73 => {
+                    self.flush_xmm0_slots();
+                    self.flush_scratch_registers();
+                    let b_slot = self.pop_stack();
+                    let a_slot = self.pop_stack();
+                    self.load_slot_to_reg(RAX, a_slot);
+                    self.emit_movq_xmm_from_rax(0);
+                    self.load_slot_to_reg(RAX, b_slot);
+                    self.emit_movq_xmm_from_rax(1);
+                    let helper = if op == 0x72 {
+                        self.helpers.jit_frem
+                    } else {
+                        self.helpers.jit_drem
+                    };
+                    self.emit_call_absolute(helper);
+                    self.emit_movq_rax_from_xmm(0);
+                    self.push_from_rax_as_xmm0();
+                    pc += 1;
+                }
+
                 // ineg
                 0x74 => {
                     self.pop_to_rax();
@@ -3720,7 +3717,12 @@ impl Compiler {
                     self.pop_to_rax();
                     // SHR eax, cl
                     self.buf.emit(&[0xD3, 0xE8]);
-                    // Zero-extend eax to rax (automatic with 32-bit ops on x64)
+                    // MOVSXD rax, eax: an int is held sign-extended. A shift
+                    // by 0 (mod 32) leaves bit 31 set, and the 32-bit SHR
+                    // zero-extends it, so `-1 >>> 0` would read as 2^32 - 1
+                    // to any 64-bit consumer (a compare, an index, i2l).
+                    self.rex_w();
+                    self.buf.emit(&[0x63, 0xC0]);
                     self.push_from_rax();
                     pc += 1;
                 }
@@ -5079,8 +5081,12 @@ impl Compiler {
                         self.record_branch_target_depth(target);
                     }
 
-                    if npairs <= 6 {
-                        // Small: linear CMP chain (fast for few entries)
+                    // The binary search needs strictly ascending keys. JVMS
+                    // requires them, but nothing on this path verifies it, and
+                    // an unsorted table would silently send keys to default.
+                    let sorted = pairs.windows(2).all(|w| w[0].0 < w[1].0);
+                    if npairs <= 6 || !sorted {
+                        // Small or unsorted: linear CMP chain
                         for &(key, target) in &pairs {
                             self.buf.emit(&[0x3D]); // CMP EAX, imm32
                             self.buf.emit(&key.to_le_bytes());
@@ -14144,6 +14150,17 @@ impl Compiler {
                         .get(&pc)
                         .map(|&i| self.typecheck_info[i])
                         .unwrap_or((pc, std::ptr::null(), 0));
+                    // A site with no resolved target cannot be compiled
+                    // correctly: `jit_checkcast` has no class to test against
+                    // and answers with a silent null, which turns an object
+                    // into `null` instead of passing it or throwing. Stay
+                    // interpreted. The height is unchanged (pop one, push one),
+                    // so the model stays plausible until the post-loop check.
+                    if name_ptr.is_null() || name_len == 0 {
+                        self.fail("singlepass-codegen/checkcast-unresolved-site");
+                        pc += 3;
+                        continue;
+                    }
 
                     // ---- inline class-id fast path (see `checkcast_inline_enabled`) ----
                     //
@@ -14357,6 +14374,14 @@ impl Compiler {
                         .get(&pc)
                         .map(|&i| self.typecheck_info[i])
                         .unwrap_or((pc, std::ptr::null(), 0));
+                    // Same as `checkcast`: with no resolved target the helper
+                    // answers `false` for every object, a wrong answer rather
+                    // than a missing one. Stay interpreted.
+                    if name_ptr.is_null() || name_len == 0 {
+                        self.fail("singlepass-codegen/instanceof-unresolved-site");
+                        pc += 3;
+                        continue;
+                    }
 
                     let obj_slot = self.pop_stack();
 

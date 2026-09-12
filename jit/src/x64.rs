@@ -1519,14 +1519,6 @@ struct Compiler {
     bulk_set_byte_stride_loops: Vec<BulkSetByteStrideLoop>,
     /// Canonical nested byte/boolean Sieve loops.
     byte_sieve_loops: Vec<ByteSieveLoop>,
-    /// T5.2.17 — loop unswitch candidates.
-    ///
-    /// Each entry describes a loop with a loop-invariant conditional
-    /// branch that can be lifted to produce two specialized loops.
-    /// The emitter consumes this list to duplicate the body and hoist
-    /// the branch above the header.
-    loop_unswitch_candidates: Vec<LoopUnswitchCandidate>,
-
     // ── MED-4 / Fix 3 — PC-indexed lookup acceleration ─────────────────
     //
     // The original layout stores per-call-site metadata in `Vec<(pc, …)>`
@@ -3078,7 +3070,6 @@ impl Compiler {
             bulk_zero_byte_fill_loops: Vec::new(),
             bulk_set_byte_stride_loops: Vec::new(),
             byte_sieve_loops: Vec::new(),
-            loop_unswitch_candidates: Vec::new(),
             field_info_idx: FxHashMap::default(),
             static_field_info_idx: FxHashMap::default(),
             invoke_info_idx: FxHashMap::default(),

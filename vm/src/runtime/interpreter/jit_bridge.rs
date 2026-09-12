@@ -392,6 +392,26 @@ pub(crate) fn live_osr_continuation_artifact(frame_index: usize) -> Option<usize
     })
 }
 
+/// The `int`-family value a compiled method returned, narrowed to its
+/// descriptor's type.
+///
+/// JVMS §6.5 `ireturn`: a method whose return type is `boolean`, `byte`,
+/// `char` or `short` returns its value truncated to that type (`boolean` to
+/// bit 0). The interpreter does this at `ireturn`; neither JIT tier does, so a
+/// compiled body fed non-javac bytecode (`iconst_2; ireturn` from a `Z` method)
+/// handed the interpreter a 2. Narrowing at the bridge is where the compiled
+/// value re-enters interpreted code.
+fn narrow_int_return(ret_type: u8, raw: i64) -> i32 {
+    // Casts: the JIT ABI returns every int-family value in the i64 register.
+    match ret_type {
+        b'Z' => (raw & 1) as i32,
+        b'B' => i32::from(raw as i8),
+        b'C' => i32::from(raw as u16),
+        b'S' => i32::from(raw as i16),
+        _ => raw as i32,
+    }
+}
+
 pub(super) fn compile_osr_artifact(
     shared: &SharedVm,
     class_id: ClassId,
@@ -4690,7 +4710,7 @@ pub(super) fn try_osr(
     let ret_type = crate::jit::return_type(&method_descriptor);
     match ret_type {
         b'V' => Some(None),
-        b'I' | b'B' | b'C' | b'S' | b'Z' => Some(Some(Value::Int(result_i64 as i32))), // Cast: JIT ABI -- i64 register convention
+        b'I' | b'B' | b'C' | b'S' | b'Z' => Some(Some(Value::Int(narrow_int_return(ret_type, result_i64)))),
         b'J' => Some(Some(Value::Long(result_i64))),
         b'F' => Some(Some(Value::Float(f32::from_bits(result_i64 as u32)))), // Cast: JIT ABI -- i64 register convention
         b'D' => Some(Some(Value::Double(f64::from_bits(result_i64 as u64)))), // Cast: JIT ABI -- i64 register convention
@@ -12525,7 +12545,7 @@ pub(super) fn execute_jit_call(
         b'B' | b'C' | b'S' | b'Z' => {
             thread.frames[frame_idx]
                 .stack
-                .push_unchecked(Value::Int(result as i32)); // Cast: JIT ABI -- i64 register convention
+                .push_unchecked(Value::Int(narrow_int_return(return_type, result)));
         }
         b'[' | b'L' => {
             if result == 0 {
@@ -12976,7 +12996,7 @@ pub(super) fn execute_jit_call_decoded(
         b'I' | b'B' | b'C' | b'S' | b'Z' => {
             thread.frames[frame_idx]
                 .stack
-                .push_unchecked(Value::Int(result as i32)); // Cast: JIT ABI -- i64 register convention
+                .push_unchecked(Value::Int(narrow_int_return(return_type, result)));
         }
         b'J' => {
             thread.frames[frame_idx]
@@ -13330,7 +13350,7 @@ pub(super) fn execute_jit_call_oneshot(
 
     // Normal return — convert, never push.
     Ok(Some(match return_type {
-        b'I' | b'B' | b'C' | b'S' | b'Z' => Some(Value::Int(result as i32)), // Cast: JIT ABI -- i64 register convention
+        b'I' | b'B' | b'C' | b'S' | b'Z' => Some(Value::Int(narrow_int_return(return_type, result))),
         b'J' => Some(Value::Long(result)),
         b'F' => Some(Value::Float(f32::from_bits(result as u32))), // Cast: JIT ABI -- i64 register convention
         b'D' => Some(Value::Double(f64::from_bits(result as u64))), // Cast: JIT ABI -- i64 register convention

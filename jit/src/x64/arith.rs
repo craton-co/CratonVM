@@ -255,8 +255,10 @@ impl Compiler {
                             self.buf.emit(&[0x63, 0xC0]);
                         }
                         0x7c => {
-                            // iushr: SHR eax,cl (32-bit zero-extends)
+                            // iushr: SHR eax,cl ; movsxd (a zero shift keeps bit 31)
                             self.buf.emit(&[0xD3, 0xE8]);
+                            self.rex_w();
+                            self.buf.emit(&[0x63, 0xC0]);
                         }
                         0x7e => {
                             // iand: AND eax,ecx ; movsxd

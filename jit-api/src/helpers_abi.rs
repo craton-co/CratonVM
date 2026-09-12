@@ -237,6 +237,9 @@ impl_helper_arg_abi! {
     f32 => true,
     f64 => true,
     *const u8 => false,
+    // An out-parameter the helper writes through: a frame or scratch word
+    // address, a machine word in an integer register like any pointer.
+    *mut i64 => false,
 }
 
 impl HelperRetAbi for () {
@@ -706,7 +709,7 @@ helper_fn_slots! {
     // element READ fast path. A decline leaves the site's native dispatch to
     // run unchanged, so every case it does not recognise keeps today's
     // behaviour. See `JitRuntimeHelpers::ffm_segment_get`.
-    HelperFnFfmSegmentGet, ffm_segment_get, ffm_segment_get_fn, (i64, i64, i64, i64) -> i64;
+    HelperFnFfmSegmentGet, ffm_segment_get, ffm_segment_get_fn, (i64, i64, i64, *mut i64) -> i64;
     // `(seg, index, kind, raw_value) -> 1 handled | 0 declined` — the WRITE
     // twin. See `JitRuntimeHelpers::ffm_segment_set`.
     HelperFnFfmSegmentSet, ffm_segment_set, ffm_segment_set_fn, (i64, i64, i64, i64) -> i64;
@@ -725,7 +728,7 @@ helper_fn_slots! {
     // address, not a value: on a hit the helper stores the throwable there,
     // which is the operand slot the handler block starts from. See
     // `JitRuntimeHelpers::local_handler_lookup`.
-    HelperFnLocalHandlerLookup, local_handler_lookup, local_handler_lookup_fn, (i64, i64, i64) -> i64;
+    HelperFnLocalHandlerLookup, local_handler_lookup, local_handler_lookup_fn, (i64, i64, *mut i64) -> i64;
 }
 
 // ---------------------------------------------------------------------

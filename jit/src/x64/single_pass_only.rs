@@ -39,7 +39,8 @@
 //! either would cost a large population of IR bodies to buy nothing.
 //!
 //! A third was dropped for a different and more interesting reason. **Loop
-//! unswitching is detected but not actually performed.**
+//! unswitching was detected but never performed** (the detector and its
+//! flag-setting pre-header were deleted on 2026-09-12).
 //! `detect_loop_unswitch_candidates` feeds `emit_loop_unswitch_preheader`,
 //! whose own contract says the sequence "is *additive* — it reads
 //! `invariant_local` and sets flags but never writes back to any local

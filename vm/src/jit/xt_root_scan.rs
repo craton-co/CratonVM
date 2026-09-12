@@ -573,6 +573,14 @@ mod imp {
     const OFF_GPR_LO: usize = 0x78;
     const OFF_GPR_HI: usize = 0xF0;
     // CONTEXT_CONTROL | CONTEXT_INTEGER for AMD64.
+    //
+    // No CONTEXT_FLOATING_POINT, deliberately: neither JIT tier ever holds a
+    // reference in an XMM register. The single-pass operand stack puts only
+    // float/double values in `StackSlot::Xmm`, and the IR tier's linear scan
+    // gives XMM homes only to FP-typed intervals. A reference that is live in
+    // compiled code is in a general-purpose register or a stack word, which is
+    // exactly what this capture and the stack band below cover. A change that
+    // lets an oop into a vector register must extend both captures first.
     const CONTEXT_CONTROL_INTEGER: u32 = 0x0010_0001 | 0x0010_0002;
 
     /// Backstop on how far above `Rsp` we scan a peer's stack (matches the
@@ -1417,6 +1425,8 @@ mod imp {
         }
 
         let uc = &*(ucontext as *const libc::ucontext_t);
+        // General-purpose registers only; see CONTEXT_CONTROL_INTEGER in the
+        // Windows arm for why no JIT reference can be in `fpregs`.
         let g = &uc.uc_mcontext.gregs;
         let read_reg = |idx: i32| -> usize { g[idx as usize] as usize };
         let rip = read_reg(libc::REG_RIP);

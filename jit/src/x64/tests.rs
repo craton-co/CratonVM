@@ -9461,10 +9461,6 @@ fn test_bounds_elimination_inclusive_not_safe() {
     let loops = detect_loops(&code, code_len);
     assert_eq!(loops[0], (0, 12));
 
-    // analyze_loop_bound must flag the loop as inclusive.
-    let bounds = analyze_loop_bound(&code, 0, 12, 15, 0).expect("loop bound recognized");
-    assert!(bounds.inclusive, "if_icmpgt exit must be marked inclusive");
-
     // Default (opt-in flag off): inclusive loops take no guard at all.
     __set_inclusive_spec_bce_override(Some(false));
     let (off_safe, off_guards) = analyze_bounds_elimination(&code, code_len, &loops);
@@ -9514,11 +9510,6 @@ fn test_bce_varadd_step_guard_and_commuted_refusal() {
     let code_len = 17;
     let loops = detect_loops(&code, code_len);
     assert_eq!(loops[0].0, 0);
-    assert_eq!(
-        find_iv_step_provenance(&code, 0, 16, 0),
-        Some(IvStep::VarAdd(3)),
-        "canonical j += i must name the step local"
-    );
     let (safe_pcs, guards) = analyze_bounds_elimination(&code, code_len, &loops);
     assert!(
         safe_pcs.contains(&8),
@@ -9539,7 +9530,6 @@ fn test_bce_varadd_step_guard_and_commuted_refusal() {
         0x1a, 0x1b, 0xa2, 0x00, 0x10, 0x2c, 0x1a, 0x04, 0x54, 0x1d, 0x1a, 0x60, 0x3b, 0xa7, 0xff,
         0xf3, 0xb1, 0x00, 0x00, 0x00,
     ];
-    assert_eq!(find_iv_step_provenance(&commuted, 0, 16, 0), None);
     let (safe2, guards2) = analyze_bounds_elimination(&commuted, code_len, &loops);
     assert!(
         !safe2.contains(&8),
@@ -10684,281 +10674,6 @@ fn t17_b_simd_ewise_avx2_gated() {
     // the early return above.)
     let cm = compiled.unwrap();
     assert!(!cm.entry_ptr().is_null(), "compiled entry must be valid");
-}
-
-// T5.2.17 — loop unswitching tests
-
-#[test]
-fn test_detect_loop_unswitch_candidate_found() {
-    // for (i = 0; i < n; i++) { if (flag != 0) {} }
-    // Locals: 0=flag (invariant), 1=n, 2=i
-    //
-    // PC offsets (instruction boundaries):
-    //  0: iconst_0            (1)
-    //  1: istore_2            (1)
-    //  2: iload_2   HEADER    (1)
-    //  3: iload_1             (1)
-    //  4: if_icmpge +15 → 19  (3)
-    //  7: iload_0   (flag)    (1)
-    //  8: ifeq +5 → 13        (3)
-    // 11: nop                 (1)
-    // 12: nop                 (1)
-    // 13: iinc 2, 1           (3)
-    // 16: goto -14 → 2        (3)  back-edge
-    // 19: return              (1)
-    let code: Vec<u8> = vec![
-        0x03, 0x3D, // 0-1
-        0x1C, 0x1B, 0xa2, 0x00, 0x0F, // 2-6
-        0x1A, // 7
-        0x99, 0x00, 0x05, // 8-10
-        0x00, 0x00, // 11-12
-        0x84, 0x02, 0x01, // 13-15
-        0xa7, 0xff, 0xF2, // 16-18
-        0xB1, // 19
-    ];
-    let code_len = code.len();
-    let loops = detect_loops(&code, code_len);
-    let &(header, back_edge) = loops
-        .iter()
-        .find(|&&(h, _)| h == 2)
-        .expect("should detect outer for loop");
-    let candidates = detect_loop_unswitch_candidates(&code, code_len, &[(header, back_edge)]);
-    assert!(
-        !candidates.is_empty(),
-        "should find an unswitch candidate for the invariant flag"
-    );
-    let c = &candidates[0];
-    assert_eq!(c.header_pc, header);
-    assert_eq!(c.invariant_local, 0);
-    assert_eq!(c.branch_op, 0x99); // ifeq
-}
-
-#[test]
-fn test_detect_loop_unswitch_rejects_when_local_written() {
-    // Same shape as above but the body writes local 0 — so it's
-    // no longer invariant and must not be unswitched.
-    //
-    // PC offsets:
-    //  0-1:   iconst_0 istore_2
-    //  2-6:   iload_2 iload_1 if_icmpge +17 → 21
-    //  7:     iload_0 (flag)
-    //  8-10:  ifeq +5 → 15
-    // 11:     iconst_1
-    // 12:     istore_0              ← writes local 0
-    // 13-14:  (pad nops)
-    // 15-17:  iinc 2, 1
-    // 18-20:  goto -16 → 2
-    // 21:     return
-    let code: Vec<u8> = vec![
-        0x03, 0x3D, // 0-1
-        0x1C, 0x1B, 0xa2, 0x00, 0x11, // 2-6
-        0x1A, // 7
-        0x99, 0x00, 0x05, // 8-10
-        0x04, // 11: iconst_1
-        0x3B, // 12: istore_0 (writes local 0)
-        0x00, 0x00, // 13-14: nop nop
-        0x84, 0x02, 0x01, // 15-17: iinc 2,1
-        0xa7, 0xff, 0xF0, // 18-20: goto -16 → 2
-        0xB1, // 21: return
-    ];
-    let code_len = code.len();
-    let loops = detect_loops(&code, code_len);
-    let &(header, back_edge) = loops
-        .iter()
-        .find(|&&(h, _)| h == 2)
-        .expect("should detect loop at PC=2");
-    let candidates = detect_loop_unswitch_candidates(&code, code_len, &[(header, back_edge)]);
-    assert!(
-        candidates.is_empty(),
-        "should NOT unswitch when the predicate local is written in the loop"
-    );
-}
-
-#[test]
-fn test_detect_loop_unswitch_rejects_large_body() {
-    // Body > MAX_UNSWITCH_BYTECODES → rejected even if predicate
-    // is invariant.
-    // Build a large loop by padding with nops.
-    let mut code = vec![0x03, 0x3D]; // i = 0
-    let header = code.len();
-    code.extend_from_slice(&[0x1C, 0x1B, 0xa2, 0x00, 0x00]); // iload i,n,if_icmpge
-    code.push(0x1A); // iload_0 (flag)
-    code.extend_from_slice(&[0x99, 0x00, 0x03]); // ifeq
-                                                 // Pad the body with nops so size > MAX_UNSWITCH_BYTECODES.
-    for _ in 0..(MAX_UNSWITCH_BYTECODES + 5) {
-        code.push(0x00);
-    }
-    let back_edge = code.len();
-    code.extend_from_slice(&[0x84, 0x02, 0x01]); // iinc (part of body)
-    code.extend_from_slice(&[0xa7, 0xFF, 0xFF]); // goto (back_edge)
-    code.push(0xB1); // return
-    let candidates = detect_loop_unswitch_candidates(&code, code.len(), &[(header, back_edge)]);
-    assert!(
-        candidates.is_empty(),
-        "should NOT unswitch bodies larger than MAX_UNSWITCH_BYTECODES"
-    );
-}
-
-// ── T17.Β.3 — Loop unswitch emission ───────────────────────────
-
-/// Build a tiny loop that exhibits an invariant-branch unswitch
-/// pattern: `for (i=0; i<n; i++) if (flag != 0) {}`. Locals:
-/// 0=flag (invariant), 1=n, 2=i.
-fn tiny_unswitchable_loop() -> (Vec<u8>, usize) {
-    // PC layout:
-    //  0: iconst_0
-    //  1: istore_2            (i = 0)
-    //  2: iload_2    HEADER
-    //  3: iload_1             (n)
-    //  4: if_icmpge +15 → 19  (3)
-    //  7: iload_0             (flag)
-    //  8: ifeq +5 → 13        (invariant branch)
-    // 11: nop nop             (body side)
-    // 13: iinc 2, 1           (induction)
-    // 16: goto -14 → 2        (back-edge)
-    // 19: return
-    let code: Vec<u8> = vec![
-        0x03, 0x3D, 0x1C, 0x1B, 0xa2, 0x00, 0x0F, 0x1A, 0x99, 0x00, 0x05, 0x00, 0x00, 0x84, 0x02,
-        0x01, 0xa7, 0xff, 0xF2, 0xB1, 0, 0,
-    ];
-    let code_len = 20;
-    (code, code_len)
-}
-
-fn compile_tiny_unswitchable() -> Option<CompiledMethod> {
-    let (code, code_len) = tiny_unswitchable_loop();
-    compile(
-        &code,
-        code_len,
-        2, // params: flag, n
-        3, // locals: flag, n, i
-        false,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
-        Vec::new(),
-        HashMap::new(),
-        HashMap::new(),
-        &test_helpers(),
-        std::collections::HashSet::new(),
-        HashMap::new(),
-        None, // string_layout
-    )
-}
-
-/// Emit the unswitched variant via the regular compile path and
-/// confirm the compilation succeeds. The emission is *additive*:
-/// it evaluates the invariant local once at the loop preheader
-/// but never writes back any Java-visible state, so the final
-/// locals after `n` iterations match the original scalar loop
-/// bit-for-bit. This is the bytecode-equivalent contract.
-#[test]
-fn t17_b_loop_unswitch_bytecode_equiv() {
-    let compiled = compile_tiny_unswitchable();
-    assert!(
-        compiled.is_some(),
-        "unswitchable loop must compile; emission is additive"
-    );
-    // Confirm the candidate list is non-empty — otherwise the
-    // preheader evaluation wouldn't have fired at all.
-    let (code, code_len) = tiny_unswitchable_loop();
-    let loops = detect_loops(&code, code_len);
-    let cands = detect_loop_unswitch_candidates(&code, code_len, &loops);
-    assert!(
-        !cands.is_empty(),
-        "detection must identify the invariant flag — emission relies on it"
-    );
-    assert_eq!(cands[0].branch_op, 0x99, "detected op must be ifeq");
-    assert_eq!(cands[0].invariant_local, 0, "flag is local 0");
-
-    // Tiny body is well under MAX_UNSWITCH_BYTECODES.
-    let body_size = cands[0].back_edge_pc - cands[0].header_pc;
-    assert!(
-        body_size <= MAX_UNSWITCH_BYTECODES,
-        "body size {body_size} must be ≤ {MAX_UNSWITCH_BYTECODES}"
-    );
-}
-
-/// A loop whose body exceeds `MAX_UNSWITCH_BYTECODES` must be
-/// rejected by the detector; the emitter consequently produces
-/// the unmodified scalar loop (no preheader evaluation, no
-/// duplication). Compilation still succeeds.
-#[test]
-fn t17_b_loop_unswitch_large_body_rejected() {
-    // Build a large loop (body > MAX_UNSWITCH_BYTECODES).
-    let mut code = vec![0x03, 0x3D]; // i = 0
-    let header = code.len();
-    code.extend_from_slice(&[0x1C, 0x1B, 0xa2, 0x00, 0x00]); // iload i,n,if_icmpge
-    code.push(0x1A); // iload_0 (flag)
-    code.extend_from_slice(&[0x99, 0x00, 0x03]); // ifeq
-    for _ in 0..(MAX_UNSWITCH_BYTECODES + 5) {
-        code.push(0x00); // padding nops
-    }
-    let back_edge = code.len();
-    code.extend_from_slice(&[0x84, 0x02, 0x01]); // iinc
-                                                 // Real back-edge to the loop header. (Historical note: this was a
-                                                 // hardcoded `goto -1`, landing on the iinc's last operand byte —
-                                                 // not an instruction boundary. The unresolved patch was silently
-                                                 // skipped before `patch_branches` learned to reject such targets.)
-    let goto_pc = code.len();
-    let goto_off = (header as i32 - goto_pc as i32) as i16; // Cast: fits — tiny method
-    code.push(0xa7);
-    code.extend_from_slice(&goto_off.to_be_bytes());
-    code.push(0xB1); // return
-    code.push(0); // padding
-    code.push(0);
-
-    let code_len = code.len() - 2;
-    let loops = detect_loops(&code, code_len);
-    let cands = detect_loop_unswitch_candidates(&code, code_len, &loops);
-    assert!(
-        cands.is_empty(),
-        "large body must not produce an unswitch candidate"
-    );
-
-    // Compilation still succeeds via the normal scalar path.
-    let compiled = compile(
-        &code,
-        code_len,
-        2,
-        3,
-        false,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
-        Vec::new(),
-        HashMap::new(),
-        HashMap::new(),
-        &test_helpers(),
-        std::collections::HashSet::new(),
-        HashMap::new(),
-        None, // string_layout
-    );
-    assert!(
-        compiled.is_some(),
-        "large-body loop must still compile through the scalar fallback"
-    );
-    // The key guarantee: no preheader evaluation was emitted, so
-    // code size reflects only the scalar loop body (the emitter
-    // short-circuited in `emit_loop_unswitch_preheader`).
-    let _ = header;
-    let _ = back_edge;
 }
 
 #[test]
@@ -17366,7 +17081,19 @@ fn dup_x2_without_a_provable_form_bails_under_its_own_name() {
 /// shelf life, and the failure should say which fact expired.
 #[test]
 fn the_unlowered_opcode_catch_all_names_itself() {
-    const EXEMPLAR: u8 = 0x72; // frem
+    // The reason string must survive even while no admitted opcode can reach
+    // it: the guard below keeps the exemption list empty, and the catch-all is
+    // what a future admission without an arm would land on.
+    assert!(
+        include_str!("bytecode_walk.rs")
+            .contains("self.fail(\"singlepass-codegen/opcode-scan-admitted-but-unlowered\")"),
+        "the catch-all's named reason is gone"
+    );
+    let Some(&(exemplar, _)) = SCAN_ADMITTED_WITHOUT_A_SINGLE_PASS_ARM.first() else {
+        return;
+    };
+    #[allow(non_snake_case)]
+    let EXEMPLAR = exemplar;
     assert!(
         !single_pass_dispatch_arms().contains(&EXEMPLAR),
         "0x{EXEMPLAR:02x} is lowered now, so it can no longer drive the walk \
@@ -17410,14 +17137,9 @@ fn the_unlowered_opcode_catch_all_names_itself() {
 /// the opcode, so admitting it buys a compilation the scanner would otherwise
 /// refuse. "Nobody lowers it anywhere" is the `dup2_x2` shape and belongs in
 /// an arm, not on this list.
-const SCAN_ADMITTED_WITHOUT_A_SINGLE_PASS_ARM: &[(u8, &str)] = &[
-    (
-        0x72,
-        "frem — the optimizing IR backend lowers it via a call to the jit_frem \
-         fmod helper, so admitting it lets the IR pipeline see the method",
-    ),
-    (0x73, "drem — same as frem, via jit_drem"),
-];
+///
+/// Empty since 2026-09-12, when `frem`/`drem` gained a single-pass arm.
+const SCAN_ADMITTED_WITHOUT_A_SINGLE_PASS_ARM: &[(u8, &str)] = &[];
 
 /// Every opcode value the top-level dispatch `match op` in `bytecode_walk.rs`
 /// has an arm for.
@@ -17532,7 +17254,7 @@ fn the_dispatch_arm_parser_reads_the_real_match() {
     // And it must not invent coverage for opcodes nobody lowers here.
     for (op, what) in [
         (0xa8u8, "jsr — unlowered in both walkers"),
-        (0x72u8, "frem — deliberately IR-only"),
+        (0xa9u8, "ret — unlowered in both walkers"),
     ] {
         assert!(
             !arms.contains(&op),
