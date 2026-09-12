@@ -5119,6 +5119,15 @@ impl Compiler {
                 0xac..=0xb0 => {
                     self.flush_scratch_registers();
                     self.pop_to_rax();
+                    if code[pc] == 0xac {
+                        // JVMS §6.5: a `boolean`/`byte`/`char`/`short` return is
+                        // narrowed at `ireturn`. A compiled caller reads RAX
+                        // raw, so without this a `()Z` body returning 2 hands
+                        // it 2. The return type is the method key's; an empty
+                        // key (the legacy test wrapper) narrows nothing.
+                        let tag = crate::narrowed_int_return_tag(&self.method_key);
+                        self.emit_narrow_int_return(tag);
+                    }
                     self.emit_epilogue();
                     self.reset_spills();
                     dead = true;
@@ -10151,6 +10160,10 @@ impl Compiler {
                                     }
                                     self.buf.emit(&[0x48, 0x63, 0xC1]); // MOVSXD RAX, ECX
                                     self.push_from_rax();
+                                    // Counted HERE, where the site is emitted,
+                                    // not in the matcher (review #80).
+                                    crate::ATOMIC_INTRINSIC_SITES
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                                     for p in bail {
                                         self.deopt_stubs.push((p, pc, 6));
@@ -10235,6 +10248,8 @@ impl Compiler {
                                 self.buf.emit(&[0x0F, 0x94, 0xC0]); // SETZ AL
                                 self.buf.emit(&[0x0F, 0xB6, 0xC0]); // MOVZX EAX, AL
                                 self.push_from_rax();
+                                crate::ATOMIC_INTRINSIC_SITES
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                                 for p in bail {
                                     self.deopt_stubs.push((p, pc, 6));
@@ -10390,6 +10405,10 @@ impl Compiler {
                                     }
                                     self.buf.emit(&[0x48, 0x89, 0xC8]); // MOV RAX, RCX
                                     self.push_from_rax();
+                                    // Counted at emission, not in the matcher
+                                    // (review #80).
+                                    crate::ATOMIC_LONG_INTRINSIC_SITES
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                                     for p in bail {
                                         self.deopt_stubs.push((p, pc, 6));
@@ -10474,6 +10493,8 @@ impl Compiler {
                                 self.buf.emit(&[0x0F, 0x94, 0xC0]); // SETZ AL
                                 self.buf.emit(&[0x0F, 0xB6, 0xC0]); // MOVZX EAX, AL
                                 self.push_from_rax();
+                                crate::ATOMIC_LONG_INTRINSIC_SITES
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                                 for p in bail {
                                     self.deopt_stubs.push((p, pc, 6));
@@ -10583,6 +10604,15 @@ impl Compiler {
                                         self.buf.emit(&[0x48, 0x63, 0xC1]);
                                     }
                                     self.push_from_rax();
+                                    // Counted at emission, not in the matcher
+                                    // (review #80).
+                                    if is_long {
+                                        crate::LONG_LONG_VALUE_INTRINSIC_SITES
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    } else {
+                                        crate::INTEGER_INT_VALUE_INTRINSIC_SITES
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
 
                                     for p in bail {
                                         self.deopt_stubs.push((p, pc, 6));
@@ -14310,7 +14340,91 @@ impl Compiler {
                         continue;
                     }
 
+                    // ---- inline fast path: checkcast's guards, instanceof's answers ----
+                    //
+                    // Exactly the preconditions of the `checkcast` arm above,
+                    // read the same way and for the same reasons (see the long
+                    // comments there): the target id comes from the site's
+                    // interned name, the operand must be a trusted oop, and the
+                    // whole thing sits under `checkcast_inline_enabled`. Only
+                    // the ANSWERS differ, and instanceof has more of them to
+                    // give without a call:
+                    //
+                    // * null — `instanceof` is 0 for null (JVMS §6.5), so null
+                    //   needs no helper at all. (checkcast sends null to the
+                    //   helper only because it has no second null path.)
+                    // * a plain object whose header class id IS the target — 1.
+                    //   Arrays are screened out by the `KIND_TAGS == 0` compare
+                    //   first: an array header carries its component's id (or
+                    //   0), BUG-JIT-ARRAY-INSTANCEOF-20260726.
+                    // * a 1-D primitive array whose KIND_TAGS byte is the
+                    //   target's — 1. Primitive array types have no subtypes.
+                    // * anything else — the helper, emitted unchanged below.
+                    //
+                    // The two call-free answers are stubs placed AFTER the
+                    // helper call, so the call sequence is emitted in the same
+                    // linear position (and byte-for-byte the same) as before,
+                    // and the stubs are compiled against the post-call state,
+                    // in which RAX is the result on every edge into the join.
+                    // No counter and no debug flag of its own: the checkcast
+                    // counters describe checkcast, and this arm adds no state.
+                    let target_class_id = crate::typecheck_target_for_site(name_ptr)
+                        .filter(|&id| id != 0);
+                    // Read BEFORE the pop, as in the checkcast arm.
+                    let operand_is_trusted_oop = !self.method_key.is_empty()
+                        && self.stack_oop_marks_exact
+                        && self.stack_oop_marks.last().copied().unwrap_or(false);
+
                     let obj_slot = self.pop_stack();
+
+                    // SAFETY: `name_ptr`/`name_len` are an `intern_typecheck_target`
+                    // pair, leaked for the life of the process.
+                    let prim_array_tag = unsafe { crate::typecheck_site_name(name_ptr, name_len) }
+                        .and_then(cratonvm_types::primitive_array_kind_tags_byte)
+                        .filter(|_| checkcast_inline_enabled() && operand_is_trusted_oop);
+                    let inline_target = target_class_id.filter(|_| {
+                        checkcast_inline_enabled()
+                            && operand_is_trusted_oop
+                            && prim_array_tag.is_none()
+                    });
+                    let mut null_patches: Vec<usize> = Vec::new();
+                    let mut true_patches: Vec<usize> = Vec::new();
+                    if prim_array_tag.is_some() || inline_target.is_some() {
+                        self.load_slot_to_reg(RAX, obj_slot);
+                        // TEST RAX, RAX ; JZ → the `0` stub.
+                        null_patches = self.emit_trusted_oop_receiver_check();
+                        let mut slow: Vec<usize> = Vec::new();
+                        if let Some(tag) = prim_array_tag {
+                            // CMP BYTE [RAX+KIND_TAGS_BYTE_OFFSET], tag ; JE → `1`.
+                            self.buf.emit(&[
+                                0x80,
+                                0x78,
+                                cratonvm_types::KIND_TAGS_BYTE_OFFSET as u8, // Cast: x86-64 disp8
+                                tag,
+                            ]);
+                            true_patches.push(self.emit_jcc_rel32_patch(0x84)); // JE → `1`
+                        } else if let Some(target_class_id) = inline_target {
+                            // CMP BYTE [RAX+KIND_TAGS_BYTE_OFFSET], 0 ; JNE → helper.
+                            self.buf.emit(&[
+                                0x80,
+                                0x78,
+                                cratonvm_types::KIND_TAGS_BYTE_OFFSET as u8, // Cast: x86-64 disp8
+                                0x00,
+                            ]);
+                            slow.push(self.emit_jcc_rel32_patch(0x85)); // JNE → helper
+                            // CMP DWORD [RAX+class_id_off], target_class_id ;
+                            // JE → `1`. Same `81 B8 disp32 imm32` form as checkcast.
+                            let cid_off = self.helpers.class_id_offset_in_obj as i32; // Cast: x86-64 disp32
+                            self.buf.emit(&[0x81, 0xB8]);
+                            self.buf.emit(&cid_off.to_le_bytes());
+                            self.buf.emit(&target_class_id.to_le_bytes());
+                            true_patches.push(self.emit_jcc_rel32_patch(0x84)); // JE → `1`
+                        }
+                        // Fall-through and every JNE: the helper.
+                        for p in slow {
+                            self.patch_rel32_to_here(p);
+                        }
+                    }
 
                     // Call jit_instanceof(vm_ptr, obj_ptr, class_name_ptr, class_name_len) → 0/1
                     self.emit_load_local(ARG_REGS[0], self.heap_local_offset); // vm_ptr
@@ -14327,6 +14441,31 @@ impl Compiler {
                     // oop map even though the return value is a
                     // primitive int.
                     self.emit_oop_map_for_safepoint();
+                    if !null_patches.is_empty() || !true_patches.is_empty() {
+                        // Helper result in RAX: skip the two stubs.
+                        let past_helper = self.emit_jmp_rel32_patch();
+                        let mut join: Vec<usize> = vec![past_helper];
+                        if !null_patches.is_empty() {
+                            for p in null_patches {
+                                self.patch_rel32_to_here(p);
+                            }
+                            // XOR EAX, EAX — null is not an instance of anything.
+                            self.emit_xor_reg_self(RAX);
+                            if !true_patches.is_empty() {
+                                join.push(self.emit_jmp_rel32_patch());
+                            }
+                        }
+                        if !true_patches.is_empty() {
+                            for p in true_patches {
+                                self.patch_rel32_to_here(p);
+                            }
+                            // MOV RAX, 1 — the receiver is exactly the target.
+                            self.emit_mov_imm32_sx(RAX, 1);
+                        }
+                        for p in join {
+                            self.patch_rel32_to_here(p);
+                        }
+                    }
                     // Result (0 or 1) is in RAX — push onto stack
                     self.push_from_rax();
                     pc += 3;

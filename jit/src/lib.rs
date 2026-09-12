@@ -13965,8 +13965,14 @@ pub fn try_resolve_intrinsic(
 /// `AtomicInteger` is not final, so a receiver could be a subclass that
 /// overrides `getAndIncrement`; only an exact class-id match may take the
 /// inline path.
-/// Number of call sites the ATOMIC_INT matcher has admitted this process.
-/// `CRATONVM_DBG_ATOMIC_INTRINSIC=1` prints each one. A perf claim about this
+/// Number of ATOMIC_INT call sites (the `XADD`/load arm and the `CMPXCHG` arm)
+/// the single-pass backend has EMITTED inline this process.
+///
+/// Bumped where the codegen emits the site, not in the matcher (review #80): a
+/// registered site can still be dropped before emission, and the matcher is a
+/// query, so counting there counted questions rather than sites. A code-buffer
+/// retry re-emits its method and counts its sites again.
+/// `CRATONVM_DBG_ATOMIC_INTRINSIC=1` prints each matcher hit. A perf claim about this
 /// family is not believable without checking that this is non-zero — the
 /// intrinsic answering the same values as the native it replaced proves
 /// nothing about whether it actually ran.
@@ -14011,7 +14017,109 @@ pub fn try_resolve_atomic_intrinsic(
     descriptor: &str,
     guard_class_id: u32,
 ) -> Option<(usize, usize, u8, u32)> {
-    if class != "java/util/concurrent/atomic/AtomicInteger" {
+    try_resolve_atomic_intrinsic_for_site(class, None, name, descriptor, guard_class_id)
+}
+
+/// Is `name descriptor` one of the methods the ATOMIC_INT / ATOMIC_LONG ladders
+/// claim AND declared `final` by `jdk_class` in the JDK?
+///
+/// A `final` method cannot be overridden, so a site that resolves to it runs
+/// exactly the JDK body whatever the receiver's subclass — the one proof this
+/// crate can supply without a class-hierarchy resolver. The RMW family
+/// (`get*`, `getAnd*`, `*AndGet`, `compareAndSet`, `weakCompareAndSet`) is
+/// `public final` on both classes. `AtomicLong.longValue()` is claimed by the
+/// long ladder but is an ordinary overridable `Number` accessor, so it is
+/// deliberately absent: an exact `AtomicLong` site may take it, a subclass
+/// site may not.
+fn atomic_intrinsic_method_is_final_in_jdk(jdk_class: &str, name: &str, descriptor: &str) -> bool {
+    match jdk_class {
+        "java/util/concurrent/atomic/AtomicInteger" => matches!(
+            (name, descriptor),
+            ("get", "()I")
+                | ("getPlain", "()I")
+                | ("getAcquire", "()I")
+                | ("getAndIncrement", "()I")
+                | ("getAndDecrement", "()I")
+                | ("incrementAndGet", "()I")
+                | ("decrementAndGet", "()I")
+                | ("getAndAdd", "(I)I")
+                | ("compareAndSet", "(II)Z")
+                | ("weakCompareAndSet", "(II)Z")
+                | ("addAndGet", "(I)I")
+        ),
+        "java/util/concurrent/atomic/AtomicLong" => matches!(
+            (name, descriptor),
+            ("get", "()J")
+                | ("getPlain", "()J")
+                | ("getAcquire", "()J")
+                | ("getAndIncrement", "()J")
+                | ("getAndDecrement", "()J")
+                | ("incrementAndGet", "()J")
+                | ("decrementAndGet", "()J")
+                | ("getAndAdd", "(J)J")
+                | ("compareAndSet", "(JJ)Z")
+                | ("weakCompareAndSet", "(JJ)Z")
+                | ("addAndGet", "(J)J")
+        ),
+        _ => false,
+    }
+}
+
+/// May an invoke site be matched against the `Atomic*` intrinsic family of
+/// `jdk_class`? (review #80)
+///
+/// * Yes when the constant-pool class IS `jdk_class` — the historical match.
+/// * Otherwise only when method resolution says the site's method is DECLARED
+///   by `jdk_class` (`resolved_declaring_class`) AND that method is `final`
+///   there ([`atomic_intrinsic_method_is_final_in_jdk`]). `class Counter
+///   extends AtomicInteger` calling `incrementAndGet()` names `Counter` in its
+///   constant pool, yet binds to the JDK body no subclass can replace.
+///
+/// A declaring class that is NOT `jdk_class` — an intermediate class that could
+/// have overridden the method, or no resolution at all — never matches, so this
+/// can never intrinsify a call a subclass could override.
+pub fn atomic_intrinsic_site_class_matches(
+    jdk_class: &str,
+    cp_class: &str,
+    resolved_declaring_class: Option<&str>,
+    name: &str,
+    descriptor: &str,
+) -> bool {
+    cp_class == jdk_class
+        || (resolved_declaring_class == Some(jdk_class)
+            && atomic_intrinsic_method_is_final_in_jdk(jdk_class, name, descriptor))
+}
+
+/// [`try_resolve_atomic_intrinsic`] for a site whose constant-pool class may be
+/// a SUBCLASS of `AtomicInteger`; see [`atomic_intrinsic_site_class_matches`]
+/// for when that is admitted.
+///
+/// `resolved_declaring_class` is the class that declares the method the invoke
+/// resolves to. Every registration site passes `None` today — no resolver that
+/// `try_compile` receives answers that question — so production behaviour is
+/// the exact constant-pool match until one is threaded through.
+///
+/// `guard_class_id` stays the SITE's class id for a subclass site: the emitted
+/// guard is an exact class-id compare, so only receivers of exactly that class
+/// take the inline path. The layout is still slot 0, which is `value` on a
+/// subclass instance only while inherited fields precede declared ones — the
+/// same assumption the registered native's `get_field_volatile(this, 0)` makes
+/// for every receiver, but one to confirm against the VM's field layout before
+/// a resolver is wired.
+pub fn try_resolve_atomic_intrinsic_for_site(
+    class: &str,
+    resolved_declaring_class: Option<&str>,
+    name: &str,
+    descriptor: &str,
+    guard_class_id: u32,
+) -> Option<(usize, usize, u8, u32)> {
+    if !atomic_intrinsic_site_class_matches(
+        "java/util/concurrent/atomic/AtomicInteger",
+        class,
+        resolved_declaring_class,
+        name,
+        descriptor,
+    ) {
         return None;
     }
     if atomic_intrinsic_disabled() {
@@ -14048,7 +14156,6 @@ pub fn try_resolve_atomic_intrinsic(
     };
     // ===== INTRINSIC REGION END: ATOMIC_INT =====
     let (intrinsic, num_params) = hit?;
-    ATOMIC_INTRINSIC_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_ATOMIC_INTRINSIC") {
         eprintln!(
             "[atomic-intrinsic] {}.{}{} class_id={} compact_off={} legacy_off={}",
@@ -14073,7 +14180,9 @@ pub fn try_resolve_atomic_intrinsic(
     Some((intrinsic.as_entry(), num_params, ret, layout.class_id))
 }
 
-/// Call sites the `AtomicLong` intrinsic has claimed this process.
+/// Call sites the single-pass backend has EMITTED as `AtomicLong` intrinsics
+/// this process — counted at emission, not in the matcher (review #80); see
+/// [`ATOMIC_INTRINSIC_SITES`].
 ///
 /// The acceptance criterion, and not the ns/op: the 32-bit twin's own doc says
 /// "a perf claim about this family is not believable without checking that this
@@ -14115,7 +14224,26 @@ pub fn try_resolve_atomic_long_intrinsic(
     descriptor: &str,
     guard_class_id: u32,
 ) -> Option<(usize, usize, u8, u32)> {
-    if class != "java/util/concurrent/atomic/AtomicLong" {
+    try_resolve_atomic_long_intrinsic_for_site(class, None, name, descriptor, guard_class_id)
+}
+
+/// The 64-bit twin of [`try_resolve_atomic_intrinsic_for_site`], on the same
+/// terms: a subclass site matches only through a resolved declaring class of
+/// `AtomicLong` and a method `final` there — which excludes `longValue()`.
+pub fn try_resolve_atomic_long_intrinsic_for_site(
+    class: &str,
+    resolved_declaring_class: Option<&str>,
+    name: &str,
+    descriptor: &str,
+    guard_class_id: u32,
+) -> Option<(usize, usize, u8, u32)> {
+    if !atomic_intrinsic_site_class_matches(
+        "java/util/concurrent/atomic/AtomicLong",
+        class,
+        resolved_declaring_class,
+        name,
+        descriptor,
+    ) {
         return None;
     }
     if atomic_long_intrinsic_disabled() {
@@ -14149,7 +14277,6 @@ pub fn try_resolve_atomic_long_intrinsic(
     };
     // ===== INTRINSIC REGION END: ATOMIC_LONG =====
     let (intrinsic, num_params) = hit?;
-    ATOMIC_LONG_INTRINSIC_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_ATOMIC_INTRINSIC") {
         eprintln!(
             "[atomic-long-intrinsic] {}.{}{} class_id={} compact_off={} legacy_off={}",
@@ -14170,7 +14297,9 @@ pub fn try_resolve_atomic_long_intrinsic(
     Some((intrinsic.as_entry(), num_params, ret, layout.class_id))
 }
 
-/// Sites the BOX_UNBOX intrinsic has claimed this process, split by class.
+/// Sites the single-pass backend has EMITTED as BOX_UNBOX intrinsics this
+/// process, split by class — counted at emission, not in the matcher
+/// (review #80); see [`ATOMIC_INTRINSIC_SITES`].
 ///
 /// The acceptance criterion, and not the ns/op — the same rule the two
 /// `Atomic*` counters beside this one state: "the intrinsic answering the same
@@ -14369,7 +14498,6 @@ pub(crate) fn box_unbox_intrinsic_shape(
             if layout.class_id == 0 {
                 return None;
             }
-            LONG_LONG_VALUE_INTRINSIC_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_ATOMIC_INTRINSIC") {
                 eprintln!(
                     "[box-unbox-intrinsic] java/lang/Long.longValue()J class_id={} compact_off={} legacy_off={}",
@@ -14388,7 +14516,6 @@ pub(crate) fn box_unbox_intrinsic_shape(
             if layout.class_id == 0 {
                 return None;
             }
-            INTEGER_INT_VALUE_INTRINSIC_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_ATOMIC_INTRINSIC") {
                 eprintln!(
                     "[box-unbox-intrinsic] java/lang/Integer.intValue()I class_id={} compact_off={} legacy_off={}",
@@ -14749,6 +14876,103 @@ mod atomic_accessor_intrinsic_tests {
             !src.contains("(\"set\", \"(I)V\") => Some((JitIntrinsic::AtomicIntGet"),
             "`set` was mapped onto the LOAD intrinsic. If intrinsifying it is              deliberate it needs its own arm with StoreLoad ordering."
         );
+    }
+
+    /// Review #80: `class Counter extends AtomicInteger` calling
+    /// `counter.incrementAndGet()` names `Counter` in its constant pool. When
+    /// resolution says the method is declared by the JDK class and is `final`
+    /// there, the site must reach the intrinsic — guarded on the SITE's class id.
+    #[test]
+    fn subclass_site_of_a_final_jdk_method_matches_through_the_declaring_class() {
+        const CID: u32 = 12345;
+        const AI: &str = "java/util/concurrent/atomic/AtomicInteger";
+        const AL: &str = "java/util/concurrent/atomic/AtomicLong";
+
+        let (entry, num_params, ret, guard) = try_resolve_atomic_intrinsic_for_site(
+            "pkg/Counter",
+            Some(AI),
+            "incrementAndGet",
+            "()I",
+            CID,
+        )
+        .expect("a final AtomicInteger method must match through its declaring class");
+        assert_eq!(entry, JitIntrinsic::AtomicIntIncrementAndGet.as_entry());
+        assert_eq!((num_params, ret), (0, b'I'));
+        assert_eq!(guard, CID, "the guard is the site's own class id");
+
+        let (entry, _, ret, _) = try_resolve_atomic_long_intrinsic_for_site(
+            "pkg/LongCounter",
+            Some(AL),
+            "compareAndSet",
+            "(JJ)Z",
+            CID,
+        )
+        .expect("a final AtomicLong method must match through its declaring class");
+        assert_eq!(entry, JitIntrinsic::AtomicLongCompareAndSet.as_entry());
+        assert_eq!(ret, b'Z');
+
+        // No resolution: the historical exact match, which a subclass misses.
+        assert!(try_resolve_atomic_intrinsic_for_site(
+            "pkg/Counter",
+            None,
+            "incrementAndGet",
+            "()I",
+            CID
+        )
+        .is_none());
+        assert!(try_resolve_atomic_intrinsic("pkg/Counter", "incrementAndGet", "()I", CID).is_none());
+        // Declared by an intermediate class, which could have overridden it.
+        assert!(try_resolve_atomic_intrinsic_for_site(
+            "pkg/Counter",
+            Some("pkg/Base"),
+            "incrementAndGet",
+            "()I",
+            CID
+        )
+        .is_none());
+        // The other family's declaring class does not count.
+        assert!(try_resolve_atomic_intrinsic_for_site(
+            "pkg/Counter",
+            Some(AL),
+            "incrementAndGet",
+            "()I",
+            CID
+        )
+        .is_none());
+    }
+
+    /// Review #80: a method the ladder claims but the JDK does NOT declare
+    /// `final` may be overridden by a subclass, so a subclass site must keep
+    /// ordinary dispatch even when resolution names the JDK class.
+    #[test]
+    fn subclass_site_of_an_overridable_jdk_method_is_not_intrinsified() {
+        const CID: u32 = 12345;
+        const AL: &str = "java/util/concurrent/atomic/AtomicLong";
+        // `longValue()` is claimed on an exact `AtomicLong` site...
+        assert!(try_resolve_atomic_long_intrinsic(AL, "longValue", "()J", CID).is_some());
+        // ...but is an overridable `Number` accessor, so never on a subclass site.
+        assert!(try_resolve_atomic_long_intrinsic_for_site(
+            "pkg/LongCounter",
+            Some(AL),
+            "longValue",
+            "()J",
+            CID
+        )
+        .is_none());
+        assert!(!atomic_intrinsic_site_class_matches(
+            AL,
+            "pkg/LongCounter",
+            Some(AL),
+            "longValue",
+            "()J"
+        ));
+        assert!(atomic_intrinsic_site_class_matches(
+            AL,
+            AL,
+            None,
+            "longValue",
+            "()J"
+        ));
     }
 }
 
@@ -26635,6 +26859,10 @@ fn try_compile_inner(
         // unconditionally rather than only under the long gate.
         let ptypes = ir_param_types(&cached.method_descriptor, cached.is_static);
         builder.set_param_types(&ptypes);
+        // JVMS §6.5 `ireturn` narrowing for a `Z`/`B`/`C`/`S` return, the same
+        // four tags the interpreter bridge narrows. A compiled caller reads the
+        // return register raw, so the body has to narrow before it returns.
+        builder.set_return_descriptor(&cached.method_descriptor);
         // COV-03: admit `J` / `F`+`D` INSTANCE FIELD accesses from the same two
         // flags this admission chain evaluates. A wide field is the one way a
         // category-2 or FP value can enter the graph with no category-2/FP
@@ -31663,6 +31891,14 @@ fn try_compile_inner(
                 // access is sound only behind an exact class-id guard, and
                 // without one the site must keep ordinary dispatch (which runs
                 // any subclass override).
+                //
+                // Matched on the constant-pool class only (review #80): a
+                // `Counter extends AtomicInteger` site would need the class that
+                // DECLARES the resolved method, which no resolver handed to
+                // `try_compile` supplies. `try_resolve_atomic_intrinsic_for_site`
+                // takes that answer; wiring it needs a hook such as
+                // `Fn(u16) -> Option<String>` (cp index -> declaring class of the
+                // resolved method), analogous to `cp_invokespecial_owner_resolver`.
                 if let Some((entry, num_params, ret, guard_class_id)) = cp_invoke_class_id_resolver
                     .and_then(|r| r(cp_idx))
                     .and_then(|cid| {
@@ -33075,6 +33311,27 @@ pub fn param_spec_slot_indices(descriptor: &str) -> Vec<usize> {
         slot += width;
     }
     out
+}
+
+/// The int-category return tag that JVMS §6.5 `ireturn` narrows (`Z`, `B`,
+/// `C` or `S`), or `None` when the return needs no narrowing (`I`, or not an
+/// int-category return at all).
+///
+/// Accepts a bare descriptor or a `"Class.method:descriptor"` method key. It
+/// reads only the last two bytes: an int-category return is the single byte
+/// after the closing `)`, while a reference return ends in `;` and a
+/// primitive-array return has `[` before its element byte, so neither can
+/// match. That also keeps it immune to a `)` inside a class name, which a
+/// scan for the first or last `)` is not.
+///
+/// The interpreter bridge narrows the same four tags (`narrow_int_return` in
+/// `jit_bridge.rs`); both compiled tiers now narrow at `ireturn` too, so a
+/// compiled caller never sees a `boolean` of 2.
+pub fn narrowed_int_return_tag(descriptor: &str) -> Option<u8> {
+    match descriptor.as_bytes() {
+        [.., b')', tag @ (b'Z' | b'B' | b'C' | b'S')] => Some(*tag),
+        _ => None,
+    }
 }
 
 /// Parse the return type from a method descriptor. Returns 'I', 'J', 'V', etc.

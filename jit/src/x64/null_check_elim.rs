@@ -658,11 +658,16 @@ mod receiver_elision_reach_tests {
         let bare = src
             .matches("self.emit_trusted_oop_receiver_check()")
             .count();
+        // 2026-09-12: 4 -> 5. The `instanceof` arm now takes checkcast's
+        // inline class-id guard, and its null test must stay bare for the
+        // checkcast reason: null is a legal `instanceof` operand (answer 0),
+        // so its `JZ` targets a result stub, not an NPE, and an elided test
+        // would let null fall into the `KIND_TAGS` byte compare and fault.
         assert_eq!(
-            bare, 4,
-            "expected the two `putfield` and two `checkcast` arms to keep the \
-             unconditional check; found {bare}. Moving one of them onto the \
-             `_at` form is a miscompile, not a simplification."
+            bare, 5,
+            "expected the two `putfield`, two `checkcast` and one `instanceof` \
+             arms to keep the unconditional check; found {bare}. Moving one of \
+             them onto the `_at` form is a miscompile, not a simplification."
         );
     }
 }

@@ -9026,6 +9026,307 @@ fn test_instanceof_null() {
     assert_eq!(result, 0);
 }
 
+/// Compile `int f(Object o) { return o instanceof <name>; }` through the door
+/// that can reach the inline typecheck guard: a non-empty `method_key` and an
+/// oop-marked parameter are the trusted-oop clauses the checkcast arm reads.
+fn instanceof_inline_fixture(
+    helpers: &JitRuntimeHelpers,
+    name: &str,
+    target_class_id: Option<u32>,
+) -> CompiledMethod {
+    let (name_ptr, name_len) = crate::intern_typecheck_target(name, target_class_id);
+    let code: Vec<u8> = vec![
+        0x2a, // 0: aload_0
+        0xc1, 0x00, 0x01, // 1: instanceof #1
+        0xac, // 4: ireturn
+        0, 0,
+    ];
+    compile_with_param_slots(
+        &crate::compile_gate::CompileAdmission::for_backend_test(),
+        &code,
+        5,
+        1,
+        1,
+        false,
+        Vec::new(),                         // multianewarray_info
+        Vec::new(),                         // field_info
+        vec![(1usize, name_ptr, name_len)], // typecheck_info
+        Vec::new(),                         // static_field_info
+        Vec::new(),                         // new_info
+        Vec::new(),                         // new_deferred_info
+        Vec::new(),                         // anewarray_info
+        Vec::new(),                         // anewarray_deferred_info
+        Vec::new(),                         // invoke_info
+        Vec::new(),                         // direct_calls
+        Vec::new(),                         // mic_slots
+        Vec::new(),                         // pic_slots
+        Vec::new(),                         // ldc_info
+        Vec::new(),                         // ldc_string_info
+        Vec::new(),                         // ldc_class_info
+        Vec::new(),                         // ldc2w_info
+        Default::default(),                 // ldc_fp_pcs
+        HashMap::new(),
+        HashMap::new(),
+        helpers,
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        HashMap::new(), // inline_guard_variants (PGO-02)
+        None,           // string_layout
+        &[],
+        0,
+        0b1, // param_oop_mask: the parameter is a reference
+        Vec::new(),
+        "T.f:(Ljava/lang/Object;)I", // non-empty ⇒ trusted-oop eligible
+        Vec::new(),
+        None, // elidable_init_pcs: no constant pool, so nothing is proven empty
+    )
+    .expect("instanceof must compile")
+}
+
+/// A header-only stand-in for a heap object: the class id at
+/// `class_id_offset_in_obj` (0 in `test_helpers`) and the KIND_TAGS byte,
+/// everything else zero. Neither the inline guard nor the marker helper reads
+/// anything further.
+fn fake_typecheck_header(class_id: u32, kind_tags: u8) -> Box<[u64; 8]> {
+    let kind_off = cratonvm_types::KIND_TAGS_BYTE_OFFSET;
+    assert!(
+        (4..64).contains(&kind_off),
+        "the fake header assumes KIND_TAGS lies past the 4-byte class id and inside 64 bytes"
+    );
+    let mut words = Box::new([0u64; 8]);
+    let base = words.as_mut_ptr() as *mut u8; // Cast: byte view of the header words
+    // SAFETY: `base` addresses 64 owned bytes and both writes are in range.
+    unsafe {
+        std::ptr::copy_nonoverlapping(class_id.to_le_bytes().as_ptr(), base, 4);
+        *base.add(kind_off) = kind_tags;
+    }
+    words
+}
+
+/// Finding #76: `instanceof` takes checkcast's inline class-id guard. Null and
+/// an exact plain-object match answer WITHOUT the helper; everything else still
+/// calls it, and the helper's answer is what the method returns.
+#[test]
+fn instanceof_inline_guard_answers_null_and_exact_without_the_helper() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    if !checkcast_inline_enabled() {
+        // `CRATONVM_JIT_CHECKCAST_INLINE=0` reverts both arms to the helper;
+        // nothing inline to assert.
+        return;
+    }
+    static HITS: AtomicUsize = AtomicUsize::new(0);
+    /// Marker helper: counts, and answers 1 — the answer a subclass receiver
+    /// would get, and one the call-free `0` stub can never produce.
+    unsafe extern "C" fn marker_instanceof(_vm: i64, _obj: i64, _name: i64, _len: i64) -> i64 {
+        HITS.fetch_add(1, Ordering::SeqCst);
+        1
+    }
+    let mut helpers = test_helpers();
+    helpers.instanceof_check = marker_instanceof as *const () as usize;
+    assert_eq!(helpers.class_id_offset_in_obj, 0);
+
+    const TARGET: u32 = 0x0076_7601;
+    let compiled = instanceof_inline_fixture(&helpers, "t76/InstanceofExactTarget", Some(TARGET));
+    assert_eq!(
+        calls_to(&compiled, helpers.instanceof_check),
+        1,
+        "the slow path must still carry exactly one helper call"
+    );
+
+    HITS.store(0, Ordering::SeqCst);
+    // SAFETY (every call below): JIT code compiled from valid bytecode; the
+    // argument is null or a live, aligned fake header the guard only reads.
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    let got = unsafe { compiled.try_call(&[0]).expect("jit call") };
+    assert_eq!(got, 0, "null instanceof anything is 0");
+    assert_eq!(HITS.load(Ordering::SeqCst), 0, "null must not reach the helper");
+
+    let exact = fake_typecheck_header(TARGET, 0);
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    let got = unsafe {
+        compiled
+            .try_call(&[exact.as_ptr() as i64]) // Cast: object address as JIT argument
+            .expect("jit call")
+    };
+    assert_eq!(got, 1, "an exact plain-object match is an instance");
+    assert_eq!(
+        HITS.load(Ordering::SeqCst),
+        0,
+        "an exact class-id match must not reach the helper"
+    );
+
+    let other = fake_typecheck_header(TARGET + 1, 0);
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    let got = unsafe {
+        compiled
+            .try_call(&[other.as_ptr() as i64]) // Cast: object address as JIT argument
+            .expect("jit call")
+    };
+    assert_eq!(got, 1, "a different class returns the helper's answer");
+    assert_eq!(HITS.load(Ordering::SeqCst), 1, "a different class must call the helper");
+
+    // An ARRAY header carrying the target's id (a reference array records its
+    // component's) must not match inline: BUG-JIT-ARRAY-INSTANCEOF-20260726.
+    let array = fake_typecheck_header(TARGET, 0x01);
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    let got = unsafe {
+        compiled
+            .try_call(&[array.as_ptr() as i64]) // Cast: object address as JIT argument
+            .expect("jit call")
+    };
+    assert_eq!(got, 1, "an array receiver returns the helper's answer");
+    assert_eq!(HITS.load(Ordering::SeqCst), 2, "an array receiver must call the helper");
+}
+
+/// The 1-D primitive-array variant: `o instanceof byte[]` is settled by the
+/// KIND_TAGS byte alone, with no class id at all.
+#[test]
+fn instanceof_primitive_array_tag_answers_without_the_helper() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    if !checkcast_inline_enabled() {
+        return;
+    }
+    static HITS: AtomicUsize = AtomicUsize::new(0);
+    unsafe extern "C" fn marker_instanceof(_vm: i64, _obj: i64, _name: i64, _len: i64) -> i64 {
+        HITS.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+    let mut helpers = test_helpers();
+    helpers.instanceof_check = marker_instanceof as *const () as usize;
+    let tag = cratonvm_types::primitive_array_kind_tags_byte("[B").expect("byte[] has a tag");
+    let compiled = instanceof_inline_fixture(&helpers, "[B", None);
+
+    HITS.store(0, Ordering::SeqCst);
+    let bytes = fake_typecheck_header(0, tag);
+    // SAFETY (every call below): as in the test above.
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    let got = unsafe {
+        compiled
+            .try_call(&[bytes.as_ptr() as i64]) // Cast: object address as JIT argument
+            .expect("jit call")
+    };
+    assert_eq!(got, 1, "a byte[] header is an instance of byte[]");
+    assert_eq!(HITS.load(Ordering::SeqCst), 0);
+
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    let got = unsafe { compiled.try_call(&[0]).expect("jit call") };
+    assert_eq!(got, 0, "null instanceof byte[] is 0");
+    assert_eq!(HITS.load(Ordering::SeqCst), 0);
+
+    let plain = fake_typecheck_header(7, 0);
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    let got = unsafe {
+        compiled
+            .try_call(&[plain.as_ptr() as i64]) // Cast: object address as JIT argument
+            .expect("jit call")
+    };
+    assert_eq!(got, 0, "a tag mismatch returns the helper's answer");
+    assert_eq!(HITS.load(Ordering::SeqCst), 1, "a tag mismatch must call the helper");
+}
+
+/// Compile `code` as the method `method_key` names, through the door that
+/// carries a method key — the legacy `compile` wrapper passes `""`, which
+/// narrows nothing.
+fn keyed_int_method(
+    code: &[u8],
+    code_len: usize,
+    num_params: usize,
+    method_key: &str,
+) -> CompiledMethod {
+    let param_jvm_slots: Vec<usize> = (0..num_params).collect();
+    compile_with_param_slots(
+        &crate::compile_gate::CompileAdmission::for_backend_test(),
+        code,
+        code_len,
+        num_params,
+        num_params,
+        false,
+        Vec::new(),         // multianewarray_info
+        Vec::new(),         // field_info
+        Vec::new(),         // typecheck_info
+        Vec::new(),         // static_field_info
+        Vec::new(),         // new_info
+        Vec::new(),         // new_deferred_info
+        Vec::new(),         // anewarray_info
+        Vec::new(),         // anewarray_deferred_info
+        Vec::new(),         // invoke_info
+        Vec::new(),         // direct_calls
+        Vec::new(),         // mic_slots
+        Vec::new(),         // pic_slots
+        Vec::new(),         // ldc_info
+        Vec::new(),         // ldc_string_info
+        Vec::new(),         // ldc_class_info
+        Vec::new(),         // ldc2w_info
+        Default::default(), // ldc_fp_pcs
+        HashMap::new(),
+        HashMap::new(),
+        &test_helpers(),
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        HashMap::new(), // inline_guard_variants (PGO-02)
+        None,           // string_layout
+        &param_jvm_slots,
+        num_params,
+        0, // param_oop_mask: int parameters only
+        Vec::new(),
+        method_key,
+        Vec::new(),
+        None, // elidable_init_pcs: no constant pool, so nothing is proven empty
+    )
+    .expect("int method must compile")
+}
+
+/// Finding #84: JVMS §6.5 `ireturn` narrows a `boolean` return as if by
+/// `value & 1` and a `byte`/`char`/`short` return by truncation and extension.
+/// The interpreter bridge always did; a compiled caller reads RAX raw, so the
+/// compiled body must do it too. `B`/`S` results are checked as full `i64`s:
+/// this backend keeps an `int` sign-extended through RAX.
+#[test]
+fn ireturn_narrows_boolean_byte_char_short_returns() {
+    // SAFETY (every call): JIT code compiled from valid bytecode, called with
+    // exactly its declared int arguments.
+    // ()Z: iconst_2; ireturn -> 2 & 1 = 0
+    let z = keyed_int_method(&[0x05, 0xac, 0, 0], 2, 0, "T.z:()Z");
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    assert_eq!(unsafe { z.try_call(&[]) }, Ok(0));
+    // ()B: sipush 200; ireturn -> (byte) 200 = -56
+    let b = keyed_int_method(&[0x11, 0x00, 0xC8, 0xac, 0, 0], 4, 0, "T.b:()B");
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    assert_eq!(unsafe { b.try_call(&[]) }, Ok(-56));
+    // ()C: iconst_m1; ireturn -> (char) -1 = 65535
+    let c = keyed_int_method(&[0x02, 0xac, 0, 0], 2, 0, "T.c:()C");
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    assert_eq!(unsafe { c.try_call(&[]) }, Ok(65535));
+    // (I)S: iload_0; ireturn. A parameter rather than `ldc 70000`, so the value
+    // cannot be folded and the legacy wrapper's lack of an `ldc` table does not
+    // matter. (short) 70000 = 4464, (short) -70000 = -4464.
+    let s = keyed_int_method(&[0x1a, 0xac, 0, 0], 2, 1, "T.s:(I)S");
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    assert_eq!(unsafe { s.try_call(&[70000]) }, Ok(4464));
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    assert_eq!(unsafe { s.try_call(&[-70000]) }, Ok(-4464));
+    // Controls: an `I` return, and a method with no key, are left alone.
+    let i = keyed_int_method(&[0x1a, 0xac, 0, 0], 2, 1, "T.i:(I)I");
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    assert_eq!(unsafe { i.try_call(&[70000]) }, Ok(70000));
+    let unkeyed = keyed_int_method(&[0x05, 0xac, 0, 0], 2, 0, "");
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    assert_eq!(unsafe { unkeyed.try_call(&[]) }, Ok(2));
+}
+
+#[test]
+fn narrowed_int_return_tag_reads_only_the_return_byte() {
+    assert_eq!(crate::narrowed_int_return_tag("()Z"), Some(b'Z'));
+    assert_eq!(crate::narrowed_int_return_tag("T.f:(I)B"), Some(b'B'));
+    assert_eq!(crate::narrowed_int_return_tag("(JJ)C"), Some(b'C'));
+    assert_eq!(crate::narrowed_int_return_tag("a/B.m:()S"), Some(b'S'));
+    assert_eq!(crate::narrowed_int_return_tag("()I"), None);
+    assert_eq!(crate::narrowed_int_return_tag("()V"), None);
+    assert_eq!(crate::narrowed_int_return_tag("()[Z"), None);
+    assert_eq!(crate::narrowed_int_return_tag("()La/Z;"), None);
+    assert_eq!(crate::narrowed_int_return_tag(""), None);
+}
+
 #[cfg(feature = "vm-tests")]
 #[test]
 fn test_bounds_check_iaload_in_bounds() {
