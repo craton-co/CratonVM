@@ -17166,10 +17166,47 @@ fn plan_register_residency(
         }
     }
     let (mut skip_const, mut skip_single_use) = (0usize, 0usize);
+    // What `ir_reserve_carried_enabled`'s pass will want, computed with ITS
+    // predicate so the two cannot disagree about who is a candidate. Its own
+    // `gp_reg_of[id].is_none()` filter is the one thing left out -- nothing is
+    // assigned yet, and the point here is to reserve room BEFORE that happens.
+    // See `ir_residency_crossblock_budget_enabled`.
+    let mut carried_w: Vec<u64> = (0..n)
+        .filter(|&id| live.carried.get(id).copied().unwrap_or(false))
+        .filter(|&id| plan.node_color.get(id).copied().flatten().is_some())
+        .filter(|&id| match graph.nodes.get(id) {
+            Some(node) => {
+                matches!(node.ty, IrType::Int | IrType::Long)
+                    && !matches!(node.op, Op::Const(_))
+                    && (ir_phi_residency_enabled() || !matches!(node.op, Op::Phi))
+            }
+            None => false,
+        })
+        .map(|id| live.weight.get(id).copied().unwrap_or(0))
+        .collect();
+    // Descending, because the carried pass serves its own candidates in that
+    // order (`cands.sort_unstable_by(|a, b| b.0.cmp(&a.0)...)`) and the register
+    // a crossblock value takes comes off the BOTTOM of that list.
+    carried_w.sort_unstable_by(|a, b| b.cmp(a));
+    let carried_demand = carried_w.len();
+    let (mut crossblock_taken, mut crossblock_over) = (0usize, 0usize);
     for id in 0..n {
         let Some(segs) = alloc.segments.get(id) else {
             continue;
         };
+        // A value the carry window cannot reach, and whether the budget still
+        // has room for it. `crossblock_candidate` is what it IS;
+        // `crossblock_admit` is what this method can still afford.
+        let crossblock_candidate = ir_residency_crossblock_enabled()
+            && use_count.get(id).copied().unwrap_or(0) == 1
+            && !single_use_is_in_the_carry_window(graph, schedule, id);
+        let crossblock_admit = crossblock_candidate
+            && (!ir_residency_crossblock_budget_enabled()
+                || live.weight.get(id).copied().unwrap_or(0)
+                    >= carried_displacement_price(&carried_w, crossblock_taken));
+        if crossblock_candidate && !crossblock_admit {
+            crossblock_over += 1;
+        }
         if ir_residency_pays_enabled() {
             match graph.nodes.get(id).map(|node| &node.op) {
                 Some(Op::Const(_)) => {
@@ -17210,9 +17247,7 @@ fn plan_register_residency(
                     schedule,
                     id,
                     use_count.get(id).copied().unwrap_or(0),
-                ) && !(ir_residency_crossblock_enabled()
-                    && use_count.get(id).copied().unwrap_or(0) == 1
-                    && !single_use_is_in_the_carry_window(graph, schedule, id)) =>
+                ) && !crossblock_admit =>
                 {
                     skip_single_use += 1;
                     continue;
@@ -17337,6 +17372,12 @@ fn plan_register_residency(
         }
         if is_gp {
             gp_reg_of[id] = Some(reg.num);
+            // Charged HERE rather than at the guard: everything between the two
+            // can still `continue`, and a budget spent on a value that never
+            // got a register would starve the carried pass for nothing.
+            if crossblock_candidate {
+                crossblock_taken += 1;
+            }
         } else {
             reg_of[id] = Some(reg.num);
         }
@@ -17615,7 +17656,8 @@ fn plan_register_residency(
             "[ir-ls] skipped: split_or_spilled={skip_split} \
              wrong_bank_or_type={skip_bank} no_home={skip_home} phi={skip_phi} \
              const={skip_const} single_use={skip_single_use} param_copies={param_copies} \
-             spilled={skip_spilled} no_alloc={skip_no_alloc} carried_reserved={carried_reserved}"
+             spilled={skip_spilled} no_alloc={skip_no_alloc} carried_reserved={carried_reserved}              | crossblock: price={} taken={crossblock_taken}              over={crossblock_over} carried_demand={carried_demand} carried_w={carried_w:?}",
+            carried_displacement_price(&carried_w, crossblock_taken)
         );
         eprintln!("[ir-ls] safepoints={}", graph.safepoints.len());
     }
@@ -19382,8 +19424,17 @@ fn ir_residency_pays_enabled() -> bool {
 /// `split_or_spilled` goes 12 -> 28 and `carried_reserved` 5 -> 2. The model
 /// above prices the register as free to take; under pressure its real price is
 /// whatever the value that would otherwise have held it was worth, and on that
-/// probe that value is read every iteration. A successor rule needs an
-/// occupancy term, not just better prices on the two it has.
+/// probe that value is read every iteration.
+///
+/// [`ir_residency_crossblock_budget_enabled`] is that occupancy term, and it is
+/// **default ON**. With it, `mix` compiles byte-identically to this flag being
+/// off (3164) so its 12.5% is structurally gone, and `FieldLoop`'s win is kept
+/// (1039). It is still not enough to flip THIS flag on: `mixNarrow` remains
+/// 1.067x slower over a 0.0% floor, and it cannot be fixed by any rule of that
+/// shape -- it and `FieldLoop.sum` present identical carried weights, identical
+/// displacement price and identical candidate weights, and diverge anyway. Loop
+/// weight is not the discriminating variable; the allocator's own outcome under
+/// the added pressure is. See section 6d.
 ///
 /// Correctness is not the objection -- section 6b: `jit-flag-soak` divergent=0,
 /// every `CratonBench` / `CratonBenchC2` checksum bit-identical.
@@ -19394,6 +19445,83 @@ fn ir_residency_pays_enabled() -> bool {
 /// door`) while still running the IR pipeline, so a linear-scan census can differ
 /// between arms that execute byte-identical code. The first run of `RegPressure`
 /// read 1.000x over a 0.5% floor for exactly that reason.
+/// Leave the loop-carried reservation its registers before the crossblock arm
+/// spends them -- **default ON**, opt out with
+/// `CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK_BUDGET=0`.
+///
+/// [`ir_residency_crossblock_enabled`] admits single-use values in the MAIN
+/// residency loop. `ir_reserve_carried_enabled`'s pass runs after it, over
+/// `free = ir_gp_file() - taken`, so on a contended method the crossblock arm
+/// can spend the whole file before the values read on every iteration are ever
+/// considered. That is measured, on `probes/RegPressure.java`: 5 loop-carried
+/// values resident with the flag off, 2 with it on, and 5-12% SLOWER.
+///
+/// The budget is the cheapest form of the occupancy term that result asks for.
+/// Count what the carried pass will want -- the same predicate it uses -- and
+/// let the crossblock arm have only what is left over:
+///
+/// ```text
+/// budget = ir_gp_file().len() - |{ id : live.carried[id] && has home
+///                                      && Int|Long && !Const && (phi ok) }|
+/// ```
+///
+/// It is deliberately a COUNT and not a priority queue. The carried pass
+/// already orders its own candidates by loop-weighted use count; this only has
+/// to stop the main loop from emptying the file first, and a count does that
+/// without duplicating the ordering in two places that could disagree.
+/// What the NEXT register taken from the loop-carried reservation costs, in
+/// loop-weighted uses, once `taken` have already been taken.
+///
+/// `carried_w` is every carried candidate's `live.weight`, descending. The
+/// carried pass serves its list in that same order and stops when the file runs
+/// out, so the value a crossblock admission actually displaces is the weakest
+/// one that would still have been served -- `carried_w[file_len - 1]` -- and
+/// each further admission displaces the next one up. The bar therefore RISES as
+/// the file empties, which is what stops a run of cheap single-use values from
+/// evicting the whole carried set one register at a time.
+///
+/// Returns `u64::MAX` once the file is spent, refusing everything after that,
+/// and `0` when there are fewer carried candidates than registers -- nothing is
+/// displaced then, so nothing has to be outbid.
+///
+/// The caller compares with `>=`, not `>`, and that is MEASURED rather than
+/// chosen. On `probes/FieldLoop.java` the carried weights are
+/// `[20, 11, 10, 10, 10, 10]`, so the price is 10 -- and the induction variable
+/// the whole transform exists to serve weighs exactly 10 too. Under `>` all ten
+/// candidates are refused and the body reverts to its slow 1052 bytes. A tie
+/// means "these two values are read equally often", and at that point the
+/// crossblock value is the better holder: the carried pass's own candidates are
+/// phis and loop-carried values whose home word is written by
+/// `emit_phi_copies` at every incoming edge regardless, so their register saves
+/// reads only, while the crossblock value's register removes a store AND a
+/// reload. `probes/RegPressure.java` is unaffected by the tie-break -- its price
+/// is 21 against candidates weighing 10, which `>=` refuses just as `>` did.
+///
+/// This replaces a COUNT-based budget, which was built first and measured wrong:
+/// `ir_gp_file().len() - carried_demand` is zero for any loop with five or more
+/// carried candidates, which is most loops including `probes/FieldLoop.java` --
+/// so it removed the regression on `RegPressure` by removing the transform
+/// everywhere, reverting `FieldLoop.sum` to its slow 1052-byte body. A count
+/// cannot tell "displacing something worth less than me" from "displacing
+/// something worth more".
+fn carried_displacement_price(carried_w: &[u64], taken: usize) -> u64 {
+    let file_len = ir_gp_file().len();
+    if carried_w.len() < file_len {
+        return 0;
+    }
+    match file_len.checked_sub(1 + taken) {
+        Some(i) => carried_w.get(i).copied().unwrap_or(0),
+        None => u64::MAX,
+    }
+}
+
+fn ir_residency_crossblock_budget_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK_BUDGET") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
 fn ir_residency_crossblock_enabled() -> bool {
     matches!(
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK").as_deref(),
@@ -19668,6 +19796,64 @@ mod tests {").next().unwrap_or(src);
     /// arms in one process reports byte-identical code when a scheduling flag
     /// is memoised, and the result looks like "the transform does nothing"
     /// rather than "the flag was never re-read".
+    /// The displacement price rises as the file empties, and is zero when
+    /// nothing would be displaced.
+    ///
+    /// Both ends matter and both were wrong in an earlier draft. A price that
+    /// did NOT rise let a run of cheap single-use values evict the whole
+    /// carried set one register at a time; a price that was not zero for an
+    /// under-subscribed file made the transform inert on straight-line code,
+    /// where there is no carried value to outbid in the first place.
+    ///
+    /// The weights are `probes/FieldLoop.java`'s real ones, so this also pins
+    /// the case the `>=` tie-break exists for: price 10 against a candidate
+    /// weighing 10 must be admissible, or that probe's 7.6% goes away.
+    #[test]
+    fn the_displacement_price_rises_as_the_file_empties() {
+        let file = ir_gp_file().len();
+        assert!(
+            file >= 2,
+            "the rest of this test assumes a file worth sharing"
+        );
+
+        // Fewer carried candidates than registers: nothing is displaced.
+        assert_eq!(carried_displacement_price(&[99; 1], 0), 0);
+        assert_eq!(carried_displacement_price(&[], 0), 0);
+
+        // FieldLoop.sum's measured weights, descending.
+        let fieldloop = [20u64, 11, 10, 10, 10, 10];
+        assert!(
+            fieldloop.len() >= file,
+            "fixture must over-subscribe the file to displace anything"
+        );
+        let first = carried_displacement_price(&fieldloop, 0);
+        assert_eq!(
+            first,
+            fieldloop[file - 1],
+            "the first admission displaces the WEAKEST value still served"
+        );
+        assert!(
+            10 >= first,
+            "the induction variable weighs 10 and must be admissible at the              first price -- this is the `>=` tie-break §6d measured"
+        );
+
+        // Strictly rising, then refusing outright once the file is spent.
+        let mut prev = first;
+        for taken in 1..file {
+            let now = carried_displacement_price(&fieldloop, taken);
+            assert!(
+                now >= prev,
+                "price fell at taken={taken}: {prev} -> {now}; a falling price                  lets cheap values evict the carried set one register at a time"
+            );
+            prev = now;
+        }
+        assert_eq!(
+            carried_displacement_price(&fieldloop, file),
+            u64::MAX,
+            "once the file is spent nothing may be admitted at any weight"
+        );
+    }
+
     #[test]
     fn crossblock_flag_is_read_live() {
         let read = |v: Option<&str>| {

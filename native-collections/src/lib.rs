@@ -51739,6 +51739,12 @@ fn tm_new_range_view(
         }
     };
     let view_pin = ctx.pin_native_root(view);
+    // The view never runs a constructor, so nothing writes its declared
+    // reference defaults -- see `init_tm_reference_defaults`. This is the site
+    // the census row came from: `descendingKeySet()` mints a view here and
+    // hands it to `native_tm_key_set`, whose `cached_tm_view` reads `keySet`
+    // on it before anything has stored one.
+    init_tm_reference_defaults(ctx, view);
     let source = ctx.read_native_pin(src_pin, source);
     let src_cmp = tm_get_slot(ctx, source, TM_FIELD_COMPARATOR);
     let view_cmp = if descending {
@@ -54113,6 +54119,65 @@ fn ts_remove_at(ctx: &mut dyn NativeContext, data: ObjectRef, size: i32, pos: us
 // TreeMap native methods
 // ===========================================================================
 
+/// JVMS §2.3 defaults for the REFERENCE fields a `TreeMap` declares and
+/// inherits, which nothing else on the construction path writes.
+///
+/// `tm_set_slot` keeps this family's state in `tm_array_table`, a Rust
+/// side-table keyed on the object, and touches a real field only through its
+/// two explicit mirrors (`size` and `comparator`). So the declared reference
+/// fields are never assigned by anything: `native_tm_init` is registered for
+/// `TreeMap.<init>()V`, so the real constructor -- which would leave them null
+/// the way HotSpot does -- does not run either.
+///
+/// `Value::Object` carries a `NonNull` niche, so the all-zero cell
+/// `alloc_zeroed` leaves decodes as `Value::Int(0)` and NOT as
+/// `Value::Object(None)`. A read of one of these slots therefore hands
+/// `coerce_field_value_for_slot` a primitive in a slot declared `L`, and it
+/// DESTROYS the value. Measured on `probes/CollectionSlotFloor`, before this:
+///
+/// ```text
+///   descriptor-coercion census: total=1 primitive-into-reference[read=1]
+///     class_id=124 index=0 descriptor=L hits=1
+/// ```
+///
+/// `class_id=124` is `java/util/TreeMap` and index 0 is `keySet` -- INHERITED
+/// from `java.util.AbstractMap`, whose `keySet` and `values` precede
+/// `TreeMap`'s own seven, which is why the layout reports `fields=9` and why
+/// slot 0 is not `comparator`. `cached_tm_view` is the reader: it resolves the
+/// view field by name and expects `Object(None)` for "no view cached yet".
+///
+/// It coerces to null, which is the right answer for a freshly built map --
+/// and that is exactly why it has to be written rather than tolerated. The
+/// census exists to find the reads where the coerced answer is NOT right, and
+/// a benign row sitting at a fixed locator is how a real one stays hidden.
+///
+/// Resolved against the RECEIVER's own class, so a fabricated stub that
+/// declares none of these names is a no-op rather than a write to whatever
+/// those slots mean there, and bounds-checked for the same reason. Not a GC
+/// point (`set_field` never allocates from the Java heap), so callers may pass
+/// a reference they have already re-read through a pin.
+fn init_tm_reference_defaults(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    let class_id = ctx.class_id_of_object(this);
+    let num_fields = ctx.object_num_fields(this);
+    // `keySet`/`values` are `AbstractMap`'s; the rest are `TreeMap`'s own.
+    // `comparator` is absent deliberately -- `tm_set_slot`'s mirror writes it
+    // on every path into this constructor, including the null one.
+    for name in [
+        "keySet",
+        "values",
+        "root",
+        "entrySet",
+        "navigableKeySet",
+        "descendingMap",
+    ] {
+        if let Some(slot) = ctx.resolve_field_index_by_class_id(class_id, name) {
+            if slot < num_fields {
+                ctx.set_field(this, slot, Value::Object(None));
+            }
+        }
+    }
+}
+
 fn native_tm_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -54132,6 +54197,7 @@ fn native_tm_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // the first `put` -- `root` stays null -- and an empty map that is never
     // written is the common shape in configuration and model code.
     ih_seed(ctx, this);
+    init_tm_reference_defaults(ctx, this);
     tm_set_slot(ctx, this, TM_FIELD_DATA, Value::Object(None));
     tm_set_slot(ctx, this, TM_FIELD_SIZE, Value::Int(0));
     tm_set_slot(ctx, this, TM_FIELD_COMPARATOR, Value::Object(None));
@@ -54147,6 +54213,7 @@ fn native_tm_init_comparator(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // No allocation here also means `cmp` needs no pin across one.
     ih_seed(ctx, this);
     let cmp = args.get(1).copied().unwrap_or(Value::Object(None));
+    init_tm_reference_defaults(ctx, this);
     tm_set_slot(ctx, this, TM_FIELD_DATA, Value::Object(None));
     tm_set_slot(ctx, this, TM_FIELD_SIZE, Value::Int(0));
     tm_set_slot(ctx, this, TM_FIELD_COMPARATOR, cmp);
@@ -55624,6 +55691,8 @@ fn ts_publish_real_backing_map(ctx: &mut dyn NativeContext, this: ObjectRef) {
         }
     };
     let map_pin = ctx.pin_native_root(map);
+    // Same as the range view above: allocated, never constructed.
+    init_tm_reference_defaults(ctx, map);
     // `PRESENT` is the JDK's own sentinel value for every `TreeSet` mapping.
     // A missing one is not a reason to refuse the mirror — the VALUES of a set's
     // backing map are not observable through any `Set` operation — so fall back

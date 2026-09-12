@@ -1496,6 +1496,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_IR_RELOC_EMIT` | JIT | `CRATONVM_JIT=ir-reloc-emit` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_RESERVE_CARRIED` | JIT | `CRATONVM_JIT=ir-reserve-carried` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK` | JIT | `CRATONVM_JIT=ir-residency-crossblock` | opt-in | off | behaviour | snapshot | jit |
+| `CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK_BUDGET` | JIT | `CRATONVM_JIT=ir-residency-crossblock-budget` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_RESIDENCY_PAYS` | JIT | `CRATONVM_JIT=ir-residency-pays` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_RPO_LAYOUT` | JIT | `CRATONVM_JIT=ir-rpo-layout` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_SCALAR_INTRINSICS` | JIT | `CRATONVM_JIT=ir-scalar-intrinsics` | opt-in | off | behaviour | snapshot | jit |
