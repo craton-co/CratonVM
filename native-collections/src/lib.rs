@@ -12056,17 +12056,24 @@ fn register_hashmap_natives(r: &mut NativeMethodRegistry) {
 /// # Why this is a SPLIT and not a deletion
 ///
 /// §9a.3 declined the change as a ten-site audit, and the count was right: the
-/// eager allocation is load-bearing for this crate's OWN maps. This function has
+/// eager allocation is load-bearing for this crate's OWN maps. This function had
 /// NINE internal callers -- the `Collections.EMPTY_MAP`/`EMPTY_SET` singleton
 /// fallbacks, `emptyMap`/`emptySet`/`singleton*`, both `Properties`
 /// constructors and the `Hashtable(int)` path -- and `alloc_hs_backing` builds
 /// every `HashSet` and view backing map through the capacity constructor, at
 /// least two consumers of which do `map_state(..).0.unwrap()`.
 ///
-/// The audit's answer is that NONE of them needs to change: they all keep the
-/// eager behaviour they have today via [`map_init_eager`], and only a map a
-/// JAVA constructor asks for becomes lazy. That is one edit per call site and
-/// no behavioural question at any of them, rather than nine judgement calls.
+/// The audit's answer was that NONE of them needed to change: they all kept the
+/// eager behaviour they had via [`map_init_eager`], and only a map a JAVA
+/// constructor asks for became lazy. That was one edit per call site and no
+/// behavioural question at any of them, rather than nine judgement calls.
+///
+/// TWO of those nine have since been asked the question and answered it the
+/// other way. Both `Properties` constructors are LAZY as of 2026-09-12, leaving
+/// SEVEN eager callers -- see [`props_init_map_half`], which carries the
+/// evidence. The short version is that the audit's premise does not hold for
+/// that class: its table is not one of "this crate's own maps" in any useful
+/// sense, because no `Properties` native reads or writes a bucket table at all.
 pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     map_init_inner(ctx, args, false)
 }
@@ -65425,16 +65432,67 @@ fn register_properties_natives(registry: &mut NativeMethodRegistry) {
     registry.set_category(__prev_cat);
 }
 
+/// The `Hashtable`-inherited half of both `Properties` constructors: allocate
+/// NOTHING, which is what HotSpot's own `Properties()` does.
+///
+/// # What used to happen, and what it cost
+///
+/// Both constructors called `map_init_eager`. `Properties` is deliberately
+/// EXCLUDED from `CF_HASHTABLE_LAYOUT` (JDK 25 backs it with a side
+/// `ConcurrentHashMap`, not with `Hashtable`'s buckets), so that call took the
+/// GENERIC arm of [`map_init_inner`] and allocated an `Object[16]` into the
+/// receiver's `table`. On a real-layout `Properties` that is 144 bytes of the
+/// 224 an empty one retained, against HotSpot's 120.3.
+///
+/// # Why null is safe here, which is a MEASUREMENT and not an argument
+///
+/// The comment this replaces named one risk — "leaving it null would make
+/// `map_state` report no buckets on a receiver whose native put path does not
+/// go through `map_resize`" — and the risk is real in the abstract. It does not
+/// apply to this class, on three independent counts:
+///
+///   * **Nothing writes that array.** `register_properties_sidetable`
+///     (`native-builtins`) runs AFTER `register_collections_natives` in BOTH
+///     `vm_init` arms and OVERWRITES every Map method on `java/util/Properties`
+///     — `put`, `get`, `remove`, `clear`, `size`, `isEmpty`, `containsKey`,
+///     `keySet`, `values`, `entrySet`, `keys`, `elements`, `contains`. Not one
+///     of those bodies reads or writes a bucket table: a String->String pair
+///     goes to the Rust side-table, anything else to the real `map` CHM, which
+///     `put_non_string_into_chm` CREATES ON DEMAND. `map_carrier_class_for_receiver`
+///     already records the consequence, measured: a `Properties` bucket table
+///     reports `occupied=0` with `size=2`.
+///   * **The one path that COULD reach the buckets already handles null.**
+///     `native_map_put_evict_pinned` opens with
+///     `if initial_buckets.is_none() || size + 1 > (cap * 3) / 4 { map_resize(..) }`
+///     — the branch a JDK-bytecode-constructed `LinkedHashMap` has always taken
+///     — so even a receiver that somehow reached the generic put would
+///     materialise its table on first insert rather than drop the write.
+///     `map_state`'s capacity fallback reads `threshold` when there is no
+///     table, and the lazy arm sets it to 0, so that path answers
+///     `MAP_DEFAULT_CAPACITY` — the same 16 the eager array had.
+///   * **The busiest `Properties` in the VM has ALWAYS had a null table.**
+///     `system_properties_object` allocates the `System.getProperties()`
+///     singleton and writes NONE of its slots; `java.home` and every other
+///     bootstrap property has been read out of a bucket-less `Properties`
+///     since that factory was written. This change makes every other
+///     `Properties` the same shape as the one that was already proving it.
+///
+/// HotSpot agrees, and that is the oracle rather than the reasoning above:
+/// `probes/CollectionShapeCause.java`'s field dump on a real JDK 25 shows
+/// `new Properties()` leaving `table` null, `loadFactor` 0.0 and `threshold` 0,
+/// with the entries in a `ConcurrentHashMap map`.
+fn props_init_map_half(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
+    native_map_init(ctx, &[Value::Object(Some(this))])
+}
+
 fn native_props_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    // EAGER: `Properties` keeps its entries in a Rust side-table and its
-    // slot 0 IS the inherited `Hashtable.table`; leaving it null would make
-    // `map_state` report no buckets on a receiver whose native put path does
-    // not go through `map_resize`. Behaviour here is unchanged.
-    map_init_eager(ctx, &[Value::Object(Some(this))])?;
+    // LAZY, like the JDK. See [`props_init_map_half`] for why the receiver's
+    // bucket table stays null.
+    props_init_map_half(ctx, this)?;
     props_set_defaults(ctx, this, Value::Object(None));
     Ok(None)
 }
@@ -65444,11 +65502,9 @@ fn native_props_init_defaults(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    // EAGER: `Properties` keeps its entries in a Rust side-table and its
-    // slot 0 IS the inherited `Hashtable.table`; leaving it null would make
-    // `map_state` report no buckets on a receiver whose native put path does
-    // not go through `map_resize`. Behaviour here is unchanged.
-    map_init_eager(ctx, &[Value::Object(Some(this))])?;
+    // LAZY, like the JDK. See [`props_init_map_half`] for why the receiver's
+    // bucket table stays null.
+    props_init_map_half(ctx, this)?;
     // Store the defaults reference in the REAL `defaults` field, resolved by
     // name on the receiver's class. On a real-layout `java.util.Properties` the
     // inherited Hashtable fields push `defaults` well past this native model's

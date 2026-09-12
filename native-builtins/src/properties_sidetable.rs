@@ -2823,10 +2823,36 @@ fn native_properties_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(k))) => *k,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let key = read_java_text(ctx, key_obj).unwrap_or_default();
-    if key.is_empty() {
-        return Ok(Some(Value::Object(None)));
-    }
+    // A KEY WITH NO STRING FORM AT ALL is the only one this function may skip
+    // the side-table for, and it must still reach the CHM.
+    //
+    // This used to be `read_java_text(..).unwrap_or_default()` followed by
+    // `if key.is_empty() { return null }`, which returned BEFORE
+    // `remove_from_properties_backend` for two quite different keys and was
+    // wrong for both. `native_properties_put` routes a non-String key to the
+    // real `map` CHM (`put_non_string_into_chm`), so the entry stayed there
+    // while the caller was told there had been nothing to remove — and
+    // `size()`/`keySet()`/`containsKey()` all read the CHM, so it went on
+    // being counted. That is a silent failure of exactly the shape this file's
+    // header describes, and the one `probes/PropertiesBacking.java` caught:
+    //
+    // ```text
+    //   p.put(Integer.valueOf(3), "byIntKey");
+    //   p.remove(Integer.valueOf(3))  ->  null   (HotSpot: "byIntKey")
+    //   p.size()                      ->  3      (HotSpot: 2)
+    // ```
+    //
+    // The EMPTY String is the second key that took that return, and it needs
+    // the opposite treatment, because the two writers disagree about where it
+    // goes: `native_properties_put` sends it to the CHM (its side-table arm is
+    // guarded by `!ks.is_empty()`), while `native_properties_set_property`
+    // calls `put_kv_units` unconditionally and puts it in BOTH. It is an
+    // ordinary key to every reader here — `native_properties_contains_key`
+    // looks it up in the side-table like any other — so it takes the ordinary
+    // path below, which clears both stores.
+    let Some(key) = read_java_text(ctx, key_obj) else {
+        return Ok(Some(remove_from_properties_backend(ctx, this, key_obj)));
+    };
     let removed = remove_kv_units(ctx, this, &key);
     // The system-properties view must propagate removal to the global store,
     // mirroring how `setProperty`/`put` propagate writes — otherwise
