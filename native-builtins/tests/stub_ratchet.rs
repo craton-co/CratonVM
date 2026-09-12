@@ -2202,7 +2202,33 @@ use cratonvm_types::compat::CompatibilityMode;
 /// above): the total not moving at all is the cleanest of the four readings
 /// -- every added SyntheticStub row is an existing Bridge relabelled, zero new
 /// registrations, exactly what a table landing on a fresh `dev` predicts.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3859;
+/// # 3859 → 3940, 2026-09-12, L1 wave 7 (+81 on every arm, TOTAL
+/// registrations unchanged at 13961)
+///
+/// 79 triples re-tagged `Bridge` -> `SyntheticStub` by one retirement table
+/// (`RETIRED_SHADOW_L1_HT_TRIPLES`), and 81 REGISTRATIONS because two of them
+/// are registered twice — which is the distinction this file's own failure
+/// text spells out, and the reason 81 is not an arithmetic slip.
+///
+/// PAIRED, not subtracted: the control (`origin/dev` at `0ad29ab00`, its own
+/// worktree and its own target dir) was measured in the same three arms in the
+/// same sitting, and PASSED at the constants this line replaces.
+///
+/// ```text
+///                       no-mgmt   mgmt   syn-jdk   total registrations
+///   control  0ad29ab00     3832   3859      3832   13593 / 13961 / 13628
+///   trial    this wave     3913   3940      3913   13593 / 13961 / 13628
+/// ```
+///
+/// The total not moving in any arm is the reading this file asks for: every
+/// added stub row is an existing `Bridge` relabelled, none is a new fake.
+///
+/// The same sitting measured the two WITHDRAWN versions of this wave on the
+/// same control, which is the arithmetic check on this constant: 189 triples
+/// (`LinkedHashMap`'s 102 and eight `HashMap` rows included) read
+/// 4011 / 4038 / 4011 = +179, and 87 triples read 3921 / 3948 / 3921 = +89.
+/// Two doubles in every one of the three counts.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3940;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2573,7 +2599,33 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3859;
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
 /// # 2948 → 3832, 2026-09-12 — see [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]'s
 /// account of this same merge; `+884` here too, total unchanged 13606 -> 13606.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3832;
+/// # 3832 → 3913, 2026-09-12, L1 wave 7 (+81 on every arm, TOTAL
+/// registrations unchanged at 13593)
+///
+/// 79 triples re-tagged `Bridge` -> `SyntheticStub` by one retirement table
+/// (`RETIRED_SHADOW_L1_HT_TRIPLES`), and 81 REGISTRATIONS because two of them
+/// are registered twice — which is the distinction this file's own failure
+/// text spells out, and the reason 81 is not an arithmetic slip.
+///
+/// PAIRED, not subtracted: the control (`origin/dev` at `0ad29ab00`, its own
+/// worktree and its own target dir) was measured in the same three arms in the
+/// same sitting, and PASSED at the constants this line replaces.
+///
+/// ```text
+///                       no-mgmt   mgmt   syn-jdk   total registrations
+///   control  0ad29ab00     3832   3859      3832   13593 / 13961 / 13628
+///   trial    this wave     3913   3940      3913   13593 / 13961 / 13628
+/// ```
+///
+/// The total not moving in any arm is the reading this file asks for: every
+/// added stub row is an existing `Bridge` relabelled, none is a new fake.
+///
+/// The same sitting measured the two WITHDRAWN versions of this wave on the
+/// same control, which is the arithmetic check on this constant: 189 triples
+/// (`LinkedHashMap`'s 102 and eight `HashMap` rows included) read
+/// 4011 / 4038 / 4011 = +179, and 87 triples read 3921 / 3948 / 3921 = +89.
+/// Two doubles in every one of the three counts.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3913;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2813,7 +2865,33 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3832;
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
 /// # 2948 → 3832, 2026-09-12 — see [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]'s
 /// account of this same merge; `+884` here too, total unchanged 13641 -> 13641.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 3832;
+/// # 3832 → 3913, 2026-09-12, L1 wave 7 (+81 on every arm, TOTAL
+/// registrations unchanged at 13628)
+///
+/// 79 triples re-tagged `Bridge` -> `SyntheticStub` by one retirement table
+/// (`RETIRED_SHADOW_L1_HT_TRIPLES`), and 81 REGISTRATIONS because two of them
+/// are registered twice — which is the distinction this file's own failure
+/// text spells out, and the reason 81 is not an arithmetic slip.
+///
+/// PAIRED, not subtracted: the control (`origin/dev` at `0ad29ab00`, its own
+/// worktree and its own target dir) was measured in the same three arms in the
+/// same sitting, and PASSED at the constants this line replaces.
+///
+/// ```text
+///                       no-mgmt   mgmt   syn-jdk   total registrations
+///   control  0ad29ab00     3832   3859      3832   13593 / 13961 / 13628
+///   trial    this wave     3913   3940      3913   13593 / 13961 / 13628
+/// ```
+///
+/// The total not moving in any arm is the reading this file asks for: every
+/// added stub row is an existing `Bridge` relabelled, none is a new fake.
+///
+/// The same sitting measured the two WITHDRAWN versions of this wave on the
+/// same control, which is the arithmetic check on this constant: 189 triples
+/// (`LinkedHashMap`'s 102 and eight `HashMap` rows included) read
+/// 4011 / 4038 / 4011 = +179, and 87 triples read 3921 / 3948 / 3921 = +89.
+/// Two doubles in every one of the three counts.
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 3913;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
