@@ -208,3 +208,38 @@ Two things make that safe rather than a collision:
 
 Recorded here rather than by amending lane 0's ownership table, which is lane 0's
 own cell to edit.
+
+## 9. One gate target is red on the merge, and it is not this change
+
+`cargo test -p cratonvm-vm --lib` fails exactly one test on the merged tree:
+
+```text
+runtime::interpreter::tests::ffm_group_layout_force_native_covers_member_layouts
+assertion failed: force_native_over_real_jdk_bytecode(
+    "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl", "carrier", "()Ljava/lang/Class;")
+```
+
+**Attributed, not inferred.** The same test, the same filter, in the same
+worktree and target dir with the source touched between the two builds, fails
+identically on PRISTINE `origin/dev` (`da7cc2da6`): `0 passed; 1 failed` on both
+sides, same assertion, 10 crates recompiled on the dev leg so it is not a stale
+artefact.
+
+The history agrees: lane 4's wave 2 (`8393fbc1d`) retired 137
+`ValueLayouts$Of*Impl` shadows and edited the force-native rules in
+`vm/src/runtime/interpreter/native_override.rs` (14 lines), while
+`vm/src/runtime/interpreter/tests.rs` has no commit in that range — the rules
+moved and the test that pins them did not. That is the failure family
+`a-retirement-table-is-mode-blind-and-can-disarm-a-real-jdk-keep-arm` describes,
+and this test is the guard that exists to catch it, so it should be read as
+working rather than as noise.
+
+Nothing in this change is FFM: its files are the two `BootLoader` natives, the
+four deleted package registrations, two gate baselines, the mock's two opt-in
+accessors and a corpus vector. The other five gate targets are green on the
+merge, and the three corpus arms are 41 / 134 / 93 with no failures.
+
+It is filed for lane 4 rather than fixed here: whether the `carrier` rows should
+still force the native, or the assertion should follow the rules, is a question
+about what their retirement intended — and editing another lane's assertion to
+make a gate green is how a gate becomes a rubber stamp.

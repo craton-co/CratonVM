@@ -1997,7 +1997,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// time. Three independent derivations of one delta is what makes it a property
 /// of this branch rather than of a tree, which is the claim a re-freeze makes.
 ///
-/// # 2892 -> 2891, 2026-09-11 — one triple LEFT the stub population
+/// # 2943 -> 2942, 2026-09-12 — one triple LEFT the stub population
 ///
 /// `java/lang/Package.getPackages()[Ljava/lang/Package;` is no longer registered
 /// at all: the four empty-array overrides for the plural package methods were
@@ -2008,16 +2008,17 @@ use cratonvm_types::compat::CompatibilityMode;
 /// A DECREASE is re-frozen in the same change, because this ratchet asserts `<=`:
 /// a baseline left above the tree silently re-admits that many new stubs.
 ///
-/// RE-MEASURED ON THE MERGE with lane 4's wave 2 (`+137`), not carried across it.
-/// This branch had measured `2728 -> 2727` before that wave landed, and the line
-/// above is the printed one after it. The delta is the same 1 both times, and it
-/// was checked at ROW granularity rather than by subtraction: with
-/// `CRATONVM_RATCHET_ROWS=1` on both trees, one target dir, sorted and `comm`-ed,
-/// exactly ONE row is on `dev` and not here --
+/// RE-MEASURED ON EACH MERGE, never carried across one. This branch measured
+/// `2728 -> 2727`, then `2865 -> 2864` after lane 4 wave 2, then this line after
+/// lane 4 wave 3 and lane 1 wave 6 — three waves re-froze these constants while
+/// this one row was in flight, and the delta is the same 1 every time BECAUSE it
+/// was re-measured rather than subtracted. It was also checked at ROW granularity:
+/// `CRATONVM_RATCHET_ROWS=1` on both trees, one target dir with a touch between
+/// them, sorted and `comm`-ed, gives exactly ONE row on `dev` and not here --
 /// `native-builtins/src/lang_class.rs|java/lang/Package.getPackages|()[Ljava/lang/Package;`
 /// -- and none the other way. Record:
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2943;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2942;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2275,7 +2276,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2943;
 /// each registration is re-tagged separately. The `--jdk-only-report` census
 /// for the same prefixes reports **15 distinct triples refused, 0 with a
 /// survivor** -- the same population counted the other way.
-/// # 2865 -> 2864, 2026-09-11 — one triple LEFT the stub population
+/// # 2916 -> 2915, 2026-09-12 — one triple LEFT the stub population
 ///
 /// `java/lang/Package.getPackages()[Ljava/lang/Package;` is no longer registered
 /// at all: the four empty-array overrides for the plural package methods were
@@ -2286,16 +2287,17 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2943;
 /// A DECREASE is re-frozen in the same change, because this ratchet asserts `<=`:
 /// a baseline left above the tree silently re-admits that many new stubs.
 ///
-/// RE-MEASURED ON THE MERGE with lane 4's wave 2 (`+137`), not carried across it.
-/// This branch had measured `2728 -> 2727` before that wave landed, and the line
-/// above is the printed one after it. The delta is the same 1 both times, and it
-/// was checked at ROW granularity rather than by subtraction: with
-/// `CRATONVM_RATCHET_ROWS=1` on both trees, one target dir, sorted and `comm`-ed,
-/// exactly ONE row is on `dev` and not here --
+/// RE-MEASURED ON EACH MERGE, never carried across one. This branch measured
+/// `2728 -> 2727`, then `2865 -> 2864` after lane 4 wave 2, then this line after
+/// lane 4 wave 3 and lane 1 wave 6 — three waves re-froze these constants while
+/// this one row was in flight, and the delta is the same 1 every time BECAUSE it
+/// was re-measured rather than subtracted. It was also checked at ROW granularity:
+/// `CRATONVM_RATCHET_ROWS=1` on both trees, one target dir with a touch between
+/// them, sorted and `comm`-ed, gives exactly ONE row on `dev` and not here --
 /// `native-builtins/src/lang_class.rs|java/lang/Package.getPackages|()[Ljava/lang/Package;`
 /// -- and none the other way. Record:
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2916;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2915;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2475,7 +2477,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2916;
 /// each registration is re-tagged separately. The `--jdk-only-report` census
 /// for the same prefixes reports **15 distinct triples refused, 0 with a
 /// survivor** -- the same population counted the other way.
-/// # 2865 -> 2864, 2026-09-11 — one triple LEFT the stub population
+/// # 2916 -> 2915, 2026-09-12 — one triple LEFT the stub population
 ///
 /// `java/lang/Package.getPackages()[Ljava/lang/Package;` is no longer registered
 /// at all: the four empty-array overrides for the plural package methods were
@@ -2486,16 +2488,17 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2916;
 /// A DECREASE is re-frozen in the same change, because this ratchet asserts `<=`:
 /// a baseline left above the tree silently re-admits that many new stubs.
 ///
-/// RE-MEASURED ON THE MERGE with lane 4's wave 2 (`+137`), not carried across it.
-/// This branch had measured `2728 -> 2727` before that wave landed, and the line
-/// above is the printed one after it. The delta is the same 1 both times, and it
-/// was checked at ROW granularity rather than by subtraction: with
-/// `CRATONVM_RATCHET_ROWS=1` on both trees, one target dir, sorted and `comm`-ed,
-/// exactly ONE row is on `dev` and not here --
+/// RE-MEASURED ON EACH MERGE, never carried across one. This branch measured
+/// `2728 -> 2727`, then `2865 -> 2864` after lane 4 wave 2, then this line after
+/// lane 4 wave 3 and lane 1 wave 6 — three waves re-froze these constants while
+/// this one row was in flight, and the delta is the same 1 every time BECAUSE it
+/// was re-measured rather than subtracted. It was also checked at ROW granularity:
+/// `CRATONVM_RATCHET_ROWS=1` on both trees, one target dir with a touch between
+/// them, sorted and `comm`-ed, gives exactly ONE row on `dev` and not here --
 /// `native-builtins/src/lang_class.rs|java/lang/Package.getPackages|()[Ljava/lang/Package;`
 /// -- and none the other way. Record:
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2916;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2915;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
