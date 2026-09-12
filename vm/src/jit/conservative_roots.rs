@@ -2726,7 +2726,7 @@ fn unreg_jit_accept_residue() -> bool {
 /// withheld. A loud OOM is a better default than silent corruption; the repair
 /// is to give the shallow band above `cover_hi` precise roots so the pin is not
 /// needed at all. See
-/// `docs/known-issues/gc/zgc-residue-licence-relocates-under-a-conservative-root-20260908.md`.
+/// `docs/internal/fixed-suite-bugs/gc/zgc-residue-licence-relocates-under-a-conservative-root-RESOLVED-20260912.md`.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn unreg_residue_licence_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -9463,7 +9463,7 @@ fn scan_one_frame(low_sp: usize, high_sp: usize, heap: &VmHeap, out: &mut Vec<Ob
 /// conservative band scan, so words there stop being marking roots. It exists
 /// to put a NUMBER on what a precise compiled-frame root set could buy, because
 /// the alternative is arguing about it:
-/// `docs/known-issues/h2/testvaluememory-fails-under-g1-on-conservative-jit-roots-20260908.md`
+/// `docs/internal/fixed-bugs/h2-testvaluememory-g1-conservative-jit-roots-RESOLVED-20260912.md`
 /// spent its "where to start" list on two narrowings that measurement then
 /// refuted, and the third — precise oop maps — is a project nobody will start
 /// on a guess about its payoff.

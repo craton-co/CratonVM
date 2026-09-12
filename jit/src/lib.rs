@@ -1588,7 +1588,7 @@ pub struct OopMapEntry {
     /// consumer holding a frame offset inverts it with
     /// [`FrameLayout::spill_image_index`] and needs no register decoding.
     ///
-    /// See `docs/known-issues/h2/testvaluememory-fails-under-g1-on-conservative-jit-roots-20260908.md`
+    /// See `docs/internal/fixed-bugs/h2-testvaluememory-g1-conservative-jit-roots-RESOLVED-20260912.md`
     /// for what the blind image costs when nothing narrows it: five conservative
     /// words holding 2520 KB out of a G1 collection set, one of them an `r8`
     /// leftover.

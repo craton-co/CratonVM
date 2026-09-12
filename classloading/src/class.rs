@@ -517,8 +517,8 @@ pub fn class_origin_epoch() -> u64 {
 /// hash and a probe per node visited, for a set that holds a handful of `u32`s.
 /// `perf record -F 999` over `probes/KeySetBench hoisted` (the
 /// `native-collections` per-element floor written up in
-/// `docs/known-issues/perf/springboot-configurationpropertysources-native-
-/// collections-floor-20260821.md`) attributed **9.91 %** of the whole process
+/// `docs/known-issues/springboot/springboot-configurationpropertysources-
+/// native-collections-floor-20260821.md`) attributed **9.91 %** of the whole process
 /// to `hashbrown::HashMap<ClassId, ()>::insert`, plus a further 4.59 % to
 /// `is_subclass_of_inner` itself: the largest single leaf in that profile,
 /// above every GC and dispatch frame, and reached from the collection natives'

@@ -515,6 +515,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "outgoing-arg-roots", on_key: Some("CRATONVM_GC_OUTGOING_ARG_ROOTS"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
     // G1's pin set honouring the movable/rewritable partition the
     // generational path has always honoured.
+    // DEFAULT-ON since 2026-09-12, so a KILL SWITCH, and it grew an `off_word`
+    // with the flip -- the same correction the ZGC rows above needed, for the
+    // same reason: without it `CRATONVM_GC=-g1-movable-pins` expands to
+    // UNSETTING the key, and an unset key now means ON. It shipped opt-in on
+    // 2026-09-09 having measured itself worth 1 pin in 34; the deopt
+    // `SavedRegisters` partition (`FrameLayout::deopt_gpr_lo`) is what made it
+    // worth 6 of 7. See `gc/src/g1.rs::g1_movable_pins_enabled`.
     E { group: Group::GC, token: "g1-movable-pins", on_key: Some("CRATONVM_GC_G1_MOVABLE_PINS"), off_key: None, off_word: Some("0"), since: "2026-09-09" },
     // The producer half: publishing the verifiable band partition as movable.
     E { group: Group::GC, token: "movable-band-roots", on_key: Some("CRATONVM_GC_MOVABLE_BAND_ROOTS"), off_key: None, off_word: Some("0"), since: "2026-09-09" },

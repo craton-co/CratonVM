@@ -19336,7 +19336,7 @@ impl G1Collector {
     /// object the conservative word pointed at — and an investigation that
     /// cannot see the occupancy cannot tell a pin that costs 40 bytes from one
     /// that costs a megabyte. On
-    /// `docs/known-issues/h2/testvaluememory-fails-under-g1-on-conservative-jit-roots-20260908.md`
+    /// `docs/internal/fixed-bugs/h2-testvaluememory-g1-conservative-jit-roots-RESOLVED-20260912.md`
     /// that distinction IS the defect: three pinned regions, and the two that
     /// hold nothing the roots name are the whole of the 3224-vs-2228 gap.
     ///

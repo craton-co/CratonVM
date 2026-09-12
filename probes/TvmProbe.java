@@ -54,7 +54,7 @@ import org.h2.value.ValueVarcharIgnoreCase;
 /**
  * Standalone port of {@code org.h2.test.unit.TestValueMemory}, whose
  * {@code testType} loop is the workload of
- * {@code docs/known-issues/h2/testvaluememory-fails-under-g1-on-conservative-jit-roots-20260908.md}.
+ * {@code docs/internal/fixed-bugs/h2-testvaluememory-g1-conservative-jit-roots-RESOLVED-20260912.md}.
  *
  * <h2>Why a port and not the test</h2>
  *
