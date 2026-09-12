@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Retired 2026-09-10. A RESIDUAL wave on 2026-09-11 took four of §10's five items: see §3a (a correction to this page's own §3) and §9a. Table count is now 98 + 67. |
+| **Status** | Retired 2026-09-10. Two RESIDUAL waves on 2026-09-11: §9a took four of §10's five items, §9b took 33 more rows, answered §10.1 by measurement and corrected two of §9a's own claims. Table count is now 98 + 67 + 33. What is left is §11. |
 | **Was** | `docs/known-issues/jdk-only-lanes/lane-5-concurrent-thread-unsafe.md` |
 | **Table** | [`RETIRED_SHADOW_L5_TRIPLES`](../../../native-api/src/retired_shadow.rs) |
 | **Ownership authority** | [`lane-0-integration-and-gates.md`](../../known-issues/jdk-only-lanes/lane-0-integration-and-gates.md) |
@@ -789,12 +789,13 @@ Terminal deprecation says nothing about whether a method works today, and the
 one row where the VMs disagree is `getUnsafe` — which JDK 25 does not declare
 at all.
 
-Two of the 82 are **deletions rather than retirements**:
-`ensureClassInitialized` and `shouldBeInitialized`, which `javap -p
-sun.misc.Unsafe` declares on none of the 17, 21 or 25 images. Thirty-two more
-were simply not reached by this workload and stay out, because precondition 4
-is per-triple however obvious a sibling looks. Widening the probe takes them,
-and that is a probe edit rather than a build.
+Two of the 82 were recorded here as **deletions rather than retirements**:
+`ensureClassInitialized` and `shouldBeInitialized`, "which `javap -p
+sun.misc.Unsafe` declares on none of the 17, 21 or 25 images". **That sentence
+is wrong — see §9b.** Thirty-two more were simply not reached by this workload
+and stay out, because precondition 4 is per-triple however obvious a sibling
+looks. Widening the probe takes them, and that is a probe edit rather than a
+build.
 
 **A third row was recorded as a deletion and it was wrong.** `getUnsafe` also
 answered `NoSuchMethodException`, and this page first read that as absence. It
@@ -856,6 +857,277 @@ on `RArrayStoreLibrary` — a vector that published no check count, which is a
 harness-level complaint rather than a behaviour diff. Re-run it is **132/132 on
 r2 AND on r0**, so it reproduces on neither binary.
 
+## 9b. The second residual wave, 2026-09-11 — and two things §9a got wrong
+
+§9a closed with a five-item list and the claim that four of its five were
+taken. This section is the second sitting: **33 more rows retired, §10.1
+answered by measurement rather than by hypothesis, and two factual corrections
+to §9a itself.** Both corrections are the same species of error, and it is the
+species this lane has now made three times.
+
+### 9b.1 `ensureClassInitialized` and `shouldBeInitialized` are NOT deletions
+
+§9a says, of those two `sun.misc.Unsafe` triples:
+
+> which `javap -p sun.misc.Unsafe` declares on none of the 17, 21 or 25 images
+
+That sentence is false, and the measurement is one command per image:
+
+```text
+  17   public boolean shouldBeInitialized(java.lang.Class<?>);
+       public void ensureClassInitialized(java.lang.Class<?>);
+  21   both, identically
+  25   neither — removed
+```
+
+They are declared, `public`, on two of the three supported images. So they are
+not deletions: **deleting them would take the registration away from 17 and
+21.** What they are is a VERSION BOUNDARY — live on 17 and 21, gone on 25 — and
+this lane's whole workload runs on 25, where nothing can dispatch them.
+Precondition 4 wants a dispatch observed by the citing instrument, and on this
+image there can be none. So the rows stay out of the table for a third reason
+rather than the first one, and the test that guards them says so.
+
+**Three times now, the same mistake**: `getUnsafe` was misfiled from a
+`NoSuchMethodException` (§9a), and these two from a `javap` run on ONE image.
+The rule that covers both:
+
+> "Declared by no supported image" is a claim about THREE images, and
+> reflection is not one of them.
+
+The L1 `Unsafe` page got this right and is worth copying. Its §4.6 is titled
+*"nine registrations for methods **this JDK image** does not declare"* and
+prints `On 25.0.4+7:` above the list. It scoped the claim to what it measured;
+§9a read that list and dropped the scope.
+
+### 9b.2 A three-image census, and what it found instead
+
+The correction was cheap, so the question got asked properly — every registered
+`Unsafe` triple against all three images:
+
+```text
+  image                    sun.misc.Unsafe          jdk.internal.misc.Unsafe
+  17  (17.0.20.1+1)        74 declared, 0 native    367 declared, 70 native
+  21  (21.0.12+8)          74 declared, 0 native    367 declared, 68 native
+  25  (25.0.4+7)           83 declared, 0 native    349 declared, 68 native
+```
+
+`sun.misc.Unsafe` GAINING nine methods between 21 and 25 is not a transcription
+error: 25 removes `ensureClassInitialized` and `shouldBeInitialized` and adds
+eleven private ones for the terminal-deprecation warning itself
+(`beforeMemoryAccess`, `isMemoryAccessWarned`, `singleLineWarning`, three
+lambdas, and the rest). The class is being wrapped in a warning, not emptied.
+
+Two more facts fall straight out and neither was on this page.
+
+**`sun.misc.Unsafe` has NO native methods on any of the three images.** Every
+one of the 83 carries `Code` and delegates to `theInternalUnsafe`, so
+precondition 3 is satisfied by construction for that whole class — which is why
+67 + 13 of its rows retire cleanly and why the class is nearly finished.
+
+**`jdk.internal.misc.Unsafe` is 68 `ACC_NATIVE` methods and ~280 Java ones.**
+Contract §1.5 keeps every one of the 68 a `Bridge` permanently, so a fifth of
+that class is not a retirement backlog at all — it is the floor. §10.4 treated
+the class as one undifferentiated remainder; it is two populations, and `javap`
+separates them in one command.
+
+### 9b.3 What the wave retired: 33 triples, two instruments
+
+`RETIRED_SHADOW_L5S_TRIPLES`.
+
+**13 `sun/misc/Unsafe` address-form accessors.** §9a said the way to the rows
+its workload missed was *"a probe edit rather than a build"*, and it was:
+`apps/probes/L5SunMiscUnsafe.java` grew an `addrRow` helper and seven cases that
+allocate, round-trip one type through the `(long)` accessor pair, and free.
+
+```text
+  1. the dial was asked          reached 13, yielded 13, declined_no_bytecode 0
+  2. whole probe tree no worse   see the acceptance section
+  3. the image target has Code   declared=true, acc_native=false, has_code=true
+                                 on all 13, from --explain-jdk-only
+  4. a dispatch per triple       outcome=bytecode-won on all 13, one row each
+```
+
+13 dispatches for 14 calls is not a miscount: `getByte(J)B` was retired in the
+first wave, so it is no longer registered and the dial cannot reach it.
+
+**20 `jdk/internal/misc/Unsafe` delegating accessors**, dispatched by
+`probes/UnsafeShadowSweep.java` — L1's 457-row harness, which this lane did not
+have to write. These are §10.4's list exactly.
+
+### 9b.4 `invocations` cannot answer precondition 4 on this surface
+
+Precondition 4 is written as *`invocations > 0` in that instrument's own run*,
+and that field is **not readable here**. The registry dump taken from the
+probe's own run reports, for every one of the 13 address rows:
+
+```text
+  invocations: 0    invocations_complete: false
+  slots_with_incomplete_invocations: 45
+```
+
+A zero from a counter that says it did not finish counting is a fact about the
+counter. The evidence used instead is the `--jdk-only-report`'s per-triple
+`outcome`, which comes from the dispatch itself — and it needs
+**`--explain-jdk-only`**, without which every `outcome` is `null` and the whole
+set reads as "nothing dispatched anywhere".
+
+### 9b.5 The class-wide dial is not a verdict on 20 triples
+
+Arming `jdk/internal/misc/Unsafe` whole takes `UnsafeShadowSweep` from **472
+rows and rc=0 to 292 rows and rc=1**, and `d(hs,armed)` from 12 to 192. §10.4
+predicted exactly this. It is a statement about the CLASS, not about these 20
+triples: the same armed run yields **46** distinct triples to bytecode, and the
+26 this wave does not take are what breaks it. Three families, each excluded for
+a reason that does not expire with more probe rows:
+
+  * **every `*Unaligned` row** — they compute a byte offset from the offset they
+    are handed, and this VM hands them a slot index;
+  * **the sub-word atomics** (`compareAndExchange{Byte,Short}`,
+    `compareAndSet{Byte,Short}`, `getAndAdd{Byte,Short}`) — same cause, the JDK
+    masks within an enclosing word at a computed byte offset;
+  * **the four that ARE the numbering** — `objectFieldOffset`,
+    `staticFieldOffset`, `staticFieldBase`, `arrayIndexScale` — plus `getUnsafe`
+    and `ensureClassInitialized`.
+
+`weakCompareAndSetIntPlain` is out and its seven siblings are in. The sweep
+never dispatched it, and a row whose only evidence is that its siblings passed
+is what precondition 4 exists to refuse.
+
+### 9b.6 §10.1 answered: 98 of the 99 ForkJoin keeps cannot be retired at all
+
+§10.1 called `ForkJoinPool`'s external submission "the last thing standing
+between this lane and its largest family" and put 70 rows behind it. §3a
+re-characterised the defect. This closes the item, and the answer turns out not
+to be about the defect at all.
+
+`real_forkjoinpool` is **ON by default**
+(`!present("CRATONVM_SYNTHETIC_FORKJOINPOOL")`), in every mode, so the only
+ForkJoin natives that exist are the ones `keep_real_forkjoinpool_bridge` and
+`keep_real_forkjointask_bridge` name. Both predicates open with
+`self.effective_category() == NativeKind::Bridge` — and the retirement re-tag in
+`register` has already turned a retired triple into a `SyntheticStub` before
+they are consulted. §4a found that mechanism on two `ScheduledThreadPoolExecutor`
+rows. Measured over the keep lists themselves — one registration per triple into
+a fresh registry under each kind, which is what
+`real_layout_bridge_keeps_are_not_retired_shadows` does to the tables:
+
+```text
+  keep-listed ForkJoin triples          99
+  kept as Bridge, DROPPED as stub       98     <- unretirable BY THE TABLE
+  kept as both                           1     ForkJoinPool.execute(FJT)V
+  dropped as both                        0
+```
+
+So 98 of them are not "held pending a fix" — they are **outside what a
+retirement table can express**. Putting one in a table does not make it yield to
+bytecode in `--jdk-only`; it deletes the native in every mode, compatible
+included, which is a behaviour change no retirement is allowed to make.
+
+The one exception is
+`ForkJoinPool.execute(Ljava/util/concurrent/ForkJoinTask;)V`, because the drop
+arm reads `method_name != "execute"`. It is retirable by the table and **should
+not be retired**, for the unrelated reason §9a records: it was registered the
+previous day precisely because, unregistered, it queued into a real `WorkQueue`
+while `join()` read the side table.
+
+**So §10.1 is not a retirement item and never was.** The work is to move the
+pool and task surface off the `fjp_state` side table and delete the keep arms
+with it — one subsystem change, after which there is nothing left to retire
+because there is nothing left registered. Sizing it as "70 rows this lane could
+take" was wrong by construction, and no amount of probing the double would have
+found that out: it is a property of `register`, not of `ForkJoinPool`.
+
+### 9b.7 The second residual wave's acceptance
+
+Two binaries from one revision, `cv-base` at `dev` (`e240573a8`) and `cv-l5s`
+with the table and the probe edit.
+
+```text
+  not inert       cv-base registers all 33 of the triples; cv-l5s registers 0
+                  of them, 9240 -> 9207 strict registrations. The sweep's
+                  bridge_invocations fall 9853 -> 9711: 142 dispatches that
+                  were a native are now the JDK's own bytecode.
+  the workloads   d(base,l5s) = 0 on L5SunMiscUnsafe (57 rows) and 0 on
+                  UnsafeShadowSweep (472 rows). d(hs,*) unchanged at 2 and 12 —
+                  the 2 is the `getUnsafe` member-filter row, the 12 are L1's
+                  adjudicated residuals.
+  probe tree      154 measured, 0 worse, 0 better, 10 moved
+  stub ratchet    stubs +33 in both measured arms; TOTAL FLAT
+```
+
+**The probe tree was run with a CONTROL arm, and that is the only reason the
+result reads as it does.** Three CratonVM runs per probe — base, base again, and
+trial — so "A and B differ" can be read against "A and A differ":
+
+```text
+  probe                     d(hs,A)  d(hs,B)  MOVED(A,B)  NOISE(A,A)
+  FilePathSweep                  60       60          60          60
+  HibfixVarHandleProbe           16       16          16          16
+  SbLayoutBench                  12       12          12          12
+  VhCasProbe                      8        8           8           8
+  RandomBench / ScannerBench      6        6           6           6
+  L4AbsPath                      10       10           8          10
+  FilesSweep                      2        2           2           2
+  SystemRuntimeObjectSweep       12       12           2           2
+```
+
+Every moved row moves by the same amount when the base binary is diffed against
+ITSELF. Without that column these are ten regressions to explain, and a
+plausible story is available for most of them. The first pass of this battery
+had no control and reported `L5FjDouble` as BETTER by 2; the controlled run does
+not list it at all.
+
+**The one WORSE row was `VtHandoffProbe`, 10 -> 14, and it was re-measured
+rather than argued.** Five runs of each binary against the same oracle:
+
+```text
+  run       1     2     3     4     5
+  base     10    10     0    14    14
+  l5s      10    10     0    10    10
+```
+
+**The base binary produces 14 twice on its own, and 0 once.** The probe's range
+is {0, 10, 14} — the trial binary never left 10 except for the same zero — so
+the battery's single WORSE row is this probe's own spread, which §7 already
+prices at 14 lines. Nothing is claimed in either direction.
+
+**The stub ratchet was moved with the PAIRED ratchet, not arithmetic.**
+`CRATONVM_UNRETIRE_NATIVE_SHADOW` set to the 33 triples gives the before-number
+on the very same tree:
+
+```text
+  arm                     stubs before -> after     total before -> after
+  no-management               2728 -> 2761             13622 -> 13622
+  management                  2755 -> 2788             13990 -> 13990
+  synthetic-jdk               2728 -> 2761             13657 -> 13657
+```
+
+Total FLAT and stubs up by exactly the wave — the ratchet's own first case,
+*"existing fakes were relabelled (welcome; re-freeze with the list)"*. The list
+is 33 `@@STUB` lines, added, with none removed.
+
+**Then `dev` moved and it was measured again.** Lane 4's wave 2 landed +137 on
+the same three constants while this one was in flight, so the pair was retaken
+on the merge: `2865 -> 2898`, `2892 -> 2925`, `2865 -> 2898`, totals unchanged.
++33 and flat both times. A delta is a property of the branch only if it survives
+the tree moving under it, which is why lane 4 re-measured theirs too.
+
+**The paired run also found the TOTALS 13 low — a re-occurrence, not a
+discovery.** `MEASURED_TOTAL_REGISTRATIONS_*` is **ungated**: nothing asserts
+it, and its only reader is the stub test's failure message, which uses it to
+classify WHY the stub count moved. Each read 13 below the tree it was measured
+on (13609 vs 13622, 13977 vs 13990, 13644 vs 13657). The constants' own doc
+comment already records the same drift twice — *"REFRESHED 2026-08-24 ... both
+were stale by 13 in BOTH arms ... the same equal-in-both-arms drift this doc
+comment already records twice"* — so this is the fourth time, with the same
+consequence each time: a wave that trusts the constant reads "total UP by 13,
+stubs up by 33" and classifies a clean relabel as *"new fakes were registered —
+the regression this gate exists for"*. Re-frozen to the measured values. It is
+the `STRICT_MIN_TOTAL_REGISTRATIONS` lesson from the other side, and lane 4
+replaced that constant with `STRICT_UNEXPLAINED_DROP_MAX` the same day for the
+same reason: an absolute number nothing enforces is not evidence.
+
 ## 10. What the next wave should do, in order (as written 2026-09-10; see §9a for what happened)
 
 1. **`ForkJoinPool`'s external submission.** §3 localises it to the submitter's
@@ -890,3 +1162,85 @@ r2 AND on r0**, so it reproduces on neither binary.
    `registry::tests::real_layout_bridge_keeps_are_not_retired_shadows` will go
    red the moment someone adds the rows without the other half, which is the
    point of it.
+
+## 11. What is left, after the second residual wave (2026-09-11)
+
+§10 is kept above as written, because three of its five items turned out to be
+mis-sized rather than merely undone and the record of how is worth more than a
+tidy list. This is what a next wave would actually find.
+
+**1. `sun/misc/Unsafe` is finished except for six rows, and none of the six is a
+retirement.** 67 + 13 = 80 of its registrations are retired. What is left:
+
+```text
+  <clinit>()V                     a class initialiser, not a shadow
+  getUnsafe()Lsun/misc/Unsafe;    correct native; the divergence is the
+                                  core-reflection member filter, another lane's
+  ensureClassInitialized, shouldBeInitialized
+                                  declared on 17 and 21, removed on 25 — §9b.1.
+                                  Retirable only from a 17 or 21 run
+  defineClass, acquireFence, releaseFence, compareAndExchangeObject,
+  weakCompareAndExchangeObject    declared by NO supported image — deletions
+```
+
+**2. The deletion worklist is 19 triples / 22 registrations, and it is
+measured.** Registrations whose method is declared by NONE of 17, 21 and 25 —
+four on `sun/misc/Unsafe`, eighteen on `jdk/internal/misc/Unsafe`, mostly the
+`weakCompareAndExchange*` family the JDK renamed to `weakCompareAndSet*`. They
+shadow nothing and no caller on any supported image can name them, which is lane
+0's bucket F. Six source sites hold all 22:
+
+```text
+  unsafe_natives.rs:2150-2151   acquireFence/releaseFence, the `for class in
+                                &[u, u2]` loop -> 4 rows, BOTH classes
+  unsafe_jdk25.rs:270-272       addressSize0 / isBigEndian0 / unalignedAccess0,
+                                registered twice each -> 6 rows
+  unsafe_natives.rs:2203,2223   weakCompareAndExchange{Int,Long}{,Acquire,
+                                Release} -> 6 rows
+  unsafe_natives.rs:2247        weakCompareAndExchangeReference{,Acquire,
+                                Release} and ...Object -> 4 rows
+  unsafe_natives.rs:2250        the `ends_with("Object")` arm, sun/misc only ->
+                                compareAndExchangeObject and
+                                weakCompareAndExchangeObject -> 2 rows
+```
+
+Note the asymmetry that last arm creates: `compareAndExchangeObject` IS declared
+on `jdk/internal/misc/Unsafe` for 17 and 21, and is declared on
+`sun/misc/Unsafe` NOWHERE — so one loop iteration registers a live row and a
+dead one, and only the `sun/misc` half is a deletion.
+
+**Do not derive this list from the kind map.** Five neighbours in the same
+position (`getReferencePlain`, `putReferencePlain`, `monitorEnter`,
+`monitorExit`, `defineAnonymousClass`) were deleted from the source on
+2026-08-29 and `scripts/baselines/jdk-only-kind-map-25-linux.tsv` still carries
+rows for them — it is hand-amended and nothing re-measures it. The 22 above come
+from a `--dump-native-registry` taken from the binary and intersected with the
+three images; the kind map's answer to the same question is 29.
+
+And check the SYNTHETIC-JDK arm before deleting: the fabricated image is a
+fourth image, and "no supported image declares it" is a statement about the
+other three.
+
+**3. `jdk/internal/misc/Unsafe`, per triple, minus the floor.** 68 of its
+methods are `ACC_NATIVE` on the image and stay `Bridge` forever (§1.5). Of the
+rest, 20 are now retired and 26 more were dispatched-and-yielded in the armed
+sweep but belong to the three families §9b.5 names as permanently blocked. The
+remainder needs a dispatch each, and `probes/UnsafeShadowSweep.java` is the
+instrument — widening it is a probe edit, not a build.
+
+**4. `ForkJoinPool` is a subsystem change, not a wave.** §9b.6: 98 of the 99
+keep-listed triples cannot be expressed in a retirement table at all, because
+the keep predicate reads the kind and the re-tag has already changed it. The
+work is to move the pool and task surface off the `fjp_state` side table and
+delete the keep arms with it; there is no intermediate step that retires rows
+one at a time. Whoever takes it should read §3a first — the double is a race
+between two completion models, it is absent from shipped `--jdk-only`, and
+arming the task classes with the pool measured worse.
+
+**5. The two `ScheduledThreadPoolExecutor` rows** — unchanged from §10.5, and
+now visibly one instance of the §9b.6 mechanism rather than a curiosity. They
+need a real-JDK Spring measurement and then the keep arm and the table entry
+deleted together, which is that corpus owner's call rather than this lane's.
+
+**Not this lane's, and open:** the core-reflection member filter,
+`docs/known-issues/jdk-only/core-reflection-has-no-member-filter-20260911.md`.

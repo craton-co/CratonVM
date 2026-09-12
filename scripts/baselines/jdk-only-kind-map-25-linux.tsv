@@ -284,8 +284,36 @@
 #   every one of these triples and the probe stayed byte-identical.
 #
 #   sun/misc/Unsafe.{getUnsafe, ensureClassInitialized, shouldBeInitialized}
-#   are deliberately NOT edited. JDK 25 does not declare them, so nothing can
-#   dispatch them and they are deletions rather than retirements.
+#   are deliberately NOT edited. CORRECTION 2026-09-11 (same day): the reason
+#   given here was "JDK 25 does not declare them, so ... they are deletions
+#   rather than retirements", and that is right about 25 and wrong about the
+#   other two images. `javap -p sun.misc.Unsafe` declares ensureClassInitialized
+#   and shouldBeInitialized, public, on BOTH 17 and 21; only 25 removed them.
+#   They are a version boundary, not a deletion -- deleting them would take the
+#   registration away from two of the three supported images. getUnsafe is
+#   declared on all three and is out for its own reason (the core-reflection
+#   member filter). The rows stay unedited either way; the REASON changes.
+# amended: 2026-09-11, lane 5 SECOND residual wave. THIRTY-THREE rows edited by
+#   hand for thirty-three triples: bridge -> synthetic-stub, kind_stated 0 -> 1.
+#
+#   One row per triple, for once. The 87-for-67 and 21-for-19 gaps above are
+#   triples registered at more than one ordinal; every one of these 33 is
+#   registered at ordinal 0 only, and the count was taken by matching the table
+#   against this file rather than by assuming the ratio held.
+#
+#   13 are sun/misc/Unsafe's ADDRESS-form accessors (getInt(J)I and its
+#   siblings, as against the (Ljava/lang/Object;J) twins retired above) and were
+#   dispatched under CRATONVM_ENFORCE_NATIVE_SHADOW=sun/misc/Unsafe by
+#   apps/probes/L5SunMiscUnsafe.java -- reached 13, yielded 13,
+#   declined_no_bytecode 0, outcome=bytecode-won on each, and the probe
+#   byte-identical armed and unarmed over 57 rows.
+#
+#   20 are jdk/internal/misc/Unsafe's delegating accessors, dispatched by
+#   probes/UnsafeShadowSweep.java. Those were NOT adjudicated by a class-wide
+#   dial arm: arming that class whole takes the sweep from 472 rows to 292, and
+#   the same run is what named the 26 other yielded triples this wave refuses
+#   (every *Unaligned row, the sub-word atomics, and the four that report the
+#   VM's own offset numbering). See RETIRED_SHADOW_L5S_TRIPLES.
 # amended: 2026-09-11, lane L0 wave 2. TWENTY-ONE rows edited by hand for
 #   NINETEEN triples, not re-measured: bridge -> synthetic-stub.
 #
@@ -9758,17 +9786,17 @@ jdk/internal/misc/Unsafe	arrayIndexScale	(Ljava/lang/Class;)I	0	bridge	0	1
 jdk/internal/misc/Unsafe	arrayIndexScale0	(Ljava/lang/Class;)I	0	bridge	1	1
 jdk/internal/misc/Unsafe	compareAndExchangeInt	(Ljava/lang/Object;JII)I	0	bridge	1	1
 jdk/internal/misc/Unsafe	compareAndExchangeInt	(Ljava/lang/Object;JII)I	1	bridge	1	1
-jdk/internal/misc/Unsafe	compareAndExchangeIntAcquire	(Ljava/lang/Object;JII)I	0	bridge	0	1
-jdk/internal/misc/Unsafe	compareAndExchangeIntRelease	(Ljava/lang/Object;JII)I	0	bridge	0	1
+jdk/internal/misc/Unsafe	compareAndExchangeIntAcquire	(Ljava/lang/Object;JII)I	0	synthetic-stub	1	1
+jdk/internal/misc/Unsafe	compareAndExchangeIntRelease	(Ljava/lang/Object;JII)I	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	compareAndExchangeLong	(Ljava/lang/Object;JJJ)J	0	bridge	1	1
 jdk/internal/misc/Unsafe	compareAndExchangeLong	(Ljava/lang/Object;JJJ)J	1	bridge	1	1
-jdk/internal/misc/Unsafe	compareAndExchangeLongAcquire	(Ljava/lang/Object;JJJ)J	0	bridge	0	1
-jdk/internal/misc/Unsafe	compareAndExchangeLongRelease	(Ljava/lang/Object;JJJ)J	0	bridge	0	1
+jdk/internal/misc/Unsafe	compareAndExchangeLongAcquire	(Ljava/lang/Object;JJJ)J	0	synthetic-stub	1	1
+jdk/internal/misc/Unsafe	compareAndExchangeLongRelease	(Ljava/lang/Object;JJJ)J	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	compareAndExchangeObject	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
 jdk/internal/misc/Unsafe	compareAndExchangeReference	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	1	1
 jdk/internal/misc/Unsafe	compareAndExchangeReference	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	1	bridge	1	1
-jdk/internal/misc/Unsafe	compareAndExchangeReferenceAcquire	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
-jdk/internal/misc/Unsafe	compareAndExchangeReferenceRelease	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
+jdk/internal/misc/Unsafe	compareAndExchangeReferenceAcquire	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	0	synthetic-stub	1	1
+jdk/internal/misc/Unsafe	compareAndExchangeReferenceRelease	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	compareAndSetInt	(Ljava/lang/Object;JII)Z	0	bridge	1	1
 jdk/internal/misc/Unsafe	compareAndSetLong	(Ljava/lang/Object;JJJ)Z	0	bridge	1	1
 jdk/internal/misc/Unsafe	compareAndSetReference	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z	0	bridge	1	1
@@ -9828,8 +9856,8 @@ jdk/internal/misc/Unsafe	getFloat	(Ljava/lang/Object;J)F	0	bridge	1	1
 jdk/internal/misc/Unsafe	getFloatVolatile	(Ljava/lang/Object;J)F	0	bridge	1	1
 jdk/internal/misc/Unsafe	getInt	(J)I	0	bridge	0	1
 jdk/internal/misc/Unsafe	getInt	(Ljava/lang/Object;J)I	0	bridge	1	1
-jdk/internal/misc/Unsafe	getIntAcquire	(Ljava/lang/Object;J)I	0	bridge	0	1
-jdk/internal/misc/Unsafe	getIntOpaque	(Ljava/lang/Object;J)I	0	bridge	0	1
+jdk/internal/misc/Unsafe	getIntAcquire	(Ljava/lang/Object;J)I	0	synthetic-stub	1	1
+jdk/internal/misc/Unsafe	getIntOpaque	(Ljava/lang/Object;J)I	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	getIntUnaligned	(Ljava/lang/Object;J)I	0	bridge	0	1
 jdk/internal/misc/Unsafe	getIntUnaligned	(Ljava/lang/Object;J)I	1	bridge	0	1
 jdk/internal/misc/Unsafe	getIntUnaligned	(Ljava/lang/Object;JZ)I	0	bridge	0	1
@@ -9838,7 +9866,7 @@ jdk/internal/misc/Unsafe	getIntVolatile	(Ljava/lang/Object;J)I	0	bridge	1	1
 jdk/internal/misc/Unsafe	getLoadAverage0	([DI)I	0	bridge	1	1
 jdk/internal/misc/Unsafe	getLong	(J)J	0	bridge	0	1
 jdk/internal/misc/Unsafe	getLong	(Ljava/lang/Object;J)J	0	bridge	1	1
-jdk/internal/misc/Unsafe	getLongAcquire	(Ljava/lang/Object;J)J	0	bridge	0	1
+jdk/internal/misc/Unsafe	getLongAcquire	(Ljava/lang/Object;J)J	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	getLongUnaligned	(Ljava/lang/Object;J)J	0	bridge	0	1
 jdk/internal/misc/Unsafe	getLongUnaligned	(Ljava/lang/Object;J)J	1	bridge	0	1
 jdk/internal/misc/Unsafe	getLongUnaligned	(Ljava/lang/Object;JZ)J	0	bridge	0	1
@@ -9846,7 +9874,7 @@ jdk/internal/misc/Unsafe	getLongUnaligned	(Ljava/lang/Object;JZ)J	1	bridge	0	1
 jdk/internal/misc/Unsafe	getLongVolatile	(Ljava/lang/Object;J)J	0	bridge	1	1
 jdk/internal/misc/Unsafe	getReference	(Ljava/lang/Object;J)Ljava/lang/Object;	0	bridge	1	1
 jdk/internal/misc/Unsafe	getReferenceAcquire	(Ljava/lang/Object;J)Ljava/lang/Object;	0	synthetic-stub	1	1
-jdk/internal/misc/Unsafe	getReferenceOpaque	(Ljava/lang/Object;J)Ljava/lang/Object;	0	bridge	0	1
+jdk/internal/misc/Unsafe	getReferenceOpaque	(Ljava/lang/Object;J)Ljava/lang/Object;	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	getReferencePlain	(Ljava/lang/Object;J)Ljava/lang/Object;	0	bridge	0	1
 jdk/internal/misc/Unsafe	getReferenceVolatile	(Ljava/lang/Object;J)Ljava/lang/Object;	0	bridge	1	1
 jdk/internal/misc/Unsafe	getShort	(J)S	0	bridge	0	1
@@ -9896,7 +9924,7 @@ jdk/internal/misc/Unsafe	putFloatVolatile	(Ljava/lang/Object;JF)V	0	bridge	1	1
 jdk/internal/misc/Unsafe	putInt	(JI)V	0	bridge	0	1
 jdk/internal/misc/Unsafe	putInt	(Ljava/lang/Object;JI)V	0	bridge	1	1
 jdk/internal/misc/Unsafe	putIntOpaque	(Ljava/lang/Object;JI)V	0	synthetic-stub	1	1
-jdk/internal/misc/Unsafe	putIntRelease	(Ljava/lang/Object;JI)V	0	bridge	0	1
+jdk/internal/misc/Unsafe	putIntRelease	(Ljava/lang/Object;JI)V	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	putIntUnaligned	(Ljava/lang/Object;JI)V	0	bridge	0	1
 jdk/internal/misc/Unsafe	putIntUnaligned	(Ljava/lang/Object;JI)V	1	bridge	0	1
 jdk/internal/misc/Unsafe	putIntUnaligned	(Ljava/lang/Object;JIZ)V	0	bridge	0	1
@@ -9904,7 +9932,7 @@ jdk/internal/misc/Unsafe	putIntUnaligned	(Ljava/lang/Object;JIZ)V	1	bridge	0	1
 jdk/internal/misc/Unsafe	putIntVolatile	(Ljava/lang/Object;JI)V	0	bridge	1	1
 jdk/internal/misc/Unsafe	putLong	(JJ)V	0	bridge	0	1
 jdk/internal/misc/Unsafe	putLong	(Ljava/lang/Object;JJ)V	0	bridge	1	1
-jdk/internal/misc/Unsafe	putLongRelease	(Ljava/lang/Object;JJ)V	0	bridge	0	1
+jdk/internal/misc/Unsafe	putLongRelease	(Ljava/lang/Object;JJ)V	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	putLongUnaligned	(Ljava/lang/Object;JJ)V	0	bridge	0	1
 jdk/internal/misc/Unsafe	putLongUnaligned	(Ljava/lang/Object;JJ)V	1	bridge	0	1
 jdk/internal/misc/Unsafe	putLongUnaligned	(Ljava/lang/Object;JJZ)V	0	bridge	0	1
@@ -9963,18 +9991,18 @@ jdk/internal/misc/Unsafe	weakCompareAndExchangeReference	(Ljava/lang/Object;JLja
 jdk/internal/misc/Unsafe	weakCompareAndExchangeReferenceAcquire	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
 jdk/internal/misc/Unsafe	weakCompareAndExchangeReferenceRelease	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
 jdk/internal/misc/Unsafe	weakCompareAndSetInt	(Ljava/lang/Object;JII)Z	0	synthetic-stub	1	1
-jdk/internal/misc/Unsafe	weakCompareAndSetIntAcquire	(Ljava/lang/Object;JII)Z	0	bridge	0	1
+jdk/internal/misc/Unsafe	weakCompareAndSetIntAcquire	(Ljava/lang/Object;JII)Z	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	weakCompareAndSetIntPlain	(Ljava/lang/Object;JII)Z	0	synthetic-stub	1	1
-jdk/internal/misc/Unsafe	weakCompareAndSetIntRelease	(Ljava/lang/Object;JII)Z	0	bridge	0	1
+jdk/internal/misc/Unsafe	weakCompareAndSetIntRelease	(Ljava/lang/Object;JII)Z	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	weakCompareAndSetLong	(Ljava/lang/Object;JJJ)Z	0	synthetic-stub	1	1
-jdk/internal/misc/Unsafe	weakCompareAndSetLongAcquire	(Ljava/lang/Object;JJJ)Z	0	bridge	0	1
-jdk/internal/misc/Unsafe	weakCompareAndSetLongPlain	(Ljava/lang/Object;JJJ)Z	0	bridge	0	1
-jdk/internal/misc/Unsafe	weakCompareAndSetLongRelease	(Ljava/lang/Object;JJJ)Z	0	bridge	0	1
+jdk/internal/misc/Unsafe	weakCompareAndSetLongAcquire	(Ljava/lang/Object;JJJ)Z	0	synthetic-stub	1	1
+jdk/internal/misc/Unsafe	weakCompareAndSetLongPlain	(Ljava/lang/Object;JJJ)Z	0	synthetic-stub	1	1
+jdk/internal/misc/Unsafe	weakCompareAndSetLongRelease	(Ljava/lang/Object;JJJ)Z	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	weakCompareAndSetObject	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z	0	bridge	0	1
 jdk/internal/misc/Unsafe	weakCompareAndSetReference	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z	0	synthetic-stub	1	1
-jdk/internal/misc/Unsafe	weakCompareAndSetReferenceAcquire	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z	0	bridge	0	1
-jdk/internal/misc/Unsafe	weakCompareAndSetReferencePlain	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z	0	bridge	0	1
-jdk/internal/misc/Unsafe	weakCompareAndSetReferenceRelease	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z	0	bridge	0	1
+jdk/internal/misc/Unsafe	weakCompareAndSetReferenceAcquire	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z	0	synthetic-stub	1	1
+jdk/internal/misc/Unsafe	weakCompareAndSetReferencePlain	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z	0	synthetic-stub	1	1
+jdk/internal/misc/Unsafe	weakCompareAndSetReferenceRelease	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z	0	synthetic-stub	1	1
 jdk/internal/misc/Unsafe	writeback0	(J)V	0	bridge	1	1
 jdk/internal/misc/Unsafe	writebackPostSync0	()V	0	bridge	1	1
 jdk/internal/misc/Unsafe	writebackPreSync0	()V	0	bridge	1	1
@@ -11211,7 +11239,7 @@ sun/misc/Unsafe	freeMemory	(J)V	3	synthetic-stub	1	1
 sun/misc/Unsafe	freeMemory	(J)V	4	synthetic-stub	1	1
 sun/misc/Unsafe	freeMemory	(J)V	5	synthetic-stub	1	1
 sun/misc/Unsafe	fullFence	()V	0	synthetic-stub	1	1
-sun/misc/Unsafe	getAddress	(J)J	0	bridge	0	1
+sun/misc/Unsafe	getAddress	(J)J	0	synthetic-stub	1	1
 sun/misc/Unsafe	getAndAddInt	(Ljava/lang/Object;JI)I	0	synthetic-stub	1	1
 sun/misc/Unsafe	getAndAddLong	(Ljava/lang/Object;JJ)J	0	synthetic-stub	1	1
 sun/misc/Unsafe	getAndSetInt	(Ljava/lang/Object;JI)I	0	synthetic-stub	1	1
@@ -11222,16 +11250,16 @@ sun/misc/Unsafe	getBooleanVolatile	(Ljava/lang/Object;J)Z	0	synthetic-stub	1	1
 sun/misc/Unsafe	getByte	(J)B	0	synthetic-stub	1	1
 sun/misc/Unsafe	getByte	(Ljava/lang/Object;J)B	0	synthetic-stub	1	1
 sun/misc/Unsafe	getByteVolatile	(Ljava/lang/Object;J)B	0	synthetic-stub	1	1
-sun/misc/Unsafe	getChar	(J)C	0	bridge	0	1
+sun/misc/Unsafe	getChar	(J)C	0	synthetic-stub	1	1
 sun/misc/Unsafe	getChar	(Ljava/lang/Object;J)C	0	synthetic-stub	1	1
 sun/misc/Unsafe	getCharVolatile	(Ljava/lang/Object;J)C	0	synthetic-stub	1	1
-sun/misc/Unsafe	getDouble	(J)D	0	bridge	0	1
+sun/misc/Unsafe	getDouble	(J)D	0	synthetic-stub	1	1
 sun/misc/Unsafe	getDouble	(Ljava/lang/Object;J)D	0	synthetic-stub	1	1
 sun/misc/Unsafe	getDoubleVolatile	(Ljava/lang/Object;J)D	0	synthetic-stub	1	1
-sun/misc/Unsafe	getFloat	(J)F	0	bridge	0	1
+sun/misc/Unsafe	getFloat	(J)F	0	synthetic-stub	1	1
 sun/misc/Unsafe	getFloat	(Ljava/lang/Object;J)F	0	synthetic-stub	1	1
 sun/misc/Unsafe	getFloatVolatile	(Ljava/lang/Object;J)F	0	synthetic-stub	1	1
-sun/misc/Unsafe	getInt	(J)I	0	bridge	0	1
+sun/misc/Unsafe	getInt	(J)I	0	synthetic-stub	1	1
 sun/misc/Unsafe	getInt	(Ljava/lang/Object;J)I	0	synthetic-stub	1	1
 sun/misc/Unsafe	getIntVolatile	(Ljava/lang/Object;J)I	0	synthetic-stub	1	1
 sun/misc/Unsafe	getLoadAverage	([DI)I	0	synthetic-stub	1	1
@@ -11240,7 +11268,7 @@ sun/misc/Unsafe	getLong	(Ljava/lang/Object;J)J	0	synthetic-stub	1	1
 sun/misc/Unsafe	getLongVolatile	(Ljava/lang/Object;J)J	0	synthetic-stub	1	1
 sun/misc/Unsafe	getObject	(Ljava/lang/Object;J)Ljava/lang/Object;	0	synthetic-stub	1	1
 sun/misc/Unsafe	getObjectVolatile	(Ljava/lang/Object;J)Ljava/lang/Object;	0	synthetic-stub	1	1
-sun/misc/Unsafe	getShort	(J)S	0	bridge	0	1
+sun/misc/Unsafe	getShort	(J)S	0	synthetic-stub	1	1
 sun/misc/Unsafe	getShort	(Ljava/lang/Object;J)S	0	synthetic-stub	1	1
 sun/misc/Unsafe	getShortVolatile	(Ljava/lang/Object;J)S	0	synthetic-stub	1	1
 sun/misc/Unsafe	getUnsafe	()Lsun/misc/Unsafe;	0	bridge	0	1
@@ -11248,22 +11276,22 @@ sun/misc/Unsafe	loadFence	()V	0	synthetic-stub	1	1
 sun/misc/Unsafe	objectFieldOffset	(Ljava/lang/reflect/Field;)J	0	synthetic-stub	1	1
 sun/misc/Unsafe	pageSize	()I	0	synthetic-stub	1	1
 sun/misc/Unsafe	park	(ZJ)V	0	synthetic-stub	1	1
-sun/misc/Unsafe	putAddress	(JJ)V	0	bridge	0	1
+sun/misc/Unsafe	putAddress	(JJ)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putBoolean	(Ljava/lang/Object;JZ)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putBooleanVolatile	(Ljava/lang/Object;JZ)V	0	synthetic-stub	1	1
-sun/misc/Unsafe	putByte	(JB)V	0	bridge	0	1
+sun/misc/Unsafe	putByte	(JB)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putByte	(Ljava/lang/Object;JB)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putByteVolatile	(Ljava/lang/Object;JB)V	0	synthetic-stub	1	1
-sun/misc/Unsafe	putChar	(JC)V	0	bridge	0	1
+sun/misc/Unsafe	putChar	(JC)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putChar	(Ljava/lang/Object;JC)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putCharVolatile	(Ljava/lang/Object;JC)V	0	synthetic-stub	1	1
-sun/misc/Unsafe	putDouble	(JD)V	0	bridge	0	1
+sun/misc/Unsafe	putDouble	(JD)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putDouble	(Ljava/lang/Object;JD)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putDoubleVolatile	(Ljava/lang/Object;JD)V	0	synthetic-stub	1	1
-sun/misc/Unsafe	putFloat	(JF)V	0	bridge	0	1
+sun/misc/Unsafe	putFloat	(JF)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putFloat	(Ljava/lang/Object;JF)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putFloatVolatile	(Ljava/lang/Object;JF)V	0	synthetic-stub	1	1
-sun/misc/Unsafe	putInt	(JI)V	0	bridge	0	1
+sun/misc/Unsafe	putInt	(JI)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putInt	(Ljava/lang/Object;JI)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putIntVolatile	(Ljava/lang/Object;JI)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putLong	(JJ)V	0	synthetic-stub	1	1
@@ -11271,7 +11299,7 @@ sun/misc/Unsafe	putLong	(Ljava/lang/Object;JJ)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putLongVolatile	(Ljava/lang/Object;JJ)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putObject	(Ljava/lang/Object;JLjava/lang/Object;)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putObjectVolatile	(Ljava/lang/Object;JLjava/lang/Object;)V	0	synthetic-stub	1	1
-sun/misc/Unsafe	putShort	(JS)V	0	bridge	0	1
+sun/misc/Unsafe	putShort	(JS)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putShort	(Ljava/lang/Object;JS)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putShortVolatile	(Ljava/lang/Object;JS)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	reallocateMemory	(JJ)J	0	synthetic-stub	1	1

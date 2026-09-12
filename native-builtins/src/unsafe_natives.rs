@@ -2183,9 +2183,23 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
     let long_desc = "(Ljava/lang/Object;JJJ)J";
     let ref_desc = "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;";
 
-    // Only the un-suffixed form is ACC_NATIVE on JDK 25 (both images). The
-    // `Acquire`/`Release`/`weak*` spellings are not declared at all — the JDK
-    // lowers those to the plain form in `VarHandle` — so they stay ambient.
+    // Only the un-suffixed form is ACC_NATIVE on JDK 25 (both images).
+    //
+    // CORRECTED 2026-09-11: the rest of this note used to read "the
+    // `Acquire`/`Release`/`weak*` spellings are not declared at all - the JDK
+    // lowers those to the plain form in `VarHandle` - so they stay ambient",
+    // and it is right about ONE of those two groups. `javap -p
+    // jdk.internal.misc.Unsafe` on 17, 21 AND 25:
+    //
+    //   public final int compareAndExchangeIntAcquire(Object, long, int, int);
+    //   public final boolean weakCompareAndSetIntAcquire(Object, long, int, int);
+    //
+    // The `compareAndExchange*{Acquire,Release}` and `weakCompareAndSet*`
+    // spellings ARE declared - ordinary Java methods carrying Code, which is
+    // what makes them retirable §1.4 shadows, and they are retired in
+    // `RETIRED_SHADOW_L5S_TRIPLES`. What is genuinely undeclared on all three
+    // images is the `weakCompareAndExchange*` family below, which is a
+    // DELETION candidate rather than an ambient registration.
     registry.register_with_kind(
         u2,
         "compareAndExchangeInt",
