@@ -47,6 +47,7 @@ pub mod intrinsic;
 pub mod layout_alias;
 pub mod native_id;
 pub mod native_ring;
+pub mod net_wait;
 /// Receiver classes no supported JDK image declares — the measured table that
 /// decides which `Bridge` registrations are `SyntheticStub` by §1.5.
 pub mod no_image_receiver;

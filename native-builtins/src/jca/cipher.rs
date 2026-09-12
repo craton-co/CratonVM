@@ -795,6 +795,34 @@ fn cipher_init_record_with_counter(
             "No installed provider supports this key: (null)",
         ));
     }
+
+    // A key states its own algorithm, and SunJCE's `AESCrypt.setKey` refuses
+    // one that is not AES: `SecretKeySpec(bytes, "Blowfish")` handed to an AES
+    // cipher is a programming error the JDK names exactly. This VM took the
+    // sixteen bytes and encrypted with AES regardless -- the same silent
+    // substitution as the `AesFixed` key-length defect one field over, and
+    // worse, because here the CALLER believes it chose Blowfish.
+    //
+    // Only the AES families are policed, because only their refusal text is
+    // known exactly. The others would need their wording measured first, and
+    // inventing it would trade a measured row for an unmeasured one.
+    //
+    // MEASURED, `L6JcaSweep` row 99.
+    let (this_name, _, _) = parse_transformation(&cipher_algorithm_of(ctx, this));
+    if matches!(
+        cipher_family(&this_name),
+        Some(CipherFamily::Aes | CipherFamily::AesFixed(_))
+    ) {
+        if let Some(named) = key_declared_algorithm(ctx, key) {
+            if !named.eq_ignore_ascii_case("AES") && !named.eq_ignore_ascii_case("Rijndael") {
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/security/InvalidKeyException",
+                    "Wrong algorithm: AES or Rijndael required",
+                ));
+            }
+        }
+    }
     let tkey = obj_key(ctx, this);
     let algo = with_table_read(|t| {
         t.get(&tkey)
@@ -2002,6 +2030,73 @@ fn cipher_iv_parameters(ctx: &mut dyn NativeContext, algo: &str, iv: &[u8]) -> M
     match init {
         Ok(_) => Ok(Some(Value::Object(Some(ap_obj)))),
         Err(_) => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// `Cipher.getInstance` is the one JCA factory whose null contract is NOT a
+/// `NullPointerException`. `Cipher.tokenizeTransformation` treats a null
+/// transformation exactly like `""`, and the caller reports both as
+/// `NoSuchAlgorithmException: Null or empty transformation`. Every other
+/// factory in this crate goes the other way -- `Signature.getInstance(null)`
+/// and `KeyFactory.getInstance(null)` are `NullPointerException: null
+/// algorithm name` -- so the two cannot share one guard, and a uniform null
+/// check here would fix three rows by breaking two others.
+///
+/// MEASURED, `L6JcaSweep` row 68. This VM answered neither contract: the
+/// shared `obj_arg` helper threw `NullPointerException: null object argument`,
+/// which is this VM's own wording for a null reference argument and matches
+/// no JDK message.
+fn cipher_require_transformation(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    if matches!(args.first(), None | Some(Value::Object(None))) {
+        return Err(crate::jca::provider_chain::throw_no_such_algorithm_public(
+            ctx,
+            "Null or empty transformation",
+        ));
+    }
+    Ok(())
+}
+
+/// `Cipher.init(mode, (Key) null)`.
+///
+/// `cipher_init_record_with_counter` has carried the right refusal for this
+/// since the row was first measured -- `InvalidKeyException: No installed
+/// provider supports this key: (null)` -- and it has never once run, because
+/// every `init` overload reaches it through `obj_arg(args, 2)?`, which throws
+/// this VM's own `NullPointerException: null object argument` one line
+/// earlier. A guard behind an earlier throw is not a guard. The deeper check
+/// stays as the backstop for a key that is present but yields no bytes.
+///
+/// MEASURED, `L6JcaSweep` row 108 (and row 124 for the same shape on `Mac`).
+fn cipher_require_key(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    if matches!(args.get(2), None | Some(Value::Object(None))) {
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/security/InvalidKeyException",
+            "No installed provider supports this key: (null)",
+        ));
+    }
+    Ok(())
+}
+
+/// The algorithm a key states for itself, read from the `algorithm` FIELD
+/// rather than through `getAlgorithm()`.
+///
+/// Deliberately not a virtual call: this runs inside `init`, between the
+/// argument checks and the state write, and a re-entry into the VM there can
+/// move both `this` and `key` under the caller. The field is what
+/// `SecretKeySpec` stores and what `AESCrypt.setKey` reads. A key that does
+/// not declare it (a hardware key, a third-party implementation) yields
+/// `None` and is not policed -- which is the conservative direction.
+fn key_declared_algorithm(ctx: &mut dyn NativeContext, key: ObjectRef) -> Option<String> {
+    match ctx.get_field_by_name(key, "algorithm") {
+        Value::Object(Some(s)) => ctx.read_string(s),
+        _ => None,
     }
 }
 
@@ -5003,6 +5098,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/lang/String;)Ljavax/crypto/Cipher;",
         |ctx, args| {
+            cipher_require_transformation(ctx, args)?;
             let algo = obj_arg(args, 0)?;
             let algo_str = ctx.read_string(algo).unwrap_or_default();
             // The anonymous overload resolves aliases too, against the
@@ -5062,6 +5158,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 1,
                 crate::jca::provider_chain::ProviderArgWording::Cipher,
             )?;
+            cipher_require_transformation(ctx, args)?;
             let algo = obj_arg(args, 0)?;
             let algo_str = ctx.read_string(algo).unwrap_or_default();
             crate::jca::provider_chain::check_provider_ownership(
@@ -5080,6 +5177,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/Cipher;",
         |ctx, args| {
+            cipher_require_transformation(ctx, args)?;
             let algo = obj_arg(args, 0)?;
             let algo_str = ctx.read_string(algo).unwrap_or_default();
             crate::jca::provider_chain::check_provider_ownership(
@@ -5097,6 +5195,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
     r.register(cipher, "init", "(ILjava/security/Key;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let mode = args[1].as_int().unwrap_or(0);
+        cipher_require_key(ctx, args)?;
         let key = obj_arg(args, 2)?;
         if cipher_is_delegated(ctx, this) {
             return cipher_delegate_init(
@@ -5128,6 +5227,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let mode = args[1].as_int().unwrap_or(0);
+            cipher_require_key(ctx, args)?;
             let key = obj_arg(args, 2)?;
             let spec = match args.get(3) {
                 Some(Value::Object(Some(spec))) => Some(*spec),
@@ -5175,6 +5275,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let mode = args[1].as_int().unwrap_or(0);
+            cipher_require_key(ctx, args)?;
             let key = obj_arg(args, 2)?;
             let spec = match args.get(3) {
                 Some(Value::Object(Some(spec))) => Some(*spec),
@@ -5233,6 +5334,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let mode = args[1].as_int().unwrap_or(0);
+            cipher_require_key(ctx, args)?;
             let key = obj_arg(args, 2)?;
             let alg_params = match args.get(3) {
                 Some(Value::Object(Some(p))) => Some(*p),
@@ -5260,6 +5362,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let mode = args[1].as_int().unwrap_or(0);
+            cipher_require_key(ctx, args)?;
             let key = obj_arg(args, 2)?;
             let alg_params = match args.get(3) {
                 Some(Value::Object(Some(p))) => Some(*p),
@@ -5366,6 +5469,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let mode = args[1].as_int().unwrap_or(0);
+            cipher_require_key(ctx, args)?;
             let key = obj_arg(args, 2)?;
             if cipher_is_delegated(ctx, this) {
                 return cipher_delegate_init(
