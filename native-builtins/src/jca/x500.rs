@@ -3,67 +3,50 @@
 
 //! WP6.6 — `javax.security.auth.x500.X500Principal` natives.
 //!
-//! ## Probe surface
+//! ## What is here and what is next door
 //!
-//! `apps/sig_probe/SigProbe.java` exercises:
+//! This file is the BINDING: it reads the arguments, keeps the object's state,
+//! and raises what the JDK raises. The DN grammar — parsing, the four output
+//! formats, and the DER — is [`super::x500_name`], and it is a separate module
+//! because a DN is not a keyword and a string. Every defect the 2026-09-11
+//! wave fixed here came from a model that could not hold an attribute value's
+//! ASN.1 STRING TYPE, and 138 of `L6X500Sweep`'s 403 rows differed from
+//! HotSpot 25.0.4+7 because of it.
 //!
-//! ```java
-//! X500Principal dn = new X500Principal("CN=Test, O=Acme, C=SE");
-//! byte[] der = dn.getEncoded();
-//! X500Principal back = new X500Principal(der);
-//! if (!dn.equals(back)) { System.out.println("FAIL DN"); System.exit(1); }
-//! System.out.println("DN OK");
-//! ```
-//!
-//! Two construction paths (string + DER), one accessor (`getEncoded`),
-//! and a structural `equals`.  `getName()` is convenient too — the JDK's
-//! tests print principals through it, and the `WP6.6` follow-up
-//! certificate plumbing dereferences it.
+//! There used to be a second parser in this file. There is not any more: two
+//! parsers in one file agree until the day they do not, and this one had
+//! already drifted — its re-derivation path encoded a `#<hex>` value a second
+//! time, so a principal stopped equalling itself.
 //!
 //! ## Layout
 //!
-//! `X500Principal` instances are allocated by the VM's `new` bytecode from
-//! the *real* JDK 25 class, which declares exactly one instance field —
+//! `X500Principal` instances are allocated by the VM's `new` bytecode from the
+//! *real* JDK 25 class, which declares exactly one instance field —
 //! `transient X500Name thisX500Name` (the three `RFC*` constants are
-//! `static`).  The object therefore has a single slot (index 0).
+//! `static`). The object therefore has a single slot (index 0), and this VM
+//! repurposes it to hold the principal's RFC 2253 name.
 //!
-//! | Slot | Field                       |
-//! |------|-----------------------------|
-//! |  0   | canonical RFC-4514 string  |
+//! | Slot | Field |
+//! |------|-------|
+//! |  0   | the RFC 2253 name string |
 //!
-//! We repurpose that one slot to hold the canonical DN string.  The DER
-//! form is *not* stored as a field — there is nowhere to put it — and is
-//! re-derived on demand by re-encoding the canonical string (the canonical
-//! `Name` encoding is byte-stable, so this round-trips exactly).  Writing a
-//! second slot (the old layout) was an out-of-bounds field write that the
-//! heap guard silently dropped.
-//!
-//! ## DN ↔ DER
-//!
-//! Encoding is the canonical X.500 `Name` from RFC 5280:
-//!
-//! ```text
-//! Name           ::= SEQUENCE OF RDN
-//! RDN            ::= SET SIZE (1..MAX) OF AttributeTypeAndValue
-//! AttributeTypeAndValue ::= SEQUENCE { type OID, value DirectoryString }
-//! ```
-//!
-//! Per RFC 4514 §2.1, RDNs in the string form are emitted in *reverse*
-//! order — the most-specific RDN first.  The encoder reverses the parsed
-//! list before serializing so that `dn.getEncoded()` matches the JDK
-//! byte-for-byte for the probe's input.
-//!
-//! Decoding recognises the OIDs from RFC 4519 (`CN`, `OU`, `O`, `L`, `ST`,
-//! `C`, `STREET`, `DC`) plus PKCS-9 `EMAILADDRESS`.  Unknown OIDs round-
-//! trip as their dotted-decimal text representation, e.g. `1.2.3=value`.
+//! The DER cannot live there — there is no second slot — so it is kept beside
+//! the object in [`x500_der_table`], keyed by identity. That table is the
+//! authority for `getEncoded()` because re-deriving an encoding from the name
+//! loses the string type of any value whose type its text does not imply.
+//! Everything else reads the NAME first: the RFC 2253 form spells such values
+//! as `#<DER hex>`, so parsing it back recovers the type where it matters and
+//! preserves the attribute ORDER inside a multi-valued RDN, which DER's sorted
+//! SET discards.
 
 #![allow(clippy::needless_range_loop)]
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use super::asn1;
+use super::x500_name;
 
 /// The single declared instance slot of `X500Principal` (`thisX500Name`).
 /// We repurpose it to hold the canonical RFC-4514 DN string. The real JDK
@@ -71,356 +54,6 @@ use super::asn1;
 /// built from is kept beside the object instead (see `x500_der_table`) —
 /// re-deriving it from this string loses the ASN.1 string types.
 const FIELD_CANONICAL: usize = 0;
-
-// ---------------------------------------------------------------------------
-// Known attribute OIDs (RFC 4519 + extras)
-// ---------------------------------------------------------------------------
-
-/// Mapping name -> OID (in dotted-decimal).
-fn name_to_oid(name: &str) -> Option<&'static str> {
-    let upper = name.to_ascii_uppercase();
-    match upper.as_str() {
-        "CN" => Some("2.5.4.3"),
-        "OU" => Some("2.5.4.11"),
-        "O" => Some("2.5.4.10"),
-        "L" => Some("2.5.4.7"),
-        "ST" => Some("2.5.4.8"),
-        "C" => Some("2.5.4.6"),
-        "STREET" => Some("2.5.4.9"),
-        "SERIALNUMBER" => Some("2.5.4.5"),
-        "DC" => Some("0.9.2342.19200300.100.1.25"),
-        "UID" => Some("0.9.2342.19200300.100.1.1"),
-        "EMAILADDRESS" => Some("1.2.840.113549.1.9.1"),
-        "T" => Some("2.5.4.12"),
-        "TITLE" => Some("2.5.4.12"),
-        "GIVENNAME" => Some("2.5.4.42"),
-        "INITIALS" => Some("2.5.4.43"),
-        "GENERATION" => Some("2.5.4.44"),
-        "SURNAME" => Some("2.5.4.4"),
-        _ => None,
-    }
-}
-
-/// Mapping OID -> short name for canonical rendering.
-fn oid_to_name(oid: &str) -> Option<&'static str> {
-    match oid {
-        "2.5.4.3" => Some("CN"),
-        "2.5.4.11" => Some("OU"),
-        "2.5.4.10" => Some("O"),
-        "2.5.4.7" => Some("L"),
-        "2.5.4.8" => Some("ST"),
-        "2.5.4.6" => Some("C"),
-        "2.5.4.9" => Some("STREET"),
-        "2.5.4.5" => Some("SERIALNUMBER"),
-        "0.9.2342.19200300.100.1.25" => Some("DC"),
-        "0.9.2342.19200300.100.1.1" => Some("UID"),
-        "1.2.840.113549.1.9.1" => Some("EMAILADDRESS"),
-        "2.5.4.12" => Some("T"),
-        "2.5.4.42" => Some("GIVENNAME"),
-        "2.5.4.43" => Some("INITIALS"),
-        "2.5.4.44" => Some("GENERATION"),
-        "2.5.4.4" => Some("SURNAME"),
-        _ => None,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Encoding: RFC 4514 string -> DER
-// ---------------------------------------------------------------------------
-
-/// Tokenise a DN string into `(name, value)` pairs in *input order*.
-///
-/// Splitting on commas is delicate because RFC 4514 escapes `,` with
-/// backslash inside values.  We do a one-pass walker tracking escapes.
-fn parse_dn_string(s: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            // Take the next char literally (could be `,`, `=`, `+`, …).
-            if let Some(n) = chars.next() {
-                cur.push(n);
-            }
-        } else if c == ',' {
-            push_rdn(&mut out, std::mem::take(&mut cur));
-        } else {
-            cur.push(c);
-        }
-    }
-    if !cur.trim().is_empty() {
-        push_rdn(&mut out, cur);
-    }
-    out
-}
-
-fn push_rdn(out: &mut Vec<(String, String)>, raw: String) {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return;
-    }
-    if let Some(eq) = trimmed.find('=') {
-        let (k, v) = trimmed.split_at(eq);
-        let key = k.trim().to_string();
-        let val = v[1..].trim().to_string();
-        out.push((key, val));
-    }
-}
-
-/// Split a DN component at unescaped separators while retaining the escapes
-/// for the attribute-value parser.
-fn split_unescaped(raw: &str, separator: char) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut escaped = false;
-    for ch in raw.chars() {
-        if escaped {
-            current.push('\\');
-            current.push(ch);
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if ch == separator {
-            out.push(std::mem::take(&mut current));
-        } else {
-            current.push(ch);
-        }
-    }
-    if escaped {
-        current.push('\\');
-    }
-    out.push(current);
-    out
-}
-
-fn parse_attribute(raw: &str) -> Option<(String, String)> {
-    let trimmed = raw.trim();
-    let mut escaped = false;
-    let mut eq = None;
-    for (idx, ch) in trimmed.char_indices() {
-        if escaped {
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if ch == '=' {
-            eq = Some(idx);
-            break;
-        }
-    }
-    let eq = eq?;
-    let key = trimmed[..eq].trim().to_string();
-    let mut value = String::new();
-    let mut chars = trimmed[eq + 1..].trim().chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            if let Some(next) = chars.next() {
-                value.push(next);
-            }
-        } else {
-            value.push(ch);
-        }
-    }
-    Some((key, value))
-}
-
-/// Parse an RFC-4514 DN preserving the attributes that share one `+` RDN.
-///
-/// `X500Principal.getName()` renders a multi-valued RDN as
-/// `OU=Keycloak+CN=899700252580`. Treating that as a single `OU` value loses
-/// the CN when `getEncoded()` re-derives the principal's DER.
-fn parse_grouped_rdns(s: &str) -> Vec<Vec<(String, String)>> {
-    split_unescaped(s, ',')
-        .into_iter()
-        .filter_map(|rdn| {
-            let attrs = split_unescaped(&rdn, '+')
-                .into_iter()
-                .filter_map(|attr| parse_attribute(&attr))
-                .collect::<Vec<_>>();
-            (!attrs.is_empty()).then_some(attrs)
-        })
-        .collect()
-}
-
-fn grouped_render_rdns(groups: &[Vec<(String, String)>]) -> Vec<(String, String)> {
-    groups
-        .iter()
-        .filter_map(|group| match group.as_slice() {
-            [] => None,
-            [attribute] => Some(attribute.clone()),
-            _ => Some((
-                String::new(),
-                group
-                    .iter()
-                    .map(|(key, value)| {
-                        format!("{}={}", key.to_ascii_uppercase(), escape_value(value))
-                    })
-                    .collect::<Vec<_>>()
-                    .join("+"),
-            )),
-        })
-        .collect()
-}
-
-/// Encode a DN (parsed RDN list, in RFC-4514 string order) to DER.
-///
-/// The JDK emits the X.500 `Name` SEQUENCE in *most-specific-last* order —
-/// the opposite of the RFC 4514 string order — so we reverse before
-/// emitting.
-pub fn encode_rdns_to_der(rdns: &[(String, String)]) -> Vec<u8> {
-    let groups = rdns
-        .iter()
-        .cloned()
-        .map(|attribute| vec![attribute])
-        .collect::<Vec<_>>();
-    encode_grouped_rdns_to_der(&groups)
-}
-
-fn encode_grouped_rdns_to_der(groups: &[Vec<(String, String)>]) -> Vec<u8> {
-    // Pre-allocate the SEQUENCE OF RDN content.
-    let mut seq_inner = Vec::new();
-    for group in groups.iter().rev() {
-        let mut attrs = Vec::new();
-        for (key, value) in group {
-            // OID lookup with a synthetic dotted fallback to keep encoding
-            // total — unknown attribute names are dotted-decimal already.
-            let oid = name_to_oid(key).unwrap_or(key.as_str());
-            let oid_der = asn1::encode_oid(oid).unwrap_or_else(|_| {
-                // Last-ditch: encode the literal name as a UTF8String OID
-                // placeholder. The decoder's symmetric fallback round-trips
-                // this via the dotted-decimal name, so equality survives.
-                asn1::encode_tlv(asn1::TAG_UTF8_STRING, key.as_bytes())
-            });
-            let val_der = asn1::encode_directory_string(value);
-            let mut inner = Vec::new();
-            inner.extend_from_slice(&oid_der);
-            inner.extend_from_slice(&val_der);
-            attrs.push(asn1::encode_sequence(&inner));
-        }
-        // DER SET elements are ordered lexicographically by their complete
-        // encodings; this also makes equivalent multi-valued RDNs stable.
-        attrs.sort();
-        let rdn_inner = attrs.into_iter().flatten().collect::<Vec<_>>();
-        seq_inner.extend_from_slice(&asn1::encode_set(&rdn_inner));
-    }
-    asn1::encode_sequence(&seq_inner)
-}
-
-// ---------------------------------------------------------------------------
-// Decoding: DER -> canonical RFC 4514 string
-// ---------------------------------------------------------------------------
-
-/// Decode an X.500 Name DER blob into a list of `(name, value)` pairs in
-/// RFC 4514 *string* order (most-specific first).
-pub fn decode_rdns(der: &[u8]) -> Result<Vec<(String, String)>, asn1::DerError> {
-    let (tag, hdr, content_len, _) = asn1::read_header(der)?;
-    if tag != asn1::TAG_SEQUENCE {
-        return Err(asn1::DerError::BadTag);
-    }
-    let content = &der[hdr..hdr + content_len];
-    let mut rdns = Vec::new();
-    let mut pos = 0;
-    while pos < content.len() {
-        let (rdn_tag, rdn_hdr, rdn_clen, rdn_total) = asn1::read_header(&content[pos..])?;
-        if rdn_tag != asn1::TAG_SET {
-            return Err(asn1::DerError::BadTag);
-        }
-        let rdn_content = &content[pos + rdn_hdr..pos + rdn_hdr + rdn_clen];
-        // The probe builds single-attribute RDNs; the JDK's encoding for
-        // multi-valued RDNs joins with `+` per RFC 4514 §2.2, but we don't
-        // need that here.
-        let mut attrs = Vec::new();
-        let mut ap = 0;
-        while ap < rdn_content.len() {
-            let (atag, ahdr, aclen, atot) = asn1::read_header(&rdn_content[ap..])?;
-            if atag != asn1::TAG_SEQUENCE {
-                return Err(asn1::DerError::BadTag);
-            }
-            let acontent = &rdn_content[ap + ahdr..ap + ahdr + aclen];
-            // OID
-            let (otag, ohdr, oclen, ototal) = asn1::read_header(acontent)?;
-            if otag != asn1::TAG_OID {
-                return Err(asn1::DerError::BadTag);
-            }
-            let oid = asn1::read_oid(&acontent[ohdr..ohdr + oclen])?;
-            // DirectoryString
-            let after_oid = &acontent[ototal..];
-            let (vtag, vhdr, vclen, _) = asn1::read_header(after_oid)?;
-            let val = asn1::read_directory_string(vtag, &after_oid[vhdr..vhdr + vclen])
-                .ok_or(asn1::DerError::BadTag)?;
-            attrs.push((oid, val));
-            ap += atot;
-        }
-        // Single-valued RDN → one (name, value) entry. Multi-valued RDN (a SET
-        // with >1 AttributeTypeAndValue — real X.509 certs use these, e.g. a
-        // subject of surname+givenName+CN) is rendered RFC 4514 §2.2 with the
-        // attributes joined by `+`, stored as a single pre-rendered entry with
-        // an empty key. Dropping all but the first attribute (the old behaviour)
-        // lost the CN, so keycloak's `new X500Name(getName()).getRDNs(CN)`
-        // returned null.
-        if attrs.len() == 1 {
-            let (oid, val) = attrs.into_iter().next().unwrap();
-            let name = oid_to_name(&oid).map(|s| s.to_string()).unwrap_or(oid);
-            rdns.push((name, val));
-        } else if !attrs.is_empty() {
-            let joined = attrs
-                .iter()
-                .map(|(oid, val)| {
-                    let name = oid_to_name(oid)
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| oid.clone());
-                    format!("{}={}", name.to_ascii_uppercase(), escape_value(val))
-                })
-                .collect::<Vec<_>>()
-                .join("+");
-            rdns.push((String::new(), joined));
-        }
-        pos += rdn_total;
-    }
-    // The DER stores RDNs in most-specific-last order; the RFC 4514
-    // string form puts them most-specific-first.
-    rdns.reverse();
-    Ok(rdns)
-}
-
-/// Render an RDN list in canonical RFC 4514 / RFC 2253 form: `CN=Name,O=Org,C=US`.
-///
-/// RFC 4514 §2.1 / RFC 2253 separate RDNs with a bare COMMA — **no space**.
-/// That is exactly what `X500Principal.getName()` (default RFC2253) returns on
-/// HotSpot. The previous `", "` join produced a space, which then broke BC's
-/// `new X500Name(principal.getName())` re-parse: the space-prefixed `" CN"`
-/// attribute didn't match `getRDNs(BCStyle.CN)`, so keycloak's
-/// `X500NameRDNExtractor` returned null for the cert's Common Name.
-pub fn render_canonical(rdns: &[(String, String)]) -> String {
-    rdns.iter()
-        .map(|(k, v)| {
-            if k.is_empty() {
-                // Pre-rendered multi-valued RDN (already `a=b+c=d`, escaped).
-                v.clone()
-            } else {
-                format!("{}={}", k.to_ascii_uppercase(), escape_value(v))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn escape_value(v: &str) -> String {
-    // RFC 4514 §2.4 — escape `,` `+` `"` `\` `<` `>` `;`, leading `#` and
-    // leading/trailing space.  The probe values don't need it but we
-    // handle it for correctness.
-    let mut out = String::with_capacity(v.len());
-    let bytes: Vec<char> = v.chars().collect();
-    for (i, c) in bytes.iter().enumerate() {
-        let needs_escape = matches!(*c, ',' | '+' | '"' | '\\' | '<' | '>' | ';')
-            || (i == 0 && (*c == '#' || *c == ' '))
-            || (i + 1 == bytes.len() && *c == ' ');
-        if needs_escape {
-            out.push('\\');
-        }
-        out.push(*c);
-    }
-    out
-}
 
 // ---------------------------------------------------------------------------
 // Native bindings
@@ -479,26 +112,173 @@ fn populate(ctx: &mut dyn NativeContext, this: ObjectRef, canonical: &str, der: 
     ctx.set_field(this, FIELD_CANONICAL, Value::Object(Some(s)));
 }
 
-/// Populate from a string DN.
-fn init_from_string(ctx: &mut dyn NativeContext, this: ObjectRef, dn: &str) {
-    let groups = parse_grouped_rdns(dn);
-    let der = encode_grouped_rdns_to_der(&groups);
-    let canon = render_canonical(&grouped_render_rdns(&groups));
-    populate(ctx, this, &canon, &der);
+/// Populate from a string DN, or raise the way the JDK raises.
+///
+/// The JDK's parser VALIDATES. `L6X500Sweep` asked it nineteen malformed
+/// names — `CN`, `=Alice`, `CN=Alice,,O=x`, `CN=#0402`, `NoSuchKeyword=x`,
+/// `1..2=x`, `CN="unterminated`, … — and every one raised
+/// `IllegalArgumentException("improperly specified input name: <dn>")`. This
+/// VM built a principal from all nineteen, usually an EMPTY one, which is the
+/// dangerous answer: an empty DN equals no certificate subject, so an access
+/// check against it fails closed-looking and silently.
+fn init_from_string(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    dn: &str,
+    keywords: Option<&std::collections::HashMap<String, String>>,
+) -> Result<(), MethodCallFailed> {
+    let Ok(rdns) = x500_name::parse_dn(dn, keywords) else {
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/lang/IllegalArgumentException",
+            &format!("improperly specified input name: {dn}"),
+        ));
+    };
+    let der = x500_name::encode_der(&rdns);
+    let name = x500_name::render(&rdns, x500_name::Format::Rfc2253);
+    populate(ctx, this, &name, &der);
+    Ok(())
 }
 
-/// Populate from a DER byte array.  On parse failure we still populate
-/// so equality has *something* to compare; the canonical form falls back
-/// to the printable hex of the input.
-fn init_from_der(ctx: &mut dyn NativeContext, this: ObjectRef, der: &[u8]) {
-    match decode_rdns(der) {
-        Ok(rdns) => {
-            let canon = render_canonical(&rdns);
-            populate(ctx, this, &canon, der);
+/// Populate from a DER byte array. A DER that does not decode is
+/// `IllegalArgumentException("improperly specified input name")` — with no
+/// `: <dn>` suffix, there being no name to name.
+fn init_from_der(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    der: &[u8],
+) -> Result<(), MethodCallFailed> {
+    // ZERO bytes is an empty name, not a malformed one. Measured: `new
+    // X500Principal(new byte[0]).getName()` is `""` on HotSpot while
+    // `new byte[]{1,2,3,4}` raises — so the encoding is not being validated
+    // into existence, it is being read, and there is nothing to read.
+    if der.is_empty() {
+        populate(ctx, this, "", der);
+        return Ok(());
+    }
+    let Ok(rdns) = x500_name::decode_der(der) else {
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/lang/IllegalArgumentException",
+            "improperly specified input name",
+        ));
+    };
+    let name = x500_name::render(&rdns, x500_name::Format::Rfc2253);
+    populate(ctx, this, &name, der);
+    Ok(())
+}
+
+/// The parsed DN of a principal.
+///
+/// The DER is authoritative because it carries each value's ASN.1 string type
+/// and the stored name string does not: `CN=\41lice` and `CN=Alice` render
+/// identically and encode differently. The string is the fallback for a
+/// principal whose side-table row has been evicted.
+fn rdns_of(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<x500_name::Rdn> {
+    // The STORED NAME first, and the DER only as the fallback.
+    //
+    // That looks backwards — the DER carries the ASN.1 types and the string
+    // does not — but the string is the RFC 2253 form, which spells any value
+    // its grammar cannot express as `#<DER hex>`; parsing it back recovers the
+    // type for exactly the values whose type is not implied by their text.
+    //
+    // What the DER cannot recover is ORDER INSIDE a multi-valued RDN. An RDN
+    // is a SET and DER sorts a SET by encoding, so `CN=Alice+OU=Eng` comes
+    // back as `OU=Eng+CN=Alice` — measured, and wrong: HotSpot prints the
+    // attributes in the order the name was written and sorts only when it
+    // encodes.
+    if let Some(text) = get_canonical(ctx, this) {
+        if let Ok(rdns) = x500_name::parse_dn(&text, None) {
+            if !rdns.is_empty() {
+                return rdns;
+            }
         }
-        Err(_) => {
-            populate(ctx, this, "", der);
+    }
+    let der = get_der(ctx, this);
+    if !der.is_empty() {
+        if let Ok(rdns) = x500_name::decode_der(&der) {
+            return rdns;
         }
+    }
+    Vec::new()
+}
+
+/// Read a `java.util.Map<String,String>` argument into a Rust map.
+///
+/// Both of `X500Principal`'s maps are String->String, and they run in OPPOSITE
+/// directions: the constructor's is keyword->OID (so a caller can name an
+/// attribute the JDK's table lacks) and `getName`'s is OID->keyword (so a
+/// caller can spell one it would otherwise print as a dotted OID). Reading is
+/// the same; who calls it decides which way round it is read.
+fn read_string_map(
+    ctx: &mut dyn NativeContext,
+    map: ObjectRef,
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    // Every call below is real Java and therefore a GC point, and the
+    // iterator, the entry set and the map itself are all live across the
+    // loop — so each one is read back through its pin after every call
+    // rather than carried as the address it had when we got it.
+    let map_pin = ctx.pin_native_root(map);
+    let map = ctx.read_native_pin(map_pin, map);
+    let set = match ctx.invoke_virtual(map, "entrySet", "()Ljava/util/Set;", &[]) {
+        Ok(Some(Value::Object(Some(set)))) => set,
+        _ => {
+            ctx.unpin_native_roots(map_pin);
+            return out;
+        }
+    };
+    let set_pin = ctx.pin_native_root(set);
+    let set = ctx.read_native_pin(set_pin, set);
+    let it = match ctx.invoke_virtual(set, "iterator", "()Ljava/util/Iterator;", &[]) {
+        Ok(Some(Value::Object(Some(it)))) => it,
+        _ => {
+            ctx.unpin_native_roots(map_pin);
+            return out;
+        }
+    };
+    let it_pin = ctx.pin_native_root(it);
+    loop {
+        let it_now = ctx.read_native_pin(it_pin, it);
+        match ctx.invoke_virtual(it_now, "hasNext", "()Z", &[]) {
+            Ok(Some(Value::Int(1))) => {}
+            _ => break,
+        }
+        let it_now = ctx.read_native_pin(it_pin, it);
+        let entry = match ctx.invoke_virtual(it_now, "next", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(entry)))) => entry,
+            _ => break,
+        };
+        let entry_pin = ctx.pin_native_root(entry);
+        let entry_now = ctx.read_native_pin(entry_pin, entry);
+        let key = match ctx.invoke_virtual(entry_now, "getKey", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(k)))) => ctx.read_string(k),
+            _ => None,
+        };
+        let entry_now = ctx.read_native_pin(entry_pin, entry);
+        let value = match ctx.invoke_virtual(entry_now, "getValue", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(v)))) => ctx.read_string(v),
+            _ => None,
+        };
+        ctx.unpin_native_roots(entry_pin);
+        if let (Some(k), Some(v)) = (key, value) {
+            out.insert(k.to_ascii_uppercase(), v);
+        }
+    }
+    ctx.unpin_native_roots(map_pin);
+    out
+}
+
+/// Map a `getName(String)` format argument onto a renderer.
+fn format_of(name: &str) -> Option<x500_name::Format> {
+    if name.eq_ignore_ascii_case("RFC2253") {
+        Some(x500_name::Format::Rfc2253)
+    } else if name.eq_ignore_ascii_case("RFC1779") {
+        Some(x500_name::Format::Rfc1779)
+    } else if name.eq_ignore_ascii_case("CANONICAL") {
+        Some(x500_name::Format::Canonical)
+    } else {
+        None
     }
 }
 
@@ -607,8 +387,14 @@ fn recall_der(ctx: &mut dyn NativeContext, this: ObjectRef, canonical: &str) -> 
         };
         t.get(&id).cloned()?
     };
-    let rdns = decode_rdns(&der).ok()?;
-    if render_canonical(&rdns) == canonical {
+    // The stored name is the RFC 2253 form, so the check has to render the
+    // decoded DER the same way — comparing against a CANONICAL rendering would
+    // reject every entry, since the two differ in case for every DN that has a
+    // letter in it. (The old helper this replaces was named `render_canonical`
+    // and produced the RFC 2253 form, which is how the mismatch stayed
+    // invisible.)
+    let rdns = x500_name::decode_der(&der).ok()?;
+    if x500_name::render(&rdns, x500_name::Format::Rfc2253) == canonical {
         Some(der)
     } else {
         None
@@ -627,145 +413,21 @@ fn get_der(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<u8> {
         if let Some(der) = recall_der(ctx, this, &canon) {
             return der;
         }
-        let groups = parse_grouped_rdns(&canon);
-        if !groups.is_empty() {
-            return encode_grouped_rdns_to_der(&groups);
+        // Re-derive through the same grammar the constructors use. The old
+        // `parse_grouped_rdns` + `encode_grouped_rdns_to_der` pair could not
+        // read the `#<hex>` value form, so re-deriving the encoding of
+        // `1.3.6.1.4.1.99999.1=#130178` produced a UTF8String whose CONTENT was
+        // the seven characters `#130178` — the value encoded twice, and a
+        // principal that no longer equalled itself.
+        if let Ok(rdns) = x500_name::parse_dn(&canon, None) {
+            if !rdns.is_empty() {
+                return x500_name::encode_der(&rdns);
+            }
         }
     }
     Vec::new()
 }
 
-// ---------------------------------------------------------------------------
-// The three JDK string forms
-// ---------------------------------------------------------------------------
-//
-// `X500Principal` has three of them and they are NOT interchangeable:
-//
-// | form      | keywords            | case      | whitespace           |
-// |-----------|---------------------|-----------|----------------------|
-// | RFC2253   | RFC 2253 set        | as-parsed | as-parsed            |
-// | RFC1779   | RFC 1779 set + OID. | as-parsed | as-parsed, quoted    |
-// | CANONICAL | RFC 2253 set, lower | LOWERCASE | trimmed + collapsed  |
-//
-// Every one of them used to answer the RFC2253 string, and `equals` compared
-// THAT — so two DNs that differ only in attribute-name case or in runs of
-// spaces compared UNEQUAL here and EQUAL on HotSpot. That is not cosmetic:
-// PKIX name chaining is defined on the canonical form, so bc-java's PKITS
-// vectors 4.3.3/4.3.4/4.3.5/4.3.11 (whitespace, case and UTF8 name chaining)
-// could not match a CRL to its issuer — `No CRLs found for issuer ...` — and
-// `AttrCertTest` reported `principal[0] for entity names don't match`.
-//
-// `hashCode` is the canonical form's `String.hashCode()`, which is what makes
-// it consistent with the new `equals` (the JDK's own `X500Name.hashCode()` is
-// defined that way, and the two agree value-for-value on every DN in
-// `probes/`).
-
-/// The attribute types RFC 2253 gives a keyword; everything else is written as
-/// its dotted OID in the 2253 and canonical forms.
-fn rfc2253_keyword(oid: &str) -> Option<&'static str> {
-    match oid {
-        "2.5.4.3" => Some("CN"),
-        "2.5.4.7" => Some("L"),
-        "2.5.4.8" => Some("ST"),
-        "2.5.4.10" => Some("O"),
-        "2.5.4.11" => Some("OU"),
-        "2.5.4.6" => Some("C"),
-        "2.5.4.9" => Some("STREET"),
-        "0.9.2342.19200300.100.1.25" => Some("DC"),
-        "0.9.2342.19200300.100.1.1" => Some("UID"),
-        _ => None,
-    }
-}
-
-/// The narrower RFC 1779 keyword set. Anything outside it is spelled
-/// `OID.<dotted>` — measured on HotSpot 25, where `DC=example` renders as
-/// `OID.0.9.2342.19200300.100.1.25=example`.
-fn rfc1779_keyword(oid: &str) -> Option<&'static str> {
-    match oid {
-        "2.5.4.3" => Some("CN"),
-        "2.5.4.7" => Some("L"),
-        "2.5.4.8" => Some("ST"),
-        "2.5.4.10" => Some("O"),
-        "2.5.4.11" => Some("OU"),
-        "2.5.4.6" => Some("C"),
-        "2.5.4.9" => Some("STREET"),
-        _ => None,
-    }
-}
-
-/// Resolve whatever the stored string used as an attribute name (a keyword or
-/// an already-dotted OID) to its dotted OID.
-fn key_to_oid(key: &str) -> String {
-    name_to_oid(key)
-        .map(str::to_string)
-        .unwrap_or_else(|| key.to_string())
-}
-
-/// One AVA in canonical form: lowercase type, escaped + trimmed +
-/// space-collapsed + lowercased value.
-fn canonical_ava(key: &str, value: &str) -> String {
-    let oid = key_to_oid(key);
-    let ty = match rfc2253_keyword(&oid) {
-        Some(k) => k.to_ascii_lowercase(),
-        None => oid.clone(),
-    };
-    // Escapes first, so an escaped separator is not mistaken for one later.
-    // `#` is escaped only in leading position (measured: HotSpot's canonical
-    // for `CN=with#hash` is `cn=with#hash`, unescaped).
-    let mut escaped = String::with_capacity(value.len());
-    for (i, c) in value.chars().enumerate() {
-        match c {
-            ',' | '+' | '"' | '\\' | '<' | '>' | ';' => {
-                escaped.push('\\');
-                escaped.push(c);
-            }
-            '#' if i == 0 => {
-                escaped.push('\\');
-                escaped.push('#');
-            }
-            _ => escaped.push(c),
-        }
-    }
-    // Then trim, collapse runs of SPACE (only U+0020 — HotSpot leaves a TAB
-    // alone: `CN=Tab<TAB>Inside` canonicalises with the tab intact), lowercase.
-    let mut out = String::with_capacity(escaped.len());
-    let mut pending_space = false;
-    for c in escaped.trim().chars() {
-        if c == ' ' {
-            pending_space = true;
-            continue;
-        }
-        if pending_space {
-            out.push(' ');
-            pending_space = false;
-        }
-        out.push(c);
-    }
-    format!("{ty}={}", out.to_lowercase())
-}
-
-/// The RFC 2253 CANONICAL form of a whole DN.
-///
-/// A multi-valued RDN's AVAs are SORTED by their rendered strings, which is
-/// what makes `CN=a+OU=b+O=c` and `O=c+CN=a+OU=b` the same name (HotSpot:
-/// `cn=a+o=c+ou=b`). RDN order itself is significant and preserved.
-fn canonical_form(groups: &[Vec<(String, String)>]) -> String {
-    groups
-        .iter()
-        .map(|group| {
-            let mut avas: Vec<String> = group.iter().map(|(k, v)| canonical_ava(k, v)).collect();
-            avas.sort();
-            avas.join("+")
-        })
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// `java.lang.String.hashCode()` over the UTF-16 code units of `s`.
-///
-/// Must be the JAVA hash, not a Rust one: `X500Principal.hashCode()` is
-/// `getName(CANONICAL).hashCode()` on the JDK, and code that keys a `HashMap`
-/// on principals depends on the exact value.
 fn java_string_hash(s: &str) -> i32 {
     let mut h: i32 = 0;
     for u in s.encode_utf16() {
@@ -776,83 +438,6 @@ fn java_string_hash(s: &str) -> i32 {
 
 /// One AVA rendered with `keyword`'s type map, quoting the value when RFC 1779
 /// requires it. Shared by the RFC 1779 form and by `toString`, which differ ONLY
-/// in which types get a keyword.
-fn quoted_ava(key: &str, value: &str, keyword: fn(&str) -> Option<&'static str>) -> String {
-    let oid = key_to_oid(key);
-    let ty = match keyword(&oid) {
-        Some(k) => k.to_string(),
-        None => format!("OID.{oid}"),
-    };
-    // Quote when the value has a leading or trailing space, a run of two or
-    // more spaces, or any character RFC 1779 lists as special.
-    let chars: Vec<char> = value.chars().collect();
-    let mut quote = chars.first() == Some(&' ') || chars.last() == Some(&' ');
-    let mut prev_space = false;
-    for &c in &chars {
-        if matches!(c, ',' | '+' | '=' | '"' | '<' | '>' | '#' | ';' | '\n') {
-            quote = true;
-        }
-        if c == ' ' && prev_space {
-            quote = true;
-        }
-        prev_space = c == ' ';
-    }
-    if !quote {
-        return format!("{ty}={value}");
-    }
-    let mut inner = String::with_capacity(value.len() + 2);
-    for c in &chars {
-        if *c == '"' || *c == '\\' {
-            inner.push('\\');
-        }
-        inner.push(*c);
-    }
-    format!("{ty}=\"{inner}\"")
-}
-
-/// A whole DN in one of the two `", "`-separated forms — RDNs separated by
-/// `", "`, AVAs inside one RDN by `" + "`.
-fn quoted_form(
-    groups: &[Vec<(String, String)>],
-    keyword: fn(&str) -> Option<&'static str>,
-) -> String {
-    groups
-        .iter()
-        .map(|group| {
-            group
-                .iter()
-                .map(|(k, v)| quoted_ava(k, v, keyword))
-                .collect::<Vec<_>>()
-                .join(" + ")
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// The RFC 1779 form: only the seven RFC 1779 keywords, everything else
-/// `OID.<dotted>`.
-fn rfc1779_form(groups: &[Vec<(String, String)>]) -> String {
-    quoted_form(groups, rfc1779_keyword)
-}
-
-/// What `X500Principal.toString()` prints. Same layout and quoting as RFC 1779
-/// but the FULL keyword map — measured on HotSpot 25, `EMAILADDRESS=a@b.com`
-/// where `getName(RFC1779)` writes `OID.1.2.840.113549.1.9.1=a@b.com`, and the
-/// same for `T`/`GIVENNAME`/`SURNAME`/`UID`/`DC`/`SERIALNUMBER`. bc-java's
-/// `AttrCertTest` compares this string literally, including the
-/// `EMAILADDRESS=mlorch@vt.edu` tail.
-fn to_string_form(groups: &[Vec<(String, String)>]) -> String {
-    quoted_form(groups, |oid| oid_to_name(oid))
-}
-
-/// The stored RFC 2253 string of `this`, re-parsed into RDN groups.
-fn grouped_of(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Vec<(String, String)>> {
-    match get_canonical(ctx, this) {
-        Some(text) => parse_grouped_rdns(&text),
-        None => Vec::new(),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
@@ -873,14 +458,23 @@ pub fn register(r: &mut NativeMethodRegistry) {
                 .into())
             }
         };
-        let dn = read_string(ctx, args, 1).unwrap_or_default();
-        init_from_string(ctx, this, &dn);
+        // A null name is a NullPointerException with the JDK's own wording,
+        // not an empty principal.
+        let Some(dn) = read_string(ctx, args, 1) else {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("provided null name".into()),
+            }
+            .into());
+        };
+        init_from_string(ctx, this, &dn, None)?;
         Ok(None)
     });
 
-    // <init>(String, Map) — same as <init>(String) for our purposes;
-    // the keyword override map only matters for unknown OIDs and the
-    // probe doesn't supply one.
+    // <init>(String, Map) — the map is an attribute-type keyword map, keyed by
+    // KEYWORD and valued by dotted OID (its javadoc's direction). It is the
+    // only way a caller can name an attribute the JDK's own table does not
+    // have; without it, `MYOID=x` is an unparseable name rather than a
+    // principal with an odd attribute.
     r.register(
         cls,
         "<init>",
@@ -895,13 +489,29 @@ pub fn register(r: &mut NativeMethodRegistry) {
                     .into())
                 }
             };
-            let dn = read_string(ctx, args, 1).unwrap_or_default();
-            init_from_string(ctx, this, &dn);
+            let Some(dn) = read_string(ctx, args, 1) else {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some("provided null name".into()),
+                }
+                .into());
+            };
+            let map = match args.get(2) {
+                Some(Value::Object(Some(m))) => read_string_map(ctx, *m),
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("provided null keyword map".into()),
+                    }
+                    .into())
+                }
+            };
+            init_from_string(ctx, this, &dn, Some(&map))?;
             Ok(None)
         },
     );
 
-    // <init>(byte[]) — parse DER.
+    // <init>(byte[]) — parse DER. A null or unparseable array raises: the JDK
+    // has nothing to build a name from either way, and answers
+    // `IllegalArgumentException` for both.
     r.register(cls, "<init>", "([B)V", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
@@ -912,8 +522,17 @@ pub fn register(r: &mut NativeMethodRegistry) {
                 .into())
             }
         };
+        // A NULL array and an EMPTY one are different answers: null raises,
+        // empty is the empty name.
+        if !matches!(args.get(1), Some(Value::Object(Some(_)))) {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "java/lang/IllegalArgumentException",
+                "improperly specified input name",
+            ));
+        }
         let der = read_byte_array(ctx, args, 1).unwrap_or_default();
-        init_from_der(ctx, this, &der);
+        init_from_der(ctx, this, &der)?;
         Ok(None)
     });
 
@@ -944,7 +563,7 @@ pub fn register(r: &mut NativeMethodRegistry) {
             // NPEs there too. Do NOT build an empty principal instead.
             _ => {
                 return Err(RuntimeError::NullPointerException {
-                    message: Some("X500Principal: null InputStream".into()),
+                    message: Some("provided null input stream".into()),
                 }
                 .into())
             }
@@ -971,19 +590,7 @@ pub fn register(r: &mut NativeMethodRegistry) {
         // Name encoding. Report that instead of populating a nameless
         // principal — `init_from_der` alone would fall back to an empty
         // canonical string and hide the failure.
-        if der.is_empty() {
-            return Err(RuntimeError::IllegalArgumentException {
-                message: "X500Principal: empty DER stream".to_string(),
-            }
-            .into());
-        }
-        if let Err(e) = decode_rdns(&der) {
-            return Err(RuntimeError::IllegalArgumentException {
-                message: format!("X500Principal: invalid DER encoding: {e:?}"),
-            }
-            .into());
-        }
-        init_from_der(ctx, this, &der);
+        init_from_der(ctx, this, &der)?;
         Ok(None)
     });
 
@@ -1002,33 +609,36 @@ pub fn register(r: &mut NativeMethodRegistry) {
         };
         let mut der = get_der(ctx, this);
         if der.is_empty() {
-            // Recover from the named field: re-encode from the canonical
-            // string so getEncoded never silently returns 0 bytes.
-            let canon = match ctx.get_field_by_name(this, "thisX500Name") {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => get_canonical(ctx, this).unwrap_or_default(),
-            };
-            if !canon.is_empty() {
-                let rdns = parse_dn_string(&canon);
-                der = encode_rdns_to_der(&rdns);
-            }
+            // Recover from the stored name. This loses the ASN.1 string type
+            // of any value whose type is not the one the text implies, which
+            // is why the side table is consulted first and why it exists.
+            der = x500_name::encode_der(&rdns_of(ctx, this));
         }
         let arr = alloc_byte_array(ctx, &der);
         Ok(Some(Value::Object(Some(arr))))
     });
 
-    // getName() -> String  (canonical RFC 2253 / 4514)
+    // getName() -> String. RFC 2253, which is the stored form.
     r.register(cls, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
-        let s = get_canonical(ctx, this).unwrap_or_default();
+        let s = match get_canonical(ctx, this) {
+            Some(text) => text,
+            None => x500_name::render(&rdns_of(ctx, this), x500_name::Format::Rfc2253),
+        };
         let so = ctx.create_string(&s);
         Ok(Some(Value::Object(Some(so))))
     });
 
-    // getName(String format) -> String
+    // getName(String format) -> String.
+    //
+    // The three formats are three different renderings of one name, not one
+    // string with its separators swapped: the keyword table, the escaping and
+    // the treatment of a value's ASN.1 type all differ. An unrecognised (or
+    // null) format is `IllegalArgumentException("invalid format specified")`
+    // rather than a silent fall-back to RFC 2253.
     r.register(
         cls,
         "getName",
@@ -1042,33 +652,81 @@ pub fn register(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(f))) => ctx.read_string(*f).unwrap_or_default(),
                 _ => String::new(),
             };
-            // The stored string is the RFC 2253 form. RFC1779 and CANONICAL are
-            // genuinely different renderings of it, not the same string with the
-            // separators swapped: the old `s.replace(',', ", ")` answered an
-            // unquoted RFC2253 string for RFC1779 and the RFC2253 string
-            // verbatim for CANONICAL.
-            let s = if fmt.eq_ignore_ascii_case("RFC1779") {
-                rfc1779_form(&grouped_of(ctx, this))
-            } else if fmt.eq_ignore_ascii_case("CANONICAL") {
-                canonical_form(&grouped_of(ctx, this))
-            } else {
-                get_canonical(ctx, this).unwrap_or_default()
+            let Some(format) = format_of(&fmt) else {
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/lang/IllegalArgumentException",
+                    "invalid format specified",
+                ));
             };
+            let s = x500_name::render(&rdns_of(ctx, this), format);
             let so = ctx.create_string(&s);
             Ok(Some(Value::Object(Some(so))))
         },
     );
 
-    // toString() -> String. The JDK's is `thisX500Name.toString()`: the `", "`
-    // layout with RFC 1779's quoting, but the FULL keyword map — NOT the RFC
-    // 2253 string this used to answer, and not `getName(RFC1779)` either. See
-    // `to_string_form`.
+    // getName(String format, Map<String,String> oidMap) -> String.
+    //
+    // This map runs OID -> keyword, the opposite direction to the
+    // constructor's, and CANONICAL rejects it outright: the canonical form is
+    // defined by the standard and a caller's keyword would make two equal
+    // names render differently.
+    r.register(
+        cls,
+        "getName",
+        "(Ljava/lang/String;Ljava/util/Map;)Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let fmt = match args.get(1) {
+                Some(Value::Object(Some(f))) => ctx.read_string(*f).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let format = match format_of(&fmt) {
+                Some(x500_name::Format::Canonical) | None => {
+                    return Err(crate::phases_early::throw_jca_exc(
+                        ctx,
+                        "java/lang/IllegalArgumentException",
+                        "invalid format specified",
+                    ))
+                }
+                Some(other) => other,
+            };
+            let map = match args.get(2) {
+                Some(Value::Object(Some(m))) => read_string_map(ctx, *m),
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("provided null OID map".into()),
+                    }
+                    .into())
+                }
+            };
+            for keyword in map.values() {
+                if !keyword.chars().next().is_some_and(|c| c.is_alphabetic()) {
+                    return Err(crate::phases_early::throw_jca_exc(
+                        ctx,
+                        "java/lang/IllegalArgumentException",
+                        "keyword does not start with letter",
+                    ));
+                }
+            }
+            let s = x500_name::render_with_oid_map(&rdns_of(ctx, this), format, &map);
+            let so = ctx.create_string(&s);
+            Ok(Some(Value::Object(Some(so))))
+        },
+    );
+
+    // toString() -> String. `X500Name.toString()`: the `", "` layout with RFC
+    // 1779's quoting, and the JDK's FULL keyword table, which is where `DNQ`,
+    // `T` and `EMAILADDRESS` come from.
     r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
-        let s = to_string_form(&grouped_of(ctx, this));
+        let s = x500_name::render(&rdns_of(ctx, this), x500_name::Format::Display);
         let so = ctx.create_string(&s);
         Ok(Some(Value::Object(Some(so))))
     });
@@ -1083,7 +741,7 @@ pub fn register(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let canon = canonical_form(&grouped_of(ctx, this));
+        let canon = x500_name::render(&rdns_of(ctx, this), x500_name::Format::Canonical);
         Ok(Some(Value::Int(java_string_hash(&canon))))
     });
 
@@ -1109,9 +767,22 @@ pub fn register(r: &mut NativeMethodRegistry) {
         if !other_is_principal {
             return Ok(Some(Value::Int(0)));
         }
-        let a = canonical_form(&grouped_of(ctx, this));
-        let b = canonical_form(&grouped_of(ctx, other));
-        Ok(Some(Value::Int(i32::from(!a.is_empty() && a == b))))
+        let a = x500_name::render(&rdns_of(ctx, this), x500_name::Format::Canonical);
+        let b = x500_name::render(&rdns_of(ctx, other), x500_name::Format::Canonical);
+        if !a.is_empty() || !b.is_empty() {
+            return Ok(Some(Value::Int(i32::from(a == b))));
+        }
+        // BOTH canonical forms are empty, which is two different situations:
+        // the genuinely empty DN (`new X500Principal("")`, and two of those
+        // ARE equal), and a principal whose stored name this VM's other
+        // natives wrote directly into the object without going through the
+        // parser — `phases_late::ssl_security` mints several that way. For the
+        // second, an empty canonical form means "did not parse", and treating
+        // two unparseable names as equal would make every one of them equal to
+        // every other. Fall back to the stored text.
+        let a_text = get_canonical(ctx, this).unwrap_or_default();
+        let b_text = get_canonical(ctx, other).unwrap_or_default();
+        Ok(Some(Value::Int(i32::from(a_text == b_text))))
     });
 
     // sun.security.x509.X500Name.asX500Principal() — kcfull #12.
@@ -1185,63 +856,40 @@ mod tests {
         NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
     };
 
+    /// The six tests that used to live here exercised a SECOND parser that
+    /// this file no longer has: `parse_dn_string`, `parse_grouped_rdns`,
+    /// `encode_rdns_to_der`, `decode_rdns` and `render_canonical` were the old
+    /// keyword-and-text model, and every claim they made is now made against
+    /// the real grammar in `x500_name.rs`'s own tests — where the expected
+    /// values are HotSpot 25.0.4+7's rather than this VM's.
+    ///
+    /// The mapping, so the deletion is auditable rather than a disappearance:
+    ///
+    /// | old test | now |
+    /// |---|---|
+    /// | `parse_dn_simple` | `x500_name::tests::a_dotted_oid_attribute_renders_hex_in_rfc2253_and_text_in_rfc1779` and the round-trip test |
+    /// | `parse_dn_with_escaped_comma` | `a_quoted_value_keeps_its_comma` |
+    /// | `round_trip_probe_input` | `the_der_round_trips_through_decode` |
+    /// | `unknown_oid_round_trip` | `the_keyword_map_is_keyed_by_keyword_not_by_oid` + the round-trip test |
+    /// | `canonical_uppercases_keys` | `canonical_collapses_spaces_but_not_tabs` (canonical LOWERCASES; the old test asserted the opposite and passed, because the old renderer did that) |
+    /// | `grouped_rdn_preserves_each_attribute_in_der` | `a_multi_valued_rdn_keeps_both_attributes_and_sorts_only_in_canonical` |
+    ///
+    /// The fifth row is the one worth reading twice. `canonical_uppercases_keys`
+    /// asserted `canon.starts_with("CN=test")`, and the JDK's CANONICAL form is
+    /// `cn=test` — the test was written from the implementation, agreed with
+    /// it, and pinned the defect.
     #[test]
-    fn parse_dn_simple() {
-        let p = parse_dn_string("CN=Test, O=Acme, C=SE");
-        assert_eq!(p.len(), 3);
-        assert_eq!(p[0], ("CN".into(), "Test".into()));
-        assert_eq!(p[1], ("O".into(), "Acme".into()));
-        assert_eq!(p[2], ("C".into(), "SE".into()));
-    }
-
-    #[test]
-    fn parse_dn_with_escaped_comma() {
-        let p = parse_dn_string(r"CN=Doe\, John, O=Acme");
-        assert_eq!(p.len(), 2);
-        assert_eq!(p[0], ("CN".into(), "Doe, John".into()));
-    }
-
-    #[test]
-    fn round_trip_probe_input() {
-        let dn = "CN=Test, O=Acme, C=SE";
-        let parsed = parse_dn_string(dn);
-        let der = encode_rdns_to_der(&parsed);
-        let back = decode_rdns(&der).expect("decode");
-        let canon_in = render_canonical(&parsed);
-        let canon_out = render_canonical(&back);
-        assert_eq!(canon_in, canon_out);
-        // Re-encode: should be byte-identical (canonical DER).
-        let der2 = encode_rdns_to_der(&back);
-        assert_eq!(der, der2);
-    }
-
-    #[test]
-    fn unknown_oid_round_trip() {
-        // Unknown attribute name encoded as dotted-decimal OID survives.
-        let parsed = vec![("1.2.3.4".to_string(), "value".to_string())];
-        let der = encode_rdns_to_der(&parsed);
-        let back = decode_rdns(&der).expect("decode");
-        assert_eq!(back.len(), 1);
-        assert_eq!(back[0].0, "1.2.3.4");
-        assert_eq!(back[0].1, "value");
-    }
-
-    #[test]
-    fn canonical_uppercases_keys() {
-        let parsed = parse_dn_string("cn=test, o=ACME");
-        let canon = render_canonical(&parsed);
-        assert!(canon.starts_with("CN=test"));
-        assert!(canon.contains("O=ACME"));
-    }
-
-    #[test]
-    fn grouped_rdn_preserves_each_attribute_in_der() {
-        let groups = parse_grouped_rdns("C=US,O=Craton,OU=Keycloak+CN=899700252580");
-        assert_eq!(groups[2].len(), 2);
-        let der = encode_grouped_rdns_to_der(&groups);
-        let decoded = decode_rdns(&der).expect("decode");
-        let canonical = render_canonical(&decoded);
-        assert!(canonical.contains("CN=899700252580"));
-        assert!(canonical.contains("OU=Keycloak"));
+    fn the_dn_grammar_is_tested_in_x500_name() {
+        // A live assertion rather than a comment: the formats this file's
+        // natives hand out come from that module, and this is the seam.
+        let rdns = x500_name::parse_dn("CN=Test,O=Acme,C=SE", None).expect("parses");
+        assert_eq!(
+            x500_name::render(&rdns, x500_name::Format::Rfc2253),
+            "CN=Test,O=Acme,C=SE"
+        );
+        assert_eq!(
+            x500_name::render(&rdns, x500_name::Format::Canonical),
+            "cn=test,o=acme,c=se"
+        );
     }
 }
