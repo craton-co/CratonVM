@@ -1405,6 +1405,32 @@ fn huc_real_perform_inner(
             // dropped it. Setting the field is the fix; a guard inside a native
             // the dispatch never consults is not.
             ctx.set_field_by_name(this_settled, "connected", Value::Int(1));
+            // `getURL()` after a followed redirect names the FINAL URL.
+            //
+            // The JDK writes it in `followRedirect()` (`url = locUrl`), so
+            // `getURL()` — inherited `URLConnection` bytecode reading the
+            // carrier's own `url` field, exactly like `connected` above —
+            // answers where the response actually came from. This loop
+            // tracked the final URL in `current_url` and threw it away, so
+            // `L6HttpLoopbackSweep` row 57 read back the 302 rather than the
+            // 200 it followed to.
+            //
+            // Built before the field write and behind a fresh pin: the URL
+            // constructor allocates and runs bytecode, so `this_settled` can
+            // move under it.
+            if current_url != url_str {
+                let pin = ctx.pin_native_root(this_settled);
+                let spec = ctx.create_string(&current_url);
+                if let Ok(Some(Value::Object(Some(final_url)))) = ctx.new_object_initialized(
+                    "java/net/URL",
+                    "(Ljava/lang/String;)V",
+                    &[Value::Object(Some(spec))],
+                ) {
+                    let this_now = ctx.read_native_pin(pin, this_settled);
+                    ctx.set_field_by_name(this_now, "url", Value::Object(Some(final_url)));
+                }
+                ctx.unpin_native_roots(pin);
+            }
             Ok(status)
         }
         // A read timeout maps to java.net.SocketTimeoutException (real-JDK
@@ -1465,10 +1491,23 @@ fn huc_real_perform_inner(
         // reach Java as `ConnectException`, not a generic IOException — real
         // code catches it specifically (see the type's own doc).
         Err(ref e) if e.starts_with(CONNECT_REFUSED_SENTINEL) => {
-            Err(RuntimeError::ConnectException {
-                message: e.trim_start_matches(CONNECT_REFUSED_SENTINEL).to_string(),
-            }
-            .into())
+            // The JDK's message is the CONSTANT `Connection refused (connect
+            // failed)` — `PlainSocketImpl` appends "(connect failed)" to the
+            // OS `strerror` and nothing else. MEASURED on HotSpot 25.0.4+7
+            // (`L6HttpLoopbackSweep` row 76); this VM forwarded Rust's
+            // `io::Error` text, which names the address it dialled
+            // (`connect 127.0.0.1:37761: Connection refused (os error 111)`).
+            // Two defects in one string: an ephemeral PORT, which makes the
+            // row differ from ITSELF across runs, and the same species as
+            // `addr is of illegal length` — a helpfulness the caller cannot
+            // ask for and the oracle does not have.
+            let text = e.trim_start_matches(CONNECT_REFUSED_SENTINEL);
+            let message = if text.contains("Connection refused") {
+                "Connection refused (connect failed)".to_string()
+            } else {
+                text.to_string()
+            };
+            Err(RuntimeError::ConnectException { message }.into())
         }
         // A transport failure before a response is available is an IOException.
         Err(e) => Err(ioex(format!("HttpURLConnection response failed: {e}"))),
@@ -1609,11 +1648,10 @@ fn huc_real_indexed_headers(
     this: ObjectRef,
 ) -> Vec<(Option<String>, String)> {
     let key = ctx.identity_hash_code(this);
-    let Some((status, reason, headers)) = real_results()
-        .lock()
-        .ok()
-        .and_then(|t| t.get(&key).map(|r| (r.status, r.reason.clone(), r.headers.clone())))
-    else {
+    let Some((status, reason, headers)) = real_results().lock().ok().and_then(|t| {
+        t.get(&key)
+            .map(|r| (r.status, r.reason.clone(), r.headers.clone()))
+    }) else {
         return Vec::new();
     };
     let reason = if reason.is_empty() {
@@ -4458,7 +4496,9 @@ fn huc_get_response_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // perform from the real URL rather than misreading our synthetic HUC_* slots.
     if let Some(url_str) = huc_real_object_url(ctx, &mut this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
-            return Ok(Some(Value::Int(huc_real_perform(ctx, &mut this, &url_str)?)));
+            return Ok(Some(Value::Int(huc_real_perform(
+                ctx, &mut this, &url_str,
+            )?)));
         }
     }
     ensure_connected(ctx, this)?;
@@ -4803,7 +4843,9 @@ fn huc_get_header_field_indexed(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     if let Some(url_str) = huc_real_object_url(ctx, &mut this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
             huc_real_perform(ctx, &mut this, &url_str)?;
-            let v = huc_real_indexed_headers(ctx, this).get(idx as usize).cloned();
+            let v = huc_real_indexed_headers(ctx, this)
+                .get(idx as usize)
+                .cloned();
             return Ok(Some(match v {
                 Some((_k, val)) => Value::Object(Some(ctx.create_string(&val))),
                 None => Value::Object(None),
@@ -4833,7 +4875,9 @@ fn huc_get_header_field_key_indexed(
     if let Some(url_str) = huc_real_object_url(ctx, &mut this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
             huc_real_perform(ctx, &mut this, &url_str)?;
-            let v = huc_real_indexed_headers(ctx, this).get(idx as usize).cloned();
+            let v = huc_real_indexed_headers(ctx, this)
+                .get(idx as usize)
+                .cloned();
             return Ok(Some(match v {
                 // Index 0 is the status line, and its key is null — not the
                 // empty string, which a caller comparing with `equals` would
@@ -5400,6 +5444,12 @@ fn huc_set_instance_follow_redirects(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
+    // The JDK's own `instanceFollowRedirects` field, BY NAME, on every
+    // carrier — the same lesson as `connected`: `HttpURLConnection.
+    // getInstanceFollowRedirects()` is one `getfield` of inherited bytecode
+    // for any receiver this file does not serve, and a synthetic SLOT index
+    // names a different field on a real class.
+    ctx.set_field_by_name(this, "instanceFollowRedirects", Value::Int(v));
     if is_real_carrier(ctx, this) {
         with_real_req(ctx, this, |req| {
             req.follow_redirects = v != 0;
@@ -5426,7 +5476,17 @@ fn huc_get_instance_follow_redirects(
             .unwrap_or(true);
         return Ok(Some(Value::Int(if follow { 1 } else { 0 })));
     }
-    Ok(Some(ctx.get_field(this, HUC_INSTANCE_FOLLOW_REDIRECTS)))
+    // The JDK's field by NAME before the synthetic slot: `L6HttpLogicSweep`
+    // row 154 read `false` from a freshly minted carrier where HotSpot reads
+    // `true`, because slot 9 is `instanceFollowRedirects` only in the
+    // SYNTHETIC layout, and the real field it aliases arrives zeroed on a
+    // carrier that is ALLOCATED rather than constructed. The mint site now
+    // writes that field (see `net_phase_e`'s `openConnection`), so a named
+    // read is both correct here and what inherited bytecode already does.
+    match ctx.get_field_by_name(this, "instanceFollowRedirects") {
+        Value::Int(v) => Ok(Some(Value::Int(v))),
+        _ => Ok(Some(ctx.get_field(this, HUC_INSTANCE_FOLLOW_REDIRECTS))),
+    }
 }
 
 fn huc_using_proxy(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {

@@ -1298,18 +1298,16 @@ pub(crate) fn bsd_parsable_v4(src: &str) -> bool {
     }
     let mut saw_alternate_radix = false;
     for part in &parts {
-        let (digits, radix) = if let Some(hex) = part
-            .strip_prefix("0x")
-            .or_else(|| part.strip_prefix("0X"))
-        {
-            saw_alternate_radix = true;
-            (hex, 16)
-        } else if part.len() > 1 && part.starts_with('0') {
-            saw_alternate_radix = true;
-            (&part[1..], 8)
-        } else {
-            (*part, 10)
-        };
+        let (digits, radix) =
+            if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+                saw_alternate_radix = true;
+                (hex, 16)
+            } else if part.len() > 1 && part.starts_with('0') {
+                saw_alternate_radix = true;
+                (&part[1..], 8)
+            } else {
+                (*part, 10)
+            };
         if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
             return false;
         }
@@ -3261,6 +3259,77 @@ pub(crate) fn uri_hash_code(ctx: &dyn NativeContext, uri: ObjectRef) -> i32 {
     h
 }
 
+/// `java.net.URI.compareTo(null)`.
+///
+/// The JDK has no null check here — `compareTo`'s first statement is
+/// `compareIgnoringCase(this.scheme, that.scheme)`, so the argument is
+/// dereferenced and the helpful NPE names the field it was reading. Measured
+/// on HotSpot 25.0.4+7:
+///
+/// ```text
+/// java.lang.NullPointerException: Cannot read field "scheme" because "that" is null
+/// ```
+///
+/// This registration cannot get there by dereferencing (it never touches a
+/// field), so the message is a constant — but an `IllegalArgumentException`,
+/// which is what stood here, is a different type on the wire and a
+/// `catch (NullPointerException)` walks straight past it.
+fn uri_compare_to_null() -> cratonvm_types::error::MethodCallFailed {
+    npe("Cannot read field \"scheme\" because \"that\" is null")
+}
+
+/// The `IllegalArgumentException` `java.net.URI.create(String)` throws for a
+/// parse failure: the `URISyntaxException`'s own `getMessage()` as the
+/// message, and that exception as the CAUSE.
+///
+/// MEASURED on HotSpot 25.0.4+7:
+///
+/// ```text
+///   URI.create("http://h/%zz")
+///     java.lang.IllegalArgumentException: Malformed escape pair at index 9: http://h/%zz
+///     cause java.net.URISyntaxException: Malformed escape pair at index 9: http://h/%zz
+/// ```
+///
+/// The JDK gets both for free — `catch (URISyntaxException x) { throw new
+/// IllegalArgumentException(x.getMessage(), x); }` — and this reproduces that
+/// literally rather than re-deriving the text, so the two doors cannot drift.
+fn uri_create_iae(
+    ctx: &mut dyn NativeContext,
+    input: &str,
+    fail: &crate::UriParseFail,
+) -> cratonvm_types::error::MethodCallFailed {
+    // The text the JDK's own `getMessage()` would produce, kept as the
+    // fallback for the (allocation-failure only) paths below.
+    let trimmed = crate::uri_exception_input(input);
+    let text = match fail.index {
+        Some(i) => format!("{} at index {i}: {trimmed}", fail.reason),
+        None => format!("{}: {trimmed}", fail.reason),
+    };
+    let Some(MethodCallFailed::ExceptionThrown(cause)) =
+        crate::uri_syntax_exception_pub(ctx, input, fail)
+    else {
+        return iae(text);
+    };
+    // `getMessage()` runs bytecode and the constructor below allocates, so the
+    // cause has to survive both.
+    let pin = ctx.pin_native_root(cause);
+    let cause = ctx.read_native_pin(pin, cause);
+    let msg = match ctx.invoke_virtual(cause, "getMessage", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(m)))) => m,
+        _ => ctx.create_string(&text),
+    };
+    let cause = ctx.read_native_pin(pin, cause);
+    let built = ctx.new_object_initialized(
+        "java/lang/IllegalArgumentException",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+        &[Value::Object(Some(msg)), Value::Object(Some(cause))],
+    );
+    ctx.unpin_native_roots(pin);
+    match built {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        _ => iae(text),
+    }
+}
 fn cmp_order(o: std::cmp::Ordering) -> i32 {
     match o {
         std::cmp::Ordering::Less => -1,
@@ -3380,22 +3449,74 @@ fn opt_str_eq_ignore_case(a: &Option<String>, b: &Option<String>) -> bool {
     }
 }
 
+/// `java.lang.String.hashCode()` over UTF-16 code units.
+///
+/// Not `str::bytes()`: `java.net.URI` hashes CHARS, and for any component
+/// carrying a non-ASCII character (`http://h/\u{e9}`) a byte fold and a
+/// code-unit fold give different numbers.
+fn java_string_hash(s: &str) -> i32 {
+    s.encode_utf16()
+        .fold(0i32, |acc, u| acc.wrapping_mul(31).wrapping_add(u as i32))
+}
+
+/// `java.net.URI.normalizedHash(int, String)` — the arm taken for a component
+/// that contains a `%`, so that two URIs differing only in the CASE of an
+/// escape triplet (`%c3%a9` vs `%C3%A9`) hash alike, as `URI.equals` requires.
+fn uri_normalized_hash(h: i32, s: &str) -> i32 {
+    let u: Vec<u16> = s.encode_utf16().collect();
+    let mut inner: i32 = 0;
+    let mut i = 0usize;
+    while i < u.len() {
+        let c = u[i];
+        inner = inner.wrapping_mul(31).wrapping_add(c as i32);
+        if c == u16::from(b'%') {
+            // The next TWO units, upper-cased, exactly as the JDK does — and
+            // unguarded there too, because `%` only survives the parser as the
+            // first unit of a well-formed triplet.
+            for k in (i + 1)..(i + 3) {
+                let d = u.get(k).copied().unwrap_or(0);
+                let up = if (b'a' as u16..=b'z' as u16).contains(&d) {
+                    d - 32
+                } else {
+                    d
+                };
+                inner = inner.wrapping_mul(31).wrapping_add(up as i32);
+            }
+            i += 2;
+        }
+        i += 1;
+    }
+    h.wrapping_mul(127).wrapping_add(inner)
+}
+
+/// `java.net.URI.hash(int, String)` — the case-SENSITIVE component step.
+///
+/// This is `h * 127 + s.hashCode()`, a fresh string hash mixed into the
+/// accumulator, NOT a continuation of one 31-based fold across the whole URI.
+/// The difference is not cosmetic: it was worth **31 of `L6UriSweep`'s 40
+/// differing rows**, every `hashCode` row the probe asks.
 fn hash_str(h: i32, s: Option<&str>) -> i32 {
     match s {
-        Some(s) => s
-            .bytes()
-            .fold(h, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i32)),
         None => h,
+        Some(s) if !s.contains('%') => h.wrapping_mul(127).wrapping_add(java_string_hash(s)),
+        Some(s) => uri_normalized_hash(h, s),
     }
 }
 
+/// `java.net.URI.hashIgnoringCase(int, String)` — used for `scheme` and
+/// `host`, the two components `URI.equals` compares case-insensitively. Unlike
+/// [`hash_str`] this one really does continue the accumulator's 31-fold.
 fn hash_str_ignore_case(h: i32, s: Option<&str>) -> i32 {
     match s {
-        Some(s) => s.bytes().fold(h, |acc, b| {
-            acc.wrapping_mul(31)
-                .wrapping_add(b.to_ascii_lowercase() as i32)
-        }),
         None => h,
+        Some(s) => s.encode_utf16().fold(h, |acc, u| {
+            let low = if (b'A' as u16..=b'Z' as u16).contains(&u) {
+                u + 32
+            } else {
+                u
+            };
+            acc.wrapping_mul(31).wrapping_add(low as i32)
+        }),
     }
 }
 
@@ -5081,7 +5202,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let other = match args.get(1) {
             Some(Value::Object(Some(o))) => *o,
-            _ => return Err(iae("URI.compareTo null")),
+            _ => return Err(uri_compare_to_null()),
         };
         Ok(Some(Value::Int(uri_compare(ctx, this, other))))
     });
@@ -5091,7 +5212,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let other = match args.get(1) {
             Some(Value::Object(Some(o))) => *o,
-            _ => return Err(iae("URI.compareTo null")),
+            _ => return Err(uri_compare_to_null()),
         };
         Ok(Some(Value::Int(uri_compare(ctx, this, other))))
     });
@@ -5333,53 +5454,17 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Object(None))),
             };
             let s = ctx.read_string(s_obj).unwrap_or_default();
-            // URI.create(String) translates URI(String) parse failures to
-            // IllegalArgumentException, but valid results must keep make_uri's
-            // field layout for the URI accessors used by Keycloak.
-            if let Some((pos, reason)) = crate::uri_scheme_name_fail_index(&s) {
-                return Err(iae(format!("{reason} at index {pos}: {s}")));
-            }
-            let strict_uri_chars = crate::nbflags().uri_strict_chars;
-            let illegal = if strict_uri_chars {
-                crate::uri_first_illegal_index(&s)
-            } else {
-                s.char_indices()
-                    .find(|(_, c)| (*c as u32) < 0x20 || (*c as u32) == 0x7f)
-                    .map(|(i, _)| i)
-            };
-            if let Some(pos) = illegal {
-                return Err(iae(format!("Illegal character in URI at index {pos}: {s}")));
-            }
-            // `URI.create` is `new URI(str)` with the checked exception
-            // translated, so it owes the same refusals in the same order.
-            if let Some(pos) = crate::uri_expected_authority_fail_index(&s) {
-                return Err(iae(format!("Expected authority at index {pos}: {s}")));
-            }
-            // The bracketed-authority check the CONSTRUCTOR already runs. Both
-            // doors owe the same refusals — `URI.create` is documented as
-            // `new URI(str)` with the checked exception translated — and this
-            // one was only on the constructor, so `http://[::1/a` was refused
-            // by `new URI` and accepted here.
-            // The SAME closing-bracket rule the constructor runs, reached
-            // through the function it was extracted into rather than a second
-            // copy of it.
-            if let Some(pos) = crate::uri_closing_bracket_fail_index(&s) {
-                return Err(iae(format!(
-                    "Expected closing bracket for IPv6 address at index {pos}: {s}"
-                )));
-            }
-            if crate::nbflags().uri_strict_chars {
-                if let Some(fail) = crate::uri_ipv6_authority_fail(&s) {
-                    return Err(iae(match fail.index {
-                        Some(pos) => format!("{} at index {pos}: {s}", fail.reason),
-                        None => format!("{}: {s}", fail.reason),
-                    }));
-                }
-            }
-            if let Some(pos) = crate::uri_empty_ssp_fail_index(&s) {
-                return Err(iae(format!(
-                    "Expected scheme-specific part at index {pos}: {s}"
-                )));
+            // `URI.create(String)` is `new URI(str)` with the checked
+            // exception TRANSLATED, not replaced. Two things came out of that
+            // word, and this door had neither: the same refusals in the same
+            // order (it carried its own four-of-seven transcription with a
+            // catch-all `Illegal character in URI at index 9` where the
+            // constructor names the component), and the `URISyntaxException`
+            // itself as the `IllegalArgumentException`'s CAUSE — which is the
+            // only place the reason and index survive for a caller that
+            // catches the unchecked wrapper.
+            if let Some(fail) = crate::uri_parse_fail(&s) {
+                return Err(uri_create_iae(ctx, &s, &fail));
             }
             Ok(Some(Value::Object(Some(make_uri(ctx, &s)?))))
         },
@@ -9145,7 +9230,12 @@ fn field5_is_full_url(s: &str) -> bool {
     }
     match s.split_once(':') {
         Some((scheme, rest)) => {
-            !scheme.is_empty() && !rest.is_empty() && !rest.bytes().all(|b| b.is_ascii_digit())
+            // `rest.parse::<i64>()`, not "every byte is a digit": `h:-1` is a
+            // PORT too — HotSpot answers `getPort() == -1` and keeps `h:-1` as
+            // the authority — and the digits-only test read it as a scheme, so
+            // `new URL("http://h:-1/p").toExternalForm()` handed back the bare
+            // authority `h:-1` in place of the whole URL.
+            !scheme.is_empty() && !rest.is_empty() && rest.parse::<i64>().is_err()
         }
         None => false,
     }
@@ -10246,6 +10336,24 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         };
         let url_str = ctx.read_string(url_str_obj).unwrap_or_default();
 
+        // `URL.toURI()` is `new URI(toString())`, so it owes that
+        // constructor's refusals — and this door PUBLISHED the text into a
+        // URI carrier without ever parsing it, so `new URL("http://h/a b")
+        // .toURI()` handed back a URI whose own constructor rejects its text
+        // (`Illegal character in path at index 10`). Three `L6UrlSweep` rows,
+        // and the same door Spring reaches when it catches
+        // `URISyntaxException` to fall back to a string path.
+        //
+        // Only the CHECK is shared with the constructor; the publish below
+        // stays, because the `jar:`/`nested:` fallback it exists for is
+        // load-bearing for Spring and Tomcat (see the retirement record's
+        // item 3).
+        if let Some(fail) = crate::uri_parse_fail(&url_str) {
+            if let Some(exc) = crate::uri_syntax_exception_pub(ctx, &url_str, &fail) {
+                return Err(exc);
+            }
+        }
+
         // Always build a synthetic URI. Returning a real-JDK URI here leaves
         // our `URI.getSchemeSpecificPart()` override without access to the raw
         // string (layout differs), which can degrade to empty SSP and break
@@ -10327,15 +10435,10 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         // Read the protocol field (slot 0 in our synthetic URL layout).
         let protocol = read_field_string_or(ctx, this, 0, "");
-        let port = match protocol.as_str() {
-            "http" => 80,
-            "https" => 443,
-            "ftp" => 21,
-            "gopher" => 70,
-            // file/jar/jrt/classpath/nested/etc. → -1 per JDK URLStreamHandler
-            _ => -1i32,
-        };
-        Ok(Some(Value::Int(port)))
+        // file/jar/jrt/classpath/nested/etc. → -1 per JDK URLStreamHandler.
+        // One table, shared with `URL.equals`/`sameFile`/`hashCode`, which
+        // substitute the same default for an absent port.
+        Ok(Some(Value::Int(crate::url_default_port(&protocol))))
     });
 
     r.register(url, "openStream", "()Ljava/io/InputStream;", |ctx, args| {
@@ -11054,6 +11157,12 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // that inherited one-`getfield` body — and a fresh connection that
             // answers `false` is reporting a value the caller never chose.
             ctx.set_field_by_name(conn, "useCaches", Value::Int(1));
+            // Same species, same fix: `HttpURLConnection`'s field initialiser is
+            // `instanceFollowRedirects = followRedirects`, i.e. true, and the
+            // constructor that would run it never runs on this ALLOCATED
+            // carrier. `L6HttpLogicSweep` row 154 read `false` from a
+            // connection nobody had configured.
+            ctx.set_field_by_name(conn, "instanceFollowRedirects", Value::Int(1));
             // A carrier this call just minted inherits nothing. See
             // `http_url_connection::real_forget`: its side tables are keyed by
             // identity hash and this address may have belonged to a connection
@@ -13865,14 +13974,11 @@ fn re5_start_async_send(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> Option<cratonvm_types::ObjectRef> {
-    let future = match ctx.new_object_initialized(
-        "java/util/concurrent/CompletableFuture",
-        "()V",
-        &[],
-    ) {
-        Ok(Some(Value::Object(Some(f)))) => f,
-        _ => return None,
-    };
+    let future =
+        match ctx.new_object_initialized("java/util/concurrent/CompletableFuture", "()V", &[]) {
+            Ok(Some(Value::Object(Some(f)))) => f,
+            _ => return None,
+        };
     let future_root = ctx.add_global_root(future);
     let task = match try_alloc_concurrent_synthetic(ctx, RE5_SEND_TASK, RE5_TASK_FIELDS) {
         Ok(t) => t,
@@ -13880,9 +13986,21 @@ fn re5_start_async_send(
     };
     let future = ctx.resolve_global_root(future_root).unwrap_or(future);
     ctx.set_field(task, RE5_TASK_FUTURE, Value::Object(Some(future)));
-    ctx.set_field(task, RE5_TASK_CLIENT, args.first().copied().unwrap_or(Value::Object(None)));
-    ctx.set_field(task, RE5_TASK_REQUEST, args.get(1).copied().unwrap_or(Value::Object(None)));
-    ctx.set_field(task, RE5_TASK_HANDLER, args.get(2).copied().unwrap_or(Value::Object(None)));
+    ctx.set_field(
+        task,
+        RE5_TASK_CLIENT,
+        args.first().copied().unwrap_or(Value::Object(None)),
+    );
+    ctx.set_field(
+        task,
+        RE5_TASK_REQUEST,
+        args.get(1).copied().unwrap_or(Value::Object(None)),
+    );
+    ctx.set_field(
+        task,
+        RE5_TASK_HANDLER,
+        args.get(2).copied().unwrap_or(Value::Object(None)),
+    );
 
     let task_root = ctx.add_global_root(task);
     let thread = match ctx.new_object_initialized(
@@ -15651,6 +15769,15 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 eprintln!("[dbg-tls-auth] re6 SSLContext.getInstance");
             }
             let proto_val = args.first().copied().unwrap_or(Value::Object(None));
+            // MEASURED on HotSpot 25.0.4+7: `SSLContext.getInstance(null)` is
+            // `NullPointerException: null protocol name`, from
+            // `Objects.requireNonNull(protocol, "null protocol name")` at the
+            // top of the method. `value_or_string`'s default turned it into a
+            // working "TLS" context, so a caller who computed a null protocol
+            // got TLS and no signal.
+            if matches!(proto_val, Value::Object(None)) {
+                return Err(npe("null protocol name"));
+            }
             let proto = value_or_string(ctx, proto_val, "TLS");
             // W3-7 (RJdkSecurity.tls:291). TWO defects on this line.
             //
@@ -15681,6 +15808,7 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             let name = ctx.create_string(&proto);
             ctx.set_field(obj, 0, Value::Object(Some(name)));
             ctx.set_field(obj, 1, Value::Int(0));
+            crate::jca::ssl_context_spi::mark_context_uninitialized(ctx, obj);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -15734,6 +15862,7 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             let name = ctx.create_string("Default");
             ctx.set_field(obj, 0, Value::Object(Some(name)));
             ctx.set_field(obj, 1, Value::Int(1));
+            crate::jca::ssl_context_spi::mark_context_initialized(ctx, obj);
             crate::t27_tls::set_runtime_default_ssl_context(obj);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -15752,7 +15881,10 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 crate::t27_tls::set_runtime_default_ssl_context(ctx_obj);
                 Ok(None)
             }
-            _ => Err(npe("context")),
+            // `SSLContext.setDefault(null)` is `Objects.requireNonNull(context)`
+            // — the one-argument overload, so the NPE carries NO message.
+            // MEASURED: HotSpot `msg=null`, this VM `msg=context`.
+            _ => Err(npe_no_message()),
         },
     );
     r.register(
@@ -15781,6 +15913,7 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 );
             }
             ctx.set_field(this, 1, Value::Int(1));
+            crate::jca::ssl_context_spi::mark_context_initialized(ctx, this);
             // Stash the actual KeyManager objects too (may include a test
             // wrapper like Tomcat's `TrackingKeyManager`). rustls's own
             // client-cert path otherwise only ever presents one fixed
@@ -15919,6 +16052,7 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 return r;
             }
             let this = obj_arg(args, 0)?;
+            crate::jca::ssl_context_spi::require_context_initialized(ctx, this)?;
             if crate::nbflags().dbg_tls_auth_ok {
                 eprintln!(
                     "[dbg-tls-auth] re6 SSLContext.getSocketFactory key={}",
@@ -15948,6 +16082,7 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 return r;
             }
             let this = obj_arg(args, 0)?;
+            crate::jca::ssl_context_spi::require_context_initialized(ctx, this)?;
             let f = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 1)?;
             ctx.set_field(f, 0, Value::Object(Some(this)));
             Ok(Some(Value::Object(Some(f))))
@@ -16114,6 +16249,15 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             ) {
                 return r;
             }
+            // `SSLContextImpl.engineCreateSSLEngine` is guarded by
+            // `checkInitialized` exactly like the two factory getters.
+            //
+            // THIS registration is the live one, not the pair in
+            // `phases_late::ssl_security` — a `for desc in [..]` loop hides
+            // them from the grep that finds every other `"createSSLEngine"`,
+            // which is how a trial binary with the gate on the other two
+            // still answered `L6TlsParamSweep` row 65 with an engine.
+            crate::jca::ssl_context_spi::require_context_initialized(ctx, obj_arg(args, 0)?)?;
             let eng0 = try_alloc_concurrent_synthetic(ctx, "sun/security/ssl/SSLEngineImpl", 4)?;
             // Everything below this point allocates (a ReentrantLock, and the
             // peer-host String further down), so `eng` must be pinned and
