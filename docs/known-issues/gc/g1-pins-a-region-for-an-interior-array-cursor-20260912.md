@@ -106,8 +106,8 @@ for an interior address), narrowing the conservative band scan by storage class
 
 | `probes/TvmProbe.java`, G1, `--Xmx 2g` | rows over threshold | worst row | sum of 40 rows |
 |---|---:|---:|---:|
-| `dev@c0bebbde5` | 4–5 | 3330 | ~93000 |
-| + the deopt `SavedRegisters` partition | 1–3 | 3251 | ~81000 |
+| `dev` (both trees measured) | mean 4.5–4.7 | 3331 | ~92500–93100 |
+| + the deopt `SavedRegisters` partition | mean 1.8–1.9 | 3252 | ~80200–80500 |
 | **no conservative JIT roots at all** | **0** | **2228** | **57621** |
 
 Every row passes in the floor arm, so the JIT root set is the entire remaining
@@ -145,17 +145,22 @@ Java frames (primordial thread): <none published yet>
 Its crash handler then hangs rather than exiting — two runs had to be killed by
 PID — so an arm that never returns is this, not a slow VM.
 
-**Twelve runs per arm, sequential and alternating so any host drift lands on
-both:**
+**Two batteries, each sequential and alternating so any host drift lands on
+both arms, the second run after merging `dev` and rebuilding both:**
 
-| | runs | SIGSEGV | rows over threshold | sum of all 40 rows |
-|---|---:|---:|---|---:|
-| `dev@c0bebbde5` | 12 | **6** | 4, 2, 6, 6, 4, 6 (mean 4.67) | 93136 |
-| + the `SavedRegisters` partition | 12 | **0** | 0–4 (mean 1.83) | 80170 |
+| battery | arm | runs | SIGSEGV | rows over threshold | sum of all 40 rows |
+|---|---|---:|---:|---|---:|
+| `dev@c0bebbde5` | base | 12 | **6** | mean 4.67 | 93136 |
+| | + the `SavedRegisters` partition | 12 | **0** | mean 1.83 | 80170 |
+| `dev@0a805f3fc` | control | 10 | **4** | mean 4.50 | 92535 |
+| | + the partition | 10 | **1** | mean 1.89 | 80457 |
 
-Six to zero, Fisher's exact p ≈ 0.014. **Stated as an association, not a cause**
-— this battery was built to measure retention, the crash is a side observation
-in it, and nobody has read the faulting instruction.
+Pooled: **10 crashes in 22 control runs against 1 in 22**, Fisher's exact
+p ≈ 0.003. **Stated as an association, not a cause** — these batteries were
+built to measure retention, the crash is a side observation in them, and nobody
+has read the faulting instruction. Note also what the second battery corrected:
+the first read 6-to-0 and would have supported "eliminates", which the second
+refutes. It is a reduction.
 
 There IS a mechanism that would explain it, and it is the reason this paragraph
 is here rather than in a footnote. `remap_one_frame_register_images` rewrites a
@@ -167,6 +172,7 @@ happened to reject was neither pinned nor rewritten, and the deopt stub then
 reconstructs an interpreter frame from it (`FrameValue::RegisterRef` ->
 `regs.gpr` -> `Object`) at its pre-move address.
 
-Whoever confirms or refutes that needs a crash-focused battery rather than this
-one: same two binaries, `CRATONVM_DBG_JIT_NAMES=1` so the faulting pc is
-attributed, and enough runs to separate 6/12 from 0/12 with room to spare.
+Whoever confirms or refutes that needs a crash-focused battery rather than
+these: the same two binaries, `CRATONVM_DBG_JIT_NAMES=1` so the faulting pc is
+attributed to a compiled method, and enough runs to separate 10/22 from 1/22
+with room to spare.

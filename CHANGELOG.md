@@ -46,19 +46,24 @@ worth anything alone:
   both                      0                       sum 59357
 ```
 
-Twelve runs per arm, sequential and alternating so any host drift lands on both:
-rows over threshold **4.67 -> 1.83**, sum of all forty rows **93136 -> 80170**.
-The floor for scale, with no conservative JIT roots at all
-(`CRATONVM_DBG_NO_JIT_ROOT_SCAN=1`, unsound): sum 57621.
+Two batteries, each sequential and alternating so any host drift lands on both
+arms, the second run after merging `dev` and rebuilding both — because a merge
+that touches none of your files can still move your numbers. Rows over
+threshold **4.67 -> 1.83** then **4.50 -> 1.89**; sum of all forty rows
+**93136 -> 80170** then **92535 -> 80457**. Two trees thirty-seven commits apart
+agree to within 1 % on both columns. The floor for scale, with no conservative
+JIT roots at all (`CRATONVM_DBG_NO_JIT_ROOT_SCAN=1`, unsound): sum 57621.
 
-That battery also carries an observation it was not built to make and which is
-therefore reported rather than claimed: the unmodified binary SIGSEGV'd **6 of
-its 12 runs** on this workload and the fixed one **0 of 12** (Fisher's exact
-p ~ 0.014). `remap_one_frame_register_images` rewrites an admitted region's
-moved references whether or not the conservative scan rooted the word, so before
-this change a reference in the deopt GPR image that `is_object_address` happened
-to reject was neither pinned nor rewritten — which would explain it. Confirming
-that needs a crash-focused battery; the detail is on the interior-cursor page.
+Those batteries also carry an observation they were not built to make and which
+is therefore reported rather than claimed: pooled, the unmodified binary
+SIGSEGV'd **10 of 22 runs** on this workload and the fixed one **1 of 22**
+(Fisher's exact p ~ 0.003). `remap_one_frame_register_images` rewrites an
+admitted region's moved references whether or not the conservative scan rooted
+the word, so before this change a reference in the deopt GPR image that
+`is_object_address` happened to reject was neither pinned nor rewritten — which
+would explain it. Note what the second battery corrected: the first read 6-to-0
+and would have supported "eliminates". It is a reduction. Confirming the cause
+needs a crash-focused battery; the detail is on the interior-cursor page.
 
 `probes/TvmProbe.java` is added as the instrument — a standalone port of
 `org.h2.test.unit.TestValueMemory`, whose `TestBase` superclass is not published

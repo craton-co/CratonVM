@@ -9,7 +9,7 @@ here, and has its own page:
 
 | | |
 |---|---|
-| **Status** | **RESOLVED as an account of the defect.** Type 0 was already fixed (`3224 -> 2227`). The G1 JIT pin set is now genuinely narrowed rather than nominally: the movable filter drops **6 of 7** pins where it previously dropped **0 of 34**. |
+| **Status** | **RESOLVED as an account of the defect.** Type 0 was already fixed (`3224 -> 2227`). The G1 JIT pin set is now genuinely narrowed rather than nominally: the movable filter drops **6 of 7** pins, where it was off and dropped none of 34. |
 | **Landed here** | the frame-deopt `SavedRegisters` partition (`FrameLayout::deopt_gpr_lo` / `deopt_xmm_lo`), and `CRATONVM_GC_G1_MOVABLE_PINS` **default ON**. |
 | **Refuted here** | the page's own "the A5 span sweep is most of it" — `a5_sweeps=0`, `a5_roots=0` on this workload, so the sweep contributes nothing to measure. |
 | **Measured on** | `dev@c0bebbde5` + this change, Windows 11 / x86-64 / 8 cores, `probes/TvmProbe.java` (a standalone port of the test, added here), `-XX:+UseG1GC --Xmx 2g`. |
@@ -142,31 +142,39 @@ applies to all of them equally:
 
 ## 5. What it is worth, measured
 
-Twelve runs per arm, **sequential and alternating** so any host drift lands on
-both. (Sequential rather than interleaved-concurrent, which is this project's
-usual protocol: two VMs side by side reach a pre-existing SIGSEGV whose crash
-handler then hangs, and that costs more reps than the interleaving saves — see
-§6 and the companion page's §7.)
+Two batteries, each **sequential and alternating** so any host drift lands on
+both arms. (Sequential rather than interleaved-concurrent, which is this
+project's usual protocol: two VMs side by side reach a pre-existing SIGSEGV
+whose crash handler then hangs, and that costs more reps than the interleaving
+saves.) The second battery was run AFTER merging `dev` and rebuilding both
+arms, because a merge that touches none of your files can still move your
+numbers:
 
-| | complete runs | SIGSEGV | rows over threshold | sum of all 40 rows |
-|---|---:|---:|---|---:|
-| `dev@c0bebbde5` | 6 of 12 | 6 | 4, 2, 6, 6, 4, 6 — mean **4.67** | mean **93136** |
-| **+ this change** | **12 of 12** | **0** | 0–4 — mean **1.83** | mean **80170** |
+| battery | arm | complete | SIGSEGV | rows over threshold | sum of all 40 rows |
+|---|---|---:|---:|---|---:|
+| `dev@c0bebbde5` | base | 6 of 12 | 6 | mean **4.67** | **93136** |
+| | + this change | 12 of 12 | 0 | mean **1.83** | **80170** |
+| `dev@0a805f3fc` | control | 6 of 10 | 4 | mean **4.50** | **92535** |
+| | + this change | 9 of 10 | 1 | mean **1.89** | **80457** |
 
-and the floor, for scale — `CRATONVM_DBG_NO_JIT_ROOT_SCAN=1`, unsound, no
+Two trees thirty-seven commits apart agree to within 1 % on both columns.
+
+And the floor, for scale — `CRATONVM_DBG_NO_JIT_ROOT_SCAN=1`, unsound, no
 conservative JIT roots at all: **0 rows over, sum 57621, worst row 2228.**
 
-So of the ~35 500 KB the JIT root scan costs this suite, this change recovers
-about **13 000** and §6 names the rest.
+So of the ~35 000 KB the JIT root scan costs this suite, this change recovers
+about **12 000** and §6 names the rest.
 
-**The SIGSEGV column is an observation this battery was not built to make**, and
-it is carried rather than claimed: 6 of 12 against 0 of 12 is Fisher's exact
-p ≈ 0.014, and there is a mechanism that would explain it —
-`remap_one_frame_register_images` rewrites an admitted region's moved references
-whether or not the conservative scan rooted the word, so before this change a
-reference in the deopt GPR image that `is_object_address` happened to reject was
-neither pinned nor rewritten. Confirming that needs a crash-focused battery, not
-this one. The companion page carries the detail.
+**The SIGSEGV column is an observation these batteries were not built to make**,
+and it is carried rather than claimed. Pooled, it is **10 crashes in 22 control
+runs against 1 in 22** (Fisher's exact p ~ 0.003) — a reduction, not an
+elimination, and the first battery's 6-to-0 would have read as one. There is a
+mechanism that would explain it: `remap_one_frame_register_images` rewrites an
+admitted region's moved references whether or not the conservative scan rooted
+the word, so before this change a reference in the deopt GPR image that
+`is_object_address` happened to reject was neither pinned nor rewritten.
+Confirming that needs a crash-focused battery, not these. The companion page
+carries the detail.
 
 The rows that still fail do
 so by 50–330 KB against a 2928 KB threshold — one G1 region, on one row, and
@@ -212,7 +220,7 @@ so sub-region pinning is not available), and it gets its own page:
 | item 2 — per-safepoint liveness for compiled-frame words | **IMPLEMENTED** before this session; `deadspill=7622 outgoing=1876` words skipped per run. |
 | "the A5 span sweep is most of it", `a5_roots=4794` | **REFUTED HERE.** `a5_sweeps=0 a5_roots=0` on this workload; the page's own census is the instrument. |
 | `CRATONVM_GC_G1_MOVABLE_PINS` is "correct, wired, and starved" | **STANDS as a diagnosis**; it is no longer starved, and it is now the default. |
-| the deopt `SavedRegisters` block "is not what keeps the last five regions pinned" | **REFUTED HERE.** It is 2852 of the 2888 `outgoing-args-or-deopt-regs` refusals, and partitioning it is worth ~13 000 KB across the suite. |
+| the deopt `SavedRegisters` block "is not what keeps the last five regions pinned" | **REFUTED HERE.** It is 2852 of the 2888 `outgoing-args-or-deopt-regs` refusals, and partitioning it is worth ~12 000 KB across the suite. |
 | "do not raise the threshold / exclude the class / shrink `region_size`" | **STANDS.** None was done. |
 
 ## 8. Repro
