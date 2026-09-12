@@ -88,6 +88,9 @@
 pub mod aarch64;
 pub mod aarch64_backend;
 pub mod bailout;
+// The one bytecode decoder both tiers share: instruction lengths, branch and
+// switch targets, reachability, and an instruction CFG with dominators.
+pub(crate) mod bytecode_analysis;
 // The one door every backend entry point must pass through. There are THREE
 // doors (method entry, the eager first-call compile, OSR), and only the first
 // ever asked the admission questions; the other two grew hand-copied subsets
