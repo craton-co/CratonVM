@@ -20,16 +20,26 @@ The instrument is the lane's own probe tree, run as a two-binary A/B against
 HotSpot 25.0.4+7. `difflines` is `diff | grep -c '^[<>]'`, which is two lines
 per differing row.
 
-| probe | rows | base | after | differing rows fixed |
+| probe | printed rows | base | after | differing rows fixed |
 |---|---:|---:|---:|---:|
-| `L6InetSweep` | 850 | 380 | 0 | **190** |
-| `L6X500Sweep` | 403 | 276 | see §7 | |
-| `L6JcaSweep` | 196 | 72 | see §7 | |
-| `L6TlsParamSweep` | 116 | 66 | see §7 | |
-| `L6HttpLoopbackSweep` | 78 | *did not exist* | see §7 | |
+| `L6InetSweep` | 850 | 380 | **0** | 190 |
+| `L6X500Sweep` | 403 | 276 | **0** | 138 |
+| `L6JcaSweep` | 196 | 72 | 34 | 19 |
+| `L6TlsParamSweep` | 116 | 66 | 52 | 7 |
+| `L6HttpLoopbackSweep` | 78 | *no fixture* | 20 | 11 of the 21 it found |
+| `L6HttpLogicSweep` | 166 | 20 | 18 | 1 |
+| `JdkOnlyPlatformProbe` | 11 | 2 | **0** | 1 |
+| everything else measured | | | | unchanged |
 
-The base binary is `origin/dev` at `8f09c89b9`, built from the same worktree
-as the trial so the two differ only by this wave's source.
+**367 differing rows, and no probe moved the wrong way.** The last row is the
+one worth noticing: `JdkOnlyPlatformProbe` is not an L6 probe and nobody aimed
+at it — it asks the platform what it is, and two of its rows were the
+`InetAddress` literal defect seen from somewhere else.
+
+The base binary is `origin/dev` at `8f09c89b9`, built from the same worktree as
+the trial so the two differ only by this wave's source. `L6SocketSweep`,
+`L6UriSweep` and `L6UrlSweep` are unchanged at 40, 80 and 14 diff lines: this
+wave did not touch them, and §6 says why.
 
 ---
 
@@ -360,10 +370,23 @@ worktree, so they differ only by this wave:
   --jdk-only corpus, trial   133 passed, 0 failed
   --jdk-only corpus, control 133 passed, 0 failed
   SUITE=all                  133 passed, 0 failed
-  SUITE=core                 PENDING
-  gate set, five configs     PENDING
-  probe tree A/B             PENDING
+  SUITE=core                  93 passed, 0 failed
+  gate: types                 rc=0, 15 test binaries
+  gate: native-api            rc=0, 10 test binaries
+  gate: native-builtins      x3  10 of 11 binaries green in each; the lib
+                                 binary failed on THREE tests, all of them
+                                 pinning behaviour this wave measured away
+                                 (see the `test(l6)` commit) — fixed, and
+                                 re-run in run 2
+  A/B, 32 relevant probes     0 worse, 7 better, 0 line-count moves
 ```
+
+**The stub ratchet is green in all three configurations.** It is one of the ten
+integration binaries that passed while the lib binary failed, and it is the one
+that would have caught this wave's new registrations moving a frozen count —
+`Inet6AddressImpl.lookupAllHostAddr(String,int)`, four `SSLSocket` methods and
+`X500Principal.getName(String,Map)` are all `Bridge`, and the ratchet counts
+`SyntheticStub`.
 
 **Run 2 — the merged tree**, which is what actually lands: the gate set and
 the three arms again, on a binary built from the merge. The isolation run is
