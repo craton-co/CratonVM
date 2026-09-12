@@ -5087,16 +5087,19 @@ impl OsrEntryPlan {
     ///  * `RETHROW` — not a resume point at all; the bci names a throwing
     ///    instruction to be routed through the exception table. Refused.
     ///
-    /// **`Unsupported` and `MaterializationRequired` in a local.** Both refuse.
-    /// An `Unsupported` local used to be tolerated on the argument that
-    /// `classify_local_kinds` marks a slot `Ambiguous` at every bci when it is
-    /// accessed as two kinds anywhere, and that verified bytecode keeps such a
-    /// slot dead or re-stored before it is read. The second half does not
-    /// follow: a slot reused as `int` in one region and as a reference in
-    /// another is well typed and LIVE inside each region, and the live frame's
-    /// word there is whatever the compiled code last left in it, not
-    /// necessarily the value the interpreter expects.
-    /// `MaterializationRequired` is **not** tolerated either: it means a value that
+    /// **`Unsupported` vs `MaterializationRequired` in a local.** An
+    /// `Unsupported` local is tolerated: the 1-pass backend's
+    /// `classify_local_kinds` is a coarse whole-method scan that marks a slot
+    /// `Ambiguous` at *every* bci if it is accessed as two kinds *anywhere*, so
+    /// the live frame's current value is left in place. Refusing instead is
+    /// not the safe direction: it discards the exit's committed side effects
+    /// and replays them from pre-entry state, which is the defect recorded in
+    /// `jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md`. The
+    /// tolerance still rests on "dead or re-stored before read", which
+    /// whole-method classification does not prove for a slot reused as two
+    /// kinds; the precise answer is bytecode liveness at the exit bci. See
+    /// `jit-resume-tolerates-unsupported-locals-without-liveness-20260912.md`.
+    /// `MaterializationRequired` is **not** tolerated: it means a value that
     /// *was* live got deleted by an optimization with no rebuild recipe, so the
     /// live frame's stale pre-entry word is genuinely wrong, not merely
     /// unread. Guessing it is exactly what `FrameValue::MaterializationRequired`
@@ -5208,13 +5211,9 @@ impl OsrEntryPlan {
         }
         for (i, v) in rframe.locals.iter().enumerate() {
             match v {
-                // See the doc comment: not provably unread, so not a resume.
-                FV::Unsupported => {
-                    return Err(osr_refusal(
-                        OSR_REFUSE_EXIT_REPLAY,
-                        format!("exit at bci {}: local {i} is Unsupported", rframe.bci),
-                    ));
-                }
+                // See the doc comment: coarse-classifier noise, left at the
+                // live frame's current value.
+                FV::Unsupported => {}
                 FV::MaterializationRequired(ev) => {
                     return Err(osr_refusal(
                         OSR_REFUSE_EXIT_REPLAY,
@@ -17278,8 +17277,19 @@ unsafe fn collect_code_buffers_in_band(lo: usize, hi: usize, out: &mut Vec<usize
     if hi - lo > MAX_BAND_BYTES {
         return false;
     }
-    // Every `ExecutableBuffer` is in this snapshot from `new` to `Drop`, so a
-    // body a frame on this stack can return into is always in it.
+    // The lock-free snapshot may LAG registrations (see
+    // `JIT_CODE_REGION_SNAPSHOT`): a buffer created since the last republish is
+    // absent from it. A summary built from a lagging snapshot would omit a body
+    // this stack returns into, and the drain would free it under the parked
+    // thread. So catch the snapshot up first. One lock per blocking transition,
+    // and only a clone when something was registered since the last republish;
+    // a blocked thread runs no code newer than this scan before it leaves.
+    {
+        let mut guard = jit_code_regions().lock().unwrap_or_else(|e| e.into_inner());
+        if guard.published_epoch != REGIONS_EPOCH.load(std::sync::atomic::Ordering::Acquire) {
+            publish_region_snapshot(&mut guard);
+        }
+    }
     let regions = jit_code_region_snapshot().load();
     let (Some(&(envelope_lo, _)), Some(&(_, envelope_hi))) = (regions.first(), regions.last())
     else {
@@ -39121,14 +39131,15 @@ mod tests {
         assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_EXIT_REPLAY));
         assert!(err.to_string().contains("local 1"), "{err}");
 
-        // `Unsupported` in a LOCAL refuses too: a slot the coarse classifier
-        // calls ambiguous can still be live at this bci, so the live frame's
-        // current word is not known to be the interpreter's value.
+        // `Unsupported` in a LOCAL is the documented exception: refusing would
+        // replay the exit's committed side effects from pre-entry state, so the
+        // live frame's current value stands and the resume goes ahead.
         let mut unsupported_local = base.clone();
         unsupported_local.locals[2] = deopt::FrameValue::Unsupported;
-        let err = plan.resume_after_exit(&cm, &unsupported_local).unwrap_err();
-        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_EXIT_REPLAY));
-        assert!(err.to_string().contains("local 2"), "{err}");
+        assert_eq!(
+            plan.resume_after_exit(&cm, &unsupported_local).unwrap(),
+            OSR_T_HEADER
+        );
 
         // `Unsupported` on the operand STACK has no such argument.
         let mut unsupported_stack = base.clone();

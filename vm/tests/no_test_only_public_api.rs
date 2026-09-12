@@ -194,7 +194,7 @@ use std::path::{Path, PathBuf};
 /// deleted — shims onto a model queue that no production path ever fed — and
 /// `code_cache_lifecycle_raw` gained a production caller in
 /// `code_cache_lifecycle_report`, which now reports the JIT's real accounting.
-const BASELINE_OFFENDERS: usize = 292;
+const BASELINE_OFFENDERS: usize = 291;
 
 /// Minimum number of declarations the scan must find before its result means
 /// anything.
