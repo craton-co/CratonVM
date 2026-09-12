@@ -267,8 +267,12 @@ order:
 > both moved. `FrameState::caller` is no longer `None` at every producer: the
 > single-pass backend's deopt-point publisher (`jit/src/x64/deopt_stubs.rs`)
 > sets `frame_state.caller = self.inline_caller_chain()`, which is non-`None`
-> inside a spliced body (since 2026-08-18). The IR lowerer's own producers still
-> write `caller: None`. And the VM transfer is no longer single-frame:
+> inside a spliced body (since 2026-08-18). The IR lowerer builds `caller` through
+> `caller_chain_for`, which yields `None` in practice: IR-tier inlining
+> (`CRATONVM_JIT_IR_INLINE`, default on) splices callees with the caller's
+> `invoke` bci and re-execute semantics and deliberately registers no inline
+> scope, so the `InlineScopeTable` is empty on every compile. And the VM
+> transfer is no longer single-frame:
 > `transfer_osr_exit_into_live_frame_checked` hands a frame with caller frames
 > to `transfer_osr_exit_chain_into_live_frame`, which writes the outermost scope
 > into the live frame and pushes the rest.
@@ -542,7 +546,8 @@ answers, now with reasons).
 * ~~**`FrameState::caller` is still `None` at every producer.**~~ **Partly
   lifted:** the single-pass backend's deopt-point publisher
   (`jit/src/x64/deopt_stubs.rs`) records `inline_caller_chain()` inside a
-  spliced body; the IR lowerer's producers still write `caller: None`.
+  spliced body. The IR lowerer's `caller_chain_for` still yields `None`, because
+  IR-tier splicing registers no inline scope.
   `osr-entry-inlined-scope` still refuses an inlined artifact with deopt points
   none of which records a chain.
 * ~~**The VM's OSR-exit transfer is single-frame.**~~ **Lifted:**

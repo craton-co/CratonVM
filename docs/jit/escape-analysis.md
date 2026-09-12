@@ -440,7 +440,8 @@ is recorded here so that whoever enables handler compilation knows to revisit
 > re-verified for this update. Separately, §7 step 5's "`FrameState::caller`
 > is hard-coded `None` in both backends" is no longer true of the single-pass
 > backend, whose deopt-point publisher records `inline_caller_chain()`. The IR
-> lowerer's producers still write `caller: None`. §8 item 1 is resolved by 6.1.
+> lowerer's `caller_chain_for` still yields `None`, because IR-tier splicing
+> registers no inline scope. §8 item 1 is resolved by 6.1.
 
 All in `jit/src/lib.rs`, which is another agent's file. Cited by symbol, not
 line, because that file is being edited concurrently.
