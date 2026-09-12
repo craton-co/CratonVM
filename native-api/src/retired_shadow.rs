@@ -7095,6 +7095,9 @@ static RETIRED_SHADOW_L2_TRIPLES: &[(&str, &str, &str)] = &[
 ///                 the real `isPresent`/`value` 2-field layout     retire
 ///   Arrays        stateless                                      retire
 ///   TreeMap/Set   `tm_array_table()` — a Rust side table         HELD
+///                 REVISED 2026-09-12 (wave 8): the real `root` is a
+///                 real `TreeMap$Entry` tree, `size` is mirrored, and
+///                 the side table now has a READER. RETIRED, 156.
 ///   LinkedHashMap `lhm_overlay()` — a Rust side table            HELD
 ///   HashMap       real `table`, but 9 probes move                HELD
 ///   Hashtable     real `table`, but 4 probes move                HELD
@@ -7113,7 +7116,12 @@ static RETIRED_SHADOW_L2_TRIPLES: &[(&str, &str, &str)] = &[
 ///   java/util/Collections                  0      1      36
 ///   java/util/Optional                     0      0      15
 ///   java/util/Arrays                       0      0      44
-///   java/util/TreeMap,TreeSet              9      1      19   <- held
+///   java/util/TreeMap,TreeSet              9      1      19   <- RETIRED
+///                                                              wave 8; the
+///                                                              9 were a dial
+///                                                              reading, and
+///                                                              two binaries
+///                                                              say 1
 ///   java/util/LinkedHashMap               11      1      18   <- held
 ///   java/util/HashMap                      9      0      44   <- held
 ///   java/util/Hashtable                    4      0      44   <- held
@@ -8546,6 +8554,694 @@ static RETIRED_SHADOW_L1_HT_TRIPLES: &[(&str, &str, &str)] = &[
         "java/util/Hashtable$ValueCollection",
         "toString",
         "()Ljava/lang/String;",
+    ),
+];
+
+/// L1 wave 8 — `java/util/TreeMap`, `java/util/TreeSet` and the family's view
+/// and iterator carriers, 156 triples.
+///
+/// # What the hold said, and what was actually true
+///
+/// Section 1 of the lane page held this family on *"state is
+/// `tm_array_table()`, a Rust side table"*, and `the_l1_families_measured_
+/// load_bearing_are_still_held` said the same in four words: *"the real
+/// `root`/`size`/`comparator` are never written"*. Wave 7 reflected them on an
+/// unarmed control and all three matched HotSpot 25.0.4+7 —
+/// `tm_publish_real_root` builds a real red-black tree of real
+/// `java.util.TreeMap$Entry` nodes, `tm_set_slot` mirrors `size` by name, and
+/// the comparator was always there. What was left of the hold was the
+/// DIRECTION: that mirror was one-way, and its own doc said so.
+///
+/// # The two changes that made the family takeable
+///
+/// Both are in `native-collections`, and neither moves the store:
+///
+/// * `tm_pairs_from_real_root` — the READ half of that mirror. With the
+///   natives gone, real bytecode maintains `root` and `tm_array_table` is
+///   empty; a native that still has to decode a `TreeMap` (every `toArray`
+///   over a view, every `new ArrayList<>(view)`) now reads the node graph.
+/// * `ts_view_source`'s by-name arm and `collect_collection_elements_pinned`'s
+///   `TreeMap$KeySet` arm — the view carriers. `TreeMap$KeySet` is in NEITHER
+///   `MAP_VIEW_CARRIERS` nor `SET_VIEW_CARRIERS`, and `TreeMap$EntrySet` is in
+///   the first but `vc_route`'s gate was the values predicate, so its
+///   entry-shaped arm had never run.
+///
+/// And one correction that only the two-binary arm could find: the side table
+/// gets SEEDED once on a read path and then rots, so `tm_collect_pairs` now
+/// arbitrates between the two stores with the receiver's own `size` field
+/// rather than preferring either. See its doc — `StaleViewAddAllProbe` is the
+/// probe, and it was the only row in a 163-probe tree that moved.
+///
+/// # Measured
+///
+/// ```text
+///   dial armed on `java/util/TreeMap` alone, apps/probes/L1MapViewToArrayProbe
+///     control            38 rows differ       (unarmed: 0)
+///     + decode fix       16 rows differ
+///     + retirement        0 rows differ
+/// ```
+///
+/// The 16 the dial could not clear are the dial's own: it declines at the
+/// DISPATCH DOOR, so `native_ts_iterator` still ran and still minted a
+/// `java/util/TreeMap$KeyIterator` whose own `hasNext` the same armed scope
+/// then declined — real JDK bytecode over a carrier this VM laid out itself.
+/// A retirement deletes the registration instead, so the iterator is the
+/// image's and the question does not arise. Two instruments, and only the
+/// second one can answer for a retirement.
+///
+/// # Acceptance
+///
+/// Two binaries from the same tree (`origin/dev` at `f99c2e748` merged in),
+/// `cratonvm-l1w8-ctl2` and `cratonvm-l1w8-t7`, over the whole probe tree --
+/// 163 measured, 9 the shared battery cannot compile:
+///
+/// ```text
+///   --jdk-only     0 worse   2 better   0 line-count mismatches
+///   DEFAULT mode   0 worse   1 better   0 line-count mismatches
+///   regression-suite SUITE=all    136 / 136 on BOTH binaries
+///   regression-suite SUITE=core    95 /  95 on BOTH binaries
+/// ```
+///
+/// One "better" is attributable: `NullArgMsgProbe` -2, where
+/// `TreeSet.addAll(null)` now carries the helpful NPE text real bytecode
+/// builds instead of the native's bare `null`. The other two are not claimed
+/// -- `L5FjDouble` is a ForkJoin scheduling row, and `ConcurrentStressSweep`
+/// is the probe wave 7 measured moving AGAINST ITSELF, 0/4/2/4 over four
+/// control-versus-control runs.
+///
+/// A control arm was run first, same script, the same binary on both sides:
+/// 163 probes, 0 worse, 0 better. The noise floor for this battery on this
+/// host is zero, which is what lets the two rows above be read at all.
+///
+/// The nine probes the battery skips for want of `--add-exports` were run by
+/// hand against both binaries: all five that compile read base 0 / trial 0.
+///
+///
+/// # Re-taken on the landing tree
+///
+/// `origin/dev` moved 35 commits mid-wave, and one of them was a sibling
+/// lane's fix to `TreeMap`'s declared reference fields (`cached_tm_view`, the
+/// same function family). So the whole set was re-run against a control built
+/// from `0a805f3fc` itself:
+///
+/// ```text
+///   --jdk-only     164 probes   0 worse   1 better (NullArgMsgProbe -2)
+///   DEFAULT        164 probes   2 worse   1 better  <- both "worse" are flakes
+///   regression-suite SUITE=all   trial 136 / 136, control 135 / 136
+///   regression-suite SUITE=core   95 /  95 on both
+/// ```
+///
+/// The two default-mode rows are `ChmShadowSweep` (+12) and
+/// `ConcurrentStressSweep` (+2), and they are the same `ConcurrentHashMap`
+/// race the strict corpus prints as `T19_H6_CAS_DIAG`. Measured rather than
+/// asserted: 20 INTERLEAVED pairs of `ChmShadowSweep` in default mode give
+/// **control 5/20 non-zero, trial 3/20** — the probe loses one of 800
+/// concurrent writes about a fifth of the time on either binary, and the
+/// battery's single sample happened to catch the control clean. The control's
+/// own `SUITE=all` lost `RMapGcStress` in the same way while the trial passed
+/// 136/136.
+/// # Scope
+///
+/// 156 rows: every `owns_slot && kind == "bridge"` registration under the two
+/// prefixes that is bucket A or B **on all three supported images** —
+/// jdk-17.0.20.1+1, jdk-21.0.12+8 and jdk-25.0.4+7, censused separately rather
+/// than assumed from the newest. Seven rows are refused by all three and stay
+/// out: `TreeMap.iterator()`, which no image declares, and six
+/// `TreeMap$KeySet` members (`<init>` ×3, `clone`, `readObject`, `writeObject`)
+/// that exist only because `register_tree_set_natives` mirrors `TreeSet`'s
+/// surface onto the carrier.
+///
+/// The family's three iterator carriers are in the table WITH their producers,
+/// which is the condition
+/// `a-carrier-minted-for-other-families-blocks-its-own-retirement` names:
+/// `TreeMap$KeyIterator` is minted for `java/util/TreeSet` and
+/// `TreeMap$KeySet`, `$ValueIterator` for `TreeMap$Values`, `$EntryIterator`
+/// for `TreeMap$EntrySet` — and all five of those classes are retired here.
+/// Nothing outside the family mints one.
+static RETIRED_SHADOW_L1_TM_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/util/TreeMap", "<init>", "()V"),
+    ("java/util/TreeMap", "<init>", "(Ljava/util/Comparator;)V"),
+    ("java/util/TreeMap", "<init>", "(Ljava/util/Map;)V"),
+    ("java/util/TreeMap", "<init>", "(Ljava/util/SortedMap;)V"),
+    (
+        "java/util/TreeMap",
+        "ceilingEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+    ),
+    (
+        "java/util/TreeMap",
+        "ceilingKey",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    ("java/util/TreeMap", "clear", "()V"),
+    (
+        "java/util/TreeMap",
+        "comparator",
+        "()Ljava/util/Comparator;",
+    ),
+    (
+        "java/util/TreeMap",
+        "compute",
+        "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/TreeMap",
+        "computeIfAbsent",
+        "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/TreeMap",
+        "computeIfPresent",
+        "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    ("java/util/TreeMap", "containsKey", "(Ljava/lang/Object;)Z"),
+    (
+        "java/util/TreeMap",
+        "containsValue",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/TreeMap",
+        "descendingKeySet",
+        "()Ljava/util/NavigableSet;",
+    ),
+    (
+        "java/util/TreeMap",
+        "descendingMap",
+        "()Ljava/util/NavigableMap;",
+    ),
+    ("java/util/TreeMap", "entrySet", "()Ljava/util/Set;"),
+    ("java/util/TreeMap", "firstEntry", "()Ljava/util/Map$Entry;"),
+    ("java/util/TreeMap", "firstKey", "()Ljava/lang/Object;"),
+    (
+        "java/util/TreeMap",
+        "floorEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+    ),
+    (
+        "java/util/TreeMap",
+        "floorKey",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/TreeMap",
+        "forEach",
+        "(Ljava/util/function/BiConsumer;)V",
+    ),
+    (
+        "java/util/TreeMap",
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/TreeMap",
+        "getOrDefault",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/TreeMap",
+        "headMap",
+        "(Ljava/lang/Object;)Ljava/util/SortedMap;",
+    ),
+    (
+        "java/util/TreeMap",
+        "headMap",
+        "(Ljava/lang/Object;Z)Ljava/util/NavigableMap;",
+    ),
+    (
+        "java/util/TreeMap",
+        "higherEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+    ),
+    (
+        "java/util/TreeMap",
+        "higherKey",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    ("java/util/TreeMap", "isEmpty", "()Z"),
+    ("java/util/TreeMap", "keySet", "()Ljava/util/Set;"),
+    ("java/util/TreeMap", "lastEntry", "()Ljava/util/Map$Entry;"),
+    ("java/util/TreeMap", "lastKey", "()Ljava/lang/Object;"),
+    (
+        "java/util/TreeMap",
+        "lowerEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+    ),
+    (
+        "java/util/TreeMap",
+        "lowerKey",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/TreeMap",
+        "merge",
+        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/TreeMap",
+        "navigableKeySet",
+        "()Ljava/util/NavigableSet;",
+    ),
+    (
+        "java/util/TreeMap",
+        "pollFirstEntry",
+        "()Ljava/util/Map$Entry;",
+    ),
+    (
+        "java/util/TreeMap",
+        "pollLastEntry",
+        "()Ljava/util/Map$Entry;",
+    ),
+    (
+        "java/util/TreeMap",
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    ("java/util/TreeMap", "putAll", "(Ljava/util/Map;)V"),
+    (
+        "java/util/TreeMap",
+        "putIfAbsent",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/TreeMap",
+        "remove",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/TreeMap",
+        "remove",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/TreeMap",
+        "replace",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/TreeMap",
+        "replace",
+        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/TreeMap",
+        "replaceAll",
+        "(Ljava/util/function/BiFunction;)V",
+    ),
+    ("java/util/TreeMap", "size", "()I"),
+    (
+        "java/util/TreeMap",
+        "subMap",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/SortedMap;",
+    ),
+    (
+        "java/util/TreeMap",
+        "subMap",
+        "(Ljava/lang/Object;ZLjava/lang/Object;Z)Ljava/util/NavigableMap;",
+    ),
+    (
+        "java/util/TreeMap",
+        "tailMap",
+        "(Ljava/lang/Object;)Ljava/util/SortedMap;",
+    ),
+    (
+        "java/util/TreeMap",
+        "tailMap",
+        "(Ljava/lang/Object;Z)Ljava/util/NavigableMap;",
+    ),
+    ("java/util/TreeMap", "toString", "()Ljava/lang/String;"),
+    ("java/util/TreeMap", "values", "()Ljava/util/Collection;"),
+    (
+        "java/util/TreeMap$Entry",
+        "setValue",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    ("java/util/TreeMap$EntryIterator", "hasNext", "()Z"),
+    (
+        "java/util/TreeMap$EntryIterator",
+        "next",
+        "()Ljava/lang/Object;",
+    ),
+    ("java/util/TreeMap$EntryIterator", "remove", "()V"),
+    ("java/util/TreeMap$EntrySet", "clear", "()V"),
+    (
+        "java/util/TreeMap$EntrySet",
+        "contains",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/TreeMap$EntrySet",
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+    ),
+    ("java/util/TreeMap$EntrySet", "isEmpty", "()Z"),
+    (
+        "java/util/TreeMap$EntrySet",
+        "iterator",
+        "()Ljava/util/Iterator;",
+    ),
+    (
+        "java/util/TreeMap$EntrySet",
+        "remove",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/TreeMap$EntrySet",
+        "removeIf",
+        "(Ljava/util/function/Predicate;)Z",
+    ),
+    ("java/util/TreeMap$EntrySet", "size", "()I"),
+    (
+        "java/util/TreeMap$EntrySet",
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+    ),
+    (
+        "java/util/TreeMap$EntrySet",
+        "stream",
+        "()Ljava/util/stream/Stream;",
+    ),
+    (
+        "java/util/TreeMap$EntrySet",
+        "toArray",
+        "()[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/TreeMap$EntrySet",
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/TreeMap$EntrySet",
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/TreeMap$EntrySet",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/util/TreeMap$KeyIterator", "hasNext", "()Z"),
+    (
+        "java/util/TreeMap$KeyIterator",
+        "next",
+        "()Ljava/lang/Object;",
+    ),
+    ("java/util/TreeMap$KeyIterator", "remove", "()V"),
+    ("java/util/TreeMap$KeySet", "add", "(Ljava/lang/Object;)Z"),
+    (
+        "java/util/TreeMap$KeySet",
+        "addAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/TreeMap$KeySet",
+        "ceiling",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    ("java/util/TreeMap$KeySet", "clear", "()V"),
+    (
+        "java/util/TreeMap$KeySet",
+        "comparator",
+        "()Ljava/util/Comparator;",
+    ),
+    (
+        "java/util/TreeMap$KeySet",
+        "contains",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/TreeMap$KeySet",
+        "descendingIterator",
+        "()Ljava/util/Iterator;",
+    ),
+    (
+        "java/util/TreeMap$KeySet",
+        "descendingSet",
+        "()Ljava/util/NavigableSet;",
+    ),
+    ("java/util/TreeMap$KeySet", "first", "()Ljava/lang/Object;"),
+    (
+        "java/util/TreeMap$KeySet",
+        "floor",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/TreeMap$KeySet",
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+    ),
+    (
+        "java/util/TreeMap$KeySet",
+        "headSet",
+        "(Ljava/lang/Object;)Ljava/util/SortedSet;",
+    ),
+    (
+        "java/util/TreeMap$KeySet",
+        "headSet",
+        "(Ljava/lang/Object;Z)Ljava/util/NavigableSet;",
+    ),
+    (
+        "java/util/TreeMap$KeySet",
+        "higher",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    ("java/util/TreeMap$KeySet", "isEmpty", "()Z"),
+    (
+        "java/util/TreeMap$KeySet",
+        "iterator",
+        "()Ljava/util/Iterator;",
+    ),
+    ("java/util/TreeMap$KeySet", "last", "()Ljava/lang/Object;"),
+    (
+        "java/util/TreeMap$KeySet",
+        "lower",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/TreeMap$KeySet",
+        "pollFirst",
+        "()Ljava/lang/Object;",
+    ),
+    (
+        "java/util/TreeMap$KeySet",
+        "pollLast",
+        "()Ljava/lang/Object;",
+    ),
+    (
+        "java/util/TreeMap$KeySet",
+        "remove",
+        "(Ljava/lang/Object;)Z",
+    ),
+    ("java/util/TreeMap$KeySet", "size", "()I"),
+    (
+        "java/util/TreeMap$KeySet",
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+    ),
+    (
+        "java/util/TreeMap$KeySet",
+        "stream",
+        "()Ljava/util/stream/Stream;",
+    ),
+    (
+        "java/util/TreeMap$KeySet",
+        "subSet",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/SortedSet;",
+    ),
+    (
+        "java/util/TreeMap$KeySet",
+        "subSet",
+        "(Ljava/lang/Object;ZLjava/lang/Object;Z)Ljava/util/NavigableSet;",
+    ),
+    (
+        "java/util/TreeMap$KeySet",
+        "tailSet",
+        "(Ljava/lang/Object;)Ljava/util/SortedSet;",
+    ),
+    (
+        "java/util/TreeMap$KeySet",
+        "tailSet",
+        "(Ljava/lang/Object;Z)Ljava/util/NavigableSet;",
+    ),
+    (
+        "java/util/TreeMap$KeySet",
+        "toArray",
+        "()[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/TreeMap$KeySet",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/util/TreeMap$ValueIterator", "hasNext", "()Z"),
+    (
+        "java/util/TreeMap$ValueIterator",
+        "next",
+        "()Ljava/lang/Object;",
+    ),
+    ("java/util/TreeMap$ValueIterator", "remove", "()V"),
+    ("java/util/TreeMap$Values", "clear", "()V"),
+    (
+        "java/util/TreeMap$Values",
+        "contains",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/TreeMap$Values",
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+    ),
+    ("java/util/TreeMap$Values", "isEmpty", "()Z"),
+    (
+        "java/util/TreeMap$Values",
+        "iterator",
+        "()Ljava/util/Iterator;",
+    ),
+    (
+        "java/util/TreeMap$Values",
+        "remove",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/TreeMap$Values",
+        "removeIf",
+        "(Ljava/util/function/Predicate;)Z",
+    ),
+    ("java/util/TreeMap$Values", "size", "()I"),
+    (
+        "java/util/TreeMap$Values",
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+    ),
+    (
+        "java/util/TreeMap$Values",
+        "stream",
+        "()Ljava/util/stream/Stream;",
+    ),
+    (
+        "java/util/TreeMap$Values",
+        "toArray",
+        "()[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/TreeMap$Values",
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/TreeMap$Values",
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/TreeMap$Values",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/util/TreeSet", "<init>", "()V"),
+    ("java/util/TreeSet", "<init>", "(Ljava/util/Collection;)V"),
+    ("java/util/TreeSet", "<init>", "(Ljava/util/Comparator;)V"),
+    ("java/util/TreeSet", "add", "(Ljava/lang/Object;)Z"),
+    ("java/util/TreeSet", "addAll", "(Ljava/util/Collection;)Z"),
+    (
+        "java/util/TreeSet",
+        "ceiling",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    ("java/util/TreeSet", "clear", "()V"),
+    ("java/util/TreeSet", "clone", "()Ljava/lang/Object;"),
+    (
+        "java/util/TreeSet",
+        "comparator",
+        "()Ljava/util/Comparator;",
+    ),
+    ("java/util/TreeSet", "contains", "(Ljava/lang/Object;)Z"),
+    (
+        "java/util/TreeSet",
+        "descendingIterator",
+        "()Ljava/util/Iterator;",
+    ),
+    (
+        "java/util/TreeSet",
+        "descendingSet",
+        "()Ljava/util/NavigableSet;",
+    ),
+    ("java/util/TreeSet", "first", "()Ljava/lang/Object;"),
+    (
+        "java/util/TreeSet",
+        "floor",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/TreeSet",
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+    ),
+    (
+        "java/util/TreeSet",
+        "headSet",
+        "(Ljava/lang/Object;)Ljava/util/SortedSet;",
+    ),
+    (
+        "java/util/TreeSet",
+        "headSet",
+        "(Ljava/lang/Object;Z)Ljava/util/NavigableSet;",
+    ),
+    (
+        "java/util/TreeSet",
+        "higher",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    ("java/util/TreeSet", "isEmpty", "()Z"),
+    ("java/util/TreeSet", "iterator", "()Ljava/util/Iterator;"),
+    ("java/util/TreeSet", "last", "()Ljava/lang/Object;"),
+    (
+        "java/util/TreeSet",
+        "lower",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    ("java/util/TreeSet", "pollFirst", "()Ljava/lang/Object;"),
+    ("java/util/TreeSet", "pollLast", "()Ljava/lang/Object;"),
+    (
+        "java/util/TreeSet",
+        "readObject",
+        "(Ljava/io/ObjectInputStream;)V",
+    ),
+    ("java/util/TreeSet", "remove", "(Ljava/lang/Object;)Z"),
+    ("java/util/TreeSet", "size", "()I"),
+    (
+        "java/util/TreeSet",
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+    ),
+    ("java/util/TreeSet", "stream", "()Ljava/util/stream/Stream;"),
+    (
+        "java/util/TreeSet",
+        "subSet",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/SortedSet;",
+    ),
+    (
+        "java/util/TreeSet",
+        "subSet",
+        "(Ljava/lang/Object;ZLjava/lang/Object;Z)Ljava/util/NavigableSet;",
+    ),
+    (
+        "java/util/TreeSet",
+        "tailSet",
+        "(Ljava/lang/Object;)Ljava/util/SortedSet;",
+    ),
+    (
+        "java/util/TreeSet",
+        "tailSet",
+        "(Ljava/lang/Object;Z)Ljava/util/NavigableSet;",
+    ),
+    ("java/util/TreeSet", "toArray", "()[Ljava/lang/Object;"),
+    ("java/util/TreeSet", "toString", "()Ljava/lang/String;"),
+    (
+        "java/util/TreeSet",
+        "writeObject",
+        "(Ljava/io/ObjectOutputStream;)V",
     ),
 ];
 
@@ -10873,6 +11569,238 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
         && !crate::unretire::is_excluded(class_name, method_name, descriptor)
 }
 
+/// Lane 4 wave 5 -- three of the four families the wave-1 BUILDS backed out,
+/// 27 rows over eight classes of `java/io/`, `java/nio/channels/` and
+/// `java/nio/file/attribute/`.
+///
+/// No new prefix. `java/io/` and `java/nio/` were both admitted by wave 1 and
+/// every class here is under one of them, so the table is the whole of the
+/// decision.
+///
+/// # A backed-out family's recorded CAUSE is a hypothesis, and these were three
+///
+/// §9.2 of the lane page lost five families on wave 1's builds and wrote one
+/// cause for all of them: "a fabricated carrier whose real fields this VM never
+/// writes". Wave 4 took `java/nio/CharBuffer` and found that false for it.
+/// This wave took the rest and found the record wrong in a THIRD way -- not
+/// stale, and not mistaken about which vector, but mistaken about the
+/// MECHANISM in one case and about the kind of thing it was in another:
+///
+/// * **The file-handle group (9)** -- `FileOutputStream`, `FileCleanable`,
+///   `FileDescriptor` and the abstract-receiver `java/nio/channels/FileChannel`
+///   -- went out as an UN-ATTRIBUTED group because `RJdkSecurity` reproduced
+///   under no dial scope. §9.4 then found that vector's cause and fixed it: a
+///   `java.io.File` carrier with an unwritten `prefixLength`. **Nobody re-tried
+///   the group after the fix.** It is green here in every arm, and the whole of
+///   its blocker was a defect in a different class that had been closed for two
+///   days.
+/// * **`java/nio/file/attribute/` (12)** was attributed to `RFileTimes` by a
+///   dial sweep, and that attribution is CORRECT -- the vector fails on this
+///   table alone, reproduced one row at a time. The recorded mechanism is not:
+///   it is not a fabricated carrier, it is a READER. See below.
+/// * **`java/io/ByteArrayInputStream` (9)** was attributed to `RSslLiveSession`,
+///   also correctly, and is not a defect at all. Six rows retire; three are
+///   carved out because they carry an OBSERVATION rather than an answer. See
+///   `the_backed_out_wave_is_twenty_seven_rows_over_eight_classes`.
+///
+/// The fourth, `java/nio/file/spi/FileSystemProvider`, is not here and not
+/// because it was forgotten: `the_provider_family_is_retired_by_no_table` has
+/// the measurement that blocks it, and the blocker is a concrete `Path`.
+///
+/// # `filetime_read_millis` read a value whose UNIT it did not check
+///
+/// `FileTime` stores a PAIR. `FileTime.from(Instant)` compiles to
+/// `new FileTime(0L, null, instant)` on 17, 21 and 25 alike -- `value` is a
+/// literal `lconst_0` and the time is in `instant`. This VM's reader took
+/// `value` for milliseconds, which held only because `filetime_alloc`, the
+/// other end of the same VM, converts to millis before storing. Retire
+/// `from`/`fromMillis` and real bytecode becomes the producer; the setter then
+/// read **0** and `BasicFileAttributeView.setTimes` stamped every file
+/// 1970-01-01. That is `RFileTimes`, and it is wave 4's finding in a new place:
+/// **a native that owns both ends of a convention agrees with itself whatever
+/// the convention is, and a retirement is how you ask for a second opinion.**
+///
+/// Fixed in the commit this table lands with, not carved out -- the rows are
+/// correct and the reader was not.
+///
+/// # Four arms, and the wave MOVES the probe toward HotSpot
+///
+/// `apps/probes/L4W5Sweep.java`, 183 rows over all four families, diffed
+/// against a HotSpot 25 oracle rather than against the control alone:
+///
+/// ```text
+///   A  control (origin/dev f99c2e748), --jdk-only        8 rows differ
+///   B  this wave, --jdk-only                             4 rows differ
+///   C  this wave, compatible mode          0 differ FROM THE CONTROL
+///   D  this wave + UNRETIRE, same binary   0 differ FROM THE CONTROL
+/// ```
+///
+/// Arm D names `27 table row(s)` across its eight rules at arm time, which is
+/// the receipt that B's movement is THIS table's and not a neighbour's under a
+/// prefix that admits the whole of `java/io/`.
+///
+/// The four rows it moves are four silent wrong answers, all toward HotSpot:
+///
+/// ```text
+///   FileTime.from(..., NANOSECONDS).toString()   .123Z          -> .123456789Z
+///   FileTime.from(..., NANOSECONDS).to(NANOS)    ...123000000   -> ...123456789
+///   PosixFilePermissions.fromString("rwx")       a Set          -> IAE
+///   FileChannel.isOpen() after the stream closed true           -> false
+/// ```
+///
+/// The last is §4's species exactly. The receiver is a REAL
+/// `sun.nio.ch.FileChannelImpl` in all three arms -- a native registered on
+/// `java/nio/channels/FileChannel` won the door for it and answered from this
+/// VM's fd table instead of from the `closed` field real `close()` had just
+/// set. Not a crash; a confident wrong answer to "is this channel open".
+///
+/// The 4 that remain are all carrier-IDENTITY rows this table does not touch
+/// (`BasicFileAttributeView` and `FileAttribute` minted as their INTERFACES,
+/// `Files.newInputStream` answering `FileInputStream` where HotSpot answers
+/// `sun.nio.ch.ChannelInputStream`).
+///
+/// # The corpus is what found both defects, and no probe did
+///
+/// The probe tree was clean on the first build of this table. The corpus was
+/// not: `RFileTimes` and `RSslLiveSession`, the two vectors §9.2 named, failed
+/// on it and were attributed to a family in six runs and to a row in nine more
+/// -- `CRATONVM_UNRETIRE_NATIVE_SHADOW`, no rebuild. §9.3's rule, paid for
+/// again.
+///
+/// ```text
+///   CRATONVM_ARGS=--jdk-only   control  136 passed, 0 failed
+///                              wave     136 passed, 0 failed
+///   SUITE=all                  wave     136 passed, 0 failed
+///   SUITE=core                 wave      95 passed, 0 failed
+/// ```
+///
+/// The two `--jdk-only` arms were compared VECTOR BY VECTOR and not by their
+/// totals: 136 lines each, zero differing. `TIMEOUT=600`; no timing claim is
+/// made from any arm.
+///
+/// # 27 of 27 through the funnel, 33 registrations, 0 survivors
+///
+/// Every row is invoked by `L4W5Sweep` under `--nojit
+/// CRATONVM_DISABLE_INTRINSICS=1`, which is what makes the census's
+/// `invocations_complete: true` mean what it says. One row --
+/// `FileOutputStream.write([BII)V` -- reports the count as INCOMPLETE, so
+/// precondition 4 rests on its `outcome` instead, and the control's report has
+/// it `native-won`.
+///
+/// The strict registry drops 33 registrations over the 27 triples and the
+/// wave's report carries no `native-won` among them; the control's report has
+/// 22. The gap between 27 and 33 is six double-registered triples, and it is
+/// the same six the ratchet counts.
+///
+/// # +33 in three arms, on one binary
+///
+/// ```text
+///   arm             OFF             ON              delta
+///   (default)   3979 / 13590    4012 / 13590        +33 / 0
+///   management  4006 / 13958    4039 / 13958        +33 / 0
+///   synthetic   3979 / 13625    4012 / 13625        +33 / 0
+/// ```
+///
+/// The OFF column is the same binary with this wave's rows disarmed, and it
+/// lands exactly on LANE 5's landed figures -- the third residual wave of that
+/// lane re-froze these same three constants between this wave's first
+/// measurement and its merge. That is what says the two compose rather than
+/// overlap, and it is a stronger statement than the pre-merge sitting could
+/// make: the same +33 in all three arms, measured twice, on trees 35
+/// registrations apart.
+///
+/// Totals identical in both columns: every stub added is an existing `Bridge`
+/// relabelled.
+///
+/// # Kind map: 32 rows amended, and the gate is no redder than dev
+///
+/// `bridge -> synthetic-stub` in the 25/linux baseline, written rather than
+/// regenerated so dev's own 1 050 flips are not absorbed. **32, not 33**:
+/// `PosixFilePermission.valueOf` is absent from the baseline altogether, and
+/// this gate passes and REPORTS a new row rather than failing on it, so
+/// freezing a row whose history this wave has not measured would be the wrong
+/// repair. After the amendment the wave fires 1 050 -- exactly the control's
+/// count -- and names no row of this table.
+///
+/// Measured on **linux/x86_64 against JDK 25**.
+static RETIRED_SHADOW_L4_BACKED_OUT_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/io/ByteArrayInputStream", "<init>", "([B)V"),
+    ("java/io/ByteArrayInputStream", "<init>", "([BII)V"),
+    ("java/io/ByteArrayInputStream", "available", "()I"),
+    ("java/io/ByteArrayInputStream", "read", "([B)I"),
+    ("java/io/ByteArrayInputStream", "reset", "()V"),
+    ("java/io/ByteArrayInputStream", "skip", "(J)J"),
+    (
+        "java/io/FileCleanable",
+        "register",
+        "(Ljava/io/FileDescriptor;)V",
+    ),
+    ("java/io/FileDescriptor", "<init>", "()V"),
+    ("java/io/FileOutputStream", "close", "()V"),
+    ("java/io/FileOutputStream", "flush", "()V"),
+    ("java/io/FileOutputStream", "write", "(I)V"),
+    ("java/io/FileOutputStream", "write", "([B)V"),
+    ("java/io/FileOutputStream", "write", "([BII)V"),
+    ("java/nio/channels/FileChannel", "close", "()V"),
+    ("java/nio/channels/FileChannel", "isOpen", "()Z"),
+    (
+        "java/nio/file/attribute/FileTime",
+        "compareTo",
+        "(Ljava/nio/file/attribute/FileTime;)I",
+    ),
+    (
+        "java/nio/file/attribute/FileTime",
+        "from",
+        "(JLjava/util/concurrent/TimeUnit;)Ljava/nio/file/attribute/FileTime;",
+    ),
+    (
+        "java/nio/file/attribute/FileTime",
+        "from",
+        "(Ljava/time/Instant;)Ljava/nio/file/attribute/FileTime;",
+    ),
+    (
+        "java/nio/file/attribute/FileTime",
+        "fromMillis",
+        "(J)Ljava/nio/file/attribute/FileTime;",
+    ),
+    (
+        "java/nio/file/attribute/FileTime",
+        "toInstant",
+        "()Ljava/time/Instant;",
+    ),
+    ("java/nio/file/attribute/FileTime", "toMillis", "()J"),
+    (
+        "java/nio/file/attribute/FileTime",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/nio/file/attribute/PosixFilePermission",
+        "valueOf",
+        "(Ljava/lang/String;)Ljava/nio/file/attribute/PosixFilePermission;",
+    ),
+    (
+        "java/nio/file/attribute/PosixFilePermission",
+        "values",
+        "()[Ljava/nio/file/attribute/PosixFilePermission;",
+    ),
+    (
+        "java/nio/file/attribute/PosixFilePermissions",
+        "asFileAttribute",
+        "(Ljava/util/Set;)Ljava/nio/file/attribute/FileAttribute;",
+    ),
+    (
+        "java/nio/file/attribute/PosixFilePermissions",
+        "fromString",
+        "(Ljava/lang/String;)Ljava/util/Set;",
+    ),
+    (
+        "java/nio/file/attribute/PosixFilePermissions",
+        "toString",
+        "(Ljava/util/Set;)Ljava/lang/String;",
+    ),
+];
+
 /// Every retired-shadow table, in one slice, so a gate can walk the whole
 /// population instead of naming one wave.
 ///
@@ -10992,6 +11920,13 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // inherits -- on a THIRD. See
     // `wave_seven_refused_the_linked_hash_map_iterator_half`.
     RETIRED_SHADOW_L1_HT_TRIPLES,
+    // 2026-09-12, L1 wave 8. The whole `TreeMap`/`TreeSet` family, 156 rows.
+    // Takeable for the same reason wave 7's were and one more: the state was
+    // already real (`root`, `size`, `comparator` all match HotSpot on an
+    // unarmed control), and this wave added the READ half of the `root`
+    // mirror -- `tm_pairs_from_real_root` -- so a native that still has to
+    // decode a TreeMap can do it from the node graph real bytecode maintains.
+    RETIRED_SHADOW_L1_TM_TRIPLES,
     // Lane 4 wave 2, added WITH the table rather than after a gate caught it --
     // which is the whole point of the loop this const now feeds.
     RETIRED_SHADOW_L4_FFM_TRIPLES,
@@ -11002,6 +11937,10 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // Lane 4 wave 4. No new prefix either: `java/nio/` was admitted by wave 1,
     // which retires this class's `java/nio/ByteBuffer` twin under it.
     RETIRED_SHADOW_L4_CHARBUFFER_TRIPLES,
+    // Lane 4 wave 5. No new prefix either: `java/io/` and `java/nio/` were
+    // both admitted by wave 1, and every class in this table is under one of
+    // them. The table is the whole of the decision.
+    RETIRED_SHADOW_L4_BACKED_OUT_TRIPLES,
 ];
 
 #[cfg(test)]
@@ -11171,6 +12110,115 @@ mod tests {
                 assert!(
                     !triple_is_retired_shadow(c, m, d),
                     "{c}.{m}{d} is retired, and no wave has measured {c}"
+                );
+            }
+        }
+    }
+
+    /// Wave 5's twenty-seven, and the four rows it leaves behind in classes it
+    /// otherwise takes whole.
+    ///
+    /// Three of the four are `java/io/ByteArrayInputStream`'s `read()I`,
+    /// `read([BII)I` and `close()V`, and they are NOT left out because they
+    /// answer wrongly. They answer exactly as the real bodies do. They are the
+    /// only three sites in the VM that dispatch `BaisEvent`
+    /// (`native-io/src/lib.rs`), which is how this VM makes HotSpot's
+    /// keep-alive DRAIN INSTANT observable: at body EOF, and at close, the
+    /// `https` carrier is recycled and every connection-level accessor starts
+    /// throwing `IllegalStateException: connection not yet open` again.
+    ///
+    /// Retiring them removes the observation with the native. MEASURED, one
+    /// run per row against `RSslLiveSession`: un-retiring EITHER `read()I` or
+    /// `close()V` alone clears the vector, because `drainTrap` drains with the
+    /// no-arg read and then closes and either site still fires. `read([BII)I`
+    /// is here for a reason no vector demonstrates -- it carries the same
+    /// observer for a caller that drains with the three-argument read -- and
+    /// leaving it out on the strength of "nothing went red" would ship the
+    /// same defect with no vector to find it.
+    ///
+    /// **This is a coupling and not a carrier defect**, so it is a different
+    /// kind of blocker from every other one in this lane: the row is correct,
+    /// the retirement is correct, and what breaks is a side effect hung off a
+    /// general-purpose class by a subsystem that has no other way to see the
+    /// instant. Moving it to a stream the HTTP layer owns is nominated in the
+    /// lane page; until then these three stay.
+    ///
+    /// The fourth is `PosixFilePermission.<clinit>()V`, out for the funnel's
+    /// reason and not for a behavioural one: it reads `invocations: 0` with
+    /// `invocations_complete: true` in this wave's own census, taken from a
+    /// probe that initializes the enum twice over. The native is simply never
+    /// the thing that runs class initialization here, and a row no measurement
+    /// reaches must not be taken.
+    #[test]
+    fn the_backed_out_wave_is_twenty_seven_rows_over_eight_classes() {
+        const CLASSES: &[&str] = &[
+            "java/io/ByteArrayInputStream",
+            "java/io/FileCleanable",
+            "java/io/FileDescriptor",
+            "java/io/FileOutputStream",
+            "java/nio/channels/FileChannel",
+            "java/nio/file/attribute/FileTime",
+            "java/nio/file/attribute/PosixFilePermission",
+            "java/nio/file/attribute/PosixFilePermissions",
+        ];
+        let mut classes = std::collections::BTreeSet::new();
+        for (c, m, d) in RETIRED_SHADOW_L4_BACKED_OUT_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is in lane 4's backed-out table and the predicate cannot see it"
+            );
+            assert!(
+                CLASSES.contains(c),
+                "{c} is not one of the eight classes this wave measured"
+            );
+            classes.insert(*c);
+        }
+        assert_eq!(RETIRED_SHADOW_L4_BACKED_OUT_TRIPLES.len(), 27);
+        assert_eq!(classes.len(), CLASSES.len(), "{classes:?}");
+
+        // The `BaisEvent` observers. A table row for any of these three is the
+        // defect `RSslLiveSession` catches, and nothing else would.
+        for (m, d) in [("read", "()I"), ("read", "([BII)I"), ("close", "()V")] {
+            assert!(
+                !triple_is_retired_shadow("java/io/ByteArrayInputStream", m, d),
+                "java/io/ByteArrayInputStream.{m}{d} dispatches BaisEvent; retiring it \
+                 removes this VM's only view of HotSpot's drain instant"
+            );
+        }
+        assert!(
+            !triple_is_retired_shadow(
+                "java/nio/file/attribute/PosixFilePermission",
+                "<clinit>",
+                "()V"
+            ),
+            "the enum's <clinit> is unreached by the wave's funnel"
+        );
+    }
+
+    /// The FOURTH backed-out family is retired by NO table, and that is a
+    /// decision with a measurement behind it rather than an omission.
+    ///
+    /// `java/nio/file/spi/FileSystemProvider` is nine bucket-A/B rows today
+    /// (four when §9.2 backed it out). Every one of them is blocked on the same
+    /// thing: `p57_alloc_provider` stamps instances with the ABSTRACT class on
+    /// purpose, and `FILE_SYSTEM_PROVIDER_IMPLS` records what minting the
+    /// concrete one costs -- both halves were written, built and run on
+    /// 2026-09-10, and `L4FilesSweep` went from 0 to 172 differing lines
+    /// because `UnixPath.toUnixPath`'s `instanceof UnixPath` fails against this
+    /// VM's interface-stamped Paths. Path first, provider second, and the Path
+    /// half is ~100 registrations mirrored onto `sun/nio/fs/UnixPath`.
+    ///
+    /// Asserted across EVERY table rather than against this wave's, because the
+    /// blocker belongs to the class and not to one lane's list: a row for it
+    /// arriving in any wave is the thing that would re-break `L4FilesSweep`.
+    #[test]
+    fn the_provider_family_is_retired_by_no_table() {
+        for table in RETIRED_SHADOW_TABLES {
+            for (c, m, d) in *table {
+                assert_ne!(
+                    *c, "java/nio/file/spi/FileSystemProvider",
+                    "{c}.{m}{d} is retired, and this VM's provider is stamped with the \
+                     ABSTRACT class -- the call reaches a declaration with no body"
                 );
             }
         }
@@ -12220,7 +13268,11 @@ mod tests {
         // The lane's three named blockers, each with a measurement behind it.
         // `StringBuilder` is the JIT intrinsic door (2026-08-28, N2);
         // `System.getProperty` is the property-store inversion; `System$1` is
-        // the hidden-class `defineClass0` failure found on 2026-09-10.
+        // ~~the hidden-class `defineClass0` failure found on 2026-09-10~~ FIXED
+        // 2026-09-12 (a hidden class could not refer to itself; the ENFORCE arm
+        // over the whole --jdk-only corpus is 136/0 now, was 39/1). It stays out
+        // of the table anyway: a clean dial arm is not a retirement score, and
+        // the dial cannot promote. These 28 rows need the two-binary score.
         for (c, m, d) in [
             ("java/lang/StringBuilder", "append", "(I)Ljava/lang/StringBuilder;"),
             ("java/lang/AbstractStringBuilder", "charAt", "(I)C"),
@@ -13877,16 +14929,89 @@ Ljava/nio/channels/FileChannel;"
     /// reason `Logger.log`'s eighth overload is: a per-class sweep called all
     /// five CHM classes RETIRE-SAFE, and nothing but an entry here records
     /// that they were considered and rejected.
+    /// L1 wave 8 took the whole `TreeMap`/`TreeSet` family, and this records
+    /// the shape of the thing rather than only the count: the map, the set,
+    /// the three view carriers, the three iterator carriers and the node
+    /// class, all in one table, because the family's carriers are minted by
+    /// its own members and a subset would have left a producer behind.
+    ///
+    /// The seven rows that stayed out are asserted too. They are not a
+    /// judgement — no supported image declares them — and an assertion is the
+    /// only thing that tells a later reader they were considered.
     #[test]
-    fn the_held_collection_families_are_not_retired() {
+    fn wave_eight_retired_the_tree_map_family() {
+        assert_eq!(
+            RETIRED_SHADOW_L1_TM_TRIPLES.len(),
+            156,
+            "the wave-8 TreeMap table changed size; re-take the three-image census"
+        );
         for (c, m, d) in [
-            // needs-VM-support: state is not real.
             (
                 "java/util/TreeMap",
                 "get",
                 "(Ljava/lang/Object;)Ljava/lang/Object;",
             ),
+            (
+                "java/util/TreeMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
             ("java/util/TreeSet", "add", "(Ljava/lang/Object;)Z"),
+            (
+                "java/util/TreeMap$KeySet",
+                "toArray",
+                "()[Ljava/lang/Object;",
+            ),
+            (
+                "java/util/TreeMap$EntrySet",
+                "toArray",
+                "()[Ljava/lang/Object;",
+            ),
+            (
+                "java/util/TreeMap$Values",
+                "toArray",
+                "()[Ljava/lang/Object;",
+            ),
+        ] {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "wave 8 should have retired {c}.{m}{d}"
+            );
+        }
+        for (c, m, d) in [
+            ("java/util/TreeMap", "iterator", "()Ljava/util/Iterator;"),
+            ("java/util/TreeMap$KeySet", "clone", "()Ljava/lang/Object;"),
+            (
+                "java/util/TreeMap$KeySet",
+                "writeObject",
+                "(Ljava/io/ObjectOutputStream;)V",
+            ),
+        ] {
+            assert!(
+                !RETIRED_SHADOW_L1_TM_TRIPLES.contains(&(c, m, d)),
+                "{c}.{m}{d} is declared by no supported image and must stay out \
+                 of the wave-8 table"
+            );
+        }
+    }
+
+    #[test]
+    fn the_held_collection_families_are_not_retired() {
+        for (c, m, d) in [
+            // needs-VM-support: state is not real.
+            //
+            // 2026-09-12, L1 wave 8: `java/util/TreeMap` and
+            // `java/util/TreeSet` came OFF this list, all 156 triples. The
+            // label was wrong about them in the same way it was wrong about
+            // `Hashtable` the same day -- the real `root` IS a real
+            // `TreeMap$Entry` tree and `size` is mirrored -- and what was
+            // still true, that the mirror had no reader, is what
+            // `tm_pairs_from_real_root` closes. The sentence this note
+            // replaces claimed `TreeMap.firstKey` answered the wrong key and
+            // `TreeSet` lost half its elements under the dial; on two
+            // binaries 34 days later the whole probe tree moves ONE row, and
+            // that row was a stale side table, not a missing store. See
+            // `RETIRED_SHADOW_L1_TM_TRIPLES`.
             // 2026-09-10, L1 wave 1: `java/util/ArrayDeque` came OFF this
             // list. The `needs-VM-support` label above was true when it was
             // written and is not now — `ad_ensure_capacity` keeps the JDK's
@@ -14451,14 +15576,17 @@ Ljava/nio/channels/FileChannel;"
     #[test]
     fn the_l1_families_measured_load_bearing_are_still_held() {
         for (c, m, d) in [
-            // 9 probes worse. State is `tm_array_table()`, a Rust side table;
-            // the real `root`/`size`/`comparator` are never written.
-            (
-                "java/util/TreeMap",
-                "get",
-                "(Ljava/lang/Object;)Ljava/lang/Object;",
-            ),
-            ("java/util/TreeSet", "add", "(Ljava/lang/Object;)Z"),
+            // RETIRED 2026-09-12, L1 wave 8, and the row that stood here is
+            // worth keeping as a sentence rather than deleting: "9 probes
+            // worse. State is `tm_array_table()`, a Rust side table; the real
+            // `root`/`size`/`comparator` are never written." Every clause of
+            // the second sentence was false by the time anyone read it --
+            // three separate changes had made those fields real -- and the
+            // first was a DIAL reading, which cannot answer for a retirement
+            // because the dial declines at the dispatch door and a retirement
+            // deletes the registration. Two binaries, 163 probes: one row
+            // moved. See `RETIRED_SHADOW_L1_TM_TRIPLES` and
+            // `wave_eight_retired_the_tree_map_family`.
             // STILL HELD, and 2026-09-12 (L1 wave 7) it is held for a
             // different reason than the one written here. "State is
             // `lhm_overlay()`" is false: `lhm_set` mirrors `head`, `tail`,

@@ -581,6 +581,42 @@ pub(crate) fn handler_has_unsafe_local_read(
                     propagated |= 1u64 << slot;
                 }
             }
+            // wide <load|store|iinc|ret> <u16 index> — the same reads and
+            // writes with a 16-bit slot. Without this arm a `wide iload 70`
+            // or a `wide iinc` of an unassigned slot read as safe.
+            0xc4 => {
+                if pc + 3 < code.len() {
+                    let real = code[pc + 1];
+                    let slot = u32::from(u16::from_be_bytes([code[pc + 2], code[pc + 3]]));
+                    let is_safe = slot < 64 && (safe & (1u64 << slot)) != 0;
+                    match real {
+                        0x15..=0x19 | 0xa9 => unsafe_read = !is_safe,
+                        0x36..=0x3a => {
+                            if slot < 64 {
+                                propagated |= 1u64 << slot;
+                            }
+                        }
+                        0x84 => {
+                            unsafe_read = !is_safe;
+                            if slot < 64 {
+                                propagated |= 1u64 << slot;
+                            }
+                        }
+                        _ => unsafe_read = true,
+                    }
+                } else {
+                    unsafe_read = true;
+                }
+            }
+            // ret reads its return-address local.
+            0xa9 => {
+                if pc + 1 < code.len() {
+                    let slot = code[pc + 1] as u32;
+                    unsafe_read = slot >= 64 || (safe & (1u64 << slot)) == 0;
+                } else {
+                    unsafe_read = true;
+                }
+            }
             0x84 => {
                 // iinc — reads then writes the same slot.
                 if pc + 1 < code.len() {
@@ -2003,14 +2039,31 @@ pub fn allocate_registers_arm64(
     num_params: usize,
     loops: &[(usize, usize)],
 ) -> RegAllocResult {
-    // The ARM64 backend does not build a category-2-aware slot map today, and
-    // its own prologue assumes the identity layout too, so both sides agree.
+    allocate_registers_arm64_with_param_slots(code, code_len, num_locals, num_params, &[], loops)
+}
+
+/// [`allocate_registers_arm64`] with the real argument layout.
+///
+/// `param_slots` is the JVM local slot of each incoming argument
+/// (`compute_param_jvm_slots`); an empty slice selects the identity layout
+/// `0..num_params`. The ARM64 backend used to pass `&[]` unconditionally while
+/// its prologue also assumed the identity layout, so the two agreed -- and were
+/// both wrong for every signature with a `long`/`double` before its last
+/// parameter. See [`param_live_in_mask`] for what the wrong seed costs.
+pub fn allocate_registers_arm64_with_param_slots(
+    code: &[u8],
+    code_len: usize,
+    num_locals: usize,
+    num_params: usize,
+    param_slots: &[usize],
+    loops: &[(usize, usize)],
+) -> RegAllocResult {
     allocate_registers_with(
         code,
         code_len,
         num_locals,
         num_params,
-        &[],
+        param_slots,
         loops,
         &ARM64_LOCAL_GPRS,
         &ARM64_LOCAL_FPS,
@@ -2291,6 +2344,24 @@ pub fn regalloc_invariants_hold(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wide_local_read_in_a_handler_is_decoded() {
+        // wide iload 5; ireturn -- slot 5 is not safe on entry.
+        let code = [0xc4, 0x15, 0x00, 0x05, 0xac];
+        assert!(handler_has_unsafe_local_read(&code, code.len(), 0, 0));
+        assert!(!handler_has_unsafe_local_read(&code, code.len(), 0, 1 << 5));
+        // wide istore 5; wide iinc 5 1; wide iload 5; ireturn -- the store
+        // makes the later reads safe.
+        let code = [
+            0x03, 0xc4, 0x36, 0x00, 0x05, 0xc4, 0x84, 0x00, 0x05, 0x00, 0x01, 0xc4, 0x15, 0x00,
+            0x05, 0xac,
+        ];
+        assert!(!handler_has_unsafe_local_read(&code, code.len(), 0, 0));
+        // wide iinc 70 1 reads a slot the mask cannot name.
+        let code = [0xc4, 0x84, 0x00, 70, 0x00, 0x01, 0xb1];
+        assert!(handler_has_unsafe_local_read(&code, code.len(), 0, u64::MAX));
+    }
 
     // T1.1.22-25 — invariant checker unit tests.
     //
@@ -4405,6 +4476,13 @@ fn ir_op_is_safepoint(op: &Op) -> bool {
             // mirror on first touch, same as the three above.
             | Op::InstanceOf { .. }
             | Op::CheckCast { .. }
+            // `ir_lower` publishes an oop map before each of these: a
+            // contended monitor acquire parks the thread for a whole
+            // collection, and `jit_aastore` allocates its
+            // `ArrayStoreException`.
+            | Op::MonitorEnter
+            | Op::MonitorExit
+            | Op::ArrayStore(crate::ir::MemKind::Ref)
     )
 }
 
@@ -4459,6 +4537,14 @@ fn ir_op_is_call(op: &Op) -> bool {
             // helper calls above.
             | Op::InstanceOf { .. }
             | Op::CheckCast { .. }
+            // `emit_monitor_stub` calls `jit_monitor_enter`/`jit_monitor_exit`,
+            // and a reference `ArrayStore` is `MOV RAX, jit_aastore ; CALL RAX`;
+            // all three return into the body. They were missing, so a
+            // float/double interval in a caller-saved XMM (XMM2-5 on both ABIs,
+            // XMM2-7 on System V) was not split across the Rust helper.
+            | Op::MonitorEnter
+            | Op::MonitorExit
+            | Op::ArrayStore(crate::ir::MemKind::Ref)
     )
 }
 
@@ -6842,7 +6928,13 @@ mod linear_scan_tests {
     #[test]
     fn a_reference_live_across_a_safepoint_gets_no_register_by_default() {
         let mut f = Fixture::new(12);
-        let across = f.value(Op::Load(crate::ir::MemKind::Ref), IrType::Ref, 0, 8, &[3, 8]);
+        let across = f.value(
+            Op::Load(crate::ir::MemKind::Ref),
+            IrType::Ref,
+            0,
+            8,
+            &[3, 8],
+        );
         let prim = f.value(Op::Add, IrType::Int, 0, 8, &[3, 8]);
         let (graph, live) = f.finish();
         let mut model = bare_model(gp(4));
@@ -6872,7 +6964,13 @@ mod linear_scan_tests {
     #[test]
     fn refs_may_cross_safepoints_lifts_that_refusal_and_only_that_one() {
         let mut f = Fixture::new(12);
-        let across = f.value(Op::Load(crate::ir::MemKind::Ref), IrType::Ref, 0, 8, &[3, 8]);
+        let across = f.value(
+            Op::Load(crate::ir::MemKind::Ref),
+            IrType::Ref,
+            0,
+            8,
+            &[3, 8],
+        );
         let pinned = f.home_bound(IrType::Ref, 0, 8, &[3, 8]);
         let (graph, live) = f.finish();
         let mut model = bare_model(gp(4));
@@ -7597,6 +7695,10 @@ mod linear_scan_tests {
             // `jit_getfield` / `jit_putfield_int`.
             Op::Load(crate::ir::MemKind::Double),
             Op::Store(crate::ir::MemKind::Int),
+            // `jit_monitor_enter` / `jit_monitor_exit` / `jit_aastore`.
+            Op::MonitorEnter,
+            Op::MonitorExit,
+            Op::ArrayStore(crate::ir::MemKind::Ref),
         ] {
             assert!(
                 ir_op_is_call(&op),

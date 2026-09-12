@@ -25,7 +25,9 @@
 //! ## Key Differences from x86-64
 //!
 //! - Fixed-width 32-bit instructions (vs variable-length x86).
-//! - No flags register for comparisons — use conditional branch forms directly.
+//! - Flags live in NZCV, set only by the `S` forms (`SUBS`/`CMP`, `ADDS`/`CMN`,
+//!   `ANDS`/`TST`, `FCMP`); plain `ADD`/`SUB`/`STR` never touch them. A value
+//!   can be materialized from flags without a branch (`CSET`, `CSNEG`, ...).
 //! - Separate instruction and data caches — must flush icache after writing code.
 //! - W^X on Apple Silicon — handled by `platform::make_executable`.
 //! - NEON (128-bit SIMD) instead of AVX2 (256-bit).
@@ -280,6 +282,30 @@ impl Cond {
     #[inline]
     pub fn enc(self) -> u32 {
         self as u32
+    }
+
+    /// The logical negation of this condition (the ISA flips bit 0). `AL` and
+    /// `NV` invert to each other, and both mean "always" in A64.
+    #[inline]
+    pub fn invert(self) -> Cond {
+        match self {
+            Cond::EQ => Cond::NE,
+            Cond::NE => Cond::EQ,
+            Cond::HS => Cond::LO,
+            Cond::LO => Cond::HS,
+            Cond::MI => Cond::PL,
+            Cond::PL => Cond::MI,
+            Cond::VS => Cond::VC,
+            Cond::VC => Cond::VS,
+            Cond::HI => Cond::LS,
+            Cond::LS => Cond::HI,
+            Cond::GE => Cond::LT,
+            Cond::LT => Cond::GE,
+            Cond::GT => Cond::LE,
+            Cond::LE => Cond::GT,
+            Cond::AL => Cond::NV,
+            Cond::NV => Cond::AL,
+        }
     }
 }
 
@@ -693,18 +719,21 @@ impl Aarch64Emitter {
                 self.movn(rd, 0, 0);
             }
         } else {
-            // MOVZ strategy: start with first non-zero (or zero if all zero),
-            // then MOVK remaining non-zero chunks.
-            let mut first = true;
-            for (i, &chunk) in chunks.iter().enumerate() {
-                if chunk == 0 && !first {
-                    continue;
-                }
-                if first {
-                    self.movz(rd, chunk, (i as u8) * 16);
-                    first = false;
-                } else {
-                    self.movk(rd, chunk, (i as u8) * 16);
+            // MOVZ strategy: MOVZ the first NON-ZERO halfword, then MOVK the
+            // remaining non-zero ones. The previous loop MOVZ'd halfword 0 even
+            // when it was zero, so e.g. `0x1_0000` cost `MOVZ #0; MOVK #1, LSL
+            // #16` instead of the single `MOVZ #1, LSL #16`. Only the all-zero
+            // value needs `MOVZ #0`.
+            match chunks.iter().position(|&c| c != 0) {
+                None => self.movz(rd, 0, 0),
+                Some(first) => {
+                    // Cast: `first` is an index into a 4-element array.
+                    self.movz(rd, chunks[first], (first as u8) * 16);
+                    for (i, &chunk) in chunks.iter().enumerate().skip(first + 1) {
+                        if chunk != 0 {
+                            self.movk(rd, chunk, (i as u8) * 16);
+                        }
+                    }
                 }
             }
         }
@@ -1005,19 +1034,13 @@ impl Aarch64Emitter {
         pos
     }
 
-    /// ADRP Xd, <offset>  (PC-relative page, +/- 4GB)
-    pub fn adrp(&mut self, rd: Reg, offset: i32) -> usize {
-        let pos = self.offset();
-        if !imm21_fits(offset as i64) {
-            self.mark_branch_overflow("ADRP", offset as i64);
-        }
-        let imm = offset as u32;
-        let immlo = imm & 0x3;
-        let immhi = (imm >> 2) & 0x7FFFF;
-        let inst = (immlo << 29) | 0x9000_0000 | (immhi << 5) | rd.enc();
-        self.emit_u32(inst);
-        pos
-    }
+    // There is deliberately no `adrp`. The one that lived here took a BYTE
+    // offset and packed it into imm21 as if it were a PAGE count, so any
+    // non-zero argument addressed a page 4096 times further away than asked.
+    // It had no caller. A correct one needs the absolute PC of the instruction
+    // (ADRP is relative to its PAGE, not to itself), which an emitter writing
+    // into a relocatable `Vec<u8>` does not know; add it together with that
+    // plumbing, not before.
 
     /// Emit an ADR with a zero offset as a placeholder. Returns the byte offset
     /// of the instruction for later patching with `patch_adr`.
@@ -1071,22 +1094,48 @@ impl Aarch64Emitter {
         self.code[offset..offset + 4].copy_from_slice(&bytes);
     }
 
-    /// Patch a B.cond / CBZ / CBNZ instruction at `offset` to target `target`.
+    /// Patch a conditional branch at `offset` to target `target`: B.cond, CBZ,
+    /// CBNZ (imm19), or TBZ/TBNZ (imm14).
+    ///
+    /// The field is chosen from the OPCODE of the word being patched. The
+    /// previous version cleared bits 23:5 unconditionally, which is right for
+    /// the imm19 family and wrong for TBZ/TBNZ: their bits 23:19 hold the low
+    /// five bits of the TESTED BIT NUMBER, so patching one silently changed
+    /// which bit it tested. A word that is none of these is refused (the
+    /// overflow flag is set and the buffer must be discarded) rather than
+    /// having a field written into an instruction that has no such field.
     pub fn patch_bcond(&mut self, offset: usize, target: usize) {
         let delta64 = target as i64 - offset as i64;
-        if !imm19_fits(delta64) {
-            self.mark_branch_overflow("B.cond/CBZ patch", delta64);
-        }
-        let delta = delta64 as i32;
-        let imm19 = ((delta >> 2) as u32) & 0x7FFFF;
         let existing = u32::from_le_bytes([
             self.code[offset],
             self.code[offset + 1],
             self.code[offset + 2],
             self.code[offset + 3],
         ]);
-        // Clear the imm19 field (bits 23:5), preserve the rest.
-        let patched = (existing & !0x00FF_FFE0) | (imm19 << 5);
+        // Cast: a range-checked (or overflow-flagged) branch displacement.
+        let delta = delta64 as i32;
+        let patched = if existing & 0x7E00_0000 == 0x3600_0000 {
+            // TBZ/TBNZ: b5(31) 011011 op(24) b40(23:19) imm14(18:5) Rt.
+            if !imm14_fits(delta64) {
+                self.mark_branch_overflow("TBZ/TBNZ patch", delta64);
+            }
+            let imm14 = ((delta >> 2) as u32) & 0x3FFF;
+            (existing & !0x0007_FFE0) | (imm14 << 5)
+        } else if existing & 0xFF00_0010 == 0x5400_0000 || existing & 0x7E00_0000 == 0x3400_0000 {
+            // B.cond: 01010100 imm19(23:5) 0 cond.  CBZ/CBNZ: sf 011010 op imm19 Rt.
+            if !imm19_fits(delta64) {
+                self.mark_branch_overflow("B.cond/CBZ patch", delta64);
+            }
+            let imm19 = ((delta >> 2) as u32) & 0x7FFFF;
+            (existing & !0x00FF_FFE0) | (imm19 << 5)
+        } else {
+            debug_assert!(
+                false,
+                "patch_bcond on {existing:#010x}, which is not B.cond/CBZ/CBNZ/TBZ/TBNZ"
+            );
+            self.overflow = true;
+            return;
+        };
         let bytes = patched.to_le_bytes();
         self.code[offset..offset + 4].copy_from_slice(&bytes);
     }
@@ -1269,6 +1318,41 @@ impl Aarch64Emitter {
         self.emit_u32(inst);
     }
 
+    /// FMOV Sd, Wn  (32-bit general to single, bit-pattern move)
+    pub fn fmov_s_from_w(&mut self, rd: FpReg, rn: Reg) {
+        // 0 00 11110 00 1 00 111 000000 Rn Rd
+        let inst = 0x1E27_0000 | (rn.enc() << 5) | rd.enc();
+        self.emit_u32(inst);
+    }
+
+    /// FMOV Wd, Sn  (single to 32-bit general, bit-pattern move; zero-extends
+    /// into Xd)
+    pub fn fmov_w_from_s(&mut self, rd: Reg, rn: FpReg) {
+        // 0 00 11110 00 1 00 110 000000 Rn Rd
+        let inst = 0x1E26_0000 | (rn.enc() << 5) | rd.enc();
+        self.emit_u32(inst);
+    }
+
+    /// SCVTF Sd, Xn  (signed int64 to single)
+    pub fn scvtf_s_x(&mut self, rd: FpReg, rn: Reg) {
+        let inst = 0x9E22_0000 | (rn.enc() << 5) | rd.enc();
+        self.emit_u32(inst);
+    }
+
+    /// FCVTZS Wd, Dn  (double to signed int32, round toward zero, SATURATING at
+    /// the 32-bit bounds -- which is `d2i`'s JVMS semantics; the 64-bit form
+    /// saturates at the 64-bit bounds instead)
+    pub fn fcvtzs_w_d(&mut self, rd: Reg, rn: FpReg) {
+        let inst = 0x1E78_0000 | (rn.enc() << 5) | rd.enc();
+        self.emit_u32(inst);
+    }
+
+    /// FCVTZS Xd, Sn  (single to signed int64, round toward zero)
+    pub fn fcvtzs_x_s(&mut self, rd: Reg, rn: FpReg) {
+        let inst = 0x9E38_0000 | (rn.enc() << 5) | rd.enc();
+        self.emit_u32(inst);
+    }
+
     /// FNEG Dd, Dn  (double negate)
     pub fn fneg_d(&mut self, rd: FpReg, rn: FpReg) {
         // 0 00 11110 01 1 0000 10 10000 Rn Rd
@@ -1406,6 +1490,231 @@ impl Aarch64Emitter {
     }
 
     // -----------------------------------------------------------------------
+    // 32-bit (W) data processing
+    // -----------------------------------------------------------------------
+    //
+    // The backend lowers JVM `int` arithmetic with these. A W-form result is
+    // the true 32-bit wrapped value and the upper half of the X register is
+    // zero; the backend then re-establishes its sign-extended canonical form
+    // with `sxtw`. The variable shifts are the other reason: `LSLV`/`LSRV`/
+    // `ASRV` on a W register take the amount MOD 32, which is exactly the
+    // `& 0x1f` that `ishl`/`ishr`/`iushr` require, and the X forms take it MOD
+    // 64, which is `lshl`'s `& 0x3f`.
+
+    /// NEG Wd, Wn  (alias for SUB Wd, WZR, Wn)
+    pub fn neg_w(&mut self, rd: Reg, rn: Reg) {
+        self.sub_w(rd, XZR, rn);
+    }
+
+    /// AND Wd, Wn, Wm
+    pub fn and_w(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = logic_shifted(false, 0b00, ShiftType::LSL, 0, rm, 0, rn, rd);
+        self.emit_u32(inst);
+    }
+
+    /// ORR Wd, Wn, Wm
+    pub fn orr_w(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = logic_shifted(false, 0b01, ShiftType::LSL, 0, rm, 0, rn, rd);
+        self.emit_u32(inst);
+    }
+
+    /// EOR Wd, Wn, Wm
+    pub fn eor_w(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = logic_shifted(false, 0b10, ShiftType::LSL, 0, rm, 0, rn, rd);
+        self.emit_u32(inst);
+    }
+
+    /// LSL Wd, Wn, Wm  (shift amount is Wm MOD 32)
+    pub fn lsl_w(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = dp_2src(false, rm, 0b001000, rn, rd);
+        self.emit_u32(inst);
+    }
+
+    /// LSR Wd, Wn, Wm  (shift amount is Wm MOD 32)
+    pub fn lsr_w(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = dp_2src(false, rm, 0b001001, rn, rd);
+        self.emit_u32(inst);
+    }
+
+    /// ASR Wd, Wn, Wm  (shift amount is Wm MOD 32)
+    pub fn asr_w(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = dp_2src(false, rm, 0b001010, rn, rd);
+        self.emit_u32(inst);
+    }
+
+    /// CMP Wn, Wm  (alias for SUBS WZR, Wn, Wm)
+    pub fn cmp_w(&mut self, rn: Reg, rm: Reg) {
+        let inst = dp_shifted_reg(false, 0b11, 0b01011, ShiftType::LSL, 0, rm, 0, rn, XZR);
+        self.emit_u32(inst);
+    }
+
+    /// CMP Wn, #imm12
+    pub fn cmp_imm_w(&mut self, rn: Reg, imm12: u16) {
+        let inst = addsub_imm(false, true, true, imm12, false, rn, XZR);
+        self.emit_u32(inst);
+    }
+
+    /// CMN Xn, #imm12  (sets flags for Xn + imm, i.e. compares with -imm)
+    pub fn cmn_imm(&mut self, rn: Reg, imm12: u16) {
+        let inst = addsub_imm(true, false, true, imm12, false, rn, XZR);
+        self.emit_u32(inst);
+    }
+
+    /// CMN Wn, #imm12
+    pub fn cmn_imm_w(&mut self, rn: Reg, imm12: u16) {
+        let inst = addsub_imm(false, false, true, imm12, false, rn, XZR);
+        self.emit_u32(inst);
+    }
+
+    // -----------------------------------------------------------------------
+    // Bitfield: sign / zero extension
+    // -----------------------------------------------------------------------
+
+    /// SXTW Xd, Wn  (SBFM Xd, Xn, #0, #31)
+    pub fn sxtw(&mut self, rd: Reg, rn: Reg) {
+        self.emit_u32(bitfield(true, 0b00, 0, 31, rn, rd));
+    }
+
+    /// SXTH Xd, Wn  (SBFM Xd, Xn, #0, #15)
+    pub fn sxth(&mut self, rd: Reg, rn: Reg) {
+        self.emit_u32(bitfield(true, 0b00, 0, 15, rn, rd));
+    }
+
+    /// SXTB Xd, Wn  (SBFM Xd, Xn, #0, #7)
+    pub fn sxtb(&mut self, rd: Reg, rn: Reg) {
+        self.emit_u32(bitfield(true, 0b00, 0, 7, rn, rd));
+    }
+
+    /// UXTW: `MOV Wd, Wn` (ORR Wd, WZR, Wn), which clears the upper half of Xd.
+    pub fn uxtw(&mut self, rd: Reg, rn: Reg) {
+        let inst = logic_shifted(false, 0b01, ShiftType::LSL, 0, rn, 0, XZR, rd);
+        self.emit_u32(inst);
+    }
+
+    // -----------------------------------------------------------------------
+    // Logical immediate (bitmask) forms
+    // -----------------------------------------------------------------------
+
+    /// AND Xd, Xn, #imm. Returns `false`, emitting nothing, when `imm` is not a
+    /// valid bitmask immediate (see [`encode_logical_imm`]); the caller must
+    /// then materialize the constant and use the register form.
+    #[must_use]
+    pub fn and_imm(&mut self, rd: Reg, rn: Reg, imm: u64) -> bool {
+        self.logic_imm(true, 0b00, rd, rn, imm)
+    }
+
+    /// AND Wd, Wn, #imm (32-bit bitmask immediate). See [`Self::and_imm`].
+    #[must_use]
+    pub fn and_imm_w(&mut self, rd: Reg, rn: Reg, imm: u32) -> bool {
+        self.logic_imm(false, 0b00, rd, rn, u64::from(imm))
+    }
+
+    /// ORR Xd, Xn, #imm. See [`Self::and_imm`].
+    #[must_use]
+    pub fn orr_imm(&mut self, rd: Reg, rn: Reg, imm: u64) -> bool {
+        self.logic_imm(true, 0b01, rd, rn, imm)
+    }
+
+    /// EOR Xd, Xn, #imm. See [`Self::and_imm`].
+    #[must_use]
+    pub fn eor_imm(&mut self, rd: Reg, rn: Reg, imm: u64) -> bool {
+        self.logic_imm(true, 0b10, rd, rn, imm)
+    }
+
+    fn logic_imm(&mut self, sf: bool, opc: u32, rd: Reg, rn: Reg, imm: u64) -> bool {
+        let Some((n, immr, imms)) = encode_logical_imm(imm, if sf { 64 } else { 32 }) else {
+            return false;
+        };
+        let inst = ((sf as u32) << 31)
+            | ((opc & 0x3) << 29)
+            | (0b100100u32 << 23)
+            | (n << 22)
+            | (immr << 16)
+            | (imms << 10)
+            | (rn.enc() << 5)
+            | rd.enc();
+        self.emit_u32(inst);
+        true
+    }
+
+    // -----------------------------------------------------------------------
+    // Conditional select
+    // -----------------------------------------------------------------------
+
+    /// CSEL Xd, Xn, Xm, cond  (Xd = cond ? Xn : Xm)
+    pub fn csel(&mut self, rd: Reg, rn: Reg, rm: Reg, cond: Cond) {
+        self.emit_u32(cond_select(true, 0, 0, rm, cond, rn, rd));
+    }
+
+    /// CSINC Xd, Xn, Xm, cond  (Xd = cond ? Xn : Xm + 1)
+    pub fn csinc(&mut self, rd: Reg, rn: Reg, rm: Reg, cond: Cond) {
+        self.emit_u32(cond_select(true, 0, 1, rm, cond, rn, rd));
+    }
+
+    /// CSINV Xd, Xn, Xm, cond  (Xd = cond ? Xn : !Xm)
+    pub fn csinv(&mut self, rd: Reg, rn: Reg, rm: Reg, cond: Cond) {
+        self.emit_u32(cond_select(true, 1, 0, rm, cond, rn, rd));
+    }
+
+    /// CSNEG Xd, Xn, Xm, cond  (Xd = cond ? Xn : -Xm)
+    pub fn csneg(&mut self, rd: Reg, rn: Reg, rm: Reg, cond: Cond) {
+        self.emit_u32(cond_select(true, 1, 1, rm, cond, rn, rd));
+    }
+
+    /// CSET Xd, cond  (Xd = cond ? 1 : 0) = CSINC Xd, XZR, XZR, invert(cond)
+    pub fn cset(&mut self, rd: Reg, cond: Cond) {
+        self.csinc(rd, XZR, XZR, cond.invert());
+    }
+
+    /// CSETM Xd, cond  (Xd = cond ? -1 : 0) = CSINV Xd, XZR, XZR, invert(cond)
+    pub fn csetm(&mut self, rd: Reg, cond: Cond) {
+        self.csinv(rd, XZR, XZR, cond.invert());
+    }
+
+    /// CNEG Xd, Xn, cond  (Xd = cond ? -Xn : Xn) = CSNEG Xd, Xn, Xn, invert(cond)
+    pub fn cneg(&mut self, rd: Reg, rn: Reg, cond: Cond) {
+        self.csneg(rd, rn, rn, cond.invert());
+    }
+
+    // -----------------------------------------------------------------------
+    // ADD/SUB extended register
+    // -----------------------------------------------------------------------
+
+    /// ADD Xd|SP, Xn|SP, Rm, <extend> #amount
+    ///
+    /// The one ADD form in which register 31 means SP in BOTH `rd` and `rn`.
+    /// The shifted-register form reads 31 as XZR, so `ADD X16, SP, X16` written
+    /// that way silently computes `0 + X16`. `amount` must be 0..=4.
+    pub fn add_ext(&mut self, rd: Reg, rn: Reg, rm: Reg, extend: Extend, amount: u8) {
+        self.emit_u32(addsub_ext(true, false, rm, extend, amount, rn, rd));
+    }
+
+    /// SUB Xd|SP, Xn|SP, Rm, <extend> #amount. See [`Self::add_ext`].
+    pub fn sub_ext(&mut self, rd: Reg, rn: Reg, rm: Reg, extend: Extend, amount: u8) {
+        self.emit_u32(addsub_ext(true, true, rm, extend, amount, rn, rd));
+    }
+
+    /// LDRSW Xt, [Xn, Wm, UXTW #2]  (load a sign-extended 32-bit word from
+    /// `Xn + (zero-extended Wm) * 4`; the jump-table read)
+    pub fn ldrsw_reg_uxtw_scaled(&mut self, rt: Reg, rn: Reg, rm: Reg) {
+        // size=10, V=0, opc=10 (LDRSW), option=010 (UXTW), S=1 (scale by 4)
+        let inst = ldst_reg_offset(0b10, 0, 0b10, rm, 0b010, 1, rn, rt.enc());
+        self.emit_u32(inst);
+    }
+
+    /// Append a raw 32-bit data word (a jump-table entry).
+    pub fn emit_u32_data(&mut self, value: u32) -> usize {
+        let pos = self.offset();
+        self.emit_u32(value);
+        pos
+    }
+
+    /// Overwrite the 32-bit little-endian word at `offset`.
+    pub fn patch_u32(&mut self, offset: usize, value: u32) {
+        self.code[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    // -----------------------------------------------------------------------
     // System instructions
     // -----------------------------------------------------------------------
 
@@ -1461,6 +1770,23 @@ enum ShiftType {
     ROR = 0b11, // only for logic ops
 }
 
+/// The `option` field of the extended-register ADD/SUB and load/store forms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+#[allow(dead_code)]
+pub enum Extend {
+    UXTB = 0b000,
+    UXTH = 0b001,
+    UXTW = 0b010,
+    /// Zero-extend 64 bits, i.e. no extension: the form used to add a plain X
+    /// register to SP.
+    UXTX = 0b011,
+    SXTB = 0b100,
+    SXTH = 0b101,
+    SXTW = 0b110,
+    SXTX = 0b111,
+}
+
 // ---------------------------------------------------------------------------
 // Branch-offset range checks
 // ---------------------------------------------------------------------------
@@ -1491,8 +1817,7 @@ fn imm14_fits(delta: i64) -> bool {
     (delta & 0b11) == 0 && (-(1 << 15)..(1 << 15)).contains(&delta)
 }
 
-/// `ADR`/`ADRP` imm21: a 21-bit signed value (unscaled for ADR; pages for
-/// ADRP). Range −2^20 ..= 2^20 − 1.
+/// `ADR` imm21: a 21-bit signed, unscaled byte offset. Range −2^20 ..= 2^20 − 1.
 #[inline]
 fn imm21_fits(delta: i64) -> bool {
     (-(1 << 20)..(1 << 20)).contains(&delta)
@@ -1571,6 +1896,109 @@ fn logic_shifted(
         | ((imm6 as u32 & 0x3F) << 10)
         | (rn.enc() << 5)
         | rd.enc()
+}
+
+/// Bitfield (SBFM/UBFM).
+/// sf(1) opc(2) 100110 N(1) immr(6) imms(6) Rn(5) Rd(5), with N == sf.
+fn bitfield(sf: bool, opc: u32, immr: u32, imms: u32, rn: Reg, rd: Reg) -> u32 {
+    ((sf as u32) << 31)
+        | ((opc & 0x3) << 29)
+        | (0b100110u32 << 23)
+        | ((sf as u32) << 22)
+        | ((immr & 0x3F) << 16)
+        | ((imms & 0x3F) << 10)
+        | (rn.enc() << 5)
+        | rd.enc()
+}
+
+/// Conditional select (CSEL/CSINC/CSINV/CSNEG).
+/// sf(1) op(1) S=0 11010100 Rm(5) cond(4) 0 o2(1) Rn(5) Rd(5)
+fn cond_select(sf: bool, op: u32, o2: u32, rm: Reg, cond: Cond, rn: Reg, rd: Reg) -> u32 {
+    ((sf as u32) << 31)
+        | ((op & 1) << 30)
+        | (0b11010100u32 << 21)
+        | (rm.enc() << 16)
+        | (cond.enc() << 12)
+        | ((o2 & 1) << 10)
+        | (rn.enc() << 5)
+        | rd.enc()
+}
+
+/// Add/subtract (extended register).
+/// sf(1) op(1) S=0 01011 00 1 Rm(5) option(3) imm3(3) Rn(5) Rd(5)
+fn addsub_ext(sf: bool, sub: bool, rm: Reg, extend: Extend, amount: u8, rn: Reg, rd: Reg) -> u32 {
+    ((sf as u32) << 31)
+        | ((sub as u32) << 30)
+        | (0b01011u32 << 24)
+        | (1u32 << 21)
+        | (rm.enc() << 16)
+        | ((extend as u32) << 13)
+        | ((amount as u32 & 0x7) << 10)
+        | (rn.enc() << 5)
+        | rd.enc()
+}
+
+/// `value` is a non-empty contiguous run of ones starting at bit 0.
+fn is_mask_64(value: u64) -> bool {
+    value != 0 && (value.wrapping_add(1) & value) == 0
+}
+
+/// `value` is a non-empty contiguous run of ones anywhere.
+fn is_shifted_mask_64(value: u64) -> bool {
+    value != 0 && is_mask_64((value - 1) | value)
+}
+
+/// Encode `imm` as an AArch64 logical (bitmask) immediate for a `reg_size`-bit
+/// register, returning `(N, immr, imms)`, or `None` when it has no encoding.
+///
+/// A bitmask immediate is a 2-, 4-, 8-, 16-, 32- or 64-bit element, consisting
+/// of a rotated run of ones, repeated to fill the register. All-zeros and
+/// all-ones are not encodable. This is the algorithm of LLVM's
+/// `processLogicalImmediate`, which is the reference the tests check against.
+pub fn encode_logical_imm(imm: u64, reg_size: u32) -> Option<(u32, u32, u32)> {
+    if reg_size != 32 && reg_size != 64 {
+        return None;
+    }
+    if imm == 0
+        || imm == u64::MAX
+        || (reg_size == 32 && (imm >> 32 != 0 || imm == u64::from(u32::MAX)))
+    {
+        return None;
+    }
+    // The smallest element size whose repetition produces `imm`.
+    let mut size = reg_size;
+    loop {
+        size /= 2;
+        let mask = (1u64 << size) - 1;
+        if (imm & mask) != ((imm >> size) & mask) {
+            size *= 2;
+            break;
+        }
+        if size <= 2 {
+            break;
+        }
+    }
+    // The rotation that turns the element into 0^m 1^n.
+    let mask = u64::MAX >> (64 - size);
+    let mut elem = imm & mask;
+    let (rotation, ones) = if is_shifted_mask_64(elem) {
+        let i = elem.trailing_zeros();
+        (i, (elem >> i).trailing_ones())
+    } else {
+        elem |= !mask;
+        if !is_shifted_mask_64(!elem) {
+            return None;
+        }
+        let clo = elem.leading_ones();
+        (64 - clo, clo + elem.trailing_ones() - (64 - size))
+    };
+    let immr = (size - rotation) & (size - 1);
+    // Ones above the element-size bit, then the run length minus one below it.
+    let nimms = ((!(u64::from(size) - 1)) << 1) | u64::from(ones - 1);
+    // Cast: single bits and a 6-bit field extracted from a u64.
+    let n = (((nimms >> 6) & 1) ^ 1) as u32;
+    let imms = (nimms & 0x3F) as u32;
+    Some((n, immr, imms))
 }
 
 /// Add/subtract immediate.
@@ -2348,7 +2776,7 @@ mod tests {
         assert!(!imm14_fits(1 << 15));
         assert!(!imm14_fits(-(1 << 15) - 4));
 
-        // imm21 (ADR/ADRP): 21-bit signed, unscaled.
+        // imm21 (ADR): 21-bit signed, unscaled.
         assert!(imm21_fits((1 << 20) - 1));
         assert!(imm21_fits(-(1 << 20)));
         assert!(!imm21_fits(1 << 20));
@@ -2441,5 +2869,203 @@ mod tests {
             let p = e.b(0);
             e.patch_branch(p, p + (1 << 27));
         });
+    }
+
+    // -- 2026-09-12 review fixes --------------------------------------------
+
+    /// A zero low halfword costs no instruction. The old MOVZ path always
+    /// MOVZ'd halfword 0, so `0x1_0000` took two words.
+    #[test]
+    fn test_mov_imm64_skips_zero_halfwords() {
+        let mut e = Aarch64Emitter::new();
+        e.mov_imm64(Reg::X3, 0x0001_0000);
+        assert_eq!(e.code().len(), 4, "one MOVZ #1, LSL #16");
+        let i = inst_at(&e, 0);
+        assert_eq!((i >> 29) & 0x3, 0b10, "MOVZ");
+        assert_eq!((i >> 21) & 0x3, 1, "hw = 1 (LSL #16)");
+        assert_eq!((i >> 5) & 0xFFFF, 1);
+
+        let mut e2 = Aarch64Emitter::new();
+        e2.mov_imm64(Reg::X0, 0x0000_ABCD_0000_0000);
+        assert_eq!(e2.code().len(), 4, "a lone halfword at LSL #32 is one word");
+        assert_eq!((inst_at(&e2, 0) >> 21) & 0x3, 2);
+
+        let mut e3 = Aarch64Emitter::new();
+        e3.mov_imm64(Reg::X0, 0x1234_0000_0000_5678);
+        assert_eq!(e3.code().len(), 8, "MOVZ #0x5678 then MOVK #0x1234, LSL #48");
+    }
+
+    /// Patching a TBZ must not destroy its bit number.
+    ///
+    /// TBZ's bits 23:19 are the low five bits of the TESTED BIT, and the old
+    /// `patch_bcond` cleared bits 23:5 for every word it touched.
+    #[test]
+    fn test_patch_bcond_preserves_a_tbz_bit_number() {
+        let mut e = Aarch64Emitter::new();
+        let pos = e.tbz(Reg::X3, 37, 0);
+        e.nop();
+        e.nop();
+        let target = e.offset();
+        e.patch_bcond(pos, target);
+        let inst = inst_at(&e, pos);
+        assert_eq!((inst >> 31) & 1, 1, "b5 of bit 37 survives");
+        assert_eq!((inst >> 19) & 0x1F, 37 & 0x1F, "b40 of bit 37 survives");
+        assert_eq!((inst >> 5) & 0x3FFF, 3, "imm14 = 12 bytes / 4");
+        assert_eq!(inst & 0x1F, 3, "Rt survives");
+        assert!(!e.overflowed());
+
+        // CBZ still takes the imm19 path.
+        let mut c = Aarch64Emitter::new();
+        let cpos = c.cbz(Reg::X9, 0);
+        c.nop();
+        let ctarget = c.offset();
+        c.patch_bcond(cpos, ctarget);
+        let ci = inst_at(&c, cpos);
+        assert_eq!((ci >> 5) & 0x7FFFF, 2);
+        assert_eq!(ci & 0x1F, 9);
+        assert_eq!((ci >> 24) & 0xFF, 0xB4, "still CBZ");
+    }
+
+    /// A TBZ patch beyond its ±32 KB field overflows, rather than being
+    /// checked against the wider imm19 range.
+    #[test]
+    fn test_patch_bcond_tbz_out_of_range_overflows() {
+        assert_branch_overflow_detected(|e| {
+            let p = e.tbz(Reg::X0, 1, 0);
+            e.patch_bcond(p, p + (1 << 15));
+        });
+    }
+
+    /// Bitmask immediates, against words produced by an assembler.
+    #[test]
+    fn test_logical_immediate_encodings() {
+        let mut e = Aarch64Emitter::new();
+        assert!(e.and_imm(Reg::X0, Reg::X1, 0xFFFF));
+        assert_eq!(last_inst(&e), 0x9240_3C20, "and x0, x1, #0xffff");
+        assert!(e.and_imm_w(Reg::X0, Reg::X1, 0xFF));
+        assert_eq!(last_inst(&e), 0x1200_1C20, "and w0, w1, #0xff");
+        assert!(e.and_imm(Reg::X0, Reg::X0, 0x5555_5555_5555_5555));
+        assert_eq!(last_inst(&e), 0x9200_F000, "and x0, x0, #0x5555555555555555");
+        assert!(e.and_imm(Reg::X2, Reg::X2, 31));
+        assert_eq!(last_inst(&e), 0x9240_1042, "and x2, x2, #31");
+        assert!(e.orr_imm(Reg::X0, Reg::X0, 0xFFFF_FFFF_0000_0000));
+        assert_eq!(
+            encode_logical_imm(0xFFFF_FFFF_0000_0000, 64),
+            Some((1, 32, 31)),
+            "a rotated run of 32 ones"
+        );
+
+        // Not encodable: nothing is emitted and the caller is told.
+        let before = e.code().len();
+        assert!(!e.and_imm(Reg::X0, Reg::X0, 0), "all-zeros");
+        assert!(!e.and_imm(Reg::X0, Reg::X0, u64::MAX), "all-ones");
+        assert!(!e.and_imm(Reg::X0, Reg::X0, 0b101), "not a rotated run");
+        assert!(!e.and_imm_w(Reg::X0, Reg::X0, u32::MAX), "32-bit all-ones");
+        assert_eq!(e.code().len(), before, "a refused immediate emits nothing");
+        assert_eq!(encode_logical_imm(0x1_0000_0000, 32), None, "wider than W");
+    }
+
+    /// CSET/CSETM/CNEG and the condition inversion they rely on.
+    #[test]
+    fn test_conditional_select_encodings() {
+        let mut e = Aarch64Emitter::new();
+        e.cset(Reg::X0, Cond::EQ);
+        assert_eq!(last_inst(&e), 0x9A9F_17E0, "cset x0, eq = csinc x0, xzr, xzr, ne");
+        e.csetm(Reg::X1, Cond::LT);
+        assert_eq!(last_inst(&e), 0xDA9F_A3E1, "csetm x1, lt = csinv x1, xzr, xzr, ge");
+        e.cneg(Reg::X0, Reg::X0, Cond::LT);
+        assert_eq!(last_inst(&e), 0xDA80_A400, "cneg x0, x0, lt = csneg x0, x0, x0, ge");
+        e.csel(Reg::X2, Reg::X3, Reg::X4, Cond::HI);
+        assert_eq!(last_inst(&e), 0x9A84_8062, "csel x2, x3, x4, hi");
+
+        for c in [Cond::EQ, Cond::HS, Cond::MI, Cond::VS, Cond::HI, Cond::GE, Cond::GT, Cond::AL] {
+            assert_eq!(c.invert().invert(), c);
+            assert_eq!(c.invert().enc(), c.enc() ^ 1, "{c:?} inverts by flipping bit 0");
+        }
+    }
+
+    #[test]
+    fn test_sign_and_zero_extension_encodings() {
+        let mut e = Aarch64Emitter::new();
+        e.sxtw(Reg::X0, Reg::X1);
+        assert_eq!(last_inst(&e), 0x9340_7C20, "sxtw x0, w1");
+        e.sxtb(Reg::X2, Reg::X3);
+        assert_eq!(last_inst(&e), 0x9340_1C62, "sxtb x2, w3");
+        e.sxth(Reg::X2, Reg::X3);
+        assert_eq!(last_inst(&e), 0x9340_3C62, "sxth x2, w3");
+        e.uxtw(Reg::X0, Reg::X1);
+        assert_eq!(last_inst(&e), 0x2A01_03E0, "mov w0, w1");
+    }
+
+    /// The extended-register form is the one ADD in which register 31 is SP on
+    /// both sides -- which is what makes `SP +/- X16` expressible at all.
+    #[test]
+    fn test_extended_register_addsub_encodings() {
+        let mut e = Aarch64Emitter::new();
+        e.add_ext(Reg::SP, Reg::SP, Reg::X16, Extend::UXTX, 0);
+        assert_eq!(last_inst(&e), 0x8B30_63FF, "add sp, sp, x16");
+        e.sub_ext(Reg::SP, Reg::SP, Reg::X16, Extend::UXTX, 0);
+        assert_eq!(last_inst(&e), 0xCB30_63FF, "sub sp, sp, x16");
+        e.add_ext(Reg::X16, Reg::X29, Reg::X16, Extend::UXTX, 0);
+        assert_eq!(last_inst(&e), 0x8B30_63B0, "add x16, x29, x16");
+        // The shifted-register ADD with Rn = 31 is a DIFFERENT instruction
+        // (it reads XZR) -- the control that makes the words above mean
+        // something.
+        let mut s = Aarch64Emitter::new();
+        s.add(Reg::X16, Reg::SP, Reg::X16);
+        assert_ne!(last_inst(&s), 0x8B30_63F0, "shifted-register ADD is not SP-relative");
+    }
+
+    #[test]
+    fn test_w_form_data_processing_encodings() {
+        let mut e = Aarch64Emitter::new();
+        e.lsl_w(Reg::X0, Reg::X1, Reg::X2);
+        assert_eq!(last_inst(&e), 0x1AC2_2020, "lsl w0, w1, w2");
+        e.lsr_w(Reg::X0, Reg::X1, Reg::X2);
+        assert_eq!(last_inst(&e), 0x1AC2_2420, "lsr w0, w1, w2");
+        e.asr_w(Reg::X0, Reg::X1, Reg::X2);
+        assert_eq!(last_inst(&e), 0x1AC2_2820, "asr w0, w1, w2");
+        e.cmp_w(Reg::X1, Reg::X2);
+        assert_eq!(last_inst(&e), 0x6B02_003F, "cmp w1, w2");
+        e.cmp_imm_w(Reg::X0, 1);
+        assert_eq!(last_inst(&e), 0x7100_041F, "cmp w0, #1");
+        e.cmn_imm_w(Reg::X0, 1);
+        assert_eq!(last_inst(&e), 0x3100_041F, "cmn w0, #1");
+        e.neg_w(Reg::X0, Reg::X1);
+        assert_eq!(last_inst(&e), 0x4B01_03E0, "neg w0, w1");
+        e.and_w(Reg::X0, Reg::X1, Reg::X2);
+        assert_eq!(last_inst(&e), 0x0A02_0020, "and w0, w1, w2");
+        e.mul_w(Reg::X0, Reg::X1, Reg::X2);
+        assert_eq!(last_inst(&e), 0x1B02_7C20, "mul w0, w1, w2");
+    }
+
+    #[test]
+    fn test_fp_width_conversion_encodings() {
+        let mut e = Aarch64Emitter::new();
+        e.fmov_s_from_w(FpReg::D0, Reg::X1);
+        assert_eq!(last_inst(&e), 0x1E27_0020, "fmov s0, w1");
+        e.fmov_w_from_s(Reg::X0, FpReg::D1);
+        assert_eq!(last_inst(&e), 0x1E26_0020, "fmov w0, s1");
+        e.scvtf_s_x(FpReg::D0, Reg::X1);
+        assert_eq!(last_inst(&e), 0x9E22_0020, "scvtf s0, x1");
+        e.fcvtzs_w_d(Reg::X0, FpReg::D1);
+        assert_eq!(last_inst(&e), 0x1E78_0020, "fcvtzs w0, d1");
+        e.fcvtzs_x_s(Reg::X0, FpReg::D1);
+        assert_eq!(last_inst(&e), 0x9E38_0020, "fcvtzs x0, s1");
+        e.fcvtzs_w_s(Reg::X0, FpReg::D1);
+        assert_eq!(last_inst(&e), 0x1E38_0020, "fcvtzs w0, s1");
+        e.fneg_s(FpReg::D0, FpReg::D1);
+        assert_eq!(last_inst(&e), 0x1E21_4020, "fneg s0, s1");
+        e.fneg_d(FpReg::D0, FpReg::D1);
+        assert_eq!(last_inst(&e), 0x1E61_4020, "fneg d0, d1");
+        e.fcmp_s(FpReg::D0, FpReg::D1);
+        assert_eq!(last_inst(&e), 0x1E21_2000, "fcmp s0, s1");
+    }
+
+    #[test]
+    fn test_ldrsw_register_offset_encoding() {
+        let mut e = Aarch64Emitter::new();
+        e.ldrsw_reg_uxtw_scaled(Reg::X17, Reg::X16, Reg::X17);
+        assert_eq!(last_inst(&e), 0xB8B1_5A11, "ldrsw x17, [x16, w17, uxtw #2]");
     }
 }

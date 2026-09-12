@@ -1357,6 +1357,12 @@ pub struct CountedLoop {
     /// Whether the body provably performs no heap store or call that could
     /// change a field the limit reads.
     pub heap_stable: bool,
+    /// Whether the body can leave the loop other than through the recognised
+    /// exit test: a second leaving branch or switch arm, a return, or an
+    /// `athrow`. The exit test then bounds the trip count only from above, so
+    /// [`CountedLoop::trip_count`] reports `min == 0` and
+    /// [`CountedLoop::prove_trip_count_at_least`] refuses a guard.
+    pub has_other_exit: bool,
 }
 
 impl CountedLoop {
@@ -1875,10 +1881,9 @@ impl CountedLoop {
         } else {
             (count(ilo, gov_hi), count(ihi, gov_lo))
         };
-        Some(TripCount {
-            min: min.min(max),
-            max,
-        })
+        // A second exit can end the loop before the recognised test fails.
+        let min = if self.has_other_exit { 0 } else { min.min(max) };
+        Some(TripCount { min, max })
     }
 
     /// Prove that the body executes at least `minimum` times, emitting a
@@ -1969,6 +1974,11 @@ impl CountedLoop {
             if t.min >= minimum {
                 return TripCountProof::Static;
             }
+        }
+        // A pre-header compare on the limit says nothing about a loop that can
+        // also leave through a `break`, a return or a throw.
+        if self.has_other_exit {
+            return TripCountProof::Refused(RefusalReason::UnsupportedLoopForm);
         }
         // Only `+1` yields a trip-count-valued witness; see the doc comment.
         if stride != 1 {
@@ -2241,6 +2251,7 @@ mod range_tests {
             form: LoopForm::PreTested,
             modified_locals: 1u64 << IV,
             heap_stable: true,
+            has_other_exit: false,
         }
     }
 
@@ -3074,6 +3085,7 @@ mod range_tests {
             form: LoopForm::PreTested,
             modified_locals: 1u64 << 3,
             heap_stable: true,
+            has_other_exit: false,
         };
 
         // Without the nest, the inclusive comparator needs the
@@ -3134,6 +3146,7 @@ mod range_tests {
             form: LoopForm::PreTested,
             modified_locals: 1u64 << 3,
             heap_stable: true,
+            has_other_exit: false,
         };
         let env = RangeEnv::new().with_loop_iv(&outer);
         assert_eq!(env.local(IV), IntRange::new(0, 7));

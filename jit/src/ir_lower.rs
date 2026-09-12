@@ -912,7 +912,7 @@ struct Lowerer<'a> {
     /// owning the innermost RBP without decoding the call that created the
     /// frame. Both 0 when unavailable → nothing is published.
     inline_cm_tls_disp: usize,
-    compile_id: u32,
+    compile_id: crate::CompileIdReservation,
     /// `jit_service_callee_deopt` — services a compiled callee's `i64::MIN`
     /// deopt sentinel at the megamorphic stub's inline call site, so the
     /// callee's stashed frame is resumed there instead of escaping to the
@@ -944,6 +944,21 @@ struct Lowerer<'a> {
     /// `Op::New` so a deopt snapshot slot holding it lowers to a
     /// `FrameValue::VirtualObject`. `None` ⇒ disabled (byte-identical default).
     sr_map: Option<&'a ScalarReplacementMap>,
+    /// Bytecode indices with a safepoint snapshot in `graph.safepoints`.
+    ///
+    /// This and the next two are indexes over `graph`, gathered once in
+    /// [`Lowerer::new`] — the lowerer holds the graph by shared reference, so
+    /// they cannot go stale. Each replaces a scan that ran once per division
+    /// ([`Lowerer::emit_div_zero_guard`]) or once per snapshot
+    /// ([`Lowerer::deopt_block_for_bci`]), which a method near the node cap
+    /// paid as nodes × divisions.
+    safepoint_bcis: std::collections::HashSet<usize>,
+    /// Bytecode indices an `Op::Guard { bci }` is anchored at.
+    guard_bcis: std::collections::HashSet<usize>,
+    /// Every node a deopt at a bci can fire from, in node-id order: each
+    /// `Op::Guard { bci }` under its `bci`, and each `Op::Div` / `Op::Rem`
+    /// under its `bytecode_pc`.
+    deopt_sites_by_bci: HashMap<usize, Vec<NodeId>>,
     /// Which inlined callee each safepoint snapshot belongs to, and the caller
     /// scopes stacked above it. Consumed by [`Lowerer::caller_chain_for`] to
     /// fill `FrameState::caller`, which was hard-coded `None` before this
@@ -1687,14 +1702,37 @@ impl<'a> Lowerer<'a> {
             compile_id: if crate::x64::inline_rbp_tls_disp() != 0
                 && crate::x64::inline_cm_tls_disp() != 0
             {
-                crate::reserve_compile_id()
+                crate::CompileIdReservation::reserve()
             } else {
-                0
+                crate::CompileIdReservation::none()
             },
             service_callee_deopt: helpers.service_callee_deopt,
             branch_hints,
             spliced_ranges,
             sr_map,
+            safepoint_bcis: graph.safepoints.iter().map(|s| s.bci).collect(),
+            guard_bcis: graph
+                .nodes
+                .iter()
+                .filter_map(|n| match n.op {
+                    Op::Guard { bci } => Some(bci),
+                    _ => None,
+                })
+                .collect(),
+            deopt_sites_by_bci: {
+                let mut sites: HashMap<usize, Vec<NodeId>> = HashMap::new();
+                for (id, n) in graph.nodes.iter().enumerate() {
+                    let key = match n.op {
+                        Op::Guard { bci } => Some(bci),
+                        Op::Div | Op::Rem => n.bytecode_pc,
+                        _ => None,
+                    };
+                    if let Some(bci) = key {
+                        sites.entry(bci).or_default().push(id as NodeId);
+                    }
+                }
+                sites
+            },
             inline_scopes,
             inline_frame_sites,
             inline_frame_rows: Vec::new(),
@@ -1797,7 +1835,9 @@ impl<'a> Lowerer<'a> {
                 }
             }
             for id in 0..self.gp_reg_of.len() {
-                let Some(reg) = self.gp_reg_of[id] else { continue };
+                let Some(reg) = self.gp_reg_of[id] else {
+                    continue;
+                };
                 // `IR_LOWER_LS_GPRS` and nothing else: `DEOPT_ARG0` is spilled
                 // holding the point pointer rather than its trapping value
                 // (see `emit_deopt_stub`), and no register outside the file can
@@ -1922,11 +1962,7 @@ impl<'a> Lowerer<'a> {
             // predicates use: nameable in a register, or named by no deopt
             // that can happen (a phi's own publisher makes the trap-free arm
             // redundant for it, which is why the two spellings differ).
-            let named_reachable = self
-                .deopt_named_reachable
-                .get(id)
-                .copied()
-                .unwrap_or(true);
+            let named_reachable = self.deopt_named_reachable.get(id).copied().unwrap_or(true);
             let nameable = self.deopt_nameable.get(id).copied().unwrap_or(false);
             let frame_ok = if is_phi {
                 nameable || !named_reachable
@@ -1987,7 +2023,11 @@ impl<'a> Lowerer<'a> {
         // can actually happen is not pinned by a frame state either. Its
         // register is published by the edge copies (`emit_copy_op`), which the
         // `ir_phi_copy_regs_enabled` clause above already requires.
-        if !self.deopt_nameable.get(phi as usize).copied().unwrap_or(false)
+        if !self
+            .deopt_nameable
+            .get(phi as usize)
+            .copied()
+            .unwrap_or(false)
             && self
                 .deopt_named_reachable
                 .get(phi as usize)
@@ -2012,12 +2052,9 @@ impl<'a> Lowerer<'a> {
         if !ir_drop_unreachable_homes_enabled() {
             return false;
         }
-        *self.graph_trap_free.get_or_init(|| {
-            self.graph
-                .nodes
-                .iter()
-                .all(|n| op_cannot_deopt(&n.op))
-        })
+        *self
+            .graph_trap_free
+            .get_or_init(|| self.graph.nodes.iter().all(|n| op_cannot_deopt(&n.op)))
     }
 
     /// Is this value pinned to its home only by frame states nothing can
@@ -2182,7 +2219,11 @@ impl<'a> Lowerer<'a> {
         // authoritative on ordinary methods — see
         // `compute_deopt_named_reachable` for why one `getfield` used to be
         // enough to force every promoted value in the method back to memory.
-        if !self.deopt_nameable.get(id as usize).copied().unwrap_or(false)
+        if !self
+            .deopt_nameable
+            .get(id as usize)
+            .copied()
+            .unwrap_or(false)
             && !(self.graph_cannot_deopt() && self.assigned_gpr(id).is_some())
             && !(!self
                 .deopt_named_reachable
@@ -2211,7 +2252,12 @@ impl<'a> Lowerer<'a> {
     /// home word exactly as before — this is additive, and with
     /// `CRATONVM_JIT_IR_DEOPT_REGS` off it answers `None` for every value.
     fn register_frame_value(&self, id: NodeId, ty: IrType) -> Option<FrameValue> {
-        if !self.deopt_nameable.get(id as usize).copied().unwrap_or(false) {
+        if !self
+            .deopt_nameable
+            .get(id as usize)
+            .copied()
+            .unwrap_or(false)
+        {
             return None;
         }
         let reg = self.gp_reg_of.get(id as usize).copied().flatten()?;
@@ -2482,15 +2528,7 @@ impl<'a> Lowerer<'a> {
         }
         if !matches!(
             node.op,
-            Op::Add
-                | Op::Sub
-                | Op::Mul
-                | Op::And
-                | Op::Or
-                | Op::Xor
-                | Op::Shl
-                | Op::Shr
-                | Op::UShr
+            Op::Add | Op::Sub | Op::Mul | Op::And | Op::Or | Op::Xor | Op::Shl | Op::Shr | Op::UShr
         ) {
             return false;
         }
@@ -3124,7 +3162,8 @@ impl<'a> Lowerer<'a> {
         // — and turns the refusal into the file:line of the reader that wants
         // converting to `gp_load_value`. Both façades below forward it.
         if self.home_dropped.get(id as usize).copied().unwrap_or(false) {
-            self.home_read_refusals.set(self.home_read_refusals.get() + 1);
+            self.home_read_refusals
+                .set(self.home_read_refusals.get() + 1);
             let site = core::panic::Location::caller();
             return Err(Bailout::with_context(
                 BailoutReason::UnallocatedValue { node: id },
@@ -3174,7 +3213,7 @@ impl<'a> Lowerer<'a> {
             Err(bailout) => {
                 self.unallocated_slot_use.set(true);
                 self.latch_bailout(bailout);
-                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IRSLOT").is_some() {
+                if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IRSLOT") {
                     match self.graph.nodes.get(id as usize) {
                         Some(n) => eprintln!(
                             "[irslot] UNALLOCATED node={} op={:?} ty={:?} inputs={:?} pc={:?}",
@@ -3325,7 +3364,7 @@ impl<'a> Lowerer<'a> {
         // claim below requires `coverable` AND (published OR nothing to
         // publish).
         let published = self.emit_shadow_push(&slots);
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_RELOC").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_RELOC") {
             eprintln!(
                 "[ir-reloc] safepoint id={id} slots={slots:?} coverable={coverable} \
                  published={published} thread_helper={:#x} thread_slot={} savebase={} \
@@ -3557,9 +3596,13 @@ impl<'a> Lowerer<'a> {
         }
         let mut published: Vec<NodeId> = Vec::new();
         for op in ops {
-            if let Err(bailout) =
-                self.emit_copy_op(op, &src_node_of, &phi_of_dst, &defer_publish, &mut published)
-            {
+            if let Err(bailout) = self.emit_copy_op(
+                op,
+                &src_node_of,
+                &phi_of_dst,
+                &defer_publish,
+                &mut published,
+            ) {
                 self.latch_bailout(bailout);
                 return;
             }
@@ -3610,7 +3653,11 @@ impl<'a> Lowerer<'a> {
                 // keeps its home store precisely so this loop can read it.
                 if ir_phi_home_publish_guard_enabled()
                     && !defer_publish.contains(&c.phi)
-                    && self.home_dropped.get(c.phi as usize).copied().unwrap_or(false)
+                    && self
+                        .home_dropped
+                        .get(c.phi as usize)
+                        .copied()
+                        .unwrap_or(false)
                 {
                     if self.resident_gpr(c.phi).is_some() {
                         // The register already holds it -- which is the whole
@@ -3747,7 +3794,12 @@ impl<'a> Lowerer<'a> {
             .copied()
             .filter(|_| ir_phi_copy_regs_enabled() && ir_phi_copy_direct_enabled())
             .filter(|phi| !defer_publish.contains(phi))
-            .filter(|phi| self.home_dropped.get(*phi as usize).copied().unwrap_or(false))
+            .filter(|phi| {
+                self.home_dropped
+                    .get(*phi as usize)
+                    .copied()
+                    .unwrap_or(false)
+            })
             .and_then(|phi| self.assigned_gpr(phi).map(|reg| (phi, reg)));
         let stage_reg = stage.map_or(RAX, |(_, reg)| reg);
         let mut from_reg = false;
@@ -3760,7 +3812,11 @@ impl<'a> Lowerer<'a> {
                 // the same reason the publish is — the value is defined before
                 // any edge that reads it, and the register is exclusively its
                 // own (that is a clause of `phi_home_droppable`).
-                let homeless = self.home_dropped.get(sid as usize).copied().unwrap_or(false);
+                let homeless = self
+                    .home_dropped
+                    .get(sid as usize)
+                    .copied()
+                    .unwrap_or(false);
                 let src_reg = if homeless {
                     self.assigned_gpr(sid)
                 } else {
@@ -3803,7 +3859,11 @@ impl<'a> Lowerer<'a> {
         // only thing that carries the value — keep it.
         let drop_home = phi_of_dst.get(&dst).is_some_and(|phi| {
             !defer_publish.contains(phi)
-                && self.home_dropped.get(*phi as usize).copied().unwrap_or(false)
+                && self
+                    .home_dropped
+                    .get(*phi as usize)
+                    .copied()
+                    .unwrap_or(false)
         });
         if drop_home {
             self.home_stores_dropped += 1;
@@ -4262,7 +4322,7 @@ impl<'a> Lowerer<'a> {
         self.buf.emit_byte(0x25); // SIB: [disp32] absolute
         self.buf
             .emit(&(self.inline_cm_tls_disp as u32).to_le_bytes());
-        self.buf.emit(&self.compile_id.to_le_bytes());
+        self.buf.emit(&self.compile_id.id().to_le_bytes());
     }
 
     /// Cache `*mut JvmThread` in its reserved slot.
@@ -4905,13 +4965,14 @@ impl<'a> Lowerer<'a> {
         }
         self.emit_ref_store_path_trace(&crate::metrics::IR_REF_STORE_INLINE_TAKEN);
         self.gp_load_value(RDX, value);
-        self.buf.emit(&[0xF6, 0xC1, cratonvm_types::GC_FLAG_COMPACT]); // TEST CL, imm8
+        self.buf
+            .emit(&[0xF6, 0xC1, cratonvm_types::GC_FLAG_COMPACT]); // TEST CL, imm8
         let legacy_shape = self.emit_jcc_rel32(0x84); // JZ -> the 16-byte cell
-        // COMPACT: a reference field is the bare 8-byte pointer at the cell
-        // base, which is exactly what the inline `getfield` arm reads back.
-        //
-        // Cast: a compact field offset plus the header is bounded by the
-        // object size.
+                                                      // COMPACT: a reference field is the bare 8-byte pointer at the cell
+                                                      // base, which is exactly what the inline `getfield` arm reads back.
+                                                      //
+                                                      // Cast: a compact field offset plus the header is bounded by the
+                                                      // object size.
         let cell_off = (HEADER_SIZE + c_off as usize) as i32;
         self.emit_ref_store_path_trace(&crate::metrics::IR_REF_STORE_SHAPE_COMPACT);
         self.buf.emit(&[0x48, 0x89, 0x90]); // MOV [RAX + disp32], RDX
@@ -5798,9 +5859,8 @@ impl<'a> Lowerer<'a> {
         // written at all. A carried value normally still writes its home,
         // because `graph.safepoints` names it.
         let carry = self.carry_at_store(offset);
-        let drop_store = carry.is_some_and(|(id, _, _)| {
-            self.home_dropped.get(id as usize).copied().unwrap_or(false)
-        });
+        let drop_store = carry
+            .is_some_and(|(id, _, _)| self.home_dropped.get(id as usize).copied().unwrap_or(false));
         if !drop_store && !self.publish_def_at_store(offset) {
             let mut bytes = FrameAccess::new();
             enc_frame_store(RAX, offset, &mut bytes);
@@ -5815,7 +5875,12 @@ impl<'a> Lowerer<'a> {
             if reg != RAX {
                 self.emit_mov_reg_reg64_raw(reg, RAX);
             }
-            if self.carry_deferred.get(id as usize).copied().unwrap_or(false) {
+            if self
+                .carry_deferred
+                .get(id as usize)
+                .copied()
+                .unwrap_or(false)
+            {
                 // The DEFERRED slot. `reg` is RCX by construction (the planner
                 // only defers a consumer's second operand), and the value has
                 // to survive exactly one arm before its consumer reads it.
@@ -6696,7 +6761,7 @@ impl<'a> Lowerer<'a> {
     /// The cascade's guards touch RAX (the receiver and its class id), R10 (the
     /// cache-slot base) and R11 (the call target), and **nothing else** — no
     /// `ENTRY_ABI_REGS` member appears in `emit_cmp_eax_r10_disp`,
-    /// `emit_cmp_byte_r10_disp_zero`, `emit_cmp_qword_r10_disp_zero`, or the
+    /// `emit_load_ic_entry_word`, `emit_strip_ic_context_tag`, or the
     /// receiver null and kind checks. A layout established here therefore
     /// survives every arm of the cascade to its `CALL`.
     ///
@@ -6757,36 +6822,43 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// `CMP BYTE [R10 + disp], 0` — selects the cached target's entry ABI.
-    fn emit_cmp_byte_r10_disp_zero(&mut self, disp: u8) {
-        // REX.B + 80 /7 + ModRM(mod=01, /7, rm=R10) + disp8 + imm8
-        self.buf.emit(&[0x41, 0x80, 0x7A, disp, 0x00]);
-    }
-
-    /// `CMP QWORD [R10 + disp], 0` — rejects a profile-seeded cache
-    /// entry whose class id is known but whose compiled target is not yet
-    /// installed.
-    fn emit_cmp_qword_r10_disp_zero(&mut self, disp: u8) {
-        // REX.W+B + 83 /7 + ModRM(mod=01, /7, rm=R10) + disp8 + imm8
-        self.buf.emit(&[0x49, 0x83, 0x7A, disp, 0x00]);
-    }
-
-    /// `MOV R11, qword [R10 + disp] ; CALL R11` — the cached-entry indirect
-    /// call.
+    /// `MOV R11, qword [R10 + disp] ; TEST R11, R11` — capture an inline-cache
+    /// entry word ONCE. The caller follows with `JZ .slow` (a zero word is a
+    /// profile seed with no target, or a withdrawn one) and then
+    /// [`Self::emit_strip_ic_context_tag`].
     ///
-    /// SECURITY INVARIANT (inherited verbatim from `x64.rs`'s inline caches):
-    /// nothing may be emitted between these two instructions. R10 is a general
-    /// scratch register; keeping the call target addressed through it across
-    /// any other emitted instruction would let an R10 clobber redirect native
-    /// control flow. Loading into R11 (caller-saved, not an argument register
-    /// on either ABI, clobbered by the call anyway) immediately before the
-    /// `CALL` closes the window to a single fixed pair.
-    fn emit_call_cached_entry(&mut self, disp: u8) {
+    /// The word carries the target AND its calling convention
+    /// (`JIT_IC_NEEDS_CONTEXT_TAG` in bit 0). Loading the two separately let a
+    /// reader pair one publication's address with the next one's ABI flag, or
+    /// pass a non-zero check and then load a zero target.
+    fn emit_load_ic_entry_word(&mut self, disp: u8) {
         if disp == 0 {
             self.buf.emit(&[0x4D, 0x8B, 0x1A]); // MOV R11, [R10]
         } else {
             self.buf.emit(&[0x4D, 0x8B, 0x5A, disp]); // MOV R11, [R10+disp8]
         }
+        self.buf.emit(&[0x4D, 0x85, 0xDB]); // TEST R11, R11
+    }
+
+    /// `BTR R11, 0` — move the needs-context tag into CF and leave the bare
+    /// entry address in R11. The caller branches `JNC` to the context-free
+    /// arm.
+    fn emit_strip_ic_context_tag(&mut self) {
+        const _: () = assert!(crate::JIT_IC_NEEDS_CONTEXT_TAG == 1);
+        // REX.W+B + 0F BA /6 + ModRM(mod=11, /6, rm=R11) + imm8
+        self.buf.emit(&[0x49, 0x0F, 0xBA, 0xF3, 0x00]);
+    }
+
+    /// `CALL R11` — the cached-entry indirect call, through the target
+    /// [`Self::emit_load_ic_entry_word`] captured.
+    ///
+    /// SECURITY INVARIANT (inherited from `x64.rs`'s inline caches): the call
+    /// target must not be addressed through R10 across other emitted code, so
+    /// it lives in R11 (caller-saved, not an argument register on either ABI,
+    /// clobbered by the call anyway). Between the capture and this CALL only
+    /// the ABI marshalling runs, and it writes `ENTRY_ABI_REGS` only — nothing
+    /// that writes R11 may be emitted there.
+    fn emit_call_loaded_ic_entry(&mut self) {
         self.buf.emit(&[0x41, 0xFF, 0xD3]); // CALL R11
                                             // The callee is COMPILED JAVA, so its prologue published ITS (rbp,
                                             // compile id) into the innermost-frame mirror and nothing on the return
@@ -6847,19 +6919,21 @@ impl<'a> Lowerer<'a> {
     ///   ; ── monomorphic ──
     ///   MOV  R10, imm64 mic
     ///   CMP  EAX, [R10 + CACHED_CLASS_ID_OFFSET]     ; JNE .pic
-    ///   CMP  BYTE [R10 + CACHED_NEEDS_CONTEXT], 0    ; JE  .mic_noctx
-    ///   <marshal context ABI> ; JMP .mic_call
+    ///   MOV  R11, [R10 + CACHED_ENTRY_PTR_OFFSET]    ; tagged word, loaded ONCE
+    ///   TEST R11, R11 ; JZ .slow
+    ///   BTR  R11, 0                                  ; CF = needs-context
+    ///   JNC  .mic_noctx ; <marshal context ABI> ; JMP .mic_call
     /// .mic_noctx: <marshal context-free ABI>
-    /// .mic_call: MOV R11,[R10+8] ; CALL R11 ; JMP .done
+    /// .mic_call: CALL R11 ; JMP .done
     ///   ; ── polymorphic, 4-way ──
     /// .pic:
     ///   MOV  R10, imm64 pic
     ///   for i in 0..4:
-    ///     CMP EAX, [R10+CLASS_ID_OFFSETS[i]]  ; JNE .pic_{i+1} (last: .slow)
-    ///     CMP BYTE [R10+NEEDS_CONTEXT[i]], 0  ; JE  .entry_noctx
-    ///     <marshal context ABI> ; JMP .entry_call
+    ///     CMP EAX, [R10+CLASS_ID_OFFSETS[i]]   ; JNE .pic_{i+1} (last: .slow)
+    ///     MOV R11, [R10+ENTRY_PTR_OFFSETS[i]]  ; TEST R11,R11 ; JZ .slow
+    ///     BTR R11, 0 ; JNC .entry_noctx ; <marshal context ABI> ; JMP .entry_call
     ///   .entry_noctx: <marshal context-free ABI>
-    ///   .entry_call: MOV R11,[R10+ENTRY_PTR_OFFSETS[i]] ; CALL R11 ; JMP .done
+    ///   .entry_call: CALL R11 ; JMP .done
     ///   ; ── megamorphic / cold ──
     /// .slow:
     ///   <marshal args into the frame staging region>
@@ -6978,26 +7052,27 @@ impl<'a> Lowerer<'a> {
         self.emit_mov_reg_imm64(R10, mic as u64);
         self.emit_cmp_eax_r10_disp(JitMICSlot::CACHED_CLASS_ID_OFFSET as u8);
         let mic_miss = self.emit_jcc_rel32(0x85); // JNE .pic
-        self.emit_cmp_qword_r10_disp_zero(JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8);
-        slow_patches.push(self.emit_jcc_rel32(0x84)); // JE .slow
-        self.emit_cmp_byte_r10_disp_zero(JitMICSlot::CACHED_NEEDS_CONTEXT_OFFSET as u8);
-        // Falls THROUGH on the context case and jumps on the no-context one,
-        // because the no-context layout is already in place: the fall-through
-        // shifts it, the jump does nothing at all. That inverts the old sense of
-        // this branch, which is why the target is named for what it skips.
+        self.emit_load_ic_entry_word(JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8);
+        slow_patches.push(self.emit_jcc_rel32(0x84)); // JZ .slow
+        self.emit_strip_ic_context_tag();
+        // Falls THROUGH on the context case (carry set) and jumps on the
+        // no-context one, because the no-context layout is already in place:
+        // the fall-through shifts it, the jump does nothing at all. That
+        // inverts the old sense of this branch, which is why the target is
+        // named for what it skips.
         if premarshal {
-            let mic_noctx = self.emit_jcc_rel32(0x84); // JE .mic_ready (no shift)
+            let mic_noctx = self.emit_jcc_rel32(0x83); // JNC .mic_ready (no shift)
             self.emit_ic_shift_for_context(num_args);
             self.patch_rel32_to_here(mic_noctx);
         } else {
-            let mic_noctx = self.emit_jcc_rel32(0x84); // JE .mic_noctx
+            let mic_noctx = self.emit_jcc_rel32(0x83); // JNC .mic_noctx
             self.emit_ic_abi_marshal(inputs, num_args, true);
             let mic_call = self.emit_jmp_rel32();
             self.patch_rel32_to_here(mic_noctx);
             self.emit_ic_abi_marshal(inputs, num_args, false);
             self.patch_rel32_to_here(mic_call);
         }
-        self.emit_call_cached_entry(JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8);
+        self.emit_call_loaded_ic_entry();
         self.emit_inline_callee_deopt_service(info_ptr, num_args, inputs);
         done_patches.push(self.emit_jmp_rel32());
 
@@ -7017,23 +7092,23 @@ impl<'a> Lowerer<'a> {
             } else {
                 next_entry = Some(miss);
             }
-            self.emit_cmp_qword_r10_disp_zero(JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8);
-            slow_patches.push(self.emit_jcc_rel32(0x84)); // JE .slow
-            self.emit_cmp_byte_r10_disp_zero(JitPICSlot::NEEDS_CONTEXT_OFFSETS[i] as u8);
+            self.emit_load_ic_entry_word(JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8);
+            slow_patches.push(self.emit_jcc_rel32(0x84)); // JZ .slow
+            self.emit_strip_ic_context_tag();
             // Same inversion as the MIC arm above.
             if premarshal {
-                let noctx = self.emit_jcc_rel32(0x84); // JE .entry_ready (no shift)
+                let noctx = self.emit_jcc_rel32(0x83); // JNC .entry_ready (no shift)
                 self.emit_ic_shift_for_context(num_args);
                 self.patch_rel32_to_here(noctx);
             } else {
-                let noctx = self.emit_jcc_rel32(0x84); // JE .entry_noctx
+                let noctx = self.emit_jcc_rel32(0x83); // JNC .entry_noctx
                 self.emit_ic_abi_marshal(inputs, num_args, true);
                 let call = self.emit_jmp_rel32();
                 self.patch_rel32_to_here(noctx);
                 self.emit_ic_abi_marshal(inputs, num_args, false);
                 self.patch_rel32_to_here(call);
             }
-            self.emit_call_cached_entry(JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8);
+            self.emit_call_loaded_ic_entry();
             self.emit_inline_callee_deopt_service(info_ptr, num_args, inputs);
             done_patches.push(self.emit_jmp_rel32());
         }
@@ -7068,7 +7143,11 @@ impl<'a> Lowerer<'a> {
         let arg_offsets: Vec<i32> = (0..num_args)
             .map(|i| {
                 let arg = inputs[2 + i];
-                if self.home_dropped.get(arg as usize).copied().unwrap_or(false)
+                if self
+                    .home_dropped
+                    .get(arg as usize)
+                    .copied()
+                    .unwrap_or(false)
                     && staged_arg_slot_enabled()
                 {
                     // Cast: an argument index is bounded by the callee's
@@ -7723,11 +7802,7 @@ impl<'a> Lowerer<'a> {
     /// succ_block` carries: one per value phi of the successor's merge whose
     /// input for this edge is a real node. Pure; `emit_phi_copies` emits
     /// exactly these and `edge_has_phi_copies` asks whether there are any.
-    fn gather_phi_copies(
-        &self,
-        pred_block: usize,
-        succ_block: usize,
-    ) -> Vec<PhiCopy> {
+    fn gather_phi_copies(&self, pred_block: usize, succ_block: usize) -> Vec<PhiCopy> {
         let merge_ctrl = self.schedule.blocks[succ_block].ctrl;
         if !matches!(
             self.graph.nodes[merge_ctrl as usize].op,
@@ -8214,12 +8289,7 @@ impl<'a> Lowerer<'a> {
             if !op_home_is_one_store_rax(&node.op) {
                 continue;
             }
-            if self
-                .deopt_named_reachable
-                .get(id)
-                .copied()
-                .unwrap_or(true)
-            {
+            if self.deopt_named_reachable.get(id).copied().unwrap_or(true) {
                 continue;
             }
             self.home_dropped[id] = true;
@@ -8671,6 +8741,12 @@ impl<'a> Lowerer<'a> {
                     target,
                     self.frame_record,
                 );
+                // Retract the push the map above emitted, exactly as
+                // `Op::New` does. Without it `lower_inner`'s push/reload
+                // balance check refused every method with a synchronized block
+                // — after emitting the whole body. The reload works through
+                // RCX, so the helper's RAX survives for the sentinel test.
+                self.emit_shadow_reload();
                 // `i64::MIN` means the helper published a pending Java
                 // exception (a null receiver takes the NPE path).
                 self.emit_mov_reg_imm64(RCX, i64::MIN as u64);
@@ -8685,13 +8761,21 @@ impl<'a> Lowerer<'a> {
                 let ok = self.buf.pos();
                 let rel = ok as i32 - (ok_patch as i32 + 4);
                 Self::patch_or_bail(&mut self.buf, ok_patch, rel);
-                // Store the possibly-REMAPPED reference back. A contended
-                // acquire can move the object while this thread is parked.
-                // Idempotent with the collector's own rewrite:
+                // Store the possibly-REMAPPED reference back — after ENTER only.
+                // A contended acquire can move the object while this thread is
+                // parked, and `jit_monitor_enter` returns the object. Idempotent
+                // with the collector's own rewrite:
                 // `conservative_roots::remap_one_jit_frame` rewrites published
-                // slots keyed on their CURRENT value, so if it already wrote
-                // the new address, writing the same address again is a no-op.
-                self.store_rax(obj_slot);
+                // slots keyed on their CURRENT value, so if it already wrote the
+                // new address, writing the same address again is a no-op.
+                //
+                // `jit_monitor_exit` returns `1` on success, not the object, so
+                // storing RAX after an exit overwrote the object's home with the
+                // address 1: a second `synchronized (this)` in the same method
+                // read `this` back as 1, and the oop map published it.
+                if matches!(node.op, Op::MonitorEnter) {
+                    self.store_rax(obj_slot);
+                }
             }
             Op::New {
                 class_id,
@@ -9005,8 +9089,18 @@ impl<'a> Lowerer<'a> {
                 // null, and two distinct objects 4 GiB apart would test equal
                 // to each other. Selected from the operand types, so an int
                 // compare keeps the shorter encoding.
-                let ref_cmp = matches!(self.graph.nodes[node.inputs[0] as usize].ty, IrType::Ref)
-                    || matches!(self.graph.nodes[node.inputs[1] as usize].ty, IrType::Ref);
+                //
+                // A `long` compare needs all 64 bits for the same reason: the
+                // builder's `ldiv`/`lrem` zero guard is `Cmp(Ne, divisor, 0L)`,
+                // and a 32-bit CMP saw a divisor of `1L << 32` as zero and
+                // deoptimised on every call.
+                let ref_cmp = matches!(
+                    self.graph.nodes[node.inputs[0] as usize].ty,
+                    IrType::Ref | IrType::Long
+                ) || matches!(
+                    self.graph.nodes[node.inputs[1] as usize].ty,
+                    IrType::Ref | IrType::Long
+                );
                 if ref_cmp {
                     // CMP RAX, RCX
                     self.buf.emit(&[0x48, 0x39, 0xC8]);
@@ -9077,7 +9171,8 @@ impl<'a> Lowerer<'a> {
                 let uop = *op;
                 let class_id = *class_id;
                 let bci = node.bytecode_pc.unwrap_or(0);
-                let Some((compact_off, legacy_off)) = crate::ir::unbox_offsets(uop, class_id) else {
+                let Some((compact_off, legacy_off)) = crate::ir::unbox_offsets(uop, class_id)
+                else {
                     // The planner already asked and got an answer; a refusal
                     // here means the layout moved under us between planning and
                     // lowering. Refuse the artifact rather than emit a load
@@ -9364,8 +9459,7 @@ impl<'a> Lowerer<'a> {
                         // exactly the `distance & 31` / `& 63` the JLS
                         // specifies, negative distances included.
                         self.gp_load_value(RCX, node.inputs[1]);
-                        let left =
-                            matches!(sop, ScalarOp::RotateLeftI | ScalarOp::RotateLeftL);
+                        let left = matches!(sop, ScalarOp::RotateLeftI | ScalarOp::RotateLeftL);
                         let modrm = if left { 0xC0 } else { 0xC8 };
                         if w {
                             self.buf.emit(&[0x48, 0xD3, modrm]); // ROL/ROR RAX, CL
@@ -9705,12 +9799,7 @@ impl<'a> Lowerer<'a> {
                     // at its end. `false` means "not admitted", and the
                     // unconditional helper call below then runs exactly as it
                     // did before. See `emit_gated_ir_ref_putfield`.
-                    if self.emit_gated_ir_ref_putfield(
-                        node.bytecode_pc,
-                        base,
-                        value,
-                        field_index,
-                    ) {
+                    if self.emit_gated_ir_ref_putfield(node.bytecode_pc, base, value, field_index) {
                         return;
                     }
                     // jit_putfield_object(vm_ptr, obj_ptr, field_index, val).
@@ -10099,8 +10188,10 @@ impl<'a> Lowerer<'a> {
                         // SAFETY: as the `invoke_kind == 4` read above — the
                         // pointer names a live `JitInvokeInfo` owned by
                         // `ir_call_infos` for the lifetime of this compile.
-                        let has_receiver =
-                            matches!(unsafe { (*(*info_ptr as *const JitInvokeInfo)).invoke_kind }, 0 | 1 | 2);
+                        let has_receiver = matches!(
+                            unsafe { (*(*info_ptr as *const JitInvokeInfo)).invoke_kind },
+                            0 | 1 | 2
+                        );
                         self.emit_direct_cross_call(
                             &node.inputs,
                             slot,
@@ -10892,15 +10983,25 @@ impl<'a> Lowerer<'a> {
                 // nonzero); `None` keeps the boolean-in-RAX shape.
                 let fused_cc: Option<u8> = match self.graph.nodes.get(cond_id as usize) {
                     Some(cmp_node)
-                        if self.fused_cmp.get(cond_id as usize).copied().unwrap_or(false) =>
+                        if self
+                            .fused_cmp
+                            .get(cond_id as usize)
+                            .copied()
+                            .unwrap_or(false) =>
                     {
                         match cmp_node.op {
                             Op::Cmp(cc) => {
                                 let a = cmp_node.inputs[0];
                                 let b = cmp_node.inputs[1];
-                                let ref_cmp =
-                                    matches!(self.graph.nodes[a as usize].ty, IrType::Ref)
-                                        || matches!(self.graph.nodes[b as usize].ty, IrType::Ref);
+                                // 64-bit for `Ref` and `Long` operands; see the
+                                // unfused `Op::Cmp` arm.
+                                let ref_cmp = matches!(
+                                    self.graph.nodes[a as usize].ty,
+                                    IrType::Ref | IrType::Long
+                                ) || matches!(
+                                    self.graph.nodes[b as usize].ty,
+                                    IrType::Ref | IrType::Long
+                                );
                                 // Both already in registers: compare them
                                 // there. A fused compare is the one arm that
                                 // may do this without owing anything else — it
@@ -11062,7 +11163,7 @@ impl<'a> Lowerer<'a> {
                             Some(cc) if favor_false => (cc, false_block, true_block),
                             Some(cc) => (cc ^ 1, true_block, false_block),
                             None if favor_false => (0x85u8, false_block, true_block), // JNE
-                            None => (0x84u8, true_block, false_block),               // JE
+                            None => (0x84u8, true_block, false_block),                // JE
                         };
                         self.buf.emit(&[0x0F, jcc_far]);
                         let far_patch = self.buf.pos();
@@ -11188,7 +11289,9 @@ impl<'a> Lowerer<'a> {
     /// anything, and a pass whose only evidence is "the code got smaller" is a
     /// pass nobody can tune.
     fn emit_jmp_to_block_or_fall_through(&mut self, target: usize, block_idx: usize) {
-        if ir_fallthrough_enabled() && target == block_idx + 1 && target < self.schedule.blocks.len()
+        if ir_fallthrough_enabled()
+            && target == block_idx + 1
+            && target < self.schedule.blocks.len()
         {
             FALLTHROUGHS_ELIDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
@@ -11251,7 +11354,12 @@ impl<'a> Lowerer<'a> {
             // a clause of `phi_home_droppable`, and the two must not be able to
             // drift apart. If they ever do, refuse the compile rather than
             // describe the frame word nothing wrote.
-            if self.home_dropped.get(node_id as usize).copied().unwrap_or(false) {
+            if self
+                .home_dropped
+                .get(node_id as usize)
+                .copied()
+                .unwrap_or(false)
+            {
                 self.latch_bailout(Bailout::with_context(
                     BailoutReason::UnallocatedValue { node: node_id },
                     format!("n{node_id}'s home was dropped but no register describes it"),
@@ -11489,7 +11597,7 @@ impl<'a> Lowerer<'a> {
     ///   Returns `None`.
     fn emit_div_zero_guard(&mut self, ty: IrType, bytecode_pc: Option<usize>) -> Option<usize> {
         let bci = match bytecode_pc {
-            Some(b) if self.graph.safepoints.iter().any(|s| s.bci == b) => b,
+            Some(b) if self.safepoint_bcis.contains(&b) => b,
             _ => return None,
         };
         // TEST ECX,ECX (int) / TEST RCX,RCX (long): ZF=1 when divisor == 0.
@@ -11498,11 +11606,9 @@ impl<'a> Lowerer<'a> {
         } else {
             self.buf.emit(&[0x48, 0x85, 0xC9]);
         }
-        let anchored = self
-            .graph
-            .nodes
-            .iter()
-            .any(|n| matches!(n.op, Op::Guard { bci: g } if g == bci));
+        // Both questions are answered from sets `Lowerer::new` gathered once;
+        // asking the graph here was a whole-graph scan per division.
+        let anchored = self.guard_bcis.contains(&bci);
         if !anchored {
             self.emit_deopt_if_zero(bci, DeoptReason::DivByZero);
             return None;
@@ -12032,7 +12138,7 @@ impl<'a> Lowerer<'a> {
                 live_across(id) && !named.contains(&(id as NodeId))
             });
             if unseedable {
-                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
+                if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_LINEAR_SCAN") {
                     for (id, r) in live.range.iter().enumerate() {
                         if self
                             .graph
@@ -12043,7 +12149,9 @@ impl<'a> Lowerer<'a> {
                             continue;
                         }
                         if r.is_some_and(|r| {
-                            r.lo < entry_pos && entry_pos <= r.hi && !named.contains(&(id as NodeId))
+                            r.lo < entry_pos
+                                && entry_pos <= r.hi
+                                && !named.contains(&(id as NodeId))
                         }) {
                             eprintln!(
                                 "[ir-ls]   osr block {bi} (bci {bci}) refused: n{id} {:?} is live                                  across it and no local names it",
@@ -12576,7 +12684,7 @@ impl<'a> Lowerer<'a> {
         // exactly the historical `frame_value_for` mapping (byte-identical).
         if let Some(sr) = self.sr_map {
             let deopt_block = self.deopt_block_for_bci(sp.bci);
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SCALAR_DEOPT") {
                 let matches: Vec<NodeId> = sp
                     .locals
                     .iter()
@@ -12699,13 +12807,22 @@ impl<'a> Lowerer<'a> {
         // the case that anchoring exists to fix — the scheduler hoisted the
         // division — so consulting both would report "ambiguous" and give up
         // on a program point that is in fact unambiguous.
-        let anchored = self
-            .graph
-            .nodes
-            .iter()
-            .any(|n| matches!(n.op, Op::Guard { bci: gb } if gb == bci));
+        let anchored = self.guard_bcis.contains(&bci);
         let mut found: Option<usize> = None;
-        for (id, n) in self.graph.nodes.iter().enumerate() {
+        // Only the nodes `Lowerer::new` indexed under this bci can answer, so
+        // walk those rather than the whole graph once per snapshot. They are in
+        // node-id order, and the answer does not depend on the order anyway:
+        // every exit is either a single agreed block or `None`.
+        let sites: &[NodeId] = self
+            .deopt_sites_by_bci
+            .get(&bci)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for &site in sites {
+            let id = site as usize;
+            let Some(n) = self.graph.nodes.get(id) else {
+                continue;
+            };
             // The deopt at `bci` fires from an explicit `Op::Guard { bci }`, or
             // — for a graph with no guard at this bci — from the div/rem
             // zero/overflow guard the lowerer emits at the node carrying
@@ -12761,7 +12878,7 @@ impl<'a> Lowerer<'a> {
         sr: &ScalarReplacementMap,
         emitted: &mut std::collections::HashSet<NodeId>,
     ) -> FrameValue {
-        let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some();
+        let dbg = cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SCALAR_DEOPT");
         let info = match sr.objects.get(&new_id) {
             Some(i) => i,
             // Unreachable through `resolve_frame_state` (which only calls here
@@ -12903,7 +13020,7 @@ impl<'a> Lowerer<'a> {
             field_values.push(fv);
         }
         emitted.insert(new_id);
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SCALAR_DEOPT") {
             eprintln!(
                 "[DBG_SCALAR_DEOPT] emit VirtualObject (new {new_id}, class_id {}, {} field(s)) at deopt block {db}",
                 info.class_id, info.num_fields
@@ -16059,7 +16176,7 @@ fn isel_shadow_enabled() -> bool {
 
 /// `CRATONVM_DBG=ir-isel` — print one shadow-selection line per compile.
 fn isel_shadow_reporting() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_ISEL").is_some()
+    cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_ISEL")
 }
 
 /// `CRATONVM_JIT=ir-isel-verify` — build the level-2 machine list and check the
@@ -16725,9 +16842,7 @@ fn ir_residency_pays_here(
 fn ir_residency_loop_weight_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_LS_LOOP_WEIGHT").is_some()
-    })
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_IR_LS_LOOP_WEIGHT"))
 }
 
 /// Copy a loop-live int/long PARAMETER into a callee-saved register at entry —
@@ -16770,17 +16885,13 @@ fn ir_reserve_carried_enabled() -> bool {
 fn ir_param_prologue_copy_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_PARAM_COPY").is_some()
-    })
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_IR_PARAM_COPY"))
 }
 
 fn ir_this_nonnull_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_THIS_NONNULL").is_some()
-    })
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_IR_THIS_NONNULL"))
 }
 
 fn linear_scan_enabled() -> bool {
@@ -16969,7 +17080,7 @@ fn ir_lower_machine_model(
 /// somewhere, for one of four reasons" and could not be acted on. Naming the
 /// conjunct is the difference between a count and a diagnosis.
 fn ls_refuse(reason: &str) -> Option<RegResidency> {
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_LINEAR_SCAN") {
         eprintln!("[ir-ls] refused: {reason}");
     }
     None
@@ -17115,7 +17226,11 @@ fn plan_register_residency(
         // Decline to promote and keep the frame layout the colourer already
         // produced; there is no reason to lose the whole optimized body over
         // an optimization that did not fit.
-        Err(_) => return Ok(ls_refuse("linear scan declined (pressure, fixed constraint or split budget)")),
+        Err(_) => {
+            return Ok(ls_refuse(
+                "linear scan declined (pressure, fixed constraint or split budget)",
+            ))
+        }
     };
     // `allocate_linear_scan` verifies its own result. Re-verify anyway: this
     // call site's guarantee must not rest on an internal detail of another
@@ -17501,12 +17616,14 @@ fn plan_register_residency(
                     // `Ref` is excluded for the safepoint reason the bank match
                     // gives, not as tuning: `OopMapEntry` names frame slots
                     // only. FP belongs to the other file.
-                    Some(node) => matches!(node.ty, IrType::Int | IrType::Long)
+                    Some(node) => {
+                        matches!(node.ty, IrType::Int | IrType::Long)
                         // A constant is materialised as an immediate by every
                         // reader, so its register could never be read.
                         && !matches!(node.op, Op::Const(_))
                         // A phi is only publishable when its edges publish it.
-                        && (ir_phi_residency_enabled() || !matches!(node.op, Op::Phi)),
+                        && (ir_phi_residency_enabled() || !matches!(node.op, Op::Phi))
+                    }
                     None => false,
                 }
             })
@@ -17638,7 +17755,7 @@ fn plan_register_residency(
     // (`[ir-ls] homes: dropped_values=`) is the outcome, and
     // `Lowerer::census_home_blocks` (`[ir-ls] homes kept:`) is the per-cause
     // breakdown of what is left.
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_LINEAR_SCAN") {
         eprintln!(
             "[ir-ls] nodes={n} positions={} peak_live={} deopt_pins_released={released} \
              scan_promoted={} resident={promoted} (fp={fp_promoted} gp={gp_promoted}) \
@@ -17651,7 +17768,7 @@ fn plan_register_residency(
             alloc.reloads,
         );
     }
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_LINEAR_SCAN") {
         eprintln!(
             "[ir-ls] skipped: split_or_spilled={skip_split} \
              wrong_bank_or_type={skip_bank} no_home={skip_home} phi={skip_phi} \
@@ -17681,7 +17798,7 @@ fn plan_register_residency(
 /// caller's signal to run the method in a lower tier. A compiler refusal must
 /// never terminate the VM.
 fn refuse(bailout: Bailout) -> Option<CompiledMethod> {
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_BAILOUT").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_BAILOUT") {
         eprintln!("[ir-bailout] {bailout}");
     }
     record_bailout(&bailout);
@@ -17800,7 +17917,7 @@ fn legacy_ir_code_buffer_estimate() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_LEGACY_BUFFER_ESTIMATE").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_IR_LEGACY_BUFFER_ESTIMATE")
     })
 }
 
@@ -17815,7 +17932,7 @@ fn legacy_ir_code_buffer_estimate() -> bool {
 ///
 /// `[ir-bufsize] nodes=N calls=C wanted=W capacity=C' ratio=… overflow=bool`
 fn report_ir_buffer_size(nodes: usize, call_nodes: usize, wanted: usize, capacity: usize) {
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_BUFSIZE").is_none() {
+    if !cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_BUFSIZE") {
         return;
     }
     // Integer permille, so the line stays greppable and needs no float
@@ -18367,7 +18484,7 @@ pub(crate) fn lower_inner_with_scopes(
     if let Err(bailout) = check_frame_size(frame_estimate, DEFAULT_MAX_FRAME_BYTES) {
         return refuse(bailout);
     }
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_SLOTS").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_SLOTS") {
         eprintln!(
             "[ir-slots] nodes={} blocks={} slots={} peak_live={} frame_bytes={frame_estimate}",
             graph.nodes.len(),
@@ -18710,7 +18827,7 @@ pub(crate) fn lower_inner_with_scopes(
 
     let lowerer_osr_entries = std::mem::take(&mut lowerer.osr_entries);
     if ir_osr_entry_enabled()
-        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some()
+        && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_LINEAR_SCAN")
     {
         eprintln!(
             "[ir-ls] osr entries: emitted={} refused={:?}",
@@ -18877,7 +18994,7 @@ pub(crate) fn lower_inner_with_scopes(
     // noticing that the optimizing tier plans no residency there at all, so
     // both arms had been running identical machine code.
     if ls_active
-        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some()
+        && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_LINEAR_SCAN")
         && (lowerer.phi_copy_reg_reads > 0
             || lowerer.phi_copy_reg_publishes > 0
             || lowerer.phi_copy_publish_deferred > 0
@@ -18898,7 +19015,7 @@ pub(crate) fn lower_inner_with_scopes(
     }
     if ls_active
         && ir_deopt_regs_enabled()
-        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some()
+        && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_LINEAR_SCAN")
     {
         eprintln!(
             "[ir-ls] deopt regs: nameable={} frame_slots_named_by_register={} regs_base={}",
@@ -18943,7 +19060,7 @@ pub(crate) fn lower_inner_with_scopes(
         lowerer.deferred_skips[7],
         lowerer.deferred_mid_foldable,
     );
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_LINEAR_SCAN") {
         eprintln!(
             "[ir-ls] carries: planned={} taken={} read={} refused={} \
              stores_dropped={} still_deopt_named={} deferred={}/{} cmp_in_place={}+{} \
@@ -18975,7 +19092,13 @@ pub(crate) fn lower_inner_with_scopes(
              mid_writes_rcx={} (of which foldable={}) | non_candidate_windows={}",
             lowerer.deferred_candidates,
             lowerer.carry_deferred_planned,
-            d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+            d[1],
+            d[2],
+            d[3],
+            d[4],
+            d[5],
+            d[6],
+            d[7],
             lowerer.deferred_mid_foldable,
             d[0],
         );
@@ -19014,8 +19137,9 @@ pub(crate) fn lower_inner_with_scopes(
     }
 
     // Carry the identity the prologue encoded, so publication can bind it to
-    // the artifact this buffer becomes.
-    let compile_id = lowerer.compile_id;
+    // the artifact this buffer becomes. It stays a reservation until the
+    // artifact exists: the overflow refusal below drops it, releasing the id.
+    let mut compile_id = lowerer.compile_id;
     let mut buf = lowerer.buf;
     // Soundness bail (jit-inlining-and-ir-calls). `ExecutableBuffer::emit` is
     // non-panicking: on capacity exhaustion it sets a sticky `overflowed` flag
@@ -19045,7 +19169,7 @@ pub(crate) fn lower_inner_with_scopes(
     let _code_size = buf.pos();
 
     let mut cm = CompiledMethod::new(buf);
-    cm.compile_id = compile_id;
+    cm.compile_id = compile_id.hand_off();
     cm.deopt_points = deopt_points;
     // Published unconditionally since 2026-09-09.
     //
@@ -19629,9 +19753,7 @@ fn ir_receiver_guard_cse_enabled() -> bool {
 fn staged_arg_slot_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_STAGED_ARG_SLOT").is_none()
-    })
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_NO_JIT_STAGED_ARG_SLOT"))
 }
 
 fn ir_inline_tlab_enabled() -> bool {
@@ -19695,15 +19817,22 @@ mod tests {
     #[test]
     fn every_phi_home_publish_site_is_guarded_against_a_dropped_home() {
         let src = include_str!("ir_lower.rs");
-        let body = src.split("
-mod tests {").next().unwrap_or(src);
+        let body = src
+            .split(
+                "
+mod tests {",
+            )
+            .next()
+            .unwrap_or(src);
         assert!(
             body.contains("fn publish_gp_from_slot"),
             "the scanned region no longer contains the publish helpers — the              test module boundary moved"
         );
+        // Whitespace-insensitive: rustfmt re-wraps method chains.
+        let squashed: String = body.split_whitespace().collect();
         assert!(
-            body.contains("ir_phi_home_publish_guard_enabled()")
-                && body.contains("self.home_dropped.get(c.phi as usize)"),
+            squashed.contains("ir_phi_home_publish_guard_enabled()")
+                && squashed.contains("self.home_dropped.get(c.phiasusize)"),
             "the dropped-home publish guard is gone from `emit_phi_copies`; a              phi whose home was dropped would be published from a word nothing              wrote"
         );
         // The PHI publishes only. Every other `publish_*_from_slot` call in
@@ -19714,7 +19843,8 @@ mod tests {").next().unwrap_or(src);
             .lines()
             .map(|l| l.trim().to_string())
             .filter(|l| {
-                (l.contains("publish_gp_from_slot(c.phi") || l.contains("publish_fp_from_slot(c.phi"))
+                (l.contains("publish_gp_from_slot(c.phi")
+                    || l.contains("publish_fp_from_slot(c.phi"))
                     && !l.starts_with("//")
                     && !l.contains("/// ")
             })
@@ -19744,6 +19874,7 @@ mod tests {").next().unwrap_or(src);
     /// is ever dereferenced). SAFETY: `JitRuntimeHelpers` is `#[repr(C)]` with
     /// all-integer (usize) fields, so an all-zero bit pattern is a valid value.
     fn no_helpers() -> JitRuntimeHelpers {
+        // SAFETY: `JitRuntimeHelpers` is `#[repr(C)]` and every field is a `usize`, so all-zero is a valid value; the test wires only the slots it exercises.
         unsafe { std::mem::zeroed() }
     }
 
@@ -20019,6 +20150,7 @@ mod tests {").next().unwrap_or(src);
         let compiled = lower(&graph, &schedule, 0, 0, &helpers).expect("live allocation");
         // SAFETY: helper ignores the synthetic context.
         assert_eq!(
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             unsafe { compiled.try_call_with_context(1, &[]) },
             Ok(i64::MIN)
         );
@@ -20168,6 +20300,7 @@ mod tests {").next().unwrap_or(src);
         let compiled = lower(&graph, &schedule, 1, 1, &helpers).expect("live allocation");
         // SAFETY: helper ignores the synthetic context/length.
         assert_eq!(
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             unsafe { compiled.try_call_with_context(1, &[-1]) },
             Ok(i64::MIN)
         );
@@ -20236,6 +20369,40 @@ mod tests {").next().unwrap_or(src);
         assert_eq!(HITS.load(Ordering::SeqCst), 1);
     }
 
+    /// Finding #84 on the optimizing tier: JVMS §6.5 `ireturn` narrows a
+    /// `Z`/`B`/`C`/`S` return. The builder inserts the same nodes `i2b`/`i2c`/
+    /// `i2s`/`iand` build, so only the low 32 bits of RAX are this tier's
+    /// `int` and that is what is compared.
+    #[test]
+    fn ireturn_narrows_boolean_byte_char_short_returns() {
+        static FLAG: u8 = 0;
+        extern "C" fn slow_poll() {}
+        let cases: [(&[u8], usize, &str, &[i64], i32); 6] = [
+            (&[0x05, 0xac], 0, "()Z", &[], 0),                  // iconst_2
+            (&[0x11, 0x00, 0xC8, 0xac], 0, "()B", &[], -56),    // sipush 200
+            (&[0x02, 0xac], 0, "()C", &[], 65535),              // iconst_m1
+            (&[0x1a, 0xac], 1, "(I)S", &[70000], 4464),         // iload_0
+            (&[0x1a, 0xac], 1, "(I)S", &[-70000], -4464),       // iload_0
+            (&[0x1a, 0xac], 1, "(I)I", &[70000], 70000),        // control
+        ];
+        for (code, n, desc, args, want) in cases {
+            let mut builder = IrBuilder::new(n, n);
+            builder.set_return_descriptor(desc);
+            let graph = builder.build(code, code.len()).expect("IR build");
+            let schedule = ir_schedule::schedule(&graph);
+            let mut helpers = no_helpers();
+            helpers.safepoint_flag_addr = &FLAG as *const u8 as usize;
+            helpers.safepoint_slow_path = slow_poll as *const () as usize;
+            let compiled = lower(&graph, &schedule, n, n, &helpers)
+                .unwrap_or_else(|| panic!("{desc} must lower"));
+            // SAFETY: the lowered body takes exactly `n` int arguments and
+            // returns an int; the poll flag is a static zero.
+            let got = unsafe { compiled.try_call(args) }.expect("call");
+            // Cast: this tier's `int` result is the low 32 bits of RAX.
+            assert_eq!(got as i32, want, "{desc} with {args:?}");
+        }
+    }
+
     /// An OUTLINED safepoint poll stops exactly when the inline one does, and
     /// the method finishes either way.
     ///
@@ -20299,6 +20466,7 @@ mod tests {").next().unwrap_or(src);
         // one; `slow_poll` is `extern "C"` and touches only its own counter.
         let run = |cm: &CompiledMethod| -> (i64, usize) {
             HITS.store(0, Ordering::SeqCst);
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             let got = unsafe { cm.try_call(&[7]) }.expect("call");
             (got, HITS.load(Ordering::SeqCst))
         };
@@ -20509,7 +20677,9 @@ mod tests {").next().unwrap_or(src);
 
         let code_bytes = compiled.code_bytes();
         assert!(
-            !code_bytes.windows(5).any(|w| w == [0xE9, 0x00, 0x00, 0x00, 0x00]),
+            !code_bytes
+                .windows(5)
+                .any(|w| w == [0xE9, 0x00, 0x00, 0x00, 0x00]),
             "emitted a JMP rel32 with displacement 0 -- a jump to the next \
              instruction; {} bytes of code",
             code_bytes.len(),
@@ -20520,6 +20690,7 @@ mod tests {").next().unwrap_or(src);
         // body, and the census cannot tell the difference.
         // SAFETY: one int parameter, no context, no helpers reachable.
         for (arg, want) in [(0i64, 2i64), (1, 1), (-7, 1)] {
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             let got = unsafe { compiled.try_call(&[arg]).expect("call") };
             assert_eq!(got, want, "f({arg})");
         }
@@ -20562,15 +20733,29 @@ mod tests {").next().unwrap_or(src);
         }
         let mut helpers = no_helpers();
         helpers.monitor_enter = fake_monitor as *const () as usize;
-        helpers.monitor_exit = fake_monitor as *const () as usize;
+        // The real `jit_monitor_exit` returns 1 on success, NOT the object.
+        // A fake that echoed `obj` for exit as well hid the lowering writing
+        // that return value back into the object's home slot.
+        extern "C" fn fake_monitor_exit(_vm: i64, _obj: i64) -> i64 {
+            1
+        }
+        helpers.monitor_exit = fake_monitor_exit as *const () as usize;
         let cm = lower(&graph, &schedule, 1, 1, &helpers)
             .expect("a monitor graph with a helper must compile");
-        let target = (fake_monitor as *const () as usize).to_le_bytes();
         let bytes = cm.code_bytes();
-        let calls = bytes.windows(8).filter(|w| *w == target).count();
+        let calls_to = |f: usize| {
+            let target = f.to_le_bytes();
+            bytes.windows(8).filter(|w| *w == target).count()
+        };
         assert_eq!(
-            calls, 2,
-            "monitorenter and monitorexit must each call the helper"
+            calls_to(fake_monitor as *const () as usize),
+            1,
+            "monitorenter must call the enter helper"
+        );
+        assert_eq!(
+            calls_to(fake_monitor_exit as *const () as usize),
+            1,
+            "monitorexit must call the exit helper"
         );
     }
     /// COV-03 — build the one-line `void set(Corpus o, X v) { o.f = v; }` graph
@@ -20921,9 +21106,8 @@ mod tests {").next().unwrap_or(src);
              the field held before, and the reader believes the discriminant"
         );
         let mut pay_store: Vec<u8> = vec![0x48, 0x89, 0x90]; // MOV [RAX+disp32], RDX
-        pay_store.extend_from_slice(
-            &(legacy_off + FIELD_CELL_PAYLOAD64_OFFSET as i32).to_le_bytes(),
-        );
+        pay_store
+            .extend_from_slice(&(legacy_off + FIELD_CELL_PAYLOAD64_OFFSET as i32).to_le_bytes());
         assert!(
             contains_seq(&code, &pay_store),
             "the legacy shape must write the 64-bit pointer payload"
@@ -20952,20 +21136,14 @@ mod tests {").next().unwrap_or(src);
     fn the_gated_arm_tests_the_flags_byte_for_compactness_and_for_the_skip_mask() {
         let code = lower_compact_ref_putfield(true, 8);
         assert!(
-            contains_seq(
-                &code,
-                &[0xF6, 0xC1, cratonvm_types::GC_FLAG_COMPACT]
-            ),
+            contains_seq(&code, &[0xF6, 0xC1, cratonvm_types::GC_FLAG_COMPACT]),
             "the arm must test GC_FLAG_COMPACT — a class with a registered \
              compact layout can still have legacy-cell instances, and storing \
              a pointer at the packed offset into one of those corrupts a \
              neighbouring field"
         );
         assert!(
-            contains_seq(
-                &code,
-                &[0xF6, 0xC1, cratonvm_types::GC_FLAG_OLD_GEN]
-            ),
+            contains_seq(&code, &[0xF6, 0xC1, cratonvm_types::GC_FLAG_OLD_GEN]),
             "the arm must test the published skip mask to rule the post \
              barrier out"
         );
@@ -20973,8 +21151,7 @@ mod tests {").next().unwrap_or(src);
         // twice. A second read would be a second chance for the two answers to
         // come from different bytes.
         let mut read_seq: Vec<u8> = vec![0x0F, 0xB6, 0x88];
-        read_seq
-            .extend_from_slice(&(cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32).to_le_bytes());
+        read_seq.extend_from_slice(&(cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32).to_le_bytes());
         assert!(
             contains_seq(&code, &read_seq),
             "the flags byte must be read as a BYTE at its own offset, not as \
@@ -21891,20 +22068,9 @@ mod tests {").next().unwrap_or(src);
         let code = lower_virtual_call_with_ic(&ic);
 
         // MIC: class id at offset 0 → `CMP EAX,[R10]` = 41 3B 02;
-        // needs_context at 16 → `CMP BYTE [R10+16],0` = 41 80 7A 10 00;
-        // entry ptr at 8 → `MOV R11,[R10+8]` = 4D 8B 5A 08.
+        // tagged entry word at 8 → `MOV R11,[R10+8]` = 4D 8B 5A 08.
         assert_eq!(JitMICSlot::CACHED_CLASS_ID_OFFSET, 0);
         assert!(contains_seq(&code, &[0x41, 0x3B, 0x02]));
-        assert!(contains_seq(
-            &code,
-            &[
-                0x41,
-                0x80,
-                0x7A,
-                JitMICSlot::CACHED_NEEDS_CONTEXT_OFFSET as u8,
-                0x00
-            ]
-        ));
         assert!(contains_seq(
             &code,
             &[
@@ -21914,21 +22080,8 @@ mod tests {").next().unwrap_or(src);
                 crate::x64::disp::disp8_const(JitMICSlot::CACHED_ENTRY_PTR_OFFSET as i64) as u8,
             ]
         ));
-        assert!(
-            contains_seq(
-                &code,
-                &[
-                    0x49,
-                    0x83,
-                    0x7A,
-                    JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8,
-                    0x00
-                ]
-            ),
-            "a class-only profiled MIC seed must miss until entry_ptr is populated"
-        );
 
-        // PIC: one guard + one needs-context gate + one entry load per entry.
+        // PIC: one guard + one entry-word load per entry.
         for i in 0..crate::JIT_PIC_ENTRIES {
             let cid = JitPICSlot::CLASS_ID_OFFSETS[i] as u8;
             if cid == 0 {
@@ -21943,19 +22096,6 @@ mod tests {").next().unwrap_or(src);
                 contains_seq(
                     &code,
                     &[
-                        0x41,
-                        0x80,
-                        0x7A,
-                        JitPICSlot::NEEDS_CONTEXT_OFFSETS[i] as u8,
-                        0x00
-                    ]
-                ),
-                "PIC entry {i} needs-context gate must be emitted"
-            );
-            assert!(
-                contains_seq(
-                    &code,
-                    &[
                         0x4D,
                         0x8B,
                         0x5A,
@@ -21963,20 +22103,32 @@ mod tests {").next().unwrap_or(src);
                             as u8,
                     ]
                 ),
-                "PIC entry {i} cached-entry load must be emitted"
+                "PIC entry {i} entry-word load must be emitted"
             );
+        }
+
+        // Every cached-entry call — the MIC, the four PIC ways and the two
+        // hashed ways — tests the word it loaded for zero (a class-only profile
+        // seed, or a withdrawn target) and strips the context tag from THAT
+        // word. One of each per `CALL R11`.
+        let calls = count_seq(&code, &[0x41, 0xFF, 0xD3]);
+        assert_eq!(calls, 1 + crate::JIT_PIC_ENTRIES + crate::JIT_MEGA_WAYS);
+        assert_eq!(
+            count_seq(&code, &[0x4D, 0x85, 0xDB]),
+            calls,
+            "every cached-entry call must reject a zero word it loaded itself"
+        );
+        assert_eq!(
+            count_seq(&code, &[0x49, 0x0F, 0xBA, 0xF3, 0x00]),
+            calls,
+            "every cached-entry call must take its ABI from the word it calls"
+        );
+        // And nothing may still read a separate needs-context byte: the MIC's
+        // old flag at offset 16, or the PIC's at 48..=51.
+        for off in [16u8, 48, 49, 50, 51] {
             assert!(
-                contains_seq(
-                    &code,
-                    &[
-                        0x49,
-                        0x83,
-                        0x7A,
-                        JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8,
-                        0x00
-                    ]
-                ),
-                "PIC entry {i} must reject a class-only profile seed"
+                !contains_seq(&code, &[0x41, 0x80, 0x7A, off, 0x00]),
+                "a separate needs-context byte at offset {off} must not be read"
             );
         }
     }
@@ -22172,9 +22324,11 @@ mod tests {").next().unwrap_or(src);
             return;
         }
 
-        // Still stub-only. Then the gate must be OPT-IN: `runtime_var_os(..)
-        // .is_some()` is off unless the variable is set, whereas a
+        // Still stub-only. Then the gate must be OPT-IN: `runtime_flag_on(..)`
+        // is off unless the variable is set to a truthy value, whereas a
         // `map_or(true, ..)` or a `!matches!(.., Ok("0"))` would be default-on.
+        // (It was a presence-only `.is_some()` read until 2026-09-12, and this
+        // needle matched that; see `jit-presence-only-flag-reads-FIXED.md`.)
         let lib_src = include_str!("lib.rs");
         let body = lib_src
             .split("fn c2_alloc_upgrade_enabled() -> bool {")
@@ -22184,7 +22338,7 @@ mod tests {").next().unwrap_or(src);
             .next()
             .expect("the function ends");
         assert!(
-            body.contains("is_some()"),
+            body.contains("runtime_flag_on("),
             "`c2_alloc_upgrade_enabled` is no longer opt-in, but the optimizing \
              tier still lowers `Op::New` through `emit_new_object_stub` — every \
              promoted allocation now pays a CALL where the single-pass backend \
@@ -22293,7 +22447,8 @@ mod tests {").next().unwrap_or(src);
             &taken
         };
         assert_eq!(
-            &base_code, expected_base,
+            &base_code,
+            expected_base,
             "with no hint the fall-through edge comes from the block layout \
              (`ir_branch_layout_polarity_enabled` = {}), and this fixture's \
              layout agrees with the not-taken hint",
@@ -22411,6 +22566,7 @@ mod tests {").next().unwrap_or(src);
 
         // Guard passes (cond != 0): normal return of `val`.
         let _ = take_last_deopt(); // clear any stale state
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let ok = unsafe { method.try_call(&[1, 777]).expect("call (guard ok)") };
         assert_eq!(ok, 777, "guard passes → returns val");
         assert!(take_last_deopt().is_none(), "no deopt when guard passes");
@@ -22418,6 +22574,7 @@ mod tests {").next().unwrap_or(src);
         // Guard fails (cond == 0): deopt sentinel returned, frame reconstructed
         // from the LIVE machine frame — locals resolved to the actual argument
         // values sitting in their spill slots.
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let sentinel = unsafe { method.try_call(&[0, 777]).expect("call (guard fail)") };
         assert_eq!(sentinel, i64::MIN, "guard fails → deopt sentinel");
         let frame = take_last_deopt().expect("deopt reconstructed a frame");
@@ -23160,6 +23317,7 @@ mod tests {").next().unwrap_or(src);
         assert!(compiled.is_some());
         let method = compiled.unwrap();
         // Execute the compiled code
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let result = unsafe { method.try_call(&[]).expect("test JIT call") };
         assert_eq!(result, 42, "Should return 42");
     }
@@ -23171,6 +23329,7 @@ mod tests {").next().unwrap_or(src);
         let compiled = compile_via_ir(&code, 4, 0, 0);
         assert!(compiled.is_some());
         let method = compiled.unwrap();
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let result = unsafe { method.try_call(&[]).expect("test JIT call") };
         assert_eq!(result, 7, "Should return 7 after constant folding");
     }
@@ -23208,8 +23367,6 @@ mod tests {").next().unwrap_or(src);
         let schedule = ir_schedule::schedule(&graph);
         lower(&graph, &schedule, n, n, &no_helpers()).expect("the intrinsic body must lower")
     }
-
-
 
     /// The class id every unbox-accessor test object carries, and the constant
     /// the emitted guard compares against. Any value but `0` will do; `0` is
@@ -23276,8 +23433,11 @@ mod tests {").next().unwrap_or(src);
         unsafe {
             let p = obj.as_mut_ptr() as *mut u8; // Cast: array base -> byte cursor
             std::ptr::write_unaligned(p as *mut u32, UNBOX_TEST_CLASS_ID); // Cast: header field
-            *p.add(cratonvm_types::GC_FLAGS_BYTE_OFFSET) =
-                if compact { cratonvm_types::GC_FLAG_COMPACT } else { 0 };
+            *p.add(cratonvm_types::GC_FLAGS_BYTE_OFFSET) = if compact {
+                cratonvm_types::GC_FLAG_COMPACT
+            } else {
+                0
+            };
         }
         obj
     }
@@ -23308,7 +23468,13 @@ mod tests {").next().unwrap_or(src);
         // (family, starting field value, delta, expected result, expected field)
         let cases: &[(U, i64, i64, i64, i64)] = &[
             // The three loads leave the field alone.
-            (U::LongValue, 0x1234_5678_9ABC_DEF0u64 as i64, 0, 0x1234_5678_9ABC_DEF0u64 as i64, 0x1234_5678_9ABC_DEF0u64 as i64),
+            (
+                U::LongValue,
+                0x1234_5678_9ABC_DEF0u64 as i64,
+                0,
+                0x1234_5678_9ABC_DEF0u64 as i64,
+                0x1234_5678_9ABC_DEF0u64 as i64,
+            ),
             (U::LongValue, -1, 0, -1, -1),
             (U::AtomicLongGet, i64::MIN, 0, i64::MIN, i64::MIN),
             (U::AtomicLongGet, 42, 0, 42, 42),
@@ -23326,7 +23492,13 @@ mod tests {").next().unwrap_or(src);
             (U::AtomicIntIncrementAndGet, -1, 0, 0, 0),
             (U::AtomicIntDecrementAndGet, 5, 0, 4, 4),
             (U::AtomicIntDecrementAndGet, 0, 0, -1, -1),
-            (U::AtomicIntIncrementAndGet, i32::MAX as i64, 0, i32::MIN as i64, i32::MIN as i64),
+            (
+                U::AtomicIntIncrementAndGet,
+                i32::MAX as i64,
+                0,
+                i32::MIN as i64,
+                i32::MIN as i64,
+            ),
             (U::AtomicLongGetAndAdd, 100, 5, 100, 105),
             (U::AtomicLongGetAndAdd, 100, -5, 100, 95),
             (U::AtomicLongGetAndAdd, 0, 1i64 << 40, 0, 1i64 << 40),
@@ -23357,8 +23529,8 @@ mod tests {").next().unwrap_or(src);
                 // rather than a plausible answer.
                 const POISON: u32 = 0x0BAD_0BAD;
                 let base = obj.as_mut_ptr() as *mut u8; // Cast: array base -> byte cursor
-                // SAFETY: `off` was asserted to leave 8 bytes inside the
-                // 64-byte object, and the writes are unaligned-safe.
+                                                        // SAFETY: `off` was asserted to leave 8 bytes inside the
+                                                        // 64-byte object, and the writes are unaligned-safe.
                 unsafe {
                     let at = base.add(off as usize); // Cast: resolved field offset
                     if op.is_wide() {
@@ -23370,7 +23542,11 @@ mod tests {").next().unwrap_or(src);
                 }
                 let addr = obj.as_mut_ptr() as i64; // Cast: receiver address
 
-                let args: &[i64] = if op.arity() == 1 { &[addr, delta] } else { &[addr] };
+                let args: &[i64] = if op.arity() == 1 {
+                    &[addr, delta]
+                } else {
+                    &[addr]
+                };
                 // SAFETY: the body takes the receiver (and for one family a
                 // delta), builds and tears down its own frame, and calls
                 // nothing. `obj` is a live 64-byte buffer whose header the
@@ -23380,7 +23556,8 @@ mod tests {").next().unwrap_or(src);
                 let layout = if compact { "compact" } else { "legacy" };
                 let got = if op.is_wide() { got } else { got as i32 as i64 };
                 assert_eq!(
-                    got, want,
+                    got,
+                    want,
                     "{} on a {layout} receiver (field={start:#x}, delta={delta})",
                     op.as_str(),
                 );
@@ -23400,7 +23577,8 @@ mod tests {").next().unwrap_or(src);
                     }
                 };
                 assert_eq!(
-                    field, want_field,
+                    field,
+                    want_field,
                     "{} left the wrong value in the {layout} field",
                     op.as_str(),
                 );
@@ -23522,12 +23700,22 @@ mod tests {").next().unwrap_or(src);
             (ScalarOp::MinI, 7, 3, 3),
             (ScalarOp::MinI, -5, 5, -5),
             (ScalarOp::MinI, 5, -5, -5),
-            (ScalarOp::MinI, i32::MIN as i64, i32::MAX as i64, i32::MIN as i64),
+            (
+                ScalarOp::MinI,
+                i32::MIN as i64,
+                i32::MAX as i64,
+                i32::MIN as i64,
+            ),
             (ScalarOp::MaxI, 3, 7, 7),
             (ScalarOp::MaxI, 7, 3, 7),
             (ScalarOp::MaxI, -5, 5, 5),
             (ScalarOp::MaxI, 5, -5, 5),
-            (ScalarOp::MaxI, i32::MIN as i64, i32::MAX as i64, i32::MAX as i64),
+            (
+                ScalarOp::MaxI,
+                i32::MIN as i64,
+                i32::MAX as i64,
+                i32::MAX as i64,
+            ),
             (ScalarOp::CompareI, 3, 7, -1),
             (ScalarOp::CompareI, 7, 3, 1),
             (ScalarOp::CompareI, 7, 7, 0),
@@ -23542,12 +23730,7 @@ mod tests {").next().unwrap_or(src);
             // down its own frame, and calls nothing.
             let got = unsafe { cm.try_call(&[a, b]) }.expect("the body runs");
             // The `Int` slot convention zero-extends, so compare the low half.
-            assert_eq!(
-                got as i32,
-                want as i32,
-                "{}({a}, {b})",
-                sop.as_str(),
-            );
+            assert_eq!(got as i32, want as i32, "{}({a}, {b})", sop.as_str(),);
         }
 
         let cases_l: &[(ScalarOp, i64, i64, i64)] = &[
@@ -23677,7 +23860,11 @@ mod tests {").next().unwrap_or(src);
 
         // 64-bit input AND answer.
         let unary_l: &[(ScalarOp, i64, i64)] = &[
-            (ScalarOp::ReverseBytesL, 0x0102_0304_0506_0708, 0x0807_0605_0403_0201),
+            (
+                ScalarOp::ReverseBytesL,
+                0x0102_0304_0506_0708,
+                0x0807_0605_0403_0201,
+            ),
             (ScalarOp::ReverseBytesL, 0, 0),
             (ScalarOp::LowestOneBitL, 0, 0),
             (ScalarOp::LowestOneBitL, 0x00FF_0000_0000_0000, 1i64 << 48),
@@ -23704,7 +23891,12 @@ mod tests {").next().unwrap_or(src);
             (ScalarOp::RotateLeftI, 1, -1, i32::MIN as i64),
             (ScalarOp::RotateRightI, 1, 1, i32::MIN as i64),
             (ScalarOp::RotateRightI, 1, -1, 2),
-            (ScalarOp::RotateRightI, 0x0000_00FF, 4, 0xF000_000F_u32 as i32 as i64),
+            (
+                ScalarOp::RotateRightI,
+                0x0000_00FF,
+                4,
+                0xF000_000F_u32 as i32 as i64,
+            ),
         ];
         for &(sop, x, d, want) in rot_i {
             let cm = compile_scalar_intrinsic(sop);
@@ -23739,6 +23931,7 @@ mod tests {").next().unwrap_or(src);
         let compiled = compile_via_ir(&code, 4, 2, 2);
         assert!(compiled.is_some());
         let method = compiled.unwrap();
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let result = unsafe { method.try_call(&[10, 20]).expect("test JIT call") };
         assert_eq!(result, 30, "10 + 20 = 30");
     }
@@ -23750,6 +23943,7 @@ mod tests {").next().unwrap_or(src);
         let compiled = compile_via_ir(&code, 4, 2, 2);
         assert!(compiled.is_some());
         let method = compiled.unwrap();
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let result = unsafe { method.try_call(&[30, 12]).expect("test JIT call") };
         assert_eq!(result, 18, "30 - 12 = 18");
     }
@@ -23761,6 +23955,7 @@ mod tests {").next().unwrap_or(src);
         let compiled = compile_via_ir(&code, 4, 2, 2);
         assert!(compiled.is_some());
         let method = compiled.unwrap();
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let result = unsafe { method.try_call(&[6, 7]).expect("test JIT call") };
         assert_eq!(result, 42, "6 * 7 = 42");
     }
@@ -23804,11 +23999,14 @@ mod tests {").next().unwrap_or(src);
         let method = lower(&graph, &schedule, 2, 2, &no_helpers()).expect("lower cmp graph");
 
         // a < b  → 1
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let r_true = unsafe { method.try_call(&[3, 7]).expect("test JIT call") };
         assert_eq!(r_true, 1, "3 < 7 should set the boolean to 1");
         // a >= b → 0
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let r_false = unsafe { method.try_call(&[7, 3]).expect("test JIT call") };
         assert_eq!(r_false, 0, "7 < 3 is false → 0");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let r_eq = unsafe { method.try_call(&[5, 5]).expect("test JIT call") };
         assert_eq!(r_eq, 0, "5 < 5 is false → 0");
     }
@@ -23844,10 +24042,13 @@ mod tests {").next().unwrap_or(src);
         assert!(compiled.is_some(), "ternary should compile via IR path");
         let method = compiled.unwrap();
 
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let r_true = unsafe { method.try_call(&[3, 7]).expect("test JIT call") };
         assert_eq!(r_true, 1, "3 < 7 → 1");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let r_false = unsafe { method.try_call(&[7, 3]).expect("test JIT call") };
         assert_eq!(r_false, 0, "7 < 3 → 0");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let r_eq = unsafe { method.try_call(&[5, 5]).expect("test JIT call") };
         assert_eq!(r_eq, 0, "5 == 5, not < → 0");
     }
@@ -23872,6 +24073,7 @@ mod tests {").next().unwrap_or(src);
             0x1a, 0x10, 0x08, 0x7e, 0x99, 0x00, 0x07, 0x04, 0xa7, 0x00, 0x04, 0x03, 0xac, 0, 0,
         ];
         let cm = compile_via_ir(&code, 13, 1, 1).expect("branchy predicate compiles via IR");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let f = |m: i64| unsafe { cm.try_call(&[m]).expect("call") };
         assert_eq!(f(8), 1, "8 & 8 != 0 → true");
         assert_eq!(f(0), 0, "0 & 8 == 0 → false");
@@ -23896,6 +24098,7 @@ mod tests {").next().unwrap_or(src);
             0x1a, 0x1b, 0xa1, 0x00, 0x07, 0x1a, 0xa7, 0x00, 0x04, 0x1b, 0xac, 0, 0,
         ];
         let cm = compile_via_ir(&code, 11, 2, 2).expect("max compiles via IR");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let max = |a: i64, b: i64| unsafe { cm.try_call(&[a, b]).expect("call") };
         assert_eq!(max(3, 7), 7, "max(3,7)=7");
         assert_eq!(max(7, 3), 7, "max(7,3)=7");
@@ -23920,6 +24123,7 @@ mod tests {").next().unwrap_or(src);
             0x02, 0x01, 0xa7, 0xff, 0xf4, 0x1b, 0xac, 0, 0,
         ];
         let cm = compile_via_ir(&code, 21, 1, 3).expect("loop compiles via IR");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let sum = |n: i64| unsafe { cm.try_call(&[n]).expect("call") };
         assert_eq!(sum(5), 10, "0+1+2+3+4 = 10");
         assert_eq!(sum(0), 0, "empty loop = 0");
@@ -23973,6 +24177,7 @@ mod tests {").next().unwrap_or(src);
         );
 
         // Cast: the low 32 bits of RAX are this method's `int` result.
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let sum = |n: i64| unsafe { cm.try_call(&[n]).expect("call") } as i32;
         for n in 0..24i64 {
             let want: i32 = (0..n as i32).sum();
@@ -24007,6 +24212,7 @@ mod tests {").next().unwrap_or(src);
         // means adding 3..n-1 and nothing else.
         for n in [4i64, 7, 12, 24] {
             let want: i32 = 1000 + (3..n as i32).sum::<i32>();
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             let got = unsafe { cm.ir_osr_enter(4, 0, &[n, 1000, 3]) }
                 .expect("the header door accepts three locals");
             assert_eq!(
@@ -24045,6 +24251,7 @@ mod tests {").next().unwrap_or(src);
         ];
         let cm = compile_via_ir(&code, 21, 1, 3).expect("loop compiles via IR");
         // The ordinary entry still works, unchanged.
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         assert_eq!(unsafe { cm.try_call(&[10]).expect("call") }, 45);
 
         let Some((_addr, _needed)) = cm.ir_osr_entry_addr(4) else {
@@ -24123,6 +24330,7 @@ mod tests {").next().unwrap_or(src);
         // The ordinary entry, which never skipped the constants and was always
         // right. `i < 3` on three iterations, `i >= 3` on two.
         assert_eq!(
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             unsafe { cm.try_call(&[5]).expect("test JIT call") },
             3 * 100 + 2 * 900,
             "the method-entry door: 100,100,100,900,900",
@@ -24258,6 +24466,7 @@ mod tests {").next().unwrap_or(src);
         // `int` result; the upper half is not sign-extended, so the comparison
         // is made on the 32 bits the body actually wrote.
         assert_eq!(
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             unsafe { cm.try_call(&[5]).expect("test JIT call") } as i32,
             expect(5, 5.0, 0, 0),
             "the method-entry door",
@@ -24272,6 +24481,7 @@ mod tests {").next().unwrap_or(src);
             return;
         };
         // Cast: as above.
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let entered = |l: &[i64]| unsafe { cm.ir_osr_enter(8, 0, l) }.map(|v| v as i32);
         // Enter at the header in a state the method could not have reached
         // from its own entry -- `a` is 2.5, which `(double) n` never produces,
@@ -24486,6 +24696,7 @@ mod tests {").next().unwrap_or(src);
             lower(&graph, &schedule, 1, 3, &no_helpers()).expect("the spliced graph must lower");
 
         // The method-entry door. `clamp(i)` is 100 for every i below 100.
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let f = |n: i64| unsafe { cm.try_call(&[n]).expect("test JIT call") };
         assert_eq!(f(5), 500, "clamp(0..4) is 100 each");
         assert_eq!(f(0), 0, "an empty loop sums to zero");
@@ -24544,6 +24755,7 @@ mod tests {").next().unwrap_or(src);
             cm.ir_osr_entries.is_empty(),
             "with the kill switch set an artifact must carry no entry stub",
         );
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         assert_eq!(unsafe { cm.try_call(&[10]).expect("call") }, 45);
     }
 
@@ -24561,6 +24773,7 @@ mod tests {").next().unwrap_or(src);
             0xff, 0xf7, 0x1b, 0xac, 0, 0,
         ];
         let cm = compile_via_ir(&code, 18, 1, 3).expect("do-while compiles via IR");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let f = |n: i64| unsafe { cm.try_call(&[n]).expect("call") };
         assert_eq!(f(5), 10, "runs i=0..4 → 0+1+2+3+4 = 10");
         assert_eq!(f(1), 0, "runs once (i=0) → 0");
@@ -24610,6 +24823,7 @@ mod tests {").next().unwrap_or(src);
             0, 0,
         ];
         let cm = compile_via_ir(&code, 33, 1, 4).expect("nested loops compile via IR");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let f = |n: i64| unsafe { cm.try_call(&[n]).expect("call") };
         assert_eq!(f(3), 9, "3*3 = 9");
         assert_eq!(f(5), 25, "5*5 = 25");
@@ -24631,11 +24845,13 @@ mod tests {").next().unwrap_or(src);
 
         let _ = take_last_deopt(); // clear any stale state
                                    // divisor != 0 → normal result, no deopt.
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let ok = unsafe { cm.try_call(&[20, 4]).expect("call (b != 0)") };
         assert_eq!(ok, 5, "20 / 4 = 5");
         assert!(take_last_deopt().is_none(), "no deopt when divisor != 0");
 
         // divisor == 0 → deopt (sentinel + reconstructed frame), NOT a #DE fault.
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let sentinel = unsafe { cm.try_call(&[20, 0]).expect("call (b == 0)") };
         assert_eq!(sentinel, i64::MIN, "div by zero → deopt sentinel");
         let frame = take_last_deopt().expect("deopt reconstructed a frame");
@@ -24668,6 +24884,7 @@ mod tests {").next().unwrap_or(src);
         let _ = take_last_deopt(); // clear any stale state
                                    // divisor != 0 → normal full-64-bit result, no deopt. A 32-bit IDIV
                                    // would mishandle this dividend (> i32::MAX).
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let ok = unsafe { cm.try_call(&[0x1_0000_0000, 2]).expect("call (b != 0)") };
         assert_eq!(ok, 0x8000_0000, "0x1_0000_0000 / 2 (genuinely 64-bit)");
         assert!(take_last_deopt().is_none(), "no deopt when divisor != 0");
@@ -24675,6 +24892,7 @@ mod tests {").next().unwrap_or(src);
         // divisor == 0 → deopt; the reconstructed frame must carry the two LONG
         // operands as FrameValue::Long (full 64 bits) so the interpreter resumes
         // at the ldiv bci and re-executes it (throwing ArithmeticException).
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let sentinel = unsafe { cm.try_call(&[0x7_0000_0000, 0]).expect("call (b == 0)") };
         assert_eq!(sentinel, i64::MIN, "ldiv by zero → deopt sentinel");
         let frame = take_last_deopt().expect("deopt reconstructed a frame");
@@ -24772,6 +24990,7 @@ mod tests {").next().unwrap_or(src);
              value-returning exit does not (void={void_zeroes}, value={value_zeroes})",
         );
         assert_eq!(
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             unsafe { void_method.try_call(&[41]) },
             Ok(0),
             "a void method must not hand its caller the deopt sentinel",
@@ -24785,6 +25004,7 @@ mod tests {").next().unwrap_or(src);
         let (graph, schedule) = add_one_graph();
         assert!(verify_data_locations(&graph, &schedule).is_ok());
         let method = lower(&graph, &schedule, 1, 1, &no_helpers()).expect("a+1 must lower");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         assert_eq!(unsafe { method.try_call(&[41]) }, Ok(42));
     }
 
@@ -25136,7 +25356,9 @@ mod tests {").next().unwrap_or(src);
 
         // End to end, the code still computes a + (a + b).
         let cm = lower(&graph, &schedule, 2, 2, &no_helpers()).expect("lowers");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         assert_eq!(unsafe { cm.try_call(&[3, 4]) }, Ok(10));
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         assert_eq!(unsafe { cm.try_call(&[-1, 5]) }, Ok(3));
     }
 
@@ -25289,7 +25511,10 @@ mod tests {").next().unwrap_or(src);
         let prim = plan.prim_colors();
         for id in [a, t, u, v] {
             let c = plan.node_color[id as usize].expect("a coloured primitive");
-            assert!(prim.contains(&c), "n{id}'s word {c} is missing from prim_colors");
+            assert!(
+                prim.contains(&c),
+                "n{id}'s word {c} is missing from prim_colors"
+            );
         }
         assert!(
             !prim.contains(&r_color),
@@ -25590,7 +25815,9 @@ mod tests {").next().unwrap_or(src);
 
         // And it really compiles and really runs.
         let cm = lower(&graph, &schedule, 1, 1, &no_helpers()).expect("a 5 000-node method lowers");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         assert_eq!(unsafe { cm.try_call(&[0]) }, Ok(5_000));
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         assert_eq!(unsafe { cm.try_call(&[42]) }, Ok(5_042));
     }
 
@@ -26000,6 +26227,7 @@ mod tests {").next().unwrap_or(src);
         // reads as its u32 bit pattern (-4 as 0xFFFF_FFFC). Sign-extend before
         // comparing, or a correct swap reports as a failure.
         let f = |a: i64, b: i64, n: i64| {
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             let raw = unsafe { cm.try_call(&[a, b, n]).expect("call") };
             raw as i32 as i64
         };
@@ -26594,8 +26822,18 @@ mod tests {").next().unwrap_or(src);
         // for the unrelated reason that a once-read value never repays the
         // prologue save. Both are `Op::Cmp`, which reaches no helper — so
         // nothing but the type is keeping this value out of the file.
-        let a = graph.add(Op::Cmp(crate::ir::CmpOp::Ne), IrType::Int, vec![obj, obj], Some(1));
-        let b = graph.add(Op::Cmp(crate::ir::CmpOp::Eq), IrType::Int, vec![obj, obj], Some(2));
+        let a = graph.add(
+            Op::Cmp(crate::ir::CmpOp::Ne),
+            IrType::Int,
+            vec![obj, obj],
+            Some(1),
+        );
+        let b = graph.add(
+            Op::Cmp(crate::ir::CmpOp::Eq),
+            IrType::Int,
+            vec![obj, obj],
+            Some(2),
+        );
         let sum = graph.add(Op::Add, IrType::Int, vec![a, b], Some(3));
         let sum2 = graph.add(Op::Add, IrType::Int, vec![sum, sum], Some(4));
         graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, sum2], Some(5));
@@ -26603,8 +26841,8 @@ mod tests {").next().unwrap_or(src);
         let schedule = ir_schedule::schedule(&graph);
 
         let plan = plan_slots(&graph, &schedule, None);
-        let Some(residency) = plan_register_residency(&graph, &schedule, &plan)
-            .expect("the allocation verifies")
+        let Some(residency) =
+            plan_register_residency(&graph, &schedule, &plan).expect("the allocation verifies")
         else {
             return;
         };
@@ -27725,10 +27963,8 @@ mod tests {").next().unwrap_or(src);
         // The bytes each claimed arm is allowed to emit, verified by hand
         // against the Intel encoding. `48 63 C0` is MOVSXD RAX, EAX and
         // `89 C0` is MOV EAX, EAX; neither names RCX in any field.
-        let permitted: &[(&str, &[&str])] = &[
-            ("I2L", &["0x48, 0x63, 0xC0"]),
-            ("L2I", &["0x89, 0xC0"]),
-        ];
+        let permitted: &[(&str, &[&str])] =
+            &[("I2L", &["0x48, 0x63, 0xC0"]), ("L2I", &["0x89, 0xC0"])];
 
         for name in &claimed {
             let arm = arms
@@ -27927,7 +28163,10 @@ mod tests {").next().unwrap_or(src);
         // a deferred carry crossing that arm would read it.
         for r in crate::regalloc::xmm_roles::IR_GP_LINEAR_SCAN {
             assert_ne!(r, RAX, "the GP file names RAX; no arm may publish there");
-            assert_ne!(r, RCX, "the GP file names RCX, which a deferred carry holds");
+            assert_ne!(
+                r, RCX,
+                "the GP file names RCX, which a deferred carry holds"
+            );
         }
 
         for name in super::RCX_FREE_WHEN_FOLDED {
@@ -28077,15 +28316,20 @@ mod tests {").next().unwrap_or(src);
 
         for n in [0i32, 1, 2, 7, 100, -3] {
             let want: i32 = (0..n.max(0)).fold(0i32, |acc, i| acc.wrapping_add(i));
-            let got_laid = unsafe { laid_out.try_call(&[i64::from(n)]) }
-                .expect("the laid-out body runs");
+            let got_laid =
+                // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+                unsafe { laid_out.try_call(&[i64::from(n)]) }.expect("the laid-out body runs");
             let got_hint =
+                // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
                 unsafe { hinted.try_call(&[i64::from(n)]) }.expect("the hinted body runs");
             assert_eq!(
                 got_laid as u32, got_hint as u32,
                 "the two branch polarities disagree for n={n}",
             );
-            assert_eq!(got_laid as u32 as i32, want, "laid-out body wrong for n={n}");
+            assert_eq!(
+                got_laid as u32 as i32, want,
+                "laid-out body wrong for n={n}"
+            );
         }
     }
 
@@ -28132,6 +28376,7 @@ mod tests {").next().unwrap_or(src);
         let unrolled = compile(true);
 
         for (what, cm) in [("rolled", &rolled), ("unrolled", &unrolled)] {
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             let got = unsafe { cm.try_call(&[]) }.expect("the body runs");
             assert_eq!(got as u32 as i32, 10, "the {what} body summed 0..4 wrong");
         }
@@ -28147,8 +28392,7 @@ mod tests {").next().unwrap_or(src);
             .collect();
         let found = at_iadd.len();
         assert_eq!(
-            found,
-            5,
+            found, 5,
             "expected one deopt point per unrolled copy of bci 11, got {found} \
              ({at_iadd:?}) -- `snapshot_native` is what anchors a copy's frame \
              inside that copy's code, and `bci_native` alone gives all five the \
@@ -28157,7 +28401,11 @@ mod tests {").next().unwrap_or(src);
         let mut sorted = at_iadd.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), 5, "two copies share a native offset: {at_iadd:?}");
+        assert_eq!(
+            sorted.len(),
+            5,
+            "two copies share a native offset: {at_iadd:?}"
+        );
 
         // The rolled arm has one, which is what says the five above are the
         // mechanism and not something this fixture would have produced anyway.
@@ -28235,15 +28483,20 @@ mod tests {").next().unwrap_or(src);
         // `ireturn` defines the low 32 bits of RAX and nothing above them.
         for n in [0i32, 1, 2, 7, 100, -3] {
             let want: i32 = (0..n.max(0)).fold(0i32, |acc, i| acc.wrapping_add(i));
-            let got_direct = unsafe { direct_cm.try_call(&[i64::from(n)]) }
-                .expect("the direct body runs");
+            let got_direct =
+                // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+                unsafe { direct_cm.try_call(&[i64::from(n)]) }.expect("the direct body runs");
             let got_plain =
+                // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
                 unsafe { plain_cm.try_call(&[i64::from(n)]) }.expect("the plain body runs");
             assert_eq!(
                 got_direct as u32, got_plain as u32,
                 "the two staging registers disagree for n={n}",
             );
-            assert_eq!(got_direct as u32 as i32, want, "direct body wrong for n={n}");
+            assert_eq!(
+                got_direct as u32 as i32, want,
+                "direct body wrong for n={n}"
+            );
         }
     }
 
@@ -28308,8 +28561,8 @@ mod tests {").next().unwrap_or(src);
                 // differ in exactly the switch named above.
                 for n in [0i32, 1, 7, 100] {
                     let want: i32 = (0..n).fold(0i32, |acc, i| acc.wrapping_add(i));
-                    let got = unsafe { direct.try_call(&[i64::from(n)]) }
-                        .expect("the body runs");
+                    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+                    let got = unsafe { direct.try_call(&[i64::from(n)]) }.expect("the body runs");
                     assert_eq!(got as u32 as i32, want, "wrong for n={n}");
                 }
             },
@@ -28354,7 +28607,8 @@ mod tests {").next().unwrap_or(src);
         );
 
         let before = super::ir_carry_deferred_census();
-        let paired_cm = lower(&graph, &paired, 2, 2, &no_helpers()).expect("the paired body lowers");
+        let paired_cm =
+            lower(&graph, &paired, 2, 2, &no_helpers()).expect("the paired body lowers");
         let after = super::ir_carry_deferred_census();
         let plain_cm = lower(&graph, &plain, 2, 2, &no_helpers()).expect("the plain body lowers");
 
@@ -28388,15 +28642,16 @@ mod tests {").next().unwrap_or(src);
         for (a, b) in [(3i32, 4i32), (-1, 5), (0, 0), (7, -9), (i32::MAX, 2)] {
             let want = a.wrapping_add(1) ^ b.wrapping_mul(3);
             let args = [i64::from(a), i64::from(b)];
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             let got_paired = unsafe { paired_cm.try_call(&args) }.expect("the paired body runs");
+            // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
             let got_plain = unsafe { plain_cm.try_call(&args) }.expect("the plain body runs");
             assert_eq!(
                 got_paired, got_plain,
                 "the two schedules disagree for ({a}, {b})",
             );
             assert_eq!(
-                got_paired as u32 as i32,
-                want,
+                got_paired as u32 as i32, want,
                 "paired body wrong for ({a}, {b})",
             );
         }
@@ -29007,10 +29262,7 @@ mod tests {").next().unwrap_or(src);
             .build(&code, code.len())
             .expect("the loop builds");
         assert!(
-            graph
-                .nodes
-                .iter()
-                .any(|n| matches!(n.op, Op::ArrayLength)),
+            graph.nodes.iter().any(|n| matches!(n.op, Op::ArrayLength)),
             "the fixture must contain an ArrayLength, or this test proves nothing"
         );
 
@@ -30197,7 +30449,7 @@ mod tests {").next().unwrap_or(src);
 /// `CRATONVM_JIT_NO_IC_FRAME_REPUBLISH=1` — stop republishing the
 /// innermost-frame mirror after an optimizing-tier inline-cache hit.
 ///
-/// The bisect lever for the republish folded into `emit_call_cached_entry`,
+/// The bisect lever for the republish folded into `emit_call_loaded_ic_entry`,
 /// which is default-ON. Latched: read once, because a codegen decision must not
 /// change under a running process. With it set, one binary reproduces the
 /// stale-mirror `ACTIVE_FRAME_MAP` refusals this fixed.
@@ -30213,23 +30465,17 @@ mod tests {").next().unwrap_or(src);
 /// two prologue changes stay independently attributable.
 fn prologue_zero_unset_locals_disabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_ZERO_UNSET_LOCALS").is_some()
-    })
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_ZERO_UNSET_LOCALS"))
 }
 
 fn prologue_zero_reserved_tail_disabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_ZERO_RESERVED_TAIL").is_some()
-    })
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_ZERO_RESERVED_TAIL"))
 }
 
 fn ic_frame_republish_disabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_IC_FRAME_REPUBLISH").is_some()
-    })
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_IC_FRAME_REPUBLISH"))
 }
 
 /// How many optimizing-tier inline-cache call sites were compiled WITH the
@@ -30248,5 +30494,3 @@ pub static IC_FRAME_REPUBLISH_SITES: std::sync::atomic::AtomicUsize =
 pub fn ic_frame_republish_sites() -> usize {
     IC_FRAME_REPUBLISH_SITES.load(std::sync::atomic::Ordering::Relaxed)
 }
-
-

@@ -1203,8 +1203,7 @@ fn check_frame_states(graph: &Graph, v: &mut Violations) {
             node_bcis.insert(pc);
         }
     }
-    let mut at_bci: std::collections::HashMap<usize, Vec<usize>> =
-        std::collections::HashMap::new();
+    let mut at_bci: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
     for (si, sp) in graph.safepoints.iter().enumerate() {
         at_bci.entry(sp.bci).or_default().push(si);
     }
@@ -1925,7 +1924,11 @@ mod tests {
         // so the by-bci scan resolves that program point to snapshot 0.
         g.nodes[b as usize].frame_snapshot = None;
         let err = verify_graph(&g, "test", VerifyOptions::default()).unwrap_err();
-        assert!(message(&err).contains("describe bci 4"), "{}", message(&err));
+        assert!(
+            message(&err).contains("describe bci 4"),
+            "{}",
+            message(&err)
+        );
     }
 
     /// A duplicated bci NO node carries is unconsultable, not ambiguous.

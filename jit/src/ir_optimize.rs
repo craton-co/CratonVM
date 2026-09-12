@@ -11,8 +11,7 @@ use std::hash::{Hash, Hasher};
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 use super::ir::{
-    CmpOp, Graph, IrType, MemKind, Node, NodeId, Op, SafepointSlotKind, SafepointSnapshot,
-    NO_NODE,
+    CmpOp, Graph, IrType, MemKind, Node, NodeId, Op, SafepointSlotKind, SafepointSnapshot, NO_NODE,
 };
 
 // ── Public API ───────────────────────────────────────────────────────
@@ -276,7 +275,7 @@ pub fn licm_enabled() -> bool {
 pub fn reassoc_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_REASSOC").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_REASSOC"))
 }
 
 /// `true` (default) when pure, call-free *branchy* integer methods may take the
@@ -288,7 +287,7 @@ pub fn reassoc_enabled() -> bool {
 pub fn ir_branchy_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_NO_IR_BRANCHY").is_none())
+    *FLAG.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_NO_IR_BRANCHY"))
 }
 
 // ── Affine strength reduction (reassociation) ────────────────────────
@@ -751,8 +750,12 @@ fn try_fold(nodes: &[Node], id: NodeId) -> Option<i64> {
             let a = const_value(nodes, node.inputs[0])?;
             let b = const_value(nodes, node.inputs[1])?;
             // Compare in the proper width so that two i32-typed constants
-            // whose i64 sign-extensions agree compare identically.
-            let result = if is_int {
+            // whose i64 sign-extensions agree compare identically. The width
+            // is the OPERANDS' — a `Cmp` result is always `Int`, so keying on
+            // `node.ty` would compare two `long` constants as truncated ints.
+            let operands_long = matches!(nodes[node.inputs[0] as usize].ty, IrType::Long)
+                || matches!(nodes[node.inputs[1] as usize].ty, IrType::Long);
+            let result = if !operands_long {
                 let ai = a as i32;
                 let bi = b as i32;
                 match cc {
@@ -789,106 +792,125 @@ fn const_value(nodes: &[Node], id: NodeId) -> Option<i64> {
 
 // ── Algebraic Simplification ─────────────────────────────────────────
 
+/// What an algebraic identity rewrites a node to.
+enum Simplified {
+    /// An existing node.
+    Node(NodeId),
+    /// The integer zero of the rewritten node's own type.
+    Zero(IrType),
+}
+
 /// Simplify expressions using algebraic identities.
 fn algebraic_simplify(graph: &mut Graph) {
-    // Ensure a zero constant exists for identity replacements.
-    let zero = find_const(&graph.nodes, 0)
-        .unwrap_or_else(|| graph.add(Op::Const(0), IrType::Int, vec![], None));
     let len = graph.nodes.len();
     for id in 0..len {
         if graph.nodes[id].op == Op::Dead {
             continue;
         }
-        if let Some(replacement) = try_simplify(&graph.nodes, id as NodeId, zero) {
-            graph.replace_all_uses(id as NodeId, replacement);
-            graph.kill(id as NodeId);
-        }
+        let replacement = match try_simplify(&graph.nodes, id as NodeId) {
+            Some(Simplified::Node(n)) => n,
+            // Materialised with the node's own type, never "the first
+            // `Const(0)` in the arena": that may be the `Ref`-typed null
+            // literal or a zero of the other integer width, and every
+            // consumer (lowering width, oop maps, deopt frame values, φ joins)
+            // reads `node.ty`.
+            Some(Simplified::Zero(ty)) => get_or_add_const(graph, 0, ty),
+            None => continue,
+        };
+        graph.replace_all_uses(id as NodeId, replacement);
+        graph.kill(id as NodeId);
     }
 }
 
-fn try_simplify(nodes: &[Node], id: NodeId, zero: NodeId) -> Option<NodeId> {
+fn try_simplify(nodes: &[Node], id: NodeId) -> Option<Simplified> {
     let node = &nodes[id as usize];
     let inputs = &node.inputs;
     match &node.op {
+        // Every identity below is an INTEGER identity. Floating-point
+        // arithmetic reuses these ops typed `Float`/`Double`, and none of them
+        // holds there: `x - x` and `x * 0` are NaN for NaN or ±Infinity, and
+        // `x + 0` loses the sign of -0.0. (`is_const_val` only matches an
+        // integer `Const`, which an FP operand never is, but the `x - x` and
+        // `x ^ x` arms look at no constant at all — `d - d == 0.0` folded to
+        // true for NaN.)
+        Op::Add | Op::Sub | Op::Mul | Op::And | Op::Or | Op::Xor | Op::Shl | Op::Shr | Op::UShr
+            if int_width(node.ty).is_none() =>
+        {
+            None
+        }
         // x + 0 → x
         Op::Add => {
             if is_const_val(nodes, inputs[1], 0) {
-                return Some(inputs[0]);
+                return Some(Simplified::Node(inputs[0]));
             }
             if is_const_val(nodes, inputs[0], 0) {
-                return Some(inputs[1]);
+                return Some(Simplified::Node(inputs[1]));
             }
             None
         }
         // x - 0 → x, x - x → 0
         Op::Sub => {
             if is_const_val(nodes, inputs[1], 0) {
-                return Some(inputs[0]);
+                return Some(Simplified::Node(inputs[0]));
             }
             if inputs[0] == inputs[1] {
-                return Some(zero);
+                return Some(Simplified::Zero(node.ty));
             }
             None
         }
         // x * 1 → x, x * 0 → 0
         Op::Mul => {
             if is_const_val(nodes, inputs[1], 1) {
-                return Some(inputs[0]);
+                return Some(Simplified::Node(inputs[0]));
             }
             if is_const_val(nodes, inputs[0], 1) {
-                return Some(inputs[1]);
+                return Some(Simplified::Node(inputs[1]));
             }
-            if is_const_val(nodes, inputs[1], 0) {
-                return Some(inputs[1]); // the zero const
-            }
-            if is_const_val(nodes, inputs[0], 0) {
-                return Some(inputs[0]); // the zero const
+            if is_const_val(nodes, inputs[1], 0) || is_const_val(nodes, inputs[0], 0) {
+                return Some(Simplified::Zero(node.ty));
             }
             None
         }
         // x & 0 → 0, x & -1 → x
         Op::And => {
-            if is_const_val(nodes, inputs[1], 0) {
-                return Some(inputs[1]);
-            }
-            if is_const_val(nodes, inputs[0], 0) {
-                return Some(inputs[0]);
+            if is_const_val(nodes, inputs[1], 0) || is_const_val(nodes, inputs[0], 0) {
+                return Some(Simplified::Zero(node.ty));
             }
             if is_const_val(nodes, inputs[1], -1) {
-                return Some(inputs[0]);
+                return Some(Simplified::Node(inputs[0]));
             }
             if is_const_val(nodes, inputs[0], -1) {
-                return Some(inputs[1]);
+                return Some(Simplified::Node(inputs[1]));
             }
             None
         }
         // x | 0 → x
         Op::Or => {
             if is_const_val(nodes, inputs[1], 0) {
-                return Some(inputs[0]);
+                return Some(Simplified::Node(inputs[0]));
             }
             if is_const_val(nodes, inputs[0], 0) {
-                return Some(inputs[1]);
+                return Some(Simplified::Node(inputs[1]));
             }
             None
         }
         // x ^ 0 → x, x ^ x → 0
         Op::Xor => {
             if is_const_val(nodes, inputs[1], 0) {
-                return Some(inputs[0]);
+                return Some(Simplified::Node(inputs[0]));
             }
             if is_const_val(nodes, inputs[0], 0) {
-                return Some(inputs[1]);
+                return Some(Simplified::Node(inputs[1]));
             }
             if inputs[0] == inputs[1] {
-                return Some(zero);
+                return Some(Simplified::Zero(node.ty));
             }
             None
         }
         // x << 0 → x, x >> 0 → x, x >>> 0 → x
         Op::Shl | Op::Shr | Op::UShr => {
             if is_const_val(nodes, inputs[1], 0) {
-                return Some(inputs[0]);
+                return Some(Simplified::Node(inputs[0]));
             }
             None
         }
@@ -921,7 +943,7 @@ fn try_simplify(nodes: &[Node], id: NodeId, zero: NodeId) -> Option<NodeId> {
                 }
             }
             if single != NO_NODE && single != id {
-                Some(single)
+                Some(Simplified::Node(single))
             } else {
                 None
             }
@@ -1213,7 +1235,7 @@ fn eliminate_redundant_loads(graph: &mut Graph) -> bool {
     if !load_cse_enabled() {
         return false;
     }
-    let dbg = std::env::var("CRATONVM_DBG_LOAD_CSE").is_ok();
+    let dbg = cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_LOAD_CSE");
     // A memory op in a COMPACT layout carries no token, so it is not on the
     // chain and the walk cannot see it. One such `Store` between two loads of
     // the cell it writes would be a write this pass steps straight over. Today
@@ -1837,9 +1859,7 @@ fn loop_entry_memory(graph: &Graph, region: NodeId, entry_pred: NodeId) -> Optio
         .nodes
         .iter()
         .find(|node| {
-            node.op == Op::Phi
-                && node.ty == IrType::Memory
-                && node.inputs.first() == Some(&region)
+            node.op == Op::Phi && node.ty == IrType::Memory && node.inputs.first() == Some(&region)
         })
         // Phi inputs are `[region, v_for_pred0, v_for_pred1, …]`, aligned with
         // the region's own predecessor list.
@@ -1941,7 +1961,7 @@ fn loop_writes_memory(graph: &Graph, body: &FxHashSet<NodeId>) -> bool {
 /// re-reading `String.value` and `String.coder` per character, and every
 /// other arm is unchanged.
 fn licm_read_hoist_enabled() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_LICM_READ_HOIST").is_none()
+    !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_LICM_READ_HOIST")
 }
 
 /// Points-to summary of a reference node, used by the LICM alias oracle to
@@ -2075,6 +2095,46 @@ fn load_safe_past_clobber(graph: &Graph, load_base: NodeId, clobbered: &FxHashSe
 /// but recognising them lets the trailing GVN pass dedup loop-entry vs loop-body
 /// copies. The store-alias oracle resolves bases through `Phi`s (cross-merge),
 /// so a store via `(cond ? A : B)` is modelled as writing `{A, B}`.
+/// Whether control node `ctrl` executes on every iteration of the loop headed
+/// by `region`: it IS the header, or it is a projection of the header's own
+/// exit test (the `If` anchored directly at the header), reached through at
+/// most a trivial single-input `Merge`.
+///
+/// Anything else — a projection of any other `If` in the body (a condition, a
+/// `break`), a real merge — is refused: the node may be skipped on some
+/// iteration, including the first. Deliberately a syntactic walk rather than a
+/// dominance query; it answers `false` whenever it is unsure, and a `false`
+/// only costs a hoist.
+fn anchored_on_every_iteration(graph: &Graph, ctrl: NodeId, region: NodeId) -> bool {
+    let mut c = ctrl;
+    for _ in 0..4 {
+        if c == region {
+            return true;
+        }
+        let Some(node) = graph.nodes.get(c as usize) else {
+            return false;
+        };
+        match node.op {
+            Op::Proj(_) => {
+                let Some(&if_id) = node.inputs.first() else {
+                    return false;
+                };
+                let Some(if_node) = graph.nodes.get(if_id as usize) else {
+                    return false;
+                };
+                if !matches!(if_node.op, Op::If) || if_node.inputs.first().copied() != Some(region)
+                {
+                    return false;
+                }
+                c = region;
+            }
+            Op::Merge if node.inputs.len() == 1 => c = node.inputs[0],
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn licm(graph: &mut Graph) -> bool {
     // Normalize the single-input `Op::Merge` control pass-throughs the builder
     // wraps around branch projections, so a javac loop header and its back-edge
@@ -2095,7 +2155,7 @@ fn licm(graph: &mut Graph) -> bool {
     // Non-vacuity diagnostic (mirrors `CRATONVM_DBG_UNROLL`): count the loads
     // this pass actually hoists, so a live soak can confirm LICM fired rather
     // than silently bailing every loop.
-    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LICM").is_some();
+    let dbg = cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_LICM");
     let mut hoisted = 0usize;
     if dbg {
         eprintln!("[DBG_LICM] {} candidate loop header(s)", headers.len());
@@ -2298,7 +2358,11 @@ fn licm(graph: &mut Graph) -> bool {
                     continue;
                 }
                 let base = inputs[2];
-                let addr = if inputs.len() >= 4 { inputs[3] } else { NO_NODE };
+                let addr = if inputs.len() >= 4 {
+                    inputs[3]
+                } else {
+                    NO_NODE
+                };
                 if !is_loop_invariant(graph, base, region, &body) {
                     if dbg {
                         eprintln!("[DBG_LICM] read-hoist load {load}: skip — base {base} variant");
@@ -2538,10 +2602,18 @@ fn licm(graph: &mut Graph) -> bool {
                 // is deliberately NOT behind `CRATONVM_JIT_IR_LICM_MEM_EDGE` —
                 // the control-edge move below is the one that was already
                 // wrong, and it is default-ON.
+                // `body_definitely_runs` proves the FIRST ITERATION happens,
+                // not that this load runs in it: a load under a condition in
+                // the body (`for (...) if (h != null) s += h.x;`) is skipped
+                // on exactly the path the condition exists for, and hoisting it
+                // raised the NPE in the pre-header anyway. So that permission
+                // also needs the load to be anchored on every iteration's
+                // spine.
                 let hoist_is_safe = inputs[0] == region
                     || base_non_null_on_entry(graph, base)
                     || crate::ir_check_elim::definitely_non_null(&graph.nodes[base as usize].op)
-                    || body_definitely_runs;
+                    || (body_definitely_runs
+                        && anchored_on_every_iteration(graph, inputs[0], region));
                 if !hoist_is_safe {
                     if dbg {
                         eprintln!(
@@ -3219,6 +3291,82 @@ fn eliminate_write_only_stores(graph: &mut Graph) {
 
 /// Remove nodes not reachable from the exit (Return), from any other
 /// side-effecting root, or from a safepoint snapshot.
+/// Is an `op` with no consumer still observable, so dead-node elimination must
+/// keep it?
+///
+/// Exhaustive on purpose -- see the call site in [`eliminate_dead_nodes`].
+fn is_dce_root(op: &Op) -> bool {
+    match op {
+        // Program exits: every `Return`, not just `graph.exit` (see the call
+        // site), and a throw, whose exception input must stay reachable.
+        Op::Return | Op::Throw => true,
+        // Memory effects and calls: their token or result may have no reader.
+        Op::Store(_) | Op::Call { .. } | Op::LambdaIntToDouble => true,
+        // cov-01: `ldc <Class>` and `getstatic` can run `<clinit>` and throw;
+        // `ldc <String>` interns, which `==` on a later literal observes.
+        Op::ConstString { .. } | Op::ConstClass { .. } | Op::LoadStatic { .. } => true,
+        // Reads that throw: NullPointerException, an out-of-bounds index,
+        // ClassCastException, or a null unboxing receiver. An unused
+        // `a.length` or `o.f` still owes its exception.
+        Op::Load(_)
+        | Op::ArrayLoad(_)
+        | Op::ArrayStore(_)
+        | Op::ArrayLength
+        | Op::CheckCast { .. }
+        | Op::Unbox { .. } => true,
+        // Allocation can run `<clinit>` (`new`), throw
+        // NegativeArraySizeException (`newarray`) or OutOfMemoryError. Scalar
+        // replacement retires the allocations it removes by marking them
+        // `Op::Dead` itself; it does not rely on this pass.
+        Op::New { .. } | Op::NewArray { .. } => true,
+        // Monitors: deleting one of a pair is an IllegalMonitorStateException,
+        // and deleting both is unplanned lock elision.
+        Op::MonitorEnter | Op::MonitorExit => true,
+        // A guard exists for the deopt it takes; it produces no value.
+        Op::Guard { .. } => true,
+        // Control structure is kept by reachability from the roots above.
+        Op::Start | Op::If | Op::Merge | Op::Region | Op::Proj(_) | Op::Phi => false,
+        // Pure values. `Div`/`Rem` owe ArithmeticException through the guard
+        // the builder anchors beside them, not through the node itself.
+        Op::Const(_)
+        | Op::ConstF(_)
+        | Op::Param(_)
+        | Op::InstanceOf { .. }
+        | Op::Add
+        | Op::Sub
+        | Op::Mul
+        | Op::Div
+        | Op::Rem
+        | Op::Neg
+        | Op::And
+        | Op::Or
+        | Op::Xor
+        | Op::Shl
+        | Op::Shr
+        | Op::UShr
+        | Op::Cmp(_)
+        | Op::LCmp
+        | Op::FCmp { .. }
+        | Op::I2L
+        | Op::L2I
+        | Op::I2F
+        | Op::I2D
+        | Op::L2F
+        | Op::L2D
+        | Op::F2I
+        | Op::F2L
+        | Op::F2D
+        | Op::D2I
+        | Op::D2L
+        | Op::D2F
+        | Op::I2B
+        | Op::I2C
+        | Op::I2S
+        | Op::ScalarIntrinsic(_)
+        | Op::Dead => false,
+    }
+}
+
 fn eliminate_dead_nodes(graph: &mut Graph) {
     if graph.exit == NO_NODE {
         return;
@@ -3282,52 +3430,17 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
     // array through the same deopt guard, and that throw is the observable
     // effect. `int n = a.length;` with `n` unused still has to NPE; deleting it
     // is not a faster answer, it is a dropped exception.
+    //
+    // The root set is decided by `is_dce_root`, an exhaustive match: a new
+    // `Op` does not compile until someone says whether deleting an unconsumed
+    // one is observable. The old allowlist silently made every unlisted op
+    // removable, which is how `getfield`, `checkcast`, `new` and `unbox` --
+    // all of which can throw -- came to be deleted when their value was unused.
     let mut worklist: Vec<NodeId> = graph
         .nodes
         .iter()
         .enumerate()
-        .filter(|(_, n)| {
-            matches!(
-                n.op,
-                Op::Return
-                    // cov-07: a throw is an observable program exit exactly
-                    // like a return — see the seeding comment above `Op::
-                    // Return`. Its exception-ref INPUT is what must stay
-                    // reachable (deleting the throw would silently turn
-                    // `throw e;` into nothing).
-                    | Op::Throw
-                    | Op::Store(_)
-                    | Op::Call { .. }
-                    // cov-01: all three are observable side effects whose value
-                    // may have no consumer. `ldc <Class>` and `getstatic` can
-                    // run `<clinit>` and throw; `ldc <String>` interns, which
-                    // is observable through `==` on a later literal. Deleting
-                    // one because nothing reads its result would drop the
-                    // class initialisation Java owes at that bytecode.
-                    | Op::ConstString { .. }
-                    | Op::ConstClass { .. }
-                    | Op::LoadStatic { .. }
-                    | Op::ArrayLoad(_)
-                    | Op::ArrayStore(_)
-                    | Op::ArrayLength
-                    // Monitors are observable side effects and must be roots.
-                    // Without this, DCE deletes a `monitorenter` whose result
-                    // nobody reads — lock elision by liveness sweep, with no
-                    // plan, no escape proof and no balance check, which is
-                    // exactly what `escape_analysis`' all-or-nothing elision
-                    // exists to prevent. Deleting only one of a pair is an
-                    // IllegalMonitorStateException.
-                    | Op::MonitorEnter
-                    | Op::MonitorExit
-                    // A guard's whole purpose is the deopt it takes when its
-                    // condition fails; it produces no value, so nothing else
-                    // roots it. Deleting the zero-divisor guard the builder
-                    // anchors at an `idiv`/`ldiv` would silently drop the
-                    // ArithmeticException that division owes — see
-                    // `IrBuilder::add_div_zero_guard`.
-                    | Op::Guard { .. }
-            )
-        })
+        .filter(|(_, n)| is_dce_root(&n.op))
         .map(|(id, _)| id as NodeId)
         .collect();
     if worklist.is_empty() {
@@ -3787,7 +3900,7 @@ fn analyze_counted_loop(
     region: NodeId,
     back_ctrl: NodeId,
 ) -> Result<CountedLoop, NotCounted> {
-    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNROLL").is_some();
+    let dbg = cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_UNROLL");
     let n = graph.nodes.len();
     // Induction phi: Phi anchored at `region`, inputs [region, init(Const), next],
     // next = Add(self, Const) or Add(Const, self).
@@ -3865,8 +3978,7 @@ fn analyze_counted_loop(
         }
         return Err(NotCounted::Shape);
     }
-    let cond = *graph
-        .nodes[if_node as usize]
+    let cond = *graph.nodes[if_node as usize]
         .inputs
         .get(1)
         .ok_or(NotCounted::Shape)?;
@@ -3934,6 +4046,22 @@ fn analyze_counted_loop(
     };
 
     // Concrete trip count by simulation (init/stride/bound all constant).
+    //
+    // At the induction variable's own width. A Java `int` IV wraps at 2^31,
+    // so simulating it in i64 gave the wrong count for a loop that steps past
+    // `Integer.MAX_VALUE` (`for (int i = 0x7FFFFFE8; i < 0x7FFFFFF0; i += 0x18)`
+    // runs 178956971 times in Java — it wraps negative and keeps going — and
+    // was unrolled to ONE trip), and the replacement constants materialised
+    // below lay outside the int range. A wrapping int run is refused outright:
+    // the only loops worth unrolling have small, non-wrapping trip counts.
+    let iv_is_int = matches!(graph.nodes[iv_phi as usize].ty, IrType::Int);
+    if iv_is_int
+        && [iv_init, iv_stride, bound]
+            .iter()
+            .any(|&v| i64::from(v as i32) != v)
+    {
+        return Err(NotCounted::Shape);
+    }
     let mut i = iv_init;
     let mut trip = 0i64;
     loop {
@@ -3946,7 +4074,18 @@ fn analyze_counted_loop(
         if !cont {
             break;
         }
-        i = i.wrapping_add(iv_stride);
+        i = if iv_is_int {
+            // Cast: all three operands checked to be exact i32 values above
+            match (i as i32).checked_add(iv_stride as i32) {
+                Some(next) => i64::from(next),
+                None => return Err(NotCounted::Shape),
+            }
+        } else {
+            match i.checked_add(iv_stride) {
+                Some(next) => next,
+                None => return Err(NotCounted::Shape),
+            }
+        };
         trip += 1;
         if trip > UNROLL_MAX_TRIP {
             // Too large, or non-terminating within the cap.
@@ -4685,7 +4824,7 @@ fn partial_unroll_loop(
 }
 
 fn unroll(graph: &mut Graph) -> bool {
-    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNROLL").is_some();
+    let dbg = cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_UNROLL");
     // Per-call, in `UnrollCensus` field order. See `publish_unroll_census`.
     let mut census = [0usize; 17];
     // Computed ONCE for the whole graph, before any header is transformed:
@@ -4869,8 +5008,11 @@ fn unroll(graph: &mut Graph) -> bool {
         }
 
         // No side effects in the loop: a Store/Call/alloc/ArrayLength/Guard/array
-        // element access that is loop-variant or control-pinned to the loop is a
-        // side effect we do not model → bail. (`ArrayLoad`/`ArrayStore` can throw
+        // element access that is control-pinned to the loop, or floating and
+        // loop-variant, is a side effect we do not model → bail. A node pinned
+        // to control OUTSIDE the loop runs after it, however much it depends on
+        // the carried values: `for (…) acc += i; println(acc);` is not a loop
+        // with a side effect. (Reading plain variance used to refuse it.) (`ArrayLoad`/`ArrayStore` can throw
         // NPE/AIOOBE and `ArrayStore` mutates the heap, so unrolling a loop that
         // contains one would duplicate/reorder those effects — conservatively
         // decline.)
@@ -4893,8 +5035,24 @@ fn unroll(graph: &mut Graph) -> bool {
                     | Op::ArrayStore(_)
                     | Op::Guard { .. }
             ) {
-                let ctrl = graph.nodes[id].inputs.first().copied().unwrap_or(NO_NODE);
-                if variant.contains(&(id as NodeId)) || ctrl == region || ctrl == back_ctrl {
+                let inputs = &graph.nodes[id].inputs;
+                // The documented `[ctrl, …]` form; a compact hand-built node has
+                // no control input and floats.
+                let pinned = match op.memory_shape() {
+                    Some(shape) => inputs.len() >= shape.min_full_arity,
+                    None => matches!(op, Op::Guard { .. }),
+                };
+                let ctrl = if pinned {
+                    inputs.first().copied().unwrap_or(NO_NODE)
+                } else {
+                    NO_NODE
+                };
+                let in_loop = if ctrl == NO_NODE {
+                    variant.contains(&(id as NodeId))
+                } else {
+                    ctrl == region || ctrl == back_ctrl || ctrl == info.if_node
+                };
+                if in_loop {
                     if dbg {
                         eprintln!("[DBG_UNROLL] region {region}: bail — loop side effect {:?} (node {id})", graph.nodes[id].op);
                     }
@@ -5224,7 +5382,13 @@ fn unroll(graph: &mut Graph) -> bool {
                     let v = info
                         .iv_init
                         .wrapping_add((t + 1).wrapping_mul(info.iv_stride));
-                    let c = graph.add(Op::Const(v), IrType::Int, vec![], None);
+                    // The IV φ's own type, not a hard-coded `Int`: a `long`
+                    // induction variable unrolled to an `Int`-typed constant
+                    // would be lowered and oop-mapped at the wrong width.
+                    // `analyze_counted_loop` already refused any run whose
+                    // steps leave that type's range.
+                    let iv_ty = graph.nodes[p as usize].ty;
+                    let c = graph.add(Op::Const(v), iv_ty, vec![], None);
                     next.insert(p, c);
                 } else {
                     let back_val = graph.nodes[p as usize].inputs[2];
@@ -5255,7 +5419,7 @@ fn unroll(graph: &mut Graph) -> bool {
         for &d in &to_clone {
             graph.kill(d);
         }
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNROLL").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_UNROLL") {
             eprintln!(
                 "[DBG_UNROLL] fully unrolled counted loop (region {region}, trip {}, {} cloned nodes/iter)",
                 info.trip,
@@ -6669,6 +6833,18 @@ mod tests {
     }
 
     #[test]
+    fn a_side_effect_after_the_loop_does_not_block_the_unroll() {
+        // for (i=0; i<5; i++) acc += i;  then a guard on `acc` at the exit.
+        let (mut g, ret) = reduction_loop(0, 5, 1);
+        let exit = g.nodes[ret as usize].inputs[0];
+        let acc = g.nodes[ret as usize].inputs[1];
+        let limit = g.add(Op::Const(100), IrType::Int, vec![], None);
+        let cond = g.add(Op::Cmp(CmpOp::Lt), IrType::Int, vec![acc, limit], None);
+        g.add(Op::Guard { bci: 0 }, IrType::Void, vec![exit, cond], None);
+        assert!(unroll(&mut g), "a post-loop effect is not a loop side effect");
+    }
+
+    #[test]
     fn test_unroll_respects_trip_cap() {
         // Trip count 100 exceeds UNROLL_MAX_TRIP → must NOT unroll.
         let (mut g, _ret) = reduction_loop(0, 100, 1);
@@ -7602,7 +7778,6 @@ mod tests {
     }
 }
 
-
 // ── Per-copy deopt metadata ──────────────────────────────────────────
 //
 // These two tests are deliberately OPPOSED. The first asserts the loop
@@ -7769,9 +7944,9 @@ mod per_copy_frames_tests {
             after,
         );
         assert!(
-            g.nodes.iter().any(|n| {
-                matches!(n.op, Op::Region | Op::Merge) && n.inputs.len() == 2
-            }),
+            g.nodes
+                .iter()
+                .any(|n| { matches!(n.op, Op::Region | Op::Merge) && n.inputs.len() == 2 }),
             "the loop header is gone, so the loop was unrolled after all",
         );
     }
@@ -8099,7 +8274,10 @@ mod per_copy_frames_tests {
                     // The memory edge is default-ON, so the "neither" arm has
                     // to turn it OFF explicitly — leaving it unset would run
                     // both arms with it on and make the contrast vacuous.
-                    ("CRATONVM_JIT_IR_LICM_MEM_EDGE", Some(licm_first.unwrap_or("0"))),
+                    (
+                        "CRATONVM_JIT_IR_LICM_MEM_EDGE",
+                        Some(licm_first.unwrap_or("0")),
+                    ),
                 ],
                 || {
                     let mut builder = IrBuilder::new(2, 4);
@@ -8883,5 +9061,87 @@ mod licm_counted_permission_tests {
             "n{load}: the bound is a parameter, so nothing proves the body \
              runs; `walk(null, 0)` must keep returning 0 rather than throwing",
         );
+    }
+}
+
+/// Regressions from the 2026-09-12 JIT review: algebraic identities that
+/// ignored the node's type, and a compare fold keyed on the result type.
+#[cfg(test)]
+mod typed_identity_tests {
+    use super::*;
+
+    fn graph_with_start() -> (Graph, NodeId) {
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: 0,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+            receiver_param: None,
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        g.entry = start;
+        (g, start)
+    }
+
+    /// `d - d` is NaN for NaN and ±Infinity, so it must not fold to zero.
+    /// `static boolean finite(double d) { return d - d == 0.0; }` returned true
+    /// for NaN when it did.
+    #[test]
+    fn a_floating_point_self_subtraction_is_not_folded() {
+        let (mut g, start) = graph_with_start();
+        let d = g.add(Op::Param(0), IrType::Double, vec![start], None);
+        let sub = g.add(Op::Sub, IrType::Double, vec![d, d], None);
+        let user = g.add(Op::Neg, IrType::Double, vec![sub], None);
+
+        algebraic_simplify(&mut g);
+
+        assert_eq!(g.nodes[user as usize].inputs[0], sub);
+        assert_ne!(g.nodes[sub as usize].op, Op::Dead);
+    }
+
+    /// `x - x` on a `long` folds to a `Long` zero, not to whichever `Const(0)`
+    /// the arena happens to hold first — here the `Ref`-typed null literal.
+    #[test]
+    fn a_long_self_subtraction_folds_to_a_long_zero() {
+        let (mut g, start) = graph_with_start();
+        let _null = g.add(Op::Const(0), IrType::Ref, vec![], None);
+        let l = g.add(Op::Param(0), IrType::Long, vec![start], None);
+        let sub = g.add(Op::Sub, IrType::Long, vec![l, l], None);
+        let user = g.add(Op::Neg, IrType::Long, vec![sub], None);
+
+        algebraic_simplify(&mut g);
+
+        let zero = g.nodes[user as usize].inputs[0];
+        assert_eq!(g.nodes[zero as usize].op, Op::Const(0));
+        assert_eq!(g.nodes[zero as usize].ty, IrType::Long);
+    }
+
+    #[test]
+    fn an_int_self_xor_folds_to_an_int_zero() {
+        let (mut g, start) = graph_with_start();
+        let _long_zero = g.add(Op::Const(0), IrType::Long, vec![], None);
+        let i = g.add(Op::Param(0), IrType::Int, vec![start], None);
+        let xor = g.add(Op::Xor, IrType::Int, vec![i, i], None);
+        let user = g.add(Op::Neg, IrType::Int, vec![xor], None);
+
+        algebraic_simplify(&mut g);
+
+        let zero = g.nodes[user as usize].inputs[0];
+        assert_eq!(g.nodes[zero as usize].op, Op::Const(0));
+        assert_eq!(g.nodes[zero as usize].ty, IrType::Int);
+    }
+
+    /// A `Cmp` result is always `Int`; the width must come from the operands.
+    /// `1L << 32 != 0L` compared as truncated ints is `0 != 0`.
+    #[test]
+    fn a_compare_of_long_constants_folds_at_64_bits() {
+        let (mut g, _start) = graph_with_start();
+        let a = g.add(Op::Const(1i64 << 32), IrType::Long, vec![], None);
+        let b = g.add(Op::Const(0), IrType::Long, vec![], None);
+        let ne = g.add(Op::Cmp(CmpOp::Ne), IrType::Int, vec![a, b], None);
+        assert_eq!(try_fold(&g.nodes, ne), Some(1));
+        let lt = g.add(Op::Cmp(CmpOp::Lt), IrType::Int, vec![b, a], None);
+        assert_eq!(try_fold(&g.nodes, lt), Some(1));
     }
 }

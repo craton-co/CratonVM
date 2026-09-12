@@ -36,14 +36,14 @@ const MAX_LOCAL_HANDLER_CANDIDATES: usize = 4;
 fn osr_refined_ref_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_OSR_REFINED_REF").is_none()
+        !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_OSR_REFINED_REF")
     })
 }
 
 fn osr_ambiguous_dead_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_OSR_AMBIGUOUS_DEAD").is_none()
+        !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_OSR_AMBIGUOUS_DEAD")
     })
 }
 
@@ -194,7 +194,7 @@ impl Compiler {
             handler_pcs: &handler_pcs,
         };
         self.stack_kinds = analyze(code, code_len, &inputs);
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STACK_KINDS").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_STACK_KINDS") {
             eprintln!(
                 "[stack-kinds] {} answered {} of {code_len} pcs (calls={} fields={} statics={})",
                 self.method_key,
@@ -367,8 +367,9 @@ impl Compiler {
         // Record a stable boxed copy (the frame-deopt stub bakes it as arg0) and
         // the by-value point (find_deopt_point / iteration). The Box payload does
         // not move when `deopt_boxes` reallocs or when it is moved into
-        // `CompiledMethod::_deopt_point_boxes` at finalize (and is leaked on
-        // Drop), so a baked imm64 of this pointer outlives the emitted code.
+        // `CompiledMethod::_deopt_point_boxes` at finalize, which drops it only
+        // with the artifact itself, so a baked imm64 of this pointer lives as
+        // long as the emitted code.
         // Capture the heap payload's address with `addr_of!` BEFORE moving the
         // Box into the Vec — pushing the Box (a pointer) does not relocate its
         // payload, so this is the same address `&**deopt_boxes.last()` would
@@ -534,7 +535,7 @@ impl Compiler {
                     // you expect at a handler appears here, the liveness at
                     // `bci` is not modelling the exception edge that reaches
                     // it — see `regalloc::handler_live_mask`.
-                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_EXCFRAME").is_some() {
+                    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_EXCFRAME") {
                         eprintln!(
                             "[excframe] DROP local={i} at bci={bci} live_mask={live_here:#x} \
                              precise={} handler_ranges={} method={}",
@@ -559,8 +560,7 @@ impl Compiler {
                     continue;
                 }
                 if let Some(state) = self.sr_virtual_object_state(new_pc) {
-                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some()
-                    {
+                    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SCALAR_DEOPT") {
                         eprintln!(
                             "[DBG_SCALAR_DEOPT] x64 emit VirtualObject local={i} new_pc={new_pc} \
                              class_id={} fields={} at bci={bci}",
@@ -709,7 +709,7 @@ impl Compiler {
                 // machine home contradicts it, or a slot liveness should have
                 // dropped before reaching here.
                 if was_unsupported
-                    && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR_SLOTS").is_some()
+                    && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_OSR_SLOTS")
                 {
                     eprintln!(
                         "[osr-slot] {} local={i} bci={bci} whole_method_kind={:?} \
@@ -749,7 +749,7 @@ impl Compiler {
         // `Value::Int`, and reading it back with `aload` then behaves as null.
         // That failure is invisible in the DROP lines alone, so print the
         // provenance the snapshot actually chose for every slot.
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_EXCFRAME").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_EXCFRAME") {
             eprintln!(
                 "[excframe] FRAME method={} bci={bci} reason={reason:?} oop_reached={oop_reached} \
                  oop_mask={oop_mask:#x} locals={:?}",
@@ -838,7 +838,7 @@ impl Compiler {
                 unknown || self.stack_oop_marks[i] == analysis_says_ref
             })
         });
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STACK_KINDS").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_STACK_KINDS") {
             // Which of the three outcomes happened is the whole diagnosis when
             // a snapshot stays `Unsupported`: no answer at this bci (the
             // analysis poisoned upstream), an answer the emitter's depth or oop
@@ -1058,7 +1058,7 @@ impl Compiler {
         has_info: bool,
         has_args_base: bool,
     ) {
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_none() {
+        if !cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
             return;
         }
         eprintln!(
@@ -1133,11 +1133,23 @@ impl Compiler {
         self.buf.emit(&i64::MIN.to_le_bytes());
         // CMP RAX, R11  — REX.WR + 39 /r + ModRM(11, R11, RAX).
         self.buf.emit(&[0x4C, 0x39, 0xD8]);
-        // JNE rel8 → skip the servicing call. Patched once the body length is
-        // known; the body is a fixed short sequence well inside rel8 range.
-        self.buf.emit(&[0x75, 0x00]);
-        let jne_patch = self.buf.pos() - 1;
-        let body_start = self.buf.pos();
+        // JNE rel32 → skip the servicing call.
+        let skip_patch = self.emit_jcc_rel32_patch(0x85);
+
+        // The servicing helper resumes the trapped callee's frame in the
+        // interpreter — Java code, so a collection can run inside it. This
+        // point sits AFTER the call site's own map was published and its shadow
+        // push reloaded, so the safepoint-id slot still names that CALL's map,
+        // which may claim complete moving-young coverage for registers that are
+        // no longer published anywhere. Clear the id to the "no map" sentinel
+        // so a collection here finds no map for this frame and fails closed
+        // instead of trusting a stale one. R11 held the compared sentinel and
+        // is otherwise free; no argument register is touched.
+        if self.precise_maps && self.sp_id_slot_off != 0 {
+            // Cast: the sentinel is `u32::MAX - 1`; see the prologue's store.
+            self.emit_mov_imm32_sx(R11, crate::x64::safepoint::SP_ID_UNSET_BC_PC as u32 as i32);
+            self.emit_store_local(self.sp_id_slot_off, R11);
+        }
 
         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
         // Cast: function pointer for JIT call target
@@ -1153,18 +1165,7 @@ impl Compiler {
         self.emit_mov_imm32_sx(ARG_REGS[3], n as i32);
         self.emit_call_absolute(helper);
 
-        // Widening: usize offset -> i64 (no truncation; for rel/displacement math)
-        let rel = (self.buf.pos() as i64) - (body_start as i64);
-        debug_assert!(
-            (0..=i64::from(i8::MAX)).contains(&rel),
-            "inline callee-deopt check body overflowed rel8 ({rel} bytes)"
-        );
-        // `u8::try_from` was the wrong range: it accepts 128..=255, which the
-        // CPU reads as a NEGATIVE rel8 — a backward branch into the body this
-        // jump exists to skip, i.e. the same shape as the PIC cascade's
-        // `JNE -128`. `patch_rel8_or_bail` range-checks against `i8` and marks
-        // the buffer (compile discarded) when it does not fit.
-        Self::patch_rel8_or_bail(&mut self.buf, jne_patch, rel);
+        self.patch_rel32_to_here(skip_patch);
     }
 
     /// Emit out-of-line bounds check failure stubs at the end of the method.
@@ -1324,7 +1325,6 @@ impl Compiler {
 
             // Standard method epilogue: restore callee-saved regs and return.
             self.emit_epilogue();
-
         }
 
         // Now the branch targets. A site with no recorded trap goes straight to
@@ -2097,7 +2097,7 @@ impl Compiler {
             // comment in `x64.rs`). Bailing the compile costs one interpreted
             // method; the alternative cost a corrupted stack.
             if frame_box_ptr.is_some() && self.deopt_regs_base == 0 {
-                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                     eprintln!(
                         "[cratonvm-jitc] compile-bail deopt-stub-without-saved-regs \
                          reason={reason} site_pc={site_pc}"
@@ -2111,11 +2111,11 @@ impl Compiler {
                 let base = self.deopt_regs_base;
                 // deopt-osr Step 9 follow-up (a): allocate (once) the artifact's
                 // retained epoch guard and bake it as the 4th arg. Leaked so its
-                // address is stable for the process lifetime — even under
-                // CRATONVM_JIT_FREE_CODE=1, where the artifact (and its deopt
-                // boxes) may be freed, this guard survives so `x64_deopt_entry`
-                // can read the live/creation epochs WITHOUT touching the box. The
-                // VM stamps it (creation epoch + live-epoch cell) at install.
+                // address is stable for the process lifetime. (It fed a
+                // before-deref short-circuit for a CRATONVM_JIT_FREE_CODE=1 mode
+                // that freed deopt boxes under running frames; that mode is gone
+                // and `x64_deopt_entry` now ignores the argument.) The VM stamps
+                // it (creation epoch + live-epoch cell) at install.
                 if self.deopt_epoch_guard.is_null() {
                     let g = Box::new(crate::deopt::DeoptEpochGuard::new());
                     // LEAK(intentional): retained for the process lifetime; baked
@@ -2158,16 +2158,16 @@ impl Compiler {
                     // is gpr[1]; see the spill loop above.
                     self.emit_load_local(RAX, base); // array
                     self.emit_load_local(RCX, base - 8); // index
-                    // Length is not live here either -- `emit_bounds_check`
-                    // folded its load into the compare -- so re-load it from the
-                    // header. RAX was just restored and the fast path
-                    // dereferenced this same word, so it cannot fault.
+                                                         // Length is not live here either -- `emit_bounds_check`
+                                                         // folded its load into the compare -- so re-load it from the
+                                                         // header. RAX was just restored and the fast path
+                                                         // dereferenced this same word, so it cannot fault.
                     const LEN_DISP: u8 =
                         crate::x64::disp::disp8_const(cratonvm_types::ARRAY_LENGTH_OFFSET as i64)
                             as u8;
                     self.buf.emit(&[0x44, 0x8B, 0x50, LEN_DISP]); // MOV R10D, [RAX+len]
-                    // jit_throw_aioobe(index, length, array_ptr, bytecode_pc) --
-                    // the same signature and order the shared pad uses.
+                                                                  // jit_throw_aioobe(index, length, array_ptr, bytecode_pc) --
+                                                                  // the same signature and order the shared pad uses.
                     #[cfg(target_os = "windows")]
                     {
                         self.buf.emit(&[0x49, 0x89, 0xC0]); // MOV R8, RAX
@@ -2196,10 +2196,10 @@ impl Compiler {
                     self.buf.emit_byte(0xB9); // MOV ECX, imm32
                     #[cfg(not(target_os = "windows"))]
                     self.buf.emit_byte(0xBF); // MOV EDI, imm32
-                    // The action travels with the bci for an ARRAY access; a
-                    // `putfield` records none and keeps `NONE`, which is what
-                    // this constant used to be for every site. See
-                    // `precise_npe_action_by_bci`.
+                                              // The action travels with the bci for an ARRAY access; a
+                                              // `putfield` records none and keeps `NONE`, which is what
+                                              // this constant used to be for every site. See
+                                              // `precise_npe_action_by_bci`.
                     let action = self
                         .precise_npe_action_by_bci
                         .get(&site_pc)
@@ -2247,30 +2247,50 @@ impl Compiler {
                 self.emit_epilogue();
             } else {
                 // Set up args for jit_uncommon_trap(vm_ptr: i64, reason: i64, bci: i64)
-                // vm_ptr is in the heap_local (frame slot) — load it first
+                //
+                // `reason` carries this artifact's compile id in its high half
+                // (0 when none was reserved). A compiled method pushes no
+                // interpreter frame, so without it the helper could only name
+                // the interpreted CALLER as the method that trapped.
+                let trap_reason_word = (reason as u64) | (u64::from(self.compile_id.id()) << 32); // Cast: reason code is a small non-negative value
+                                                                                             // vm_ptr is in the heap_local (frame slot) — load it first
                 #[cfg(target_os = "windows")]
                 {
                     // Windows x64: arg1=RCX, arg2=RDX, arg3=R8
-                    // Load vm_ptr from heap_local_offset into RCX
-                    self.emit_load_local(RCX, self.heap_local_offset);
+                    // Load vm_ptr from heap_local_offset into RCX — only when
+                    // the method HAS a heap local. Without one
+                    // `heap_local_offset` is 0 and `[rbp-0]` is the caller's
+                    // saved RBP, which `jit_uncommon_trap` (it rejects only 0)
+                    // would dereference as a `SharedVm`. Pass the null it does
+                    // check for instead, as the local-handler stubs do.
+                    if self.needs_heap {
+                        self.emit_load_local(RCX, self.heap_local_offset);
+                    } else {
+                        self.buf.emit(&[0x31, 0xC9]); // XOR ECX, ECX
+                    }
                     // MOV RDX, reason (immediate)
                     self.rex_w();
                     self.buf.emit_byte(0xB8 + RDX as u8); // MOV r64, imm64 // Cast: x86-64 register encoding
-                    self.buf.emit(&(reason as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
-                                                                   // MOV R8, bci (immediate)
+                    self.buf.emit(&trap_reason_word.to_le_bytes()); // reason | compile id << 32
+                                                                    // MOV R8, bci (immediate)
                     self.buf.emit(&[0x49, 0xB8 + (R8 as u8 - 8)]); // REX.WB + MOV r64, imm64 // Cast: x86-64 register encoding
                     self.buf.emit(&(bci as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
                 }
                 #[cfg(not(target_os = "windows"))]
                 {
                     // SysV: arg1=RDI, arg2=RSI, arg3=RDX
-                    // Load vm_ptr from heap_local_offset into RDI
-                    self.emit_load_local(RDI, self.heap_local_offset);
+                    // Load vm_ptr from heap_local_offset into RDI (null when
+                    // the method has no heap local; see the Windows arm).
+                    if self.needs_heap {
+                        self.emit_load_local(RDI, self.heap_local_offset);
+                    } else {
+                        self.buf.emit(&[0x31, 0xFF]); // XOR EDI, EDI
+                    }
                     // MOV RSI, reason (immediate)
                     self.rex_w();
                     self.buf.emit_byte(0xB8 + RSI as u8); // Cast: x86-64 register encoding
-                    self.buf.emit(&(reason as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
-                                                                   // MOV RDX, bci (immediate)
+                    self.buf.emit(&trap_reason_word.to_le_bytes()); // reason | compile id << 32
+                                                                    // MOV RDX, bci (immediate)
                     self.rex_w();
                     self.buf.emit_byte(0xB8 + RDX as u8); // Cast: x86-64 register encoding
                     self.buf.emit(&(bci as u64).to_le_bytes()); // Cast: x86-64 immediate encoding

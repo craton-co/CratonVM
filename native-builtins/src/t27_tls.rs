@@ -3777,6 +3777,28 @@ fn java_cipher_name_to_suite(name: &str) -> Option<rustls::CipherSuite> {
     })
 }
 
+/// The protocol names CratonVM's TLS stack advertises as supported, newest
+/// first — the same "one list, one spelling" rule as
+/// [`SUPPORTED_CIPHER_SUITE_NAMES`] below, and for the same reason: there were
+/// three hand-maintained copies and they disagreed.
+///
+/// `SSLSocket.getSupportedProtocols()` said `[TLSv1.3, TLSv1.2]`,
+/// `SSLEngine.getSupportedProtocols()` said `[TLSv1.3, TLSv1.2, TLSv1.1]`, and
+/// `SSLContext.getSupportedSSLParameters()` agreed with the engine — so the VM
+/// contradicted ITSELF about its own capability, which
+/// `L6TlsParamSweep` row 118 asks directly and read `false`.
+///
+/// `TLSv1.1` is in the list on purpose and the reason is not that the
+/// handshake can negotiate it: rustls cannot, and the mapper below is
+/// deliberately limited to TLS 1.2/1.3. Tomcat's `SSLUtilBase.getEnabled`
+/// INTERSECTS a connector's configured protocol list with this advertised set
+/// and silently drops anything missing, so omitting `TLSv1.1` destroys an
+/// explicit `TLSv1.1+TLSv1.2` configuration rather than declining it. The
+/// advertised set is the configuration API's vocabulary; what a handshake
+/// will actually agree to is a separate question, answered by
+/// `getEnabledProtocols`.
+pub(crate) const SUPPORTED_PROTOCOL_NAMES: &[&str] = &["TLSv1.3", "TLSv1.2", "TLSv1.1"];
+
 /// The Java cipher-suite names CratonVM's TLS stack advertises as supported,
 /// in JSSE preference order. Single source of truth for
 /// `SSLEngine.getSupportedCipherSuites`, `SSLSocket
@@ -3907,11 +3929,22 @@ fn cipher_provider_for(enabled: &[String]) -> Arc<rustls::crypto::CryptoProvider
 /// what every standard JSSE suite name carries (see the Standard Algorithm
 /// Names spec), which is enough to separate a real name from `InvalidCipher` /
 /// `SOME_INVALID_CIPHER` — the shapes the netty suite actually asserts on.
+/// The `TLS_`/`SSL_` prefix ALONE is not enough, and that gap is what
+/// `L6TlsParamSweep` row 94 measured: `TLS_NO_SUCH_SUITE` carries the prefix,
+/// so it was accepted where HotSpot throws. Every real JSSE suite name is one
+/// of two shapes — a TLS 1.3 name (`TLS_AES_128_GCM_SHA256` and its four
+/// siblings, all of which are in `SUPPORTED_CIPHER_SUITE_NAMES`) or a
+/// pre-1.3 name, which always spells out the key exchange and the cipher
+/// either side of `_WITH_`. That structural test rejects a typo without
+/// narrowing the set to what this engine can negotiate.
 pub(crate) fn is_cipher_suite_name(name: &str) -> bool {
     java_cipher_name_to_suite(name).is_some()
         || SUPPORTED_CIPHER_SUITE_NAMES.contains(&name)
-        || name.starts_with("TLS_")
-        || name.starts_with("SSL_")
+        || ((name.starts_with("TLS_") || name.starts_with("SSL_")) && name.contains("_WITH_"))
+        // `TLS_EMPTY_RENEGOTIATION_INFO_SCSV` and `TLS_FALLBACK_SCSV` are
+        // signalling values, not suites, and carry neither `_WITH_` nor a
+        // rustls mapping — JSSE still accepts them by name.
+        || name.ends_with("_SCSV")
 }
 
 /// True if at least one of `ciphers` maps to a real rustls `CipherSuite` (see
@@ -7341,74 +7374,23 @@ fn register_client_socket_mode_accessors(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
+    // The validation lives in the shared bodies, which ALSO apply the
+    // restriction. This registrar runs after `net_phase_e`'s and wins, and the
+    // first cut of it validated and then returned -- which silently dropped
+    // every client cipher/protocol restriction in the VM (Tomcat
+    // `TestSSLHostConfig{Cipher,Protocol,Compat}`). See
+    // `net_phase_e::ssl_socket_set_enabled_cipher_suites`.
     r.register(
         ss,
         "setEnabledCipherSuites",
         "([Ljava/lang/String;)V",
-        |ctx, args| {
-            // Null first, then membership: the order is observable, and
-            // `setEnabledCipherSuites(null)` reports "CipherSuites cannot be
-            // null" on HotSpot rather than complaining about a null suite.
-            let Some(Value::Object(Some(arr))) = args.get(1) else {
-                return Err(RuntimeError::IllegalArgumentException {
-                    message: "CipherSuites cannot be null".into(),
-                }
-                .into());
-            };
-            for i in 0..ctx.array_length(*arr) {
-                let name = match ctx.get_array_element(*arr, i) {
-                    Value::Object(Some(s)) => ctx.read_string(s),
-                    _ => None,
-                };
-                let name = name.unwrap_or_default();
-                if !SUPPORTED_CIPHER_SUITE_NAMES.contains(&name.as_str()) {
-                    return Err(RuntimeError::IllegalArgumentException {
-                        message: format!("Unsupported CipherSuite: {name}"),
-                    }
-                    .into());
-                }
-            }
-            Ok(None)
-        },
+        crate::net_phase_e::ssl_socket_set_enabled_cipher_suites,
     );
     r.register(
         ss,
         "setEnabledProtocols",
         "([Ljava/lang/String;)V",
-        |ctx, args| {
-            let Some(Value::Object(Some(arr))) = args.get(1) else {
-                return Err(RuntimeError::IllegalArgumentException {
-                    message: "Protocols cannot be null".into(),
-                }
-                .into());
-            };
-            for i in 0..ctx.array_length(*arr) {
-                let name = match ctx.get_array_element(*arr, i) {
-                    Value::Object(Some(s)) => ctx.read_string(s),
-                    _ => None,
-                };
-                let name = name.unwrap_or_default();
-                // The protocol names this stack reports through
-                // `getSupportedProtocols`, plus the legacy spellings JSSE
-                // still names. Anything else is a caller's typo, and HotSpot
-                // says so rather than ignoring it.
-                const KNOWN: &[&str] = &[
-                    "TLSv1.3",
-                    "TLSv1.2",
-                    "TLSv1.1",
-                    "TLSv1",
-                    "SSLv3",
-                    "SSLv2Hello",
-                ];
-                if !KNOWN.contains(&name.as_str()) {
-                    return Err(RuntimeError::IllegalArgumentException {
-                        message: format!("Unsupported protocol: {name}"),
-                    }
-                    .into());
-                }
-            }
-            Ok(None)
-        },
+        crate::net_phase_e::ssl_socket_set_enabled_protocols,
     );
     r.set_category(__prev_cat);
 }
@@ -12297,6 +12279,19 @@ pub(crate) struct EngineState {
     /// throw it away, losing whatever the re-entrant caller had done to it.
     conn_checked_out: bool,
     is_client: bool,
+    /// Whether `setUseClientMode` was ever CALLED, as distinct from what
+    /// `is_client` says the handshake will do.
+    ///
+    /// `javax.net.ssl.SSLEngine.getUseClientMode()` reports the CONFIGURED
+    /// role and a fresh `createSSLEngine()` engine has none, so HotSpot
+    /// answers `false` (and its `beginHandshake` then refuses). `is_client`
+    /// defaults to `true` here because this VM's engine callers overwhelmingly
+    /// are clients and flipping that default would turn every client that
+    /// never calls the setter into a server — a behaviour change no probe
+    /// asked for. Keeping the two apart lets the GETTER be honest about what
+    /// was configured while the handshake keeps the default it has always had.
+    /// MEASURED: `L6TlsParamSweep` rows 66 and 89.
+    client_mode_set: bool,
     /// In-process inbound buffer. `unwrap` appends to this from the source
     /// ByteBuffer, then drains via `read_tls` into rustls.
     inbound: Vec<u8>,
@@ -12450,6 +12445,7 @@ impl Default for EngineState {
             conn: None,
             conn_checked_out: false,
             is_client: true,
+            client_mode_set: false,
             inbound: Vec::new(),
             outbound: Vec::new(),
             alpn_protocols: Vec::new(),
@@ -16277,22 +16273,30 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // setUseClientMode(Z)V
+    // setUseClientMode(Z)V — this pair is the LIVE one. The engine
+    // `SSLContext.createSSLEngine()` hands out is a
+    // `sun.security.ssl.SSLEngineImpl`, so these, registered on the concrete
+    // class, beat the two copies on `javax/net/ssl/SSLEngine` in
+    // `phases_late::ssl_security` and `tls.rs` (all three now agree; a
+    // reordering must not resurrect a different answer).
     r.register(cls_impl, "setUseClientMode", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let mode = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
-        let id = engine_id_or_alloc(ctx, this);
-        with_engine(id, |s| {
-            s.is_client = mode != 0;
-        });
+        set_engine_use_client_mode(ctx, this, mode != 0);
         Ok(None)
     });
 
+    // The getter reports what was CONFIGURED, which for a fresh engine is
+    // nothing — HotSpot answers `false` there, and this answered `true`
+    // because it read the handshake default. See
+    // `EngineState::client_mode_set`: the two are deliberately separate, so
+    // the report is honest without moving the default every client relies on.
+    // MEASURED, `L6TlsParamSweep` rows 66 and 89.
     r.register(cls_impl, "getUseClientMode", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let id = engine_id_or_alloc(ctx, this);
-        let mode = with_engine(id, |s| s.is_client).unwrap_or(true);
-        Ok(Some(Value::Int(if mode { 1 } else { 0 })))
+        Ok(Some(Value::Int(i32::from(engine_use_client_mode(
+            ctx, this,
+        )))))
     });
 
     // WAS A KNOWN DIVERGENCE (waves 2-4): this pair was inert — the selector
@@ -16463,22 +16467,14 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         "getSupportedProtocols",
         "()[Ljava/lang/String;",
         |ctx, _args| {
-            // JSSE exposes TLSv1.1 as a configurable legacy protocol even
-            // though the rustls transport below cannot negotiate it. Tomcat
-            // intersects SSLHostConfig.protocols with this advertised set
-            // before it stores the connector configuration; omitting it here
-            // therefore destroys an explicit `TLSv1.1+TLSv1.2` configuration
-            // instead of preserving its requested policy. The handshake
-            // mapper remains intentionally limited to rustls's TLS 1.2/1.3
-            // implementation, so this only restores the configuration API's
-            // round-trip contract.
-            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 3);
-            let s1 = ctx.create_string("TLSv1.3");
-            let s2 = ctx.create_string("TLSv1.2");
-            let s3 = ctx.create_string("TLSv1.1");
-            ctx.set_array_element(arr, 0, Value::Object(Some(s1)));
-            ctx.set_array_element(arr, 1, Value::Object(Some(s2)));
-            ctx.set_array_element(arr, 2, Value::Object(Some(s3)));
+            // Single source of truth — see `SUPPORTED_PROTOCOL_NAMES`, which
+            // carries the TLSv1.1 rationale this copy used to state alone.
+            let protos = SUPPORTED_PROTOCOL_NAMES;
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), protos.len());
+            for (i, &p) in protos.iter().enumerate() {
+                let s = ctx.create_string(p);
+                ctx.set_array_element(arr, i, Value::Object(Some(s)));
+            }
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -18814,6 +18810,34 @@ pub(crate) fn set_engine_identity_override(
 /// they exist, so `SSLEngine.getPeerHost()`/`getPeerPort()` (plain JDK bytecode
 /// reading final fields our synthetic allocation never ran a constructor for)
 /// answer the same values rather than `null`/`-1`.
+/// `SSLEngine.setUseClientMode(boolean)` — record the role AND the fact that
+/// it was configured. See [`EngineState::client_mode_set`].
+///
+/// This replaces a `ctx.set_field(this, 0, ..)` in `phases_late::ssl_security`.
+/// Slot 0 of a real `sun.security.ssl.SSLEngineImpl` is
+/// `javax.net.ssl.SSLEngine.peerHost`, a REFERENCE — so the write was inert
+/// and the read answered a String slot as a boolean. Same species as the
+/// `SSLContext` slot-1 flag this lane found on 2026-09-12; the fix is the
+/// same, which is to put the state where the engine's state already lives.
+pub(crate) fn set_engine_use_client_mode(
+    ctx: &dyn NativeContext,
+    engine_obj: ObjectRef,
+    use_client: bool,
+) {
+    let id = engine_id_or_alloc(ctx, engine_obj);
+    with_engine(id, |s| {
+        s.is_client = use_client;
+        s.client_mode_set = true;
+    });
+}
+
+/// `SSLEngine.getUseClientMode()` — the CONFIGURED role, `false` until
+/// `setUseClientMode` has been called.
+pub(crate) fn engine_use_client_mode(ctx: &dyn NativeContext, engine_obj: ObjectRef) -> bool {
+    let id = engine_id_or_alloc(ctx, engine_obj);
+    with_engine(id, |s| s.client_mode_set && s.is_client).unwrap_or(false)
+}
+
 pub(crate) fn set_engine_peer_host(
     ctx: &mut dyn NativeContext,
     engine_obj: ObjectRef,

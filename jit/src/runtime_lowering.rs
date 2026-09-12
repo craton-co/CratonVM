@@ -21,7 +21,7 @@
 //! | `service_helper` | `emit_callee_deopt_check` | same |
 //! | `info_ptr` (`*const JitInvokeInfo`) | `emit_callee_deopt_check` | the compiling artifact's `CompiledMethod::_jit_invoke_infos` — a `Vec<Box<..>>`, so growth moves the handles, never the pointees |
 //! | `pic` (`*const JitPICSlot`) | `emit_hashed_vtable_stub` | the compiling artifact's `CompiledMethod::_jit_pic_slots`, same shape |
-//! | `mega_entry_ptrs[i]` (loaded, then `CALL R11`) | `emit_hashed_vtable_stub` | **not baked** — read from the slot at dispatch time, and retained by that slot's `mega_compiled_owners[i]` `Arc<CompiledMethod>` |
+//! | `mega_entry_words[i]` (loaded once, tag stripped, then `CALL R11`) | `emit_hashed_vtable_stub` | **not baked** — read from the slot at dispatch time, and retained by that slot's `mega_compiled_owners[i]` `Arc<CompiledMethod>` |
 //!
 //! The one that is not a constant is the interesting one: the megamorphic way's
 //! entry pointer is *loaded* rather than baked, so it can be withdrawn.  It is
@@ -365,7 +365,7 @@ pub(crate) fn emit_inline_tlab_new_ir(
         None
     };
     if let Some(why) = declined {
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
             eprintln!("[cratonvm-jitc] ir inline-TLAB bump DECLINED: {why}");
         }
         note_inline_tlab_decline(why);
@@ -374,7 +374,8 @@ pub(crate) fn emit_inline_tlab_new_ir(
 
     // The layout snapshot, from the same source the helper reads. `None` means
     // this class allocates with uniform 16-byte cells.
-    let compact: Option<(usize, *const u32, u32)> = if cratonvm_types::compact_ref_fields_enabled() {
+    let compact: Option<(usize, *const u32, u32)> = if cratonvm_types::compact_ref_fields_enabled()
+    {
         cratonvm_types::class_layout(plan.class_id)
             .filter(|l| l.field_count() == plan.num_fields)
             .map(|l| {
@@ -445,20 +446,10 @@ pub(crate) fn emit_inline_tlab_new_ir(
     // `jit_post_tlab_init`, which writes the same value again idempotently.
     // Cast: a field count is bounded by the class file's own u16 limits.
     let shape = plan.num_fields as u32;
-    buf.emit(&[
-        0x41,
-        0xC7,
-        0x43,
-        cratonvm_types::NUM_SLOTS_OFFSET as u8,
-    ]);
+    buf.emit(&[0x41, 0xC7, 0x43, cratonvm_types::NUM_SLOTS_OFFSET as u8]);
     buf.emit(&shape.to_le_bytes());
     // mark_word at MARK_WORD_OFFSET — UNCONDITIONAL. See the doc comment.
-    buf.emit(&[
-        0x49,
-        0xC7,
-        0x43,
-        cratonvm_types::MARK_WORD_OFFSET as u8,
-    ]);
+    buf.emit(&[0x49, 0xC7, 0x43, cratonvm_types::MARK_WORD_OFFSET as u8]);
     buf.emit(&0i32.to_le_bytes());
     // The gc_flags byte, as a BYTE and AFTER the mark word that would erase it.
     // `gc_age` shares this byte and is 0 at allocation, so writing the whole
@@ -792,17 +783,20 @@ pub(crate) fn emit_hashed_vtable_stub(
         buf.emit(&(JitPICSlot::MEGA_CLASS_IDS_OFFSET as i32).to_le_bytes());
         let next_or_miss = emit_jcc(buf, 0x85); // JNE
 
-        // MOV R11,[R10 + RCX*8 + mega_entry_ptrs]; zero -> slow.
+        // MOV R11,[R10 + RCX*8 + mega_entry_words]; zero -> slow. The word is
+        // loaded ONCE: it carries the target and its ABI flag together.
         buf.emit(&[0x4D, 0x8B, 0x9C, 0xCA]);
         buf.emit(&(JitPICSlot::MEGA_ENTRY_PTRS_OFFSET as i32).to_le_bytes());
         buf.emit(&[0x4D, 0x85, 0xDB]); // TEST R11,R11
         miss_patches.push(emit_jcc(buf, 0x84));
 
-        // Select the compiled entry ABI from the parallel byte array.
-        buf.emit(&[0x41, 0x80, 0xBC, 0x0A]);
-        buf.emit(&(JitPICSlot::MEGA_NEEDS_CONTEXT_OFFSET as i32).to_le_bytes());
-        buf.emit_byte(0);
-        let no_context = emit_jcc(buf, 0x84);
+        // Select the compiled entry ABI from the word just loaded: bit 0 is the
+        // needs-context tag (`JIT_IC_NEEDS_CONTEXT_TAG`). BTR moves it into CF
+        // and leaves the bare entry in R11, so the ABI and the target cannot
+        // come from two different publications of this way.
+        const _: () = assert!(crate::JIT_IC_NEEDS_CONTEXT_TAG == 1);
+        buf.emit(&[0x49, 0x0F, 0xBA, 0xF3, 0x00]); // BTR R11, 0
+        let no_context = emit_jcc(buf, 0x83); // JNC
         emit_marshal(buf, context_offset, arg_offsets, true);
         let call = emit_jmp(buf);
         patch_rel32_to_here(buf, no_context);

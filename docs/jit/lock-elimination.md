@@ -12,15 +12,43 @@ machinery both transforms sit on.
 
 ## 0. Status in one paragraph
 
+> **Status, verified against the source 2026-09-12.** The paragraph below the
+> rule was written before monitors reached the IR tier. What is true now:
+>
+> * **The IR has monitor ops and the builder emits them.** `ir::Op::MonitorEnter`
+>   and `MonitorExit` carry `[ctrl, mem, obj]`. `IrBuilder` emits them for
+>   `monitorenter` / `monitorexit` and threads the memory token through them.
+> * **They are bridged.** `escape_analysis_from_ir` maps them to
+>   `escape_analysis::Op::MonitorEnter` / `MonitorExit` and re-packs the locked
+>   reference from IR input 2 to EA input 0.
+> * **Lock elision runs in production, per plan.** `apply_ea_to_ir_pinned`
+>   (`jit/src/lib.rs`) iterates `ea_result.lock_elisions`. For each object it
+>   maps every monitor through `reverse_map` and refuses the **whole object** if
+>   any monitor has no IR counterpart, is named by a safepoint snapshot
+>   (`ea_snapshot_names`), cannot be spliced out of the memory chain
+>   (`ea_splice_feasible`), or has its value read through a non-token input.
+>   That is the §6.1 shape. Production code no longer reads the flat
+>   `elide_locks`. The comment just above that loop, which says `lock_elisions`
+>   is empty for every IR-derived graph and the loop is a no-op, is stale.
+> * **Lock coarsening is still not consumed.** `apply_lock_coarsening` is called
+>   only from `escape_analysis.rs` tests.
+> * **A method whose monitors were elided cannot deopt-resume precisely.** See
+>   §8.
+> * **Live monitors lower through the runtime helper.** `ir_lower`'s monitor arm
+>   publishes the safepoint map, calls `runtime_lowering::emit_monitor_stub`
+>   (targeting the `monitor_enter` / `monitor_exit` helper slots), reloads the
+>   shadow stack, and checks the `i64::MIN` sentinel. `lower_inner` refuses the
+>   method with "monitor helper absent" when those slots are unwired.
+
 Two transforms are implemented and tested here: **lock elision** (delete every
 monitor operation on a provably confined object) and **lock coarsening** (merge
 two adjacent lock regions on a confined object by deleting the inner
 `monitorexit`/`monitorenter` pair). Both fail closed on every axis the review
-names. Neither runs in production yet, for a reason that predates this work:
-`escape_analysis_from_ir` in `jit/src/lib.rs` has no arm that can produce
-`escape_analysis::Op::MonitorEnter`, so an IR-derived graph contains no monitor
-nodes at all and both offer lists are empty. §6 is the bridge edit that changes
-that, and it must not land before §6.1.
+names. *As first written:* neither runs in production yet, for a reason that
+predates this work: `escape_analysis_from_ir` in `jit/src/lib.rs` has no arm
+that can produce `escape_analysis::Op::MonitorEnter`, so an IR-derived graph
+contains no monitor nodes at all and both offer lists are empty. §6 is the
+bridge edit that changes that, and it must not land before §6.1.
 
 ---
 
@@ -324,6 +352,25 @@ answer should be measurable, not invisible.
 
 ## 6. Edits required outside `jit/src/escape_analysis.rs`
 
+> **Status, verified 2026-09-12.**
+>
+> * **6.1 — landed.** `apply_ea_to_ir_pinned` iterates
+>   `ea_result.lock_elisions` in exactly the shape below.
+> * **6.2 — landed for monitors and `athrow`, not for `wait` / `notify`.**
+>   `ir::Op::MonitorEnter` / `MonitorExit` exist and are bridged with the
+>   input-2 → input-0 re-pack. `ir::Op::Throw` maps to `EaOp::Throw` (cov-07).
+>   `Object.wait` / `notify` / `notifyAll` are still `EaOp::Call`: the
+>   `// The monitor half of the bridge` comment block in `jit/src/lib.rs` says
+>   they are deliberately not wired, and nothing produces `MonitorWait` /
+>   `MonitorNotify`. That comment block's "NOT WIRED … `ir::Op` has no
+>   `MonitorEnter`/`MonitorExit` variant" text is stale for the monitors
+>   themselves. The `MemEffect::monitor_enter` doc quoted below no longer says
+>   "No op produces this yet".
+> * **6.3 — open.** No `EaOp::Safepoint` is produced, so `SafepointInGap` is
+>   still unreachable from production IR.
+> * **6.4 — open.** Nothing outside `escape_analysis.rs` reads
+>   `lock_coarsening` or calls `apply_lock_coarsening`.
+
 All in `jit/src/lib.rs`, which is another agent's file. Cited by symbol, not
 line, because that file is being edited concurrently.
 
@@ -417,9 +464,11 @@ object is still a candidate for full elision on the next analysis pass.
 
 ## 7. To reconcile
 
-1. **Both transforms are unreachable in production.** No monitor node is ever
-   bridged (§6.2). The tests exercise hand-built EA graphs. This is stated so
-   that a benchmark showing "no change" is not read as "no effect".
+1. ~~**Both transforms are unreachable in production.**~~ **Half lifted
+   (verified 2026-09-12):** monitor nodes are built and bridged, so **elision**
+   is reachable and applied per plan in production (see §0). **Coarsening** is
+   still unreachable: nothing consumes `lock_coarsening` (§6.4). A benchmark
+   showing "no change" from coarsening is still not evidence of "no effect".
 2. **The `Unknown`-monitor guard is method-global.** One unattributable monitor
    refuses every lock plan in the method, including unrelated confined objects'.
    A per-object alias closure would be more precise; it is not obviously worth
@@ -444,3 +493,72 @@ object is still a candidate for full elision on the next analysis pass.
 6. **`stats.locks_elided` still counts monitor *nodes*, not objects**, so it is
    unchanged for existing consumers. `lock_objects_elided` is the new
    per-object counter.
+
+---
+
+## 8. Deopt after elision: no precise resume
+
+Verified against the source 2026-09-12. **A method that had monitors elided
+cannot deopt-resume precisely.** A deopt from its compiled body falls back to
+the whole-method re-run. The reason is that no frame state this tier builds can
+describe a held monitor.
+
+### Why
+
+Every `FrameState` `ir_lower` builds hard-codes `monitors: Vec::new()`. A precise
+resume would rebuild an interpreter frame that believes it holds no lock. The
+interpreter's own sink refuses a frame that holds monitors, but it cannot act on
+information that was never recorded.
+
+So `ir_lower::lower_inner` sets `CompiledMethod::can_deopt_resume = true` only
+when all three hold: `sr_map` is set, some deopt point carries a
+`VirtualObject`, **and no `Op::MonitorEnter` / `Op::MonitorExit` remains in the
+graph**.
+
+That last test alone was not enough. Lock elision runs **before** lowering and
+turns the monitors into `Op::Dead`, so the post-elision graph showed none. A
+guard deopt inside `synchronized (new Object()) { ... }` then resumed precisely
+with no lock held, and the interpreter's `monitorexit` threw
+`IllegalMonitorStateException`.
+
+### The latch
+
+`try_compile_inner` (`jit/src/lib.rs`) records `had_monitors` **before** escape
+analysis runs:
+
+```rust
+let had_monitors = graph
+    .nodes
+    .iter()
+    .any(|n| matches!(n.op, ir::Op::MonitorEnter | ir::Op::MonitorExit));
+```
+
+After `lower_inner` returns an artifact, `if had_monitors {
+compiled.can_deopt_resume = false; }`. That holds whether or not elision
+actually removed anything, and whatever the post-elision graph shows.
+
+The single-pass backend has the same rule under a different name.
+`x64/driver.rs` sets `can_deopt_resume = !deopt_points.is_empty() &&
+!compiler.has_elided_monitor`, and likewise `can_osr_exit` with
+`osr_exit_points`.
+
+### What the VM does instead
+
+Each deopt sink admits a precise resume on `(deopt_real_enabled() &&
+compiled.can_deopt_resume)`, OR-ed with
+`sink_precise_resume_allowed_for(...)` (`vm/src/runtime/interpreter/deopt_resume.rs`).
+The second arm is additive, and for a monitor-bearing method it is always
+false. `sink_precise_resume_allowed` requires all of:
+
+* `cratonvm_jit::deopt_sink_resume_enabled()` (default on;
+  `CRATONVM_JIT_DEOPT_SINK_RESUME=0` turns it off);
+* the method is not `ACC_SYNCHRONIZED`;
+* `!cratonvm_jit::bytecode_holds_monitor(code, code_len)`, a scan for any
+  `monitorenter` / `monitorexit` opcode. Elision is a codegen decision, not a
+  bytecode rewrite, so the opcodes are still there to see;
+* a resume bci inside the method's code.
+
+With both arms false, the sink takes the whole-method re-run. `ir_lower`'s
+comment gives the argument: the re-run re-enters a re-entrant lock and stays
+balanced. The method may still be compiled and may still deoptimize; it may not
+resume **precisely**.

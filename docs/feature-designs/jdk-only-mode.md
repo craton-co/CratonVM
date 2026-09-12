@@ -52,9 +52,11 @@ dispatch paths.
   is enforced by the strict arm rather than by the dispatch rule itself.
 - **The `redefine_immune_*` predicate family** (~8 families) is intact and not
   policy-gated.
-- **`JIT_COMPATIBILITY_MODE`** in `jit/src/lib.rs` is still a process-global
-  latched `AtomicU8`, though `jit_bridge.rs` now reads per-VM policy at three
-  sites.
+- **`JIT_COMPATIBILITY_MODE`**, the process-global latched `AtomicU8` in
+  `jit/src/lib.rs`, is **gone** (2026-09-12). The JIT takes the policy as a
+  per-compilation `jdk_only` argument from each VM's own config, so a
+  `--jdk-only` VM no longer makes later VMs in the same process over-strict.
+  See `jit-compatibility-and-despec-state-per-vm-FIXED.md`.
 
 **Rename, do not purge.** The end state is two modes reached by renaming:
 `--jdk-only` becomes `--real-jdk`, and today's `--real-jdk` (`Compatible`)

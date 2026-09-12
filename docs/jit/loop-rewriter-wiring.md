@@ -161,9 +161,10 @@ steady-state choice pointwise and leaves `-1` across the unrolled back-edge
 gap, where OSR entry must be refused outright. `osr_dead_mask` is indexed by
 the same bci and gets the same treatment with the same image choice.
 
-`despec_contains` is consulted with `bci_at(loop_header)` at both call sites
-(the aaload/arith LICM hoist filter and the speculative-BCE guard filter),
-because the de-spec registry is keyed by interpreter bci.
+`DespecRegistry::contains` (the compiling VM's registry, passed in as
+`despec`) is consulted with `bci_at(loop_header)` at both call sites (the
+aaload/arith LICM hoist filter and the speculative-BCE guard filter), because
+the de-spec registry is keyed by interpreter bci.
 
 ## Table census: all 21, and the sound/refused split
 

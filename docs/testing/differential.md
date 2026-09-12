@@ -213,6 +213,12 @@ Two rules keep it honest:
    "CratonVM execution paths disagreed with each other (reported, not gated)",
    exactly as the `jdk-only` violation census does.
 
+Rule 2 applies to `run` and `gate`. **`path-gate` is the gated form**: it takes
+`nojit` as the reference instead of HotSpot, needs no ledger, and fails on a
+reproducible split that is not in `difftest/path-gate-known.json`. The bytecode
+fuzzer `fuzz-jit` applies the same comparison to generated class files. See
+[`jit-differential.md`](jit-differential.md).
+
 ---
 
 ## 6. The opcode / execution-path matrix

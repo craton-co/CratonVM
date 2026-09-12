@@ -42,7 +42,7 @@ use super::*;
 /// `flags::with_thread_overrides`, which is how a declared flag is arranged in
 /// a test.
 pub(super) fn osr_empty_stack_entry_enabled() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_OSR_EMPTY_STACK_ENTRY").is_none()
+    !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_OSR_EMPTY_STACK_ENTRY")
 }
 
 /// How many OSR entry pcs the empty-operand-stack rule has refused this process.
@@ -131,7 +131,7 @@ impl Compiler {
         let box_ptr = self.build_and_record_deopt_point(bci, reason);
         self.osr_exit_box_ptr_by_bci.insert(bci, box_ptr);
         self.osr_exit_points.push(bci);
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
             // Step-7 emit-and-discard trace: confirm an exit map was recorded at
             // this OSR-vetted loop boundary (locals/stack come from the same
             // unit-tested `frame_value_for_slot` provenance as the guard path).
@@ -412,9 +412,7 @@ pub(super) fn publish_entry_metadata(
         // exists so `[osr-seed-stripped]` can be shown going RED on a known
         // defect before any run of it is read as a clean bill of health.
         let strip: Vec<usize> =
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_OSR_STRIP_ALL_HIGH_HALVES")
-                .is_some()
-            {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_OSR_STRIP_ALL_HIGH_HALVES") {
                 (0..num_locals)
                     .filter(|&i| high_halves.contains(&i))
                     .collect()
@@ -477,7 +475,7 @@ pub(super) fn publish_entry_metadata(
     // Set CRATONVM_JIT_OSR_DEAD_MASK_BLANKET=1 to restore the old
     // flag-every-dead-local behaviour.
     let blanket_dead_mask =
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_OSR_DEAD_MASK_BLANKET").is_some();
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_OSR_DEAD_MASK_BLANKET");
     let resident = reg_resident | xmm_resident;
     // `local <-> home register` lookup, GPR and XMM kept apart: they are
     // different register files and can never alias each other.
@@ -534,7 +532,7 @@ pub(super) fn publish_entry_metadata(
     //   ever be able to act on.
     //
     // What survives both is the real hazard: a seed that lands on a live value.
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR_SEED_COLLISION").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_OSR_SEED_COLLISION") {
         let (mut takeable, mut hits) = (0usize, 0usize);
         for &(pc, live_in) in osr_block_live_in {
             if !is_entry_pc.get(pc).copied().unwrap_or(false) {
@@ -622,7 +620,7 @@ pub(super) fn publish_entry_metadata(
     // OSR metadata would clobber?" and NAMES it — the question the loader/zip
     // cluster page could not ask, because its only oracle was a failure that had
     // stopped occurring.
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR_META").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_OSR_META") {
         // Report the mask that is actually published, alongside the blanket
         // "every dead register-resident local" set it is refined from, so the
         // two can be compared directly. Printing a separately recomputed

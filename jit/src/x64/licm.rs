@@ -324,8 +324,12 @@ fn branch_target_pcs(code: &[u8], start: usize, end: usize) -> Vec<usize> {
             // goto_w
             0xc8 => {
                 if pc + 4 < code.len() {
-                    let off =
-                        i32::from_be_bytes([code[pc + 1], code[pc + 2], code[pc + 3], code[pc + 4]]);
+                    let off = i32::from_be_bytes([
+                        code[pc + 1],
+                        code[pc + 2],
+                        code[pc + 3],
+                        code[pc + 4],
+                    ]);
                     if let Some(t) = pc.checked_add_signed(off as isize) {
                         // Cast: address arithmetic
                         targets.push(t);
@@ -362,28 +366,6 @@ pub(super) struct FpLoopHoist {
     pub(super) local_idx: usize,
     /// true = double (dload), false = float (fload).
     pub(super) is_double: bool,
-}
-
-/// Information about a vectorizable double-array sum reduction loop.
-/// Pattern: for (i = start; i < bound; i++) sum += arr[i]
-/// where arr is a double[] and sum is a double local.
-#[derive(Debug)]
-#[allow(dead_code)]
-pub(super) struct SimdFpArraySum {
-    /// Bytecode PC of the loop header.
-    pub(super) header_pc: usize,
-    /// Bytecode PC of the back-edge instruction.
-    pub(super) back_edge_pc: usize,
-    /// Local index of the induction variable (i).
-    pub(super) iv_local: usize,
-    /// Local index of the accumulator (sum).
-    pub(super) acc_local: usize,
-    /// Local index of the array reference.
-    pub(super) array_local: usize,
-    /// Local index of the loop bound.
-    pub(super) bound_local: usize,
-    /// Operation: 0x58=ADD (sum), 0x59=MUL (dot product partial).
-    pub(super) sse_op: u8,
 }
 
 /// Get the byte length of a bytecode instruction at `pc`.
@@ -597,7 +579,7 @@ pub fn precise_jit_maps_enabled() -> bool {
         // the BUG-01 ~6× throughput tax that motivated the d53c0e96 default-off
         // flip is gone on current dev. Opt out with CRATONVM_NO_PRECISE_JIT_MAPS=1.
         let enabled =
-            cratonvm_types::flags::runtime_var_os("CRATONVM_NO_PRECISE_JIT_MAPS").is_none();
+            !cratonvm_types::flags::runtime_flag_on("CRATONVM_NO_PRECISE_JIT_MAPS");
         if !enabled && moving_young_enabled() {
             eprintln!(
                 "[cratonvm] WARN: CRATONVM_NO_PRECISE_JIT_MAPS is set but a moving young \
@@ -797,9 +779,7 @@ pub fn zgc_codegen_honours_read_barrier() -> bool {
 pub fn inline_putfield_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_INLINE_PUTFIELD").is_none()
-    })
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_NO_JIT_INLINE_PUTFIELD"))
 }
 
 /// Does the GC backend have LIVE heap-region bounds published right now?
@@ -958,9 +938,7 @@ thread_local! {
 pub fn inline_tlab_new_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_INLINE_TLAB_NEW").is_none()
-    })
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_NO_JIT_INLINE_TLAB_NEW"))
 }
 
 /// Inline TLAB `newarray` — the array twin of [`inline_tlab_new_enabled`].
@@ -976,7 +954,7 @@ pub fn inline_tlab_newarray_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_INLINE_TLAB_NEWARRAY").is_none()
+        !cratonvm_types::flags::runtime_flag_on("CRATONVM_NO_JIT_INLINE_TLAB_NEWARRAY")
     })
 }
 
@@ -996,9 +974,7 @@ pub fn inline_tlab_newarray_enabled() -> bool {
 pub fn inline_tlab_zero_elision_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_TLAB_ZERO_ELISION").is_none()
-    })
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_NO_JIT_TLAB_ZERO_ELISION"))
 }
 
 pub(super) fn inline_site_is_fresh_ctor_first_store(
@@ -1087,9 +1063,7 @@ pub fn checkcast_inline_enabled() -> bool {
 pub fn inline_getfield_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_INLINE_GETFIELD").is_some()
-    })
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_INLINE_GETFIELD"))
 }
 
 /// Default-ON guarded inline `getfield` (perf/throughput-20260710).
@@ -1154,7 +1128,7 @@ pub fn guarded_inline_getfield_enabled() -> bool {
     // var every call has no measurable cost. Caching it would make the
     // off-switch racy against whichever test/thread first triggers ANY
     // getfield compilation in the process.
-    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_GETFIELD_HELPER").is_none()
+    !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_GETFIELD_HELPER")
 }
 
 /// Default-ON inline self-recursion stack check (perf/throughput-20260710).
@@ -1187,9 +1161,7 @@ pub fn inline_self_guard_enabled() -> bool {
 pub(super) fn self_cache_inherit_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_SELF_CACHE_INHERIT").is_none()
-    })
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_SELF_CACHE_INHERIT"))
 }
 
 /// Step 1 of `docs/feature-designs/precise-jit-maps-default.md` — opt-IN
@@ -1216,8 +1188,7 @@ pub fn precise_inline_frame_record_enabled() -> bool {
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
         precise_jit_maps_enabled()
-            && cratonvm_types::flags::runtime_var_os("CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD")
-                .is_none()
+            && !cratonvm_types::flags::runtime_flag_on("CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD")
     })
 }
 
@@ -1231,7 +1202,7 @@ pub fn verify_inline_frame_record_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD")
     })
 }
 
@@ -1307,7 +1278,7 @@ pub fn inline_rbp_tls_disp() -> usize {
         };
         // One-time visibility line, gated behind CRATONVM_DBG_INLINE_FR so the
         // (now default-on) path stays silent unless explicitly diagnosing.
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_INLINE_FR").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_INLINE_FR") {
             if disp != 0 {
                 eprintln!(
                     "[INLINE-FR] inline frame-record ENABLED: storing RBP via mov gs:[{:#x}]",
@@ -1378,7 +1349,7 @@ pub fn inline_rbp_tls_disp() -> usize {
                 0
             }
         });
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_INLINE_FR").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_INLINE_FR") {
             if disp != 0 {
                 eprintln!(
                     "[INLINE-FR] inline frame-record ENABLED: storing RBP via mov fs:[{:#x}]",
@@ -1450,6 +1421,7 @@ pub fn jit_thread_tls_disp() -> usize {
         }
         const TLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
         const TEB_TLS_SLOTS_OFF: usize = 0x1480;
+        // SAFETY: `TlsAlloc`/`TlsSetValue` are plain kernel32 calls, and every gs read indexes this thread's TEB TLS slot array (64 slots from `TEB_TLS_SLOTS_OFF`), which is mapped for the life of the thread.
         unsafe {
             let slot = TlsAlloc();
             if slot == TLS_OUT_OF_INDEXES {
@@ -1529,6 +1501,7 @@ pub fn publish_jit_thread_mirror(ptr: usize) {
     {
         let disp = jit_thread_tls_disp();
         if disp != 0 {
+            // SAFETY: `disp` came from the startup probe, which proved `gs:[disp]` is this thread's JIT-thread mirror slot.
             unsafe { write_gs_qword(disp, ptr) };
         }
     }
@@ -1552,6 +1525,7 @@ pub fn jit_thread_mirror_read() -> Option<usize> {
     }
     #[cfg(windows)]
     {
+        // SAFETY: `disp` came from the startup probe, which proved `gs:[disp]` is this thread's JIT-thread mirror slot.
         Some(unsafe { read_gs_qword(disp) })
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -1688,7 +1662,7 @@ pub fn inline_cm_tls_disp() -> usize {
                 0
             }
         };
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_INLINE_FR").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_INLINE_FR") {
             if disp != 0 {
                 eprintln!("[INLINE-FR] compile-id mirror ENABLED at gs:[{disp:#x}]");
             } else {
@@ -1740,7 +1714,7 @@ pub fn inline_cm_tls_disp() -> usize {
                 0
             }
         });
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_INLINE_FR").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_INLINE_FR") {
             if disp != 0 {
                 eprintln!(
                     "[INLINE-FR] compile-id mirror ENABLED at fs:[{:#x}]",
@@ -2070,7 +2044,7 @@ pub fn moving_young_relocates_compiled_frames() -> bool {
 }
 
 pub(super) fn shadow2_diag_enabled(method_label: &str) -> bool {
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SHADOW2").is_none() {
+    if !cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SHADOW2") {
         return false;
     }
     match cratonvm_types::flags::runtime_var("CRATONVM_DBG_SHADOW2_FILTER") {
@@ -2086,7 +2060,7 @@ pub(super) fn shadow2_diag_enabled(method_label: &str) -> bool {
 pub(super) fn shadow_reload_dbg() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SHADOW_RELOAD").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SHADOW_RELOAD"))
 }
 
 /// DBG helper called from JIT-emitted reload code (see `shadow_reload_dbg`).
@@ -2109,7 +2083,7 @@ pub(super) extern "C" fn jit_dbg_shadow_reload_log(
 pub(super) fn shadow_nopush() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_NOPUSH").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_SHADOW_NOPUSH"))
 }
 
 /// Bisect toggle (`CRATONVM_SHADOW_NORELOAD`) — suppress only the post-call
@@ -2119,7 +2093,7 @@ pub(super) fn shadow_nopush() -> bool {
 pub(super) fn shadow_noreload() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_NORELOAD").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_SHADOW_NORELOAD"))
 }
 
 /// spring-bug-10 (`CRATONVM_SHADOW_PIN`) — pinned shadow marking. The shadow
@@ -2133,7 +2107,7 @@ pub(super) fn shadow_noreload() -> bool {
 pub(super) fn shadow_pin_codegen() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_PIN").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_SHADOW_PIN"))
 }
 
 /// spring-bug-10 diagnostic (`CRATONVM_SHADOW_SENTINEL`) — pre-stamp the savebase
@@ -2142,7 +2116,7 @@ pub(super) fn shadow_pin_codegen() -> bool {
 pub(super) fn shadow_sentinel() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_SENTINEL").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_SHADOW_SENTINEL"))
 }
 
 /// spring-bug-10 watchpoint (`CRATONVM_SHADOW_WATCH`) — emit a prologue call to
@@ -2151,7 +2125,7 @@ pub(super) fn shadow_sentinel() -> bool {
 pub(super) fn shadow_watch() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_WATCH").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_SHADOW_WATCH"))
 }
 
 /// Process-global pointer to the VM-side `jit_arm_savebase_watch(addr)` helper,
@@ -2273,7 +2247,7 @@ pub fn inline_getstatic_enabled() -> bool {
     // per call SITE during compilation, never on the runtime hot path, and
     // caching it would make the off-switch racy against whichever thread
     // triggers the first compilation in the process.
-    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_GETSTATIC_HELPER").is_none()
+    !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_GETSTATIC_HELPER")
 }
 
 /// spring-bug-10 diagnostic (`CRATONVM_SHADOW_RAW_RELOAD`) — bypass the reload's
@@ -2282,7 +2256,7 @@ pub fn inline_getstatic_enabled() -> bool {
 pub(super) fn shadow_reload_raw() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_RAW_RELOAD").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_SHADOW_RAW_RELOAD"))
 }
 
 /// Bisect toggle (`CRATONVM_JIT_SP_INLINE_IC=0`) — keep the single-pass
@@ -2345,7 +2319,7 @@ pub(super) fn sp_tailcall_enabled() -> bool {
 pub(super) fn self_tailcall_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SELF_TAILCALL").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_SELF_TAILCALL"))
 }
 
 /// Diagnostic (`CRATONVM_SHADOW_OVERFLOW_DIAG`) — on a shadow-stack overflow
@@ -2355,9 +2329,7 @@ pub(super) fn self_tailcall_enabled() -> bool {
 pub(super) fn shadow_overflow_diag() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_OVERFLOW_DIAG").is_some()
-    })
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_SHADOW_OVERFLOW_DIAG"))
 }
 
 /// spring-bug-10 bisect toggle (`CRATONVM_SHADOW_NO_SAVEBASE`) — disable the
@@ -2368,9 +2340,7 @@ pub(super) fn shadow_overflow_diag() -> bool {
 pub(super) fn shadow_no_savebase() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_NO_SAVEBASE").is_some()
-    })
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_SHADOW_NO_SAVEBASE"))
 }
 
 /// `CRATONVM_JIT_RIP_SAFEPOINT_POLL=0` — emit the safepoint poll as
@@ -2967,29 +2937,29 @@ pub(super) fn local_mask_fail_closed_enabled() -> bool {
 pub(super) fn merge_marks_exact_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MERGE_MARKS_EXACT") {
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MERGE_MARKS_EXACT") {
             Ok(v) => !matches!(
                 v.trim().to_ascii_lowercase().as_str(),
                 "0" | "false" | "off" | "no"
             ),
             Err(_) => true,
-        }
-    })
+        },
+    )
 }
 
 pub(super) fn self_call_arg_maps_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_SELF_CALL_ARG_MAPS") {
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_SELF_CALL_ARG_MAPS") {
             Ok(v) => !matches!(
                 v.trim().to_ascii_lowercase().as_str(),
                 "0" | "false" | "off" | "no"
             ),
             Err(_) => true,
-        }
-    })
+        },
+    )
 }
 
 pub(super) fn spill_args_published_enabled() -> bool {
@@ -3021,9 +2991,7 @@ pub(super) fn spill_args_published_enabled() -> bool {
 pub(super) fn precise_reg_spill_disabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_PRECISE_REG_SPILL").is_some()
-    })
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_NO_PRECISE_REG_SPILL"))
 }
 
 /// Keep the legacy full-register spill at otherwise eligible direct
@@ -3032,9 +3000,7 @@ pub(super) fn precise_reg_spill_disabled() -> bool {
 pub(super) fn full_self_call_spill_requested() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_FULL_SELF_CALL_SPILL").is_some()
-    })
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_FULL_SELF_CALL_SPILL"))
 }
 
 /// The full set of allocatable GPRs spilled at safepoints under the `=all` gate
@@ -3102,9 +3068,7 @@ pub(super) const ALLOC_FAST_PATH_CLOBBERS: [u8; 3] = [RAX, R10, R11];
 pub(super) fn alloc_spill_sink_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_ALLOC_SPILL_SINK").is_none()
-    })
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_ALLOC_SPILL_SINK"))
 }
 
 /// Whether any local that could hold an object reference currently lives only in
@@ -3166,9 +3130,7 @@ pub(super) fn moving_oop_free_self_call_is_publishable(
 pub(super) fn flush_callee_saved_oops_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_CALLEE_OOP_FLUSH").is_none()
-    })
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_CALLEE_OOP_FLUSH"))
 }
 
 /// Enable graph-coloured callee-saved GPR homes for Java locals.
@@ -3360,9 +3322,7 @@ thread_local! {
 pub(super) fn slot_mirror_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_SLOT_MIRROR").is_none()
-    })
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_SLOT_MIRROR"))
 }
 
 pub(super) fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
@@ -8580,17 +8540,13 @@ pub fn gated_ref_store_enabled() -> bool {
 pub fn sp_ref_store_trace_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SP_REF_STORE_TRACE").is_some()
-    })
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SP_REF_STORE_TRACE"))
 }
 
 pub fn ir_ref_store_trace_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_REF_STORE_TRACE").is_some()
-    })
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_REF_STORE_TRACE"))
 }
 
 pub fn ir_gated_ref_store_enabled() -> bool {

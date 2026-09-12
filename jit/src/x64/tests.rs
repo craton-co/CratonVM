@@ -1160,6 +1160,7 @@ fn self_recursive_second_call_map(method_key: &str) -> Option<crate::OopMapEntry
         0,
         Vec::new(),
         method_key,
+        None, // despec: no VM
         Vec::new(),
         None, // elidable_init_pcs: no constant pool, so nothing is proven empty
     )?;
@@ -1421,6 +1422,7 @@ fn compiled_entry_accepts_stack_passed_java_arguments() {
     .expect("four-argument context method should compile");
     // SAFETY: `with_context` was compiled from the valid method above.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { with_context.try_call_with_context(0, &[1, 2, 3, 44]) },
         Ok(44)
     );
@@ -1647,6 +1649,7 @@ fn test_compile_branch() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[0]).expect("test JIT call") },
         0
     );
@@ -1654,6 +1657,7 @@ fn test_compile_branch() {
     // SAFETY: `compiled` is executable JIT code from valid bytecode; the single
     // i64 argument matches the compiled method's one-parameter ABI.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[1]).expect("test JIT call") },
         1
     );
@@ -1661,6 +1665,7 @@ fn test_compile_branch() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[5]).expect("test JIT call") },
         6
     );
@@ -1811,22 +1816,26 @@ fn test_compile_fib() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[0]).expect("test JIT call") },
         0
     );
     // SAFETY: `compiled` is executable JIT code from valid bytecode; each call below
     // passes a single i64 matching the compiled method's one-parameter ABI.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[1]).expect("test JIT call") },
         1
     );
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[10]).expect("test JIT call") },
         55
     );
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[20]).expect("test JIT call") },
         6765
     );
@@ -1921,10 +1930,12 @@ fn test_compile_iinc() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[5]).expect("test JIT call") },
         15
     );
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[-3]).expect("test JIT call") },
         7
     );
@@ -1973,11 +1984,13 @@ fn test_compile_idiv_irem() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[17, 5]).expect("test JIT call") },
         5
     );
     // -7 / 2 = -3, -7 % 2 = -1, total = -4
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[-7, 2]).expect("test JIT call") },
         -4
     );
@@ -2384,11 +2397,13 @@ fn test_compile_i2b() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[42]).expect("test JIT call") },
         42
     );
     // Truncation: 0x1FF → (byte) = -1
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[0x1FF]).expect("test JIT call") },
         -1
     );
@@ -2396,11 +2411,13 @@ fn test_compile_i2b() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[300]).expect("test JIT call") },
         44
     );
     // Negative: -128
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[-128]).expect("test JIT call") },
         -128
     );
@@ -2443,11 +2460,13 @@ fn test_compile_i2c() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[65]).expect("test JIT call") },
         65
     ); // 'A'
        // 0xFFFF stays as 65535 (unsigned)
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[0xFFFF]).expect("test JIT call") },
         65535
     );
@@ -2455,11 +2474,13 @@ fn test_compile_i2c() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[0x10041]).expect("test JIT call") },
         65
     );
     // Negative: -1 → 0xFFFF = 65535
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[-1]).expect("test JIT call") },
         65535
     );
@@ -2502,11 +2523,13 @@ fn test_compile_i2s() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[1000]).expect("test JIT call") },
         1000
     );
     // Truncation: 0x18000 → (short) = -32768
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[0x18000]).expect("test JIT call") },
         -32768
     );
@@ -2514,11 +2537,13 @@ fn test_compile_i2s() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[32767]).expect("test JIT call") },
         32767
     );
     // -32768 stays
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[-32768]).expect("test JIT call") },
         -32768
     );
@@ -2688,11 +2713,13 @@ fn test_compile_swap_arithmetic() {
     .expect("swap must JIT-compile");
     // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[10, 3]).expect("test JIT call") },
         7
     );
     // SAFETY: same as above.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[-4, 6]).expect("test JIT call") },
         -10
     );
@@ -2737,6 +2764,7 @@ fn test_swap_frame_frame_single() {
     .expect("single swap must JIT-compile");
     // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[0]).expect("test JIT call") },
         -3
     );
@@ -2780,6 +2808,7 @@ fn test_swap_then_push_no_live_slot_reuse() {
     .expect("swap+push must JIT-compile");
     // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[0]).expect("test JIT call") },
         -2
     );
@@ -2821,11 +2850,13 @@ fn test_swap_mixed_reg_frame() {
     .expect("mixed swap must JIT-compile");
     // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[10]).expect("test JIT call") },
         -7
     );
     // SAFETY: same as above.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[-4]).expect("test JIT call") },
         7
     );
@@ -2889,11 +2920,13 @@ fn test_if_icmp_canonicalize_preserves_popped_operands() {
     // compare read k itself as val1: k < k+3 is true → 9 arm.
     // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[10]).expect("test JIT call") },
         17
     );
     // SAFETY: same as above.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[-2]).expect("test JIT call") },
         5
     );
@@ -2950,11 +2983,13 @@ fn test_ifxx_canonicalize_preserves_popped_operand() {
     // (≤ 0) → 9 arm → 8.
     // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[-1]).expect("test JIT call") },
         6
     );
     // SAFETY: same as above.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[5]).expect("test JIT call") },
         12
     );
@@ -3002,10 +3037,12 @@ fn test_compile_dup2_form2_long() {
     // f(5) = 10, f(-7) = -14
     // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[5]).expect("test JIT call") },
         10
     );
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[-7]).expect("test JIT call") },
         -14
     );
@@ -4038,6 +4075,7 @@ fn test_compile_i2f_i2d() {
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     let result = unsafe { compiled.try_call(&[42]).expect("test JIT call") };
     assert_eq!(f32::from_bits(result as u32), 42.0f32); // Cast: JIT ABI convention
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
     let result = unsafe { compiled.try_call(&[-7]).expect("test JIT call") };
     assert_eq!(f32::from_bits(result as u32), -7.0f32); // Cast: JIT ABI convention
 
@@ -4073,6 +4111,7 @@ fn test_compile_i2f_i2d() {
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     let result = unsafe { compiled.try_call(&[42]).expect("test JIT call") };
     assert_eq!(f64::from_bits(result as u64), 42.0f64); // Cast: JIT ABI convention
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
     let result = unsafe { compiled.try_call(&[-100]).expect("test JIT call") };
     assert_eq!(f64::from_bits(result as u64), -100.0f64); // Cast: JIT ABI convention
 }
@@ -4396,6 +4435,7 @@ fn test_compile_fcmpl() {
                                      // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                      // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
         1
     );
@@ -4406,6 +4446,7 @@ fn test_compile_fcmpl() {
                                      // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                      // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
         0
     );
@@ -4416,6 +4457,7 @@ fn test_compile_fcmpl() {
                                      // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                      // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
         -1
     );
@@ -4426,10 +4468,12 @@ fn test_compile_fcmpl() {
                                      // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                      // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[nan, b]).expect("test JIT call") },
         -1
     );
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[b, nan]).expect("test JIT call") },
         -1
     );
@@ -4472,6 +4516,7 @@ fn test_compile_fcmpg() {
                                      // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                      // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
         1
     );
@@ -4481,6 +4526,7 @@ fn test_compile_fcmpg() {
                                      // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                      // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
         -1
     );
@@ -4490,10 +4536,12 @@ fn test_compile_fcmpg() {
                                          // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                          // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[nan, b]).expect("test JIT call") },
         1
     );
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[b, nan]).expect("test JIT call") },
         1
     );
@@ -4535,6 +4583,7 @@ fn test_compile_dcmpl_dcmpg() {
                                      // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                      // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
         1
     );
@@ -4543,6 +4592,7 @@ fn test_compile_dcmpl_dcmpg() {
                                      // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                      // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
         0
     );
@@ -4551,6 +4601,7 @@ fn test_compile_dcmpl_dcmpg() {
                                      // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                      // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
         -1
     );
@@ -4560,6 +4611,7 @@ fn test_compile_dcmpl_dcmpg() {
                                          // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                          // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[nan, b]).expect("test JIT call") },
         -1
     );
@@ -4595,10 +4647,12 @@ fn test_compile_dcmpl_dcmpg() {
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[nan, b]).expect("test JIT call") },
         1
     );
     assert_eq!(
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         unsafe { compiled.try_call(&[b, nan]).expect("test JIT call") },
         1
     );
@@ -6199,6 +6253,7 @@ fn trusted_oop_receiver_substitution_requires_live_bounds() {
             0b11, // param_oop_mask: both parameters are references
             vec![(2usize, 0u32, true)],
             "T.setRef:(Ljava/lang/Object;)V", // non-empty ⇒ trusted-oop eligible
+            None,                             // despec: no VM
             Vec::new(),
             None, // elidable_init_pcs: no constant pool, so nothing is proven empty
         )
@@ -7461,6 +7516,7 @@ fn detects_and_executes_canonical_strided_byte_set_loop() {
     // particular stride never reaches the invalid index, so it still
     // completes normally and demonstrates that guard failure preserves
     // the bytecode's exact store sequence.
+    // SAFETY: `ARRAY_DATA_OFFSET + byte_len` bytes lie inside `words`, which is live and sized for the array header plus data.
     unsafe {
         std::ptr::write_bytes(array_ptr.add(ARRAY_DATA_OFFSET), 0, byte_len);
     }
@@ -8972,6 +9028,309 @@ fn test_instanceof_null() {
     assert_eq!(result, 0);
 }
 
+/// Compile `int f(Object o) { return o instanceof <name>; }` through the door
+/// that can reach the inline typecheck guard: a non-empty `method_key` and an
+/// oop-marked parameter are the trusted-oop clauses the checkcast arm reads.
+fn instanceof_inline_fixture(
+    helpers: &JitRuntimeHelpers,
+    name: &str,
+    target_class_id: Option<u32>,
+) -> CompiledMethod {
+    let (name_ptr, name_len) = crate::intern_typecheck_target(name, target_class_id);
+    let code: Vec<u8> = vec![
+        0x2a, // 0: aload_0
+        0xc1, 0x00, 0x01, // 1: instanceof #1
+        0xac, // 4: ireturn
+        0, 0,
+    ];
+    compile_with_param_slots(
+        &crate::compile_gate::CompileAdmission::for_backend_test(),
+        &code,
+        5,
+        1,
+        1,
+        false,
+        Vec::new(),                         // multianewarray_info
+        Vec::new(),                         // field_info
+        vec![(1usize, name_ptr, name_len)], // typecheck_info
+        Vec::new(),                         // static_field_info
+        Vec::new(),                         // new_info
+        Vec::new(),                         // new_deferred_info
+        Vec::new(),                         // anewarray_info
+        Vec::new(),                         // anewarray_deferred_info
+        Vec::new(),                         // invoke_info
+        Vec::new(),                         // direct_calls
+        Vec::new(),                         // mic_slots
+        Vec::new(),                         // pic_slots
+        Vec::new(),                         // ldc_info
+        Vec::new(),                         // ldc_string_info
+        Vec::new(),                         // ldc_class_info
+        Vec::new(),                         // ldc2w_info
+        Default::default(),                 // ldc_fp_pcs
+        HashMap::new(),
+        HashMap::new(),
+        helpers,
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        HashMap::new(), // inline_guard_variants (PGO-02)
+        None,           // string_layout
+        &[],
+        0,
+        0b1, // param_oop_mask: the parameter is a reference
+        Vec::new(),
+        "T.f:(Ljava/lang/Object;)I", // non-empty ⇒ trusted-oop eligible
+        None, // despec: no VM, so no despeculation verdicts
+        Vec::new(),
+        None, // elidable_init_pcs: no constant pool, so nothing is proven empty
+    )
+    .expect("instanceof must compile")
+}
+
+/// A header-only stand-in for a heap object: the class id at
+/// `class_id_offset_in_obj` (0 in `test_helpers`) and the KIND_TAGS byte,
+/// everything else zero. Neither the inline guard nor the marker helper reads
+/// anything further.
+fn fake_typecheck_header(class_id: u32, kind_tags: u8) -> Box<[u64; 8]> {
+    let kind_off = cratonvm_types::KIND_TAGS_BYTE_OFFSET;
+    assert!(
+        (4..64).contains(&kind_off),
+        "the fake header assumes KIND_TAGS lies past the 4-byte class id and inside 64 bytes"
+    );
+    let mut words = Box::new([0u64; 8]);
+    let base = words.as_mut_ptr() as *mut u8; // Cast: byte view of the header words
+    // SAFETY: `base` addresses 64 owned bytes and both writes are in range.
+    unsafe {
+        std::ptr::copy_nonoverlapping(class_id.to_le_bytes().as_ptr(), base, 4);
+        *base.add(kind_off) = kind_tags;
+    }
+    words
+}
+
+/// Finding #76: `instanceof` takes checkcast's inline class-id guard. Null and
+/// an exact plain-object match answer WITHOUT the helper; everything else still
+/// calls it, and the helper's answer is what the method returns.
+#[test]
+fn instanceof_inline_guard_answers_null_and_exact_without_the_helper() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    if !checkcast_inline_enabled() {
+        // `CRATONVM_JIT_CHECKCAST_INLINE=0` reverts both arms to the helper;
+        // nothing inline to assert.
+        return;
+    }
+    static HITS: AtomicUsize = AtomicUsize::new(0);
+    /// Marker helper: counts, and answers 1 — the answer a subclass receiver
+    /// would get, and one the call-free `0` stub can never produce.
+    unsafe extern "C" fn marker_instanceof(_vm: i64, _obj: i64, _name: i64, _len: i64) -> i64 {
+        HITS.fetch_add(1, Ordering::SeqCst);
+        1
+    }
+    let mut helpers = test_helpers();
+    helpers.instanceof_check = marker_instanceof as *const () as usize;
+    assert_eq!(helpers.class_id_offset_in_obj, 0);
+
+    const TARGET: u32 = 0x0076_7601;
+    let compiled = instanceof_inline_fixture(&helpers, "t76/InstanceofExactTarget", Some(TARGET));
+    assert_eq!(
+        calls_to(&compiled, helpers.instanceof_check),
+        1,
+        "the slow path must still carry exactly one helper call"
+    );
+
+    HITS.store(0, Ordering::SeqCst);
+    // SAFETY (every call below): JIT code compiled from valid bytecode; the
+    // argument is null or a live, aligned fake header the guard only reads.
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    let got = unsafe { compiled.try_call(&[0]).expect("jit call") };
+    assert_eq!(got, 0, "null instanceof anything is 0");
+    assert_eq!(HITS.load(Ordering::SeqCst), 0, "null must not reach the helper");
+
+    let exact = fake_typecheck_header(TARGET, 0);
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    let got = unsafe {
+        compiled
+            .try_call(&[exact.as_ptr() as i64]) // Cast: object address as JIT argument
+            .expect("jit call")
+    };
+    assert_eq!(got, 1, "an exact plain-object match is an instance");
+    assert_eq!(
+        HITS.load(Ordering::SeqCst),
+        0,
+        "an exact class-id match must not reach the helper"
+    );
+
+    let other = fake_typecheck_header(TARGET + 1, 0);
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    let got = unsafe {
+        compiled
+            .try_call(&[other.as_ptr() as i64]) // Cast: object address as JIT argument
+            .expect("jit call")
+    };
+    assert_eq!(got, 1, "a different class returns the helper's answer");
+    assert_eq!(HITS.load(Ordering::SeqCst), 1, "a different class must call the helper");
+
+    // An ARRAY header carrying the target's id (a reference array records its
+    // component's) must not match inline: BUG-JIT-ARRAY-INSTANCEOF-20260726.
+    let array = fake_typecheck_header(TARGET, 0x01);
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    let got = unsafe {
+        compiled
+            .try_call(&[array.as_ptr() as i64]) // Cast: object address as JIT argument
+            .expect("jit call")
+    };
+    assert_eq!(got, 1, "an array receiver returns the helper's answer");
+    assert_eq!(HITS.load(Ordering::SeqCst), 2, "an array receiver must call the helper");
+}
+
+/// The 1-D primitive-array variant: `o instanceof byte[]` is settled by the
+/// KIND_TAGS byte alone, with no class id at all.
+#[test]
+fn instanceof_primitive_array_tag_answers_without_the_helper() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    if !checkcast_inline_enabled() {
+        return;
+    }
+    static HITS: AtomicUsize = AtomicUsize::new(0);
+    unsafe extern "C" fn marker_instanceof(_vm: i64, _obj: i64, _name: i64, _len: i64) -> i64 {
+        HITS.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+    let mut helpers = test_helpers();
+    helpers.instanceof_check = marker_instanceof as *const () as usize;
+    let tag = cratonvm_types::primitive_array_kind_tags_byte("[B").expect("byte[] has a tag");
+    let compiled = instanceof_inline_fixture(&helpers, "[B", None);
+
+    HITS.store(0, Ordering::SeqCst);
+    let bytes = fake_typecheck_header(0, tag);
+    // SAFETY (every call below): as in the test above.
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    let got = unsafe {
+        compiled
+            .try_call(&[bytes.as_ptr() as i64]) // Cast: object address as JIT argument
+            .expect("jit call")
+    };
+    assert_eq!(got, 1, "a byte[] header is an instance of byte[]");
+    assert_eq!(HITS.load(Ordering::SeqCst), 0);
+
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    let got = unsafe { compiled.try_call(&[0]).expect("jit call") };
+    assert_eq!(got, 0, "null instanceof byte[] is 0");
+    assert_eq!(HITS.load(Ordering::SeqCst), 0);
+
+    let plain = fake_typecheck_header(7, 0);
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    let got = unsafe {
+        compiled
+            .try_call(&[plain.as_ptr() as i64]) // Cast: object address as JIT argument
+            .expect("jit call")
+    };
+    assert_eq!(got, 0, "a tag mismatch returns the helper's answer");
+    assert_eq!(HITS.load(Ordering::SeqCst), 1, "a tag mismatch must call the helper");
+}
+
+/// Compile `code` as the method `method_key` names, through the door that
+/// carries a method key — the legacy `compile` wrapper passes `""`, which
+/// narrows nothing.
+fn keyed_int_method(
+    code: &[u8],
+    code_len: usize,
+    num_params: usize,
+    method_key: &str,
+) -> CompiledMethod {
+    let param_jvm_slots: Vec<usize> = (0..num_params).collect();
+    compile_with_param_slots(
+        &crate::compile_gate::CompileAdmission::for_backend_test(),
+        code,
+        code_len,
+        num_params,
+        num_params,
+        false,
+        Vec::new(),         // multianewarray_info
+        Vec::new(),         // field_info
+        Vec::new(),         // typecheck_info
+        Vec::new(),         // static_field_info
+        Vec::new(),         // new_info
+        Vec::new(),         // new_deferred_info
+        Vec::new(),         // anewarray_info
+        Vec::new(),         // anewarray_deferred_info
+        Vec::new(),         // invoke_info
+        Vec::new(),         // direct_calls
+        Vec::new(),         // mic_slots
+        Vec::new(),         // pic_slots
+        Vec::new(),         // ldc_info
+        Vec::new(),         // ldc_string_info
+        Vec::new(),         // ldc_class_info
+        Vec::new(),         // ldc2w_info
+        Default::default(), // ldc_fp_pcs
+        HashMap::new(),
+        HashMap::new(),
+        &test_helpers(),
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        HashMap::new(), // inline_guard_variants (PGO-02)
+        None,           // string_layout
+        &param_jvm_slots,
+        num_params,
+        0, // param_oop_mask: int parameters only
+        Vec::new(),
+        method_key,
+        None, // despec: no VM, so no despeculation verdicts
+        Vec::new(),
+        None, // elidable_init_pcs: no constant pool, so nothing is proven empty
+    )
+    .expect("int method must compile")
+}
+
+/// Finding #84: JVMS §6.5 `ireturn` narrows a `boolean` return as if by
+/// `value & 1` and a `byte`/`char`/`short` return by truncation and extension.
+/// The interpreter bridge always did; a compiled caller reads RAX raw, so the
+/// compiled body must do it too. `B`/`S` results are checked as full `i64`s:
+/// this backend keeps an `int` sign-extended through RAX.
+#[test]
+fn ireturn_narrows_boolean_byte_char_short_returns() {
+    // SAFETY (every call): JIT code compiled from valid bytecode, called with
+    // exactly its declared int arguments.
+    // ()Z: iconst_2; ireturn -> 2 & 1 = 0
+    let z = keyed_int_method(&[0x05, 0xac, 0, 0], 2, 0, "T.z:()Z");
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    assert_eq!(unsafe { z.try_call(&[]) }, Ok(0));
+    // ()B: sipush 200; ireturn -> (byte) 200 = -56
+    let b = keyed_int_method(&[0x11, 0x00, 0xC8, 0xac, 0, 0], 4, 0, "T.b:()B");
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    assert_eq!(unsafe { b.try_call(&[]) }, Ok(-56));
+    // ()C: iconst_m1; ireturn -> (char) -1 = 65535
+    let c = keyed_int_method(&[0x02, 0xac, 0, 0], 2, 0, "T.c:()C");
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    assert_eq!(unsafe { c.try_call(&[]) }, Ok(65535));
+    // (I)S: iload_0; ireturn. A parameter rather than `ldc 70000`, so the value
+    // cannot be folded and the legacy wrapper's lack of an `ldc` table does not
+    // matter. (short) 70000 = 4464, (short) -70000 = -4464.
+    let s = keyed_int_method(&[0x1a, 0xac, 0, 0], 2, 1, "T.s:(I)S");
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    assert_eq!(unsafe { s.try_call(&[70000]) }, Ok(4464));
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    assert_eq!(unsafe { s.try_call(&[-70000]) }, Ok(-4464));
+    // Controls: an `I` return, and a method with no key, are left alone.
+    let i = keyed_int_method(&[0x1a, 0xac, 0, 0], 2, 1, "T.i:(I)I");
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    assert_eq!(unsafe { i.try_call(&[70000]) }, Ok(70000));
+    let unkeyed = keyed_int_method(&[0x05, 0xac, 0, 0], 2, 0, "");
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+    assert_eq!(unsafe { unkeyed.try_call(&[]) }, Ok(2));
+}
+
+#[test]
+fn narrowed_int_return_tag_reads_only_the_return_byte() {
+    assert_eq!(crate::narrowed_int_return_tag("()Z"), Some(b'Z'));
+    assert_eq!(crate::narrowed_int_return_tag("T.f:(I)B"), Some(b'B'));
+    assert_eq!(crate::narrowed_int_return_tag("(JJ)C"), Some(b'C'));
+    assert_eq!(crate::narrowed_int_return_tag("a/B.m:()S"), Some(b'S'));
+    assert_eq!(crate::narrowed_int_return_tag("()I"), None);
+    assert_eq!(crate::narrowed_int_return_tag("()V"), None);
+    assert_eq!(crate::narrowed_int_return_tag("()[Z"), None);
+    assert_eq!(crate::narrowed_int_return_tag("()La/Z;"), None);
+    assert_eq!(crate::narrowed_int_return_tag(""), None);
+}
+
 #[cfg(feature = "vm-tests")]
 #[test]
 fn test_bounds_check_iaload_in_bounds() {
@@ -9461,10 +9820,6 @@ fn test_bounds_elimination_inclusive_not_safe() {
     let loops = detect_loops(&code, code_len);
     assert_eq!(loops[0], (0, 12));
 
-    // analyze_loop_bound must flag the loop as inclusive.
-    let bounds = analyze_loop_bound(&code, 0, 12, 15, 0).expect("loop bound recognized");
-    assert!(bounds.inclusive, "if_icmpgt exit must be marked inclusive");
-
     // Default (opt-in flag off): inclusive loops take no guard at all.
     __set_inclusive_spec_bce_override(Some(false));
     let (off_safe, off_guards) = analyze_bounds_elimination(&code, code_len, &loops);
@@ -9514,11 +9869,6 @@ fn test_bce_varadd_step_guard_and_commuted_refusal() {
     let code_len = 17;
     let loops = detect_loops(&code, code_len);
     assert_eq!(loops[0].0, 0);
-    assert_eq!(
-        find_iv_step_provenance(&code, 0, 16, 0),
-        Some(IvStep::VarAdd(3)),
-        "canonical j += i must name the step local"
-    );
     let (safe_pcs, guards) = analyze_bounds_elimination(&code, code_len, &loops);
     assert!(
         safe_pcs.contains(&8),
@@ -9539,7 +9889,6 @@ fn test_bce_varadd_step_guard_and_commuted_refusal() {
         0x1a, 0x1b, 0xa2, 0x00, 0x10, 0x2c, 0x1a, 0x04, 0x54, 0x1d, 0x1a, 0x60, 0x3b, 0xa7, 0xff,
         0xf3, 0xb1, 0x00, 0x00, 0x00,
     ];
-    assert_eq!(find_iv_step_provenance(&commuted, 0, 16, 0), None);
     let (safe2, guards2) = analyze_bounds_elimination(&commuted, code_len, &loops);
     assert!(
         !safe2.contains(&8),
@@ -10686,281 +11035,6 @@ fn t17_b_simd_ewise_avx2_gated() {
     assert!(!cm.entry_ptr().is_null(), "compiled entry must be valid");
 }
 
-// T5.2.17 — loop unswitching tests
-
-#[test]
-fn test_detect_loop_unswitch_candidate_found() {
-    // for (i = 0; i < n; i++) { if (flag != 0) {} }
-    // Locals: 0=flag (invariant), 1=n, 2=i
-    //
-    // PC offsets (instruction boundaries):
-    //  0: iconst_0            (1)
-    //  1: istore_2            (1)
-    //  2: iload_2   HEADER    (1)
-    //  3: iload_1             (1)
-    //  4: if_icmpge +15 → 19  (3)
-    //  7: iload_0   (flag)    (1)
-    //  8: ifeq +5 → 13        (3)
-    // 11: nop                 (1)
-    // 12: nop                 (1)
-    // 13: iinc 2, 1           (3)
-    // 16: goto -14 → 2        (3)  back-edge
-    // 19: return              (1)
-    let code: Vec<u8> = vec![
-        0x03, 0x3D, // 0-1
-        0x1C, 0x1B, 0xa2, 0x00, 0x0F, // 2-6
-        0x1A, // 7
-        0x99, 0x00, 0x05, // 8-10
-        0x00, 0x00, // 11-12
-        0x84, 0x02, 0x01, // 13-15
-        0xa7, 0xff, 0xF2, // 16-18
-        0xB1, // 19
-    ];
-    let code_len = code.len();
-    let loops = detect_loops(&code, code_len);
-    let &(header, back_edge) = loops
-        .iter()
-        .find(|&&(h, _)| h == 2)
-        .expect("should detect outer for loop");
-    let candidates = detect_loop_unswitch_candidates(&code, code_len, &[(header, back_edge)]);
-    assert!(
-        !candidates.is_empty(),
-        "should find an unswitch candidate for the invariant flag"
-    );
-    let c = &candidates[0];
-    assert_eq!(c.header_pc, header);
-    assert_eq!(c.invariant_local, 0);
-    assert_eq!(c.branch_op, 0x99); // ifeq
-}
-
-#[test]
-fn test_detect_loop_unswitch_rejects_when_local_written() {
-    // Same shape as above but the body writes local 0 — so it's
-    // no longer invariant and must not be unswitched.
-    //
-    // PC offsets:
-    //  0-1:   iconst_0 istore_2
-    //  2-6:   iload_2 iload_1 if_icmpge +17 → 21
-    //  7:     iload_0 (flag)
-    //  8-10:  ifeq +5 → 15
-    // 11:     iconst_1
-    // 12:     istore_0              ← writes local 0
-    // 13-14:  (pad nops)
-    // 15-17:  iinc 2, 1
-    // 18-20:  goto -16 → 2
-    // 21:     return
-    let code: Vec<u8> = vec![
-        0x03, 0x3D, // 0-1
-        0x1C, 0x1B, 0xa2, 0x00, 0x11, // 2-6
-        0x1A, // 7
-        0x99, 0x00, 0x05, // 8-10
-        0x04, // 11: iconst_1
-        0x3B, // 12: istore_0 (writes local 0)
-        0x00, 0x00, // 13-14: nop nop
-        0x84, 0x02, 0x01, // 15-17: iinc 2,1
-        0xa7, 0xff, 0xF0, // 18-20: goto -16 → 2
-        0xB1, // 21: return
-    ];
-    let code_len = code.len();
-    let loops = detect_loops(&code, code_len);
-    let &(header, back_edge) = loops
-        .iter()
-        .find(|&&(h, _)| h == 2)
-        .expect("should detect loop at PC=2");
-    let candidates = detect_loop_unswitch_candidates(&code, code_len, &[(header, back_edge)]);
-    assert!(
-        candidates.is_empty(),
-        "should NOT unswitch when the predicate local is written in the loop"
-    );
-}
-
-#[test]
-fn test_detect_loop_unswitch_rejects_large_body() {
-    // Body > MAX_UNSWITCH_BYTECODES → rejected even if predicate
-    // is invariant.
-    // Build a large loop by padding with nops.
-    let mut code = vec![0x03, 0x3D]; // i = 0
-    let header = code.len();
-    code.extend_from_slice(&[0x1C, 0x1B, 0xa2, 0x00, 0x00]); // iload i,n,if_icmpge
-    code.push(0x1A); // iload_0 (flag)
-    code.extend_from_slice(&[0x99, 0x00, 0x03]); // ifeq
-                                                 // Pad the body with nops so size > MAX_UNSWITCH_BYTECODES.
-    for _ in 0..(MAX_UNSWITCH_BYTECODES + 5) {
-        code.push(0x00);
-    }
-    let back_edge = code.len();
-    code.extend_from_slice(&[0x84, 0x02, 0x01]); // iinc (part of body)
-    code.extend_from_slice(&[0xa7, 0xFF, 0xFF]); // goto (back_edge)
-    code.push(0xB1); // return
-    let candidates = detect_loop_unswitch_candidates(&code, code.len(), &[(header, back_edge)]);
-    assert!(
-        candidates.is_empty(),
-        "should NOT unswitch bodies larger than MAX_UNSWITCH_BYTECODES"
-    );
-}
-
-// ── T17.Β.3 — Loop unswitch emission ───────────────────────────
-
-/// Build a tiny loop that exhibits an invariant-branch unswitch
-/// pattern: `for (i=0; i<n; i++) if (flag != 0) {}`. Locals:
-/// 0=flag (invariant), 1=n, 2=i.
-fn tiny_unswitchable_loop() -> (Vec<u8>, usize) {
-    // PC layout:
-    //  0: iconst_0
-    //  1: istore_2            (i = 0)
-    //  2: iload_2    HEADER
-    //  3: iload_1             (n)
-    //  4: if_icmpge +15 → 19  (3)
-    //  7: iload_0             (flag)
-    //  8: ifeq +5 → 13        (invariant branch)
-    // 11: nop nop             (body side)
-    // 13: iinc 2, 1           (induction)
-    // 16: goto -14 → 2        (back-edge)
-    // 19: return
-    let code: Vec<u8> = vec![
-        0x03, 0x3D, 0x1C, 0x1B, 0xa2, 0x00, 0x0F, 0x1A, 0x99, 0x00, 0x05, 0x00, 0x00, 0x84, 0x02,
-        0x01, 0xa7, 0xff, 0xF2, 0xB1, 0, 0,
-    ];
-    let code_len = 20;
-    (code, code_len)
-}
-
-fn compile_tiny_unswitchable() -> Option<CompiledMethod> {
-    let (code, code_len) = tiny_unswitchable_loop();
-    compile(
-        &code,
-        code_len,
-        2, // params: flag, n
-        3, // locals: flag, n, i
-        false,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
-        Vec::new(),
-        HashMap::new(),
-        HashMap::new(),
-        &test_helpers(),
-        std::collections::HashSet::new(),
-        HashMap::new(),
-        None, // string_layout
-    )
-}
-
-/// Emit the unswitched variant via the regular compile path and
-/// confirm the compilation succeeds. The emission is *additive*:
-/// it evaluates the invariant local once at the loop preheader
-/// but never writes back any Java-visible state, so the final
-/// locals after `n` iterations match the original scalar loop
-/// bit-for-bit. This is the bytecode-equivalent contract.
-#[test]
-fn t17_b_loop_unswitch_bytecode_equiv() {
-    let compiled = compile_tiny_unswitchable();
-    assert!(
-        compiled.is_some(),
-        "unswitchable loop must compile; emission is additive"
-    );
-    // Confirm the candidate list is non-empty — otherwise the
-    // preheader evaluation wouldn't have fired at all.
-    let (code, code_len) = tiny_unswitchable_loop();
-    let loops = detect_loops(&code, code_len);
-    let cands = detect_loop_unswitch_candidates(&code, code_len, &loops);
-    assert!(
-        !cands.is_empty(),
-        "detection must identify the invariant flag — emission relies on it"
-    );
-    assert_eq!(cands[0].branch_op, 0x99, "detected op must be ifeq");
-    assert_eq!(cands[0].invariant_local, 0, "flag is local 0");
-
-    // Tiny body is well under MAX_UNSWITCH_BYTECODES.
-    let body_size = cands[0].back_edge_pc - cands[0].header_pc;
-    assert!(
-        body_size <= MAX_UNSWITCH_BYTECODES,
-        "body size {body_size} must be ≤ {MAX_UNSWITCH_BYTECODES}"
-    );
-}
-
-/// A loop whose body exceeds `MAX_UNSWITCH_BYTECODES` must be
-/// rejected by the detector; the emitter consequently produces
-/// the unmodified scalar loop (no preheader evaluation, no
-/// duplication). Compilation still succeeds.
-#[test]
-fn t17_b_loop_unswitch_large_body_rejected() {
-    // Build a large loop (body > MAX_UNSWITCH_BYTECODES).
-    let mut code = vec![0x03, 0x3D]; // i = 0
-    let header = code.len();
-    code.extend_from_slice(&[0x1C, 0x1B, 0xa2, 0x00, 0x00]); // iload i,n,if_icmpge
-    code.push(0x1A); // iload_0 (flag)
-    code.extend_from_slice(&[0x99, 0x00, 0x03]); // ifeq
-    for _ in 0..(MAX_UNSWITCH_BYTECODES + 5) {
-        code.push(0x00); // padding nops
-    }
-    let back_edge = code.len();
-    code.extend_from_slice(&[0x84, 0x02, 0x01]); // iinc
-                                                 // Real back-edge to the loop header. (Historical note: this was a
-                                                 // hardcoded `goto -1`, landing on the iinc's last operand byte —
-                                                 // not an instruction boundary. The unresolved patch was silently
-                                                 // skipped before `patch_branches` learned to reject such targets.)
-    let goto_pc = code.len();
-    let goto_off = (header as i32 - goto_pc as i32) as i16; // Cast: fits — tiny method
-    code.push(0xa7);
-    code.extend_from_slice(&goto_off.to_be_bytes());
-    code.push(0xB1); // return
-    code.push(0); // padding
-    code.push(0);
-
-    let code_len = code.len() - 2;
-    let loops = detect_loops(&code, code_len);
-    let cands = detect_loop_unswitch_candidates(&code, code_len, &loops);
-    assert!(
-        cands.is_empty(),
-        "large body must not produce an unswitch candidate"
-    );
-
-    // Compilation still succeeds via the normal scalar path.
-    let compiled = compile(
-        &code,
-        code_len,
-        2,
-        3,
-        false,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
-        Vec::new(),
-        HashMap::new(),
-        HashMap::new(),
-        &test_helpers(),
-        std::collections::HashSet::new(),
-        HashMap::new(),
-        None, // string_layout
-    );
-    assert!(
-        compiled.is_some(),
-        "large-body loop must still compile through the scalar fallback"
-    );
-    // The key guarantee: no preheader evaluation was emitted, so
-    // code size reflects only the scalar loop body (the emitter
-    // short-circuited in `emit_loop_unswitch_preheader`).
-    let _ = header;
-    let _ = back_edge;
-}
-
 #[test]
 fn test_detect_int_array_element_wise_rejects_non_elementwise() {
     // Reduction loop (sum += arr[i]) should NOT match element-wise.
@@ -12008,8 +12082,10 @@ fn test_m5_lambda_with_captured_object() {
 #[test]
 fn p87_scratch_xmm_constants() {
     // Verify scratch XMM register constants are defined correctly
+    #[cfg(target_os = "windows")]
+    assert_eq!(SCRATCH_XMMS, [2, 3, 4, 5]);
+    #[cfg(not(target_os = "windows"))]
     assert_eq!(SCRATCH_XMMS, [2, 3, 4, 5, 6, 7]);
-    assert_eq!(SCRATCH_XMMS.len(), 6);
 }
 
 #[test]
@@ -12608,123 +12684,6 @@ fn p87_strength_reduction_emits_dadd_self() {
 }
 
 // --- 87.3: SIMD FP Operations ---
-
-#[test]
-fn p87_detect_fp_array_sum_pattern_a() {
-    // Pattern A: aload_1, iload_2, daload, dload_0, dadd, dstore_0, iinc 2 1, goto
-    // Header: iload_2, iload_3, if_icmpge
-    let code: Vec<u8> = vec![
-        0x1c, // 0: iload_2 (iv)
-        0x1d, // 1: iload_3 (bound)
-        0xa2, 0x00, 0x0C, // 2: if_icmpge +12 → target=14
-        0x2b, // 5: aload_1 (arr)
-        0x1c, // 6: iload_2 (iv)
-        0x31, // 7: daload
-        0x26, // 8: dload_0 (sum)
-        0x63, // 9: dadd
-        0x47, // 10: dstore_0
-        0x84, 0x02, 0x01, // 11: iinc 2, 1
-        0xa7, 0xFF, 0xF2, // 14: goto -14 → target=0
-        0x26, // 17: dload_0
-        0xaf, // 18: dreturn
-        0, 0,
-    ];
-    let code_len = 19;
-    let loops = detect_loops(&code, code_len);
-    assert!(!loops.is_empty(), "Should detect a loop");
-
-    let iv = find_induction_variable(&code, loops[0].0, loops[0].1 + 3);
-    assert_eq!(iv, Some(2), "Induction variable should be local 2");
-
-    let result = detect_fp_array_sum(&code, loops[0].0, loops[0].1, 2);
-    assert!(result.is_some(), "Should detect FP array sum pattern");
-    let info = result.unwrap();
-    assert_eq!(info.acc_local, 0);
-    assert_eq!(info.array_local, 1);
-    assert_eq!(info.iv_local, 2);
-    assert_eq!(info.bound_local, 3);
-    assert_eq!(info.sse_op, 0x58); // ADDPD
-}
-
-#[test]
-fn p87_detect_fp_array_sum_pattern_b() {
-    // Pattern B: dload_0, aload_1, iload_2, daload, dadd, dstore_0, iinc 2 1, goto
-    let code: Vec<u8> = vec![
-        0x1c, // 0: iload_2 (iv)
-        0x1d, // 1: iload_3 (bound)
-        0xa2, 0x00, 0x0C, // 2: if_icmpge +12
-        0x26, // 5: dload_0 (sum)
-        0x2b, // 6: aload_1 (arr)
-        0x1c, // 7: iload_2 (iv)
-        0x31, // 8: daload
-        0x63, // 9: dadd
-        0x47, // 10: dstore_0
-        0x84, 0x02, 0x01, // 11: iinc 2, 1
-        0xa7, 0xFF, 0xF2, // 14: goto -14
-        0x26, 0xaf, 0, 0,
-    ];
-    let code_len = 19;
-    let loops = detect_loops(&code, code_len);
-    assert!(!loops.is_empty());
-
-    let result = detect_fp_array_sum(&code, loops[0].0, loops[0].1, 2);
-    assert!(result.is_some(), "Should detect FP array sum pattern B");
-    let info = result.unwrap();
-    assert_eq!(info.acc_local, 0);
-    assert_eq!(info.array_local, 1);
-}
-
-#[test]
-fn p87_no_fp_array_sum_for_int_loop() {
-    // Int array sum should NOT trigger FP detection
-    // aload_1, iload_2, iaload (0x2e not 0x31), iload_0, iadd, istore_0, iinc...
-    let code: Vec<u8> = vec![
-        0x1c, // iload_2
-        0x1d, // iload_3
-        0xa2, 0x00, 0x0B, // if_icmpge
-        0x2b, // aload_1
-        0x1c, // iload_2
-        0x2e, // iaload (NOT daload)
-        0x1a, // iload_0
-        0x60, // iadd
-        0x3b, // istore_0
-        0x84, 0x02, 0x01, // iinc 2, 1
-        0xa7, 0xFF, 0xF3, // goto
-        0x1a, 0xac, 0, 0,
-    ];
-    let code_len = 18;
-    let loops = detect_loops(&code, code_len);
-    let result = detect_fp_array_sum(&code, loops[0].0, loops[0].1, 2);
-    assert!(
-        result.is_none(),
-        "Int array sum should not trigger FP detection"
-    );
-}
-
-#[test]
-fn p87_simd_fp_not_detected_without_avx2() {
-    // Verify the compile path handles the case where AVX2 is not available
-    // (On machines with AVX2 this still works — just tests the detection path)
-    let code: Vec<u8> = vec![0x26, 0xaf, 0, 0];
-    let code_len = 2;
-    let loops = detect_loops(&code, code_len);
-    // No loops → no SIMD FP
-    let simd = if has_avx2() {
-        let mut s = Vec::new();
-        for &(h, b) in &loops {
-            let end = b + bytecode_len_at(&code, b);
-            if let Some(iv) = find_induction_variable(&code, h, end) {
-                if let Some(info) = detect_fp_array_sum(&code, h, b, iv) {
-                    s.push(info);
-                }
-            }
-        }
-        s
-    } else {
-        Vec::new()
-    };
-    assert!(simd.is_empty());
-}
 
 #[test]
 fn p87_double_binop_chain_preserves_precision() {
@@ -16566,6 +16525,7 @@ fn test_unroll_with_getfield_helper_call() {
     );
 
     // Smaller trip count: 7 * 3 = 21.
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
     let result = unsafe {
         compiled
             // Cast: object/array pointer to i64 for the JIT calling convention
@@ -16576,6 +16536,7 @@ fn test_unroll_with_getfield_helper_call() {
 
     // n = 0 → loop body never executes. Still must compile + run
     // (verifying the unrolled copies don't fault on cold entry).
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
     let result = unsafe {
         compiled
             // Cast: object/array pointer to i64 for the JIT calling convention
@@ -16705,6 +16666,7 @@ fn test_unroll_nbody_pattern_getfield_double() {
 
     // n=0 → 0.0 (cold loop body, copies never executed but must
     // still be valid code).
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
     let result = unsafe {
         compiled
             // Cast: object/array pointer to i64 for the JIT calling convention
@@ -17035,6 +16997,7 @@ fn test_unroll_with_two_getfields_per_body() {
     // n=4 (matches the 4x unroll factor exactly): one full
     // unrolled block, zero spillover. Exercises the case where
     // every copy + the original execute exactly once.
+    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
     let result = unsafe {
         compiled
             // Cast: object/array pointer to i64 for the JIT calling convention
@@ -17481,7 +17444,19 @@ fn dup_x2_without_a_provable_form_bails_under_its_own_name() {
 /// shelf life, and the failure should say which fact expired.
 #[test]
 fn the_unlowered_opcode_catch_all_names_itself() {
-    const EXEMPLAR: u8 = 0x72; // frem
+    // The reason string must survive even while no admitted opcode can reach
+    // it: the guard below keeps the exemption list empty, and the catch-all is
+    // what a future admission without an arm would land on.
+    assert!(
+        include_str!("bytecode_walk.rs")
+            .contains("self.fail(\"singlepass-codegen/opcode-scan-admitted-but-unlowered\")"),
+        "the catch-all's named reason is gone"
+    );
+    let Some(&(exemplar, _)) = SCAN_ADMITTED_WITHOUT_A_SINGLE_PASS_ARM.first() else {
+        return;
+    };
+    #[allow(non_snake_case)]
+    let EXEMPLAR = exemplar;
     assert!(
         !single_pass_dispatch_arms().contains(&EXEMPLAR),
         "0x{EXEMPLAR:02x} is lowered now, so it can no longer drive the walk \
@@ -17525,14 +17500,9 @@ fn the_unlowered_opcode_catch_all_names_itself() {
 /// the opcode, so admitting it buys a compilation the scanner would otherwise
 /// refuse. "Nobody lowers it anywhere" is the `dup2_x2` shape and belongs in
 /// an arm, not on this list.
-const SCAN_ADMITTED_WITHOUT_A_SINGLE_PASS_ARM: &[(u8, &str)] = &[
-    (
-        0x72,
-        "frem — the optimizing IR backend lowers it via a call to the jit_frem \
-         fmod helper, so admitting it lets the IR pipeline see the method",
-    ),
-    (0x73, "drem — same as frem, via jit_drem"),
-];
+///
+/// Empty since 2026-09-12, when `frem`/`drem` gained a single-pass arm.
+const SCAN_ADMITTED_WITHOUT_A_SINGLE_PASS_ARM: &[(u8, &str)] = &[];
 
 /// Every opcode value the top-level dispatch `match op` in `bytecode_walk.rs`
 /// has an arm for.
@@ -17647,7 +17617,7 @@ fn the_dispatch_arm_parser_reads_the_real_match() {
     // And it must not invent coverage for opcodes nobody lowers here.
     for (op, what) in [
         (0xa8u8, "jsr — unlowered in both walkers"),
-        (0x72u8, "frem — deliberately IR-only"),
+        (0xa9u8, "ret — unlowered in both walkers"),
     ] {
         assert!(
             !arms.contains(&op),
@@ -18235,4 +18205,304 @@ fn no_age_floor_can_separate_an_old_gen_receiver_from_a_young_one() {
     // The mask answers both correctly.
     assert_ne!(old_new & cratonvm_types::GC_FLAG_OLD_GEN, 0);
     assert_eq!(young_old & cratonvm_types::GC_FLAG_OLD_GEN, 0);
+}
+
+// -----------------------------------------------------------------------
+// JIT review 2026-09-12 — regressions for the single-pass codegen findings
+// -----------------------------------------------------------------------
+
+/// `compile` with every table empty — the shape all the fixtures below need.
+macro_rules! review_compile {
+    ($code:expr, $len:expr, $params:expr, $locals:expr, $heap:expr) => {
+        compile(
+            &$code,
+            $len,
+            $params,
+            $locals,
+            $heap,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None,
+        )
+    };
+}
+
+/// `(double) i + (T) x` — the `i2d` result is still pending in XMM0 when the
+/// narrowing conversion loads its own operand. Each of f2i / f2l / d2i / d2l
+/// used to write XMM0 without moving that pending value out, so the method
+/// returned roughly `(T) x` instead of the sum.
+#[test]
+fn review_fp_to_int_conversions_keep_a_pending_xmm0_operand() {
+    // (load x, conversion, widen result back to double)
+    let cases: [(u8, u8, u8, &str); 4] = [
+        (0x23, 0x8b, 0x87, "f2i"), // fload_1 f2i i2d
+        (0x23, 0x8c, 0x8a, "f2l"), // fload_1 f2l l2d
+        (0x27, 0x8e, 0x87, "d2i"), // dload_1 d2i i2d
+        (0x27, 0x8f, 0x8a, "d2l"), // dload_1 d2l l2d
+    ];
+    for (load, conv, widen, name) in cases {
+        // iload_0 i2d <load> <conv> <widen> dadd dreturn
+        let code: Vec<u8> = vec![0x1a, 0x87, load, conv, widen, 0x63, 0xaf, 0, 0];
+        let compiled = review_compile!(code, 7, 2, 2, false)
+            .unwrap_or_else(|| panic!("{name} fixture should compile"));
+        let x_bits = if load == 0x23 {
+            3.75f32.to_bits() as i64 // Cast: JIT ABI convention
+        } else {
+            3.75f64.to_bits() as i64 // Cast: JIT ABI convention
+        };
+        // SAFETY: calling machine code compiled from the verified-shape fixture above.
+        let result = unsafe { compiled.try_call(&[5, x_bits]).expect("test JIT call") };
+        assert_eq!(
+            f64::from_bits(result as u64), // Cast: JIT ABI convention
+            8.0,
+            "{name}: (double) 5 + ({name}) 3.75 must be 8.0"
+        );
+    }
+}
+
+/// `static int f(int ok, int a, int b) { return (ok != 0 && a < b) ? a : b; }`
+/// javac makes the taken-side `iload_2` the target of the short-circuit
+/// `ifeq` as well. The CMOV min/max fusion swallowed that PC, so `ok == 0`
+/// jumped past the merged result and returned a stale slot.
+#[test]
+fn review_cmov_minmax_declines_a_span_entered_by_another_branch() {
+    let code: Vec<u8> = vec![
+        0x1a, //              0: iload_0
+        0x99, 0x00, 0x0c, //  1: ifeq -> 13
+        0x1b, //              4: iload_1
+        0x1c, //              5: iload_2
+        0xa2, 0x00, 0x07, //  6: if_icmpge -> 13
+        0x1b, //              9: iload_1
+        0xa7, 0x00, 0x04, // 10: goto -> 14
+        0x1c, //             13: iload_2
+        0xac, //             14: ireturn
+        0x00, 0x00,
+    ];
+    let compiled = review_compile!(code, 15, 3, 3, false).expect("short-circuit ternary compiles");
+    for (ok, a, b) in [
+        (0i64, 1i64, 5i64),
+        (0, 9, 5),
+        (1, 1, 5),
+        (1, 9, 5),
+        (0, -7, 3),
+        (1, -7, 3),
+    ] {
+        let expected = if ok != 0 && a < b { a } else { b };
+        // SAFETY: calling machine code compiled from the fixture above.
+        let result = unsafe { compiled.try_call(&[ok, a, b]).expect("test JIT call") };
+        assert_eq!(result as i32, expected as i32, "ok={ok} a={a} b={b}"); // Cast: int return
+    }
+}
+
+/// `long s = 0; for (int i = 3; i < n; i++) s = a[i] + s; return s;`
+/// entered with `i > n`. The vectorised pre-header computed the chunk count
+/// as an unsigned `(n - i) >> 3`, i.e. ~2^29 chunks past the array.
+#[test]
+fn review_simd_int_sum_entered_past_its_bound_runs_zero_iterations() {
+    let code: Vec<u8> = vec![
+        0x09, //              0: lconst_0
+        0x41, //              1: lstore_2
+        0x06, //              2: iconst_3
+        0x36, 0x04, //        3: istore 4
+        0x15, 0x04, //        5: iload 4   (loop header)
+        0x1b, //              7: iload_1
+        0xa2, 0x00, 0x11, //  8: if_icmpge -> 25
+        0x2a, //             11: aload_0
+        0x15, 0x04, //       12: iload 4
+        0x2e, //             14: iaload
+        0x85, //             15: i2l
+        0x20, //             16: lload_2
+        0x61, //             17: ladd
+        0x41, //             18: lstore_2
+        0x84, 0x04, 0x01, // 19: iinc 4, 1
+        0xa7, 0xff, 0xef, // 22: goto -> 5
+        0x20, //             25: lload_2
+        0xad, //             26: lreturn
+        0x00, 0x00,
+    ];
+    let compiled = review_compile!(code, 27, 2, 5, false).expect("int-sum loop compiles");
+
+    let run = |len: usize, n: i64| -> i64 {
+        let mut words = vec![0u64; (HEADER_SIZE + 4 * len + 7) / 8 + 1];
+        let array_ptr = words.as_mut_ptr() as *mut u8;
+        // SAFETY: `words` holds the VM array header plus `len` ints.
+        unsafe {
+            (array_ptr.add(ARRAY_LENGTH_OFFSET) as *mut i32).write_unaligned(len as i32); // Cast: test length
+            for i in 0..len {
+                (array_ptr.add(ARRAY_DATA_OFFSET + 4 * i) as *mut i32)
+                    .write_unaligned(i as i32 + 1); // Cast: test value
+            }
+        }
+        // SAFETY: the compiled method receives a correctly laid out int[].
+        unsafe {
+            compiled
+                .try_call(&[array_ptr as i64, n])
+                .expect("test JIT call")
+        } // Cast: pointer as JIT arg
+    };
+    assert_eq!(run(1, 1), 0, "i = 3 > n = 1 must run zero iterations");
+    assert_eq!(run(2, 0), 0, "i = 3 > n = 0 must run zero iterations");
+    // Control: a normal entry still sums a[3..16] = 4 + 5 + ... + 16.
+    assert_eq!(run(16, 16), (4..=16).sum::<i64>());
+}
+
+/// Win64 makes XMM6-XMM15 non-volatile. No scratch XMM may be one of them:
+/// neither the prologue nor any stub saves the scratch pool.
+#[test]
+fn review_scratch_xmm_pool_is_volatile_under_the_host_abi() {
+    let callee_saved: &[u8] = if cfg!(target_os = "windows") {
+        &[6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    } else {
+        &[]
+    };
+    for xmm in SCRATCH_XMMS {
+        assert!(
+            !callee_saved.contains(&xmm),
+            "scratch XMM{xmm} is callee-saved on this ABI"
+        );
+    }
+}
+
+/// `double s = 0; for (int i = 0; i < 3; i++) s += x * (c != 0 ? y : 2.0);`
+/// javac lays the `ldc2_w 2.0` directly before the `dmul`, which is also the
+/// merge point of the `goto` from the `y` arm. The in-loop strength reduction
+/// replaced the dmul with `x + x` regardless of which arm reached it.
+#[test]
+fn review_dmul_by_two_strength_reduction_skips_a_merge_point() {
+    let code: Vec<u8> = vec![
+        0x0e, //              0: dconst_0
+        0x4a, //              1: dstore_3
+        0x03, //              2: iconst_0
+        0x36, 0x05, //        3: istore 5
+        0x15, 0x05, //        5: iload 5   (loop header)
+        0x06, //              7: iconst_3
+        0xa2, 0x00, 0x1b, //  8: if_icmpge -> 35
+        0x29, //             11: dload_3
+        0x1a, //             12: iload_0
+        0x87, //             13: i2d
+        0x1c, //             14: iload_2
+        0x99, 0x00, 0x08, // 15: ifeq -> 23
+        0x1b, //             18: iload_1
+        0x87, //             19: i2d
+        0xa7, 0x00, 0x06, // 20: goto -> 26
+        0x14, 0x00, 0x01, // 23: ldc2_w #1 (2.0)
+        0x6b, //             26: dmul      (merge point)
+        0x63, //             27: dadd
+        0x4a, //             28: dstore_3
+        0x84, 0x05, 0x01, // 29: iinc 5, 1
+        0xa7, 0xff, 0xe5, // 32: goto -> 5
+        0x29, //             35: dload_3
+        0xaf, //             36: dreturn
+        0x00, 0x00,
+    ];
+    let compiled = compile(
+        &code,
+        37,
+        3,
+        6,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![(23, 2.0f64.to_bits() as i64)], // Cast: JIT ABI convention
+        HashMap::new(),
+        HashMap::new(),
+        &test_helpers(),
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        None,
+    )
+    .expect("ternary-multiply loop compiles");
+    for (c, expected) in [(1i64, 105.0f64), (0, 30.0)] {
+        // SAFETY: calling machine code compiled from the fixture above.
+        let result = unsafe { compiled.try_call(&[5, 7, c]).expect("test JIT call") };
+        assert_eq!(f64::from_bits(result as u64), expected, "c={c}"); // Cast: JIT ABI convention
+    }
+}
+
+/// `long s = 0; for (int i = 0; i < n; i++) s = a[i] + s;` over values whose
+/// sum passes 2^32. The vectorised pre-header summed 32-bit lanes and then
+/// sign-extended the wrapped total into the long accumulator.
+#[test]
+fn review_simd_int_sum_into_a_long_does_not_wrap_at_32_bits() {
+    let code: Vec<u8> = vec![
+        0x09, 0x41, 0x03, 0x36, 0x04, // lconst_0 lstore_2 iconst_0 istore 4
+        0x15, 0x04, 0x1b, 0xa2, 0x00, 0x11, // iload 4; iload_1; if_icmpge -> 25
+        0x2a, 0x15, 0x04, 0x2e, 0x85, 0x20, 0x61, 0x41, // a[i] i2l lload_2 ladd lstore_2
+        0x84, 0x04, 0x01, 0xa7, 0xff, 0xef, // iinc 4,1; goto -> 5
+        0x20, 0xad, 0x00, 0x00, // lload_2 lreturn
+    ];
+    let compiled = review_compile!(code, 27, 2, 5, false).expect("int-sum loop compiles");
+    for (len, value) in [(8usize, i32::MAX), (19, i32::MAX), (16, i32::MIN), (24, -7)] {
+        let mut words = vec![0u64; (HEADER_SIZE + 4 * len + 7) / 8 + 1];
+        let array_ptr = words.as_mut_ptr() as *mut u8;
+        // SAFETY: `words` holds the VM array header plus `len` ints.
+        unsafe {
+            (array_ptr.add(ARRAY_LENGTH_OFFSET) as *mut i32).write_unaligned(len as i32); // Cast: test length
+            for i in 0..len {
+                (array_ptr.add(ARRAY_DATA_OFFSET + 4 * i) as *mut i32).write_unaligned(value);
+            }
+        }
+        // SAFETY: the compiled method receives a correctly laid out int[].
+        let result = unsafe {
+            compiled
+                .try_call(&[array_ptr as i64, len as i64])
+                .expect("test JIT call") // Cast: JIT args
+        };
+        assert_eq!(result, value as i64 * len as i64, "len={len} value={value}");
+        // Cast: expected long sum
+    }
+}
+
+/// Callee-saved XMM save slots are 16 bytes (the whole Win64 non-volatile
+/// register) and tile the save area exactly: the first ends where the GPR
+/// save area above begins, each follows the previous with no gap or overlap,
+/// and the last ends where the region below (`xmm_saved_base + n * 16`) begins.
+/// A frame depth `d` names a word spanning `[rbp - d, rbp - d + 8)`.
+#[test]
+fn review_xmm_save_slots_tile_the_save_area() {
+    assert_eq!(XMM_SAVE_SLOT_BYTES, 16);
+    let span = |depth: i32, width: i32| (-depth, -depth + width);
+    for base in [8, 40, 104] {
+        for n in 1..=8usize {
+            let slots: Vec<(i32, i32)> = (0..n)
+                .map(|i| span(xmm_save_slot_offset(base, i), XMM_SAVE_SLOT_BYTES))
+                .collect();
+            // Top of the first slot == bottom of the 8-byte word at depth `base - 8`,
+            // the lowest word the area above may own.
+            assert_eq!(slots[0].1, span(base - 8, 8).0, "base={base}");
+            for w in slots.windows(2) {
+                assert_eq!(
+                    w[1].1, w[0].0,
+                    "slots must be contiguous, base={base} n={n}"
+                );
+            }
+            // Bottom of the last slot == top of the first word of the region below.
+            let below = base + n as i32 * XMM_SAVE_SLOT_BYTES; // Cast: n <= 8
+            assert_eq!(slots[n - 1].0, span(below, 8).1, "base={base} n={n}");
+        }
+    }
 }

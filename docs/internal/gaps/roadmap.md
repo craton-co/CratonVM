@@ -791,7 +791,7 @@ The **critical milestone**: load real JDK classes instead of synthetic stubs.
 - Speculative BCE deopt stubs call jit_uncommon_trap, return i64::MIN sentinel
 - Interpreter detects deopt sentinel and falls through to re-execute in interpreter
 - DeoptimizationPoint metadata on CompiledMethod for frame reconstruction
-- InvalidationManager tracks class hierarchy assumptions
+- InvalidationManager tracks class hierarchy assumptions (deleted 2026-09-12: never fed; `inlined_methods` plus the cache invalidation log replace it)
 - **Tests:** 15 deopt tests (controller, escalation, invalidation, end-to-end, frame state)
 
 #### Session 37: JIT Floating-Point Completeness ✅ DONE

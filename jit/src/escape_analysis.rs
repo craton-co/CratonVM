@@ -37,13 +37,14 @@
 //!
 //! # What is actually consumed
 //!
-//! [`EscapeAnalysisResult`] has four outputs; `jit/src/lib.rs` reads only two:
+//! [`EscapeAnalysisResult`] has several outputs; production code in
+//! `jit/src/lib.rs` (`apply_ea_to_ir_pinned`) reads only two:
 //!
 //! | Field | Consumer | Status |
 //! |---|---|---|
-//! | `scalar_replaceable` | IR scalar replacement | live |
-//! | `elide_locks` | IR lock elision | live |
-//! | `lock_elisions` | — | the *correct* granularity of `elide_locks` |
+//! | `scalar_replaceable` | IR scalar replacement (`plan_scalar_replacement`) | live |
+//! | `lock_elisions` | IR lock elision, applied all-or-nothing per object | live |
+//! | `elide_locks` | tests + diagnostics | the flat view of `lock_elisions`; no production reader |
 //! | `lock_coarsening` | — | offered, no consumer yet |
 //! | `lock_refusals` | tests + diagnostics | informational |
 //! | `stack_allocatable` | — | **computed, never read** |
@@ -57,9 +58,13 @@
 //!
 //! * **elision** removes every monitor operation on a confined object. It is
 //!   offered per object ([`LockElisionPlan`]) because removing a strict subset
-//!   of a balanced monitor sequence is wrong code, and the consumer that reads
-//!   the flat [`EscapeAnalysisResult::elide_locks`] list can refuse individual
-//!   nodes.
+//!   of a balanced monitor sequence is wrong code. The production consumer
+//!   (`apply_ea_to_ir_pinned` in `jit/src/lib.rs`) reads those per-object plans
+//!   and refuses a whole object when any one of its monitors cannot be removed;
+//!   the flat [`EscapeAnalysisResult::elide_locks`] list is kept for tests and
+//!   diagnostics. A method that had monitors before elision is marked unable to
+//!   deopt-resume precisely (`had_monitors`, see
+//!   `docs/jit/lock-elimination.md` §8).
 //! * **coarsening** merges two adjacent lock regions on a confined object by
 //!   deleting the inner `monitorexit`/`monitorenter` pair
 //!   ([`LockCoarseningPlan`]). It depends on no elision having landed, so it is
@@ -115,11 +120,14 @@
 //! edges**. Without them there is no CFG here to build a dominator tree from.
 //!
 //! So the analysis uses program order — ascending [`NodeId`], which is creation
-//! order — as a stand-in, and gates that stand-in on
-//! [`program_order_proves_dominance`]: it is only sound in a graph with no
-//! branch, no join and no multi-input φ. Everything else resolves to
-//! [`LoadResolution::Unknown`] and the object is refused. Recovering precision
-//! means giving the EA graph real control edges — see `docs/jit/escape-analysis.md`.
+//! order — as a stand-in, and gates that stand-in per candidate on either
+//! [`program_order_proves_dominance`] (a graph with no branch, no join and no
+//! multi-input φ) or `one_block_proves_dominance` (the allocation and every
+//! access it folds share one basic block, as recorded in `Graph::blocks`, with
+//! no φ alias). Anything else with a store to a loaded field resolves to
+//! [`LoadResolution::Unknown`] and the object is refused. Recovering more
+//! precision means giving the EA graph real control edges — see
+//! `docs/jit/escape-analysis.md`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -1781,16 +1789,29 @@ fn find_scalar_replacements(
                         // genuinely also carrying that other object.  Folding a
                         // load through it would miscompile the path on which
                         // the phi takes the unknown reference.  Require every
-                        // *reference-producing* input to be a concrete alias of
-                        // this allocation (an allocation that is `id`, or
-                        // another transparent phi we have already accepted).
+                        // *value* input to be a concrete alias of this
+                        // allocation (an allocation that is `id`, or another
+                        // transparent phi we have already accepted).
+                        //
+                        // Only the control anchor may be skipped. This used to
+                        // skip anything `is_ref_producer` did not list, on the
+                        // theory that such an input "cannot carry a foreign
+                        // object" — but the EA graph is untyped, the bridge maps
+                        // the `aconst_null` literal to `Const(0)` and a
+                        // `checkcast` to `Other`, and both ARE references.
+                        // `p = c ? new Foo() : null; p.x` folded to 0 instead of
+                        // throwing, and `c ? new Foo() : (Foo) o` read the
+                        // allocation's default instead of `o.x`. A φ that uses
+                        // the allocation is a reference φ, so every value input
+                        // is a reference; a primitive or unmapped input simply
+                        // fails the singleton test and refuses.
                         let all_inputs_alias_id = use_node.inputs.iter().all(|&inp| {
-                            if !is_ref_producer(graph, inp) {
-                                // Non-reference (e.g. the Merge control input,
-                                // a primitive) cannot carry a foreign object.
+                            let Some(input) = graph.nodes.get(inp) else {
+                                return false;
+                            };
+                            if matches!(input.op, Op::Start | Op::Merge | Op::If) {
                                 return true;
                             }
-                            // Reference input: must resolve to exactly {id}.
                             let ip = cg.resolve_points_to(inp);
                             ip.len() == 1 && ip.contains(&id)
                         });
@@ -2267,7 +2288,10 @@ fn produces_no_reference(op: &Op) -> bool {
             | Op::Return
             | Op::If
             | Op::Merge
-            | Op::Const(_)
+            // NOT `Op::Const`: the bridge maps the `aconst_null` literal to a
+            // `Const(0)`, and `synchronized (c ? new Object() : null)` merged
+            // that with the allocation — treating the null as "no reference"
+            // let the lock be elided and dropped the NPE on the null path.
             | Op::Add
             | Op::Sub
             | Op::Mul
@@ -6474,5 +6498,77 @@ mod tests {
         let r = analyze_escapes(&g);
         assert_eq!(r.escape_states.get(&o), Some(&EscapeState::NoEscape));
         assert!(r.scalar_replaceable.iter().any(|s| s.alloc_node == o));
+    }
+}
+
+/// Regressions from the 2026-09-12 JIT review: a φ that merges the allocation
+/// with a reference the untyped EA graph does not list as a "reference
+/// producer" must still refuse to be a transparent copy.
+#[cfg(test)]
+mod phi_foreign_reference_tests {
+    use super::*;
+
+    /// `Foo p = c ? new Foo() : null; return p.x;` — the null literal reaches
+    /// the EA graph as `Const(0)`. Treating it as "not a reference" folded the
+    /// load to the field default (0) instead of throwing NPE.
+    #[test]
+    fn a_phi_merging_the_allocation_with_null_blocks_scalar_replacement() {
+        let mut g = Graph::new();
+        let null = g.add_node(Op::Const(0), vec![]);
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let _store = g.add_node(Op::Store(0), vec![alloc, c1]);
+        let phi = g.add_node(Op::Phi, vec![alloc, null]);
+        let _load = g.add_node(Op::Load(0), vec![phi]);
+
+        let result = analyze_escapes(&g);
+        assert!(
+            result
+                .scalar_replaceable
+                .iter()
+                .all(|s| s.alloc_node != alloc),
+            "a phi merging the allocation with the null literal must block scalar replacement"
+        );
+    }
+
+    /// `Foo p = c ? new Foo() : (Foo) o; return p.x;` — the `checkcast` reaches
+    /// the EA graph as `Other`.
+    #[test]
+    fn a_phi_merging_the_allocation_with_a_checkcast_blocks_scalar_replacement() {
+        let mut g = Graph::new();
+        let param = g.add_node(Op::Param(0), vec![]);
+        let cast = g.add_node(Op::Other, vec![param]);
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let _store = g.add_node(Op::Store(0), vec![alloc, c1]);
+        let phi = g.add_node(Op::Phi, vec![alloc, cast]);
+        let _load = g.add_node(Op::Load(0), vec![phi]);
+
+        let result = analyze_escapes(&g);
+        assert!(
+            result
+                .scalar_replaceable
+                .iter()
+                .all(|s| s.alloc_node != alloc),
+            "a phi merging the allocation with a checkcast result must block scalar replacement"
+        );
+    }
+
+    /// The null literal merged into a lock operand is a reference too.
+    #[test]
+    fn a_constant_is_not_assumed_to_produce_no_reference() {
+        assert!(!produces_no_reference(&Op::Const(0)));
     }
 }

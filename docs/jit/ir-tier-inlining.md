@@ -1,6 +1,9 @@
 # IR-tier inlining
 
-`CRATONVM_JIT_IR_INLINE=1`. Default OFF.
+`CRATONVM_JIT_IR_INLINE`. **Default ON since 2026-09-06**; `=0` is the kill
+switch and restores the pre-flip behaviour (no callee body is spliced). See the
+doc on `ir_inline_enabled` in `jit/src/lib.rs`. Sections below written while the
+flag was opt-in may still describe it that way.
 
 ## What it is for
 

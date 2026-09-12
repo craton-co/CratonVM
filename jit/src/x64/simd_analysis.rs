@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-//! SIMD loop analysis: vectorization, SuperWord, and loop unswitching.
+//! SIMD loop analysis: vectorization and SuperWord.
 //!
 //! Moved verbatim out of `x64.rs`'s `SIMD loop analysis and vectorization`
 //! section. Lint levels declared at the parent module level (including
@@ -362,161 +362,6 @@ pub(super) fn extract_dstore_local(code: &[u8], pc: usize) -> Option<usize> {
     }
 }
 
-/// Detect a vectorizable double-array-sum pattern in a loop body.
-/// Matches: dload_sum, aload_arr, iload_iv, daload, dadd, dstore_sum, iinc iv 1, goto
-/// Or:      aload_arr, iload_iv, daload, dload_sum, dadd, dstore_sum, iinc iv 1, goto
-pub(super) fn detect_fp_array_sum(
-    code: &[u8],
-    header: usize,
-    back_edge: usize,
-    iv_local: usize,
-) -> Option<SimdFpArraySum> {
-    // back_edge should be a goto instruction
-    if code.get(back_edge).copied() != Some(0xa7) {
-        return None;
-    }
-    let back_edge_end = back_edge + 3;
-
-    // Header starts with: iload <iv>, iload <bound>, if_icmpge <exit>
-    let mut pc = header;
-
-    let iv_check = extract_iload_local(code, pc)?;
-    if iv_check != iv_local {
-        return None;
-    }
-    pc += if code[pc] == 0x15 { 2 } else { 1 };
-
-    let bound_local = extract_iload_local(code, pc)?;
-    pc += if code[pc] == 0x15 { 2 } else { 1 };
-
-    if pc + 2 >= back_edge_end || code[pc] != 0xa2 {
-        return None; // expect if_icmpge
-    }
-    pc += 3;
-
-    // Now match loop body. Two patterns:
-    // Pattern A: aload arr, iload iv, daload, dload sum, dadd, dstore sum
-    // Pattern B: dload sum, aload arr, iload iv, daload, dadd, dstore sum
-
-    let (array_local, acc_local);
-
-    // Try pattern A: aload arr first
-    if let Some(arr) = extract_aload_local(code, pc) {
-        let arr_len = if code[pc] == 0x19 { 2 } else { 1 };
-        let pc2 = pc + arr_len;
-
-        let iv2 = extract_iload_local(code, pc2);
-        if iv2 == Some(iv_local) {
-            let iv2_len = if code[pc2] == 0x15 { 2 } else { 1 };
-            let pc3 = pc2 + iv2_len;
-
-            // daload (0x31)
-            if pc3 < back_edge_end && code[pc3] == 0x31 {
-                let pc4 = pc3 + 1;
-
-                // dload sum
-                if let Some(sum) = extract_dload_local(code, pc4) {
-                    let sum_len = if code[pc4] == 0x18 { 2 } else { 1 };
-                    let pc5 = pc4 + sum_len;
-
-                    // dadd (0x63)
-                    if pc5 < back_edge_end && code[pc5] == 0x63 {
-                        let pc6 = pc5 + 1;
-
-                        // dstore sum
-                        if let Some(store_sum) = extract_dstore_local(code, pc6) {
-                            if store_sum == sum {
-                                let store_len = if code[pc6] == 0x39 { 2 } else { 1 };
-                                let pc7 = pc6 + store_len;
-
-                                // iinc iv 1
-                                if pc7 + 2 < back_edge_end
-                                    && code[pc7] == 0x84
-                                    && code[pc7 + 1] as usize == iv_local // Widening: always safe
-                                    && code[pc7 + 2] == 0x01
-                                    && pc7 + 3 == back_edge
-                                {
-                                    return Some(SimdFpArraySum {
-                                        header_pc: header,
-                                        back_edge_pc: back_edge,
-                                        iv_local,
-                                        acc_local: sum,
-                                        array_local: arr,
-                                        bound_local,
-                                        sse_op: 0x58, // ADDPD
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // If pattern A didn't match fully, fall through
-        array_local = 0; // not used
-        acc_local = 0;
-    } else {
-        array_local = 0;
-        acc_local = 0;
-    }
-
-    // Try pattern B: dload sum first
-    if let Some(sum) = extract_dload_local(code, pc) {
-        let sum_len = if code[pc] == 0x18 { 2 } else { 1 };
-        let pc2 = pc + sum_len;
-
-        if let Some(arr) = extract_aload_local(code, pc2) {
-            let arr_len = if code[pc2] == 0x19 { 2 } else { 1 };
-            let pc3 = pc2 + arr_len;
-
-            let iv2 = extract_iload_local(code, pc3);
-            if iv2 == Some(iv_local) {
-                let iv2_len = if code[pc3] == 0x15 { 2 } else { 1 };
-                let pc4 = pc3 + iv2_len;
-
-                // daload (0x31)
-                if pc4 < back_edge_end && code[pc4] == 0x31 {
-                    let pc5 = pc4 + 1;
-
-                    // dadd (0x63)
-                    if pc5 < back_edge_end && code[pc5] == 0x63 {
-                        let pc6 = pc5 + 1;
-
-                        // dstore sum
-                        if let Some(store_sum) = extract_dstore_local(code, pc6) {
-                            if store_sum == sum {
-                                let store_len = if code[pc6] == 0x39 { 2 } else { 1 };
-                                let pc7 = pc6 + store_len;
-
-                                if pc7 + 2 < back_edge_end
-                                    && code[pc7] == 0x84
-                                    && code[pc7 + 1] as usize == iv_local // Widening: always safe
-                                    && code[pc7 + 2] == 0x01
-                                    && pc7 + 3 == back_edge
-                                {
-                                    return Some(SimdFpArraySum {
-                                        header_pc: header,
-                                        back_edge_pc: back_edge,
-                                        iv_local,
-                                        acc_local: sum,
-                                        array_local: arr,
-                                        bound_local,
-                                        sse_op: 0x58, // ADDPD
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let _ = (array_local, acc_local); // suppress unused warnings
-    None
-}
-
 // ---------------------------------------------------------------------------
 // T5.2.15 — SuperWord / element-wise SIMD detection
 // ---------------------------------------------------------------------------
@@ -695,148 +540,6 @@ pub(crate) fn detect_int_array_element_wise(
         bound_local,
         op,
     })
-}
-
-// ---------------------------------------------------------------------------
-// T5.2.17 — Loop unswitching detection
-// ---------------------------------------------------------------------------
-
-/// Candidate for loop unswitching.
-///
-/// Describes a loop whose body contains a conditional branch on a
-/// local that is never written inside the loop. The JIT can legally
-/// duplicate the loop into two loops — one for each side of the
-/// branch — and hoist the condition check out of the header.
-///
-/// Detection runs on loops of ≤ `MAX_UNSWITCH_BYTECODES` bytes to
-/// bound the code-size blow-up from the duplication.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub(crate) struct LoopUnswitchCandidate {
-    /// Bytecode PC of the loop header.
-    pub header_pc: usize,
-    /// Bytecode PC of the back-edge goto.
-    pub back_edge_pc: usize,
-    /// Bytecode PC of the invariant conditional branch inside the body.
-    pub invariant_branch_pc: usize,
-    /// Local variable index whose value is the branch predicate and
-    /// that is never re-assigned in the loop body.
-    pub invariant_local: usize,
-    /// Opcode of the branch (if_icmp*, ifeq, ifne, etc.) so the
-    /// emitter can mirror it when duplicating.
-    pub branch_op: u8,
-}
-
-/// Upper limit on loop body size eligible for unswitching.
-///
-/// Chosen to match the unrolling budget: duplicating a 32-byte loop
-/// doubles to 64 bytes, comparable to the 32-byte unroll limit in the
-/// static heuristic. Larger loops have more total cost and less
-/// marginal benefit from hoisting a single branch.
-pub const MAX_UNSWITCH_BYTECODES: usize = 32;
-
-/// Detect loops eligible for unswitching.
-///
-/// A loop is a candidate when:
-/// 1. Its body size is ≤ `MAX_UNSWITCH_BYTECODES` bytes.
-/// 2. The body contains an `ifeq/ifne/.../if_icmp*` instruction.
-/// 3. The predicate comes from an `iload` whose local is never
-///    written (no `istore`/`iinc`) anywhere in the loop body.
-///
-/// When multiple branches qualify, the first one is returned. Nested
-/// loops are handled by the caller (the `loops` list already
-/// enumerates each level independently).
-#[allow(dead_code)]
-pub(crate) fn detect_loop_unswitch_candidates(
-    code: &[u8],
-    code_len: usize,
-    loops: &[(usize, usize)],
-) -> Vec<LoopUnswitchCandidate> {
-    let mut out = Vec::new();
-    for &(header, back_edge) in loops {
-        if header >= code_len || back_edge >= code_len {
-            continue;
-        }
-        let body_size = back_edge.saturating_sub(header);
-        if body_size == 0 || body_size > MAX_UNSWITCH_BYTECODES {
-            continue;
-        }
-
-        // Collect locals written inside the loop (to exclude them
-        // from the invariant set).
-        let mut written: u64 = 0;
-        {
-            let mut pc = header;
-            while pc <= back_edge && pc < code_len {
-                match code[pc] {
-                    // istore/lstore/fstore/dstore/astore <local>
-                    0x36..=0x3A if pc + 1 < code_len => {
-                        // Widening: u8 -> wider int (bytecode operand byte, value fits)
-                        written |= 1u64 << (code[pc + 1] as usize & 0x3F);
-                    }
-                    // istore_0..istore_3
-                    // Widening: u8 -> usize (opcode-relative local index, value fits)
-                    0x3B..=0x3E => written |= 1u64 << ((code[pc] - 0x3B) as usize),
-                    // lstore_0..lstore_3
-                    // Widening: u8 -> usize (opcode-relative local index, value fits)
-                    0x3F..=0x42 => written |= 1u64 << ((code[pc] - 0x3F) as usize),
-                    // fstore_0..fstore_3
-                    // Widening: u8 -> usize (opcode-relative local index, value fits)
-                    0x43..=0x46 => written |= 1u64 << ((code[pc] - 0x43) as usize),
-                    // dstore_0..dstore_3
-                    // Widening: u8 -> usize (opcode-relative local index, value fits)
-                    0x47..=0x4A => written |= 1u64 << ((code[pc] - 0x47) as usize),
-                    // astore_0..astore_3
-                    // Widening: u8 -> usize (opcode-relative local index, value fits)
-                    0x4B..=0x4E => written |= 1u64 << ((code[pc] - 0x4B) as usize),
-                    // iinc <local>, _
-                    0x84 if pc + 1 < code_len => {
-                        // Widening: u8 -> wider int (bytecode operand byte, value fits)
-                        written |= 1u64 << (code[pc + 1] as usize & 0x3F);
-                    }
-                    _ => {}
-                }
-                pc += crate::scev::bytecode_len(code, pc, code_len);
-            }
-        }
-
-        // Walk again looking for an `iload L; if*` pair where L is not
-        // in `written`. The invariant_local must be < 64 so it fits in
-        // the bitmask.
-        let mut pc = header;
-        while pc < back_edge && pc < code_len {
-            // Try to extract an iload and its local.
-            let (iload_local, iload_len) = match code.get(pc).copied() {
-                // Widening: u8 -> usize (opcode-relative local index, value fits)
-                Some(0x1A..=0x1D) => (Some((code[pc] - 0x1A) as usize), 1usize),
-                // Widening: u8 -> wider int (bytecode operand byte, value fits)
-                Some(0x15) if pc + 1 < code_len => (Some(code[pc + 1] as usize), 2usize),
-                _ => (None, 0),
-            };
-            if let Some(local) = iload_local {
-                let next_pc = pc + iload_len;
-                if next_pc < code_len {
-                    let op = code[next_pc];
-                    // if_icmpeq..if_icmple need a second iload, so we
-                    // match the simpler ifeq..ifle (0x99..=0x9E) that
-                    // operate on the single top-of-stack.
-                    let is_unary_branch = matches!(op, 0x99..=0x9E);
-                    if is_unary_branch && local < 64 && (written & (1u64 << local)) == 0 {
-                        out.push(LoopUnswitchCandidate {
-                            header_pc: header,
-                            back_edge_pc: back_edge,
-                            invariant_branch_pc: next_pc,
-                            invariant_local: local,
-                            branch_op: op,
-                        });
-                        break; // one candidate per loop is enough
-                    }
-                }
-            }
-            pc += crate::scev::bytecode_len(code, pc, code_len);
-        }
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2121,7 +1824,7 @@ pub mod vector_gate {
                 exit: NO_NODE,
                 safepoints: Vec::new(),
                 uses: UseLists::new(),
-            receiver_param: None,
+                receiver_param: None,
             }
         }
 
@@ -2178,6 +1881,7 @@ pub mod vector_gate {
                 form: LoopForm::PreTested,
                 modified_locals: 1u64 << 1,
                 heap_stable: true,
+                has_other_exit: false,
             }
         }
 

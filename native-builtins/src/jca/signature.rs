@@ -1621,6 +1621,20 @@ pub(crate) fn get_instance_offers(name: &str) -> bool {
 }
 
 fn sig_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // `getInstance(null)` is `NullPointerException: null algorithm name` --
+    // `Objects.requireNonNull(algorithm, "null algorithm name")`, which
+    // `GetInstance` runs before any provider is consulted. It is NOT
+    // `NoSuchAlgorithmException`, which is what this VM answered by reading
+    // the null as `""` and letting the empty name fall through to the
+    // is-it-offered check. `Cipher` is the exception to this contract and has
+    // its own guard -- see `cipher_require_transformation`.
+    if matches!(args.first(), None | Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("null algorithm name".to_string()),
+        }
+        .into());
+    }
+    // MEASURED, `L6JcaSweep` row 78.
     // Shared by all three `getInstance` overloads — see `check_named_provider_arg`.
     crate::jca::provider_chain::check_named_provider_arg(
         ctx,
@@ -1879,7 +1893,44 @@ fn drive_user_spi(
 fn refuse_unusable_key(
     ctx: &mut dyn NativeContext,
     alg: i32,
+    key: ObjectRef,
 ) -> cratonvm_types::error::MethodCallFailed {
+    // Two different keys reach this refusal, and the JDK gives them two
+    // different messages.
+    //
+    // A key that IS an RSA key but carries no material (`getEncoded()` null --
+    // the opaque `OpenSslPrivateKeyMethod` case the doc above describes) gets
+    // `Missing key encoding`. A key that is not an RSA key at all never
+    // reaches an RSA engine: provider selection fails first, and the message
+    // names the key's CLASS.
+    //
+    // Answering the first for the second is not merely different wording, it
+    // is a false statement about the caller's key. `L6JcaSweep` row 155 passes
+    // a `PublicKey` whose `getEncoded()` returns three bytes and whose
+    // `getAlgorithm()` is "NotRSA", and this VM told its author the encoding
+    // was missing -- which sends them to look at the wrong thing.
+    // MEASURED, `L6JcaSweep` row 155.
+    //
+    // The class name is read BEFORE the virtual call below, which can move
+    // `key`. Nothing else is read afterwards: this function only throws.
+    let cls = ctx
+        .class_name_of_id(ctx.class_id_of_object(key))
+        .unwrap_or_default()
+        .replace('/', ".");
+    let declared = match ctx.invoke_virtual(key, "getAlgorithm", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(name)))) => ctx.read_string(name),
+        _ => None,
+    };
+    let states_rsa = declared
+        .as_deref()
+        .is_some_and(|n| n.eq_ignore_ascii_case("RSA") || n.eq_ignore_ascii_case("RSASSA-PSS"));
+    if !states_rsa && !cls.is_empty() {
+        return crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/security/InvalidKeyException",
+            &format!("No installed provider supports this key: {cls}"),
+        );
+    }
     crate::phases_early::throw_jca_exc(
         ctx,
         "java/security/InvalidKeyException",
@@ -1956,6 +2007,23 @@ fn sig_init_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         clear_data(ctx, this);
         return Ok(None);
     }
+    // `initSign(null)` / `initVerify(null)` are `InvalidKeyException: Key must
+    // not be null` -- the provider's own SPI refuses before any state changes.
+    // This VM accepted the null, set the state, and left the key slot empty,
+    // moving the refusal to `sign()`/`verify()`. That matters beyond the
+    // message: a caller that walks `Security.getProviders()` catching
+    // `InvalidKeyException` to find one that accepts the key (netty's
+    // `findCompatibleSignature`) commits to this provider and fails later,
+    // from inside its own callback. Below the user-SPI branch above on
+    // purpose -- a third-party SPI decides for itself.
+    // MEASURED, `L6JcaSweep` rows 149 and 150.
+    if matches!(args.get(1), None | Some(Value::Object(None))) {
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/security/InvalidKeyException",
+            "Key must not be null",
+        ));
+    }
     let base = synthetic_base_offset(ctx, "java/security/Signature");
     set_sig_state(ctx, this, STATE_SIGN);
     sig_slot_set(ctx, this, SIG_OFF_STATE, Value::Int(STATE_SIGN));
@@ -1985,7 +2053,7 @@ fn sig_init_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             crate::jca::key_factory::register_rsa_priv_sign_material(ctx, &mut k);
             kid = extract_key_id_from_key(ctx, k);
             if !crypto_impl::rsa_key_registered(kid) {
-                return Err(refuse_unusable_key(ctx, alg));
+                return Err(refuse_unusable_key(ctx, alg, k));
             }
         }
         set_sig_keyid(ctx, this, kid);
@@ -2016,6 +2084,23 @@ fn sig_init_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         clear_data(ctx, this);
         return Ok(None);
     }
+    // `initSign(null)` / `initVerify(null)` are `InvalidKeyException: Key must
+    // not be null` -- the provider's own SPI refuses before any state changes.
+    // This VM accepted the null, set the state, and left the key slot empty,
+    // moving the refusal to `sign()`/`verify()`. That matters beyond the
+    // message: a caller that walks `Security.getProviders()` catching
+    // `InvalidKeyException` to find one that accepts the key (netty's
+    // `findCompatibleSignature`) commits to this provider and fails later,
+    // from inside its own callback. Below the user-SPI branch above on
+    // purpose -- a third-party SPI decides for itself.
+    // MEASURED, `L6JcaSweep` rows 149 and 150.
+    if matches!(args.get(1), None | Some(Value::Object(None))) {
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/security/InvalidKeyException",
+            "Key must not be null",
+        ));
+    }
     let base = synthetic_base_offset(ctx, "java/security/Signature");
     set_sig_state(ctx, this, STATE_VERIFY);
     sig_slot_set(ctx, this, SIG_OFF_STATE, Value::Int(STATE_VERIFY));
@@ -2045,7 +2130,7 @@ fn sig_init_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             crate::jca::key_factory::register_rsa_pub_verify_material(ctx, &mut k);
             kid = extract_key_id_from_key(ctx, k);
             if !crypto_impl::rsa_key_registered(kid) {
-                return Err(refuse_unusable_key(ctx, alg));
+                return Err(refuse_unusable_key(ctx, alg, k));
             }
         }
         set_sig_keyid(ctx, this, kid);
@@ -2655,6 +2740,22 @@ fn sig_set_parameter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         .is_some_and(|n| n == "java/security/spec/PSSParameterSpec")
     {
         return Ok(None);
+    }
+    // Only an RSASSA-PSS signature accepts a `PSSParameterSpec`.
+    // `SHA256withRSA` is PKCS#1 v1.5 and `RSASignature.engineSetParameter`
+    // refuses it outright: `InvalidAlgorithmParameterException: No parameters
+    // accepted`. This VM APPLIED the spec, so a caller that asked for a
+    // salt length and an MGF digest on a v1.5 signature got a v1.5 signature
+    // and no indication that any of it was ignored -- the failure mode a
+    // refusal exists to prevent.
+    // MEASURED, `L6JcaSweep` row 153.
+    let pss_alg = get_sig_algo(ctx, this).unwrap_or(-1);
+    if !matches!(pss_alg, SIG_PSS_SHA256 | SIG_PSS_SHA384 | SIG_PSS_SHA512) {
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/security/InvalidAlgorithmParameterException",
+            "No parameters accepted",
+        ));
     }
     let pin = ctx.pin_native_root(this);
     let read_name = |ctx: &mut dyn NativeContext, recv: ObjectRef, m: &str| -> Option<String> {
@@ -3323,10 +3424,25 @@ mod tests {
         };
         let mut args = vec![Value::Object(Some(sig))];
         args.push(Value::Object(key));
-        if verifying {
-            sig_init_verify(ctx, &args).unwrap();
+        let state = if verifying { STATE_VERIFY } else { STATE_SIGN };
+        if key.is_some() {
+            if verifying {
+                sig_init_verify(ctx, &args).unwrap();
+            } else {
+                sig_init_sign(ctx, &args).unwrap();
+            }
         } else {
-            sig_init_sign(ctx, &args).unwrap();
+            // `initSign(null)` / `initVerify(null)` are now refused with the
+            // JDK's `InvalidKeyException: Key must not be null` (`L6JcaSweep`
+            // rows 149 and 150), so they can no longer serve as a shortcut to
+            // the state these callers actually want: INITED, holding no key.
+            // Set that state directly. The refusal under test belongs to
+            // `sign()`/`verify()`, not to `initSign()` -- and routing through
+            // a call that now throws would have tested the new guard twice
+            // and the fail-closed contract not at all.
+            set_sig_state(ctx, sig, state);
+            sig_slot_set(ctx, sig, SIG_OFF_STATE, Value::Int(state));
+            sig_slot_set(ctx, sig, SIG_OFF_PENDING, Value::Int(0));
         }
         sig
     }

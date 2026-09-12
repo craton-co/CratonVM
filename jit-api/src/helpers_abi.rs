@@ -59,11 +59,10 @@
 //! * [`JitRuntimeHelpers::validate_with`], a version-checked validator that
 //!   names the first missing required slot.
 //!
-//! **The validator is not armed.** Nothing outside this crate calls
-//! [`JitRuntimeHelpers::validate_abi`], [`JitRuntimeHelpers::validate`] or
-//! [`JitRuntimeHelpers::null_pointers`] — the runtime half of this contract
-//! exists and is tested, but never runs in a real VM. See
-//! `docs/jit/helper-abi.md`.
+//! **The validator is armed.** The VM's `build_helpers` runs
+//! [`JitRuntimeHelpers::validate_abi`] on every table it produces and panics on
+//! a missing required slot, so a gap fails at VM start instead of surfacing as
+//! a `CALL 0` from compiled code. See `helper-abi.md`.
 //!
 //! # ABI contract
 //!
@@ -106,8 +105,7 @@ use crate::JitRuntimeHelpers;
 /// `build_helpers`) and consumers (the JIT backends) that disagree on this
 /// number disagree on where the helpers live.
 ///
-/// `6` is the revision of the 65-field, 520-byte table shipped today. The
-/// full history is in [`ABI_REVISIONS`], which a const assertion ties to this
+/// The full history, current revision last, is in [`ABI_REVISIONS`], which a const assertion ties to this
 /// constant, to [`NUM_HELPER_FIELDS`] and to [`JIT_HELPERS_ABI_SIZE`] — so
 /// appending a field without bumping this number no longer compiles.
 ///
@@ -237,6 +235,9 @@ impl_helper_arg_abi! {
     f32 => true,
     f64 => true,
     *const u8 => false,
+    // An out-parameter the helper writes through: a frame or scratch word
+    // address, a machine word in an integer register like any pointer.
+    *mut i64 => false,
 }
 
 impl HelperRetAbi for () {
@@ -706,7 +707,7 @@ helper_fn_slots! {
     // element READ fast path. A decline leaves the site's native dispatch to
     // run unchanged, so every case it does not recognise keeps today's
     // behaviour. See `JitRuntimeHelpers::ffm_segment_get`.
-    HelperFnFfmSegmentGet, ffm_segment_get, ffm_segment_get_fn, (i64, i64, i64, i64) -> i64;
+    HelperFnFfmSegmentGet, ffm_segment_get, ffm_segment_get_fn, (i64, i64, i64, *mut i64) -> i64;
     // `(seg, index, kind, raw_value) -> 1 handled | 0 declined` — the WRITE
     // twin. See `JitRuntimeHelpers::ffm_segment_set`.
     HelperFnFfmSegmentSet, ffm_segment_set, ffm_segment_set_fn, (i64, i64, i64, i64) -> i64;
@@ -725,7 +726,7 @@ helper_fn_slots! {
     // address, not a value: on a hit the helper stores the throwable there,
     // which is the operand slot the handler block starts from. See
     // `JitRuntimeHelpers::local_handler_lookup`.
-    HelperFnLocalHandlerLookup, local_handler_lookup, local_handler_lookup_fn, (i64, i64, i64) -> i64;
+    HelperFnLocalHandlerLookup, local_handler_lookup, local_handler_lookup_fn, (i64, i64, *mut i64) -> i64;
 }
 
 // ---------------------------------------------------------------------

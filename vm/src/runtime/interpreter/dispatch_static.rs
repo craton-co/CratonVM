@@ -148,7 +148,13 @@ pub(super) fn execute_invokestatic(
         .class_manager
         .read()
         .get_class(current_class_id)
-        .filter(|c| c.name.as_ref() == method_class_name.as_ref())
+        .filter(|c| {
+            super::constants::is_self_class_reference(
+                &c.name,
+                c.is_hidden(),
+                method_class_name.as_ref(),
+            )
+        })
         .map(|_| current_class_id);
 
     // Sibling static owners in a user-defined loader need the same identity
@@ -1294,6 +1300,7 @@ pub(super) fn populate_invoke_cache(
         descriptor_facts_cache: std::sync::OnceLock::new(),
         intercept_shape_cache: std::sync::OnceLock::new(),
         interp_invocations: std::sync::atomic::AtomicU32::new(0),
+        tiering_settled: std::sync::atomic::AtomicU32::new(0),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -1610,7 +1617,7 @@ pub(super) fn execute_invokestatic_cached(
             // compile had published a body. That is exactly the re-resolution
             // this per-call-site inline cache exists to avoid.
             //
-            // It is now epoch-guarded: `jit_cache_generation()` advances on every
+            // It is now epoch-guarded: this VM's `JitCache::generation()` advances on every
             // JIT-cache publication AND every invalidation (see
             // `jit::JitCache::put`/`put_osr`/`invalidate_matching`/`clear_all` --
             // the only mutators), so while this entry's snapshot still equals the
@@ -1624,7 +1631,7 @@ pub(super) fn execute_invokestatic_cached(
                 // compares unequal next time and re-probes -- safe. Memoizing a
                 // generation NEWER than the probe would be the unsound direction,
                 // and this ordering makes it impossible.
-                let jit_generation = cratonvm_jit::jit_cache_generation();
+                let jit_generation = shared.jit.jit_cache.generation();
                 let compiled_probe = if cached.jit_probe_is_current(jit_generation) {
                     None
                 } else {
@@ -1744,12 +1751,9 @@ pub(super) fn execute_invokestatic_cached(
                 && (invoc_count == jit_invocation_threshold
                     || (invoc_count - jit_invocation_threshold) % JIT_RETRY_STRIDE == 0);
             if should_attempt && !target_redefined && !continuation_interpreted {
-                // Consult tiered compilation manager for recommended tier
-                let tiered_key = crate::jit::tiered::MethodKey::new(
-                    cached.class_name.as_ref(),
-                    cached.method_name.as_ref(),
-                    cached.method_descriptor.as_ref(),
-                );
+                // Consult tiered compilation manager for recommended tier (via
+                // `offer_invocation_to_tiered_manager`, below, which skips the
+                // manager for a method whose tiering it has already settled).
                 // wire-tiered-manager: OFF-THREAD codegen for the invocation
                 // tier-up trigger. **DEFAULT-ON as of Step 7** ("retire the
                 // single fixed-threshold inline path"); `CRATONVM_BG_COMPILE=0`
@@ -1780,10 +1784,8 @@ pub(super) fn execute_invokestatic_cached(
                 // only at stride boundaries, and the manager's historical
                 // `+= 1` counting deflated its hotness view 64x (first C1
                 // recommendation at ~threshold + 64×c1_threshold real calls).
-                let recommended_tier = shared
-                    .jit
-                    .tiered_manager
-                    .on_method_invocation_observed(&tiered_key, invoc_count as u64);
+                let recommended_tier =
+                    offer_invocation_to_tiered_manager(shared, &*cached, invoc_count as u64);
                 if let Some(tier) = recommended_tier {
                     if crate::runtime::env_cache::dbg_jitc() {
                         eprintln!(

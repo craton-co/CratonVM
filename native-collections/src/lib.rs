@@ -174,6 +174,27 @@ const CF_KEY_SET_VIEW: u16 = 1 << 11;
 /// every ordinary `ArrayList` too.
 const CF_VALUES_VIEW: u16 = 1 << 12;
 
+/// The receiver's class is [`TM_ENTRY_SET_CARRIER`] — the ONE
+/// [`MAP_VIEW_CARRIERS`] member that is not a values view.
+///
+/// Its own bit rather than a sixth name in [`CF_VALUES_VIEW`], because
+/// three predicates read that one and two of them mean *values*:
+/// [`al_is_values_view`] has to answer `false` here (the real class extends
+/// `AbstractSet`, which DOES override `equals`/`hashCode`, so the
+/// content-based answer is the right one), while [`vc_route`] has to answer
+/// `true` — it has carried an entry-shaped arm since `RTreeRangeGc`, keyed
+/// on [`view_carrier_holds_entries_by_class`], and that arm was UNREACHABLE:
+/// the route's gate was the values predicate, so the one carrier the arm was
+/// written for never got past the door.
+///
+/// MEASURED on the wave-8 control, `--jdk-only`, dial armed on
+/// `java/util/TreeMap`, `apps/probes/L1MapViewToArrayProbe`:
+/// `treemap.entrySet.toArray.len` answered **0** where HotSpot 25.0.4+7
+/// answers 3, while `treemap.values.toArray.len` — the same route, a
+/// receiver one name over — was already right and printed its `[VIEWKIND]`
+/// line saying so.
+const CF_MAP_ENTRY_VIEW: u16 = 1 << 13;
+
 /// Cached classification of one `ClassId`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct ClassFacts(u16);
@@ -348,6 +369,11 @@ fn classify_class(ctx: &dyn NativeContext, cid: ClassId) -> ClassFacts {
         )
     ) {
         flags |= CF_VALUES_VIEW;
+    }
+    // The sixth `MAP_VIEW_CARRIERS` member, on its own bit. See
+    // [`CF_MAP_ENTRY_VIEW`] for why it is not a sixth name in the match above.
+    if ctx.class_name_arc_of_id(cid).as_deref() == Some(TM_ENTRY_SET_CARRIER) {
+        flags |= CF_MAP_ENTRY_VIEW;
     }
     ClassFacts(flags)
 }
@@ -6686,6 +6712,15 @@ fn collect_via_real_iterator(
         Err(e) => return Err(e),
         Ok(_) => return Ok(Vec::new()),
     };
+    if tmview_dbg() {
+        eprintln!(
+            "[TMVIEW] collect_via_real_iterator recv={} itr={}",
+            ctx.class_name_of_id(ctx.class_id_of_object(coll))
+                .unwrap_or_else(|| "<unknown>".into()),
+            ctx.class_name_of_id(ctx.class_id_of_object(it))
+                .unwrap_or_else(|| "<unknown>".into())
+        );
+    }
     let mut out = Vec::new();
     let it_pin = ctx.pin_native_root(it);
     // GC-safety for the ELEMENTS, not just the iterator.
@@ -6912,6 +6947,12 @@ fn al_or_collection_elements_pinned(
     let this = ctx.read_native_pin(this_pin, this);
     if real_size > 0 {
         elems = collect_via_real_iterator(ctx, this)?;
+    }
+    if tmview_dbg() {
+        eprintln!(
+            "[TMVIEW] al_or_collection_elements fallback real_size={real_size} walked={}",
+            elems.len()
+        );
     }
     Ok(elems)
 }
@@ -16702,6 +16743,18 @@ const MAP_VIEW_CARRIERS: &[&str] = &[
 /// [`view_carrier_holds_entries_by_class`].
 const TM_ENTRY_SET_CARRIER: &str = "java/util/TreeMap$EntrySet";
 
+/// `java/util/TreeMap$KeySet`, the one map-view carrier in NEITHER
+/// [`MAP_VIEW_CARRIERS`] nor [`SET_VIEW_CARRIERS`].
+///
+/// It is absent from both on purpose: a `TreeMap.keySet()` view is
+/// TreeSet-SHAPED — its elements live in `ts_array_table` and
+/// `register_tree_set_natives` mirrors every `native_ts_*` registration onto
+/// it — so neither the ArrayList-layout list nor the HashSet-layout one
+/// describes it. What it DOES share with both is the failure mode: a carrier
+/// the image minted itself has none of this crate's state and has to be
+/// decoded through its `this$0`. See [`ts_view_source`].
+const TM_KEY_SET_CARRIER: &str = "java/util/TreeMap$KeySet";
+
 /// `true` iff `name` is one of the [`MAP_VIEW_CARRIERS`]. Cold path only: the
 /// per-call answer comes from the `AlLayout` memo, which consults this once per
 /// `ClassId`.
@@ -18053,6 +18106,23 @@ fn is_values_view_class(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
     receiver_facts(ctx, obj).has(CF_VALUES_VIEW)
 }
 
+/// `true` iff `obj`'s runtime class is one of the [`MAP_VIEW_CARRIERS`] — the
+/// five [`is_values_view_class`] names AND [`TM_ENTRY_SET_CARRIER`].
+///
+/// This, not the values predicate, is what [`vc_route`] and
+/// [`vc_route_source_size`] are asking: *is this receiver a real JDK map-view
+/// class whose state this crate keeps somewhere the generic natives cannot
+/// read?* The answer for `TreeMap$EntrySet` is yes, and `vc_route` already
+/// knows what to do with it — see [`CF_MAP_ENTRY_VIEW`].
+///
+/// Two memoized bits rather than a name compare, because both routes sit at the
+/// head of every `native_al_*` body and so run for every ordinary `ArrayList`.
+#[inline]
+fn is_map_view_carrier_receiver(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    let facts = receiver_facts(ctx, obj);
+    facts.has(CF_VALUES_VIEW) || facts.has(CF_MAP_ENTRY_VIEW)
+}
+
 /// `true` iff `view` is a [`MAP_VIEW_CARRIERS`] object THIS crate minted —
 /// i.e. one that already carries its elements in its own
 /// [`view_carrier_slots`] `elementData` slot and its source map in the element
@@ -18189,7 +18259,7 @@ fn vc_route(
         Some(Value::Object(Some(o))) => *o,
         _ => return None,
     };
-    if !is_values_view_class(ctx, this) {
+    if !is_map_view_carrier_receiver(ctx, this) {
         return None;
     }
     if is_own_view_carrier(ctx, this) {
@@ -18289,7 +18359,7 @@ fn vc_route(
 /// / integer-overlay families correctly, which is exactly the set of answers a
 /// view over that map must agree with.
 fn vc_route_source_size(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<MethodCallResult> {
-    if !is_values_view_class(ctx, this) {
+    if !is_map_view_carrier_receiver(ctx, this) {
         return None;
     }
     if is_own_view_carrier(ctx, this) {
@@ -18388,16 +18458,83 @@ fn propagate_list_removal(
 /// element array stashes the source map in its last capacity slot), return the
 /// source map. Mirrors `values_view_source`: the marker only exists when the
 /// array is longer than the logical size and the trailing slot is non-null.
+/// `CRATONVM_DBG_TMVIEW` — the trace that separates the four places a
+/// TreeMap view decode can answer EMPTY. See `ts_view_source`.
+fn tmview_dbg() -> bool {
+    cratonvm_types::flags::runtime_var("CRATONVM_DBG_TMVIEW").is_ok()
+}
+
 fn ts_view_source(ctx: &dyn NativeContext, ts: ObjectRef) -> Option<ObjectRef> {
     let (data, size, _) = ts_state(ctx, ts);
-    let data = data?;
-    let dlen = ctx.array_length(data) as i32;
-    if dlen > size {
-        if let Value::Object(Some(src)) = ctx.get_array_element(data, (dlen - 1) as usize) {
-            return Some(src);
+    if let Some(data) = data {
+        let dlen = ctx.array_length(data) as i32;
+        if dlen > size {
+            if let Value::Object(Some(src)) = ctx.get_array_element(data, (dlen - 1) as usize) {
+                return Some(src);
+            }
         }
     }
-    None
+    // THE CARRIER THE IMAGE BUILT ITSELF has no marker, because this crate did
+    // not mint it — and it is the shape `treeMap.keySet()` takes the moment the
+    // TreeMap natives stop answering (the dial armed on `java/util/TreeMap`, or
+    // the family retired). It still has the enclosing map, in the field the
+    // JDK's own constructor wrote: `this$0`.
+    //
+    // The set-shaped twin of [`hs_backing_map`]'s by-name arm, and for the same
+    // measured reason. `java/util/TreeMap$KeySet` is in NEITHER carrier list —
+    // it shares the `native_ts_*` surface over `ts_array_table` — so nothing
+    // else in this file can see the source, and `resync_ts_view` returned the
+    // receiver untouched. MEASURED on the wave-8 control, `--jdk-only`, dial
+    // armed on `java/util/TreeMap`: `keySet().toArray()` answered `[0]` for a
+    // three-key map while `keySet().size()`, `.iterator()` and `.toString()`
+    // over the very same view were right — those reach real bytecode through
+    // the dispatch door, and `toArray`'s own `size()` question is asked BY a
+    // native, which does not.
+    //
+    // Exact class, not ancestry: a `java/util/TreeSet` reaching here with no
+    // marker is a plain set, not a view, and must keep answering `None`. It is
+    // also what makes reading `m` below safe -- `java/util/TreeSet` declares a
+    // field of that name too, and it is the set's OWN backing map rather than a
+    // view source.
+    let cid = ctx.class_id_of_object(ts);
+    if ctx.class_name_arc_of_id(cid).as_deref() != Some(TM_KEY_SET_CARRIER) {
+        return None;
+    }
+    // NOT [`values_view_class_source`], and the difference cost a build.
+    // `TreeMap.KeySet` is a STATIC nested class -- `javap -p` on
+    // jdk-17.0.20.1+1, jdk-21.0.12+8 and jdk-25.0.4+7 all give it exactly one
+    // field:
+    //
+    // ```text
+    //   final class java.util.TreeMap$KeySet<E> extends java.util.AbstractSet<E>
+    //           implements java.util.NavigableSet<E> {
+    //     private final java.util.NavigableMap<E, ?> m;
+    // ```
+    //
+    // -- so it has no `this$0` and no `map`, the two names that helper knows,
+    // and the first cut of this arm measured EXACTLY as well as no arm at all
+    // (28 of the 38 rows still differing, all of them the keySet half). The
+    // sibling carriers really are inner classes and really do have `this$0`,
+    // which is what made the wrong guess look reasonable.
+    let slot = ctx.resolve_field_index_by_class_id(cid, "m");
+    if tmview_dbg() {
+        eprintln!(
+            "[TMVIEW] ts_view_source KeySet m_slot={slot:?} nf={}",
+            ctx.object_num_fields(ts)
+        );
+    }
+    let slot = slot?;
+    if slot >= ctx.object_num_fields(ts) {
+        return None;
+    }
+    let got = ctx.get_field(ts, slot);
+    if tmview_dbg() {
+        eprintln!("[TMVIEW] ts_view_source m = {got:?}");
+    }
+    match got {
+        Value::Object(Some(m)) => Some(m),
+        _ => None,
+    }
 }
 
 /// Refresh a `TreeMap.keySet()` view from its live source map, so a read sees
@@ -18428,9 +18565,21 @@ fn resync_ts_view(
 ) -> Result<ObjectRef, MethodCallFailed> {
     let source = match ts_view_source(ctx, this) {
         Some(s) => s,
-        None => return Ok(this),
+        None => {
+            if tmview_dbg() {
+                eprintln!("[TMVIEW] resync_ts_view: no source marker");
+            }
+            return Ok(this);
+        }
     };
     if !is_tree_map_receiver(ctx, source) {
+        if tmview_dbg() {
+            eprintln!(
+                "[TMVIEW] resync_ts_view: source {} is not a TreeMap receiver",
+                ctx.class_name_of_id(ctx.class_id_of_object(source))
+                    .unwrap_or_else(|| "<unknown>".into())
+            );
+        }
         return Ok(this);
     }
     // GC-SAFETY: `tm_collect_pairs` boxes fast-mode keys (allocating), and
@@ -18444,6 +18593,9 @@ fn resync_ts_view(
         .into_iter()
         .map(|(k, _)| k)
         .collect();
+    if tmview_dbg() {
+        eprintln!("[TMVIEW] resync_ts_view rebuilt {} key(s)", keys.len());
+    }
     let (_, key_handles) = pin_value_slice(ctx, &keys);
     let cap = std::cmp::max(keys.len(), TS_DEFAULT_CAPACITY) + 1;
     let buf = alloc_ref_array(ctx, cap);
@@ -49222,6 +49374,45 @@ fn collect_collection_elements_pinned(
                 return Ok(out);
             }
         }
+        // A `java/util/TreeMap$KeySet` THE IMAGE'S OWN BYTECODE minted -- the
+        // TreeSet-shaped twin of the arm above, and it needs an arm of its own
+        // for the reason [`TM_KEY_SET_CARRIER`] gives: the class is in NEITHER
+        // carrier list, so neither `is_set_view_carrier` nor the values
+        // predicate sees it, and every layout probe below reads
+        // `ts_array_table`, which holds nothing for a view this crate did not
+        // mint.
+        //
+        // The guard is the side table itself: a carrier this crate minted has
+        // its elements there (`native_tm_key_set` writes them and
+        // `resync_ts_view` keeps them live), so this arm fires for the foreign
+        // shape and for nothing else.
+        //
+        // MEASURED, wave 8, `--jdk-only`, dial armed on `java/util/TreeMap`,
+        // `apps/probes/L1MapViewToArrayProbe`: with [`ts_view_source`]'s
+        // by-name arm in place but WITHOUT this one, the generic `toArray`
+        // fallback still answered EMPTY -- `[TMVIEW] al_or_collection_elements
+        // fallback real_size=3 walked=0`. The size question was answered
+        // correctly and the walk was not, because the walk drives
+        // `iterator()`, whose result is minted under
+        // `java/util/TreeMap$KeyIterator` -- a class the same armed scope
+        // covers, so its own `hasNext` is declined and the real JDK body reads
+        // a `next` field this VM never wrote. Decoding the source map directly
+        // needs neither the iterator nor its carrier.
+        if cls_name == TM_KEY_SET_CARRIER
+            && matches!(ts_get_slot(&*ctx, coll, TS_FIELD_DATA), Value::Object(None))
+        {
+            if let Some(source) = ts_view_source(&*ctx, coll) {
+                if is_tree_map_receiver(ctx, source) {
+                    let source_pin = ctx.pin_native_root(source);
+                    let keys: Vec<Value> = tm_collect_pairs(ctx, source)
+                        .into_iter()
+                        .map(|(k, _)| k)
+                        .collect();
+                    ctx.unpin_native_roots(source_pin);
+                    return Ok(keys);
+                }
+            }
+        }
         if cls_name == "java/util/EnumSet" {
             if let Value::Object(Some(backing)) = ctx.get_field(coll, 0) {
                 return Ok(collect_collection_elements(ctx, backing)?);
@@ -55584,7 +55775,11 @@ fn tm_publish_real_root(ctx: &mut dyn NativeContext, this: ObjectRef) {
             }
         }
     }
-    let pairs = tm_collect_pairs(ctx, this);
+    // The side table DIRECTLY, never [`tm_collect_pairs`]: that funnel falls
+    // back to `root` when the side table is empty, and a mirror whose source
+    // can be its own output is the two-producers-one-slot trap this function's
+    // doc warns about. Empty here means empty, and the mirror is cleared.
+    let pairs = tm_collect_pairs_side_table(ctx, this);
     let n = pairs.len();
     if n == 0 {
         ctx.set_field(this, root_slot, Value::Object(None));
@@ -55911,10 +56106,222 @@ fn native_tm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(Some(Value::Object(Some(ts))))
 }
 
-/// Collect (key, value) pairs in sorted order for both fast and array modes.
+/// Upper bound on the nodes [`tm_pairs_from_real_root`] will visit.
+///
+/// A malformed or cyclic node graph must not hang a native. The cap is far
+/// above any map this VM can hold in memory and far below a livelock; hitting
+/// it returns EMPTY rather than a truncated map, because a prefix of a broken
+/// tree is a wrong answer that looks like a right one.
+const TM_REAL_ROOT_WALK_CAP: usize = 1 << 24;
+
+/// The receiver's REAL `java.util.TreeMap.root` node graph, read in key order.
+///
+/// # Why a one-way mirror had to grow a reader
+///
+/// [`tm_publish_real_root`] states the direction as a design decision —
+/// *"`tm_array_table` stays the single source of truth and this mirror is
+/// rebuilt from it; nothing reads back through `root`"* — and that held for as
+/// long as the TreeMap natives were the only writers. They are not, in the two
+/// situations this lane exists to measure: with the enforcement dial armed on
+/// `java/util/TreeMap`, and with the family retired, REAL BYTECODE maintains
+/// `root` and `tm_array_table` is empty. Every side-table reader then answers
+/// zero for a map that has entries.
+///
+/// MEASURED on the wave-8 control binary, `--jdk-only`, dial armed on
+/// `java/util/TreeMap` alone, `apps/probes/L1MapViewToArrayProbe` (168 rows):
+///
+/// ```text
+///   D.treemap.keySet.toArray.len     HotSpot 3    CratonVM 0
+///   D.treemap.entrySet.toArray.len   HotSpot 3    CratonVM 0
+///   E.treemap.order.toArray          [a, b, c]    []
+/// ```
+///
+/// 38 rows, and `size()`, `iterator()`, `toString()`, `contains` and removal
+/// through the same views were all already right — they reach real bytecode
+/// through the dispatch door, which is the door `toArray`'s internally-asked
+/// `size()` does not go through.
+///
+/// # Why this does not re-open the two-producers trap
+///
+/// It is consulted from ONE place ([`tm_collect_pairs`]) and only when the side
+/// table holds no pairs for the receiver, so `tm_array_table` remains the
+/// authority wherever it has anything to say. The mirror's own writer reads the
+/// side table directly ([`tm_collect_pairs_side_table`]) and so can never
+/// republish what this function just read out of `root`.
+///
+/// # GC
+///
+/// Pure reads: no allocation, no re-entry into Java, therefore no GC point
+/// inside the walk and no pin required. The `(key, value)` pairs it returns are
+/// bare `ObjectRef`s and are the caller's problem the instant it allocates —
+/// every caller reaches this through [`tm_collect_pairs`], whose callers
+/// already pin what they keep.
+fn tm_pairs_from_real_root(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Value, Value)> {
+    let empty: Vec<(Value, Value)> = Vec::new();
+    let Some(root_slot) = ctx.resolve_field_index("java/util/TreeMap", "root") else {
+        if tmview_dbg() {
+            eprintln!("[TMVIEW] real_root: no `root` field on java/util/TreeMap");
+        }
+        return empty;
+    };
+    if root_slot >= ctx.object_num_fields(this) {
+        if tmview_dbg() {
+            eprintln!(
+                "[TMVIEW] real_root: root_slot {root_slot} >= nf {}",
+                ctx.object_num_fields(this)
+            );
+        }
+        return empty;
+    }
+    let got = ctx.get_field(this, root_slot);
+    if tmview_dbg() {
+        eprintln!(
+            "[TMVIEW] real_root: recv={} root={got:?}",
+            ctx.class_name_of_id(ctx.class_id_of_object(this))
+                .unwrap_or_else(|| "<unknown>".into())
+        );
+    }
+    let Value::Object(Some(root)) = got else {
+        return empty;
+    };
+    // The slots below are `TreeMap$Entry`'s. A `root` of any other class means
+    // something else owns this field and the walk would be reading whatever
+    // sits at those indices — the mistyped-slot read this file guards against
+    // everywhere else.
+    if ctx
+        .class_name_arc_of_id(ctx.class_id_of_object(root))
+        .as_deref()
+        != Some(TM_ENTRY_CLASS)
+    {
+        return empty;
+    }
+    let (kf, vf, lf, rf) = match (
+        ctx.resolve_field_index(TM_ENTRY_CLASS, "key"),
+        ctx.resolve_field_index(TM_ENTRY_CLASS, "value"),
+        ctx.resolve_field_index(TM_ENTRY_CLASS, "left"),
+        ctx.resolve_field_index(TM_ENTRY_CLASS, "right"),
+    ) {
+        (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+        _ => return empty,
+    };
+    // Iterative in-order walk with an explicit stack, for the reason
+    // `tm_build_tree_shape` gives for its own: `n` is unbounded from Java and a
+    // native is not the place to inherit the JVM's stack depth. The flag is
+    // "this node's left subtree has already been pushed".
+    let mut out: Vec<(Value, Value)> = Vec::new();
+    let mut stack: Vec<(ObjectRef, bool)> = vec![(root, false)];
+    while let Some((node, expanded)) = stack.pop() {
+        if out.len() >= TM_REAL_ROOT_WALK_CAP || stack.len() >= TM_REAL_ROOT_WALK_CAP {
+            return Vec::new();
+        }
+        if expanded {
+            out.push((ctx.get_field(node, kf), ctx.get_field(node, vf)));
+            continue;
+        }
+        if let Value::Object(Some(r)) = ctx.get_field(node, rf) {
+            stack.push((r, false));
+        }
+        stack.push((node, true));
+        if let Value::Object(Some(l)) = ctx.get_field(node, lf) {
+            stack.push((l, false));
+        }
+    }
+    if tmview_dbg() {
+        eprintln!("[TMVIEW] real_root: walked {} pair(s)", out.len());
+    }
+    out
+}
+
+/// The receiver's REAL `java.util.TreeMap.size` field, if it has one.
+///
+/// The tie-break between the two stores, and a fair one in both directions:
+/// [`tm_set_slot`] MIRRORS every side-table size change into this field by
+/// name — it says why, and the reason (`TreeMap.writeObject` does
+/// `s.writeInt(size)` straight off the field) is exactly that real bytecode
+/// reads it without asking a native — and real bytecode MAINTAINS it when the
+/// natives are gone. Whichever store was written last wrote here too.
+fn tm_real_size_field(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
+    let slot = ctx.resolve_field_index("java/util/TreeMap", "size")?;
+    if slot >= ctx.object_num_fields(this) {
+        return None;
+    }
+    match ctx.get_field(this, slot) {
+        Value::Int(n) => Some(n),
+        _ => None,
+    }
+}
+
+/// Collect (key, value) pairs in sorted order, from whichever of the two
+/// stores the receiver's own `size` field agrees with.
+///
+/// # Why this is not "side table first"
+///
+/// It was, for one build, and `apps/probes/StaleViewAddAllProbe` caught it.
+/// With the family RETIRED, something on the read path seeds `tm_array_table`
+/// with the map's contents once and nothing ever updates it again — the
+/// writers that would have are the retired natives — so the side table becomes
+/// a SNAPSHOT that outlives its map:
+///
+/// ```text
+///   cratonvm-l1w8-t5, --jdk-only, apps/probes/StaleViewAddAllProbe
+///     TreeMap after growth size()          5   OK      <- the real field
+///     TreeMap after growth for-each        5   OK      <- real bytecode
+///     TreeMap after growth toArray         3   FAIL    <- the side table
+///     TreeMap held view addAll after 6     3   FAIL
+/// ```
+///
+/// `size()` and the for-each walk were right because they never ask a native;
+/// every row that went through one read the stale copy. Seven rows, and the
+/// only probe in a 163-probe tree that moved.
+///
+/// So neither store gets to be the authority by position. The receiver's own
+/// `size` field names the winner ([`tm_real_size_field`]), and it is written by
+/// both of them. Where they agree — every map this crate's natives manage —
+/// the side table answers exactly as it always did.
+///
+/// An empty map costs one field read and one null `root`.
+fn tm_collect_pairs(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<(Value, Value)> {
+    let side = tm_collect_pairs_side_table(ctx, this);
+    let Some(n) = tm_real_size_field(&*ctx, this) else {
+        // No real `size` to arbitrate with (a synthetic-JDK image): the
+        // historical order, plus the real-root fallback for an empty table.
+        if !side.is_empty() {
+            return side;
+        }
+        return tm_pairs_from_real_root(&*ctx, this);
+    };
+    let want = n.max(0) as usize;
+    if want == side.len() && !side.is_empty() {
+        return side;
+    }
+    let real = tm_pairs_from_real_root(&*ctx, this);
+    if tmview_dbg() && real.len() != side.len() {
+        eprintln!(
+            "[TMVIEW] tm_collect_pairs side={} real_root={} size_field={n}",
+            side.len(),
+            real.len()
+        );
+    }
+    if real.len() == want {
+        return real;
+    }
+    // Neither store matches the field. Prefer whichever has anything to say,
+    // side table first, rather than inventing a third answer — and say nothing
+    // only when both are empty.
+    if side.is_empty() {
+        return real;
+    }
+    side
+}
+
+/// Collect (key, value) pairs in sorted order for both fast and array modes,
+/// from `tm_array_table` and nothing else.
 /// Boxes fast-mode primitive keys back to Java wrapper objects after
 /// releasing the side-table lock (boxing may re-enter the VM).
-fn tm_collect_pairs(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<(Value, Value)> {
+fn tm_collect_pairs_side_table(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Vec<(Value, Value)> {
     if tm_is_fast_mode(ctx, this) {
         let raw: Vec<(TreeKey, Value)> = tm_fast_with(ctx, this, |bt| {
             bt.iter().map(|(k, v)| (k.clone(), *v)).collect()

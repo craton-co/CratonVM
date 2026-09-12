@@ -103,6 +103,19 @@ nothing in the arithmetic and loop kernels this pass exists for.
 `verify_allocation` re-checks it independently of the allocator, so relaxing the
 rule later requires deleting a test, not forgetting a condition.
 
+> **Since 2026-09-09 the rule has one explicit knob.**
+> `MachineModel::refs_may_cross_safepoints` (default `false`) lifts exactly this
+> refusal, both in `allocate_linear_scan`'s candidate filter and in
+> `verify_allocation`'s proof 5, and nothing else. Test:
+> `refs_may_cross_safepoints_lifts_that_refusal_and_only_that_one`. The only
+> caller that sets it is `ir_lower::ir_lower_machine_model`, and only when
+> `CRATONVM_JIT_IR_REF_RESIDENCY` (default off) and
+> `CRATONVM_JIT_IR_REF_RESIDENCY_CROSS_SAFEPOINT` (default on within it) are
+> both on. That caller does not add a register bank to the oop map. The register
+> is a write-through copy of a home slot the map still names, and
+> `Lowerer::invalidate_ref_residency` drops the copy wherever a collector could
+> have run. See `docs/jit/linear-scan-wiring.md`, *Spill slots and the oop map*.
+
 ## Splitting, spilling and rematerialization
 
 Poletto–Sarkar linear scan with three additions.

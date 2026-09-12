@@ -1174,6 +1174,68 @@ jobs:
           path: target/coverage-matrix.json
           if-no-files-found: warn
 
+  # JIT execution-path lane (docs/testing/jit-differential.md).
+  #
+  # `difftest-gate` above judges CratonVM against HotSpot in `jit-on`, `nojit`
+  # and `interp-decoded` only, so no IR, OSR or deopt mode was ever gated. This
+  # job runs `path-gate`: every mode in `Mode::execution_paths()` plus
+  # `moving-gc` must agree with the interpreter (`nojit`) on exit code,
+  # uncaught exception, stdout and checksums. It needs no HotSpot run and no
+  # ledger rows (the reference is CratonVM's own interpreter), which is why it
+  # is a SEPARATE job: the HotSpot gate step above stays byte-identical.
+  #
+  # Tracked splits go in difftest/path-gate-known.json. A split that does not
+  # reproduce on re-run is reported as flaky and does not fail the job.
+  #
+  # The IR verifier lanes are exported for the whole job. A rejection is
+  # printed only under CRATONVM_DBG_IR_COMPILES and is REPORTED here, not gated
+  # (no `--fail-on-ir-verify-reject`); the nightly workflow gates it. Promote
+  # it here once a nightly has shown the seeds are rejection-free.
+  #
+  # Exit 3 (bootstrap: no binary / no javac) is not swallowed: this job builds
+  # both, so a bootstrap exit here is a broken job, not a missing prerequisite.
+  difftest-jit-paths:
+    name: JIT execution paths vs interpreter
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CRATONVM_JIT_VERIFY_IR: '1'
+      CRATONVM_JIT_VERIFY_TYPES: '1'
+      CRATONVM_JIT_VERIFY_FRAME_STATES: '1'
+      CRATONVM_JIT_VERIFY_MEMORY_CHAIN: '1'
+      CRATONVM_JIT_VERIFY_ARENA_ORDER: '1'
+      CRATONVM_DBG_IR_COMPILES: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up JDK 25 (javac for the seeds, and the boot image)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Build difftest + cratonvm
+        run: cargo build -p cratonvm-difftest -p cratonvm-cli
+
+      # No VM: generates 256 class files and runs the typed assembler's checks
+      # plus the byte-level shape check on each. A red step here is a
+      # generator bug, and it would make every nightly fuzz result noise.
+      - name: Bytecode generator self-check
+        run: cargo run -p cratonvm-difftest --bin cratonvm-difftest -- fuzz-jit --dry-run --seed 1 --count 256
+
+      - name: Execution-path gate over the seeds
+        run: >-
+          cargo run -p cratonvm-difftest --bin cratonvm-difftest --
+          path-gate --corpus difftest/seeds
+          --modes nojit,interp-decoded,direct-emit,ir-jit,osr-eager,no-osr,forced-deopt,moving-gc
+          --reference nojit
+          --known difftest/path-gate-known.json
+
   # Hermetic self-test for the JDK-only blocker generator
   # (`tools/jdk-only-blockers/blockers.py`, the tool that derives the design-§6
   # artifacts the `jdk-only` job below uploads). 51 assertions over synthetic

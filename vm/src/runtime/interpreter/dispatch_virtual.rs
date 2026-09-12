@@ -2376,12 +2376,12 @@ pub(super) fn execute_invokevirtual_cached(
                         // T2.2 -- epoch-guarded exactly like the invokestatic twin
                         // in `execute_invokestatic_cached`: skip the string-keyed
                         // `JitCache::get` while this entry's snapshot of
-                        // `jit_cache_generation()` is still current, because no
+                        // `JitCache::generation()` is still current, because no
                         // publication or invalidation has happened since the probe
                         // that missed. Read the generation before probing so a
                         // racing publication can only cause a redundant re-probe,
                         // never a missed one.
-                        let jit_generation = cratonvm_jit::jit_cache_generation();
+                        let jit_generation = shared.jit.jit_cache.generation();
                         // The SECOND census. `tierup-decline` above stops at
                         // the `&&` chain; from here down is everything that
                         // can still refuse a site the chain ADMITTED, and
@@ -2463,18 +2463,14 @@ pub(super) fn execute_invokevirtual_cached(
                                 // (`CRATONVM_BG_COMPILE=0`) restores the inline path.
                                 if crate::runtime::env_cache::bg_compile() {
                                     ensure_bg_compiler_started(shared);
-                                    let tiered_key = crate::jit::tiered::MethodKey::new(
-                                        cached.class_name.as_ref(),
-                                        cached.method_name.as_ref(),
-                                        cached.method_descriptor.as_ref(),
-                                    );
                                     // Real invocation count — see the invokestatic
                                     // twin: stride-boundary `+= 1` counting deflated
                                     // the manager's hotness view 64x.
-                                    let _ = shared
-                                        .jit
-                                        .tiered_manager
-                                        .on_method_invocation_observed(&tiered_key, cnt as u64);
+                                    let _ = offer_invocation_to_tiered_manager(
+                                        shared,
+                                        &*cached,
+                                        cnt as u64,
+                                    );
                                 } else if !promotion_barred {
                                     if let Some(CachedInvokeTarget::Jit { compiled, .. }) =
                                         try_jit_upgrade_with_gate(
@@ -4121,6 +4117,7 @@ pub(super) fn populate_virtual_invoke_cache(
         descriptor_facts_cache: std::sync::OnceLock::new(),
         intercept_shape_cache: std::sync::OnceLock::new(),
         interp_invocations: std::sync::atomic::AtomicU32::new(0),
+        tiering_settled: std::sync::atomic::AtomicU32::new(0),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -4663,7 +4660,7 @@ pub(super) fn execute_invokevirtual_fast_door(
                 );
             }
             if !has_native && (nominate_always || !promotion_barred) {
-                let jit_generation = cratonvm_jit::jit_cache_generation();
+                let jit_generation = shared.jit.jit_cache.generation();
                 let found = if promotion_barred || cached.jit_probe_is_current(jit_generation) {
                     if census && promotion_barred {
                         crate::runtime::interp_census::record_promote_refuse(
@@ -4698,7 +4695,16 @@ pub(super) fn execute_invokevirtual_fast_door(
                         // so the census still sees every call.
                         const SYNC_EVERY: u32 = 16;
                         let threshold = crate::runtime::env_cache::jit_invocation_threshold();
-                        let cnt = cached.interp_invocations.fetch_add(1, Ordering::Relaxed) + 1;
+                        // Saturating, for the reason `note_invocation_for_tierup`
+                        // gives: `fetch_add(1) + 1` wraps after 2^32 calls.
+                        let cnt = match cached.interp_invocations.fetch_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |n| n.checked_add(1),
+                        ) {
+                            Ok(previous) => previous + 1,
+                            Err(saturated) => saturated,
+                        };
                         if cnt % SYNC_EVERY == 0 {
                             shared
                                 .jit
@@ -4723,15 +4729,11 @@ pub(super) fn execute_invokevirtual_fast_door(
                         if should_attempt {
                             if crate::runtime::env_cache::bg_compile() {
                                 ensure_bg_compiler_started(shared);
-                                let tiered_key = crate::jit::tiered::MethodKey::new(
-                                    cached.class_name.as_ref(),
-                                    cached.method_name.as_ref(),
-                                    cached.method_descriptor.as_ref(),
+                                let _ = offer_invocation_to_tiered_manager(
+                                    shared,
+                                    &*cached,
+                                    cnt as u64,
                                 );
-                                let _ = shared
-                                    .jit
-                                    .tiered_manager
-                                    .on_method_invocation_observed(&tiered_key, cnt as u64);
                             } else if !promotion_barred {
                                 let gate = match thread.invoke_cache.get(caller_class_id, cp_index, false, site_pc as u32)
                                 {

@@ -1406,7 +1406,7 @@ pub(crate) struct LambdaJitSite {
     /// The impl method, for the JIT-cache probe and the redefinition gate.
     cached: Arc<CachedBytecodeMethod>,
     gate: RedefineGate,
-    /// The compiled impl body, re-probed only when `jit_cache_generation()`
+    /// The compiled impl body, re-probed only when `JitCache::generation()`
     /// moves. `None` at the current generation means "not compiled yet" — the
     /// warmup counter in `try_invoke_cached_lambda_impl` is what eventually
     /// changes that, which is why that counter and this fast path are one
@@ -1774,12 +1774,12 @@ fn build_lambda_jit_site(shared: &SharedVm, proxy_class_id: ClassId) -> SiteVerd
 /// Epoch-guarded like every other JIT-cache probe in this VM: the string-keyed
 /// `JitCache::get` — a hash, an `ArcSwap` load and a `memcmp`, together 5.6% of
 /// a lambda-shape profile when it ran per invocation — is skipped entirely
-/// while this site's snapshot of `jit_cache_generation()` is still current.
+/// while this site's snapshot of `JitCache::generation()` is still current.
 pub(crate) fn lambda_jit_site_code(
     shared: &SharedVm,
     site: &LambdaJitSite,
 ) -> Option<cratonvm_jit::RetainedCode> {
-    let generation = cratonvm_jit::jit_cache_generation();
+    let generation = shared.jit.jit_cache.generation();
     if site.code_generation.get() != generation {
         let found = shared
             .jit
@@ -2262,6 +2262,7 @@ pub(crate) fn build_lambda_impl_cached(
         descriptor_facts_cache: std::sync::OnceLock::new(),
         intercept_shape_cache: std::sync::OnceLock::new(),
         interp_invocations: std::sync::atomic::AtomicU32::new(0),
+        tiering_settled: std::sync::atomic::AtomicU32::new(0),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -2303,7 +2304,7 @@ pub(crate) fn build_lambda_impl_cached(
 /// `invoke_or_native`, which knows how to enter compiled code.
 ///
 /// The probe is epoch-guarded exactly like its three twins: while this entry's
-/// snapshot of `jit_cache_generation()` is current, nothing has been published
+/// snapshot of `JitCache::generation()` is current, nothing has been published
 /// or invalidated since the last miss, so the string-keyed `JitCache::get` is
 /// skipped. The invocation is still COUNTED in that case, or the method could
 /// never reach the threshold that makes re-probing worthwhile.
@@ -2315,7 +2316,7 @@ pub(crate) fn bytecode_callee_compiled_or_nominate(
     if crate::runtime::env_cache::disable_jit() {
         return false;
     }
-    let jit_generation = cratonvm_jit::jit_cache_generation();
+    let jit_generation = shared.jit.jit_cache.generation();
     if !cached.jit_probe_is_current(jit_generation) {
         let found = shared.jit.jit_cache.read().get(
             &cached.class_name,
@@ -2360,18 +2361,10 @@ pub(crate) fn bytecode_callee_compiled_or_nominate(
         let _ = try_jit_upgrade_with_gate(shared, cached, gate);
     } else {
         ensure_bg_compiler_started(shared);
-        let tiered_key = crate::jit::tiered::MethodKey::new(
-            cached.class_name.as_ref(),
-            cached.method_name.as_ref(),
-            cached.method_descriptor.as_ref(),
-        );
         // The REAL invocation count, not the stride boundary — see the
         // invokestatic twin, where stride-boundary `+= 1` counting deflated the
         // manager's hotness view 64x.
-        let recommended_tier = shared
-            .jit
-            .tiered_manager
-            .on_method_invocation_observed(&tiered_key, cnt as u64);
+        let recommended_tier = offer_invocation_to_tiered_manager(shared, &*cached, cnt as u64);
         if crate::runtime::env_cache::dbg_jitc() {
             eprintln!(
                 "[cratonvm-jitc] bc-callee-tiered-enqueue {}.{}{} tier={recommended_tier:?} invoc_count={cnt}",
@@ -2467,11 +2460,11 @@ pub(super) fn try_invoke_cached_lambda_impl(
         lambda_jit::bump(&lambda_jit::ELIGIBLE);
         // Epoch-guarded exactly like the twins: skip the string-keyed
         // `JitCache::get` while this entry's snapshot of
-        // `jit_cache_generation()` is still current, because no publication or
+        // `JitCache::generation()` is still current, because no publication or
         // invalidation has happened since the probe that missed. Read the
         // generation BEFORE probing so a racing publication can only cause a
         // redundant re-probe, never a missed one.
-        let jit_generation = cratonvm_jit::jit_cache_generation();
+        let jit_generation = shared.jit.jit_cache.generation();
         let compiled = if cached.jit_probe_is_current(jit_generation) {
             None
         } else {
@@ -2535,18 +2528,11 @@ pub(super) fn try_invoke_cached_lambda_impl(
                     lambda_jit::bump(&lambda_jit::NOMINATIONS);
                 } else if should_attempt {
                     ensure_bg_compiler_started(shared);
-                    let tiered_key = crate::jit::tiered::MethodKey::new(
-                        cached.class_name.as_ref(),
-                        cached.method_name.as_ref(),
-                        cached.method_descriptor.as_ref(),
-                    );
                     // Real invocation count — see the invokestatic twin:
                     // stride-boundary `+= 1` counting deflated the manager's
                     // hotness view 64x.
-                    let recommended_tier = shared
-                        .jit
-                        .tiered_manager
-                        .on_method_invocation_observed(&tiered_key, cnt as u64);
+                    let recommended_tier =
+                        offer_invocation_to_tiered_manager(shared, &*cached, cnt as u64);
                     lambda_jit::bump(&lambda_jit::NOMINATIONS);
                     if crate::runtime::env_cache::dbg_jitc() {
                         eprintln!(

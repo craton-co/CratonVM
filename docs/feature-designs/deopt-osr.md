@@ -39,7 +39,7 @@ The payoff is the standard tiered-JIT contract: speculate aggressively on the fa
 - `FrameState` — `method_key`, `bci`, `locals`, `stack`, `monitors`, `caller: Option<Box<FrameState>>` (inlined caller chain).
 - `DeoptimizationPoint` — `native_offset`, `bci`, `reason`, `action`, `speculation_id`, `frame_state`. Per-safepoint record.
 - `DeoptimizationLog` — records events, drives `should_give_up`/`most_common_reason`/`recommend_action`.
-- `InvalidationManager` — assumption tracking (`LeafClass`/`UniqueConcreteMethod`/…) with reverse indices for invalidation.
+- (Deleted 2026-09-12: `InvalidationManager` / `CompilationAssumption`. No compile path ever registered an assumption, so it evicted nothing. A body's dependency record is its own `inlined_methods`; a compile racing an invalidation is refused by the cache's invalidation log in `JitCache::put`.)
 
 ### 2. CompiledMethod deopt plumbing (`jit/src/lib.rs`)
 - `CompiledMethod` fields: `deopt_points: Vec<DeoptimizationPoint>`, `can_deopt_resume: bool`, `can_osr_exit: bool`, `compilation_epoch: u64`, `osr_exit_points: Vec<usize>`.

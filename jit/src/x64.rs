@@ -224,6 +224,10 @@ pub(crate) use inlining::inline_live_slot_clamps;
 /// Separate from the clamp above for the reason the counter itself is: one
 /// number cannot say which of the two guards a result should be credited to.
 pub(crate) use inlining::inline_locals_floor_bumps;
+/// The JVMS 4.9.1 bci bound, re-exported for `ir_lower`'s twin of
+/// `record_npe_trap_site`: the optimizing tier screens against the same bound
+/// and a second copy of it would be a second place to fix.
+pub(crate) use inlining::INLINE_FRAME_MAX_BCI;
 /// The PC -> inline-chain map, and the per-compile session that records it.
 ///
 /// NAMED rather than glob re-exported, unlike the ~15 `pub use foo::*;`
@@ -248,10 +252,6 @@ pub use inlining::{
     inline_miss_edge_poison_counts, npe_trap_lines_enabled, InlineFrameLevel, InlineFrameMap,
     InlineFrameRow, NpeTrapMap, NpeTrapSite,
 };
-/// The JVMS 4.9.1 bci bound, re-exported for `ir_lower`'s twin of
-/// `record_npe_trap_site`: the optimizing tier screens against the same bound
-/// and a second copy of it would be a second place to fix.
-pub(crate) use inlining::INLINE_FRAME_MAX_BCI;
 mod arith;
 mod arrays;
 mod deopt_stubs;
@@ -261,13 +261,13 @@ pub(crate) use objects::note_ungated_ref_store;
 // (`ir_lower`), deliberately: two tiers deciding independently what a
 // published plan means is how one of them ends up skipping a barrier the
 // other pays. `objects` is a private module, so the re-export is the seam.
-pub(crate) use objects::{ref_store_gates_of, ref_store_post_skip_mask_of};
-pub use objects::ref_store_site_counts;
-pub use objects::{inline_array_declines, inline_array_site_counts};
-pub(crate) use objects::note_gated_ref_store;
 pub use null_check_elim::receiver_null_check_counts;
 pub use null_check_elim::receiver_null_check_implicit_by_arm;
 pub use null_check_elim::receiver_null_check_implicit_count;
+pub(crate) use objects::note_gated_ref_store;
+pub use objects::ref_store_site_counts;
+pub use objects::{inline_array_declines, inline_array_site_counts};
+pub(crate) use objects::{ref_store_gates_of, ref_store_post_skip_mask_of};
 mod osr;
 mod simd;
 
@@ -287,8 +287,8 @@ thread_local! {
 mod emit;
 mod frames;
 mod operand_stack;
-pub use operand_stack::spill_slots_cap;
 pub(crate) use inlining::MAX_INLINE_MERGE_DEPTH;
+pub use operand_stack::spill_slots_cap;
 pub(crate) use operand_stack::SpillReason;
 pub mod safepoint;
 // ---------------------------------------------------------------------------
@@ -393,6 +393,44 @@ pub const LOCAL_XMMS: [u8; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
 /// When a FP binop produces a result in XMM0, it can be promoted to a scratch XMM
 /// to free XMM0 for the next operation, avoiding the XMM0→frame spill/reload cycle.
 /// These are caller-saved and must be flushed before calls and backward branches.
+///
+/// "Caller-saved" is an ABI fact, not a choice: Win64 makes XMM6-XMM15
+/// non-volatile, and neither the prologue nor the epilogue saves a scratch
+/// register (only `alloc_used_xmms`, drawn from `LOCAL_XMMS`, is saved). A
+/// sixth pending FP value promoted into XMM6/XMM7 therefore returned to the
+/// Rust caller with its non-volatile state destroyed. The pool is the
+/// volatile subset on Windows; exhaustion falls back to a frame spill in
+/// `flush_xmm0_slots`, so the smaller pool costs a store, never correctness.
+// The OSR trampoline in `lib.rs` hand-builds a prologue and must probe the
+// stack exactly as `emit_prologue` does.
+pub(crate) use reg_encoding::{
+    jit_stack_bang_enabled, stack_bang_frame_probe_disps, STACK_BANG_PAGE_SIZE,
+};
+
+/// Bytes in one callee-saved XMM save slot: the whole 128-bit register.
+///
+/// Win64 preserves all of XMM6-XMM15, not their low quadword. The single-pass
+/// prologue used to save 8 bytes with `MOVQ` and restore with a `MOVQ` that
+/// zero-extends, so a caller holding a vector in XMM8+ got its upper half
+/// back cleared. (The IR tier has saved 16 bytes with `MOVUPS` all along.)
+pub(crate) const XMM_SAVE_SLOT_BYTES: i32 = 16;
+
+/// The `[rbp - offset]` depth of callee-saved XMM save slot `i`, for a save
+/// area starting at `xmm_saved_base`.
+///
+/// Frame depths here name the LOW byte of an 8-byte word that extends upward,
+/// so the first 16-byte slot starts 8 bytes deeper than `xmm_saved_base` and
+/// ends exactly where the GPR save area above it begins; slot `n - 1` ends
+/// where `xmm_saved_base + n * XMM_SAVE_SLOT_BYTES` begins. The prologue, both
+/// epilogues and the OSR trampoline all go through this one function.
+pub(crate) fn xmm_save_slot_offset(xmm_saved_base: i32, i: usize) -> i32 {
+    // Cast: a callee-saved XMM index, at most 8.
+    xmm_saved_base + i as i32 * XMM_SAVE_SLOT_BYTES + (XMM_SAVE_SLOT_BYTES - 8)
+}
+
+#[cfg(target_os = "windows")]
+const SCRATCH_XMMS: [u8; 4] = [2, 3, 4, 5];
+#[cfg(not(target_os = "windows"))]
 const SCRATCH_XMMS: [u8; 6] = [2, 3, 4, 5, 6, 7];
 
 #[cfg(not(target_os = "windows"))]
@@ -635,6 +673,12 @@ struct Compiler {
     /// must be entered through the dispatch-aware path — same requirement,
     /// and the same reason, as `emitted_checkcast_throw`.
     emitted_aastore_throw: bool,
+    /// `jit_instanceof` resolves its target class on demand and pins the
+    /// receiver through `jit_thread_mut()` while it does; without a JIT thread
+    /// the pin is skipped and a moving collection during the class load leaves
+    /// the receiver stale. Forces the dispatch-aware entry like the two flags
+    /// above.
+    emitted_instanceof_call: bool,
     /// Forward branch patches: (native offset of rel32, target bytecode PC).
     forward_patches: Vec<(usize, usize)>,
     /// Jump table patches: (native offset of i32 entry, table_base_native_offset, target bytecode PC).
@@ -987,8 +1031,6 @@ struct Compiler {
     fp_hoist_info: Vec<FpLoopHoist>,
     /// FP LICM: frame offsets for hoisted FP values (one per FpLoopHoist entry).
     _fp_hoist_offsets: Vec<i32>,
-    /// SIMD: vectorizable double-array sum loops detected during analysis.
-    simd_fp_loops: Vec<SimdFpArraySum>,
     /// FP strength reduction: set of bytecode PCs where dmul-by-2.0 is replaced with dadd-self.
     fp_strength_reduction_pcs: FxHashSet<usize>,
     /// Scalar replacement: non-escaping NEW PCs → frame-local field storage.
@@ -1323,7 +1365,7 @@ struct Compiler {
     /// This compilation's identity, reserved BEFORE codegen because the
     /// immediate must be encoded into the prologue while the `CompiledMethod`
     /// that will own it does not exist yet. 0 → publish nothing.
-    compile_id: u32,
+    compile_id: crate::CompileIdReservation,
     /// Step 1 debug self-check (`CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD`) —
     /// when set AND inline frame-record is active, also emit the verify call.
     verify_inline_frame_record: bool,
@@ -1477,14 +1519,6 @@ struct Compiler {
     bulk_set_byte_stride_loops: Vec<BulkSetByteStrideLoop>,
     /// Canonical nested byte/boolean Sieve loops.
     byte_sieve_loops: Vec<ByteSieveLoop>,
-    /// T5.2.17 — loop unswitch candidates.
-    ///
-    /// Each entry describes a loop with a loop-invariant conditional
-    /// branch that can be lifted to produce two specialized loops.
-    /// The emitter consumes this list to duplicate the body and hoist
-    /// the branch above the header.
-    loop_unswitch_candidates: Vec<LoopUnswitchCandidate>,
-
     // ── MED-4 / Fix 3 — PC-indexed lookup acceleration ─────────────────
     //
     // The original layout stores per-call-site metadata in `Vec<(pc, …)>`
@@ -1611,11 +1645,17 @@ struct Compiler {
     deopt_epoch_guard: *const crate::deopt::DeoptEpochGuard,
     /// deopt-osr Step 9 follow-up (c): this method's `"<class>.<method>:<desc>"`
     /// key, set by `compile_with_param_slots` from its `method_key` arg. Used to
-    /// consult the per-bci de-spec registry (`crate::deopt::despec_contains`) so a
-    /// loop-header speculation that has repeatedly deopted is NOT re-emitted on
-    /// recompile. Empty (`""`) on the legacy/test `compile()` wrapper and in
-    /// production (the registry is empty), so the consult is a no-op there.
+    /// consult the per-bci de-spec registry ([`Self::despec`]) so a
+    /// speculation that has repeatedly deopted is NOT re-emitted on recompile.
+    /// Empty (`""`) on the legacy/test `compile()` wrapper, where the consult is
+    /// a no-op.
     method_key: String,
+    /// The compiling VM's per-bci de-spec registry
+    /// (`crate::deopt::DespecRegistry`), set by `compile_with_param_slots` from
+    /// its `despec` arg. `None` (the legacy/test wrappers, no VM) consults
+    /// nothing. An `Arc` rather than a borrow because `Compiler` carries no
+    /// lifetime; cloning it once per compile is one refcount increment.
+    despec: Option<std::sync::Arc<crate::deopt::DespecRegistry>>,
     /// The common direct-recursive edge cannot allocate, call another method,
     /// or poll. See [`gc_inert_selfrec_candidate`].
     gc_inert_selfrec: bool,
@@ -2120,7 +2160,11 @@ mod deopt_snapshot_tests {
         // `wide istore 70` at pc 8 clears local 70 (window 1, bit 6), which was
         // never set; assert it stays clear so the window rebasing is not just
         // setting everything.
-        assert_eq!(wmasks[code.len() + 12] & (1u64 << 6), 0, "local 70 is an int");
+        assert_eq!(
+            wmasks[code.len() + 12] & (1u64 << 6),
+            0,
+            "local 70 is an int"
+        );
         // And slot 0 in window 0 is untouched by any of it.
         assert_eq!(wmasks[4] & 1, 0, "local 0 is never stored here");
         assert!(wreached[4], "pc 4 is reachable");
@@ -2513,9 +2557,9 @@ impl Compiler {
             0
         };
         let compile_id = if inline_cm_tls_disp != 0 {
-            crate::reserve_compile_id()
+            crate::CompileIdReservation::reserve()
         } else {
-            0
+            crate::CompileIdReservation::none()
         };
         let verify_inline_frame_record = verify_inline_frame_record_enabled();
         let shadow_enabled = shadow_stack_maps_enabled();
@@ -2656,15 +2700,14 @@ impl Compiler {
                                                                                               // than `DIRECT_CALL_SERVICE_HEADROOM_SLOTS` arguments simply fails the
                                                                                               // reservation and falls back, exactly as an over-wide method does today.
         const DIRECT_CALL_SERVICE_HEADROOM_SLOTS: usize = 16;
-        let spill_slots = spill_slots_cap()
-            .map_or_else(
-                || max_stack.saturating_add(max_stack.min(DIRECT_CALL_SERVICE_HEADROOM_SLOTS)),
-                |cap| {
-                    max_stack
-                        .saturating_add(max_stack.min(DIRECT_CALL_SERVICE_HEADROOM_SLOTS))
-                        .min(cap)
-                },
-            );
+        let spill_slots = spill_slots_cap().map_or_else(
+            || max_stack.saturating_add(max_stack.min(DIRECT_CALL_SERVICE_HEADROOM_SLOTS)),
+            |cap| {
+                max_stack
+                    .saturating_add(max_stack.min(DIRECT_CALL_SERVICE_HEADROOM_SLOTS))
+                    .min(cap)
+            },
+        );
         let spill_size = (spill_slots.min(i32::MAX as usize / 8) as i32).saturating_mul(8); // Cast: address arithmetic
         let shadow_space = 32i32; // Windows x64 shadow space for helper calls
                                   // Reserved bytes ABOVE the shadow region for in-frame stack args to
@@ -2725,8 +2768,9 @@ impl Compiler {
         let num_reg_locals = local_assignments.iter().filter(|a| a.is_some()).count()
             + xmm_assignments.iter().filter(|a| a.is_some()).count();
         let callee_saved_size = alloc_used_regs.len() as i32 * 8; // Cast: x86-64 immediate encoding
-                                                                  // XMM save slots: 8 bytes each (we store the 64-bit value via MOVQ through RAX)
-        let xmm_saved_size = alloc_used_xmms.len() as i32 * 8; // Cast: x86-64 immediate encoding
+                                                                  // XMM save slots: 16 bytes each, the whole register (see
+                                                                  // `XMM_SAVE_SLOT_BYTES`).
+        let xmm_saved_size = alloc_used_xmms.len() as i32 * XMM_SAVE_SLOT_BYTES; // Cast: x86-64 immediate encoding
 
         // Callee-saved registers are saved using MOV into frame slots (not PUSH)
         // to keep RSP stable after SUB RSP. This ensures shadow space is at [RSP..RSP+31].
@@ -2897,6 +2941,7 @@ impl Compiler {
             emitted_alloc_oom_check: false,
             emitted_checkcast_throw: false,
             emitted_aastore_throw: false,
+            emitted_instanceof_call: false,
             forward_patches: Vec::new(),
             jump_table_patches: Vec::new(),
             self_call_patches: Vec::new(),
@@ -2959,7 +3004,6 @@ impl Compiler {
             scratch_xmm_in_use: 0,
             fp_hoist_info: Vec::new(),
             _fp_hoist_offsets: Vec::new(),
-            simd_fp_loops: Vec::new(),
             fp_strength_reduction_pcs: FxHashSet::default(),
             scalar_replaced: FxHashMap::default(),
             scalar_field_ops: FxHashMap::default(),
@@ -3032,7 +3076,6 @@ impl Compiler {
             bulk_zero_byte_fill_loops: Vec::new(),
             bulk_set_byte_stride_loops: Vec::new(),
             byte_sieve_loops: Vec::new(),
-            loop_unswitch_candidates: Vec::new(),
             field_info_idx: FxHashMap::default(),
             static_field_info_idx: FxHashMap::default(),
             invoke_info_idx: FxHashMap::default(),
@@ -3063,6 +3106,7 @@ impl Compiler {
             deopt_point_pcs: Vec::new(),
             deopt_epoch_guard: std::ptr::null(),
             method_key: String::new(),
+            despec: None,
             gc_inert_selfrec,
             deopt_regs_base,
             deopt_box_ptr_by_bci: FxHashMap::default(),

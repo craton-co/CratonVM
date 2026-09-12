@@ -58,6 +58,21 @@ pub struct StripedCounter {
     stripes: [Stripe; STRIPES],
 }
 
+/// The stripe one [`StripedCounter::inc_token`] incremented.
+///
+/// Handed back to [`StripedCounter::dec_token`] so the decrement cannot land on
+/// a different stripe than its increment, whatever state the thread's
+/// thread-locals are in by then. Store it in the guard (or chain entry) that
+/// owns the matching decrement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StripeToken(usize);
+
+impl StripeToken {
+    /// A token that names no increment. [`StripedCounter::dec_token`] ignores
+    /// it, so a placeholder that is never filled cannot underflow a stripe.
+    pub const UNSET: StripeToken = StripeToken(usize::MAX);
+}
+
 static NEXT_STRIPE: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
@@ -79,8 +94,12 @@ pub fn stripe_index() -> usize {
         return 0;
     }
     // A thread tearing down past its TLS destructors falls back to stripe 0.
-    // Correct (the sum still sees it), merely contended, and unreachable in
-    // any hot path.
+    // That is only correct for a counter whose increment ALSO landed there: an
+    // `inc` made on stripe `k` and a `dec` made after teardown on stripe 0
+    // would zero a live peer's count and leave stripe `k` raised forever. A
+    // pair that can straddle teardown must use [`StripedCounter::inc_token`] /
+    // [`StripedCounter::dec_token`], which carry the stripe from the increment
+    // to the decrement and never consult this function twice.
     MY_STRIPE
         .try_with(|slot| {
             let mut index = slot.get();
@@ -123,6 +142,31 @@ impl StripedCounter {
         let _ = stripe.fetch_update(Ordering::Release, Ordering::Acquire, |d| {
             Some(d.saturating_sub(1))
         });
+    }
+
+    /// Add one to this thread's stripe and return which stripe that was.
+    #[inline]
+    pub fn inc_token(&self) -> StripeToken {
+        let index = stripe_index();
+        self.stripes[index].0.fetch_add(1, Ordering::AcqRel);
+        StripeToken(index)
+    }
+
+    /// Subtract one from the stripe `token` names, saturating at zero.
+    ///
+    /// The stripe comes from the token, not from this thread's thread-local, so
+    /// a decrement that runs during thread teardown still undoes exactly the
+    /// increment it pairs with. [`StripeToken::UNSET`] is a no-op.
+    #[inline]
+    pub fn dec_token(&self, token: StripeToken) {
+        let Some(stripe) = self.stripes.get(token.0) else {
+            return;
+        };
+        let _ = stripe
+            .0
+            .fetch_update(Ordering::Release, Ordering::Acquire, |d| {
+                Some(d.saturating_sub(1))
+            });
     }
 
     /// The total across all stripes.
@@ -195,6 +239,43 @@ mod tests {
         assert_eq!(C.get(), 1, "and must not owe against a later increment");
         C.dec();
         assert!(C.is_zero());
+        C.reset();
+    }
+
+    /// A decrement that runs after its thread's stripe thread-local is gone
+    /// must undo its own increment, not stripe 0's.
+    ///
+    /// The teardown fallback is `stripe_index() -> 0`, so a decrement that
+    /// re-derived its stripe would hit stripe 0 and zero a live peer. The token
+    /// carries the increment's stripe instead.
+    #[test]
+    fn a_token_decrement_lands_on_its_increments_stripe() {
+        static C: StripedCounter = StripedCounter::new();
+        C.reset();
+        // A live peer parked on stripe 0, and an exited thread whose increment
+        // landed on stripe 5.
+        C.stripes[0].0.store(1, Ordering::Release);
+        C.stripes[5].0.store(1, Ordering::Release);
+        C.dec_token(StripeToken(5));
+        assert_eq!(
+            C.stripes[0].0.load(Ordering::Acquire),
+            1,
+            "the live peer's count on stripe 0 must survive"
+        );
+        assert_eq!(C.stripes[5].0.load(Ordering::Acquire), 0);
+        C.dec_token(StripeToken::UNSET);
+        assert_eq!(C.get(), 1, "an unset token is a no-op");
+        C.reset();
+
+        // The same pairing across a real thread exit: the increment is made on
+        // the worker's stripe, the decrement on this thread after the worker's
+        // thread-locals are destroyed.
+        let token = std::thread::spawn(|| C.inc_token())
+            .join()
+            .expect("worker finishes");
+        assert_eq!(C.get(), 1);
+        C.dec_token(token);
+        assert!(C.is_zero(), "the exited thread's stripe must be back at zero");
         C.reset();
     }
 

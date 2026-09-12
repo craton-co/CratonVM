@@ -97,7 +97,7 @@ pub(super) fn bytecode_loop_xform_rewrites_bytecode() -> bool {
 pub(super) fn bytecode_loop_xform_flag() -> bool {
     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ARMED.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_BYTECODE_LOOP_XFORM").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_BYTECODE_LOOP_XFORM")
     })
 }
 
@@ -109,7 +109,7 @@ pub(super) fn bytecode_loop_xform_flag() -> bool {
 /// requirement and not a tidiness one.
 pub(super) fn native_unroller_enabled() -> bool {
     !bytecode_loop_xform_rewrites_bytecode()
-        && cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_UNROLL").is_none()
+        && !cratonvm_types::flags::runtime_flag_on("CRATONVM_DISABLE_UNROLL")
 }
 
 /// Structural admission test for the native byte-copy loop unroller.
@@ -169,7 +169,7 @@ pub(super) fn plan_native_unroll(
     exception_ranges: &[(usize, usize, usize)],
     bypassable_headers: &FxHashSet<usize>,
 ) -> Option<(usize, usize, usize)> {
-    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some();
+    let dbg = cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_GEN");
     if bypassable_headers.contains(&header) {
         if dbg {
             eprintln!(
@@ -359,7 +359,7 @@ fn plan_versioned(
         ) {
             Ok(x) => return Ok(x),
             Err(refusal) => {
-                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some() {
+                if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_GEN") {
                     eprintln!(
                         "[JIT_GEN] loop versioning refused: header={header} \
                          back_edge={back_edge} copies={extra} reason={refusal:?} \
@@ -837,7 +837,7 @@ pub(super) fn rewritten_deopt_points_are_publishable(
                 }
                 Some(PointDifference::Divergent(how)) => {
                     crate::metrics::record_loop_xform_event("loop_xform_deopt_frames_diverge");
-                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some() {
+                    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_GEN") {
                         eprintln!(
                             "[JIT_GEN] loop-rewrite copies of bci {} diverge at \
                                  output pcs {} and {pc}: {how} — the OSR entry \

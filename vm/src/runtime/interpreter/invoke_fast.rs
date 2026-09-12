@@ -391,7 +391,17 @@ pub(super) fn note_invocation_for_tierup(
     use std::sync::atomic::Ordering;
     const JIT_RETRY_STRIDE: u32 = 64;
     let threshold = crate::runtime::env_cache::jit_invocation_threshold();
-    let cnt = cached.interp_invocations.fetch_add(1, Ordering::Relaxed) + 1;
+    // Saturating: `fetch_add(1) + 1` wrapped the per-call-site counter after
+    // 2^32 calls -- a panic in a debug build, and in release a counter that
+    // restarts below the threshold, so a method that was hot enough to be
+    // offered every 64 calls silently stops being offered for 500 calls.
+    let cnt = match cached
+        .interp_invocations
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+    {
+        Ok(previous) => previous + 1,
+        Err(saturated) => saturated,
+    };
     if cnt % INVOCATION_SYNC_EVERY == 0 {
         shared
             .jit
@@ -409,15 +419,7 @@ pub(super) fn note_invocation_for_tierup(
         return false;
     }
     ensure_bg_compiler_started(shared);
-    let tiered_key = crate::jit::tiered::MethodKey::new(
-        cached.class_name.as_ref(),
-        cached.method_name.as_ref(),
-        cached.method_descriptor.as_ref(),
-    );
-    let _ = shared
-        .jit
-        .tiered_manager
-        .on_method_invocation_observed(&tiered_key, cnt as u64);
+    let _ = offer_invocation_to_tiered_manager(shared, &**cached, cnt as u64);
     true
 }
 
@@ -426,7 +428,7 @@ pub(super) fn note_invocation_for_tierup(
 /// checks, which is the general dispatcher's job.
 #[inline]
 pub(super) fn callee_has_compiled_body(shared: &SharedVm, cached: &CachedBytecodeMethod) -> bool {
-    let jit_generation = cratonvm_jit::jit_cache_generation();
+    let jit_generation = shared.jit.jit_cache.generation();
     if cached.jit_probe_is_current(jit_generation) {
         return false;
     }

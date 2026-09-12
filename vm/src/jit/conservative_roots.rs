@@ -123,6 +123,15 @@ pub(crate) struct JitFrameChainEntry {
     /// has no `JvmThread` to ask, but no interpreter frame can have been pushed
     /// since the entry it nests inside, so the enclosing depth is exact.
     pub interp_depth: u32,
+    /// The `GLOBAL_JIT_DEPTH` stripe this entry's push incremented, filled by
+    /// [`push_entry_full`]. The pop decrements exactly that stripe, so an entry
+    /// released during thread teardown cannot land on stripe 0 and cancel a
+    /// live peer's depth. Constructors pass `StripeToken::UNSET`.
+    pub depth_stripe: cratonvm_types::striped_counter::StripeToken,
+    /// The executable-code quiescence token this entry's push took, filled by
+    /// [`push_entry_full`] and handed back to `jit_execution_leave` by the pop.
+    /// Constructors pass `JitExecutionToken::UNSET`.
+    pub exec_token: cratonvm_jit::JitExecutionToken,
 }
 
 /// Sentinel for [`JitFrameChainEntry::interp_depth`]: resolve at push time from
@@ -460,7 +469,7 @@ pub fn xt_pinned_peer_depth_enabled() -> bool {
 pub fn xt_pinned_peer_publish_only() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_XT_PINNED_PEER_PUBLISH_ONLY").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_XT_PINNED_PEER_PUBLISH_ONLY")
     })
 }
 
@@ -727,9 +736,8 @@ pub fn moving_young_osr_shadow_fallback_needed() -> bool {
     if !moving_young_enabled() {
         return false;
     }
-    let debug_shadow_disabled = cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_NOPUSH")
-        .is_some()
-        || cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_NORELOAD").is_some();
+    let debug_shadow_disabled = cratonvm_types::flags::runtime_flag_on("CRATONVM_SHADOW_NOPUSH")
+        || cratonvm_types::flags::runtime_flag_on("CRATONVM_SHADOW_NORELOAD");
     JIT_ENTRY_CHAIN.with(|c| {
         let mut chain = c.borrow_mut();
         flush_top_rbp_cache_to_chain(chain.as_mut_slice());
@@ -889,7 +897,7 @@ fn moving_young_osr_method_needs_fallback(
 pub fn shadow_pin_roots() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_PIN").is_some())
+    *ENABLED.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_SHADOW_PIN"))
 }
 
 /// Capture the current native stack pointer.
@@ -1018,6 +1026,8 @@ pub fn push_jit_entry_at(sp: usize) -> usize {
         entry_sp: sp,
         precise: None,
         interp_depth: INTERP_DEPTH_INHERIT,
+        depth_stripe: cratonvm_types::striped_counter::StripeToken::UNSET,
+        exec_token: cratonvm_jit::JitExecutionToken::UNSET,
     })
 }
 
@@ -1053,6 +1063,12 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
                 info.exact_cm_id = published_compile_id();
             }
         }
+        // Both process-wide counts are raised here, with their stripes kept in
+        // the entry the matching pop consumes. A few instructions earlier than
+        // the push they describe is the over-approximating direction for
+        // "is anyone in JIT?".
+        entry.depth_stripe = GLOBAL_JIT_DEPTH.inc_token();
+        entry.exec_token = cratonvm_jit::jit_execution_enter();
         v.push(entry);
         let n = v.len();
         top_rbp_set(0);
@@ -1065,7 +1081,6 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
         }
         n
     });
-    GLOBAL_JIT_DEPTH.inc();
     publish_self_jit_depth(depth);
     // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
     // this is the ONLY point at which a thread becomes
@@ -1076,7 +1091,6 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
         ThreadExecState::CompiledUninterruptible,
         "jit::conservative_roots::push_entry_full",
     );
-    cratonvm_jit::jit_execution_enter();
     // Mirror into the GC-side quiescence flag so the GC can defer
     // compaction whenever any thread is inside a JIT call. NEW-12's
     // precise root walk removes false positives from the root set,
@@ -1151,24 +1165,18 @@ pub fn pop_jit_entry() -> Option<usize> {
         (p, v.len())
     });
     if let Some(entry) = popped {
-        GLOBAL_JIT_DEPTH.dec();
+        GLOBAL_JIT_DEPTH.dec_token(entry.depth_stripe);
         publish_self_jit_depth(remaining);
         thread_state::record_transition(
             leaving_compiled_state(remaining),
             "jit::conservative_roots::pop_jit_entry",
         );
         cratonvm_gc::gc_quiescence::leave();
-        cratonvm_jit::jit_execution_leave();
-        // P1 code-cache retirement: leaving a compiled frame is one of the two
-        // moments `GLOBAL_JIT_DEPTH` can reach zero, and therefore one of the
-        // two moments an unpublished body can become reclaimable. The sweep
-        // asks the quiescence question itself (with the retirement queue lock
-        // held — see `code_cache_lifecycle`'s §1.2); all this site owes it is
-        // the wake-up. The gate is one relaxed load, and with nothing queued —
-        // the overwhelmingly common case — that is the whole cost.
-        if crate::jit::code_cache_lifecycle::pending_retirements() != 0 {
-            crate::jit::code_cache_lifecycle::sweep_if_quiescent();
-        }
+        // P1 code-cache retirement: `jit_execution_leave` is also the
+        // retirement queue's wake-up. It records this thread's return to depth
+        // 0 and drains when that can release something, so this hot path owes
+        // the queue nothing more.
+        cratonvm_jit::jit_execution_leave(entry.exec_token);
         note_jit_residue(entry.entry_sp);
         Some(entry.entry_sp)
     } else {
@@ -1205,6 +1213,13 @@ pub fn pop_jit_entry() -> Option<usize> {
 /// engaged. Returns the number of stale entries reclaimed.
 pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
     let mut remaining = 0usize;
+    // The counter tokens of every pruned entry, so each decrement lands on the
+    // stripe its push raised. `Vec::new` does not allocate until a prune
+    // actually removes something, which is the rare case.
+    let mut pruned_tokens: Vec<(
+        cratonvm_types::striped_counter::StripeToken,
+        cratonvm_jit::JitExecutionToken,
+    )> = Vec::new();
     let pruned = JIT_ENTRY_CHAIN.with(|c| {
         let mut v = c.borrow_mut();
         let before = v.len();
@@ -1212,6 +1227,7 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
         // above the scanner SP). Entries below it have provably returned.
         for e in v.iter().filter(|e| e.entry_sp < scanner_sp) {
             note_jit_residue(e.entry_sp);
+            pruned_tokens.push((e.depth_stripe, e.exec_token));
         }
         v.retain(|e| e.entry_sp >= scanner_sp);
         let pruned = before - v.len();
@@ -1251,10 +1267,10 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
             "jit::conservative_roots::prune_returned_jit_entries",
         );
     }
-    for _ in 0..pruned {
-        GLOBAL_JIT_DEPTH.dec();
+    for (depth_stripe, exec_token) in pruned_tokens {
+        GLOBAL_JIT_DEPTH.dec_token(depth_stripe);
         cratonvm_gc::gc_quiescence::leave();
-        cratonvm_jit::jit_execution_leave();
+        cratonvm_jit::jit_execution_leave(exec_token);
     }
     if pruned > 0 {
         publish_self_jit_depth(remaining);
@@ -1280,12 +1296,12 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
             pruned,
             scanner_sp,
         );
-        // P1 code-cache retirement: the self-heal is the OTHER way
-        // `GLOBAL_JIT_DEPTH` reaches zero. Without this wake-up a leaked
-        // `JitEntryGuard` would wedge the retirement queue exactly as it used
-        // to wedge the moving collector — and because retention is the
-        // fail-safe, that would show up as unbounded code-cache growth rather
-        // than as a crash. See `code_cache_lifecycle`'s §1.3.
+        // P1 code-cache retirement: a leaked `JitEntryGuard` is exactly what
+        // wedges the retirement queue, and each leave above pumps the drain only
+        // on its thread's schedule. Ask once, explicitly, now that the wedge is
+        // gone — retention is the fail-safe, so a missed wake-up would show up
+        // as code-cache growth rather than as a crash. See
+        // `code_cache_lifecycle`'s §1.3.
         if crate::jit::code_cache_lifecycle::pending_retirements() != 0 {
             crate::jit::code_cache_lifecycle::sweep_if_quiescent();
         }
@@ -1374,6 +1390,8 @@ impl JitEntryGuard {
         let sp = current_stack_pointer();
         let entry = JitFrameChainEntry {
             entry_sp: sp,
+            depth_stripe: cratonvm_types::striped_counter::StripeToken::UNSET,
+            exec_token: cratonvm_jit::JitExecutionToken::UNSET,
             interp_depth: match interp_depth {
                 Some(d) => u32::try_from(d).unwrap_or(u32::MAX - 1),
                 None => INTERP_DEPTH_INHERIT,
@@ -1720,9 +1738,7 @@ pub mod scan_prof {
 
     pub fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| {
-            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_SCAN_PROF").is_some()
-        })
+        *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_SCAN_PROF"))
     }
 
     #[inline]
@@ -1788,7 +1804,7 @@ fn jit_scan_cache_enabled() -> bool {
         // cache stays enabled for its perf benefit; `collection_count` keying
         // (see `JitScanCache`) keeps it from republishing freed addresses across
         // a GC. `CRATONVM_NO_JIT_SCAN_CACHE` force-disables it for bisection.
-        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_SCAN_CACHE").is_none()
+        !cratonvm_types::flags::runtime_flag_on("CRATONVM_NO_JIT_SCAN_CACHE")
             && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FORCE_MOVING").is_none()
             && cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_STACK").is_none()
     })
@@ -1800,7 +1816,7 @@ fn jit_scan_cache_enabled() -> bool {
 /// call — a kernel transition on the hottest dispatch path. Cached once.
 fn dbg_no_prune() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_NO_PRUNE").is_some())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_NO_PRUNE"))
 }
 
 /// H2-CID0 (2026-08-05) — times the unregistered-JIT-frame memo said "clean"
@@ -1833,9 +1849,7 @@ pub static A5_PROBE_WORDS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn a5_engagement_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_A5_ENGAGEMENT").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_A5_ENGAGEMENT"))
 }
 
 /// Print the A5 FALLBACK census — how many moving-young cycles the A5 probe
@@ -1906,9 +1920,7 @@ pub static UNREG_MEMO_SUPPRESSED_AUTHORITATIVE: AtomicUsize = AtomicUsize::new(0
 /// only cost is the scan itself.
 fn dbg_unreg_memo_audit() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNREG_MEMO_AUDIT").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_UNREG_MEMO_AUDIT"))
 }
 
 /// H2-CID0 (2026-08-05) — the unregistered-JIT-frame memo, as a value.
@@ -2104,9 +2116,7 @@ pub mod above_chain {
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn above_chain_scan_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ABOVE_CHAIN_SCAN").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_ABOVE_CHAIN_SCAN"))
 }
 
 /// `CRATONVM_JIT_ABOVE_CHAIN_ALL_PATHS=1` — also walk the band on the
@@ -2122,9 +2132,7 @@ fn above_chain_scan_enabled() -> bool {
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn above_chain_all_paths() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ABOVE_CHAIN_ALL_PATHS").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_ABOVE_CHAIN_ALL_PATHS"))
 }
 
 /// `CRATONVM_JIT_ABOVE_CHAIN_FROM_SP=1` — start the band at the SCANNER's SP
@@ -2137,9 +2145,7 @@ fn above_chain_all_paths() -> bool {
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn above_chain_from_sp() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ABOVE_CHAIN_FROM_SP").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_ABOVE_CHAIN_FROM_SP"))
 }
 
 /// `CRATONVM_DBG_ABOVE_CHAIN_KB=<n>` — cap the above-chain band at `n` KiB.
@@ -2171,9 +2177,7 @@ fn above_chain_scan_cap_bytes() -> Option<usize> {
 /// its CONSUMER in `scan_active_jit_frames` is windows/linux).
 fn dbg_fullstack_scan() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FULLSTACK_SCAN").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_FULLSTACK_SCAN"))
 }
 
 /// A5 fix — scan this thread's native stack band `[lo, hi)` for any word that is
@@ -2524,9 +2528,7 @@ fn call_encoding_precedes(window: &[u8]) -> bool {
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn return_pc_validation_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_RETPC_VALIDATE").is_none()
-    })
+    *ON.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_RETPC_VALIDATE"))
 }
 
 /// How many times the A5 probe diverted a moving-young cycle, split by what
@@ -2578,7 +2580,7 @@ pub fn a5_fallback_census() -> (usize, usize, usize, usize) {
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn a5_fallback_dbg() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_A5_FALLBACK").is_some())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_A5_FALLBACK"))
 }
 
 /// Kill switch for the residue filter on the MOVING-YOUNG COVERAGE probe —
@@ -2636,7 +2638,7 @@ fn a5_shape_filter_enabled() -> bool {
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn a5_census_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_A5_CENSUS").is_some())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_A5_CENSUS"))
 }
 
 /// How many times the residue filter DECLINED a hit, and how many heap objects
@@ -2674,9 +2676,7 @@ pub fn unreg_declined_census() -> (usize, usize) {
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn unreg_declined_dbg() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNREG_DECLINED").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_UNREG_DECLINED"))
 }
 
 /// Kill switch for the residue filter on the unregistered-JIT-frame probe --
@@ -2685,9 +2685,7 @@ fn unreg_declined_dbg() -> bool {
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn unreg_jit_accept_residue() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_UNREG_ACCEPT_RESIDUE").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_UNREG_ACCEPT_RESIDUE"))
 }
 
 /// Opt-in for the residue test on the unregistered-JIT-frame probe's RELOCATION
@@ -2742,9 +2740,7 @@ fn unreg_residue_licence_enabled() -> bool {
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn jit_range_scan_legacy() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_RANGE_SCAN_LEGACY").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_RANGE_SCAN_LEGACY"))
 }
 
 /// Read the safepoint id a live compiled frame published into
@@ -3042,9 +3038,7 @@ fn chain_entry_rbp_is_foreign(
 /// "any deeper frame is foreign" behaviour exactly.
 fn callee_resolve_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_GC_NO_CALLEE_RESOLVE").is_none()
-    })
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_GC_NO_CALLEE_RESOLVE"))
 }
 
 /// The [`cratonvm_jit::CompiledMethod`] that actually describes the frame
@@ -3416,7 +3410,7 @@ fn moving_young_frame_coverage_complete_at(
         // address, and those are three different repairs.
         //
         // Rate-limited to the first 32: it fires per frame per collection.
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_ROOTSCAN").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_ROOTSCAN") {
             static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             if N.fetch_add(1, Relaxed) < 32 {
                 // For the INNERMOST frame the walk hands no return address, so
@@ -3917,9 +3911,7 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
 /// guessed at. Latched once; the scan runs on every collection.
 fn band_dbg() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_BAND_DBG").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_MOVING_YOUNG_BAND_DBG"))
 }
 
 /// The safepoint id the frame at `rbp` is standing on, or `None` when the
@@ -4133,14 +4125,14 @@ fn report_unpublished_band_words(
 fn bounds_guard_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD").is_none()
+        !cratonvm_types::flags::runtime_flag_on("CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD")
     })
 }
 
 fn band_verify_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_BAND_VERIFY").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_MOVING_YOUNG_NO_BAND_VERIFY")
     })
 }
 
@@ -4156,9 +4148,7 @@ fn band_verify_disabled() -> bool {
 /// a workload ever exposes an obligation the verifier does not model.
 fn moving_young_no_jit() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_JIT").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_MOVING_YOUNG_NO_JIT"))
 }
 
 /// Scan one compiled frame's band `[rbp - frame_size, rbp)` for a word that
@@ -4257,9 +4247,7 @@ fn region_is_dataflow_modelled(layout: &cratonvm_jit::FrameLayout, off: i32) -> 
 /// The bisect lever for the dead-slot exemption, default-ON.
 fn band_map_liveness_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_GC_NO_BAND_MAP_LIVENESS").is_none()
-    })
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_GC_NO_BAND_MAP_LIVENESS"))
 }
 
 fn band_slot_is_verifiable(
@@ -4371,7 +4359,7 @@ fn band_slot_is_verifiable_with_map(
 fn band_skip_in_map_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP")
     })
 }
 
@@ -4449,8 +4437,7 @@ fn band_word_is_an_object(w: usize) -> bool {
 fn band_liveness_screen_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN")
-            .is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN")
     })
 }
 
@@ -4463,16 +4450,14 @@ fn band_liveness_screen_disabled() -> bool {
 fn band_thread_window_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_BAND_THREAD_WINDOW")
-            .is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_MOVING_YOUNG_NO_BAND_THREAD_WINDOW")
     })
 }
 
 fn band_object_screen_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_BAND_OBJECT_SCREEN")
-            .is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_MOVING_YOUNG_NO_BAND_OBJECT_SCREEN")
     })
 }
 
@@ -4592,7 +4577,7 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
         return false;
     }
 
-    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_COVERAGE_DBG").is_some();
+    let dbg = cratonvm_types::flags::runtime_flag_on("CRATONVM_MOVING_YOUNG_COVERAGE_DBG");
     let scanner_sp = current_stack_pointer();
     if !dbg_no_prune() {
         let _ = prune_returned_jit_entries(scanner_sp);
@@ -5176,7 +5161,7 @@ fn xt_jit_coverage_handshake_enabled() -> bool {
 }
 
 fn xt_coverage_dbg() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_XT_COVERAGE").is_some()
+    cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_XT_COVERAGE")
 }
 
 /// `CRATONVM_XT_JIT_COVERAGE_ASSUME=1` -- accept the peer accounting whatever
@@ -5208,13 +5193,11 @@ fn xt_coverage_dbg() -> bool {
 /// control rather than only an absence of crashes.
 fn xt_pinned_peer_credit_when_unpinnable() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_XT_PINNED_PEER_UNPINNABLE").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_XT_PINNED_PEER_UNPINNABLE"))
 }
 
 fn xt_jit_coverage_assume() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_XT_JIT_COVERAGE_ASSUME").is_some()
+    cratonvm_types::flags::runtime_flag_on("CRATONVM_XT_JIT_COVERAGE_ASSUME")
 }
 
 /// A peer thread's half of the cross-thread JIT coverage handshake.
@@ -5303,6 +5286,52 @@ pub fn current_thread_jit_depth() -> usize {
     JIT_ENTRY_CHAIN.with(|c| c.borrow().len())
 }
 
+/// Code reclamation: publish, at a transition into a blocked state, which
+/// compiled bodies this thread's stack can return into while it stays blocked.
+///
+/// A thread parked inside compiled code (a pool worker in
+/// `LinkedBlockingQueue.take()`) holds a JIT execution for as long as it is
+/// parked, so the process-wide quiescence count never reaches zero. Every return
+/// address into compiled code on this thread lies between the current frame and
+/// the outermost JIT entry's captured SP, so that band is what
+/// `cratonvm_jit::jit_thread_blocked_enter` scans. See
+/// `docs/jit/code-cache-lifetime.md`.
+///
+/// `#[inline(never)]` so the stack probe lives in this frame, which stays live
+/// for the whole scan. Called by every `GcBarrier` blocked-state entry; paired
+/// with [`note_blocking_transition_leave`].
+#[inline(never)]
+pub(crate) fn note_blocking_transition_enter() {
+    let lo = current_stack_pointer();
+    // A thread holding no JIT entry passes an empty band: nothing to scan, but
+    // the window still nests, so the matching leave stays balanced.
+    let hi = outermost_jit_entry_sp().unwrap_or(lo).max(lo);
+    // SAFETY: `[lo, hi)` is this thread's own stack between this live frame and
+    // the outermost live compiled entry's SP, all of it mapped for the call.
+    unsafe { cratonvm_jit::jit_thread_blocked_enter(lo, hi) };
+}
+
+/// End the blocked window [`note_blocking_transition_enter`] opened.
+#[inline]
+pub(crate) fn note_blocking_transition_leave() {
+    cratonvm_jit::jit_thread_blocked_leave();
+}
+
+/// Highest `entry_sp` on this thread's JIT entry chain — the outermost compiled
+/// entry — or `None` with no entry. `try_with`/`try_borrow` because a blocking
+/// transition can run during thread teardown and must never panic.
+fn outermost_jit_entry_sp() -> Option<usize> {
+    JIT_ENTRY_CHAIN
+        .try_with(|chain| {
+            chain
+                .try_borrow()
+                .ok()
+                .and_then(|entries| entries.iter().map(|e| e.entry_sp).max())
+        })
+        .ok()
+        .flatten()
+}
+
 /// The active compiled frames of the CURRENT thread, outermost first, as
 /// `(interpreter depth at entry, "class/Name.method:descriptor", owner class)`.
 ///
@@ -5323,7 +5352,7 @@ pub fn current_thread_jit_depth() -> usize {
 fn nested_trace_frames_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NESTED_TRACE_FRAMES").is_none()
+        !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_NESTED_TRACE_FRAMES")
     })
 }
 
@@ -5338,7 +5367,7 @@ fn nested_trace_frames_enabled() -> bool {
 /// encodings of a direct call was ever decoded.
 fn dbg_swchain_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SWCHAIN").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SWCHAIN"))
 }
 
 /// Kill switch for the bytecode index carried on [`ActiveCompiledFrame`].
@@ -5354,7 +5383,7 @@ fn dbg_swchain_enabled() -> bool {
 fn compiled_frame_bci_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_COMPILED_FRAME_LINES").is_none()
+        !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_COMPILED_FRAME_LINES")
     })
 }
 
@@ -5383,16 +5412,12 @@ fn compiled_frame_bci_enabled() -> bool {
 /// ON is a one-binary attribution.
 fn ir_frame_bci_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_IR_FRAME_LINES").is_none()
-    })
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_IR_FRAME_LINES"))
 }
 
 fn inline_frame_chains_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_FRAME_MAP").is_none()
-    })
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_INLINE_FRAME_MAP"))
 }
 
 /// Is `recorded` a value the JVM spec permits as a bytecode index?
@@ -6105,7 +6130,7 @@ pub static CROSS_THREAD_JIT_GAP_HITS: AtomicUsize = AtomicUsize::new(0);
 /// the detector runs on the per-native-call hot path.
 fn strict_jit_roots() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_STRICT_JIT_ROOTS").is_some())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_STRICT_JIT_ROOTS"))
 }
 
 /// Detect — and loudly report — the unsupported *multi-thread-in-JIT* condition
@@ -6292,9 +6317,7 @@ fn warn_cross_thread_jit_gap() {
 /// having been applied.
 fn dbg_no_jit_root_scan() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_NO_JIT_ROOT_SCAN").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_NO_JIT_ROOT_SCAN"))
 }
 
 /// How many times [`dbg_no_jit_root_scan`] actually suppressed a scan.
@@ -6943,9 +6966,7 @@ fn reload_top_rbp_cache(v: &[JitFrameChainEntry]) {
 /// process.
 fn cm_id_pairing_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_GC_NO_CM_ID_PAIRING").is_none()
-    })
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_GC_NO_CM_ID_PAIRING"))
 }
 
 #[inline]
@@ -6986,7 +7007,7 @@ pub fn remap_active_jit_frames(pointer_map: &cratonvm_types::PointerMap) {
     // Stage 5 diagnostic (CRATONVM_DBG_PRECISE): count frames walked / slots
     // rewritten / chain entries so we can see whether the RBP-chain walk
     // actually engages. Printed once per remap call (grep-friendly).
-    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_PRECISE").is_some();
+    let dbg = cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_PRECISE");
     let mut dbg_entries = 0usize;
     let mut dbg_precise = 0usize;
     let mut dbg_frames = 0usize;
@@ -7185,9 +7206,7 @@ pub fn remap_active_jit_frames(pointer_map: &cratonvm_types::PointerMap) {
 /// model does not describe -- and the method label.
 pub fn stale_frame_word_check_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STALE_FRAME_WORDS").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_STALE_FRAME_WORDS"))
 }
 
 pub mod stale_frame_audit {
@@ -7404,9 +7423,7 @@ fn remap_one_jit_frame(
 /// is the residual risk, recorded rather than hidden.
 pub fn remap_unmapped_dupes_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_REMAP_UNMAPPED_DUPES").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_REMAP_UNMAPPED_DUPES"))
 }
 
 pub mod unmapped_dupe_remap {
@@ -7526,9 +7543,7 @@ fn remap_unmapped_frame_dupes(
 /// them.
 fn remap_residue_dbg() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_REMAP_RESIDUE").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_REMAP_RESIDUE"))
 }
 
 /// Process-wide totals for the stale-word oracle, so a soak does not have to be
@@ -8021,7 +8036,7 @@ fn verify_oop_maps_enabled() -> bool {
     use std::sync::OnceLock;
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VERIFY_OOP_MAPS").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_VERIFY_OOP_MAPS") {
             return true;
         }
         // ARMED AUTOMATICALLY FOR THE AARCH64 SAFEPOINT PATH.
@@ -8060,9 +8075,7 @@ fn verify_oop_maps_enabled() -> bool {
 fn coverage_pin_enabled() -> bool {
     use std::sync::OnceLock;
     static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_PRECISE_COVERAGE_PIN").is_some()
-    })
+    *E.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_PRECISE_COVERAGE_PIN"))
 }
 
 /// Set once the completeness oracle has REFUTED some frame's
@@ -8210,7 +8223,7 @@ fn oracle_force_refute() -> bool {
     use std::sync::OnceLock;
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE")
     })
 }
 
@@ -9071,9 +9084,7 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
 /// whole-band sweep it replaced can be reinstated in the same binary.
 fn frame_bands_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_FRAME_BANDS").is_none()
-    })
+    *ON.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_FRAME_BANDS"))
 }
 
 /// Scan ONE compiled frame's own band using its layout, and publish the
@@ -9234,7 +9245,7 @@ fn scan_compiled_frame_bands(
 pub fn pin_unnamed_frame_refs_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_PIN_UNNAMED_FRAME_REFS").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_PIN_UNNAMED_FRAME_REFS")
     })
 }
 
@@ -9597,9 +9608,7 @@ fn scan_one_frame_filtered(
 /// `CRATONVM_DBG_VERIFY_REG_OOP_MAPS=1` -- see the module comment above.
 fn verify_reg_oop_maps() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VERIFY_REG_OOP_MAPS").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_VERIFY_REG_OOP_MAPS"))
 }
 
 thread_local! {
@@ -10201,7 +10210,7 @@ fn publish_unrewritable_band_roots(
             // cursor is one nothing will ever read again. Reporting them under
             // one `unrewritable=4` cannot separate "must pin" from "need not
             // even mark", which is the only question with a fix behind it.
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_ROOTSCAN").is_some() {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_ROOTSCAN") {
                 eprintln!(
                     "[bandword] 0x{qword:x} off={off} refusal={} region={}                      live_hi={:?} frame_size={} reg={:?}",
                     unverifiable_region(off, &cm.frame_layout, live_hi),
@@ -10386,9 +10395,7 @@ mod coverage_oracle_gate_tests {
 // default off.
 fn stale_after_remap_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_STALE_AFTER_REMAP").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_STALE_AFTER_REMAP"))
 }
 
 /// `CRATONVM_DBG_JIT_STALE_BELOW_RBP` -- additionally walk the Rust /
@@ -10398,9 +10405,7 @@ fn stale_after_remap_enabled() -> bool {
 /// compiled-frame findings; separate flag.
 fn stale_below_rbp_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_STALE_BELOW_RBP").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_STALE_BELOW_RBP"))
 }
 
 static STALE_AFTER_REMAP_HITS: std::sync::atomic::AtomicUsize =
@@ -11007,7 +11012,7 @@ fn register_image_remap_admits(off: i32, layout: &cratonvm_jit::FrameLayout) -> 
 fn remap_all_unverifiable() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_REMAP_ALL_UNVERIFIABLE").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_REMAP_ALL_UNVERIFIABLE")
     })
 }
 
@@ -11670,6 +11675,8 @@ mod tests {
         let entry_sp = current_stack_pointer() + 4096;
         push_entry_full(JitFrameChainEntry {
             entry_sp,
+            depth_stripe: cratonvm_types::striped_counter::StripeToken::UNSET,
+            exec_token: cratonvm_jit::JitExecutionToken::UNSET,
             // No interpreter stack in this unit test; `INTERP_DEPTH_INHERIT`
             // is what a site that cannot name its depth pushes, and with an
             // empty chain it resolves to 0.
