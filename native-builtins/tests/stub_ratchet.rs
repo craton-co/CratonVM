@@ -2280,7 +2280,38 @@ use cratonvm_types::compat::CompatibilityMode;
 /// (`LinkedHashMap`'s 102 and eight `HashMap` rows included) read
 /// 4011 / 4038 / 4011 = +179, and 87 triples read 3921 / 3948 / 3921 = +89.
 /// Two doubles in every one of the three counts.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3971;
+///
+/// # 2026-09-12, lane 5's THIRD residual wave: +35 in all three arms
+///
+/// `RETIRED_SHADOW_L5T_TRIPLES` -- 23 `jdk/internal/misc/Unsafe` rows (the
+/// off-heap accessor surface) and the two `sun/misc/Unsafe` rows that needed a
+/// JDK 21 run to be dispatchable at all. 25 triples, 35 REGISTRATIONS, because
+/// several of them are registered more than once and this count is per
+/// registration.
+///
+/// Measured with the PAIRED ratchet -- the same built test binary run twice,
+/// once as built and once with `CRATONVM_UNRETIRE_NATIVE_SHADOW` naming the
+/// wave's 25 triples, which turns exactly those rows back off at runtime. So
+/// the before-number and the after-number come from ONE tree and no constant
+/// anybody else froze is in the arithmetic:
+///
+/// ```text
+///                      no-mgmt   mgmt   syn-jdk   total registrations
+///   paired (rows off)     3944   3971      3944   13586 / 13954 / 13621
+///   as built              3979   4006      3979   13586 / 13954 / 13621
+/// ```
+///
+/// **The totals are identical in every arm**, which is this gate's own reading
+/// for "existing fakes were relabelled" -- case (b). Nothing new was registered
+/// and nothing was deleted.
+///
+/// The `MEASURED_TOTAL_REGISTRATIONS_*` constants move by +1 each in the same
+/// change, and that +1 is NOT this wave's. It is the previous wave's
+/// bookkeeping: lane 1's wave 7 doc comment above records its own landing-tree
+/// totals as `13586 / 13954 / 13621`, and left the three constants at the
+/// values from before it landed. The paired arm above measures the same three
+/// numbers with this wave's rows switched off, which is what says so.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 4006;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2691,7 +2722,38 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3971;
 /// (`LinkedHashMap`'s 102 and eight `HashMap` rows included) read
 /// 4011 / 4038 / 4011 = +179, and 87 triples read 3921 / 3948 / 3921 = +89.
 /// Two doubles in every one of the three counts.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3944;
+///
+/// # 2026-09-12, lane 5's THIRD residual wave: +35 in all three arms
+///
+/// `RETIRED_SHADOW_L5T_TRIPLES` -- 23 `jdk/internal/misc/Unsafe` rows (the
+/// off-heap accessor surface) and the two `sun/misc/Unsafe` rows that needed a
+/// JDK 21 run to be dispatchable at all. 25 triples, 35 REGISTRATIONS, because
+/// several of them are registered more than once and this count is per
+/// registration.
+///
+/// Measured with the PAIRED ratchet -- the same built test binary run twice,
+/// once as built and once with `CRATONVM_UNRETIRE_NATIVE_SHADOW` naming the
+/// wave's 25 triples, which turns exactly those rows back off at runtime. So
+/// the before-number and the after-number come from ONE tree and no constant
+/// anybody else froze is in the arithmetic:
+///
+/// ```text
+///                      no-mgmt   mgmt   syn-jdk   total registrations
+///   paired (rows off)     3944   3971      3944   13586 / 13954 / 13621
+///   as built              3979   4006      3979   13586 / 13954 / 13621
+/// ```
+///
+/// **The totals are identical in every arm**, which is this gate's own reading
+/// for "existing fakes were relabelled" -- case (b). Nothing new was registered
+/// and nothing was deleted.
+///
+/// The `MEASURED_TOTAL_REGISTRATIONS_*` constants move by +1 each in the same
+/// change, and that +1 is NOT this wave's. It is the previous wave's
+/// bookkeeping: lane 1's wave 7 doc comment above records its own landing-tree
+/// totals as `13586 / 13954 / 13621`, and left the three constants at the
+/// values from before it landed. The paired arm above measures the same three
+/// numbers with this wave's rows switched off, which is what says so.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3979;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2971,7 +3033,38 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3944;
 /// (`LinkedHashMap`'s 102 and eight `HashMap` rows included) read
 /// 4011 / 4038 / 4011 = +179, and 87 triples read 3921 / 3948 / 3921 = +89.
 /// Two doubles in every one of the three counts.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 3944;
+///
+/// # 2026-09-12, lane 5's THIRD residual wave: +35 in all three arms
+///
+/// `RETIRED_SHADOW_L5T_TRIPLES` -- 23 `jdk/internal/misc/Unsafe` rows (the
+/// off-heap accessor surface) and the two `sun/misc/Unsafe` rows that needed a
+/// JDK 21 run to be dispatchable at all. 25 triples, 35 REGISTRATIONS, because
+/// several of them are registered more than once and this count is per
+/// registration.
+///
+/// Measured with the PAIRED ratchet -- the same built test binary run twice,
+/// once as built and once with `CRATONVM_UNRETIRE_NATIVE_SHADOW` naming the
+/// wave's 25 triples, which turns exactly those rows back off at runtime. So
+/// the before-number and the after-number come from ONE tree and no constant
+/// anybody else froze is in the arithmetic:
+///
+/// ```text
+///                      no-mgmt   mgmt   syn-jdk   total registrations
+///   paired (rows off)     3944   3971      3944   13586 / 13954 / 13621
+///   as built              3979   4006      3979   13586 / 13954 / 13621
+/// ```
+///
+/// **The totals are identical in every arm**, which is this gate's own reading
+/// for "existing fakes were relabelled" -- case (b). Nothing new was registered
+/// and nothing was deleted.
+///
+/// The `MEASURED_TOTAL_REGISTRATIONS_*` constants move by +1 each in the same
+/// change, and that +1 is NOT this wave's. It is the previous wave's
+/// bookkeeping: lane 1's wave 7 doc comment above records its own landing-tree
+/// totals as `13586 / 13954 / 13621`, and left the three constants at the
+/// values from before it landed. The paired arm above measures the same three
+/// numbers with this wave's rows switched off, which is what says so.
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 3979;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -3048,7 +3141,12 @@ const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 3944;
 /// was the only trace a real defect left in this gate, and staleness meant
 /// nobody could have read it. The `synthetic-jdk` arm has no constant here and
 /// measured 13645 on the same tree.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13953;
+///
+/// Refreshed 2026-09-12 beside lane 5's third residual wave. The wave itself
+/// moves this by ZERO -- the paired ratchet reads the same total with its rows
+/// on and off. The +1 is the previous wave's: lane 1's wave 7 measured this
+/// number on its landing tree and re-froze the stub baselines without it.
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13954;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
@@ -3061,7 +3159,12 @@ const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13953;
 /// dev's staleness rather than either wave's — the localisation is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13585;
+///
+/// Refreshed 2026-09-12 beside lane 5's third residual wave. The wave itself
+/// moves this by ZERO -- the paired ratchet reads the same total with its rows
+/// on and off. The +1 is the previous wave's: lane 1's wave 7 measured this
+/// number on its landing tree and re-froze the stub baselines without it.
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13586;
 
 /// The `--features synthetic-jdk` total, which had no constant at all.
 ///
@@ -3087,7 +3190,12 @@ const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13585;
 /// and 13645 on that tree against 13658 on this one is exactly the drift a
 /// sentence cannot track.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13620;
+///
+/// Refreshed 2026-09-12 beside lane 5's third residual wave. The wave itself
+/// moves this by ZERO -- the paired ratchet reads the same total with its rows
+/// on and off. The +1 is the previous wave's: lane 1's wave 7 measured this
+/// number on its landing tree and re-froze the stub baselines without it.
+const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13621;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;

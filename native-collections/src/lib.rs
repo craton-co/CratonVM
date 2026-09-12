@@ -12056,17 +12056,24 @@ fn register_hashmap_natives(r: &mut NativeMethodRegistry) {
 /// # Why this is a SPLIT and not a deletion
 ///
 /// §9a.3 declined the change as a ten-site audit, and the count was right: the
-/// eager allocation is load-bearing for this crate's OWN maps. This function has
+/// eager allocation is load-bearing for this crate's OWN maps. This function had
 /// NINE internal callers -- the `Collections.EMPTY_MAP`/`EMPTY_SET` singleton
 /// fallbacks, `emptyMap`/`emptySet`/`singleton*`, both `Properties`
 /// constructors and the `Hashtable(int)` path -- and `alloc_hs_backing` builds
 /// every `HashSet` and view backing map through the capacity constructor, at
 /// least two consumers of which do `map_state(..).0.unwrap()`.
 ///
-/// The audit's answer is that NONE of them needs to change: they all keep the
-/// eager behaviour they have today via [`map_init_eager`], and only a map a
-/// JAVA constructor asks for becomes lazy. That is one edit per call site and
-/// no behavioural question at any of them, rather than nine judgement calls.
+/// The audit's answer was that NONE of them needed to change: they all kept the
+/// eager behaviour they had via [`map_init_eager`], and only a map a JAVA
+/// constructor asks for became lazy. That was one edit per call site and no
+/// behavioural question at any of them, rather than nine judgement calls.
+///
+/// TWO of those nine have since been asked the question and answered it the
+/// other way. Both `Properties` constructors are LAZY as of 2026-09-12, leaving
+/// SEVEN eager callers -- see [`props_init_map_half`], which carries the
+/// evidence. The short version is that the audit's premise does not hold for
+/// that class: its table is not one of "this crate's own maps" in any useful
+/// sense, because no `Properties` native reads or writes a bucket table at all.
 pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     map_init_inner(ctx, args, false)
 }
@@ -18856,6 +18863,23 @@ pub fn make_hashset_with_elements(
     // and bucket index is `(n - 1) & hash` for power-of-two `n`.
     let cap = std::cmp::max(elems.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
 
+    // `elems` is the CALLER's raw slice, and every allocation below is a GC
+    // point -- `alloc_ref_array`, `alloc_object` and `try_alloc_synthetic` in
+    // the real-layout branch, plus one `native_map_put` per element in the
+    // fallback. So the pin is taken HERE, ahead of the first of them, rather
+    // than beside the loop that reads the elements, which is where it used to
+    // sit: a caller that gathered its `ObjectRef`s out of a live collection
+    // holds bare addresses, and three allocations are room enough for a moving
+    // collector to leave every one of them stale before anything pinned it.
+    // `native_props_string_property_names`, walking a `defaults` chain into a
+    // plain `Vec`, is exactly that caller.
+    //
+    // This base is also the truncation point for both branches' final
+    // `unpin_native_roots`, being the earliest pin either one takes -- except
+    // for an EMPTY `elems`, where `pin_value_slice` pins nothing and answers
+    // `usize::MAX`; then each branch falls back to its own first pin.
+    let (elem_pin_base, elem_pins) = pin_value_slice(ctx, elems);
+
     // Best-effort: ensure the real classes are loaded so the field-index
     // resolver can see them.
     let hashmap_class_id = ctx
@@ -18946,11 +18970,6 @@ pub fn make_hashset_with_elements(
         ctx.set_field(set, hs_map_slot, Value::Object(Some(backing_map)));
         let set_pin = ctx.pin_native_root(set);
 
-        // `elems` is the caller's raw arg slice -- also just a bare `Vec`
-        // from this function's perspective, so it needs the same
-        // per-element re-read treatment across the node alloc below.
-        let (_, elem_pins) = pin_value_slice(ctx, elems);
-
         // The set's PRESENT marker. It was `Value::Object(None)` here, with the
         // comment "null is fine for 'is in set'". It is not fine in either
         // direction: `native_hs_add`/`native_hs_remove` read membership out of
@@ -19036,7 +19055,7 @@ pub fn make_hashset_with_elements(
         let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
         ctx.set_field(backing_map, f_size, Value::Int(size));
         let set = ctx.read_native_pin(set_pin, set);
-        ctx.unpin_native_roots(pin_base);
+        ctx.unpin_native_roots(pin_base.min(elem_pin_base));
         return Ok(set);
     }
 
@@ -19060,7 +19079,6 @@ pub fn make_hashset_with_elements(
     let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
     hs_set_backing_map(ctx, set, backing_map);
 
-    let (_, elem_pins) = pin_value_slice(ctx, elems);
     // The `let sentinel = Value::Int(1)` that stood here was dead — the marker
     // has come from `present_marker(elem)` since that helper was introduced —
     // and it read as the live marker to anyone scanning this loop. See
@@ -19076,7 +19094,7 @@ pub fn make_hashset_with_elements(
         let _ = native_map_put(ctx, &[Value::Object(Some(backing_map)), elem, present]);
     }
     let set = ctx.read_native_pin(set_pin, set);
-    ctx.unpin_native_roots(set_pin);
+    ctx.unpin_native_roots(set_pin.min(elem_pin_base));
     Ok(set)
 }
 
@@ -65425,16 +65443,67 @@ fn register_properties_natives(registry: &mut NativeMethodRegistry) {
     registry.set_category(__prev_cat);
 }
 
+/// The `Hashtable`-inherited half of both `Properties` constructors: allocate
+/// NOTHING, which is what HotSpot's own `Properties()` does.
+///
+/// # What used to happen, and what it cost
+///
+/// Both constructors called `map_init_eager`. `Properties` is deliberately
+/// EXCLUDED from `CF_HASHTABLE_LAYOUT` (JDK 25 backs it with a side
+/// `ConcurrentHashMap`, not with `Hashtable`'s buckets), so that call took the
+/// GENERIC arm of [`map_init_inner`] and allocated an `Object[16]` into the
+/// receiver's `table`. On a real-layout `Properties` that is 144 bytes of the
+/// 224 an empty one retained, against HotSpot's 120.3.
+///
+/// # Why null is safe here, which is a MEASUREMENT and not an argument
+///
+/// The comment this replaces named one risk — "leaving it null would make
+/// `map_state` report no buckets on a receiver whose native put path does not
+/// go through `map_resize`" — and the risk is real in the abstract. It does not
+/// apply to this class, on three independent counts:
+///
+///   * **Nothing writes that array.** `register_properties_sidetable`
+///     (`native-builtins`) runs AFTER `register_collections_natives` in BOTH
+///     `vm_init` arms and OVERWRITES every Map method on `java/util/Properties`
+///     — `put`, `get`, `remove`, `clear`, `size`, `isEmpty`, `containsKey`,
+///     `keySet`, `values`, `entrySet`, `keys`, `elements`, `contains`. Not one
+///     of those bodies reads or writes a bucket table: a String->String pair
+///     goes to the Rust side-table, anything else to the real `map` CHM, which
+///     `put_non_string_into_chm` CREATES ON DEMAND. `map_carrier_class_for_receiver`
+///     already records the consequence, measured: a `Properties` bucket table
+///     reports `occupied=0` with `size=2`.
+///   * **The one path that COULD reach the buckets already handles null.**
+///     `native_map_put_evict_pinned` opens with
+///     `if initial_buckets.is_none() || size + 1 > (cap * 3) / 4 { map_resize(..) }`
+///     — the branch a JDK-bytecode-constructed `LinkedHashMap` has always taken
+///     — so even a receiver that somehow reached the generic put would
+///     materialise its table on first insert rather than drop the write.
+///     `map_state`'s capacity fallback reads `threshold` when there is no
+///     table, and the lazy arm sets it to 0, so that path answers
+///     `MAP_DEFAULT_CAPACITY` — the same 16 the eager array had.
+///   * **The busiest `Properties` in the VM has ALWAYS had a null table.**
+///     `system_properties_object` allocates the `System.getProperties()`
+///     singleton and writes NONE of its slots; `java.home` and every other
+///     bootstrap property has been read out of a bucket-less `Properties`
+///     since that factory was written. This change makes every other
+///     `Properties` the same shape as the one that was already proving it.
+///
+/// HotSpot agrees, and that is the oracle rather than the reasoning above:
+/// `probes/CollectionShapeCause.java`'s field dump on a real JDK 25 shows
+/// `new Properties()` leaving `table` null, `loadFactor` 0.0 and `threshold` 0,
+/// with the entries in a `ConcurrentHashMap map`.
+fn props_init_map_half(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
+    native_map_init(ctx, &[Value::Object(Some(this))])
+}
+
 fn native_props_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    // EAGER: `Properties` keeps its entries in a Rust side-table and its
-    // slot 0 IS the inherited `Hashtable.table`; leaving it null would make
-    // `map_state` report no buckets on a receiver whose native put path does
-    // not go through `map_resize`. Behaviour here is unchanged.
-    map_init_eager(ctx, &[Value::Object(Some(this))])?;
+    // LAZY, like the JDK. See [`props_init_map_half`] for why the receiver's
+    // bucket table stays null.
+    props_init_map_half(ctx, this)?;
     props_set_defaults(ctx, this, Value::Object(None));
     Ok(None)
 }
@@ -65444,11 +65513,9 @@ fn native_props_init_defaults(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    // EAGER: `Properties` keeps its entries in a Rust side-table and its
-    // slot 0 IS the inherited `Hashtable.table`; leaving it null would make
-    // `map_state` report no buckets on a receiver whose native put path does
-    // not go through `map_resize`. Behaviour here is unchanged.
-    map_init_eager(ctx, &[Value::Object(Some(this))])?;
+    // LAZY, like the JDK. See [`props_init_map_half`] for why the receiver's
+    // bucket table stays null.
+    props_init_map_half(ctx, this)?;
     // Store the defaults reference in the REAL `defaults` field, resolved by
     // name on the receiver's class. On a real-layout `java.util.Properties` the
     // inherited Hashtable fields push `defaults` well past this native model's
@@ -65983,6 +66050,31 @@ fn native_props_property_names(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 }
 
 /// stringPropertyNames() -> Set<String>
+///
+/// # A FRESH set, not the receiver's own `keySet()` view
+///
+/// This used to take `native_map_key_set(this)` and then `add` each of the
+/// defaults' keys to it. `native_map_key_set` returns a CACHED LIVE VIEW --
+/// `cached_live_view(.., VIEW_KIND_KEYSET)`, the same instance `keySet()` hands
+/// out, which is why `map.keySet() == map.keySet()` holds here as it does on
+/// HotSpot. Adding to it therefore did two wrong things at once:
+///
+/// * it merged the DEFAULTS' keys into the view the receiver returns from
+///   `keySet()`, which must not walk the chain -- `size()` and `keySet()`
+///   deliberately see only this map's own entries, and only
+///   `stringPropertyNames()` walks;
+/// * it mutated a set the caller may already be holding from an earlier call.
+///
+/// In synthetic-JDK mode it did not even get that far: `native_hs_add` on a
+/// view carrier raises `UnsupportedOperationException`, so
+/// `stringPropertyNames()` threw outright on any `Properties` with a defaults
+/// chain. That is what `probes/CollectionSlotFloor.java`'s
+/// `Properties chain names` section reports.
+///
+/// Building one fresh set from the union fixes all three. `make_hashset_with_elements`
+/// does the de-duplication (by `hashCode`/`equals`, so an overridden key in the
+/// child shadows the parent's exactly once) and gives the set the real
+/// `HashSet` -> `HashMap` layout that JDK bytecode reads through.
 fn native_props_string_property_names(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -65991,47 +66083,33 @@ fn native_props_string_property_names(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    // Collect keys from this and all defaults into a HashSet
-    let result = native_map_key_set(ctx, &[Value::Object(Some(this))])?;
-
-    // Also add keys from defaults chain
+    // Collect first, allocate second: everything in this loop is a field or
+    // table READ, so no key gathered here can move before `make_hashset_with_elements`
+    // pins them all.
+    let mut keys: Vec<Value> = props_collect_keys(ctx, this)
+        .into_iter()
+        .map(|k| Value::Object(Some(k)))
+        .collect();
     let mut defaults_val = props_get_defaults(ctx, this);
-    while let Value::Object(Some(defs)) = defaults_val {
-        let defs_pin = ctx.pin_native_root(defs);
-        let def_keys = props_collect_keys(ctx, defs);
-        if let Some(Value::Object(Some(set))) = result {
-            // cceres5: `hs_contains`/`hs_add` re-enter Java (hashCode/equals
-            // dispatch) and can move the set and the still-pending keys; pin +
-            // re-read per iteration (see make_static_entry_set). Closure keeps
-            // the pin truncate on the error path too.
-            let set_pin = ctx.pin_native_root(set);
-            let key_vals: Vec<Value> = def_keys.iter().map(|k| Value::Object(Some(*k))).collect();
-            let (_, key_handles) = pin_value_slice(ctx, &key_vals);
-            let add_result = (|ctx: &mut dyn NativeContext| -> Result<(), MethodCallFailed> {
-                for i in 0..key_vals.len() {
-                    // Add to the result set (HashSet add = contains check + add)
-                    let set = ctx.read_native_pin(set_pin, set);
-                    let key_val = read_pinned_elem(ctx, key_handles[i], key_vals[i]);
-                    let contains = native_hs_contains(ctx, &[Value::Object(Some(set)), key_val])?;
-                    if contains != Some(Value::Int(1)) {
-                        let set = ctx.read_native_pin(set_pin, set);
-                        let key_val = read_pinned_elem(ctx, key_handles[i], key_vals[i]);
-                        native_hs_add(ctx, &[Value::Object(Some(set)), key_val])?;
-                    }
-                }
-                Ok(())
-            })(ctx);
-            ctx.unpin_native_roots(set_pin);
-            if let Err(e) = add_result {
-                ctx.unpin_native_roots(defs_pin);
-                return Err(e);
-            }
-        }
-        let defs = ctx.read_native_pin(defs_pin, defs);
+    // Bounded: a `Properties` whose `defaults` chain loops back on itself is
+    // malformed, but it is reachable from application code
+    // (`p.defaults = p` via a subclass), and a hang inside a bootstrap-path
+    // native is the worst way to report it. The JDK's own walk is unbounded;
+    // 64 is far past any real chain.
+    for _ in 0..64 {
+        let Value::Object(Some(defs)) = defaults_val else {
+            break;
+        };
+        keys.extend(
+            props_collect_keys(ctx, defs)
+                .into_iter()
+                .map(|k| Value::Object(Some(k))),
+        );
         defaults_val = props_get_defaults(ctx, defs);
-        ctx.unpin_native_roots(defs_pin);
     }
-    Ok(result)
+    Ok(Some(Value::Object(Some(make_hashset_with_elements(
+        ctx, &keys,
+    )?))))
 }
 
 // ===========================================================================

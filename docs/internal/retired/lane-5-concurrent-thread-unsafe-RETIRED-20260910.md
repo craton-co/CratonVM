@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Retired 2026-09-10. Two RESIDUAL waves on 2026-09-11 (§9a, §9b) and a DELETION wave on 2026-09-12 (§9c). Retired: 98 + 67 + 33. Deleted: 22 registrations no supported image declares. §10.1 is answered by measurement — 98 of the 99 ForkJoin keeps cannot be expressed in a retirement table at all. What is left is §11. |
+| **Status** | Retired 2026-09-10. THREE residual waves (§9a, §9b, §9d) and a DELETION wave (§9c). Retired: 98 + 67 + 33 + 25. Deleted: 22 registrations no supported image declares. Two defects fixed on the way out: `invokeCleaner` accepted a heap buffer (§9e) and `Unsafe.ADDRESS_SIZE` read 0 where HotSpot reads 8 (§9f). §10.1 is answered by measurement — 98 of the 99 ForkJoin keeps cannot be expressed in a retirement table at all. What is left is §11. |
 | **Was** | `docs/known-issues/jdk-only-lanes/lane-5-concurrent-thread-unsafe.md` |
 | **Table** | [`RETIRED_SHADOW_L5_TRIPLES`](../../../native-api/src/retired_shadow.rs) |
 | **Ownership authority** | [`lane-0-integration-and-gates.md`](../../known-issues/jdk-only-lanes/lane-0-integration-and-gates.md) |
@@ -1216,6 +1216,411 @@ registrations (`getReferencePlain`, `putReferencePlain`, `monitorEnter`,
 re-measures it, so it drifts in the direction of over-counting work that is
 already done. The 22 come from `--dump-native-registry` taken from the binary
 and intersected with the three images.
+
+## 9d. The third residual wave, 2026-09-12 — §11.3 and §11.1, and the first measurement this lane took on a second image
+
+`RETIRED_SHADOW_L5T_TRIPLES`, 25 triples over two classes. What makes it worth
+a section is not the count. Two of the things §11 was waiting for turned out to
+be instrument problems rather than subject problems, and both were answerable in
+an afternoon once the instrument was named correctly — and then the acceptance
+arm threw two rows out that every earlier instrument had passed, which is §9d.6
+and is the most transferable part of the wave.
+
+### 9d.1 The remainder was 26 triples, and the census says so exactly
+
+§11.3 described the `jdk/internal/misc/Unsafe` residue as "the rest of the
+class, per triple, minus the 68 `ACC_NATIVE` floor and the three permanently
+blocked families" and left the arithmetic open. Done from the binary and the
+three images together, it closes with nothing left over:
+
+```text
+  registered triples, --jdk-only, after the 36 already retired drop out   126
+    ACC_NATIVE on an image -> Bridge forever, contract §1.5                68
+    <clinit>()V — a class initialiser, not a shadow                         1
+    declared on SOME images only (arrayBaseOffset, compareAndExchangeObject,
+      weakCompareAndSetObject)                                              3
+    declared with Code on 17, 21 AND 25 -> candidates                      54
+      *Unaligned, both arities, four widths, get and put                   16
+      sub-word atomics (compareAndExchange/compareAndSet/getAndAdd × B,S)    6
+      the numbering, plus getUnsafe and ensureClassInitialized              6
+      invokeCleaner — measured and refused, §9d.3                           1
+      the two allocator rows the two-binary arm threw out, §9d.6            2
+      THIS WAVE                                                            23
+```
+
+The 68 is not a number this page chose. `javap -p` reports 68 `ACC_NATIVE`
+methods on the 21 and 25 images and 70 on 17, and the intersection with what is
+registered here is 68 exactly — §9b.2 predicted the floor and this is it,
+independently arrived at from the other end.
+
+**Every remaining row is now in a named family with a reason that does not
+expire.** That is what makes §11.3 finishable rather than merely reduced.
+
+### 9d.2 The instrument: `apps/probes/L5JdkInternalUnsafe.java`
+
+§11.3 said the remainder "needs a dispatch each" and named
+`probes/UnsafeShadowSweep.java` as the instrument. The sweep is 472 rows and it
+is thorough, but on this surface it reaches the off-heap accessors through the
+`sun.misc` spelling almost everywhere: of the 26 candidates its `off-heap`
+section dispatches **seven**, four of them only on a throwing edge. Nineteen
+had never been dispatched by anything in this tree.
+
+So the wave is a new probe rather than a widening, for a reason worth recording:
+`UnsafeShadowSweep` is **lane 1's** 472-row baseline, and adding rows to a
+shared instrument moves every other lane's diff. The new file is shaped exactly
+like `L5SunMiscUnsafe` — same `addrRow` helper, same `ok=`/`EX:` row format —
+so a difference between the two spellings of one method shows up as a
+difference between two transcripts that are supposed to read alike.
+
+It is reflective for the same reason its sibling is, and for one more: the same
+class file then runs on a 17, 21 or 25 image without recompiling, which is what
+made §9d.4 possible at all.
+
+```text
+  dial armed on jdk/internal/misc/Unsafe   reached 1396   yielded 99
+  per triple                               outcome = bytecode-won on all 28
+                                           triples the armed run dispatched
+  precondition 3                           declared && !acc_native && has_code
+                                           on all 28, from --explain-jdk-only
+  the workload                             d(base, armed) = 2 rows, both
+                                           `invokeCleaner` — §9d.3
+  vs HotSpot 25                            d(hs, base) = d(hs, strict) = 2
+```
+
+`reached 1396` against 99 yielded is not a discrepancy: the dial counts every
+dispatch through the door, and the 1297 `declined_no_bytecode` are the
+`ACC_NATIVE` floor answering exactly as contract §1.5 says it must.
+
+### 9d.3 `invokeCleaner` yielded to bytecode and is NOT retired
+
+It is the one row the armed arm made worse, and the dial's own verdict says the
+opposite: `outcome = bytecode-won`, so precondition 4 passes cleanly. But the
+*direct*-buffer row goes from `ok=returned` to `EX:IllegalArgumentException` the
+moment the class is armed — the JDK's bytecode reaches the buffer's `Cleaner`
+through a field this VM's direct buffers do not carry, so yielding replaces a
+working call with a throw.
+
+**Precondition 2 is not a formality that precondition 4 can overrule.** This is
+the first row on this lane where the two preconditions disagree and the dial is
+the one that is wrong, so it has its own test —
+`the_l5t_wave_refuses_invoke_cleaner_though_the_dial_yielded_it` — rather than a
+sentence in a table's doc comment.
+
+### 9d.4 The two `sun/misc/Unsafe` rows: a blocker that was about the image, not the rows
+
+§9b.1 put `ensureClassInitialized` and `shouldBeInitialized` out of the second
+wave with a precise blocker: they are declared on 17 and 21 and removed on 25,
+this lane's workload runs on 25, and precondition 4 is *a dispatch observed by
+the citing instrument*. It said they stay out "until someone measures them on a
+17 or 21 run".
+
+That run costs one flag. CratonVM takes `--java-home` pointing at any of the
+three images, `/data/jdkimages/jdk21-linux` holds a complete 21.0.12+8, and
+`L5SunMiscUnsafe` reaches its subject reflectively so the same class file runs
+there unchanged — compiled `--release 17`, so the HotSpot 21 oracle can run it
+too.
+
+```text
+  CratonVM --java-home <jdk-21.0.12+8> --jdk-only, L5SunMiscUnsafe
+  dial armed on sun/misc/Unsafe   reached 2   yielded 2   declined_no_bytecode 0
+  per triple                      outcome = bytecode-won on both
+  the workload                    d(base, armed) = 0 over 57 rows
+  precondition 3, on the 21 run   declared, !acc_native, has_code on both
+  vs HotSpot 21                   d(hs, base) = d(hs, armed) = 1
+```
+
+Note where yielding lands. The `sun.misc` bytecode delegates to
+`theInternalUnsafe.ensureClassInitialized(c)`, and the `jdk.internal` spelling
+is one of the six rows §9b.5 names as permanently blocked — so it is still a
+native here and the delegation lands on it. The two spellings are not one
+decision, and retiring the outer while the inner stays is the §4 rule working
+as written.
+
+**The transferable part is not the two rows.** A blocker of the form "this
+instrument cannot see it" is a claim about the instrument, and this one named
+its own remedy and then sat unread for a day. The three supported images are
+all on this host; running against one of the other two is a flag, not a
+project.
+
+### 9d.5 A second image confirms the member-filter defect, on a different row
+
+The one row that differs from HotSpot 21 is `getUnsafe`, and it differs in a
+new way: HotSpot 21 answers `EX:NoSuchMethodException` where CratonVM answers
+`EX:SecurityException`. `javap -p` declares `public static sun.misc.Unsafe
+getUnsafe()` on 21, so the method is there and the JDK's core-reflection member
+filter is hiding it — the same defect §9b's exclusion note records from the 25
+run, now confirmed on an image where it takes a *different* shape (25 lets
+`getMethod` through and throws from the call; 21 hides the method outright).
+
+Still not this lane's, still open:
+`docs/known-issues/jdk-only/core-reflection-has-no-member-filter-20260911.md`.
+What the second image adds is that the divergence is not one row's quirk.
+
+### 9d.6 The two-binary arm threw out two rows every earlier instrument passed
+
+This is the part worth carrying to another lane.
+
+`allocateMemory(J)J` and `reallocateMemory(JJ)J` passed everything. Precondition
+1: the dial reached them. Precondition 3: `declared && !acc_native && has_code`
+on all three images. Precondition 4: `outcome = bytecode-won`. Precondition 2,
+*as measured with the dial*: the wave's own probe was byte-identical armed and
+unarmed, 57 rows.
+
+Built into a binary they are a wreck:
+
+```text
+  AbstractReceiverSweep   base=31/0  trial=31/0   d(hs,base)=12  d(hs,trial)=16
+    DOD SITE ByteBuffer.allocateDirect(8) => java.nio.DirectByteBuffer
+    DOD SITE ByteBuffer.allocateDirect(8) => THREW IllegalArgumentException:
+                        Unsafe.setMemory: address 0x0 is not in any live arena
+  L5JdkInternalUnsafe     11 of 24 rows worse; every off-heap round trip throws
+```
+
+**An armed dial and a retirement table are not the same experiment.** The dial
+yields one dispatch and leaves the native registered for every other caller; the
+table removes it. `allocateMemory` is where that difference bites, because the
+address it returns is an arena handle and the rest of this VM's off-heap surface
+has to be able to resolve it — the JDK's own `allocateMemory` → `allocateMemory0`
+path hands back something the arena does not know, and the next `setMemory` says
+so.
+
+The attribution cost no build. `CRATONVM_UNRETIRE_NATIVE_SHADOW` turns named
+rows back off at runtime, so the bisection is a sequence of runs on the binary
+that already exists:
+
+```text
+  trial                                              arena errors 2
+  trial  unretire=all                                             0
+  trial  unretire=...allocateMemory(J)J                           0   <- it
+  trial  unretire=...setMemory(Ljava/lang/Object;JJB)V            2
+  trial  unretire=...freeMemory(J)V                               2
+  trial  unretire=...reallocateMemory(JJ)J                        2
+  trial  unretire=...copyMemory(...)                              2
+```
+
+and then the same instrument on the wave's own probe, which separated
+`reallocateMemory` from the rest and left exactly one difference standing — the
+`invokeCleaner` row that §9e FIXES, moving toward HotSpot rather than away.
+
+**`addressSize()I` is a third row and a different story**, told in §9f: it is in
+the table, and what it exposed was a defect that had been there all along.
+
+### 9d.7 The wave's acceptance
+
+The whole probe tree, two binaries, with a control arm — `l5w3-arms.sh`, which
+runs HotSpot, the `dev` binary, the wave's binary, and (wherever the trial moved
+at all) the `dev` binary a SECOND time:
+
+```text
+  measured 167, javac-skipped 6
+    moved AWAY from HotSpot (delta>0, control clean):   0
+    moved TOWARD HotSpot (delta<0, control clean):      1
+    unstable against itself (control>0):                1
+    line count moved:                                   0
+```
+
+The one improvement is `L5JdkInternalUnsafe`, `d(hs,base)=4 -> d(hs,trial)=0`:
+the wave's own probe now matches HotSpot exactly, and the rows that moved are
+§9e's `invokeCleaner` fix.
+
+The one unstable probe is `VtHandoffProbe`, `delta=4` with `ctl=4` — it moves
+four rows against ITSELF. Without the control column that is a four-row
+regression with a plausible story attached; with it, it is a virtual-thread
+handoff that does not repeat. This is the second wave in two days where the
+control arm was the difference between a finding and a fiction.
+
+Six probes are `javac`-skipped and named in the log rather than silently
+dropped: `H2MapOpsProbe`, `JcaSunTlsVectors`, `JdkInternalSweep`,
+`L1BreakIterRealProbe`, `L1LocaleProviderWorkload`, `MinAssertRedefine`.
+
+The gate set, all three feature arms, `--no-fail-fast`:
+
+```text
+  cargo test -p cratonvm-types                      ok
+  cargo test -p cratonvm-native-api --lib           ok, 443 tests
+  cargo test -p cratonvm-native-builtins --lib      ok
+  cargo test -p cratonvm-native-builtins --tests    in all three feature arms,
+                                                    exactly two red tests and
+                                                    no others
+```
+
+`--no-fail-fast` is not decoration here. `cargo test --tests` is fail-fast
+ACROSS TARGETS and `lock_discipline_ratchet` sorts before `stub_ratchet`, so the
+first attempt at this gate set reported one red and never ran the stub ratchet
+at all — THE gate for a retirement wave — and would have landed without it.
+
+  * `raw_lock_constructions_do_not_grow`: 429 against a baseline of 428. It is
+    `dev`'s, recorded by a sibling lane as the one pre-existing failure, and the
+    check that it is not this wave's is per file rather than by assertion: the
+    ratchet's needle (`Mutex::new` / `RwLock::new`) appears 0, 7 and 0 times in
+    the three files this wave touches, and 0, 7 and 0 times in the same files at
+    `origin/dev`.
+  * `synthetic_stub_count_does_not_regress`: +35 in each of the three
+    configurations, which is this wave, and it is re-frozen with the account
+    below.
+
+### 9d.8 The stub ratchet, measured with the PAIRED ratchet
+
+```text
+                       no-mgmt   mgmt   syn-jdk   total registrations
+  paired (rows off)       3944   3971      3944   13586 / 13954 / 13621
+  as built                3979   4006      3979   13586 / 13954 / 13621
+```
+
+Both rows come from the SAME built test binary — the second is it run again
+under `CRATONVM_UNRETIRE_NATIVE_SHADOW` naming the wave's 25 triples, which
+turns exactly those rows back off. So the before-number is not a constant
+somebody else froze on a different tree.
+
+35 registrations for 25 triples, because the count is per registration and
+several of these are registered more than once. **The totals are identical in
+every arm**, which is the gate's own reading for "existing fakes were
+relabelled" rather than "new fakes were written".
+
+The `MEASURED_TOTAL_REGISTRATIONS_*` constants move +1 each in the same commit
+and that +1 is **not** this wave's: the paired arm reads the same total with the
+wave's rows off. It is the previous wave's bookkeeping — lane 1's wave 7 records
+`13586 / 13954 / 13621` as its own landing-tree totals in its doc comment and
+left the three constants at the values from before it landed.
+
+### 9d.9 The corpus, three arms, both binaries
+
+```text
+  arm                            scheduled   base    trial
+  CRATONVM_ARGS=--jdk-only         136       136/0   136/0
+  SUITE=all                        136       136/0   136/0
+  SUITE=core                        95        95/0    95/0
+```
+
+Both `CV` and `JDK` are set on every arm. `run.sh` defaults `CV` to
+`target/release/cratonvm.exe` and `JDK` to a Windows Java home, neither of which
+exists on this host, and an arm that falls back to them runs nothing and still
+exits clean.
+
+Three arms and only two schedules: `SUITE=core` alone is 95 vectors, and both
+the other arms are 95 plus the 41 `RJdk*` vectors. `CRATONVM_ARGS=--jdk-only`
+adds them because `run.sh` reads the MODE, not because `SUITE` changed — worth
+knowing before reading two 136s as one arm having been skipped.
+
+The first arm's `rev=` line names a scratch commit this branch briefly carried.
+The working tree was byte-identical across that reset, so it is the same tree
+the other five arms ran.
+
+## 9e. The defect the new probe found on its first run: `invokeCleaner` frees nothing and says nothing
+
+`Unsafe.invokeCleaner(ByteBuffer)` releases a direct buffer's off-heap memory.
+Handed a HEAP buffer, all three supported images throw
+`IllegalArgumentException("buffer is non-direct")`. CratonVM returned normally
+— in `--jdk-only` **and** in compatible mode, so this is shipped behaviour and
+not a retirement artefact.
+
+```text
+  hs 25   invokeCleaner refuses a heap buffer -> EX:IllegalArgumentException
+  base    invokeCleaner refuses a heap buffer -> ok=RETURNED-WITHOUT-THROWING
+```
+
+**The comment above the body had named the case since the day it was written:**
+
+> MEASURED, HotSpot 25.0.4+7: a slice or duplicate of a direct buffer is an
+> `IllegalArgumentException` ("duplicate or slice"), **and a non-direct buffer
+> is too.** … CratonVM accepted every one of them.
+
+and the code below it implemented one of the two clauses — the `att` check that
+catches a slice or duplicate. A heap buffer has no `att` either, so it sailed
+through the only guard there was. This is the `a-test-of-the-accessor-cannot-see`
+shape in its cheapest form: **the comment is the specification and the code is
+half of it**, and nothing compares the two.
+
+Why it survived a whole lane of `Unsafe` work: `L5SunMiscUnsafe` and
+`UnsafeShadowSweep` both probe `invokeCleaner` — on a DIRECT buffer, which
+works. A refusal path has to be called on purpose or it is never called at all,
+and the row that found this one is two lines long.
+
+**The fix asks the receiver rather than deciding.** The JDK's own discriminator
+is `!directBuffer.isDirect()`, so the guard is
+`ctx.invoke_virtual(buf, "isDirect", "()Z", &[])` and not a field read or a
+class-name test. There is already an `isDirect()` registered on
+`java/nio/ByteBuffer` that derives its answer from the class name; deciding
+again here would put a SECOND answer to one question in the tree, which is how
+`getClass()`-shaped traps start. The coupling is deliberate — if `isDirect()` is
+ever wrong, this method is wrong in the same direction rather than in a new one.
+
+Only an explicit `false` refuses: a receiver whose `isDirect()` answers
+something else has a different defect, and manufacturing an
+`IllegalArgumentException` out of it would hide that one behind this one.
+
+Order matters and matches the JDK: non-direct first, then the view check. A
+heap buffer reported as "duplicate or slice" would be a second wrong message
+rather than a fix.
+
+## 9f. `Unsafe.ADDRESS_SIZE` was 0, and only a retirement could see it
+
+Retiring `addressSize()I` turned one probe row red:
+
+```text
+  addressSize -> ok=true          base
+  addressSize -> ok=false         with the row retired
+```
+
+The row asserts `addressSize() > 0`, so the retired path was answering **zero**,
+and the reason is one line of the image's own bytecode:
+
+```text
+  public int addressSize();
+       0: getstatic     #16     // Field ADDRESS_SIZE:I
+       1: ireturn
+```
+
+`addressSize()` is not a computation, it is a read of a `public static final
+int`. Measured on both VMs, through core reflection, in the same run:
+
+```text
+                                          HotSpot 25   CratonVM --jdk-only
+  jdk.internal.misc.UnsafeConstants.PAGE_SIZE    4096   4096
+  jdk.internal.misc.Unsafe.ADDRESS_SIZE             8      0
+```
+
+**The field was already wrong. Nothing could see it**, because every caller in
+this VM went through the native, which answers the host's pointer size
+correctly. Retiring the accessor made the field the only answer and the defect
+surfaced in one row.
+
+### Why it was zero
+
+`jdk/internal/misc/Unsafe.<clinit>()V` is a **registered Bridge** — this VM
+shadows the image's class initialiser and runs its own, which allocated
+`theUnsafe` and did nothing else. Every other static the real `<clinit>`
+assigns therefore stays at its default, and `ADDRESS_SIZE` is one of them.
+
+That is a general shape and it is worth stating as one: **a shadowed `<clinit>`
+is a promise to assign every static the real one assigns**, and a static nobody
+reads through bytecode is invisible until somebody does. `PAGE_SIZE` is the
+control — it lives on `UnsafeConstants`, whose initialiser is *not* shadowed, it
+reads 4096 on both VMs, and that is exactly why `pageSize()` retires in this
+wave while `addressSize()` needed a fix first.
+
+### The blast radius that was already there
+
+`javap -c` finds **seven** `getstatic ADDRESS_SIZE` sites in that class besides
+the accessor. `getAddress`/`putAddress` branch on `ADDRESS_SIZE == 4` to choose
+between a 4-byte and an 8-byte access; with the field at 0 neither VM-visible
+branch matched "4", so the wide path was taken and the answer was right **by
+accident** — 0 is not 4. A future image that spelled the test `ADDRESS_SIZE == 8`
+would have flipped every one of those sites.
+
+### The fix, and what is NOT bundled with it
+
+The shadow now assigns `ADDRESS_SIZE` from the same constant the native
+answers with, so the two cannot drift:
+
+```rust
+const UNSAFE_ADDRESS_SIZE: i32 = std::mem::size_of::<usize>() as i32;
+```
+
+`addressSize()I` **stays in the retirement table**, because with the field
+correct the bytecode is right by construction rather than by accident — and the
+row is then the cheapest possible regression test for the fix: if the `<clinit>`
+shadow ever stops assigning the static, this row goes red again the same day.
 
 ## 10. What the next wave should do, in order (as written 2026-09-10; see §9a for what happened)
 

@@ -362,6 +362,36 @@ fn native_unsafe_invoke_cleaner(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     // ((DirectBuffer) directBuffer).attachment() != null` -- a view keeps a
     // reference to what it was cut from in `attachment`, and only a root
     // direct buffer has it null.
+    //
+    // THE FIRST HALF OF THAT SENTENCE WAS NOT IMPLEMENTED until 2026-09-12.
+    // The paragraph above named the non-direct case from the day it was
+    // written; the code below only ever asked about `att`, which a HEAP buffer
+    // does not have either -- so `invokeCleaner(ByteBuffer.allocate(64))`
+    // returned normally here and threw on all three images. Found by
+    // `apps/probes/L5JdkInternalUnsafe.java` on its first run, in both
+    // `--jdk-only` and compatible mode, which is what makes it a shipped
+    // defect rather than a retirement artefact.
+    //
+    // `isDirect()` is the JDK's own discriminator and this asks the receiver
+    // for it rather than deciding from a field or a class name. Deciding here
+    // would put a SECOND answer to "is this buffer direct" in the tree, and the
+    // one already registered on `java/nio/ByteBuffer` derives from the class
+    // name -- two answers to one question is the shape of the `getClass()`
+    // trap, and the coupling is deliberate: if `isDirect()` is ever wrong, this
+    // method is wrong in the same direction rather than in a new one.
+    //
+    // Only an explicit `false` refuses. A receiver whose `isDirect()` answers
+    // something else has a different defect, and manufacturing an
+    // `IllegalArgumentException` out of it would hide that one behind this one.
+    if matches!(
+        ctx.invoke_virtual(buf, "isDirect", "()Z", &[])?,
+        Some(Value::Int(0))
+    ) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "invokeCleaner: buffer is non-direct".into(),
+        }
+        .into());
+    }
     if matches!(ctx.get_field_by_name(buf, "att"), Value::Object(Some(_))) {
         return Err(RuntimeError::IllegalArgumentException {
             message: "invokeCleaner: duplicate or slice".into(),
