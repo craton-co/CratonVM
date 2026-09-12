@@ -1207,6 +1207,18 @@ static RETIRED_SHADOW_STATELESS_TRIPLES: &[(&str, &str, &str)] = &[
 /// `every_entry_is_reachable_through_the_predicate` and its sibling exist to
 /// catch.
 const RETIRED_SHADOW_PREFIXES: &[&str] = &[
+    // 2026-09-11, lane 4 wave 2. The NARROW prefix, for the reason the
+    // `sun/nio/fs/` note below gives: `jdk/internal/foreign/` as a whole has
+    // nothing retirable under it. The segment, arena and session carriers are
+    // this VM's OWN allocation shape by a decision on record
+    // (`docs/known-issues/jdk-only/the-ffm-carrier-is-the-vms-own-allocation-shape-20260829.md`),
+    // laid out deliberately unlike the JDK's, so their real bodies must never
+    // run; only the LAYOUT carriers are minted on their real classes with
+    // their real fields. `RETIRED_SHADOW_L4_FFM_TRIPLES` retires 137 rows over
+    // the nine `ValueLayouts$Of*Impl` classes under this prefix, and nothing
+    // else under it is retired -- not the group layouts beside them, and not
+    // `varHandle` on these nine.
+    "jdk/internal/foreign/layout/",
     // 2026-09-11, lane 4 wave 1. The two wide prefixes of the largest lane:
     // 1,398 bucket-A/B shadows over 142 classes sit under them. Same rule as
     // every prefix above -- this admits those packages to one extra binary
@@ -5089,6 +5101,810 @@ static RETIRED_SHADOW_L4_TRIPLES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Lane 4 wave 2, 2026-09-11: the nine `ValueLayouts$Of*Impl` carriers.
+///
+/// **An EIGHTH table**, and the first under `jdk/internal/foreign/`. Wave 1's
+/// note said "nothing under it reached the candidate set, so its prefix is not
+/// admitted either" — that was a statement about the instrument, not about the
+/// package. The lane's ledger put 479 rows in "no probe in this tree invokes
+/// it" and named this shape as over half of them; one probe,
+/// `apps/probes/L4FfmLayoutSweep.java`, moved every one of these into the
+/// funnel in a single pass.
+///
+/// # The funnel
+///
+/// 146 registrations over nine classes, and the census taken from that probe's
+/// own run reports `invocations > 0` on **all 146**, with the schema-5
+/// `invocations_complete` bit set on every row — so this is not the lower bound
+/// that bucket usually is. 83 are bucket A and 63 bucket B (`byteSize`,
+/// `byteAlignment`, `name`, `order`, `carrier`, `byteOffset`, inherited from
+/// `AbstractLayout` and `ValueLayouts$AbstractValueLayout`, which is where the
+/// real bodies live).
+///
+/// # What the retirement does, row by row
+///
+/// Measured on `vm-l4ffm-fix`, one binary against itself, with the dial scoped
+/// to exactly this wave (`CRATONVM_ENFORCE_NATIVE_SHADOW=jdk/internal/foreign/
+/// layout/ValueLayouts$`), against HotSpot 25 over the probe's 359 rows:
+///
+/// ```text
+///   unarmed --jdk-only          25 rows differ
+///   armed on this wave          25 rows differ    <- the SAME number
+/// ```
+///
+/// The same number and **not the same rows**, which is the whole finding. 19
+/// rows the native answered wrongly become right, because the real bodies throw
+/// the JDK's own text and render the JDK's own string:
+///
+/// ```text
+///   withByteAlignment(3)   "Invalid alignment constraint: 3" -> "Invalid alignment: 3"     x9
+///   byteOffset(groupElement)  a home-grown message -> "Bad layout path: ..."               x9
+///   ADDRESS.withTargetLayout(JAVA_INT).toString()   "a8" -> "a8:i4"                        x1
+/// ```
+///
+/// and 19 become wrong, every one of them `varHandle`. **So `varHandle` is
+/// carved out and this table is 137 rows, not 146.** The real
+/// `AbstractValueLayout.varHandle()` runs `Utils.makeSegmentViewVarHandle`,
+/// which on this VM ends in `NoClassDefFoundError: java/lang/invoke/
+/// BoundMethodHandle` or hands back a CratonVM VarHandle with no variable-type
+/// metadata — `varType()` and `coordinateTypes()` then refuse, and a
+/// `vh.set`/`vh.get` round trip through a heap segment reads `size=0`. That is
+/// a MethodHandle-infrastructure gap, not a layout one, and it is the only
+/// method of the thirteen that the real body cannot service.
+///
+/// With `varHandle` out, the arm is the floor minus those 19: **six rows**, and
+/// none of them is on a class in this table.
+///
+/// # The precondition, which is the commit before this one
+///
+/// This wave does not stand on its own. The carrier fix in
+/// `native-builtins/src/phases_late/foreign_ffm.rs` had to land first, for the
+/// same reason wave 1's `java.io.File` fix had to: **a layout minted by this VM
+/// did not hold what the real bodies read.** `AbstractLayout.name` is an
+/// `Optional<String>` and the mint wrote a bare reference; `carrier` was never
+/// written at all, and the native `carrier()` derived its answer from the class
+/// NAME instead — so the method answered correctly while the field behind it
+/// was null. Armed before that fix, this same scope took the probe from 100
+/// differing lines to **358**; after it, to the floor. The dial did not find
+/// the defect and could not have: it names a family, and the failure was
+/// underneath all nine of them.
+///
+/// # What is held back, and why
+///
+/// The prefix admits `jdk/internal/foreign/layout/`; the table decides. Of the
+/// 251 bucket-A/B rows under `jdk/internal/foreign` in this census:
+///
+///  * **`varHandle` (9)** — above.
+///  * **The group layouts (35): `StructLayoutImpl`, `UnionLayoutImpl`,
+///    `SequenceLayoutImpl`, `PaddingLayoutImpl`.** One carrier defect, not
+///    thirteen: `AbstractGroupLayout.elements` is declared
+///    `java.util.List<MemoryLayout>` and this VM stores a java ARRAY in that
+///    field. Armed, `memberLayouts()` answers 0 where the oracle answers 2,
+///    `byteOffset(groupElement("c"))` cannot resolve a member that is plainly
+///    there, and every group `toString` dies in
+///    `NoSuchMethodError: 'int java.lang.foreign.MemoryLayout.size()'`. It is
+///    the same SHAPE as the defect this wave fixed and it wants the same
+///    treatment — a real `List`, written at the mint — which is a change to the
+///    group factories and belongs in its own commit with its own measurement.
+///  * **The segment, arena and session carriers (70).** Blocked by a decision
+///    on record, not by a missing measurement:
+///    `docs/known-issues/jdk-only/the-ffm-carrier-is-the-vms-own-allocation-shape-20260829.md`
+///    settles that `cratonvm/internal/foreign/MemorySegmentImpl` is the VM's own
+///    allocation shape and is laid out DELIBERATELY unlike
+///    `AbstractMemorySegmentImpl`, whose `length`/`readOnly`/`scope` would alias
+///    the carrier's `ptr`/`size`/`arena`. Retiring one of these would run a real
+///    body over those three slots. That is not a wave that needs screening; it
+///    is a wave that must not be run while that decision stands.
+///  * **`java/lang/foreign/*`** — the interfaces. Bucket C: abstract in the
+///    image, dispatched through no door, and still named by the FFM arm of
+///    `force_native_over_real_jdk_bytecode`, which this commit narrows to
+///    exactly them.
+///
+/// # The residual this wave found and did not fix
+///
+/// COMPATIBLE mode keeps a second, independent copy of the mint:
+/// `make_prepared_value_layout` in `vm/src/vm/vm_util.rs`, the preseed that
+/// gives `ValueLayout.JAVA_INT` and its fifteen siblings their statics before
+/// `<clinit>`. It resolves `byteSize`, `byteAlignment` and `name` by name and
+/// writes **three of the five** real fields; `carrier` and `order` stay null,
+/// and `ValueLayout.JAVA_INT.withName("k").equals(...)` still throws
+/// `NullPointerException` there. `--jdk-only` drops that preseed entirely and
+/// runs the real `<clinit>`, which is why the strict arm is clean and the
+/// compatible one is not (50 differing lines against 68). **It does not affect
+/// this table**: `NativeKind::allowed_in(Compatible)` is `true` for every kind,
+/// so a retired triple still dispatches its native in compatible mode and the
+/// re-tag is a `--jdk-only` change only.
+///
+/// Measured on **linux/x86_64 against JDK 25**, the platform both shell gates
+/// in this campaign are keyed to.
+static RETIRED_SHADOW_L4_FFM_TRIPLES: &[(&str, &str, &str)] = &[
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
+        "byteAlignment",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
+        "byteOffset",
+        "([Ljava/lang/foreign/MemoryLayout$PathElement;)J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
+        "byteSize",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
+        "carrier",
+        "()Ljava/lang/Class;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
+        "name",
+        "()Ljava/util/Optional;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
+        "order",
+        "()Ljava/nio/ByteOrder;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
+        "targetLayout",
+        "()Ljava/util/Optional;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/AddressLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/AddressLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
+        "withOrder",
+        "(Ljava/nio/ByteOrder;)Ljava/lang/foreign/AddressLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
+        "withOrder",
+        "(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
+        "withTargetLayout",
+        "(Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/AddressLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl",
+        "byteAlignment",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl",
+        "byteOffset",
+        "([Ljava/lang/foreign/MemoryLayout$PathElement;)J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl",
+        "byteSize",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl",
+        "carrier",
+        "()Ljava/lang/Class;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl",
+        "name",
+        "()Ljava/util/Optional;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl",
+        "order",
+        "()Ljava/nio/ByteOrder;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/ValueLayout$OfBoolean;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfBoolean;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl",
+        "withOrder",
+        "(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfBoolean;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl",
+        "withOrder",
+        "(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfByteImpl",
+        "byteAlignment",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfByteImpl",
+        "byteOffset",
+        "([Ljava/lang/foreign/MemoryLayout$PathElement;)J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfByteImpl",
+        "byteSize",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfByteImpl",
+        "carrier",
+        "()Ljava/lang/Class;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfByteImpl",
+        "name",
+        "()Ljava/util/Optional;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfByteImpl",
+        "order",
+        "()Ljava/nio/ByteOrder;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfByteImpl",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfByteImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfByteImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/ValueLayout$OfByte;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfByteImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfByteImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfByteImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfByte;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfByteImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfByteImpl",
+        "withOrder",
+        "(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfByte;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfByteImpl",
+        "withOrder",
+        "(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfCharImpl",
+        "byteAlignment",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfCharImpl",
+        "byteOffset",
+        "([Ljava/lang/foreign/MemoryLayout$PathElement;)J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfCharImpl",
+        "byteSize",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfCharImpl",
+        "carrier",
+        "()Ljava/lang/Class;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfCharImpl",
+        "name",
+        "()Ljava/util/Optional;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfCharImpl",
+        "order",
+        "()Ljava/nio/ByteOrder;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfCharImpl",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfCharImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfCharImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/ValueLayout$OfChar;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfCharImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfCharImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfCharImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfChar;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfCharImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfCharImpl",
+        "withOrder",
+        "(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfChar;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfCharImpl",
+        "withOrder",
+        "(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl",
+        "byteAlignment",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl",
+        "byteOffset",
+        "([Ljava/lang/foreign/MemoryLayout$PathElement;)J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl",
+        "byteSize",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl",
+        "carrier",
+        "()Ljava/lang/Class;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl",
+        "name",
+        "()Ljava/util/Optional;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl",
+        "order",
+        "()Ljava/nio/ByteOrder;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/ValueLayout$OfDouble;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfDouble;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl",
+        "withOrder",
+        "(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfDouble;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl",
+        "withOrder",
+        "(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl",
+        "byteAlignment",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl",
+        "byteOffset",
+        "([Ljava/lang/foreign/MemoryLayout$PathElement;)J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl",
+        "byteSize",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl",
+        "carrier",
+        "()Ljava/lang/Class;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl",
+        "name",
+        "()Ljava/util/Optional;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl",
+        "order",
+        "()Ljava/nio/ByteOrder;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/ValueLayout$OfFloat;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfFloat;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl",
+        "withOrder",
+        "(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfFloat;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl",
+        "withOrder",
+        "(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+        "byteAlignment",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+        "byteOffset",
+        "([Ljava/lang/foreign/MemoryLayout$PathElement;)J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+        "byteSize",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+        "carrier",
+        "()Ljava/lang/Class;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+        "name",
+        "()Ljava/util/Optional;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+        "order",
+        "()Ljava/nio/ByteOrder;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/ValueLayout$OfInt;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfInt;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+        "withOrder",
+        "(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfInt;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+        "withOrder",
+        "(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+        "byteAlignment",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+        "byteOffset",
+        "([Ljava/lang/foreign/MemoryLayout$PathElement;)J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+        "byteSize",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+        "carrier",
+        "()Ljava/lang/Class;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+        "name",
+        "()Ljava/util/Optional;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+        "order",
+        "()Ljava/nio/ByteOrder;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/ValueLayout$OfLong;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfLong;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+        "withOrder",
+        "(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfLong;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+        "withOrder",
+        "(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfShortImpl",
+        "byteAlignment",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfShortImpl",
+        "byteOffset",
+        "([Ljava/lang/foreign/MemoryLayout$PathElement;)J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfShortImpl",
+        "byteSize",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfShortImpl",
+        "carrier",
+        "()Ljava/lang/Class;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfShortImpl",
+        "name",
+        "()Ljava/util/Optional;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfShortImpl",
+        "order",
+        "()Ljava/nio/ByteOrder;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfShortImpl",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfShortImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfShortImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/ValueLayout$OfShort;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfShortImpl",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfShortImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfShortImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout$OfShort;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfShortImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfShortImpl",
+        "withOrder",
+        "(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout$OfShort;",
+    ),
+    (
+        "jdk/internal/foreign/layout/ValueLayouts$OfShortImpl",
+        "withOrder",
+        "(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;",
+    ),
+];
+
 /// The 2026-09-11 lane-L6 wave: `java/net/HttpURLConnection` and
 /// `ProxySelector.getDefault` -- 15 rows of a lane of 966, after the corpus
 /// refused 109 that the probe tree had cleared.
@@ -5554,6 +6370,9 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // counts seventeen shadows over a family that no longer uses them.
     RETIRED_SHADOW_L1_BI_TRIPLES,
     RETIRED_SHADOW_L1_LP_TRIPLES,
+    // Lane 4 wave 2, added WITH the table rather than after a gate caught it --
+    // which is the whole point of the loop this const now feeds.
+    RETIRED_SHADOW_L4_FFM_TRIPLES,
 ];
 
 #[cfg(test)]
@@ -5568,6 +6387,89 @@ mod tests {
                 "lane 4's table is binary-searched, so it must be sorted and                  unique: {:?} does not precede {:?}",
                 w[0],
                 w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn the_ffm_wave_is_the_nine_value_layouts_without_varhandle() {
+        // The carve-out is the load-bearing claim of this wave, so it is
+        // asserted rather than described. Retiring `varHandle` runs the real
+        // `ValueLayouts$AbstractValueLayout.varHandle()`, which reaches
+        // `Utils.makeSegmentViewVarHandle` and ends in
+        // `NoClassDefFoundError: java/lang/invoke/BoundMethodHandle` -- the one
+        // method of the thirteen whose real body this VM cannot service. A
+        // later edit that "completes" the table by adding the nine missing rows
+        // would reintroduce exactly that, silently, in `--jdk-only` only.
+        let mut classes = std::collections::BTreeSet::new();
+        for (c, m, d) in RETIRED_SHADOW_L4_FFM_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is in the lane 4 FFM table and the predicate cannot see it"
+            );
+            assert!(
+                c.starts_with("jdk/internal/foreign/layout/ValueLayouts$Of"),
+                "{c} is not one of the nine value-layout carriers this wave measured"
+            );
+            assert_ne!(
+                *m, "varHandle",
+                "{c}.{m}{d} is carved out of this wave on purpose -- see the table's doc comment"
+            );
+        }
+        assert_eq!(RETIRED_SHADOW_L4_FFM_TRIPLES.len(), 137);
+        classes.extend(RETIRED_SHADOW_L4_FFM_TRIPLES.iter().map(|(c, _, _)| *c));
+        assert_eq!(classes.len(), 9, "{classes:?}");
+        for c in &classes {
+            assert!(
+                !triple_is_retired_shadow(c, "varHandle", "()Ljava/lang/invoke/VarHandle;"),
+                "{c}.varHandle()Ljava/lang/invoke/VarHandle; must stay a live Bridge"
+            );
+        }
+    }
+
+    /// The group layouts sit under the same prefix and are NOT retired.
+    ///
+    /// `jdk/internal/foreign/layout/` admits four more carriers to the binary
+    /// search -- `StructLayoutImpl`, `UnionLayoutImpl`, `SequenceLayoutImpl`,
+    /// `PaddingLayoutImpl` -- and the prefix is not the decision. They are held
+    /// back on a measured carrier defect (`AbstractGroupLayout.elements` is a
+    /// `java.util.List` and this VM stores an array there), and a prefix that
+    /// admits them is exactly how a later wave would retire them by accident.
+    #[test]
+    fn the_ffm_group_layouts_are_admitted_by_the_prefix_and_not_retired() {
+        for (c, m, d) in [
+            (
+                "jdk/internal/foreign/layout/StructLayoutImpl",
+                "memberLayouts",
+                "()Ljava/util/List;",
+            ),
+            (
+                "jdk/internal/foreign/layout/UnionLayoutImpl",
+                "memberLayouts",
+                "()Ljava/util/List;",
+            ),
+            (
+                "jdk/internal/foreign/layout/SequenceLayoutImpl",
+                "elementCount",
+                "()J",
+            ),
+            (
+                "jdk/internal/foreign/layout/PaddingLayoutImpl",
+                "toString",
+                "()Ljava/lang/String;",
+            ),
+            // And the half a decision on record keeps out of every wave.
+            ("jdk/internal/foreign/ArenaImpl", "close", "()V"),
+            ("jdk/internal/foreign/MemorySessionImpl", "close", "()V"),
+            (
+                "jdk/internal/foreign/AbstractMemorySegmentImpl",
+                "byteSize",
+                "()J",
+            ),
+        ] {
+            assert!(
+                !triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is retired and this wave did not measure it"
             );
         }
     }

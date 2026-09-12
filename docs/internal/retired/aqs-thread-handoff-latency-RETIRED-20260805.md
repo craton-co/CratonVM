@@ -80,6 +80,35 @@ favour. The exclusion is left exactly as it is, and this row is closed as
 runs first; the probe already handles the polymorphic-call-site trap that made
 an earlier cut of it read backwards.
 
+> ### 2026-09-11: the two runs were re-attempted, and they do not reproduce.
+>
+> That instruction was followed by
+> `performance/composition-native-callback-and-the-promotion-question-CLOSED-20260911.md`.
+> The probe was rebuilt at `apps/probes/JavaUtilTierUpExclusionProbe.java`
+> (`probes/` was deleted on 2026-08-29) with the arms INTERLEAVED and a median
+> over reps, because a single A-then-B pair does not resolve this at the
+> spread the rebuild shows.
+>
+> | | 2026-08-05 | 2026-09-11, 6 reps | 10 reps |
+> |---|---:|---:|---:|
+> | `ReentrantLock` | 30 653 / 28 754 ns/op | 1 346 | 1 408 |
+> | `MyLock extends it` | 39 954 / 37 904 ns/op | 1 395 | 1 327 |
+> | subclass speed | **0.77x / 0.76x** | **0.99x** [0.93-1.06] | **1.05x** [0.97-1.14] |
+>
+> The absolute numbers moved 21x in five weeks, so the 0.77x was measured
+> against a VM that no longer exists. Priced properly — as a one-binary A/B on
+> the BASE arm alone, which removes the "different class, different call site,
+> different inlining" this two-receiver comparison also carries —
+> `CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL=1` reads **1.02x favourable with
+> overlapping ranges**. There is no 30 % regression left to defend.
+>
+> The exclusion nevertheless stays, and this row stays "do not" — for the
+> reason its own origin commit (cb563d707) gives and this page never quoted:
+> the cached virtual route "can publish a stale receiver-specific entry and
+> **then spin**". A spin is not a slowdown, and it is not what the 30 % number
+> was ever evidence about. See that page's item 2 for what would have to be
+> shown to flip it.
+
 ## The AQS-specific defect nobody had looked for
 
 Not in the original document, found by reading rather than measuring, and then

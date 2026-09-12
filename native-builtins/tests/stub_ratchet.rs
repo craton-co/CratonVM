@@ -1997,21 +1997,48 @@ use cratonvm_types::compat::CompatibilityMode;
 /// time. Three independent derivations of one delta is what makes it a property
 /// of this branch rather than of a tree, which is the claim a re-freeze makes.
 ///
-/// **Re-frozen 2026-09-11 (lane 1 wave 6): 2755 -> 2774.** `+19`, and the account
-/// is nineteen rows in two tables: `RETIRED_SHADOW_L1_BI_TRIPLES`, all
-/// seventeen of `java/text/BreakIterator` (retired WHOLE because the class is
-/// abstract -- every instance the JDK hands back is a real subclass answering
-/// its own bytecode), plus `RETIRED_SHADOW_L1_LP_TRIPLES`, one registration
-/// each on `sun/util/resources/LocaleData` and `JRELocaleProviderAdapter`.
+/// # Lane 4 wave 2, 2026-09-11 — the paired ratchet, both columns PRINTED
 ///
-/// MEASURED TWICE, ACROSS A MERGE, AND NEVER ADDED. Before dev moved this
-/// branch printed 2630/2641/2630 against dev's 2611/2622/2611; dev then
-/// re-froze twice more for other lanes (to 2728/2755/2728) and this branch
-/// re-merged. The arms were RE-RUN rather than incremented, and printed
-/// 2747/2774/2747 -- the same +19 over a control 117 higher. Two independent
-/// derivations of one delta is what makes it a property of this branch rather
-/// than of a tree.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2774;
+/// `+137` in all three configurations and the total unchanged in all three:
+/// case **(b)** in the taxonomy the panic message above sets out — existing
+/// registrations relabelled `Bridge` -> `SyntheticStub` so `--jdk-only` drops
+/// them and the JDK's own bytecode runs. The rows are
+/// `RETIRED_SHADOW_L4_FFM_TRIPLES`, 137 triples over the nine
+/// `jdk/internal/foreign/layout/ValueLayouts$Of*Impl` carriers.
+///
+/// ```text
+///   arm             OFF             ON              delta
+///   (default)   2728 / 13609    2865 / 13609        +137 / 0
+///   management  2755 / 13977    2892 / 13977        +137 / 0
+///   synthetic   2728 / 13644    2865 / 13644        +137 / 0
+/// ```
+///
+/// **The OFF column was PRINTED, not inferred from a `<=` pass**, and it
+/// reproduces every constant this wave found in this file — all three stub
+/// baselines AND all three totals — so there is no inherited drift to
+/// disentangle from the delta. It was taken with
+/// `CRATONVM_UNRETIRE_NATIVE_SHADOW=jdk/internal/foreign/layout/`, so one
+/// binary answered both halves and nothing about the comparison depends on two
+/// checkouts being otherwise identical, which is what that switch exists for.
+///
+/// Measured on the MERGE with `origin/dev`, not on the branch before it: the
+/// three baselines moved twice while this wave was in flight (2609 -> 2728 and
+/// 2620 -> 2755), and the `+137` is identical each time only because it was
+/// re-measured each time rather than subtracted.
+///
+/// ## The strict registry, and the gate that used to guard it by LEVEL
+///
+/// This wave crossed `STRICT_MIN_TOTAL_REGISTRATIONS` on its own branch —
+/// 10,998 -> 10,861 against a floor of 10,900 — because under `JdkOnly`
+/// `register_inner` REFUSES a `SyntheticStub`, so a retired triple is one row
+/// FEWER in the strict registry and that floor was guarding a number the
+/// campaign is deliberately driving down. `STRICT_UNEXPLAINED_DROP_MAX`
+/// replaced it on `dev` the same day, bounding the SHORTFALL instead, and this
+/// wave is the confirmation that the new shape is the right one: the shortfall
+/// is `13609 - 2865 - 10741 = 3` with the wave armed and `13609 - 2728 -
+/// 10878 = 3` with it un-armed. **Invariant across 137 retirements**, where the
+/// level moved by exactly 137.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2892;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2269,21 +2296,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2774;
 /// each registration is re-tagged separately. The `--jdk-only-report` census
 /// for the same prefixes reports **15 distinct triples refused, 0 with a
 /// survivor** -- the same population counted the other way.
-/// **Re-frozen 2026-09-11 (lane 1 wave 6): 2728 -> 2747.** `+19`, and the account
-/// is nineteen rows in two tables: `RETIRED_SHADOW_L1_BI_TRIPLES`, all
-/// seventeen of `java/text/BreakIterator` (retired WHOLE because the class is
-/// abstract -- every instance the JDK hands back is a real subclass answering
-/// its own bytecode), plus `RETIRED_SHADOW_L1_LP_TRIPLES`, one registration
-/// each on `sun/util/resources/LocaleData` and `JRELocaleProviderAdapter`.
-///
-/// MEASURED TWICE, ACROSS A MERGE, AND NEVER ADDED. Before dev moved this
-/// branch printed 2630/2641/2630 against dev's 2611/2622/2611; dev then
-/// re-froze twice more for other lanes (to 2728/2755/2728) and this branch
-/// re-merged. The arms were RE-RUN rather than incremented, and printed
-/// 2747/2774/2747 -- the same +19 over a control 117 higher. Two independent
-/// derivations of one delta is what makes it a property of this branch rather
-/// than of a tree.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2747;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2865;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2463,21 +2476,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2747;
 /// each registration is re-tagged separately. The `--jdk-only-report` census
 /// for the same prefixes reports **15 distinct triples refused, 0 with a
 /// survivor** -- the same population counted the other way.
-/// **Re-frozen 2026-09-11 (lane 1 wave 6): 2728 -> 2747.** `+19`, and the account
-/// is nineteen rows in two tables: `RETIRED_SHADOW_L1_BI_TRIPLES`, all
-/// seventeen of `java/text/BreakIterator` (retired WHOLE because the class is
-/// abstract -- every instance the JDK hands back is a real subclass answering
-/// its own bytecode), plus `RETIRED_SHADOW_L1_LP_TRIPLES`, one registration
-/// each on `sun/util/resources/LocaleData` and `JRELocaleProviderAdapter`.
-///
-/// MEASURED TWICE, ACROSS A MERGE, AND NEVER ADDED. Before dev moved this
-/// branch printed 2630/2641/2630 against dev's 2611/2622/2611; dev then
-/// re-froze twice more for other lanes (to 2728/2755/2728) and this branch
-/// re-merged. The arms were RE-RUN rather than incremented, and printed
-/// 2747/2774/2747 -- the same +19 over a control 117 higher. Two independent
-/// derivations of one delta is what makes it a property of this branch rather
-/// than of a tree.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2747;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2865;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
