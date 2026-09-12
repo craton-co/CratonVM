@@ -14152,6 +14152,40 @@ pub fn atomic_intrinsic_site_may_match(
     cp_class == jdk_class || atomic_intrinsic_method_is_final_in_jdk(jdk_class, name, descriptor)
 }
 
+/// The class name [`ir::try_ir_unbox_intrinsic`] should match an IR-tier
+/// unbox site as (review #80).
+///
+/// The constant-pool class, except at a subclass site of `AtomicInteger` or
+/// `AtomicLong` whose method resolves to the JDK class's `final` body
+/// ([`atomic_intrinsic_site_class_matches`]): that site matches as the JDK
+/// class. The guard and the layout still come from the SITE's class id, and
+/// the lowered guard is an exact class-id compare, so a receiver of any other
+/// class deopts. The declaring-class resolver is asked only when some JDK
+/// class declares this method `final`.
+fn ir_unbox_match_class<'a>(
+    cp_class: &'a str,
+    name: &str,
+    descriptor: &str,
+    cp_idx: u16,
+    cp_invoke_declaring_class_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+) -> &'a str {
+    let Some(jdk) = [
+        "java/util/concurrent/atomic/AtomicInteger",
+        "java/util/concurrent/atomic/AtomicLong",
+    ]
+    .into_iter()
+    .find(|&jdk| cp_class != jdk && atomic_intrinsic_method_is_final_in_jdk(jdk, name, descriptor))
+    else {
+        return cp_class;
+    };
+    let declaring = cp_invoke_declaring_class_resolver.and_then(|resolve| resolve(cp_idx));
+    if atomic_intrinsic_site_class_matches(jdk, cp_class, declaring.as_deref(), name, descriptor) {
+        jdk
+    } else {
+        cp_class
+    }
+}
+
 /// The ATOMIC_INT (`jdk_class` = `AtomicInteger`) or ATOMIC_LONG (`AtomicLong`)
 /// registration for one `invokevirtual` site, as `try_compile_inner` performs
 /// it: `(entry, num_params, return tag, guard class id)`, or `None` to keep
@@ -15008,6 +15042,55 @@ mod atomic_accessor_intrinsic_tests {
     /// site reaches the intrinsic through `cp_invoke_declaring_class_resolver`,
     /// guarded on the site's OWN class id. Without that resolver, or when it
     /// names any class other than the JDK one, the site keeps ordinary dispatch.
+    #[test]
+    fn the_final_devirt_rewrite_yields_to_an_atomic_subclass_site() {
+        const AI: &str = "java/util/concurrent/atomic/AtomicInteger";
+        let site_class_id = |_cp_idx: u16| -> Option<u32> { Some(23456) };
+        let by_ai = |_cp_idx: u16| -> Option<String> { Some(AI.to_string()) };
+        assert!(devirt_intrinsic_yield_enabled(), "the yield is default-on");
+        let y = site_yields_to_atomic_intrinsic;
+        assert!(y(7, "pkg/Counter", "incrementAndGet", "()I", Some(&site_class_id), Some(&by_ai)));
+        assert!(y(7, AI, "get", "()I", Some(&site_class_id), None));
+        // Unresolved declaring class: the intrinsic would not take it, so neither
+        // does the yield.
+        assert!(!y(7, "pkg/Counter", "incrementAndGet", "()I", Some(&site_class_id), None));
+        assert!(!y(7, "java/lang/String", "length", "()I", Some(&site_class_id), None));
+    }
+
+    #[test]
+    fn a_site_trap_refusal_is_read_back_under_the_compile_doors_key() {
+        const C: &str = "cratonvm/test/RefusalKeyProbe";
+        let id = cratonvm_types::ClassId::new(4242);
+        note_ir_method_refused(C, "m", "()V", id);
+        let key = |id| ir_refusal_memo_key(ir_method_memo_hash(C, "m", "()V"), id, redefine_epoch());
+        assert!(ir_evidence::method_already_refused(key(id)));
+        assert!(
+            !ir_evidence::method_already_refused(key(cratonvm_types::ClassId::new(4243))),
+            "a same-named class in another loader is not refused"
+        );
+    }
+
+    #[test]
+    fn ir_unbox_sites_of_an_atomic_subclass_match_as_the_jdk_class() {
+        const AI: &str = "java/util/concurrent/atomic/AtomicInteger";
+        const AL: &str = "java/util/concurrent/atomic/AtomicLong";
+        let by_ai = |_cp_idx: u16| -> Option<String> { Some(AI.to_string()) };
+        let by_al = |_cp_idx: u16| -> Option<String> { Some(AL.to_string()) };
+        let by_base = |_cp_idx: u16| -> Option<String> { Some("pkg/Base".to_string()) };
+        let m = ir_unbox_match_class;
+        assert_eq!(m("pkg/Counter", "incrementAndGet", "()I", 7, Some(&by_ai)), AI);
+        assert_eq!(m("pkg/LongCounter", "getAndAdd", "(J)J", 7, Some(&by_al)), AL);
+        // Declared by an intermediate class, which could have overridden it.
+        assert_eq!(m("pkg/Counter", "incrementAndGet", "()I", 7, Some(&by_base)), "pkg/Counter");
+        // No resolution: the exact constant-pool class, which the matcher misses.
+        assert_eq!(m("pkg/Counter", "incrementAndGet", "()I", 7, None), "pkg/Counter");
+        assert_eq!(m(AI, "incrementAndGet", "()I", 7, None), AI);
+        // A method no JDK Atomic class declares `final` never asks the resolver.
+        let never = |_cp_idx: u16| -> Option<String> { panic!("the resolver must not be asked") };
+        assert_eq!(m("java/lang/Long", "longValue", "()J", 7, Some(&never)), "java/lang/Long");
+        assert_eq!(m("pkg/LongCounter", "longValue", "()J", 7, Some(&never)), "pkg/LongCounter");
+    }
+
     #[test]
     fn a_subclass_site_registers_through_the_declaring_class_resolver() {
         const AI: &str = "java/util/concurrent/atomic/AtomicInteger";
@@ -21116,6 +21199,26 @@ pub fn ir_method_memo_hash(class_name: &str, method_name: &str, descriptor: &str
     )
 }
 
+/// Mark a method refused in the IR tier's refusal memo under the key the
+/// compile door reads: [`ir_refusal_memo_key`] of the method hash, the
+/// declaring class id and the current redefine epoch.
+///
+/// A writer that passes the bare [`ir_method_memo_hash`] to
+/// `ir_evidence::note_method_refused` marks an entry no reader ever asks for.
+/// The site-trap policy in `vm/src/jit/helpers.rs` did exactly that.
+pub fn note_ir_method_refused(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    declaring_class_id: cratonvm_types::ClassId,
+) {
+    ir_evidence::note_method_refused(ir_refusal_memo_key(
+        ir_method_memo_hash(class_name, method_name, descriptor),
+        declaring_class_id,
+        redefine_epoch(),
+    ));
+}
+
 /// Mark the method of the loaded class `class_id` as permanently bail-listed.
 /// Called when the heavy `x64::compile` path returns None (typically because of
 /// an unsupported backend pattern that won't change on retry).
@@ -22347,6 +22450,45 @@ fn site_yields_to_call_site_intrinsic(
     try_resolve_intrinsic(class, name, descriptor).is_some()
         || try_resolve_string_intrinsic(class, name, descriptor, string_layout).is_some()
         || site_yields_to_thin_instance_helper(class, name, descriptor)
+}
+
+/// [`site_yields_to_call_site_intrinsic`] for the ATOMIC_INT / ATOMIC_LONG
+/// ladders (review #80).
+///
+/// Those two cannot be asked by name alone: registering one resolves the
+/// site's guard class id and, for a subclass site, the class that declares
+/// the method. So this asks [`atomic_intrinsic_for_invoke_site`] exactly as
+/// `try_compile_inner` registers the site. Without it the `final`-method
+/// rewrite could bind `counter.incrementAndGet()` statically, and the site
+/// would leave through the direct-bind arm before the intrinsic saw it.
+fn site_yields_to_atomic_intrinsic(
+    cp_idx: u16,
+    class: &str,
+    name: &str,
+    descriptor: &str,
+    cp_invoke_class_id_resolver: Option<&dyn Fn(u16) -> Option<u32>>,
+    cp_invoke_declaring_class_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+) -> bool {
+    if !devirt_intrinsic_yield_enabled() {
+        return false;
+    }
+    [
+        "java/util/concurrent/atomic/AtomicInteger",
+        "java/util/concurrent/atomic/AtomicLong",
+    ]
+    .into_iter()
+    .any(|jdk| {
+        atomic_intrinsic_for_invoke_site(
+            jdk,
+            cp_idx,
+            class,
+            name,
+            descriptor,
+            cp_invoke_class_id_resolver,
+            cp_invoke_declaring_class_resolver,
+        )
+        .is_some()
+    })
 }
 
 /// The other two members of the set, and the reason the first version of
@@ -27980,7 +28122,15 @@ fn try_compile_inner(
                         if let Some(uop) = cp_invoke_class_id_resolver
                             .and_then(|r| r(cp_idx))
                             .and_then(|cid| {
-                                ir::try_ir_unbox_intrinsic(&cn, &mn, &desc, cid).map(|op| (op, cid))
+                                let match_class = ir_unbox_match_class(
+                                    &cn,
+                                    &mn,
+                                    &desc,
+                                    cp_idx,
+                                    cp_invoke_declaring_class_resolver,
+                                );
+                                ir::try_ir_unbox_intrinsic(match_class, &mn, &desc, cid)
+                                    .map(|op| (op, cid))
                             })
                         {
                             ir_unbox_intrinsic_sites.insert(pc, uop);
@@ -30456,12 +30606,19 @@ fn try_compile_inner(
             // is not affected: no intrinsic matches a private method, so the
             // JVMS 5.4.6 correctness rule above keeps every site it had.
             let yields_to_intrinsic = invoke_kind == 0
-                && site_yields_to_call_site_intrinsic(
+                && (site_yields_to_call_site_intrinsic(
                     &class_name,
                     &method_name,
                     &descriptor,
                     resolved_string_layout,
-                );
+                ) || site_yields_to_atomic_intrinsic(
+                    cp_idx,
+                    &class_name,
+                    &method_name,
+                    &descriptor,
+                    cp_invoke_class_id_resolver,
+                    cp_invoke_declaring_class_resolver,
+                ));
             let class_name = if invoke_kind == 0 && !yields_to_intrinsic {
                 match cp_invokespecial_owner_resolver.and_then(|r| r(cp_idx, opcode)) {
                     Some(owner) => {

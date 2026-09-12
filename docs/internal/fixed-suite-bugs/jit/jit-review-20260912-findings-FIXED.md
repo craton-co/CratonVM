@@ -1,6 +1,6 @@
 # FIXED: the 2026-09-12 JIT code review, finding by finding
 
-**Status: 90 FIXED, 2 PARTIAL, 5 OPEN** across 97 findings. The ledger has
+**Status: 92 FIXED, 1 PARTIAL, 4 OPEN** across 97 findings. The ledger has
 95 lines, because #10/#11 and #18/#19 each share one fix and one line. Every
 commit is on `fix/jit-review-20260912`, merged into `dev`. Each PARTIAL and
 OPEN finding names the known-issue record that tracks what is left.
@@ -86,7 +86,7 @@ the review are the gate that does that.
 | 40 | IR long Cmp uses a 32-bit CMP | FIXED 58bb7cfec |
 | 41 | Every synchronized-block method refused after full emission | FIXED 58bb7cfec |
 | 42 | A lowering refusal publishes an accepted verdict | FIXED 45c07691e |
-| 43 | Bottom-tested loops refuse the IR build | PARTIAL 58ede83bd (caller code builds; a rotated loop in a spliced callee body still refuses); `ir-builder-refuses-rotated-loops-20260912.md` |
+| 43 | Bottom-tested loops refuse the IR build | FIXED 58ede83bd (caller code), 762ed3ced (spliced callee bodies); `ir-builder-refuses-rotated-loops-FIXED-20260912.md` |
 | 44 | `ir_compatible` admits opcodes the builder refuses | FIXED f5329cdd5, 9b8cbce45 |
 | 45 | `ir_evidence` entries leak on an IR bail | FIXED add815189 |
 | 46 | IR frame states carry no monitor stack | OPEN `ir-frame-states-carry-no-monitor-stack-20260912.md` |
@@ -98,7 +98,7 @@ the review are the gate that does that.
 | 52 | O(n) copy-on-write registries rebuilt per change | FIXED fe92eb53b |
 | 53 | Two code-retirement systems | FIXED d7f658e9e, 66f629c9f |
 | 54 | 250 ms C2 budget on wall time, for failures and OSR | FIXED f960bed8f |
-| 55 | Tier state, OSR denials, unload keyed by class name | FIXED f960bed8f, c9cf67009, then the verdict store on `fix/jit-review-r2-20260912-verdicts`; `jit-verdicts-are-keyed-by-name-not-loader-FIXED-20260912.md` |
+| 55 | Tier state, OSR denials, unload keyed by class name | FIXED f960bed8f, c9cf67009, then the verdict store on `fix/jit-review-r2-20260912-verdicts`; `jit-verdicts-are-keyed-by-name-not-loader-FIXED-20260912.md`; the site-trap refusal memo writer used the wrong key: `site-trap-refusal-memo-written-under-the-wrong-key-FIXED-20260912.md` |
 | 56 | One failed background OSR compile bans OSR forever | FIXED f960bed8f |
 | 57 | Branch-profile window arm/disarm unbalanced | FIXED f960bed8f |
 | 58 | Never-compiling methods lock a global mutex every 64 calls | FIXED f960bed8f |
@@ -133,7 +133,7 @@ the review are the gate that does that.
 | 77 | iushr breaks the sign-extended-int invariant | FIXED 7335f4c73 |
 | 78 | lookupswitch assumes sorted keys | FIXED 7335f4c73 |
 | 79 | Bail-list keys XOR field hashes | FIXED 24e98eed4 |
-| 80 | Intrinsics: layout twice, exact CP class, env read per call | FIXED 7335f4c73, e9838de83, then the subclass resolver on `fix/jit-review-r2-20260912-verdicts`; `atomic-intrinsics-miss-subclass-call-sites-FIXED-20260912.md` |
+| 80 | Intrinsics: layout twice, exact CP class, env read per call | FIXED 7335f4c73, e9838de83, the subclass resolver on `fix/jit-review-r2-20260912-verdicts`, then the final-devirt yield and IR-tier subclass match on `fix/jit-review-r2-20260912`; `atomic-intrinsics-miss-subclass-call-sites-FIXED-20260912.md` |
 | 81 | Dead intrinsic variants and hand descriptor walkers | FIXED 7335f4c73, c9cf67009, efcc72e7e |
 | 82 | Unresolved checkcast returns null | FIXED 7335f4c73 |
 | 83 | Helper ABI self-check skips callable slots | FIXED 7335f4c73 |
@@ -141,7 +141,7 @@ the review are the gate that does that.
 | 85 | `jit_anewarray_object` missed its siblings' fixes | FIXED 7335f4c73 |
 | 86 | Peer takeover root scan reads GPRs only | FIXED 7335f4c73 (no-oops-in-XMM invariant documented) |
 | 87 | OSR trampoline cache keyed by address only | FIXED add815189 |
-| 88 | Resume tolerates Unsupported locals on a wrong argument | FIXED on `fix/jit-review-r2-20260912-verdicts` (compile-time liveness contract pinned, argument rewritten); `jit-resume-tolerates-unsupported-locals-without-liveness-FIXED-20260912.md` |
+| 88 | Resume tolerates Unsupported locals on a wrong argument | FIXED on `fix/jit-review-r2-20260912-verdicts` (compile-time liveness contract pinned, argument rewritten), then unspilled register indices refused at admission; `jit-resume-tolerates-unsupported-locals-without-liveness-FIXED-20260912.md` |
 | 89 | Scheduler places nodes in id order | FIXED 7335f4c73, merge 44f2aedf4 |
 | 90 | Quadratic scheduler and lowering scans | FIXED merge 44f2aedf4, e3735e523, 4dea5a91f, 1d08b8eff, 12419fded, b37c73722; `ir-scheduler-and-lowering-remaining-quadratic-scans-FIXED-20260912.md` |
 | 91 | DCE roots omit throwing ops | FIXED 9b8cbce45 |

@@ -47,10 +47,16 @@ The single-pass backend publishes every deopt / OSR-exit point through
    that would need a refusal later.
 
 Together, these mean an admitted artifact never carries a live `Unsupported`
-local. The only remaining producer at exit time is `deopt::resolve_value`, which
-maps a metadata defect (a register index outside the spilled file) to
-`Unsupported`. That is not a classification gap, and `DeoptVerifier` checks it
-at compile time.
+local.
+
+The one other producer of `Unsupported` at exit time was `deopt::resolve_value`.
+It maps a metadata defect, a register index outside the 16-entry files the
+deopt stub spills, to `Unsupported`. `DeoptVerifier` only runs on the IR tier's
+install path, so on the single-pass tier nothing refused such an index before
+the body ran. `value_blocks_resume` now does (`names_unspilled_register`,
+recursing through virtual-object fields). A frame naming an unspilled register
+is unresumable, so `osr_exit_policy` refuses the OSR entry, and the exit-time
+fallback cannot be reached from an admitted artifact.
 
 The exit-time code keeps its tolerance, as the review required. It never
 refuses after side effects. What changed is the documented argument:
@@ -65,6 +71,8 @@ missing was a test that pins the compile-time contract on a slot reused as two
 kinds, and a soundness argument that names it. This change adds both.
 
 ## Regression coverage
+
+`jit/src/deopt.rs`: `a_register_past_the_spilled_files_blocks_the_resume`.
 
 `jit/src/x64/tests.rs`:
 

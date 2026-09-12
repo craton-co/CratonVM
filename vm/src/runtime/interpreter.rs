@@ -4073,6 +4073,7 @@ pub fn execute(
                                             &class_name_str,
                                             method_name,
                                             method_descriptor,
+                                            class_id,
                                             deopt_reason,
                                             rframe_for_despec.bci,
                                         );

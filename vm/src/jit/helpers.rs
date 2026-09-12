@@ -4363,6 +4363,7 @@ pub(crate) fn despeculate_trapped_method(
     class_name: &str,
     method_name: &str,
     descriptor: &str,
+    declaring_class_id: ClassId,
     fallback_reason: cratonvm_jit::deopt::DeoptReason,
     bci: u32,
 ) {
@@ -4384,7 +4385,11 @@ pub(crate) fn despeculate_trapped_method(
         // would let a gate-refused method look "already decided" on its FIRST
         // trap, and the policy, including the eviction, would never be applied.
         decided = cratonvm_jit::ir::claim_site_trap_decision(h);
-        cratonvm_jit::ir_evidence::note_method_refused(h);
+        // Under the compile door's own key (method, declaring class id, redefine
+        // epoch). The bare name hash `h` marked an entry no reader ever asked
+        // for, so the next compile retried the IR tier on the method that had
+        // just trapped.
+        cratonvm_jit::note_ir_method_refused(class_name, method_name, descriptor, declaring_class_id);
         if !decided {
             cratonvm_jit::ir::note_site_trap_repeat();
         }
@@ -4666,6 +4671,7 @@ unsafe fn try_resume_trapped_callee(
         key_class,
         key_method,
         key_desc,
+        cached.declaring_class_id,
         cratonvm_jit::deopt::DeoptReason::UnreachedCode,
         bci,
     );
