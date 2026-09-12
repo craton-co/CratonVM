@@ -1597,8 +1597,13 @@ mod windows_fault {
         // the fault even if some inner frame would otherwise swallow it. We
         // still return CONTINUE_SEARCH, so a legitimate handler downstream is
         // unaffected.
-        unsafe {
-            AddVectoredExceptionHandler(1, vectored_handler);
+        // SAFETY: registering a handler function with the OS; the handler is a
+        // `'static` fn and is never removed.
+        let handle = unsafe { AddVectoredExceptionHandler(1, vectored_handler) };
+        // The handler recovers implicit null checks, so the JIT may elide them
+        // from now on (hazard 4 in `cratonvm_jit::implicit_null`).
+        if !handle.is_null() {
+            cratonvm_jit::implicit_null::note_fault_handler_installed();
         }
     }
 
@@ -3148,7 +3153,12 @@ not an address\n",
             sa.sa_sigaction = crash_signal_handler as usize;
             sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_RESTART;
             libc::sigemptyset(&mut sa.sa_mask);
-            libc::sigaction(sig, &sa, std::ptr::null_mut());
+            let installed = libc::sigaction(sig, &sa, std::ptr::null_mut()) == 0;
+            // `crash_signal_handler` recovers implicit null checks, so the JIT may
+            // elide them from now on (hazard 4 in `cratonvm_jit::implicit_null`).
+            if installed && sig == libc::SIGSEGV {
+                cratonvm_jit::implicit_null::note_fault_handler_installed();
+            }
         }
     }
 }

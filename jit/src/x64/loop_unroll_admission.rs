@@ -627,6 +627,10 @@ fn every_unrolled_copy_of_an_implicit_null_check_is_registered() {
         // nothing registers and both arms are 0, which would pass vacuously.
         return;
     }
+    // Elision also needs a recovering fault handler (hazard 4 in
+    // `implicit_null`). This test only compiles and reads metadata, it never
+    // executes a null receiver, so stand in for the VM's installer.
+    crate::implicit_null::note_fault_handler_installed();
     let code = shape_pointer_walk_loop();
     // pc -> (field index, type tag): 11 is `v` (int), 17 is `next` (ref).
     let field_info = vec![(11usize, 0usize, b'I'), (17usize, 1usize, b'L')];
