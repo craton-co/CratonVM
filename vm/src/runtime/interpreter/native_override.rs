@@ -4529,13 +4529,18 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     }
     // BREAKITER, the real data (2026-09-11): the two `LocaleResources`
     // readers `BreakIteratorProviderImpl.getBreakInstance` needs. Both
-    // answered null, which is why the BREAKITER allow-list below pins a
+    // answered null, which is why a BREAKITER allow-list used to pin a
     // synthetic iterator over `java.text.BreakIterator`'s four factories;
     // the natives registered in `locale_resources::register` read the
     // `BreakIteratorInfo` bundle class and the `*BreakIteratorData` binary
     // out of the image instead. A registration on a concrete JDK-library
     // method is SILENT without a gate entry, which is the whole reason
     // this arm exists.
+    //
+    // WAVE 6: that pin is gone (`vm/src/vm/vm_exec.rs`) and the family runs
+    // its own bytecode, so these two entries now carry it. They are the
+    // family's floor, not a stepping stone -- remove them and every
+    // BreakIterator factory is back to "Cannot load from null array".
     if class_name == "sun/util/locale/provider/LocaleResources"
         && matches!(
             method_name,

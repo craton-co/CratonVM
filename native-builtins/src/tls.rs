@@ -1566,10 +1566,17 @@ fn register_ssl_parameters(r: &mut NativeMethodRegistry) {
     );
 
     // getApplicationProtocols() -> String[]
-    // Returns the ALPN list the caller configured. The h2/http-1.1 pair is the
-    // fallback for a block nobody has configured (and for the shorter
-    // SSLParameters objects other modules allocate, whose slot 5 does not
-    // exist) — it is what this module has always advertised.
+    // Returns the ALPN list the caller configured, and NOTHING when nobody has
+    // configured one: HotSpot's answer for a fresh `SSLParameters` is a
+    // zero-length array. This copy advertised `h2/http-1.1` for an
+    // unconfigured block, which is a claim the caller never made — and a
+    // caller that reads the list to decide whether ALPN was requested was told
+    // yes by every parameters object in the VM.
+    //
+    // `t27_tls.rs::register_alpn_on_parameters` registers the same triple with
+    // a side-table implementation and wins in a full build; the two are kept
+    // in step deliberately, because "which copy won" is not a question a
+    // caller's behaviour should depend on.
     r.register(
         cls,
         "getApplicationProtocols",
@@ -1579,7 +1586,7 @@ fn register_ssl_parameters(r: &mut NativeMethodRegistry) {
             if let Value::Object(Some(arr)) = ctx.get_field(this, PAR_APP_PROTOCOLS) {
                 return Ok(Some(Value::Object(Some(arr))));
             }
-            let arr = build_string_array(ctx, &["h2", "http/1.1"]);
+            let arr = build_string_array(ctx, &[]);
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -1598,8 +1605,30 @@ fn register_ssl_parameters(r: &mut NativeMethodRegistry) {
         "([Ljava/lang/String;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let list = args.get(1).copied().unwrap_or(Value::Object(None));
-            ctx.set_field(this, PAR_APP_PROTOCOLS, list);
+            // Same two checks as the side-table copy in `t27_tls.rs`: a null
+            // array and a null-or-empty element are both
+            // `IllegalArgumentException` on HotSpot, and an ALPN list with a
+            // hole in it fails on the wire, in another process, minutes later.
+            let Some(Value::Object(Some(arr))) = args.get(1) else {
+                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: "protocols was null".into(),
+                }
+                .into());
+            };
+            let arr = *arr;
+            for i in 0..ctx.array_length(arr) {
+                let element = match ctx.get_array_element(arr, i) {
+                    Value::Object(Some(s)) => ctx.read_string(s),
+                    _ => None,
+                };
+                if !element.is_some_and(|text| !text.is_empty()) {
+                    return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                        message: "An element of protocols was null/empty".into(),
+                    }
+                    .into());
+                }
+            }
+            ctx.set_field(this, PAR_APP_PROTOCOLS, Value::Object(Some(arr)));
             Ok(None)
         },
     );

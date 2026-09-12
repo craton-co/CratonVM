@@ -2017,7 +2017,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// `native-builtins/src/lang_class.rs|java/lang/Package.getPackages|()[Ljava/lang/Package;`
 /// -- and none the other way. Record:
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2891;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2943;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2295,7 +2295,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2891;
 /// `native-builtins/src/lang_class.rs|java/lang/Package.getPackages|()[Ljava/lang/Package;`
 /// -- and none the other way. Record:
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2864;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2916;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2495,7 +2495,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2864;
 /// `native-builtins/src/lang_class.rs|java/lang/Package.getPackages|()[Ljava/lang/Package;`
 /// -- and none the other way. Record:
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2864;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2916;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -2555,7 +2555,7 @@ const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2864;
 /// was the only trace a real defect left in this gate, and staleness meant
 /// nobody could have read it. The `synthetic-jdk` arm has no constant here and
 /// measured 13645 on the same tree.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13977;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13985;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
@@ -2568,7 +2568,7 @@ const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13977;
 /// dev's staleness rather than either wave's — the localisation is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13609;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13617;
 
 /// The `--features synthetic-jdk` total, which had no constant at all.
 ///
@@ -2594,7 +2594,7 @@ const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13609;
 /// and 13645 on that tree against 13658 on this one is exactly the drift a
 /// sentence cannot track.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13644;
+const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13652;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;
