@@ -2003,14 +2003,31 @@ pub fn allocate_registers_arm64(
     num_params: usize,
     loops: &[(usize, usize)],
 ) -> RegAllocResult {
-    // The ARM64 backend does not build a category-2-aware slot map today, and
-    // its own prologue assumes the identity layout too, so both sides agree.
+    allocate_registers_arm64_with_param_slots(code, code_len, num_locals, num_params, &[], loops)
+}
+
+/// [`allocate_registers_arm64`] with the real argument layout.
+///
+/// `param_slots` is the JVM local slot of each incoming argument
+/// (`compute_param_jvm_slots`); an empty slice selects the identity layout
+/// `0..num_params`. The ARM64 backend used to pass `&[]` unconditionally while
+/// its prologue also assumed the identity layout, so the two agreed -- and were
+/// both wrong for every signature with a `long`/`double` before its last
+/// parameter. See [`param_live_in_mask`] for what the wrong seed costs.
+pub fn allocate_registers_arm64_with_param_slots(
+    code: &[u8],
+    code_len: usize,
+    num_locals: usize,
+    num_params: usize,
+    param_slots: &[usize],
+    loops: &[(usize, usize)],
+) -> RegAllocResult {
     allocate_registers_with(
         code,
         code_len,
         num_locals,
         num_params,
-        &[],
+        param_slots,
         loops,
         &ARM64_LOCAL_GPRS,
         &ARM64_LOCAL_FPS,

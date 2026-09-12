@@ -20,20 +20,171 @@
 //!   instruction cache via the compiler builtin `__clear_cache` before the
 //!   RW→RX flip, because ARM's I-cache and D-cache are not coherent (unlike
 //!   x86-64, which is automatically coherent and needs no flush).
-//! - **macOS ARM64 (Apple Silicon):** Hardware-enforced W^X — memory cannot be
-//!   writable and executable simultaneously. Must allocate as RW, write code,
-//!   then flip to RX via `mprotect`. Apple provides `pthread_jit_write_protect_np`
-//!   for per-thread fast toggling on JIT pages allocated with `MAP_JIT`.
-//!   I-cache flush uses Apple's `sys_icache_invalidate`.
+//! - **macOS ARM64 (Apple Silicon):** W^X is enforced PER THREAD on `MAP_JIT`
+//!   pages, not per page. The region is mapped once as RWX with `MAP_JIT`, and
+//!   `pthread_jit_write_protect_np` switches the calling thread between
+//!   "may write, may not execute" and the reverse. `mprotect` is not used: the
+//!   hardened runtime refuses to make a once-writable `MAP_JIT` page executable
+//!   that way, so the previous RW-then-`mprotect` shape aborted every compile
+//!   on a hardened build. Every write to code memory therefore runs inside a
+//!   [`JitWriteScope`]. I-cache flush uses Apple's `sys_icache_invalidate`.
+//!
+//! The Unix `mmap` flags are NOT portable: `MAP_ANONYMOUS` is `0x20` on Linux
+//! and `0x1000` on the BSDs and Darwin. See [`map_anonymous`].
 
 /// Errors that can occur during JIT memory operations.
 #[derive(Debug)]
 pub enum JitError {
     /// OS-level memory allocation failed.
     AllocationFailed,
-    /// mprotect / VirtualProtect failed to change page permissions.
+    /// mprotect / VirtualProtect failed to change page permissions. The payload
+    /// is the OS error code (`errno` on Unix, `GetLastError()` on Windows), not
+    /// the call's return value, which is always the uninformative `-1` / `0`.
     ProtectFailed(i32),
 }
+
+/// The `errno` of the call that just failed, for [`JitError::ProtectFailed`].
+///
+/// `mprotect` returns `-1` for every failure, so recording its return value --
+/// what this module used to do -- told a reader nothing about whether the
+/// mapping was wrong (`EINVAL`), the policy refused (`EACCES`) or memory ran
+/// out (`ENOMEM`). `-1` survives only when the OS reports no code at all.
+#[cfg(not(target_os = "windows"))]
+#[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), allow(dead_code))]
+fn last_os_error_code() -> i32 {
+    std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(-1)
+}
+
+/// Which `mmap(2)` flag values an operating system uses.
+///
+/// `PROT_*`, `MAP_PRIVATE` and `MAP_FAILED` agree across every Unix this crate
+/// can target; `MAP_ANONYMOUS` does not. The Unix allocator hard-coded Linux's
+/// `0x20` for "Linux, FreeBSD, macOS x86-64" alike. On FreeBSD and Darwin
+/// `0x20` is `MAP_RENAME` (or unassigned), so `mmap` failed with `EINVAL`,
+/// `alloc_executable` returned `None`, and the JIT was silently dead there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // a Windows build names no Unix ABI
+enum UnixMmapAbi {
+    /// Linux and Android on every architecture but MIPS.
+    Linux,
+    /// Linux on MIPS, which kept the IRIX flag values.
+    LinuxMips,
+    /// Darwin, FreeBSD, NetBSD, OpenBSD, DragonFly.
+    Bsd,
+    /// illumos and Solaris.
+    Solaris,
+}
+
+/// `MAP_ANONYMOUS` for `abi`. A pure function of its argument so the table is
+/// checked on every host, not only on the one it describes.
+#[allow(dead_code)] // unused on Windows
+const fn map_anonymous(abi: UnixMmapAbi) -> i32 {
+    match abi {
+        UnixMmapAbi::Linux => 0x20,
+        UnixMmapAbi::LinuxMips => 0x800,
+        UnixMmapAbi::Bsd => 0x1000,
+        UnixMmapAbi::Solaris => 0x100,
+    }
+}
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(any(
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "mips32r6",
+        target_arch = "mips64r6"
+    ))
+))]
+const HOST_MMAP_ABI: Option<UnixMmapAbi> = Some(UnixMmapAbi::Linux);
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "mips32r6",
+        target_arch = "mips64r6"
+    )
+))]
+const HOST_MMAP_ABI: Option<UnixMmapAbi> = Some(UnixMmapAbi::LinuxMips);
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+#[allow(dead_code)] // macOS/ARM64's allocator names `UnixMmapAbi::Bsd` directly
+const HOST_MMAP_ABI: Option<UnixMmapAbi> = Some(UnixMmapAbi::Bsd);
+#[cfg(any(target_os = "illumos", target_os = "solaris"))]
+const HOST_MMAP_ABI: Option<UnixMmapAbi> = Some(UnixMmapAbi::Solaris);
+/// Any other OS: no known flag value, so the allocator refuses rather than
+/// passing a guess to `mmap`. Refusing is what the wrong constant did too, but
+/// now it is the documented outcome rather than an accident.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "illumos",
+    target_os = "solaris"
+)))]
+#[allow(dead_code)] // Windows never maps through `mmap`
+const HOST_MMAP_ABI: Option<UnixMmapAbi> = None;
+
+/// A region in which the CURRENT THREAD may write into JIT code memory.
+///
+/// A zero-cost no-op everywhere except macOS on Apple Silicon, where code pages
+/// are `MAP_JIT` and executable-or-writable per thread. There, entering the
+/// first scope on a thread calls `pthread_jit_write_protect_np(0)` and leaving
+/// the last calls `pthread_jit_write_protect_np(1)`. Scopes nest, and the
+/// thread is back in execute mode as soon as the outermost one drops.
+///
+/// Hold it only around the write itself. While it is held, EVERY `MAP_JIT`
+/// page is non-executable for this thread, so calling into compiled code from
+/// inside a scope faults. That is why `ExecutableBuffer` takes a scope per
+/// copy rather than for the life of a buffer: a buffer that is allocated and
+/// then abandoned without `finalize` (every failed compile) would otherwise
+/// leave its thread unable to run any JIT code again.
+///
+/// `!Send`, because the permission belongs to the thread that entered it.
+#[must_use = "the write permission lasts only as long as the scope"]
+pub struct JitWriteScope {
+    _thread_bound: std::marker::PhantomData<*const ()>,
+}
+
+impl JitWriteScope {
+    /// Allow this thread to write code memory until the scope drops.
+    #[inline]
+    pub fn enter() -> Self {
+        platform_jit_write_begin();
+        Self {
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for JitWriteScope {
+    #[inline]
+    fn drop(&mut self) {
+        platform_jit_write_end();
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[inline(always)]
+fn platform_jit_write_begin() {}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[inline(always)]
+fn platform_jit_write_end() {}
 
 impl std::fmt::Display for JitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -98,6 +249,9 @@ fn platform_alloc(size: usize) -> Option<*mut u8> {
     }
 
     // Allocate as RW only — W^X enforcement.
+    // SAFETY: a null address asks the OS to choose, so the new region cannot
+    // alias an existing one; every other argument is a plain value, and a
+    // failure is reported as a null return, handled below.
     let p = unsafe {
         VirtualAlloc(
             ptr::null_mut(),
@@ -122,6 +276,9 @@ fn platform_free(ptr: *mut u8, _size: usize) {
         fn VirtualFree(lpAddress: *mut u8, dwSize: usize, dwFreeType: u32) -> i32;
     }
 
+    // SAFETY: `ptr` is the base `VirtualAlloc` returned for this region (the
+    // `free_executable` contract), and `MEM_RELEASE` with size 0 releases
+    // exactly that reservation. The caller owns no reference into it after.
     unsafe {
         VirtualFree(ptr, 0, MEM_RELEASE);
     }
@@ -158,11 +315,15 @@ fn platform_make_executable(ptr: *mut u8, size: usize) -> Result<(), JitError> {
     }
 
     let mut old_protect: u32 = 0;
+    // SAFETY: `ptr..ptr+size` lies inside a region `platform_alloc` committed,
+    // and `old_protect` is a live local the call writes one `u32` into.
     let ret = unsafe { VirtualProtect(ptr, size, PAGE_EXECUTE_READ, &mut old_protect) };
     if ret == 0 {
         // VirtualProtect returns 0 on failure; surface GetLastError() so the
         // diagnostic carries the actual OS error code rather than the useless
         // `0` return value.
+        // SAFETY: `GetLastError` takes no arguments and reads thread-local state.
+        // Cast: a Win32 error code is a `DWORD`; `ProtectFailed` carries `i32`.
         let err = unsafe { GetLastError() } as i32;
         Err(JitError::ProtectFailed(err))
     } else {
@@ -194,6 +355,10 @@ fn flush_icache_range_windows(ptr: *mut u8, size: usize) {
             dwSize: usize,
         ) -> i32;
     }
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle constant that is
+    // always valid for the calling process, and `FlushInstructionCache` only
+    // uses `ptr`/`size` as an address range to invalidate; it does not
+    // dereference them, so any range (including an empty one) is sound.
     unsafe {
         // Returns BOOL; a failure here cannot be recovered from (we are about
         // to publish this code either way), and the only documented failure
@@ -219,11 +384,15 @@ fn platform_make_writable(ptr: *mut u8, size: usize) -> Result<(), JitError> {
     }
 
     let mut old_protect: u32 = 0;
+    // SAFETY: as in `platform_make_executable`: a committed region this module
+    // allocated, and a live local for the old protection.
     let ret = unsafe { VirtualProtect(ptr, size, PAGE_READWRITE, &mut old_protect) };
     if ret == 0 {
         // VirtualProtect returns 0 on failure; surface GetLastError() so the
         // diagnostic carries the actual OS error code rather than the useless
         // `0` return value.
+        // SAFETY: `GetLastError` takes no arguments and reads thread-local state.
+        // Cast: a Win32 error code is a `DWORD`; `ProtectFailed` carries `i32`.
         let err = unsafe { GetLastError() } as i32;
         Err(JitError::ProtectFailed(err))
     } else {
@@ -232,8 +401,58 @@ fn platform_make_writable(ptr: *mut u8, size: usize) -> Result<(), JitError> {
 }
 
 // ---------------------------------------------------------------------------
-// macOS ARM64 (Apple Silicon) — W^X enforced
+// macOS ARM64 (Apple Silicon) — per-thread W^X on MAP_JIT pages
 // ---------------------------------------------------------------------------
+//
+// The previous shape mapped `MAP_JIT` pages RW and flipped them to RX with
+// `mprotect`. The hardened runtime refuses that flip for a page that was ever
+// writable, so `finalize` aborted the process on every compile of a hardened
+// build, and nothing here ever called the toggle the platform actually
+// provides. The supported protocol is: map once as RWX with `MAP_JIT`, then
+// let `pthread_jit_write_protect_np` decide, per thread, whether those pages
+// are writable (0) or executable (1). `JitWriteScope` holds the thread in write
+// mode around each copy; outside a scope it is in execute mode, which is also
+// the state a new thread starts in.
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+extern "C" {
+    fn pthread_jit_write_protect_np(enabled: i32);
+    fn sys_icache_invalidate(start: *mut core::ffi::c_void, size: usize);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+thread_local! {
+    /// How many [`JitWriteScope`]s this thread holds. Only the outermost one
+    /// toggles, so a nested write cannot re-protect pages an outer write is
+    /// still copying into.
+    static JIT_WRITE_DEPTH: std::cell::Cell<usize> = std::cell::Cell::new(0);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn platform_jit_write_begin() {
+    JIT_WRITE_DEPTH.with(|depth| {
+        let d = depth.get();
+        if d == 0 {
+            // SAFETY: takes a plain int and changes only this thread's view of
+            // `MAP_JIT` pages. The matching re-protect is in
+            // `platform_jit_write_end`, reached from `JitWriteScope::drop`.
+            unsafe { pthread_jit_write_protect_np(0) };
+        }
+        depth.set(d + 1);
+    });
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn platform_jit_write_end() {
+    JIT_WRITE_DEPTH.with(|depth| {
+        let d = depth.get().saturating_sub(1);
+        depth.set(d);
+        if d == 0 {
+            // SAFETY: as in `platform_jit_write_begin`; 1 restores execute mode.
+            unsafe { pthread_jit_write_protect_np(1) };
+        }
+    });
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn platform_alloc(size: usize) -> Option<*mut u8> {
@@ -241,8 +460,8 @@ fn platform_alloc(size: usize) -> Option<*mut u8> {
 
     const PROT_READ: i32 = 1;
     const PROT_WRITE: i32 = 2;
+    const PROT_EXEC: i32 = 4;
     const MAP_PRIVATE: i32 = 0x02;
-    const MAP_ANONYMOUS: i32 = 0x1000; // macOS uses 0x1000 for MAP_ANON
     const MAP_JIT: i32 = 0x0800;
     const MAP_FAILED: *mut u8 = !0 as *mut u8;
 
@@ -250,14 +469,52 @@ fn platform_alloc(size: usize) -> Option<*mut u8> {
         fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     }
 
-    // Allocate as RW with MAP_JIT. Apple Silicon requires MAP_JIT for pages
-    // that will later be made executable.
+    // RWX with MAP_JIT: the per-thread toggle, not the page protection, is
+    // what enforces W^X on these pages.
+    // SAFETY: a null hint without `MAP_FIXED` lets the kernel choose, so the
+    // mapping cannot alias an existing one; every argument is a plain value and
+    // a failure comes back as `MAP_FAILED`, handled below.
     let p = unsafe {
         mmap(
             ptr::null_mut(),
             size,
+            PROT_READ | PROT_WRITE | PROT_EXEC,
+            MAP_PRIVATE | map_anonymous(UnixMmapAbi::Bsd) | MAP_JIT,
+            -1,
+            0,
+        )
+    };
+    if p == MAP_FAILED {
+        None
+    } else {
+        Some(p)
+    }
+}
+
+/// Plain RW anonymous memory for the code-adjacent data cells.
+///
+/// NOT `MAP_JIT`. Those cells are written by the RUNTIME (the safepoint flag is
+/// set by whichever thread requests a stop), and a `MAP_JIT` page is writable
+/// only by a thread that is currently in write mode -- every other thread would
+/// fault on the store.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn platform_alloc_data(size: usize) -> Option<*mut u8> {
+    const PROT_READ: i32 = 1;
+    const PROT_WRITE: i32 = 2;
+    const MAP_PRIVATE: i32 = 0x02;
+    const MAP_FAILED: *mut u8 = !0 as *mut u8;
+
+    extern "C" {
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+    }
+
+    // SAFETY: as in `platform_alloc` -- a kernel-placed anonymous mapping.
+    let p = unsafe {
+        mmap(
+            std::ptr::null_mut(),
+            size,
             PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT,
+            MAP_PRIVATE | map_anonymous(UnixMmapAbi::Bsd),
             -1,
             0,
         )
@@ -274,6 +531,8 @@ fn platform_free(ptr: *mut u8, size: usize) {
     extern "C" {
         fn munmap(addr: *mut u8, len: usize) -> i32;
     }
+    // SAFETY: `ptr`/`size` describe a mapping `platform_alloc` returned (the
+    // `free_executable` contract), and nothing references it afterwards.
     unsafe {
         munmap(ptr, size);
     }
@@ -281,46 +540,23 @@ fn platform_free(ptr: *mut u8, size: usize) {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn platform_make_executable(ptr: *mut u8, size: usize) -> Result<(), JitError> {
-    const PROT_READ: i32 = 1;
-    const PROT_EXEC: i32 = 4;
-
-    extern "C" {
-        fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
-    }
-
-    unsafe {
-        // Flush instruction cache before making executable — required on ARM64
-        // where data cache and instruction cache are not coherent.
-        sys_icache_invalidate(ptr as *const u8, size);
-        let ret = mprotect(ptr, size, PROT_READ | PROT_EXEC);
-        if ret != 0 {
-            return Err(JitError::ProtectFailed(ret));
-        }
-    }
+    // Flush the instruction cache -- required on ARM64, where the data and
+    // instruction caches are not coherent. There is no permission change to
+    // make: the region is already executable for every thread not currently
+    // inside a `JitWriteScope`.
+    // SAFETY: `sys_icache_invalidate` treats `ptr..ptr+size` as an address
+    // range to discard cached decodes for; it does not dereference the memory.
+    unsafe { sys_icache_invalidate(ptr.cast(), size) };
     Ok(())
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn platform_make_writable(ptr: *mut u8, size: usize) -> Result<(), JitError> {
-    const PROT_READ: i32 = 1;
-    const PROT_WRITE: i32 = 2;
-
-    extern "C" {
-        fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
-    }
-
-    unsafe {
-        let ret = mprotect(ptr, size, PROT_READ | PROT_WRITE);
-        if ret != 0 {
-            return Err(JitError::ProtectFailed(ret));
-        }
-    }
+fn platform_make_writable(_ptr: *mut u8, _size: usize) -> Result<(), JitError> {
+    // Nothing to do at the page level: a write is permitted exactly while the
+    // writing thread holds a `JitWriteScope`, which `ExecutableBuffer`'s write
+    // paths take for themselves. Refusing here would break the patch protocol
+    // for no gain.
     Ok(())
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-extern "C" {
-    fn sys_icache_invalidate(start: *const u8, size: usize);
 }
 
 // ---------------------------------------------------------------------------
@@ -658,7 +894,7 @@ pub fn code_near_globals_stats() -> (usize, usize, bool) {
 }
 
 // ---------------------------------------------------------------------------
-// Unix (non-macOS-ARM64) — Linux, FreeBSD, macOS x86-64
+// Unix (non-macOS-ARM64) — Linux, the BSDs, macOS x86-64, illumos
 // ---------------------------------------------------------------------------
 
 #[cfg(all(
@@ -671,8 +907,9 @@ fn platform_alloc(size: usize) -> Option<*mut u8> {
     const PROT_READ: i32 = 1;
     const PROT_WRITE: i32 = 2;
     const MAP_PRIVATE: i32 = 0x02;
-    const MAP_ANONYMOUS: i32 = 0x20;
     const MAP_FAILED: *mut u8 = !0 as *mut u8;
+    // Per OS, not Linux's value everywhere -- see `UnixMmapAbi`.
+    let map_anon = map_anonymous(HOST_MMAP_ABI?);
 
     extern "C" {
         fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
@@ -685,12 +922,15 @@ fn platform_alloc(size: usize) -> Option<*mut u8> {
     // the kernel may place the mapping anywhere, and will never disturb an
     // existing one. A null hint is the historical behaviour exactly.
     let raw = |hint: *mut u8| -> Option<*mut u8> {
+        // SAFETY: no `MAP_FIXED`, so `hint` is advisory and the kernel never
+        // replaces an existing mapping; the arguments are plain values and a
+        // failure comes back as `MAP_FAILED`, handled below.
         let p = unsafe {
             mmap(
                 hint,
                 size,
                 PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS,
+                MAP_PRIVATE | map_anon,
                 -1,
                 0,
             )
@@ -704,6 +944,8 @@ fn platform_alloc(size: usize) -> Option<*mut u8> {
     let release = |p: *mut u8| {
         // Straight `munmap`, never the poisoning path: this region was mapped
         // microseconds ago, held no code, and was never executable.
+        // SAFETY: `p` is a mapping of exactly `size` bytes that `raw` returned
+        // a moment ago and that nothing else has seen.
         unsafe {
             munmap(p, size);
         }
@@ -723,6 +965,10 @@ fn platform_free(ptr: *mut u8, size: usize) {
         fn munmap(addr: *mut u8, len: usize) -> i32;
         fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
     }
+    // SAFETY: `ptr`/`size` describe a mapping `platform_alloc` returned (the
+    // `free_executable` contract). Either call retires it: `munmap` releases
+    // it, `mprotect(PROT_NONE)` leaves it mapped but inaccessible. Nothing may
+    // reference the region afterwards, which is the caller's obligation.
     unsafe {
         if jit_poison_free_enabled() {
             // DIAG: keep the mapping, make it permanently inaccessible, never
@@ -786,13 +1032,18 @@ fn platform_make_executable(ptr: *mut u8, size: usize) -> Result<(), JitError> {
         target_arch = "aarch64",
         any(target_os = "linux", target_os = "freebsd")
     ))]
+    // SAFETY: `ptr..ptr+size` is the mapping `platform_alloc` returned, so the
+    // end pointer `flush_icache_range_aarch64` computes stays one-past-the-end
+    // of that allocation.
     unsafe {
         flush_icache_range_aarch64(ptr, size);
     }
 
+    // SAFETY: a mapping this module owns; `mprotect` changes only its
+    // protection and reports failure through its return value.
     let ret = unsafe { mprotect(ptr, size, PROT_READ | PROT_EXEC) };
     if ret != 0 {
-        Err(JitError::ProtectFailed(ret))
+        Err(JitError::ProtectFailed(last_os_error_code()))
     } else {
         Ok(())
     }
@@ -815,6 +1066,11 @@ fn platform_make_executable(ptr: *mut u8, size: usize) -> Result<(), JitError> {
 ///
 /// Signature follows the GCC builtin: `void __clear_cache(char *begin,
 /// char *end)`. End is *exclusive*.
+///
+/// # Safety
+///
+/// `ptr..ptr+size` must lie within one allocation, so that `ptr.add(size)` is
+/// in bounds or one past the end.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "linux", target_os = "freebsd")
@@ -824,8 +1080,12 @@ unsafe fn flush_icache_range_aarch64(ptr: *mut u8, size: usize) {
         fn __clear_cache(begin: *mut core::ffi::c_char, end: *mut core::ffi::c_char);
     }
     let begin = ptr as *mut core::ffi::c_char;
-    let end = ptr.add(size) as *mut core::ffi::c_char;
-    __clear_cache(begin, end);
+    // SAFETY: the caller guarantees the range is one allocation, so the end
+    // pointer is at most one past its end.
+    let end = unsafe { ptr.add(size) } as *mut core::ffi::c_char;
+    // SAFETY: `__clear_cache` only issues cache-maintenance instructions over
+    // the address range; it neither reads nor writes the bytes.
+    unsafe { __clear_cache(begin, end) };
 }
 
 #[cfg(all(
@@ -840,12 +1100,22 @@ fn platform_make_writable(ptr: *mut u8, size: usize) -> Result<(), JitError> {
         fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
     }
 
+    // SAFETY: a mapping this module owns; `mprotect` changes only its
+    // protection and reports failure through its return value.
     let ret = unsafe { mprotect(ptr, size, PROT_READ | PROT_WRITE) };
     if ret != 0 {
-        Err(JitError::ProtectFailed(ret))
+        Err(JitError::ProtectFailed(last_os_error_code()))
     } else {
         Ok(())
     }
+}
+
+/// Data cells need no special mapping off macOS/ARM64: see the macOS arm's
+/// `platform_alloc_data` for why that one platform must not share the code
+/// allocator.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn platform_alloc_data(size: usize) -> Option<*mut u8> {
+    platform_alloc(size)
 }
 
 // ---------------------------------------------------------------------------
@@ -967,7 +1237,7 @@ pub fn alloc_code_adjacent_cell() -> Option<*mut u8> {
         // `platform_alloc` returns page-aligned (Unix) or 64 KiB-granule
         // aligned (Windows) memory, both a multiple of the cell size, so the
         // bump cursor stays cache-line aligned without any rounding here.
-        let base = platform_alloc(ARENA_CHUNK)? as usize;
+        let base = platform_alloc_data(ARENA_CHUNK)? as usize;
         *arena = (base, base + ARENA_CHUNK);
     }
     let cell = arena.0;
@@ -1080,10 +1350,16 @@ mod tests {
         let ptr = alloc_executable(size).expect("alloc_executable failed");
         assert!(!ptr.is_null());
 
-        // Write a pattern (memory starts as RW)
-        unsafe {
-            for i in 0..size {
-                *ptr.add(i) = (i & 0xFF) as u8;
+        // Write a pattern (memory starts as RW; on macOS/ARM64 the scope is
+        // what makes it writable for this thread).
+        {
+            let _write = JitWriteScope::enter();
+            // SAFETY: `ptr` is a fresh `size`-byte allocation that nothing
+            // else references, and every index is below `size`.
+            unsafe {
+                for i in 0..size {
+                    *ptr.add(i) = (i & 0xFF) as u8;
+                }
             }
         }
 
@@ -1091,12 +1367,98 @@ mod tests {
         make_executable(ptr, size).expect("make_executable failed");
 
         // Read back (reading is allowed in both RW and RX)
+        // SAFETY: as above; reads stay in bounds and the region is readable.
         unsafe {
             for i in 0..size {
                 assert_eq!(*ptr.add(i), (i & 0xFF) as u8);
             }
         }
 
+        free_executable(ptr, size);
+    }
+
+    /// `MAP_ANONYMOUS` differs per OS, and the table must say so on EVERY host.
+    ///
+    /// The Unix allocator used Linux's `0x20` for Linux, FreeBSD and macOS
+    /// x86-64 alike. On the BSDs and Darwin that is not `MAP_ANON`, `mmap`
+    /// failed with `EINVAL`, and the JIT was silently dead on those systems.
+    /// This checks the table itself, so a Windows or Linux CI run catches a
+    /// regression for a platform it cannot execute.
+    #[test]
+    fn map_anonymous_follows_each_os_abi() {
+        assert_eq!(map_anonymous(UnixMmapAbi::Linux), 0x20, "linux <asm-generic/mman-common.h>");
+        assert_eq!(map_anonymous(UnixMmapAbi::LinuxMips), 0x800, "linux <asm/mman.h> on MIPS");
+        assert_eq!(map_anonymous(UnixMmapAbi::Bsd), 0x1000, "Darwin and FreeBSD <sys/mman.h>");
+        assert_eq!(map_anonymous(UnixMmapAbi::Solaris), 0x100, "illumos <sys/mman.h>");
+        assert_ne!(
+            map_anonymous(UnixMmapAbi::Linux),
+            map_anonymous(UnixMmapAbi::Bsd),
+            "the two families genuinely differ -- one constant cannot serve both"
+        );
+    }
+
+    /// The host picks the family its own headers use.
+    #[test]
+    fn the_host_mmap_abi_is_this_targets_own() {
+        #[cfg(all(target_os = "linux", not(target_arch = "mips64")))]
+        assert_eq!(HOST_MMAP_ABI, Some(UnixMmapAbi::Linux));
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        assert_eq!(HOST_MMAP_ABI, Some(UnixMmapAbi::Bsd));
+        #[cfg(target_os = "windows")]
+        assert_eq!(HOST_MMAP_ABI, None, "Windows never maps through mmap");
+    }
+
+    /// A failed `mprotect` reports `errno`, not its `-1` return value.
+    ///
+    /// A pointer one byte into a page is not page-aligned, which POSIX makes
+    /// `EINVAL` (22 on Linux, the BSDs and Darwin alike).
+    #[cfg(all(
+        not(target_os = "windows"),
+        not(all(target_os = "macos", target_arch = "aarch64"))
+    ))]
+    #[test]
+    fn a_protect_failure_carries_errno() {
+        let size = 4096;
+        let ptr = alloc_executable(size).expect("alloc_executable failed");
+        // SAFETY: one byte into a 4096-byte allocation is in bounds.
+        let misaligned = unsafe { ptr.add(1) };
+        match make_executable(misaligned, size - 1) {
+            Err(JitError::ProtectFailed(code)) => {
+                assert_ne!(code, -1, "the payload must be errno, not mprotect's return value");
+                assert_eq!(code, 22, "a misaligned mprotect is EINVAL");
+            }
+            other => panic!("a misaligned mprotect must fail, got {other:?}"),
+        }
+        free_executable(ptr, size);
+    }
+
+    /// Scopes nest, and a write inside the innermost one lands.
+    #[test]
+    fn jit_write_scopes_nest() {
+        let size = 4096;
+        let ptr = alloc_executable(size).expect("alloc_executable failed");
+        {
+            let _outer = JitWriteScope::enter();
+            {
+                let _inner = JitWriteScope::enter();
+                // SAFETY: in bounds of a fresh allocation nothing else holds.
+                unsafe { *ptr = 0x5A };
+            }
+            // Still inside the outer scope: the inner drop must not have
+            // re-protected the page for this thread.
+            // SAFETY: as above.
+            unsafe { *ptr.add(1) = 0xA5 };
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            assert_eq!(JIT_WRITE_DEPTH.with(|d| d.get()), 1);
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert_eq!(JIT_WRITE_DEPTH.with(|d| d.get()), 0, "the thread is back in execute mode");
+        make_executable(ptr, size).expect("make_executable failed");
+        // SAFETY: reads in bounds of a readable region.
+        unsafe {
+            assert_eq!(*ptr, 0x5A);
+            assert_eq!(*ptr.add(1), 0xA5);
+        }
         free_executable(ptr, size);
     }
 
@@ -1128,14 +1490,19 @@ mod tests {
         let ptr = alloc_executable(size).expect("alloc_executable failed");
 
         // Write initial data
-        unsafe {
-            *ptr = 0xAA;
+        {
+            let _write = JitWriteScope::enter();
+            // SAFETY: in bounds of a fresh allocation nothing else references.
+            unsafe {
+                *ptr = 0xAA;
+            }
         }
 
         // Transition RW -> RX
         make_executable(ptr, size).expect("make_executable failed");
 
         // Read should still work
+        // SAFETY: an in-bounds read of a readable region.
         unsafe {
             assert_eq!(*ptr, 0xAA);
         }
@@ -1144,12 +1511,17 @@ mod tests {
         make_writable(ptr, size).expect("make_writable failed");
 
         // Write new data
-        unsafe {
-            *ptr = 0xBB;
+        {
+            let _write = JitWriteScope::enter();
+            // SAFETY: as above; the region is writable again.
+            unsafe {
+                *ptr = 0xBB;
+            }
         }
 
         // Transition back to RX
         make_executable(ptr, size).expect("make_executable failed");
+        // SAFETY: an in-bounds read of a readable region.
         unsafe {
             assert_eq!(*ptr, 0xBB);
         }
@@ -1180,6 +1552,7 @@ mod tests {
     fn windows_icache_flush_is_callable() {
         let size = 4096;
         let ptr = alloc_executable(size).expect("alloc_executable failed");
+        // SAFETY: in bounds of a fresh RW allocation nothing else references.
         unsafe {
             *ptr = 0x90; // one byte of "code" so the range is not untouched
         }
@@ -1212,11 +1585,15 @@ mod tests {
 
         // aarch64 `ret` = 0xD65F03C0, little-endian byte sequence
         // 0xC0 0x03 0x5F 0xD6.
-        unsafe {
-            *ptr.add(0) = 0xC0;
-            *ptr.add(1) = 0x03;
-            *ptr.add(2) = 0x5F;
-            *ptr.add(3) = 0xD6;
+        {
+            let _write = JitWriteScope::enter();
+            // SAFETY: four in-bounds bytes of a fresh allocation.
+            unsafe {
+                *ptr.add(0) = 0xC0;
+                *ptr.add(1) = 0x03;
+                *ptr.add(2) = 0x5F;
+                *ptr.add(3) = 0xD6;
+            }
         }
 
         make_executable(ptr, size).expect("make_executable failed");
@@ -1225,6 +1602,8 @@ mod tests {
         // flushed the CPU may fetch zero bytes (UDF) or stale data
         // and trap; a clean flush makes this a no-op call that
         // returns normally.
+        // SAFETY: the region now holds exactly one `RET` and is executable, so
+        // it is a valid `extern "C" fn()` that returns immediately.
         let f: extern "C" fn() = unsafe { std::mem::transmute(ptr) };
         f();
 

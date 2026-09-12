@@ -2448,6 +2448,16 @@ pub fn execute(
                     // from before the first constant-pool read.
                     // `compile_gate::admit` asks all of them; the token owns
                     // the epoch witness and must outlive the resolution below.
+                    //
+                    // x86-64 ONLY. This door reaches `x64::compile_with_param_slots`
+                    // directly, so on any other architecture it would publish
+                    // x86-64 bytes as the method's entry point. Other targets
+                    // compile through `jit::try_compile`, which selects their
+                    // backend. `cfg!` rather than `#[cfg]`, so the rest of this
+                    // path stays type-checked everywhere and is not dead code.
+                    if cfg!(not(target_arch = "x86_64")) {
+                        return None;
+                    }
                     let admission = cratonvm_jit::compile_gate::admit(
                         &class_name_str,
                         method_name,

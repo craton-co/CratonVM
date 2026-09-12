@@ -655,6 +655,10 @@ impl ExecutableBuffer {
             self.overflowed = true;
             return;
         }
+        // Per-thread write permission for this copy only: a no-op except on
+        // macOS/ARM64, where `MAP_JIT` code pages are writable only inside a
+        // scope. See `platform::JitWriteScope`.
+        let _write = platform::JitWriteScope::enter();
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(self.len), bytes.len());
         }
@@ -667,6 +671,7 @@ impl ExecutableBuffer {
         if self.len + bytes.len() > self.capacity {
             return false;
         }
+        let _write = platform::JitWriteScope::enter();
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(self.len), bytes.len());
         }
@@ -687,6 +692,7 @@ impl ExecutableBuffer {
             self.overflowed = true;
             return;
         }
+        let _write = platform::JitWriteScope::enter();
         unsafe {
             *self.ptr.add(self.len) = b;
         }
@@ -834,6 +840,7 @@ impl ExecutableBuffer {
             });
         }
         let bytes = value.to_le_bytes();
+        let _write = platform::JitWriteScope::enter();
         // Safety: bounds checked above; ptr is owned and writable.
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(offset), 4);
@@ -866,6 +873,7 @@ impl ExecutableBuffer {
                 offset,
             });
         }
+        let _write = platform::JitWriteScope::enter();
         // Safety: bounds checked above.
         unsafe {
             *self.ptr.add(offset) = value;
@@ -2601,9 +2609,9 @@ pub struct FrameLayout {
     ///
     /// x86-64 puts it deepest, which lets the band verifier treat
     /// `callee_saved_lo` as a half-line -- everything at or beyond it is a
-    /// register image or past the frame. AArch64's prologue puts the saved
-    /// FP/LR pair and the callee-saved GPRs immediately below the frame
-    /// pointer and the spill area BELOW them, so that half-line would exclude
+    /// register image or past the frame. AArch64's prologue puts the
+    /// callee-saved GPRs immediately below the frame pointer (the saved FP/LR
+    /// frame record is AT it) and the spill area BELOW them, so that half-line would exclude
     /// the entire spill area -- exactly where the oop maps point, leaving the
     /// verifier unable to see the words it exists to check.
     ///
@@ -24357,10 +24365,13 @@ fn try_compile_inner(
         optimize,
     );
 
-    // Architecture-specific backend selection.
-    // On ARM64 (aarch64), the ARM64 backend would be used instead of x64.
-    // Both x64 and ARM64 backends have bytecode→native compilation pipelines.
-    // ARM64 covers ~50+ opcodes (arithmetic, branches, float, conversions, invoke).
+    // Architecture-specific backend selection. On aarch64 the block below
+    // compiles with `aarch64_backend` and returns, bypassing the IR pipeline
+    // and the x64 backend, and only when `CRATONVM_JIT_ARM64` is set. That
+    // backend lowers leaf arithmetic, locals, conversions, compares, branches
+    // and switches; it refuses every invoke, field, array, allocation, monitor
+    // and exception opcode (see its module header).
+    //
     // Total incoming argument SLOTS for this method's own prologue.
     //
     // `count_param_slots` counts only the *declared* descriptor
@@ -24379,6 +24390,15 @@ fn try_compile_inner(
     #[cfg(target_arch = "aarch64")]
     {
         use std::collections::HashMap;
+
+        // OFF unless `CRATONVM_JIT_ARM64` is set, so "the JIT is disabled off
+        // x86-64" stays true until the backend has run on hardware. Marked as
+        // attempted so the method is permanently bail-listed: the switch is a
+        // process snapshot and a retry cannot change the answer.
+        if !aarch64_backend::arm64_jit_enabled() {
+            *backend_attempted = true;
+            return None;
+        }
 
         let code = &cached.code;
         let num_params = prologue_param_slots;

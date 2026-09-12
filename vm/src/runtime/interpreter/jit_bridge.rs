@@ -402,6 +402,12 @@ pub(super) fn compile_osr_artifact(
     max_locals: usize,
     entry_pc: usize,
 ) -> Option<Arc<crate::jit::CompiledMethod>> {
+    // x86-64 ONLY: this door calls `x64::compile_with_param_slots` directly,
+    // and no other backend publishes OSR entry points. On any other target it
+    // would publish x86-64 bytes. `cfg!` keeps the body type-checked there.
+    if cfg!(not(target_arch = "x86_64")) {
+        return None;
+    }
     // Loader-aware, and asked of this VM's manager: OSR denials belong to a
     // class identity and expire when the install epoch moves.
     let osr_key = crate::jit::tiered::MethodKey::with_class_id(
