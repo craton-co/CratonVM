@@ -13,5 +13,6 @@ pub mod alloc_class_cache;
 pub mod code_cache_lifecycle;
 pub mod conservative_roots;
 pub mod disasm;
+pub mod helper_guard;
 pub mod helpers;
 pub mod xt_root_scan;

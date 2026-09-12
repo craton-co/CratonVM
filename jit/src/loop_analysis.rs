@@ -856,7 +856,124 @@ pub fn constant_iv_init(
     if targets.contains(&store_pc) || targets.contains(&push_pc) {
         return None;
     }
+    // Dominating the header once is not the same as running before EVERY entry
+    // to it. An enclosing loop whose back edge lands after the store and at or
+    // before this header re-enters the loop without re-running the init:
+    // `int i = 0; for (r < R) { for (; i < 16; i++) a[i] += r; }` credited the
+    // inner loop a constant init of 0, and so 16 trips, on every outer pass,
+    // though it runs none after the first. Any backward branch into
+    // `(store_pc, header_pc]` refuses.
+    {
+        let mut q = 0usize;
+        while q < code_len {
+            let op = code[q];
+            let rel = match op {
+                0x99..=0xa7 | 0xc6 | 0xc7 if q + 2 < code_len => {
+                    Some(i32::from(i16::from_be_bytes([code[q + 1], code[q + 2]])))
+                }
+                0xc8 if q + 4 < code_len => Some(i32::from_be_bytes([
+                    code[q + 1],
+                    code[q + 2],
+                    code[q + 3],
+                    code[q + 4],
+                ])),
+                _ => None,
+            };
+            if let Some(rel) = rel {
+                // Cast: bytecode offsets fit i64.
+                let target = q as i64 + i64::from(rel);
+                // The loop's own back edge and `continue`s sit in the body.
+                let in_body = q >= header_pc && q < body_end;
+                if !in_body && rel < 0 && target > store_pc as i64 && target <= header_pc as i64 {
+                    return None;
+                }
+            }
+            q += inst_len_at(code, q);
+        }
+    }
     const_push_value(code, push_pc, code_len)
+}
+
+/// Whether `[header_pc, end)` can leave the loop anywhere other than the exit
+/// test at `exit_pc` and the back edge at `back_edge_pc`.
+///
+/// Any leaving branch or switch arm, return, `athrow` or subroutine jump
+/// counts. A switch whose table cannot be decoded is answered `true`: the
+/// question only ever weakens a trip-count lower bound, so the conservative
+/// answer is the one that claims an exit.
+fn loop_has_other_exit(
+    code: &[u8],
+    header_pc: usize,
+    end: usize,
+    exit_pc: usize,
+    back_edge_pc: usize,
+) -> bool {
+    let outside = |pc: usize, rel: i64| {
+        let target = pc as i64 + rel;
+        target < header_pc as i64 || target >= end as i64
+    };
+    let read_i32 = |at: usize| -> Option<i64> {
+        let b = code.get(at..at + 4)?;
+        Some(i64::from(i32::from_be_bytes([b[0], b[1], b[2], b[3]])))
+    };
+    let mut pc = header_pc;
+    while pc < end {
+        let op = code[pc];
+        if pc != exit_pc && pc != back_edge_pc {
+            match op {
+                0x99..=0xa7 | 0xc6 | 0xc7 => {
+                    let Some(b) = code.get(pc + 1..pc + 3) else {
+                        return true;
+                    };
+                    if outside(pc, i64::from(i16::from_be_bytes([b[0], b[1]]))) {
+                        return true;
+                    }
+                }
+                0xc8 => match read_i32(pc + 1) {
+                    Some(rel) if !outside(pc, rel) => {}
+                    _ => return true,
+                },
+                0xaa | 0xab => {
+                    let base = pc + 1 + (4 - (pc + 1) % 4) % 4;
+                    let Some(default) = read_i32(base) else {
+                        return true;
+                    };
+                    if outside(pc, default) {
+                        return true;
+                    }
+                    let offsets: Vec<usize> = if op == 0xaa {
+                        let (Some(lo), Some(hi)) = (read_i32(base + 4), read_i32(base + 8)) else {
+                            return true;
+                        };
+                        if hi < lo || (hi - lo) as usize >= code.len() {
+                            return true;
+                        }
+                        (0..(hi - lo + 1) as usize)
+                            .map(|i| base + 12 + 4 * i)
+                            .collect()
+                    } else {
+                        let Some(n) = read_i32(base + 4) else {
+                            return true;
+                        };
+                        if n < 0 || n as usize > code.len() {
+                            return true;
+                        }
+                        (0..n as usize).map(|i| base + 12 + 8 * i).collect()
+                    };
+                    for at in offsets {
+                        match read_i32(at) {
+                            Some(rel) if !outside(pc, rel) => {}
+                            _ => return true,
+                        }
+                    }
+                }
+                0xa8 | 0xa9 | 0xc9 | 0xac..=0xb1 | 0xbf => return true,
+                _ => {}
+            }
+        }
+        pc += inst_len_at(code, pc);
+    }
+    false
 }
 
 /// Recognise `(header_pc, back_edge_pc)` as a counted loop the range analysis
@@ -964,6 +1081,13 @@ pub fn analyze_counted_loop_at(
                                     form,
                                     modified_locals,
                                     heap_stable,
+                                    has_other_exit: loop_has_other_exit(
+                                        code,
+                                        header_pc,
+                                        end,
+                                        q,
+                                        back_edge_pc,
+                                    ),
                                 },
                                 pc,
                             ));
@@ -1487,6 +1611,78 @@ mod tests {
         // Local 0 is a parameter — never stored — so its entry value is
         // unknown, not zero.
         assert_eq!(constant_iv_init(&code, code.len(), 2, 14, 0), None);
+    }
+
+    /// `for (i = 0; i < 10; i++) { if (i == p) break; }`, or the same loop
+    /// with the `break` test replaced by `nop`s.
+    fn ten_trip_loop(with_break: bool) -> Vec<u8> {
+        let mut code = vec![
+            0x03, // 0: iconst_0
+            0x3c, // 1: istore_1
+            0x1b, // 2: iload_1 (header)
+            0x10, 10, // 3: bipush 10
+            0xa2, 0x00, 14,   // 5: if_icmpge -> 19
+            0x1b, // 8: iload_1
+            0x1a, // 9: iload_0
+            0x9f, 0x00, 9, // 10: if_icmpeq -> 19
+            0x84, 1, 1, // 13: iinc 1, 1
+            0xa7, 0xff, 0xf2, // 16: goto -> 2
+            0xb1, // 19: return
+        ];
+        if !with_break {
+            code[8..13].fill(0x00);
+        }
+        code
+    }
+
+    #[test]
+    fn a_second_exit_drops_the_trip_count_floor_to_zero() {
+        let env = RangeEnv::default();
+        let plain = analyze_counted_loop(
+            &ten_trip_loop(false),
+            20,
+            2,
+            16,
+            LoopForm::PreTested,
+            &no_math,
+        )
+        .expect("the plain loop is counted");
+        assert!(!plain.has_other_exit);
+        let t = plain.trip_count(&env).expect("constant trip count");
+        assert_eq!((t.min, t.max), (10, 10));
+
+        let broken = analyze_counted_loop(
+            &ten_trip_loop(true),
+            20,
+            2,
+            16,
+            LoopForm::PreTested,
+            &no_math,
+        )
+        .expect("the loop with a break is still counted");
+        assert!(broken.has_other_exit);
+        let t = broken.trip_count(&env).expect("an upper bound survives");
+        assert_eq!((t.min, t.max), (0, 10));
+        assert!(matches!(
+            broken.prove_trip_count_at_least(5, &env),
+            crate::scev::TripCountProof::Refused(_)
+        ));
+    }
+
+    #[test]
+    fn an_enclosing_back_edge_between_the_store_and_the_header_unproves_the_init() {
+        // for (;;) { i = 0 is outside; the outer loop re-enters at the inner
+        // header without passing the store:
+        // 0: iconst_0; 1: istore_1; 2: iload_1 (inner header); 3: bipush 10;
+        // 5: if_icmpge -> 14; 8: iinc 1,1; 11: goto -> 2; 14: goto -> 2
+        let mut code = vec![
+            0x03, 0x3c, 0x1b, 0x10, 10, 0xa2, 0x00, 9, 0x84, 1, 1, 0xa7, 0xff, 0xf7, 0xa7, 0xff,
+            0xf4, 0xb1,
+        ];
+        assert_eq!(constant_iv_init(&code, code.len(), 2, 14, 1), None);
+        // Without the outer back edge the store runs before every entry.
+        code[14..17].fill(0x00);
+        assert_eq!(constant_iv_init(&code, code.len(), 2, 14, 1), Some(0));
     }
 
     #[test]

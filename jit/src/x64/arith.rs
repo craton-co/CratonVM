@@ -255,8 +255,10 @@ impl Compiler {
                             self.buf.emit(&[0x63, 0xC0]);
                         }
                         0x7c => {
-                            // iushr: SHR eax,cl (32-bit zero-extends)
+                            // iushr: SHR eax,cl ; movsxd (a zero shift keeps bit 31)
                             self.buf.emit(&[0xD3, 0xE8]);
+                            self.rex_w();
+                            self.buf.emit(&[0x63, 0xC0]);
                         }
                         0x7e => {
                             // iand: AND eax,ecx ; movsxd
@@ -516,6 +518,17 @@ impl Compiler {
         let offset = i16::from_be_bytes([code[next_op_pc + 1], code[next_op_pc + 2]]) as i32; // Widening: always safe
         let target_pc = (next_op_pc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
 
+        // Mirror the regular `if_icmp*` arm: flush scratch (including the
+        // callee-saved-oop flush), then poll on a backward branch. The fusion
+        // skipped both, so `do { work(); } while (i++ < 1000);` — or kotlinc's
+        // `for (i in 0 until 100)` over a call-free body — had a back edge with
+        // no safepoint poll at all, and a stop-the-world collection waited for
+        // the whole loop.
+        self.flush_scratch_registers();
+        if target_pc <= next_op_pc {
+            self.emit_safepoint_poll();
+        }
+
         // Values left below value1 must be flushed to canonical frame slots
         // for the taken edge (the merge-target revival reconstructs them from
         // canonical offsets; the regular if_icmp handler does the same).
@@ -631,6 +644,8 @@ impl Compiler {
     pub(super) fn try_cmov_minmax_peephole(
         &mut self,
         code: &[u8],
+        code_len: usize,
+        branch_targets: &[bool],
         pc: usize,
         op: u8,
         val1: StackSlot,
@@ -707,6 +722,44 @@ impl Compiler {
         let mut inner = [a_local, b_local];
         inner.sort_unstable();
         if pair != inner {
+            return None;
+        }
+
+        // ---- Merge-point safety. ---------------------------------------
+        //
+        // The fusion consumes `pc..=l2_pc` and maps every PC in that span to
+        // the native offset AFTER the merged result is pushed. That is only
+        // sound when the span is entered through this `if_icmp` alone.
+        // javac's short-circuit conditions break it routinely:
+        // `(ok && a < b) ? a : b` makes the taken-side `iload` the target of
+        // the `ifeq` as well, and `(ok || a < b) ? b : a` does the same to the
+        // fall-through `iload`. A foreign edge into the span would skip the
+        // CMOV's result store and read a stale slot at L2.
+        //
+        // The operand loads must also be the instructions that produced
+        // `val1`/`val2`: `pc-2`/`pc-1` have to be instruction starts (a
+        // `sipush 0x1a1b` operand reads as two `iload`s) and must not be
+        // reachable from elsewhere, and neither may `pc` itself.
+        let is_target = |p: usize| branch_targets.get(p).copied().unwrap_or(true);
+        if is_target(pc - 1) || is_target(pc) || is_target(a_pc) || is_target(goto_pc) {
+            return None;
+        }
+        let edges = super::bce::branch_edges(code, code_len)?;
+        if edges.iter().any(|&(from, to)| to == b_pc && from != pc) {
+            return None;
+        }
+        let mut start = 0usize;
+        let mut starts_ok = (false, false);
+        while start < pc && start < code_len {
+            if start == pc - 2 {
+                starts_ok.0 = true;
+            }
+            if start == pc - 1 {
+                starts_ok.1 = true;
+            }
+            start += bytecode_len_at(code, start).max(1);
+        }
+        if start != pc || !starts_ok.0 || !starts_ok.1 {
             return None;
         }
 
@@ -1317,48 +1370,6 @@ impl Compiler {
                                       // MOVSXD RAX, EAX
         self.rex_w();
         self.buf.emit(&[0x63, 0xC0]);
-    }
-
-    /// Emit the CRC-32 (reflected) inner fold of ONE byte for the
-    /// `java.util.zip.CRC32` intrinsic — IEEE 802.3, which the hardware
-    /// `CRC32` instruction (Castagnoli) cannot compute.
-    ///
-    /// Contract:
-    ///   * `ECX` holds the running (uncomplemented) CRC state — read and
-    ///     overwritten with the folded result.
-    ///   * `EDX` holds the input byte; the caller MUST have zero-extended it
-    ///     (a `MOVZX r32, m8`), so `EDX[31:8] == 0`. `EDX` is consumed.
-    ///   * `EAX` is used as scratch and clobbered.
-    ///
-    /// No other register is touched — in particular the `update([BII)V`
-    /// loop's index (`R9`), end (`R11`) and array base (`R8`) are preserved.
-    /// No memory is accessed and no `CALL` is emitted (roadmap §8).
-    ///
-    /// The folded value is bit-identical to `native-builtins/src/zip_real.rs`
-    /// `crc32_step` / the branchless reflected-CRC step: for each of the 8
-    /// bits, `mask = -(crc & 1)` then `crc = (crc >> 1) ^ (poly & mask)`.
-    /// `poly` is the reflected IEEE polynomial `0xEDB88320`.
-    pub(super) fn emit_crc32_ieee_fold_byte(&mut self, reversed_poly: u32) {
-        // crc ^= byte:  XOR ECX, EDX  (31 D1).
-        self.buf.emit(&[0x31, 0xD1]);
-        // Eight identical reflected-CRC bit steps. Unrolled (a fixed count)
-        // so the loop body has no branch and no loop counter register.
-        for _ in 0..8 {
-            // EAX = ECX:        MOV EAX, ECX        (89 C8)
-            self.buf.emit(&[0x89, 0xC8]);
-            // EAX &= 1:         AND EAX, 1          (83 E0 01)
-            self.buf.emit(&[0x83, 0xE0, 0x01]);
-            // EAX = -EAX:       NEG EAX             (F7 D8)
-            //   → mask is 0xFFFFFFFF iff the low bit was set, else 0.
-            self.buf.emit(&[0xF7, 0xD8]);
-            // ECX >>= 1 (logical):  SHR ECX, 1      (D1 E9)
-            self.buf.emit(&[0xD1, 0xE9]);
-            // EAX &= reversed_poly:  AND EAX, imm32 (25 imm32)
-            self.buf.emit_byte(0x25);
-            self.buf.emit(&reversed_poly.to_le_bytes());
-            // ECX ^= EAX:       XOR ECX, EAX        (31 C1)
-            self.buf.emit(&[0x31, 0xC1]);
-        }
     }
 
     /// Emit a JVMS-compliant signed integer division or remainder.

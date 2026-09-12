@@ -123,7 +123,7 @@ pub(super) fn note_field_site(method_key: &str, what: &str, pc: usize, slot: usi
 fn substitute_unresolved_field_sites() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_UNRESOLVED_FIELD_SUBSTITUTE").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_UNRESOLVED_FIELD_SUBSTITUTE")
     })
 }
 
@@ -211,7 +211,7 @@ pub fn aastore_barrier_gate_census() -> (u64, u64, u64) {
 fn no_aastore_barrier_gate() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_AASTORE_BARRIER_GATE").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_AASTORE_BARRIER_GATE")
     })
 }
 
@@ -226,9 +226,7 @@ fn no_aastore_barrier_gate() -> bool {
 /// count would be measuring the workload rather than the compiler.
 fn dbg_aastore_barrier_gate() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_AASTORE_BARRIER_GATE").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_AASTORE_BARRIER_GATE"))
 }
 
 /// The int constant pushed by the instruction IMMEDIATELY before `pc`, if that
@@ -870,7 +868,7 @@ impl Compiler {
                     let n = super::osr::OSR_EMPTY_STACK_REFUSALS
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                         + 1;
-                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                         eprintln!(
                             "[cratonvm-jitc] osr-refuse (operand-stack-live) pc={pc} depth={} #{n}",
                             self.stack.len()
@@ -1112,7 +1110,7 @@ impl Compiler {
             // (throwing NPE/AIOOBE only if the access is actually reached).
             // Repeated guard failures at this header cross the per-bci
             // de-spec threshold and the recompile drops the hoist entirely
-            // (see the `despec_contains` filter on `hoist_info` in
+            // (see the `DespecRegistry::contains` filter on `hoist_info` in
             // `compile_with_param_slots`). Before these guards the hoist was
             // a raw MOV — a null/OOB row index crashed the VM or fed a
             // garbage row pointer to the loop body (test_classes/
@@ -1319,93 +1317,6 @@ impl Compiler {
                 }
             }
 
-            // === SIMD FP: Emit vectorized preheader for double-array-sum loops ===
-            {
-                let simd_fp_match = self
-                    .simd_fp_loops
-                    .iter()
-                    .find(|s| s.header_pc == pc)
-                    .map(|s| (s.iv_local, s.acc_local, s.array_local, s.bound_local));
-
-                if let Some((iv_local, acc_local, array_local, bound_local)) = simd_fp_match {
-                    let acc_offset = self.local_offset(acc_local);
-
-                    // Sync accumulator XMM/register → frame slot
-                    if let Some(xmm) = self.xmm_for_local(acc_local) {
-                        self.emit_movq_mem_rbp_from_xmm(acc_offset, xmm);
-                    } else if let Some(acc_reg) = self.reg_for_local(acc_local) {
-                        self.emit_store_local(acc_offset, acc_reg);
-                    }
-
-                    // Load array reference into RCX
-                    if let Some(reg) = self.reg_for_local(array_local) {
-                        self.emit_mov_reg_reg(RCX, reg);
-                    } else {
-                        self.emit_load_local(RCX, self.local_offset(array_local));
-                    }
-                    // Load induction variable into R10D
-                    if let Some(reg) = self.reg_for_local(iv_local) {
-                        self.emit_mov_reg_reg(R10, reg);
-                    } else {
-                        self.emit_load_local(R10, self.local_offset(iv_local));
-                    }
-                    // Load bound into R11D
-                    if let Some(reg) = self.reg_for_local(bound_local) {
-                        self.emit_mov_reg_reg(R11, reg);
-                    } else {
-                        self.emit_load_local(R11, self.local_offset(bound_local));
-                    }
-
-                    // Emit SIMD FP array sum
-                    self.emit_simd_fp_array_sum(acc_offset);
-
-                    // Sync accumulator frame slot → XMM/register
-                    if let Some(xmm) = self.xmm_for_local(acc_local) {
-                        self.emit_load_local(RAX, acc_offset);
-                        self.emit_movq_xmm_from_rax(xmm);
-                    } else if let Some(acc_reg) = self.reg_for_local(acc_local) {
-                        self.emit_load_local(acc_reg, acc_offset);
-                    }
-
-                    // Update induction variable from R10D
-                    if let Some(reg) = self.reg_for_local(iv_local) {
-                        self.emit_mov_reg_reg(reg, R10);
-                    } else {
-                        self.emit_store_local(self.local_offset(iv_local), R10);
-                    }
-                }
-            }
-
-            // === T17.Β.3 — Loop unswitch pre-header evaluation ===========
-            //
-            // The detector has already proved that `invariant_local`
-            // is never written inside the loop body and that the
-            // body size is ≤ MAX_UNSWITCH_BYTECODES. We emit a
-            // single evaluation of the invariant predicate at the
-            // preheader. The body's per-iteration branch still
-            // executes as before (so semantics are bit-identical to
-            // the scalar loop), but the early evaluation:
-            //
-            // 1. Warms the CPU branch predictor for the branch's
-            //    single outcome — because the predicate is
-            //    invariant, the per-iteration branch is always
-            //    taken the same way.
-            // 2. Serves as a hook for future body-duplication: the
-            //    pre-evaluation slot can be consumed by a specialized
-            //    code-gen variant without changing the invariant.
-            //
-            // # Correctness
-            //
-            // The emitted sequence is *additive* — it reads
-            // `invariant_local` and sets flags but never writes back
-            // to any local. Because detection rejects loops that
-            // write `invariant_local`, the value observed at the
-            // preheader matches the value observed on every
-            // iteration. Removing the emission yields identical
-            // final state, which is exactly the "bytecode-equivalent
-            // semantics" the scope requires.
-            self.emit_loop_unswitch_preheader(pc);
-
             if let Some(sieve) = self
                 .byte_sieve_loops
                 .iter()
@@ -1579,7 +1490,7 @@ impl Compiler {
             // speculative-BCE guard. Only under CRATONVM_DEOPT_EAGER + DEOPT_REAL ⇒
             // no JMP in production ⇒ byte-identical.
             if self.deopt_eager_bci == Some(pc) {
-                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
+                if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SCALAR_DEOPT") {
                     eprintln!("[DBG_SCALAR_DEOPT] x64 eager deopt-EXIT JMP emitted at bci={pc}");
                 }
                 if !self.deopt_box_ptr_by_bci.contains_key(&pc) {
@@ -1623,16 +1534,16 @@ impl Compiler {
             // INT: `push_from_rax` leaves the slot unmarked, which is what the
             // oop maps must see -- a length is never a reference.
             {
-                let len_replace = self
-                    .array_len_hoist_info
-                    .iter()
-                    .enumerate()
-                    .find_map(|(idx, h)| {
-                        h.sites
-                            .iter()
-                            .find(|&&(start, _)| start == pc)
-                            .map(|&(_, seq_end)| (seq_end, self.array_len_hoist_offsets[idx]))
-                    });
+                let len_replace =
+                    self.array_len_hoist_info
+                        .iter()
+                        .enumerate()
+                        .find_map(|(idx, h)| {
+                            h.sites
+                                .iter()
+                                .find(|&&(start, _)| start == pc)
+                                .map(|&(_, seq_end)| (seq_end, self.array_len_hoist_offsets[idx]))
+                        });
 
                 if let Some((seq_end, hoist_offset)) = len_replace {
                     self.emit_load_local(RAX, hoist_offset);
@@ -2557,11 +2468,7 @@ impl Compiler {
                             // to the inline sequence, which with the barrier
                             // armed is precisely the defect this gate exists to
                             // avoid. Failing closed is the only correct answer.
-                            crate::note_jit_bail_site_at(
-                                "aastore-zgc-barrier-no-helper",
-                                pc,
-                                0x53,
-                            );
+                            crate::note_jit_bail_site_at("aastore-zgc-barrier-no-helper", pc, 0x53);
                             return false;
                         }
                         AASTORE_ZGC_GATE_FALLBACKS
@@ -3607,7 +3514,15 @@ impl Compiler {
 
                 // dmul — with strength reduction: dmul by 2.0 → dadd self
                 0x6b => {
-                    if self.fp_strength_reduction_pcs.contains(&pc) {
+                    // A `dmul` that is itself a branch target merges operand
+                    // stacks from more than one predecessor, so the constant
+                    // 2.0 the analysis saw textually before it is only one of
+                    // the possible right operands (`x * (c ? y : 2.0)` puts
+                    // `L: ldc2_w 2.0` directly before `M: dmul`). Only the
+                    // fall-through-only shape may be strength-reduced.
+                    if self.fp_strength_reduction_pcs.contains(&pc)
+                        && !branch_targets.get(pc).copied().unwrap_or(true)
+                    {
                         // Pattern: <value>, ldc2_w 2.0, dmul
                         // Stack: [value, 2.0] → pop 2.0, emit ADDSD value, value
                         let _two = self.pop_stack(); // discard the 2.0 constant
@@ -3680,6 +3595,33 @@ impl Compiler {
                     self.pop_to_rax();
                     self.emit_safe_idiv(pc, /*is_64bit*/ true, /*is_rem*/ true);
                     self.push_from_rax();
+                    pc += 1;
+                }
+
+                // frem / drem — JVM `%` on floating point is the truncated,
+                // dividend-signed remainder (C `fmod`), which has no single
+                // instruction. Call the same `jit_frem` / `jit_drem` helpers
+                // the IR tier lowers to: `extern "C" fn(x, y) -> x` with the
+                // operands in XMM0/XMM1 and the result in XMM0 on both ABIs.
+                // Without this arm one `%` on a float kept the whole method
+                // out of the single-pass tier.
+                0x72 | 0x73 => {
+                    self.flush_xmm0_slots();
+                    self.flush_scratch_registers();
+                    let b_slot = self.pop_stack();
+                    let a_slot = self.pop_stack();
+                    self.load_slot_to_reg(RAX, a_slot);
+                    self.emit_movq_xmm_from_rax(0);
+                    self.load_slot_to_reg(RAX, b_slot);
+                    self.emit_movq_xmm_from_rax(1);
+                    let helper = if op == 0x72 {
+                        self.helpers.jit_frem
+                    } else {
+                        self.helpers.jit_drem
+                    };
+                    self.emit_call_absolute(helper);
+                    self.emit_movq_rax_from_xmm(0);
+                    self.push_from_rax_as_xmm0();
                     pc += 1;
                 }
 
@@ -3773,7 +3715,12 @@ impl Compiler {
                     self.pop_to_rax();
                     // SHR eax, cl
                     self.buf.emit(&[0xD3, 0xE8]);
-                    // Zero-extend eax to rax (automatic with 32-bit ops on x64)
+                    // MOVSXD rax, eax: an int is held sign-extended. A shift
+                    // by 0 (mod 32) leaves bit 31 set, and the 32-bit SHR
+                    // zero-extends it, so `-1 >>> 0` would read as 2^32 - 1
+                    // to any 64-bit consumer (a compare, an index, i2l).
+                    self.rex_w();
+                    self.buf.emit(&[0x63, 0xC0]);
                     self.push_from_rax();
                     pc += 1;
                 }
@@ -4013,6 +3960,10 @@ impl Compiler {
 
                 // f2i — float to int (truncate toward zero, NaN→0, overflow→MAX/MIN)
                 0x8b => {
+                    // The MOVD below writes XMM0: move any pending XMM0 value
+                    // deeper on the stack out first, as every other conversion
+                    // arm does, or it is silently replaced by this operand.
+                    self.flush_xmm0_slots();
                     self.pop_to_rax();
                     // MOVD XMM0, EAX: 66 0F 6E C0
                     self.buf.emit(&[0x66, 0x0F, 0x6E, 0xC0]);
@@ -4028,6 +3979,7 @@ impl Compiler {
 
                 // f2l — float to long (truncate toward zero, NaN→0, overflow→MAX/MIN)
                 0x8c => {
+                    self.flush_xmm0_slots(); // the MOVD below writes XMM0; see f2i
                     self.pop_to_rax();
                     // MOVD XMM0, EAX: 66 0F 6E C0
                     self.buf.emit(&[0x66, 0x0F, 0x6E, 0xC0]);
@@ -4052,6 +4004,7 @@ impl Compiler {
 
                 // d2i — double to int (truncate toward zero, NaN→0, overflow→MAX/MIN)
                 0x8e => {
+                    self.flush_xmm0_slots(); // the MOVQ below writes XMM0; see f2i
                     self.pop_to_rax();
                     // MOVQ XMM0, RAX: 66 48 0F 6E C0
                     self.buf.emit(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]);
@@ -4067,6 +4020,7 @@ impl Compiler {
 
                 // d2l — double to long (truncate toward zero, NaN→0, overflow→MAX/MIN)
                 0x8f => {
+                    self.flush_xmm0_slots(); // the MOVQ below writes XMM0; see f2i
                     self.pop_to_rax();
                     // MOVQ XMM0, RAX: 66 48 0F 6E C0
                     self.buf.emit(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]);
@@ -4262,7 +4216,15 @@ impl Compiler {
                     // the if_icmp, the fall-through iload, the goto,
                     // and the taken-side iload all at once; on hit
                     // we resume at the merge PC L2.
-                    if let Some(new_pc) = self.try_cmov_minmax_peephole(code, pc, op, val1, val2) {
+                    if let Some(new_pc) = self.try_cmov_minmax_peephole(
+                        code,
+                        code_len,
+                        &branch_targets,
+                        pc,
+                        op,
+                        val1,
+                        val2,
+                    ) {
                         // Map the original if_icmp PC to the start of
                         // the CMOV sequence so downstream branch
                         // resolution keeps working.
@@ -4714,18 +4676,19 @@ impl Compiler {
                                     // the one failure this table can produce
                                     // that nothing downstream catches, so the
                                     // condition is written rather than assumed.
-                                    self.implicit_null_sites.extend(
-                                        orig_implicit_null.iter().map(|&(fault, recover)| {
-                                            let recover = if recover >= body_start
-                                                && recover < body_end
-                                            {
-                                                recover + shift_us
-                                            } else {
-                                                recover
-                                            };
-                                            (fault + shift_us, recover)
-                                        }),
-                                    );
+                                    self.implicit_null_sites
+                                        .extend(orig_implicit_null.iter().map(
+                                            |&(fault, recover)| {
+                                                let recover = if recover >= body_start
+                                                    && recover < body_end
+                                                {
+                                                    recover + shift_us
+                                                } else {
+                                                    recover
+                                                };
+                                                (fault + shift_us, recover)
+                                            },
+                                        ));
                                     // Deopt stub patches: (patch_offset, bci,
                                     // reason). bci and reason are the same
                                     // across copies (it's the same logical
@@ -5116,8 +5079,12 @@ impl Compiler {
                         self.record_branch_target_depth(target);
                     }
 
-                    if npairs <= 6 {
-                        // Small: linear CMP chain (fast for few entries)
+                    // The binary search needs strictly ascending keys. JVMS
+                    // requires them, but nothing on this path verifies it, and
+                    // an unsorted table would silently send keys to default.
+                    let sorted = pairs.windows(2).all(|w| w[0].0 < w[1].0);
+                    if npairs <= 6 || !sorted {
+                        // Small or unsorted: linear CMP chain
                         for &(key, target) in &pairs {
                             self.buf.emit(&[0x3D]); // CMP EAX, imm32
                             self.buf.emit(&key.to_le_bytes());
@@ -5152,6 +5119,15 @@ impl Compiler {
                 0xac..=0xb0 => {
                     self.flush_scratch_registers();
                     self.pop_to_rax();
+                    if code[pc] == 0xac {
+                        // JVMS §6.5: a `boolean`/`byte`/`char`/`short` return is
+                        // narrowed at `ireturn`. A compiled caller reads RAX
+                        // raw, so without this a `()Z` body returning 2 hands
+                        // it 2. The return type is the method key's; an empty
+                        // key (the legacy test wrapper) narrows nothing.
+                        let tag = crate::narrowed_int_return_tag(&self.method_key);
+                        self.emit_narrow_int_return(tag);
+                    }
                     self.emit_epilogue();
                     self.reset_spills();
                     dead = true;
@@ -5358,7 +5334,16 @@ impl Compiler {
                     self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                     self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: x86-64 immediate encoding
                     self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
+                                                                             // `jit_getstatic` runs `<clinit>` on first touch — arbitrary
+                                                                             // Java, so allocation and a collection. That is a safepoint
+                                                                             // like any call: spill the register homes and publish a map
+                                                                             // for THIS program point. Without the bracket a register-
+                                                                             // homed reference local was unreported, and the sp-id slot
+                                                                             // still named the previous safepoint's map, which could
+                                                                             // claim complete coverage for a frame it no longer described.
+                    self.emit_pre_safepoint_spill();
                     self.emit_call_absolute(self.helpers.getstatic);
+                    self.emit_oop_map_for_safepoint();
                     // jit-linewrapper-flushtype-npe fix (2026-07-17): the
                     // helper now runs `<clinit>` on first touch and, on
                     // failure, stashes the Java exception and returns the
@@ -5450,7 +5435,10 @@ impl Compiler {
                     self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // class_id // Cast: x86-64 immediate encoding
                     self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // field_index // Cast: x86-64 immediate encoding
                     self.load_slot_to_reg(ARG_REGS[3], val_slot); // value
+                                                                  // `<clinit>` on first touch, as for `getstatic`: a safepoint.
+                    self.emit_pre_safepoint_spill();
                     self.emit_call_absolute(helper_fn);
+                    self.emit_oop_map_for_safepoint();
                     // jit-putstatic-clinit-gap fix (2026-07-17): see the
                     // matching comment at the inlined-callee 0xb3 arm above —
                     // same helper, same new fallible-`<clinit>` sentinel.
@@ -5500,9 +5488,7 @@ impl Compiler {
                                         && self.helpers.read_bounds_addr != 0))
                         })
                     {
-                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE")
-                            .is_some()
-                        {
+                        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_COMPACT_INLINE") {
                             eprintln!(
                                 "[compact-inline] getfield pc={pc} off={c_off} ref={c_is_ref}"
                             );
@@ -5575,8 +5561,7 @@ impl Compiler {
                         // verdict, not a cause, and the three clauses want
                         // completely different fixes.
                         if !receiver_is_trusted_oop
-                            && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE")
-                                .is_some()
+                            && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_COMPACT_INLINE")
                         {
                             eprintln!(
                                 "[compact-inline] getfield pc={pc} NOT-trusted-oop                                  have_key={trusted_have_key} marks_exact={trusted_marks_exact}                                  top_is_oop={trusted_top_is_oop} depth={} method={}",
@@ -5600,8 +5585,7 @@ impl Compiler {
                         // Emitted BEFORE the receiver load because the
                         // fallback form clobbers R11 and RCX, exactly as
                         // `objects.rs`'s three call sites do.
-                        let mut layout_bail: Vec<usize> = if jit_sp_field_layout_guard_enabled()
-                        {
+                        let mut layout_bail: Vec<usize> = if jit_sp_field_layout_guard_enabled() {
                             self.emit_layout_epoch_guard().into_iter().collect()
                         } else {
                             Vec::new()
@@ -6209,10 +6193,9 @@ impl Compiler {
                                         && self.helpers.region_bounds_addr != 0
                                 })
                             {
-                                if cratonvm_types::flags::runtime_var_os(
+                                if cratonvm_types::flags::runtime_flag_on(
                                     "CRATONVM_DBG_COMPACT_INLINE",
                                 )
-                                .is_some()
                                 {
                                     eprintln!("[compact-inline] putfield-ref pc={pc} off={c_off}");
                                 }
@@ -6627,7 +6610,10 @@ impl Compiler {
                         if *entry != crate::JitIntrinsic::ArraycopyPrimitive.as_entry() {
                             return true;
                         }
-                        !crate::deopt::despec_contains(&self.method_key, pc as u32)
+                        !self
+                            .despec
+                            .as_ref()
+                            .is_some_and(|registry| registry.contains(&self.method_key, pc as u32))
                     });
                     // E27-1 N2b: `indexOf(I)` is intrinsified ONLY where the
                     // needle is a compile-time constant in `0..=0xFFFF`, which
@@ -7495,12 +7481,14 @@ impl Compiler {
                         // records this bci in the de-spec registry after
                         // `PER_BCI_DESPEC_LIMIT` deopts, exactly like the
                         // loop-header speculative-BCE guards (see
-                        // `despec_contains` above); this intrinsic just needs
-                        // to honor it on recompile — bail to the generic
+                        // `DespecRegistry::contains` above); this intrinsic just
+                        // needs to honor it on recompile — bail to the generic
                         // (non-speculative) call dispatch below instead of
                         // re-emitting a guard proven to always fail.
                         else if callee_entry == crate::JitIntrinsic::ArraycopyPrimitive.as_entry()
-                            && !crate::deopt::despec_contains(&self.method_key, pc as u32)
+                            && !self.despec.as_ref().is_some_and(|registry| {
+                                registry.contains(&self.method_key, pc as u32)
+                            })
                         {
                             // Phase 2 — System.arraycopy(src, srcPos, dst,
                             // dstPos, len). The descriptor is type-erased;
@@ -7610,9 +7598,7 @@ impl Compiler {
                                 // homes, and a bail site of
                                 // `spill-range-exhausted` said only that some
                                 // range somewhere did not fit.
-                                self.fail(
-                                    "singlepass-codegen/arraycopy-scratch-spill-exhausted",
-                                );
+                                self.fail("singlepass-codegen/arraycopy-scratch-spill-exhausted");
                                 return false;
                             }
                             let s_src = scratch_base;
@@ -7950,9 +7936,9 @@ impl Compiler {
                                 .invoke_info_idx
                                 .get(&pc)
                                 .map(|&i| self.invoke_info[i].1);
-                            match dispatch_info
-                                .map(|info| (info, self.reserve_spill_slots(5, SpillReason::HelperArgs)))
-                            {
+                            match dispatch_info.map(|info| {
+                                (info, self.reserve_spill_slots(5, SpillReason::HelperArgs))
+                            }) {
                                 Some((info, Some(args_base))) => {
                                     let skip_dispatch = self.emit_jmp_rel32_patch();
                                     for &patch in &bail_patches {
@@ -8301,19 +8287,26 @@ impl Compiler {
                             || callee_entry == crate::JitIntrinsic::ArraysSortByte.as_entry()
                         {
                             // Phase 4b — java.util.Arrays.sort(prim[]) inline
-                            // insertion sort. Void return: nothing is pushed.
+                            // sort. Void return: nothing is pushed.
                             //
                             // The matcher (try_resolve_intrinsic ARRAYS_SORT
                             // region) registers only the five integral
-                            // single-arg overloads. Insertion sort is O(n^2)
-                            // but provably correct for EVERY length — empty,
-                            // single, sorted, reverse, duplicates, negatives.
-                            // There is deliberately no runtime "bail to native
-                            // for large arrays": once the call site resolves
-                            // to this intrinsic there is no native call left
-                            // to fall through to, so bailing would silently
-                            // leave a long array unsorted. Correctness wins
-                            // over the constant factor (roadmap §3.4).
+                            // single-arg overloads. Up to 47 elements — the
+                            // JDK's own insertion-sort cut-over — this is an
+                            // insertion sort; past that, an in-place heapsort,
+                            // O(n log n) and still allocation-free. The
+                            // insertion sort used to run for EVERY length:
+                            // O(n^2), so a compiled `Arrays.sort` of a million
+                            // ints took minutes instead of tens of milliseconds
+                            // and stalled every thread waiting on a safepoint
+                            // for all of it.
+                            //
+                            // Neither loop polls for a safepoint, and neither
+                            // may: the array base lives in R8, which no oop map
+                            // names, so a moving collection inside the loop
+                            // would leave it pointing at from-space. Heapsort
+                            // bounds that window to O(n log n) work, which is
+                            // what a native sort costs anyway.
                             //
                             // All work uses caller-saved scratch only
                             // (RAX/RCX/RDX/R8/R9/R10/R11) — `flush_scratch_
@@ -8376,6 +8369,11 @@ impl Compiler {
                             // MOV R9D, [R8 + ARRAY_LENGTH_OFFSET]  (45 8B 48 dd)
                             // (32-bit load zero-extends n into R9.)
                             self.buf.emit(&[0x45, 0x8B, 0x48, len_off]);
+                            // CMP R9, 47  (49 83 F9 2F) ; JG .heapsort
+                            // n is a zero-extended array length, so the signed
+                            // compare is exact.
+                            self.buf.emit(&[0x49, 0x83, 0xF9, 0x2F]);
+                            let heapsort_patch = self.emit_jcc_rel32_patch(0x8F);
                             // MOV R10D, 1   (41 BA 01 00 00 00) — i = 1
                             self.buf.emit(&[0x41, 0xBA, 0x01, 0x00, 0x00, 0x00]);
 
@@ -8510,6 +8508,97 @@ impl Compiler {
 
                             // .done: the top-of-loop JGE lands here.
                             self.patch_rel32_to_here(done_patch);
+                            // JMP .end — skip the heapsort.
+                            self.buf.emit_byte(0xE9);
+                            let end_patch = self.buf.pos();
+                            self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+
+                            // .heapsort: n > 47. Floyd's bottom-up heap
+                            // construction, then repeated extraction of the
+                            // maximum. Same register file as above, plus:
+                            //   R10 = heap build cursor / extraction end
+                            //   R11 = sift root
+                            //   RDX = sift child
+                            // RAX/RCX hold element values, loaded to 64 bits by
+                            // `emit_load`, so the signed 64-bit CMPs order every
+                            // element kind exactly as the insertion sort does.
+                            self.patch_rel32_to_here(heapsort_patch);
+                            macro_rules! jmp_back {
+                                ($s:ident, $label:expr) => {{
+                                    $s.buf.emit_byte(0xE9);
+                                    let here = $s.buf.pos();
+                                    // Widening: usize offset -> i64 for rel math
+                                    let rel = ($label as i64) - (here as i64 + 4);
+                                    // Truncation: i64 -> i32 (rel32 within one method)
+                                    $s.buf.emit(&(rel as i32).to_le_bytes());
+                                }};
+                            }
+                            // Sift a[R11] down within [0, limit). `$limit_rm` is
+                            // the ModRM byte of `CMP RDX, limit` (limit = R9 → CA,
+                            // limit = R10 → D2) under REX 4C.
+                            macro_rules! sift_down {
+                                ($s:ident, $limit_rm:expr) => {{
+                                    let sift_loop = $s.buf.pos();
+                                    // LEA RDX, [R11 + R11 + 1] — child = 2*root + 1
+                                    $s.buf.emit(&[0x4B, 0x8D, 0x54, 0x1B, 0x01]);
+                                    $s.buf.emit(&[0x4C, 0x39, $limit_rm]); // CMP RDX, limit
+                                    let sift_done = $s.emit_jcc_rel32_patch(0x8D); // JGE
+                                    emit_load(&mut $s.buf, RAX, RDX); // RAX = a[child]
+                                    $s.buf.emit(&[0x48, 0xFF, 0xC2]); // INC RDX
+                                    $s.buf.emit(&[0x4C, 0x39, $limit_rm]); // CMP RDX, limit
+                                    let no_right = $s.emit_jcc_rel32_patch(0x8D); // JGE .left
+                                    emit_load(&mut $s.buf, RCX, RDX); // RCX = a[child + 1]
+                                    $s.buf.emit(&[0x48, 0x39, 0xC8]); // CMP RAX, RCX
+                                    let left_not_smaller = $s.emit_jcc_rel32_patch(0x8D); // JGE .left
+                                    $s.buf.emit(&[0x48, 0x89, 0xC8]); // MOV RAX, RCX
+                                    $s.buf.emit_byte(0xE9); // JMP .have_child
+                                    let have_child = $s.buf.pos();
+                                    $s.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                                    // .left: the left child is the larger one.
+                                    $s.patch_rel32_to_here(no_right);
+                                    $s.patch_rel32_to_here(left_not_smaller);
+                                    $s.buf.emit(&[0x48, 0xFF, 0xCA]); // DEC RDX
+                                    // .have_child: RDX = larger child, RAX = its value.
+                                    $s.patch_rel32_to_here(have_child);
+                                    emit_load(&mut $s.buf, RCX, R11); // RCX = a[root]
+                                    $s.buf.emit(&[0x48, 0x39, 0xC1]); // CMP RCX, RAX
+                                    let in_order = $s.emit_jcc_rel32_patch(0x8D); // JGE .sift_done
+                                    emit_store(&mut $s.buf, RAX, R11); // a[root] = a[child]
+                                    emit_store(&mut $s.buf, RCX, RDX); // a[child] = old a[root]
+                                    $s.buf.emit(&[0x49, 0x89, 0xD3]); // MOV R11, RDX
+                                    jmp_back!($s, sift_loop);
+                                    $s.patch_rel32_to_here(sift_done);
+                                    $s.patch_rel32_to_here(in_order);
+                                }};
+                            }
+                            // Build: for start in (0..n/2).rev() { sift(start, n) }
+                            self.buf.emit(&[0x4D, 0x89, 0xCA]); // MOV R10, R9
+                            self.buf.emit(&[0x49, 0xD1, 0xEA]); // SHR R10, 1
+                            let build_loop = self.buf.pos();
+                            self.buf.emit(&[0x4D, 0x85, 0xD2]); // TEST R10, R10
+                            let build_done = self.emit_jcc_rel32_patch(0x84); // JZ
+                            self.buf.emit(&[0x49, 0xFF, 0xCA]); // DEC R10
+                            self.buf.emit(&[0x4D, 0x89, 0xD3]); // MOV R11, R10
+                            sift_down!(self, 0xCA);
+                            jmp_back!(self, build_loop);
+                            self.patch_rel32_to_here(build_done);
+                            // Extract: for end in (1..n).rev() { swap(0, end); sift(0, end) }
+                            self.buf.emit(&[0x4D, 0x89, 0xCA]); // MOV R10, R9
+                            let extract_loop = self.buf.pos();
+                            self.buf.emit(&[0x49, 0xFF, 0xCA]); // DEC R10
+                            self.buf.emit(&[0x4D, 0x85, 0xD2]); // TEST R10, R10
+                            let sorted = self.emit_jcc_rel32_patch(0x8E); // JLE
+                            self.buf.emit(&[0x45, 0x31, 0xDB]); // XOR R11D, R11D
+                            emit_load(&mut self.buf, RAX, R11); // RAX = a[0]
+                            emit_load(&mut self.buf, RCX, R10); // RCX = a[end]
+                            emit_store(&mut self.buf, RCX, R11); // a[0] = a[end]
+                            emit_store(&mut self.buf, RAX, R10); // a[end] = old a[0]
+                            sift_down!(self, 0xD2);
+                            jmp_back!(self, extract_loop);
+                            self.patch_rel32_to_here(sorted);
+
+                            // .end
+                            self.patch_rel32_to_here(end_patch);
                             // Void method — nothing pushed; `ret_type` is 'V'.
                             let _ = ret_type;
                         }
@@ -9109,8 +9198,7 @@ impl Compiler {
                             // the mirror of the defect this staging fixes. Truncating
                             // to the mark drops exactly what this site pushed; no
                             // safepoint can have run in between to take them.
-                            self.pending_staged_arg_oops
-                                .truncate(staged_self_args_mark);
+                            self.pending_staged_arg_oops.truncate(staged_self_args_mark);
 
                             // Skip the following xreturn — we already jumped
                             pc += 3; // invokestatic
@@ -9731,6 +9819,7 @@ impl Compiler {
                                 if p.is_null() {
                                     None
                                 } else {
+                                    // SAFETY: `p` is non-null here and owned by this compile's `_jit_invoke_infos` arena, which outlives the code.
                                     crate::ffm_kind_for_descriptor(unsafe { (*p).descriptor })
                                 }
                             });
@@ -9740,9 +9829,7 @@ impl Compiler {
                                     // compile's `_jit_invoke_infos` arena and
                                     // outlives the code being emitted.
                                     let ret_tag = unsafe { (*info).return_type };
-                                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FFM")
-                                        .is_some()
-                                    {
+                                    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_FFM") {
                                         eprintln!(
                                             "[ffm] EMITTED pc={pc} kind={kind} is_get={is_get}"
                                         );
@@ -9814,7 +9901,9 @@ impl Compiler {
                                     // ---- decline edge: the unchanged dispatch
                                     self.patch_rel32_to_here(declined);
                                     let nargs = if is_get { 3 } else { 4 };
-                                    let args_base = match self.reserve_spill_slots(nargs, SpillReason::HelperArgs) {
+                                    let args_base = match self
+                                        .reserve_spill_slots(nargs, SpillReason::HelperArgs)
+                                    {
                                         Some(b) => b,
                                         None => {
                                             self.fail(
@@ -9904,9 +9993,7 @@ impl Compiler {
                                 // compile, which drops the method to the
                                 // interpreter and is always safe.
                                 _ => {
-                                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FFM")
-                                        .is_some()
-                                    {
+                                    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_FFM") {
                                         eprintln!(
                                             "[ffm] UNHANDLED pc={pc} info={} kind={:?} helper={}",
                                             info_ptr.is_some(),
@@ -10078,6 +10165,10 @@ impl Compiler {
                                     }
                                     self.buf.emit(&[0x48, 0x63, 0xC1]); // MOVSXD RAX, ECX
                                     self.push_from_rax();
+                                    // Counted HERE, where the site is emitted,
+                                    // not in the matcher (review #80).
+                                    crate::ATOMIC_INTRINSIC_SITES
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                                     for p in bail {
                                         self.deopt_stubs.push((p, pc, 6));
@@ -10106,9 +10197,12 @@ impl Compiler {
                         // (`compareAndExchange`, which returns the witness, is
                         // NOT claimed here and keeps its native).
                         if !intrinsic_handled
-                            && callee_entry == crate::JitIntrinsic::AtomicIntCompareAndSet.as_entry()
+                            && callee_entry
+                                == crate::JitIntrinsic::AtomicIntCompareAndSet.as_entry()
                         {
-                            if let Some(layout) = crate::AtomicIntFieldLayout::new(0, guard_class_id) {
+                            if let Some(layout) =
+                                crate::AtomicIntFieldLayout::new(0, guard_class_id)
+                            {
                                 self.flush_scratch_registers();
                                 if crate::deopt_real_enabled() {
                                     self.snapshot_pre_intrinsic_call(
@@ -10159,6 +10253,8 @@ impl Compiler {
                                 self.buf.emit(&[0x0F, 0x94, 0xC0]); // SETZ AL
                                 self.buf.emit(&[0x0F, 0xB6, 0xC0]); // MOVZX EAX, AL
                                 self.push_from_rax();
+                                crate::ATOMIC_INTRINSIC_SITES
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                                 for p in bail {
                                     self.deopt_stubs.push((p, pc, 6));
@@ -10314,6 +10410,10 @@ impl Compiler {
                                     }
                                     self.buf.emit(&[0x48, 0x89, 0xC8]); // MOV RAX, RCX
                                     self.push_from_rax();
+                                    // Counted at emission, not in the matcher
+                                    // (review #80).
+                                    crate::ATOMIC_LONG_INTRINSIC_SITES
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                                     for p in bail {
                                         self.deopt_stubs.push((p, pc, 6));
@@ -10342,9 +10442,12 @@ impl Compiler {
                         // (`compareAndExchange`, which returns the witness, is
                         // NOT claimed here and keeps its native).
                         if !intrinsic_handled
-                            && callee_entry == crate::JitIntrinsic::AtomicLongCompareAndSet.as_entry()
+                            && callee_entry
+                                == crate::JitIntrinsic::AtomicLongCompareAndSet.as_entry()
                         {
-                            if let Some(layout) = crate::AtomicLongFieldLayout::new(0, guard_class_id) {
+                            if let Some(layout) =
+                                crate::AtomicLongFieldLayout::new(0, guard_class_id)
+                            {
                                 self.flush_scratch_registers();
                                 if crate::deopt_real_enabled() {
                                     self.snapshot_pre_intrinsic_call(
@@ -10395,6 +10498,8 @@ impl Compiler {
                                 self.buf.emit(&[0x0F, 0x94, 0xC0]); // SETZ AL
                                 self.buf.emit(&[0x0F, 0xB6, 0xC0]); // MOVZX EAX, AL
                                 self.push_from_rax();
+                                crate::ATOMIC_LONG_INTRINSIC_SITES
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                                 for p in bail {
                                     self.deopt_stubs.push((p, pc, 6));
@@ -10504,6 +10609,15 @@ impl Compiler {
                                         self.buf.emit(&[0x48, 0x63, 0xC1]);
                                     }
                                     self.push_from_rax();
+                                    // Counted at emission, not in the matcher
+                                    // (review #80).
+                                    if is_long {
+                                        crate::LONG_LONG_VALUE_INTRINSIC_SITES
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    } else {
+                                        crate::INTEGER_INT_VALUE_INTRINSIC_SITES
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
 
                                     for p in bail {
                                         self.deopt_stubs.push((p, pc, 6));
@@ -10542,8 +10656,7 @@ impl Compiler {
                         // exception, a growth, or a coder inflation: the native
                         // does all three, unchanged.
                         if !intrinsic_handled
-                            && (callee_entry
-                                == crate::JitIntrinsic::StringBuilderLength.as_entry()
+                            && (callee_entry == crate::JitIntrinsic::StringBuilderLength.as_entry()
                                 || callee_entry
                                     == crate::JitIntrinsic::StringBuilderAppendChar.as_entry())
                         {
@@ -10563,8 +10676,11 @@ impl Compiler {
                                     self.flush_scratch_registers();
                                     // Operands, deepest first: receiver, then
                                     // (append only) the char.
-                                    let ch_slot =
-                                        if is_append { Some(self.pop_stack()) } else { None };
+                                    let ch_slot = if is_append {
+                                        Some(self.pop_stack())
+                                    } else {
+                                        None
+                                    };
                                     let recv_slot = self.pop_stack();
 
                                     let mut decline: Vec<usize> = Vec::new();
@@ -10658,9 +10774,7 @@ impl Compiler {
                                     {
                                         Some(base) => base,
                                         None => {
-                                            self.fail(
-                                                "singlepass-codegen/sb-args-spill-exhausted",
-                                            );
+                                            self.fail("singlepass-codegen/sb-args-spill-exhausted");
                                             return false;
                                         }
                                     };
@@ -10679,10 +10793,7 @@ impl Compiler {
                                     if ch_slot.is_some() {
                                         self.emit_store_local(top - 8, RCX);
                                     }
-                                    self.emit_load_local(
-                                        ARG_REGS[0],
-                                        self.heap_local_offset,
-                                    );
+                                    self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                                     self.emit_mov_imm64(ARG_REGS[1], info as *const _ as i64);
                                     self.emit_lea_frame_slot(ARG_REGS[2], top);
                                     self.emit_mov_imm32_sx(ARG_REGS[3], nargs as i32);
@@ -11626,13 +11737,12 @@ impl Compiler {
                         // intrinsics (Phase 4c). Both classes hold a single
                         // `private int crc` at instance field slot 0 — the
                         // running (uncomplemented) CRC state — see
-                        // crc_layout_contract.md. The four
-                        // sentinels handled here:
+                        // crc_layout_contract.md. The two
+                        // sentinels handled here (the IEEE `CRC32` variants
+                        // were never registered and were deleted 2026-09-12):
                         //
                         //   Crc32cUpdateByte  : CRC32C.update(I)V
                         //   Crc32cUpdateBytes : CRC32C.update([BII)V
-                        //   Crc32UpdateByte   : CRC32.update(I)V
-                        //   Crc32UpdateBytes  : CRC32.update([BII)V
                         //
                         // Every variant:
                         //   1. pops the operand stack (receiver is the
@@ -11662,18 +11772,12 @@ impl Compiler {
                         {
                             let crc32c_byte = crate::JitIntrinsic::Crc32cUpdateByte.as_entry();
                             let crc32c_bytes = crate::JitIntrinsic::Crc32cUpdateBytes.as_entry();
-                            let crc32_byte = crate::JitIntrinsic::Crc32UpdateByte.as_entry();
-                            let crc32_bytes = crate::JitIntrinsic::Crc32UpdateBytes.as_entry();
                             let is_crc32c =
                                 callee_entry == crc32c_byte || callee_entry == crc32c_bytes;
-                            let is_crc32_ieee =
-                                callee_entry == crc32_byte || callee_entry == crc32_bytes;
-                            let is_byte_form =
-                                callee_entry == crc32c_byte || callee_entry == crc32_byte;
-                            let is_bytes_form =
-                                callee_entry == crc32c_bytes || callee_entry == crc32_bytes;
+                            let is_byte_form = callee_entry == crc32c_byte;
+                            let is_bytes_form = callee_entry == crc32c_bytes;
 
-                            if is_crc32c || is_crc32_ieee {
+                            if is_crc32c {
                                 // The matcher only registers a CRC32 family
                                 // intrinsic with a resolved class id (it
                                 // skips registration when guard_class_id
@@ -11684,11 +11788,6 @@ impl Compiler {
                                     "CRC32 intrinsic reached codegen without a guard class id",
                                 );
 
-                                // Reflected polynomial for the IEEE bit loop.
-                                // Castagnoli uses the hardware instruction,
-                                // so this constant is only consumed when
-                                // `is_crc32_ieee`.
-                                const CRC32_IEEE_REVERSED_POLY: u32 = 0xEDB8_8320;
                                 // Instance field cell for the `int crc` at
                                 // slot 0: HEADER_SIZE + 0*SLOT_SIZE, then the
                                 // tag word at +0 and the 32-bit payload at
@@ -11742,11 +11841,8 @@ impl Compiler {
                                 // the next bytecode re-allocates spill slots
                                 // from the same base.
                                 let scratch_slots = if is_byte_form { 2 } else { 4 };
-                                if !self.spill_range_fits(self.next_spill_offset, scratch_slots)
-                                {
-                                    self.fail(
-                                        "singlepass-codegen/intrinsic-pin-spill-exhausted",
-                                    );
+                                if !self.spill_range_fits(self.next_spill_offset, scratch_slots) {
+                                    self.fail("singlepass-codegen/intrinsic-pin-spill-exhausted");
                                     return false;
                                 }
                                 let s_recv = self.next_spill_offset;
@@ -11798,11 +11894,6 @@ impl Compiler {
                                 // folding helper consumes the former, so the
                                 // CRC32 path complements on either side.
                                 self.emit_mov_r32_mem_disp32(RCX, RAX, pay_off);
-                                if is_crc32_ieee {
-                                    // NOT ECX — public CRC32 value -> running
-                                    // reflected-CRC state before the fold.
-                                    self.buf.emit(&[0xF7, 0xD1]);
-                                }
 
                                 if is_byte_form {
                                     // --- update(I)V: fold one byte ---
@@ -11810,14 +11901,10 @@ impl Compiler {
                                     self.emit_load_local(RDX, s_a);
                                     // MOVZX EDX, DL  (0F B6 D2) — low 8 bits.
                                     self.buf.emit(&[0x0F, 0xB6, 0xD2]);
-                                    if is_crc32c {
-                                        // CRC32 ECX, DL — hardware Castagnoli
-                                        // fold of one byte. F2 0F 38 F0 /r,
-                                        // ModRM 0xCA = reg=ECX rm=EDX(=DL).
-                                        self.buf.emit(&[0xF2, 0x0F, 0x38, 0xF0, 0xCA]);
-                                    } else {
-                                        self.emit_crc32_ieee_fold_byte(CRC32_IEEE_REVERSED_POLY);
-                                    }
+                                    // CRC32 ECX, DL — hardware Castagnoli
+                                    // fold of one byte. F2 0F 38 F0 /r,
+                                    // ModRM 0xCA = reg=ECX rm=EDX(=DL).
+                                    self.buf.emit(&[0xF2, 0x0F, 0x38, 0xF0, 0xCA]);
                                 } else {
                                     // --- update([BII)V: fold a range ---
                                     // Guards (all bail to the deopt stub,
@@ -11873,41 +11960,24 @@ impl Compiler {
                                     let loop_label = self.buf.pos();
                                     self.buf.emit(&[0x4D, 0x39, 0xD9]); // CMP R9,R11
                                     let done_patch = self.emit_jcc_rel32_patch(0x8D); // JGE
-                                    if is_crc32c {
-                                        // EAX = byte = arr[R9].
-                                        // MOVZX EAX, BYTE [R8 + R9 + HDR]
-                                        //   43 0F B6 44 08 dd
-                                        //   (REX.X for R9 index, REX.B for
-                                        //    R8 base → 0x43; SIB scale=1).
-                                        self.buf.emit(&[
-                                            0x43,
-                                            0x0F,
-                                            0xB6,
-                                            0x44,
-                                            0x08,
-                                            // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
-                                            HEADER_SIZE as u8,
-                                        ]);
-                                        // CRC32 ECX, AL — hardware Castagnoli
-                                        // fold. F2 0F 38 F0 /r, ModRM 0xC8 =
-                                        // reg=ECX rm=EAX(=AL).
-                                        self.buf.emit(&[0xF2, 0x0F, 0x38, 0xF0, 0xC8]);
-                                    } else {
-                                        // EDX = byte = arr[R9] — the IEEE
-                                        // bit loop consumes the byte in EDX.
-                                        // MOVZX EDX, BYTE [R8 + R9 + HDR]
-                                        //   43 0F B6 54 08 dd
-                                        self.buf.emit(&[
-                                            0x43,
-                                            0x0F,
-                                            0xB6,
-                                            0x54,
-                                            0x08,
-                                            // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
-                                            HEADER_SIZE as u8,
-                                        ]);
-                                        self.emit_crc32_ieee_fold_byte(CRC32_IEEE_REVERSED_POLY);
-                                    }
+                                    // EAX = byte = arr[R9].
+                                    // MOVZX EAX, BYTE [R8 + R9 + HDR]
+                                    //   43 0F B6 44 08 dd
+                                    //   (REX.X for R9 index, REX.B for
+                                    //    R8 base → 0x43; SIB scale=1).
+                                    self.buf.emit(&[
+                                        0x43,
+                                        0x0F,
+                                        0xB6,
+                                        0x44,
+                                        0x08,
+                                        // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
+                                        HEADER_SIZE as u8,
+                                    ]);
+                                    // CRC32 ECX, AL — hardware Castagnoli
+                                    // fold. F2 0F 38 F0 /r, ModRM 0xC8 =
+                                    // reg=ECX rm=EAX(=AL).
+                                    self.buf.emit(&[0xF2, 0x0F, 0x38, 0xF0, 0xC8]);
                                     // INC R9 ; JMP .loop
                                     self.buf.emit(&[0x49, 0xFF, 0xC1]); // INC R9
                                     self.buf.emit_byte(0xE9); // JMP rel32
@@ -11922,11 +11992,6 @@ impl Compiler {
                                     self.patch_rel32_to_here(done_patch);
                                 }
 
-                                if is_crc32_ieee {
-                                    // NOT ECX — running reflected-CRC state
-                                    // back to real JDK CRC32's public value.
-                                    self.buf.emit(&[0xF7, 0xD1]);
-                                }
 
                                 // --- write CRC state back to slot 0 ---
                                 // RAX = receiver again (reload — RAX was
@@ -12235,9 +12300,7 @@ impl Compiler {
                             // slot live as a fallback), PIC takes
                             // precedence: it caches a 4-entry superset.
                             let pic_ptr = self.pic_slots_idx.get(&pc).map(|&i| self.pic_slots[i].1);
-                            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN")
-                                .is_some()
-                            {
+                            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_GEN") {
                                 eprintln!(
                                     "[JIT_GEN_INVOKE_VS] pc={} op=0x{:02x} info_kind={} mic_present={} pic_present={} {}.{}{}",
                                     pc, op, info_ref.invoke_kind, mic_ptr.is_some(), pic_ptr.is_some(),
@@ -12332,8 +12395,8 @@ impl Compiler {
                             // Layout (verified by `test_jit_mic_slot_offsets` in
                             // jit/src/lib.rs; struct is `#[repr(C)]`):
                             //   offset  0  AtomicU32  cached_class_id
-                            //   offset  8  AtomicU64  cached_entry_ptr
-                            //   offset 16  AtomicBool cached_needs_context
+                            //   offset  8  AtomicU64  cached_entry_word
+                            //              (entry | needs-context in bit 0)
                             //
                             // HIGH-7 follow-up — Inline 4-way PIC fast-path
                             // guard. `JitPICSlot` is now `#[repr(C)]` with
@@ -12343,7 +12406,10 @@ impl Compiler {
                             //
                             //   CLASS_ID_OFFSETS      = [0, 4, 8, 12]
                             //   ENTRY_PTR_OFFSETS     = [16, 24, 32, 40]
-                            //   NEEDS_CONTEXT_OFFSETS = [48, 49, 50, 51]
+                            //
+                            // Each entry offset holds a TAGGED word: the
+                            // target address with bit 0 set when it needs
+                            // the VM context (`JIT_IC_NEEDS_CONTEXT_TAG`).
                             //
                             // The Mutex<Option<String>> array (`class_names`)
                             // is moved to the tail so its unstable layout
@@ -12360,15 +12426,17 @@ impl Compiler {
                             //   mov   eax, [rax]                       ; class_id @ ObjectHeader+0
                             //   ; --- per slot i in 0..4 ---
                             //   cmp   eax, [r10 + CLASS_ID_OFFSETS[i]]
-                            //   jne   .try_{i+1}  (or .miss for i==2)
-                            //   cmp   byte [r10 + NEEDS_CONTEXT_OFFSETS[i]], 0
-                            //   je    .noctx
-                            //   <load context ABI: vm_ptr + arg_slots[0..n]>
-                            //   jmp   .call
+                            //   jne   .try_{i+1}  (or .miss for the last)
+                            //   mov   r11, [r10 + ENTRY_PTR_OFFSETS[i]] ; ONE load
+                            //   test  r11, r11
+                            //   jz    .miss
+                            //   btr   r11, 0          ; CF = needs-context tag
+                            //   jnc   .noctx
+                            //   jmp   .call           ; context ABI already live
                             // .noctx:
                             //   <load context-free ABI: arg_slots[0..n]>
                             // .call:
-                            //   call  qword [r10 + ENTRY_PTR_OFFSETS[i]]
+                            //   call  r11
                             //   jmp   .done
                             //   ; --- end per-slot ---
                             // .miss:
@@ -12499,7 +12567,6 @@ impl Compiler {
                                 // a compile error here.
                                 const CLASS_ID_OFFS: [u8; 4] = [0, 4, 8, 12];
                                 const ENTRY_PTR_OFFS: [u8; 4] = [16, 24, 32, 40];
-                                const NEEDS_CTX_OFFS: [u8; 4] = [48, 49, 50, 51];
 
                                 // Compile-time sanity: the byte offsets we
                                 // hardcode in the encodings below must
@@ -12515,10 +12582,8 @@ impl Compiler {
                                         && crate::JitPICSlot::ENTRY_PTR_OFFSETS[1] == 24
                                         && crate::JitPICSlot::ENTRY_PTR_OFFSETS[2] == 32
                                         && crate::JitPICSlot::ENTRY_PTR_OFFSETS[3] == 40
-                                        && crate::JitPICSlot::NEEDS_CONTEXT_OFFSETS[0] == 48
-                                        && crate::JitPICSlot::NEEDS_CONTEXT_OFFSETS[1] == 49
-                                        && crate::JitPICSlot::NEEDS_CONTEXT_OFFSETS[2] == 50
-                                        && crate::JitPICSlot::NEEDS_CONTEXT_OFFSETS[3] == 51
+                                        // `BTR R11, 0` below strips exactly bit 0.
+                                        && crate::JIT_IC_NEEDS_CONTEXT_TAG == 1
                                 );
 
                                 // R10 = pic_ptr (imm64, fixed 10-byte form).
@@ -12782,28 +12847,33 @@ impl Compiler {
                                         miss_patches_rel32.push(self.buf.pos() - 4);
                                     }
 
+                                    // Capture the way's target ONCE. The word
+                                    // carries the entry AND its calling
+                                    // convention, so the ABI chosen below and
+                                    // the CALL can never come from two
+                                    // different publications of this way.
+                                    // MOV R11, qword [R10 + ENTRY_PTR_OFFS[i]]
+                                    // 4 bytes: REX.WRB + 8B /r + ModRM(01,R11,R10) + disp8
+                                    self.buf.emit(&[0x4D, 0x8B, 0x5A, ENTRY_PTR_OFFS[i]]);
                                     // A receiver profile may pre-populate only
-                                    // class_id; entry_ptr remains zero until
-                                    // the resolving helper compiles and
-                                    // publishes a concrete target.
-                                    // CMP QWORD [R10 + ENTRY_PTR_OFFS[i]], 0
-                                    self.buf.emit(&[0x49, 0x83, 0x7A, ENTRY_PTR_OFFS[i], 0x00]);
-                                    // JE rel32 → .miss
+                                    // class_id, and a retired way's word is
+                                    // zeroed: never CALL a zero target.
+                                    // TEST R11, R11 (3 bytes)
+                                    self.buf.emit(&[0x4D, 0x85, 0xDB]);
+                                    // JZ rel32 → .miss
                                     self.buf.emit(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
                                     miss_patches_rel32.push(self.buf.pos() - 4);
 
-                                    // CMP BYTE [R10 + NEEDS_CTX_OFFS[i]], 0
-                                    // 5 bytes: REX.B (0x41) + 80 /7 + modrm
-                                    //   modrm = mod(01) reg(/7=111) rm(010)
-                                    //         = 0b01_111_010 = 0x7A
-                                    //   + disp8 + imm8(0)
-                                    self.buf.emit(&[0x41, 0x80, 0x7A, NEEDS_CTX_OFFS[i], 0x00]);
+                                    // BTR R11, 0 — CF := the needs-context
+                                    // tag, R11 := the bare entry address.
+                                    // 5 bytes: REX.WB + 0F BA /6 + ModRM(11,110,R11) + imm8
+                                    self.buf.emit(&[0x49, 0x0F, 0xBA, 0xF3, 0x00]);
 
-                                    // JE rel32 → .noctx. Both ABI shapes are
+                                    // JNC rel32 → .noctx. Both ABI shapes are
                                     // valid cache hits; small interface
                                     // implementations are commonly
                                     // context-free.
-                                    self.buf.emit(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+                                    self.buf.emit(&[0x0F, 0x83, 0x00, 0x00, 0x00, 0x00]);
                                     let noctx_patch = self.buf.pos() - 4;
 
                                     // Callee ABI args (vm_ptr + n) have
@@ -12838,40 +12908,22 @@ impl Compiler {
                                     );
                                     self.buf.try_patch_i32(ctx_call_patch, call_rel as i32).ok();
 
-                                    // SECURITY FIX (V1): do NOT keep the
-                                    // call target live in memory addressed
-                                    // through R10 across an indirect CALL.
-                                    // R10 is the shared bounds-check / SIMD
-                                    // scratch register (see SCRATCH_REGS
-                                    // exclusion and emit_bounds_check, which
-                                    // clobbers R10D). Previously this site
-                                    // emitted `CALL qword [R10 + disp]`, so
-                                    // ANY R10-clobbering instruction emitted
-                                    // in the window between `MOV R10,&slot`
-                                    // and the CALL would corrupt the call
-                                    // target → indirect call to an attacker-
-                                    // influenced address. We close the window
-                                    // to a single, fixed instruction pair:
-                                    // load the entry_ptr into R11 (a
-                                    // caller-saved scratch reg that is NOT in
-                                    // ARG_REGS / SCRATCH_REGS / LOCAL_REGS and
-                                    // is clobbered by the call anyway) and
-                                    // CALL R11. The R10→R11 load reads R10
-                                    // exactly once, immediately before the
-                                    // CALL, with nothing emittable in between,
-                                    // so no later codegen can perturb the
-                                    // target. INVARIANT: nothing may be
-                                    // emitted between this entry-ptr load and
-                                    // the paired `CALL R11` below.
+                                    // SECURITY FIX (V1): do NOT keep the call
+                                    // target live in memory addressed through
+                                    // R10 across an indirect CALL — R10 is the
+                                    // shared bounds-check / SIMD scratch
+                                    // register. The target was captured into
+                                    // R11 above (a caller-saved scratch reg
+                                    // that is NOT in ARG_REGS / SCRATCH_REGS /
+                                    // LOCAL_REGS and is clobbered by the call
+                                    // anyway) and R10 is not read again.
+                                    // Between that capture and this CALL only
+                                    // the `emit_load_local` loads of the
+                                    // no-context ABI run, and they write
+                                    // ARG_REGS alone. INVARIANT: nothing that
+                                    // writes R11 may be emitted between the
+                                    // entry-word capture and this `CALL R11`.
                                     //
-                                    // MOV R11, qword [R10 + ENTRY_PTR_OFFS[i]]
-                                    if ENTRY_PTR_OFFS[i] == 0 {
-                                        // 3 bytes: REX.WRB + 8B /r + ModRM(00,R11,R10)
-                                        self.buf.emit(&[0x4D, 0x8B, 0x1A]);
-                                    } else {
-                                        // 4 bytes: REX.WRB + 8B /r + ModRM(01,R11,R10) + disp8
-                                        self.buf.emit(&[0x4D, 0x8B, 0x5A, ENTRY_PTR_OFFS[i]]);
-                                    }
                                     // CALL R11  (3 bytes: REX.B + FF /2 + ModRM(11,/2,R11))
                                     self.buf.emit(&[0x41, 0xFF, 0xD3]);
                                     // A compiled callee's prologue publishes
@@ -13030,27 +13082,35 @@ impl Compiler {
                                 self.buf.emit(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
                                 mic_miss_patches32.push(self.buf.pos() - 4);
 
+                                // Capture the tagged target word ONCE: the
+                                // entry address with the needs-context flag in
+                                // bit 0, so the ABI and the call target come
+                                // from the same publication.
+                                // MOV R11, qword [R10 + 8]
+                                // 4 bytes: REX.WRB + 8B /r + ModRM(01,R11,R10) + disp8
+                                self.buf.emit(&[0x4D, 0x8B, 0x5A, 0x08]);
                                 // A profiled MIC can publish the receiver class
                                 // before the helper has installed a compiled
-                                // target. Never CALL a class-only seed.
-                                // CMP QWORD [R10 + 8], 0
-                                self.buf.emit(&[0x49, 0x83, 0x7A, 0x08, 0x00]);
-                                // JE rel32 → .miss
+                                // target, and a withdrawal zeroes the word.
+                                // Never CALL a zero target.
+                                // TEST R11, R11 (3 bytes)
+                                self.buf.emit(&[0x4D, 0x85, 0xDB]);
+                                // JZ rel32 → .miss
                                 self.buf.emit(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
                                 mic_miss_patches32.push(self.buf.pos() - 4);
 
-                                // CMP BYTE [R10 + 16], 0  — select cached entry ABI.
-                                // 5 bytes: REX.B (0x41) + 80 /7 + modrm(01 111 010) + disp8 + imm8
-                                self.buf.emit(&[0x41, 0x80, 0x7A, 0x10, 0x00]);
+                                // BTR R11, 0 — CF := needs-context, R11 := entry.
+                                // 5 bytes: REX.WB + 0F BA /6 + ModRM(11,110,R11) + imm8
+                                self.buf.emit(&[0x49, 0x0F, 0xBA, 0xF3, 0x00]);
 
-                                // JE rel32 → .noctx. Context-free compiled
+                                // JNC rel32 → .noctx. Context-free compiled
                                 // methods use Java arg0 in ARG_REGS[0], while
                                 // context-using methods reserve that register
                                 // for vm_ptr. The cache publishes this ABI bit;
                                 // honoring both shapes is essential because
                                 // small interface implementations almost
                                 // always compile context-free.
-                                self.buf.emit(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+                                self.buf.emit(&[0x0F, 0x83, 0x00, 0x00, 0x00, 0x00]);
                                 let noctx_patch = self.buf.pos() - 4;
 
                                 // ---- Set up callee ABI: (vm_ptr, arg_slots[0..n]) ----
@@ -13088,25 +13148,14 @@ impl Compiler {
                                 self.buf.try_patch_i32(ctx_call_patch, call_rel as i32).ok();
 
                                 // SECURITY FIX (V1): same hardening as the
-                                // PIC arm — never CALL indirectly through a
-                                // target addressed by R10, because R10 is the
-                                // shared bounds-check / SIMD scratch register
-                                // and any R10-clobbering instruction emitted
-                                // in the window between `MOV R10,&slot` and
-                                // the CALL would redirect the call. The
-                                // ABI-marshalling loop above this point loads
-                                // into ARG_REGS (never R10), so R10 is intact
-                                // here today, but we still tighten the window
-                                // to a single fixed pair: load the cached
-                                // entry_ptr into R11 (caller-saved scratch,
-                                // not in ARG_REGS / SCRATCH_REGS / LOCAL_REGS,
-                                // clobbered by the call anyway) and CALL R11.
-                                // INVARIANT: nothing may be emitted between
-                                // this load and the paired `CALL R11`.
+                                // PIC arm — the target was captured into R11
+                                // (caller-saved scratch, not in ARG_REGS /
+                                // SCRATCH_REGS / LOCAL_REGS) before the ABI
+                                // marshalling, which loads into ARG_REGS only,
+                                // and R10 is not read again. INVARIANT: nothing
+                                // that writes R11 may be emitted between the
+                                // entry-word capture and this `CALL R11`.
                                 //
-                                // MOV R11, qword [R10 + 8]  — cached_entry_ptr.
-                                // 4 bytes: REX.WRB + 8B /r + ModRM(01,R11,R10) + disp8
-                                self.buf.emit(&[0x4D, 0x8B, 0x5A, 0x08]);
                                 // CALL R11  (3 bytes: REX.B + FF /2 + ModRM(11,/2,R11))
                                 self.buf.emit(&[0x41, 0xFF, 0xD3]);
                                 self.emit_post_call_rbp_republish();
@@ -13411,7 +13460,7 @@ impl Compiler {
                     let bridge_entry =
                         crate::INDY_BRIDGE_FN.load(std::sync::atomic::Ordering::Relaxed);
                     if bridge_site != 0 && bridge_entry != 0 && ret_type != b'V' {
-                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                             eprintln!("[cratonvm-jitc] indy bridge pc={} args={}", pc, arg_slots);
                         }
                         let pre_pop_spill = self.next_spill_offset;
@@ -13433,9 +13482,7 @@ impl Compiler {
                             let Some(args_end) =
                                 self.checked_spill_range_end(pre_pop_spill, arg_slots)
                             else {
-                                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC")
-                                    .is_some()
-                                {
+                                if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                                     eprintln!(
                                         "[cratonvm-jitc] indy bridge spill overflow pc={} base={} args={}",
                                         pc, pre_pop_spill, arg_slots
@@ -13569,7 +13616,7 @@ impl Compiler {
                         .last()
                         .is_some_and(|p| !crate::deopt::frame_state_is_resumable(&p.frame_state));
                     if unresumable_trap {
-                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                             eprintln!(
                                 "[cratonvm-jitc] compile-bail unresumable-indy-trap bci={pc}"
                             );
@@ -13785,15 +13832,13 @@ impl Compiler {
                         // call stays, and only the bump is inlined.
                         let skip_helper =
                             helper_is_noop && !cratonvm_types::jit_tlab_registration_required();
-                        let can_inline = cratonvm_types::flags::runtime_var_os(
+                        let can_inline = !cratonvm_types::flags::runtime_flag_on(
                             "CRATONVM_JIT_DISABLE_INLINE_NEW",
                         )
-                        .is_none()
                             && (helper_is_noop
-                                || cratonvm_types::flags::runtime_var_os(
+                                || cratonvm_types::flags::runtime_flag_on(
                                     "CRATONVM_JIT_ENABLE_INLINE_NEW",
-                                )
-                                .is_some())
+                                ))
                             && self.helpers.get_current_thread != 0
                             && self.helpers.tlab_post_init != 0
                             && self.helpers.new_object != 0
@@ -14068,6 +14113,17 @@ impl Compiler {
                         .get(&pc)
                         .map(|&i| self.typecheck_info[i])
                         .unwrap_or((pc, std::ptr::null(), 0));
+                    // A site with no resolved target cannot be compiled
+                    // correctly: `jit_checkcast` has no class to test against
+                    // and answers with a silent null, which turns an object
+                    // into `null` instead of passing it or throwing. Stay
+                    // interpreted. The height is unchanged (pop one, push one),
+                    // so the model stays plausible until the post-loop check.
+                    if name_ptr.is_null() || name_len == 0 {
+                        self.fail("singlepass-codegen/checkcast-unresolved-site");
+                        pc += 3;
+                        continue;
+                    }
 
                     // ---- inline class-id fast path (see `checkcast_inline_enabled`) ----
                     //
@@ -14143,10 +14199,9 @@ impl Compiler {
                         }
                         if inline_target.is_none()
                             && prim_array_tag.is_none()
-                            && cratonvm_types::flags::runtime_var_os(
+                            && cratonvm_types::flags::runtime_flag_on(
                                 "CRATONVM_DBG_CHECKCAST_INLINE",
                             )
-                            .is_some()
                         {
                             eprintln!(
                                 "[checkcast-inline] pc={pc} REFUSED target_id={target_class_id:?} have_key={trusted_have_key} marks_exact={trusted_marks_exact} top_is_oop={trusted_top_is_oop} method={}",
@@ -14281,8 +14336,100 @@ impl Compiler {
                         .get(&pc)
                         .map(|&i| self.typecheck_info[i])
                         .unwrap_or((pc, std::ptr::null(), 0));
+                    // Same as `checkcast`: with no resolved target the helper
+                    // answers `false` for every object, a wrong answer rather
+                    // than a missing one. Stay interpreted.
+                    if name_ptr.is_null() || name_len == 0 {
+                        self.fail("singlepass-codegen/instanceof-unresolved-site");
+                        pc += 3;
+                        continue;
+                    }
+
+                    // ---- inline fast path: checkcast's guards, instanceof's answers ----
+                    //
+                    // Exactly the preconditions of the `checkcast` arm above,
+                    // read the same way and for the same reasons (see the long
+                    // comments there): the target id comes from the site's
+                    // interned name, the operand must be a trusted oop, and the
+                    // whole thing sits under `checkcast_inline_enabled`. Only
+                    // the ANSWERS differ, and instanceof has more of them to
+                    // give without a call:
+                    //
+                    // * null — `instanceof` is 0 for null (JVMS §6.5), so null
+                    //   needs no helper at all. (checkcast sends null to the
+                    //   helper only because it has no second null path.)
+                    // * a plain object whose header class id IS the target — 1.
+                    //   Arrays are screened out by the `KIND_TAGS == 0` compare
+                    //   first: an array header carries its component's id (or
+                    //   0), BUG-JIT-ARRAY-INSTANCEOF-20260726.
+                    // * a 1-D primitive array whose KIND_TAGS byte is the
+                    //   target's — 1. Primitive array types have no subtypes.
+                    // * anything else — the helper, emitted unchanged below.
+                    //
+                    // The two call-free answers are stubs placed AFTER the
+                    // helper call, so the call sequence is emitted in the same
+                    // linear position (and byte-for-byte the same) as before,
+                    // and the stubs are compiled against the post-call state,
+                    // in which RAX is the result on every edge into the join.
+                    // No counter and no debug flag of its own: the checkcast
+                    // counters describe checkcast, and this arm adds no state.
+                    let target_class_id = crate::typecheck_target_for_site(name_ptr)
+                        .filter(|&id| id != 0);
+                    // Read BEFORE the pop, as in the checkcast arm.
+                    let operand_is_trusted_oop = !self.method_key.is_empty()
+                        && self.stack_oop_marks_exact
+                        && self.stack_oop_marks.last().copied().unwrap_or(false);
 
                     let obj_slot = self.pop_stack();
+
+                    // SAFETY: `name_ptr`/`name_len` are an `intern_typecheck_target`
+                    // pair, leaked for the life of the process.
+                    let prim_array_tag = unsafe { crate::typecheck_site_name(name_ptr, name_len) }
+                        .and_then(cratonvm_types::primitive_array_kind_tags_byte)
+                        .filter(|_| checkcast_inline_enabled() && operand_is_trusted_oop);
+                    let inline_target = target_class_id.filter(|_| {
+                        checkcast_inline_enabled()
+                            && operand_is_trusted_oop
+                            && prim_array_tag.is_none()
+                    });
+                    let mut null_patches: Vec<usize> = Vec::new();
+                    let mut true_patches: Vec<usize> = Vec::new();
+                    if prim_array_tag.is_some() || inline_target.is_some() {
+                        self.load_slot_to_reg(RAX, obj_slot);
+                        // TEST RAX, RAX ; JZ → the `0` stub.
+                        null_patches = self.emit_trusted_oop_receiver_check();
+                        let mut slow: Vec<usize> = Vec::new();
+                        if let Some(tag) = prim_array_tag {
+                            // CMP BYTE [RAX+KIND_TAGS_BYTE_OFFSET], tag ; JE → `1`.
+                            self.buf.emit(&[
+                                0x80,
+                                0x78,
+                                cratonvm_types::KIND_TAGS_BYTE_OFFSET as u8, // Cast: x86-64 disp8
+                                tag,
+                            ]);
+                            true_patches.push(self.emit_jcc_rel32_patch(0x84)); // JE → `1`
+                        } else if let Some(target_class_id) = inline_target {
+                            // CMP BYTE [RAX+KIND_TAGS_BYTE_OFFSET], 0 ; JNE → helper.
+                            self.buf.emit(&[
+                                0x80,
+                                0x78,
+                                cratonvm_types::KIND_TAGS_BYTE_OFFSET as u8, // Cast: x86-64 disp8
+                                0x00,
+                            ]);
+                            slow.push(self.emit_jcc_rel32_patch(0x85)); // JNE → helper
+                            // CMP DWORD [RAX+class_id_off], target_class_id ;
+                            // JE → `1`. Same `81 B8 disp32 imm32` form as checkcast.
+                            let cid_off = self.helpers.class_id_offset_in_obj as i32; // Cast: x86-64 disp32
+                            self.buf.emit(&[0x81, 0xB8]);
+                            self.buf.emit(&cid_off.to_le_bytes());
+                            self.buf.emit(&target_class_id.to_le_bytes());
+                            true_patches.push(self.emit_jcc_rel32_patch(0x84)); // JE → `1`
+                        }
+                        // Fall-through and every JNE: the helper.
+                        for p in slow {
+                            self.patch_rel32_to_here(p);
+                        }
+                    }
 
                     // Call jit_instanceof(vm_ptr, obj_ptr, class_name_ptr, class_name_len) → 0/1
                     self.emit_load_local(ARG_REGS[0], self.heap_local_offset); // vm_ptr
@@ -14293,11 +14440,37 @@ impl Compiler {
                                                                        // before any GC-triggering CALL.
                     self.emit_pre_safepoint_spill();
                     self.emit_call_absolute(self.helpers.instanceof_check);
+                    self.emitted_instanceof_call = true;
                     // T1.1.2 — instanceof may resolve the target class
                     // on demand, allocating a Class mirror. Emit the
                     // oop map even though the return value is a
                     // primitive int.
                     self.emit_oop_map_for_safepoint();
+                    if !null_patches.is_empty() || !true_patches.is_empty() {
+                        // Helper result in RAX: skip the two stubs.
+                        let past_helper = self.emit_jmp_rel32_patch();
+                        let mut join: Vec<usize> = vec![past_helper];
+                        if !null_patches.is_empty() {
+                            for p in null_patches {
+                                self.patch_rel32_to_here(p);
+                            }
+                            // XOR EAX, EAX — null is not an instance of anything.
+                            self.emit_xor_reg_self(RAX);
+                            if !true_patches.is_empty() {
+                                join.push(self.emit_jmp_rel32_patch());
+                            }
+                        }
+                        if !true_patches.is_empty() {
+                            for p in true_patches {
+                                self.patch_rel32_to_here(p);
+                            }
+                            // MOV RAX, 1 — the receiver is exactly the target.
+                            self.emit_mov_imm32_sx(RAX, 1);
+                        }
+                        for p in join {
+                            self.patch_rel32_to_here(p);
+                        }
+                    }
                     // Result (0 or 1) is in RAX — push onto stack
                     self.push_from_rax();
                     pc += 3;
@@ -14390,9 +14563,12 @@ impl Compiler {
                     // local that is proven non-null at this PC, the TEST
                     // can never be zero so `ifnull` is dead and the
                     // fall-through is always taken. Skip both the TEST
-                    // and the JE.
-                    let proven_nonnull = preceding_aload_nonnull_local(code, pc)
-                        .is_some_and(|l| self.is_local_nonnull(pc, l));
+                    // and the JE. Not at a merge point: there the tested value
+                    // may have been pushed on another path than the `aload`
+                    // textually before this PC.
+                    let proven_nonnull = !self.null_check_info.is_merge_point(pc)
+                        && preceding_aload_nonnull_local(code, pc)
+                            .is_some_and(|l| self.is_local_nonnull(pc, l));
                     if proven_nonnull {
                         // No-op: fall through. We still need a non-empty
                         // branch-target record so downstream merges see
@@ -14443,9 +14619,10 @@ impl Compiler {
                     // always taken: emit an unconditional JMP rel32 and
                     // skip the TEST + Jcc pair. Saves the 3-byte TEST
                     // + 1-byte (Jcc opcode-pair high byte) for every
-                    // proven site.
-                    let proven_nonnull = preceding_aload_nonnull_local(code, pc)
-                        .is_some_and(|l| self.is_local_nonnull(pc, l));
+                    // proven site. Not at a merge point (see `ifnull`).
+                    let proven_nonnull = !self.null_check_info.is_merge_point(pc)
+                        && preceding_aload_nonnull_local(code, pc)
+                            .is_some_and(|l| self.is_local_nonnull(pc, l));
                     if proven_nonnull {
                         // JMP rel32 (5 bytes; patched).
                         self.buf.emit_byte(0xE9);
@@ -14505,7 +14682,8 @@ impl Compiler {
                     let recv_offset = match recv_slot {
                         StackSlot::Frame(offset) => offset,
                         StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg, ..) => {
-                            let Some(offset) = self.reserve_spill_slots(1, SpillReason::HelperArgs) else {
+                            let Some(offset) = self.reserve_spill_slots(1, SpillReason::HelperArgs)
+                            else {
                                 return false;
                             };
                             self.emit_store_local(offset, reg);

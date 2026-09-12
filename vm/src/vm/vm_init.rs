@@ -4492,15 +4492,10 @@ impl SharedVm {
                 // overrides (c1/c2/osr/c2_min/enabled). Identical to the default
                 // policy when the environment is unset.
                 tiered_manager: crate::jit::tiered::TieredCompilationManager::with_env_policy(),
-                compilation_broker: parking_lot::Mutex::new(
-                    crate::jit::tiered::CompilationBroker::with_default_policy(),
-                ),
                 deopt_log: parking_lot::Mutex::new(crate::jit::deopt::DeoptimizationLog::new()),
+                despec_registry: Arc::new(crate::jit::deopt::DespecRegistry::new()),
                 method_epochs: parking_lot::RwLock::new(FxHashMap::default()),
                 method_epoch_overflow: std::sync::atomic::AtomicU64::new(0),
-                invalidation_manager: parking_lot::Mutex::new(
-                    cratonvm_jit::deopt::InvalidationManager::new(),
-                ),
                 // JIT slow-path allocation: per-class init recipe cache.
                 jit_alloc_class_cache: crate::jit::alloc_class_cache::JitAllocClassCache::new(),
             },
@@ -5944,24 +5939,23 @@ impl SharedVm {
     ///    `Vec<JdkOnlyViolation>`. A `Compatible` VM that asked for
     ///    `--jdk-only-report` would pay three uncontended locks for three
     ///    guaranteed-empty answers. The early return is free.
-    /// 2. **Honesty.** `cratonvm_jit`'s policy is a process global that
-    ///    latches monotonically toward strict (see
-    ///    `cratonvm_jit::set_jit_execution_policy`). Two VMs in one process can
-    ///    therefore make a `Compatible` VM compile under strict policy — never
-    ///    the reverse — and that VM's JIT would start filling these sinks with
-    ///    refusals it never asked for. Folding them into a report whose `mode`
-    ///    field says `"compatible"` would attribute another VM's policy
+    /// 2. **Honesty.** The sinks are process-wide, so rows a sibling `JdkOnly`
+    ///    VM recorded are visible from here. Folding them into a report whose
+    ///    `mode` field says `"compatible"` would attribute another VM's policy
     ///    decisions to this one. A `Compatible` VM has no JDK-only policy, so
-    ///    it reports no JDK-only violations, full stop.
+    ///    it reports no JDK-only violations, full stop. (Until 2026-09-12 the
+    ///    JIT's policy was itself a process-global latch that only moved toward
+    ///    strict, so a `Compatible` VM could even compile under strict policy
+    ///    and record refusals of its own. The policy is now a per-compilation
+    ///    argument taken from each VM's own config, and the latch is gone.)
     ///
     /// The residual imprecision runs the other way and cannot be fixed here:
     /// in a multi-VM process where at least one VM is `JdkOnly`, these three
     /// lists are **process-wide**, not this VM's. A `JdkOnly` VM's report may
-    /// therefore include rows produced while a sibling `Compatible` VM was
-    /// running. Making them per-VM is the wave-2 change named in
-    /// `cratonvm_jit`'s `JDK-ONLY-WAVE2` note (move the policy and the helper
-    /// addresses into a per-VM struct); until then this is over-reporting in
-    /// the strict direction, which is the safe direction for a diagnostic.
+    /// therefore include rows produced while a sibling `JdkOnly` VM was
+    /// running. The policy is per VM; the sinks are not yet. Until they are,
+    /// this over-reports in the strict direction, which is the safe direction
+    /// for a diagnostic.
     ///
     /// Each sink is append-only and bounded (4096 entries by default since
     /// 2026-08-20, `CRATONVM_NATIVE_SHADOW_SINK_CAP`) with an internal dedup, so
@@ -7845,18 +7839,16 @@ impl SharedVm {
                     let _ = jit.invalidate_for_class_change(sup);
                 }
             }
-            // T5.4.4 — also consult the InvalidationManager's
-            // `on_class_loaded(class_id)` which tracks `LeafClass`
-            // compilation assumptions that the `inlined_methods` scan
-            // above cannot see (an assumption refers to the class_id
-            // whose leaf-ness was assumed, not the class whose code
-            // was inlined). This closes the loop for CHA-devirtualized
-            // entries whose inlined_methods list doesn't already name
-            // the newly loaded class.
-            let _evicted_by_cha = self.invalidate_jit_for_class(name);
-            for sup in &supertypes {
-                let _evicted_sup = self.invalidate_jit_for_class(sup);
-            }
+            // T5.4.4 — that loop IS the whole class-hierarchy listener. A
+            // compiled body's dependency record is its own `inlined_methods`,
+            // filled from `InlinePlan::invalidation_triples`, which names both
+            // an inlined callee and the receiver class a guarded speculation
+            // relied on. A second listener used to run here over an
+            // `InvalidationManager` whose `register_assumption` no compile path
+            // ever called, so it evicted nothing while its comment claimed to
+            // close the CHA loop; it has been deleted. A compile still running
+            // when this define lands is refused at publication by the cache's
+            // invalidation log (`JitCache::put`).
 
             // Phase 1 — Item 6: `@EnableGpuAsync(warmup = N)` class-load
             // warmup. If the class is annotated, eagerly pre-compile up
@@ -7972,13 +7964,24 @@ impl SharedVm {
         event: crate::jit::deopt::DeoptEvent,
         tiered_key: &crate::jit::tiered::MethodKey,
     ) -> crate::jit::deopt::DeoptAction {
-        let mut log = self.jit.deopt_log.lock();
-        // The bci-aware policy: a method whose only failing speculation has
-        // already been de-spec'd is recompiled, not blacklisted. See
-        // `DeoptimizationLog::recommend_action_at_bci`.
-        let action = log.recommend_action_at_bci(method_key, event.reason, event.bci);
-        log.record_deopt(method_key, event);
-        self.jit.tiered_manager.on_deoptimization(tiered_key);
+        let reason = event.reason;
+        let bci = event.bci;
+        let action = {
+            let mut log = self.jit.deopt_log.lock();
+            // The bci-aware policy: a method whose only failing speculation has
+            // already been de-spec'd is recompiled, not blacklisted. See
+            // `DeoptimizationLog::recommend_action_at_bci`.
+            let action =
+                log.recommend_action_at_bci(method_key, reason, bci, &self.jit.despec_registry);
+            log.record_deopt(method_key, event);
+            action
+        };
+        // Outside the log lock, and WITH the action: the manager charges a trap
+        // only for an action that threw the body away, so a soft exit no
+        // longer spends the method's C2 (and OSR) allowance.
+        self.jit
+            .tiered_manager
+            .on_deoptimization(tiered_key, reason, bci, action);
         action
     }
 
@@ -8036,76 +8039,6 @@ impl SharedVm {
             .entry(method_key.to_string())
             .or_insert_with(|| Box::new(std::sync::atomic::AtomicU64::new(0)));
         cell.as_ref() as *const std::sync::atomic::AtomicU64
-    }
-
-    /// T5.4.4 — Class-hierarchy change listener.
-    ///
-    /// When `class_name` is linked/registered, walk the
-    /// [`cratonvm_jit::deopt::InvalidationManager`] to collect every compiled
-    /// method that made a `LeafClass(class_id)` assumption (or registered a
-    /// direct `class_dependencies` entry) for the newly loaded class, then
-    /// evict each of those entries from [`Self::jit_cache`]. Method keys in
-    /// the invalidation manager are stored as `"<class>.<method>:<descriptor>"`
-    /// (see `s36_invalidation_manager_tracks_class_dependencies`); we parse
-    /// that format back into the tuple the cache expects.
-    ///
-    /// Returns the number of entries evicted. A return value of 0 is normal —
-    /// it just means no compiled code depended on this class.
-    pub fn invalidate_jit_for_class(&self, class_name: &str) -> usize {
-        // Resolve ClassId — if the class isn't loaded yet (e.g. a caller
-        // invoked us before registration completed), there can be no
-        // LeafClass assumption on it, so there's nothing to evict.
-        let class_id_u32: u32 = match self
-            .classes
-            .class_manager
-            .read()
-            .get_loaded_class_id(class_name)
-        {
-            Some(cid) => cid.as_u32(),
-            None => return 0,
-        };
-
-        // Ask the invalidation manager which method keys are now invalid.
-        let invalidated_keys: Vec<String> = {
-            let inv = self.jit.invalidation_manager.lock();
-            inv.on_class_loaded(class_id_u32)
-        };
-        if invalidated_keys.is_empty() {
-            return 0;
-        }
-
-        // Parse each "<class>.<method>:<descriptor>" key and remove the
-        // matching entry from the JIT cache.
-        let mut evicted = 0usize;
-        let mut jit = self.jit.jit_cache.write();
-        for key in &invalidated_keys {
-            // Split on the last ':' to isolate the descriptor (the descriptor
-            // itself may not contain ':', but the class name / method name
-            // could theoretically contain one via inner-class mangling, so
-            // splitting from the right is the safe choice).
-            let (class_method, descriptor) = match key.rsplit_once(':') {
-                Some(t) => t,
-                None => continue,
-            };
-            // Split `<class>.<method>` on the last '.' — class names may
-            // contain dots (e.g. `foo.bar.Baz.methodName`).
-            let (class_part, method_part) = match class_method.rsplit_once('.') {
-                Some(t) => t,
-                None => continue,
-            };
-            let before = jit.len();
-            let part_class_id = self
-                .classes
-                .class_manager
-                .read()
-                .get_loaded_class_id(class_part)
-                .unwrap_or(cratonvm_types::ClassId::new(0));
-            jit.remove(class_part, method_part, descriptor, part_class_id);
-            if jit.len() < before {
-                evicted += 1;
-            }
-        }
-        evicted
     }
 }
 
@@ -9267,7 +9200,7 @@ impl SharedVm {
 // TODO(orchestrator): extend the wiring to the remaining hot locks
 // (`jit_cache`, `native_libraries`, `upcall_table`, `jni_global_refs`,
 // `class_init_waiters`, `class_loading_locks`, `deopt_log`,
-// `invalidation_manager`, `jit_skip_set`, `cleaner_thread.pending_actions`,
+// `jit_skip_set`, `cleaner_thread.pending_actions`,
 // and the `ProfileStore` L4.a/L4.b sub-hierarchy in `jit/src/profile.rs`).
 
 mod ranked_locks {

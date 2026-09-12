@@ -144,6 +144,25 @@ bytecode verification, and that `direct-emit` is approximate because the VM
 exposes no hard "IR off" switch — are in
 [`docs/testing/differential.md`](../docs/testing/differential.md).
 
+### Gating the execution paths, and fuzzing them
+
+Two subcommands **gate** those splits, with the interpreter as the oracle and
+no HotSpot run or ledger row involved
+([`docs/testing/jit-differential.md`](../docs/testing/jit-differential.md)):
+
+```bash
+# Every execution-path mode (+ moving-gc) must agree with nojit. CI: difftest-jit-paths.
+cratonvm-difftest path-gate --corpus difftest/seeds
+
+# Generated class files, written directly as bytecode, JIT modes vs nojit.
+cratonvm-difftest fuzz-jit --seed 1 --count 100
+cratonvm-difftest fuzz-jit --seed 1 --count 100 --extra-env CRATONVM_DBG_GC_STRESS=65536
+cratonvm-difftest fuzz-jit --dry-run --seed 1 --count 256      # generator checks only, no VM
+```
+
+Tracked splits live in `difftest/path-gate-known.json`. Failing fuzz programs
+are minimized to a runnable `.class` under `target/jitfuzz-failures/`.
+
 ### JDK-only modes
 
 `docs/feature-designs/jdk-only-mode.md` adds a second axis to the mode matrix:

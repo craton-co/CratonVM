@@ -12,8 +12,15 @@
 > to what it used to say — the first increment's reasoning is worth reading and
 > its facts are not safe to quote. The one that mattered most is in *The
 > register file*: this file's "no reference can be register-resident, because
-> there is no GP register" argument is **gone**, and the property now rests on
-> `plan_register_residency` refusing `IrType::Ref`.
+> there is no GP register" argument is **gone**. By default the property now
+> rests on `plan_register_residency` refusing `IrType::Ref`. Under the opt-in
+> `CRATONVM_JIT_IR_REF_RESIDENCY` (default off) a reference **may** hold a GP
+> register as an invalidated write-through copy.
+>
+> **Update, 2026-09-12.** *Safepoints*, *What clobbers what* and *Spill slots
+> and the oop map* have been rewritten against `jit/src/regalloc.rs` and
+> `jit/src/ir_lower.rs`, and carry no inline corrections: read those three
+> sections as current.
 >
 > What is NOT stale is this file's central claim, and it is the reason to keep
 > reading it: **write-through buys loads, not stores.** That ceiling was
@@ -250,53 +257,181 @@ file offers no GP register, so no reference could be register-resident at all.
 
 ## Safepoints
 
-The rule is unchanged from `docs/jit/linear-scan-regalloc.md`: **references stay
-in memory across every safepoint.** Here it holds three times over.
+> **Verified against the source 2026-09-12** (`jit/src/regalloc.rs`,
+> `jit/src/ir_lower.rs`). This section and the next two replace the first
+> increment's text, which named four ops in `ir_op_is_call` and said no
+> reference could ever hold a register.
 
-1. ~~**Structurally.** The file is XMM-only; references are `RegClass::Gp`. A
-   `Ref` cannot be promoted because there is no register for it.~~ **No longer
-   true, 2026-09-02**: there is a GP file. The obligation is discharged by TYPE
-   instead — `plan_register_residency` refuses `IrType::Ref` outright. The test
-   name is unchanged (`a_reference_is_never_register_resident`) and so is the
-   property; only the reason it holds moved from "no such register exists" to
-   "the planner will not put one there". Legs 2 and 3 below never depended on
-   the file being XMM-only and are untouched.
-2. **By the allocator.** `allocate_linear_scan` refuses to promote a `Ref` whose
-   range covers a safepoint, and `verify_allocation` re-checks it independently
-   (proof 5).
-3. **By write-through.** Even a promoted value's home word holds it at every
-   instruction boundary, so `emit_safepoint_map`'s frame-slot publication is
-   exactly as complete as it was before the allocator existed.
+The default rule is the one `docs/jit/linear-scan-regalloc.md` states:
+**references stay in memory across every safepoint.** It holds three times over.
+There is one opt-in exception, `CRATONVM_JIT_IR_REF_RESIDENCY` (token
+`jit/ir-ref-residency`, **default off**, since 2026-09-09), described under
+*Spill slots and the oop map* below.
 
-### The map consumer, checked
+1. **By type.** `plan_register_residency` matches each allocated register
+   against its value's type. It admits `(RegClass::Xmm, Float | Double)` into
+   `IR_LOWER_LS_XMMS` and `(RegClass::Gp, Int | Long)` into
+   `IR_LOWER_LS_GPRS`. It admits `(RegClass::Gp, Ref)` **only** when
+   `ir_ref_residency_enabled()`, and everything else counts as `skip_bank`.
+   Pinned by `a_reference_is_never_register_resident` and
+   `a_reference_is_never_promoted_into_the_gp_file`.
+2. **By the allocator.** `allocate_linear_scan` drops a candidate when
+   `live.is_ref[id] && !model.refs_may_cross_safepoints &&
+   model.range_covers_safepoint(range)`, and `verify_allocation` proof 5
+   re-checks the produced segments under the same knob.
+   `ir_lower_machine_model` sets `refs_may_cross_safepoints =
+   ir_ref_residency_enabled() && ir_ref_residency_cross_safepoint_enabled()`,
+   which is `false` by default. `MachineModel::for_graph` alone always sets it
+   `false`. Test: `refs_may_cross_safepoints_lifts_that_refusal_and_only_that_one`.
+3. **By write-through.** A reference's home store is never dropped:
+   `value_home_droppable` and `phi_home_droppable` admit only `Int` and `Long`.
+   So the word `emit_safepoint_map` names still holds the reference at every
+   safepoint, including under ref residency.
 
-`vm/src/jit/conservative_roots.rs` (read-only for this change) consumes
-`OopMapEntry::frame_slot_offsets` — *frame slot offsets*, `i16` displacements
-from RBP — plus `frame_layout`, `live_frame_hi` and `sp_id_slot_off`. **There is
-no register bank in the map, and no code path that would rewrite a register on
-an evacuation.** Publishing a reference in a register would therefore need work
-in the map format, the frame walker and the deopt frame reconstructor before it
-could even be attempted. Nothing here goes near that: the map is byte-identical
-to what the colourer-only path produces.
+### What clobbers what: `ir_op_is_call`, `ir_op_is_safepoint`, `MachineModel`
 
-### Calls the op model does not see
+Two private predicates in `jit/src/regalloc.rs` classify ops. Both are
+deliberate over-approximations of what `ir_lower` emits:
 
-Two clobber gaps were found and closed while doing this. Both would have
-destroyed a caller-saved register the allocator thought was live:
+| Op | `ir_op_is_safepoint` (collector may read the map) | `ir_op_is_call` (caller-saved registers destroyed) |
+|---|---|---|
+| `Call`, `New`, `NewArray` | yes | yes |
+| `ConstString`, `ConstClass`, `LoadStatic` | yes | yes |
+| `LambdaIntToDouble` | yes | yes |
+| `InstanceOf`, `CheckCast` | yes | yes |
+| `MonitorEnter`, `MonitorExit` | yes | yes |
+| `ArrayStore(MemKind::Ref)` | yes | yes |
+| `Guard` | yes | **no** |
+| `Rem`, `Load(_)`, `Store(_)` | **no** | yes |
 
-* **`regalloc::ir_op_is_call` was not a superset of `ir_lower`'s calls.** It
-  named `Call`, `New`, `NewArray` and `LambdaIntToDouble`. `ir_lower` also emits
-  a `CALL` that returns into the body for `Op::Rem` on `Float`/`Double`
-  (`jit_frem`/`jit_drem`), `Op::Load(_)` (`jit_getfield`) and `Op::Store(_)`
-  (`jit_putfield_int`). The predicate now names all seven, with a test.
-  `Op::Guard` is deliberately still absent: its failure edge runs the epilogue
-  and never returns into the body, and counting it would deny a register to
-  every value in a bounds-checked loop for no gain.
-* **The cooperative safepoint poll belongs to no node.** On a loop back edge
-  `lower_terminator` emits `TEST byte [flag] ; JZ ; CALL slow_path` between the
-  terminator and the edge — a position `MachineModel::for_graph` marks a
-  *safepoint* but not a *clobber*. `ir_lower_machine_model` adds it, tested by
-  `the_machine_model_clobbers_the_back_edge_poll`.
+Why the three columns disagree, per the predicates' own doc comments:
+
+* **`Guard` is a safepoint but not a call.** Its failure edge jumps to the shared
+  deopt stub, which calls `ir_deopt_entry` and then runs the epilogue. It never
+  returns into the body, so whatever it destroys is never read again. Counting
+  it as a clobber would deny a register to every value in a bounds-checked
+  loop.
+* **`Rem`, `Load`, `Store` are calls but not oop-map publication sites.**
+  `Op::Rem` on `Float`/`Double` calls `jit_frem` / `jit_drem`. `Op::Load(_)`
+  calls `jit_getfield` whenever that helper is wired, which is every real
+  compile. `Op::Store(_)` calls a putfield helper. Each is
+  `MOV RAX, helper ; CALL RAX` and returns into the body. The predicate lists
+  `Op::Rem` without a type test, so an integer remainder is also treated as a
+  clobber.
+* **Monitors and reference `ArrayStore` are both.** `ir_lower` publishes an oop
+  map before each: a contended acquire can park for a whole collection, and
+  `jit_aastore` allocates its `ArrayStoreException`. They were added to
+  `ir_op_is_call` after a float/double interval in a caller-saved XMM was found
+  not split across the helper.
+
+`MachineModel::for_graph(graph, schedule, live, regs)` turns those predicates
+into positions:
+
+* for every scheduled node and terminator that has a position: a **safepoint**
+  if `ir_op_is_safepoint`; a **clobber** of every `caller_saved` register in the
+  file if `ir_op_is_call`; `Div` / `Rem` also destroy RAX and RDX, and
+  `Shl` / `Shr` / `UShr` destroy RCX. Clobbers are filtered to registers that
+  are actually in the file.
+* for every block with a back edge (a successor `s <= b`): both the position
+  before the outgoing edge and the edge position are **safepoints**, because
+  the cooperative poll sits between them.
+* `fixed` starts empty (`pin_entry_params` fills it) and
+  `refs_may_cross_safepoints` is `false`.
+
+`ir_lower::ir_lower_machine_model` adds what an op-derived model cannot see.
+Those same two back-edge positions also become **clobbers** of the file's
+caller-saved subset, because the poll's slow path (`jit_safepoint_slow_path`) is
+an ordinary `extern "C"` call. Clobbers are merged per position through a
+`BTreeMap`, because `MachineModel::clobbered_at` binary-searches a sorted list
+with one entry per position. Test:
+`the_machine_model_clobbers_the_back_edge_poll`.
+
+Which registers that actually touches follows from the files
+(`regalloc::xmm_roles`):
+
+* **GP file** (`IR_GP_LINEAR_SCAN`): RBX and R12–R15, plus RSI/RDI on Win64.
+  Every register in it is callee-saved on its target, so no call clobbers it.
+  The Win64 widening is used only under `CRATONVM_JIT_IR_GP_WIDE` (opt-in,
+  default off); otherwise the first `IR_GP_LINEAR_SCAN_NARROW` (5) are the file
+  on every platform. The prologue saves those a plan hands out
+  (`IR_GP_PROLOGUE_SAVED`).
+* **XMM file** (`IR_LINEAR_SCAN` = XMM2–XMM7): on Win64, XMM6/XMM7 are
+  callee-saved and saved by the prologue (`IR_PROLOGUE_SAVED`); XMM2–XMM5 are
+  caller-saved. On System V all six are caller-saved and the save list is
+  empty. So in practice a call or a back-edge poll clobbers XMM2–XMM5 (Win64)
+  or XMM2–XMM7 (System V).
+
+### Spill slots and the oop map
+
+Three different "slot" notions meet here. Only the first one reaches machine
+code or the oop map.
+
+1. **Home slots from `ir_lower::plan_slots`**: the frame layout `ir_lower`
+   actually emits, and the only slots `emit_safepoint_map` names.
+   The colouring keeps two free lists and never moves a colour between its
+   reference and non-reference lists (`plan_slots`' own comments call this step
+   `assign_colors`; no function of that name exists).
+   `verify_slot_colouring` re-derives the no-aliasing property rather than
+   trusting it. Every phi, every value a
+   `graph.safepoints` snapshot names, and every scalar-replacement field value
+   is pinned (never shares a word). A `Ref` result of `Call`, `ConstString`,
+   `ConstClass` or `LoadStatic` is `fresh_only`: it may donate a colour but never
+   receive a recycled one, because the map published before that call already
+   named the word.
+2. **The allocator's own home colouring** (`ls_color_homes`, exposed as
+   `Allocation::stack_slot` / `stack_slots`). It keeps three pools,
+   `HomeClass::{Ref, Prim, Pinned}`, and `verify_allocation` proof 6 checks that
+   no word mixes pools, so a word the map names can never come to hold a
+   primitive. `ir_lower` does **not** read it; see *The deopt pins*.
+3. **Planned spill events** (`Allocation::events`, `SpillKind::{Store, Load,
+   Remat, Move}`). These are computed and not emitted. A value whose allocation
+   has more than one segment is not promoted at all.
+
+`Lowerer::emit_safepoint_map` is emitted immediately **before** the GC-capable
+call, and before the node's result slot is allocated. It:
+
+* stores the safepoint id into `[rbp - sp_id_slot_off]`;
+* collects `ref_param_homes`, the prologue's homes for reference parameters,
+  plus `node_slot` of every defined node typed `IrType::Ref`. If any such node
+  has no slot or an offset beyond `i16::MAX`, the list is cleared and coverage
+  is declared incomplete (fail closed);
+* pushes those slots onto the shadow stack (`emit_shadow_push`);
+* records an `OopMapEntry` with `frame_slot_offsets` = those slots,
+  `moving_young_coverage_complete = coverable && (published ||
+  slots.is_empty())`, `reg_oop_mask: None`, `local_oop_mask: None`,
+  `non_oop_stack_slots` = the non-`Ref` colours (`prim_slot_offsets`), and
+  `stack_marks_exact: true`.
+
+The map therefore describes **home slots only**. A register copy is invisible to
+the collector, which is safe for two reasons:
+
+* **by default**, no reference is in a register (legs 1–3 above);
+* **under `CRATONVM_JIT_IR_REF_RESIDENCY`**, the register is a write-through
+  copy of a home the map does name. `Lowerer::invalidate_ref_residency(except)`
+  clears the residency of every reference-typed register owner at each point
+  where control can leave the body and come back, so the next read reloads the
+  word the collector may have rewritten. `except` is the node the site itself
+  just defined: a call's result is produced after the collection and is fresh.
+  The doc comment on `ir_ref_residency_enabled` says why this invalidation asks
+  an allowlist (`op_cannot_deopt`) rather than `ir_op_is_safepoint`: the backend
+  also emits plain helper calls at ops that are not on the safepoint list
+  (`Op::Load` reaching `jit_getfield`, `Op::Store` reaching a putfield helper).
+  `ir_ref_residency_cross_safepoint_enabled` (default on within that flag;
+  `CRATONVM_JIT_IR_REF_RESIDENCY_CROSS_SAFEPOINT=0` turns it off) decides
+  whether such a range may cross a safepoint at all.
+
+**Contrast with the single-pass backend.** `OopMapEntry` now has a register-file
+half, `reg_oop_mask` (a bitmask over `x64::ALL_SPILL_GPRS`). The single-pass
+backend's `emit_pre_safepoint_spill` writes its register file into the frame's
+`reg_spill` region, a blind image a conservative scan can read. The IR tier sets
+`reg_oop_mask: None` and emits no such image: its references are staged in frame
+slots, so it has no register claim to make.
+
+`vm/src/jit/conservative_roots.rs` consumes `frame_slot_offsets` (`i16`
+displacements from RBP), plus `frame_layout`, `live_frame_hi` and
+`sp_id_slot_off`. No code path rewrites a register on an evacuation, which is
+why the reference exception above is built as a cache that is invalidated,
+rather than as a register the collector is told about.
 
 ---
 
@@ -351,7 +486,7 @@ the default.
 | `build_live_model`'s position count disagrees with the schedule | promote nothing |
 | `build_live_model`'s `wants_loc` disagrees with `plan_slots`' coloured set | promote nothing |
 | A value's allocation has more than one segment (a split / spill / reload) | that value is not promoted |
-| A value is not `Float`/`Double`, has no home colour, or is a phi | that value is not promoted — **as written**; the bank now also takes `Int`/`Long`, and phis are admitted separately by `ir_phi_residency_enabled`. `IrType::Ref` is the one type still refused outright |
+| A value is not `Float`/`Double`, has no home colour, or is a phi | that value is not promoted — **as written**; the bank now also takes `Int`/`Long`, and phis are admitted separately by `ir_phi_residency_enabled`. `IrType::Ref` is refused (`skip_bank`) unless `CRATONVM_JIT_IR_REF_RESIDENCY` is on (default off) |
 | Two values share a register but `plan_slots` says their ranges overlap | **both** lose the register, counted as `demoted` |
 | A clobber falls inside a value's `plan_slots` range | that value loses the register, counted as `demoted` |
 
@@ -452,6 +587,11 @@ first increment; each item carries where it stands as of **2026-09-10**.
    by `plan_register_residency`, so there is no per-safepoint publish plan and
    `OopMapEntry` is unchanged. Reference promotion is still not done and still
    needs the register bank item 3 names.
+
+   **Since 2026-09-09, opt-in:** `CRATONVM_JIT_IR_REF_RESIDENCY` (default off)
+   admits a reference into the GP file without a register bank. The home is
+   still written, and `invalidate_ref_residency` drops the copy wherever a
+   collector could have run. See *Spill slots and the oop map*.
 3. **Stores are not eliminated.** Write-through is what makes the safepoint,
    deopt and phi arguments hold without touching those paths. Dropping the home
    store means teaching `emit_safepoint_map`, `build_deopt_points` and
@@ -503,5 +643,13 @@ first increment; each item carries where it stands as of **2026-09-10**.
   converted FP emission sites, the `lower_inner_with_scopes` call site.
 * `jit/src/regalloc.rs` — `ir_op_is_call` widened to the helper-backed ops,
   `LiveModel::release_deopt_pins`, doc on `MachineModel::for_graph`'s limits.
+  Also, as of 2026-09-12: `ir_op_is_safepoint`,
+  `MachineModel::refs_may_cross_safepoints`, `HomeClass` / `ls_color_homes`,
+  `SpillKind`, and `xmm_roles` (`IR_LINEAR_SCAN`, `IR_PROLOGUE_SAVED`,
+  `IR_GP_LINEAR_SCAN`, `IR_GP_LINEAR_SCAN_NARROW`, `IR_GP_PROLOGUE_SAVED`).
+* `jit/src/ir_lower.rs`, also: `emit_safepoint_map`, `plan_slots` /
+  `verify_slot_colouring`, `value_home_droppable` / `phi_home_droppable`,
+  `invalidate_ref_residency`, `ir_ref_residency_enabled` /
+  `ir_ref_residency_cross_safepoint_enabled`.
 * `jit/src/metrics.rs` — documentation only; `note_current_spills` /
   `note_current_reloads` already existed and now have a caller.

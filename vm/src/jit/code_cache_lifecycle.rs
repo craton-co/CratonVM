@@ -164,44 +164,44 @@
 //!
 //! Every recording entry point here is **per compilation or per retirement**,
 //! not per call, so all of them are ungated (the same reasoning
-//! `gc_metrics.rs` applies to its collector-side counters). The single hot-path
-//! touch is [`pending_retirements`], one relaxed load of a process-global
-//! `AtomicUsize`, called from `pop_jit_entry` / `prune_returned_jit_entries`
-//! before anything else runs. With nothing queued — the overwhelmingly common
-//! case — that is the entire cost.
+//! `gc_metrics.rs` applies to its collector-side counters). The only boundary
+//! touch here is [`pending_retirements`], one relaxed load of the JIT retirement
+//! queue's gauge, called from `prune_returned_jit_entries`; the per-exit wake-up
+//! lives in `cratonvm_jit::jit_execution_leave`, which makes the same one-load
+//! check first. With nothing queued — the overwhelmingly common case — that is
+//! the entire cost.
 //!
-//! # 5. Reconciliation with what already exists
+//! # 5. The process report reads the real queue
 //!
-//! `jit/src/lib.rs` already carries a partial version of this: `defer_jit_owner`
-//! queues a superseded `Arc<CompiledMethod>` when `ACTIVE_JIT_EXECUTIONS`
-//! (another striped counter, fed from the *same* `push_entry_full` /
-//! `pop_jit_entry` boundary) is non-zero, and
-//! `drain_deferred_jit_owners_if_quiescent` drops the queue when it reads zero.
-//! What this module adds:
+//! The retirement queue that actually holds executable memory is
+//! `cratonvm_jit`'s: `defer_jit_owner` queues every withdrawn owner, stamped
+//! with a retirement generation, and its drain releases a body either when the
+//! process-wide in-JIT count reads zero or on per-thread evidence — every
+//! running JIT thread has returned to depth 0 since the body's stamp, and no
+//! thread blocked inside compiled code has a stack word pointing into it
+//! (`docs/jit/code-cache-lifetime.md`, "Reclaiming while a thread is parked in
+//! compiled code"). The drain takes the queue lock before any observation,
+//! which is §1.2's ordering, and retention stays the counted fail-safe.
 //!
-//! 1. **Ordering.** ~~`drain_deferred_jit_owners_if_quiescent` performs the
-//!    `is_zero()` walk *before* taking the queue lock~~ — fixed on `dev`; it
-//!    now walks with the queue lock held, as [`CodeCacheLifecycle::sweep`]
-//!    does. See §1.2. What that path still lacks is this module's measurement
-//!    and its named fail-safe, below.
-//! 2. **Measurement.** The existing path reclaims silently. Nothing counts
-//!    installed or reclaimed bytes, sweeps, deferrals, failed allocations or
-//!    recompilations, so "the code cache is growing" cannot be distinguished
-//!    from "the code cache cannot reclaim".
-//! 3. **A named fail-safe.** A retention that cannot be proven safe is a
-//!    first-class, counted outcome rather than an early `return`.
+//! This module used to keep a second, parallel queue whose install and retire
+//! counters no production path fed: `record_install` and `record_retirement`
+//! had no callers, so the report and the JIT-leave gate always read zero while
+//! the real queue grew. The process-level functions are now views of the real
+//! one:
 //!
-//! The two are not yet joined: `jit/src/lib.rs` is outside this change's file
-//! ownership, so the install/retire call sites there still have to be routed
-//! into this module. `docs/jit/code-cache-lifecycle.md` lists them with the
-//! exact edit each one needs.
+//! * [`pending_retirements`] is its queued-owner gauge;
+//! * [`sweep_if_quiescent`] runs its drain;
+//! * [`code_cache_lifecycle_raw`] takes installs, withdrawals, queued and
+//!   reclaimed bytes and drain counts from
+//!   `cratonvm_jit::jit_code_reclamation_stats`.
 //!
-//! This list named `vm/src/runtime/jit_integration.rs` as a second such place
-//! until 2026-09-02. It had no call sites to route: that module was a PARALLEL,
-//! never-referenced model of this whole layer -- its own counters, code cache,
-//! OSR manager, deopt manager and inline caches -- dead since the initial
-//! commit, and it has been deleted. The real install and retire sites are the
-//! ones in `jit/src/lib.rs`, and they are the whole list.
+//! [`CodeCacheLifecycle`] itself remains as the executable model of the
+//! protocol — its tests pin the accounting identities, the W^X steps and the
+//! lock ordering against a simulated quiescence signal — but no production path
+//! installs into or retires through an instance of it.
+//!
+//! (`vm/src/runtime/jit_integration.rs`, a never-referenced parallel model of
+//! this whole layer, was deleted on 2026-09-02.)
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -804,8 +804,9 @@ impl std::fmt::Display for SweepOutcome {
 
 /// A code cache's lifecycle accounting and its retirement queue.
 ///
-/// There is one process instance ([`process_lifecycle`]); tests construct their
-/// own so they neither observe nor disturb it. An instance built with
+/// The process-level functions ([`pending_retirements`], [`sweep_if_quiescent`],
+/// [`code_cache_lifecycle_raw`]) report the real JIT retirement queue, not an
+/// instance of this model; tests construct their own. An instance built with
 /// [`CodeCacheLifecycle::new`] reads the real quiescence signal
 /// (`GLOBAL_JIT_DEPTH`); one built with
 /// [`CodeCacheLifecycle::with_simulated_quiescence`] reads a depth the test
@@ -1471,11 +1472,11 @@ impl std::fmt::Display for CodeCacheLifecycleReport {
 // The process instance
 // ---------------------------------------------------------------------------
 
-/// The process-wide code-cache lifecycle.
-///
-/// A plain `static` rather than a `OnceLock`, deliberately: [`pending_retirements`]
-/// is read on the JIT-leave path and must be one relaxed load with no lazy-init
-/// branch. `CodeCacheLifecycle::new` is `const` for exactly this reason.
+/// The process instance of the model, kept for the gauges the JIT's real
+/// accounting does not carry: failed allocations, configured capacity and the
+/// arena's free-space shape (`record_allocation_failure` and friends). Its queue
+/// is never used — installs, withdrawals and reclamation are read from
+/// `cratonvm_jit` by [`code_cache_lifecycle_raw`].
 ///
 /// Unlike `gc_metrics.rs`, this is **not** made thread-local under `cfg(test)`.
 /// A per-thread process instance would make the concurrency test unable to
@@ -1504,46 +1505,35 @@ impl std::fmt::Display for CodeCacheLifecycleReport {
 ///    census reading.
 static PROCESS_LIFECYCLE: CodeCacheLifecycle = CodeCacheLifecycle::new();
 
-/// The process-wide code-cache lifecycle.
-pub fn process_lifecycle() -> &'static CodeCacheLifecycle {
-    &PROCESS_LIFECYCLE
-}
-
-/// Bodies awaiting reclamation process-wide.
+/// Owners waiting in the JIT retirement queue — the real queue in
+/// `cratonvm_jit`, not an instance of this module's model. One relaxed load.
 ///
-/// **The hot-path gate.** `pop_jit_entry` / `prune_returned_jit_entries` test
-/// this before doing anything else; with nothing queued (the overwhelmingly
-/// common case) one relaxed load is the entire cost of the retirement
-/// machinery on the interpreter/JIT boundary.
+/// The gate `prune_returned_jit_entries` tests before asking for a drain.
 #[inline]
 pub fn pending_retirements() -> usize {
-    PROCESS_LIFECYCLE.pending.load(Ordering::Relaxed)
+    cratonvm_jit::jit_retirement_queue_len()
 }
 
-/// Run a process-wide sweep. Reclaims only if quiescence holds; otherwise
-/// retains everything and counts the deferral.
+/// Ask the JIT retirement queue to release every retired body no thread can
+/// still execute or return into.
 ///
-/// Called from the JIT-leave path, which is the moment the in-JIT depth can
-/// have reached zero.
+/// `quiescent` reports that nothing is left queued. `reclaimed_*` are the
+/// process-wide deltas across the call, so a drain another thread ran
+/// concurrently is included; `sequence` is the queue's drain count.
 pub fn sweep_if_quiescent() -> SweepOutcome {
-    PROCESS_LIFECYCLE.sweep()
-}
-
-/// Record an installation in the process cache. See
-/// [`CodeCacheLifecycle::install`].
-pub fn record_install(method: MethodId, extent: BodyExtent) -> Installed {
-    PROCESS_LIFECYCLE.install(method, extent)
-}
-
-/// Enqueue an already-unpublished body in the process cache. See
-/// [`CodeCacheLifecycle::retire`] for the caller's precondition.
-pub fn record_retirement(
-    method: MethodId,
-    extent: BodyExtent,
-    reason: usize,
-    owner: Option<Box<dyn Send>>,
-) -> u64 {
-    PROCESS_LIFECYCLE.retire(method, extent, reason, owner)
+    let before = cratonvm_jit::jit_code_reclamation_stats();
+    let after = cratonvm_jit::reclaim_retired_jit_code();
+    SweepOutcome {
+        sequence: after.drains,
+        quiescent: after.queued_owners == 0,
+        reclaimed_bodies: after
+            .reclaimed_bodies
+            .saturating_sub(before.reclaimed_bodies),
+        reclaimed_bytes: after.reclaimed_bytes.saturating_sub(before.reclaimed_bytes),
+        deferred_bodies: after.queued_owners,
+        deferred_bytes: after.queued_bytes,
+        oldest_deferral_sweeps: 0,
+    }
 }
 
 /// Record a refused code-cache allocation in the process cache.
@@ -1562,16 +1552,41 @@ pub fn record_free_space(free: FreeSpace) {
 }
 
 /// Snapshot the process code cache's raw counters.
+///
+/// Installs, withdrawals, queued and reclaimed bodies and bytes, and drain
+/// counts come from the JIT's real accounting
+/// (`cratonvm_jit::jit_code_reclamation_stats`), as does the configured cap.
+/// The failed-allocation and free-space gauges, which the JIT does not keep,
+/// still come from the process instance's `record_*` gauges.
 pub fn code_cache_lifecycle_raw() -> CodeCacheLifecycleRaw {
-    PROCESS_LIFECYCLE.raw()
+    let mut raw = PROCESS_LIFECYCLE.raw();
+    let jit = cratonvm_jit::jit_code_reclamation_stats();
+    raw.installs = jit.installed_bodies;
+    raw.installed_bytes = jit.installed_bytes;
+    raw.installed_code_bytes = jit.installed_code_bytes;
+    raw.retirements = jit.withdrawn_bodies;
+    raw.retired_bytes = jit.withdrawn_bytes;
+    raw.reclaimed_bodies = jit.reclaimed_bodies;
+    raw.reclaimed_bytes = jit.reclaimed_bytes;
+    raw.reclaimed_code_bytes = jit.reclaimed_code_bytes;
+    raw.sweeps = jit.drains;
+    raw.sweeps_deferred = jit.drains_deferred;
+    raw.deferred_bodies = jit.queued_owners;
+    raw.deferred_bytes = jit.queued_bytes;
+    let cap = cratonvm_jit::jit_code_cache_cap_bytes();
+    if cap != usize::MAX {
+        raw.capacity_bytes = cap as u64;
+    }
+    raw
 }
 
-/// The process code cache's lifecycle report.
+/// The process code cache's lifecycle report, derived from
+/// [`code_cache_lifecycle_raw`].
 ///
 /// Cheap (a few dozen relaxed loads and some float division); safe to call
 /// outside a pause.
 pub fn code_cache_lifecycle_report() -> CodeCacheLifecycleReport {
-    PROCESS_LIFECYCLE.report()
+    CodeCacheLifecycleReport::from_raw(code_cache_lifecycle_raw())
 }
 
 // ---------------------------------------------------------------------------
@@ -2352,23 +2367,45 @@ mod tests {
         assert_eq!(lc.report().live_bytes, 0);
     }
 
-    /// The process shim is wired to the same machinery, and its identity holds
-    /// even though other tests share it. Deltas and identities only — see the
-    /// `PROCESS_LIFECYCLE` doc comment.
+    /// The process report reads the JIT's real accounting: publishing a body is
+    /// an install, flushing it is a withdrawal, and the report's identities hold.
+    /// This used to drive a model queue nothing in production fed, so the
+    /// report it checked always read zero. Deltas and identities only — other
+    /// tests share the process counters.
     #[test]
-    fn the_process_shim_maintains_the_installed_minus_reclaimed_identity() {
+    fn the_process_report_reads_the_real_jit_accounting() {
         let before = code_cache_lifecycle_raw();
-        let m = method_id("shim/Probe", "run", "()V");
-        record_install(m, extent(128, 2_048));
-        let after = code_cache_lifecycle_raw();
-        assert!(after.installs >= before.installs + 1);
-        assert!(after.installed_bytes >= before.installed_bytes + 2_048);
 
-        record_retirement(m, extent(128, 2_048), retire_reason::SHUTDOWN, None);
-        // Drain: the JIT-leave hook may also have swept it already, which is
-        // the point of the shared instance and is why nothing here asserts an
-        // absolute queue length.
-        while pending_retirements() != 0 && sweep_if_quiescent().quiescent {}
+        let cache = cratonvm_jit::JitCache::new();
+        let mut buf = cratonvm_jit::ExecutableBuffer::new(64).expect("alloc executable");
+        buf.emit(&[0xC3]);
+        cache.put(
+            "lifecycle/Probe".into(),
+            "run".into(),
+            "()V".into(),
+            cratonvm_types::ClassId::new(7),
+            cratonvm_jit::CompiledMethod::new(buf),
+        );
+        let installed = code_cache_lifecycle_raw();
+        assert!(
+            installed.installs >= before.installs + 1,
+            "a publication must count as an install"
+        );
+        assert!(installed.installed_bytes >= before.installed_bytes + 64);
+
+        assert_eq!(cache.clear_all(), 1);
+        let withdrawn = code_cache_lifecycle_raw();
+        assert!(
+            withdrawn.retirements >= before.retirements + 1,
+            "a flushed body must count as a withdrawal"
+        );
+
+        let swept = sweep_if_quiescent();
+        assert_eq!(
+            swept.quiescent,
+            swept.deferred_bodies == 0,
+            "the sweep reports the real queue it drained"
+        );
 
         let r = code_cache_lifecycle_report();
         assert_eq!(
@@ -2379,11 +2416,6 @@ mod tests {
         assert_eq!(
             r.live_bodies,
             r.raw.installs.saturating_sub(r.raw.reclaimed_bodies),
-        );
-        assert_eq!(
-            pending_retirements(),
-            process_lifecycle().queued_bodies(),
-            "the hot-path gate and the queue it guards must be the same number",
         );
     }
 }

@@ -104,8 +104,9 @@ go through `LoopXform::bci_at`:
 * `deopt_box_ptr_by_bci`, `exc_frame_box_ptr_by_bci`, `osr_exit_box_ptr_by_bci`
   — `FxHashMap` keyed by bci.
 * The deopt frame snapshot's `bci: bci as u32` fields.
-* `deopt_eager_bci`, `osr_exit_test_trigger_bci`, and the `despec_contains`
-  consult on `LoopHoist::loop_header` — all bci-valued.
+* `deopt_eager_bci`, `osr_exit_test_trigger_bci`, and the
+  `DespecRegistry::contains` consult on `LoopHoist::loop_header` — all
+  bci-valued.
 * `pc_to_native` and `osr_entry_native` are **indexed** by bci and published as
   `CompiledMethod::osr_pc_to_native`, which the runtime indexes with an
   interpreter bci. These cannot merely be translated on read: they must be

@@ -268,6 +268,7 @@ pub fn compile(
         // empty for tests/AOT → legacy/helper field path.
         PENDING_COMPACT_FIELD_INFO.with(|c| std::mem::take(&mut *c.borrow_mut())),
         "",         // method_key: legacy/test wrapper disables the per-bci de-spec consult
+        None,       // despec: no VM, so no per-VM de-spec registry to consult
         Vec::new(), // indy_info: legacy/test wrapper passes no invokedynamic sites
         // elidable_init_pcs: no constant pool here, so nothing is PROVEN empty
         // and nothing may be elided. See the parameter's doc.
@@ -395,7 +396,7 @@ pub(super) fn spliced_bytecode_len(site: &crate::InlineSite) -> usize {
 pub(super) fn inline_reserve_path_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_RESERVE_PATH").is_none()
+        !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_INLINE_RESERVE_PATH")
     })
 }
 
@@ -558,11 +559,17 @@ pub fn compile_with_param_slots(
     compact_field_info: Vec<(usize, u32, bool)>,
     // deopt-osr Step 9 follow-up (c) — this method's
     // `"<class>.<method>:<descriptor>"` key, used to consult the per-bci de-spec
-    // registry (`crate::deopt::despec_contains`) and suppress a loop-header
-    // speculative-BCE guard that has repeatedly deopted. `""` (the legacy/test
-    // `compile()` wrapper) disables the consult; the registry is empty in
-    // production, so a non-empty key is still byte-identical there.
+    // registry (`despec` below) and suppress a loop-header speculative-BCE
+    // guard that has repeatedly deopted. `""` (the legacy/test `compile()`
+    // wrapper) disables the consult; an empty registry leaves codegen
+    // byte-identical.
     method_key: &str,
+    // The compiling VM's per-bci de-spec registry
+    // (`crate::deopt::DespecRegistry`, owned by the VM's `JitRealm`). Per VM,
+    // not per process: one VM's despeculation verdicts must not strip
+    // speculations from another VM's compiles. `None` (no VM in scope: the
+    // legacy `compile()` wrapper and crate fixtures) consults nothing.
+    despec: Option<&std::sync::Arc<crate::deopt::DespecRegistry>>,
     // Resolved `invokedynamic` (0xba) call-site info — see the `indy_info`
     // field doc on the `Compiler` struct. Empty from the legacy `compile()`
     // test wrapper (which also passes no `indy_ops` to `jit_scan` callers, so
@@ -734,7 +741,7 @@ pub fn compile_with_param_slots(
     ) {
         Ok(x) => {
             crate::metrics::record_loop_xform_event("loop_xform_applied");
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some() {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_GEN") {
                 eprintln!(
                     "[JIT_GEN] bytecode loop rewrite: kind={:?} versioned={} header={} \
                      body_len={} copies={} code_len {}->{} poll_free={}",
@@ -752,7 +759,7 @@ pub fn compile_with_param_slots(
         }
         Err(refusal) => {
             if !matches!(refusal, LoopRewriteRefusal::NotArmed)
-                && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
+                && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_GEN")
             {
                 eprintln!("[JIT_GEN] bytecode loop rewrite refused: {refusal:?}");
             }
@@ -779,7 +786,7 @@ pub fn compile_with_param_slots(
         Some(x) => x.exception_ranges.clone(),
         None => exception_ranges,
     };
-    // The per-bci de-spec registry (`crate::deopt::despec_contains`) is keyed
+    // The per-bci de-spec registry (`crate::deopt::DespecRegistry`) is keyed
     // by INTERPRETER bci, but every loop header below is an output pc. Consult
     // it through the provenance map. Identity when unarmed.
     let despec_bci = |pc: usize| -> u32 {
@@ -1068,7 +1075,7 @@ pub fn compile_with_param_slots(
     // where the second coefficient prevented an overflow from a run where the
     // predicate never matched anything. Cheap — the env read is behind the
     // shape test, so an ordinary method never performs it.
-    if table_init_shaped && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+    if table_init_shaped && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
         eprintln!(
             "[cratonvm-jitc] code-buffer estimate: table-init shape \
              method={} code_len={} invokes={} bytes_per_bytecode={}",
@@ -1196,12 +1203,11 @@ pub fn compile_with_param_slots(
     // `AttributesImpl.ensureCapacity` witness.
     let bypassable_headers =
         find_bypassable_loop_headers(code, code_len, &loops, &exception_ranges);
-    let hoist_info =
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_AALOAD_LICM").is_some() {
-            Vec::new()
-        } else {
-            find_loop_hoists(code, code_len, &loops)
-        };
+    let hoist_info = if cratonvm_types::flags::runtime_flag_on("CRATONVM_DISABLE_AALOAD_LICM") {
+        Vec::new()
+    } else {
+        find_loop_hoists(code, code_len, &loops)
+    };
     // Per-bci de-spec (same registry the speculative-BCE guards use): the
     // hoisted aaload's null+bounds preheader guard deopts at the loop-header
     // bci; once a header crosses the de-spec threshold, drop its hoists so
@@ -1211,8 +1217,9 @@ pub fn compile_with_param_slots(
     let hoist_info: Vec<LoopHoist> = hoist_info
         .into_iter()
         .filter(|h| {
-            let despec = crate::deopt::despec_contains(method_key, despec_bci(h.loop_header));
-            if despec && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+            let despec = despec
+                .is_some_and(|registry| registry.contains(method_key, despec_bci(h.loop_header)));
+            if despec && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
                 eprintln!(
                     "[cratonvm-deopt] de-spec: dropping aaload LICM hoist at loop_header \
                      bci={} for {} (recompile with in-loop checked access)",
@@ -1232,15 +1239,12 @@ pub fn compile_with_param_slots(
     // hoist changes the emitted body of essentially every loop over an array
     // in the VM, so it needs one, and the bisect it serves must reach the
     // level the change is at (the emission, not the analysis).
-    let array_len_hoist_info = if cratonvm_types::flags::runtime_var_os(
-        "CRATONVM_DISABLE_ARRAYLEN_LICM",
-    )
-    .is_some()
-    {
-        Vec::new()
-    } else {
-        find_array_len_hoists(code, code_len, &loops)
-    };
+    let array_len_hoist_info =
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DISABLE_ARRAYLEN_LICM") {
+            Vec::new()
+        } else {
+            find_array_len_hoists(code, code_len, &loops)
+        };
     // One filter, not the aaload hoist's two. There is no per-bci de-spec to
     // apply because this pre-header speculates on nothing: it throws the NPE
     // the body would have thrown rather than deopting, so there is no failed
@@ -1258,7 +1262,7 @@ pub fn compile_with_param_slots(
         .filter(|h| !bypassable_headers.contains(&h.loop_header))
         .collect();
     if !array_len_hoist_info.is_empty()
-        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
+        && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_GEN")
     {
         eprintln!(
             "[JIT_GEN] arraylength-LICM hoists={} sites={:?}",
@@ -1274,7 +1278,7 @@ pub fn compile_with_param_slots(
     // loop pre-header. These are pure, non-faulting ALU expressions on
     // loop-invariant locals/constants — see `find_arith_loop_hoists`.
     let arith_hoist_info =
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_ARITH_LICM").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DISABLE_ARITH_LICM") {
             Vec::new()
         } else {
             find_arith_loop_hoists(code, code_len, &loops)
@@ -1284,7 +1288,7 @@ pub fn compile_with_param_slots(
         .filter(|h| !bypassable_headers.contains(&h.loop_header))
         .collect();
     if !arith_hoist_info.is_empty()
-        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
+        && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_GEN")
     {
         eprintln!(
             "[JIT_GEN] arith-LICM hoists={} runs={:?}",
@@ -1294,30 +1298,6 @@ pub fn compile_with_param_slots(
                 .map(|h| (h.seq_start, h.seq_end, h.steps.len()))
                 .collect::<Vec<_>>(),
         );
-    }
-
-    // Round-8 wave-3 HIGH fix (Fix 3): generic LICM scaffold for
-    // getfield/getstatic loads. The analysis is invoked here so the
-    // pipeline links against the new `loop_analysis` module and
-    // pattern surfaces during compilation; the result is currently
-    // discarded because hoisting itself requires safepoint /
-    // oop-map / regalloc participation that is intentionally
-    // deferred to a later round (see `loop_analysis.rs` module doc).
-    //
-    // TODO(round-12+): wire the returned `InvariantLoad` records
-    // into the emitter as a pre-header hoist consumer alongside the
-    // existing `LoopHoist` (aaload) and `FpLoopHoist` (dload)
-    // mechanisms.
-    {
-        let licm_loops = crate::loop_analysis::detect_loops(code, code_len);
-        let mut total = 0usize;
-        for li in &licm_loops {
-            let v = crate::loop_analysis::find_invariant_loads(li, code);
-            total += v.len();
-        }
-        // Suppress dead_code warnings on the analysis output without
-        // changing emission behavior.
-        let _ = total;
     }
 
     // T5.2.1 — SCEV induction variable analysis.
@@ -1350,7 +1330,7 @@ pub fn compile_with_param_slots(
     // (and SIMD, which also elides per-element checks) so every array access is
     // bounds-checked — to test whether an elided check causes the out-of-bounds
     // array-store heap corruption.
-    let no_bce = cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_BCE").is_some();
+    let no_bce = cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_BCE");
     let (bounds_safe_pcs, speculative_bce_guards) = if no_bce {
         (FxHashSet::default(), Vec::new())
     } else {
@@ -1388,7 +1368,7 @@ pub fn compile_with_param_slots(
         Vec::new()
     };
     if !matrix_dot_loops.is_empty()
-        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
+        && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_GEN")
     {
         eprintln!(
             "[JIT_GEN] matrix-dot headers={:?}",
@@ -1415,21 +1395,14 @@ pub fn compile_with_param_slots(
         Vec::new()
     };
 
-    // SIMD FP: detect vectorizable double-array-sum loops (requires AVX2)
-    let simd_fp_loops = if has_avx2() {
-        let mut simd = Vec::new();
-        for &(header, back_edge) in &loops {
-            let back_edge_end = back_edge + bytecode_len_at(code, back_edge);
-            if let Some(iv) = find_induction_variable(code, header, back_edge_end) {
-                if let Some(info) = detect_fp_array_sum(code, header, back_edge, iv) {
-                    simd.push(info);
-                }
-            }
-        }
-        simd
-    } else {
-        Vec::new()
-    };
+    // No vectorised floating-point reduction. There used to be one for
+    // `s += a[i]` over a `double[]`: four lane accumulators seeded with +0.0
+    // and combined as (l0+l2)+(l1+l3). Java FP addition is strict IEEE and not
+    // associative, so that reordering changed results ({1e16, 1, -1e16, 1}
+    // summed to 2.0 instead of 1.0) and turned an all -0.0 sum into +0.0.
+    // `vector_gate::admit_vectorization` refuses reductions under
+    // `FpRelaxation::Strict` for exactly this reason; the retired detector
+    // never consulted it. A future FP reduction goes through that gate.
 
     // T5.2.15 — Int-array element-wise SIMD detection.
     //
@@ -1458,7 +1431,7 @@ pub fn compile_with_param_slots(
         set_stride: bulk_set_byte_stride_loops,
         sieve: byte_sieve_loops,
     } = detect_bulk_byte_loops(code, code_len, &loops, &bypassable_headers);
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_GEN")
         && !(bulk_zero_byte_fill_loops.is_empty()
             && bulk_set_byte_stride_loops.is_empty()
             && byte_sieve_loops.is_empty())
@@ -1559,9 +1532,7 @@ pub fn compile_with_param_slots(
                 })
                 .collect()
         };
-    if !unroll_loops.is_empty()
-        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
-    {
+    if !unroll_loops.is_empty() && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_GEN") {
         eprintln!("[JIT_GEN] unroll admitted={unroll_loops:?}");
     }
 
@@ -1716,9 +1687,7 @@ pub fn compile_with_param_slots(
         }
         analyze_escapes(code, code_len, &invokespecial_shapes)
     };
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some()
-        && !new_info.is_empty()
-    {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SCALAR_DEOPT") && !new_info.is_empty() {
         eprintln!(
             "[DBG_SCALAR_DEOPT] x64::compile escape re-analysis: new_info={} non_escaping_new={:?} invoke_info={}",
             new_info.len(),
@@ -1732,7 +1701,7 @@ pub fn compile_with_param_slots(
     let scalar_base = max_locals + (if needs_heap { 1 } else { 0 }) + num_hoists;
     let empty_non_escaping = std::collections::HashSet::new();
     let non_escaping_for_sr = if precise_exception_frames
-        || cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_SCALAR_REPLACEMENT").is_some()
+        || cratonvm_types::flags::runtime_flag_on("CRATONVM_DISABLE_SCALAR_REPLACEMENT")
     {
         &empty_non_escaping
     } else {
@@ -1748,12 +1717,12 @@ pub fn compile_with_param_slots(
     );
     let num_scalar_slots = sr_plan.total_slots;
     let force_inline_new =
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ENABLE_INLINE_NEW").is_some();
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_ENABLE_INLINE_NEW");
     let cache_jit_thread_for_inline_new = needs_heap
         && helpers.get_current_thread != 0
         && helpers.tlab_post_init != 0
         && helpers.new_object != 0
-        && cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_DISABLE_INLINE_NEW").is_none()
+        && !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_DISABLE_INLINE_NEW")
         && new_info
             .iter()
             .any(|(_, _, num_fields, has_prim_init, has_finalizer)| {
@@ -1906,6 +1875,7 @@ pub fn compile_with_param_slots(
     compiler.param_jvm_slots = param_jvm_slots.to_vec();
     compiler.param_slot_span = param_slot_span;
     compiler.method_key = method_key.to_string();
+    compiler.despec = despec.cloned();
     // Coordinate change, emitter half: the three sites that BAKE a bci as an
     // immediate into machine code consult this. It must be installed before
     // `compile_bytecode` runs — those stubs are emitted at the end of that
@@ -1924,19 +1894,21 @@ pub fn compile_with_param_slots(
     // so those accesses get their per-element checks back — a dropped guard
     // with the elisions left in place would be an UNGUARDED speculative elide
     // (silent out-of-bounds access on exactly the input that kept deopting).
-    // Inert in production / on the `compile()` wrapper: `despec_contains`
-    // returns `false` for an empty key or empty registry, so both sets are
-    // unchanged ⇒ byte-identical codegen.
+    // Inert on the `compile()` wrapper and with nothing de-spec'd:
+    // `DespecRegistry::contains` returns `false` for an empty key or empty
+    // registry, and `None` consults nothing, so both sets are unchanged ⇒
+    // byte-identical codegen.
     let mut bounds_safe_pcs = bounds_safe_pcs;
     let speculative_bce_guards: Vec<SpeculativeBCEGuard> = speculative_bce_guards
         .into_iter()
         .filter(|g| {
-            let despec = crate::deopt::despec_contains(method_key, despec_bci(g.loop_header));
+            let despec = despec
+                .is_some_and(|registry| registry.contains(method_key, despec_bci(g.loop_header)));
             if despec {
                 for covered_pc in &g.covered_pcs {
                     bounds_safe_pcs.remove(covered_pc);
                 }
-                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+                if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
                     eprintln!(
                         "[cratonvm-deopt] de-spec: suppressing speculative-BCE guard at \
                          loop_header bci={} for {} (recompile without it; per-element \
@@ -1998,10 +1970,6 @@ pub fn compile_with_param_slots(
         .into_iter()
         .filter(|s| simd_covered(s.header_pc, s.array_local, s.bound_local, s.iv_local))
         .collect();
-    let simd_fp_loops: Vec<SimdFpArraySum> = simd_fp_loops
-        .into_iter()
-        .filter(|s| simd_covered(s.header_pc, s.array_local, s.bound_local, s.iv_local))
-        .collect();
     let simd_element_wise_loops: Vec<SimdArrayElementWise> = simd_element_wise_loops
         .into_iter()
         .filter(|e| {
@@ -2013,10 +1981,6 @@ pub fn compile_with_param_slots(
     // A SIMD batch pre-header is emitted under the same placement contract as
     // the LICM hoists, so a bypassable header must not carry one either.
     let simd_loops: Vec<SimdIntArraySum> = simd_loops
-        .into_iter()
-        .filter(|s| !bypassable_headers.contains(&s.header_pc))
-        .collect();
-    let simd_fp_loops: Vec<SimdFpArraySum> = simd_fp_loops
         .into_iter()
         .filter(|s| !bypassable_headers.contains(&s.header_pc))
         .collect();
@@ -2087,7 +2051,7 @@ pub fn compile_with_param_slots(
     } else {
         None
     };
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some()
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SCALAR_DEOPT")
         && !compiler.scalar_replaced.is_empty()
     {
         let mut keys: Vec<usize> = compiler.sr_local_prov_at.keys().copied().collect();
@@ -2100,7 +2064,7 @@ pub fn compile_with_param_slots(
             compiler.has_elided_monitor,
         );
     }
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_GEN") {
         eprintln!(
             "[JIT_GEN_INSTALL] mic_slots count={} pcs={:?}",
             mic_slots.len(),
@@ -2119,7 +2083,7 @@ pub fn compile_with_param_slots(
     // so the CMP cascade falls straight through to the helper on
     // first invocation; once the runtime helper populates a slot,
     // subsequent dispatches take the inline fast path.
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_GEN") {
         eprintln!(
             "[JIT_GEN_INSTALL] pic_slots count={} pcs={:?}",
             pic_slots.len(),
@@ -2146,7 +2110,6 @@ pub fn compile_with_param_slots(
     compiler.ldc_fp_pcs = ldc_fp_pcs;
     compiler.fp_hoist_info = fp_hoist_info;
     compiler.fp_strength_reduction_pcs = fp_strength_reduction_pcs;
-    compiler.simd_fp_loops = simd_fp_loops;
     // Phase B (real-frame-deopt x64 backport): build the per-field type map for
     // scalar-replaced objects by joining the per-access-site `field_info`
     // (`(pc, field_index, type_tag)`) with the plan's `field_ops` (`pc → new_pc`).
@@ -2227,8 +2190,6 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
     if !compiler.byte_sieve_loops.is_empty() || !compiler.bulk_set_byte_stride_loops.is_empty() {
         compiler.kernel_operand_cache = false;
     }
-    // T5.2.17 — loop unswitching candidates.
-    compiler.loop_unswitch_candidates = detect_loop_unswitch_candidates(code, code_len, &loops);
 
     // MED-4 / Fix 3 — pre-build pc-indexed lookup maps for the hot
     // codegen sites (getfield/putfield/invoke*/new/anewarray/ldc/…)
@@ -2336,7 +2297,7 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
             compiler.dbg_last_op,
         ));
         crate::note_jit_bail_site_at(site, pc, op);
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
             eprintln!("[cratonvm-jitc] codegen-bail site={site} pc={pc} op=0x{op:02x}");
         }
         return None;
@@ -2376,7 +2337,7 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
             target,
             target_op,
         );
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
             eprintln!(
                 "[cratonvm-jitc] branch-target-unresolved target={target} op=0x{target_op:02x} \
                  nearest_emitted_at_or_below={nearest} code_len={code_len}"
@@ -2525,7 +2486,7 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
             orig_code_len,
         ) {
             crate::metrics::record_loop_xform_event("loop_xform_deopt_bci_unpublishable");
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some() {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_GEN") {
                 eprintln!("[JIT_GEN] bytecode loop rewrite DISCARDED: {why}");
             }
             tracing::warn!(
@@ -2600,6 +2561,9 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
         || compiler.emitted_checkcast_throw
         // A refused `aastore` stashes an ArrayStoreException the same way.
         || compiler.emitted_aastore_throw
+        // `jit_instanceof` pins its receiver through the JIT thread while it
+        // loads the target class; the thread-less entry left it unpinned.
+        || compiler.emitted_instanceof_call
         // BUG-1 companion — a direct (non-dispatch) self-recursive CALL site:
         // its stack guard stashes a catchable StackOverflowError near native
         // exhaustion and returns the i64::MIN sentinel, so the method MUST be
@@ -2696,14 +2660,14 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
         if base != cm.code_bytes().as_ptr() as usize {
             crate::note_jit_bail_site_at("implicit-null-entry-not-base", 0, 0);
         } else {
-        for (fault_off, recover_off) in implicit_null_sites {
-            // A full table DECLINES. The site keeps its elided check, and the
-            // fault it would have caught then arrives as a crash instead of an
-            // NPE — so a decline is a real loss, not a graceful degradation,
-            // and that is why `implicit_null::counts` prints it rather than
-            // swallowing it.
-            let _ = crate::implicit_null::register(base + fault_off, base + recover_off);
-        }
+            for (fault_off, recover_off) in implicit_null_sites {
+                // A full table DECLINES. The site keeps its elided check, and the
+                // fault it would have caught then arrives as a crash instead of an
+                // NPE — so a decline is a real loss, not a graceful degradation,
+                // and that is why `implicit_null::counts` prints it rather than
+                // swallowing it.
+                let _ = crate::implicit_null::register(base + fault_off, base + recover_off);
+            }
         }
     }
 
@@ -2895,7 +2859,9 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
     // caller lookup answered with the enclosing class. The optimizing backend
     // never had the bug: `ir_lower.rs` assigns `cm.compile_id` at its own
     // finalize, which is the line this mirrors.
-    cm.compile_id = compiler.compile_id;
+    // Handed off, not copied: a compile that bails before this line drops
+    // the reservation, which releases the id.
+    cm.compile_id = compiler.compile_id.hand_off();
     // Stage A.2 (precise oop maps, B-K fix) — a method is "fully precisely
     // covered" only when EVERY GC-capable safepoint that flushed its
     // register-locals (`safepoint_pcs`) also recorded a precise oop map
@@ -2966,7 +2932,7 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
     // Only the unmapped PCs are listed, capped: on a large method
     // `safepoint_pcs` can hold hundreds of entries and the difference is the
     // whole content of the report.
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OOPCOV").is_some()
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_OOPCOV")
         && !(cm.fully_oop_covered && cm.fully_shadow_covered)
     {
         let mut missing: Vec<u32> = compiler

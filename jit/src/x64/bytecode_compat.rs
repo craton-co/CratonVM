@@ -19,20 +19,20 @@ use super::*;
 /// regression bisection while the arms are fresh.
 pub(super) fn dupx_codegen_disabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_DUPX").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_DUPX"))
 }
 
 /// DBG bisection (spring-bug-11): disable ONLY the dup_x1 (0x5A) codegen arm,
 /// to tell whether the Groovy SIGSEGV is in dup_x1 vs dup_x2 vs a co-located op.
 pub(super) fn dup_x1_codegen_disabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_DUP_X1").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_DUP_X1"))
 }
 
 /// DBG bisection (spring-bug-11): disable ONLY the dup_x2 (0x5B) codegen arm.
 pub(super) fn dup_x2_codegen_disabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_DUP_X2").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_DUP_X2"))
 }
 
 /// Disable ONLY the dup2_x2 (0x5E) codegen arm, restoring the historical
@@ -42,8 +42,7 @@ pub(super) fn dup_x2_codegen_disabled() -> bool {
 /// `dup-x2`.
 pub(super) fn dup2_x2_codegen_disabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE
-        .get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_DUP2_X2").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_DUP2_X2"))
 }
 
 /// Kill-switch for the IR tier's trusted-oop receiver shortcut on a PRIMITIVE
@@ -57,7 +56,7 @@ pub(super) fn dup2_x2_codegen_disabled() -> bool {
 pub fn trusted_oop_receiver_getfield_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_TRUSTED_OOP_GETFIELD").is_none()
+        !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_TRUSTED_OOP_GETFIELD")
     })
 }
 
@@ -66,8 +65,7 @@ pub fn trusted_oop_receiver_getfield_enabled() -> bool {
 /// methods carry the opcode; this says what happened inside each one.
 pub(super) fn dupx_trace() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE
-        .get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DUPX_TRACE").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DUPX_TRACE"))
 }
 
 /// DBG bisection (spring-bug-11): immediately `canonicalize_stack()` after a
@@ -78,9 +76,7 @@ pub(super) fn dupx_trace() -> bool {
 /// op is to blame.
 pub(super) fn dupx_eager_canon() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_DUPX_EAGER_CANON").is_some()
-    })
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_DUPX_EAGER_CANON"))
 }
 
 /// Parse a comma-separated env var into a substring list, `None` when unset or
@@ -189,8 +185,7 @@ pub(super) fn sp_inline_mega_enabled() -> bool {
 /// method names. One line per emitted site, at compile time — not per call.
 pub(super) fn sp_ic_site_trace() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE
-        .get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SP_IC_SITES").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SP_IC_SITES"))
 }
 
 pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitScanResult> {
@@ -212,16 +207,17 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
     let mut indy_ops: Vec<(usize, u16)> = Vec::new(); // (pc, cp_index) for `invokedynamic` (0xba)
     let mut has_athrow = false; // RBC.6 — method contains 0xbf
     let mut has_newarray = false; // Primitive array allocation (0xbc)
-                                  // RBC.6 local-handler-safety fix — every `*load`/`*store`/`iinc`
-                                  // instruction's (bytecode_pc, local_slot). Populated inline in the
-                                  // existing, already-correct per-opcode arms below (zero new pc-
-                                  // advancement logic — just recording a side effect), so it can never
-                                  // diverge from this scanner's own opcode-width decoding. Consumed by
-                                  // `local_handler_reads_unsafe_local` (jit/src/lib.rs) to conservatively
-                                  // verify every exception-table handler in a method only ever reads a
-                                  // local it (or something reachable before it in bytecode order,
-                                  // starting from the handler's own entry pc) has itself written — see
-                                  // that function's doc comment for why this check exists.
+    let mut has_putstatic = false;
+    // RBC.6 local-handler-safety fix — every `*load`/`*store`/`iinc`
+    // instruction's (bytecode_pc, local_slot). Populated inline in the
+    // existing, already-correct per-opcode arms below (zero new pc-
+    // advancement logic — just recording a side effect), so it can never
+    // diverge from this scanner's own opcode-width decoding. Consumed by
+    // `local_handler_reads_unsafe_local` (jit/src/lib.rs) to conservatively
+    // verify every exception-table handler in a method only ever reads a
+    // local it (or something reachable before it in bytecode order,
+    // starting from the handler's own entry pc) has itself written — see
+    // that function's doc comment for why this check exists.
     let mut local_slot_ops: Vec<(usize, bool, u16)> = Vec::new(); // (pc, is_store, slot)
                                                                   // BUG-LQB-SCOPE (RELAXED, see docs/feature-designs/jit-local-exception-handlers.md
                                                                   // — documented alongside the RBC.6 relaxation it was found while
@@ -379,13 +375,8 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             0x60..=0x6f => {
                 pc += 1;
             }
-            // irem, lrem, frem, drem. (frem/drem 0x72/0x73: only the optimizing
-            // IR backend lowers them — via a CALL to the jit_frem/jit_drem fmod
-            // helper. The single-pass backend has no codegen arm, so it bails
-            // them through the `match op` catch-all (`return false`). Admitting
-            // them at scan time lets the IR pipeline see the method instead of
-            // rejecting it outright here; with the FP gate off the method still
-            // bails to single-pass → interpreter, exactly as before.)
+            // irem, lrem, frem, drem. Both tiers lower frem/drem (0x72/0x73) to
+            // a CALL to the jit_frem/jit_drem fmod helper.
             0x70..=0x73 => {
                 pc += 1;
             }
@@ -479,7 +470,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                     // narrow form either, so refuse the method rather than
                     // widen the set this walk claims to model.
                     _ => {
-                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                             eprintln!("[cratonvm-jitc] scan-bail wide op=0x{wop:02x} pc={pc}");
                         }
                         return None;
@@ -552,6 +543,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             }
             // putstatic — static field write (needs vm context)
             0xb3 => {
+                has_putstatic = true;
                 if pc + 2 >= code_len {
                     return None;
                 }
@@ -872,7 +864,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             }
             // Anything else: not JIT-compatible
             _ => {
-                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                     eprintln!("[cratonvm-jitc] scan-bail op=0x{:02x} pc={}", op, pc);
                 }
                 return None;
@@ -931,6 +923,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
         indy_ops,
         has_athrow,
         has_newarray,
+        has_putstatic,
         local_slot_ops,
     })
 }
@@ -979,6 +972,10 @@ pub struct JitScanResult {
     pub has_athrow: bool,
     /// The method contains primitive `newarray` (0xbc).
     pub has_newarray: bool,
+    /// Whether the method contains a `putstatic` (0xb3). `static_field_ops`
+    /// lists reads and writes together, and only a write is refused by
+    /// `ir::ir_compatible`.
+    pub has_putstatic: bool,
     /// RBC.6 local-handler-safety fix — every `*load`/`*store`/`iinc`
     /// instruction's `(bytecode_pc, is_store, local_slot)`, in bytecode
     /// order. See the field's push sites in `jit_scan` and

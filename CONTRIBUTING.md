@@ -12,7 +12,7 @@ By participating, you are expected to uphold this code.
 
 1. Fork the repository and clone your fork
 2. Install prerequisites (see [BUILD_GUIDE.md](BUILD_GUIDE.md)):
-   - Rust 1.80+ via [rustup.rs](https://rustup.rs)
+   - Rust 1.88+ via [rustup.rs](https://rustup.rs)
    - JDK 17+ (for compiling test Java classes)
    - Visual Studio Build Tools (Windows only)
 3. Build and run tests:

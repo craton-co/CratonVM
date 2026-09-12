@@ -1791,7 +1791,7 @@ pub const INVENTORY: &[E] = &[
     // Declared 2026-08-24. An OPT-OUT: the optimizing tier republishes the
     // innermost-frame mirror after an inline-cache hit by default, and this key
     // restores the stale-mirror behaviour so one binary has both arms. See
-    // `ir_lower::emit_call_cached_entry`.
+    // `ir_lower::emit_call_loaded_ic_entry`.
     // Declared 2026-08-26. An OPT-OUT: the staged invoke-argument buffer is
     // published on the SHADOW stack by default, not merely named in the oop
     // map. The band verifier consults only the shadow stack. See
@@ -1839,12 +1839,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "precise-reg-spill", on_key: None, off_key: Some("CRATONVM_NO_PRECISE_REG_SPILL"), off_word: None, since: "2026-07-11" },
     E { group: Group::JIT, token: "precise-virtual-invokes", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_VIRTUAL_INVOKES"), off_word: None, since: "2026-07-31" },
     // Guard-dominated bounds-check elimination (`x64::bce::range_bce_enabled`).
-    // Default-**OFF** and presence-parsed: the gate is `.is_some()`, so
-    // `CRATONVM_JIT_RANGE_BCE=0` *enables* it. `off_word` must therefore stay
-    // `None` — `Some("0")` would make `CRATONVM_JIT=-range-bce` write `"0"` and
-    // switch the pass **on**, and a wrong elision here is an out-of-bounds heap
-    // write. `-bce` (`CRATONVM_JIT_NO_BCE`) still kills every reason including
-    // this one.
+    // Default-**OFF**. The gate was presence-parsed (`.is_some()`) until
+    // 2026-09-12, when `CRATONVM_JIT_RANGE_BCE=0` *enabled* it; it is now a
+    // `runtime_flag_on` read, so `=0` is off. `off_word` still stays `None`:
+    // unsetting the key is off under both readings, and a wrong elision here is
+    // an out-of-bounds heap write, so the token must not depend on which parser
+    // a future edit leaves behind. `-bce` (`CRATONVM_JIT_NO_BCE`) still kills
+    // every reason including this one.
     E { group: Group::JIT, token: "range-bce", on_key: Some("CRATONVM_JIT_RANGE_BCE"), off_key: None, off_word: None, since: "2026-08-01" },
     E { group: Group::JIT, token: "range-scan-legacy", on_key: Some("CRATONVM_JIT_RANGE_SCAN_LEGACY"), off_key: None, off_word: None, since: "2026-06-23" },
     E { group: Group::JIT, token: "reassoc", on_key: Some("CRATONVM_JIT_REASSOC"), off_key: None, off_word: None, since: "2026-06-16" },
@@ -2095,8 +2096,13 @@ pub const INVENTORY: &[E] = &[
     // spelling -- the same shape as `no-atomic-intrinsic` above it.
     E { group: Group::JIT, token: "atomic-long-intrinsic", on_key: None, off_key: Some("CRATONVM_JIT_NO_ATOMIC_LONG_INTRINSIC"), off_word: None, since: "2026-08-27" },
     E { group: Group::JIT, token: "box-unbox-intrinsic", on_key: None, off_key: Some("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC"), off_word: None, since: "2026-09-02" },
+    // Compile-worker counts for the tiered manager's two lanes
+    // (`tiered::compiler_thread_counts`): C1 defaults to 1 worker, C2 to
+    // max(1, log2(cpus)); either is clamped to 1..=64.
+    E { group: Group::JIT, token: "tier-c1-threads", on_key: Some("CRATONVM_TIER_C1_THREADS"), off_key: None, off_word: None, since: "2026-09-12" },
     E { group: Group::JIT, token: "tier-c1-threshold", on_key: Some("CRATONVM_TIER_C1_THRESHOLD"), off_key: None, off_word: None, since: "2026-06-22" },
     E { group: Group::JIT, token: "tier-c2-min-invocations", on_key: Some("CRATONVM_TIER_C2_MIN_INVOCATIONS"), off_key: None, off_word: None, since: "2026-06-22" },
+    E { group: Group::JIT, token: "tier-c2-threads", on_key: Some("CRATONVM_TIER_C2_THREADS"), off_key: None, off_word: None, since: "2026-09-12" },
     E { group: Group::JIT, token: "tier-c2-threshold", on_key: Some("CRATONVM_TIER_C2_THRESHOLD"), off_key: None, off_word: None, since: "2026-06-22" },
     E { group: Group::JIT, token: "tier-osr-backedge", on_key: Some("CRATONVM_TIER_OSR_BACKEDGE"), off_key: None, off_word: None, since: "2026-06-22" },
     E { group: Group::JIT, token: "tier-osr-threshold", on_key: Some("CRATONVM_TIER_OSR_THRESHOLD"), off_key: None, off_word: None, since: "2026-06-22" },
@@ -2218,9 +2224,18 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "loader-blind-cp-resolve", on_key: Some("CRATONVM_JIT_LOADER_BLIND_CP_RESOLVE"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "local-mask-fail-closed", on_key: Some("CRATONVM_JIT_LOCAL_MASK_FAIL_CLOSED"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
     E { group: Group::JIT, token: "wide-local-oop-maps", on_key: Some("CRATONVM_JIT_WIDE_LOCAL_OOP_MAPS"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
+    // `arm64` is opt-in: the aarch64 backend compiles nothing unless it is set,
+    // because nothing in this repository has proven that backend on hardware.
+    E { group: Group::JIT, token: "arm64", on_key: Some("CRATONVM_JIT_ARM64"), off_key: None, off_word: None, since: "2026-09-12" },
     E { group: Group::JIT, token: "arm64-safepoints", on_key: Some("CRATONVM_JIT_ARM64_SAFEPOINTS"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
     E { group: Group::JIT, token: "ir-gc-point-maps", on_key: Some("CRATONVM_JIT_IR_GC_POINT_MAPS"), off_key: None, off_word: Some("0"), since: "2026-08-30" },
     E { group: Group::JIT, token: "zero-spid", on_key: Some("CRATONVM_JIT_ZERO_SPID"), off_key: None, off_word: Some("0"), since: "2026-08-30" },
+    // Profiler and debugger symbol sinks for JIT code, all opt-in: `perf-map`
+    // writes perf-<pid>.map, `jitdump` writes jit-<pid>.dump (Linux), `gdb` feeds
+    // the GDB JIT interface (Linux). See `jit/src/code_events.rs`.
+    E { group: Group::JIT, token: "perf-map", on_key: Some("CRATONVM_JIT_PERF_MAP"), off_key: None, off_word: None, since: "2026-09-12" },
+    E { group: Group::JIT, token: "jitdump", on_key: Some("CRATONVM_JIT_JITDUMP"), off_key: None, off_word: None, since: "2026-09-12" },
+    E { group: Group::JIT, token: "gdb", on_key: Some("CRATONVM_JIT_GDB"), off_key: None, off_word: None, since: "2026-09-12" },
     E { group: Group::GC, token: "card-metrics", on_key: Some("CRATONVM_GC_CARD_METRICS"), off_key: None, off_word: None, since: "2026-07-31" },
     // NOTE: `CRATONVM_DBG_MAPGEN` and `CRATONVM_DBG_VACATED_FRAMES` are declared
     // in the DBG group, which is where their names say they belong and which is
@@ -4176,8 +4191,8 @@ mod tests {
     /// Two knobs that were asked for and are deliberately **not** here.
     ///
     /// `CRATONVM_TIER_BROKER`: `jit/src/tiered.rs` reads no such key — the
-    /// broker is additive and still unwired, and the row exists only as a
-    /// proposal in `docs/jit/compilation-broker.md`.
+    /// standalone `CompilationBroker` it would have gated was deleted
+    /// 2026-09-12 without ever being wired (`docs/jit/compilation-broker.md`).
     /// `CRATONVM_JIT_BYTECODE_UNROLL`: the loop rewriter is armed by a
     /// thread-local (`x64::set_bytecode_loop_rewriter_armed`) and reads no
     /// environment at all.

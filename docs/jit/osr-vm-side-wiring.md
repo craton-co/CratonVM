@@ -119,15 +119,16 @@ locals only — so a future trigger at a bci with live operands is **refused**
 `cratonvm_jit::osr_refusal_is_permanent` is the predicate that decides whether
 the VM may cache it:
 
-* **Memoed** via `crate::jit::mark_osr_entry_rejected` — the seven
+* **Memoed** via `crate::jit::mark_osr_entry_rejected` — the nine
   `OSR_PERMANENT_REFUSAL_TAGS`: `osr-entry-no-table`,
   `osr-entry-pc-not-an-entry`, `osr-entry-dead-local-mask`,
   `osr-entry-undescribable-slot`, `osr-entry-inlined-scope`,
-  `osr-entry-unconditional-trap`, `osr-entry-unresumable-exit`. Each is a pure
-  function of the artifact, so it reproduces for every future back-edge over
-  the same pc and re-running the pipeline can only reach it again.
+  `osr-entry-unconditional-trap`, `osr-entry-unresumable-exit`,
+  `osr-entry-ambiguous-exit-image`, `osr-entry-contract-disagreement`. Each is a
+  pure function of the artifact, so it reproduces for every future back-edge
+  over the same pc and re-running the pipeline can only reach it again.
 * **Not memoed** — `osr-entry-local-count`, `osr-entry-operand-stack`,
-  `osr-entry-slot-type-mismatch`, `osr-entry-returnaddress`. These depend on the
+  `osr-entry-slot-type-mismatch`, `osr-entry-returnaddress-slot`. These depend on the
   *incoming interpreter state*; the next trip over the back-edge carries
   different locals and may well be admissible. Memoing one would permanently
   deny OSR at that pc on the strength of one unlucky iteration.
@@ -150,9 +151,13 @@ Structurally, in this order:
 2. **An admitted entry is `ExactTransfer`.** `validate_osr_entry` ends in
    `osr_exit_policy`, which walks **every** deopt point of the artifact and
    refuses the entry (`osr-entry-unresumable-exit`, permanent, memoed) if any of
-   them holds monitors, carries a caller scope, has non-`REEXECUTE` semantics, or
-   fails `deopt::frame_state_is_resumable` — which is exactly where
-   `MaterializationRequired` and `Unsupported` are caught. This runs **before**
+   them holds monitors, has non-`REEXECUTE` semantics, or fails
+   `deopt::frame_state_is_resumable` — which is exactly where
+   `MaterializationRequired` and `Unsupported` are caught. A caller scope is no
+   longer refused as such: `osr_exit_policy` refuses (`osr-entry-inlined-scope`)
+   only a chain deeper than `deopt::MAX_OSR_INLINE_RESUME_DEPTH` (9), and it
+   also refuses two resume images at one bci whose `ResumeSemantics` disagree
+   (`osr-entry-ambiguous-exit-image`). This runs **before**
    the trampoline, when nothing has executed, so the refusal costs no replay.
 3. **The exit is the same set.** Every refusal
    `transfer_osr_exit_into_live_frame` can raise for a *reconstructed* frame is
@@ -177,7 +182,11 @@ yet.
 
 ## 5. Tests
 
-In `vm/src/runtime/interpreter.rs`, `mod deopt_step3_tests`:
+In `vm/src/runtime/interpreter/deopt_resume.rs`, `mod deopt_step3_tests` (the
+module moved there from `vm/src/runtime/interpreter.rs`). The last row's test
+no longer exists under that name. Since the multi-frame transfer landed, the
+module's caller-chain test is
+`a_caller_chain_refuses_for_a_named_reason_not_for_being_a_chain`.
 
 | Test | Asserts |
 | --- | --- |
@@ -230,6 +239,11 @@ The memoization split itself is asserted on the `jit` side
   refusal was memoed. That costs one metadata walk plus one `Vec`, throttled by
   the per-pc backoff — worth folding into the reuse arm if the walk ever shows
   up in a profile.
+* **Lifted, 2026-08-18:** the transfer is no longer single-frame.
+  `transfer_osr_exit_into_live_frame_checked` hands a frame with caller frames
+  to `transfer_osr_exit_chain_into_live_frame`, and `osr_exit_policy` admits a
+  chain up to `deopt::MAX_OSR_INLINE_RESUME_DEPTH` (9), refusing only deeper
+  ones. The original bullet follows for the record.
 * **The single-frame transfer still refuses a described caller chain**, and
   `osr_exit_policy` refuses such an artifact at admission for the same reason.
   Those two lift together, not separately — see `on-stack-replacement.md` §7 and

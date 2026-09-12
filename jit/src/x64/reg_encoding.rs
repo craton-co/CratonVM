@@ -99,17 +99,17 @@ pub(super) const ARG_REGS: [u8; 6] = [RDI, RSI, RDX, RCX, R8, R9];
 /// guard page; deep compiled recursion then faults later in arbitrary helper or
 /// shadow-stack code. Probe one page at a time before the subtract, then keep a
 /// one-page headroom probe below the final RSP.
-pub(super) const STACK_BANG_PAGE_SIZE: i32 = 4096;
+pub(crate) const STACK_BANG_PAGE_SIZE: i32 = 4096;
 
 /// Keep code size bounded for malformed or extreme bytecode. A method needing a
 /// frame larger than this falls back to the interpreter instead of emitting a
 /// giant inline probe sequence.
 pub(super) const MAX_STACK_BANG_PROBES: usize = 512;
 
-pub(super) fn jit_stack_bang_enabled() -> bool {
+pub(crate) fn jit_stack_bang_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_STACK_BANG").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_STACK_BANG") {
             return false;
         }
         match cratonvm_types::flags::runtime_var("CRATONVM_JIT_STACK_BANG") {
@@ -127,7 +127,7 @@ pub(super) fn jit_stack_bang_enabled() -> bool {
 /// Returned values are negative displacements from the pre-subtract RSP. They
 /// cover every page crossed by the frame allocation and include the exact final
 /// frame bottom when it is not page-aligned.
-pub(super) fn stack_bang_frame_probe_disps(frame_size: i32) -> Option<Vec<i32>> {
+pub(crate) fn stack_bang_frame_probe_disps(frame_size: i32) -> Option<Vec<i32>> {
     if frame_size <= 0 {
         return Some(Vec::new());
     }

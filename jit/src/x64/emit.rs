@@ -193,6 +193,46 @@ impl Compiler {
         self.buf.emit(&bytes[..len]);
     }
 
+    /// MOVUPS [rbp - offset], XMMn — all 128 bits into a 16-byte frame slot.
+    ///
+    /// The callee-saved XMM save. Win64 preserves the whole of XMM6-XMM15, so
+    /// the 64-bit `emit_movq_mem_rbp_from_xmm` is not a save at all for a
+    /// caller that holds a vector there. Encoding: `[REX.R] 0F 11 /r`; no
+    /// alignment requirement, so the slot needs no padding.
+    pub(super) fn emit_movups_mem_rbp_from_xmm(&mut self, offset: i32, xmm: u8) {
+        let Ok(d) = Disp::encode_for_base(-(offset as i64), RBP) else {
+            self.buf
+                .mark_codegen_unencodable("frame-displacement-unencodable");
+            return;
+        };
+        if xmm >= 8 {
+            self.buf.emit_byte(0x44); // REX.R (RBP needs no REX.B)
+        }
+        self.buf.emit_byte(0x0F);
+        self.buf.emit_byte(0x11);
+        self.buf.emit_byte(d.modrm(xmm, RBP));
+        let (bytes, len) = d.bytes();
+        self.buf.emit(&bytes[..len]);
+    }
+
+    /// MOVUPS XMMn, [rbp - offset] — the restore paired with
+    /// [`Self::emit_movups_mem_rbp_from_xmm`]. Encoding: `[REX.R] 0F 10 /r`.
+    pub(super) fn emit_movups_xmm_from_mem_rbp(&mut self, xmm: u8, offset: i32) {
+        let Ok(d) = Disp::encode_for_base(-(offset as i64), RBP) else {
+            self.buf
+                .mark_codegen_unencodable("frame-displacement-unencodable");
+            return;
+        };
+        if xmm >= 8 {
+            self.buf.emit_byte(0x44);
+        }
+        self.buf.emit_byte(0x0F);
+        self.buf.emit_byte(0x10);
+        self.buf.emit_byte(d.modrm(xmm, RBP));
+        let (bytes, len) = d.bytes();
+        self.buf.emit(&bytes[..len]);
+    }
+
     /// MOVSD XMMdst, XMMsrc — move scalar double between XMM registers.
     pub(super) fn emit_movsd_xmm_xmm(&mut self, dst: u8, src: u8) {
         // F2 [REX] 0F 10 modrm — MOVSD dst, src
@@ -269,6 +309,28 @@ impl Compiler {
         }
         self.buf.emit_byte(0x31); // XOR r/m32, r32
         self.modrm_reg(reg, reg);
+    }
+
+    /// JVMS §6.5 `ireturn`: narrow the value in RAX to the method's declared
+    /// int-category return type, as if by `value & 1` for `boolean` and by
+    /// truncation plus sign/zero extension for `byte`/`char`/`short`.
+    ///
+    /// `tag` is [`crate::narrowed_int_return_tag`]'s answer; `None` emits
+    /// nothing. The results keep this backend's int convention — an `int` is
+    /// sign-extended through all 64 bits of RAX — so `B`/`S` sign-extend to 64
+    /// and `Z`/`C`, which are never negative, zero-extend.
+    pub(super) fn emit_narrow_int_return(&mut self, tag: Option<u8>) {
+        match tag {
+            // AND EAX, 1 (83 /4 ib) — the 32-bit op zero-extends into RAX.
+            Some(b'Z') => self.buf.emit(&[0x83, 0xE0, 0x01]),
+            // MOVSX RAX, AL (REX.W 0F BE /r).
+            Some(b'B') => self.buf.emit(&[0x48, 0x0F, 0xBE, 0xC0]),
+            // MOVZX EAX, AX (0F B7 /r) — zero-extends into RAX.
+            Some(b'C') => self.buf.emit(&[0x0F, 0xB7, 0xC0]),
+            // MOVSX RAX, AX (REX.W 0F BF /r).
+            Some(b'S') => self.buf.emit(&[0x48, 0x0F, 0xBF, 0xC0]),
+            _ => {}
+        }
     }
 
     // ── CMOV helpers (round-8 perf, round-7 jit #7) ──────────────────
@@ -1179,7 +1241,10 @@ impl Compiler {
     /// registers (AL/CL/DL/BL); an extended register would need a REX prefix
     /// this encoding does not emit, so it is refused rather than mis-encoded.
     pub(super) fn emit_cmp_r8_mem8(&mut self, lhs: u8, base: u8, disp: i32) {
-        debug_assert!(lhs < 4, "emit_cmp_r8_mem8: r{lhs} is not a legacy byte register");
+        debug_assert!(
+            lhs < 4,
+            "emit_cmp_r8_mem8: r{lhs} is not a legacy byte register"
+        );
         if base >= 8 {
             self.buf.emit_byte(0x41); // REX.B
         }
@@ -1189,7 +1254,10 @@ impl Compiler {
 
     /// `TEST r8, imm8` for a legacy byte register.
     pub(super) fn emit_test_r8_imm8(&mut self, reg: u8, imm: u8) {
-        debug_assert!(reg < 4, "emit_test_r8_imm8: r{reg} is not a legacy byte register");
+        debug_assert!(
+            reg < 4,
+            "emit_test_r8_imm8: r{reg} is not a legacy byte register"
+        );
         self.buf.emit(&[0xF6, 0xC0 | (reg & 7), imm]);
     }
 

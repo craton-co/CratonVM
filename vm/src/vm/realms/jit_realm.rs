@@ -52,7 +52,7 @@ pub struct JitRealm {
     /// negative set: a stale *seal* only costs throughput (the method stays
     /// interpreted), but a stale *pass* would let a redefined body — whose new
     /// bytecode may call a native-shadowed target — reach the compiler, which
-    /// is exactly what the seal exists to prevent. `bump_redefine_epoch()` is
+    /// is exactly what the seal exists to prevent. `JitCache::bump_redefine_epoch` is
     /// already called on every `redefineClass`, beside the `clear_all()` that
     /// evicts the compiled artifacts, so an entry stamped with an older epoch
     /// is simply a miss and the gate re-runs.
@@ -73,25 +73,20 @@ pub struct JitRealm {
     /// Tiered compilation manager — decides when and at which tier to compile.
     pub tiered_manager: crate::jit::tiered::TieredCompilationManager,
 
-    /// Compilation policy — admission, tier selection, and the per-class
-    /// invalidation epoch. See `docs/jit/compilation-broker.md` and
-    /// `docs/jit/broker-install-epoch.md`.
-    ///
-    /// This field exists so the class epoch has PRODUCERS. The broker's own
-    /// doc comment says a redefine "also bumps the class's epoch" — true of
-    /// the broker and false of the process, because nothing held one. An epoch
-    /// nobody bumps reads as protection and is not. The bumps are wired at the
-    /// four events that falsify a queued request's assumptions: JVMTI
-    /// redefine, class unload, `defineClass` over an already-loaded name, and
-    /// JNI `DefineClass`.
-    ///
-    /// `Mutex` because the broker is `&mut self`-driven and carries no
-    /// interior locking — deliberately, so the integration owns the
-    /// concurrency decision rather than inheriting one.
-    pub compilation_broker: parking_lot::Mutex<crate::jit::tiered::CompilationBroker>,
-
     /// Deoptimization log — records deopt events and drives adaptive recompilation.
     pub deopt_log: parking_lot::Mutex<crate::jit::deopt::DeoptimizationLog>,
+
+    /// Per-bci de-speculation registry: the `(method_key, bci)` speculation
+    /// sites THIS VM has given up on. Written by the real-frame-deopt resume
+    /// sink (`deopt_resume.rs`), read by every compile this VM requests (passed
+    /// as `Some(&shared.jit.despec_registry)`) and by
+    /// `DeoptimizationLog::recommend_action_at_bci`.
+    ///
+    /// Was the process-global `DESPEC_SET` in `jit/src/deopt.rs` until
+    /// 2026-09-12, so an embedded or second VM inherited despeculation verdicts
+    /// it never earned. An `Arc` because the x64 `Compiler` holds it for the
+    /// duration of a compile, which may run on a background compile worker.
+    pub despec_registry: Arc<crate::jit::deopt::DespecRegistry>,
 
     /// deopt-osr Step 9 — per-method *live* compilation epoch (a monotonic
     /// invalidation generation), keyed by the same `"<class>.<method>:<descriptor>"`
@@ -116,10 +111,6 @@ pub struct JitRealm {
     /// Shared fail-closed epoch for methods admitted after the bounded
     /// per-method epoch table reaches capacity.
     pub(crate) method_epoch_overflow: std::sync::atomic::AtomicU64,
-
-    /// Invalidation manager — tracks class-hierarchy assumptions and invalidates
-    /// dependent compiled methods when class loading breaks those assumptions.
-    pub invalidation_manager: parking_lot::Mutex<cratonvm_jit::deopt::InvalidationManager>,
 
     /// Per-class allocation-init cache for the JIT slow-path allocators
     /// (`jit_new_object` + the guarded TLAB-refill arm): primitive-field

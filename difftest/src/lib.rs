@@ -91,11 +91,28 @@
 //! sets, how to read the matrix, and how to tell a harness false positive from
 //! a real VM divergence.
 
+//! ## JIT correctness lanes
+//!
+//! Two additions target the JIT specifically, and neither needs a reference
+//! JDK — the interpreter (`nojit`) is the oracle:
+//!
+//! * [`pathgate`] gates a corpus on every execution-path mode agreeing with
+//!   `nojit`. CI runs it over `difftest/seeds` for the IR, OSR and deopt modes
+//!   the HotSpot gate does not cover, so those modes need no ledger rows.
+//! * [`jitfuzz`] generates small verifiable class files straight from bytecode
+//!   (through the typed assembler in [`classgen`]), biased toward the
+//!   semantics JITs get wrong, and reports any mode whose output differs from
+//!   `nojit`, minimizing the failing class for triage.
+//!
+//! Operator guide: `docs/testing/jit-differential.md`.
+
 pub mod census;
 pub mod checksum;
+pub mod classgen;
 pub mod crossmode;
 pub mod generate;
 pub mod harness;
+pub mod jitfuzz;
 pub mod ledger;
 pub mod matrix;
 pub mod minimize;
@@ -103,4 +120,5 @@ pub mod mutate;
 pub mod normalize;
 pub mod opcorpus;
 pub mod oracle;
+pub mod pathgate;
 pub mod runner;

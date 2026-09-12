@@ -44,7 +44,7 @@ bang, and the missing Windows-on-ARM i-cache flush.
 
 | Mechanism | x86-64 | AArch64 | Status |
 |---|---|---|---|
-| **Safepoint poll (entry)** | `Backend::emit_safepoint_poll_prologue`, reads `helpers.safepoint_flag_addr`, on by default (`jit_safepoint_polls_enabled`) | `Arm64Backend::emit_safepoint_poll` at the END of the prologue, **opt-in** (`CRATONVM_JIT_ARM64_SAFEPOINTS`, default-OFF) | **BUILT 2026-09-03.** The old cell read "none, and none possible (no helper address plumbed in, and a poll needs a CALL which `emit_invoke` refuses)". `set_helpers` plumbs the table; the poll emits its own `BLR` rather than going through `emit_invoke`, which refuses *bytecode* invokes for a different reason (no call-target resolution). Default-OFF because nothing here can EXECUTE aarch64 — see §Verification. |
+| **Safepoint poll (entry)** | `Backend::emit_safepoint_poll_prologue`, reads `helpers.safepoint_flag_addr`, on by default (`jit_safepoint_polls_enabled`) | `Arm64Backend::emit_safepoint_poll` just after the argument homing, **opt-in** (`CRATONVM_JIT_ARM64_SAFEPOINTS`, default-OFF) | **BUILT 2026-09-03.** The old cell read "none, and none possible (no helper address plumbed in, and a poll needs a CALL which `emit_invoke` refuses)". `set_helpers` plumbs the table; the poll emits its own `BLR` rather than going through `emit_invoke`, which refuses *bytecode* invokes for a different reason (no call-target resolution). Default-OFF because nothing here can EXECUTE aarch64 — see §Verification. |
 | **Safepoint poll (loop back-edge)** | `Backend::emit_safepoint_poll` at every back-edge | a poll at every LOOP HEADER (bound label), opt-in | **BUILT 2026-09-03; the bail is what it replaces.** `label_for_pc` refused any backward branch target because a compiled loop with no safepoint is a region a stop-the-world request can never interrupt. With polls on, back edges are RECORDED instead (`back_edge_targets`, discovered in pass 1) and pass 2 emits one poll per header — so **loops compile again**. With polls off the refusal stands, unchanged. Placed at the header rather than at the ~11 branch sites so a switch's case labels, which are emitted mid-dispatch, are not corrupted. |
 | **Oop-map publication** | precise per-safepoint `OopMapEntry` maps, keyed by native PC | the WRITER and the PUBLICATION PATH now work; `pending_oop_maps` is still empty because the backend emits no safepoint | **Writer FIXED 2026-09-03; the gap is now the safepoint, not the map.** The writer keyed maps off `instruction_count * 4`, wrong for this pseudo-op stream (`Label`/`Comment` emit 0 bytes, `ConstantPoolEntry` emits 8, `MovImm`/`AddImm`/`CmpImm`/far `Ldr`/`Str` expand to 1–4 words), and the 2026-08-01 audit made it fail closed. It is now keyed the way that audit prescribed: the compiler records an `Arm64PendingOopMap` against the pseudo-op INDEX after the safepoint, and `emit_machine_code_with_oop_maps` resolves it to the encoder's byte offset (discarding the method if it cannot be placed). `publish_compiled_method` attaches the maps to the artifact — the `cfg`-gated caller previously built its `CompiledMethod` and dropped `oop_maps` entirely, unnoticed because that block is not compiled on x86-64. Its first caller arrived with the safepoint polls, and REFERENCE LOCALS are named as of 2026-09-03: a frame-homed one where it lives, a register-homed one (X19–X28) stored to a reserved home, named, and reloaded after the call — callee-saved is not enough for a relocating collector, because the value survives inside the CALLEE's saved-register area where only the conservative walk sees it and a conservative walk cannot rewrite. Oop-ness comes from the flow-sensitive `compute_local_oop_masks` shared with x64. The SAFEPOINT-ID SLOT landed 2026-09-04: each poll stamps its bci (or `ENTRY_POLL_BC_PC`) into a reserved frame word, the prologue stamps `SP_ID_UNSET_BC_PC` first so an uninitialised slot cannot read as a valid id, each map carries the same value as `bytecode_pc`, and `emit_frame_record` publishes FP through `helpers.frame_record` so the runtime can locate the frame to read it — `find_oop_map_for_safepoint_id` now selects the map for the site a frame is actually standing at. `fully_oop_covered` is COMPUTED as of 2026-09-04 from four terms that can each sink it (id slot present; at least one safepoint; one map per safepoint so every id resolves; no safepoint that failed to describe its live set), and only ever true with the polls opt-in on. Getting there required fixing the operand oop MARKS, which were not in lockstep with the operand stack — a mark outlived its value and was re-read for the next one, naming primitives as references and losing references. **Never executed**: arm `CRATONVM_DBG_VERIFY_OOP_MAPS` on the first aarch64 run before trusting the flag. |
 | **GC write barrier (card / remembered set)** | inline reference store + `helpers.write_barrier`; the `GC_FLAG_OLD_GEN` young/old test is inline | **unreachable** — no `putfield`, no `putstatic`, no `aastore`, no `new`. There is no reference store to guard. | N/A by construction. The `GC_FLAG_OLD_GEN`-on-promotion hazard this branch found in the x86 inline store has **no AArch64 analogue**: the analogous store does not exist. |
@@ -55,7 +55,7 @@ bang, and the missing Windows-on-ARM i-cache flush.
 | **Deopt trap patching (self-modifying code)** | x86-64 patches traps into live code | **no patch sites exist** | N/A — see §3. |
 | **Inline caches (MIC / PIC)** | `JitMICSlot` / `JitPICSlot`, allocated per call site | absent (no calls at all) | N/A. See §2 for the memory-model requirement any future AArch64 IC inherits. |
 | **Inline TLAB bump allocation** | present | absent (no `new`) | N/A. |
-| **Stack-overflow bang** | `emit_stack_bang_before_frame_alloc` probes every page the frame crosses, before moving RSP | none — the prologue is a bare `SUB SP, SP, #frame` | **FIXED — now bails** for `frame_size >= 4096`. `max_locals`/`max_stack` are class-file `u16`s, so `num_spills = gpr_spills + max_stack` could produce ~512 KiB frames that step clean past the guard page. |
+| **Stack-overflow bang** | `emit_stack_bang_before_frame_alloc` probes every page the frame crosses, before moving RSP | `stack_bang_probe_offsets`: one `SUB X16, SP, #off; STR XZR, [X16]` per page crossed, plus the exact bottom, before `SUB SP` | **FIXED 2026-09-12.** Frames `>= 4096` bytes were refused (2026-08-01) because there was no bang, and could not have been allocated anyway: a wide `SUB SP` had no encoding until the extended-register ADD/SUB. Frames needing more than 512 probes (2 MiB) still refuse. |
 | **Callee-saved register discipline (GPR)** | correct | correct — `used_callee_saved` saved/restored in prologue/epilogue | OK. |
 | **Callee-saved register discipline (FP)** | correct | **was broken** — float locals were homed in `D8`–`D15`, which AAPCS64 makes callee-saved, while the prologue saved only GPRs and `Arm64FrameLayout` reserves no FP save area | **FIXED.** `compile_pass` now ignores `alloc.xmm_assignments`; float locals live in frame slots or GPRs. See §4. |
 | **Frame-slot addressing (GPR)** | correct | correct since "ARM64 BUG #1" (`ldur`/`stur`, no writeback) | OK. |
@@ -63,9 +63,9 @@ bang, and the missing Windows-on-ARM i-cache flush.
 | **Branch-displacement overflow** | `ExecutableBuffer::overflowed` → bail | `Aarch64Emitter::overflowed()` sticky flag, read by `emit_machine_code` | OK (fixed). |
 | **Unbound label / unresolved branch** | n/a | `emit_machine_code` returns `None` | OK (fixed). |
 | **Wide-immediate truncation** | n/a | `emit_addsub_imm_safe` / `CmpImm` materialise into IP0 | OK, and the one unencodable shape now **bails** instead of emitting `BRK` and reporting success. |
-| **32-bit int semantics** | W-form / correct wrapping | **`iadd`/`isub`/`imul`/`ineg`/`ishl`/`ishr`/`iushr` lower to 64-bit X-form** | **OPEN — silent miscompile.** See §5. Deliberately not fixed here. |
+| **32-bit int semantics** | W-form / correct wrapping | W-form ops followed by `SXTW`; an `int` is held sign-extended | **FIXED 2026-09-12.** See §5. |
 | **I-cache maintenance, Linux/FreeBSD aarch64** | n/a (coherent caches) | `__clear_cache` in `platform_make_executable`, before the RW→RX flip | OK. |
-| **I-cache maintenance, macOS aarch64** | n/a | `sys_icache_invalidate` in `platform_make_executable` | OK, with an unvalidated caveat (§3). |
+| **I-cache maintenance, macOS aarch64** | n/a | `sys_icache_invalidate` in `platform_make_executable`; W^X through `pthread_jit_write_protect_np` | **FIXED 2026-09-12**, unexecuted (§3). |
 | **I-cache maintenance, Windows aarch64** | n/a | **was absent** — the Windows arm of `platform.rs` had no arch conditional at all | **FIXED.** `flush_icache_range_windows` (`FlushInstructionCache`) now runs before the RW→RX flip on every non-x86 Windows target. |
 | **Cross-thread code publication (reader-side ISB)** | n/a (x86 is coherent + TSO) | not present anywhere | **OPEN — cross-file.** See §2. |
 
@@ -157,14 +157,20 @@ and deopt trap patching". The finding is that **there are none**.
   sequence, and after this audit all three OS families do it. The remaining
   hole is the reader-side `ISB` of §2.1.
 
-**Unvalidated caveats on the macOS path.** `platform_alloc` maps with `MAP_JIT`
-but nothing ever calls `pthread_jit_write_protect_np`. On Apple Silicon,
-`MAP_JIT` pages under the hardened runtime are governed by the per-thread
-W^X toggle, and `mmap(MAP_JIT)` itself requires the
-`com.apple.security.cs.allow-jit` entitlement. Whether the current
-allocate-RW → write → `mprotect`-RX shape works depends on entitlement and
-hardening configuration. Not changed, because it cannot be tested from here and
-a wrong guess would break the one aarch64 path that may currently work.
+**The macOS path (changed 2026-09-12, still unexecuted).** `platform_alloc`
+mapped `MAP_JIT` pages RW and flipped them RX with `mprotect`, and nothing
+called `pthread_jit_write_protect_np`. Under the hardened runtime that flip is
+refused, so every compile aborted in `finalize`. Pages are now mapped RWX with
+`MAP_JIT` once and W^X is enforced per thread: `platform::JitWriteScope` calls
+`pthread_jit_write_protect_np(0)` around each write into code memory (every
+`ExecutableBuffer` write path takes one) and `(1)` after, nesting per thread.
+`make_executable` is `sys_icache_invalidate` alone. The code-adjacent data
+cells, which the runtime writes from arbitrary threads, no longer come from the
+`MAP_JIT` allocator on that platform. `mmap(MAP_JIT)` still requires the
+`com.apple.security.cs.allow-jit` entitlement on a hardened build. Separately,
+the Unix allocator passed Linux's `MAP_ANONYMOUS` (`0x20`) on every Unix, which
+on FreeBSD and Darwin x86-64 is not `MAP_ANON`: `mmap` failed and the JIT was
+silently dead there. The flag is per OS now.
 
 ---
 
@@ -267,7 +273,17 @@ blanket refusal.
 
 ---
 
-## 5. Deliberately NOT fixed: 32-bit integer width
+## 5. 32-bit integer width — FIXED 2026-09-12
+
+The fix took the second of the two shapes below, applied to every `int` op:
+an `int` is held sign-extended, every producer is a W-form instruction followed
+by `SXTW`, `f2i`/`d2i` use `FCVTZS W`, `l2i` is `SXTW` (it was a zero-extending
+`AND`), `i2l` is a relabelling, and `int` compares, `ifeq`/`ifne` (`CBZ W`) and
+switch keys read the W register. The variable shifts need no mask: W-form
+`LSLV`/`LSRV`/`ASRV` take the distance MOD 32 and the X forms MOD 64, which is
+the JVMS `& 0x1f` / `& 0x3f` exactly. `arm64_execution`'s two tests that pinned
+the 64-bit answers now assert the JVMS ones. What follows is the record from
+before the fix.
 
 `iadd`, `isub`, `imul`, `ineg`, `ishl`, `ishr`, `iushr` all lower to 64-bit
 X-form instructions (`emit_int_add` → `Arm64Instruction::Add` → `Aarch64Emitter::add`,
@@ -307,11 +323,10 @@ These are outside this lane's three files. None were touched.
    The right shape is an `ISB` (or a documented reliance on the syscall) on the
    path that first branches into a newly published `CompiledMethod` on a thread
    other than the compiler.
-2. **`vm/src/runtime/interpreter.rs` and `vm/src/vm.rs` call `x64::compile*`
-   directly** from the eager first-call, OSR and probe paths, with no
-   `target_arch` guard. An aarch64 build would emit x86-64 bytes from those
-   sites. Already noted in the module header ("Reachability"); still true, still
-   outside this lane.
+2. **Direct `x64::compile*` call sites.** FIXED 2026-09-12 for the two that
+   publish code: the eager first-call door (`vm/src/runtime/interpreter.rs`)
+   and `compile_osr_artifact` (`vm/src/runtime/interpreter/jit_bridge.rs`)
+   return without compiling on any target but x86-64.
 3. **`regalloc::ARM64_LOCAL_FPS`** advertises `D8`–`D15` as available for locals.
    With §4.3 the backend simply ignores it, so nothing is broken, but the
    allocator is now computing an assignment nobody consumes. If someone later
@@ -333,3 +348,33 @@ These are outside this lane's three files. None were touched.
   be large (loops are most of what was compilable), and that is the intended
   trade: interpreting a loop is correct, compiling one without a safepoint is
   not.
+
+---
+
+## 8. The 2026-09-12 review
+
+A review found that this backend miscompiled ordinary leaf methods. All of the
+following are fixed in code and covered by host-independent tests (pseudo-op
+shapes, exact instruction words, and `eval_int_method`, a small evaluator that
+checks VALUES of integer methods on any host). **None has executed on AArch64
+hardware**, so the backend is now OFF by default: `CRATONVM_JIT_ARM64=1` (or
+`CRATONVM_JIT=arm64`) turns it on.
+
+| Defect | Fix |
+|---|---|
+| Scratch spills were keyed by REGISTER: when the allocator wrapped onto a live register, popping the new value reloaded the old one (`a - (b+1+2+3+4)` = -4 for `(100, 5)`) | One typed operand stack whose entries record their own location (register or depth slot); see the module header |
+| The float stack's allocator had no liveness check and no spill | The same model covers V0-V7 |
+| `freturn`/`dreturn` discarded the value and emitted a bare `RET`, skipping the epilogue | Bit-exact `FMOV` into X0, then the epilogue |
+| `tableswitch`/`lookupswitch` took case constants from the scratch allocator, which could return the key's register (`CMP R, R`) | A jump table through X16/X17 for `tableswitch`; compares against an immediate or IP0 for `lookupswitch` |
+| Argument `i` was homed in local `i`, and frame-homed parameters (every FP one) were never stored | `compute_param_jvm_slots` layout, `STR` to frame homes, and the real slots handed to the allocator |
+| `fcmpg`/`dcmpg` returned -1 for NaN (`B.LT` is true on unordered) | `CSET ne; CNEG mi` (`*cmpg`) / `CNEG lt` (`*cmpl`) |
+| `float` was modelled as `double` end to end | S-form constants, arithmetic, compares, conversions, locals and returns |
+| `d2i`/`f2i` saturated at 64 bits; `l2i` zero-extended; `int` ops were 64-bit | §5 |
+| `fneg`/`dneg` computed `0.0 - x`, so `-(0.0)` was `+0.0` | `FNEG` |
+| The safepoint poll spilled only GPR operands across its `BLR` | Every register-located operand, GPR and FP |
+| The frame record sat at `[FP-16]`, not at `[FP]`/`[FP+8]` | `STP X29, X30, [SP, #-16]!; ADD X29, SP, #0`; offsets rebased; `emit_addr_into_ip0` and wide SP adjustments use the extended-register form (the shifted form reads 31 as XZR) |
+| No stack bang; frames >= 4096 bytes refused | Probes per page; see the census row |
+| Eager first-call and OSR doors called `x64::compile_with_param_slots` on every architecture | `cfg!(not(target_arch = "x86_64"))` returns |
+| Encoder: `adrp` packed a byte offset as a page count; `patch_bcond` clobbered a TBZ bit number; `mov_imm64` spent a word on a zero low halfword; `estimated_size` was `len * 4` | `adrp` deleted; opcode-aware patch; minimal MOVZ; a per-pseudo-op upper bound. New: bitmask immediates, `CSET`/`CSINC`/`CSINV`/`CSNEG`, `SXTW`/`UXTW`, ADD/SUB extended register |
+| Unwired code: the peephole optimizer, `emit_neon_array_sum`/`emit_neon_dot_product`, `emit_ldr_literal`, `emit_float_rem`, `emit_int_div`, and `BRK #0` after a refusal | Removed |
+| `platform.rs`: Linux `MAP_ANONYMOUS` on every Unix; `ProtectFailed` carried `-1`; macOS/ARM64 flipped `MAP_JIT` pages with `mprotect` | Per-OS flag table; `errno`; `pthread_jit_write_protect_np` (§3) |

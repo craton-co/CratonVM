@@ -457,6 +457,18 @@ pub struct CachedBytecodeMethod {
     /// batches so the census and `hot_but_stuck_in_interpreter` still see
     /// every call (see `dispatch_virtual::execute_invokevirtual_fast_door`).
     pub interp_invocations: std::sync::atomic::AtomicU32,
+    /// The tiered manager's "nothing left to decide" stamp for this call
+    /// site's method, or `0`.
+    ///
+    /// Written from `TieredCompilationManager::on_method_invocation_settling`
+    /// and checked with `TieredCompilationManager::tiering_settled` before the
+    /// interpreter's tier-up hooks call the manager again. A method that will
+    /// never compile (declined by policy, out of retries, already at C2) used
+    /// to take the manager's global `methods` mutex and build a fresh key at
+    /// every retry stride for the life of the process. The stamp is a manager
+    /// generation, so a deopt, an unload, a redefinition or a policy change
+    /// expires every stamp at once and the hook resumes asking.
+    pub tiering_settled: std::sync::atomic::AtomicU32,
     /// Per-call-site native-dispatch memo. **Read it through
     /// [`Self::native_call_site`], never directly.**
     ///
@@ -528,9 +540,9 @@ pub struct CachedBytecodeMethod {
     /// opted out of both the policy check and the census.
     pub native_callback_cache: std::sync::OnceLock<cratonvm_native_api::NativeCallSite>,
     /// T2.5 — memoized JIT invocation-counter key for this method, i.e. the
-    /// packed `(declaring_class_id << 32) | hash(method_name ++ descriptor)`
-    /// u64 that the interpreter uses to index
-    /// `ProfileStore::increment_invocation`.
+    /// packed `(declaring_class_id << 64) | fingerprint(method_name, descriptor)`
+    /// u128 that the interpreter uses to index
+    /// `ProfileStore::increment_invocation` (see [`invoc_key_parts`]).
     ///
     /// The interpreter's `Bytecode` / `VirtualBytecode` dispatch arms recomputed
     /// this key on EVERY interpreted invocation of a not-yet-compiled method by
@@ -540,10 +552,10 @@ pub struct CachedBytecodeMethod {
     /// Memoized here for exactly the same reason (and by exactly the same
     /// argument) as [`Self::force_native_cache`] and
     /// [`Self::native_callback_cache`] above. Read via [`Self::invoc_key`].
-    pub invoc_key: std::sync::OnceLock<u64>,
+    pub invoc_key: std::sync::OnceLock<u128>,
     /// T2.2 — epoch memo for "this method has no published JIT body".
     ///
-    /// Holds the value of `cratonvm_jit::jit_cache_generation()` as of the last
+    /// Holds the value of the owning VM's `JitCache::generation()` as of the last
     /// time an interpreter dispatch arm probed the shared JIT cache for this
     /// method and found *nothing*. `0` means "never probed" (the live generation
     /// starts at 1 and only ever increases, so `0` can never compare equal to
@@ -555,7 +567,7 @@ pub struct CachedBytecodeMethod {
     /// published a body for this method. That lookup hashes all three strings
     /// and then re-compares all three with full string equality — the exact
     /// re-resolution the per-call-site inline cache exists to avoid. Because
-    /// *every* JIT-cache publication and invalidation bumps the global
+    /// *every* JIT-cache publication and invalidation bumps that cache's
     /// generation, comparing this snapshot against it is an equivalent test:
     /// equal ⇒ the cache content has not changed since we last looked and found
     /// nothing, so looking again cannot find anything. Steady state therefore
@@ -615,6 +627,12 @@ impl Clone for CachedBytecodeMethod {
             intercept_shape_cache: self.intercept_shape_cache.clone(),
             interp_invocations: std::sync::atomic::AtomicU32::new(
                 self.interp_invocations.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            // Carried forward for the reason `jit_probe_generation` is: the
+            // stamp is generation-keyed, so an inherited stale one simply fails
+            // `tiering_settled` and the clone asks the manager again.
+            tiering_settled: std::sync::atomic::AtomicU32::new(
+                self.tiering_settled.load(std::sync::atomic::Ordering::Relaxed),
             ),
             // `NativeCallSite: Clone` snapshots the memo word. Carrying it
             // forward is sound for the same reason `jit_probe_generation`'s
@@ -758,13 +776,12 @@ impl CachedBytecodeMethod {
     /// [`Self::invoc_key`]. Computed on first use, then read straight out of the
     /// `OnceLock`.
     ///
-    /// The hash must stay bit-identical to the two open-coded loops this
-    /// replaced (`vm/src/runtime/interpreter.rs`, the invokestatic `Bytecode`
-    /// arm and the instance tier-up path), because both keyed the *same*
-    /// `ProfileStore` invocation counters: a different key would silently reset
-    /// every method's warmup count.
+    /// Every door that counts this method must compute the same key, because
+    /// they all key the *same* `ProfileStore` invocation counters: a door with a
+    /// different key silently counts a method's warmup in a counter nobody
+    /// else reads. [`invoc_key_parts`] is the one definition.
     #[inline]
-    pub fn invoc_key(&self) -> u64 {
+    pub fn invoc_key(&self) -> u128 {
         *self.invoc_key.get_or_init(|| {
             invoc_key_parts(
                 self.declaring_class_id.as_u32(),
@@ -777,8 +794,9 @@ impl CachedBytecodeMethod {
     /// T2.2 — has this method already been probed against the shared JIT cache
     /// at generation `current_generation` and found to have no compiled body?
     ///
-    /// `current_generation` must come from `cratonvm_jit::jit_cache_generation()`
-    /// (an `Acquire` load). A `true` answer means the caller may skip the
+    /// `current_generation` must come from the owning VM's
+    /// `JitCache::generation()` (an `Acquire` load). Per cache, so another VM's
+    /// compilations do not invalidate this VM's memo. A `true` answer means the caller may skip the
     /// string-keyed `JitCache::get` entirely.
     #[inline]
     pub fn jit_probe_is_current(&self, current_generation: u64) -> bool {
@@ -808,17 +826,34 @@ impl CachedBytecodeMethod {
 /// fail: [`CachedBytecodeMethod::invoc_key`] memoizes this, and the interpreter's
 /// back-edge tier-up path recomputes it from a live frame (where no
 /// `CachedBytecodeMethod` is in hand). Keep them bit-identical.
+///
+/// `(declaring_class_id << 64) | fingerprint`, where the fingerprint is a
+/// 64-bit FNV-1a over the name, a `0xFF` separator and the descriptor, passed
+/// through the splitmix64 finalizer so the low bits the store shards on are
+/// well mixed. The key used to be a 32-bit `31 * h` fold of the concatenated
+/// strings: overloads could share a counter (short strings collide by
+/// construction -- `"Aa"` and `"BB"` fold alike), and with no separator a name
+/// and descriptor could trade characters. `0xFF` never occurs in modified
+/// UTF-8, so the boundary is unambiguous. The class id stays whole in the high
+/// half because `ProfileStore::invalidate_class` sweeps by it.
 #[inline]
-pub fn invoc_key_parts(declaring_class_id: u32, method_name: &str, method_descriptor: &str) -> u64 {
-    let mut h = 0u32;
+pub fn invoc_key_parts(declaring_class_id: u32, method_name: &str, method_descriptor: &str) -> u128 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = FNV_OFFSET;
     for &b in method_name.as_bytes() {
-        h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: hash computation
+        h = (h ^ u64::from(b)).wrapping_mul(FNV_PRIME);
     }
+    h = (h ^ 0xFF).wrapping_mul(FNV_PRIME);
     for &b in method_descriptor.as_bytes() {
-        h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: hash computation
+        h = (h ^ u64::from(b)).wrapping_mul(FNV_PRIME);
     }
-    // Widening: class ID to u64 for hash key
-    ((declaring_class_id as u64) << 32) | (h as u64)
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^= h >> 31;
+    (u128::from(declaring_class_id) << 64) | u128::from(h)
 }
 
 /// JEP 358 (helpful NPE) — operation-kind codes carried out-of-band from a
@@ -1158,10 +1193,11 @@ mod getfield_arg_tests {
 ///
 /// This struct is an ABI, not a data structure. The rules are absolute:
 ///
-/// * **`#[repr(C)]` is mandatory.** The JIT reads slots as
-///   `[helpers_ptr + disp32]` with the displacement computed at compile time.
-///   `repr(Rust)` may reorder fields, which would silently re-point every
-///   baked `CALL` at a different helper.
+/// * **`#[repr(C)]` is mandatory.** Backends read a slot by field name at
+///   compile time and bake its value into a `CALL`, but `HELPER_FIELDS`, the
+///   `Offset` slots and every golden-offset check name slots by byte offset.
+///   `repr(Rust)` may reorder fields, which would silently re-point each of
+///   those at a different helper.
 /// * **Every field is `usize`** (8 bytes; x86-64 only), so the byte offset of
 ///   field *N* is exactly `N * 8`. A non-`usize` field would introduce padding
 ///   and break that identity — see the `const _` assertions below.
@@ -2151,6 +2187,7 @@ mod tests {
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -2337,7 +2374,7 @@ mod tests {
     fn jit_probe_generation_memo_reports_current_only_for_the_recorded_value() {
         let cached = make_cached_method();
         // A fresh entry has never probed: 0 can never equal a live generation
-        // (`JIT_CACHE_GENERATION` starts at 1 and only increases).
+        // (a cache generation starts at 1 and only increases).
         assert!(!cached.jit_probe_is_current(1));
         assert!(!cached.jit_probe_is_current(u64::MAX));
 
@@ -2817,11 +2854,11 @@ mod tests {
 
     // --- JitRuntimeHelpers golden ABI offsets ---
     //
-    // The JIT compiler bakes `JitRuntimeHelpers` field addresses into
-    // generated RWX machine code as absolute CALL targets and as
-    // `[helpers_ptr + disp32]` loads. A silent field reorder would
-    // change the disp32 immediates while the JIT still emits the old
-    // offsets — i.e. a CALL that used to dispatch `new_object` would
+    // The JIT compiler bakes `JitRuntimeHelpers` slot values into
+    // generated RWX machine code as absolute CALL targets, and
+    // `HELPER_FIELDS` plus the `Offset` slots name slots by byte offset.
+    // A silent field reorder would leave those offsets naming the old
+    // slots — i.e. a CALL that used to dispatch `new_object` would
     // now dispatch `anewarray_object`, with no compile error. This
     // failure is undetectable at runtime until the wrong helper
     // corrupts the heap.

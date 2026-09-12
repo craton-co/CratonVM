@@ -819,6 +819,35 @@ pub fn run_cratonvm_with_dumps(
     run_subprocess(cmd, timeout)
 }
 
+/// Run `<main_class>` on CratonVM in `mode`, then layer `extra_env` on top of
+/// the mode's own knobs.
+///
+/// The extra pairs are applied **after** [`apply_mode_env`] clears and re-sets
+/// the mode knobs, so they are the one way to combine a mode with a knob it
+/// does not set — `forced-deopt` under `CRATONVM_DBG_GC_STRESS`, or `ir-jit`
+/// with `CRATONVM_DEOPT_EAGER`. Used by the bytecode differential fuzzer
+/// (`cratonvm-difftest fuzz-jit --extra-env`); the mode matrix itself never
+/// passes any, so every existing mode's argv and env are unchanged.
+pub fn run_cratonvm_with_env(
+    bin: &Path,
+    classpath: &Path,
+    main_class: &str,
+    mode: Mode,
+    timeout: Duration,
+    extra_env: &[(String, String)],
+) -> Result<Observation, RunError> {
+    let mut cmd = Command::new(bin);
+    cmd.args(mode.cli_args());
+    cmd.arg("-cp").arg(classpath).arg(main_class);
+    apply_mode_env(&mut cmd, mode);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let mut obs = run_subprocess(cmd, timeout)?;
+    obs.exception = crate::oracle::parse_exception(&obs.stderr);
+    Ok(obs)
+}
+
 /// Run `<main_class>` on HotSpot with `classpath`.
 pub fn run_hotspot(
     classpath: &Path,

@@ -435,6 +435,13 @@ fails, this table is stale.
 | `IDENTITY_HASH_CODE_OFFSET as i32` | 1 | disp32 | 15234 (was bare `8`) |
 | `NUM_SLOTS_OFFSET` in Rust pointer arithmetic | 1 | n/a | 29422 |
 
+**2026-09-12 — two `HEADER_SIZE as i32` sites removed (13 → 11).** The
+vectorised `double[]` sum (`emit_simd_fp_array_sum`) was retired because it
+reordered strict IEEE additions (`{1e16, 1, -1e16, 1}` summed to 2.0). Its
+pre-header base (`ADD RAX, imm32`) and its scalar-tail `[RCX + R10*8 + disp32]`
+load were both disp32 sites of this pattern; nothing replaced them. The tripwire
+records 11.
+
 **2026-09-11 — the inline `newarray` bump and the StringBuilder intrinsics.**
 Five new **disp8** sites in `x64/objects.rs`, and they are safe against a
 header change for one reason worth stating plainly: they are all behind ONE
@@ -454,6 +461,10 @@ not in the tripwire — the test is the authority and it now records 15.
 Totals: **35** `HEADER_SIZE` disp8 sites, **13** `HEADER_SIZE` disp32 sites, **18**
 compile-time-arithmetic uses, **30** `ARRAY_LENGTH_OFFSET` sites, **23** other named
 header-offset sites. **118 sites** in this file.
+
+2026-09-12: the raw `HEADER_SIZE as u8` total fell 22 -> 21. The IEEE `CRC32` range fold in
+`bytecode_walk.rs` was deleted along with the intrinsic variants that were never registered, and
+its `byte[]` element load was one of these sites.
 
 2026-09-02: the raw-narrowing row fell 23 -> 22 and the checked row appeared. The array
 bounds check's length load moved from the fast path into its cold stub — the fast path is

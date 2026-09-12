@@ -29,6 +29,17 @@ Tokens are comma-separated and whitespace around them is ignored. A token the
 group does not define prints one line on stderr and is otherwise ignored — a
 typo is loud, which it was not before.
 
+**Setting a legacy JIT switch directly.** A grouped token writes `1` into its
+legacy variable. If you export that variable yourself, the JIT's boolean switches
+(`CRATONVM_JIT_*`, `CRATONVM_NO_*`, `CRATONVM_DBG_*` and the other names the JIT
+crate reads as on/off) treat `0`, `false`, `off`, `no` and the empty string as
+**off**. Matching is case-insensitive and ignores surrounding whitespace. Any
+other value is on. Until 2026-09-12 these switches only checked whether the
+variable was set, so `CRATONVM_JIT_RANGE_BCE=0` turned the pass *on*. A few
+JIT-read names that carry a value (a number, a word such as `nostore`), or that
+the collector also reads as a gate, still check only for presence. See
+`jit-presence-only-flag-reads-FIXED.md` for the list.
+
 ## The five scalars
 
 These keep their own name: they are a path, a location or a master switch, not
@@ -617,7 +628,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-454 tokens.
+460 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1008,8 +1019,10 @@ export inherited from a parent shell.
 | `site-cache-stubs` | `CRATONVM_JIT_SITE_CACHE_STUBS` |
 | `atomic-long-intrinsic` | `CRATONVM_JIT_NO_ATOMIC_LONG_INTRINSIC` |
 | `box-unbox-intrinsic` | `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC` |
+| `tier-c1-threads` | `CRATONVM_TIER_C1_THREADS` |
 | `tier-c1-threshold` | `CRATONVM_TIER_C1_THRESHOLD` |
 | `tier-c2-min-invocations` | `CRATONVM_TIER_C2_MIN_INVOCATIONS` |
+| `tier-c2-threads` | `CRATONVM_TIER_C2_THREADS` |
 | `tier-c2-threshold` | `CRATONVM_TIER_C2_THRESHOLD` |
 | `tier-osr-backedge` | `CRATONVM_TIER_OSR_BACKEDGE` |
 | `tier-osr-threshold` | `CRATONVM_TIER_OSR_THRESHOLD` |
@@ -1061,9 +1074,13 @@ export inherited from a parent shell.
 | `loader-blind-cp-resolve` | `CRATONVM_JIT_LOADER_BLIND_CP_RESOLVE` |
 | `local-mask-fail-closed` | `CRATONVM_JIT_LOCAL_MASK_FAIL_CLOSED` |
 | `wide-local-oop-maps` | `CRATONVM_JIT_WIDE_LOCAL_OOP_MAPS` |
+| `arm64` | `CRATONVM_JIT_ARM64` |
 | `arm64-safepoints` | `CRATONVM_JIT_ARM64_SAFEPOINTS` |
 | `ir-gc-point-maps` | `CRATONVM_JIT_IR_GC_POINT_MAPS` |
 | `zero-spid` | `CRATONVM_JIT_ZERO_SPID` |
+| `perf-map` | `CRATONVM_JIT_PERF_MAP` |
+| `jitdump` | `CRATONVM_JIT_JITDUMP` |
+| `gdb` | `CRATONVM_JIT_GDB` |
 | `int-value-direct` | `CRATONVM_JIT_INT_VALUE_DIRECT` |
 | `indy-lambda-fast` | `CRATONVM_JIT_INDY_LAMBDA_FAST` |
 | `hot-lookup-cache` | `CRATONVM_JIT_HOT_LOOKUP_CACHE` |
