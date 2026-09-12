@@ -3318,11 +3318,25 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
             let arr = scope.get(&arr_h);
             scope.set_array_element(arr, i, Value::Object(Some(m_obj)));
         }
-        let set = try_alloc_concurrent_synthetic(&mut *scope, "java/util/HashSet", 3)?;
-        let arr = scope.get(&arr_h);
-        scope.set_field(set, 0, Value::Object(Some(arr)));
-        scope.set_field(set, 1, Value::Int(len as i32));
-        scope.set_field(set, 2, Value::Int(16));
+        // A REAL `java.util.HashSet`, through its own `<init>` and `add`.
+        //
+        // The three slots this used to write -- module array at absolute 0,
+        // count at 1, capacity at 2 -- are the MAP layout, on a class whose
+        // one real instance field is `map` (`Ljava/util/HashMap;`). Every
+        // `Set` method on the returned object dereferences `map`, so
+        // `layer.modules().size()` answered 0 on a layer this native had just
+        // filled, and the raw writes were part of what pinned
+        // `java/util/HashSet`'s slot floor at three against that one field.
+        let modules: Vec<cratonvm_types::ObjectRef> = {
+            let arr = scope.get(&arr_h);
+            (0..len)
+                .filter_map(|i| match scope.get_array_element(arr, i) {
+                    Value::Object(Some(m)) => Some(m),
+                    _ => None,
+                })
+                .collect()
+        };
+        let set = crate::build_real_hash_set(&mut *scope, &modules)?;
         Ok(Some(Value::Object(Some(set))))
     });
 

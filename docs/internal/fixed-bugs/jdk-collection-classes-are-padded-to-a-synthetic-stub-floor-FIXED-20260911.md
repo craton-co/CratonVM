@@ -5,8 +5,9 @@
 closed the same day. The two floors it fixed are unchanged; its four open rows
 are resolved, and **three of the four had a cause the page did not name**.
 
-One residual is filed separately rather than left here:
-`docs/known-issues/perf/the-synthetic-slot-floor-is-one-number-for-two-layouts-20260911.md`.
+One residual was filed separately rather than left here, and is itself closed:
+`docs/internal/fixed-bugs/the-synthetic-slot-floor-is-one-number-for-two-layouts-FIXED-20260912.md`.
+All seven of the classes §6 below leaves open are fixed there.
 
 **Verified on:** Windows 11, JDK 25 Temurin `25.0.3+9`, branch
 `claude/collections-real-jdk-20260911` off `dev@f5a67c0f6`.
@@ -158,9 +159,12 @@ Those three were fixed on 2026-09-11 (they build through the real
 this section got wrong. The floor is a single number consulted in BOTH modes,
 and in synthetic-JDK mode `HashSet` really is map-shaped, so 3 is correct there.
 Six other classes are padded by the same thing. Superseded by
-`docs/known-issues/perf/the-synthetic-slot-floor-is-one-number-for-two-layouts-20260911.md`.
-`LinkedHashSet` declares no instance fields of its own and inherits the same
-floor, so it is padded for the same reason and moves with it.
+`docs/internal/fixed-bugs/the-synthetic-slot-floor-is-one-number-for-two-layouts-FIXED-20260912.md`,
+where all seven are closed: the floor is consulted only where the layout it
+describes is the layout in use (`FLOOR_EXEMPT_CLASSES`), and `HashSet` drops
+128 -> 88. `LinkedHashSet` declares no instance fields of its own and inherits
+the same floor, so it was padded for the same reason and moved with it
+(152 -> 112).
 
 ## 7. The gate this page's own change had broken
 
