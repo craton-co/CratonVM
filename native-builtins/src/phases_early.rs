@@ -9366,8 +9366,7 @@ fn fjp_compute_void(
         ctx.invoke_virtual(task, "compute", "()V", &[]).map(|_| ())
     };
     let live_task = ctx.read_native_pin(task_pin, task);
-    let outcome =
-        fjp_complete_from_outcome(ctx, live_task, outcome.map(|()| Value::Object(None)));
+    let outcome = fjp_complete_from_outcome(ctx, live_task, outcome.map(|()| Value::Object(None)));
     ctx.unpin_native_roots(task_pin);
     (live_task, outcome.map(|_| ()))
 }
