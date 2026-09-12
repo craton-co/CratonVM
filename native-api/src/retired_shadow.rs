@@ -11569,6 +11569,238 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
         && !crate::unretire::is_excluded(class_name, method_name, descriptor)
 }
 
+/// Lane 4 wave 5 -- three of the four families the wave-1 BUILDS backed out,
+/// 27 rows over eight classes of `java/io/`, `java/nio/channels/` and
+/// `java/nio/file/attribute/`.
+///
+/// No new prefix. `java/io/` and `java/nio/` were both admitted by wave 1 and
+/// every class here is under one of them, so the table is the whole of the
+/// decision.
+///
+/// # A backed-out family's recorded CAUSE is a hypothesis, and these were three
+///
+/// §9.2 of the lane page lost five families on wave 1's builds and wrote one
+/// cause for all of them: "a fabricated carrier whose real fields this VM never
+/// writes". Wave 4 took `java/nio/CharBuffer` and found that false for it.
+/// This wave took the rest and found the record wrong in a THIRD way -- not
+/// stale, and not mistaken about which vector, but mistaken about the
+/// MECHANISM in one case and about the kind of thing it was in another:
+///
+/// * **The file-handle group (9)** -- `FileOutputStream`, `FileCleanable`,
+///   `FileDescriptor` and the abstract-receiver `java/nio/channels/FileChannel`
+///   -- went out as an UN-ATTRIBUTED group because `RJdkSecurity` reproduced
+///   under no dial scope. §9.4 then found that vector's cause and fixed it: a
+///   `java.io.File` carrier with an unwritten `prefixLength`. **Nobody re-tried
+///   the group after the fix.** It is green here in every arm, and the whole of
+///   its blocker was a defect in a different class that had been closed for two
+///   days.
+/// * **`java/nio/file/attribute/` (12)** was attributed to `RFileTimes` by a
+///   dial sweep, and that attribution is CORRECT -- the vector fails on this
+///   table alone, reproduced one row at a time. The recorded mechanism is not:
+///   it is not a fabricated carrier, it is a READER. See below.
+/// * **`java/io/ByteArrayInputStream` (9)** was attributed to `RSslLiveSession`,
+///   also correctly, and is not a defect at all. Six rows retire; three are
+///   carved out because they carry an OBSERVATION rather than an answer. See
+///   `the_backed_out_wave_is_twenty_seven_rows_over_eight_classes`.
+///
+/// The fourth, `java/nio/file/spi/FileSystemProvider`, is not here and not
+/// because it was forgotten: `the_provider_family_is_retired_by_no_table` has
+/// the measurement that blocks it, and the blocker is a concrete `Path`.
+///
+/// # `filetime_read_millis` read a value whose UNIT it did not check
+///
+/// `FileTime` stores a PAIR. `FileTime.from(Instant)` compiles to
+/// `new FileTime(0L, null, instant)` on 17, 21 and 25 alike -- `value` is a
+/// literal `lconst_0` and the time is in `instant`. This VM's reader took
+/// `value` for milliseconds, which held only because `filetime_alloc`, the
+/// other end of the same VM, converts to millis before storing. Retire
+/// `from`/`fromMillis` and real bytecode becomes the producer; the setter then
+/// read **0** and `BasicFileAttributeView.setTimes` stamped every file
+/// 1970-01-01. That is `RFileTimes`, and it is wave 4's finding in a new place:
+/// **a native that owns both ends of a convention agrees with itself whatever
+/// the convention is, and a retirement is how you ask for a second opinion.**
+///
+/// Fixed in the commit this table lands with, not carved out -- the rows are
+/// correct and the reader was not.
+///
+/// # Four arms, and the wave MOVES the probe toward HotSpot
+///
+/// `apps/probes/L4W5Sweep.java`, 183 rows over all four families, diffed
+/// against a HotSpot 25 oracle rather than against the control alone:
+///
+/// ```text
+///   A  control (origin/dev f99c2e748), --jdk-only        8 rows differ
+///   B  this wave, --jdk-only                             4 rows differ
+///   C  this wave, compatible mode          0 differ FROM THE CONTROL
+///   D  this wave + UNRETIRE, same binary   0 differ FROM THE CONTROL
+/// ```
+///
+/// Arm D names `27 table row(s)` across its eight rules at arm time, which is
+/// the receipt that B's movement is THIS table's and not a neighbour's under a
+/// prefix that admits the whole of `java/io/`.
+///
+/// The four rows it moves are four silent wrong answers, all toward HotSpot:
+///
+/// ```text
+///   FileTime.from(..., NANOSECONDS).toString()   .123Z          -> .123456789Z
+///   FileTime.from(..., NANOSECONDS).to(NANOS)    ...123000000   -> ...123456789
+///   PosixFilePermissions.fromString("rwx")       a Set          -> IAE
+///   FileChannel.isOpen() after the stream closed true           -> false
+/// ```
+///
+/// The last is §4's species exactly. The receiver is a REAL
+/// `sun.nio.ch.FileChannelImpl` in all three arms -- a native registered on
+/// `java/nio/channels/FileChannel` won the door for it and answered from this
+/// VM's fd table instead of from the `closed` field real `close()` had just
+/// set. Not a crash; a confident wrong answer to "is this channel open".
+///
+/// The 4 that remain are all carrier-IDENTITY rows this table does not touch
+/// (`BasicFileAttributeView` and `FileAttribute` minted as their INTERFACES,
+/// `Files.newInputStream` answering `FileInputStream` where HotSpot answers
+/// `sun.nio.ch.ChannelInputStream`).
+///
+/// # The corpus is what found both defects, and no probe did
+///
+/// The probe tree was clean on the first build of this table. The corpus was
+/// not: `RFileTimes` and `RSslLiveSession`, the two vectors §9.2 named, failed
+/// on it and were attributed to a family in six runs and to a row in nine more
+/// -- `CRATONVM_UNRETIRE_NATIVE_SHADOW`, no rebuild. §9.3's rule, paid for
+/// again.
+///
+/// ```text
+///   CRATONVM_ARGS=--jdk-only   control  136 passed, 0 failed
+///                              wave     136 passed, 0 failed
+///   SUITE=all                  wave     136 passed, 0 failed
+///   SUITE=core                 wave      95 passed, 0 failed
+/// ```
+///
+/// The two `--jdk-only` arms were compared VECTOR BY VECTOR and not by their
+/// totals: 136 lines each, zero differing. `TIMEOUT=600`; no timing claim is
+/// made from any arm.
+///
+/// # 27 of 27 through the funnel, 33 registrations, 0 survivors
+///
+/// Every row is invoked by `L4W5Sweep` under `--nojit
+/// CRATONVM_DISABLE_INTRINSICS=1`, which is what makes the census's
+/// `invocations_complete: true` mean what it says. One row --
+/// `FileOutputStream.write([BII)V` -- reports the count as INCOMPLETE, so
+/// precondition 4 rests on its `outcome` instead, and the control's report has
+/// it `native-won`.
+///
+/// The strict registry drops 33 registrations over the 27 triples and the
+/// wave's report carries no `native-won` among them; the control's report has
+/// 22. The gap between 27 and 33 is six double-registered triples, and it is
+/// the same six the ratchet counts.
+///
+/// # +33 in three arms, on one binary
+///
+/// ```text
+///   arm             OFF             ON              delta
+///   (default)   3979 / 13590    4012 / 13590        +33 / 0
+///   management  4006 / 13958    4039 / 13958        +33 / 0
+///   synthetic   3979 / 13625    4012 / 13625        +33 / 0
+/// ```
+///
+/// The OFF column is the same binary with this wave's rows disarmed, and it
+/// lands exactly on LANE 5's landed figures -- the third residual wave of that
+/// lane re-froze these same three constants between this wave's first
+/// measurement and its merge. That is what says the two compose rather than
+/// overlap, and it is a stronger statement than the pre-merge sitting could
+/// make: the same +33 in all three arms, measured twice, on trees 35
+/// registrations apart.
+///
+/// Totals identical in both columns: every stub added is an existing `Bridge`
+/// relabelled.
+///
+/// # Kind map: 32 rows amended, and the gate is no redder than dev
+///
+/// `bridge -> synthetic-stub` in the 25/linux baseline, written rather than
+/// regenerated so dev's own 1 050 flips are not absorbed. **32, not 33**:
+/// `PosixFilePermission.valueOf` is absent from the baseline altogether, and
+/// this gate passes and REPORTS a new row rather than failing on it, so
+/// freezing a row whose history this wave has not measured would be the wrong
+/// repair. After the amendment the wave fires 1 050 -- exactly the control's
+/// count -- and names no row of this table.
+///
+/// Measured on **linux/x86_64 against JDK 25**.
+static RETIRED_SHADOW_L4_BACKED_OUT_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/io/ByteArrayInputStream", "<init>", "([B)V"),
+    ("java/io/ByteArrayInputStream", "<init>", "([BII)V"),
+    ("java/io/ByteArrayInputStream", "available", "()I"),
+    ("java/io/ByteArrayInputStream", "read", "([B)I"),
+    ("java/io/ByteArrayInputStream", "reset", "()V"),
+    ("java/io/ByteArrayInputStream", "skip", "(J)J"),
+    (
+        "java/io/FileCleanable",
+        "register",
+        "(Ljava/io/FileDescriptor;)V",
+    ),
+    ("java/io/FileDescriptor", "<init>", "()V"),
+    ("java/io/FileOutputStream", "close", "()V"),
+    ("java/io/FileOutputStream", "flush", "()V"),
+    ("java/io/FileOutputStream", "write", "(I)V"),
+    ("java/io/FileOutputStream", "write", "([B)V"),
+    ("java/io/FileOutputStream", "write", "([BII)V"),
+    ("java/nio/channels/FileChannel", "close", "()V"),
+    ("java/nio/channels/FileChannel", "isOpen", "()Z"),
+    (
+        "java/nio/file/attribute/FileTime",
+        "compareTo",
+        "(Ljava/nio/file/attribute/FileTime;)I",
+    ),
+    (
+        "java/nio/file/attribute/FileTime",
+        "from",
+        "(JLjava/util/concurrent/TimeUnit;)Ljava/nio/file/attribute/FileTime;",
+    ),
+    (
+        "java/nio/file/attribute/FileTime",
+        "from",
+        "(Ljava/time/Instant;)Ljava/nio/file/attribute/FileTime;",
+    ),
+    (
+        "java/nio/file/attribute/FileTime",
+        "fromMillis",
+        "(J)Ljava/nio/file/attribute/FileTime;",
+    ),
+    (
+        "java/nio/file/attribute/FileTime",
+        "toInstant",
+        "()Ljava/time/Instant;",
+    ),
+    ("java/nio/file/attribute/FileTime", "toMillis", "()J"),
+    (
+        "java/nio/file/attribute/FileTime",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/nio/file/attribute/PosixFilePermission",
+        "valueOf",
+        "(Ljava/lang/String;)Ljava/nio/file/attribute/PosixFilePermission;",
+    ),
+    (
+        "java/nio/file/attribute/PosixFilePermission",
+        "values",
+        "()[Ljava/nio/file/attribute/PosixFilePermission;",
+    ),
+    (
+        "java/nio/file/attribute/PosixFilePermissions",
+        "asFileAttribute",
+        "(Ljava/util/Set;)Ljava/nio/file/attribute/FileAttribute;",
+    ),
+    (
+        "java/nio/file/attribute/PosixFilePermissions",
+        "fromString",
+        "(Ljava/lang/String;)Ljava/util/Set;",
+    ),
+    (
+        "java/nio/file/attribute/PosixFilePermissions",
+        "toString",
+        "(Ljava/util/Set;)Ljava/lang/String;",
+    ),
+];
+
 /// Every retired-shadow table, in one slice, so a gate can walk the whole
 /// population instead of naming one wave.
 ///
@@ -11705,6 +11937,10 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // Lane 4 wave 4. No new prefix either: `java/nio/` was admitted by wave 1,
     // which retires this class's `java/nio/ByteBuffer` twin under it.
     RETIRED_SHADOW_L4_CHARBUFFER_TRIPLES,
+    // Lane 4 wave 5. No new prefix either: `java/io/` and `java/nio/` were
+    // both admitted by wave 1, and every class in this table is under one of
+    // them. The table is the whole of the decision.
+    RETIRED_SHADOW_L4_BACKED_OUT_TRIPLES,
 ];
 
 #[cfg(test)]
@@ -11874,6 +12110,115 @@ mod tests {
                 assert!(
                     !triple_is_retired_shadow(c, m, d),
                     "{c}.{m}{d} is retired, and no wave has measured {c}"
+                );
+            }
+        }
+    }
+
+    /// Wave 5's twenty-seven, and the four rows it leaves behind in classes it
+    /// otherwise takes whole.
+    ///
+    /// Three of the four are `java/io/ByteArrayInputStream`'s `read()I`,
+    /// `read([BII)I` and `close()V`, and they are NOT left out because they
+    /// answer wrongly. They answer exactly as the real bodies do. They are the
+    /// only three sites in the VM that dispatch `BaisEvent`
+    /// (`native-io/src/lib.rs`), which is how this VM makes HotSpot's
+    /// keep-alive DRAIN INSTANT observable: at body EOF, and at close, the
+    /// `https` carrier is recycled and every connection-level accessor starts
+    /// throwing `IllegalStateException: connection not yet open` again.
+    ///
+    /// Retiring them removes the observation with the native. MEASURED, one
+    /// run per row against `RSslLiveSession`: un-retiring EITHER `read()I` or
+    /// `close()V` alone clears the vector, because `drainTrap` drains with the
+    /// no-arg read and then closes and either site still fires. `read([BII)I`
+    /// is here for a reason no vector demonstrates -- it carries the same
+    /// observer for a caller that drains with the three-argument read -- and
+    /// leaving it out on the strength of "nothing went red" would ship the
+    /// same defect with no vector to find it.
+    ///
+    /// **This is a coupling and not a carrier defect**, so it is a different
+    /// kind of blocker from every other one in this lane: the row is correct,
+    /// the retirement is correct, and what breaks is a side effect hung off a
+    /// general-purpose class by a subsystem that has no other way to see the
+    /// instant. Moving it to a stream the HTTP layer owns is nominated in the
+    /// lane page; until then these three stay.
+    ///
+    /// The fourth is `PosixFilePermission.<clinit>()V`, out for the funnel's
+    /// reason and not for a behavioural one: it reads `invocations: 0` with
+    /// `invocations_complete: true` in this wave's own census, taken from a
+    /// probe that initializes the enum twice over. The native is simply never
+    /// the thing that runs class initialization here, and a row no measurement
+    /// reaches must not be taken.
+    #[test]
+    fn the_backed_out_wave_is_twenty_seven_rows_over_eight_classes() {
+        const CLASSES: &[&str] = &[
+            "java/io/ByteArrayInputStream",
+            "java/io/FileCleanable",
+            "java/io/FileDescriptor",
+            "java/io/FileOutputStream",
+            "java/nio/channels/FileChannel",
+            "java/nio/file/attribute/FileTime",
+            "java/nio/file/attribute/PosixFilePermission",
+            "java/nio/file/attribute/PosixFilePermissions",
+        ];
+        let mut classes = std::collections::BTreeSet::new();
+        for (c, m, d) in RETIRED_SHADOW_L4_BACKED_OUT_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is in lane 4's backed-out table and the predicate cannot see it"
+            );
+            assert!(
+                CLASSES.contains(c),
+                "{c} is not one of the eight classes this wave measured"
+            );
+            classes.insert(*c);
+        }
+        assert_eq!(RETIRED_SHADOW_L4_BACKED_OUT_TRIPLES.len(), 27);
+        assert_eq!(classes.len(), CLASSES.len(), "{classes:?}");
+
+        // The `BaisEvent` observers. A table row for any of these three is the
+        // defect `RSslLiveSession` catches, and nothing else would.
+        for (m, d) in [("read", "()I"), ("read", "([BII)I"), ("close", "()V")] {
+            assert!(
+                !triple_is_retired_shadow("java/io/ByteArrayInputStream", m, d),
+                "java/io/ByteArrayInputStream.{m}{d} dispatches BaisEvent; retiring it \
+                 removes this VM's only view of HotSpot's drain instant"
+            );
+        }
+        assert!(
+            !triple_is_retired_shadow(
+                "java/nio/file/attribute/PosixFilePermission",
+                "<clinit>",
+                "()V"
+            ),
+            "the enum's <clinit> is unreached by the wave's funnel"
+        );
+    }
+
+    /// The FOURTH backed-out family is retired by NO table, and that is a
+    /// decision with a measurement behind it rather than an omission.
+    ///
+    /// `java/nio/file/spi/FileSystemProvider` is nine bucket-A/B rows today
+    /// (four when §9.2 backed it out). Every one of them is blocked on the same
+    /// thing: `p57_alloc_provider` stamps instances with the ABSTRACT class on
+    /// purpose, and `FILE_SYSTEM_PROVIDER_IMPLS` records what minting the
+    /// concrete one costs -- both halves were written, built and run on
+    /// 2026-09-10, and `L4FilesSweep` went from 0 to 172 differing lines
+    /// because `UnixPath.toUnixPath`'s `instanceof UnixPath` fails against this
+    /// VM's interface-stamped Paths. Path first, provider second, and the Path
+    /// half is ~100 registrations mirrored onto `sun/nio/fs/UnixPath`.
+    ///
+    /// Asserted across EVERY table rather than against this wave's, because the
+    /// blocker belongs to the class and not to one lane's list: a row for it
+    /// arriving in any wave is the thing that would re-break `L4FilesSweep`.
+    #[test]
+    fn the_provider_family_is_retired_by_no_table() {
+        for table in RETIRED_SHADOW_TABLES {
+            for (c, m, d) in *table {
+                assert_ne!(
+                    *c, "java/nio/file/spi/FileSystemProvider",
+                    "{c}.{m}{d} is retired, and this VM's provider is stamped with the \
+                     ABSTRACT class -- the call reaches a declaration with no body"
                 );
             }
         }
