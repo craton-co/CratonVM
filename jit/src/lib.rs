@@ -655,6 +655,10 @@ impl ExecutableBuffer {
             self.overflowed = true;
             return;
         }
+        // Per-thread write permission for this copy only: a no-op except on
+        // macOS/ARM64, where `MAP_JIT` code pages are writable only inside a
+        // scope. See `platform::JitWriteScope`.
+        let _write = platform::JitWriteScope::enter();
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(self.len), bytes.len());
         }
@@ -667,6 +671,7 @@ impl ExecutableBuffer {
         if self.len + bytes.len() > self.capacity {
             return false;
         }
+        let _write = platform::JitWriteScope::enter();
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(self.len), bytes.len());
         }
@@ -687,6 +692,7 @@ impl ExecutableBuffer {
             self.overflowed = true;
             return;
         }
+        let _write = platform::JitWriteScope::enter();
         unsafe {
             *self.ptr.add(self.len) = b;
         }
@@ -834,6 +840,7 @@ impl ExecutableBuffer {
             });
         }
         let bytes = value.to_le_bytes();
+        let _write = platform::JitWriteScope::enter();
         // Safety: bounds checked above; ptr is owned and writable.
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(offset), 4);
@@ -866,6 +873,7 @@ impl ExecutableBuffer {
                 offset,
             });
         }
+        let _write = platform::JitWriteScope::enter();
         // Safety: bounds checked above.
         unsafe {
             *self.ptr.add(offset) = value;
