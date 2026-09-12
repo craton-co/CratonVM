@@ -52,20 +52,63 @@ public class L5SunMiscUnsafe {
         System.out.println(s);
     }
 
+    /**
+     * One off-heap round trip: allocate, hand the address to `c`, free.
+     *
+     * The `finally` is the point. Without it a row whose accessor throws leaks
+     * its allocation, and a probe that leaks once per failing row stops being a
+     * measurement of the accessor and starts being one of the allocator.
+     */
+    static void addrRow(String name, int bytes, AddrCall c) {
+        String out;
+        Long addr = null;
+        try {
+            addr = (Long) m("allocateMemory", long.class).invoke(U, (long) bytes);
+            out = "ok=" + c.run(addr);
+        } catch (Throwable t) {
+            out = unwrap(t);
+        } finally {
+            if (addr != null) {
+                try {
+                    m("freeMemory", long.class).invoke(U, addr);
+                } catch (Throwable ignored) {
+                    // A failed free is not this row's subject, and reporting it
+                    // here would attribute it to the accessor above.
+                }
+            }
+        }
+        say("addr." + name + " -> " + out);
+    }
+
+    interface AddrCall {
+        Object run(long addr) throws Throwable;
+    }
+
     /** Every call goes through here so a throw is a ROW rather than an exit. */
     static void probe(String name, Call c) {
         String out;
         try {
             out = "ok=" + c.run();
         } catch (Throwable t) {
-            Throwable r = t;
-            // Reflection wraps; the interesting class is the cause.
-            while (r instanceof java.lang.reflect.InvocationTargetException && r.getCause() != null) {
-                r = r.getCause();
-            }
-            out = "EX:" + r.getClass().getSimpleName();
+            out = unwrap(t);
         }
         say(name + " -> " + out);
+    }
+
+    /**
+     * `EX:<SimpleName>` for the exception a row actually raised.
+     *
+     * Shared by both row helpers on purpose: two copies of this would let the
+     * address rows and the object rows report the same throw differently, and
+     * a diff would then be about the formatting rather than the VM.
+     */
+    static String unwrap(Throwable t) {
+        Throwable r = t;
+        // Reflection wraps; the interesting class is the cause.
+        while (r instanceof java.lang.reflect.InvocationTargetException && r.getCause() != null) {
+            r = r.getCause();
+        }
+        return "EX:" + r.getClass().getSimpleName();
     }
 
     interface Call {
@@ -371,6 +414,57 @@ public class L5SunMiscUnsafe {
             byte b0 = (Byte) m("getByte", long.class).invoke(U, addr);
             m("freeMemory", long.class).invoke(U, addr);
             return b0 == (byte) 0x7f;
+        });
+
+        // ---- the ADDRESS-form accessors, one row per type ----
+        //
+        // The object-form accessors above cover `(Object, long)`; these are the
+        // `(long)` twins that read and write raw memory with no receiver, and
+        // they are a DIFFERENT registration per type -- 13 triples that the
+        // first two sittings of this workload never dispatched, which is why
+        // they stayed out of the table. Precondition 4 is per triple however
+        // obvious the sibling looks, and `getByte(J)B`, `getLong(J)J` and
+        // `putLong(JJ)V` being retired says nothing about `getInt(J)I`.
+        //
+        // One row per pair rather than one row for the family: a row that
+        // throws costs its own row and nothing else, and a family row would
+        // report the first failure as the family's.
+        //
+        // Every value is chosen to survive a narrowing that should not happen:
+        // `0x4142` in a char is printable if something writes it as bytes, and
+        // the float/double values are exact in binary so no rounding can be
+        // mistaken for a defect.
+        addrRow("byte", 1, a -> {
+            m("putByte", long.class, byte.class).invoke(U, a, (byte) 0x5a);
+            return ((Byte) m("getByte", long.class).invoke(U, a)) == (byte) 0x5a;
+        });
+        addrRow("char", 2, a -> {
+            m("putChar", long.class, char.class).invoke(U, a, (char) 0x4142);
+            return ((Character) m("getChar", long.class).invoke(U, a)) == (char) 0x4142;
+        });
+        addrRow("short", 2, a -> {
+            m("putShort", long.class, short.class).invoke(U, a, (short) -31416);
+            return ((Short) m("getShort", long.class).invoke(U, a)) == (short) -31416;
+        });
+        addrRow("int", 4, a -> {
+            m("putInt", long.class, int.class).invoke(U, a, 0x0badf00d);
+            return ((Integer) m("getInt", long.class).invoke(U, a)) == 0x0badf00d;
+        });
+        addrRow("float", 4, a -> {
+            m("putFloat", long.class, float.class).invoke(U, a, 0.5f);
+            return ((Float) m("getFloat", long.class).invoke(U, a)) == 0.5f;
+        });
+        addrRow("double", 8, a -> {
+            m("putDouble", long.class, double.class).invoke(U, a, -0.25d);
+            return ((Double) m("getDouble", long.class).invoke(U, a)) == -0.25d;
+        });
+        // `putAddress`/`getAddress` store an address-SIZED value, so the
+        // written value must fit 32 bits for the row to mean the same thing on
+        // a VM that reports `addressSize() == 4`. Both VMs here report 8; the
+        // row is written so that fact is not what it measures.
+        addrRow("address", 8, a -> {
+            m("putAddress", long.class, long.class).invoke(U, a, 0x12345678L);
+            return ((Long) m("getAddress", long.class).invoke(U, a)) == 0x12345678L;
         });
 
         // ---- object and class services ----

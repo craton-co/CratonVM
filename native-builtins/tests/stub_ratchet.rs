@@ -1997,7 +1997,46 @@ use cratonvm_types::compat::CompatibilityMode;
 /// time. Three independent derivations of one delta is what makes it a property
 /// of this branch rather than of a tree, which is the claim a re-freeze makes.
 ///
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2755;
+/// # 2026-09-11, lane 5's SECOND residual wave: +33 in every arm, total FLAT
+///
+/// `RETIRED_SHADOW_L5S_TRIPLES` re-tags 33 `Unsafe` triples from `Bridge` to
+/// `SyntheticStub` — 13 `sun/misc/Unsafe` address-form accessors and 20
+/// `jdk/internal/misc/Unsafe` delegating accessors. No registration is added or
+/// removed; 33 change kind.
+///
+/// Measured with the PAIRED ratchet rather than by arithmetic:
+/// `CRATONVM_UNRETIRE_NATIVE_SHADOW` set to the 33 triples turns the table off
+/// at runtime, so the before-number comes from the SAME tree and the same test
+/// binary:
+///
+/// ```text
+///   arm             stubs before -> after     total before -> after
+///   no-management       2728 -> 2761             13622 -> 13622
+///   management          2755 -> 2788             13990 -> 13990
+///   synthetic-jdk       2728 -> 2761             13657 -> 13657
+/// ```
+///
+/// +33 in all three, total FLAT in all three — this gate's own first case,
+/// "existing fakes were relabelled (welcome; re-freeze with the list)". The
+/// list is the 33 `@@STUB` lines `dump_synthetic_stubs` gains, with none lost.
+///
+/// ## The paired run also found these constants' TOTALS stale by 13
+///
+/// Every `MEASURED_TOTAL_REGISTRATIONS_*` below read 13 LOW against the tree it
+/// was measured on — 13609 vs 13622, 13977 vs 13990, 13644 vs 13657 — and the
+/// before-arm of the pair is what proves that is not this wave's doing, because
+/// it reads the higher number with the table turned off.
+///
+/// Those constants are UNGATED: nothing asserts them, and their only reader is
+/// the stub assertion's failure message, which uses them to classify WHY the
+/// stub count moved. So they drift silently as `dev` gains registrations, and
+/// the first wave to move the stub count then gets told its clean relabel is
+/// "new fakes were registered — the regression this gate exists for". They are
+/// re-frozen to the measured values here. This is the same failure mode the
+/// note on `STRICT_MIN_TOTAL_REGISTRATIONS` describes from the other end: an
+/// ABSOLUTE number that nothing enforces, used as evidence.
+///
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2788;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2255,7 +2294,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2755;
 /// each registration is re-tagged separately. The `--jdk-only-report` census
 /// for the same prefixes reports **15 distinct triples refused, 0 with a
 /// survivor** -- the same population counted the other way.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2728;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2761;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2435,7 +2474,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2728;
 /// each registration is re-tagged separately. The `--jdk-only-report` census
 /// for the same prefixes reports **15 distinct triples refused, 0 with a
 /// survivor** -- the same population counted the other way.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2728;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2761;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -2495,7 +2534,7 @@ const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2728;
 /// was the only trace a real defect left in this gate, and staleness meant
 /// nobody could have read it. The `synthetic-jdk` arm has no constant here and
 /// measured 13645 on the same tree.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13977;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13990;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
@@ -2508,7 +2547,7 @@ const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13977;
 /// dev's staleness rather than either wave's — the localisation is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13609;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13622;
 
 /// The `--features synthetic-jdk` total, which had no constant at all.
 ///
@@ -2534,7 +2573,7 @@ const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13609;
 /// and 13645 on that tree against 13658 on this one is exactly the drift a
 /// sentence cannot track.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13644;
+const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13657;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;
