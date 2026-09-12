@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Retired 2026-09-10. THREE residual waves (§9a, §9b, §9d) and a DELETION wave (§9c). Retired: 98 + 67 + 33 + 25. Deleted: 22 registrations no supported image declares. Two defects fixed on the way out: `invokeCleaner` accepted a heap buffer (§9e) and `Unsafe.ADDRESS_SIZE` read 0 where HotSpot reads 8 (§9f). §10.1 is answered by measurement — 98 of the 99 ForkJoin keeps cannot be expressed in a retirement table at all. What is left is §11. |
+| **Status** | Retired 2026-09-10. THREE residual waves (§9a, §9b, §9d) and a DELETION wave (§9c). Retired: 98 + 67 + 33 + 25. Deleted: 22 registrations no supported image declares. Two defects fixed on the way out: `invokeCleaner` accepted a heap buffer (§9e) and `Unsafe.ADDRESS_SIZE` read 0 where HotSpot reads 8 (§9f). §10.1 is answered by measurement — 98 of the 99 ForkJoin keeps cannot be expressed in a retirement table at all. §11.4 is answered by another (§9g): the two completion models now agree and the double does not move, so what remains there is a contract change rather than a wave. **§11 has nothing open that belongs to this lane.** |
 | **Was** | `docs/known-issues/jdk-only-lanes/lane-5-concurrent-thread-unsafe.md` |
 | **Table** | [`RETIRED_SHADOW_L5_TRIPLES`](../../../native-api/src/retired_shadow.rs) |
 | **Ownership authority** | [`lane-0-integration-and-gates.md`](../../known-issues/jdk-only-lanes/lane-0-integration-and-gates.md) |
@@ -1622,6 +1622,152 @@ correct the bytecode is right by construction rather than by accident — and th
 row is then the cheapest possible regression test for the fix: if the `<clinit>`
 shadow ever stops assigning the static, this row goes red again the same day.
 
+## 9g. §11.4 measured: the two models now agree, and the double does not move
+
+§3a diagnosed the ForkJoin double as *"the two halves of this pool disagree
+about completion, and the side table has no claim state"*, and said the work was
+to add a claim **or** to move the pool and task surface onto a single model.
+§11.4 recorded that as a subsystem change and left it.
+
+Half of it turns out to be cheap, and measuring the cheap half is what settles
+the other half.
+
+### 9g.1 The two models, stated as a measurement
+
+`apps/probes/L5FjStatus.java` asks both models the same question after each of
+eight shapes completes: `isDone()`, which is whatever this VM answers, and bit
+31 of the REAL `ForkJoinTask.status` field, read through core reflection, which
+is the JDK's own answer and the one a real worker's `doExec()` consults.
+
+```text
+                                  HotSpot 25      CratonVM --jdk-only (dev)
+  RecursiveTask fork+join         statusDone=true statusDone=FALSE
+  RecursiveTask invoke            true            FALSE
+  RecursiveAction fork+join       true            FALSE
+  commonPool execute+join         true            FALSE
+  commonPool submit+get           true            FALSE
+  second join on a done task      true            FALSE
+  cancel before run               true            FALSE
+  task that threw                 true            FALSE
+```
+
+Eight rows, and `isDone()` answers `true` in every one of them. The side table says the
+task is finished and the word the JDK's own bytecode reads says it is not —
+identically in `--jdk-only` and in compatible mode.
+
+**And the field is reachable.** The side table exists because, under a real
+layout, `ctx.get_field(this, 1)` was not `done` — an argument against reaching
+the field BY INDEX that says nothing about reaching it by NAME.
+`get_field_by_name`/`set_field_by_name` resolve `status` on the real class, and
+this probe reads it back through reflection rather than assuming the write
+landed.
+
+### 9g.2 Stamping the real word closes all eight
+
+`fjp_stamp_real_status` ORs the bits the real `setDone()` / `trySetThrown()` /
+`trySetCancelled()` OR, at every site where the side table records a completion
+— six of them, plus a `fjp_cancel_and_stamp` wrapper for the six identical
+`cancel(Z)Z` registrations. It never clears a bit: the real word is write-once
+per bit, and a VM that could clear `ABNORMAL` would manufacture exactly the
+fabricated success W6-9 removed from `fjp_state_set_done`.
+
+```text
+  L5FjStatus, HotSpot 25 vs CratonVM --jdk-only
+    dev binary      8 rows differ
+    with stamping   IDENTICAL
+```
+
+On a receiver with no `status` field — the synthetic-JDK carrier — the store is
+dropped and nothing happens, which is correct: there is only one model there.
+
+### 9g.3 It does NOT move the double, and that is the answer to §11.4
+
+§3a's experiment, re-run on both binaries — twenty submission shapes, three
+configurations, five runs each, because the count varies run to run:
+
+```text
+                      doubled / 20 rows, five runs
+  hotspot             0/20
+  dev    unarmed      0/20  0/20  0/20  0/20  0/20
+  dev    pool         2/20  2/20  3/20  1/20  2/20
+  dev    pool+tasks   1/20  2/20  2/20  2/20  1/20
+  trial  unarmed      0/20  0/20  0/20  0/20  0/20
+  trial  pool         2/20  2/20  2/20  2/20  2/20
+  trial  pool+tasks   2/20  2/20  2/20  2/20  2/20
+```
+
+Unchanged. The rows that double are the same ones — `RecursiveTask
+pool.invoke` and `commonPool RecursiveTask pool.submit+get`, with an occasional
+third — on both binaries.
+
+**This is exactly what §3a predicts, and it is worth having measured rather than
+reasoned.** Stamping records a completion; it does not CLAIM a task. Both
+runners start before either finishes, so a bit set at the end of the body
+cannot stop a body that is already running. §3a's sentence — *"nothing claims a
+task before its body runs"* — survives the change intact.
+
+So the remaining work is a claim, and the shape of it is now precise rather than
+open. The only thing the JDK's `doExec()` consults is `status < 0`, so a claim
+this VM can express means setting `DONE` **before** the body runs — which makes
+`isDone()` answer `true` for a task that is still running. That is a contract
+change, not a defect fix, and it is why §11.4 is a design change and not a wave.
+The page can now say so from a measurement.
+
+### 9g.4 Why the stamping stays anyway
+
+It closes eight rows of divergence from HotSpot at no measured cost, in both
+modes; it makes any bytecode that reads `isDone()` / `isCompletedAbnormally()`
+without passing through a native agree with the natives that do; and it is the
+prerequisite for the claim, which cannot be written against a word nothing
+maintains.
+
+It also means a real worker declines a task this VM has already finished, which
+is one of the two halves of the race — the half that does not need a contract
+change.
+
+### 9g.5 The stamping's acceptance
+
+Two binaries from the same tree — the merged tree, and the merged tree with the
+stamping — so the control is not 31 commits away from the trial.
+
+```text
+  the probe tree, 168 measured, 6 javac-skipped
+    moved AWAY from HotSpot (delta>0, control clean):   0
+    moved TOWARD HotSpot (delta<0, control clean):      1
+    unstable against itself (control>0):                0
+    line count moved:                                   0
+```
+
+The one movement is `L5FjStatus`, `d(hs,base)=16 -> d(hs,trial)=0`, control
+clean — this change and nothing else.
+
+```text
+  cargo test -p cratonvm-types                        ok, 607 tests
+  cargo test -p cratonvm-native-api --lib             ok, 443
+  cargo test -p cratonvm-native-builtins --lib        ok, 4265
+  cargo test -p cratonvm-native-builtins --tests      GREEN in all three
+                                                      feature arms
+  corpus, both binaries    --jdk-only 136/136   all 136/136   core 95/95
+```
+
+The stub ratchet does not move: this change registers nothing and re-tags
+nothing. `lock_discipline_ratchet` is green here where it was red for §9d — a
+sibling lane landed `1c6656f8f fix(jar): the manifest-sections cache takes an
+ORDERED leaf lock, not a raw Mutex` in between, which is the 429th raw lock
+going back to 428. Worth naming rather than letting a red turn green quietly.
+
+### 9g.6 The instrument lesson: the needle came from the prose
+
+The first run of the doubling experiment reported **0 doubled rows in every
+configuration**, including the two §3a measured at 2 to 8. The grep was for
+`computes=2`, which is what §3 writes — and `L5FjDouble` never prints it. Its
+vocabulary is `single` / `CONCURRENT-two-threads` / `NESTED-reentrant` /
+`SEQUENTIAL-same-thread`.
+
+The tell was the clock: thirty runs in thirteen seconds. Every cell now reads
+`doubled/rows`, so a zero arrives with the row count that makes it a result
+rather than an empty pipe.
+
 ## 10. What the next wave should do, in order (as written 2026-09-10; see §9a for what happened)
 
 1. **`ForkJoinPool`'s external submission.** §3 localises it to the submitter's
@@ -1657,84 +1803,110 @@ shadow ever stops assigning the static, this row goes red again the same day.
    red the moment someone adds the rows without the other half, which is the
    point of it.
 
-## 11. What is left, after the second residual wave (2026-09-11)
+## 11. What is left: nothing that belongs to this lane
 
-§10 is kept above as written, because three of its five items turned out to be
-mis-sized rather than merely undone and the record of how is worth more than a
-tidy list. This is what a next wave would actually find.
+§11 was written on 2026-09-11 as a five-item list for a next wave. Three items
+were taken, one was answered by measurement, and one turned out to belong to
+somebody else. This section records where each of them went, and the page has no
+open work after it.
 
-**1. `sun/misc/Unsafe` is finished except for six rows, and none of the six is a
-retirement.** 67 + 13 = 80 of its registrations are retired. What is left:
+**The previous version of this section is NOT kept above.** §10 was kept because
+three of its five items were mis-SIZED and the record of how was worth more than
+a tidy list. These five were not mis-sized; they were done. Two of them had a
+stale row in them, and those corrections are named below rather than preserved
+in place.
 
-```text
-  <clinit>()V                     a class initialiser, not a shadow
-  getUnsafe()Lsun/misc/Unsafe;    correct native; the divergence is the
-                                  core-reflection member filter, another lane's
-  ensureClassInitialized, shouldBeInitialized
-                                  declared on 17 and 21, removed on 25 — §9b.1.
-                                  Retirable only from a 17 or 21 run
-  defineClass, acquireFence, releaseFence, compareAndExchangeObject,
-  weakCompareAndExchangeObject    declared by NO supported image — deletions
-```
+### 11.1 `sun/misc/Unsafe` — finished
 
-**2. The deletion worklist is 19 triples / 22 registrations, and it is
-measured.** Registrations whose method is declared by NONE of 17, 21 and 25 —
-four on `sun/misc/Unsafe`, eighteen on `jdk/internal/misc/Unsafe`, mostly the
-`weakCompareAndExchange*` family the JDK renamed to `weakCompareAndSet*`. They
-shadow nothing and no caller on any supported image can name them, which is lane
-0's bucket F. Six source sites hold all 22:
+Two registrations remain in `--jdk-only`, and neither is a retirement:
 
 ```text
-  unsafe_natives.rs:2150-2151   acquireFence/releaseFence, the `for class in
-                                &[u, u2]` loop -> 4 rows, BOTH classes
-  unsafe_jdk25.rs:270-272       addressSize0 / isBigEndian0 / unalignedAccess0,
-                                registered twice each -> 6 rows
-  unsafe_natives.rs:2203,2223   weakCompareAndExchange{Int,Long}{,Acquire,
-                                Release} -> 6 rows
-  unsafe_natives.rs:2247        weakCompareAndExchangeReference{,Acquire,
-                                Release} and ...Object -> 4 rows
-  unsafe_natives.rs:2250        the `ends_with("Object")` arm, sun/misc only ->
-                                compareAndExchangeObject and
-                                weakCompareAndExchangeObject -> 2 rows
+  <clinit>()V                     a class initialiser, declared by no image
+                                  because it is this VM's own. Retiring it is
+                                  not meaningful; §9f is what it needs
+                                  watching for instead.
+  getUnsafe()Lsun/misc/Unsafe;    the native is CORRECT (SecurityException off
+                                  the boot path, measured against HotSpot on
+                                  both 21 and 25). The divergence is the
+                                  missing core-reflection member filter, which
+                                  is cross-cutting and has its own page.
 ```
 
-Note the asymmetry that last arm creates: `compareAndExchangeObject` IS declared
-on `jdk/internal/misc/Unsafe` for 17 and 21, and is declared on
-`sun/misc/Unsafe` NOWHERE — so one loop iteration registers a live row and a
-dead one, and only the `sun/misc` half is a deletion.
+§9d.4 took the last two retirable rows. 67 + 13 + 2 = 82 of that class's
+registrations are retired and the rest are deleted.
 
-**Do not derive this list from the kind map.** Five neighbours in the same
-position (`getReferencePlain`, `putReferencePlain`, `monitorEnter`,
-`monitorExit`, `defineAnonymousClass`) were deleted from the source on
-2026-08-29 and `scripts/baselines/jdk-only-kind-map-25-linux.tsv` still carries
-rows for them — it is hand-amended and nothing re-measures it. The 22 above come
-from a `--dump-native-registry` taken from the binary and intersected with the
-three images; the kind map's answer to the same question is 29.
+**Correction to the old §11.1.** It listed `defineClass`, `acquireFence`,
+`releaseFence`, `compareAndExchangeObject` and `weakCompareAndExchangeObject` as
+"declared by NO supported image — deletions". Four of them were deleted by §9c
+on 2026-09-12. The fifth, `defineClass`, had already been deleted on
+**2026-08-29** and was stale the day §11 was written —
+`native-builtins/src/deprecated_internal.rs` carries the note. A residual list
+that is not re-derived from the binary carries rows that are already done; this
+is the third time that has bitten on this page and the remedy is the same each
+time: `--dump-native-registry`, not the kind map and not the last list.
 
-And check the SYNTHETIC-JDK arm before deleting: the fabricated image is a
-fourth image, and "no supported image declares it" is a statement about the
-other three.
+### 11.2 The deletion worklist — done
 
-**3. `jdk/internal/misc/Unsafe`, per triple, minus the floor.** 68 of its
-methods are `ACC_NATIVE` on the image and stay `Bridge` forever (§1.5). Of the
-rest, 20 are now retired and 26 more were dispatched-and-yielded in the armed
-sweep but belong to the three families §9b.5 names as permanently blocked. The
-remainder needs a dispatch each, and `probes/UnsafeShadowSweep.java` is the
-instrument — widening it is a probe edit, not a build.
+§9c, 2026-09-12: 19 triples, 22 registrations, six source sites.
 
-**4. `ForkJoinPool` is a subsystem change, not a wave.** §9b.6: 98 of the 99
-keep-listed triples cannot be expressed in a retirement table at all, because
-the keep predicate reads the kind and the re-tag has already changed it. The
-work is to move the pool and task surface off the `fjp_state` side table and
-delete the keep arms with it; there is no intermediate step that retires rows
-one at a time. Whoever takes it should read §3a first — the double is a race
-between two completion models, it is absent from shipped `--jdk-only`, and
-arming the task classes with the pool measured worse.
+### 11.3 `jdk/internal/misc/Unsafe` — done
 
-**5. The two `ScheduledThreadPoolExecutor` rows** — unchanged from §10.5, and
-now visibly one instance of the §9b.6 mechanism rather than a curiosity. They
-need a real-JDK Spring measurement and then the keep arm and the table entry
-deleted together, which is that corpus owner's call rather than this lane's.
+§9d, 2026-09-12. The arithmetic closes with nothing left over: 126 registered
+triples, a 68-method `ACC_NATIVE` floor that `javap` and the registry agree on
+from opposite ends, `<clinit>`, three partials, and 54 candidates of which 23
+are now retired and every one of the other 31 is in a named family with a reason
+that does not expire:
 
-**Not this lane's, and open:** the core-reflection member filter,
-`docs/known-issues/jdk-only/core-reflection-has-no-member-filter-20260911.md`.
+```text
+  *Unaligned, both arities, four widths, get and put                16
+  sub-word atomics (compareAndExchange/compareAndSet/getAndAdd × B,S) 6
+  the numbering, plus getUnsafe and ensureClassInitialized            6
+  invokeCleaner — the dial yielded it and the arm went red, §9d.3     1
+  allocateMemory and reallocateMemory — §9d.6                         2
+```
+
+The last three lines are asserted by name in `retired_shadow.rs`'s own tests, so
+a future wave that adds one of them fails in a unit test rather than in a corpus
+arm three hours later.
+
+### 11.4 `ForkJoinPool` — half taken, and the other half is now a sentence rather than a shrug
+
+§9g. The two completion models were made to agree: `fjp_stamp_real_status`
+writes the JDK's own `status` word wherever the side table records a completion,
+and `L5FjStatus` goes from **eight rows differing from HotSpot to none**.
+
+The double did **not** move — 2 of 20 rows under an armed pool on both binaries,
+0 of 20 unarmed on both, which is shipped behaviour and was already clean. That
+is the measurement §11.4 was missing, and it converts the remaining item from
+"a subsystem change" into something specific:
+
+> The only thing the JDK's `doExec()` consults is `status < 0`. A claim this VM
+> can express therefore means setting `DONE` **before** the body runs, which
+> makes `isDone()` answer `true` for a task that is still running. That is a
+> contract change, not a defect fix.
+
+Nobody should take that on as a retirement wave, and §9b.6 already says why the
+98 keep-listed rows cannot be expressed in a table at all. If it is taken, it is
+taken as a design change to the pool's completion model, with §3a's
+`L5FjDouble` and §9g's `L5FjStatus` as the instruments — both now exist and both
+have a recorded baseline.
+
+### 11.5 `ScheduledThreadPoolExecutor` — moved to its own page
+
+[`docs/known-issues/jdk-only/scheduled-thread-pool-executor-keep-arm-20260912.md`](../../known-issues/jdk-only/scheduled-thread-pool-executor-keep-arm-20260912.md).
+
+The two rows are held by a keep arm written for Spring's
+`ThreadPoolTaskScheduler`, and what would change that judgement is a real-JDK
+Spring corpus run — which belongs to that corpus's owner. Leaving them here made
+them look like unfinished retirement work, which they are not.
+
+`apps/probes/L5StpeKeepArm.java` went with them: the isolated shape is identical
+to HotSpot with the class armed (`reached 23, yielded 23`, `bytecode-won` on
+both triples), which is the cheap half of the evidence and explicitly not the
+half that decides.
+
+### Still open, still not this lane's
+
+The core-reflection member filter,
+`docs/known-issues/jdk-only/core-reflection-has-no-member-filter-20260911.md` —
+now confirmed on a second image, in a second shape (§9d.5).
