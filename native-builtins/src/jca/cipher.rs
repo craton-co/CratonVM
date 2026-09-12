@@ -7122,9 +7122,16 @@ mod tests {
             !refuses_algorithm("AES/CTR/NoPadding"),
             "AES/CTR/NoPadding is computed now"
         );
+        // The padded spelling is refused as a PADDING, not as an algorithm:
+        // `aes_padding_verdict` names the padding it will not take, and
+        // `classify_transformation` turns that into
+        // `NoSuchPaddingException`. That is the JDK's distinction too — the
+        // transformation exists, the padding does not go with it — and this
+        // assertion said `refuses_algorithm` on the first attempt, which is
+        // the wrong half of it.
         assert!(
-            refuses_algorithm("AES/CTR/PKCS5Padding"),
-            "there is no padded CTR"
+            refuses_padding("AES/CTR/PKCS5Padding"),
+            "CTR is a stream mode: the padding is what is refused, not the mode"
         );
         // `DESede` and `DESede/ECB/PKCS5Padding` were on this list until
         // 2026-08-27 and are now COMPUTED, by the same rule that put
