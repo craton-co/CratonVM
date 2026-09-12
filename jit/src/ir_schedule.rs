@@ -1309,29 +1309,77 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
     }
 
     // Step 2: Find terminators for each block
-    // Walk control edges forward from each block head
-    for block_idx in 0..blocks.len() {
-        let head = blocks[block_idx].ctrl;
-        // Find nodes that use this control token
-        for (id, node) in graph.nodes.iter().enumerate() {
-            if node.op == Op::Dead {
-                continue;
+    //
+    // An `If` / `Return` / `Throw` terminates the block its control input
+    // heads. One pass over the graph, finding that block through
+    // `node_to_block`, rather than one whole-graph scan per block: that was
+    // O(blocks × nodes), which a method near the node cap pays in full. Nodes
+    // are visited in id order and a later match overwrites an earlier one, so a
+    // block two terminators name keeps the higher id, as the per-block scan
+    // did.
+    for (id, node) in graph.nodes.iter().enumerate() {
+        if !matches!(node.op, Op::If | Op::Return | Op::Throw) {
+            continue;
+        }
+        let Some(&head) = node.inputs.first() else {
+            continue;
+        };
+        let Some(&block_idx) = node_to_block.get(head as usize) else {
+            continue;
+        };
+        // Only block heads have an entry yet, and no terminator is a head; the
+        // `ctrl` check makes that a fact here rather than an assumption.
+        if block_idx < blocks.len() && blocks[block_idx].ctrl == head {
+            blocks[block_idx].terminator = Some(id as NodeId);
+            node_to_block[id] = block_idx;
+        }
+    }
+
+    // Step 3 reads, per block, the projections of its `If` terminator and the
+    // merges its control feeds. Both are gathered here in ONE pass, for the
+    // same reason as Step 2. Each list is built in node-id order — the order
+    // the per-block scans visited them in — so the successor and predecessor
+    // lists below come out identical.
+    let num_blocks = blocks.len();
+    let mut if_projs: Vec<Vec<(u8, usize)>> = vec![Vec::new(); num_blocks];
+    let mut fed_merges: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+    for (id, node) in graph.nodes.iter().enumerate() {
+        match &node.op {
+            Op::Proj(which) => {
+                let Some(&term) = node.inputs.first() else {
+                    continue;
+                };
+                let Some(&tb) = node_to_block.get(term as usize) else {
+                    continue;
+                };
+                if tb >= num_blocks || blocks[tb].terminator != Some(term) || !is_if(graph, term)
+                {
+                    continue;
+                }
+                let succ_block = node_to_block[id];
+                if succ_block == usize::MAX {
+                    continue;
+                }
+                if_projs[tb].push((*which, succ_block));
             }
-            match &node.op {
-                Op::If => {
-                    if !node.inputs.is_empty() && node.inputs[0] == head {
-                        blocks[block_idx].terminator = Some(id as NodeId);
-                        node_to_block[id] = block_idx;
+            Op::Merge | Op::Region => {
+                for &head in node.inputs.iter() {
+                    let Some(&hb) = node_to_block.get(head as usize) else {
+                        continue;
+                    };
+                    if hb >= num_blocks || blocks[hb].ctrl != head {
+                        continue;
+                    }
+                    // A merge naming the same head twice is ONE successor (the
+                    // scan asked `inputs.contains(&head)`). This merge's inputs
+                    // are visited consecutively, so a repeat is always the
+                    // list's last entry.
+                    if fed_merges[hb].last() != Some(&id) {
+                        fed_merges[hb].push(id);
                     }
                 }
-                Op::Return | Op::Throw => {
-                    if !node.inputs.is_empty() && node.inputs[0] == head {
-                        blocks[block_idx].terminator = Some(id as NodeId);
-                        node_to_block[id] = block_idx;
-                    }
-                }
-                _ => {}
             }
+            _ => {}
         }
     }
 
@@ -1365,18 +1413,10 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
                     // Sorting by the projection's own index makes the invariant
                     // a property of this code rather than of node-allocation
                     // order. It is a no-op on every graph the builder makes.
-                    let mut succs: Vec<(u8, usize)> = Vec::new();
-                    for (id, node) in graph.nodes.iter().enumerate() {
-                        let Op::Proj(which) = &node.op else { continue };
-                        if node.inputs.first().copied() != Some(term) {
-                            continue;
-                        }
-                        let succ_block = node_to_block[id];
-                        if succ_block == usize::MAX {
-                            continue;
-                        }
-                        succs.push((*which, succ_block));
-                    }
+                    //
+                    // `if_projs` holds them in node-id order; the sort is
+                    // stable, so equal indices keep that order as before.
+                    let mut succs: Vec<(u8, usize)> = std::mem::take(&mut if_projs[block_idx]);
                     succs.sort_by_key(|&(which, _)| which);
                     for (_which, succ_block) in succs {
                         if !blocks[block_idx].successors.contains(&succ_block) {
@@ -1397,20 +1437,16 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
 
         // For blocks without explicit terminator (fall-through via goto → merge),
         // check if the block's control feeds into a Merge/Region
-        let head = blocks[block_idx].ctrl;
-        for (id, node) in graph.nodes.iter().enumerate() {
-            if matches!(&node.op, Op::Merge | Op::Region) {
-                if node.inputs.contains(&head) {
-                    let succ_block = node_to_block[id];
-                    if succ_block != usize::MAX
-                        && succ_block != block_idx
-                        && !blocks[block_idx].successors.contains(&succ_block)
-                    {
-                        blocks[block_idx].successors.push(succ_block);
-                        if !blocks[succ_block].predecessors.contains(&block_idx) {
-                            blocks[succ_block].predecessors.push(block_idx);
-                        }
-                    }
+        // (`fed_merges`, gathered above.)
+        for &id in &fed_merges[block_idx] {
+            let succ_block = node_to_block[id];
+            if succ_block != usize::MAX
+                && succ_block != block_idx
+                && !blocks[block_idx].successors.contains(&succ_block)
+            {
+                blocks[block_idx].successors.push(succ_block);
+                if !blocks[succ_block].predecessors.contains(&block_idx) {
+                    blocks[succ_block].predecessors.push(block_idx);
                 }
             }
         }
