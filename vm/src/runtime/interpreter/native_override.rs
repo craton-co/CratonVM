@@ -4254,10 +4254,20 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     // objects, so calls such as `ValueLayout$OfFloat.withByteAlignment(J)`
     // must be served by the registered layout shims instead of falling through
     // to an abstract interface method with no Code attribute.
+    //
+    // THE INTERFACES ONLY, since 2026-09-11. This arm also named
+    // `jdk/internal/foreign/layout/ValueLayouts$`, and that spelling outlived
+    // its reason: the impl classes are no longer abstract stand-ins but the
+    // REAL JDK classes, minted with their real fields, and every one of these
+    // eleven methods has real `Code` on them -- declared or inherited. Lane 4
+    // wave 2 retires those 146 registrations
+    // (`cratonvm_native_api::retired_shadow`), and an arm saying "never yield
+    // to the bytecode" about the same names would have contradicted the table
+    // saying "yield to it". The comment above is the arm's original rationale
+    // and is still exactly right about the four interface spellings kept here.
     if (class_name == "java/lang/foreign/ValueLayout"
         || class_name == "java/lang/foreign/AddressLayout"
-        || class_name.starts_with("java/lang/foreign/ValueLayout$")
-        || class_name.starts_with("jdk/internal/foreign/layout/ValueLayouts$"))
+        || class_name.starts_with("java/lang/foreign/ValueLayout$"))
         && matches!(
             method_name,
             "byteSize"
@@ -4519,13 +4529,18 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     }
     // BREAKITER, the real data (2026-09-11): the two `LocaleResources`
     // readers `BreakIteratorProviderImpl.getBreakInstance` needs. Both
-    // answered null, which is why the BREAKITER allow-list below pins a
+    // answered null, which is why a BREAKITER allow-list used to pin a
     // synthetic iterator over `java.text.BreakIterator`'s four factories;
     // the natives registered in `locale_resources::register` read the
     // `BreakIteratorInfo` bundle class and the `*BreakIteratorData` binary
     // out of the image instead. A registration on a concrete JDK-library
     // method is SILENT without a gate entry, which is the whole reason
     // this arm exists.
+    //
+    // WAVE 6: that pin is gone (`vm/src/vm/vm_exec.rs`) and the family runs
+    // its own bytecode, so these two entries now carry it. They are the
+    // family's floor, not a stepping stone -- remove them and every
+    // BreakIterator factory is back to "Cannot load from null array".
     if class_name == "sun/util/locale/provider/LocaleResources"
         && matches!(
             method_name,

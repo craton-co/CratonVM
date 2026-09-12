@@ -2081,27 +2081,6 @@ pub(crate) fn register_p59_package(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // Package.getPackages() — static. Real-JDK bytecode delegates to
-    // `ClassLoader.getClassLoader(Reflection.getCallerClass()).getPackages()`,
-    // which in turn calls `packages().toArray(...)` with `packages()` returning
-    // a Stream over the `packages` ConcurrentHashMap. In our boot, that path
-    // routes back through bytecode which (in JDK 25) leaks a Stream object
-    // where a `Package[]` is required (observed: `ReferencePipeline$Head`
-    // returned from `ClassLoader.getPackages()[Ljava/lang/Package;`,
-    // triggering NPE on arraylength in callers like
-    // `org/jboss/modules/ConcurrentClassLoader.<clinit>` during WildFly boot).
-    // Override with an empty `Package[]` — JBoss-modules only uses this for a
-    // sanity scan and tolerates an empty result. Mirrors the existing
-    // `ClassLoader.getDefinedPackages()` empty-array override.
-    r.register(
-        pkg,
-        "getPackages",
-        "()[Ljava/lang/Package;",
-        |ctx, _args| {
-            let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            Ok(Some(Value::Object(Some(empty))))
-        },
-    );
     r.set_category(__prev_cat);
 }
 
@@ -3339,11 +3318,25 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
             let arr = scope.get(&arr_h);
             scope.set_array_element(arr, i, Value::Object(Some(m_obj)));
         }
-        let set = try_alloc_concurrent_synthetic(&mut *scope, "java/util/HashSet", 3)?;
-        let arr = scope.get(&arr_h);
-        scope.set_field(set, 0, Value::Object(Some(arr)));
-        scope.set_field(set, 1, Value::Int(len as i32));
-        scope.set_field(set, 2, Value::Int(16));
+        // A REAL `java.util.HashSet`, through its own `<init>` and `add`.
+        //
+        // The three slots this used to write -- module array at absolute 0,
+        // count at 1, capacity at 2 -- are the MAP layout, on a class whose
+        // one real instance field is `map` (`Ljava/util/HashMap;`). Every
+        // `Set` method on the returned object dereferences `map`, so
+        // `layer.modules().size()` answered 0 on a layer this native had just
+        // filled, and the raw writes were part of what pinned
+        // `java/util/HashSet`'s slot floor at three against that one field.
+        let modules: Vec<cratonvm_types::ObjectRef> = {
+            let arr = scope.get(&arr_h);
+            (0..len)
+                .filter_map(|i| match scope.get_array_element(arr, i) {
+                    Value::Object(Some(m)) => Some(m),
+                    _ => None,
+                })
+                .collect()
+        };
+        let set = crate::build_real_hash_set(&mut *scope, &modules)?;
         Ok(Some(Value::Object(Some(set))))
     });
 

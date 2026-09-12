@@ -56,6 +56,49 @@ pub fn tierup_decline_enabled() -> bool {
     gate(&TIERUP_DECLINE_ON, "CRATONVM_DBG_TIERUP_DECLINE")
 }
 
+static CALLBACK_MEMO_ON: AtomicU8 = AtomicU8::new(0);
+
+/// `CRATONVM_DBG_CALLBACK_MEMO=1` — the native->Java callback memo's
+/// engagement census (`crate::runtime::native_callee_memo`).
+///
+/// Read it the way `direct-binds` is read: a `hits` count alone cannot tell a
+/// working memo from a workload with no native->Java callbacks in it, so
+/// `probes` is printed beside it as the denominator and `fills`/`evictions`
+/// beside THAT, because a memo whose fills track its probes is a memo that is
+/// thrashing rather than one that is working.
+#[inline(always)]
+pub fn callback_memo_enabled() -> bool {
+    gate(&CALLBACK_MEMO_ON, "CRATONVM_DBG_CALLBACK_MEMO")
+}
+
+static PROMOTE_REFUSE_ON: AtomicU8 = AtomicU8::new(0);
+
+/// `CRATONVM_DBG_PROMOTE_REFUSE=1` — the SECOND tier-up census, and the one
+/// `tierup-decline` structurally cannot produce.
+///
+/// `tierup-decline` names the first condition of the `&&` chain in
+/// `execute_invokevirtual_cached` that refused a site. A site that chain
+/// ADMITS can still be interpreted, and on the composition workload that is
+/// exactly what happens: with
+/// `CRATONVM_JIT_VIRTUAL_NOMINATE_ALWAYS=1 CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL=1`
+/// the `tierup-decline` census reports `CompletableFuture.getNow` admitted and
+/// `CRATONVM_DBG_INTERP_FRAMES=1` still reports 40 000 interpreted frames for
+/// it in 40 000 chains — so the refusal is downstream of the chain and nothing
+/// named it. See
+/// `composition-native-callback-and-the-promotion-question-20260902.md` item 2:
+/// "what is missing is the reason the `jit_cache` probe or
+/// `execute_jit_call_decoded` then refuses, which is a second census and the
+/// next thing to build."
+///
+/// One row per dispatch, keyed by the reason the site did not END UP in
+/// compiled code. `entered_compiled` is the success row and is recorded too: a
+/// refusal census with no success row cannot be told from an instrument that
+/// is not wired up.
+#[inline(always)]
+pub fn promote_refuse_enabled() -> bool {
+    gate(&PROMOTE_REFUSE_ON, "CRATONVM_DBG_PROMOTE_REFUSE")
+}
+
 static DIRECT_BINDS_ON: AtomicU8 = AtomicU8::new(0);
 
 /// `CRATONVM_DBG_DIRECT_BINDS=1` — the thin-direct-call engagement census.
@@ -131,6 +174,29 @@ pub fn record_tierup_decline(reason: &str, class: &str, method: &str, descriptor
     }
 }
 
+fn promote_refuse_census() -> &'static Census {
+    static C: OnceLock<Census> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record why a site the tier-up `&&` chain ADMITTED did or did not end up
+/// executing compiled code. Caller has already tested
+/// [`promote_refuse_enabled`].
+#[cold]
+pub fn record_promote_refuse(reason: &str, class: &str, method: &str, descriptor: &str) {
+    let key = format!("{reason} {class}.{method}{descriptor}");
+    if let Ok(mut m) = promote_refuse_census().lock() {
+        *m.entry(key).or_insert(0) += 1;
+    }
+}
+
+/// The `execute_jit_call_decoded` half, recorded from `jit_bridge` where the
+/// cached entry is in hand but the census module is not otherwise reached.
+#[cold]
+pub fn record_decoded_call_refusal(reason: &str, class: &str, method: &str, descriptor: &str) {
+    record_promote_refuse(reason, class, method, descriptor);
+}
+
 fn dump(label: &str, c: &Census, top: usize) {
     let Ok(m) = c.lock() else { return };
     if m.is_empty() {
@@ -188,6 +254,10 @@ pub fn report_at_exit() {
     report_unrebuildable_frames();
     dump("interp-frames", interp_census(), 60);
     dump("tierup-decline", decline_census(), 60);
+    dump("promote-refuse", promote_refuse_census(), 60);
+    // `CRATONVM_DBG=dispatch-tally`, which could only report every 2^20 rows
+    // and therefore printed nothing at the size its own page measures.
+    crate::vm::dump_dispatch_tally_at_exit();
     // C1→C2 supersede engagement. `unchanged`/`first-publish` are the two
     // outcomes that cannot invalidate anything, and `ic_evictions` is what the
     // epoch bump actually costs — the number of `Jit` invoke-cache entries it
@@ -385,6 +455,29 @@ pub fn report_at_exit() {
         // — a fact about the workload, not a broken pass.
         let load_cse = cratonvm_jit::ir_optimize::ir_load_cse_census();
         eprintln!("[c2-supersede] ir redundant reads removed: {load_cse}");
+        // Inline field-read sites, split by whether the site before it in the
+        // same block had already run the layout-epoch guard and the per-object
+        // compactness test. `later` is the population a CSE of those two could
+        // serve; `elided` beside it is what the receiver null-check CSE
+        // ALREADY serves, which is the comparison that says whether the
+        // remaining guards are worth the work.
+        // Why a workload has few inline field sites has two very different
+        // answers — the code reads few fields, or the inline path refused most
+        // of them — and only this distinguishes them.
+        let declines = cratonvm_jit::metrics::ir_getfield_declines();
+        if !declines.is_empty() {
+            let joined: Vec<String> =
+                declines.iter().map(|(n, v)| format!("{n}={v}")).collect();
+            eprintln!(
+                "[c2-supersede] ir getfield inline declines: {}",
+                joined.join(" ")
+            );
+        }
+        let (first_site, later_site) = cratonvm_jit::ir_lower::ir_field_site_census();
+        let (seeded, elided, emitted) = cratonvm_jit::metrics::ir_receiver_null_check_counts();
+        eprintln!(
+            "[c2-supersede] ir inline field sites: first-in-block={first_site} later-in-block={later_site}; receiver null checks: seeded={seeded} elided={elided} emitted={emitted}"
+        );
         // Speculation. A zero with `CRATONVM_JIT_IR_SPECULATE=1` means no
         // branch in this workload was one-sided over the sample — a fact about
         // the program, not about the pass — and that is precisely what a bare
@@ -521,6 +614,13 @@ pub fn report_at_exit() {
             pc.already_adjacent,
             pc.deopt_between,
             pc.no_node,
+        );
+    }
+    if callback_memo_enabled() {
+        let [probes, hits, fills, evictions] = crate::runtime::native_callee_memo::census();
+        let misses = probes.saturating_sub(hits);
+        eprintln!(
+            "[callback-memo] probes={probes} hits={hits} misses={misses} fills={fills} evictions={evictions}"
         );
     }
     if direct_binds_enabled() {

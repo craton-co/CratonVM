@@ -1603,8 +1603,90 @@ fn is_synthesized_locale_base(name: &str) -> bool {
 /// accessors return a plain `ResourceBundle` (no `checkcast`), and
 /// `DateFormatSymbols`/`DecimalFormatSymbols` consume them through the curated
 /// English/US map populated by `build_bundle`.
-fn needs_concrete_bundle_class(name: &str) -> bool {
-    name.ends_with(".TimeZoneNames")
+fn needs_concrete_bundle_class(name: &str, caller_is_app: bool) -> bool {
+    name.ends_with(".TimeZoneNames") || (name.ends_with(".LocaleNames") && !caller_is_app)
+}
+
+/// `.LocaleNames` was added 2026-09-11 (wave 6) and the paragraph above said
+/// why it was not there: "nothing in the failing test exercises their cast".
+/// Something does now.
+///
+/// `apps/probes/L1LocaleProviderWorkload` asks for
+/// `Locale.getDisplayVariant` and `getDisplayScript`, and both land in
+/// `LocaleData.getLocaleNames`, whose `checkcast` to
+/// `sun/util/resources/OpenListResourceBundle` a curated
+/// `java/util/ResourceBundle` cannot satisfy:
+///
+/// ```text
+///   N.displayVariant  Valencian -> THREW java.lang.ClassCastException
+///       class java.util.ResourceBundle cannot be cast to class
+///       sun.util.resources.OpenListResourceBundle
+/// ```
+///
+/// The other half of that paragraph -- "the real CLDR display names live in
+/// `sun.util.resources.cldr.ext.*`, which the simple locale-candidate chain
+/// does not reach" -- was true of the chain and is what
+/// [`concrete_bundle_chain`] fixes. `jimage list` on the JDK 25.0.3 image:
+///
+/// ```text
+///   sun/util/resources/LocaleNames.class            (legacy root)
+///   sun/util/resources/cldr/LocaleNames.class
+///   sun/util/resources/cldr/LocaleNames_en.class
+///   sun/util/resources/cldr/ext/LocaleNames_ca.class
+/// ```
+///
+/// `CurrencyNames` has the same shape and is deliberately NOT added: it
+/// measured `+38` armed on the same probe, so its curated path is doing work
+/// the class bundles would have to replace, and that is its own measurement.
+///
+/// # `LocaleNames` is routed for JDK-INTERNAL callers only, and that is
+/// MEASURED
+///
+/// The first cut routed it for every caller and cost one probe:
+///
+/// ```text
+///   CurrencyNameProbe row 18   HotSpot: THREW MissingResourceException
+///                                       "Can't find bundle for base name
+///                                        sun.util.resources.LocaleNames"
+///                              this VM: sun.util.resources.cldr.LocaleNames_en
+/// ```
+///
+/// Application code calling `ResourceBundle.getBundle` on that base name by
+/// hand gets a `MissingResourceException` on HotSpot, and answering it is a
+/// wrong answer even though the bundle is real and the cast would have
+/// worked. The `checkcast` that needs the real class lives in
+/// `LocaleData.getLocaleNames`, which is not application code -- so
+/// `caller_is_app` is exactly the discriminator, and it is already computed
+/// here for `is_jdk_internal_bundle`'s sake.
+///
+/// `TimeZoneNames` is NOT gated the same way: it was routed unconditionally
+/// in 2026-08 for Tomcat's `TestExpiresFilter` and nothing has measured the
+/// app-caller side of it. Narrowing someone else's fix on an argument rather
+/// than a measurement is how a working path breaks.
+fn concrete_bundle_chain(
+    bundle_name: &str,
+    chain: &[(String, String, String)],
+) -> Vec<(String, String, String)> {
+    let Some((root_pkg, ext_pkg)) = cldr_packages(bundle_name) else {
+        return chain.to_vec();
+    };
+    let root_pkg = root_pkg.replace('/', ".");
+    let ext_pkg = ext_pkg.replace('/', ".");
+    let mut out: Vec<(String, String, String)> = chain.to_vec();
+    // LEAST specific first, and appended AFTER the plain candidates on
+    // purpose: `try_class_bundle` links each existing candidate as the child
+    // of the previous one and returns the last, so the CLDR bundle ends up
+    // the most specific and the legacy root becomes its parent rather than
+    // its replacement.
+    for (cand, lang, country) in chain {
+        let Some(simple) = cand.rsplit('.').next() else {
+            continue;
+        };
+        for pkg in [root_pkg.as_str(), ext_pkg.as_str()] {
+            out.push((format!("{pkg}.{simple}"), lang.clone(), country.clone()));
+        }
+    }
+    out
 }
 
 /// Real-JDK "java.class" bundle format: the bundle is a compiled
@@ -2139,7 +2221,14 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // javac/launcher messages — and some apps ship resources — as compiled
     // bundle classes, e.g. `com.sun.tools.javac.resources.compiler`). Skip the
     // hand-synthesized locale-data families, which stay on their curated path.
-    if !is_synthesized_locale_base(&bundle_name) || needs_concrete_bundle_class(&bundle_name) {
+    if !is_synthesized_locale_base(&bundle_name)
+        || needs_concrete_bundle_class(&bundle_name, caller_is_app)
+    {
+        let chain = if needs_concrete_bundle_class(&bundle_name, caller_is_app) {
+            concrete_bundle_chain(&bundle_name, &chain)
+        } else {
+            chain.clone()
+        };
         if let Some(real) = try_class_bundle(ctx, &chain) {
             ctx.unpin_native_roots(loader_pin.unwrap_or(obj_pin));
             return Ok(Some(Value::Object(Some(real))));
@@ -4298,5 +4387,97 @@ fn calendar_id_is_gregorian(ctx: &mut dyn NativeContext, arg: Option<&Value>) ->
             id.eq_ignore_ascii_case("gregory") || id.eq_ignore_ascii_case("iso8601")
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod w6_concrete_bundle_chain_tests {
+    use super::*;
+
+    /// The CLDR candidates are APPENDED, least-specific first, and the plain
+    /// ones are kept.
+    ///
+    /// Both halves matter. Keeping the plain chain means `TimeZoneNames`,
+    /// whose legacy root is the one `try_class_bundle` has always found,
+    /// still finds it. Appending means the CLDR bundle is instantiated LAST
+    /// and therefore returned, with the legacy root as its parent rather than
+    /// its replacement.
+    #[test]
+    fn the_cldr_packages_are_appended_after_the_plain_candidates() {
+        let chain = vec![
+            (
+                "sun.util.resources.LocaleNames".to_string(),
+                String::new(),
+                String::new(),
+            ),
+            (
+                "sun.util.resources.LocaleNames_en".to_string(),
+                "en".to_string(),
+                String::new(),
+            ),
+        ];
+        let out = concrete_bundle_chain("sun.util.resources.LocaleNames", &chain);
+        let names: Vec<&str> = out.iter().map(|(c, _, _)| c.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "sun.util.resources.LocaleNames",
+                "sun.util.resources.LocaleNames_en",
+                "sun.util.resources.cldr.LocaleNames",
+                "sun.util.resources.cldr.ext.LocaleNames",
+                "sun.util.resources.cldr.LocaleNames_en",
+                "sun.util.resources.cldr.ext.LocaleNames_en",
+            ]
+        );
+        // The locale each candidate stands for travels with it: `rb_get_bundle`
+        // reads that pair back to stamp the bundle's `locale` field, and a
+        // candidate that lost its language would stamp the root.
+        assert_eq!(out[4].1, "en");
+    }
+
+    /// A base name with no CLDR package pair is handed back untouched rather
+    /// than given invented candidates.
+    #[test]
+    fn a_non_locale_base_name_keeps_its_own_chain() {
+        let chain = vec![(
+            "com.example.Messages".to_string(),
+            String::new(),
+            String::new(),
+        )];
+        let out = concrete_bundle_chain("com.example.Messages", &chain);
+        assert_eq!(out, chain);
+    }
+
+    /// The two families this routing is for, and the one it is deliberately
+    /// not for.
+    #[test]
+    fn currency_names_is_not_routed_to_the_class_bundles() {
+        assert!(needs_concrete_bundle_class(
+            "sun.util.resources.TimeZoneNames",
+            false
+        ));
+        assert!(needs_concrete_bundle_class(
+            "sun.util.resources.LocaleNames",
+            false
+        ));
+        // An APPLICATION caller asking for `LocaleNames` by hand gets
+        // HotSpot's `MissingResourceException`, not our real bundle --
+        // measured on `CurrencyNameProbe` rows 18 and 20.
+        assert!(!needs_concrete_bundle_class(
+            "sun.util.resources.LocaleNames",
+            true
+        ));
+        // `TimeZoneNames` is unconditional, as it has been since 2026-08.
+        assert!(needs_concrete_bundle_class(
+            "sun.util.resources.TimeZoneNames",
+            true
+        ));
+        // +38 armed on `L1LocaleProviderWorkload`: its curated path is doing
+        // work the class bundles would have to replace, and that is its own
+        // measurement rather than this one's corollary.
+        assert!(!needs_concrete_bundle_class(
+            "sun.util.resources.CurrencyNames",
+            false
+        ));
     }
 }

@@ -5702,6 +5702,72 @@ impl ClassManager {
         self.define_class_with_options(name, bytes, loader_id, DefineClassOptions::default())
     }
 
+    /// The synthetic slot FLOOR, applied to a class being defined from real
+    /// class-file bytes.
+    ///
+    /// Both places that define such a class — [`Self::define_class_with_options`]
+    /// and the stub-upgrade path — call this rather than open-coding the
+    /// `max`, so the floor and the exemptions below it cannot drift apart. A
+    /// FABRICATED stub never reaches here: `synthesize_stub_class` takes its
+    /// fields straight from `synthetic_stub_fields` and consults no floor, so
+    /// nothing this function does can change synthetic-JDK mode.
+    ///
+    /// The floor is the parent's already-floored total plus the class's own
+    /// fabricated instance fields, and it pads a real class up to the width
+    /// native code was written against. `java.net.InetSocketAddress` is the
+    /// case it exists for: one declared instance field (`holder`), and a
+    /// native `<init>` that writes raw synthetic indices on the REAL class.
+    ///
+    /// For [`FLOOR_EXEMPT_CLASSES`] it is skipped. Their fabricated table is a
+    /// layout for the STUB and a fiction for the real class, and applying it
+    /// pads the class out of the compact layout entirely — a padded slot has
+    /// no descriptor, so `ClassStore::build_compact_layout` refuses the class
+    /// outright and every one of its slots falls back to the legacy uniform
+    /// 16-byte tagged cell. `java.util.Properties` paid 544 bytes empty for
+    /// ten fields that pack into ~190 that way; `HashSet` paid 128 for one
+    /// reference.
+    fn apply_synthetic_floor(
+        &self,
+        name: &str,
+        superclass_id: Option<ClassId>,
+        num_total_fields: usize,
+    ) -> usize {
+        if floor_is_synthetic_only(name) {
+            // Report a JDK whose shape has moved out from under the screen
+            // that cleared this class. The exemption was measured against a
+            // specific real layout; a changed one moves every absolute index
+            // the natives were checked at, and the failure mode is the silent
+            // one (`set_field` DROPS an out-of-range write).
+            if let Some((expected, actual)) =
+                floor_exempt_real_extent_disagreement(name, num_total_fields)
+            {
+                static REPORTED: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                if REPORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                    eprintln!(
+                        "[layout] {name}: floor-exempt class declares {actual} instance \
+                         fields, not the {expected} its exemption in \
+                         FLOOR_EXEMPT_CLASSES was screened against. Re-run the screen \
+                         before trusting this class's raw-slot natives."
+                    );
+                }
+            }
+            return num_total_fields;
+        }
+        let stub_instance_count = synthetic_stub_fields(name)
+            .iter()
+            .filter(|f| !f.access_flags.contains(FieldAccessFlags::STATIC))
+            .count();
+        let stub_parent_fields = match superclass_id {
+            Some(super_id) => self
+                .class_store
+                .get(super_id)
+                .map_or(0, |c| c.num_total_fields),
+            None => 0,
+        };
+        num_total_fields.max(stub_parent_fields + stub_instance_count)
+    }
+
     /// NEW-8: extended define_class entry point used by
     /// `MethodHandles.Lookup.defineHiddenClass`. Accepts an
     /// [`DefineClassOptions`] that lets the caller override the stored
@@ -6319,20 +6385,13 @@ impl ClassManager {
         // slots would never be allocated (so reads see uninitialised slots and
         // misreport as e.g. `port is not an int`). Pad with the larger of the
         // declared count and the synthetic stub layout.
-        let stub_fields = synthetic_stub_fields(name);
-        let stub_instance_count = stub_fields
-            .iter()
-            .filter(|f| !f.access_flags.contains(FieldAccessFlags::STATIC))
-            .count();
-        let stub_parent_fields = match superclass_id {
-            Some(super_id) => self
-                .class_store
-                .get(super_id)
-                .map_or(0, |c| c.num_total_fields),
-            None => 0,
-        };
-        let stub_total = stub_parent_fields + stub_instance_count;
-        let num_total_fields = num_total_fields.max(stub_total);
+        //
+        // Except for the classes [`FLOOR_EXEMPT_CLASSES`] names, where the
+        // floor describes the FABRICATED layout and nothing else: no native
+        // writes a raw absolute slot past what the real class declares, so the
+        // padding buys nothing and costs the whole object. See
+        // `apply_synthetic_floor`.
+        let num_total_fields = self.apply_synthetic_floor(name, superclass_id, num_total_fields);
         if field_trace_enabled()
             && (name.contains("DefaultHttpMessageConverters")
                 || name.contains("AnsiOutputApplicationListener")
@@ -10609,23 +10668,12 @@ impl ClassManager {
             compute_field_layout(&class_file.fields, superclass_id, &self.class_store);
 
         // Wave 3-B (RE.4): pad to the synthetic stub field count when defined
-        // (mirrors `define_class_with_options`). Required for classes that are
-        // upgraded from a synthetic stub but whose real bytecode field count
-        // is smaller than the synthetic-mode layout used by native helpers.
-        let stub_fields_for_pad = synthetic_stub_fields(name);
-        let stub_instance_count_for_pad = stub_fields_for_pad
-            .iter()
-            .filter(|f| !f.access_flags.contains(FieldAccessFlags::STATIC))
-            .count();
-        let stub_parent_fields_for_pad = match superclass_id {
-            Some(super_id) => self
-                .class_store
-                .get(super_id)
-                .map_or(0, |c| c.num_total_fields),
-            None => 0,
-        };
-        let stub_total_for_pad = stub_parent_fields_for_pad + stub_instance_count_for_pad;
-        let num_total_fields = num_total_fields.max(stub_total_for_pad);
+        // (mirrors `define_class_with_options`, through the same helper so the
+        // two cannot disagree about the floor or about who is exempt from it).
+        // Required for classes that are upgraded from a synthetic stub but
+        // whose real bytecode field count is smaller than the synthetic-mode
+        // layout used by native helpers.
+        let num_total_fields = self.apply_synthetic_floor(name, superclass_id, num_total_fields);
 
         // Extract source file. Inlined here (rather than
         // `class_file.source_file()`) so we pattern-match through
@@ -12816,6 +12864,119 @@ pub fn synthetic_stub_total_field_count(name: &str) -> usize {
     total
 }
 
+/// The classes whose synthetic slot floor describes the SYNTHETIC layout ONLY,
+/// with the real instance-field extent each one has when it is defined from
+/// real class-file bytes.
+///
+/// # Why a floor can be mode-specific at all
+///
+/// [`synthetic_stub_fields`] is one number consulted in two places that mean
+/// two different things:
+///
+/// * **Fabricating a stub** (`synthesize_stub_class`) — the table IS the
+///   layout. The natives that serve the class index it from 0 and nothing else
+///   declares those slots, so the count is a definition, not a floor.
+/// * **Defining a class from real bytes** (`define_class_with_options`, and the
+///   stub-upgrade path) — the table is a FLOOR, padding the real layout up to
+///   the width native code was written against. `java.net.InetSocketAddress`
+///   is the case that needs it: it declares one instance field (`holder`) and
+///   its native `<init>` writes raw synthetic indices on the REAL class, which
+///   an unpadded object has no room for. An out-of-range `set_field` is
+///   DROPPED, not raised, so removing that floor fails in silence.
+///
+/// For the classes below the second reading is false: in real-JDK mode nothing
+/// writes a raw absolute slot past what the class itself declares, because the
+/// natives that serve them resolve by NAME (`hs_map_slot`,
+/// `props_defaults_slot`, `receiver_table_slot`) or are shadowed out by the
+/// class's own bytecode. Applying the floor to them costs the whole object:
+/// `ClassStore::build_compact_layout` refuses a compact layout to any class
+/// with a padded slot — a padded slot has no descriptor, so its oop-map entry
+/// would be a guess — and the class falls back to the legacy uniform 16-byte
+/// tagged cell for EVERY slot. Padding by one costs 2x-4.5x.
+///
+/// # The number beside each name
+///
+/// It is the instance fields the REAL chain declares, measured on JDK 25
+/// Temurin `25.0.3+9` with `CRATONVM_DBG_LAYOUT=1`
+/// (`declared_instance_fields=`). It is not used to size anything — the real
+/// class file does that — it is what
+/// [`floor_exempt_real_extent_disagreement`] compares the loaded class against
+/// so a JDK whose shape has moved is reported rather than silently exempted,
+/// and what the `t9d_floor_exempt_classes_have_no_oversized_factories` gate
+/// (`vm/tests/tier1_tests.rs`) compares every literal
+/// `alloc_concurrent_synthetic(ctx, "name", n)` site against.
+///
+/// # Adding a class here
+///
+/// The screen is mechanical: a class may be exempt **iff** no native writes a
+/// raw absolute slot at or past its real extent on a receiver of that class in
+/// real-JDK mode. Both halves of that population are greppable — literal
+/// factories (which the gate reads) and raw `ctx.set_field(obj, N, ..)` on a
+/// receiver the caller did not allocate. Converting the writer to
+/// `set_field_by_name`, or to the class's own `<init>`, is what clears a class;
+/// lowering the number without doing that is the silent failure above.
+///
+/// `java/util/ArrayDeque` is deliberately NOT here: its fourth slot became
+/// dead when `ad_state` started deriving the count from `head`/`tail`, so its
+/// table was simply narrowed to the three the real class declares and the
+/// class needs no exemption in either mode.
+pub const FLOOR_EXEMPT_CLASSES: &[(&str, usize)] = &[
+    // One real field, `map` (`Ljava/util/HashMap;`). `hs_map_slot` answers
+    // absolute 0 for it in BOTH modes, which is the only index the
+    // `native_hs_*` surface uses. The synthetic table keeps three because
+    // `wildfly_security::count_carrying_hash_set` writes a count at slot 1 —
+    // under an explicit `is_class_synthetic_stub` gate, so that shape is
+    // reachable only where it is the layout.
+    ("java/util/HashSet", 1),
+    // Declares no instance fields of its own; it is `HashSet`'s one field,
+    // inherited, and it was padded for exactly the same reason.
+    ("java/util/LinkedHashSet", 1),
+    // One real field, `al` (`Ljava/util/concurrent/CopyOnWriteArrayList;`).
+    // `hs_map_slot` names it explicitly beside `HashSet` and answers absolute
+    // 0; the synthetic table's second slot mirrors `CopyOnWriteArrayList`'s
+    // `(data, size)` and is written only on the fabricated stub.
+    ("java/util/concurrent/CopyOnWriteArraySet", 1),
+    // Two real fields, `head` and `tail` (both `Node`). The four-slot table is
+    // `native_lbq_*`'s `(head, tail, size, capacity)`, which serves the
+    // fabricated stub; a real one runs its own lock-free bytecode, and a fresh
+    // instance has `head == tail == new Node<>()` built by it.
+    ("java/util/concurrent/ConcurrentLinkedQueue", 2),
+    ("java/util/concurrent/ConcurrentLinkedDeque", 2),
+    // Ten across the chain: `Hashtable`'s eight plus `Properties`' two. The
+    // sixteen-slot table is the fabricated model, and every native that serves
+    // a real `Properties` resolves its slot on the RECEIVER —
+    // `props_defaults_slot` by name with the model slot as a fallback,
+    // `publish_map_table` through `receiver_table_slot`. The one factory that
+    // asks for sixteen (`system_properties_object`) writes NO slot at all: the
+    // singleton's entries live in `properties_sidetable`'s side table.
+    ("java/util/Properties", 10),
+];
+
+/// Whether `name`'s synthetic slot floor must NOT be applied to a class being
+/// defined from real class-file bytes. See [`FLOOR_EXEMPT_CLASSES`].
+#[must_use]
+pub fn floor_is_synthetic_only(name: &str) -> bool {
+    FLOOR_EXEMPT_CLASSES.iter().any(|(c, _)| *c == name)
+}
+
+/// `Some((expected, actual))` when `name` is floor-exempt and the real class
+/// just defined does not have the instance-field extent
+/// [`FLOOR_EXEMPT_CLASSES`] recorded for it.
+///
+/// An exemption is only sound while the real layout is the one it was screened
+/// against. A JDK that grows or drops a field on one of these classes moves
+/// every absolute index the natives were checked at, and the failure mode is
+/// the silent one — a dropped `set_field`. This turns that into a line on
+/// stderr naming the class and both counts.
+#[must_use]
+fn floor_exempt_real_extent_disagreement(name: &str, declared: usize) -> Option<(usize, usize)> {
+    FLOOR_EXEMPT_CLASSES
+        .iter()
+        .find(|(c, _)| *c == name)
+        .map(|(_, expected)| (*expected, declared))
+        .filter(|(expected, actual)| expected != actual)
+}
+
 /// CratonVM's fabricated slot **model** for `name` — the same table that sizes
 /// a bytecode `new` of the stub and that pads a real class up to the count
 /// native code was written against.
@@ -13379,8 +13540,25 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // rather than zero so the `HS_FIELD_MAP = 0` shape -- `m`, the backing
         // map, at absolute 0 -- still has somewhere to live in synthetic mode.
         "java/util/TreeSet" => instance_fields(1),
-        // ArrayDeque = 4 fields (data, head, tail, size)
-        "java/util/ArrayDeque" => instance_fields(4),
+        // ArrayDeque = 3 fields (elements, head, tail) — EXACTLY what the real
+        // `java.util.ArrayDeque` declares, in the same order, so the class is
+        // never padded and keeps its compact layout.
+        //
+        // It was four. The fourth was `size`, and `ad_state` stopped reading it
+        // on 2026-08-30: the count is DERIVED from `head`/`tail` the way the
+        // JDK's own `size()` derives it (`sub(tail, head, elements.length)`),
+        // because any real body that moves either index — `delete`,
+        // `DeqIterator.remove`, and every mutator this VM does not register —
+        // cannot know a fourth slot exists and desynced it. Nothing has
+        // written slot 3 since; the only reader left was a `>` bound in
+        // `collect_collection_elements`, which now asks for the three that
+        // exist.
+        //
+        // Narrowing it here is what takes the class off the padded list: a
+        // floor of four against a real three cost `ArrayDeque` the compact
+        // layout for ALL of its slots (`build_compact_layout` refuses any
+        // padded class) and 232 bytes empty against HotSpot's 112.
+        "java/util/ArrayDeque" => instance_fields(3),
         // EnumSet = 2 fields (elements backing, enum type)
         "java/util/EnumSet" => instance_fields(2),
         // PriorityQueue = 3 fields (data, size, comparator)

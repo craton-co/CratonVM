@@ -285,8 +285,17 @@ where retiring is a defect.
   still owns the slot after the 2026-08-11 retirement refuses the bridge, so the
   real bytecode never runs. Same shape as this lane's `BigInteger` survivor, in
   an already-landed wave.
-- **`Package.getPackages()` returns empty**, on the control and after the
-  retirement alike — so it is neither caused nor fixed here. 2 probe rows.
+- ~~**`Package.getPackages()` returns empty**, on the control and after the
+  retirement alike — so it is neither caused nor fixed here. 2 probe rows.~~
+  **FIXED 2026-09-11**, and the reason the retirement could not move it is worth
+  keeping: the bytecode this lane's refusal falls through to is
+  `ClassLoader.getClassLoader(caller).getPackages()`, and THAT triple had an
+  empty-array native of its own — retiring one of two overrides that agree on a
+  wrong answer changes nothing. Four registrations over three files, all citing a
+  stream-pipeline leak that no longer reproduces, and under them two stubbed
+  `BootLoader` natives. 0 -> 35 on both arms against HotSpot's 91, and the triple
+  has LEFT `RETIRED_SHADOW_L2_TRIPLES` because nothing registers it any more.
+  Record: `package-getpackages-answered-empty-FIXED-20260911.md`.
 - **`the_drift_baseline_has_no_stale_rows` is red on `origin/dev`**, from lane
   0's `Class.getModule` `Intrinsic` re-tag. Attributed and recorded in
   `bug-two-drift-gates-are-red-on-pristine-dev-from-a-class-parameterised-registrar-20260822.md`.

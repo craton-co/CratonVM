@@ -510,7 +510,7 @@ included); a `CRATONVM_DBG_JIT_METHOD_STATS=1` run counts **1.02 M** compiled-co
 → Rust-native dispatches for 4000 compares, 255 per compare.
 
 So this page's target belongs to
-`docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md`, and the work
+`docs/internal/performance/interpreted-invoke-cost-350ns-RETIRED-20260911.md`, and the work
 below is recorded there in full.
 
 ### One refusal was 36% of every call, and it is fixed

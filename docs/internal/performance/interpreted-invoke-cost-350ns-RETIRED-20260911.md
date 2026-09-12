@@ -1,12 +1,22 @@
-# The interpreted invoke costs ~350 ns, and the biggest piece is moving a `Frame`
+# The interpreted invoke cost ~350 ns; it is ~110 now, and the biggest piece was never the `Frame` move
 
 | | |
 |---|---|
-| **Status** | OPEN — a tracked throughput item with a measured target, not a failing test |
-| **Severity** | low — no test fails on this; it is the ceiling several suites sit under |
+| **Status** | RETIRED 2026-09-11 — all three exit criteria discharged; see § Exit criteria, discharged. The pass ran past midnight, so its criterion-3 numbers are stamped 2026-09-12 |
+| **Severity** | low — no test fails on this; it was the ceiling several suites sat under |
 | **HotSpot** | interpreter (`-Xint`) pays ~4 ns for the same operation |
-| **CratonVM** | ~350 ns per interpreted `invokevirtual` (Windows and Linux, independently) |
+| **CratonVM, at opening** | ~350 ns per interpreted `invokevirtual` (Windows and Linux, independently) |
+| **CratonVM, at retirement** | **~110 ns** (87–158 across 32 rounds), same probe, same `--nojit`, control printed beside it and `origin/dev` in the next column |
 | **Opened** | 2026-08-25, inheriting criterion 3 of the retired `webapp-deploy-annotation-scan-interpreted-226x` write-up |
+| **Closed by** | six passes: the quickened field access and the three fast doors (2 and 3), the in-place frame install (4), the synchronized callee (5), and the cached-native call site (6) |
+
+**Read this first if you are here for a number.** The title's 350 ns is the
+2026-08-25 figure and it is kept because five sections below reason from it.
+The figure at retirement is in the table above and in
+§ "3. `InvokeAttributionProbe`'s invoke delta". Every per-operation number on
+this page is an internal control on one binary unless it says otherwise, and
+two of the passes below record measurements that did **not** separate — those
+are as load-bearing as the ones that did.
 
 This page is the successor to the Tomcat annotation-scan investigation, which
 ran from 2026-08-03 to 2026-08-24 and retired with its own two exit criteria
@@ -547,6 +557,17 @@ Both are structurally real, and neither is a point fix.
   tier-up block: `!is_special`, `!cached.is_synchronized`,
   `!has_registered_native`, `!receiver_is_java_util`,
   `cached.exception_table.is_empty()`.
+
+  **And in a SECOND copy, in `execute_invokevirtual_fast_door`** — which is the
+  door that actually serves the warm monomorphic hit, i.e. nearly every hit.
+  It spells the same `java/util/` test as the `class_is_java_util` bitmap
+  rather than as `starts_with("java/util/")`, so a grep over the tier-up paths
+  finds only the first one, and until 2026-09-11 it read neither of the
+  2026-09-02 nomination/promotion switches and still gated the COUNTER on the
+  prefix. `composition-native-callback-and-the-promotion-question-CLOSED-20260911.md`
+  item 2 is how that was found: the census this page's sibling relies on
+  reported 629 rows where the workload produces 46 268, because the dispatches
+  had migrated to a door nothing instrumented.
 
   **Do not "just count them".** That was built and measured
   (`CRATONVM_JIT=special-tierup`, reverted): counted invocations moved
@@ -1333,38 +1354,6 @@ because it is not a cold path.
 The fill, which is the oop-map half, and the general dispatchers' by-value
 push (see the note that closes the emplace section above).
 
-## Exit criteria
-
-There is deliberately no throughput number here. Setting one before the
-direct-compiled-call project scopes itself would be inventing it — that is the
-mistake the retired page made and had to re-scope out of.
-
-What this page asks for instead:
-
-1. **The frame push/pop moves are gone.** `Frame::new_pooled_cached`,
-   `init_locals_from_parts` and `copy_args_to_locals` are the push side.
-   The symmetric fix to piece 1 is **not** justified on the current evidence:
-   `push_frame_and_fire_entry` no longer appears among the `memcpy` callers at
-   all after that change, so the push-side move is either already elided by the
-   compiler or below 0.5%. **Re-measure before building it.**
-2. **The direct compiled call is legal for handler-bearing and `java.util`
-   callees**, with `regression-suite/perf/c2-reach.sh` and a CratonBench pass
-   green.
-3. **`InvokeAttributionProbe`'s invoke delta is reported on a host at load < 10**,
-   in both arm orders, with the `noCall` control printed beside it. No claim on
-   this page is accepted without its control column.
-
-## Reproduction
-
-```bash
-javac -d /tmp/probeout probes/InvokeAttributionProbe.java
-<cratonvm> --java-home <real JDK 25> --Xmx 1g --nojit -c /tmp/probeout InvokeAttributionProbe 8000000 both 3
-```
-
-`both` self-times and prints `withCall_ns`, `noCall_ns` and `invokeDelta_ns` per
-round. `call` and `nocall` select a single arm, which is what a native profiler
-needs: recording both in one process mixes them and no symbol can be attributed.
-
 ### The general dispatchers, on a day the doors went dark
 
 The section above ends by naming what it did not cover. Between then and this,
@@ -1679,3 +1668,658 @@ blocks on a second monitor — every arm ends by proving from a second thread an
 from JMX that the lock came back free), `probes/JmxMonitorOwnership.java`.
 Both oracles pass on HotSpot and on both settings of the switch, under the JIT
 and under `--nojit`.
+
+## The sixth pass (2026-09-11): the registered native was never priced, and the census that ranked it was reading one row late
+
+The fifth pass closed by ranking what the doors still refuse and naming the
+top of that list — "**69% of what is left is a registered native**" — as the
+next structural item. This pass takes it, and it also takes the last two exit
+criteria.
+
+It begins with the instrument, because every number the fifth pass published
+from the virtual door has to be re-read through a defect in it — one that a
+second branch found and fixed the same night, independently.
+
+### The census was one row late, and its largest row did not exist
+
+(**Landed on `dev` in parallel by `d41ffd4db` while this pass was running** —
+see the note at the end of this section. The diagnosis below is recorded
+because the tally it corrects is quoted three sections above, not because this
+branch is where the repair came from.)
+
+`execute_invokevirtual_fast_door` gained decline counters in the fifth pass.
+Eleven of them were paired with the reason belonging to the **next** refusal
+in the function, from the operand-stack depth test down to the descriptor
+overflow — so a site that declined because the receiver's class had gone
+polymorphic reported "receiver is an array", one that declined on an
+intercepted callee reported "interface receiver-selection memo miss", and so
+on down the chain. The shift began where the reasons started: the cache-shape
+refusal — the `_ =>` arm of the inline-cache match, i.e. "this site's cached
+target is not a `VirtualBytecode` at all" — recorded **nothing**, and the
+strings slid up one place to fill the gap.
+
+That missing row is not a corner. On `probes/NativeDoor.java`:
+
+```text
+[invoke-door] declines by reason (total 903907):
+[invoke-door]   301849  33.4%  virtual: cached target is not VirtualBytecode
+[invoke-door]   300383  33.2%  special: cached target is not plain bytecode
+[invoke-door]   200214  22.1%  static: cached target is a registered native
+[invoke-door]   100076  11.1%  static: cached target is not plain bytecode
+```
+
+The largest single row in the tally was the one that did not exist. Four more
+refusals returned `None` with no note at all — the `java.util` bitmap having
+no answer for the receiver class, an inline tier-up attempt falling due, a
+compiled callee with more arguments than the inline buffer, and an argument
+slot needing coercion — so each of those populations was invisible too.
+
+**What this costs the fifth pass's published table.** Less than it might
+have. That table has exactly one `virtual:` row —
+`virtual: callee is SYNCHRONIZED` at 28.7% — and it sits ABOVE the shift, so
+it is correct; it is the row that motivated the synchronized-callee work and
+that work stands. Its `special:` and `static:` rows come from the `decline!`
+macro, which pairs each literal with its own `return`, and are unaffected.
+What the table is missing is the door's commonest refusal of all, which had no
+counter to appear under — and what any *future* virtual row would have been
+is one reason late until now.
+
+**Two branches found this at the same time, which is itself the finding.**
+`d41ffd4db` — "both of the composition residuals, and the doors they were at
+the wrong end of", 2026-09-11 23:07, on an unrelated line of work — landed the
+identical re-pairing, with the same strings in the same order and the same
+note on the cache-shape arm, hours before this branch merged. Its author
+arrived from the composition page's item 2, which "could not read its own arm";
+this one arrived from the fifth pass's decline ranking. A census that reports
+the wrong row is not a niche defect: it misleads everyone who reads it, and it
+misled two people independently within a day. This branch keeps `d41ffd4db`'s
+version wholesale and adds only what it did not cover — the **four refusals
+that still recorded nothing at all** (the `java.util` bitmap, the inline
+tier-up, the over-wide compiled callee, the argument slot needing coercion),
+taking the door's decline sites from 18 to 22 — plus teaching its new
+four-state tier-up census about the handler-callee switch below.
+
+The lesson is the one this page keeps re-learning from the other side: *a
+census is an instrument, and an instrument nobody checked against the code it
+measures is not evidence.* The fifth pass built this census precisely because
+the door "had no counters at all"; it then trusted the counters it had just
+written.
+
+### What the doors refuse, priced
+
+`CachedInvokeTarget::Native` and `CachedInvokeTarget::VirtualNative` are the
+two inline-cache shapes a fast door can never serve: there is no frame to
+push, so a door built around `read_args_verbatim` + a frame install has
+nothing to do. The general dispatchers own them, and what they were paying is
+what this pass removes.
+
+Every cached-native dispatch called `pop_coerced_invoke_args_virtual` /
+`_static`, whose first act is `method_site_info` → `resolve_method_ref` for
+two facts: each parameter's descriptor tag, and the return tag. That is a
+resolution-cache `RwLock` read, a hash probe and three `Arc<str>` clone/drop
+pairs — **per call** — followed by `ParamTags::of` scanning the string it just
+obtained, `jit::return_type` scanning it again for the byte after `')'`, and
+two `Vec::with_capacity` heap allocations to hold the arguments.
+
+None of it is a variable. An inline-cache entry is keyed by
+`(caller class, cp index)` and the promoted cross-thread entry by the same
+triple, so the call site's descriptor is a **constant of the entry**. Both
+variants now carry `facts: DescriptorFacts`, tokenised at fill time from the
+identical `resolve_method_metadata` result the hit path used to re-fetch, and
+`pop_coerced_invoke_args_*_facts` reads the arguments straight into a stack
+array against `facts.param_tags[i]`, with `facts.ret_tag` handed to the
+callback helper as `RetTag::Known`. `native_site_facts_usable` refuses the two
+shapes the tag array cannot describe — a descriptor with more parameters than
+`DescriptorFacts::INLINE_PARAMS`, and any disagreement between the entry's
+`num_params` and the tokenised count — and those fall back to the general
+helper unchanged.
+
+The equivalence is pinned rather than argued:
+`param_tags_match_nth_param_tag_byte` already asserted, over a table that
+includes malformed and overflowing descriptors, that `DescriptorFacts` answers
+identically to `ParamTags::of` and that `facts.ret_tag == jit::return_type`.
+This pass added the exact claim the new pops rest on — `facts.param_tags[i]`
+is the byte the scan would have produced, for every `i` a complete tag array
+covers — and `cached_native_facts_are_refused_for_the_shapes_they_cannot_describe`
+for the guard.
+
+**And the leaf question was never asked on the virtual arm.** Both `Native`
+arms have gone through `invoke_cached_native_callback_leaf_aware` since the
+leaf funnel landed. `VirtualNative` — the arm that serves every
+`invokevirtual` and `invokeinterface` on a registered native, which is the
+largest cached-native population there is — did not: it called
+`invoke_cached_native_callback` and paid the full funnel (argument pinning,
+the STW probe, the `NativeRunning` transition pair, the JNI drain) for bodies
+whose registration says they cannot block. The id is the one the cache already
+resolved, so the question is one bounds-checked index.
+
+Kill switch: `CRATONVM_JIT_NO_CACHED_NATIVE_FACTS=1`
+(`CRATONVM_JIT=-cached-native-facts`). It restores the old path **whole**,
+leaf-awareness included — a switch that keeps half the change is not a
+control, which is this page's own finding about the first `iface-select` A/B.
+
+### Engagement first
+
+`CRATONVM_DBG_FIELD_SITE=1` now ends its line with
+`cached-native: facts_static=… facts_virtual=… resolve=… leaf=…`.
+`resolve` is the general helper: it is what the counter would report if the
+facts path never fired, which is how the field fast path shipped a first
+version measuring nothing (`get hit=0 miss=1801267`) and how the
+`invokespecial` door shipped its first (`special hit=0 miss=997`).
+
+`probes/CollatorSplit.java 2000`, `--nojit` — the fifth pass's own workload:
+
+```text
+cached-native: facts_static=64708 facts_virtual=291322 resolve=0 leaf=13
+```
+
+356 030 cached-native dispatches, **none** of them through the old helper.
+
+`probes/NativeDoor.java` takes a third argument that runs ONE arm, which is
+what makes that counter readable per arm. At 60 000 iterations:
+
+| arm | facts_static | facts_virtual | leaf |
+|---|---:|---:|---:|
+| `identityHashCode` | **60 161** | 1 133 | 1 |
+| `nanoTime` | **60 162** | 1 133 | **60 001** |
+| `sbCharAt` | 162 | **61 132** | 1 |
+| `arraycopy` | 162 | 1 133 | 1 |
+| `sbLength` | 162 | 1 133 | 1 |
+| `requireNonNull` | 162 | 1 133 | 1 |
+| `strHashCode` | 162 | 1 133 | 1 |
+
+162 / 1 133 / 1 is what VM startup alone contributes, so those three arms are
+the only ones that reach a cached-native entry — and the whole-probe run
+agrees arithmetically: `facts_static=200 224 facts_virtual=101 156` over all
+thirteen arms at 100 000 iterations each is exactly the two static arms plus
+the one virtual arm and nothing else. **The other ten arms are internal
+controls the change cannot touch**, which is the whole design of the table
+below.
+
+`nanoTime`'s `leaf=60 001` is not this pass's doing: the static `Native` arm
+has been leaf-aware since the leaf funnel landed, so its 62 ns below is the
+descriptor work alone.
+
+### The numbers
+
+`probes/NativeDoor.java` at 200 000 × 5, six interleaved passes, ONE binary
+(`cratonvm-invk-p1a`, this branch), `--nojit`, ns/iteration. The switch is the
+only difference between the columns:
+
+| arm | ON (default) | OFF (`CRATONVM_JIT_NO_CACHED_NATIVE_FACTS=1`) | pairwise |
+|---|---|---|---:|
+| `nocall` (control) | 41.1 41.6 41.2 39.1 40.9 39.3 | 40.2 42.2 40.2 41.9 40.6 41.3 | 3/6 |
+| `bcStatic` (control) | 148 148 153 156 145 148 | 148 150 147 149 149 145 | 2/6 |
+| `bcVirtual` (control) | 187 187 192 181 189 186 | 180 187 190 185 186 179 | 2/6 |
+| `objHashCode` (control) | 320 322 320 312 316 318 | 318 312 314 325 319 315 | 2/6 |
+| `objGetClass` (control) | 361 357 396 375 360 354 | 359 349 394 361 374 345 | 1/6 |
+| `strCharAt` (control) | 425 436 473 452 433 436 | 428 430 422 418 438 423 | 2/6 |
+| `strHashCode` (control) | 236 234 256 239 236 239 | 245 252 237 241 243 236 | 4/6 |
+| `arraycopy` (control) | 540 536 569 523 539 535 | 553 543 552 545 561 548 | 5/6 |
+| `requireNonNull` (control) | 191 188 201 188 197 198 | 189 193 191 200 193 191 | 2/6 |
+| `sbLength` (control) | 389 393 390 421 391 392 | 395 393 403 405 398 395 | 4/6 |
+| **`identityHashCode`** | **263 261 285 269 267 263** | 353 344 350 349 352 351 | **6/6** |
+| **`nanoTime`** | **205 205 204 206 213 208** | 268 271 272 263 272 265 | **6/6** |
+| **`sbCharAt`** | **488 504 511 510 543 496** | 551 585 586 568 570 569 | **6/6** |
+
+**6/6 with no overlap on all three served arms** — the WORST `ON` pass of each
+beats the BEST `OFF` pass (285 against 344, 213 against 263, 543 against 551)
+— while all ten controls overlap across their whole range and none of them
+wins more than 5 of 6 either way. Roughly **85 ns off a static registered
+native, 62 ns off a leaf one and 70 ns off a virtual one**, against calls that
+cost 260–590 ns.
+
+**Repeated on the merged binary, on a quieter host.** After `origin/dev` was
+merged in — which brought another branch's rework of the same door — four more
+interleaved passes, same probe, same switch, ns/iteration:
+
+| arm | ON | OFF | pairwise |
+|---|---|---|---:|
+| `nocall` (control) | 32.6 32.0 32.6 33.5 | 32.0 32.1 32.7 33.9 | 3/4 |
+| `bcStatic` (control) | 117 117 113 114 | 111 112 114 114 | 1/4 |
+| `bcVirtual` (control) | 140 140 139 141 | 137 141 136 140 | 1/4 |
+| eight more controls | — overlapping, 1–2/4 — | | |
+| **`identityHashCode`** | **207 215 204 208** | 272 277 277 276 | **4/4** |
+| **`nanoTime`** | **170 176 171 174** | 207 208 215 210 | **4/4** |
+| **`sbCharAt`** | **406 421 399 409** | 444 435 435 458 | **4/4** |
+
+4/4 with no overlap again, on all three, with every control flat. The
+**absolute** figures are ~30% lower than the table above because that host was
+busier — `nocall` reads 32 ns here against 40 — and the deltas shrink with
+them, to ~67 / ~37 / ~33 ns. That is the expected shape for removing a fixed
+quantity of work from a call whose other costs also shrank, and it is why the
+claim is "6/6 and 4/4 against flat controls" rather than a nanosecond figure
+quoted out of its host.
+
+**What is NOT measured here, and is not claimed.** No arm of this probe is a
+*leaf* virtual native — `sbCharAt` reports `leaf=1`, i.e. startup only — so
+the leaf-awareness half of the `VirtualNative` change fires on nothing this
+probe runs. It has neither a timing nor an engagement count here, and the
+`leaf=` column is there so that whoever finds a workload with one can see it
+immediately. It is kept on the grounds this page has applied to unmeasured
+deletions since the 2026-08-11 work: it removes a funnel from a path the two
+sibling `Native` arms already skip, adds nothing, and its precondition is
+decided by the registry (`is_leaf_id` on an id the cache already resolved)
+rather than by the call site.
+
+**And it does not resolvably move an end-to-end workload.** `CollatorSplit
+2000`, nine interleaved passes, the `equals` arm: ON median 500 ms, OFF 539 ms,
+**5/9 pairwise with the distributions overlapping across most of their range**
+(ON reaches 679, OFF reaches 685). The direction is favourable and the
+magnitude is not resolvable on this host — the same shape as §"The aggregate
+does NOT resolvably move an end-to-end workload" and the fifth pass's own
+closing note. The per-call figures above are internal controls on one binary;
+the workload figure is not, and only the first is claimed.
+
+### The four call sites that were still undoing frame-slot reuse
+
+The 2026-09-03 work put the in-place install on every general dispatcher and
+closed by naming what it did not cover: "The three `Frame::new_pooled_cached`
+sites in `jit/helpers.rs` — the JIT's interpreted-callee path — still build by
+value, but they hand the frame to `execute_prebuilt_frame` rather than pushing
+it, so converting them is a change to that function's contract and not this
+one."
+
+It is not a change to that function's contract, because that function was
+already split. `execute_prebuilt_frame` is two lines —
+`push_frame_and_fire_entry` then `run_pushed_frame_to_completion` — and the
+tail has been `pub(crate)` since the deopt-resume sinks needed it.
+`install_and_run_cached_frame` is the same two lines with the install ladder
+in place of the push, and the four sites that had a
+`(CachedBytecodeMethod, args)` pair rather than a hand-built frame now use it:
+
+* `jit::helpers`' static, virtual and special bytecode-callee helpers — the
+  JIT's route into an interpreted callee;
+* the interpreted arm of lambda dispatch (`lambda.rs`), which is every
+  non-compiled lambda call in the process.
+
+The point is not the build. It is that `push_frame_and_fire_entry`
+**harvests and trims the retired slot** before pushing, so each of these was
+destroying the slot the next interpreted call at that depth would have rebuilt
+itself in — once per call. That is exactly the shape the 2026-09-03 note
+described for the general dispatchers ("Worse than not helping"), and these
+four were the population left in it. A mixed JIT/interpreter workload has a
+JIT→interpreter call between interpreted calls constantly.
+
+The three deopt/exception sinks that still call `execute_prebuilt_frame`
+(`run_jit_callee_handler`, the two precise-resume sinks) are deliberately left:
+each builds its frame with a resume pc, a pushed exception oop and a
+transferred monitor, so there is no `(cached, args)` pair to install from, and
+all three are cold by construction.
+
+**No timing is claimed for this.** It is a deletion of a known-priced shape
+rather than a new mechanism — the same install whose arrival on the general
+dispatchers measured ~70 cycles a call — and the arm it replaces is restored
+whole by `CRATONVM_JIT_NO_FRAME_EMPLACE`, which is a switch shared with the
+general dispatchers and therefore cannot isolate it. What it has is engagement:
+`install: reuse=… emplace=… byvalue=…` in the site-cache line now counts these
+four sites, and `byvalue=0` on a default run says every one of them found or
+made a slot rather than moving a frame into one.
+
+### Four of the probes this page names had been deleted
+
+Nobody noticed, because nobody re-ran them:
+
+| probe | deleted by | what it is for |
+|---|---|---|
+| `probes/InvokeAttributionProbe.java` | `3b2901531`, 2026-08-29 | **exit criterion 3**, and this page's Reproduction block |
+| `probes/CallFloorProbe.java` | `3b2901531`, 2026-08-29 | the `HotSpot -Xint` vs `--nojit` increments table at the head of this page |
+| `probes/CalleeHandlerRoutingProbe.java` | `e33f6d7e3`, 2026-08-29 | the correctness oracle for **exit criterion 2**'s handler-bearing half |
+| `probes/CalleeTierUpProbe.java` | `e33f6d7e3`, 2026-08-29 | the price of the instance tier-up the same gate controls |
+
+The first two went in a documentation-consistency commit, the second two in a
+commit called `cleanup` that removed the whole `apps/tomcat-suite-runner`
+tree. In every case this page kept citing them, and its own Reproduction block
+had been a command that could not run for two weeks.
+
+All four are restored to `probes/`. `InvokeAttributionProbe` additionally
+**alternates its arm order** on odd rounds and prints which order each round
+used: exit criterion 3 asks for the delta "in both arm orders", and the probe
+as written always ran `withCall` first, so the first arm of every round paid
+whatever the host was doing when the round began and the delta inherited it.
+
+Two new ones join them. `probes/NativeDoor.java` prices a call to a registered
+native against three bytecode calls of the same shape in one process, and
+takes a third argument that runs ONE arm so the process-wide engagement
+counters are readable per arm. `probes/JavaUtilPromote.java` puts the same
+`HashMap.get` / `ArrayList.get` bytecodes against a `java/util/` receiver and
+against a user subclass of the same class, which is the A/B the
+`receiver_is_java_util` exclusion has never had.
+
+### The five suite vectors this page recorded as red are green
+
+The fourth pass recorded five vectors "already red on dev when this pass
+landed", with a build-not-an-argument control proving the interpreter work did
+not cause them: `RJitMultiArrayClass`, `RMapGcStress`, `RJdkIntrinsics3`,
+`REncodingFidelity`, `RBufferPoolCount`. All five pass on the binary this pass
+built, and so does everything else:
+
+```text
+REGRESSION SUITE: 93 passed, 0 failed
+  COUNTS: 93 of 93 SCHEDULED vectors passed; 0 scheduled vectors failed
+```
+
+and the same 93/93 with **both** exit-criterion-2 switches set. None of that is
+this pass's doing — they were other people's bugs and were fixed elsewhere —
+but the page carried them as open and now does not.
+
+## Exit criteria, discharged
+
+The criteria below are the ones this page set for itself on 2026-08-25. Each
+is answered with what was run, on which binary, and what the answer does not
+cover.
+
+### 1. The frame push/pop moves are gone — met
+
+The criterion named `Frame::new_pooled_cached`, `init_locals_from_parts` and
+`copy_args_to_locals` as the push side, and said of the symmetric fix
+"**Re-measure before building it**".
+
+It was re-measured, by the 2026-09-02 `FrameShape` pass, and the answer
+re-scoped the criterion: the cost is the per-frame **object churn**, not the
+filling of the buffers (14 cycles for 48 extra local slots, about 0.3 cycles
+per slot, already vectorised). Everything that churn is made of has since left
+the interpreted call path — frame-slot reuse, the emplace,
+`install_cached_frame` on all five general pushes, and now the four remaining
+`(cached, args)` builders. On a default run the site-cache line reads
+`install: reuse=… emplace=… byvalue=0`: **no interpreted call moves a `Frame`
+into the frame stack any more.**
+
+The three sinks that still call `execute_prebuilt_frame` build their frame
+with a resume pc, a pushed exception oop and a transferred monitor; there is
+no `(cached, args)` pair to install from and all three are cold.
+
+What is left is the locals **fill** — 14 cycles, and the half that needs
+precise oop maps. The 2026-09-02 pass already named it as the piece to build
+first "because it is what makes an arena legal, not merely fast". That is a
+different project with its own page to be written, not a residual of this one.
+
+### 2. The direct compiled call is legal for handler-bearing and `java.util` callees — met, opt-in
+
+Both exclusions are switchable, censused and priced; the regression suite is
+green with both lifted; and neither default is flipped, for reasons this
+section gives one at a time.
+
+The criterion asks for the direct compiled call to be **legal** for
+handler-bearing and `java.util` callees. Both exclusions live in
+`execute_invokevirtual_cached`'s promotion block; they are the last two
+operands of `promotion_barred`, and they are two completely different kinds of
+thing.
+
+**The `java.util` half was already a switch.** `jit_virtual_promote_java_util`
+(`CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL=1`) landed 2026-09-02 and its own
+doc comment says why it is opt-in: "the policy has never been priced on its
+own", because the measurement that refused to narrow the prefix compared two
+receiver classes in two loop methods. It is a **performance policy**, not a
+correctness gate, and the page's criterion is met by it existing with a
+measurement attached rather than by flipping it blind.
+
+**The handler-bearing half claimed to be a correctness gate, and the claim had
+gone stale.** Its comment says:
+
+> A handler-bearing callee must never be entered by a DIRECT compiled call.
+> `execute_jit_call_decoded` below has no interpreter boundary at which the
+> callee's own exception table can be resumed.
+
+That was true when it was written. `execute_jit_call_decoded` now drains
+`sig.exception`, `sig.npe`, `sig.aioobe` and `sig.arithmetic` through
+`route_jit_signal_exception(shared, thread, caller_frame_idx, cached, …)` —
+where `cached` is the **callee** — which prefers a precise exceptional frame
+published by the callee's own deopt stub, falls back to the callee's stamped
+athrow bci, and enters the callee's handler through
+`route_jit_exception_through_method`. That is the RBC.6 machinery
+(`docs/feature-designs/jit-local-exception-handlers.md`), and
+`handler_resume_needs_precise_locals` is its refusal: a handler that reads a
+local the fallback cannot supply propagates rather than entering with zeroed
+locals.
+
+The gate's own commit (`7952e8370`, 2026-07-30) already recorded that it was
+not demonstrated:
+
+> NOT proven, and recorded as such in the docs: the original stranding could
+> not be reproduced, so the new gate is correct by construction rather than
+> demonstrated against the symptom — a deliberately un-gated control binary
+> also matches HotSpot on the routing probe.
+
+and it is the **fourth of four** routes to a direct compiled entry. The other
+three keep their refusals for reasons this does not touch; in particular the
+inline machine-code MIC/PIC cascade (`mic_callee_has_exception_table`) `CALL`s
+the raw entry pointer from compiled code and has no Rust frame at which to
+route anything. That one is not relaxed.
+
+`CRATONVM_JIT_VIRTUAL_PROMOTE_HANDLER_CALLEE=1` relaxes this one, and the
+oracle it was written against — `probes/CalleeHandlerRoutingProbe.java`,
+restored above — is the evidence.
+
+#### Engagement, before any output is believed
+
+The oracle is worthless without it: a handler-bearing callee that never
+compiles is never promoted either, so a probe can print nine correct lines
+with the gate relaxed and prove nothing. `CRATONVM_DBG_FIELD_SITE=1` now ends
+with `virtual-promote: handler-bearing=N plain=N`, counting every direct
+compiled call the cached-virtual promotion makes, split by whether the callee
+declares handlers.
+
+`CalleeHandlerRoutingProbe 400000`:
+
+```text
+default                                virtual-promote: handler-bearing=0    plain=0
+CRATONVM_JIT_VIRTUAL_PROMOTE_HANDLER_CALLEE=1   virtual-promote: handler-bearing=3383 plain=0
+```
+
+and `CRATONVM_DBG=tierup-decline` names the gate on the same three methods:
+
+```text
+gate on      1 callee_exception_table CalleeHandlerRoutingProbe$Target.viaArray([II)I
+             1 callee_exception_table CalleeHandlerRoutingProbe$Target.viaField(LCalleeHandlerRoutingProbe$Holder;)I
+             1 callee_exception_table CalleeHandlerRoutingProbe$Target.viaNested([II)I
+gate off     1 admitted               (the same three)
+```
+
+#### What the two flags are worth, and why neither moved a benchmark
+
+Both were run against `regression-suite/perf/c2-reach.sh` and CratonBench, as
+the criterion asks, and both came back with nothing to report — for a reason
+the engagement census names.
+
+`c2-reach.sh` over the whole of CratonBench, default versus both flags on:
+
+| | requests | of which C1 | admitted | bodies | admitted-not-lowered | c1 / c2 / osr |
+|---|---:|---:|---:|---:|---:|---|
+| default | 16 | 4 | 7 | 5 | 2 | 4 / 10 / 8 |
+| both on | 16 | 4 | 7 | 5 | 2 | 4 / 10 / 8 |
+
+**Byte-identical.** CratonBench totals, three interleaved reps, ms:
+default 49 732 / 48 551 / 48 778, both on 48 867 / 48 906 / 50 395 —
+overlapping, 1/3 pairwise, which is what "green" means here.
+
+The census says why: `virtual-promote: handler-bearing=0 plain=0` on **every**
+CratonBench run in both arms. The cached-virtual promotion never fires on that
+workload at all, so neither flag has anything to change. A benchmark that
+cannot reach the code under test is not evidence that the code is harmless —
+it is evidence that the benchmark is the wrong instrument, and saying so is
+the point of printing the counter.
+
+Where the exclusions DO have a population, `CRATONVM_DBG=tierup-decline` says
+how large it is. `probes/ClassLoadShape.java` — this page's own
+interpreted-phase probe, 40 rounds of class loading and reflection:
+
+```text
+     16  admitted
+      8  receiver_is_java_util
+      2  registered_native
+```
+
+so a third of what that chain sees is refused by the `java.util` prefix. On
+CratonBench it is one method. And in neither case does lifting it produce a
+single direct compiled call (`plain=0` with the switch on), because within
+those runs no compiled body for those callees exists to promote **to**.
+
+`probes/JavaUtilPromote.java` (new) was written to force the case — the same
+`HashMap.get` / `ArrayList.get` bytecodes against a `java/util/` receiver and
+against a user subclass of the same class, so the gate's only input is the
+one thing that differs — and it finds the population empty for a third reason:
+`java/util/ArrayList.add` declines as **`registered_native`**, one operand
+EARLIER in the same chain, and `HashMap.get` never reaches the chain at all
+because its inline-cache entry is a `VirtualNative`, not a `VirtualBytecode`.
+CratonVM's hot `java.util` methods are `native-collections` registrations, and
+a registered native is refused by a different conjunct.
+
+**So the `java.util` exclusion is priced, finally, and the price is nothing
+measurable on any workload available here.** That is not the same as "it costs
+nothing"; it is "the workloads that would show it are the ones this page has
+never been able to run" — a Tomcat deploy or a Spring boot, where the
+`receiver_is_java_util` row would be large. The switch and the counter are
+what make that a one-command question for whoever has one.
+
+#### The default is NOT flipped, and this is the blocker
+
+Both flags stay opt-in. The handler-bearing one has: an oracle that engages
+3 383 direct calls and matches HotSpot line for line, the regression suite
+green 93/93 with it on, `c2-reach` identical, and an analysis of why the
+premise expired. What it does not have is a run of the workload family the
+original bar cited — an embedded server — because this host has no such
+fixture, and `MultipartAutoConfigurationTests` could not serve as a gate even
+for the commit that added the bar.
+
+That matters more than usual here because the failure mode is not a
+degradation. When `route_jit_signal_exception` cannot map a frame it
+**propagates**, and a propagated exception whose callee had a matching handler
+is a wrong answer, silently. This page's own standard — "the control that
+proves it is a build, not an argument" — says a default flip on a promotion
+policy needs the workload, not the analysis.
+
+One thing that analysis did settle, and it is worth recording because it was
+the last open worry: the `!has_dispatch` fast entry in
+`execute_jit_call_decoded` drops `sig.exception` without draining it, which
+would leak a callee's exception past its own handler. It is unreachable for
+any callee that could raise one — `x64/driver.rs` sets `has_dispatch` for a
+method with any invoke, direct call, bounds-check stub, null-check store stub,
+`athrow`, monitor helper, allocation OOM check or checkcast throw, so a
+compiled method with a reachable handler always takes the dispatch-aware
+route. A method that reaches the fast entry with a non-empty exception table
+protects straight-line arithmetic that cannot throw.
+
+### 3. `InvokeAttributionProbe`'s invoke delta, both arm orders, control printed — met
+
+`probes/InvokeAttributionProbe.java` is restored and now alternates its arm
+order, printing which order each round used. Windows dev host, `--nojit`,
+8 000 000 iterations, four interleaved passes of four rounds each, the
+shipping binary against `origin/dev` built from the same tree, taken in a
+window where the box was at 14% with 49 GB free and the `noCall` control sat
+flat at 51–73 ns in **both** columns:
+
+| | this page, 2026-08-25 (Windows) | `dev`, 2026-09-12 | this branch, 2026-09-12 |
+|---|---|---|---|
+| `withCall` | 388–512 ns/iter | 155–192 | 165–213 |
+| `noCall` (control) | 94–124 | 51–73 | 51–72 |
+| **invoke delta** | **290–417** | **87–138** | **102–158** |
+
+Raw, `withCall,noCall,delta`, arm order flipped between passes and binary
+order flipped with it:
+
+```text
+p1 dev  159,51,107  192,53,138  161,73,87   184,61,122
+p1 new  165,54,110  189,56,132  181,55,125  213,55,158
+p2 new  166,56,110  180,52,127  170,67,102  201,72,129
+p2 dev  162,53,109  168,54,114  185,58,126  169,64,104
+p3 dev  160,52,108  155,54,101  182,58,123  161,71,89
+p3 new  172,54,118  392,51,340  198,62,135  180,53,127
+p4 new  175,55,119  172,53,118  170,53,116  173,58,114
+p4 dev  166,53,112  164,54,110  172,61,111  184,67,116
+```
+
+**The criterion is met and the two columns are not different.** The invoke
+delta is ~110 ns, against the 290–417 this page opened on — and `dev` and this
+branch overlap across almost their whole range, medians about 110 and 120, one
+392/340 outlier in `new` p3 recorded rather than dropped.
+
+That overlap is the expected answer and it is worth stating as a result rather
+than an absence. **This pass does not touch the path this probe measures**:
+`InvokeAttributionProbe`'s invoke is an `invokevirtual` on a three-bytecode
+bytecode callee, which the virtual fast door has served since 2026-09-02. The
+sixth pass changes the cached-NATIVE arms and four frame installs; the probe
+reaches none of them. A difference here would have needed explaining. The one
+mechanism by which it could have moved — `CachedInvokeTarget` growing a field
+and so widening every inline-cache entry — was checked and did not happen: the
+enum is 56 bytes before and after, because the `Intrinsic` variant already set
+that size and `Native` with its `DescriptorFacts` is 48.
+
+**So the 350 → ~110 ns is not this pass's**, and the page should not be read as
+claiming it. It came from the doors, the in-place install and the quickened
+field access, which is exactly where passes two through four said it would
+come from, and it is the reason the title carries both figures. What the sixth
+pass is worth is the three-arm table in §"The numbers", which is an internal
+control on one binary.
+
+**What this number is NOT.** One host, and a different host from the one the
+290–417 column was taken on, so the two are comparable only in the sense that
+both are Windows and both printed their control. An earlier attempt at this
+same comparison, made while two unrelated `cratonvm` processes from other
+worktrees held the box at 100% and free memory at zero, put the `noCall`
+control anywhere between 58 and 342 ns and is **not reported** — that is the
+page's own definition of an unresolved measurement, and §"Measuring this at
+all" is the discipline that names it.
+
+## What is left, and where it lives now
+
+Nothing on this page is still open. What it names and does not close belongs
+to other work, and each has somewhere to go:
+
+* **The locals fill and the precise oop maps.** 14 cycles per call, and the
+  prerequisite is the verifier's stack maps rather than more zeroing. Scoped
+  by the 2026-09-02 `FrameShape` pass; a project, and the page says so.
+* **Polymorphic sites.** The fast field site, the invoke doors and the inline
+  cache all fall back on every receiver change, because the cache is
+  monomorphic by construction. Making it polymorphic is a different design.
+* **`ZgcRealHeap::try_alloc_object` builds legacy bodies** while the class
+  system builds compact layouts for the same classes. Named by the second
+  pass; it changes the layout of every ZGC-allocated object.
+* **`invokespecial` still does not feed the tiered manager from a cached
+  site.** `dispatch_virtual.rs`'s chain opens with `!is_special` and that
+  gates counting as well as promotion. The uncached route counts every method
+  regardless of opcode, which is why constructors are found compiled anyway —
+  so the framing "constructors are invisible to tier-up" remains false. The
+  small change is splitting counting from promotion; the blast radius is that
+  it widens which methods reach the optimizing tier.
+* **A `new` per-call-site class-resolution cache**, which the "untaken levers"
+  section asked for, **is built** — `site_cache::ClassSiteCache` /
+  `ResolvedNewSite`, with its admission rule (no loader namespace) and its two
+  epochs documented on the type. That lever is closed, not open.
+* **Flipping either exit-criterion-2 default** needs an embedded-server or
+  framework workload, which is the one instrument this page has never had.
+
+## Reproduction
+
+```bash
+javac -d /tmp/probe probes/InvokeAttributionProbe.java probes/NativeDoor.java \
+    probes/Dispatch.java probes/CalleeHandlerRoutingProbe.java
+
+# exit criterion 3 — the headline, with its control
+<cratonvm> --java-home <real JDK 25> --Xmx 1g --nojit -c /tmp/probe \
+    InvokeAttributionProbe 8000000 both 6
+
+# the sixth pass's A/B, one binary, six interleaved passes
+for pass in 1 2 3 4 5 6; do
+  for arm in "" "CRATONVM_JIT_NO_CACHED_NATIVE_FACTS=1"; do
+    env $arm <cratonvm> --java-home <JDK 25> --nojit -c /tmp/probe \
+        NativeDoor 200000 5
+  done
+done
+
+# which arms reach a cached-native entry at all — READ THIS FIRST
+CRATONVM_DBG_FIELD_SITE=1 <cratonvm> --java-home <JDK 25> --nojit \
+    -c /tmp/probe NativeDoor 60000 1 identityHashCode
+
+# exit criterion 2's oracle, and its engagement counter
+CRATONVM_DBG_FIELD_SITE=1 CRATONVM_JIT_VIRTUAL_PROMOTE_HANDLER_CALLEE=1 \
+    <cratonvm> --java-home <JDK 25> -c /tmp/probe \
+    CalleeHandlerRoutingProbe 400000
+```
+
+`InvokeAttributionProbe`'s `both` self-times and prints `withCall_ns`,
+`noCall_ns` and `invokeDelta_ns` per round, alternating the arm order. `call`
+and `nocall` select a single arm, which is what a native profiler needs:
+recording both in one process mixes them and no symbol can be attributed.
+`NativeDoor`'s third argument selects a single arm, for the same reason applied
+to the process-wide engagement counters.
