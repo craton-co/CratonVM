@@ -4693,45 +4693,7 @@ impl ClassManager {
         ];
 
         // Tier 3: Exception hierarchy — needed for catch handlers in real bytecode
-        let exception_classes = [
-            "java/lang/NullPointerException",
-            "java/lang/ArithmeticException",
-            "java/lang/ArrayIndexOutOfBoundsException",
-            "java/lang/IndexOutOfBoundsException",
-            "java/lang/StringIndexOutOfBoundsException",
-            "java/lang/ClassCastException",
-            "java/lang/IllegalArgumentException",
-            "java/lang/IllegalStateException",
-            "java/lang/UnsupportedOperationException",
-            "java/lang/ClassNotFoundException",
-            "java/lang/NoSuchMethodException",
-            "java/lang/NoSuchFieldException",
-            "java/lang/NoSuchMethodError",
-            "java/lang/NoSuchFieldError",
-            "java/lang/AbstractMethodError",
-            "java/lang/IncompatibleClassChangeError",
-            "java/lang/IllegalAccessError",
-            "java/lang/InstantiationError",
-            "java/lang/StackOverflowError",
-            "java/lang/OutOfMemoryError",
-            "java/lang/ExceptionInInitializerError",
-            "java/lang/LinkageError",
-            "java/lang/VerifyError",
-            "java/lang/SecurityException",
-            "java/lang/NegativeArraySizeException",
-            "java/lang/ArrayStoreException",
-            "java/lang/IllegalMonitorStateException",
-            "java/lang/InterruptedException",
-            "java/lang/CloneNotSupportedException",
-            "java/lang/NumberFormatException",
-            "java/io/IOException",
-            "java/io/FileNotFoundException",
-            "java/io/UnsupportedEncodingException",
-            "java/io/EOFException",
-            "java/util/NoSuchElementException",
-            "java/util/ConcurrentModificationException",
-            "java/lang/reflect/InvocationTargetException",
-        ];
+        let exception_classes = BOOTSTRAP_EXCEPTION_CLASSES;
 
         // Tier 4: Collections, concurrency, and functional interfaces
         let collections_classes = [
@@ -11244,6 +11206,89 @@ fn jdk_name_is_subclass(child: &str, parent: &str) -> bool {
     false
 }
 
+/// The throwable classes `bootstrap_core_classes` pre-loads (its "Tier 3").
+///
+/// Hoisted out of that function so a test can iterate it. Every name here is
+/// one this VM can hand to running bytecode, so every name here must have a
+/// `jdk_superclass` arm that reaches `java/lang/Throwable` -- see
+/// `throwable_like_inherits_its_chain`, which asserts exactly that over this
+/// list. A name added below with no arm gets a blanket `java/lang/Object`
+/// parent, which costs it the three-slot throwable model AND its compact
+/// layout, and nothing else would have said so.
+const BOOTSTRAP_EXCEPTION_CLASSES: &[&str] = &[
+    "java/lang/NullPointerException",
+    "java/lang/ArithmeticException",
+    "java/lang/ArrayIndexOutOfBoundsException",
+    "java/lang/IndexOutOfBoundsException",
+    "java/lang/StringIndexOutOfBoundsException",
+    "java/lang/ClassCastException",
+    "java/lang/IllegalArgumentException",
+    "java/lang/IllegalStateException",
+    "java/lang/UnsupportedOperationException",
+    "java/lang/ClassNotFoundException",
+    "java/lang/NoSuchMethodException",
+    "java/lang/NoSuchFieldException",
+    "java/lang/NoSuchMethodError",
+    "java/lang/NoSuchFieldError",
+    "java/lang/AbstractMethodError",
+    "java/lang/IncompatibleClassChangeError",
+    "java/lang/IllegalAccessError",
+    "java/lang/InstantiationError",
+    "java/lang/StackOverflowError",
+    "java/lang/OutOfMemoryError",
+    "java/lang/ExceptionInInitializerError",
+    "java/lang/LinkageError",
+    "java/lang/VerifyError",
+    "java/lang/SecurityException",
+    "java/lang/NegativeArraySizeException",
+    "java/lang/ArrayStoreException",
+    "java/lang/IllegalMonitorStateException",
+    "java/lang/InterruptedException",
+    "java/lang/CloneNotSupportedException",
+    "java/lang/NumberFormatException",
+    "java/io/IOException",
+    "java/io/FileNotFoundException",
+    "java/io/UnsupportedEncodingException",
+    "java/io/EOFException",
+    "java/util/NoSuchElementException",
+    "java/util/ConcurrentModificationException",
+    "java/lang/reflect/InvocationTargetException",
+];
+
+/// Does `name`'s fabricated superclass chain reach `java/lang/Throwable`?
+///
+/// `synthetic_stub_fields` asks this to decide whether a throwable-shaped stub
+/// should declare the three-slot model itself or INHERIT it. A name
+/// `jdk_superclass` knows gets a real fabricated parent chain — the stub mint
+/// path loads `jdk_superclass(name)` and sizes the class to
+/// `parent.num_total_fields + own` — so re-declaring the three at every level
+/// double-counts, and an exception hierarchy is deep enough for that to matter.
+/// A name it does not know gets a blanket `java/lang/Object` parent and must
+/// declare them.
+///
+/// `java/lang/Throwable` itself answers FALSE: nothing above it carries the
+/// model, and its own arm is what declares it.
+///
+/// The walk is bounded rather than trusting `jdk_superclass` to terminate. It
+/// does terminate today — every arm either names a strictly higher class or
+/// falls through to `java/lang/Object` — but this function's whole job is to
+/// decide a field count, and a cycle introduced later should cost a wrong
+/// count, not a hang inside class definition.
+fn jdk_chain_reaches_throwable(name: &str) -> bool {
+    let mut cur = name;
+    for _ in 0..64 {
+        let parent = jdk_superclass(cur);
+        if parent == "java/lang/Throwable" {
+            return true;
+        }
+        if parent == cur || parent == "java/lang/Object" {
+            return false;
+        }
+        cur = parent;
+    }
+    false
+}
+
 fn jdk_superclass(name: &str) -> &'static str {
     match name {
         // Throwable hierarchy
@@ -11259,6 +11304,25 @@ fn jdk_superclass(name: &str) -> &'static str {
 
         // Exception hierarchy
         "java/lang/Exception" => "java/lang/Throwable",
+        // Two checked exceptions that extend `Exception` DIRECTLY on HotSpot
+        // and had no arm here AT ALL. That was invisible while every throwable
+        // re-declared the three-slot model; once the model moved to
+        // inherit-not-redeclare it is what `CRATONVM_DBG_LAYOUT=1` reports:
+        //
+        // ```text
+        //   java/lang/InterruptedException        num_total_fields=9 declared=6 PADDED by 3
+        //   java/lang/CloneNotSupportedException  num_total_fields=9 declared=6 PADDED by 3
+        // ```
+        //
+        // A missing arm means a blanket `java/lang/Object` parent, so
+        // `jdk_chain_reaches_throwable` answers no, so each re-declares the
+        // three and is floored to nine against a real six -- and one padded
+        // slot costs the whole class its compact layout. `Thread.sleep` and
+        // `Object.clone` are on ordinary paths, so those two pads were paid by
+        // ordinary programs.
+        "java/lang/InterruptedException" | "java/lang/CloneNotSupportedException" => {
+            "java/lang/Exception"
+        }
         "java/io/IOException" => "java/lang/Exception",
         "java/io/FileNotFoundException" => "java/io/IOException",
         // Serialization's own IOException subtree. Needed as soon as anything
@@ -11267,6 +11331,28 @@ fn jdk_superclass(name: &str) -> &'static str {
         // `NotSerializableException` extends `java.lang.Object`, so
         // `catch (IOException)` — and even `catch (Exception)` — does not
         // match it, and the throw escapes the handler that was written for it.
+        // The same argument as the serialization subtree, for the `IOException`
+        // subclasses `native-builtins`' `THROWABLE_FAMILY_CLASSES` registers
+        // constructors on. Without an edge a fabricated `EOFException` extends
+        // `java.lang.Object`, and MEASURED on `--synthetic-jdk` 2026-09-12:
+        //
+        // ```text
+        //   new EOFException("m") instanceof IOException   HotSpot true
+        //                                                  CratonVM false
+        // ```
+        //
+        // -- so `catch (IOException)` around a stream read does not match the
+        // end-of-file it was written for, and the throw escapes. `readObject`
+        // loops are written exactly that way.
+        "java/io/EOFException"
+        | "java/io/UnsupportedEncodingException"
+        | "java/io/InterruptedIOException" => "java/io/IOException",
+        // `java.net`'s two, which are `IOException`s on HotSpot and are reached
+        // the same way (`URL` / `Socket` code catches `IOException`).
+        "java/net/MalformedURLException" | "java/net/UnknownHostException" => "java/io/IOException",
+        // NOT an `IOException`: `UncheckedIOException` is the wrapper that
+        // exists precisely so it does not have to be caught as one.
+        "java/io/UncheckedIOException" => "java/lang/RuntimeException",
         "java/io/ObjectStreamException" => "java/io/IOException",
         "java/io/NotSerializableException"
         | "java/io/InvalidClassException"
@@ -11337,9 +11423,45 @@ fn jdk_superclass(name: &str) -> &'static str {
         | "java/lang/AbstractMethodError"
         | "java/lang/ExceptionInInitializerError"
         | "java/lang/BootstrapMethodError" => "java/lang/LinkageError",
+        // `InstantiationError` is an `IncompatibleClassChangeError`, not a
+        // direct `LinkageError` -- it is the error a `new` of an abstract class
+        // raises, which is precisely an incompatible class change. It had no
+        // arm at all and was `PADDED by 3` for the same reason as the two
+        // checked exceptions above; the extra level is free, because the
+        // three slots are inherited either way and only the chain differs.
+        "java/lang/InstantiationError" => "java/lang/IncompatibleClassChangeError",
 
         // java.lang.reflect (JDK hierarchy for reflective wrappers)
-        "java/lang/reflect/ReflectiveOperationException" => "java/lang/Exception",
+        //
+        // `ReflectiveOperationException` lives in `java.lang`, NOT
+        // `java.lang.reflect` -- only `InvocationTargetException` below is in
+        // the subpackage. The `reflect/` spelling was the only one here, so
+        // the real `java/lang/ReflectiveOperationException` had no edge at
+        // all: it took the throwable arm's three own fields and was floored to
+        // nine against a real six (`CRATONVM_DBG_LAYOUT=1`: `PADDED by 3`).
+        // `InvocationTargetException`'s arm points at the misspelled name, so
+        // its fabricated chain stopped at `java/lang/Object` rather than
+        // reaching `Throwable`.
+        //
+        // Its siblings were never affected by this: `ClassNotFoundException`,
+        // `NoSuchMethodException` and `NoSuchFieldException` are edged to
+        // `RuntimeException` above, so their chains always reached
+        // `Throwable`, and `InterruptedException`, `CloneNotSupportedException`
+        // and `InstantiationError` had no arm of their own -- each is fixed
+        // where it belongs, not here.
+        //
+        // The misspelling is kept beside the real name: a name nothing
+        // resolves costs nothing, `InvocationTargetException` below still
+        // spells it that way, and removing it is a separate question from
+        // fixing the real one.
+        "java/lang/ReflectiveOperationException"
+        | "java/lang/reflect/ReflectiveOperationException" => "java/lang/Exception",
+        // `InstantiationException` -- the CHECKED one, raised by
+        // `Class.newInstance` -- is a `ReflectiveOperationException` on
+        // HotSpot. `native-builtins` registers constructors for it (the
+        // message-only ctor family), so this VM can hand one out, and without
+        // an arm it had the same no-chain pad as the three above.
+        "java/lang/InstantiationException" => "java/lang/ReflectiveOperationException",
         "java/lang/reflect/InvocationTargetException" => {
             "java/lang/reflect/ReflectiveOperationException"
         }
@@ -13205,34 +13327,24 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 attributes: vec![],
             },
         ],
-        // Throwable and common exception types: 2 fields (message, cause)
-        "java/lang/Throwable"
-        | "java/lang/Exception"
-        | "java/lang/RuntimeException"
-        | "java/lang/Error"
-        | "java/lang/NullPointerException"
-        | "java/lang/ArithmeticException"
-        | "java/lang/ArrayIndexOutOfBoundsException"
-        | "java/lang/IndexOutOfBoundsException"
-        | "java/lang/ClassCastException"
-        | "java/lang/IllegalArgumentException"
-        | "java/lang/IllegalStateException"
-        | "java/lang/UnsupportedOperationException"
-        | "java/lang/ClassNotFoundException"
-        | "java/lang/NoSuchMethodException"
-        | "java/lang/StackOverflowError"
-        | "java/lang/OutOfMemoryError"
-        | "java/lang/VerifyError"
-        | "java/util/NoSuchElementException"
-        // W7-33's synthetic-mode residual: without a field arm the fabricated
-        // carrier gets no slots, and the two `Throwable` slots every other
-        // exception here relies on (message, cause) are what a `getMessage()` on
-        // a caught `EmptyStackException` reads.
-        | "java/util/EmptyStackException"
-        | "java/util/InputMismatchException"
-        | "java/io/IOException"
-        | "java/io/FileNotFoundException"
-        | "java/lang/NumberFormatException" => instance_fields(2),
+        // `java.lang.Throwable` — THREE fields, and only `Throwable` itself.
+        //
+        // The three are `synthetic_throwable_slot`'s own map, which is the one
+        // definition of a synthetic throwable's layout:
+        // `detailMessage` = 0, `cause` = 1, `suppressedExceptions` = 2. This
+        // arm declared TWO, so slot 2 fell outside a bare synthetic
+        // `Throwable` and `write_throwable_field`'s
+        // `slot < object_num_fields(this)` guard dropped every
+        // `addSuppressed` on one.
+        //
+        // Every SUBCLASS is deliberately absent, and that is the fix for the
+        // compounding described on `throwable_like_inherits_its_chain`: the
+        // count here is a class's OWN fields, appended after its parent's, and
+        // an exception hierarchy is deep. Declaring three at each level made
+        // `java/io/FileNotFoundException` claim twelve slots for a three-slot
+        // model, and in real-JDK mode stacked them on top of a real
+        // `Throwable`'s six.
+        "java/lang/Throwable" => instance_fields(3),
         "java/lang/Boolean" => {
             let mut fields = vec![
                 ClassFileField {
@@ -16787,7 +16899,43 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
             || name.ends_with("Exception")
             || name.ends_with("Error") =>
         {
-            instance_fields(3)
+            // ZERO when the chain actually reaches `java/lang/Throwable`, so
+            // the three slots are INHERITED rather than re-declared at every
+            // level.
+            //
+            // The comment above is why this arm exists and it is still true —
+            // "a synthetic stub's superclass is a blanket `java/lang/Object`
+            // unless special-cased" — but the special case is exactly what
+            // `jdk_superclass` IS, and for a name it knows, the fabricated
+            // parent chain is built from it (`synthesize_stub_class` loads
+            // `jdk_superclass(name)` and sums `parent.num_total_fields +
+            // own`). So for those names re-declaring three is not insurance,
+            // it is DOUBLE COUNTING, and it compounds with depth:
+            //
+            // ```text
+            //                              before   after   model
+            //   java/lang/Throwable             2       3       3
+            //   java/lang/Exception             4       3       3
+            //   java/io/IOException             6       3       3
+            //   java/io/FileNotFoundException   8       3       3
+            // ```
+            //
+            // In real-JDK mode the same sum is applied as a FLOOR on top of the
+            // real class, whose `Throwable` already declares six — so
+            // `IOException` was floored to 10 against a real 6 and
+            // `FileNotFoundException` to 12, and `build_compact_layout` refuses
+            // any padded class, which put every exception object this VM
+            // allocates on the legacy 16-byte-per-slot layout.
+            //
+            // An application exception (`…/DbException`) has no
+            // `jdk_superclass` edge, so its chain does NOT reach `Throwable`,
+            // so it still gets the three this arm was written for — which is
+            // the case the `ParseException` measurement above pins.
+            if jdk_chain_reaches_throwable(name) {
+                Vec::new()
+            } else {
+                instance_fields(3)
+            }
         }
 
         _ => vec![],
@@ -18830,6 +18978,135 @@ fn field_trace_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every JDK throwable this VM can fabricate inherits the three-slot model
+    /// instead of re-declaring it, and the ones that must still declare it do.
+    ///
+    /// `synthetic_stub_fields`' throwable arm hands out ZERO own fields when
+    /// `jdk_chain_reaches_throwable` says the fabricated parent chain carries
+    /// them. That is only safe while the chain really does reach
+    /// `java/lang/Throwable`: a name whose `jdk_superclass` arm is missing gets
+    /// a blanket `java/lang/Object` parent, so zero own fields would mean a
+    /// stub with NO slots, and every `write_throwable_field` on it is dropped
+    /// by its own `slot < object_num_fields` guard — `getMessage()` on a
+    /// freshly-constructed one answers null. That is the `ParseException`
+    /// measurement quoted in the arm.
+    ///
+    /// So the two halves are asserted together: the count, and the reason the
+    /// count is allowed to be zero.
+    #[test]
+    fn throwable_like_inherits_its_chain() {
+        // Named here rather than derived, so that DELETING a `jdk_superclass`
+        // arm fails this test instead of silently moving a class into the
+        // three-own-fields branch.
+        const CHAINED: &[&str] = &[
+            "java/lang/Exception",
+            "java/lang/RuntimeException",
+            "java/lang/Error",
+            "java/lang/LinkageError",
+            "java/lang/NullPointerException",
+            "java/lang/ArithmeticException",
+            "java/lang/ArrayIndexOutOfBoundsException",
+            "java/lang/IndexOutOfBoundsException",
+            "java/lang/ClassCastException",
+            "java/lang/IllegalArgumentException",
+            "java/lang/IllegalStateException",
+            "java/lang/UnsupportedOperationException",
+            "java/lang/ClassNotFoundException",
+            "java/lang/NoSuchMethodException",
+            "java/lang/ReflectiveOperationException",
+            "java/lang/NoSuchFieldException",
+            "java/lang/InterruptedException",
+            "java/lang/CloneNotSupportedException",
+            "java/lang/InstantiationError",
+            "java/lang/InstantiationException",
+            "java/lang/StackOverflowError",
+            "java/lang/OutOfMemoryError",
+            "java/lang/VerifyError",
+            "java/util/NoSuchElementException",
+            "java/util/EmptyStackException",
+            "java/util/InputMismatchException",
+            "java/util/ConcurrentModificationException",
+            "java/io/IOException",
+            "java/io/FileNotFoundException",
+            "java/io/EOFException",
+            "java/io/UnsupportedEncodingException",
+            "java/io/InterruptedIOException",
+            "java/io/UncheckedIOException",
+            "java/io/NotSerializableException",
+            "java/net/MalformedURLException",
+            "java/net/UnknownHostException",
+            "java/lang/NumberFormatException",
+        ];
+        for name in CHAINED {
+            assert!(
+                jdk_chain_reaches_throwable(name),
+                "{name}: `jdk_superclass` no longer reaches java/lang/Throwable, so \
+                 `synthetic_stub_fields` would give it a blanket Object parent AND \
+                 zero own fields — a stub with no slots, whose every throwable \
+                 field write is silently dropped. Restore the arm, or take the \
+                 name out of this list and let it declare its own three."
+            );
+            assert!(
+                synthetic_stub_fields(name)
+                    .iter()
+                    .filter(|f| !f.access_flags.contains(FieldAccessFlags::STATIC))
+                    .count()
+                    == 0,
+                "{name}: declares its own throwable slots on top of an inherited \
+                 chain. That double-counts, and in real-JDK mode the sum is a \
+                 FLOOR over the real class: one padded slot costs the whole \
+                 object its compact layout."
+            );
+            // The extent the natives actually index, whatever the depth.
+            assert_eq!(
+                synthetic_stub_total_field_count(name),
+                3,
+                "{name}: the synthetic throwable model is \
+                 detailMessage/cause/suppressedExceptions — three absolute \
+                 slots, at every depth. See `synthetic_throwable_slot`."
+            );
+        }
+
+        // And EXHAUSTIVELY, over the list `bootstrap_core_classes` actually
+        // pre-loads. The hand-written names above are the regression cases --
+        // they say which arms were added for which measurement, and deleting
+        // one of those arms names the class it broke. This loop is the part
+        // that catches a name ADDED to the bootstrap list with no arm at all,
+        // which is how `InterruptedException`, `CloneNotSupportedException`,
+        // `InstantiationError` and `InstantiationException` each sat at
+        // `PADDED by 3` with nothing to report it.
+        //
+        // Only the chain is asserted here, not the own-field count:
+        // `InvocationTargetException` deliberately declares its own seven (it
+        // carries `target` and has natives that index it by absolute slot), so
+        // it is a legitimate exception to the zero-own-fields rule while still
+        // having to reach `Throwable` like everything else.
+        for name in BOOTSTRAP_EXCEPTION_CLASSES {
+            assert!(
+                jdk_chain_reaches_throwable(name),
+                "{name}: is pre-loaded by `bootstrap_core_classes` but its \
+                 `jdk_superclass` chain does not reach java/lang/Throwable, so \
+                 it gets a blanket `java/lang/Object` parent -- no inherited \
+                 throwable slots, no `catch (Exception)` match, and a floor \
+                 that pads it out of its compact layout. Add a `jdk_superclass` \
+                 arm for it."
+            );
+        }
+
+        // `Throwable` itself declares them; nothing above it carries the model.
+        assert!(!jdk_chain_reaches_throwable("java/lang/Throwable"));
+        assert_eq!(synthetic_stub_total_field_count("java/lang/Throwable"), 3);
+
+        // An application exception `jdk_superclass` has never heard of keeps
+        // the three this arm was written for.
+        assert!(!jdk_chain_reaches_throwable("com/example/app/WidgetException"));
+        assert_eq!(
+            synthetic_stub_total_field_count("com/example/app/WidgetException"),
+            3
+        );
+    }
+
     use crate::class::ClassStore;
     use cratonvm_reader::class_access_flags::{ClassAccessFlags, FieldAccessFlags};
     use cratonvm_reader::class_file_version::ClassFileVersion;
