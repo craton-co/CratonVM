@@ -187,6 +187,30 @@ listener could only be built on the process-wide identity — and the one thing
 this file must never do is stand up a listener without the client verifier a
 caller asked for. A loud refusal replaces a silent plaintext listener.
 
+### Why there was anything to find
+
+`native-builtins/src/tls_deny.rs` exists for exactly this defect. Its module
+doc opens with the mechanism — the plaintext base registrations call
+`deny_plaintext_fallback` first, and a TLS-factory receiver reaching them is
+refused — and it carries two allowlists, a test that checks them against the
+live registry, and eleven unit tests of the refusal itself. The no-arg
+overload was even IN the unbridged list, with a paragraph explaining that
+`create_ssl_server_socket` binds and builds in one step so there is no unbound
+socket to hand back.
+
+**`deny_plaintext_fallback` had no caller outside its own test module.** All
+nine plaintext base registrations in `phases_early` went straight to their
+bodies. The net was never hung, so the one overload it was written to catch
+went on returning a plaintext `java.net.ServerSocket` for as long as the
+module existed — and the allowlist that said so read as a decision rather than
+as the symptom it was.
+
+The nine call sites are now real. With both unbridged sets empty this is
+behaviourally inert today, which is the point: every descriptor the plaintext
+base registers is bridged on the TLS class, so dispatch never reaches the base
+for one, and the guard is there for the NEXT overload rather than this one.
+A premise in a comment is not a compile-time link.
+
 ## 7. Item 1 — the lists, asked of the VM about ITSELF
 
 §6 is right that the suite and protocol lists cannot match HotSpot's and that
@@ -296,4 +320,64 @@ item names and this wave did not open.
 
 ## 10. The gates
 
-Filled in at landing — see the commit that adds this section's numbers.
+Two runs. The first found three tests this wave moved; the second is the tree
+that lands.
+
+**Run 1 — isolation, on the pre-merge tree.** Base and trial built from one
+worktree at `bdb02d94e`, so they differ only by this wave:
+
+```text
+  A/B, 9 L6 probes            0 worse, 5 better, 62 rows closed
+      L6UriSweep              80 diff lines -> 0
+      L6UrlSweep              14            -> 0
+      L6TlsParamSweep         58            -> 36
+      L6HttpLogicSweep        18            -> 14
+      L6HttpLoopbackSweep     20            -> 16
+      L6JcaSweep / L6InetSweep / L6X500Sweep / L6SocketSweep   unmoved
+```
+
+Three trial binaries, not one, and each time the tell was the same: base and
+trial printed the same words. Twice for the `SSLContext` gate (§5) and once
+for `URL.toURI` — the fix that was measured, not the fix that was reasoned
+about, is the one that moved a row.
+
+**Run 2 — the merged tree**, which is what lands. `dev` moved 60+ commits
+under this wave:
+
+```text
+  --jdk-only corpus          134 passed, 0 failed
+  SUITE=all                  134 passed, 0 failed
+  SUITE=core                  93 passed, 0 failed
+  gate: types                 green
+  gate: native-api            green
+  gate: native-builtins       one target failed  (see below)
+  gate: ... --features management     one target failed  (the same one)
+  gate: ... --features synthetic-jdk  one target failed  (the same one)
+  A/B re-run against the merged binary   reproduces every number above
+```
+
+### The one red, and why it is not this wave's
+
+`raw_lock_constructions_do_not_grow` reports **429 against a baseline of 428**
+in all three `native-builtins` configurations. That is the red this wave's own
+BASE commit is about: `bdb02d94e`, "the second dev-owned red on this merge,
+named to the line", records 429 on pristine `origin/dev`.
+
+It was re-derived here rather than taken on trust, because this wave really
+did add two locks and had to prove it had removed them. The test's census is a
+source scan, so it can be run against two revisions with no build at all: the
+same algorithm over `git archive bdb02d94e` and over the landing tree gives
+**429 both times, with an empty per-file diff**. The two side tables this wave
+adds are `OrderedPlMutex` at `LockLevel::Scratch` and are counted as ordered,
+not raw.
+
+The test caps its site list at 40 alphabetically, so it names neither the
+culprit nor the innocent — which is why the per-file diff, not the site list,
+is the instrument.
+
+### One flaky row, recorded
+
+`L6SocketSweep` scored 40 diff lines on the base binary in one run and 42 in
+another, same binary, same probe. Nothing in this wave touches it. The trial's
+40 in the second run is therefore not a fix and is not counted above; the row
+that moves needs finding before anyone reads a delta there.
