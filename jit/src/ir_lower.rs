@@ -120,6 +120,12 @@ pub struct VirtualObjectInfo {
     /// `VirtualObject` there — else a deopt *before* a store would materialize
     /// the post-store value instead of the field's actual (earlier) value.
     pub store_ctrls: Vec<NodeId>,
+    /// The eliminated field stores' own node ids, parallel to `store_ctrls`.
+    /// When a store's block IS the deopt block, strict dominance cannot answer
+    /// and the id order within the block does — see
+    /// `Lowerer::eliminated_node_precedes_deopt`. A shorter list than
+    /// `store_ctrls` (a hand-built map) makes the same-block case refuse.
+    pub store_nodes: Vec<NodeId>,
 }
 
 /// Maps each scalar-replaced `Op::New` (by IR `NodeId`) to its
@@ -956,8 +962,14 @@ struct Lowerer<'a> {
     /// Bytecode indices an `Op::Guard { bci }` is anchored at.
     guard_bcis: std::collections::HashSet<usize>,
     /// Every node a deopt at a bci can fire from, in node-id order: each
-    /// `Op::Guard { bci }` under its `bci`, and each `Op::Div` / `Op::Rem`
-    /// under its `bytecode_pc`.
+    /// `Op::Guard { bci }` under its `bci`, each `Op::Div` / `Op::Rem` under its
+    /// `bytecode_pc`, and every other node that can transfer to the interpreter
+    /// (`!op_cannot_deopt`) under its `bytecode_pc` mapped through the spliced
+    /// ranges to the bci a deopt from it resumes at.
+    ///
+    /// Before 2026-09-12 only guards and divisions were indexed, so a
+    /// scalar-replaced object live at a call, a field access or an allocation
+    /// had no deopt block and could never be described.
     deopt_sites_by_bci: HashMap<usize, Vec<NodeId>>,
     /// The reference every LIVE `Op::MonitorEnter` / `Op::MonitorExit` names.
     ///
@@ -1732,11 +1744,20 @@ impl<'a> Lowerer<'a> {
                 })
                 .collect(),
             deopt_sites_by_bci: {
+                // `Lowerer::resume_bci`'s mapping, restated: `self` does not
+                // exist yet.
+                let resume = |pc: usize| {
+                    spliced_ranges
+                        .iter()
+                        .find(|&&(start, end, _)| pc >= start && pc < end)
+                        .map_or(pc, |&(_, _, invoke)| invoke)
+                };
                 let mut sites: HashMap<usize, Vec<NodeId>> = HashMap::new();
                 for (id, n) in graph.nodes.iter().enumerate() {
                     let key = match n.op {
                         Op::Guard { bci } => Some(bci),
                         Op::Div | Op::Rem => n.bytecode_pc,
+                        ref op if !op_cannot_deopt(op) => n.bytecode_pc.map(resume),
                         _ => None,
                     };
                     if let Some(bci) = key {
@@ -12795,6 +12816,7 @@ impl<'a> Lowerer<'a> {
         // exactly the historical `frame_value_for` mapping (byte-identical).
         if let Some(sr) = self.sr_map {
             let deopt_block = self.deopt_block_for_bci(sp.bci);
+            let first_site = deopt_block.and_then(|b| self.deopt_first_site_in_block(sp.bci, b));
             if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SCALAR_DEOPT") {
                 let matches: Vec<NodeId> = sp
                     .locals
@@ -12815,7 +12837,7 @@ impl<'a> Lowerer<'a> {
             let mut locals = Vec::with_capacity(sp.locals.len());
             for &n in &sp.locals {
                 locals.push(if n != NO_NODE && sr.objects.contains_key(&n) {
-                    self.frame_value_for_object(n, deopt_block, sr, &mut emitted)
+                    self.frame_value_for_object(n, deopt_block, first_site, sr, &mut emitted)
                 } else {
                     self.frame_value_for(n)
                 });
@@ -12823,7 +12845,7 @@ impl<'a> Lowerer<'a> {
             let mut stack = Vec::with_capacity(sp.stack.len());
             for &n in &sp.stack {
                 stack.push(if n != NO_NODE && sr.objects.contains_key(&n) {
-                    self.frame_value_for_object(n, deopt_block, sr, &mut emitted)
+                    self.frame_value_for_object(n, deopt_block, first_site, sr, &mut emitted)
                 } else {
                     self.frame_value_for(n)
                 });
@@ -12832,7 +12854,7 @@ impl<'a> Lowerer<'a> {
             // already defined is named by reference, not defined a second time.
             let monitors = self.resolve_monitors(sp, |n| {
                 if n != NO_NODE && sr.objects.contains_key(&n) {
-                    self.frame_value_for_object(n, deopt_block, sr, &mut emitted)
+                    self.frame_value_for_object(n, deopt_block, first_site, sr, &mut emitted)
                 } else {
                     self.monitor_object_value(n)
                 }
@@ -12914,12 +12936,87 @@ impl<'a> Lowerer<'a> {
         built
     }
 
+    /// Does `op` (a node indexed under `bci` in [`Self::deopt_sites_by_bci`])
+    /// fire the deopt at `bci`?
+    ///
+    /// An explicit `Op::Guard { bci }` does; a division does only when no guard
+    /// is anchored at its bci (the anchored guard owns the trap, and the
+    /// floating division beside it traps nowhere); every other indexed node is
+    /// indexed precisely because it can transfer from that program point.
+    fn fires_deopt_at(op: &Op, bytecode_pc: Option<usize>, bci: usize, anchored: bool) -> bool {
+        match op {
+            Op::Div | Op::Rem => !anchored && bytecode_pc == Some(bci),
+            Op::Guard { bci: gb } => *gb == bci,
+            other => !op_cannot_deopt(other),
+        }
+    }
+
+    /// The lowest node id among the deopt sites at `bci` that sit in `block`.
+    ///
+    /// The builder creates a block's control-pinned nodes in bytecode walk
+    /// order, so a node with a smaller id in the same block executes before
+    /// every one of these sites. See [`Self::eliminated_node_precedes_deopt`].
+    fn deopt_first_site_in_block(&self, bci: usize, block: usize) -> Option<NodeId> {
+        let anchored = self.guard_bcis.contains(&bci);
+        let sites: &[NodeId] = self
+            .deopt_sites_by_bci
+            .get(&bci)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        sites
+            .iter()
+            .copied()
+            .filter(|&site| {
+                self.graph.nodes.get(site as usize).is_some_and(|n| {
+                    Self::fires_deopt_at(&n.op, n.bytecode_pc, bci, anchored)
+                        && self.schedule.node_to_block.get(site as usize).copied() == Some(block)
+                })
+            })
+            .min()
+    }
+
+    /// Had the eliminated node `victim` (an `Op::New` or one of its field
+    /// stores), whose control input is `ctrl`, executed by the time the deopt
+    /// in block `db` fires?
+    ///
+    /// * `ctrl`'s block strictly dominates `db` — yes, on every path.
+    /// * `ctrl`'s block IS `db` — yes exactly when `victim` precedes the first
+    ///   deopt site there (`first_site`). Both are control-pinned nodes of one
+    ///   block, which the builder creates in bytecode walk order and nothing
+    ///   later reorders: a store is a hard barrier to hoisting, an unroll clones
+    ///   whole iterations in execution order, and a load-CSE survivor is the
+    ///   earlier node. A floating division is excluded as a site when a guard
+    ///   is anchored at its bci (always, for built graphs).
+    /// * otherwise — no. Refusing costs a precise resume, never correctness.
+    ///
+    /// The same-block case used to refuse outright, which made the recipe fail
+    /// for the commonest shape there is: `o = new; o.f = x; ...; guard` in one
+    /// straight-line block.
+    fn eliminated_node_precedes_deopt(
+        &self,
+        ctrl: NodeId,
+        victim: Option<NodeId>,
+        db: usize,
+        first_site: Option<NodeId>,
+    ) -> bool {
+        if self.schedule.node_strictly_dominates_block(ctrl, db) {
+            return true;
+        }
+        let same_block = self
+            .schedule
+            .node_to_block
+            .get(ctrl as usize)
+            .is_some_and(|&b| b != usize::MAX && b == db);
+        same_block
+            && matches!((victim, first_site), (Some(v), Some(site)) if v < site)
+    }
+
     /// Block where the deopt at `bci` fires — the program point all of a
-    /// scalar-replaced object's field stores must dominate for its
-    /// `VirtualObject` emission to be temporally correct. v1 deopt points are
-    /// div/rem guards, so the block is that of the `Op::Div`/`Op::Rem` node
-    /// carrying this bci. Returns `None` (⇒ the producer bails to `Undefined`)
-    /// when the block can't be uniquely identified.
+    /// scalar-replaced object's field stores must precede for its
+    /// `VirtualObject` emission to be temporally correct: the block of the
+    /// deopt site(s) [`Self::deopt_sites_by_bci`] indexes under this bci.
+    /// Returns `None` (⇒ the producer bails to `MaterializationRequired`) when
+    /// the block can't be uniquely identified.
     fn deopt_block_for_bci(&self, bci: usize) -> Option<usize> {
         // An `Op::Guard` at this bci OWNS the deopt: since
         // `ir::IrBuilder::add_div_zero_guard`, a division's zero-divisor trap
@@ -12944,15 +13041,11 @@ impl<'a> Lowerer<'a> {
             let Some(n) = self.graph.nodes.get(id) else {
                 continue;
             };
-            // The deopt at `bci` fires from an explicit `Op::Guard { bci }`, or
-            // — for a graph with no guard at this bci — from the div/rem
-            // zero/overflow guard the lowerer emits at the node carrying
-            // `bytecode_pc == bci`.
-            let is_deopt_here = match &n.op {
-                Op::Div | Op::Rem => !anchored && n.bytecode_pc == Some(bci),
-                Op::Guard { bci: gb } => *gb == bci,
-                _ => false,
-            };
+            // The deopt at `bci` fires from an explicit `Op::Guard { bci }`,
+            // from the div/rem zero/overflow guard the lowerer emits at a
+            // division no guard is anchored beside, or from any other node that
+            // can transfer from this program point.
+            let is_deopt_here = Self::fires_deopt_at(&n.op, n.bytecode_pc, bci, anchored);
             if is_deopt_here {
                 let b = *self.schedule.node_to_block.get(id)?;
                 if b == usize::MAX {
@@ -12996,6 +13089,7 @@ impl<'a> Lowerer<'a> {
         &self,
         new_id: NodeId,
         deopt_block: Option<usize>,
+        first_site: Option<NodeId>,
         sr: &ScalarReplacementMap,
         emitted: &mut std::collections::HashSet<NodeId>,
     ) -> FrameValue {
@@ -13026,15 +13120,12 @@ impl<'a> Lowerer<'a> {
             }
         };
         // The allocation and every field store must have executed before the
-        // deopt (strict block dominance — same-block ordering is conservatively
-        // rejected; see `Schedule::node_strictly_dominates_block`). We test the
-        // *control* node of each — the New/store nodes themselves are now
+        // deopt: strict block dominance, or the same block and an earlier node
+        // id (`eliminated_node_precedes_deopt`). We test the *control* node of
+        // each for the block — the New/store nodes themselves are now
         // `Op::Dead` (unscheduled), but their captured control inputs are live
-        // and carry the same block.
-        if !self
-            .schedule
-            .node_strictly_dominates_block(info.new_ctrl, db)
-        {
+        // and carry the same block — and the dead node's own id for the order.
+        if !self.eliminated_node_precedes_deopt(info.new_ctrl, Some(new_id), db, first_site) {
             if dbg {
                 eprintln!(
                     "[DBG_SCALAR_DEOPT] bail new {new_id}: new_ctrl {} (block {:?}) !strict-dom deopt block {db}",
@@ -13044,8 +13135,9 @@ impl<'a> Lowerer<'a> {
             }
             return Self::eliminated_object(new_id, info, EliminationCause::ScalarReplacedObject);
         }
-        for &store_ctrl in &info.store_ctrls {
-            if !self.schedule.node_strictly_dominates_block(store_ctrl, db) {
+        for (k, &store_ctrl) in info.store_ctrls.iter().enumerate() {
+            let store_node = info.store_nodes.get(k).copied();
+            if !self.eliminated_node_precedes_deopt(store_ctrl, store_node, db, first_site) {
                 if dbg {
                     eprintln!(
                         "[DBG_SCALAR_DEOPT] bail new {new_id}: store_ctrl {} (block {:?}) !strict-dom deopt block {db}",
@@ -13095,7 +13187,13 @@ impl<'a> Lowerer<'a> {
                     // turns that refusal into a refusal of the enclosing
                     // object. Fail-closed, one level at a time.
                     if sr.objects.contains_key(&vnode) {
-                        let nested = self.frame_value_for_object(vnode, deopt_block, sr, emitted);
+                        let nested = self.frame_value_for_object(
+                            vnode,
+                            deopt_block,
+                            first_site,
+                            sr,
+                            emitted,
+                        );
                         if matches!(
                             nested,
                             FrameValue::Undefined
@@ -22750,8 +22848,9 @@ mod tests {",
     /// block2 (else):   return 0
     /// ```
     ///
-    /// `same_block_guard` puts the guard in block0 instead (no `If`), so the New/
-    /// store do NOT strictly dominate it — the temporal-hazard bail case.
+    /// `same_block_guard` puts the guard in block0 instead (no `If`), created
+    /// BEFORE the New/store — so the allocation neither dominates the guard's
+    /// block nor precedes the guard inside it: the temporal-hazard bail case.
     /// `dup_local` puts the object in TWO local slots (sharing → `VirtualObjectRef`).
     /// Returns `(graph, sr_map, new_id)`; the New + store are marked `Op::Dead`
     /// (simulating `apply_ea_to_ir`) and `sr_map` captures their control inputs.
@@ -22772,6 +22871,11 @@ mod tests {",
         let c0 = g.add(Op::Proj(0), IrType::Control, vec![start], None);
         let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
         let cond = g.add(Op::Param(0), IrType::Int, vec![start], None);
+        // Same-block mode: the guard comes FIRST, so in block0's execution order
+        // the deopt fires before the object exists.
+        if same_block_guard {
+            let _guard = g.add(Op::Guard { bci: 10 }, IrType::Void, vec![c0, cond], None);
+        }
         // o = new Foo(); o.x = 7  (both controlled by c0 → block0)
         let newo = g.add(
             Op::New {
@@ -22801,9 +22905,7 @@ mod tests {",
         };
 
         let guard_ctrl = if same_block_guard {
-            // Guard in block0 (after the store), no branch → same block as New/store.
-            let guard = g.add(Op::Guard { bci: 10 }, IrType::Void, vec![c0, cond], None);
-            let _ = guard;
+            // Guard already in block0 (before the New), no branch → same block.
             let ret = g.add(Op::Return, IrType::Void, vec![c0, v7], None);
             g.exit = ret;
             c0
@@ -22848,6 +22950,7 @@ mod tests {",
                 field_values: vec![Some(v7)],
                 new_ctrl,
                 store_ctrls: vec![store_ctrl],
+                store_nodes: vec![store],
             },
         );
         (g, ScalarReplacementMap { objects }, newo)
@@ -23062,10 +23165,89 @@ mod tests {",
         }
     }
 
+    /// The commonest shape there is: `o = new Foo(); o.x = 7; ...; guard` in ONE
+    /// straight-line block. Strict block dominance cannot answer (same block),
+    /// and until 2026-09-12 that alone refused the recipe — so an object live at
+    /// a guard in a branch-free method could never be described. The allocation
+    /// and its store precede the guard in the block's execution order, which is
+    /// the builder's node-id order, and the recipe is emitted.
+    #[test]
+    fn test_scalar_deopt_describes_an_object_stored_earlier_in_the_guards_block() {
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+            receiver_param: None,
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let c0 = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let cond = g.add(Op::Param(0), IrType::Int, vec![start], None);
+        let newo = g.add(
+            Op::New {
+                class_id: 7,
+                num_fields: 1,
+            },
+            IrType::Ref,
+            vec![c0, mem],
+            None,
+        );
+        let f0 = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let v7 = g.add(Op::Const(7), IrType::Int, vec![], None);
+        let store = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![c0, mem, newo, f0, v7],
+            None,
+        );
+        // AFTER the store, same control → same block, later in it.
+        let _guard = g.add(Op::Guard { bci: 10 }, IrType::Void, vec![c0, cond], None);
+        let ret = g.add(Op::Return, IrType::Void, vec![c0, v7], None);
+        g.exit = ret;
+        g.safepoints.push(SafepointSnapshot {
+            bci: 10,
+            locals: vec![cond, newo],
+            stack: vec![],
+            monitors: Vec::new(),
+        });
+        g.nodes[newo as usize].op = Op::Dead;
+        g.nodes[newo as usize].inputs.clear();
+        g.nodes[store as usize].op = Op::Dead;
+        g.nodes[store as usize].inputs.clear();
+        let mut objects = HashMap::new();
+        objects.insert(
+            newo,
+            VirtualObjectInfo {
+                array_element_type: None,
+                class_id: 7,
+                num_fields: 1,
+                field_values: vec![Some(v7)],
+                new_ctrl: c0,
+                store_ctrls: vec![c0],
+                store_nodes: vec![store],
+            },
+        );
+        let sr_map = ScalarReplacementMap { objects };
+
+        let schedule = ir_schedule::schedule(&g);
+        let cm = lower_with_scalar_deopt(&g, &schedule, 1, 3, &no_helpers(), Some(&sr_map))
+            .expect("lower");
+        match &deopt_locals_at(&cm, 10)[1] {
+            FrameValue::VirtualObject(state) => {
+                assert_eq!(state.id, newo as usize);
+                assert_eq!(state.field_values, vec![FrameValue::Int(7)]);
+            }
+            other => panic!("expected VirtualObject, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_scalar_deopt_bails_when_store_not_dominating() {
-        // Guard in the SAME block as the New/store → strict dominance fails (v1
-        // conservatively rejects same-block ordering). The bail names the
+        // Guard in the SAME block as the New/store but BEFORE them → neither
+        // strict dominance nor the in-block order proves the object existed
+        // when the guard fires. The bail names the
         // eliminated allocation instead of claiming the slot is undefined, so
         // the resume is REFUSED (safe whole-method re-run) rather than served a
         // fabricated `Int(0)` — which for this reference local would be `null`.
@@ -23125,6 +23307,7 @@ mod tests {",
                 field_values: vec![],
                 new_ctrl: 1, // Proj(0) — the entry control, dominates everything
                 store_ctrls: vec![],
+                store_nodes: vec![],
             },
         );
         sr_map
@@ -23182,6 +23365,7 @@ mod tests {",
                 // dominance gate refuses it.
                 new_ctrl: NO_NODE,
                 store_ctrls: vec![],
+                store_nodes: vec![],
             },
         );
         sr_map

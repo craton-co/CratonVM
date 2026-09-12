@@ -2833,6 +2833,50 @@ impl Graph {
         }
     }
 
+    /// Drop the snapshots whose `keep` entry is `false`, preserving the order of
+    /// the rest. Returns how many were dropped; `0` (and no change) when `keep`
+    /// is not one entry per snapshot.
+    ///
+    /// Every [`Node::frame_snapshot`] is renumbered to its snapshot's new index,
+    /// and cleared when that snapshot was dropped — a caller that drops a
+    /// snapshot a live node claims has decided nothing reads it. The def-use
+    /// edges are rebuilt, since every slot position after the first dropped
+    /// snapshot moved.
+    ///
+    /// Must run before anything records snapshot indices elsewhere (an
+    /// `InlineScopeTable`); nothing in the pipeline does before lowering.
+    pub fn retain_safepoints(&mut self, keep: &[bool]) -> usize {
+        if keep.len() != self.safepoints.len() || keep.iter().all(|&k| k) {
+            return 0;
+        }
+        let mut remap: Vec<Option<u32>> = Vec::with_capacity(keep.len());
+        let mut next = 0u32;
+        for &k in keep {
+            if k {
+                remap.push(Some(next));
+                next += 1;
+            } else {
+                remap.push(None);
+            }
+        }
+        let before = self.safepoints.len();
+        let old = std::mem::take(&mut self.safepoints);
+        self.safepoints = old
+            .into_iter()
+            .zip(keep.iter().copied())
+            .filter_map(|(sp, k)| k.then_some(sp))
+            .collect();
+        for node in self.nodes.iter_mut() {
+            if let Some(si) = node.frame_snapshot {
+                node.frame_snapshot = remap.get(si as usize).copied().flatten();
+            }
+        }
+        if self.uses.tracking {
+            self.rebuild_use_lists();
+        }
+        before - self.safepoints.len()
+    }
+
     /// Bind `id` to the snapshot at `graph.safepoints[snapshot]` as the frame
     /// describing ITS program point, overriding `ir_lower`'s by-bci scan.
     ///
@@ -12970,11 +13014,21 @@ mod tests {
     /// monitor state to record at the join: refused.
     #[test]
     fn a_join_whose_edges_hold_different_monitors_refuses_the_build() {
-        //  0: iload_1  1: ifeq +7 -> 8
-        //  4: aload_0  5: monitorenter  6: goto +2 -> 8     (holds `a` on this edge)
-        //  8: return                                        (join: held vs not held)
-        let code = [0x1b, 0x99, 0x00, 0x07, 0x2a, 0xc2, 0xa7, 0x00, 0x02, 0xb1, 0, 0];
+        //  0: iload_1  1: ifeq +8 -> 9
+        //  4: aload_0  5: monitorenter  6: goto +3 -> 9     (holds `a` on this edge)
+        //  9: return                                        (join: held vs not held)
+        let code = [0x1b, 0x99, 0x00, 0x08, 0x2a, 0xc2, 0xa7, 0x00, 0x03, 0xb1, 0, 0];
         assert!(IrBuilder::new(2, 2).build(&code, 10).is_none());
+        // The control: the same join with the lock released on that edge first
+        // (`aload_0; monitorexit` before the goto) builds, which is what shows the
+        // refusal above is the monitor disagreement and not the bytecode shape.
+        //  0: iload_1  1: ifeq +10 -> 11
+        //  4: aload_0  5: monitorenter  6: aload_0  7: monitorexit
+        //  8: goto +3 -> 11   11: return
+        let balanced = [
+            0x1b, 0x99, 0x00, 0x0a, 0x2a, 0xc2, 0x2a, 0xc3, 0xa7, 0x00, 0x03, 0xb1, 0, 0,
+        ];
+        assert!(IrBuilder::new(2, 2).build(&balanced, 12).is_some());
     }
 
     #[test]
