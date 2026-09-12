@@ -388,9 +388,45 @@ that would have caught this wave's new registrations moving a frozen count —
 `X500Principal.getName(String,Map)` are all `Bridge`, and the ratchet counts
 `SyntheticStub`.
 
-**Run 2 — the merged tree**, which is what actually lands: the gate set and
-the three arms again, on a binary built from the merge. The isolation run is
-what tells run 2's red from this wave's.
+**Run 2 — the merged tree**, which is what actually lands. `dev` moved 40+
+commits under this wave, so the arms score a binary built from the merge:
+
+```text
+  --jdk-only corpus          133 passed, 0 failed
+  SUITE=all                  133 passed, 0 failed
+  SUITE=core                  93 passed, 0 failed   (see below)
+  gate: types                 rc=0, 15 test binaries
+  gate: native-api            rc=0, 10 test binaries
+  gate: native-builtins       rc=0, 11 test binaries
+  gate: ... --features management    rc=0, 11 test binaries
+  gate: ... --features synthetic-jdk rc=0, 11 test binaries
+```
+
+### The core arm that was red, and why it was the environment
+
+`SUITE=core`'s first run on the merged binary reported 60 failures and **90
+harness errors**, beginning mid-sweep with
+
+```text
+  run.sh: line 837: .../regression-suite/.guard-tmp.3679748/cv.key: No such file or directory
+  HARNESS ERROR [G4] RDirectBufferElem: the HotSpot oracle run FAILED (rc=1), so the
+    'expected' side of the cross-VM diff is an artefact of the oracle's failure
+```
+
+Three things say environment rather than defect, and `run.sh`'s own comment
+says the first of them: **"total redness that INCLUDES the harness guard is an
+ENVIRONMENT failure, not a defect."** The second is that the ORACLE failed —
+the diff's expected side was an artefact, so nothing was being compared. The
+third is that `dev` changed nothing under `regression-suite/`, and the same
+`SUITE=core` on the same harness had passed 93/93 an hour earlier.
+
+Re-run alone: **93 passed, 0 failed, 0 harness errors**, and
+`RDirectBufferElem` — the first casualty — passes. Two sibling lanes were
+running their own suites on the same host at the time.
+
+The rule this is an instance of: *read which side of a cross-VM diff failed
+before reading the diff*. A red arm whose ORACLE exited non-zero is not a
+measurement of the VM at all.
 
 ### Why the ordering changed mid-run
 
