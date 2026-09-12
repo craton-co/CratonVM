@@ -1971,6 +1971,24 @@ fn zip_entry_err(
         )),
     }
 }
+/// Step aside for a user subclass of `java.net.URLConnection`.
+///
+/// One line at the top of a registration whose class an application can
+/// extend. See `http_url_connection::subclass_runs_its_own_bytecode` for the
+/// defect and the discriminator; the short version is that dispatch probes the
+/// RECEIVER's class chain, so a native registered on `URLConnection` for this
+/// VM's own carriers also claims every method a test double inherits — and
+/// answers it without ever consulting the double's overrides.
+macro_rules! uc_subclass_guard {
+    ($ctx:expr, $args:expr, $name:literal, $desc:literal) => {
+        if let Some(forwarded) = crate::http_url_connection::subclass_runs_its_own_bytecode(
+            $ctx, $args, $name, $desc,
+        ) {
+            return forwarded;
+        }
+    };
+}
+
 fn npe<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
     RuntimeError::NullPointerException {
         message: Some(message.into()),
@@ -11141,28 +11159,15 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // side table.
             let this = ctx.read_native_pin(p_this, this);
             ctx.set_field_by_name(conn, "url", Value::Object(Some(this)));
-            // Default request method "GET" so `huc_perform` doesn't trip
-            // on a missing method when the http(s) path is exercised.
-            let m = ctx.create_string("GET");
+            // Everything else `java.net.URLConnection` and
+            // `java.net.HttpURLConnection` declare an initialiser for —
+            // `method`, `doInput`, `useCaches`, `instanceFollowRedirects`,
+            // `connected`, and the four `-1` sentinels a zeroed carrier reads
+            // as ALREADY SET. One list, shared with `huc_init`, because a
+            // user subclass reaching `super(u)` has the identical hole; see
+            // `huc_write_declared_field_defaults` for what each one costs.
             let conn = ctx.read_native_pin(p_conn, conn);
-            ctx.set_field_by_name(conn, "method", Value::Object(Some(m)));
-            ctx.set_field_by_name(conn, "doInput", Value::Int(1));
-            ctx.set_field_by_name(conn, "connected", Value::Int(0));
-            // `URLConnection`'s field initialiser is `useCaches =
-            // defaultUseCaches`, i.e. true. The constructor that would run it
-            // never runs on this ALLOCATED carrier, so the field arrives
-            // zeroed. Nothing in `perform` consults it, but `getUseCaches()`
-            // reports it — see `register_https_delegate_forwarders`, which
-            // routes the https carrier's delegate-forwarding override back to
-            // that inherited one-`getfield` body — and a fresh connection that
-            // answers `false` is reporting a value the caller never chose.
-            ctx.set_field_by_name(conn, "useCaches", Value::Int(1));
-            // Same species, same fix: `HttpURLConnection`'s field initialiser is
-            // `instanceFollowRedirects = followRedirects`, i.e. true, and the
-            // constructor that would run it never runs on this ALLOCATED
-            // carrier. `L6HttpLogicSweep` row 154 read `false` from a
-            // connection nobody had configured.
-            ctx.set_field_by_name(conn, "instanceFollowRedirects", Value::Int(1));
+            let conn = crate::http_url_connection::huc_write_declared_field_defaults(ctx, conn);
             // A carrier this call just minted inherits nothing. See
             // `http_url_connection::real_forget`: its side tables are keyed by
             // identity hash and this address may have belonged to a connection
@@ -11524,7 +11529,18 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "setUseCaches",
         "(Z)V",
         |ctx, args| {
+            uc_subclass_guard!(ctx, args, "setUseCaches", "(Z)V");
             let this = obj_arg(args, 0)?;
+            // `URLConnection.setUseCaches` opens with `checkConnected()`:
+            // "if already connected". Writing the field regardless let a
+            // caller change caching on a connection whose request had already
+            // gone out and reported success.
+            if matches!(ctx.get_field_by_name(this, "connected"), Value::Int(v) if v != 0) {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "Already connected".to_string(),
+                }
+                .into());
+            }
             let use_caches = args.get(1).and_then(Value::as_int).unwrap_or(1);
             ctx.set_field_by_name(this, "useCaches", Value::Int(use_caches));
             Ok(None)
@@ -11565,6 +11581,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "getContentLength",
         "()I",
         |ctx, args| {
+            uc_subclass_guard!(ctx, args, "getContentLength", "()I");
             let this = obj_arg(args, 0)?;
             let url = huc_url_string(ctx, this);
             let len = synthetic_resource_url_content_len(ctx, &url);
@@ -11581,6 +11598,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "getContentLengthLong",
         "()J",
         |ctx, args| {
+            uc_subclass_guard!(ctx, args, "getContentLengthLong", "()J");
             let this = obj_arg(args, 0)?;
             let url = huc_url_string(ctx, this);
             Ok(Some(Value::Long(synthetic_resource_url_content_len(
@@ -11593,6 +11611,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "getLastModified",
         "()J",
         |ctx, args| {
+            uc_subclass_guard!(ctx, args, "getLastModified", "()J");
             let this = obj_arg(args, 0)?;
             let url = huc_url_string(ctx, this);
             Ok(Some(Value::Long(synthetic_resource_url_last_modified(
@@ -12095,6 +12114,11 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // getHeaderFieldDate("last-modified", ...) shape used by Spring Boot's
     // JarUrlConnectionTests and NestedUrlConnectionTests.
     r.register(huc, "getLastModified", "()J", |ctx, args| {
+        // A user subclass gets `URLConnection.getLastModified` itself, whose
+        // `getHeaderFieldDate` accepts the two legacy date formats this
+        // native's `parse_rfc1123_date_millis` does not. MEASURED
+        // (`L6HttpLogicSweep` row 101: an RFC 850 `Last-Modified` read 0).
+        uc_subclass_guard!(ctx, args, "getLastModified", "()J");
         let this = obj_arg(args, 0)?;
         let url = huc_origin_url_string(ctx, this);
         let value = if url.starts_with("http://") || url.starts_with("https://") {
@@ -16139,7 +16163,8 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             ) {
                 return r;
             }
-            let protocols = ["TLSv1.3", "TLSv1.2", "TLSv1.1"];
+            // Single source of truth — see `t27_tls::SUPPORTED_PROTOCOL_NAMES`.
+            let protocols = crate::t27_tls::SUPPORTED_PROTOCOL_NAMES;
             // Single source of truth — see `t27_tls::SUPPORTED_CIPHER_SUITE_NAMES`.
             // Tomcat's `JSSEUtil.initialise()` reads this list and
             // `SSLUtilBase.getEnabled` silently DROPS any configured suite
@@ -16155,7 +16180,7 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(arr))
             };
             let carr = mk(ctx, ciphers);
-            let parr = mk(ctx, &protocols);
+            let parr = mk(ctx, protocols);
             // SSLParameters(String[] cipherSuites, String[] protocols)
             ctx.new_object_initialized(
                 "javax/net/ssl/SSLParameters",
@@ -17882,6 +17907,10 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/net/DatagramSocket;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // See `getOption` below: `Objects.requireNonNull(name)` first.
+            if !matches!(args.get(1), Some(Value::Object(Some(_)))) {
+                return Err(npe_no_message());
+            }
             let name = ds_socket_option_name(ctx, args.get(1).copied());
             let value = args.get(2).copied().unwrap_or(Value::Object(None));
             let fd = ds_get(this).fd;
@@ -17919,9 +17948,13 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
                 _ => {
                     // The JDK throws for an option its provider does not
                     // support; naming it is what lets a caller tell that from
-                    // a failure to apply one we do support.
+                    // a failure to apply one we do support. The wording is
+                    // `sun.nio.ch.Net`'s own — `"'" + name + "' not
+                    // supported"` — because a caller that string-matches the
+                    // JDK's text (or a test that asserts it) sees the same
+                    // sentence here.
                     return Err(RuntimeError::UnsupportedOperationException {
-                        message: format!("DatagramSocket.setOption: {name} is not supported"),
+                        message: format!("'{name}' not supported"),
                     }
                     .into());
                 }
@@ -17936,6 +17969,14 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         "(Ljava/net/SocketOption;)Ljava/lang/Object;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // `getOption`/`setOption` open with `Objects.requireNonNull(name)`,
+            // which throws a MESSAGELESS NPE. Reading the name off a null
+            // option produced `""` and then an
+            // `UnsupportedOperationException` naming the empty string — the
+            // wrong type, for a caller who passed null by mistake.
+            if !matches!(args.get(1), Some(Value::Object(Some(_)))) {
+                return Err(npe_no_message());
+            }
             let name = ds_socket_option_name(ctx, args.get(1).copied());
             let sd = ds_get(this);
             if sd.fd < 0 {
@@ -17976,7 +18017,7 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
                     ds_box_int(ctx, n as i32)
                 }
                 _ => Err(RuntimeError::UnsupportedOperationException {
-                    message: format!("DatagramSocket.getOption: {name} is not supported"),
+                    message: format!("'{name}' not supported"),
                 }
                 .into()),
             }
@@ -18071,9 +18112,23 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
     // `true` after `disconnect()` — backwards, and invisible to the compiler.)
     r.register(ds, "connect", "(Ljava/net/SocketAddress;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // The JDK's three refusals, in its order:
+        //   null                       -> IllegalArgumentException "Address can't be null"
+        //   not an InetSocketAddress   -> IllegalArgumentException "Unsupported address type"
+        //   InetSocketAddress.createUnresolved(..) -> SocketException "Unresolved address"
+        // The third is the one that mattered: an unresolved address reached
+        // the resolver and came back as a bare `IOException` naming
+        // getaddrinfo, so a caller could not tell "you passed me a hostname I
+        // was never asked to resolve" from "the network is down".
         let Some(Value::Object(Some(sa))) = args.get(1).copied() else {
-            return Err(ioex("DatagramSocket.connect: null address"));
+            return Err(iae("Address can't be null"));
         };
+        if matches!(
+            ctx.invoke_virtual(sa, "isUnresolved", "()Z", &[]),
+            Ok(Some(Value::Int(1)))
+        ) {
+            return Err(socket_ex(ctx, "Unresolved address"));
+        }
         // Same real-vs-synthetic layout trap `dp_layout` covers for
         // `DatagramPacket`, one class over: a real-JDK
         // `java.net.InetSocketAddress` declares ONE instance field
@@ -18103,11 +18158,18 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ds, "send", "(Ljava/net/DatagramPacket;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let pkt = obj_arg(args, 1)?;
-        let fd = ds_get(this).fd;
-        if fd < 0 {
-            return Err(ioex("DatagramSocket: closed"));
-        }
+        // `DatagramSocket.send(DatagramPacket p)` opens with `synchronized
+        // (p)`, so a null packet is a MONITORENTER on null and HotSpot's
+        // helpful-NPE names the parameter. `obj_arg`'s generic "null object
+        // argument" said the same thing in words no JDK ever prints.
+        let Some(Value::Object(Some(pkt))) = args.get(1).copied() else {
+            return Err(npe(
+                "Cannot enter synchronized block because \"p\" is null".to_string(),
+            ));
+        };
+        ds_require_not_closed(ctx, this)?;
+        let fd = ds_require_open_socket(ctx, this)?;
+        let fd = fd as i32;
         let lay = dp_layout(ctx, pkt);
         let data_arr = match ctx.get_field(pkt, lay.buf) {
             Value::Object(Some(a)) => a,
@@ -18128,6 +18190,19 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         };
         if host.is_empty() || !(1..=65535).contains(&port) {
             return Err(iae(format!("DatagramPacket: bad addr {host}:{port}")));
+        }
+        // A connected socket may only send to its peer: "if this socket is
+        // connected and the packet's address does not match the connected
+        // address, or if the packet's port does not match the connected port,
+        // an IllegalArgumentException is thrown". Without the check the
+        // datagram went to the packet's address, which is the opposite of
+        // what connecting a socket is for.
+        if ds_get(this).connected == 1 {
+            if let Some((peer_host, peer_port)) = ds_peer(this) {
+                if peer_host != host || peer_port != port {
+                    return Err(iae("Connected and packet address differ"));
+                }
+            }
         }
         let payload = java_byte_array_to_vec(ctx, data_arr, off, len)?;
         let target = format!("{host}:{port}");
@@ -18151,10 +18226,8 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let pkt = obj_arg(args, 1)?;
-            let fd = ds_get(this).fd;
-            if fd < 0 {
-                return Err(ioex("DatagramSocket: closed"));
-            }
+            ds_require_not_closed(ctx, this)?;
+            let fd = ds_require_open_socket(ctx, this)? as i32;
             let lay = dp_layout(ctx, pkt);
             let data_arr = match ctx.get_field(pkt, lay.buf) {
                 Value::Object(Some(a)) => a,
@@ -18261,21 +18334,31 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(Value::Int(ds_get(this).closed)))
     });
+    // `getLocalPort()` is specified to answer `-1` once the socket is closed —
+    // "the local port number to which this socket is bound, -1 if the socket
+    // is closed". Keeping the port made `close()` look like a no-op to any
+    // caller that reads the port back to decide whether to rebind.
     r.register(ds, "getLocalPort", "()I", |_ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(ds_get(this).port)))
+        let sd = ds_get(this);
+        Ok(Some(Value::Int(if sd.closed != 0 { -1 } else { sd.port })))
     });
-    r.register(ds, "setSoTimeout", "(I)V", |_ctx, args| {
+    // JDK order: the closed check FIRST, then the argument check. A closed
+    // socket refuses `setSoTimeout(-1)` with `SocketException`, not with the
+    // `IllegalArgumentException` an argument-first reading would give.
+    r.register(ds, "setSoTimeout", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        ds_require_not_closed(ctx, this)?;
         let ms = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         if ms < 0 {
-            return Err(iae("negative SO_TIMEOUT"));
+            return Err(iae("timeout < 0"));
         }
         ds_set(this, |s| s.timeout = ms);
         Ok(None)
     });
-    r.register(ds, "getSoTimeout", "()I", |_ctx, args| {
+    r.register(ds, "getSoTimeout", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        ds_require_not_closed(ctx, this)?;
         Ok(Some(Value::Int(ds_get(this).timeout)))
     });
 
@@ -18327,6 +18410,20 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
     // instead of enabling phase-72's incompatible raw-slot duplicate.
     r.register(ds, "connect", "(Ljava/net/InetAddress;I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // `java.net.DatagramSocket.connect(InetAddress, int)` is a null check
+        // and then `connect(new InetSocketAddress(address, port))`, so BOTH
+        // refusals below belong to it and neither depends on the socket being
+        // open: the old body validated nothing and silently accepted a port
+        // of -1 or 65536 by falling through its `(1..=65535)` guard.
+        if !matches!(args.get(1), Some(Value::Object(Some(_)))) {
+            return Err(iae("Address can't be null"));
+        }
+        let requested_port = args.get(2).and_then(Value::as_int).unwrap_or(0);
+        if !(0..=0xFFFF).contains(&requested_port) {
+            // `InetSocketAddress`'s own `checkPort`, which is where this
+            // throw happens on HotSpot — hence the colon with no space.
+            return Err(iae(format!("port out of range:{requested_port}")));
+        }
         let fd = ds_get(this).fd;
         if fd >= 0 {
             let host = match args.get(1) {
@@ -18494,37 +18591,34 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             _ => "0.0.0.0:0".to_string(),
         };
         let sd = ds_get(this);
-        if sd.closed != 0 {
-            return Err(ioex("DatagramSocket: closed"));
+        ds_require_not_closed(ctx, this)?;
+        // "if the socket is already bound" -> SocketException("Already
+        // bound"). Every constructor here except `<init>(null)` opens and
+        // binds an fd, so `fd >= 0` IS bound; rebinding it silently moved a
+        // live socket to a new port, which `isBound()` had already reported
+        // true for.
+        if sd.fd >= 0 {
+            return Err(socket_ex(ctx, "Already bound"));
         }
-        let reuse = sd.reuse_address == 1;
         // Same wildcard rule as the constructors: keep the dual stack.
+        //
+        // There is no rebind arm any more. There used to be one, for
+        // `sd.fd >= 0`, and it is exactly the case the refusal above now
+        // covers — an already-bound socket. A `udp_rebind` there was the JDK
+        // contract inverted: it moved a live socket to another port and
+        // reported success.
         let wildcard_port = cratonvm_native_api::fd_table::wildcard_bind_port(&spec);
-        let fd = if sd.fd >= 0 {
-            // Keep the fd id: it is this socket's identity in every side table.
-            let rebound = match wildcard_port {
-                Some(port) => ctx
-                    .fd_table()
-                    .udp_rebind_dual_stack(sd.fd as u32, port, reuse),
-                None => ctx.fd_table().udp_rebind(sd.fd as u32, Some(&spec), reuse),
-            };
-            // Keep the JDK type: an unavailable address is `BindException`,
-            // not a bare `IOException`. Same reasoning as
-            // `capability_gate::translate_bind_io`, which serves the
-            // constructor paths.
-            rebound.map_err(|e| {
-                crate::capability_gate::translate_bind_failure(e, |io| {
-                    format!("DatagramSocket.bind: {io}")
-                })
-            })?;
-            sd.fd
-        } else {
+        let fd = {
             let opened = match wildcard_port {
                 Some(port) => {
                     crate::capability_gate::open_udp_wildcard_dual_stack_gated(&*ctx, port)
                 }
                 None => crate::capability_gate::open_udp_gated(&*ctx, Some(&spec)),
             };
+            // Keep the JDK type: an unavailable address is `BindException`,
+            // not a bare `IOException`. Same reasoning as
+            // `capability_gate::translate_bind_io`, which serves the
+            // constructor paths.
             let fd = opened.map_err(|e| {
                 crate::capability_gate::translate_open_failure(e, |io| {
                     format!("DatagramSocket.bind: {io}")
@@ -18597,20 +18691,23 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
     // `FileDescriptorTable` primitive already.
     r.register(ds, "getSendBufferSize", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd = ds_require_open(this)?;
+        let fd = ds_require_open_socket(ctx, this)?;
         let n = ctx
             .fd_table()
             .udp_send_buffer_size(fd)
             .map_err(|e| ioex(format!("getSendBufferSize: {e}")))?;
         Ok(Some(Value::Int(n as i32)))
     });
+    // The four size/class setters carry the JDK's own wording. "Invalid send
+    // size" is not a paraphrase of "negative send buffer size": zero is
+    // refused too, which the old text denied.
     r.register(ds, "setSendBufferSize", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let n = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         if n <= 0 {
-            return Err(iae("negative send buffer size"));
+            return Err(iae("Invalid send size"));
         }
-        let fd = ds_require_open(this)?;
+        let fd = ds_require_open_socket(ctx, this)?;
         ctx.fd_table()
             .udp_set_send_buffer_size(fd, n as usize)
             .map_err(|e| ioex(format!("setSendBufferSize: {e}")))?;
@@ -18618,7 +18715,7 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
     });
     r.register(ds, "getReceiveBufferSize", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd = ds_require_open(this)?;
+        let fd = ds_require_open_socket(ctx, this)?;
         let n = ctx
             .fd_table()
             .udp_recv_buffer_size(fd)
@@ -18629,9 +18726,9 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let n = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         if n <= 0 {
-            return Err(iae("negative receive buffer size"));
+            return Err(iae("Invalid receive size"));
         }
-        let fd = ds_require_open(this)?;
+        let fd = ds_require_open_socket(ctx, this)?;
         ctx.fd_table()
             .udp_set_recv_buffer_size(fd, n as usize)
             .map_err(|e| ioex(format!("setReceiveBufferSize: {e}")))?;
@@ -18639,7 +18736,7 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
     });
     r.register(ds, "getTrafficClass", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd = ds_require_open(this)?;
+        let fd = ds_require_open_socket(ctx, this)?;
         let n = ctx
             .fd_table()
             .udp_tos(fd)
@@ -18650,9 +18747,9 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let n = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         if !(0..=255).contains(&n) {
-            return Err(iae("tc is not in range 0 -- 255"));
+            return Err(iae("Invalid IP_TOS value"));
         }
-        let fd = ds_require_open(this)?;
+        let fd = ds_require_open_socket(ctx, this)?;
         ctx.fd_table()
             .udp_set_tos(fd, n as u32)
             .map_err(|e| ioex(format!("setTrafficClass: {e}")))?;
@@ -18672,6 +18769,40 @@ fn ds_require_open(this: ObjectRef) -> Result<u32, cratonvm_types::error::Method
     let fd = ds_get(this).fd;
     if fd < 0 {
         return Err(ioex("Socket is closed"));
+    }
+    Ok(fd as u32)
+}
+
+/// `if (isClosed()) throw new SocketException("Socket is closed")` — the first
+/// line of nearly every `java.net.DatagramSocket` accessor.
+///
+/// The concrete type is the point. `java.io.IOException` walks straight past
+/// `catch (SocketException e)`, and the JDK's own bodies throw the subclass,
+/// so a caller that distinguishes "this socket is gone" from "this send
+/// failed" cannot do so against an `ioex`. Closed is `closed != 0` alone: a
+/// socket built with `new DatagramSocket(null)` has no fd yet and is UNBOUND,
+/// not closed, and must still answer its getters.
+fn ds_require_not_closed(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    if ds_get(this).closed != 0 {
+        return Err(socket_ex(ctx, "Socket is closed"));
+    }
+    Ok(())
+}
+
+/// [`ds_require_open`] with the JDK's exception TYPE.
+///
+/// Same body, `java.net.SocketException` instead of `java.io.IOException`;
+/// see [`ds_require_not_closed`] for why that matters.
+fn ds_require_open_socket(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<u32, cratonvm_types::error::MethodCallFailed> {
+    let fd = ds_get(this).fd;
+    if fd < 0 {
+        return Err(socket_ex(ctx, "Socket is closed"));
     }
     Ok(fd as u32)
 }
@@ -22855,13 +22986,24 @@ mod tests {
             indexed.is_empty(),
             "a real-JDK carrier is being written by SLOT INDEX: {indexed:?}. Those              constants are this file's synthetic map and do not match the JDK's field              layout — MEASURED, slot 1 is URLConnection.doInput and slot 9 is              URLConnection.requests. Use ctx.set_field_by_name."
         );
+        // `url` is the one field only the mint site can supply; the rest of
+        // the declared initial state moved into
+        // `http_url_connection::huc_write_declared_field_defaults`, shared
+        // with `huc_init`, so that a subclass carrier and a minted one cannot
+        // disagree about what a fresh connection looks like. The assertion is
+        // the same claim as before — nothing here is written by SLOT — plus
+        // the requirement that the shared list is actually called.
         assert!(
             lines[alloc..end]
                 .iter()
-                .filter(|l| l.contains("ctx.set_field_by_name(conn,"))
-                .count()
-                >= 4,
-            "the four values this carrier needs (url, method, doInput, connected) must              each be written by name"
+                .any(|l| l.contains(r#"ctx.set_field_by_name(conn, "url""#)),
+            "the carrier's own `url` must still be written by name"
+        );
+        assert!(
+            lines[alloc..end]
+                .iter()
+                .any(|l| l.contains("huc_write_declared_field_defaults")),
+            "the carrier must still be given the field values its constructor              would have written — `URLConnection`/`HttpURLConnection` declare four              `-1` sentinels that a zeroed carrier reads as ALREADY SET"
         );
     }
 

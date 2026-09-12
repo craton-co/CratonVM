@@ -2074,17 +2074,55 @@ pub(crate) fn native_system_set_property(
     }
 }
 
+/// Fixed offset added to every reading of this file's monotonic clocks —
+/// `System.nanoTime` and `jdk.internal.perf.Perf.highResCounter` — so that
+/// neither clock's origin is zero.
+///
+/// `Instant` has no fixed epoch, so each clock's origin is its own first
+/// call rather than process start — which means the FIRST reading measures
+/// the gap between `Instant::now()` and the very next statement. On Windows
+/// that gap is under the clock's resolution, so the first call returned
+/// exactly 0 or 100 ns, roughly half and half.
+///
+/// A zero-valued reading is not merely ugly, it is wrong in a way Java code
+/// notices, because the sentinel idiom
+///
+/// ```java
+/// long started = 0;
+/// ...
+/// if (started == 0) started = System.nanoTime();
+/// ```
+///
+/// is everywhere in the JDK and its dependents. A clock that can answer 0
+/// leaves such a timer permanently disarmed, re-latching on every pass and
+/// never measuring anything. HotSpot's origins are arbitrary but in practice
+/// large, so the idiom is sound there and callers are entitled to assume it.
+///
+/// 2^40 ns is about 18 minutes: comfortably past any first-call jitter, and
+/// nowhere near `i64` overflow (which is ~292 years of nanoseconds), so
+/// arithmetic on deltas and deadlines is unaffected. Neither clock promises
+/// more than monotonicity and meaningful differences, both of which a
+/// constant offset preserves.
+///
+/// The two clocks share this constant but NOT their `START`, so they remain
+/// independent clocks with independent origins. Nothing here makes them
+/// comparable to each other, and no caller may assume it.
+const MONOTONIC_ORIGIN_NANOS: i64 = 1 << 40;
+
 pub(crate) fn native_system_nano_time(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
     use std::time::Instant;
-    // Use a monotonic clock. We return the elapsed nanos since the first call.
-    // Rust's Instant doesn't have a fixed epoch, but nano deltas work.
+    // Use a monotonic clock. We return the elapsed nanos since the first call,
+    // biased by a fixed non-zero origin. Rust's Instant doesn't have a fixed
+    // epoch, but nano deltas work — and the bias keeps the first reading
+    // positive, which the zero-sentinel idiom depends on. See
+    // `MONOTONIC_ORIGIN_NANOS`.
     use std::sync::OnceLock;
     static START: OnceLock<Instant> = OnceLock::new();
     let start = START.get_or_init(Instant::now);
-    let nanos = start.elapsed().as_nanos() as i64;
+    let nanos = MONOTONIC_ORIGIN_NANOS + start.elapsed().as_nanos() as i64;
     Ok(Some(Value::Long(nanos)))
 }
 
@@ -7000,12 +7038,17 @@ pub(crate) fn native_perf_high_res_counter(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    // highResCounter() -> long nanos-since-start
+    // highResCounter() -> long nanos-since-start, biased by a fixed non-zero
+    // origin. This had exactly the lazy-`OnceLock` shape `System.nanoTime`
+    // had, and therefore exactly the same first-reading-is-0 defect. It feeds
+    // the same "is my timer armed yet?" comparisons, and `highResFrequency`
+    // below reports nanosecond ticks, so callers scale this value as a
+    // duration. See `MONOTONIC_ORIGIN_NANOS`.
     use std::sync::OnceLock;
     use std::time::Instant;
     static START: OnceLock<Instant> = OnceLock::new();
     let start = START.get_or_init(Instant::now);
-    let nanos = start.elapsed().as_nanos() as i64;
+    let nanos = MONOTONIC_ORIGIN_NANOS + start.elapsed().as_nanos() as i64;
     Ok(Some(Value::Long(nanos)))
 }
 
@@ -8351,5 +8394,77 @@ mod shutdown_hook_contract_tests {
         assert_eq!(hook_count(), 0);
 
         reset_registry();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Monotonic clock origins (`System.nanoTime`, `Perf.highResCounter`)
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod monotonic_clock_tests {
+    use super::*;
+    use crate::test_utils::mock_ctx;
+
+    fn nano_time() -> i64 {
+        let mut ctx = mock_ctx();
+        match native_system_nano_time(&mut ctx, &[]) {
+            Ok(Some(Value::Long(v))) => v,
+            other => panic!("nanoTime must answer a long, got {other:?}"),
+        }
+    }
+
+    fn high_res_counter() -> i64 {
+        let mut ctx = mock_ctx();
+        match native_perf_high_res_counter(&mut ctx, &[]) {
+            Ok(Some(Value::Long(v))) => v,
+            other => panic!("highResCounter must answer a long, got {other:?}"),
+        }
+    }
+
+    /// The clock never reads zero, INCLUDING on its very first call.
+    ///
+    /// This is the guard on `MONOTONIC_ORIGIN_NANOS`. Without the offset the
+    /// first reading in a process is the gap between `Instant::now()` and the
+    /// next statement, which on Windows is below the clock's resolution — so
+    /// it came back as exactly 0 about half the time, disarming every
+    /// `if (started == 0) started = System.nanoTime();` timer in Java.
+    ///
+    /// The assertion deliberately does not depend on being the first caller:
+    /// `START` is a process-wide `OnceLock` that a sibling test may already
+    /// have initialised, and the whole point of a fixed origin is that the
+    /// answer is positive either way.
+    #[test]
+    fn nano_time_is_never_zero() {
+        let t = nano_time();
+        assert!(
+            t >= MONOTONIC_ORIGIN_NANOS,
+            "nanoTime must start at a non-zero origin, got {t}"
+        );
+    }
+
+    /// `jdk.internal.perf.Perf.highResCounter` had the identical lazy-origin
+    /// defect and now carries the identical guarantee.
+    #[test]
+    fn high_res_counter_is_never_zero() {
+        let t = high_res_counter();
+        assert!(
+            t >= MONOTONIC_ORIGIN_NANOS,
+            "highResCounter must start at a non-zero origin, got {t}"
+        );
+    }
+
+    /// A constant offset must not cost monotonicity.
+    #[test]
+    fn nano_time_is_monotonic() {
+        let t1 = nano_time();
+        let t2 = nano_time();
+        assert!(t2 >= t1, "nanoTime went backwards: {t1} then {t2}");
+    }
+
+    #[test]
+    fn high_res_counter_is_monotonic() {
+        let t1 = high_res_counter();
+        let t2 = high_res_counter();
+        assert!(t2 >= t1, "highResCounter went backwards: {t1} then {t2}");
     }
 }

@@ -427,9 +427,19 @@ pub fn register_multicast_socket_overrides(r: &mut NativeMethodRegistry) {
             _ => return Ok(None),
         };
         let ttl = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
+        // "if ttl is not in the range 0 <= ttl <= 255". The `.max(0)` below is
+        // what a negative TTL used to become — silently 0, on a call that
+        // reported success — and 256 was pushed to the kernel unchanged.
+        // MEASURED, `L6SocketSweep` rows 52 and 53.
+        if !(0..=255).contains(&ttl) {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "Invalid TTL/hop value".into(),
+            }
+            .into());
+        }
         let fd = ctx.get_field(this, 3).as_int().unwrap_or(-1);
         if fd >= 0 {
-            let _ = ctx.fd_table().udp_set_ttl(fd as u32, ttl.max(0) as u32);
+            let _ = ctx.fd_table().udp_set_ttl(fd as u32, ttl as u32);
         }
         if ctx.object_num_fields(this) >= 5 {
             ctx.set_field(this, 4, Value::Int(ttl));
@@ -449,17 +459,31 @@ pub fn register_multicast_socket_overrides(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
+            // The two refusals come BEFORE the best-effort join, and they are
+            // not best-effort: `joinGroup(null, null)` and
+            // `joinGroup(new InetSocketAddress(loopback, 0), null)` both
+            // returned normally, so a caller was told it had joined a group
+            // that does not exist. Swallowing the KERNEL's error is a
+            // deliberate portability choice (a host with no multicast-capable
+            // interface must not fail Tribes channel startup); swallowing the
+            // CALLER's mistake is not. MEASURED, `L6SocketSweep` rows 55, 56.
+            let Some(Value::Object(Some(sa))) = args.get(1).copied() else {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "Unsupported address type".into(),
+                }
+                .into());
+            };
+            let group = ms_sockaddr_ipv4(ctx, sa);
+            let Some(ip) = group.filter(|ip| ip.is_multicast()) else {
+                return Err(ms_socket_exception(ctx, "Not a multicast address"));
+            };
             let fd = ctx.get_field(this, 3).as_int().unwrap_or(-1);
             if fd >= 0 {
-                if let Some(Value::Object(Some(sa))) = args.get(1).copied() {
-                    if let Some(ip) = ms_sockaddr_ipv4(ctx, sa) {
-                        let _ = ctx.fd_table().udp_join_multicast_v4(
-                            fd as u32,
-                            &ip,
-                            &std::net::Ipv4Addr::UNSPECIFIED,
-                        );
-                    }
-                }
+                let _ = ctx.fd_table().udp_join_multicast_v4(
+                    fd as u32,
+                    &ip,
+                    &std::net::Ipv4Addr::UNSPECIFIED,
+                );
             }
             Ok(None)
         },
@@ -688,6 +712,33 @@ fn ms_inet_host(ctx: &mut dyn NativeContext, ia: ObjectRef) -> Option<String> {
 
 /// Extract the IPv4 group address from a SocketAddress (InetSocketAddress) via
 /// `getAddress().getHostAddress()`, parsed as an `Ipv4Addr`.
+/// A real, catchable `java.net.SocketException`.
+///
+/// `RuntimeError` has no variant for it, and the type is what a caller catches
+/// — `java.io.IOException` with the right words walks straight past
+/// `catch (SocketException e)`. Falls back to an `IOException` only if the
+/// class cannot be built.
+fn ms_socket_exception(ctx: &mut dyn NativeContext, message: &str) -> MethodCallFailed {
+    let jmsg = ctx.create_string(message);
+    match ctx.new_object_initialized(
+        "java/net/SocketException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(jmsg))],
+    ) {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            // No catch-local root holds it yet and `new_object_initialized`
+            // has released its constructor pin.
+            let pin = ctx.pin_native_root(exc);
+            let exc = ctx.read_native_pin(pin, exc);
+            MethodCallFailed::ExceptionThrown(exc)
+        }
+        _ => RuntimeError::IOException {
+            message: message.to_string(),
+        }
+        .into(),
+    }
+}
+
 fn ms_sockaddr_ipv4(ctx: &mut dyn NativeContext, sa: ObjectRef) -> Option<std::net::Ipv4Addr> {
     let ia = ms_iv_obj(ctx, sa, "getAddress", "()Ljava/net/InetAddress;")?;
     ms_inet_host(ctx, ia)?.parse().ok()

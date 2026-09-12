@@ -1633,12 +1633,104 @@ pub(super) fn isolated_loader_class_not_found(
 /// referenced it. The loader-drive branches deliberately do not — a class
 /// resolved by running a user `loadClass` was produced by that loader, not
 /// fabricated, so there is no violation to attribute.
+/// Does `stored` name a hidden class whose class-FILE name is `referenced`?
+///
+/// Every hidden-class mint site writes `format!("{original}/0x{id:x}")` off the
+/// one `HIDDEN_CLASS_COUNTER` -- `native-builtins/src/classloader.rs`,
+/// `lookup_define.rs` (twice), `lang_system.rs`, `unsafe_natives.rs` and
+/// `unsafe_natives_ext.rs` -- so that suffix is the ONLY difference between the
+/// name a hidden class is stored under and the name its own constant pool
+/// carries.
+///
+/// The suffix has to be `/0x` followed by hex and nothing else. `A/0x1$Inner`
+/// is a different class from `A`, and answering `true` for it would resolve an
+/// unrelated reference to the hidden class -- a wrong answer, where the bug this
+/// predicate fixes is only a missing one.
+pub(crate) fn hidden_stored_name_is_self(stored: &str, referenced: &str) -> bool {
+    match stored
+        .strip_prefix(referenced)
+        .and_then(|rest| rest.strip_prefix("/0x"))
+    {
+        Some(hex) => !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+        None => false,
+    }
+}
+
+/// Is `referenced` -- a constant-pool class name -- the referencing class's own
+/// name?
+///
+/// Two dispatch doors ask this to recognise a SELF-call and answer it from the
+/// frame's own `ClassId` instead of a loader-blind name lookup
+/// (`dispatch_static`'s `self_class_id`, `invoke`'s `self_match`). Both used
+/// exact string equality, which a hidden class can never satisfy: it is stored
+/// under `"<class-file name>/0x<counter>"` and its constant pool carries the
+/// class-file name. The lookup they fall through to cannot find it either --
+/// a hidden class is in no loader's namespace -- so a hidden class calling its
+/// own static method raised `NoClassDefFoundError` under a name that named the
+/// class doing the calling.
+///
+/// Takes the two facts rather than the `Class` so it stays a pure function the
+/// gate below can drive, and so neither caller has to take a second lock: both
+/// already hold the class.
+pub(crate) fn is_self_class_reference(stored: &str, hidden: bool, referenced: &str) -> bool {
+    stored == referenced || (hidden && hidden_stored_name_is_self(stored, referenced))
+}
+
+/// The referencing class IS the class being referenced, named the way its own
+/// class file names it.
+///
+/// JEP 371: a hidden class is deliberately not registered in any loader's
+/// namespace -- `set_class_hidden` is what makes `find_class_by_name` and
+/// `Class.forName` unable to see it -- but its constant pool still carries its
+/// class-FILE name, and `this_class` and every self-naming `Fieldref` /
+/// `Methodref` resolve through that name. A name lookup therefore cannot answer
+/// a hidden class's reference to itself, and before this arm existed it did not:
+/// it raised `NoClassDefFoundError` under the UNMANGLED name.
+///
+/// `MethodHandleProxies`' generated proxy is the worked example, and is why
+/// `java/lang/System$1` could not be retired (lane 2 §4). Its `<clinit>` is
+/// `ldc <the interface>; putstatic <ITSELF>.interfaceType`, and its `<init>`
+/// does `invokestatic <ITSELF>.ensureOriginalLookup` and compares
+/// `ldc <ITSELF>` against `lookup.lookupClass()` -- three self-references, two
+/// of them reached before any of the interface's own methods run.
+fn hidden_self_reference(
+    shared: &SharedVm,
+    referencing_class_id: ClassId,
+    name: &str,
+) -> Option<ClassId> {
+    // The counter every mint site bumps, read before anything takes a lock:
+    // zero means no hidden class has ever been defined in this process, so no
+    // reference can be one. This function is on EVERY constant-pool class
+    // resolution, so the not-taken path has to cost a relaxed load and a
+    // branch.
+    if cratonvm_native_builtins::classloader::HIDDEN_CLASS_COUNTER
+        .load(std::sync::atomic::Ordering::Relaxed)
+        == 0
+    {
+        return None;
+    }
+    let cm = shared.classes.class_manager.read();
+    let class = cm.get_class(referencing_class_id)?;
+    if !class.is_hidden() {
+        return None;
+    }
+    hidden_stored_name_is_self(&class.name, name).then_some(referencing_class_id)
+}
+
 pub(crate) fn resolve_class_loader_aware(
     shared: &SharedVm,
     thread: &mut JvmThread,
     referencing_class_id: ClassId,
     name: &str,
 ) -> Result<ClassId, MethodCallFailed> {
+    // (0-pre-pre) A hidden class referring to ITSELF. Answered before the
+    //     transform hook and before every load below, because there is nothing
+    //     to load: the class is already defined, and the only reason a lookup
+    //     fails is that it is stored under a name its own bytecode never
+    //     mentions. See `hidden_self_reference`.
+    if let Some(self_id) = hidden_self_reference(shared, referencing_class_id, name) {
+        return Ok(self_id);
+    }
     // (0-pre) `java.lang.instrument` transform-on-load. Every branch below ends
     //     in a `load_class_concurrent*` or a user `loadClass`, and neither can
     //     run a Java `ClassFileTransformer` — the first holds the class-manager
