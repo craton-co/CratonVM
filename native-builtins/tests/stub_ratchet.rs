@@ -2144,25 +2144,31 @@ use cratonvm_types::compat::CompatibilityMode;
 /// The PAIRED measurement, both columns off the same three test binaries with
 /// `CRATONVM_UNRETIRE_NATIVE_SHADOW=java/nio/CharBuffer` producing the OFF one
 /// — its arm report prints `17 table row(s)`, which is the receipt that it
-/// disarmed this table and not a neighbour under `java/nio/`:
+/// disarmed this table and not a neighbour under `java/nio/`. Taken TWICE,
+/// before the merge and again on the merged tree, because a delta carried
+/// across a merge is the mistake this file's own history keeps recording:
 ///
 /// ```text
-///   arm             OFF             ON              delta
-///   (default)   2915 / 13615    2932 / 13615        +17 / 0
-///   management  2942 / 13983    2959 / 13983        +17 / 0
-///   synthetic   2915 / 13650    2932 / 13650        +17 / 0
+///   pre-merge (base bdb02d94e)          on the merge (62ae280f8)
+///   arm            OFF     ->  ON       OFF     ->  ON        delta
+///   (default)     2915     -> 2932     2948     -> 2965       +17
+///   management    2942     -> 2959     2975     -> 2992       +17
+///   synthetic     2915     -> 2932     2948     -> 2965       +17
 /// ```
 ///
-/// The OFF column passing at the constants as committed is what says the
-/// baselines were current and that nothing but this wave moves them.
+/// Two independent derivations of the same +17, with the OFF column passing at
+/// whatever the constants were at that moment — which is what says the
+/// baselines were current on both trees and that nothing but this wave moves
+/// them. The second pair is what the constants below are set from; the first is
+/// kept because agreeing twice is the claim, not the number.
 ///
-/// **The totals fell by 2 in every arm and in BOTH columns**, so they are the
-/// merge base's, not this wave's: a re-tag moves a row between kinds and cannot
-/// change how many registrations exist. `MEASURED_TOTAL_REGISTRATIONS_*` are
-/// documentation rather than assertions, which is exactly why they go stale, so
-/// they are re-frozen here with the stub baselines rather than left to drift
-/// another wave. Same shape as wave 3's 8.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2975;
+/// **The totals fell in every arm and in BOTH columns — by 2 before the merge
+/// and by 13 on it** — so they are dev's, not this wave's: a re-tag moves a row
+/// between kinds and cannot change how many registrations exist.
+/// `MEASURED_TOTAL_REGISTRATIONS_*` are documentation rather than assertions,
+/// which is exactly why they go stale, so they are re-frozen here with the stub
+/// baselines rather than left to drift another wave. Same shape as wave 3's 8.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2992;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2443,7 +2449,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2975;
 /// `native-builtins/src/lang_class.rs|java/lang/Package.getPackages|()[Ljava/lang/Package;`
 /// -- and none the other way. Record:
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2948;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2965;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2646,7 +2652,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2948;
 /// `native-builtins/src/lang_class.rs|java/lang/Package.getPackages|()[Ljava/lang/Package;`
 /// -- and none the other way. Record:
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2948;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2965;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -2723,7 +2729,7 @@ const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2948;
 /// was the only trace a real defect left in this gate, and staleness meant
 /// nobody could have read it. The `synthetic-jdk` arm has no constant here and
 /// measured 13645 on the same tree.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13974;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13961;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
@@ -2736,7 +2742,7 @@ const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13974;
 /// dev's staleness rather than either wave's — the localisation is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13606;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13593;
 
 /// The `--features synthetic-jdk` total, which had no constant at all.
 ///
@@ -2762,7 +2768,7 @@ const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13606;
 /// and 13645 on that tree against 13658 on this one is exactly the drift a
 /// sentence cannot track.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13641;
+const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13628;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;
