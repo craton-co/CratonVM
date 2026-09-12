@@ -347,7 +347,149 @@ fn loop_depths(blocks: &[Block], dom: &Dominators) -> Vec<u32> {
 }
 
 /// The deepest block that dominates every block in `of`, or `None`.
+///
+/// The same answer as [`deepest_common_dominator_by_scan`], which tests every
+/// block, but found by walking the dominator tree:
+///
+/// * a member past the end is dominated by no block, so the answer is `None`;
+/// * an unreachable member is dominated by EVERY block, so it constrains
+///   nothing, and the answer is the nearest common dominator of the reachable
+///   members, found by climbing `idom` chains;
+/// * when every member is unreachable, every block qualifies, and the scan's
+///   "deeper wins" rule settles on the highest-numbered unreachable block
+///   (pinned by
+///   `sink_common_dominator_treats_an_unreachable_use_as_dominated_by_every_block`).
+///
+/// An empty `of`, or a relation whose size is not `nb`, is answered by the scan
+/// itself. The sink pass never asks either question.
 fn deepest_common_dominator(dom: &Dominators, of: &[usize], nb: usize) -> Option<usize> {
+    if of.is_empty() || nb != dom.len() {
+        return deepest_common_dominator_by_scan(dom, of, nb);
+    }
+    let mut common: Option<usize> = None;
+    for &b in of {
+        if b >= nb {
+            return None;
+        }
+        if !dom.is_reachable(b) {
+            continue;
+        }
+        common = Some(match common {
+            None => b,
+            Some(mut x) => {
+                // The entry dominates every reachable block, so this stops at
+                // block 0 at the latest.
+                while !dom.dominates(x, b) {
+                    match dom.idom(x) {
+                        Some(up) => x = up,
+                        None => return deepest_common_dominator_by_scan(dom, of, nb),
+                    }
+                }
+                x
+            }
+        });
+    }
+    match common {
+        Some(x) => Some(x),
+        None => dom.last_unreached(),
+    }
+}
+
+/// Where the sink pass puts a node whose inputs put it in `early` and whose uses
+/// need it no lower than `late`. `early` must dominate `late`.
+///
+/// Among the blocks on the dominator path between the two, the shallowest loop
+/// nesting wins. With `equal_depth` on, a tie goes to the later block, the one
+/// the current best dominates. The same answer as
+/// [`choose_sink_block_by_scan`], which tests every block for "on the path",
+/// but it visits only the path: the `idom` chain from `late` up to `early`,
+/// sorted by block number so the scan's tie-breaking order is kept. `path` is
+/// scratch space, reused across calls.
+///
+/// When `late` is unreachable, every block dominates it, so the candidates are
+/// not a path. That case, and a relation whose size is not `nb`, go to the
+/// scan.
+fn choose_sink_block(
+    dom: &Dominators,
+    depth: &[u32],
+    early: usize,
+    late: usize,
+    equal_depth: bool,
+    nb: usize,
+    path: &mut Vec<usize>,
+) -> usize {
+    if nb != dom.len() || !dom.is_reachable(late) {
+        return choose_sink_block_by_scan(dom, depth, early, late, equal_depth, nb);
+    }
+    path.clear();
+    let mut x = late;
+    loop {
+        path.push(x);
+        if x == early {
+            break;
+        }
+        match dom.idom(x) {
+            Some(up) => x = up,
+            // The chain reached the entry without meeting `early`, so `early`
+            // does not dominate `late`. The caller rules that out; let the
+            // scan answer rather than guess.
+            None => return choose_sink_block_by_scan(dom, depth, early, late, equal_depth, nb),
+        }
+    }
+    path.sort_unstable();
+    let mut best = early;
+    for &cand in path.iter() {
+        if depth[cand] < depth[best] {
+            best = cand;
+            continue;
+        }
+        if equal_depth && depth[cand] == depth[best] && cand != best && dom.dominates(best, cand)
+        {
+            best = cand;
+        }
+    }
+    best
+}
+
+/// [`choose_sink_block`] by testing every block. This is the placement loop
+/// the sink pass ran before it walked the dominator tree. It is kept verbatim
+/// as the answer for the cases the walk hands back, and as the reference the
+/// tests hold the walk to.
+fn choose_sink_block_by_scan(
+    dom: &Dominators,
+    depth: &[u32],
+    early: usize,
+    late: usize,
+    equal_depth: bool,
+    nb: usize,
+) -> usize {
+    let mut best = early;
+    for cand in 0..nb {
+        if !dom.dominates(early, cand) || !dom.dominates(cand, late) {
+            continue;
+        }
+        // Shallower loop nesting always wins: that is this pass's
+        // original claim and it is never traded away.
+        if depth[cand] < depth[best] {
+            best = cand;
+            continue;
+        }
+        // At equal depth, take the LATEST — the candidate the current
+        // best dominates. Every candidate here dominates `late`, which
+        // dominates every use, so this shortens the live range without
+        // moving the value below any reader. `cand != best` keeps the
+        // reflexive case from counting as a move.
+        if equal_depth && depth[cand] == depth[best] && cand != best && dom.dominates(best, cand) {
+            best = cand;
+        }
+    }
+    best
+}
+
+/// [`deepest_common_dominator`] by testing every block, as it was computed
+/// before the dominator-tree walk. Kept as the answer for the cases the walk
+/// hands back, and as the reference the tests hold the walk to.
+fn deepest_common_dominator_by_scan(dom: &Dominators, of: &[usize], nb: usize) -> Option<usize> {
     let mut best: Option<usize> = None;
     for cand in 0..nb {
         if !of.iter().all(|&b| dom.dominates(cand, b)) {
@@ -463,6 +605,8 @@ fn place_sunk_nodes(
 ) -> usize {
     let nb = blocks.len();
     let mut moved = 0usize;
+    // Scratch for `choose_sink_block`, reused across nodes and rounds.
+    let mut path: Vec<usize> = Vec::new();
 
     // Iterated, because a node can only follow its uses: the `Add` feeding the
     // `Return` has to reach the exit block before the `Mul` feeding the `Add`
@@ -556,30 +700,10 @@ fn place_sunk_nodes(
             if !dom.dominates(early, late) {
                 continue;
             }
-            let mut best = early;
-            for cand in 0..nb {
-                if !dom.dominates(early, cand) || !dom.dominates(cand, late) {
-                    continue;
-                }
-                // Shallower loop nesting always wins: that is this pass's
-                // original claim and it is never traded away.
-                if depth[cand] < depth[best] {
-                    best = cand;
-                    continue;
-                }
-                // At equal depth, take the LATEST — the candidate the current
-                // best dominates. Every candidate here dominates `late`, which
-                // dominates every use, so this shortens the live range without
-                // moving the value below any reader. `cand != best` keeps the
-                // reflexive case from counting as a move.
-                if equal_depth
-                    && depth[cand] == depth[best]
-                    && cand != best
-                    && dom.dominates(best, cand)
-                {
-                    best = cand;
-                }
-            }
+            // Only the dominator path from `early` down to `late` is a
+            // candidate; `choose_sink_block` walks that path instead of
+            // testing every block.
+            let best = choose_sink_block(dom, depth, early, late, equal_depth, nb, &mut path);
             if best != early {
                 node_to_block[id] = best;
                 changed = true;
@@ -1766,6 +1890,10 @@ pub struct Dominators {
     pre: Vec<usize>,
     /// Post-order number of each reachable block in the dominator tree.
     post: Vec<usize>,
+    /// The highest-numbered block the entry does not reach, if any. The sink
+    /// pass's answer when every use it has to cover is unreachable; see
+    /// `deepest_common_dominator`.
+    last_unreached: Option<usize>,
 }
 
 impl Dominators {
@@ -1779,7 +1907,12 @@ impl Dominators {
         let mut pre = vec![0usize; n];
         let mut post = vec![0usize; n];
         if n == 0 {
-            return Dominators { idom, pre, post };
+            return Dominators {
+                idom,
+                pre,
+                post,
+                last_unreached: None,
+            };
         }
 
         // Forward edges, derived from `predecessors` rather than read from
@@ -1873,7 +2006,13 @@ impl Dominators {
             }
         }
 
-        Dominators { idom, pre, post }
+        let last_unreached = (0..n).rev().find(|&b| idom[b] == UNREACHED);
+        Dominators {
+            idom,
+            pre,
+            post,
+            last_unreached,
+        }
     }
 
     /// The nearest common dominator of two processed blocks: walk whichever is
@@ -1909,9 +2048,21 @@ impl Dominators {
         }
     }
 
+    /// True for a block the entry reaches; `false` for an unreachable block and
+    /// for an out-of-range index.
+    pub fn is_reachable(&self, b: usize) -> bool {
+        matches!(self.idom.get(b), Some(&d) if d != UNREACHED)
+    }
+
+    /// The highest-numbered block the entry does not reach, or `None` when
+    /// every block is reachable.
+    pub fn last_unreached(&self) -> Option<usize> {
+        self.last_unreached
+    }
+
     /// True iff block `a` dominates block `b`. Reflexive.
     ///
-    /// Exactly [`dominates`] over [`Self::to_matrix`]: `false` for an
+    /// The same answers the dense matrix this replaced gave: `false` for an
     /// out-of-range index, `true` for any `a` when `b` is unreachable, and
     /// `false` when only `a` is.
     #[inline]
@@ -4576,6 +4727,68 @@ mod tests {
         assert_eq!(deepest_common_dominator(&dom, &[1, 2, 4], 5), Some(1));
         // No block dominates an out-of-range use.
         assert_eq!(deepest_common_dominator(&dom, &[2, 9], 5), None);
+    }
+
+    /// The sink pass's dominator-tree walks give the same answers as the block
+    /// scans they replaced, on several hundred generated CFGs. Unreachable
+    /// blocks, self loops and irreducible cycles are all included. Placement
+    /// is checked under both the real loop depths and random depths, so ties
+    /// break the same way too.
+    #[test]
+    fn sink_placement_walks_match_the_block_scans_on_generated_cfgs() {
+        let mut state: u64 = 0x5DEE_CE66_D1CE_4E5B;
+        let mut next = |bound: usize| -> usize {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) as usize) % bound.max(1)
+        };
+        let mut path: Vec<usize> = Vec::new();
+        for case in 0..300 {
+            let n = 1 + next(20);
+            let m = next(3 * n + 1);
+            let edges: Vec<(usize, usize)> = (0..m).map(|_| (next(n), next(n))).collect();
+            let blocks = cfg(n, &edges);
+            let dom = Dominators::compute(&blocks);
+
+            for _ in 0..24 {
+                let k = 1 + next(4);
+                // `next(n + 1)` can name one block past the end.
+                let of: Vec<usize> = (0..k).map(|_| next(n + 1)).collect();
+                assert_eq!(
+                    deepest_common_dominator(&dom, &of, n),
+                    deepest_common_dominator_by_scan(&dom, &of, n),
+                    "case {case}: common dominator of {of:?}"
+                );
+            }
+
+            let loop_depth = loop_depths(&blocks, &dom);
+            let random_depth: Vec<u32> = (0..n).map(|_| next(3) as u32).collect();
+            for depth in [&loop_depth, &random_depth] {
+                for early in 0..n {
+                    for late in 0..n {
+                        if !dom.dominates(early, late) {
+                            continue;
+                        }
+                        for equal_depth in [false, true] {
+                            assert_eq!(
+                                choose_sink_block(
+                                    &dom,
+                                    depth,
+                                    early,
+                                    late,
+                                    equal_depth,
+                                    n,
+                                    &mut path
+                                ),
+                                choose_sink_block_by_scan(&dom, depth, early, late, equal_depth, n),
+                                "case {case}: early {early}, late {late}, equal_depth {equal_depth}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ── Step 4 placement order ───────────────────────────────────────────
