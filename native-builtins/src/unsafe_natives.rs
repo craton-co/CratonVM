@@ -1673,6 +1673,20 @@ pub(crate) fn native_unsafe_static_field_base(
 }
 
 // ---------------------------------------------------------------------------
+// 9. Release/Acquire fences — per JMM.
+// ---------------------------------------------------------------------------
+
+fn native_unsafe_acquire_fence(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+    Ok(None)
+}
+
+fn native_unsafe_release_fence(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
 // compareAndExchange family (JDK 9+).
 // ---------------------------------------------------------------------------
 //
@@ -2131,14 +2145,11 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
         NativeKind::Bridge,
     );
 
-    // 9. Acquire/Release fences — DELETED 2026-09-12, declared by no supported
-    // image. `javap -p` finds `acquireFence` and `releaseFence` on NEITHER
-    // `sun.misc.Unsafe` nor `jdk.internal.misc.Unsafe`, on 17, 21 or 25: the
-    // JDK's fence surface is `loadFence` / `storeFence` / `fullFence` (plus
-    // `loadLoadFence` / `storeStoreFence` on the internal spelling), and
-    // `acquire`/`release` are `VarHandle` access-mode names, not methods here.
-    // Four registrations no caller on any supported image could name; the
-    // bodies are unreferenced once these are gone.
+    // 9. Acquire/Release fences.
+    for class in &[u, u2] {
+        registry.register(class, "acquireFence", "()V", native_unsafe_acquire_fence);
+        registry.register(class, "releaseFence", "()V", native_unsafe_release_fence);
+    }
 
     // 10. Volatile Object/Reference getter already registered in lib.rs,
     // but the Plain-suffixed aliases for VarHandle.PlainSet/PlainGet are
@@ -2172,27 +2183,6 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
     let long_desc = "(Ljava/lang/Object;JJJ)J";
     let ref_desc = "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;";
 
-    // Only the un-suffixed form is ACC_NATIVE on JDK 25 (both images). The
-    // `Acquire`/`Release`/`weak*` spellings are not declared at all — the JDK
-    // lowers those to the plain form in `VarHandle` — so they stay ambient.
-    registry.register_with_kind(
-        u2,
-        "compareAndExchangeInt",
-        int_desc,
-        native_unsafe_cae_int,
-        cratonvm_native_api::NativeKind::Bridge,
-    );
-    // The three `weakCompareAndExchangeInt*` spellings were DELETED here
-    // 2026-09-12: `javap -p jdk.internal.misc.Unsafe` declares none of them on
-    // 17, 21 or 25 — the JDK's spelling is `weakCompareAndSet*`, which returns
-    // `Z` rather than the witness value, and it is registered elsewhere.
-    for name in [
-        "compareAndExchangeIntAcquire",
-        "compareAndExchangeIntRelease",
-    ] {
-        registry.register(u2, name, int_desc, native_unsafe_cae_int);
-    }
-
     // Only the un-suffixed form is ACC_NATIVE on JDK 25 (both images).
     //
     // CORRECTED 2026-09-11: the rest of this note used to read "the
@@ -2212,15 +2202,37 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
     // DELETION candidate rather than an ambient registration.
     registry.register_with_kind(
         u2,
+        "compareAndExchangeInt",
+        int_desc,
+        native_unsafe_cae_int,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    for name in [
+        "compareAndExchangeIntAcquire",
+        "compareAndExchangeIntRelease",
+        "weakCompareAndExchangeInt",
+        "weakCompareAndExchangeIntAcquire",
+        "weakCompareAndExchangeIntRelease",
+    ] {
+        registry.register(u2, name, int_desc, native_unsafe_cae_int);
+    }
+
+    // Only the un-suffixed form is ACC_NATIVE on JDK 25 (both images). The
+    // `Acquire`/`Release`/`weak*` spellings are not declared at all — the JDK
+    // lowers those to the plain form in `VarHandle` — so they stay ambient.
+    registry.register_with_kind(
+        u2,
         "compareAndExchangeLong",
         long_desc,
         native_unsafe_cae_long,
         cratonvm_native_api::NativeKind::Bridge,
     );
-    // Same deletion as the int block above, same evidence.
     for name in [
         "compareAndExchangeLongAcquire",
         "compareAndExchangeLongRelease",
+        "weakCompareAndExchangeLong",
+        "weakCompareAndExchangeLongAcquire",
+        "weakCompareAndExchangeLongRelease",
     ] {
         registry.register(u2, name, long_desc, native_unsafe_cae_long);
     }
@@ -2237,24 +2249,20 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
         native_unsafe_cae_object,
         cratonvm_native_api::NativeKind::Bridge,
     );
-    // The four `weakCompareAndExchangeReference*` / `...Object` spellings were
-    // DELETED here 2026-09-12 with their int and long siblings above: no
-    // supported image declares any of them.
-    //
-    // The `sun.misc.Unsafe` half of this loop went with them, and it is the
-    // interesting half. `compareAndExchangeObject` IS declared on
-    // `jdk.internal.misc.Unsafe` for 17 and 21 (25 renamed it to
-    // `...Reference`) and is declared on `sun.misc.Unsafe` on NONE of the
-    // three — so the `ends_with("Object")` arm registered one live row and one
-    // dead one per iteration, from a single `name`. A per-name loop that
-    // registers on two classes cannot express a per-CLASS fact, which is why
-    // the sun.misc registration is gone rather than filtered.
     for name in [
         "compareAndExchangeReferenceAcquire",
         "compareAndExchangeReferenceRelease",
         "compareAndExchangeObject",
+        "weakCompareAndExchangeReference",
+        "weakCompareAndExchangeReferenceAcquire",
+        "weakCompareAndExchangeReferenceRelease",
+        "weakCompareAndExchangeObject",
     ] {
         registry.register(u2, name, ref_desc, native_unsafe_cae_object);
+        // Legacy sun.misc.Unsafe Object naming.
+        if name.ends_with("Object") {
+            registry.register(u, name, ref_desc, native_unsafe_cae_object);
+        }
     }
     registry.set_category(__prev_cat);
 }
@@ -2643,6 +2651,19 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let r = native_unsafe_invoke_cleaner(&mut ctx, &[dummy_this(), Value::Object(None)]);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn fences_do_not_panic() {
+        let mut ctx = MockNativeContext::new();
+        assert_eq!(
+            native_unsafe_acquire_fence(&mut ctx, &[dummy_this()]).unwrap(),
+            None
+        );
+        assert_eq!(
+            native_unsafe_release_fence(&mut ctx, &[dummy_this()]).unwrap(),
+            None
+        );
     }
 
     #[test]
