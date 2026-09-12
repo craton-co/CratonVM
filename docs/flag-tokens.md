@@ -616,7 +616,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-449 tokens.
+450 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -832,6 +832,7 @@ export inherited from a parent shell.
 | `ir-licm-before-unroll` | `CRATONVM_JIT_IR_LICM_BEFORE_UNROLL` |
 | `ir-poll-outline` | `CRATONVM_JIT_IR_POLL_OUTLINE` |
 | `ir-load-cse` | `CRATONVM_JIT_IR_LOAD_CSE` |
+| `ir-load-cse-alias` | `CRATONVM_JIT_IR_LOAD_CSE_ALIAS` |
 | `ir-licm-hoist-counted` | `CRATONVM_JIT_IR_LICM_HOIST_COUNTED` |
 | `ir-per-copy-frames` | `CRATONVM_JIT_IR_PER_COPY_FRAMES` |
 | `ir-partial-unroll` | `CRATONVM_JIT_IR_PARTIAL_UNROLL` |

@@ -1084,10 +1084,48 @@ fn is_pure_memory_read(op: &Op) -> bool {
 const LOAD_CSE_CHAIN_BUDGET: usize = 64;
 
 /// Is memory state `to` reachable backwards from memory state `from` through
-/// nothing but pure reads anchored at `ctrl`?
+/// nothing that can have written the cell `reads`?
 ///
 /// `from == to` is the zero-length case and is `true`.
-fn memory_chain_reaches(graph: &Graph, from: NodeId, to: NodeId, ctrl: NodeId) -> bool {
+///
+/// # What may sit on the path
+///
+/// By default only a pure read — `MemAccess::{FieldRead, ArrayRead,
+/// LengthRead}`, which advances the memory token and writes nothing. That is
+/// the whole rule, and it is why one `Op::Store` stops the merge however
+/// obviously it writes somewhere else.
+///
+/// `CRATONVM_JIT_IR_LOAD_CSE_ALIAS=1` replaces it with the question the alias
+/// model already answers: does this node WRITE anything that may alias the cell
+/// being read? `ir::effect_of_node` classifies the node and `Graph::may_alias`
+/// decides, so `this.a; this.b = x; this.a` merges — two different field
+/// indices are two different cells whatever the bases are, because two
+/// different objects have disjoint storage and one object cannot have one cell
+/// at two indices.
+///
+/// The read rule is not deleted but subsumed: a read's `writes` class is
+/// `AliasClass::None`, which aliases nothing.
+///
+/// Three things still stop the walk even when nothing aliases, and each is a
+/// separate claim:
+///
+/// * a **safepoint**, because a relocating collector may run there. `MemEffect`
+///   says a load may cross one freely, and that is about MOVING a load; this
+///   pass DELETES one and hands an older value to a later program point, which
+///   is a different claim and not one to make on the strength of a comment
+///   about the other.
+/// * an **allocation**, for the reason `MemEffect::allocates` gives: which
+///   allocation runs first is observable, and it is also a safepoint.
+/// * any **ordering stronger than `MemOrder::Plain`**. A volatile access is a
+///   fence; re-using a value read before one is exactly what a fence forbids.
+fn memory_chain_reaches(
+    graph: &Graph,
+    from: NodeId,
+    to: NodeId,
+    ctrl: NodeId,
+    reads: crate::ir::AliasClass,
+) -> bool {
+    let alias_aware = load_cse_alias_enabled();
     let mut cur = from;
     for _ in 0..LOAD_CSE_CHAIN_BUDGET {
         if cur == to {
@@ -1096,11 +1134,29 @@ fn memory_chain_reaches(graph: &Graph, from: NodeId, to: NodeId, ctrl: NodeId) -
         let Some(node) = graph.node_opt(cur) else {
             return false;
         };
-        if !is_pure_memory_read(&node.op) {
-            return false;
-        }
         if node.input_opt(0) != Some(ctrl) {
             return false;
+        }
+        if !is_pure_memory_read(&node.op) {
+            if !alias_aware {
+                return false;
+            }
+            // `Graph::memory_effect`, not the bare `effect_of_node`: the
+            // graph-aware form folds an offset operand that names an
+            // `Op::Const` into `AccessOffset::Const`, and a pair of unequal
+            // constants is the ONLY thing that ever proves two accesses to the
+            // same base disjoint. With the unfolded form every field index
+            // stays `Dynamic` and nothing is ever provably distinct — which is
+            // exactly how the first version of this passed its negative test
+            // and failed its positive one.
+            let eff = graph.memory_effect(cur);
+            if eff.safepoint
+                || eff.allocates
+                || eff.order != crate::ir::MemOrder::Plain
+                || graph.may_alias(eff.writes, reads)
+            {
+                return false;
+            }
         }
         let Some(slot) = crate::ir::memory_token_slot(node) else {
             return false;
@@ -1219,7 +1275,11 @@ fn eliminate_redundant_loads(graph: &mut Graph) -> bool {
                 let Some(a_mem) = an.input_opt(token_slot) else {
                     continue;
                 };
-                if memory_chain_reaches(graph, b_mem, a_mem, b_ctrl) {
+                // The cell `b` reads, as the alias model describes it. A
+                // read's `reads` class IS its address, so this needs no second
+                // spelling of the layout rules.
+                let reads = graph.memory_effect(b).reads;
+                if memory_chain_reaches(graph, b_mem, a_mem, b_ctrl, reads) {
                     found = a;
                     break;
                 }
@@ -1301,6 +1361,17 @@ thread_local! {
 /// Redundant reads eliminated **on this thread**, since it started.
 pub fn ir_load_cse_census_here() -> u64 {
     IR_LOADS_CSE_HERE.with(|c| c.get())
+}
+
+/// `CRATONVM_JIT_IR_LOAD_CSE_ALIAS` — default OFF. Widens the chain walk from
+/// "only reads may sit between" to "nothing that may alias may sit between",
+/// which is a widening of a SOUNDNESS argument and so gets its own switch on
+/// top of the pass's.
+fn load_cse_alias_enabled() -> bool {
+    matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_LOAD_CSE_ALIAS").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
 }
 
 /// `CRATONVM_JIT_IR_LOAD_CSE` — default OFF while it is measured.
@@ -8309,8 +8380,28 @@ mod load_cse_tests {
         info: &std::collections::HashMap<usize, (usize, u8)>,
         on: bool,
     ) -> Graph {
+        optimized_aliased(code, code_len, nargs, nlocals, info, on, false)
+    }
+
+    /// As [`optimized`], with `CRATONVM_JIT_IR_LOAD_CSE_ALIAS` under the
+    /// caller's control.
+    fn optimized_aliased(
+        code: &[u8],
+        code_len: usize,
+        nargs: usize,
+        nlocals: usize,
+        info: &std::collections::HashMap<usize, (usize, u8)>,
+        on: bool,
+        alias: bool,
+    ) -> Graph {
         cratonvm_types::flags::with_thread_overrides(
-            &[("CRATONVM_JIT_IR_LOAD_CSE", Some(if on { "1" } else { "0" }))],
+            &[
+                ("CRATONVM_JIT_IR_LOAD_CSE", Some(if on { "1" } else { "0" })),
+                (
+                    "CRATONVM_JIT_IR_LOAD_CSE_ALIAS",
+                    Some(if alias { "1" } else { "0" }),
+                ),
+            ],
             || {
                 let mut builder = IrBuilder::new(nargs, nlocals);
                 builder.set_field_info(info.clone());
@@ -8524,6 +8615,75 @@ mod load_cse_tests {
             "the store must stay ordered after the `w` read that sat between \
              the removed read and its survivor — splicing to the survivor \
              would drop exactly that edge",
+        );
+    }
+
+    /// With the alias switch on, a write to a DIFFERENT field stops blocking.
+    ///
+    /// Same fixture as `a_write_between_two_reads_of_the_same_cell_stops_the_
+    /// merge` — `int f() { int a = this.v; this.w = 1; return a + this.v; }`
+    /// — and the contrast between the two tests is the whole content of
+    /// `CRATONVM_JIT_IR_LOAD_CSE_ALIAS`. Two different field indices are two
+    /// different cells whatever the bases are: one object cannot hold one cell
+    /// at two indices, and two objects have disjoint storage.
+    #[test]
+    fn the_alias_switch_lets_a_write_to_another_field_be_stepped_over() {
+        #[rustfmt::skip]
+        let code = [
+            0x2Au8, 0xB4, 0x00, 0x07,       // aload_0; getfield v      pc 1
+            0x3C,                           // istore_1                 a
+            0x2A, 0x04, 0xB5, 0x00, 0x08,   // aload_0; iconst_1; putfield w   pc 7
+            0x1B,                           // iload_1
+            0x2A, 0xB4, 0x00, 0x07,         // aload_0; getfield v      pc 12
+            0x60,                           // iadd
+            0xAC,                           // ireturn
+        ];
+        let info = field_info(&[(1, 0), (7, 1), (12, 0)]);
+
+        let off = optimized_aliased(&code, code.len(), 1, 2, &info, true, false);
+        assert_eq!(
+            live_loads(&off),
+            2,
+            "without the switch one `Op::Store` stops the walk whatever it \
+             writes — the state this widening starts from",
+        );
+
+        let on = optimized_aliased(&code, code.len(), 1, 2, &info, true, true);
+        assert_eq!(
+            live_loads(&on),
+            1,
+            "`w` is field 1 and `v` is field 0, so the store cannot have \
+             written the cell either read addresses",
+        );
+    }
+
+    /// And a write to the SAME field still stops it, switch or no switch.
+    ///
+    /// `int f() { int a = this.v; this.v = 1; return a + this.v; }`. Without
+    /// this test the alias switch could be a blanket "step over every store"
+    /// and the test above would not notice — which is the shape of a widening
+    /// that quietly stopped being sound.
+    #[test]
+    fn the_alias_switch_still_refuses_a_write_to_the_same_cell() {
+        #[rustfmt::skip]
+        let code = [
+            0x2Au8, 0xB4, 0x00, 0x07,       // aload_0; getfield v      pc 1
+            0x3C,                           // istore_1                 a
+            0x2A, 0x04, 0xB5, 0x00, 0x07,   // aload_0; iconst_1; putfield v   pc 7
+            0x1B,                           // iload_1
+            0x2A, 0xB4, 0x00, 0x07,         // aload_0; getfield v      pc 12
+            0x60,                           // iadd
+            0xAC,                           // ireturn
+        ];
+        // Every site is field 0 — the store writes exactly what both reads read.
+        let info = field_info(&[(1, 0), (7, 0), (12, 0)]);
+
+        let on = optimized_aliased(&code, code.len(), 1, 2, &info, true, true);
+        assert_eq!(
+            live_loads(&on),
+            2,
+            "the store writes the cell both reads address; the second read \
+             must see 1, not the value the first one loaded",
         );
     }
 
