@@ -87,7 +87,13 @@ pub mod bailout;
 // doors (method entry, the eager first-call compile, OSR), and only the first
 // ever asked the admission questions; the other two grew hand-copied subsets
 // of them. See `docs/feature-designs/jit-osr-entry-metadata.md` step 3.
+// Publication/retirement events for profilers and debuggers, and the three
+// sinks behind them (perf map, jitdump, GDB JIT interface).
+pub mod code_events;
 pub mod compile_gate;
+pub mod gdb_jit;
+pub mod jitdump;
+pub mod perf_map;
 pub mod deopt;
 pub mod escape_analysis;
 pub mod gpu_barrier;
