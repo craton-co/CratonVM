@@ -17,6 +17,11 @@
 //!   checksum-declaring Java program per JVMS opcode (C2 review P0).
 //! * `matrix` — generate the opcode / execution-path coverage matrix from the
 //!   corpus's own class files (C2 review P0).
+//! * `path-gate` — gate a corpus on every execution-path mode agreeing with the
+//!   interpreter; no HotSpot run and no ledger rows needed.
+//! * `fuzz-jit` — generate verifiable class files straight from bytecode, run
+//!   them under the interpreter and each JIT mode, and write any minimized
+//!   disagreement out for triage.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -24,8 +29,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
 
+use cratonvm_difftest::classgen::{self, ClassVersion};
 use cratonvm_difftest::generate::{self, Rng, TargetFamily};
 use cratonvm_difftest::harness::{self, RunOne};
+use cratonvm_difftest::jitfuzz::{self, FuzzConfig};
+use cratonvm_difftest::pathgate::{self, KnownSplits, PathGateConfig};
 use cratonvm_difftest::ledger::{self, Ledger};
 use cratonvm_difftest::matrix::{self, CoverageMatrix, GeneratorIndex};
 use cratonvm_difftest::minimize;
@@ -79,6 +87,122 @@ enum Cmd {
     GenOpcodes(GenOpcodesArgs),
     /// Generate the opcode / execution-path coverage matrix (C2 review P0).
     Matrix(MatrixArgs),
+    /// CI gate: every execution-path mode must agree with the interpreter.
+    PathGate(PathGateArgs),
+    /// Bytecode differential fuzzer: generated class files, JIT modes vs nojit.
+    FuzzJit(FuzzJitArgs),
+}
+
+#[derive(Args)]
+struct PathGateArgs {
+    /// Directory of programs to judge (default: `difftest/seeds`).
+    #[arg(long)]
+    corpus: Option<PathBuf>,
+
+    /// Modes to run. The reference is skipped when judging; every other mode
+    /// must agree with it.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = pathgate::DEFAULT_MODES,
+        value_parser = parse_one_mode
+    )]
+    modes: Vec<Mode>,
+
+    /// The oracle mode.
+    #[arg(long, default_value = "nojit", value_parser = parse_one_mode)]
+    reference: Mode,
+
+    /// Known-splits file (default: `difftest/path-gate-known.json`).
+    #[arg(long)]
+    known: Option<PathBuf>,
+
+    /// Fail when a run's stderr shows the IR verifier rejecting a method.
+    /// Only observable with `CRATONVM_DBG_IR_COMPILES=1` exported.
+    #[arg(long)]
+    fail_on_ir_verify_reject: bool,
+
+    /// Hard per-run timeout in seconds.
+    #[arg(long, default_value_t = DEFAULT_TIMEOUT.as_secs())]
+    timeout_secs: u64,
+
+    /// Explicit JDK home, used only for `javac`.
+    #[arg(long)]
+    jdk: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct FuzzJitArgs {
+    /// First seed.
+    #[arg(long, default_value_t = 1)]
+    seed: u64,
+
+    /// Number of consecutive seeds to run.
+    #[arg(long, default_value_t = 100)]
+    count: u64,
+
+    /// Modes to compare against the reference.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = jitfuzz::DEFAULT_MODES,
+        value_parser = parse_one_mode
+    )]
+    modes: Vec<Mode>,
+
+    /// The oracle mode.
+    #[arg(long, default_value = "nojit", value_parser = parse_one_mode)]
+    reference: Mode,
+
+    /// Where failing programs are written (default: `target/jitfuzz-failures`).
+    #[arg(long)]
+    out: Option<PathBuf>,
+
+    /// Trip count of each program's hot loop in `main`.
+    #[arg(long, default_value_t = jitfuzz::DEFAULT_ROUNDS)]
+    rounds: u32,
+
+    /// Class-file major version: 52 (with StackMapTable) or 49 (without).
+    #[arg(long, default_value_t = 52)]
+    class_version: u16,
+
+    /// `KEY=VALUE` env added to every non-reference mode (repeatable), e.g.
+    /// `--extra-env CRATONVM_DBG_GC_STRESS=65536`.
+    #[arg(long = "extra-env", value_name = "KEY=VALUE")]
+    extra_env: Vec<String>,
+
+    /// Write failing programs unminimized.
+    #[arg(long)]
+    no_minimize: bool,
+
+    /// Treat an IR verifier rejection on stderr as a failure (export
+    /// `CRATONVM_DBG_IR_COMPILES=1` so it is printed).
+    #[arg(long)]
+    fail_on_ir_verify_reject: bool,
+
+    /// Also run each program on HotSpot and compare it with the reference.
+    #[arg(long)]
+    hotspot: bool,
+
+    /// Explicit JDK home for `--hotspot`.
+    #[arg(long)]
+    jdk: Option<PathBuf>,
+
+    /// Stop after this many failing programs.
+    #[arg(long, default_value_t = 20)]
+    max_failures: usize,
+
+    /// Hard per-run timeout in seconds.
+    #[arg(long, default_value_t = 60)]
+    timeout_secs: u64,
+
+    /// Generate and self-check the classes without running any VM.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// With `--dry-run`: also write each class and its description here.
+    #[arg(long)]
+    dump: Option<PathBuf>,
 }
 
 /// Flags shared by `run` and `gate` (the A/B-executing subcommands).
@@ -367,6 +491,201 @@ fn main() -> ExitCode {
         Cmd::Gate(args) => cmd_gate(&args),
         Cmd::GenOpcodes(args) => cmd_gen_opcodes(&args),
         Cmd::Matrix(args) => cmd_matrix(&args),
+        Cmd::PathGate(args) => cmd_path_gate(&args),
+        Cmd::FuzzJit(args) => cmd_fuzz_jit(&args),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// path-gate — execution paths vs the interpreter, no HotSpot, no ledger
+// ---------------------------------------------------------------------------
+
+fn cmd_path_gate(args: &PathGateArgs) -> ExitCode {
+    let known_path = args.known.clone().unwrap_or_else(pathgate::default_known_path);
+    let known = match KnownSplits::load(&known_path) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!(
+                "cratonvm-difftest path-gate: cannot read {}: {e} — exit {}.",
+                known_path.display(),
+                exit::BOOTSTRAP
+            );
+            return ExitCode::from(exit::BOOTSTRAP);
+        }
+    };
+    let cfg = PathGateConfig {
+        corpus: args
+            .corpus
+            .clone()
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("seeds")),
+        modes: args.modes.clone(),
+        reference: args.reference,
+        timeout: Duration::from_secs(args.timeout_secs),
+        jdk_home: args.jdk.clone(),
+        known,
+        fail_on_ir_verify_reject: args.fail_on_ir_verify_reject,
+    };
+    println!(
+        "cratonvm-difftest path-gate — corpus {} | reference {} | modes {}",
+        cfg.corpus.display(),
+        cfg.reference.label(),
+        cfg.modes
+            .iter()
+            .map(|m| m.label())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let report = match pathgate::run_path_gate(&cfg) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "cratonvm-difftest path-gate: {e} — bootstrap, exit {} (non-fatal).",
+                exit::BOOTSTRAP
+            );
+            return ExitCode::from(exit::BOOTSTRAP);
+        }
+    };
+    print!("{}", pathgate::render(&report, cfg.reference));
+    let code = report.exit_code();
+    println!(
+        "cratonvm-difftest path-gate: {}. exit {code}.",
+        if code == 0 {
+            "clean — every execution path agrees with the reference"
+        } else {
+            "FAIL — an execution path disagrees with the reference"
+        }
+    );
+    ExitCode::from(code)
+}
+
+// ---------------------------------------------------------------------------
+// fuzz-jit — the bytecode differential fuzzer
+// ---------------------------------------------------------------------------
+
+fn cmd_fuzz_jit(args: &FuzzJitArgs) -> ExitCode {
+    let Some(version) = ClassVersion::from_major(args.class_version) else {
+        eprintln!(
+            "cratonvm-difftest fuzz-jit: --class-version must be 52 or 49 (got {}).",
+            args.class_version
+        );
+        return ExitCode::from(exit::BOOTSTRAP);
+    };
+    let mut extra_env = Vec::new();
+    for kv in &args.extra_env {
+        match kv.split_once('=') {
+            Some((k, v)) if !k.is_empty() => extra_env.push((k.to_string(), v.to_string())),
+            _ => {
+                eprintln!("cratonvm-difftest fuzz-jit: --extra-env expects KEY=VALUE (got {kv:?}).");
+                return ExitCode::from(exit::BOOTSTRAP);
+            }
+        }
+    }
+    let end = args.seed.saturating_add(args.count);
+
+    if args.dry_run {
+        if let Some(dump) = &args.dump {
+            if let Err(e) = std::fs::create_dir_all(dump) {
+                eprintln!("cratonvm-difftest fuzz-jit: cannot create {}: {e}", dump.display());
+                return ExitCode::from(exit::BOOTSTRAP);
+            }
+        }
+        let mut bad = 0usize;
+        for seed in args.seed..end {
+            let p = jitfuzz::generate_program(seed, args.rounds);
+            let cats: Vec<&str> = p.categories().iter().map(|c| c.label()).collect();
+            let checked = jitfuzz::build_class(&p, version)
+                .and_then(|b| classgen::check_class_shape(&b).map(|()| b));
+            match checked {
+                Ok(bytes) => {
+                    println!("  OK    {} ({} bytes) [{}]", p.name, bytes.len(), cats.join(","));
+                    if let Some(dump) = &args.dump {
+                        let _ = std::fs::write(dump.join(format!("{}.class", p.name)), &bytes);
+                        let _ = std::fs::write(dump.join(format!("{}.txt", p.name)), jitfuzz::describe(&p));
+                    }
+                }
+                Err(e) => {
+                    bad += 1;
+                    println!("  BAD   {} [{}]: {e}", p.name, cats.join(","));
+                }
+            }
+        }
+        println!(
+            "cratonvm-difftest fuzz-jit --dry-run — {} program(s), {bad} rejected by the generator's own checks",
+            end - args.seed
+        );
+        return ExitCode::from(if bad == 0 { exit::OK } else { exit::NEW_DIVERGENCE });
+    }
+
+    let Some(bin) = runner::cratonvm_binary() else {
+        eprintln!(
+            "cratonvm-difftest fuzz-jit: cratonvm binary not found (build it / set CRATONVM_BIN) — exit {}.",
+            exit::BOOTSTRAP
+        );
+        return ExitCode::from(exit::BOOTSTRAP);
+    };
+    if args.hotspot && !runner::java_available(args.jdk.as_deref()) {
+        eprintln!("cratonvm-difftest fuzz-jit: --hotspot needs java — exit {}.", exit::BOOTSTRAP);
+        return ExitCode::from(exit::BOOTSTRAP);
+    }
+
+    let work_dir = std::env::temp_dir().join(format!("difftest_jitfuzz_{}", std::process::id()));
+    let cfg = FuzzConfig {
+        modes: args.modes.clone(),
+        reference: args.reference,
+        timeout: Duration::from_secs(args.timeout_secs),
+        rounds: args.rounds,
+        version,
+        extra_env,
+        minimize: !args.no_minimize,
+        fail_on_ir_verify_reject: args.fail_on_ir_verify_reject,
+        hotspot: args.hotspot,
+        jdk_home: args.jdk.clone(),
+        out_dir: args.out.clone().unwrap_or_else(|| {
+            runner::workspace_root()
+                .join("target")
+                .join("jitfuzz-failures")
+        }),
+        work_dir: work_dir.clone(),
+    };
+    println!(
+        "cratonvm-difftest fuzz-jit — seeds {}..{} | reference {} | modes {} | extra env [{}] | class v{}",
+        args.seed,
+        end,
+        cfg.reference.label(),
+        cfg.modes
+            .iter()
+            .map(|m| m.label())
+            .collect::<Vec<_>>()
+            .join(","),
+        args.extra_env.join(" "),
+        version.major()
+    );
+    let result = jitfuzz::fuzz(&bin, args.seed, args.count, args.max_failures.max(1), &cfg, |line| {
+        println!("{line}")
+    });
+    let _ = std::fs::remove_dir_all(&work_dir);
+    match result {
+        Ok(summary) => {
+            println!(
+                "cratonvm-difftest fuzz-jit — {} program(s) ran, {} failed{}",
+                summary.ran,
+                summary.failures.len(),
+                if summary.failures.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (written under {})", cfg.out_dir.display())
+                }
+            );
+            ExitCode::from(if summary.failures.is_empty() {
+                exit::OK
+            } else {
+                exit::NEW_DIVERGENCE
+            })
+        }
+        Err(e) => {
+            eprintln!("cratonvm-difftest fuzz-jit: {e} — exit {}.", exit::BOOTSTRAP);
+            ExitCode::from(exit::BOOTSTRAP)
+        }
     }
 }
 
