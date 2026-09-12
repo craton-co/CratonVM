@@ -16682,140 +16682,7 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "javax/net/ssl/SSLSocket",
         "setEnabledCipherSuites",
         "([Ljava/lang/String;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let mut ciphers: Vec<String> = Vec::new();
-            if let Some(Value::Object(Some(arr))) = args.get(1) {
-                let len = ctx.array_length(*arr);
-                for i in 0..len {
-                    if let Value::Object(Some(s)) = ctx.get_array_element(*arr, i) {
-                        if let Some(t) = ctx.read_string(s) {
-                            ciphers.push(t);
-                        }
-                    }
-                }
-            }
-            // FIX (tls-handshake-enforcement-gap, doc 21): on a probe socket
-            // (`set_huc_factory_probe_mode`) there is no connection to
-            // reconnect — record the restriction verbatim, INCLUDING names
-            // this rustls build cannot map, and let
-            // `http_url_connection::perform` decide what it can enforce when
-            // it builds the one real connection.
-            if crate::nbflags().dbg_tls_auth_ok {
-                eprintln!(
-                    "[dbg-tls-auth] SSLSocket.setEnabledCipherSuites n={} probe={} tls_id={}",
-                    ciphers.len(),
-                    is_probe_socket(ctx, this),
-                    crate::phases_late::new13_resolve_tls_id(ctx, this)
-                );
-            }
-            if is_probe_socket(ctx, this) {
-                record_probe_ciphers(ctx, this, ciphers);
-                return Ok(None);
-            }
-            // A socket from `createSocket(Socket wrapped, ...)` handshakes
-            // lazily, so a restriction set beforehand still counts. THIS
-            // registration overrides the one in `phases_late/ssl_security.rs`
-            // (net_phase_e registers later, last-writer-wins) which was the
-            // only place that handled the deferred case — so overriding it
-            // silently dropped the restriction for every layered socket,
-            // which is the shape the real JDK `HttpsURLConnection` uses.
-            let tls_id = crate::phases_late::new13_resolve_tls_id(ctx, this);
-            if tls_id >= crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
-                && tls_id < crate::servlet::RUSTLS_SOCK_ID_BASE
-            {
-                let pending_id = tls_id - crate::servlet::PENDING_LAYERED_SOCK_ID_BASE;
-                crate::t27_tls::set_pending_layered_socket_ciphers(pending_id, ciphers);
-                return Ok(None);
-            }
-            // A connect-path socket has not handshaked yet (its `connect`
-            // parked the endpoint -- see `PENDING_CONNECT_SOCK_ID_BASE`), so
-            // there is no established connection to tear down and redo. Accept
-            // and discard, which is what this registration already did for an
-            // already-handshaked socket.
-            if tls_id >= crate::servlet::PENDING_CONNECT_SOCK_ID_BASE
-                && tls_id < crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
-            {
-                return Ok(None);
-            }
-            if ciphers.is_empty() || !crate::t27_tls::any_cipher_mappable(&ciphers) {
-                return Ok(None);
-            }
-            // FIX (netty-client-socket-write-after-close residual): don't
-            // reconnect when `ciphers` covers this socket's ENTIRE supported
-            // set (`ssl_sock_supported_cipher_suites` in phases_late.rs, the
-            // list `SSLSocket.getSupportedCipherSuites()` returns) — that's
-            // not a real restriction, just a caller re-asserting "use
-            // everything you support" (the common case: e.g. Apache
-            // HttpClient5's `SSLConnectionSocketFactory` calls
-            // `setEnabledCipherSuites(getSupportedCipherSuites())` as part of
-            // its normal connection setup, unconditionally, for every socket
-            // it creates — not only ones under an actual cipher policy).
-            // Reconnecting anyway tears down a connection that may have been
-            // established under semantics THIS rustls-only path cannot
-            // reproduce (a Java TrustManager accepting a self-signed/test
-            // certificate — see `new13_do_create_socket`'s post-connect
-            // `checkServerTrusted` delegation, which this reconnect has no
-            // way to redo), turning a harmless no-op call into a hard
-            // failure. Only reconnect for a GENUINE restriction: a proper
-            // subset of the supported suites (e.g. Tomcat's
-            // `TesterSupport.ClientSSLSocketFactory`, which this reconnect
-            // exists for in the first place — see the FIX comment above).
-            let requested: std::collections::HashSet<&str> =
-                ciphers.iter().map(String::as_str).collect();
-            let is_full_supported_set = CLIENT_SUPPORTED_CIPHER_SUITES
-                .iter()
-                .all(|c| requested.contains(c));
-            if is_full_supported_set {
-                return Ok(None);
-            }
-            let side = sock_get(ctx, this);
-            let host = side.host.clone();
-            if host.is_empty() || side.port <= 0 {
-                return Ok(None);
-            }
-            let client_ident = crate::t27_tls::huc_default_client_identity();
-            let cfg = match crate::t27_tls::build_engine_client_config_with_identity_ciphers(
-                &["http/1.1"],
-                client_ident.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
-                None,
-                None,
-                &ciphers,
-                &[],
-            ) {
-                Ok(cfg) => cfg,
-                Err(msg) => {
-                    return Err(crate::phases_early::throw_jca_exc(
-                        ctx,
-                        "javax/net/ssl/SSLHandshakeException",
-                        &msg,
-                    ));
-                }
-            };
-            // T19.H1: see the matching comment on `createSocket` above — this
-            // reconnect blocks on real network I/O too and must announce it.
-            ctx.begin_blocking_region();
-            let connect_result =
-                crate::t27_tls::rustls_client_connect(cfg, &host, side.port as u16);
-            ctx.end_blocking_region();
-            match connect_result {
-                Ok(rid) => {
-                    if side.stream_id >= 0 {
-                        let _ = crate::servlet::s2_tls_close(side.stream_id);
-                    }
-                    let new_id = crate::servlet::RUSTLS_SOCK_ID_BASE + rid;
-                    sock_set(ctx, this, |s| {
-                        s.stream_id = new_id;
-                    });
-                    Ok(None)
-                }
-                Err(msg) => Err(crate::phases_early::throw_jca_exc(
-                    ctx,
-                    "javax/net/ssl/SSLHandshakeException",
-                    &msg,
-                )),
-            }
-        },
+        ssl_socket_set_enabled_cipher_suites,
     );
     // FIX (tls-handshake-enforcement-gap, doc 21): `SSLSocket
     // .setEnabledProtocols` was registered only in `phases_late/
@@ -16830,126 +16697,7 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "javax/net/ssl/SSLSocket",
         "setEnabledProtocols",
         "([Ljava/lang/String;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let mut protocols: Vec<String> = Vec::new();
-            if let Some(Value::Object(Some(arr))) = args.get(1) {
-                let len = ctx.array_length(*arr);
-                for i in 0..len {
-                    if let Value::Object(Some(s)) = ctx.get_array_element(*arr, i) {
-                        if let Some(t) = ctx.read_string(s) {
-                            protocols.push(t);
-                        }
-                    }
-                }
-            }
-            if crate::nbflags().dbg_tls_auth_ok {
-                eprintln!(
-                    "[dbg-tls-auth] SSLSocket.setEnabledProtocols protocols={:?} probe={} \
-                     tls_id={} host={:?} port={}",
-                    protocols,
-                    is_probe_socket(ctx, this),
-                    crate::phases_late::new13_resolve_tls_id(ctx, this),
-                    sock_get(ctx, this).host,
-                    sock_get(ctx, this).port
-                );
-            }
-            // Probe socket (`set_huc_factory_probe_mode`): report the
-            // restriction back to `http_url_connection`, which applies it to
-            // the one real connection it makes.
-            if is_probe_socket(ctx, this) {
-                record_probe_protocols(ctx, this, protocols);
-                return Ok(None);
-            }
-            // A socket from `createSocket(Socket wrapped, ...)` has a DEFERRED
-            // handshake, so a restriction set before the first I/O still
-            // counts — the cipher sibling in `phases_late/ssl_security.rs`
-            // already did this and the protocol setter did not.
-            let tls_id = crate::phases_late::new13_resolve_tls_id(ctx, this);
-            if tls_id >= crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
-                && tls_id < crate::servlet::RUSTLS_SOCK_ID_BASE
-            {
-                let pending_id = tls_id - crate::servlet::PENDING_LAYERED_SOCK_ID_BASE;
-                crate::t27_tls::set_pending_layered_socket_protocols(pending_id, protocols);
-                return Ok(None);
-            }
-            // A connect-path socket has not handshaked yet (its `connect`
-            // parked the endpoint -- see `PENDING_CONNECT_SOCK_ID_BASE`), so
-            // there is no established connection to tear down and redo. Accept
-            // and discard, which is what this registration already did for an
-            // already-handshaked socket.
-            if tls_id >= crate::servlet::PENDING_CONNECT_SOCK_ID_BASE
-                && tls_id < crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
-            {
-                return Ok(None);
-            }
-            // Otherwise the socket came from `createSocket(host, port)`, which
-            // handshakes EAGERLY — so, exactly like the `setEnabledCipherSuites`
-            // sibling above, the only way to honour the JDK contract ("a
-            // restriction the peer cannot satisfy makes the connection fail")
-            // is to tear the connection down and redo it under the
-            // restriction. That is the path `TestSSLHostConfigProtocol`'s
-            // `testTlsVersionMismatchServerTls12ClientTls13` takes:
-            // `TesterSupport.ClientSSLSocketFactory.reconfigureSocket` calls
-            // this immediately after `createSocket` returns, and simply
-            // accepting-and-discarding left the client offering both TLS
-            // versions, so a deliberate version mismatch negotiated the other
-            // version and SUCCEEDED where real JSSE refuses.
-            let restricted = crate::t27_tls::protocol_restriction_is_real(&protocols);
-            if !restricted {
-                // Empty, unrecognised, or "everything we support" — the
-                // caller is not actually narrowing anything, so leave the
-                // established connection alone rather than pay a reconnect
-                // (and risk losing semantics this reconnect cannot redo).
-                return Ok(None);
-            }
-            let side = sock_get(ctx, this);
-            let host = side.host.clone();
-            if host.is_empty() || side.port <= 0 {
-                return Ok(None);
-            }
-            let client_ident = crate::t27_tls::huc_default_client_identity();
-            let cfg = match crate::t27_tls::build_engine_client_config_with_identity_ciphers(
-                &["http/1.1"],
-                client_ident.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
-                None,
-                None,
-                &[],
-                &protocols,
-            ) {
-                Ok(cfg) => cfg,
-                Err(msg) => {
-                    return Err(crate::phases_early::throw_jca_exc(
-                        ctx,
-                        "javax/net/ssl/SSLHandshakeException",
-                        &msg,
-                    ));
-                }
-            };
-            // T19.H1: same blocking-region requirement as the cipher
-            // reconnect above — this performs real network I/O.
-            ctx.begin_blocking_region();
-            let connect_result =
-                crate::t27_tls::rustls_client_connect(cfg, &host, side.port as u16);
-            ctx.end_blocking_region();
-            match connect_result {
-                Ok(rid) => {
-                    if side.stream_id >= 0 {
-                        let _ = crate::servlet::s2_tls_close(side.stream_id);
-                    }
-                    let new_id = crate::servlet::RUSTLS_SOCK_ID_BASE + rid;
-                    sock_set(ctx, this, |s| {
-                        s.stream_id = new_id;
-                    });
-                    Ok(None)
-                }
-                Err(msg) => Err(crate::phases_early::throw_jca_exc(
-                    ctx,
-                    "javax/net/ssl/SSLHandshakeException",
-                    &msg,
-                )),
-            }
-        },
+        ssl_socket_set_enabled_protocols,
     );
     // `SSLSocketFactory.getDefault()` is deliberately NOT registered here.
     //
@@ -24705,5 +24453,341 @@ mod tests {
             "header(\"\", v) must be IllegalArgumentException: invalid header \
              name — got {text}"
         );
+    }
+}
+
+/// `SSLSocket.setEnabledCipherSuites` -- the ONE implementation, registered by both
+/// `register_phase_e_networking` and `t27_tls::register_client_socket_mode_accessors`.
+///
+/// REGRESSION 2026-09-11 (`ee264ea33`): `t27_tls` registers this triple AFTER
+/// this file and gave it a body of its own that validated the names and did
+/// nothing else, so it won by last-writer-wins and every restriction below --
+/// the `HttpsURLConnection` probe recording, the deferred layered-socket
+/// entry, the eager-socket reconnect -- stopped running. Tomcat's
+/// `TestSSLHostConfigCipher`, `TestSSLHostConfigProtocol` and
+/// `TestSSLHostConfigCompat` connected unrestricted where JSSE refuses the
+/// handshake. Both registrars now name this function, so which one wins no
+/// longer decides the behaviour.
+pub(crate) fn ssl_socket_set_enabled_cipher_suites(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // Validate before anything else, with HotSpot's messages: null first,
+    // then membership (the order is observable -- `setEnabledCipherSuites(null)`
+    // reports "CipherSuites cannot be null", not a null suite).
+    let Some(Value::Object(Some(arr))) = args.get(1).copied() else {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "CipherSuites cannot be null".into(),
+        }
+        .into());
+    };
+    for i in 0..ctx.array_length(arr) {
+        let name = match ctx.get_array_element(arr, i) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        }
+        .unwrap_or_default();
+        if !crate::t27_tls::SUPPORTED_CIPHER_SUITE_NAMES.contains(&name.as_str()) {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("Unsupported CipherSuite: {name}"),
+            }
+            .into());
+        }
+    }
+    let this = obj_arg(args, 0)?;
+    let mut ciphers: Vec<String> = Vec::new();
+    if let Some(Value::Object(Some(arr))) = args.get(1) {
+        let len = ctx.array_length(*arr);
+        for i in 0..len {
+            if let Value::Object(Some(s)) = ctx.get_array_element(*arr, i) {
+                if let Some(t) = ctx.read_string(s) {
+                    ciphers.push(t);
+                }
+            }
+        }
+    }
+    // FIX (tls-handshake-enforcement-gap, doc 21): on a probe socket
+    // (`set_huc_factory_probe_mode`) there is no connection to
+    // reconnect — record the restriction verbatim, INCLUDING names
+    // this rustls build cannot map, and let
+    // `http_url_connection::perform` decide what it can enforce when
+    // it builds the one real connection.
+    if crate::nbflags().dbg_tls_auth_ok {
+        eprintln!(
+            "[dbg-tls-auth] SSLSocket.setEnabledCipherSuites n={} probe={} tls_id={}",
+            ciphers.len(),
+            is_probe_socket(ctx, this),
+            crate::phases_late::new13_resolve_tls_id(ctx, this)
+        );
+    }
+    if is_probe_socket(ctx, this) {
+        record_probe_ciphers(ctx, this, ciphers);
+        return Ok(None);
+    }
+    // A socket from `createSocket(Socket wrapped, ...)` handshakes
+    // lazily, so a restriction set beforehand still counts. THIS
+    // registration overrides the one in `phases_late/ssl_security.rs`
+    // (net_phase_e registers later, last-writer-wins) which was the
+    // only place that handled the deferred case — so overriding it
+    // silently dropped the restriction for every layered socket,
+    // which is the shape the real JDK `HttpsURLConnection` uses.
+    let tls_id = crate::phases_late::new13_resolve_tls_id(ctx, this);
+    if tls_id >= crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
+        && tls_id < crate::servlet::RUSTLS_SOCK_ID_BASE
+    {
+        let pending_id = tls_id - crate::servlet::PENDING_LAYERED_SOCK_ID_BASE;
+        crate::t27_tls::set_pending_layered_socket_ciphers(pending_id, ciphers);
+        return Ok(None);
+    }
+    // A connect-path socket has not handshaked yet (its `connect`
+    // parked the endpoint -- see `PENDING_CONNECT_SOCK_ID_BASE`), so
+    // there is no established connection to tear down and redo. Accept
+    // and discard, which is what this registration already did for an
+    // already-handshaked socket.
+    if tls_id >= crate::servlet::PENDING_CONNECT_SOCK_ID_BASE
+        && tls_id < crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
+    {
+        return Ok(None);
+    }
+    if ciphers.is_empty() || !crate::t27_tls::any_cipher_mappable(&ciphers) {
+        return Ok(None);
+    }
+    // FIX (netty-client-socket-write-after-close residual): don't
+    // reconnect when `ciphers` covers this socket's ENTIRE supported
+    // set (`ssl_sock_supported_cipher_suites` in phases_late.rs, the
+    // list `SSLSocket.getSupportedCipherSuites()` returns) — that's
+    // not a real restriction, just a caller re-asserting "use
+    // everything you support" (the common case: e.g. Apache
+    // HttpClient5's `SSLConnectionSocketFactory` calls
+    // `setEnabledCipherSuites(getSupportedCipherSuites())` as part of
+    // its normal connection setup, unconditionally, for every socket
+    // it creates — not only ones under an actual cipher policy).
+    // Reconnecting anyway tears down a connection that may have been
+    // established under semantics THIS rustls-only path cannot
+    // reproduce (a Java TrustManager accepting a self-signed/test
+    // certificate — see `new13_do_create_socket`'s post-connect
+    // `checkServerTrusted` delegation, which this reconnect has no
+    // way to redo), turning a harmless no-op call into a hard
+    // failure. Only reconnect for a GENUINE restriction: a proper
+    // subset of the supported suites (e.g. Tomcat's
+    // `TesterSupport.ClientSSLSocketFactory`, which this reconnect
+    // exists for in the first place — see the FIX comment above).
+    let requested: std::collections::HashSet<&str> = ciphers.iter().map(String::as_str).collect();
+    let is_full_supported_set = CLIENT_SUPPORTED_CIPHER_SUITES
+        .iter()
+        .all(|c| requested.contains(c));
+    if is_full_supported_set {
+        return Ok(None);
+    }
+    let side = sock_get(ctx, this);
+    let host = side.host.clone();
+    if host.is_empty() || side.port <= 0 {
+        return Ok(None);
+    }
+    let client_ident = crate::t27_tls::huc_default_client_identity();
+    let cfg = match crate::t27_tls::build_engine_client_config_with_identity_ciphers(
+        &["http/1.1"],
+        client_ident.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
+        None,
+        None,
+        &ciphers,
+        &[],
+    ) {
+        Ok(cfg) => cfg,
+        Err(msg) => {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "javax/net/ssl/SSLHandshakeException",
+                &msg,
+            ));
+        }
+    };
+    // T19.H1: see the matching comment on `createSocket` above — this
+    // reconnect blocks on real network I/O too and must announce it.
+    ctx.begin_blocking_region();
+    let connect_result = crate::t27_tls::rustls_client_connect(cfg, &host, side.port as u16);
+    ctx.end_blocking_region();
+    match connect_result {
+        Ok(rid) => {
+            if side.stream_id >= 0 {
+                let _ = crate::servlet::s2_tls_close(side.stream_id);
+            }
+            let new_id = crate::servlet::RUSTLS_SOCK_ID_BASE + rid;
+            sock_set(ctx, this, |s| {
+                s.stream_id = new_id;
+            });
+            Ok(None)
+        }
+        Err(msg) => Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "javax/net/ssl/SSLHandshakeException",
+            &msg,
+        )),
+    }
+}
+
+/// `SSLSocket.setEnabledProtocols` -- the ONE implementation, registered by both
+/// `register_phase_e_networking` and `t27_tls::register_client_socket_mode_accessors`.
+///
+/// REGRESSION 2026-09-11 (`ee264ea33`): `t27_tls` registers this triple AFTER
+/// this file and gave it a body of its own that validated the names and did
+/// nothing else, so it won by last-writer-wins and every restriction below --
+/// the `HttpsURLConnection` probe recording, the deferred layered-socket
+/// entry, the eager-socket reconnect -- stopped running. Tomcat's
+/// `TestSSLHostConfigCipher`, `TestSSLHostConfigProtocol` and
+/// `TestSSLHostConfigCompat` connected unrestricted where JSSE refuses the
+/// handshake. Both registrars now name this function, so which one wins no
+/// longer decides the behaviour.
+pub(crate) fn ssl_socket_set_enabled_protocols(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // Validate before anything else, with HotSpot's messages. The accepted
+    // names are the protocols this stack reports through
+    // `getSupportedProtocols` plus the legacy spellings JSSE still names;
+    // anything else is a caller's typo, and HotSpot says so.
+    let Some(Value::Object(Some(arr))) = args.get(1).copied() else {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Protocols cannot be null".into(),
+        }
+        .into());
+    };
+    const KNOWN: &[&str] = &[
+        "TLSv1.3",
+        "TLSv1.2",
+        "TLSv1.1",
+        "TLSv1",
+        "SSLv3",
+        "SSLv2Hello",
+    ];
+    for i in 0..ctx.array_length(arr) {
+        let name = match ctx.get_array_element(arr, i) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        }
+        .unwrap_or_default();
+        if !KNOWN.contains(&name.as_str()) {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("Unsupported protocol: {name}"),
+            }
+            .into());
+        }
+    }
+    let this = obj_arg(args, 0)?;
+    let mut protocols: Vec<String> = Vec::new();
+    if let Some(Value::Object(Some(arr))) = args.get(1) {
+        let len = ctx.array_length(*arr);
+        for i in 0..len {
+            if let Value::Object(Some(s)) = ctx.get_array_element(*arr, i) {
+                if let Some(t) = ctx.read_string(s) {
+                    protocols.push(t);
+                }
+            }
+        }
+    }
+    if crate::nbflags().dbg_tls_auth_ok {
+        eprintln!(
+            "[dbg-tls-auth] SSLSocket.setEnabledProtocols protocols={:?} probe={} \
+             tls_id={} host={:?} port={}",
+            protocols,
+            is_probe_socket(ctx, this),
+            crate::phases_late::new13_resolve_tls_id(ctx, this),
+            sock_get(ctx, this).host,
+            sock_get(ctx, this).port
+        );
+    }
+    // Probe socket (`set_huc_factory_probe_mode`): report the
+    // restriction back to `http_url_connection`, which applies it to
+    // the one real connection it makes.
+    if is_probe_socket(ctx, this) {
+        record_probe_protocols(ctx, this, protocols);
+        return Ok(None);
+    }
+    // A socket from `createSocket(Socket wrapped, ...)` has a DEFERRED
+    // handshake, so a restriction set before the first I/O still
+    // counts — the cipher sibling in `phases_late/ssl_security.rs`
+    // already did this and the protocol setter did not.
+    let tls_id = crate::phases_late::new13_resolve_tls_id(ctx, this);
+    if tls_id >= crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
+        && tls_id < crate::servlet::RUSTLS_SOCK_ID_BASE
+    {
+        let pending_id = tls_id - crate::servlet::PENDING_LAYERED_SOCK_ID_BASE;
+        crate::t27_tls::set_pending_layered_socket_protocols(pending_id, protocols);
+        return Ok(None);
+    }
+    // A connect-path socket has not handshaked yet (its `connect`
+    // parked the endpoint -- see `PENDING_CONNECT_SOCK_ID_BASE`), so
+    // there is no established connection to tear down and redo. Accept
+    // and discard, which is what this registration already did for an
+    // already-handshaked socket.
+    if tls_id >= crate::servlet::PENDING_CONNECT_SOCK_ID_BASE
+        && tls_id < crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
+    {
+        return Ok(None);
+    }
+    // Otherwise the socket came from `createSocket(host, port)`, which
+    // handshakes EAGERLY — so, exactly like the `setEnabledCipherSuites`
+    // sibling above, the only way to honour the JDK contract ("a
+    // restriction the peer cannot satisfy makes the connection fail")
+    // is to tear the connection down and redo it under the
+    // restriction. That is the path `TestSSLHostConfigProtocol`'s
+    // `testTlsVersionMismatchServerTls12ClientTls13` takes:
+    // `TesterSupport.ClientSSLSocketFactory.reconfigureSocket` calls
+    // this immediately after `createSocket` returns, and simply
+    // accepting-and-discarding left the client offering both TLS
+    // versions, so a deliberate version mismatch negotiated the other
+    // version and SUCCEEDED where real JSSE refuses.
+    let restricted = crate::t27_tls::protocol_restriction_is_real(&protocols);
+    if !restricted {
+        // Empty, unrecognised, or "everything we support" — the
+        // caller is not actually narrowing anything, so leave the
+        // established connection alone rather than pay a reconnect
+        // (and risk losing semantics this reconnect cannot redo).
+        return Ok(None);
+    }
+    let side = sock_get(ctx, this);
+    let host = side.host.clone();
+    if host.is_empty() || side.port <= 0 {
+        return Ok(None);
+    }
+    let client_ident = crate::t27_tls::huc_default_client_identity();
+    let cfg = match crate::t27_tls::build_engine_client_config_with_identity_ciphers(
+        &["http/1.1"],
+        client_ident.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
+        None,
+        None,
+        &[],
+        &protocols,
+    ) {
+        Ok(cfg) => cfg,
+        Err(msg) => {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "javax/net/ssl/SSLHandshakeException",
+                &msg,
+            ));
+        }
+    };
+    // T19.H1: same blocking-region requirement as the cipher
+    // reconnect above — this performs real network I/O.
+    ctx.begin_blocking_region();
+    let connect_result = crate::t27_tls::rustls_client_connect(cfg, &host, side.port as u16);
+    ctx.end_blocking_region();
+    match connect_result {
+        Ok(rid) => {
+            if side.stream_id >= 0 {
+                let _ = crate::servlet::s2_tls_close(side.stream_id);
+            }
+            let new_id = crate::servlet::RUSTLS_SOCK_ID_BASE + rid;
+            sock_set(ctx, this, |s| {
+                s.stream_id = new_id;
+            });
+            Ok(None)
+        }
+        Err(msg) => Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "javax/net/ssl/SSLHandshakeException",
+            &msg,
+        )),
     }
 }

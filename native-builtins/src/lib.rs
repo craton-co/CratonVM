@@ -21836,6 +21836,133 @@ pub fn register_essential_natives_with_shims(
         row.get(idx).filter(|t| !t.is_empty()).cloned()
     }
 
+    /// `TimeZoneNameUtility.retrieveDisplayName(id, daylight, style, locale)`,
+    /// run on the JDK's own bytecode.
+    ///
+    /// `Some(Some(name))` is a name, `Some(None)` is the utility's own `null`
+    /// (the caller then takes `TimeZone.getDisplayName`'s fallbacks), and
+    /// `None` means the utility could not be run at all -- a synthetic-JDK
+    /// image has no such class -- so the caller keeps its pre-existing path.
+    /// A `null` locale is `Locale.getDefault(Locale.Category.DISPLAY)`, which is
+    /// what `getDisplayName()` passes.
+    fn tz_display_name_via_utility(
+        ctx: &mut dyn NativeContext,
+        id: &str,
+        daylight: bool,
+        long_style: bool,
+        locale: Option<ObjectRef>,
+    ) -> Option<Option<String>> {
+        let locale = match locale {
+            Some(l) => l,
+            None => {
+                let display = ctx
+                    .ensure_class_initialized("java/util/Locale$Category")
+                    .ok()
+                    .and_then(|cid| {
+                        ctx.static_field_index_by_name(cid, "DISPLAY")
+                            .map(|idx| ctx.get_static_field(cid, idx))
+                    });
+                let by_category = match display {
+                    Some(cat @ Value::Object(Some(_))) => ctx
+                        .invoke(
+                            "java/util/Locale",
+                            "getDefault",
+                            "(Ljava/util/Locale$Category;)Ljava/util/Locale;",
+                            &[cat],
+                        )
+                        .ok()
+                        .flatten(),
+                    _ => None,
+                };
+                let resolved = match by_category {
+                    Some(v @ Value::Object(Some(_))) => Some(v),
+                    _ => ctx
+                        .invoke(
+                            "java/util/Locale",
+                            "getDefault",
+                            "()Ljava/util/Locale;",
+                            &[],
+                        )
+                        .ok()
+                        .flatten(),
+                };
+                match resolved {
+                    Some(Value::Object(Some(l))) => l,
+                    _ => return None,
+                }
+            }
+        };
+        let locale_pin = ctx.pin_native_root(locale);
+        let id_s = ctx.create_string(id);
+        let locale_now = ctx.read_native_pin(locale_pin, locale);
+        ctx.unpin_native_roots(locale_pin);
+        let answer = ctx.invoke(
+            "sun/util/locale/provider/TimeZoneNameUtility",
+            "retrieveDisplayName",
+            "(Ljava/lang/String;ZILjava/util/Locale;)Ljava/lang/String;",
+            &[
+                Value::Object(Some(id_s)),
+                Value::Int(i32::from(daylight)),
+                Value::Int(i32::from(long_style)),
+                Value::Object(Some(locale_now)),
+            ],
+        );
+        match answer {
+            Ok(Some(Value::Object(Some(s)))) => Some(ctx.read_string(s)),
+            Ok(Some(Value::Object(None))) => Some(None),
+            _ => None,
+        }
+    }
+
+    /// The tail of `TimeZone.getDisplayName(boolean, int, Locale)` once the
+    /// name utility has answered `null`: a custom `GMT±...` id verbatim,
+    /// otherwise `ZoneInfoFile.toCustomID(getRawOffset() [+ getDSTSavings()])`.
+    fn tz_display_name_jdk_fallback(
+        ctx: &mut dyn NativeContext,
+        this: ObjectRef,
+        id: &str,
+        daylight: bool,
+    ) -> String {
+        if id.len() > 3 && id.starts_with("GMT") && matches!(id.as_bytes()[3], b'+' | b'-') {
+            return id.to_string();
+        }
+        let this_pin = ctx.pin_native_root(this);
+        let mut offset = ctx
+            .invoke_virtual(this, "getRawOffset", "()I", &[])
+            .ok()
+            .flatten()
+            .and_then(|v| v.as_int())
+            .unwrap_or(0);
+        if daylight {
+            let this_now = ctx.read_native_pin(this_pin, this);
+            offset += ctx
+                .invoke_virtual(this_now, "getDSTSavings", "()I", &[])
+                .ok()
+                .flatten()
+                .and_then(|v| v.as_int())
+                .unwrap_or(0);
+        }
+        ctx.unpin_native_roots(this_pin);
+        tz_custom_id(offset)
+    }
+
+    /// `sun.util.calendar.ZoneInfoFile.toCustomID(int)`, transcribed.
+    fn tz_custom_id(gmt_offset_ms: i32) -> String {
+        let mut offset = gmt_offset_ms / 1_000;
+        let sign = if offset >= 0 {
+            '+'
+        } else {
+            offset = -offset;
+            '-'
+        };
+        let (hh, mm, ss) = (offset / 3_600, (offset % 3_600) / 60, offset % 60);
+        let mut id = format!("GMT{sign}{hh:02}:{mm:02}");
+        if ss != 0 {
+            id.push_str(&format!(":{ss:02}"));
+        }
+        id
+    }
+
     fn tz_display_name_full(
         ctx: &mut dyn NativeContext,
         this: ObjectRef,
@@ -21843,10 +21970,40 @@ pub fn register_essential_natives_with_shims(
         long_style: bool,
         locale: Option<ObjectRef>,
     ) -> Result<String, MethodCallFailed> {
+        // `this` crosses the name utility's bytecode below; read it back
+        // through a pin before the fallback uses it.
+        let this_pin = ctx.pin_native_root(this);
         let id = match ctx.get_field_by_name(this, "ID") {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => String::new(),
         };
+        // `TimeZone.getDisplayName(boolean, int, Locale)`'s own algorithm, when
+        // the image has the JDK's name utility to run it on.
+        //
+        // 2026-09-12 (Tomcat `TestConcurrentDateFormat` residual): the CLDR row
+        // read below leaves every name CLDR INHERITS empty, and this native then
+        // answered its hard-coded "UTC" -- measured against HotSpot 25.0.3 on 14
+        // zones x 5 locales x 4 styles, 143 of 280 answers differed:
+        // `America/Buenos_Aires` SHORT was "UTC" where HotSpot says
+        // "GMT-03:00" (so `new Date(0).toString()` printed `UTC` on a `-03:00`
+        // host), `Etc/GMT+5` and `Africa/Casablanca` were "UTC" in every style,
+        // and every `Locale.ROOT` name was "Coordinated Universal Time".
+        // `TimeZoneNameUtility.retrieveDisplayName` derives those names through
+        // `CLDRTimeZoneNameProviderImpl`, which became reachable the same day
+        // (`locale_bootstrap::jre_adapter_get_locale_service_provider`'s
+        // `TimeZoneNameProvider` arm).
+        let answer = if id.is_empty() {
+            None
+        } else {
+            tz_display_name_via_utility(ctx, &id, daylight, long_style, locale)
+        };
+        let this = ctx.read_native_pin(this_pin, this);
+        ctx.unpin_native_roots(this_pin);
+        match answer {
+            Some(Some(name)) => return Ok(name),
+            Some(None) => return Ok(tz_display_name_jdk_fallback(ctx, this, &id, daylight)),
+            None => {}
+        }
         // A custom `GMT+hh:mm` id has no CLDR name and displays verbatim, which
         // is what HotSpot does for a `ZoneInfo` with no localized name.
         if !(id.starts_with("GMT+") || id.starts_with("GMT-")) {
@@ -21922,6 +22079,41 @@ pub fn register_essential_natives_with_shims(
                 }
                 _ => "UTC".to_string(),
             };
+            // JDK 25's `TimeZone.getTimeZone(String, boolean)` opens with this
+            // warning for every `ZoneId.SHORT_IDS` key, on every call, before
+            // resolving anything. This native replaces that body, so the
+            // warning was never printed -- measured 2026-09-12 as the one line
+            // separating this VM from HotSpot 25.0.3 on a 280-name
+            // `TimeZone.getDisplayName` sweep that asks for "PST".
+            const SHORT_IDS: &[&str] = &[
+                "ACT", "AET", "AGT", "ART", "AST", "BET", "BST", "CAT", "CNT", "CST", "CTT", "EAT",
+                "ECT", "IET", "IST", "JST", "MIT", "NET", "NST", "PLT", "PNT", "PRT", "PST", "SST",
+                "VST", "EST", "MST", "HST",
+            ];
+            if SHORT_IDS.contains(&id.as_str()) {
+                let err = ctx
+                    .ensure_class_initialized("java/lang/System")
+                    .ok()
+                    .and_then(|cid| {
+                        ctx.static_field_index_by_name(cid, "err")
+                            .map(|idx| ctx.get_static_field(cid, idx))
+                    });
+                if let Some(Value::Object(Some(err))) = err {
+                    let err_pin = ctx.pin_native_root(err);
+                    let line = ctx.create_string(&format!(
+                        "WARNING: Use of the three-letter time zone ID \"{id}\" is deprecated \
+                         and it will be removed in a future release"
+                    ));
+                    let err = ctx.read_native_pin(err_pin, err);
+                    ctx.unpin_native_roots(err_pin);
+                    let _ = ctx.invoke_virtual(
+                        err,
+                        "println",
+                        "(Ljava/lang/String;)V",
+                        &[Value::Object(Some(line))],
+                    );
+                }
+            }
             // Canonicalise custom GMT-offset ids ("GMT+2" -> "GMT+02:00") so
             // getID() matches the real JDK; IANA/named ids are kept verbatim.
             let custom_gmt = normalize_gmt_custom_id(&id);
