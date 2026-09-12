@@ -50,7 +50,7 @@
 //! # Why dominance and not "earlier in the same block"
 //!
 //! Both, actually -- and the same-block case is the one that needs care.
-//! `Schedule::dom` is a relation over BLOCKS, so it answers nothing about two
+//! `Schedule::dom` (a `Dominators`) is a relation over BLOCKS, so it answers nothing about two
 //! nodes in one block. Within a block the pass walks `Block::nodes` in order
 //! and accumulates facts as it goes, which is sound because `ir_lower` emits a
 //! block's nodes in exactly that order. That coupling is asserted rather than
@@ -63,7 +63,7 @@
 //!
 //! 1. **`Schedule::dom` is indexed by POST-layout block numbers.** The pass
 //!    queries it with post-layout indices, and frequency-driven layout permutes
-//!    the block vector. `schedule_with_options` recomputes the matrix after a
+//!    the block vector. `schedule_with_options` recomputes the relation after a
 //!    permutation for exactly this reason ("the dominator relation is a
 //!    property of the CFG, not of its numbering") -- if it ever stopped, every
 //!    dominance answer here would be read from the wrong row.
@@ -412,12 +412,7 @@ fn dominates(schedule: &Schedule, b: usize, d: usize) -> bool {
         // block on the strength of a later one.
         return false;
     }
-    schedule
-        .dom
-        .get(b)
-        .and_then(|row| row.get(d))
-        .copied()
-        .unwrap_or(false)
+    schedule.dom.dominates(d, b)
 }
 
 // ── Range-based bounds-check elimination ─────────────────────────────
@@ -477,7 +472,8 @@ struct UpperBound {
     true_block: usize,
 }
 
-/// `dom[b][d]`, but reflexive — a block dominates itself.
+/// Does block `d` dominate block `b`? Unlike [`dominates`], a block dominates
+/// itself here.
 ///
 /// The redundancy pass deliberately answers `false` for `b == d` so a check
 /// cannot prove itself; the range pass needs the opposite, because an access
@@ -485,13 +481,7 @@ struct UpperBound {
 /// the predecessor's terminator, before any node of the true block).
 #[inline]
 fn dominates_reflexive(schedule: &Schedule, b: usize, d: usize) -> bool {
-    b == d
-        || schedule
-            .dom
-            .get(b)
-            .and_then(|row| row.get(d))
-            .copied()
-            .unwrap_or(false)
+    b == d || schedule.dom.dominates(d, b)
 }
 
 /// Collect every branch that proves `idx < ArrayLength(base)` on one of its

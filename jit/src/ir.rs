@@ -4898,6 +4898,12 @@ pub struct IrBuilder {
     const_intern: HashMap<(i64, IrType), NodeId>,
     /// How far into `graph.nodes` [`Self::const_intern`] has indexed.
     const_intern_upto: usize,
+    /// True while [`Self::build`] walks the caller's bytecode block by block,
+    /// in reverse post-order, instead of in pc order. That happens only for a
+    /// method with a rotated loop; see [`BlockWalk`]. Read by
+    /// [`Self::prune_always_taken_branch`]: its `pc = target` jump is a
+    /// pc-order move that the block walk's ranges cannot follow.
+    block_walk: bool,
 }
 
 thread_local! {
@@ -5117,6 +5123,7 @@ impl IrBuilder {
             string_layout: published_string_layout(),
             const_intern: HashMap::new(),
             const_intern_upto: 0,
+            block_walk: false,
         }
     }
 
@@ -6625,6 +6632,13 @@ impl IrBuilder {
         if !self.splice.is_empty() {
             return false;
         }
+        // A pruned branch continues the walk at `target_pc`, skipping the
+        // untaken arm by pc order. The block walk visits ranges in reverse
+        // post-order and would lose its place, and the fall-through block it
+        // still visits would have no live control. Keep the branch instead.
+        if self.block_walk {
+            return false;
+        }
         let Some(ctrl) = self.ctrl_opt() else {
             return false;
         };
@@ -7001,6 +7015,32 @@ impl IrBuilder {
             .filter(|target| reachable.contains(target))
             .collect();
 
+        // ── Bottom-tested (rotated) loops ────────────────────────────
+        //
+        // ECJ, Kotlin, Scala and several bytecode generators rotate a loop:
+        // `goto test; body: …; test: if<cond> body`. In pc order the body, a
+        // loop header by the verifier's "target of a backward branch"
+        // definition, comes before every one of its predecessors. The pc walk
+        // below reaches it with no control token, `activate_loop_header` has
+        // no entry edge to seed its phis from, and the safety net refused the
+        // whole method.
+        //
+        // Such a method is walked in reverse post-order of its block CFG
+        // instead (see `BlockWalk`). A block is then visited after every
+        // forward predecessor, the test block before the body it dominates,
+        // and the loop headers are the targets of the edges that are
+        // retreating in THAT order. Every method the pc walk already handles
+        // keeps the pc walk, node for node.
+        let block_walk: Option<BlockWalk> =
+            if has_rotated_loop_header(&verified, &reachable, &self.loop_headers, code_len) {
+                match BlockWalk::reverse_postorder(&verified, &reachable, code_len) {
+                    Some(walk) => Some(walk),
+                    None => return ir_build_bail(line!(), 0),
+                }
+            } else {
+                None
+            };
+
         // ── The same pre-scan, for every SPLICED body ────────────────
         //
         // `verified_code` above analysed `code[..code_len]` — the caller alone.
@@ -7089,12 +7129,86 @@ impl IrBuilder {
             }
         }
 
+        // A block walk's loop headers replace the caller's pc-order ones: a
+        // rotated body is an ordinary forward merge in reverse post-order, and
+        // its test block is the header. A spliced body's headers (at or past
+        // `code_len`) are kept, because a relocated body is still walked in pc
+        // order.
+        let mut range_end = code_len;
+        let mut next_range = 0usize;
+        if let Some(walk) = block_walk.as_ref() {
+            self.loop_headers.retain(|&h| h >= code_len);
+            self.loop_headers.extend(walk.headers.iter().copied());
+            self.block_walk = true;
+            // `BlockWalk::reverse_postorder` returns at least one range, and
+            // the first starts at pc 0.
+            range_end = walk.ranges[0].1;
+            next_range = 1;
+        }
+
         let mut pc = 0;
-        // The `|| !self.splice.is_empty()` half is IR-tier inlining: inside a
-        // splice `pc` addresses a relocated callee body appended AFTER
-        // `code_len`, and the walk must keep going until that body returns.
-        // With no splices open this is exactly `pc < code_len`.
-        while pc < code_len || !self.splice.is_empty() {
+        // Where the walk stops, and where it goes next.
+        //
+        // The pc walk stops at `code_len` with no splice open. That is the
+        // loop condition this used to be, `pc < code_len ||
+        // !self.splice.is_empty()`: inside a splice `pc` addresses a relocated
+        // callee body appended AFTER `code_len`, and the walk must keep going
+        // until that body returns.
+        //
+        // The block walk stops when its ranges run out. At the end of each
+        // range, `pc` is the instruction after the range's last one. If control
+        // is still live, that instruction falls through into `pc`. The walk
+        // visits `pc` somewhere else in its order, so the edge is recorded
+        // exactly as the merge activation below records a fall-through: as a
+        // predecessor, or as a back edge when `pc` was already visited.
+        // Control and the abstract frame are then dropped before the jump, the
+        // same as after a `goto`. The next range starts at a merge, whose
+        // activation restores them from its predecessors.
+        loop {
+            if self.splice.is_empty() {
+                match block_walk.as_ref() {
+                    None => {
+                        if pc >= code_len {
+                            break;
+                        }
+                    }
+                    Some(walk) => {
+                        if pc >= range_end {
+                            // An arm moved `pc` past the range's end rather than
+                            // onto it. The ranges and the walk disagree about
+                            // where instructions end; refuse.
+                            if pc != range_end {
+                                return ir_build_bail(line!(), pc);
+                            }
+                            if self.ctrl_opt().is_some() {
+                                // Only a merge target can be reached by a
+                                // fall-through that the order does not follow:
+                                // every other block is placed right after the
+                                // block that falls into it.
+                                if !self.merges.contains_key(&pc) {
+                                    return ir_build_bail(line!(), pc);
+                                }
+                                self.add_merge_predecessor(pc);
+                            }
+                            let Some(&(start, end)) = walk.ranges.get(next_range) else {
+                                break;
+                            };
+                            next_range += 1;
+                            self.ctrl = NO_NODE;
+                            // A local no entry edge initialises gets no loop
+                            // phi, so `activate_loop_header` leaves its slot
+                            // as it finds it. After a jump that would be a
+                            // value from whichever block the order visited
+                            // last, which need not dominate this one. Say
+                            // "uninitialised" instead.
+                            self.locals.fill(NO_NODE);
+                            self.stack.clear();
+                            pc = start;
+                            range_end = end;
+                        }
+                    }
+                }
+            }
             // Bounds on the relocated region. A callee body that falls off its
             // own end never executed a return, which means the resolver admitted
             // a shape the walk does not agree with — refuse rather than walk
@@ -9660,6 +9774,222 @@ fn normally_reachable_pcs(
     reachable
 }
 
+/// Does the caller's code have a loop header that the pc-order walk in
+/// [`IrBuilder::build`] cannot build?
+///
+/// That is a reachable header other than pc 0 with no reachable predecessor at
+/// a LOWER pc. At pc 0 the method entry itself is the forward entry. The pc
+/// walk activates a header when it arrives, and needs an entry edge recorded
+/// by then. A rotated loop's body, `goto test; body: …; test: if<cond> body`,
+/// has no such edge. Its only predecessors are the back edge from the test and,
+/// through the test, the `goto`, and both sit at higher pcs or target the test
+/// instead.
+///
+/// `loop_headers` is the caller's own set: the verifier's "target of a
+/// backward branch" headers, filtered to reachable pcs.
+fn has_rotated_loop_header(
+    verified: &cratonvm_reader::VerifiedCode,
+    reachable: &HashSet<usize>,
+    loop_headers: &HashSet<usize>,
+    code_len: usize,
+) -> bool {
+    // A method with no loop, which is most methods, pays nothing more.
+    if !loop_headers.iter().any(|&h| h != 0 && h < code_len) {
+        return false;
+    }
+    let mut entered_forward: HashSet<usize> = HashSet::new();
+    for insn in verified.instructions() {
+        let pc = insn.pc as usize;
+        if pc >= code_len || !reachable.contains(&pc) {
+            continue;
+        }
+        for succ in verified.successors(pc) {
+            if succ > pc && loop_headers.contains(&succ) {
+                entered_forward.insert(succ);
+            }
+        }
+    }
+    loop_headers
+        .iter()
+        .any(|&h| h != 0 && h < code_len && !entered_forward.contains(&h))
+}
+
+/// The order in which [`IrBuilder::build`] walks a method that has a rotated
+/// loop (see [`has_rotated_loop_header`]): the reachable caller bytecode cut
+/// into basic blocks, in reverse post-order of the block CFG.
+///
+/// # Why reverse post-order
+///
+/// In RPO every edge goes forward except the retreating ones, and in a
+/// reducible CFG those are exactly the back edges, whose targets dominate their
+/// sources. So when the walk reaches a block, every forward predecessor has
+/// already recorded its snapshot, which is the invariant `activate_merge` and
+/// `activate_loop_header` both rest on. Every later predecessor is a back edge,
+/// which `add_merge_predecessor` back-patches into the header's phis. The pc
+/// walk has the same invariant for javac's top-tested loops only because pc
+/// order happens to be such an order for them.
+///
+/// The loop headers are therefore the targets of the edges that are retreating
+/// in THIS order, not the verifier's backward-branch targets. In
+/// `goto test; body: …; test: if<cond> body` the header is the test, which
+/// dominates the body. The body becomes an ordinary one-predecessor merge.
+///
+/// # What the walk relies on, and checks
+///
+/// * **A block reached only by fall-through is placed right after the block
+///   that falls into it.** Such a block is not a merge target, so only the
+///   live walk state carries its entry. The DFS visits a block's fall-through
+///   successor LAST (`VerifiedCode::successors` lists it last), and that puts
+///   the successor immediately after its only predecessor in reverse
+///   post-order.
+/// * **Every loop header is a merge target**, so there is an `Op::Merge` to
+///   hang its phis on.
+///
+/// A method that breaks either is refused (`None`), never walked.
+struct BlockWalk {
+    /// `[start, end)` bytecode ranges in walk order. Blocks adjacent both in
+    /// the order and in the bytecode are coalesced into one range, so a range
+    /// ends exactly where the order leaves the bytecode's own sequence. The
+    /// first range starts at pc 0.
+    ranges: Vec<(usize, usize)>,
+    /// Start pcs of the blocks targeted by an edge that is retreating in this
+    /// order.
+    headers: HashSet<usize>,
+}
+
+impl BlockWalk {
+    /// Cut the reachable instructions below `code_len` into blocks and order
+    /// them. `None` for a CFG whose shape breaks one of the checks on
+    /// [`BlockWalk`].
+    fn reverse_postorder(
+        verified: &cratonvm_reader::VerifiedCode,
+        reachable: &HashSet<usize>,
+        code_len: usize,
+    ) -> Option<BlockWalk> {
+        // Reachable instructions in pc order, as `(pc, next_pc)`.
+        let insns: Vec<(usize, usize)> = verified
+            .instructions()
+            .iter()
+            .map(|insn| (insn.pc as usize, insn.next_pc as usize))
+            .filter(|&(pc, _)| pc < code_len && reachable.contains(&pc))
+            .collect();
+        if insns.first().map(|&(pc, _)| pc) != Some(0) {
+            return None;
+        }
+        let merge_targets: HashSet<usize> = verified
+            .merge_targets()
+            .iter()
+            .map(|&t| t as usize)
+            .collect();
+
+        // Block leaders are: the entry; every merge target; every successor of
+        // an instruction that does not simply fall through, and the
+        // instruction after it; and any instruction whose textual predecessor
+        // is unreachable.
+        let mut leaders: HashSet<usize> = HashSet::new();
+        leaders.insert(0);
+        for (k, &(pc, next)) in insns.iter().enumerate() {
+            if merge_targets.contains(&pc) || (k > 0 && insns[k - 1].1 != pc) {
+                leaders.insert(pc);
+            }
+            let succs = verified.successors(pc);
+            if !(succs.len() == 1 && succs[0] == next) {
+                leaders.extend(succs.iter().copied());
+                leaders.insert(next);
+            }
+        }
+
+        // Blocks, numbered in pc order: start, end (the `next_pc` of the last
+        // instruction), and the last instruction's pc. Block 0 starts at pc 0.
+        let mut starts: Vec<usize> = Vec::new();
+        let mut ends: Vec<usize> = Vec::new();
+        let mut lasts: Vec<usize> = Vec::new();
+        for &(pc, next) in &insns {
+            if leaders.contains(&pc) || starts.is_empty() {
+                starts.push(pc);
+                ends.push(next);
+                lasts.push(pc);
+            } else {
+                let b = ends.len() - 1;
+                ends[b] = next;
+                lasts[b] = pc;
+            }
+        }
+        let nb = starts.len();
+        let block_at: HashMap<usize, usize> =
+            starts.iter().enumerate().map(|(b, &s)| (s, b)).collect();
+
+        // Successor blocks, branch targets first and the fall-through last.
+        let mut succ: Vec<Vec<usize>> = Vec::with_capacity(nb);
+        for &last in &lasts {
+            let mut out = Vec::new();
+            for s in verified.successors(last) {
+                if s >= code_len {
+                    continue;
+                }
+                // Every successor of a block's last instruction is a leader
+                // by construction; a miss means the cut above is wrong.
+                out.push(*block_at.get(&s)?);
+            }
+            succ.push(out);
+        }
+
+        // Iterative DFS from the entry: a long chain of blocks must not recurse.
+        let mut seen = vec![false; nb];
+        let mut postorder: Vec<usize> = Vec::with_capacity(nb);
+        let mut dfs: Vec<(usize, usize)> = vec![(0, 0)];
+        seen[0] = true;
+        while let Some(&(b, i)) = dfs.last() {
+            if i < succ[b].len() {
+                let top = dfs.len() - 1;
+                dfs[top].1 = i + 1;
+                let s = succ[b][i];
+                if !seen[s] {
+                    seen[s] = true;
+                    dfs.push((s, 0));
+                }
+            } else {
+                dfs.pop();
+                postorder.push(b);
+            }
+        }
+        // Every block holds reachable code, so the DFS must reach all of them.
+        if postorder.len() != nb {
+            return None;
+        }
+        let order: Vec<usize> = postorder.into_iter().rev().collect();
+        let mut pos = vec![0usize; nb];
+        for (k, &b) in order.iter().enumerate() {
+            pos[b] = k;
+        }
+
+        let mut headers: HashSet<usize> = HashSet::new();
+        for b in 0..nb {
+            for &s in &succ[b] {
+                let target = starts[s];
+                if pos[s] <= pos[b] {
+                    if !merge_targets.contains(&target) {
+                        return None;
+                    }
+                    headers.insert(target);
+                }
+                if target == ends[b] && !merge_targets.contains(&target) && pos[s] != pos[b] + 1 {
+                    return None;
+                }
+            }
+        }
+
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        for &b in &order {
+            match ranges.last_mut() {
+                Some(last) if last.1 == starts[b] => last.1 = ends[b],
+                _ => ranges.push((starts[b], ends[b])),
+            }
+        }
+        Some(BlockWalk { ranges, headers })
+    }
+}
+
 /// Parse a `tableswitch` (0xaa) / `lookupswitch` (0xab) at opcode offset
 /// `op_pc`. Returns `(instruction_len, default_target, cases)` where each case
 /// is `(match_value, target_pc)`; all targets are absolute bytecode offsets
@@ -11846,6 +12176,168 @@ mod tests {
     fn build_ir(code: &[u8], code_len: usize, num_params: usize, num_locals: usize) -> Graph {
         let builder = IrBuilder::new(num_params, num_locals);
         builder.build(code, code_len).expect("IR build failed")
+    }
+
+    // ── Bottom-tested (rotated) loops ────────────────────────────────────
+
+    /// `int f(int n) { int s = 0; for (int i = 0; i < n; i++) s += i; return s; }`
+    /// as ECJ emits it: jump forward to the test, branch back to the body.
+    const ROTATED_FOR: [u8; 23] = [
+        0x03, 0x3c, // 0: iconst_0; 1: istore_1        s = 0
+        0x03, 0x3d, // 2: iconst_0; 3: istore_2        i = 0
+        0xa7, 0x00, 0x0a, // 4: goto 14
+        0x1b, 0x1c, 0x60, 0x3c, // 7: iload_1; iload_2; iadd; istore_1   body
+        0x84, 0x02, 0x01, // 11: iinc 2, 1
+        0x1c, 0x1a, // 14: iload_2; 15: iload_0        test
+        0xa1, 0xff, 0xf7, // 16: if_icmplt 7
+        0x1b, 0xac, // 19: iload_1; 20: ireturn
+        0, 0,
+    ];
+
+    /// `int f(int n) { do { n = n - 3; } while (n > 0); return n; }`. The loop
+    /// header is pc 0, where the method entry is the forward edge.
+    const DO_WHILE_AT_ENTRY: [u8; 12] = [
+        0x1a, 0x06, 0x64, 0x3b, // 0: iload_0; iconst_3; isub; istore_0
+        0x1a, // 4: iload_0
+        0x9d, 0xff, 0xfb, // 5: ifgt 0
+        0x1a, 0xac, // 8: iload_0; 9: ireturn
+        0, 0,
+    ];
+
+    /// A javac-shaped outer loop around an ECJ-shaped inner one:
+    /// `int f(int n) { int c = 0; for (int i = 0; i < n; i++) for (int j = 0; j < i; j++) c += j; return c; }`.
+    const ROTATED_INSIDE_JAVAC_LOOP: [u8; 36] = [
+        0x03, 0x3c, // 0: c = 0
+        0x03, 0x3d, // 2: i = 0
+        0x1c, 0x1a, 0xa2, 0x00, 0x1a, // 4: iload_2; iload_0; if_icmpge 32   outer header
+        0x03, 0x3e, // 9: j = 0
+        0xa7, 0x00, 0x0a, // 11: goto 21
+        0x1b, 0x1d, 0x60, 0x3c, // 14: iload_1; iload_3; iadd; istore_1   inner body
+        0x84, 0x03, 0x01, // 18: iinc 3, 1
+        0x1d, 0x1c, 0xa1, 0xff, 0xf7, // 21: iload_3; iload_2; if_icmplt 14   inner test
+        0x84, 0x02, 0x01, // 26: iinc 2, 1
+        0xa7, 0xff, 0xe7, // 29: goto 4
+        0x1b, 0xac, // 32: iload_1; 33: ireturn
+        0, 0,
+    ];
+
+    /// A rotated loop whose body joins an if/else:
+    /// `int f(int n) { int s = 0; for (int i = 0; i < n; i++) { if ((i & 1) == 0) s += i; else s -= 1; } return s; }`.
+    const ROTATED_WITH_IF_ELSE: [u8; 35] = [
+        0x03, 0x3c, // 0: s = 0
+        0x03, 0x3d, // 2: i = 0
+        0xa7, 0x00, 0x16, // 4: goto 26
+        0x1c, 0x04, 0x7e, // 7: iload_2; iconst_1; iand        body
+        0x9a, 0x00, 0x0a, // 10: ifne 20
+        0x1b, 0x1c, 0x60, 0x3c, // 13: s += i
+        0xa7, 0x00, 0x06, // 17: goto 23
+        0x84, 0x01, 0xff, // 20: iinc 1, -1
+        0x84, 0x02, 0x01, // 23: iinc 2, 1                   join
+        0x1c, 0x1a, // 26: iload_2; 27: iload_0              test
+        0xa1, 0xff, 0xeb, // 28: if_icmplt 7
+        0x1b, 0xac, // 31: iload_1; 32: ireturn
+        0, 0,
+    ];
+
+    /// The id of the `Op::Merge` the builder made for `pc`.
+    fn merge_at(graph: &Graph, pc: usize) -> NodeId {
+        graph
+            .nodes
+            .iter()
+            .position(|n| matches!(n.op, Op::Merge) && n.bytecode_pc == Some(pc))
+            .unwrap_or_else(|| panic!("no merge at pc {pc}")) as NodeId
+    }
+
+    /// The merge at `header` is a loop header with one entry and one back
+    /// edge, and at least one phi carries a value around it.
+    fn assert_loop_header(graph: &Graph, header: usize) {
+        let merge = merge_at(graph, header);
+        assert_eq!(
+            graph.nodes[merge as usize].inputs.len(),
+            2,
+            "pc {header}: one entry edge and one back edge"
+        );
+        assert!(
+            graph.nodes.iter().any(|n| matches!(n.op, Op::Phi)
+                && n.input_opt(0) == Some(merge)
+                && n.inputs.len() == 3),
+            "pc {header}: a loop-carried phi with its back-edge input patched in"
+        );
+    }
+
+    #[test]
+    fn a_rotated_for_loop_builds_with_its_test_block_as_the_header() {
+        let graph = build_ir(&ROTATED_FOR, 21, 1, 3);
+        assert_loop_header(&graph, 14);
+        assert_eq!(
+            graph.nodes[merge_at(&graph, 7) as usize].inputs.len(),
+            1,
+            "the body is an ordinary merge reached only by the test's branch"
+        );
+    }
+
+    #[test]
+    fn a_do_while_whose_header_is_the_method_entry_builds() {
+        let graph = build_ir(&DO_WHILE_AT_ENTRY, 10, 1, 1);
+        assert_loop_header(&graph, 0);
+    }
+
+    #[test]
+    fn a_rotated_loop_nested_in_a_javac_loop_builds() {
+        let graph = build_ir(&ROTATED_INSIDE_JAVAC_LOOP, 34, 1, 4);
+        assert_loop_header(&graph, 4);
+        assert_loop_header(&graph, 21);
+    }
+
+    #[test]
+    fn a_rotated_loop_with_an_if_else_join_in_its_body_builds() {
+        let graph = build_ir(&ROTATED_WITH_IF_ELSE, 33, 1, 3);
+        assert_loop_header(&graph, 26);
+        assert_eq!(
+            graph.nodes[merge_at(&graph, 23) as usize].inputs.len(),
+            2,
+            "the if/else join inside the body is a forward merge of both arms"
+        );
+    }
+
+    /// The order and headers `BlockWalk` computes for the ECJ `for`, block by
+    /// block. A pc-order method never gets a block walk at all.
+    #[test]
+    fn the_block_walk_visits_the_test_before_the_body_it_dominates() {
+        fn walk_for(code: &[u8], len: usize) -> (bool, Option<BlockWalk>) {
+            let Ok(verified) = cratonvm_reader::verified_code(&code[..len]) else {
+                panic!("fixture does not verify");
+            };
+            let reachable = normally_reachable_pcs(&verified, len);
+            let headers: HashSet<usize> = verified
+                .loop_headers()
+                .iter()
+                .map(|&h| h as usize)
+                .filter(|h| reachable.contains(h))
+                .collect();
+            let rotated = has_rotated_loop_header(&verified, &reachable, &headers, len);
+            (rotated, BlockWalk::reverse_postorder(&verified, &reachable, len))
+        }
+
+        let (rotated, walk) = walk_for(&ROTATED_FOR, 21);
+        assert!(rotated, "the ECJ body has no forward entry");
+        let walk = walk.expect("an ECJ loop has a walk");
+        // Entry block, then test + exit (adjacent in the bytecode), then body.
+        assert_eq!(walk.ranges, vec![(0, 7), (14, 21), (7, 14)]);
+        assert_eq!(walk.headers, HashSet::from([14]));
+
+        let (rotated, _) = walk_for(&ROTATED_INSIDE_JAVAC_LOOP, 34);
+        assert!(rotated);
+        let (rotated, _) = walk_for(&DO_WHILE_AT_ENTRY, 10);
+        assert!(!rotated, "pc 0 is entered by the method entry");
+        // javac's nested counted loops: both headers are entered by fall-through.
+        let javac_nested = [
+            0x03, 0x3c, 0x03, 0x3d, 0x1c, 0x1a, 0xa2, 0x00, 0x19, 0x03, 0x3e, 0x1d, 0x1a, 0xa2,
+            0x00, 0x0c, 0x84, 0x01, 0x01, 0x84, 0x03, 0x01, 0xa7, 0xff, 0xf5, 0x84, 0x02, 0x01,
+            0xa7, 0xff, 0xe8, 0x1b, 0xac, 0, 0,
+        ];
+        let (rotated, _) = walk_for(&javac_nested, 33);
+        assert!(!rotated, "a javac loop keeps the pc walk");
     }
 
     /// `int f(int x) { return x == 0 ? 2 : 1; }`, whose `ifeq` at pc 1 the
