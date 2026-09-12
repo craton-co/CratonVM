@@ -17696,6 +17696,23 @@ pub fn jit_install_epoch() -> u64 {
     JIT_INSTALL_EPOCH.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Redefinitions observed by ANY VM in this process.
+///
+/// The per-VM counter is [`JitCache::redefine_epoch`], which is what inline
+/// caches compare against. This one exists for the verdict stores that are
+/// process-wide themselves (bail list, OSR-entry rejects, the IR refusal
+/// memo): a verdict about bytecode another VM just replaced must stop
+/// counting, and a redefinition in an unrelated VM costing a recompile is the
+/// safe direction.
+static JIT_PROCESS_REDEFINE_EPOCH: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// The process-wide redefinition count. See [`JIT_PROCESS_REDEFINE_EPOCH`].
+#[inline]
+pub fn redefine_epoch() -> u32 {
+    JIT_PROCESS_REDEFINE_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Advance the compilation epoch and return the NEW value.
 #[inline]
 pub fn bump_jit_install_epoch() -> u64 {
@@ -18118,6 +18135,7 @@ flushed at epoch {barrier}",
     pub fn bump_redefine_epoch(&self) {
         self.redefine_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
+        JIT_PROCESS_REDEFINE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
         bump_jit_install_epoch();
     }
 
