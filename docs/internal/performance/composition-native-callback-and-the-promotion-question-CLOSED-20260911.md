@@ -397,8 +397,20 @@ spelling both work; the second prints a one-line notice naming the first.
 ## Gates
 
 * Regression suite **93/93 scheduled vectors, 0 failures, 0 list/coverage
-  errors, 0 harness-blindness flags**, on the final binary.
-* `cargo test -p cratonvm-vm --lib` 2 666 passed / 0 failed;
+  errors, 0 harness-blindness flags** — twice, once before merging dev and
+  again on the merged tree, which is the rule this line exists for (dev moved
+  149 commits between the fork point and the merge; a 93/93 can become a 92/93
+  on same-day dev). Every engagement number on this page was re-taken after the
+  merge and holds: `invokes(general)` still 1 421 at both 2 000 and 40 000
+  chains, `getNow` still 40 000 → 511 interpreted frames under the promotion
+  switch, callback-memo hit rate still 99.9 %.
+* `cargo test -p cratonvm-vm --lib` 2 666 passed / 1 failed, and the one is
+  `ffm_group_layout_force_native_covers_member_layouts` — **confirmed
+  pre-existing**: a `git worktree` on pristine `origin/dev` fails it
+  identically, and nothing on this branch touches
+  `force_native_over_real_jdk_bytecode` or the FFM layout lists (`git diff
+  origin/dev...HEAD | grep -c` reads 0 for both). Before the dev merge the same
+  suite was 2 666 / 0.
   `cargo test -p cratonvm-types -p cratonvm-native-api` clean — the first of
   those is what enforces the four-file flag contract (`flag_surface`,
   `flag_docs_generated`, `flag_declaration_guard`) for the four new switches.
