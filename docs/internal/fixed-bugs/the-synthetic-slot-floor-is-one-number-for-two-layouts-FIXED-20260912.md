@@ -8,8 +8,11 @@ itself the successor to
 `HashSet` are converted, and the screen it asked for is a gate.
 
 **Verified on:** Windows 11, JDK 25 Temurin `25.0.3+9`, branch
-`claude/synthetic-slot-floor-fix-8e9672` off `dev@2405991d1`, with a baseline
-worktree built from the SAME commit for the synthetic-JDK comparison.
+`claude/synthetic-slot-floor-fix-8e9672`, with a baseline worktree built from
+the SAME commit for the synthetic-JDK comparison. Twice: once off
+`dev@2405991d1`, and again after merging `dev@3e8442e5f` — same numbers, same
+verdicts, same 127 `field index OOB`, so nothing in the intervening upstream
+work interacts with the exemption.
 
 ## 1. The measurement that closes it
 
@@ -180,6 +183,18 @@ caller did not allocate — is the same grep and is not machine-checkable withou
 type information; it is covered by the runtime out-of-range reporter in
 `gen_heap::set_field` and by §6's probe, and the exemption table's doc states
 the rule for anyone adding a class.
+
+`ConcurrentLinkedQueue` is the sharp demonstration that the second half really
+is discharged, because it is the one class whose natives would visibly break if
+it were not. `native_lbq_init` writes four absolute slots on the receiver and
+`native_lbq_size` READS the third; with the floor gone the class has two, so
+slots 2 and 3 are off the end and `size()` would answer 0 on a queue holding 40
+elements. `CollectionSlotFloor` asserts 40, a full 24-element FIFO drain in
+order, and `poll()` on an emptied queue -- and passes. The registrations exist
+and do not run: a real `ConcurrentLinkedQueue` is served by its own lock-free
+bytecode, and `CollectionShapeCause`'s field dump shows `head` and `tail`
+holding real `ConcurrentLinkedQueue$Node` objects, which only that bytecode
+builds.
 
 `array_deque_synthetic_table_matches_the_real_class` freezes the §2 narrowing at
 three, so it cannot grow back by accident the way `LinkedHashMap`'s floor did.
