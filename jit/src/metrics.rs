@@ -1746,9 +1746,11 @@ pub fn reset_osr_counts() {
     }
 }
 
-/// Every scheduling event that discards a compilation request, in the fixed
-/// order [`scheduling_counts`] reports.
-pub const SCHEDULING_EVENTS: [&str; 4] = [
+/// Every scheduling event of the tiered compile queues -- mostly requests that
+/// were discarded instead of compiled -- in the fixed order
+/// [`scheduling_counts`] reports. Indices are part of the contract:
+/// `crate::tiered` records by index.
+pub const SCHEDULING_EVENTS: [&str; 7] = [
     // A queued request was discarded at dispatch because the process-wide JIT
     // install epoch (`crate::jit_install_epoch`) moved after it was queued —
     // a JVMTI redefinition or a code-cache flush replaced the world the
@@ -1775,12 +1777,30 @@ pub const SCHEDULING_EVENTS: [&str; 4] = [
     // non-zero value in the middle of a run means the worker was stopped with
     // work outstanding, which is not.
     "queue_shutdown_abandoned",
+    // A request was refused because its method already held the in-flight
+    // slot (`CompilerCore::admit`). Not a drop -- nothing was queued -- and
+    // expected to stay near zero: the policy doors check the slot themselves,
+    // so this counts doors that pushed without asking, which is exactly how a
+    // method used to acquire two queued tasks.
+    "queue_deduplicated",
+    // A queued request was discarded because its method took a counted trap
+    // (`TieredCompilationManager::on_deoptimization`) or bailed out of C2. The
+    // request was formed against the profile that just proved wrong.
+    "queue_dropped_deoptimized",
+    // A compile callback panicked and the worker contained it
+    // (`tiered::contain_compile_panic`). The method is recorded as ineligible
+    // and the worker keeps running. Any non-zero value is a compiler bug with a
+    // one-line warning attached to its first occurrence.
+    "worker_panic",
 ];
 
 /// One relaxed counter per [`SCHEDULING_EVENTS`] entry. Fixed array, same
 /// reasoning as [`crate::bailout`]'s: the event set is closed, so this needs
 /// no allocation, no lock and no initialization order.
 static SCHEDULING_COUNTERS: [AtomicU64; SCHEDULING_EVENTS.len()] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),

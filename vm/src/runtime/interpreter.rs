@@ -2366,9 +2366,19 @@ pub fn execute(
                             ((class_id.as_u32() as u64) << 32) | (h as u64)
                         };
                         let n = shared.jit.profile_store.increment_invocation(invoc_key);
-                        if n >= crate::runtime::env_cache::jit_invocation_threshold() {
+                        let threshold = crate::runtime::env_cache::jit_invocation_threshold();
+                        // The stride every dispatch door uses. This door had
+                        // none and consulted the manager on EVERY invocation
+                        // past the threshold: a global mutex and a freshly
+                        // built key per call, for a method that may never
+                        // compile at all.
+                        const JIT_RETRY_STRIDE: u32 = 64;
+                        if n >= threshold
+                            && (n == threshold || (n - threshold) % JIT_RETRY_STRIDE == 0)
+                        {
                             ensure_bg_compiler_started(shared);
-                            let tiered_key = crate::jit::tiered::MethodKey::new(
+                            let tiered_key = crate::jit::tiered::MethodKey::with_class_id(
+                                class_id,
                                 class_name_str.as_str(),
                                 method_name,
                                 method_descriptor,
@@ -3740,6 +3750,7 @@ pub fn execute(
                                         descriptor_facts_cache: std::sync::OnceLock::new(),
                                         intercept_shape_cache: std::sync::OnceLock::new(),
                                         interp_invocations: std::sync::atomic::AtomicU32::new(0),
+                                        tiering_settled: std::sync::atomic::AtomicU32::new(0),
                                         native_callback_cache: std::sync::OnceLock::new(),
                                         invoc_key: std::sync::OnceLock::new(),
                                         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -5175,7 +5186,8 @@ pub fn pop_and_recycle_frame_with_reason(
                 let crossed_now = total.saturating_sub(f.backward_count / 32) < threshold;
                 if crossed_now || total % 64 == 0 {
                     ensure_bg_compiler_started(shared);
-                    let tiered_key = crate::jit::tiered::MethodKey::new(
+                    let tiered_key = crate::jit::tiered::MethodKey::with_class_id(
+                        f.class_id,
                         f.class_name(),
                         f.method_name(),
                         f.method_descriptor(),
@@ -5451,7 +5463,8 @@ pub(crate) fn try_osr_with_backoff(
             // compile (idempotent), and back off so we re-probe later rather
             // than spin. A subsequent hot back-edge finds the published
             // artifact and falls through to the reuse-enter below.
-            let key = crate::jit::tiered::MethodKey::new(cn, mn, md);
+            // Loader-aware: OSR denials and the in-flight slot are per class.
+            let key = crate::jit::tiered::MethodKey::with_class_id(frame_class_id, cn, mn, md);
             // An artifact this same path already published, which reports
             // `can_osr_enter(entry_pc) == false`, will report that forever:
             // `osr_pc_to_native[entry_pc]` is a pure function of the bytecode
@@ -5477,7 +5490,7 @@ pub(crate) fn try_osr_with_backoff(
             //
             // Strictly a waste-elimination change: it removes compiles, never
             // adds compiled execution. The loop runs interpreted either way.
-            if crate::jit::tiered::is_osr_denied(&key) || published_but_unenterable {
+            if shared.jit.tiered_manager.is_osr_denied(&key) || published_but_unenterable {
                 // Counted, because this path is why `osr_entered=0` can appear
                 // next to `osr_refused_entry=0` and a non-zero `osr=` compile
                 // count — a combination that reads like "OSR was never even

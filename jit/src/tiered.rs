@@ -25,23 +25,21 @@
 //!       └──► C1 (after 3+ deopts → c2_bailout, stays C1)
 //! ```
 
-use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
+use cratonvm_types::ClassId;
 use parking_lot::{Condvar, Mutex, RwLock};
 use rustc_hash::FxHashMap;
 
+use crate::deopt::{DeoptAction, DeoptReason};
+
 /// Consecutive background-compile attempts allowed to fail (run but not
 /// publish a body) at a given tier before `should_compile` gives up on that
-/// method entirely. See `CompilerCore::complete_task` / `should_compile`.
+/// method entirely. See `CompilerCore::finish` / `should_compile`.
 const MAX_TIER_FAIL_RETRIES: u32 = 3;
-
-fn osr_deny_list() -> &'static RwLock<HashSet<MethodKey>> {
-    static LIST: std::sync::OnceLock<RwLock<HashSet<MethodKey>>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| RwLock::new(HashSet::new()))
-}
 
 /// Process-start timestamp, seeded from [`TieredCompilationManager::new`]
 /// (constructed very early during VM init, well before any method can reach
@@ -60,49 +58,204 @@ fn process_uptime_ms() -> u64 {
     process_start().elapsed().as_millis() as u64
 }
 
-/// Returns true when OSR is permanently disabled for this method, without
-/// affecting normal invocation-counted JIT compilation.
-///
-/// `java/util/DualPivotQuicksort.sort` was statically denied here for one
-/// day (commit 05f6930e, "Deny OSR for DualPivotQuicksort.sort") as a
-/// scoped mitigation for the ES `SortingDigestTests` garbage-index
-/// corruption. A parallel, independent investigation the same day
-/// (a8c5825d, "Fix IR-lowerer unallocated-slot miscompile corrupting
-/// Arrays.sort(double[]) under JIT") found and fixed the actual root
-/// cause -- the IR/C2 backend's `slot_of()` returned a bogus `0` default
-/// for SSA nodes the scheduler never placed in an emitted block, so an
-/// emitted use read `[rbp - 0]` (the saved caller RBP) as data; plus a
-/// phantom-return-value push on the raw self-recursive-CALL path for VOID
-/// methods, an OSR dead-local mask gap for XMM-resident locals, and a
-/// precise-maps RBP-mirror restore gap around Rust-side compiled-entry
-/// calls. With those fixed, OSR-entering `DualPivotQuicksort.sort` is safe
-/// (`ES SortingDigestTests -Jit on` verified 19/20 with the static deny
-/// REMOVED, same as with it present -- the deny was never load-bearing for
-/// correctness once a8c5825d landed).
-///
-/// The static deny stayed in place afterward purely as a perf/complexity
-/// artifact of the parallel-fix landing, but it has a real cost: routing
-/// every self-recursive call of a denied method through the
-/// `self_call_stack_guard` helper path (instead of the fast inlined
-/// stack-floor check) on every OSR-entered invocation is itself the
-/// documented dominant per-level cost for recursion-heavy code
-/// (`perf/throughput-20260710`), and CratonVM's `on_backedge`/`request_osr`
-/// dispatch is a per-loop-back-edge hot path -- so a static string-keyed
-/// deny check sitting there is pure overhead once nothing needs denying.
-/// Removed: OSR is now available for `DualPivotQuicksort.sort` again, and
-/// `is_osr_denied` only consults the *dynamic* `osr_deny_list`.
-pub fn is_osr_denied(key: &MethodKey) -> bool {
-    osr_deny_list().read().contains(key)
+// ───────────────────────────────────────────────────────────────────────────────
+// Compile-panic containment
+// ───────────────────────────────────────────────────────────────────────────────
+
+thread_local! {
+    /// Depth of [`contain_compile_panic`] scopes active on this thread.
+    ///
+    /// Read by the VM's crash handler from inside the panic hook, which runs
+    /// BEFORE `catch_unwind` receives the unwind. A panic raised while this is
+    /// non-zero is about to be caught and turned into a declined compile, so
+    /// the handler must neither write `hs_err_pid<pid>.log` nor latch its
+    /// one-report-per-process guard: either would leave the next REAL crash
+    /// with no report at all.
+    static COMPILE_PANIC_SCOPES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// Permanently disable OSR for this method in the current VM process.
-pub fn mark_osr_denied(key: MethodKey) {
-    osr_deny_list().write().insert(key);
+/// Whether the current thread is inside a [`contain_compile_panic`] scope.
+///
+/// `try_with`, never `with`: the crash handler calls this from a panic hook,
+/// and a second panic raised there (this thread's TLS already destroyed)
+/// aborts the process before anything is reported.
+pub fn compile_panic_is_contained() -> bool {
+    COMPILE_PANIC_SCOPES
+        .try_with(|depth| depth.get() > 0)
+        .unwrap_or(false)
 }
 
-/// Test helper: reset process-global OSR deny state.
-pub fn clear_osr_deny_list_for_test() {
-    osr_deny_list().write().clear();
+/// One [`contain_compile_panic`] scope. The depth drops when the guard drops,
+/// which during a panic is AFTER the hook has already asked.
+struct CompilePanicScope;
+
+impl CompilePanicScope {
+    fn enter() -> Self {
+        let _ = COMPILE_PANIC_SCOPES.try_with(|depth| depth.set(depth.get().saturating_add(1)));
+        CompilePanicScope
+    }
+}
+
+impl Drop for CompilePanicScope {
+    fn drop(&mut self) {
+        let _ = COMPILE_PANIC_SCOPES.try_with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// Run one compile with its panics contained.
+///
+/// The workspace builds with `panic = "unwind"`, and before this existed a
+/// panic anywhere in codegen unwound out of the only compile thread in the
+/// process: the worker died with `active` still set, `inflight_epoch` still
+/// non-zero and the method still marked queued, nothing restarted it, and
+/// tiering stopped for the rest of the run with no diagnostic beyond the panic
+/// message itself.
+///
+/// A compile is the one piece of VM work whose failure has an obvious safe
+/// answer -- do not compile that method again -- which is what the callers do
+/// with an `Err`. `AssertUnwindSafe` rests on two facts: nothing a compile
+/// builds is visible to other threads until `JitCache::put` publishes it, and
+/// the `parking_lot` locks it takes do not poison, so an unwind leaves no lock
+/// held and no half-published body behind.
+pub fn contain_compile_panic<R>(f: impl FnOnce() -> R) -> std::thread::Result<R> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _scope = CompilePanicScope::enter();
+        f()
+    }))
+}
+
+/// The human-readable part of a panic payload.
+pub fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "<non-string panic payload>".to_string())
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Compile cost measurement and worker sizing
+// ───────────────────────────────────────────────────────────────────────────────
+
+/// CPU time the calling thread has consumed so far, or `None` where no
+/// per-thread clock is wired up (the caller then falls back to wall time).
+///
+/// The C2 compile budget is charged in THIS unit. A compile thread that is
+/// descheduled -- an oversubscribed CI host, a stop-the-world pause, a laptop
+/// throttling -- accrues wall time while doing no work, and charging that to
+/// the method demoted healthy methods to C1 for the rest of the process.
+#[allow(unreachable_code)]
+pub fn current_thread_cpu_time() -> Option<std::time::Duration> {
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        struct FileTime {
+            low: u32,
+            high: u32,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentThread() -> *mut std::ffi::c_void;
+            fn GetThreadTimes(
+                thread: *mut std::ffi::c_void,
+                creation: *mut FileTime,
+                exit: *mut FileTime,
+                kernel: *mut FileTime,
+                user: *mut FileTime,
+            ) -> i32;
+        }
+        let mut creation = FileTime::default();
+        let mut exit = FileTime::default();
+        let mut kernel = FileTime::default();
+        let mut user = FileTime::default();
+        // SAFETY: `GetCurrentThread` returns a pseudo-handle that is always
+        // valid for the calling thread and needs no close, and every out
+        // pointer is a live, writable `FILETIME` in this frame.
+        let ok = unsafe {
+            GetThreadTimes(
+                GetCurrentThread(),
+                &mut creation,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        // A FILETIME counts 100-nanosecond intervals in two 32-bit halves.
+        let ticks = |t: FileTime| (u64::from(t.high) << 32) | u64::from(t.low);
+        return Some(std::time::Duration::from_nanos(
+            ticks(kernel).saturating_add(ticks(user)).saturating_mul(100),
+        ));
+    }
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    {
+        #[repr(C)]
+        struct Timespec {
+            tv_sec: i64,
+            tv_nsec: i64,
+        }
+        unsafe extern "C" {
+            fn clock_gettime(clock_id: i32, tp: *mut Timespec) -> i32;
+        }
+        // `CLOCK_THREAD_CPUTIME_ID` from `<time.h>`, the same on every Linux
+        // architecture.
+        const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+        let mut ts = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a live, writable `struct timespec` (two `long`s on
+        // an LP64 target) and the clock id is a kernel-defined constant.
+        let rc = unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        if rc != 0 {
+            return None;
+        }
+        // Cast: a thread CPU clock is non-negative, and `tv_nsec < 1e9`.
+        return Some(std::time::Duration::new(
+            ts.tv_sec as u64,
+            ts.tv_nsec as u32,
+        ));
+    }
+    None
+}
+
+/// How many compile workers each lane gets, as `(c1, c2)`.
+///
+/// C1 defaults to one worker and C2 to `max(1, floor(log2(cpus)))`, the shape
+/// of HotSpot's `CICompilerCount` split: the optimizing tier gets the larger
+/// share because its compiles are the long ones. `CRATONVM_TIER_C1_THREADS`
+/// and `CRATONVM_TIER_C2_THREADS` override either, clamped to `1..=64` -- a
+/// lane with no worker would leave every request routed to it queued forever.
+pub fn compiler_thread_counts() -> (usize, usize) {
+    compiler_thread_counts_with(
+        |name| cratonvm_types::flags::runtime_var(name).ok(),
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+    )
+}
+
+/// Testable core of [`compiler_thread_counts`].
+pub fn compiler_thread_counts_with(
+    get: impl Fn(&str) -> Option<String>,
+    cpus: usize,
+) -> (usize, usize) {
+    let parse = |name: &str| -> Option<usize> {
+        get(name)?
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .map(|n| n.clamp(1, 64))
+    };
+    let cpus = cpus.max(1);
+    // floor(log2(cpus)); `cpus >= 1`, so the subtraction cannot underflow.
+    let log2 = (usize::BITS - 1 - cpus.leading_zeros()) as usize;
+    let c1 = parse("CRATONVM_TIER_C1_THREADS").unwrap_or(1);
+    let c2 = parse("CRATONVM_TIER_C2_THREADS").unwrap_or(log2.max(1));
+    (c1, c2)
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -219,76 +372,66 @@ impl CompilationPolicy {
 // MethodKey
 // ───────────────────────────────────────────────────────────────────────────────
 
-/// Uniquely identifies a method.
+/// Uniquely identifies a method: its declaring class's identity plus its name
+/// and descriptor.
+///
+/// **Loader-aware.** Two classes of the same name in different loaders -- the
+/// ByteBuddy / Mockito / servlet-container shape -- declare different methods,
+/// and a key made of names alone merged them: one loader's `ineligible`
+/// verdict, `c2_bailout`, OSR denial or queued request applied silently to the
+/// other, and unloading one class discarded the tiering state of both.
+/// `class_id` is what separates them. `ClassId(0)` means "not resolved" and is
+/// what [`MethodKey::new`] produces; it remains for tests and for callers that
+/// genuinely hold only a name, and such a key is matched by name.
+///
+/// The strings are `Arc<str>` so a key built from a `CachedBytecodeMethod`
+/// costs three reference-count increments rather than three heap allocations:
+/// the interpreter builds one at every tier-up stride.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MethodKey {
-    pub class_name: String,
-    pub method_name: String,
-    pub descriptor: String,
+    pub class_id: ClassId,
+    pub class_name: Arc<str>,
+    pub method_name: Arc<str>,
+    pub descriptor: Arc<str>,
 }
 
 impl MethodKey {
+    /// A key with no resolved class identity. See the type's doc.
     pub fn new(
-        class_name: impl Into<String>,
-        method_name: impl Into<String>,
-        descriptor: impl Into<String>,
+        class_name: impl Into<Arc<str>>,
+        method_name: impl Into<Arc<str>>,
+        descriptor: impl Into<Arc<str>>,
+    ) -> Self {
+        Self::with_class_id(ClassId::new(0), class_name, method_name, descriptor)
+    }
+
+    /// A key for a method of the loaded class `class_id`.
+    pub fn with_class_id(
+        class_id: ClassId,
+        class_name: impl Into<Arc<str>>,
+        method_name: impl Into<Arc<str>>,
+        descriptor: impl Into<Arc<str>>,
     ) -> Self {
         Self {
+            class_id,
             class_name: class_name.into(),
             method_name: method_name.into(),
             descriptor: descriptor.into(),
         }
     }
-}
 
-// ───────────────────────────────────────────────────────────────────────────────
-// Profile types
-// ───────────────────────────────────────────────────────────────────────────────
-
-/// Branch taken/not-taken counts at a single bytecode offset.
-#[derive(Debug, Clone, Default)]
-pub struct BranchProfile {
-    pub taken: u64,
-    pub not_taken: u64,
-}
-
-/// Receiver type profile at a virtual call site.
-#[derive(Debug, Clone, Default)]
-pub struct ReceiverProfile {
-    /// Top receivers (class_id, count), limited to 3.
-    pub receivers: Vec<(u32, u64)>,
-    pub total_calls: u64,
-}
-
-/// Type profile for checkcast/instanceof.
-#[derive(Debug, Clone, Default)]
-pub struct TypeProfile {
-    /// Observed types (class_id, count).
-    pub types: Vec<(u32, u64)>,
-    pub total_checks: u64,
-}
-
-/// Null-check profile.
-#[derive(Debug, Clone, Default)]
-pub struct NullProfile {
-    pub null_seen: u64,
-    pub non_null_seen: u64,
-}
-
-/// Aggregated profile data collected during interpreted / C1 execution.
-/// T10.9.B: FxHashMap — bytecode-offset keys, hot path per-branch.
-#[derive(Debug, Clone, Default)]
-pub struct MethodProfile {
-    /// Branch taken/not-taken counts per bytecode offset.
-    pub branch_counts: FxHashMap<u32, BranchProfile>,
-    /// Receiver type profiles per call site.
-    pub receiver_profiles: FxHashMap<u32, ReceiverProfile>,
-    /// Type profiles for checkcast/instanceof.
-    pub type_profiles: FxHashMap<u32, TypeProfile>,
-    /// Null check profiles.
-    pub null_profiles: FxHashMap<u32, NullProfile>,
-    /// Total profiled invocations.
-    pub profiled_invocations: u64,
+    /// Whether this key names a method of the class `(class_id, class_name)`.
+    ///
+    /// Identity decides when both sides carry one. When either side does not,
+    /// the name decides, which is the old behaviour and errs towards
+    /// invalidating too much rather than too little.
+    pub fn belongs_to(&self, class_id: ClassId, class_name: &str) -> bool {
+        if self.class_id.as_u32() != 0 && class_id.as_u32() != 0 {
+            self.class_id == class_id
+        } else {
+            &*self.class_name == class_name
+        }
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -296,6 +439,12 @@ pub struct MethodProfile {
 // ───────────────────────────────────────────────────────────────────────────────
 
 /// Tracks per-method compilation state.
+///
+/// There is no profile in here any more. A `MethodProfile` with branch,
+/// receiver, type and null tables used to live on this struct, filled by
+/// `record_branch` / `record_receiver` / `record_type_check` /
+/// `record_null_check`, none of which had a caller outside this file's tests.
+/// The live profile is `crate::profile::ProfileStore`.
 #[derive(Debug, Clone)]
 pub struct MethodState {
     /// Unique method identifier.
@@ -304,35 +453,58 @@ pub struct MethodState {
     pub current_tier: CompilationTier,
     /// Number of interpreter invocations.
     pub invocation_count: u64,
-    /// Number of back-edge executions (loop iterations).
+    /// Number of OSR requests made for this method -- each one a loop the
+    /// interpreter's back-edge schedule judged hot.
     pub backedge_count: u64,
-    /// Whether currently queued for compilation.
+    /// Whether a request for this method holds the in-flight slot: queued, or
+    /// dispatched and still compiling. See [`CompilerCore::admit`].
     pub queued_for_compilation: bool,
-    /// Tier at which it is queued.
+    /// Tier of the request holding the slot.
     pub queued_tier: Option<CompilationTier>,
-    /// Number of deoptimizations.
+    /// OSR bci of the request holding the slot (`None` for method entry).
+    /// With `queued_tier`, the identity a leaving request is matched against
+    /// before it may release the slot -- see [`CompilerCore::release_slot_for`].
+    pub queued_osr_bci: Option<u32>,
+    /// The request holding the slot opened a branch-profile window
+    /// (`profile::arm_branch_profiling_for_c2`), which must be closed exactly
+    /// once on whichever way the request leaves: completion, a stale drop, a
+    /// deoptimization drop, a class invalidation or shutdown.
+    ///
+    /// The window used to be closed on EVERY C2 completion instead. That
+    /// closed windows nobody opened (OSR tasks, the straight-to-C2 invocation
+    /// path) and never closed the ones whose request was dropped rather than
+    /// compiled, so the census drifted in both directions at once.
+    pub branch_window_armed: bool,
+    /// Counted traps (deopts whose action threw the body away), decayed over
+    /// time. Soft deopts are not in here; see [`deopt_is_counted_trap`].
     pub deopt_count: u32,
+    /// Counted traps per `(reason, bci)`, decayed together with `deopt_count`.
+    pub trap_counts: FxHashMap<(DeoptReason, u32), u32>,
+    /// `invocation_count` at the last trap decay.
+    pub trap_decay_invocations: u64,
+    /// [`process_uptime_ms`] at the last trap decay.
+    pub trap_decay_ms: u64,
+    /// Successful method-entry C2 compiles that spent more than
+    /// [`MAX_C2_COMPILE_TIME_MS`] of compile-thread CPU time.
+    pub c2_budget_overruns: u32,
     /// Last compilation time in milliseconds.
     pub last_compile_time_ms: u64,
     /// Whether this method is too complex for C2.
     pub c2_bailout: bool,
-    /// Profile data collected during interpreted/C1 execution.
-    pub profile: MethodProfile,
     /// Consecutive background-compile attempts that ran but did not
-    /// publish a compiled body (`complete_task(success=false)`). Distinct
+    /// publish a compiled body (`finish(success=false)`). Distinct
     /// from `c2_bailout` (which tracks *runtime* deopt-driven demotion from
     /// an already-published C2 body) — this tracks the compile STEP itself
     /// never producing/publishing code, so `current_tier` never advances
     /// past whatever tier last actually succeeded. `should_compile` stops
-    /// recommending further attempts once this saturates, mirroring the
-    /// existing "3+ deopts" convention for `c2_bailout` above.
+    /// recommending further attempts once this saturates.
     ///
     /// Counts **compile attempts that ran and failed** only. A task the VM
     /// declined on policy grounds never lands here — see [`Self::ineligible`].
     pub tier_fail_count: u32,
     /// The VM declined to compile this method for a reason that cannot change
-    /// for the life of the process — the JIT skip list rejected it, or a
-    /// permanent OSR denial applies.
+    /// for the life of the process — the JIT skip list rejected it, a
+    /// permanent OSR denial applies, or its compile panicked.
     ///
     /// This exists because the two outcomes used to be conflated. A policy
     /// decline reported `success=false` exactly like a failed compile, so a
@@ -358,7 +530,9 @@ pub struct MethodState {
     ///
     /// Recording the decline once, under its own flag, ends the churn on the
     /// first attempt and leaves `tier_fail_count` meaning only what its name
-    /// says.
+    /// says. A class redefinition clears it
+    /// ([`TieredCompilationManager::on_class_redefined`]): the verdict was
+    /// about the old bytecode.
     pub ineligible: bool,
 }
 
@@ -371,14 +545,129 @@ impl MethodState {
             backedge_count: 0,
             queued_for_compilation: false,
             queued_tier: None,
+            queued_osr_bci: None,
+            branch_window_armed: false,
             deopt_count: 0,
+            trap_counts: FxHashMap::default(),
+            trap_decay_invocations: 0,
+            trap_decay_ms: process_uptime_ms(),
+            c2_budget_overruns: 0,
             last_compile_time_ms: 0,
             c2_bailout: false,
-            profile: MethodProfile::default(),
             tier_fail_count: 0,
             ineligible: false,
         }
     }
+
+    /// Whether nothing the invocation hook can do will change this method's
+    /// tiering until something invalidates the state.
+    ///
+    /// Deliberately narrow. A C1 method that has not bailed out of C2 is NOT
+    /// settled: it can still be recommended for C2 once it is hot enough.
+    fn tiering_is_settled(&self) -> bool {
+        self.ineligible
+            || self.tier_fail_count >= MAX_TIER_FAIL_RETRIES
+            || self.current_tier >= CompilationTier::C2
+            || (self.c2_bailout && self.current_tier >= CompilationTier::C1)
+    }
+}
+
+/// What one visit to the invocation hook decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvocationVerdict {
+    /// The tier a compile was just queued at, if any.
+    pub recommended: Option<CompilationTier>,
+    /// Non-zero when the hook can no longer change this method's tiering. The
+    /// value is the manager's settled generation at the moment of the answer;
+    /// the caller stores it on the call site (`CachedBytecodeMethod::
+    /// tiering_settled`) and skips the manager -- its global `methods` mutex,
+    /// and the key it would build -- while
+    /// [`TieredCompilationManager::tiering_settled`] still accepts the stamp.
+    /// Any event that could unsettle a method (a deopt, an invalidation, a
+    /// redefinition, a policy change) moves the generation, which expires
+    /// every stamp at once.
+    pub settled_generation: u32,
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Trap accounting
+// ───────────────────────────────────────────────────────────────────────────────
+
+/// Counted traps at one `(reason, bci)` before the method stops being offered
+/// to C2. HotSpot's `PerBytecodeTrapLimit` is 4 for the same reason: one
+/// speculation that keeps failing is a property of the code, not noise.
+pub const PER_BCI_TRAP_LIMIT: u32 = 4;
+
+/// Counted traps across the whole method, however they are spread over sites,
+/// before it stops being offered to C2 -- the analogue of HotSpot's per-method
+/// trap limit and recompilation cutoff.
+pub const PER_METHOD_TRAP_CUTOFF: u32 = 16;
+
+/// Trap counts halve once the method has run this many further invocations...
+pub const TRAP_DECAY_INVOCATIONS: u64 = 20_000;
+
+/// ...or once this much process time has passed, whichever comes first.
+///
+/// The time arm exists because a method whose body is recompiled immediately
+/// after each trap (the eager `RecompileAndReinterpret` re-queue in
+/// `DeoptimizationController::deoptimize`) stops reaching the interpreter's
+/// invocation hook, so its invocation count stops moving.
+pub const TRAP_DECAY_MS: u64 = 60_000;
+
+/// Whether a deopt with this recommended action is a trap the method is
+/// charged for.
+///
+/// Only actions that throw the body away count. `Reinterpret` is a soft exit:
+/// the frame continues in the interpreter and the body is still good. Charging
+/// those spent a method's whole C2 allowance on routine OSR loop exits -- three
+/// of them banned C2 *and* OSR for the rest of the process. A debugger's
+/// `TransferToInterpreter` and a pending exception's handler hand-off are not
+/// speculation failures at all, whatever action the log recommends for them.
+pub fn deopt_is_counted_trap(reason: DeoptReason, action: DeoptAction) -> bool {
+    if matches!(
+        reason,
+        DeoptReason::TransferToInterpreter | DeoptReason::PendingException
+    ) {
+        return false;
+    }
+    matches!(
+        action,
+        DeoptAction::RecompileAndReinterpret
+            | DeoptAction::MakeNotEntrant
+            | DeoptAction::MakeNotCompilable
+    )
+}
+
+/// Whether this deopt evicts the method-entry body from the JIT cache.
+///
+/// The single source of truth for `DeoptimizationController::deoptimize`, which
+/// performs the eviction, and [`TieredCompilationManager::on_deoptimization`],
+/// which must drop `current_tier` exactly when the body is gone: a tier that
+/// reads "compiled" over an empty cache is a method that is never recommended
+/// again and stays interpreted forever. A soft OSR exit keeps its body;
+/// everything else is evicted.
+pub fn deopt_evicts_method_body(reason: DeoptReason, action: DeoptAction) -> bool {
+    !(reason == DeoptReason::OsrExit && action == DeoptAction::Reinterpret)
+}
+
+/// Halve a method's trap counts when enough invocations or time have passed
+/// since the last decay.
+fn decay_traps(state: &mut MethodState, now_ms: u64) {
+    let by_invocations = state
+        .invocation_count
+        .saturating_sub(state.trap_decay_invocations)
+        >= TRAP_DECAY_INVOCATIONS;
+    let by_time = now_ms.saturating_sub(state.trap_decay_ms) >= TRAP_DECAY_MS;
+    if !(by_invocations || by_time) {
+        return;
+    }
+    state.deopt_count /= 2;
+    state.trap_counts.retain(|_, n| {
+        *n /= 2;
+        *n > 0
+    });
+    state.trap_decay_invocations = state.invocation_count;
+    state.trap_decay_ms = now_ms;
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -395,9 +684,8 @@ pub enum CompilationPriority {
 
 /// A single compilation task.
 ///
-/// `PartialEq`/`Eq` were added for [`CompilationBroker`]'s tests, which assert
-/// on the exact request a queue shed or handed back. Every field was already
-/// comparable; nothing about the task's meaning changed.
+/// `PartialEq`/`Eq` so a test can assert on the exact request a queue handed
+/// back or dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompilationTask {
     pub method_key: MethodKey,
@@ -420,7 +708,7 @@ pub struct CompilationTask {
 /// by construction rather than by convention.
 ///
 /// See `docs/jit/broker-install-epoch.md` for which epoch this is and what it
-/// answers — it is deliberately NOT [`CompilationBroker`]'s per-class epoch.
+/// answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct QueuedRequest {
     /// [`crate::jit_install_epoch`] as of the moment this request entered the
@@ -446,15 +734,15 @@ struct StaleRequest {
     current_epoch: u64,
 }
 
-/// Priority queue for compilation tasks.
+/// Priority queue for compilation tasks. One per compile lane.
 pub struct CompilationQueue {
-    /// High priority: C2 recompilations.
+    /// High priority: method-entry C2 and OSR requests.
     high: VecDeque<QueuedRequest>,
     /// Normal priority: C1 compilations.
     normal: VecDeque<QueuedRequest>,
-    /// Low priority: speculative compilations.
+    /// Low priority: C1→C2 supersedes and other speculative compilations.
     low: VecDeque<QueuedRequest>,
-    /// Total tasks processed.
+    /// Total tasks that left the queue, stale drops included.
     total_processed: u64,
 }
 
@@ -538,8 +826,35 @@ impl CompilationQueue {
         self.high.len() + self.normal.len() + self.low.len()
     }
 
-    fn is_empty(&self) -> bool {
-        self.len() == 0
+    /// Rank of the request [`Self::dequeue`] would hand out next: 2 for High,
+    /// 1 for Normal, 0 for Low, `None` when empty.
+    fn front_rank(&self) -> Option<u8> {
+        if !self.high.is_empty() {
+            Some(2)
+        } else if !self.normal.is_empty() {
+            Some(1)
+        } else if !self.low.is_empty() {
+            Some(0)
+        } else {
+            None
+        }
+    }
+
+    /// Remove and return every queued task `pred` selects, keeping the order
+    /// of what remains.
+    fn remove_matching(&mut self, pred: impl Fn(&CompilationTask) -> bool) -> Vec<CompilationTask> {
+        let mut removed = Vec::new();
+        for band in [&mut self.high, &mut self.normal, &mut self.low] {
+            band.retain(|entry| {
+                if pred(&entry.task) {
+                    removed.push(entry.task.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        removed
     }
 
     /// Remove and return every queued request.
@@ -557,49 +872,122 @@ impl CompilationQueue {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// CompilerCore — shared between the manager and the background compile thread
+// CompilerCore — shared between the manager and its compile workers
 // ───────────────────────────────────────────────────────────────────────────────
 
-/// State the background compile thread shares with the manager.
+/// The lane serving the single-pass (C1-family) backend.
+const C1_LANE: usize = 0;
+/// The lane serving the optimizing backend: method-entry C2 and every OSR
+/// request.
+const C2_LANE: usize = 1;
+
+/// The lane `task` is compiled on.
+fn lane_of(task: &CompilationTask) -> usize {
+    if task.osr_bci.is_some() || tier_uses_optimized_backend(task.target_tier) {
+        C2_LANE
+    } else {
+        C1_LANE
+    }
+}
+
+/// One compile lane: a queue, and the condvar its workers park on.
 ///
-/// The compilation queue, its wake-up condvar, the "compiler is running" flag,
-/// and the shutdown flag all live here behind an [`Arc`] so the spawned worker
-/// can drain the queue off the mutator thread without a back-reference to the
-/// whole [`TieredCompilationManager`] (which is owned by `SharedVm` by value).
+/// There are two because one worker used to serve everything, and a C1
+/// compile -- the cheap one, and the one that gets a method out of the
+/// interpreter -- waited behind every High-priority C2 and OSR compile queued
+/// ahead of it. Each lane has its own workers ([`compiler_thread_counts`]), so
+/// the cheap tier waits only on other cheap work. Ordering within a lane, and
+/// the install-epoch gate, are exactly what the single queue had.
+struct CompileLane {
+    queue: Mutex<CompilationQueue>,
+    wake: Condvar,
+}
+
+impl CompileLane {
+    fn new() -> Self {
+        Self {
+            queue: Mutex::new(CompilationQueue::new()),
+            wake: Condvar::new(),
+        }
+    }
+}
+
+/// How one compile attempt ended, as [`CompilerCore::finish`] applies it.
+#[derive(Debug, Clone, Copy)]
+struct Completion {
+    tier: CompilationTier,
+    /// OSR bci of the request (`None` for method entry). With `tier`, the
+    /// identity the in-flight slot is released against.
+    osr_bci: Option<u32>,
+    /// The request was for an OSR artifact.
+    osr: bool,
+    /// Wall-clock compile time, for the statistics.
+    compile_time_ms: u64,
+    /// What the C2 budget is charged: compile-thread CPU time where the
+    /// platform reports it, wall time otherwise.
+    budget_ms: u64,
+    success: bool,
+    declined_permanently: bool,
+}
+
+/// State the compile workers share with the manager.
+///
+/// The lanes, the "compiler is running" and shutdown flags and every per-method
+/// verdict live here behind an [`Arc`] so the spawned workers can drain the
+/// queues off the mutator thread without a back-reference to the whole
+/// [`TieredCompilationManager`] (which is owned by `SharedVm` by value).
 struct CompilerCore {
     /// Per-method compilation state.
     /// T10.9.B: FxHashMap — MethodKey (internal class/name/desc) is trusted.
     ///
-    /// Lives here (rather than on the manager) so the background compile thread,
-    /// which only holds an `Arc<CompilerCore>`, can update a method's tier /
-    /// queued flag on completion under the same lock the mutator-side API uses.
+    /// Lives here (rather than on the manager) so a worker, which only holds
+    /// an `Arc<CompilerCore>`, can update a method's tier / queued flag on
+    /// completion under the same lock the mutator-side API uses.
     methods: Mutex<FxHashMap<MethodKey, MethodState>>,
-    /// Pending compilation tasks (three-priority).
-    queue: Mutex<CompilationQueue>,
-    /// Signalled whenever a task is enqueued or shutdown is requested.
-    wake: Condvar,
-    /// Whether a background worker is currently running.
+    /// The two compile lanes, indexed by [`C1_LANE`] / [`C2_LANE`].
+    lanes: [CompileLane; 2],
+    /// Whether this manager's workers are running.
     active: AtomicBool,
-    /// Requests the worker to stop: it finishes any in-flight compile, then
-    /// exits at the next queue check (remaining queued tasks are abandoned —
-    /// acceptable at teardown).
+    /// Requests the workers to stop: each finishes any in-flight compile, then
+    /// exits at its next queue check (remaining queued tasks are drained and
+    /// counted by [`BackgroundCompiler::shutdown`]).
     shutdown: AtomicBool,
-    /// Number of tasks the worker has finished compiling (for tests/diagnostics).
+    /// Number of tasks the workers have finished compiling (for tests/diagnostics).
     completed: AtomicU64,
-    /// Requests discarded at dispatch instead of compiled — the local mirror
-    /// of `crate::metrics::scheduling_dropped_total`, so a test can assert on
+    /// Requests discarded instead of compiled — the local mirror of
+    /// `crate::metrics::scheduling_dropped_total`, so a test can assert on
     /// one manager's behaviour without reading a process-wide table shared
     /// with every other manager and every sibling test.
     dropped: AtomicU64,
-    /// Install epoch the in-flight compile was dispatched at, or `0` when the
-    /// worker is idle.
+    /// Requests refused because the method already held the in-flight slot.
+    deduplicated: AtomicU64,
+    /// Compiles whose `compile_fn` panicked and was contained.
+    worker_panics: AtomicU64,
+    /// Whether the first contained panic has been logged (later ones are only
+    /// counted).
+    panic_logged: AtomicBool,
+    /// Install epoch of the most recently dispatched compile still running, or
+    /// `0` when every worker is idle.
     ///
     /// The dispatch-time gate can only refuse a request whose epoch had
-    /// *already* moved. This records the epoch of the compile that is running
-    /// now, so the worker can tell afterwards whether the world moved
+    /// *already* moved. This records the epoch a running compile was
+    /// dispatched at, so a worker can tell afterwards whether the world moved
     /// underneath it — the window that only the per-cache flush barrier in
-    /// `JitCache::put` can close, and the one this field makes visible.
+    /// `JitCache::put` can close, and the one this field makes visible. With
+    /// several workers it is a sample, not a per-compile record.
     inflight_epoch: AtomicU64,
+    /// Compiles currently running across all workers.
+    inflight_count: AtomicU64,
+    /// Generation that [`InvocationVerdict::settled_generation`] stamps are
+    /// checked against. Starts at 1 so a zeroed stamp never matches.
+    settled_generation: AtomicU32,
+    /// Branch-profile windows opened by this manager minus those it closed.
+    /// Zero whenever no C2 nomination is outstanding.
+    branch_window_balance: AtomicI64,
+    /// OSR denials, each stamped with the install epoch it was recorded at.
+    /// A denial whose stamp is no longer current has expired: see
+    /// [`TieredCompilationManager::is_osr_denied`].
+    osr_denied: RwLock<FxHashMap<MethodKey, u64>>,
     /// Test seam: when set, the source of "the current install epoch" instead
     /// of the process-wide [`crate::jit_install_epoch`].
     ///
@@ -633,11 +1021,11 @@ struct CompilerCore {
     /// a leaked JMX owned-monitor set, not admission. The gate exists so the
     /// trade can be priced on the gauntlet, not so it can be flipped.
     ///
-    /// Mirrored onto the core because the supersede runs on the worker, which
+    /// Mirrored onto the core because the supersede runs on a worker, which
     /// holds only an `Arc<CompilerCore>` and cannot reach the manager's policy
     /// mutex. One relaxed load on a path that already takes `methods`.
     c2_upgrade_min_invocations: AtomicU64,
-    /// Aggregate compilation statistics (shared so the worker can update them).
+    /// Aggregate compilation statistics (shared so the workers can update them).
     stats: CompilationStats,
 }
 
@@ -661,13 +1049,19 @@ impl CompilerCore {
     fn with_install_epoch_source(install_epoch_source: Option<Arc<AtomicU64>>) -> Self {
         Self {
             methods: Mutex::new(FxHashMap::default()),
-            queue: Mutex::new(CompilationQueue::new()),
-            wake: Condvar::new(),
+            lanes: [CompileLane::new(), CompileLane::new()],
             active: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             completed: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+            deduplicated: AtomicU64::new(0),
+            worker_panics: AtomicU64::new(0),
+            panic_logged: AtomicBool::new(false),
             inflight_epoch: AtomicU64::new(0),
+            inflight_count: AtomicU64::new(0),
+            settled_generation: AtomicU32::new(1),
+            branch_window_balance: AtomicI64::new(0),
+            osr_denied: RwLock::new(FxHashMap::default()),
             install_epoch_source,
             // 0 = no gate. Raised by the manager's constructor and by
             // `set_policy` only when the operator set the knob explicitly.
@@ -678,7 +1072,7 @@ impl CompilerCore {
 
     /// The install epoch as of right now.
     ///
-    /// One relaxed-ish atomic load on the default path — the same load
+    /// One atomic load on the default path — the same load
     /// `crate::jit_install_epoch` performs, which is already on every
     /// compilation's entry path.
     fn current_install_epoch(&self) -> u64 {
@@ -688,17 +1082,84 @@ impl CompilerCore {
         }
     }
 
-    /// Push a task, stamped with the install epoch it was queued at, and wake
-    /// the worker (if any).
+    /// Push a task onto its lane, stamped with the install epoch it was queued
+    /// at, and wake one of that lane's workers.
     ///
-    /// Every enqueue in the process funnels through here — the two policy
-    /// paths in [`TieredCompilationManager`], the OSR paths, the C1→C2
-    /// upgrade, and the VM's direct [`TieredCompilationManager::enqueue_compilation`]
-    /// — so no door into the queue can produce an unstamped request.
+    /// Every enqueue funnels through here (via [`Self::admit`]), so no door
+    /// into either queue can produce an unstamped request.
     fn enqueue(&self, task: CompilationTask) {
         let epoch = self.current_install_epoch();
-        self.queue.lock().enqueue(task, epoch);
-        self.wake.notify_one();
+        let lane = &self.lanes[lane_of(&task)];
+        lane.queue.lock().enqueue(task, epoch);
+        lane.wake.notify_one();
+    }
+
+    /// Give `task` the method's in-flight slot and queue it, or refuse it.
+    /// Returns whether it was queued.
+    ///
+    /// Call with `methods` held: this takes a lane's queue lock, which is the
+    /// established `methods` → `queue` order.
+    ///
+    /// **One slot per method**, whatever the tier or the bci. With a single
+    /// compile thread a second request for a method only cost a wasted
+    /// compile. With a worker per lane it is the same method compiled
+    /// concurrently into two code buffers, the duplicate-install shape this VM
+    /// has already paid for in code reclamation. `enqueue_compilation` -- the
+    /// VM's deopt re-queue door -- used to push unconditionally and was the
+    /// concrete way a method acquired two tasks. The policy doors check the
+    /// flag themselves before building a task, so a refusal here is counted:
+    /// it only happens on a door that did not.
+    fn admit(&self, state: &mut MethodState, task: CompilationTask) -> bool {
+        if state.queued_for_compilation {
+            self.deduplicated.fetch_add(1, Ordering::Relaxed);
+            crate::metrics::record_scheduling_event(crate::metrics::SCHEDULING_EVENTS[4]);
+            return false;
+        }
+        state.queued_for_compilation = true;
+        state.queued_tier = Some(task.target_tier);
+        state.queued_osr_bci = task.osr_bci;
+        self.enqueue(task);
+        true
+    }
+
+    /// Release the in-flight slot for a request leaving by any exit, closing
+    /// the branch-profile window it opened.
+    ///
+    /// A request that no longer holds the slot does not release it. That
+    /// happens when a deopt dropped a queued request, the slot was re-granted,
+    /// and the OLD request is only now reaching completion or retirement:
+    /// clearing the flag then would admit a duplicate beside the new request.
+    fn release_slot_for(
+        &self,
+        state: &mut MethodState,
+        tier: CompilationTier,
+        osr_bci: Option<u32>,
+    ) {
+        if state.queued_for_compilation
+            && (state.queued_tier != Some(tier) || state.queued_osr_bci != osr_bci)
+        {
+            return;
+        }
+        state.queued_for_compilation = false;
+        state.queued_tier = None;
+        state.queued_osr_bci = None;
+        if std::mem::take(&mut state.branch_window_armed) {
+            self.close_branch_window();
+        }
+    }
+
+    /// Open a branch-profile window for the C2 nomination `state` is about to
+    /// receive. Paired with exactly one [`Self::close_branch_window`], through
+    /// `branch_window_armed`.
+    fn open_branch_window(&self, state: &mut MethodState) {
+        state.branch_window_armed = true;
+        self.branch_window_balance.fetch_add(1, Ordering::Relaxed);
+        crate::profile::arm_branch_profiling_for_c2();
+    }
+
+    fn close_branch_window(&self) {
+        self.branch_window_balance.fetch_sub(1, Ordering::Relaxed);
+        crate::profile::disarm_branch_profiling_for_c2();
     }
 
     /// Release the in-flight slot of every dropped request, count the drop,
@@ -706,11 +1167,11 @@ impl CompilerCore {
     ///
     /// ## Lock order
     ///
-    /// This takes `methods` and **must not** be called while `queue` is held.
-    /// The established order in this file is `methods` → `queue`:
-    /// `should_compile_inner` holds `methods` across `CompilerCore::enqueue`,
-    /// which takes `queue`. The worker discovers stale requests while holding
-    /// `queue`, so it collects them into a `Vec`, drops the queue guard, and
+    /// This takes `methods` and **must not** be called while a lane's queue is
+    /// held. The established order in this file is `methods` → `queue`:
+    /// `should_compile_inner` holds `methods` across [`Self::admit`], which
+    /// takes `queue`. A worker discovers stale requests while holding its
+    /// queue, so it collects them into a `Vec`, drops the queue guard, and
     /// only then calls this. Taking `methods` under `queue` here would invert
     /// the order and deadlock against any thread on the invocation hook.
     ///
@@ -719,13 +1180,13 @@ impl CompilerCore {
     /// `current_tier`, `tier_fail_count` and `ineligible` are all left alone.
     /// A stale request is not a compile failure and not a policy decline —
     /// nothing was compiled and nothing was decided. Routing this through
-    /// [`Self::complete_task`] with `success = false` would spend one of the
+    /// [`Self::finish`] with `success = false` would spend one of the
     /// method's [`MAX_TIER_FAIL_RETRIES`], so three redefinitions during
     /// warmup would leave a hot method permanently un-compilable with no
     /// diagnostic — precisely the silent loss this whole path exists to
-    /// prevent. Clearing the queued flag is the entire state change, and it is
-    /// what lets the next invocation re-admit the method against the bytecode
-    /// that is actually loaded.
+    /// prevent. Releasing the slot (and closing its branch window) is the
+    /// entire state change, and it is what lets the next invocation re-admit
+    /// the method against the bytecode that is actually loaded.
     fn retire_stale(&self, stale: &[StaleRequest]) {
         if stale.is_empty() {
             return;
@@ -735,8 +1196,7 @@ impl CompilerCore {
             let mut methods = self.methods.lock();
             for request in stale {
                 if let Some(state) = methods.get_mut(&request.task.method_key) {
-                    state.queued_for_compilation = false;
-                    state.queued_tier = None;
+                    self.release_slot_for(state, request.task.target_tier, request.task.osr_bci);
                 }
             }
         }
@@ -764,27 +1224,127 @@ impl CompilerCore {
             .fetch_add(stale.len() as u64, Ordering::Release);
     }
 
-    /// Pop the next request that is still current, dropping and retiring any
-    /// stale ones ahead of it.
+    /// Pop the highest-priority request across BOTH lanes, for the manual
+    /// drains ([`TieredCompilationManager::dequeue_compilation`] and
+    /// [`TieredCompilationManager::next_fresh_task`]) -- the compile pipeline
+    /// drains one lane per worker instead.
     ///
-    /// Never blocks: `None` means the queue held nothing fresh, not that the
-    /// caller should assume there was nothing there.
-    fn take_fresh(&self) -> Option<CompilationTask> {
-        let mut stale: Vec<StaleRequest> = Vec::new();
-        let task = {
-            let current = self.current_install_epoch();
-            let mut queue = self.queue.lock();
-            queue.dequeue_fresh(current, &mut stale)
-        };
-        self.retire_stale(&stale);
-        task
+    /// With `current = Some(epoch)`, requests queued before `epoch` are pushed
+    /// onto `stale` on the way past, exactly as [`CompilationQueue::dequeue_fresh`]
+    /// does; with `None` the stamp is ignored.
+    fn pop_across_lanes(
+        &self,
+        current: Option<u64>,
+        stale: &mut Vec<StaleRequest>,
+    ) -> Option<CompilationTask> {
+        // Both lane locks, always C1 then C2. A worker only ever holds its own
+        // lane's lock, and nothing takes `methods` under either, so this
+        // order cannot deadlock.
+        let mut c1 = self.lanes[C1_LANE].queue.lock();
+        let mut c2 = self.lanes[C2_LANE].queue.lock();
+        loop {
+            let from_c2 = match (c1.front_rank(), c2.front_rank()) {
+                (None, None) => return None,
+                (Some(_), None) => false,
+                (None, Some(_)) => true,
+                // Equal ranks go to the optimizing lane.
+                (Some(r1), Some(r2)) => r2 >= r1,
+            };
+            let entry = if from_c2 { c2.dequeue() } else { c1.dequeue() }?;
+            match current {
+                Some(now) if entry.install_epoch < now => stale.push(StaleRequest {
+                    task: entry.task,
+                    event: crate::metrics::SCHEDULING_EVENTS[0],
+                    queued_epoch: entry.install_epoch,
+                    current_epoch: now,
+                }),
+                _ => return Some(entry.task),
+            }
+        }
     }
 
-    /// C1→C2 supersede: enqueue a Low-priority C2 recompile for a method
-    /// whose C1 body just published. Idempotent: skipped when the method is
-    /// already queued, already at C2, has bailed out of C2, or has exhausted
-    /// its compile retries. Called by the worker loop AFTER
-    /// [`Self::complete_task`] cleared the C1 task's queued flag.
+    /// Remove every queued (not yet dispatched) request for `key` from both
+    /// lanes. Call with `methods` held.
+    fn remove_queued_for(&self, key: &MethodKey) -> Vec<CompilationTask> {
+        let mut removed = Vec::new();
+        for lane in &self.lanes {
+            removed.extend(
+                lane.queue
+                    .lock()
+                    .remove_matching(|task| task.method_key == *key),
+            );
+        }
+        removed
+    }
+
+    /// Number of requests queued across both lanes.
+    fn queue_len(&self) -> usize {
+        self.lanes.iter().map(|lane| lane.queue.lock().len()).sum()
+    }
+
+    /// Requests that have left either lane, stale drops included.
+    #[cfg(test)]
+    fn total_processed(&self) -> u64 {
+        self.lanes
+            .iter()
+            .map(|lane| lane.queue.lock().total_processed)
+            .sum()
+    }
+
+    /// Expire every [`InvocationVerdict::settled_generation`] stamp handed out
+    /// so far.
+    fn bump_settled_generation(&self) {
+        // A wrap to 0 is harmless: a 0 stamp never counts as settled.
+        self.settled_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Whether OSR is denied for `key` at the current install epoch.
+    fn is_osr_denied(&self, key: &MethodKey) -> bool {
+        let denied = self.osr_denied.read();
+        match denied.get(key) {
+            Some(&stamp) => stamp == self.current_install_epoch(),
+            None => false,
+        }
+    }
+
+    fn mark_osr_denied(&self, key: MethodKey) {
+        let epoch = self.current_install_epoch();
+        self.osr_denied.write().insert(key, epoch);
+    }
+
+    fn note_dispatch(&self, epoch: u64) {
+        self.inflight_count.fetch_add(1, Ordering::AcqRel);
+        self.inflight_epoch.store(epoch, Ordering::Release);
+    }
+
+    fn note_dispatch_done(&self) {
+        if self.inflight_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.inflight_epoch.store(0, Ordering::Release);
+        }
+    }
+
+    /// Count a contained compile panic and log the first one.
+    fn note_worker_panic(&self, task: &CompilationTask, payload: &(dyn std::any::Any + Send)) {
+        self.worker_panics.fetch_add(1, Ordering::Relaxed);
+        crate::metrics::record_scheduling_event(crate::metrics::SCHEDULING_EVENTS[6]);
+        if !self.panic_logged.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                target: "cratonvm::jit",
+                "compile of {}.{}{} (tier={:?}{}) panicked and was contained: {}. The method is \
+                 now ineligible and the compile worker keeps running; later panics are counted \
+                 under the `worker_panic` scheduling event without this line.",
+                task.method_key.class_name,
+                task.method_key.method_name,
+                task.method_key.descriptor,
+                task.target_tier,
+                task.osr_bci
+                    .map(|b| format!(" osr_bci={b}"))
+                    .unwrap_or_default(),
+                panic_payload_message(payload),
+            );
+        }
+    }
+
     /// One more C2 attempt for a method whose IR build bailed on a `new` whose
     /// class had not loaded yet.
     ///
@@ -810,111 +1370,134 @@ impl CompilerCore {
                 return;
             }};
         }
-        {
-            let mut methods = self.methods.lock();
-            // `or_insert_with`, not `get_mut`. MEASURED: `get_mut` refused
-            // every method the eager first-call door compiles, with "no tier
-            // state for this method" -- that door hands the backend a method
-            // the interpreter never counted invocations for, so the manager has
-            // never seen its key. `RJitGc.make` is one, and it is the method
-            // this whole path exists for.
-            //
-            // Creating the state here is what `on_invocation` / `on_backedge`
-            // do for their own keys, and it is inert for everything else: a
-            // fresh `MethodState` is `current_tier = Interpreter`, unqueued,
-            // and every other gate below still applies.
-            let state = methods
-                .entry(key.clone())
-                .or_insert_with(|| MethodState::new(key.clone()));
-            if state.queued_for_compilation {
-                refuse!("already queued");
-            }
-            if state.c2_bailout {
-                refuse!("c2_bailout");
-            }
-            if state.ineligible {
-                refuse!("ineligible");
-            }
-            if state.tier_fail_count >= MAX_TIER_FAIL_RETRIES {
-                refuse!("tier_fail_count exhausted");
-            }
-            let gate = self.c2_upgrade_min_invocations.load(Ordering::Relaxed);
-            if gate != 0 && state.invocation_count < gate {
-                refuse!("below the c2-upgrade hotness gate");
-            }
-            if dbg {
-                eprintln!(
-                    "[cratonvm-jitc] deferred-new retry ENQUEUED {}.{}{}",
-                    key.class_name, key.method_name, key.descriptor
-                );
-            }
-            state.queued_for_compilation = true;
-            state.queued_tier = Some(CompilationTier::C2);
+        let mut methods = self.methods.lock();
+        // `or_insert_with`, not `get_mut`. MEASURED: `get_mut` refused
+        // every method the eager first-call door compiles, with "no tier
+        // state for this method" -- that door hands the backend a method
+        // the interpreter never counted invocations for, so the manager has
+        // never seen its key. `RJitGc.make` is one, and it is the method
+        // this whole path exists for.
+        //
+        // Creating the state here is what `on_invocation` / `request_osr`
+        // do for their own keys, and it is inert for everything else: a
+        // fresh `MethodState` is `current_tier = Interpreter`, unqueued,
+        // and every other gate below still applies.
+        let state = methods
+            .entry(key.clone())
+            .or_insert_with(|| MethodState::new(key.clone()));
+        if state.queued_for_compilation {
+            refuse!("already queued");
+        }
+        if state.c2_bailout {
+            refuse!("c2_bailout");
+        }
+        if state.ineligible {
+            refuse!("ineligible");
+        }
+        if state.tier_fail_count >= MAX_TIER_FAIL_RETRIES {
+            refuse!("tier_fail_count exhausted");
+        }
+        let gate = self.c2_upgrade_min_invocations.load(Ordering::Relaxed);
+        if gate != 0 && state.invocation_count < gate {
+            refuse!("below the c2-upgrade hotness gate");
+        }
+        if dbg {
+            eprintln!(
+                "[cratonvm-jitc] deferred-new retry ENQUEUED {}.{}{}",
+                key.class_name, key.method_name, key.descriptor
+            );
         }
         // Open the branch-profile window: there is now an optimizing compile
-        // pending that will read the counts. See
-        // `profile::arm_branch_profiling_for_c2`.
-        crate::profile::arm_branch_profiling_for_c2();
-        self.enqueue(CompilationTask {
-            method_key: key.clone(),
-            target_tier: CompilationTier::C2,
-            priority: CompilationPriority::Low,
-            enqueue_time_ms: 0,
-            osr_bci: None,
-        });
+        // pending that will read the counts. Closed by whichever exit the
+        // request takes -- see `MethodState::branch_window_armed`.
+        self.open_branch_window(state);
+        self.admit(
+            state,
+            CompilationTask {
+                method_key: key.clone(),
+                target_tier: CompilationTier::C2,
+                priority: CompilationPriority::Low,
+                enqueue_time_ms: 0,
+                osr_bci: None,
+            },
+        );
     }
 
+    /// C1→C2 supersede: enqueue a Low-priority C2 recompile for a method
+    /// whose C1 body just published. Idempotent: skipped when the method is
+    /// already queued, already at C2, has bailed out of C2, or has exhausted
+    /// its compile retries. Called by the worker loop AFTER [`Self::finish`]
+    /// released the C1 task's slot.
     fn request_c2_upgrade(&self, key: &MethodKey) {
+        let mut methods = self.methods.lock();
+        let Some(state) = methods.get_mut(key) else {
+            return;
+        };
+        if state.queued_for_compilation
+            || state.current_tier >= CompilationTier::C2
+            || state.c2_bailout
+            || state.ineligible
+            || state.tier_fail_count >= MAX_TIER_FAIL_RETRIES
         {
-            let mut methods = self.methods.lock();
-            let Some(state) = methods.get_mut(key) else {
-                return;
-            };
-            if state.queued_for_compilation
-                || state.current_tier >= CompilationTier::C2
-                || state.c2_bailout
-                || state.ineligible
-                || state.tier_fail_count >= MAX_TIER_FAIL_RETRIES
-            {
-                return;
-            }
-            // Hotness gate, off unless the operator set
-            // `CRATONVM_TIER_C2_THRESHOLD`. Every other door to C2 asks for
-            // `invocation_count >= c2_threshold`; this one asked for nothing,
-            // which is what made that knob inert for the path that produces
-            // nearly all C2 compiles. See the field for why the default stays
-            // ungated. A method held back here is not held back forever:
-            // `should_compile`'s own C2 arm admits it once it really is that hot.
-            let gate = self.c2_upgrade_min_invocations.load(Ordering::Relaxed);
-            if gate != 0 && state.invocation_count < gate {
-                return;
-            }
-            state.queued_for_compilation = true;
-            state.queued_tier = Some(CompilationTier::C2);
+            return;
         }
-        crate::profile::arm_branch_profiling_for_c2();
-        self.enqueue(CompilationTask {
-            method_key: key.clone(),
-            target_tier: CompilationTier::C2,
-            priority: CompilationPriority::Low,
-            enqueue_time_ms: 0,
-            osr_bci: None,
-        });
+        // Hotness gate, off unless the operator set
+        // `CRATONVM_TIER_C2_THRESHOLD`. Every other door to C2 asks for
+        // `invocation_count >= c2_threshold`; this one asked for nothing,
+        // which is what made that knob inert for the path that produces
+        // nearly all C2 compiles. See the field for why the default stays
+        // ungated. A method held back here is not held back forever:
+        // `should_compile`'s own C2 arm admits it once it really is that hot.
+        let gate = self.c2_upgrade_min_invocations.load(Ordering::Relaxed);
+        if gate != 0 && state.invocation_count < gate {
+            return;
+        }
+        self.open_branch_window(state);
+        self.admit(
+            state,
+            CompilationTask {
+                method_key: key.clone(),
+                target_tier: CompilationTier::C2,
+                priority: CompilationPriority::Low,
+                enqueue_time_ms: 0,
+                osr_bci: None,
+            },
+        );
     }
 
-    /// Pop the highest-priority task, or `None` if the queue is empty.
-    ///
-    /// Stamp-blind — see [`CompilationQueue::dequeue`]. Backs the manual
-    /// [`TieredCompilationManager::dequeue_compilation`] drain only; the
-    /// compile pipeline goes through [`Self::take_fresh`].
-    fn dequeue(&self) -> Option<CompilationTask> {
-        self.queue.lock().dequeue().map(|entry| entry.task)
+    /// Record that `key` finished a compile attempt at `tier`, charging wall
+    /// time to the C2 budget. The workers call [`Self::finish`] directly with
+    /// a CPU-time budget; this is the shape
+    /// [`TieredCompilationManager::compilation_complete`] and the tests use.
+    fn complete_task(
+        &self,
+        key: &MethodKey,
+        tier: CompilationTier,
+        compile_time_ms: u64,
+        success: bool,
+        osr: bool,
+        declined_permanently: bool,
+    ) {
+        let osr_bci = if osr {
+            self.methods.lock().get(key).and_then(|s| s.queued_osr_bci)
+        } else {
+            None
+        };
+        self.finish(
+            key,
+            Completion {
+                tier,
+                osr_bci,
+                osr,
+                compile_time_ms,
+                budget_ms: compile_time_ms,
+                success,
+                declined_permanently,
+            },
+        );
     }
 
-    /// Record that `key` finished a compile attempt at `tier`. Mirrors
-    /// [`TieredCompilationManager::compilation_complete`] but operates purely on
-    /// the shared core so the background worker needs no back-reference to the
-    /// (by-value, non-`Arc`) manager.
+    /// Record that `key` finished a compile attempt.
     ///
     /// `success` reports whether the attempt actually produced and published a
     /// compiled body (vs. `compile_fn` running but bailing internally — a
@@ -939,40 +1522,30 @@ impl CompilerCore {
     /// across 20,000 invocations). This is the mirror image of the
     /// `request_osr` decoupling introduced with the independent OSR cache:
     /// OSR requests are not suppressed by method-entry C2, and method-entry
-    /// tiering must not be suppressed by an OSR artifact. Queue flags and
-    /// fail counters still clear/advance normally so both pipelines share
+    /// tiering must not be suppressed by an OSR artifact. Slots and
+    /// fail counters still clear/advance normally, so both pipelines share
     /// the single in-flight slot.
-    fn complete_task(
-        &self,
-        key: &MethodKey,
-        tier: CompilationTier,
-        compile_time_ms: u64,
-        success: bool,
-        osr: bool,
-        declined_permanently: bool,
-    ) {
+    fn finish(&self, key: &MethodKey, c: Completion) {
         {
             let mut methods = self.methods.lock();
             if let Some(state) = methods.get_mut(key) {
-                if success {
-                    if !osr {
-                        state.current_tier = tier;
+                if c.success {
+                    if !c.osr {
+                        state.current_tier = c.tier;
                     }
                     state.tier_fail_count = 0;
-                } else if declined_permanently {
-                    // Policy verdict, not a compile failure: the skip list and
-                    // the OSR-denial set are pure functions of inputs that are
-                    // fixed once the method is loaded, so re-asking can only
-                    // produce the same answer. Record it once and stop; do NOT
+                } else if c.declined_permanently {
+                    // Policy verdict, not a compile failure: the skip list, the
+                    // OSR-denial set and a contained panic are verdicts that
+                    // re-asking cannot change. Record it once and stop; do NOT
                     // spend `tier_fail_count`, which exists to bound genuinely
                     // failing codegen. See `MethodState::ineligible`.
                     state.ineligible = true;
                 } else {
                     state.tier_fail_count = state.tier_fail_count.saturating_add(1);
                 }
-                state.queued_for_compilation = false;
-                state.queued_tier = None;
-                state.last_compile_time_ms = compile_time_ms;
+                self.release_slot_for(state, c.tier, c.osr_bci);
+                state.last_compile_time_ms = c.compile_time_ms;
                 // jit-inlining-and-ir-calls — tier-4 compile-time guard.
                 //
                 // The optimizing IR pipeline's admission rule was widened
@@ -984,40 +1557,39 @@ impl CompilerCore {
                 // and `ir::IR_MAX_GRAPH_NODES` bound the *static* inputs to a
                 // compile, but nothing bounded the OBSERVED cost.
                 //
-                // This closes that: a C2 compile that actually took longer than
-                // `MAX_C2_COMPILE_TIME_MS` is not re-attempted at C2 — the
-                // method degrades to C1 exactly as if it had deopted three
-                // times. Reusing `c2_bailout` rather than adding new state is
-                // deliberate: every existing degradation path already consults
-                // it (`should_compile`, `on_backedge`, `request_osr`,
+                // This closes that: a method whose C2 compiles keep costing more
+                // than `MAX_C2_COMPILE_TIME_MS` is not re-attempted at C2 and
+                // degrades to C1. Reusing `c2_bailout` rather than adding new
+                // state is deliberate: every existing degradation path already
+                // consults it (`should_compile`, `request_osr`,
                 // `request_c2_upgrade`), so the demotion is coherent with the
-                // deopt-driven one by construction, and the `c2_bailouts`
-                // statistic keeps counting the whole "stopped trying C2"
-                // population.
+                // trap-driven one by construction.
                 //
-                // Note this is measured on a compile that SUCCEEDED — a slow
-                // failure is already handled by `tier_fail_count`. A one-off
-                // slow compile on a contended host will demote a method that
-                // might have been fine; that is the intended conservative
-                // direction (C1 code is correct code, just less optimized).
-                if tier == CompilationTier::C2
-                    && compile_time_ms > MAX_C2_COMPILE_TIME_MS
+                // Only a compile that SUCCEEDED, at method entry, is charged. A
+                // slow failure is already bounded by `tier_fail_count` and
+                // charging it too punished a method twice for one attempt; an
+                // OSR compile builds a different artifact (a loop-entry body)
+                // and says nothing about what the method-entry compile costs.
+                // The budget is compile-thread CPU time where the platform
+                // reports it -- a descheduled worker is not a slow compile --
+                // and a method gets `C2_BUDGET_OVERRUNS_BEFORE_DEMOTION`
+                // overruns, not one, before it is demoted.
+                if c.success
+                    && !c.osr
+                    && c.tier == CompilationTier::C2
+                    && c.budget_ms > MAX_C2_COMPILE_TIME_MS
                     && !state.c2_bailout
                 {
-                    state.c2_bailout = true;
-                    self.stats.c2_bailouts.fetch_add(1, Ordering::Relaxed);
+                    state.c2_budget_overruns = state.c2_budget_overruns.saturating_add(1);
+                    if state.c2_budget_overruns >= C2_BUDGET_OVERRUNS_BEFORE_DEMOTION {
+                        state.c2_bailout = true;
+                        self.stats.c2_bailouts.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
-        // Close the branch-profile window for this nomination, on EVERY
-        // outcome and not only on success: a C2 task that failed, declined or
-        // was dropped still opened the window, and a nomination that opens
-        // without closing pins branch recording on for the life of the process.
-        if tier == CompilationTier::C2 {
-            crate::profile::disarm_branch_profiling_for_c2();
-        }
-        if success {
-            match tier {
+        if c.success {
+            match c.tier {
                 CompilationTier::C1 | CompilationTier::C1WithProfiling => {
                     self.stats.c1_compilations.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1029,7 +1601,7 @@ impl CompilerCore {
         }
         self.stats
             .total_compile_time_ms
-            .fetch_add(compile_time_ms, Ordering::Relaxed);
+            .fetch_add(c.compile_time_ms, Ordering::Relaxed);
         self.completed.fetch_add(1, Ordering::Release);
     }
 }
@@ -1041,7 +1613,7 @@ pub struct CompileOutcome {
     /// Wall-clock compile time in milliseconds.
     pub compile_time_ms: u64,
     /// `true` only if the attempt actually published a compiled body (see
-    /// [`CompilerCore::complete_task`] for why this must not be conflated
+    /// [`CompilerCore::finish`] for why this must not be conflated
     /// with "the task was processed").
     pub published: bool,
     /// C1→C2 supersede: the VM judged this method would take the optimizing
@@ -1095,10 +1667,10 @@ impl CompileOutcome {
     }
 }
 
-/// A compile callback invoked on the background thread for each drained task.
+/// A compile callback invoked on a worker thread for each drained task.
 /// The actual codegen is supplied by the VM at startup; `tiered.rs` only owns
-/// the scheduling.
-pub type CompileFn = Box<dyn Fn(&CompilationTask) -> CompileOutcome + Send + 'static>;
+/// the scheduling. `Sync` because every worker of both lanes shares one.
+pub type CompileFn = Box<dyn Fn(&CompilationTask) -> CompileOutcome + Send + Sync + 'static>;
 
 /// Whether a target tier should use the **optimized** (C2-equivalent) backend.
 ///
@@ -1120,49 +1692,70 @@ pub fn tier_uses_optimized_backend(tier: CompilationTier) -> bool {
     matches!(tier, CompilationTier::C2 | CompilationTier::FullProfile)
 }
 
-/// Handle to the spawned background compile thread.
+thread_local! {
+    /// Set on every compile worker thread.
+    ///
+    /// [`BackgroundCompiler::shutdown`] reads it so it never joins the thread
+    /// it is running on: a worker upgrades a `Weak<SharedVm>` per task, can end
+    /// up holding the last `Arc`, and then drops the VM -- and with it this
+    /// handle -- on the worker itself.
+    static ON_COMPILE_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Handle to one manager's compile workers.
 ///
 /// Dropping the handle (or calling [`BackgroundCompiler::shutdown`]) signals the
-/// worker to finish and joins it, so no compile thread outlives the VM.
+/// workers to finish and joins them, so no compile thread outlives its VM.
 pub struct BackgroundCompiler {
     core: Arc<CompilerCore>,
-    handle: Option<JoinHandle<()>>,
+    handles: Vec<JoinHandle<()>>,
 }
 
 impl BackgroundCompiler {
-    /// Request shutdown and join the worker thread.
+    /// Request shutdown and join the worker threads.
     pub fn shutdown(&mut self) {
-        // Set the shutdown flag while holding the queue lock the worker parks
-        // on. Without this, a lost-wakeup race deadlocks `join()`: the worker
-        // can load `shutdown == false` (under the queue lock), then this thread
-        // could store `true` + `notify_all` before the worker reaches
-        // `wake.wait()`, so the worker parks AFTER the notify and never wakes.
-        // Holding the lock here forces our store to land either while the worker
-        // is already parked (so `notify_all` wakes it) or before it re-checks
-        // the flag — `parking_lot::Condvar::wait` registers the waiter before
-        // releasing the lock, so no notification can be missed.
-        {
-            let _q = self.core.queue.lock();
-            self.core.shutdown.store(true, Ordering::Release);
+        // Store the flag, then take and release each lane's lock before
+        // notifying it. Without the lock a lost-wakeup race deadlocks `join()`:
+        // a worker can load `shutdown == false` (under its lane lock), this
+        // thread then stores `true` + `notify_all` before the worker reaches
+        // `wake.wait()`, and the worker parks AFTER the notify and never wakes.
+        // Acquiring the lane lock forces this thread to wait until such a
+        // worker has parked (`parking_lot::Condvar::wait` registers the waiter
+        // before releasing the lock), so the notify that follows reaches it; a
+        // worker that loads the flag after the store sees `true`.
+        self.core.shutdown.store(true, Ordering::Release);
+        for lane in &self.core.lanes {
+            drop(lane.queue.lock());
+            lane.wake.notify_all();
         }
-        self.core.wake.notify_all();
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
+        let on_worker = ON_COMPILE_WORKER.try_with(|w| w.get()).unwrap_or(false);
+        for handle in self.handles.drain(..) {
+            if on_worker {
+                // Detach instead: joining could wait on this very thread. The
+                // workers see the flag and exit on their own.
+                continue;
+            }
+            let _ = handle.join();
         }
         self.core.active.store(false, Ordering::Release);
         // Whatever was still queued is abandoned here. That is correct at
         // teardown, but it is still a set of compilation requests that will
         // never be serviced, so it is counted rather than left to be inferred
         // from a queue that simply stopped moving. A non-zero
-        // `queue_shutdown_abandoned` in the middle of a run says the worker
-        // was stopped with work outstanding, which is a different — and worse
+        // `queue_shutdown_abandoned` in the middle of a run says the workers
+        // were stopped with work outstanding, which is a different — and worse
         // — story than the same number at exit.
         //
         // Drained (not merely counted) so a restarted worker cannot resume
         // requests stamped at a pre-teardown epoch, and so the count and the
-        // queue can never disagree. Joined first: the worker owns the queue
+        // queue can never disagree. Joined first: the workers own the queues
         // until then.
-        let abandoned = self.core.queue.lock().drain_all();
+        let abandoned: Vec<CompilationTask> = self
+            .core
+            .lanes
+            .iter()
+            .flat_map(|lane| lane.queue.lock().drain_all())
+            .collect();
         if !abandoned.is_empty() {
             let stale: Vec<StaleRequest> = abandoned
                 .into_iter()
@@ -1184,21 +1777,12 @@ impl Drop for BackgroundCompiler {
     }
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// Process-global background compiler
-// ───────────────────────────────────────────────────────────────────────────────
-
-/// Holds the single process-wide [`BackgroundCompiler`] handle for its lifetime.
-///
-/// The interpreter's invocation hook runs on the mutator and only has a `&self`
-/// borrow of the by-value `SharedVm::tiered_manager`; it can't own the worker
-/// handle. We park the handle here so the worker keeps running (the handle is
-/// not dropped) and a single worker is started exactly once via [`Once`].
-static BACKGROUND_COMPILER: Mutex<Option<BackgroundCompiler>> = Mutex::new(None);
-static BACKGROUND_COMPILER_INIT: std::sync::Once = std::sync::Once::new();
-
-/// Diagnostic-only handle to the (singular, per-process) [`CompilerCore`] —
+/// Diagnostic-only handle to the FIRST [`CompilerCore`] this process built —
 /// see [`TieredCompilationManager::new`] and [`dump_method_stats_to_stderr`].
+///
+/// Not a scheduling input. Workers, queues and verdicts all live on the
+/// manager, so a second VM in the process is fully functional; it is merely
+/// absent from this one exit-time dump.
 static DIAG_CORE: std::sync::OnceLock<Arc<CompilerCore>> = std::sync::OnceLock::new();
 /// Diagnostic-only snapshot of the active policy's `c1_threshold`, captured
 /// at [`TieredCompilationManager::new`] — used by
@@ -1703,31 +2287,22 @@ pub fn dump_method_stats_to_stderr() {
     }
 }
 
-/// Idempotently start the background compile thread for `mgr`.
+/// Idempotently start `mgr`'s background compile workers.
 ///
-/// Safe to call on every interpreter invocation hook — the spawn happens at most
-/// once (guarded by [`Once`]). `compile_fn` performs the actual codegen for a
-/// drained task off the mutator thread; for increment 1 the VM passes a
-/// drain-only closure (real codegen wiring lands when the VM-init path can be
-/// touched). The worker handle is parked in a process-global so it lives for the
-/// VM's lifetime; the OS reclaims the thread at process exit.
+/// Safe to call on every interpreter invocation hook: once the manager's
+/// workers are running this is one atomic load. `make_compile_fn` builds the
+/// codegen callback all of them share.
+///
+/// The worker handle lives on the manager, so each VM in a process gets its
+/// own workers and dropping the manager joins them. It used to be a
+/// process-wide `Once` plus a global handle slot tied to whichever manager
+/// asked first: a second VM in the same process enqueued into a queue no
+/// worker ever drained.
 pub fn ensure_background_compiler<F>(mgr: &TieredCompilationManager, make_compile_fn: F)
 where
     F: FnOnce() -> CompileFn,
 {
-    BACKGROUND_COMPILER_INIT.call_once(|| {
-        if let Some(handle) = mgr.start_background_compiler(make_compile_fn()) {
-            *BACKGROUND_COMPILER.lock() = Some(handle);
-        }
-    });
-}
-
-/// Stop the process-global background compiler (drains+joins). Mainly for tests
-/// and orderly shutdown; production relies on process exit.
-pub fn shutdown_background_compiler() {
-    if let Some(mut handle) = BACKGROUND_COMPILER.lock().take() {
-        handle.shutdown();
-    }
+    mgr.ensure_background_compiler(make_compile_fn);
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -1740,7 +2315,11 @@ pub struct CompilationStats {
     pub c1_compilations: AtomicU64,
     pub c2_compilations: AtomicU64,
     pub osr_compilations: AtomicU64,
+    /// Every deoptimization reported, soft or counted.
     pub deoptimizations: AtomicU64,
+    /// Of `deoptimizations`, the ones not charged as traps — see
+    /// [`deopt_is_counted_trap`].
+    pub soft_deoptimizations: AtomicU64,
     pub c2_bailouts: AtomicU64,
     pub total_compile_time_ms: AtomicU64,
 }
@@ -1751,21 +2330,24 @@ pub struct CompilationStats {
 
 /// Central coordinator for tiered compilation decisions.
 pub struct TieredCompilationManager {
-    /// Per-method state + queue + stats + wake/shutdown flags, shared with the
-    /// background compile thread (which holds an `Arc<CompilerCore>`).
+    /// Per-method state, the compile lanes, stats and flags, shared with the
+    /// compile workers (which hold an `Arc<CompilerCore>`).
     core: Arc<CompilerCore>,
     /// Compilation policy.
     policy: Mutex<CompilationPolicy>,
+    /// This manager's running workers, when started through
+    /// [`Self::ensure_background_compiler`]. Dropped with the manager, which
+    /// signals shutdown and joins them.
+    background: Mutex<Option<BackgroundCompiler>>,
 }
 
-/// Maximum number of deoptimizations before bailing out of C2.
-const MAX_DEOPTS_BEFORE_BAILOUT: u32 = 3;
-
-/// Wall-clock budget for a single C2 (optimizing IR) compile, in milliseconds.
+/// Compile-thread CPU budget for a single C2 (optimizing IR) compile, in
+/// milliseconds.
 ///
-/// A successful C2 compile that exceeds this demotes the method to C1 for the
-/// rest of the process, via the same `c2_bailout` flag the 3-deopt rule uses.
-/// See the guard in `CompilerCore::complete_task` for the full rationale.
+/// A method whose successful method-entry C2 compiles exceed this
+/// [`C2_BUDGET_OVERRUNS_BEFORE_DEMOTION`] times is demoted to C1 for the rest
+/// of the process, via the same `c2_bailout` flag the trap limits use. See the
+/// guard in `CompilerCore::finish` for the full rationale.
 ///
 /// 250 ms is roughly two orders of magnitude above a typical C2 compile in this
 /// JIT (single-digit milliseconds for the arithmetic kernels that historically
@@ -1774,8 +2356,12 @@ const MAX_DEOPTS_BEFORE_BAILOUT: u32 = 3;
 /// `ir::IR_MAX_GRAPH_NODES`, not to tune throughput.
 pub const MAX_C2_COMPILE_TIME_MS: u64 = 250;
 
-/// Maximum number of receiver types tracked per call site.
-const MAX_RECEIVER_TYPES: usize = 3;
+/// Over-budget C2 compiles a method is allowed before it is demoted.
+///
+/// One is not evidence. A single overrun is as likely to be a cold code cache,
+/// a first-time class-hierarchy walk or a page-fault storm as a pathological
+/// method, and the demotion it triggers lasts the whole process.
+pub const C2_BUDGET_OVERRUNS_BEFORE_DEMOTION: u32 = 2;
 
 impl TieredCompilationManager {
     /// Create a new manager with the given policy.
@@ -1807,11 +2393,8 @@ impl TieredCompilationManager {
         let core = Arc::new(CompilerCore::with_install_epoch_source(
             install_epoch_source,
         ));
-        // Diagnostic-only: the VM constructs exactly one manager per process
-        // (this is an embedded single-JVM-per-process binary, not a
-        // multi-tenant host), so a "last one registered" global handle is
-        // safe here purely for `dump_method_stats_to_stderr`'s exit-time
-        // introspection — see that function's doc comment.
+        // Diagnostic-only: the first manager in the process is the one
+        // `dump_method_stats_to_stderr` reports. See `DIAG_CORE`.
         let _ = DIAG_CORE.set(core.clone());
         DIAG_C1_THRESHOLD.store(policy.c1_threshold as u64, Ordering::Relaxed);
         core.c2_upgrade_min_invocations
@@ -1819,40 +2402,97 @@ impl TieredCompilationManager {
         Self {
             core,
             policy: Mutex::new(policy),
+            background: Mutex::new(None),
         }
     }
 
     /// Remove queued and historical tiering state for an unloaded class.
     ///
-    /// Called from the VM's class-unload path (`vm/src/memory/gc.rs`). The
-    /// queued requests it removes are counted as drops — they are compilation
-    /// requests that will never be serviced, and "the class went away" is a
-    /// perfectly good reason that is still worth being able to see. It is also
-    /// the one drop reason that is genuinely final: unlike a stale-epoch drop,
-    /// there is no next invocation to re-admit the method.
-    pub fn invalidate_class(&self, class_name: &str) {
-        self.core
-            .methods
-            .lock()
-            .retain(|key, _| key.class_name != class_name);
+    /// Called from the VM's class-unload path (`vm/src/memory/gc.rs`) with the
+    /// class's identity, so unloading one loader's `com/example/Foo` leaves
+    /// another loader's alone. The queued requests it removes are counted as
+    /// drops — they are compilation requests that will never be serviced, and
+    /// "the class went away" is a perfectly good reason that is still worth
+    /// being able to see. It is also the one drop reason that is genuinely
+    /// final: unlike a stale-epoch drop, there is no next invocation to
+    /// re-admit the method.
+    ///
+    /// Also forgets the class's OSR denials, and closes the branch-profile
+    /// window of any removed method whose C2 nomination was still outstanding.
+    pub fn invalidate_class(&self, class_id: ClassId, class_name: &str) {
+        let mut windows_to_close = 0u32;
         let dropped = {
-            let mut queue = self.core.queue.lock();
-            let before = queue.len();
-            queue
-                .high
-                .retain(|entry| entry.task.method_key.class_name != class_name);
-            queue
-                .normal
-                .retain(|entry| entry.task.method_key.class_name != class_name);
-            queue
-                .low
-                .retain(|entry| entry.task.method_key.class_name != class_name);
-            (before - queue.len()) as u64
+            let mut methods = self.core.methods.lock();
+            methods.retain(|key, state| {
+                if !key.belongs_to(class_id, class_name) {
+                    return true;
+                }
+                windows_to_close += u32::from(state.branch_window_armed);
+                false
+            });
+            // Under the same `methods` guard, in the established `methods` →
+            // `queue` order, so no invocation hook can re-admit one of these
+            // methods between the two removals.
+            self.core
+                .lanes
+                .iter()
+                .map(|lane| {
+                    lane.queue
+                        .lock()
+                        .remove_matching(|task| task.method_key.belongs_to(class_id, class_name))
+                        .len() as u64
+                })
+                .sum::<u64>()
         };
+        self.core
+            .osr_denied
+            .write()
+            .retain(|key, _| !key.belongs_to(class_id, class_name));
+        for _ in 0..windows_to_close {
+            self.core.close_branch_window();
+        }
         if dropped > 0 {
             crate::metrics::record_scheduling_events(crate::metrics::SCHEDULING_EVENTS[1], dropped);
             self.core.dropped.fetch_add(dropped, Ordering::Release);
         }
+        self.core.bump_settled_generation();
+    }
+
+    /// Forget the verdicts recorded against a class whose bytecode was just
+    /// replaced — a JVMTI redefine or retransform, or a `defineClass` over an
+    /// already-loaded name.
+    ///
+    /// `ineligible`, `tier_fail_count`, `c2_bailout`, the trap counts and any
+    /// OSR denial were all learned from the OLD bytecode, and none of them is
+    /// evidence about the new one. The method keeps its invocation count, so
+    /// it re-admits at its next stride instead of re-warming from zero. Queued
+    /// requests are left to the install-epoch gate, which the redefinition has
+    /// already moved.
+    ///
+    /// Keyed by name, for every loader: the call sites that know a class was
+    /// replaced have the name in hand, and resetting a same-named class in
+    /// another loader costs at most a recompile.
+    pub fn on_class_redefined(&self, class_name: &str) {
+        {
+            let mut methods = self.core.methods.lock();
+            for (key, state) in methods.iter_mut() {
+                if &*key.class_name != class_name {
+                    continue;
+                }
+                state.current_tier = CompilationTier::Interpreter;
+                state.tier_fail_count = 0;
+                state.ineligible = false;
+                state.c2_bailout = false;
+                state.c2_budget_overruns = 0;
+                state.deopt_count = 0;
+                state.trap_counts.clear();
+            }
+        }
+        self.core
+            .osr_denied
+            .write()
+            .retain(|key, _| &*key.class_name != class_name);
+        self.core.bump_settled_generation();
     }
 
     /// Create a new manager with the default policy.
@@ -1868,7 +2508,7 @@ impl TieredCompilationManager {
         Self::new(CompilationPolicy::from_env())
     }
 
-    // ── Invocation / back-edge hooks ─────────────────────────────────────
+    // ── Invocation hooks ─────────────────────────────────────────────────
 
     /// Called on each method invocation from the interpreter.
     /// Increments the counter and checks if compilation should be triggered.
@@ -1884,10 +2524,10 @@ impl TieredCompilationManager {
     /// consults the tiered manager only at stride boundaries (the
     /// `JIT_RETRY_STRIDE = 64` schedule past the warmup threshold). With the
     /// plain `+= 1` counting, the manager's view of "hotness" was therefore
-    /// 64x DEFLATED: a method needed `c1_threshold (200) × 64 ≈ 12,800` real
-    /// invocations past warmup before the manager recommended its first C1
-    /// compile (observed live: `tiered-enqueue … invoc_count=13236` for a
-    /// `CRATONVM_JIT_THRESHOLD=500` run). Passing the interpreter's real
+    /// 64x DEFLATED: a method needed `c1_threshold × 64` real invocations past
+    /// warmup before the manager recommended its first C1 compile (observed
+    /// live, when `c1_threshold` was 200: `tiered-enqueue … invoc_count=13236`
+    /// for a `CRATONVM_JIT_THRESHOLD=500` run). Passing the interpreter's real
     /// per-method count lets the recommendation fire at the intended
     /// thresholds. `observed_count == 0` (or a stale/smaller value) degrades
     /// to the historical `+= 1` behaviour.
@@ -1896,30 +2536,65 @@ impl TieredCompilationManager {
         key: &MethodKey,
         observed_count: u64,
     ) -> Option<CompilationTier> {
+        self.on_method_invocation_settling(key, observed_count)
+            .recommended
+    }
+
+    /// [`Self::on_method_invocation_observed`], also reporting whether the
+    /// method's tiering is settled — see [`InvocationVerdict`].
+    ///
+    /// This is the door the interpreter's hooks use. A method that will never
+    /// compile used to take this global mutex and build a key at every stride
+    /// for the life of the process; the settled stamp lets the call site stop
+    /// asking until something changes.
+    pub fn on_method_invocation_settling(
+        &self,
+        key: &MethodKey,
+        observed_count: u64,
+    ) -> InvocationVerdict {
+        // Read BEFORE deciding, so a concurrent bump (a deopt landing while
+        // this runs) expires the stamp this call hands out.
+        let generation = self.core.settled_generation.load(Ordering::Acquire);
         let mut methods = self.core.methods.lock();
         let state = methods
             .entry(key.clone())
             .or_insert_with(|| MethodState::new(key.clone()));
-        state.invocation_count += 1;
-        state.profile.profiled_invocations += 1;
+        state.invocation_count = state.invocation_count.saturating_add(1);
         if observed_count > state.invocation_count {
             state.invocation_count = observed_count;
         }
 
         if state.queued_for_compilation {
-            return None;
+            return InvocationVerdict {
+                recommended: None,
+                settled_generation: 0,
+            };
         }
 
         let policy = self.policy.lock();
         if !policy.tiered_enabled {
-            return None;
+            // Settled until `set_policy` moves the generation.
+            return InvocationVerdict {
+                recommended: None,
+                settled_generation: generation,
+            };
         }
 
-        self.should_compile_inner(state, &policy)
+        let recommended = self.should_compile_inner(state, &policy);
+        let settled = recommended.is_none() && state.tiering_is_settled();
+        InvocationVerdict {
+            recommended,
+            settled_generation: if settled { generation } else { 0 },
+        }
     }
 
-    /// Called on each back-edge (loop iteration) from the interpreter.
-    /// May trigger OSR compilation.
+    /// Whether a stamp from [`InvocationVerdict::settled_generation`] still
+    /// holds. One atomic load; `0` is never settled.
+    #[inline]
+    pub fn tiering_settled(&self, stamp: u32) -> bool {
+        stamp != 0 && stamp == self.core.settled_generation.load(Ordering::Acquire)
+    }
+
     /// Ask for the ONE extra optimizing attempt a method is owed after its IR
     /// build bailed on a `new` whose class had not loaded yet.
     ///
@@ -1936,69 +2611,21 @@ impl TieredCompilationManager {
         self.core.request_deferred_new_retry(key);
     }
 
-    pub fn on_backedge(&self, key: &MethodKey, bci: u32) -> Option<CompilationTask> {
-        if is_osr_denied(key) {
-            return None;
-        }
-        let mut methods = self.core.methods.lock();
-        let state = methods
-            .entry(key.clone())
-            .or_insert_with(|| MethodState::new(key.clone()));
-        state.backedge_count += 1;
-
-        let policy = self.policy.lock();
-        if !policy.tiered_enabled {
-            return None;
-        }
-
-        if state.backedge_count >= policy.osr_threshold as u64
-            && !state.queued_for_compilation
-            && state.current_tier < CompilationTier::C2
-            && !state.c2_bailout
-        {
-            let target_tier = if state.c2_bailout {
-                CompilationTier::C1
-            } else {
-                CompilationTier::C2
-            };
-
-            state.queued_for_compilation = true;
-            state.queued_tier = Some(target_tier);
-
-            let task = CompilationTask {
-                method_key: key.clone(),
-                target_tier,
-                priority: CompilationPriority::High,
-                enqueue_time_ms: 0,
-                osr_bci: Some(bci),
-            };
-
-            self.core.enqueue(task.clone());
-            self.core
-                .stats
-                .osr_compilations
-                .fetch_add(1, Ordering::Relaxed);
-            return Some(task);
-        }
-        None
-    }
-
     /// wire-tiered-manager Step 5 (precise background OSR): request an OSR
     /// compilation for a method whose loop the *caller* has already judged hot.
     ///
-    /// Unlike [`on_backedge`], which counts every back-edge and only enqueues
-    /// once its `osr_threshold` is crossed, this enqueues **immediately** — the
-    /// interpreter's per-frame back-edge schedule (`Frame::should_try_osr`) is
-    /// the throttle, so calling `on_backedge` per iteration just to reach the
-    /// count threshold would both pay a lock per back-edge and double-count.
-    /// It is idempotent: a no-op (returns `None`) if the method is already
-    /// queued or has bailed out of C2. Method-entry C2 does not suppress this
-    /// request because OSR bodies live in an independent cache. The enqueued task
+    /// This enqueues **immediately** — the interpreter's per-frame back-edge
+    /// schedule (`Frame::should_try_osr`) is the throttle. (A counting
+    /// `on_backedge` twin that fired at `policy.osr_threshold` existed beside
+    /// this with no production caller and an unreachable branch; it was
+    /// deleted.) It is idempotent: a no-op (returns `None`) if the method is
+    /// already queued, has bailed out of C2, or its OSR is denied at the
+    /// current install epoch. Method-entry C2 does not suppress this request
+    /// because OSR bodies live in an independent cache. The enqueued task
     /// carries `osr_bci` so the background worker compiles an OSR-enterable
-    /// artifact; the mutator enters it once published. (Threshold tuning of
-    /// when a loop counts as "hot enough" is Step 6.)
+    /// artifact; the mutator enters it once published.
     pub fn request_osr(&self, key: &MethodKey, bci: u32) -> Option<CompilationTask> {
-        if is_osr_denied(key) {
+        if self.core.is_osr_denied(key) {
             return None;
         }
         let mut methods = self.core.methods.lock();
@@ -2017,32 +2644,32 @@ impl TieredCompilationManager {
             // `should_compile`/`request_c2_upgrade`: without this, a method
             // whose OSR artifact compile keeps returning `published=false`
             // (e.g. an uninlinable callee) has `current_tier` permanently
-            // stuck below C2 and `queued_for_compilation` cleared by
-            // `complete_task` after each failure — so the very next hot
-            // back-edge re-enqueues an OSR task, forever, with no
-            // diagnostic. This is the OSR-request twin of the plain
-            // background-compile bail-listing gap (see the `try_compile`
-            // ldc/ldc2_w fix): observed as a silent hang where the same
-            // method (`TestResponsePerformance.doHomebrew`) kept getting
-            // "bg-compile ... osr_bci=..." re-attempted every stride while
-            // never completing even one 1M-iteration measurement pass.
+            // stuck below C2 and its slot released by `finish` after each
+            // failure — so the very next hot back-edge re-enqueues an OSR
+            // task, forever, with no diagnostic. This is the OSR-request twin
+            // of the plain background-compile bail-listing gap (see the
+            // `try_compile` ldc/ldc2_w fix): observed as a silent hang where
+            // the same method (`TestResponsePerformance.doHomebrew`) kept
+            // getting "bg-compile ... osr_bci=..." re-attempted every stride
+            // while never completing even one 1M-iteration measurement pass.
+            // A TRANSIENT OSR compile failure is retried through exactly this
+            // budget rather than denied outright.
             || state.ineligible
             || state.tier_fail_count >= MAX_TIER_FAIL_RETRIES
         {
             return None;
         }
 
-        let target_tier = CompilationTier::C2;
-        state.queued_for_compilation = true;
-        state.queued_tier = Some(target_tier);
         let task = CompilationTask {
             method_key: key.clone(),
-            target_tier,
+            target_tier: CompilationTier::C2,
             priority: CompilationPriority::High,
             enqueue_time_ms: 0,
             osr_bci: Some(bci),
         };
-        self.core.enqueue(task.clone());
+        if !self.core.admit(state, task.clone()) {
+            return None;
+        }
         self.core
             .stats
             .osr_compilations
@@ -2050,99 +2677,58 @@ impl TieredCompilationManager {
         Some(task)
     }
 
-    // ── Profile recording ────────────────────────────────────────────────
-
-    /// Record a branch outcome for profiling.
-    pub fn record_branch(&self, key: &MethodKey, bci: u32, taken: bool) {
-        let mut methods = self.core.methods.lock();
-        let state = methods
-            .entry(key.clone())
-            .or_insert_with(|| MethodState::new(key.clone()));
-        let bp = state.profile.branch_counts.entry(bci).or_default();
-        if taken {
-            bp.taken += 1;
-        } else {
-            bp.not_taken += 1;
-        }
+    /// Whether OSR is denied for this method at the current install epoch.
+    ///
+    /// A denial is a verdict about the code that was loaded when it was made,
+    /// so it expires when the JIT install epoch moves (a redefinition or a
+    /// code-cache flush) and is forgotten outright by [`Self::on_class_redefined`]
+    /// and [`Self::invalidate_class`]. Before this it was a process-global,
+    /// name-keyed set that one failed background compile populated for good.
+    ///
+    /// History, because it explains why nothing is denied statically any
+    /// more: `java/util/DualPivotQuicksort.sort` was denied here for one day
+    /// (05f6930e) as a mitigation for a garbage-index corruption whose real
+    /// cause (a8c5825d, the IR lowerer's unallocated-slot miscompile) was found
+    /// the same day; with that fixed the deny was pure cost on a per-back-edge
+    /// path and was removed. Only the dynamic, per-manager denials remain.
+    pub fn is_osr_denied(&self, key: &MethodKey) -> bool {
+        self.core.is_osr_denied(key)
     }
 
-    /// Record a receiver type at a call site.
-    pub fn record_receiver(&self, key: &MethodKey, bci: u32, class_id: u32) {
-        let mut methods = self.core.methods.lock();
-        let state = methods
-            .entry(key.clone())
-            .or_insert_with(|| MethodState::new(key.clone()));
-        let rp = state.profile.receiver_profiles.entry(bci).or_default();
-        rp.total_calls += 1;
-
-        // Update or insert the class_id, keeping at most MAX_RECEIVER_TYPES.
-        if let Some(entry) = rp.receivers.iter_mut().find(|(id, _)| *id == class_id) {
-            entry.1 += 1;
-        } else if rp.receivers.len() < MAX_RECEIVER_TYPES {
-            rp.receivers.push((class_id, 1));
-        } else {
-            // Replace the least-frequent entry if the new class_id is hotter.
-            if let Some(min_entry) = rp.receivers.iter_mut().min_by_key(|(_, c)| *c) {
-                if min_entry.1 < 1 {
-                    *min_entry = (class_id, 1);
-                }
-            }
-        }
+    /// Deny OSR for this method until the install epoch moves. Reserve it for
+    /// verdicts the current bytecode cannot change; a transient failure should
+    /// be reported as a failed compile, which is retried.
+    pub fn mark_osr_denied(&self, key: MethodKey) {
+        self.core.mark_osr_denied(key);
     }
 
-    /// Record a type check result (checkcast/instanceof).
-    pub fn record_type_check(&self, key: &MethodKey, bci: u32, class_id: u32) {
-        let mut methods = self.core.methods.lock();
-        let state = methods
-            .entry(key.clone())
-            .or_insert_with(|| MethodState::new(key.clone()));
-        let tp = state.profile.type_profiles.entry(bci).or_default();
-        tp.total_checks += 1;
-
-        if let Some(entry) = tp.types.iter_mut().find(|(id, _)| *id == class_id) {
-            entry.1 += 1;
-        } else {
-            tp.types.push((class_id, 1));
-        }
-    }
-
-    /// Record a null check result.
-    pub fn record_null_check(&self, key: &MethodKey, bci: u32, was_null: bool) {
-        let mut methods = self.core.methods.lock();
-        let state = methods
-            .entry(key.clone())
-            .or_insert_with(|| MethodState::new(key.clone()));
-        let np = state.profile.null_profiles.entry(bci).or_default();
-        if was_null {
-            np.null_seen += 1;
-        } else {
-            np.non_null_seen += 1;
-        }
+    /// Drop every OSR denial this manager holds.
+    pub fn clear_osr_denials(&self) {
+        self.core.osr_denied.write().clear();
     }
 
     // ── Compilation queue ────────────────────────────────────────────────
 
-    /// Enqueue a compilation task.
-    pub fn enqueue_compilation(&self, task: CompilationTask) {
+    /// Enqueue a compilation task. Returns whether it was queued: a method that
+    /// already holds the in-flight slot is refused (see `CompilerCore::admit`).
+    pub fn enqueue_compilation(&self, task: CompilationTask) -> bool {
         let mut methods = self.core.methods.lock();
         let state = methods
             .entry(task.method_key.clone())
             .or_insert_with(|| MethodState::new(task.method_key.clone()));
-        state.queued_for_compilation = true;
-        state.queued_tier = Some(task.target_tier);
-        drop(methods);
-        self.core.enqueue(task);
+        self.core.admit(state, task)
     }
 
-    /// Dequeue the next compilation task (highest priority first).
+    /// Dequeue the next compilation task (highest priority first, across both
+    /// lanes), ignoring install-epoch stamps.
     pub fn dequeue_compilation(&self) -> Option<CompilationTask> {
-        self.core.dequeue()
+        self.core.pop_across_lanes(None, &mut Vec::new())
     }
 
     /// Notify that compilation completed successfully at `tier`. A thin
-    /// synchronous wrapper over [`CompilerCore::complete_task`] (always
+    /// synchronous wrapper over `CompilerCore::complete_task` (always
     /// reports `success = true` — this API has no failure-reporting caller
-    /// today; production code goes through the background worker's
+    /// today; production code goes through the background workers'
     /// `compiler_loop`, which threads a real success/failure bool through).
     pub fn compilation_complete(
         &self,
@@ -2156,35 +2742,115 @@ impl TieredCompilationManager {
 
     // ── Deoptimization ───────────────────────────────────────────────────
 
-    /// Notify that deoptimization occurred for the given method.
-    pub fn on_deoptimization(&self, key: &MethodKey) {
-        let mut methods = self.core.methods.lock();
-        if let Some(state) = methods.get_mut(key) {
-            state.deopt_count += 1;
-            state.current_tier = CompilationTier::Interpreter;
-            state.queued_for_compilation = false;
-            state.queued_tier = None;
-
-            if state.deopt_count >= MAX_DEOPTS_BEFORE_BAILOUT {
-                state.c2_bailout = true;
-                self.core.stats.c2_bailouts.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+    /// Record a deoptimization of `key` at `bci`, with the action the deopt log
+    /// recommended for it.
+    ///
+    /// HotSpot-style trap accounting:
+    ///
+    ///  * Every deopt is counted in `stats.deoptimizations`.
+    ///  * A deopt that evicted the method-entry body
+    ///    ([`deopt_evicts_method_body`]) drops `current_tier` to the
+    ///    interpreter, because nothing is compiled any more.
+    ///  * Only a counted trap ([`deopt_is_counted_trap`]) is charged to the
+    ///    method. It drops any request still queued for it — formed against
+    ///    the profile that just proved wrong, and leaving it queued is how a
+    ///    second request got admitted beside it — and the method stops being
+    ///    offered to C2 once one `(reason, bci)` reaches
+    ///    [`PER_BCI_TRAP_LIMIT`] or the whole method reaches
+    ///    [`PER_METHOD_TRAP_CUTOFF`]. Both counts halve over time
+    ///    ([`TRAP_DECAY_INVOCATIONS`], [`TRAP_DECAY_MS`]), so a burst early
+    ///    in a long run does not ban the method for the rest of it.
+    ///  * `MakeNotCompilable` also records the method as ineligible: the VM
+    ///    has just put it on its skip list.
+    ///
+    /// Every deopt used to be charged, whatever its action, and three of them
+    /// set `c2_bailout` for good — which also blocks `request_osr`. Soft OSR
+    /// loop exits alone were enough to take a hot loop's OSR away.
+    pub fn on_deoptimization(
+        &self,
+        key: &MethodKey,
+        reason: DeoptReason,
+        bci: u32,
+        action: DeoptAction,
+    ) {
         self.core
             .stats
             .deoptimizations
             .fetch_add(1, Ordering::Relaxed);
+        let counted = deopt_is_counted_trap(reason, action);
+        let evicted = deopt_evicts_method_body(reason, action);
+        if !counted {
+            self.core
+                .stats
+                .soft_deoptimizations
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if !counted && !evicted {
+            return;
+        }
+        let now_ms = process_uptime_ms();
+        let mut dropped = 0u64;
+        {
+            let mut methods = self.core.methods.lock();
+            if let Some(state) = methods.get_mut(key) {
+                if evicted {
+                    state.current_tier = CompilationTier::Interpreter;
+                }
+                if counted {
+                    decay_traps(state, now_ms);
+                    let at_site = {
+                        let n = state.trap_counts.entry((reason, bci)).or_insert(0);
+                        *n = n.saturating_add(1);
+                        *n
+                    };
+                    state.deopt_count = state.deopt_count.saturating_add(1);
+                    let removed = self.core.remove_queued_for(key);
+                    for task in &removed {
+                        self.core
+                            .release_slot_for(state, task.target_tier, task.osr_bci);
+                    }
+                    dropped = removed.len() as u64;
+                    if action == DeoptAction::MakeNotCompilable {
+                        state.ineligible = true;
+                    }
+                    if (at_site >= PER_BCI_TRAP_LIMIT || state.deopt_count >= PER_METHOD_TRAP_CUTOFF)
+                        && !state.c2_bailout
+                    {
+                        state.c2_bailout = true;
+                        self.core.stats.c2_bailouts.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        if dropped > 0 {
+            crate::metrics::record_scheduling_events(crate::metrics::SCHEDULING_EVENTS[5], dropped);
+            self.core.dropped.fetch_add(dropped, Ordering::Release);
+        }
+        self.core.bump_settled_generation();
     }
 
     /// Notify that C2 compilation bailed out (method too complex, etc.).
+    /// Drops any request still queued for the method, as a counted trap does.
     pub fn on_c2_bailout(&self, key: &MethodKey) {
-        let mut methods = self.core.methods.lock();
-        if let Some(state) = methods.get_mut(key) {
-            state.c2_bailout = true;
-            state.queued_for_compilation = false;
-            state.queued_tier = None;
+        let mut dropped = 0u64;
+        {
+            let mut methods = self.core.methods.lock();
+            if let Some(state) = methods.get_mut(key) {
+                state.c2_bailout = true;
+                let removed = self.core.remove_queued_for(key);
+                for task in &removed {
+                    self.core
+                        .release_slot_for(state, task.target_tier, task.osr_bci);
+                }
+                dropped = removed.len() as u64;
+            }
+        }
+        if dropped > 0 {
+            crate::metrics::record_scheduling_events(crate::metrics::SCHEDULING_EVENTS[5], dropped);
+            self.core.dropped.fetch_add(dropped, Ordering::Release);
         }
         self.core.stats.c2_bailouts.fetch_add(1, Ordering::Relaxed);
+        self.core.bump_settled_generation();
     }
 
     // ── Queries ──────────────────────────────────────────────────────────
@@ -2197,11 +2863,6 @@ impl TieredCompilationManager {
             .get(key)
             .map(|s| s.current_tier)
             .unwrap_or(CompilationTier::Interpreter)
-    }
-
-    /// Get a clone of the profile data for a method.
-    pub fn get_profile(&self, key: &MethodKey) -> Option<MethodProfile> {
-        self.core.methods.lock().get(key).map(|s| s.profile.clone())
     }
 
     /// Get compilation statistics.
@@ -2222,28 +2883,30 @@ impl TieredCompilationManager {
         }
     }
 
-    /// Update the compilation policy.
+    /// Update the compilation policy. Expires every settled stamp, since a new
+    /// threshold or a re-enabled tiering can unsettle any method.
     pub fn set_policy(&self, policy: CompilationPolicy) {
         self.core
             .c2_upgrade_min_invocations
             .store(c2_upgrade_gate(&policy), Ordering::Relaxed);
         *self.policy.lock() = policy;
+        self.core.bump_settled_generation();
     }
 
-    /// Check if the compilation queue is empty.
+    /// Check if both compilation queues are empty.
     pub fn queue_empty(&self) -> bool {
-        self.core.queue.lock().is_empty()
+        self.core.queue_len() == 0
     }
 
-    /// Get the number of tasks in the compilation queue.
+    /// Get the number of tasks queued across both lanes.
     pub fn queue_size(&self) -> usize {
-        self.core.queue.lock().len()
+        self.core.queue_len()
     }
 
     /// Pop the next request that is still current at the install epoch,
     /// dropping (and retiring) any stale ones ahead of it.
     ///
-    /// This is the dispatch API the background worker uses. Exposed so the
+    /// The same rule the workers apply, across both lanes. Exposed so the
     /// dispatch rule can be exercised — and asserted on — without a thread, a
     /// backend, or a clock: enqueue, bump the epoch, call this, read
     /// [`Self::dropped_requests`].
@@ -2251,7 +2914,11 @@ impl TieredCompilationManager {
     /// `None` means nothing fresh was queued. It does **not** mean nothing was
     /// there: stale entries ahead of an empty tail are consumed and counted.
     pub fn next_fresh_task(&self) -> Option<CompilationTask> {
-        self.core.take_fresh()
+        let mut stale: Vec<StaleRequest> = Vec::new();
+        let current = self.core.current_install_epoch();
+        let task = self.core.pop_across_lanes(Some(current), &mut stale);
+        self.core.retire_stale(&stale);
+        task
     }
 
     /// The install epoch this manager currently considers current.
@@ -2264,7 +2931,7 @@ impl TieredCompilationManager {
         self.core.current_install_epoch()
     }
 
-    /// Install epoch of the compile running right now, or `0` when idle.
+    /// Install epoch of a compile running right now, or `0` when idle.
     pub fn inflight_install_epoch(&self) -> u64 {
         self.core.inflight_epoch.load(Ordering::Acquire)
     }
@@ -2280,6 +2947,23 @@ impl TieredCompilationManager {
         self.core.dropped.load(Ordering::Acquire)
     }
 
+    /// Requests refused because their method already held the in-flight slot.
+    pub fn deduplicated_requests(&self) -> u64 {
+        self.core.deduplicated.load(Ordering::Acquire)
+    }
+
+    /// Compiles whose callback panicked and was contained.
+    pub fn worker_panics(&self) -> u64 {
+        self.core.worker_panics.load(Ordering::Acquire)
+    }
+
+    /// Branch-profile windows this manager opened minus those it closed. Zero
+    /// whenever no C2 nomination is outstanding; anything else left at exit is
+    /// a window pinned open.
+    pub fn branch_window_balance(&self) -> i64 {
+        self.core.branch_window_balance.load(Ordering::Acquire)
+    }
+
     /// Get all method states: (key, current_tier, invocation_count).
     pub fn method_states(&self) -> Vec<(MethodKey, CompilationTier, u64)> {
         self.core
@@ -2290,7 +2974,7 @@ impl TieredCompilationManager {
             .collect()
     }
 
-    /// Whether the background compiler is active.
+    /// Whether this manager's compile workers are running.
     pub fn compiler_active(&self) -> bool {
         self.core.active.load(Ordering::Relaxed)
     }
@@ -2298,33 +2982,61 @@ impl TieredCompilationManager {
     /// Set whether the background compiler is active.
     ///
     /// Retained for compatibility / tests that only assert the flag. The real
-    /// worker is started via [`start_background_compiler`] and flips this flag
-    /// itself.
+    /// workers are started via [`Self::start_background_compiler`] and flip
+    /// this flag themselves.
     pub fn set_compiler_active(&self, active: bool) {
         self.core.active.store(active, Ordering::Relaxed);
     }
 
-    /// Number of tasks the background worker has finished compiling.
+    /// Number of tasks the workers have finished compiling.
     pub fn completed_compilations(&self) -> u64 {
         self.core.completed.load(Ordering::Relaxed)
     }
 
-    /// Spawn the background compile thread (idempotent).
+    /// Start this manager's workers once and keep their handle on the manager.
+    /// See the free [`ensure_background_compiler`].
+    pub fn ensure_background_compiler<F>(&self, make_compile_fn: F)
+    where
+        F: FnOnce() -> CompileFn,
+    {
+        if self.core.active.load(Ordering::Acquire) {
+            return;
+        }
+        let mut slot = self.background.lock();
+        if slot.is_some() || self.core.active.load(Ordering::Acquire) {
+            return;
+        }
+        *slot = self.start_background_compiler(make_compile_fn());
+    }
+
+    /// Stop the workers started by [`Self::ensure_background_compiler`] (drains
+    /// and joins). Also happens when the manager is dropped.
+    pub fn shutdown_background_compiler(&self) {
+        let handle = self.background.lock().take();
+        if let Some(mut handle) = handle {
+            handle.shutdown();
+        }
+    }
+
+    /// Spawn the compile workers (idempotent).
     ///
-    /// The worker loops: block on the queue's condvar until a task is available
-    /// (or shutdown is requested), drain the highest-priority task, run
-    /// `compile_fn` for it **off the mutator thread**, then record completion on
-    /// the shared core. The returned [`BackgroundCompiler`] owns the join handle;
-    /// dropping it (e.g. at VM teardown) signals shutdown and joins, so no
-    /// compile thread outlives the VM.
+    /// Each lane gets its own workers ([`compiler_thread_counts`]). A worker
+    /// loops: block on its lane's condvar until a task is available (or
+    /// shutdown is requested), drain the highest-priority task, run
+    /// `compile_fn` for it **off the mutator thread**, then record completion
+    /// on the shared core. The returned [`BackgroundCompiler`] owns the join
+    /// handles; dropping it (e.g. at VM teardown) signals shutdown and joins,
+    /// so no compile thread outlives the VM.
     ///
-    /// Takes `&self` (not `Arc<Self>`): the worker only needs the
+    /// Takes `&self` (not `Arc<Self>`): the workers only need the
     /// `Arc<CompilerCore>`, so this works even though `SharedVm` owns the
     /// manager by value.
     ///
-    /// Returns `None` if a worker is already active.
+    /// Returns `None` if workers are already active, or if a lane could not
+    /// get a single worker (every thread that did start is stopped again, and
+    /// the slot released so a retry can succeed).
     pub fn start_background_compiler(&self, compile_fn: CompileFn) -> Option<BackgroundCompiler> {
-        // Atomically claim the single-worker slot.
+        // Atomically claim the worker slot.
         if self
             .core
             .active
@@ -2335,81 +3047,104 @@ impl TieredCompilationManager {
         }
         self.core.shutdown.store(false, Ordering::Release);
 
-        let core = Arc::clone(&self.core);
-        // The default Rust thread stack (~2 MiB) has no margin for compiling
-        // methods with deep IR (heavy inlining, long expression chains from
-        // generated/framework code such as Quarkus/JUnit5 test-framework
-        // classes) — unlike the main-vm interpreter thread, which was bumped
-        // to 128 MiB after binaryTrees(18)-style recursion overflowed 64 MiB
-        // (see vm-cli/src/main.rs). Give the compiler thread the same
-        // 16 MiB headroom already used for other native-recursion-heavy
-        // worker threads (see libcratonvm's foreign-attach threads); the
-        // cost is virtual-address-space only (no commit until touched).
-        let handle = std::thread::Builder::new()
-            .name("cratonvm-jit-compiler".to_string())
-            .stack_size(16 * 1024 * 1024)
-            .spawn(move || {
-                Self::compiler_loop(&core, compile_fn);
-            })
-            .ok();
-
-        match handle {
-            Some(handle) => Some(BackgroundCompiler {
-                core: Arc::clone(&self.core),
-                handle: Some(handle),
-            }),
-            None => {
-                // Spawn failed — release the slot so a retry can succeed.
-                self.core.active.store(false, Ordering::Release);
-                None
+        let compile_fn: Arc<CompileFn> = Arc::new(compile_fn);
+        let (c1_workers, c2_workers) = compiler_thread_counts();
+        let mut background = BackgroundCompiler {
+            core: Arc::clone(&self.core),
+            handles: Vec::new(),
+        };
+        for (lane, workers) in [(C1_LANE, c1_workers), (C2_LANE, c2_workers)] {
+            let mut spawned = 0usize;
+            for _ in 0..workers {
+                let core = Arc::clone(&self.core);
+                let compile_fn = Arc::clone(&compile_fn);
+                // The default Rust thread stack (~2 MiB) has no margin for
+                // compiling methods with deep IR (heavy inlining, long
+                // expression chains from generated/framework code such as
+                // Quarkus/JUnit5 test-framework classes) — unlike the main-vm
+                // interpreter thread, which was bumped to 128 MiB after
+                // binaryTrees(18)-style recursion overflowed 64 MiB (see
+                // vm-cli/src/main.rs). Give each compiler thread the same
+                // 16 MiB headroom already used for other native-recursion-heavy
+                // worker threads (see libcratonvm's foreign-attach threads); the
+                // cost is virtual-address-space only (no commit until touched).
+                let spawn = std::thread::Builder::new()
+                    .name("cratonvm-jit-compiler".to_string())
+                    .stack_size(16 * 1024 * 1024)
+                    .spawn(move || {
+                        let _ = ON_COMPILE_WORKER.try_with(|w| w.set(true));
+                        Self::compiler_loop(&core, lane, &compile_fn);
+                    });
+                match spawn {
+                    Ok(handle) => {
+                        background.handles.push(handle);
+                        spawned += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if spawned == 0 {
+                // A lane with no worker would leave its requests queued
+                // forever. Stop what did start; `shutdown` releases `active`.
+                background.shutdown();
+                return None;
             }
         }
+        Some(background)
     }
 
-    /// Body of the background compile thread.
+    /// Body of a compile worker, serving one lane.
     ///
     /// ## GC-STW-safety invariant (wire-tiered-manager increment 3)
     ///
-    /// This loop runs on the unregistered, GC-neutral `cratonvm-jit-compiler`
-    /// daemon (see [`start_background_compiler`]). The queue wait MUST block on
-    /// `CompilerCore`'s OWN [`Condvar`] (`core.wake`) while holding ONLY this
-    /// crate's `core.queue` mutex — never any VM lock. `tiered.rs` is in the
-    /// `cratonvm-jit` crate and cannot even name `SharedVm`'s locks, so the wait
-    /// here is structurally VM-lock-free: `core.queue`/`core.wake`/`core.methods`
-    /// are jit-crate-private. `parking_lot::Condvar::wait` releases `q` while the
-    /// worker is parked and re-acquires it on wake.
+    /// This loop runs on an unregistered, GC-neutral `cratonvm-jit-compiler`
+    /// daemon (see [`Self::start_background_compiler`]). The queue wait MUST
+    /// block on the lane's OWN [`Condvar`] while holding ONLY this crate's lane
+    /// queue mutex — never any VM lock. `tiered.rs` is in the `cratonvm-jit`
+    /// crate and cannot even name `SharedVm`'s locks, so the wait here is
+    /// structurally VM-lock-free: the lanes and `core.methods` are
+    /// jit-crate-private. `parking_lot::Condvar::wait` releases the queue lock
+    /// while the worker is parked and re-acquires it on wake.
     ///
     /// The VM-side codegen + publish runs in `compile_fn` with NO lock of any
-    /// kind held by this frame (`q` is dropped at the end of the inner scope
-    /// before `compile_fn` is called). The VM closure
-    /// ([`crate::...background_compile_task`]) is responsible for bounding its
-    /// own VM-lock scopes; this loop guarantees it is entered lock-free. The net
-    /// effect: while the worker idles on `core.wake`, it holds no lock a mutator
-    /// could need, so a mutator never stalls behind it and a concurrent STW
-    /// completes promptly.
+    /// kind held by this frame (the queue guard is dropped at the end of the
+    /// inner scope before `compile_fn` is called). The VM closure
+    /// (`background_compile_task`) is responsible for bounding its own VM-lock
+    /// scopes; this loop guarantees it is entered lock-free. The net effect:
+    /// while a worker idles, it holds no lock a mutator could need, so a
+    /// mutator never stalls behind it and a concurrent STW completes promptly.
     ///
     /// ## Stale-request drop (install epoch)
     ///
-    /// A request is dispatched only if the process-wide JIT install epoch is
-    /// still the one it was queued at. If a JVMTI redefinition or a code-cache
-    /// flush moved the epoch in between, the request describes a world that no
-    /// longer exists and is dropped HERE, before the backend is entered,
-    /// rather than after — the per-cache flush barrier in `JitCache::put`
-    /// would refuse the resulting body anyway, so compiling it is pure waste.
-    /// The drop is explicit: counted under
-    /// `crate::metrics::SCHEDULING_EVENTS[0]`, the method's in-flight slot
-    /// released, no retry spent. See [`CompilerCore::retire_stale`] and
-    /// `docs/jit/broker-install-epoch.md`.
-    fn compiler_loop(core: &Arc<CompilerCore>, compile_fn: CompileFn) {
+    /// A request is dispatched only if the JIT install epoch is still the one
+    /// it was queued at. If a JVMTI redefinition or a code-cache flush moved
+    /// the epoch in between, the request describes a world that no longer
+    /// exists and is dropped HERE, before the backend is entered, rather than
+    /// after — the per-cache flush barrier in `JitCache::put` would refuse the
+    /// resulting body anyway, so compiling it is pure waste. The drop is
+    /// explicit: counted under `crate::metrics::SCHEDULING_EVENTS[0]`, the
+    /// method's in-flight slot released, no retry spent. See
+    /// [`CompilerCore::retire_stale`] and `docs/jit/broker-install-epoch.md`.
+    ///
+    /// ## Panic containment and the compile budget
+    ///
+    /// `compile_fn` runs under [`contain_compile_panic`]. A panic there is
+    /// logged once, counted as `worker_panic`, recorded as a permanent decline
+    /// for that method, and the loop carries on: the in-flight epoch is reset
+    /// and the slot released exactly as for any other outcome. The compile is
+    /// also bracketed by [`current_thread_cpu_time`], which is what the C2
+    /// budget is charged.
+    fn compiler_loop(core: &Arc<CompilerCore>, lane: usize, compile_fn: &CompileFn) {
+        let lane_ref = &core.lanes[lane];
         loop {
-            // Pop one FRESH task while holding ONLY the jit-crate queue lock;
-            // block on the core's own condvar when empty so the worker idles
+            // Pop one FRESH task while holding ONLY this lane's queue lock;
+            // block on the lane's condvar when empty so the worker idles
             // instead of spinning. No VM lock is — or can be — held across
             // this wait.
             //
             // Stale requests found on the way are collected, not acted on:
             // retiring one takes `core.methods`, and taking `methods` while
-            // holding `queue` would invert this file's `methods` → `queue`
+            // holding a queue would invert this file's `methods` → `queue`
             // order (see `retire_stale`). So the queue guard is released
             // first, `retire_stale` runs, and the loop re-enters — which is
             // also why `stale` is re-created per iteration.
@@ -2417,7 +3152,7 @@ impl TieredCompilationManager {
                 let mut stale: Vec<StaleRequest> = Vec::new();
                 let mut shutting_down = false;
                 let popped = {
-                    let mut q = core.queue.lock();
+                    let mut q = lane_ref.queue.lock();
                     loop {
                         if core.shutdown.load(Ordering::Acquire) {
                             shutting_down = true;
@@ -2432,7 +3167,7 @@ impl TieredCompilationManager {
                             None if !stale.is_empty() => break None,
                             // `parking_lot::Condvar::wait` releases `q` while parked and
                             // re-acquires on wake; spurious wakeups re-check the loop.
-                            None => core.wake.wait(&mut q),
+                            None => lane_ref.wake.wait(&mut q),
                         }
                     }
                 };
@@ -2450,9 +3185,9 @@ impl TieredCompilationManager {
                 }
             };
 
-            // Compile off the mutator thread with NO lock held by this frame
-            // (`q` was dropped above), then publish completion. `compile_fn`
-            // bounds its own VM-lock scopes internally.
+            // Compile off the mutator thread with NO lock held by this frame,
+            // then publish completion. `compile_fn` bounds its own VM-lock
+            // scopes internally.
             //
             // `dispatch_epoch` is the in-flight stamp: the dispatch gate above
             // proved the epoch had not moved *yet*, and this is what lets the
@@ -2462,28 +3197,45 @@ impl TieredCompilationManager {
             // refuse a body stamped below the owning cache's flush barrier.
             // Recording it makes the residual visible instead of invisible.
             let dispatch_epoch = core.current_install_epoch();
-            core.inflight_epoch.store(dispatch_epoch, Ordering::Release);
-            let outcome = compile_fn(&task);
-            core.inflight_epoch.store(0, Ordering::Release);
+            core.note_dispatch(dispatch_epoch);
+            let cpu_before = current_thread_cpu_time();
+            let result = contain_compile_panic(|| compile_fn(&task));
+            let cpu_ms = match (cpu_before, current_thread_cpu_time()) {
+                (Some(before), Some(after)) => {
+                    Some(after.saturating_sub(before).as_millis() as u64)
+                }
+                _ => None,
+            };
+            core.note_dispatch_done();
             if core.current_install_epoch() != dispatch_epoch {
                 crate::metrics::record_scheduling_event(crate::metrics::SCHEDULING_EVENTS[2]);
             }
-            core.complete_task(
+            let outcome = match result {
+                Ok(outcome) => outcome,
+                Err(payload) => {
+                    core.note_worker_panic(&task, &*payload);
+                    CompileOutcome::declined(0)
+                }
+            };
+            core.finish(
                 &task.method_key,
-                task.target_tier,
-                outcome.compile_time_ms,
-                outcome.published,
-                task.osr_bci.is_some(),
-                outcome.declined_permanently,
+                Completion {
+                    tier: task.target_tier,
+                    osr_bci: task.osr_bci,
+                    osr: task.osr_bci.is_some(),
+                    compile_time_ms: outcome.compile_time_ms,
+                    budget_ms: cpu_ms.unwrap_or(outcome.compile_time_ms),
+                    success: outcome.published,
+                    declined_permanently: outcome.declined_permanently,
+                },
             );
             // C1→C2 supersede: a freshly-published C1-family body whose
             // method the VM judged IR-eligible gets a Low-priority C2
-            // recompile. Enqueued AFTER complete_task so the C1 task's
-            // `queued_for_compilation` flag has been cleared (otherwise the
-            // idempotence gate would drop the upgrade). OSR tasks are
-            // excluded (their artifacts serve loop entry; the invocation
-            // path re-tiers separately), as are tasks already at an
-            // optimized tier.
+            // recompile. Enqueued AFTER `finish` so the C1 task's slot has
+            // been released (otherwise the idempotence gate would drop the
+            // upgrade). OSR tasks are excluded (their artifacts serve loop
+            // entry; the invocation path re-tiers separately), as are tasks
+            // already at an optimized tier.
             if outcome.published
                 && outcome.c2_upgrade_candidate
                 && task.osr_bci.is_none()
@@ -2514,9 +3266,6 @@ impl TieredCompilationManager {
     ) -> Option<CompilationTier> {
         let target = self.should_compile(state, policy)?;
 
-        state.queued_for_compilation = true;
-        state.queued_tier = Some(target);
-
         let priority = match target {
             CompilationTier::C2 => CompilationPriority::High,
             CompilationTier::C1 | CompilationTier::C1WithProfiling => CompilationPriority::Normal,
@@ -2531,8 +3280,6 @@ impl TieredCompilationManager {
             osr_bci: None,
         };
 
-        // `self.core.enqueue` takes the queue lock (distinct from `methods`,
-        // which the caller still holds) and wakes the background worker.
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TIER_ENQUEUE").is_some() {
             eprintln!(
                 "[cratonvm-tier] enqueue {}.{}{} tier={:?} invocations={} elapsed_ms={}",
@@ -2544,7 +3291,11 @@ impl TieredCompilationManager {
                 process_uptime_ms(),
             );
         }
-        self.core.enqueue(task);
+        // `admit` takes a lane's queue lock (distinct from `methods`, which
+        // the caller still holds) and wakes one of its workers.
+        if !self.core.admit(state, task) {
+            return None;
+        }
         Some(target)
     }
 
@@ -2554,19 +3305,15 @@ impl TieredCompilationManager {
         state: &MethodState,
         policy: &CompilationPolicy,
     ) -> Option<CompilationTier> {
-        // Keep the background compiler from queueing the known-corrupting
-        // BigInteger implementation. `try_compile` carries the same final
-        // guard for direct/manual queue paths that bypass this policy method.
         // Give up after repeated compile-attempt failures (the attempt ran
-        // but never published a body — see `complete_task`), matching the
-        // "3+ deopts" convention `c2_bailout` already uses below. Without
-        // this, a method whose compile step keeps failing for a reason
-        // outside the (fast) permanent bail-list — e.g. a transient
-        // code-cache-cap or in-flight class redefine — would be
-        // re-recommended and re-enqueued on every single invocation
-        // forever, since a failed attempt no longer advances `current_tier`.
-        // A policy decline is permanent by construction, so one is enough —
-        // unlike `tier_fail_count`, which deliberately allows retries.
+        // but never published a body — see `finish`). Without this, a method
+        // whose compile step keeps failing for a reason outside the (fast)
+        // permanent bail-list — e.g. a transient code-cache-cap or in-flight
+        // class redefine — would be re-recommended and re-enqueued on every
+        // single invocation forever, since a failed attempt no longer
+        // advances `current_tier`. A policy decline is permanent by
+        // construction, so one is enough — unlike `tier_fail_count`, which
+        // deliberately allows retries.
         if state.ineligible {
             return None;
         }
@@ -2579,7 +3326,6 @@ impl TieredCompilationManager {
                 if !state.c2_bailout
                     && state.invocation_count >= policy.c2_threshold as u64
                     && state.invocation_count >= policy.c2_min_invocations as u64
-                    && state.profile.profiled_invocations > 0
                 {
                     return Some(CompilationTier::C2);
                 }
@@ -2620,11 +3366,12 @@ mod tests {
 
     /// A key used ONLY by the deny-list test.
     ///
-    /// `mark_osr_denied` writes to a PROCESS-GLOBAL set. Marking the shared
-    /// `test_key()` therefore denies OSR for every other test in the binary
-    /// that uses it, for as long as the mark stands — which is exactly how
-    /// `stats_osr_compilations` intermittently observed 0 OSR compilations
-    /// instead of 1. Keep the poison on a key nobody else touches.
+    /// OSR denials used to live in a PROCESS-GLOBAL set, and marking the
+    /// shared `test_key()` denied OSR for every other test in the binary —
+    /// which is how `stats_osr_compilations` once intermittently observed 0
+    /// OSR compilations instead of 1. They are per manager now; the key stays
+    /// distinct so a test that reads as "denied" names a method nothing else
+    /// uses.
     fn osr_deny_only_key() -> MethodKey {
         MethodKey::new("craton/test/OsrDenyOnly", "denied", "()V")
     }
@@ -2742,26 +3489,12 @@ mod tests {
 
     // ── wire-tiered-manager Step 5: request_osr ──────────────────────────
 
-    /// Serialises the tests that mutate the process-global OSR deny list.
-    ///
-    /// `osr_deny_list()` is one `RwLock<HashSet<MethodKey>>` for the whole
-    /// process, and `clear_osr_deny_list_for_test` wipes it outright. Run in
-    /// parallel, one test's clear lands between another's `mark_osr_denied`
-    /// and its assertion. There is no per-test identity to key off here -- the
-    /// deny list IS the shared state under test -- so unlike the code-cache
-    /// tests these serialise rather than retry.
-    fn osr_deny_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
     #[test]
     fn step5_request_osr_enqueues_osr_task_immediately() {
-        let _osr_deny_guard = osr_deny_test_guard();
-        clear_osr_deny_list_for_test();
         let mgr = TieredCompilationManager::with_default_policy();
         let key = test_key();
-        // Unlike on_backedge, the first call enqueues immediately (no 10k count).
+        // The first call enqueues immediately: the interpreter's per-frame
+        // back-edge schedule is the throttle, not a count kept here.
         let task = mgr
             .request_osr(&key, 42)
             .expect("first request should enqueue");
@@ -2775,38 +3508,32 @@ mod tests {
             .dequeue_compilation()
             .expect("an OSR task should be queued");
         assert_eq!(dq.osr_bci, Some(42));
-        assert_eq!(
-            mgr.stats()
-                .osr_compilations
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
-        clear_osr_deny_list_for_test();
+        assert_eq!(mgr.stats().osr_compilations.load(Ordering::Relaxed), 1);
     }
 
     #[test]
     fn step5_request_osr_honors_osr_deny_list() {
-        let _osr_deny_guard = osr_deny_test_guard();
-        clear_osr_deny_list_for_test();
-        let mgr = TieredCompilationManager::with_default_policy();
+        // Pinned epoch: a denial expires when the install epoch moves, and the
+        // process-wide one moves whenever any test flushes a cache.
+        let mgr = worker_manager(CompilationPolicy::default());
         let key = osr_deny_only_key();
-        mark_osr_denied(key.clone());
+        mgr.mark_osr_denied(key.clone());
+        assert!(mgr.is_osr_denied(&key));
         assert!(
             mgr.request_osr(&key, 42).is_none(),
             "OSR-denied method must not enqueue an OSR task"
         );
-        assert!(
-            mgr.on_backedge(&key, 42).is_none(),
-            "OSR-denied method must not enqueue through backedge accounting"
-        );
         assert!(mgr.dequeue_compilation().is_none());
-        clear_osr_deny_list_for_test();
+        // The denial belongs to this manager, not to the process.
+        let other = worker_manager(CompilationPolicy::default());
+        assert!(
+            other.request_osr(&key, 42).is_some(),
+            "another VM's manager must not inherit this one's OSR denials"
+        );
     }
 
     #[test]
     fn step5_request_osr_is_independent_of_method_entry_c2_but_honors_bailout() {
-        let _osr_deny_guard = osr_deny_test_guard();
-        clear_osr_deny_list_for_test();
         // A method-entry C2 body does not provide an OSR entry and therefore
         // must not suppress the separately cached OSR artifact.
         let mgr = TieredCompilationManager::with_default_policy();
@@ -2826,6 +3553,54 @@ mod tests {
         assert!(
             mgr2.request_osr(&key2, 7).is_none(),
             "bailed method: no OSR enqueue"
+        );
+    }
+
+    /// A denial is a verdict about the code that was loaded when it was made,
+    /// so it expires when the install epoch moves, and a redefinition of the
+    /// class forgets it outright. It used to be a process-global set that one
+    /// failed background compile populated for good.
+    #[test]
+    fn an_osr_denial_expires_when_the_install_epoch_moves() {
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mgr = epoch_driven_manager(&epoch);
+        let key = MethodKey::new("craton/test/OsrExpiry", "loop", "()V");
+        mgr.mark_osr_denied(key.clone());
+        assert!(mgr.request_osr(&key, 3).is_none());
+        epoch.store(2, Ordering::Release);
+        assert!(
+            !mgr.is_osr_denied(&key),
+            "a denial stamped at epoch 1 has expired at epoch 2"
+        );
+        assert!(mgr.request_osr(&key, 3).is_some());
+
+        let redefined = MethodKey::new("craton/test/OsrRedefined", "loop", "()V");
+        mgr.mark_osr_denied(redefined.clone());
+        mgr.on_class_redefined("craton/test/OsrRedefined");
+        assert!(
+            !mgr.is_osr_denied(&redefined),
+            "a redefinition forgets the class's denials"
+        );
+    }
+
+    /// A failed OSR compile is a failed compile, not a denial: it spends one
+    /// retry and the next hot back-edge asks again, up to the fail limit.
+    #[test]
+    fn a_failed_osr_compile_is_retried_up_to_the_fail_limit() {
+        let mgr = epoch_driven_manager(&Arc::new(AtomicU64::new(1)));
+        let key = MethodKey::new("craton/test/OsrRetry", "loop", "()V");
+        for attempt in 0..MAX_TIER_FAIL_RETRIES {
+            let task = mgr
+                .request_osr(&key, 9)
+                .unwrap_or_else(|| panic!("attempt {attempt}: a failed OSR compile must be retried"));
+            assert_eq!(mgr.next_fresh_task(), Some(task));
+            mgr.core
+                .complete_task(&key, CompilationTier::C2, 1, false, true, false);
+            assert!(!mgr.is_osr_denied(&key), "a failed compile must not deny OSR");
+        }
+        assert!(
+            mgr.request_osr(&key, 9).is_none(),
+            "the retry budget still bounds an OSR compile that keeps failing"
         );
     }
 
@@ -2918,100 +3693,6 @@ mod tests {
         assert!(c2_triggered);
     }
 
-    // ── OSR trigger ──────────────────────────────────────────────────────
-
-    #[test]
-    fn osr_triggered_after_backedge_threshold() {
-        let policy = CompilationPolicy {
-            osr_threshold: 50,
-            ..CompilationPolicy::default()
-        };
-        let mgr = TieredCompilationManager::new(policy);
-        let key = test_key();
-        let mut osr_task = None;
-        for _i in 0..50 {
-            if let Some(t) = mgr.on_backedge(&key, 42) {
-                osr_task = Some(t);
-            }
-        }
-        let task = osr_task.unwrap();
-        assert_eq!(task.osr_bci, Some(42));
-        assert_eq!(task.target_tier, CompilationTier::C2);
-    }
-
-    // ── Branch profile ───────────────────────────────────────────────────
-
-    #[test]
-    fn branch_profile_recording() {
-        let mgr = TieredCompilationManager::with_default_policy();
-        let key = test_key();
-        mgr.record_branch(&key, 10, true);
-        mgr.record_branch(&key, 10, true);
-        mgr.record_branch(&key, 10, false);
-
-        let profile = mgr.get_profile(&key).unwrap();
-        let bp = &profile.branch_counts[&10];
-        assert_eq!(bp.taken, 2);
-        assert_eq!(bp.not_taken, 1);
-    }
-
-    // ── Receiver profile (top 3) ─────────────────────────────────────────
-
-    #[test]
-    fn receiver_profile_recording_top3() {
-        let mgr = TieredCompilationManager::with_default_policy();
-        let key = test_key();
-        // Record 4 different class_ids — only 3 should be retained.
-        for _ in 0..10 {
-            mgr.record_receiver(&key, 5, 100);
-        }
-        for _ in 0..5 {
-            mgr.record_receiver(&key, 5, 200);
-        }
-        for _ in 0..3 {
-            mgr.record_receiver(&key, 5, 300);
-        }
-        // This fourth type should not displace existing ones (they all have count >= 1).
-        mgr.record_receiver(&key, 5, 400);
-
-        let profile = mgr.get_profile(&key).unwrap();
-        let rp = &profile.receiver_profiles[&5];
-        assert_eq!(rp.receivers.len(), 3);
-        assert_eq!(rp.total_calls, 19);
-    }
-
-    // ── Type profile ─────────────────────────────────────────────────────
-
-    #[test]
-    fn type_profile_recording() {
-        let mgr = TieredCompilationManager::with_default_policy();
-        let key = test_key();
-        mgr.record_type_check(&key, 20, 42);
-        mgr.record_type_check(&key, 20, 42);
-        mgr.record_type_check(&key, 20, 99);
-
-        let profile = mgr.get_profile(&key).unwrap();
-        let tp = &profile.type_profiles[&20];
-        assert_eq!(tp.total_checks, 3);
-        assert_eq!(tp.types.len(), 2);
-    }
-
-    // ── Null profile ─────────────────────────────────────────────────────
-
-    #[test]
-    fn null_profile_recording() {
-        let mgr = TieredCompilationManager::with_default_policy();
-        let key = test_key();
-        mgr.record_null_check(&key, 15, true);
-        mgr.record_null_check(&key, 15, false);
-        mgr.record_null_check(&key, 15, false);
-
-        let profile = mgr.get_profile(&key).unwrap();
-        let np = &profile.null_profiles[&15];
-        assert_eq!(np.null_seen, 1);
-        assert_eq!(np.non_null_seen, 2);
-    }
-
     // ── Queue priority ordering ──────────────────────────────────────────
 
     #[test]
@@ -3043,6 +3724,8 @@ mod tests {
             osr_bci: None,
         });
 
+        // The three sit on two lanes (C1 and C2); the manual drain still
+        // hands them out in priority order across both.
         let t1 = mgr.dequeue_compilation().unwrap();
         assert_eq!(t1.priority, CompilationPriority::High);
         let t2 = mgr.dequeue_compilation().unwrap();
@@ -3189,8 +3872,8 @@ mod tests {
         // 1st invocation crosses c1_threshold=1 and enqueues C1.
         assert_eq!(mgr.on_method_invocation(&key), Some(CompilationTier::C1));
         // Fail it MAX_TIER_FAIL_RETRIES - 1 times; each failure must still
-        // leave the method eligible for another attempt (queued_for_compilation
-        // reset, current_tier untouched).
+        // leave the method eligible for another attempt (slot released,
+        // current_tier untouched).
         for i in 0..(MAX_TIER_FAIL_RETRIES - 1) {
             mgr.core
                 .complete_task(&key, CompilationTier::C1, 1, false, false, false);
@@ -3274,7 +3957,7 @@ mod tests {
         assert_eq!(mgr.current_tier(&key), CompilationTier::C1);
     }
 
-    // ── Deoptimization ───────────────────────────────────────────────────
+    // ── Deoptimization and trap accounting ───────────────────────────────
 
     #[test]
     fn deoptimization_drops_to_interpreter() {
@@ -3284,36 +3967,190 @@ mod tests {
         mgr.compilation_complete(&key, CompilationTier::C2, 50);
         assert_eq!(mgr.current_tier(&key), CompilationTier::C2);
 
-        mgr.on_deoptimization(&key);
+        mgr.on_deoptimization(
+            &key,
+            DeoptReason::ClassCheck,
+            7,
+            DeoptAction::RecompileAndReinterpret,
+        );
         assert_eq!(mgr.current_tier(&key), CompilationTier::Interpreter);
     }
 
+    /// The same speculation failing again and again is a property of the code:
+    /// `PER_BCI_TRAP_LIMIT` counted traps at one site end the method's C2 career.
     #[test]
-    fn multiple_deopts_trigger_c2_bailout() {
+    fn repeated_traps_at_one_bci_trigger_c2_bailout() {
         let mgr = TieredCompilationManager::with_default_policy();
         let key = test_key();
         mgr.on_method_invocation(&key);
-        for _ in 0..3 {
+        for i in 0..PER_BCI_TRAP_LIMIT {
+            assert!(
+                !mgr.core.methods.lock()[&key].c2_bailout,
+                "trap {i} is still below the per-bci limit"
+            );
             mgr.compilation_complete(&key, CompilationTier::C2, 10);
-            mgr.on_deoptimization(&key);
+            mgr.on_deoptimization(
+                &key,
+                DeoptReason::NullCheck,
+                12,
+                DeoptAction::RecompileAndReinterpret,
+            );
         }
-        // After 3 deopts, c2_bailout should be set.
+        assert!(mgr.core.methods.lock()[&key].c2_bailout);
+    }
+
+    /// Traps spread over different sites are charged to the method, which has
+    /// a larger allowance than any one site.
+    #[test]
+    fn traps_across_sites_use_the_per_method_cutoff() {
+        let mgr = TieredCompilationManager::with_default_policy();
+        let key = test_key();
+        mgr.on_method_invocation(&key);
+        for bci in 0..PER_METHOD_TRAP_CUTOFF - 1 {
+            mgr.on_deoptimization(
+                &key,
+                DeoptReason::BoundsCheck,
+                bci,
+                DeoptAction::RecompileAndReinterpret,
+            );
+        }
+        assert!(
+            !mgr.core.methods.lock()[&key].c2_bailout,
+            "one trap per site, and still below the per-method cutoff"
+        );
+        mgr.on_deoptimization(
+            &key,
+            DeoptReason::BoundsCheck,
+            9_999,
+            DeoptAction::RecompileAndReinterpret,
+        );
+        assert!(mgr.core.methods.lock()[&key].c2_bailout);
+    }
+
+    /// Soft deopts are not charged. A soft OSR exit keeps its body, so it does
+    /// not move the tier either; a debugger transfer or a pending exception's
+    /// hand-off evicts the body but is not a speculation failure.
+    #[test]
+    fn soft_deopts_do_not_set_c2_bailout() {
+        let mgr = TieredCompilationManager::with_default_policy();
+        let key = test_key();
+        mgr.on_method_invocation(&key);
+        mgr.compilation_complete(&key, CompilationTier::C2, 10);
+        for _ in 0..50 {
+            mgr.on_deoptimization(&key, DeoptReason::OsrExit, 30, DeoptAction::Reinterpret);
+        }
+        {
+            let methods = mgr.core.methods.lock();
+            let state = &methods[&key];
+            assert!(!state.c2_bailout, "soft OSR exits must not ban C2");
+            assert_eq!(state.deopt_count, 0);
+            assert_eq!(state.current_tier, CompilationTier::C2, "the body was kept");
+        }
+        for _ in 0..50 {
+            mgr.on_deoptimization(
+                &key,
+                DeoptReason::TransferToInterpreter,
+                30,
+                DeoptAction::RecompileAndReinterpret,
+            );
+            mgr.on_deoptimization(
+                &key,
+                DeoptReason::PendingException,
+                30,
+                DeoptAction::MakeNotEntrant,
+            );
+        }
+        {
+            let methods = mgr.core.methods.lock();
+            let state = &methods[&key];
+            assert!(!state.c2_bailout);
+            assert_eq!(state.deopt_count, 0);
+            assert_eq!(
+                state.current_tier,
+                CompilationTier::Interpreter,
+                "an evicted body drops the tier even when the deopt is not charged"
+            );
+        }
+        assert_eq!(mgr.stats().soft_deoptimizations.load(Ordering::Relaxed), 150);
+        assert!(
+            mgr.request_osr(&key, 30).is_some(),
+            "OSR stays available: nothing here was a counted trap"
+        );
+    }
+
+    /// Trap counts decay, so a burst early in a long run does not ban a method
+    /// for the rest of it.
+    #[test]
+    fn trap_counts_decay_with_invocations() {
+        let mgr = TieredCompilationManager::with_default_policy();
+        let key = test_key();
+        mgr.on_method_invocation(&key);
+        for _ in 0..PER_BCI_TRAP_LIMIT - 1 {
+            mgr.on_deoptimization(
+                &key,
+                DeoptReason::ClassCheck,
+                5,
+                DeoptAction::RecompileAndReinterpret,
+            );
+        }
+        // The method keeps running long enough for its counts to decay...
+        let seen = mgr
+            .method_states()
+            .into_iter()
+            .find(|(k, _, _)| *k == key)
+            .map(|(_, _, count)| count)
+            .expect("state for key");
+        let _ = mgr.on_method_invocation_observed(&key, seen + TRAP_DECAY_INVOCATIONS);
+        // ...so one more trap at the same site is not the one that reaches the
+        // limit.
+        mgr.on_deoptimization(
+            &key,
+            DeoptReason::ClassCheck,
+            5,
+            DeoptAction::RecompileAndReinterpret,
+        );
         let methods = mgr.core.methods.lock();
-        assert!(methods[&key].c2_bailout);
+        let state = &methods[&key];
+        assert!(!state.c2_bailout, "decayed counts must not reach the per-bci limit");
+        assert_eq!(
+            state.trap_counts[&(DeoptReason::ClassCheck, 5)],
+            (PER_BCI_TRAP_LIMIT - 1) / 2 + 1
+        );
+    }
+
+    #[test]
+    fn deopt_resets_queued_state() {
+        let mgr = TieredCompilationManager::with_default_policy();
+        let key = test_key();
+        mgr.enqueue_compilation(CompilationTask {
+            method_key: key.clone(),
+            target_tier: CompilationTier::C2,
+            priority: CompilationPriority::High,
+            enqueue_time_ms: 0,
+            osr_bci: None,
+        });
+        mgr.on_deoptimization(
+            &key,
+            DeoptReason::ReceiverTypeChanged,
+            0,
+            DeoptAction::RecompileAndReinterpret,
+        );
+
+        let methods = mgr.core.methods.lock();
+        let state = &methods[&key];
+        assert!(!state.queued_for_compilation);
+        assert!(state.queued_tier.is_none());
+        drop(methods);
+        assert!(mgr.queue_empty(), "the queued request is dropped, not left behind");
     }
 
     // ── Tier-4 compile-time guard (jit-inlining-and-ir-calls) ────────────
 
     /// A C2 compile that stays inside `MAX_C2_COMPILE_TIME_MS` must leave the
-    /// method eligible for C2; one that exceeds it must demote the method to
-    /// C1 for the rest of the process, through the SAME `c2_bailout` flag the
-    /// 3-deopt rule uses (so every existing degradation path honours it with
-    /// no additional wiring).
-    ///
-    /// This is the coherence guarantee for the widened `ir_compatible` gate:
-    /// the population reaching tier 4 grew from small arithmetic kernels to
-    /// ordinary call-bearing application methods, and nothing previously
-    /// bounded the OBSERVED cost of an optimizing compile.
+    /// method eligible for C2. Repeated compiles that exceed it demote the
+    /// method to C1 for the rest of the process, through the SAME `c2_bailout`
+    /// flag the trap limits use (so every existing degradation path honours it
+    /// with no additional wiring). One overrun is not enough.
     #[test]
     fn slow_c2_compile_demotes_to_c1() {
         let mgr = TieredCompilationManager::with_default_policy();
@@ -3327,19 +4164,84 @@ mod tests {
             "a C2 compile at exactly the budget must not demote"
         );
 
-        // Over the budget → permanent C2 bailout, and the statistic counts it
-        // alongside deopt-driven bailouts.
-        let before = mgr.stats().c2_bailouts.load(Ordering::Relaxed);
+        // One overrun is not evidence.
         mgr.compilation_complete(&key, CompilationTier::C2, MAX_C2_COMPILE_TIME_MS + 1);
         assert!(
+            !mgr.core.methods.lock()[&key].c2_bailout,
+            "a single over-budget compile must not demote"
+        );
+
+        // Repeated overruns are, and the statistic counts the demotion
+        // alongside the trap-driven ones.
+        let before = mgr.stats().c2_bailouts.load(Ordering::Relaxed);
+        for _ in 1..C2_BUDGET_OVERRUNS_BEFORE_DEMOTION {
+            mgr.compilation_complete(&key, CompilationTier::C2, MAX_C2_COMPILE_TIME_MS + 1);
+        }
+        assert!(
             mgr.core.methods.lock()[&key].c2_bailout,
-            "a C2 compile over MAX_C2_COMPILE_TIME_MS must demote the method to C1"
+            "repeated C2 compiles over MAX_C2_COMPILE_TIME_MS must demote the method to C1"
         );
         assert_eq!(
             mgr.stats().c2_bailouts.load(Ordering::Relaxed),
             before + 1,
             "the compile-time demotion must be counted as a c2 bailout"
         );
+    }
+
+    /// Only a successful method-entry compile is charged. A slow failure is
+    /// already bounded by `tier_fail_count`, and an OSR compile builds a
+    /// different artifact.
+    #[test]
+    fn failed_and_osr_c2_compiles_are_not_charged_to_the_budget() {
+        let mgr = TieredCompilationManager::with_default_policy();
+        let key = test_key();
+        mgr.on_method_invocation(&key);
+        for _ in 0..(C2_BUDGET_OVERRUNS_BEFORE_DEMOTION * 3) {
+            mgr.core.complete_task(
+                &key,
+                CompilationTier::C2,
+                MAX_C2_COMPILE_TIME_MS * 10,
+                false,
+                false,
+                false,
+            );
+            mgr.core.complete_task(
+                &key,
+                CompilationTier::C2,
+                MAX_C2_COMPILE_TIME_MS * 10,
+                true,
+                true,
+                false,
+            );
+        }
+        let methods = mgr.core.methods.lock();
+        assert_eq!(methods[&key].c2_budget_overruns, 0);
+        assert!(!methods[&key].c2_bailout);
+    }
+
+    /// The budget is charged `Completion::budget_ms` — compile-thread CPU time
+    /// from the worker — not the wall-clock time the statistics record. A
+    /// descheduled compile thread is not a slow compile.
+    #[test]
+    fn the_c2_budget_is_charged_cpu_time_not_wall_time() {
+        let mgr = TieredCompilationManager::with_default_policy();
+        let key = test_key();
+        mgr.on_method_invocation(&key);
+        for _ in 0..(C2_BUDGET_OVERRUNS_BEFORE_DEMOTION * 2) {
+            mgr.core.finish(
+                &key,
+                Completion {
+                    tier: CompilationTier::C2,
+                    osr_bci: None,
+                    osr: false,
+                    compile_time_ms: MAX_C2_COMPILE_TIME_MS * 20,
+                    budget_ms: 1,
+                    success: true,
+                    declined_permanently: false,
+                },
+            );
+        }
+        assert!(!mgr.core.methods.lock()[&key].c2_bailout);
     }
 
     /// The compile-time guard is C2-only: a slow C1 compile is not a reason to
@@ -3352,6 +4254,43 @@ mod tests {
         mgr.on_method_invocation(&key);
         mgr.compilation_complete(&key, CompilationTier::C1, MAX_C2_COMPILE_TIME_MS * 10);
         assert!(!mgr.core.methods.lock()[&key].c2_bailout);
+    }
+
+    #[test]
+    fn the_thread_cpu_clock_is_monotonic_where_it_is_wired() {
+        // Platforms without a per-thread clock return `None`, and the budget
+        // falls back to wall time; nothing to assert there.
+        let Some(before) = current_thread_cpu_time() else {
+            return;
+        };
+        let mut x = 0u64;
+        for i in 0..2_000_000u64 {
+            x = x.wrapping_mul(31).wrapping_add(i);
+        }
+        std::hint::black_box(x);
+        let after = current_thread_cpu_time().expect("a clock that answered once answers again");
+        assert!(after >= before);
+    }
+
+    #[test]
+    fn compiler_thread_counts_follow_log2_cpus_and_clamp_overrides() {
+        let unset = |_: &str| -> Option<String> { None };
+        assert_eq!(compiler_thread_counts_with(unset, 1), (1, 1));
+        assert_eq!(compiler_thread_counts_with(unset, 2), (1, 1));
+        assert_eq!(compiler_thread_counts_with(unset, 8), (1, 3));
+        assert_eq!(compiler_thread_counts_with(unset, 64), (1, 6));
+        let set = |name: &str| -> Option<String> {
+            match name {
+                "CRATONVM_TIER_C1_THREADS" => Some("0".to_string()),
+                "CRATONVM_TIER_C2_THREADS" => Some("1000".to_string()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            compiler_thread_counts_with(set, 8),
+            (1, 64),
+            "0 clamps up to one worker, and an absurd count clamps down"
+        );
     }
 
     // ── C2 bailout stays at C1 ───────────────────────────────────────────
@@ -3427,15 +4366,10 @@ mod tests {
 
     #[test]
     fn stats_osr_compilations() {
-        let policy = CompilationPolicy {
-            osr_threshold: 5,
-            ..CompilationPolicy::default()
-        };
-        let mgr = TieredCompilationManager::new(policy);
+        let mgr = TieredCompilationManager::with_default_policy();
         let key = test_key();
-        for _ in 0..5 {
-            mgr.on_backedge(&key, 0);
-        }
+        assert!(mgr.request_osr(&key, 0).is_some());
+        assert!(mgr.request_osr(&key, 0).is_none(), "already queued");
         assert_eq!(mgr.stats().osr_compilations.load(Ordering::Relaxed), 1);
     }
 
@@ -3445,8 +4379,9 @@ mod tests {
         let key = test_key();
         mgr.on_method_invocation(&key);
         mgr.compilation_complete(&key, CompilationTier::C2, 10);
-        mgr.on_deoptimization(&key);
+        mgr.on_deoptimization(&key, DeoptReason::UncommonTrap, 1, DeoptAction::Reinterpret);
         assert_eq!(mgr.stats().deoptimizations.load(Ordering::Relaxed), 1);
+        assert_eq!(mgr.stats().soft_deoptimizations.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -3527,13 +4462,9 @@ mod tests {
 
     #[test]
     fn osr_compilation_has_bci() {
-        let policy = CompilationPolicy {
-            osr_threshold: 1,
-            ..CompilationPolicy::default()
-        };
-        let mgr = TieredCompilationManager::new(policy);
+        let mgr = TieredCompilationManager::with_default_policy();
         let key = test_key();
-        let task = mgr.on_backedge(&key, 77).unwrap();
+        let task = mgr.request_osr(&key, 77).unwrap();
         assert_eq!(task.osr_bci, Some(77));
     }
 
@@ -3564,33 +4495,6 @@ mod tests {
         assert_eq!(mgr.current_tier(&key), CompilationTier::C1WithProfiling);
     }
 
-    // ── Profile data accessible ──────────────────────────────────────────
-
-    #[test]
-    fn profile_data_accessible_after_recording() {
-        let mgr = TieredCompilationManager::with_default_policy();
-        let key = test_key();
-        mgr.record_branch(&key, 0, true);
-        mgr.record_null_check(&key, 1, false);
-
-        let profile = mgr.get_profile(&key).unwrap();
-        assert!(profile.branch_counts.contains_key(&0));
-        assert!(profile.null_profiles.contains_key(&1));
-    }
-
-    // ── Profiled invocations counted ─────────────────────────────────────
-
-    #[test]
-    fn profiled_invocations_counted() {
-        let mgr = TieredCompilationManager::with_default_policy();
-        let key = test_key();
-        for _ in 0..10 {
-            mgr.on_method_invocation(&key);
-        }
-        let profile = mgr.get_profile(&key).unwrap();
-        assert_eq!(profile.profiled_invocations, 10);
-    }
-
     // ── Compilation task priorities ──────────────────────────────────────
 
     #[test]
@@ -3604,16 +4508,17 @@ mod tests {
     #[test]
     fn queue_total_processed_counter() {
         let mgr = TieredCompilationManager::with_default_policy();
-        let key = test_key();
+        // Two methods: one method holds one in-flight slot, so a second request
+        // for the same key would be refused rather than queued.
         mgr.enqueue_compilation(CompilationTask {
-            method_key: key.clone(),
+            method_key: test_key(),
             target_tier: CompilationTier::C1,
             priority: CompilationPriority::Normal,
             enqueue_time_ms: 0,
             osr_bci: None,
         });
         mgr.enqueue_compilation(CompilationTask {
-            method_key: key.clone(),
+            method_key: test_key2(),
             target_tier: CompilationTier::C2,
             priority: CompilationPriority::High,
             enqueue_time_ms: 0,
@@ -3622,8 +4527,7 @@ mod tests {
         mgr.dequeue_compilation();
         mgr.dequeue_compilation();
 
-        let q = mgr.core.queue.lock();
-        assert_eq!(q.total_processed, 2);
+        assert_eq!(mgr.core.total_processed(), 2);
     }
 
     // ── Custom policy thresholds ─────────────────────────────────────────
@@ -3652,14 +4556,6 @@ mod tests {
         assert_eq!(triggered_at, Some(10));
     }
 
-    // ── No profile returns None ──────────────────────────────────────────
-
-    #[test]
-    fn no_profile_returns_none() {
-        let mgr = TieredCompilationManager::with_default_policy();
-        assert!(mgr.get_profile(&test_key()).is_none());
-    }
-
     // ── Compiler active flag ─────────────────────────────────────────────
 
     #[test]
@@ -3680,27 +4576,6 @@ mod tests {
         assert!(CompilationTier::FullProfile < CompilationTier::C2);
     }
 
-    // ── Deopt resets queued state ────────────────────────────────────────
-
-    #[test]
-    fn deopt_resets_queued_state() {
-        let mgr = TieredCompilationManager::with_default_policy();
-        let key = test_key();
-        mgr.enqueue_compilation(CompilationTask {
-            method_key: key.clone(),
-            target_tier: CompilationTier::C2,
-            priority: CompilationPriority::High,
-            enqueue_time_ms: 0,
-            osr_bci: None,
-        });
-        mgr.on_deoptimization(&key);
-
-        let methods = mgr.core.methods.lock();
-        let state = &methods[&key];
-        assert!(!state.queued_for_compilation);
-        assert!(state.queued_tier.is_none());
-    }
-
     // ── C2 bailout stat incremented ──────────────────────────────────────
 
     #[test]
@@ -3712,18 +4587,17 @@ mod tests {
         assert_eq!(mgr.stats().c2_bailouts.load(Ordering::Relaxed), 1);
     }
 
-    // ── Backedge disabled when tiered off ────────────────────────────────
+    // ── OSR requests disabled when tiered off ────────────────────────────
 
     #[test]
-    fn backedge_disabled_when_tiered_off() {
+    fn osr_request_disabled_when_tiered_off() {
         let policy = CompilationPolicy {
-            osr_threshold: 1,
             tiered_enabled: false,
             ..CompilationPolicy::default()
         };
         let mgr = TieredCompilationManager::new(policy);
         let key = test_key();
-        assert!(mgr.on_backedge(&key, 0).is_none());
+        assert!(mgr.request_osr(&key, 0).is_none());
     }
 
     // ── Background worker drains an enqueued task off-thread ──────────────
@@ -4410,7 +5284,7 @@ mod tests {
         });
         mgr.enqueue_compilation(c1_task(&survivor));
 
-        mgr.invalidate_class("craton/test/EpochSubject");
+        mgr.invalidate_class(ClassId::new(0), "craton/test/EpochSubject");
 
         assert_eq!(mgr.queue_size(), 1, "only the unrelated class survives");
         assert_eq!(counts.count("queue_dropped_class_invalidated"), 2);
@@ -4434,7 +5308,7 @@ mod tests {
 
         let mut bg = BackgroundCompiler {
             core: Arc::clone(&mgr.core),
-            handle: None,
+            handles: Vec::new(),
         };
         bg.shutdown();
 
@@ -4445,5 +5319,337 @@ mod tests {
             "abandoning work at teardown is correct, but it is still countable"
         );
         assert_eq!(mgr.dropped_requests(), 2);
+    }
+
+    // ── Deduplication: one in-flight slot per method ─────────────────────
+
+    #[test]
+    fn an_identical_request_is_deduplicated_not_queued_twice() {
+        let counts = crate::metrics::SchedulingCapture::start();
+        let mgr = epoch_driven_manager(&Arc::new(AtomicU64::new(1)));
+        let key = epoch_key("dedup");
+        let c2 = CompilationTask {
+            target_tier: CompilationTier::C2,
+            priority: CompilationPriority::High,
+            ..c1_task(&key)
+        };
+
+        assert!(mgr.enqueue_compilation(c1_task(&key)));
+        assert!(
+            !mgr.enqueue_compilation(c1_task(&key)),
+            "an identical request is refused"
+        );
+        assert!(
+            !mgr.enqueue_compilation(c2.clone()),
+            "so is a different request while the slot is held: one compile per method at a time"
+        );
+        assert_eq!(mgr.queue_size(), 1);
+        assert_eq!(mgr.deduplicated_requests(), 2);
+        assert_eq!(counts.count("queue_deduplicated"), 2);
+
+        // A dispatched request still holds the slot until it completes.
+        assert_eq!(mgr.next_fresh_task(), Some(c1_task(&key)));
+        assert!(!mgr.enqueue_compilation(c1_task(&key)));
+        mgr.core
+            .complete_task(&key, CompilationTier::C1, 1, true, false, false);
+        assert!(mgr.enqueue_compilation(c2), "the slot frees on completion");
+    }
+
+    /// A counted trap drops the request still queued for its method, so the
+    /// VM's eager re-queue gets the slot instead of a second task beside it.
+    #[test]
+    fn a_counted_trap_drops_the_queued_request() {
+        let counts = crate::metrics::SchedulingCapture::start();
+        let mgr = epoch_driven_manager(&Arc::new(AtomicU64::new(1)));
+        let key = epoch_key("trappedWhileQueued");
+        assert!(mgr.enqueue_compilation(CompilationTask {
+            target_tier: CompilationTier::C2,
+            priority: CompilationPriority::High,
+            ..c1_task(&key)
+        }));
+
+        mgr.on_deoptimization(
+            &key,
+            DeoptReason::ClassCheck,
+            3,
+            DeoptAction::RecompileAndReinterpret,
+        );
+        assert_eq!(mgr.queue_size(), 0, "the stale C2 request is gone");
+        assert_eq!(mgr.dropped_requests(), 1);
+        assert_eq!(counts.count("queue_dropped_deoptimized"), 1);
+
+        assert!(mgr.enqueue_compilation(CompilationTask {
+            priority: CompilationPriority::High,
+            ..c1_task(&key)
+        }));
+        assert_eq!(mgr.queue_size(), 1, "exactly one request, not two");
+    }
+
+    // ── Loader-aware method keys ─────────────────────────────────────────
+
+    #[test]
+    fn same_named_classes_in_different_loaders_tier_independently() {
+        let policy = CompilationPolicy {
+            c1_threshold: 1,
+            ..CompilationPolicy::default()
+        };
+        let mgr =
+            TieredCompilationManager::with_install_epoch_source(policy, Some(Arc::new(AtomicU64::new(1))));
+        let app = MethodKey::with_class_id(ClassId::new(7), "com/example/Foo", "run", "()V");
+        let plugin = MethodKey::with_class_id(ClassId::new(9), "com/example/Foo", "run", "()V");
+        assert_ne!(app, plugin);
+
+        assert_eq!(mgr.on_method_invocation(&app), Some(CompilationTier::C1));
+        mgr.core
+            .complete_task(&app, CompilationTier::C1, 0, false, false, true);
+        mgr.mark_osr_denied(app.clone());
+
+        assert_eq!(
+            mgr.on_method_invocation(&plugin),
+            Some(CompilationTier::C1),
+            "one loader's ineligible verdict must not apply to the other's class"
+        );
+        assert!(!mgr.is_osr_denied(&plugin));
+
+        // Unloading one loader's class leaves the other's state and queue alone.
+        mgr.invalidate_class(ClassId::new(7), "com/example/Foo");
+        let states = mgr.method_states();
+        assert!(states.iter().all(|(k, _, _)| *k != app));
+        assert!(states.iter().any(|(k, _, _)| *k == plugin));
+        assert!(!mgr.is_osr_denied(&app), "unload forgets the class's denials");
+        // The app's C1 request (never dispatched here) went with its class.
+        assert_eq!(mgr.queue_size(), 1, "the plugin's queued request survives");
+    }
+
+    // ── Branch-profile windows: armed once, closed once ──────────────────
+
+    #[test]
+    fn every_branch_window_is_closed_exactly_once_whichever_way_its_request_leaves() {
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mgr = epoch_driven_manager(&epoch);
+
+        // 1. A C1→C2 supersede dropped as stale.
+        let stale = epoch_key("windowStale");
+        mgr.on_method_invocation(&stale);
+        mgr.compilation_complete(&stale, CompilationTier::C1, 1);
+        mgr.core.request_c2_upgrade(&stale);
+        assert_eq!(mgr.branch_window_balance(), 1);
+        epoch.store(2, Ordering::Release);
+        assert_eq!(mgr.next_fresh_task(), None);
+        assert_eq!(mgr.branch_window_balance(), 0, "a stale drop closes the window");
+
+        // 2. An OSR C2 completion never opened one and must not close one.
+        let osr = epoch_key("windowOsr");
+        let task = mgr.request_osr(&osr, 4).expect("OSR request");
+        assert_eq!(mgr.next_fresh_task(), Some(task));
+        mgr.core
+            .complete_task(&osr, CompilationTier::C2, 1, true, true, false);
+        assert_eq!(
+            mgr.branch_window_balance(),
+            0,
+            "an OSR completion closes nothing it did not open"
+        );
+
+        // 3. A deferred-new retry still queued when its class is invalidated.
+        let unloaded = epoch_key("windowUnloaded");
+        mgr.request_deferred_new_retry(&unloaded);
+        assert_eq!(mgr.branch_window_balance(), 1);
+        mgr.invalidate_class(ClassId::new(0), "craton/test/EpochSubject");
+        assert_eq!(
+            mgr.branch_window_balance(),
+            0,
+            "invalidate_class closes the window of the request it drops"
+        );
+
+        // 4. The ordinary exit: a supersede that compiles.
+        let compiled = epoch_key("windowCompiled");
+        mgr.on_method_invocation(&compiled);
+        mgr.compilation_complete(&compiled, CompilationTier::C1, 1);
+        mgr.core.request_c2_upgrade(&compiled);
+        let task = mgr.next_fresh_task().expect("the supersede dispatches");
+        mgr.core
+            .complete_task(&compiled, task.target_tier, 1, true, false, false);
+        assert_eq!(mgr.branch_window_balance(), 0);
+    }
+
+    // ── Settled tiering: the interpreter stops asking ────────────────────
+
+    #[test]
+    fn a_method_that_can_never_compile_reports_settled_until_something_changes() {
+        let policy = CompilationPolicy {
+            c1_threshold: 1,
+            ..CompilationPolicy::default()
+        };
+        let mgr = TieredCompilationManager::new(policy);
+        let key = test_key();
+
+        let first = mgr.on_method_invocation_settling(&key, 0);
+        assert_eq!(first.recommended, Some(CompilationTier::C1));
+        assert_eq!(
+            first.settled_generation, 0,
+            "a method with a request in flight is not settled"
+        );
+
+        mgr.core
+            .complete_task(&key, CompilationTier::C1, 0, false, false, true);
+        let banned = mgr.on_method_invocation_settling(&key, 0);
+        assert_eq!(banned.recommended, None);
+        assert!(
+            mgr.tiering_settled(banned.settled_generation),
+            "an ineligible method is settled"
+        );
+
+        // Anything that could unsettle a method expires every stamp.
+        mgr.on_class_redefined("java/lang/String");
+        assert!(!mgr.tiering_settled(banned.settled_generation));
+        assert_eq!(
+            mgr.on_method_invocation_settling(&key, 0).recommended,
+            Some(CompilationTier::C1),
+            "the redefinition cleared the verdict"
+        );
+        assert!(!mgr.tiering_settled(0), "a zero stamp is never settled");
+    }
+
+    // ── Panic containment ────────────────────────────────────────────────
+
+    #[test]
+    fn a_contained_panic_is_visible_to_the_panic_hook_as_contained() {
+        assert!(!compile_panic_is_contained());
+        let inside = contain_compile_panic(compile_panic_is_contained).expect("no panic");
+        assert!(inside, "the crash handler must see the scope while the hook runs");
+        let caught = contain_compile_panic(|| -> () { panic!("deliberate contained panic (test)") });
+        assert!(caught.is_err());
+        assert!(
+            !compile_panic_is_contained(),
+            "the scope closes again after the unwind"
+        );
+    }
+
+    #[test]
+    fn the_worker_survives_a_panicking_compile_fn() {
+        use std::sync::mpsc;
+        let policy = CompilationPolicy {
+            c1_threshold: 1,
+            c2_threshold: u32::MAX,
+            c2_min_invocations: u32::MAX,
+            osr_threshold: u32::MAX,
+            tiered_enabled: true,
+            c1_profiling: true,
+        };
+        let mgr = worker_manager(policy);
+        let doomed = MethodKey::new("craton/test/Panics", "boom", "()V");
+        let healthy = MethodKey::new("craton/test/Panics", "fine", "()V");
+
+        let (tx, rx) = mpsc::channel::<MethodKey>();
+        let bg = mgr
+            .start_background_compiler(Box::new(move |task: &CompilationTask| -> CompileOutcome {
+                if &*task.method_key.method_name == "boom" {
+                    panic!("deliberate compile panic (test)");
+                }
+                tx.send(task.method_key.clone()).unwrap();
+                CompileOutcome {
+                    compile_time_ms: 1,
+                    published: true,
+                    c2_upgrade_candidate: false,
+                    deferred_new_retry: false,
+                    declined_permanently: false,
+                }
+            }))
+            .expect("worker should start");
+
+        assert_eq!(mgr.on_method_invocation(&doomed), Some(CompilationTier::C1));
+        let deadline = std::time::Instant::now() + WORKER_RENDEZVOUS;
+        while mgr.completed_compilations() == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(mgr.worker_panics(), 1, "the panic was contained and counted");
+
+        // The same lane keeps serving: the next C1 compile still runs.
+        assert_eq!(mgr.on_method_invocation(&healthy), Some(CompilationTier::C1));
+        assert_eq!(
+            rx.recv_timeout(WORKER_RENDEZVOUS)
+                .expect("the worker must survive the panic"),
+            healthy
+        );
+        let deadline = std::time::Instant::now() + WORKER_RENDEZVOUS;
+        while mgr.completed_compilations() < 2 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        {
+            let methods = mgr.core.methods.lock();
+            assert!(
+                methods[&doomed].ineligible,
+                "a panicking compile is a permanent decline"
+            );
+            assert!(
+                !methods[&doomed].queued_for_compilation,
+                "and its slot is released"
+            );
+        }
+        assert_eq!(mgr.inflight_install_epoch(), 0, "the in-flight epoch is reset");
+        assert!(mgr.compiler_active());
+        drop(bg);
+    }
+
+    // ── Per-manager workers ──────────────────────────────────────────────
+
+    #[test]
+    fn a_second_manager_in_one_process_drains_its_own_queue() {
+        use std::sync::mpsc;
+        let policy = || CompilationPolicy {
+            c1_threshold: 1,
+            c2_threshold: u32::MAX,
+            c2_min_invocations: u32::MAX,
+            osr_threshold: u32::MAX,
+            tiered_enabled: true,
+            c1_profiling: true,
+        };
+        let compile_into = |tx: mpsc::Sender<MethodKey>| -> CompileFn {
+            Box::new(move |task: &CompilationTask| -> CompileOutcome {
+                tx.send(task.method_key.clone()).unwrap();
+                CompileOutcome {
+                    compile_time_ms: 1,
+                    published: true,
+                    c2_upgrade_candidate: false,
+                    deferred_new_retry: false,
+                    declined_permanently: false,
+                }
+            })
+        };
+        let first = worker_manager(policy());
+        let second = worker_manager(policy());
+        let (tx1, rx1) = mpsc::channel::<MethodKey>();
+        let (tx2, rx2) = mpsc::channel::<MethodKey>();
+        // The production door, for both: it used to be a process-wide `Once`,
+        // so the second call started nothing.
+        ensure_background_compiler(&first, || compile_into(tx1));
+        ensure_background_compiler(&second, || compile_into(tx2));
+        assert!(first.compiler_active() && second.compiler_active());
+
+        let k1 = MethodKey::new("craton/test/VmOne", "m", "()V");
+        let k2 = MethodKey::new("craton/test/VmTwo", "m", "()V");
+        assert_eq!(second.on_method_invocation(&k2), Some(CompilationTier::C1));
+        assert_eq!(
+            rx2.recv_timeout(WORKER_RENDEZVOUS)
+                .expect("the second VM's queue is drained"),
+            k2
+        );
+        assert_eq!(first.on_method_invocation(&k1), Some(CompilationTier::C1));
+        assert_eq!(
+            rx1.recv_timeout(WORKER_RENDEZVOUS)
+                .expect("the first VM's queue is drained"),
+            k1
+        );
+        assert!(
+            rx1.try_recv().is_err() && rx2.try_recv().is_err(),
+            "neither manager compiled the other's request"
+        );
+
+        second.shutdown_background_compiler();
+        assert!(!second.compiler_active());
+        assert!(
+            first.compiler_active(),
+            "stopping one VM's workers leaves the other's running"
+        );
     }
 }

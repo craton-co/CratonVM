@@ -178,7 +178,7 @@ pub fn unload_dead_class_metadata(
         shared
             .jit
             .tiered_manager
-            .invalidate_class(class.name.as_ref());
+            .invalidate_class(class.id, class.name.as_ref());
         shared.jit.deopt_log.lock().clear_class(class.name.as_ref());
         jit_entries_retired += shared
             .jit

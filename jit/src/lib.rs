@@ -33133,6 +33133,7 @@ mod tests {
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -33375,6 +33376,7 @@ mod tests {
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -33462,6 +33464,7 @@ mod tests {
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -34738,6 +34741,7 @@ mod tests {
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -34890,6 +34894,7 @@ mod tests {
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -35015,6 +35020,7 @@ mod tests {
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -35150,6 +35156,7 @@ mod tests {
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -35289,6 +35296,7 @@ mod tests {
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -35370,6 +35378,7 @@ mod tests {
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -35463,6 +35472,7 @@ mod tests {
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -36527,33 +36537,28 @@ mod tests {
         )));
     }
 
-    /// A long-running loop must request an OSR compile at its back-edge — and a
-    /// short one must not. The request has to name the loop header, because the
-    /// entry bci is what the compiled artifact publishes a native offset for.
+    /// A hot loop's OSR request must name the loop header, because the entry
+    /// bci is what the compiled artifact publishes a native offset for — and
+    /// the loop, which keeps running while the compile is queued, must not
+    /// enqueue a task per iteration.
+    ///
+    /// This used to drive `TieredCompilationManager::on_backedge` across its
+    /// `osr_threshold`. That door had no production caller (the interpreter's
+    /// per-frame back-edge schedule is the throttle, and it calls
+    /// `request_osr`) and was deleted.
     #[test]
     fn a_long_running_loop_requests_osr_at_the_backedge() {
-        use tiered::{CompilationPolicy, CompilationTier, MethodKey, TieredCompilationManager};
-        // A manager of our own, and a method key no other test names, so this
-        // shares no state with the process-global OSR deny list or the
-        // per-method tables (which is why it does NOT clear them: another
-        // test's manager may be mid-run).
-        let policy = CompilationPolicy {
-            osr_threshold: 64,
-            ..CompilationPolicy::default()
-        };
-        let mgr = TieredCompilationManager::new(policy);
+        use tiered::{CompilationTier, MethodKey, TieredCompilationManager};
+        // A manager of our own, and a method key no other test names: OSR
+        // denials and per-method state are per manager, so nothing here is
+        // shared with another test.
+        let mgr = TieredCompilationManager::with_default_policy();
         let key = MethodKey::new("craton/probe/OsrEntry", "sum", "([I)I");
         let bci = OSR_T_HEADER as u32;
 
-        for i in 0..63 {
-            assert!(
-                mgr.on_backedge(&key, bci).is_none(),
-                "back-edge {i} is below the OSR threshold and must not tier up"
-            );
-        }
         let task = mgr
-            .on_backedge(&key, bci)
-            .expect("the 64th back-edge crosses osr_threshold and must request an OSR compile");
+            .request_osr(&key, bci)
+            .expect("a hot back-edge must request an OSR compile");
         assert_eq!(
             task.osr_bci,
             Some(bci),
@@ -36561,12 +36566,13 @@ mod tests {
         );
         assert_eq!(task.target_tier, CompilationTier::C2);
         assert_eq!(task.method_key, key);
-        // The loop keeps running while the compile is queued; it must not
-        // enqueue a task per iteration.
-        assert!(
-            mgr.on_backedge(&key, bci).is_none(),
-            "an already-queued OSR request must not be re-enqueued"
-        );
+        for i in 0..63 {
+            assert!(
+                mgr.request_osr(&key, bci).is_none(),
+                "back-edge {i}: an already-queued OSR request must not be re-enqueued"
+            );
+        }
+        assert_eq!(mgr.queue_size(), 1);
     }
 
     /// The happy path, on the production artifact shape (no deopt metadata):
@@ -38859,6 +38865,7 @@ mod tests {
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -39507,6 +39514,7 @@ mod tests {
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -39529,6 +39537,7 @@ mod tests {
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -39671,6 +39680,7 @@ mod tests {
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),

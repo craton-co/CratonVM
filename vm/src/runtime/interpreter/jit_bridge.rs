@@ -402,10 +402,17 @@ pub(super) fn compile_osr_artifact(
     max_locals: usize,
     entry_pc: usize,
 ) -> Option<Arc<crate::jit::CompiledMethod>> {
-    let osr_key = crate::jit::tiered::MethodKey::new(&class_name, &method_name, &method_descriptor);
+    // Loader-aware, and asked of this VM's manager: OSR denials belong to a
+    // class identity and expire when the install epoch moves.
+    let osr_key = crate::jit::tiered::MethodKey::with_class_id(
+        class_id,
+        class_name.as_str(),
+        method_name.as_str(),
+        method_descriptor.as_str(),
+    );
     osr_stage("entry");
     cratonvm_types::osr_refusal_census::note_attempt();
-    if crate::jit::tiered::is_osr_denied(&osr_key) {
+    if shared.jit.tiered_manager.is_osr_denied(&osr_key) {
         return None;
     }
     // The two whole-method vetoes that must also stop a CACHED artifact from
@@ -944,7 +951,7 @@ pub(super) fn compile_osr_artifact(
                         class_name, method_name, method_descriptor
                     );
                 }
-                crate::jit::tiered::mark_osr_denied(osr_key.clone());
+                shared.jit.tiered_manager.mark_osr_denied(osr_key.clone());
                 return None;
             }
 
@@ -4747,10 +4754,21 @@ pub(super) fn resweep_held_deferred_new_retries(shared: &SharedVm, on_class_defi
                     "[cratonvm-jitc] deferred-new RE-OFFERED {class_name}.{method_name}{descriptor} — its class has loaded"
                 );
             }
+            // The held list records names only, so resolve the class the way
+            // this file's other by-name doors do. A key without the class's
+            // identity would not match the state the invocation hooks built,
+            // and the retry would take a second in-flight slot beside it.
+            let class_id = shared
+                .classes
+                .class_manager
+                .read()
+                .get_loaded_class_id(&class_name)
+                .unwrap_or(ClassId::new(0));
             shared
                 .jit
                 .tiered_manager
-                .request_deferred_new_retry(&crate::jit::tiered::MethodKey::new(
+                .request_deferred_new_retry(&crate::jit::tiered::MethodKey::with_class_id(
+                    class_id,
                     &*class_name,
                     &*method_name,
                     &*descriptor,
@@ -6309,6 +6327,7 @@ pub(super) fn compile_optimizing_artifact(
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -6993,6 +7012,29 @@ pub(super) fn try_jit_upgrade_with_gate(
     cached: &Arc<CachedBytecodeMethod>,
     gate: RedefineGate,
 ) -> Option<CachedInvokeTarget> {
+    // Panic containment for the inline upgrade door; see `try_jit_compile_callee`.
+    match cratonvm_jit::tiered::contain_compile_panic(|| {
+        try_jit_upgrade_with_gate_uncontained(shared, cached, gate)
+    }) {
+        Ok(target) => target,
+        Err(payload) => {
+            note_contained_mutator_compile_panic(
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+                &*payload,
+            );
+            None
+        }
+    }
+}
+
+/// [`try_jit_upgrade_with_gate`] without panic containment.
+fn try_jit_upgrade_with_gate_uncontained(
+    shared: &SharedVm,
+    cached: &Arc<CachedBytecodeMethod>,
+    gate: RedefineGate,
+) -> Option<CachedInvokeTarget> {
     // Kill-switch: CRATONVM_DISABLE_JIT=1 forces interpreter-only execution.
     // Mirrors the gate in `try_jit_compile_callee` so the user-facing
     // CRATONVM_DISABLE_JIT flag actually disables BOTH JIT entry points
@@ -7435,6 +7477,52 @@ pub(super) fn callee_neg_fingerprint(class_name: &str, method_name: &str, descri
 /// also what lets the inline-cache publications inside that window take their
 /// own keep-alive.
 pub fn try_jit_compile_callee(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    optimize: bool,
+) -> Option<(std::sync::Arc<cratonvm_jit::CompiledMethod>, usize, bool)> {
+    // The mutator-thread compile door, with its panics contained the way the
+    // background workers' are (`cratonvm_jit::tiered::contain_compile_panic`).
+    // Without this a codegen panic unwound through the interpreter frame that
+    // asked for the callee.
+    match cratonvm_jit::tiered::contain_compile_panic(|| {
+        try_jit_compile_callee_uncontained(shared, class_name, method_name, descriptor, optimize)
+    }) {
+        Ok(compiled) => compiled,
+        Err(payload) => {
+            note_contained_mutator_compile_panic(class_name, method_name, descriptor, &*payload);
+            None
+        }
+    }
+}
+
+/// A compile panic caught on a mutator thread: bail-list the method so no door
+/// asks for it again, count it under the workers' `worker_panic` scheduling
+/// event, and warn once per process.
+fn note_contained_mutator_compile_panic(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    payload: &(dyn std::any::Any + Send),
+) {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    cratonvm_jit::mark_jit_bail_listed(class_name, method_name, descriptor);
+    cratonvm_jit::metrics::record_scheduling_event(cratonvm_jit::metrics::SCHEDULING_EVENTS[6]);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            target: "cratonvm::jit",
+            "compile of {class_name}.{method_name}{descriptor} panicked on a mutator thread and \
+             was contained: {}. The method is bail-listed and keeps running interpreted; later \
+             contained panics are counted under the `worker_panic` scheduling event.",
+            cratonvm_jit::tiered::panic_payload_message(payload),
+        );
+    }
+}
+
+/// [`try_jit_compile_callee`] without panic containment.
+fn try_jit_compile_callee_uncontained(
     shared: &SharedVm,
     class_name: &str,
     method_name: &str,
@@ -8050,6 +8138,7 @@ pub(super) fn try_jit_compile_callee_slow(
         descriptor_facts_cache: std::sync::OnceLock::new(),
         intercept_shape_cache: std::sync::OnceLock::new(),
         interp_invocations: std::sync::atomic::AtomicU32::new(0),
+        tiering_settled: std::sync::atomic::AtomicU32::new(0),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -9075,6 +9164,11 @@ pub(super) fn try_jit_compile_callee_slow(
 /// program (a `main()` loop that never crosses the invocation threshold) still
 /// starts the worker.
 pub(super) fn ensure_bg_compiler_started(shared: &SharedVm) {
+    // One atomic load once this VM's workers are running. The `Weak` below
+    // takes the `self_arc` read lock, and every tier-up stride used to pay it.
+    if shared.jit.tiered_manager.compiler_active() {
+        return;
+    }
     let weak_vm: std::sync::Weak<SharedVm> =
         shared.self_arc.read().as_ref().cloned().unwrap_or_default();
     crate::jit::tiered::ensure_background_compiler(&shared.jit.tiered_manager, || {
@@ -9084,6 +9178,45 @@ pub(super) fn ensure_bg_compiler_started(shared: &SharedVm) {
             },
         )
     });
+}
+
+/// Offer one tier-up stride of `cached`'s method to the tiered manager, and
+/// return the tier it queued a compile at, if any.
+///
+/// The door every interpreter tier-up hook goes through. It checks the call
+/// site's `tiering_settled` stamp first: a method the manager has already said
+/// it can do nothing more for -- declined by policy, out of compile retries,
+/// already at C2 -- used to take the manager's global `methods` mutex and
+/// allocate three `String`s for its key at every stride, for the life of the
+/// process. Now it costs one relaxed load and one atomic compare until
+/// something (a deopt, an unload, a redefinition, a policy change) moves the
+/// manager's generation. The key it builds shares the cached method's
+/// `Arc<str>`s and carries the declaring class's identity, so same-named
+/// classes in different loaders keep separate tiering state.
+///
+/// Starting the worker stays the caller's job, because the `CRATONVM_BG_COMPILE=0`
+/// paths consult the manager without one.
+pub(super) fn offer_invocation_to_tiered_manager(
+    shared: &SharedVm,
+    cached: &cratonvm_jit_api::CachedBytecodeMethod,
+    invocation_count: u64,
+) -> Option<crate::jit::tiered::CompilationTier> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let manager = &shared.jit.tiered_manager;
+    if manager.tiering_settled(cached.tiering_settled.load(Relaxed)) {
+        return None;
+    }
+    let key = crate::jit::tiered::MethodKey::with_class_id(
+        cached.declaring_class_id,
+        Arc::clone(&cached.class_name),
+        Arc::clone(&cached.method_name),
+        Arc::clone(&cached.method_descriptor),
+    );
+    let verdict = manager.on_method_invocation_settling(&key, invocation_count);
+    cached
+        .tiering_settled
+        .store(verdict.settled_generation, Relaxed);
+    verdict.recommended
 }
 
 /// wire-tiered-manager Step 5: resolve the inputs the off-thread OSR compile
@@ -9341,7 +9474,7 @@ pub(super) fn background_compile_task(
     // docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md).
     // Nothing is statically skipped now; `CRATONVM_JIT_DENY` is the single
     // remaining force-interpret lever, applied in `jit::try_compile`.
-    if task.osr_bci.is_some() && crate::jit::tiered::is_osr_denied(&task.method_key) {
+    if task.osr_bci.is_some() && shared.jit.tiered_manager.is_osr_denied(&task.method_key) {
         return declined(0);
     }
     let optimized = crate::jit::tiered::tier_uses_optimized_backend(task.target_tier)
@@ -9390,24 +9523,42 @@ pub(super) fn background_compile_task(
             false
         };
         if !published {
-            // The compile inputs and policy are stable for the life of this
-            // loaded method. Prevent a failed background artifact from being
-            // re-enqueued forever now that pending work no longer consumes the
-            // frame's permanent-rejection budget.
+            // Which failures deny OSR, and which are retried.
             //
-            // Surface the denial under the existing compile-trace flag: this
-            // is a PERMANENT, process-lifetime decision that silently leaves
-            // the method's loops interpreted forever (a once-invoked harness
-            // main with the hot loop inline runs ~8x slow with zero other
-            // diagnostics — found the hard way, perf/halfgap-20260717).
+            // This used to deny OSR for the method on ANY unpublished result,
+            // for the rest of the process. Most ways a background OSR compile
+            // comes back empty are transient: the class manager could not hand
+            // over the inputs this time (`fetch_osr_compile_inputs` returned
+            // `None`), the code cache was full, a redefinition landed
+            // mid-compile, a callee had not loaded yet. Denying on those turned
+            // one unlucky compile into a method whose loops stayed interpreted
+            // forever (a once-invoked harness main with the hot loop inline ran
+            // ~8x slow with zero other diagnostics, perf/halfgap-20260717).
+            //
+            // So a failure is a failed compile -- it spends one of the method's
+            // `MAX_TIER_FAIL_RETRIES` and the next hot back-edge asks again,
+            // which also bounds the re-enqueue loop the old denial existed to
+            // stop -- unless the compiler recorded a verdict the loaded bytecode
+            // cannot change by bail-listing the method. Only then is OSR denied,
+            // and that denial still expires when the install epoch moves.
+            let permanent = cratonvm_jit::is_jit_bail_listed(
+                &task.method_key.class_name,
+                &task.method_key.method_name,
+                &task.method_key.descriptor,
+            );
             if crate::runtime::env_cache::dbg_jitc() {
                 eprintln!(
-                    "[cratonvm-jitc] OSR-compile FAILED {}.{}{} osr_bci={} stage={} — method marked OSR-denied for the rest of this process",
+                    "[cratonvm-jitc] OSR-compile FAILED {}.{}{} osr_bci={} stage={} — {}",
                     task.method_key.class_name,
                     task.method_key.method_name,
                     task.method_key.descriptor,
                     osr_bci,
                     osr_stage_get(),
+                    if permanent {
+                        "bail-listed: OSR denied until the install epoch moves"
+                    } else {
+                        "transient: counted as a failed compile and retried"
+                    },
                 );
                 eprintln!(
                     "[cratonvm-jitc]   …and the bail this method last recorded: {}",
@@ -9419,7 +9570,13 @@ pub(super) fn background_compile_task(
                     .unwrap_or_else(|| "none recorded".to_string()),
                 );
             }
-            crate::jit::tiered::mark_osr_denied(task.method_key.clone());
+            if permanent {
+                shared
+                    .jit
+                    .tiered_manager
+                    .mark_osr_denied(task.method_key.clone());
+                return declined(start.elapsed().as_millis() as u64);
+            }
         }
         return CompileOutcome {
             // Widening: smaller integer -> 64-bit (zero/sign-extended).

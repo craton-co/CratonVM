@@ -457,6 +457,18 @@ pub struct CachedBytecodeMethod {
     /// batches so the census and `hot_but_stuck_in_interpreter` still see
     /// every call (see `dispatch_virtual::execute_invokevirtual_fast_door`).
     pub interp_invocations: std::sync::atomic::AtomicU32,
+    /// The tiered manager's "nothing left to decide" stamp for this call
+    /// site's method, or `0`.
+    ///
+    /// Written from `TieredCompilationManager::on_method_invocation_settling`
+    /// and checked with `TieredCompilationManager::tiering_settled` before the
+    /// interpreter's tier-up hooks call the manager again. A method that will
+    /// never compile (declined by policy, out of retries, already at C2) used
+    /// to take the manager's global `methods` mutex and build a fresh key at
+    /// every retry stride for the life of the process. The stamp is a manager
+    /// generation, so a deopt, an unload, a redefinition or a policy change
+    /// expires every stamp at once and the hook resumes asking.
+    pub tiering_settled: std::sync::atomic::AtomicU32,
     /// Per-call-site native-dispatch memo. **Read it through
     /// [`Self::native_call_site`], never directly.**
     ///
@@ -615,6 +627,12 @@ impl Clone for CachedBytecodeMethod {
             intercept_shape_cache: self.intercept_shape_cache.clone(),
             interp_invocations: std::sync::atomic::AtomicU32::new(
                 self.interp_invocations.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            // Carried forward for the reason `jit_probe_generation` is: the
+            // stamp is generation-keyed, so an inherited stale one simply fails
+            // `tiering_settled` and the clone asks the manager again.
+            tiering_settled: std::sync::atomic::AtomicU32::new(
+                self.tiering_settled.load(std::sync::atomic::Ordering::Relaxed),
             ),
             // `NativeCallSite: Clone` snapshots the memo word. Carrying it
             // forward is sound for the same reason `jit_probe_generation`'s
@@ -2151,6 +2169,7 @@ mod tests {
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),

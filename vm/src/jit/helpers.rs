@@ -3210,6 +3210,7 @@ unsafe fn resolve_callee_cached(
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -4545,6 +4546,7 @@ unsafe fn try_resume_trapped_callee(
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -23590,12 +23592,22 @@ impl DeoptimizationController {
             speculation_id: 0,
         };
 
-        // Record in deopt log and get recommended action
-        let tiered_key = cratonvm_jit::tiered::MethodKey {
-            class_name: class_name.to_string(),
-            method_name: method_name.to_string(),
-            descriptor: descriptor.to_string(),
-        };
+        // Record in deopt log and get recommended action. The class is resolved
+        // by name, for the reason the eviction below gives; resolving it up
+        // front lets the tiered manager's key carry the class identity its
+        // per-method state is keyed by.
+        let class_id = vm
+            .classes
+            .class_manager
+            .read()
+            .get_loaded_class_id(class_name)
+            .unwrap_or(cratonvm_types::ClassId::new(0));
+        let tiered_key = cratonvm_jit::tiered::MethodKey::with_class_id(
+            class_id,
+            class_name,
+            method_name,
+            descriptor,
+        );
         let action = vm.record_deoptimization(&method_key, event, &tiered_key);
 
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
@@ -23621,8 +23633,9 @@ impl DeoptimizationController {
         // interpretation (347s/round vs a 63-72s/round fully-interpreted
         // baseline for the same benchmark -- docs/known-issues/tomcat-08-07/
         // silent-hang-no-signature-cluster.md, TestResponsePerformance).
-        let skip_eviction = reason == cratonvm_jit::deopt::DeoptReason::OsrExit
-            && action == cratonvm_jit::deopt::DeoptAction::Reinterpret;
+        // The predicate is shared with the tiered manager, which must drop the
+        // method's tier exactly when this evicts its body.
+        let skip_eviction = !cratonvm_jit::tiered::deopt_evicts_method_body(reason, action);
         if !skip_eviction {
             // `deoptimize` is a `&str`-keyed public API with ~20 call sites;
             // resolving the class globally by name here preserves this

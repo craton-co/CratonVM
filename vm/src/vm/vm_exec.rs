@@ -8457,6 +8457,9 @@ impl<'a> NativeContextImpl<'a> {
             );
         }
         let _ = self.shared.invalidate_jit_for_class(&name);
+        // Every tiering verdict recorded against the old bytecode (ineligible,
+        // c2_bailout, trap counts, OSR denials) says nothing about the new one.
+        self.shared.jit.tiered_manager.on_class_redefined(&name);
         Ok(())
     }
 }
@@ -10827,6 +10830,9 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
                 // T5.4.4 вЂ” additionally consult the InvalidationManager's
                 // LeafClass/class_dependencies entries.
                 let cha_evicted = self.shared.invalidate_jit_for_class(name);
+                // A define over an already-loaded name replaces that class's
+                // bytecode, and with it every tiering verdict about the old one.
+                self.shared.jit.tiered_manager.on_class_redefined(name);
                 if cha_evicted > 0 {
                     tracing::debug!(
                         "JIT: invalidated {cha_evicted} method(s) via CHA listener for class: {name}"
@@ -10901,6 +10907,9 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
                 }
                 // T5.4.4 вЂ” CHA-listener invalidation
                 let cha_evicted = self.shared.invalidate_jit_for_class(name);
+                // A define over an already-loaded name replaces that class's
+                // bytecode, and with it every tiering verdict about the old one.
+                self.shared.jit.tiered_manager.on_class_redefined(name);
                 if cha_evicted > 0 {
                     tracing::debug!(
                         "JIT: invalidated {cha_evicted} method(s) via CHA listener for class: {name}"
@@ -11035,6 +11044,9 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             tracing::debug!("JIT: invalidated {evicted} method(s) due to defineClass: {name}");
         }
         let cha_evicted = self.shared.invalidate_jit_for_class(name);
+        // A define over an already-loaded name replaces that class's bytecode,
+        // and with it every tiering verdict about the old one.
+        self.shared.jit.tiered_manager.on_class_redefined(name);
         if cha_evicted > 0 {
             tracing::debug!("JIT: CHA-invalidated {cha_evicted} method(s) for: {name}");
         }
