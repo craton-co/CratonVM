@@ -118,6 +118,33 @@
 //! caveat as the two JFR tables — if `inner` is ever given a level it must be
 //! a HIGHER one, never an equal one.
 //!
+//! Two singles in September, each paying back exactly the one raw lock that had
+//! taken `dev` to 429, and both at `Scratch`:
+//!
+//! * 2026-09-02 — `jdk_builtin_module_sets`' cache (`src/classloader.rs`),
+//!   landed raw in `23e262ab1` the day before.
+//! * 2026-09-12 — `jar_manifest_sections_cached`'s `CACHE`
+//!   (`src/phases_late/jar_manifest.rs`), landed raw in `ace814806`. Its read
+//!   sat in an `if let` scrutinee, so it needed the same hoist the 2026-08-17
+//!   round applied to three TLS tables: the guard now drops before
+//!   `jar_entry_bytes_cached` takes its own two caches, which is what makes
+//!   `Scratch` a claim rather than something true by luck. Note it is also
+//!   called AFTER `jar_path_mtime`, which holds the `Scratch` mtime memo — two
+//!   locks at the floor must not nest, and these do not.
+//!
+//! Neither lowers [`BASELINE_RAW_LOCKS`]. Each converted the same lock that had
+//! raised the count, so 428 is the figure on both sides of the change and the
+//! `assert_eq!` below is satisfied without touching it.
+//!
+//! **The first of the two was never recorded here, and that cost the second one
+//! a full re-derivation of the census.** `git bisect` over the ratchet is also
+//! misleading once this has happened twice: the predicate is not monotonic, so
+//! it reports the FIRST 428 -> 429 transition (2026-09-01, since repaired) and
+//! not the one currently responsible. What names the live site is a MULTISET
+//! diff of the census against the last green tree — the count moved while the
+//! set of distinct source lines did not, because the new construction was a
+//! third copy of a line that already appeared twice.
+//!
 //! Not converted, and worth naming so the next person does not re-derive it:
 //! `boot_layer_memo` (`src/jboss_jdkspecific.rs`) and `p60_current_handle_memo`
 //! (`src/phases_late.rs`) both hold their guard across `ctx.add_global_root`,
