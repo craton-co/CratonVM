@@ -5635,15 +5635,25 @@ pub(crate) fn subclass_runs_its_own_bytecode(
     Some(ctx.invoke_virtual_bytecode_only(this, name, descriptor, &args[1..]))
 }
 
-/// Wrap each `(name, descriptor, body)` in [`subclass_runs_its_own_bytecode`]
-/// and register the wrapper.
+/// Define one `sa_*` wrapper per triple, each guarding its body with
+/// [`subclass_runs_its_own_bytecode`].
 ///
 /// One generated `fn` per triple, because `NativeCallback` is a bare `fn`
 /// pointer with no captures: the wrapper has to know its own name and
 /// descriptor at runtime, and a closure that captured them could not be
 /// registered.
-macro_rules! subclass_aware_registrations {
-    ($r:expr, $cls:expr, [ $( ($fname:ident, $name:expr, $desc:expr, $inner:expr) ),+ $(,)? ]) => {
+///
+/// **It generates the BODIES only, never the `r.register` calls**, and that is
+/// not a style choice. `registrar_drift.rs` and `registrar_reachability.rs`
+/// find registrations by SCANNING this source; they expand `for` loops and
+/// they cannot expand a macro. Emitting the calls from here made 29 triples
+/// vanish from both scanners, and `the_drift_baseline_has_no_stale_rows` went
+/// red naming eleven `register_phase54_net_extras` pairs that still drift
+/// exactly as much as they did before — the gate had simply been blinded to
+/// the shipping half. `register_one` therefore keeps its 31 literal
+/// `r.register(cls, …)` lines.
+macro_rules! subclass_aware_bodies {
+    ( $( ($fname:ident, $name:expr, $desc:expr, $inner:expr) ),+ $(,)? ) => {
         $(
             fn $fname(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 if let Some(forwarded) = subclass_runs_its_own_bytecode(ctx, args, $name, $desc) {
@@ -5652,7 +5662,6 @@ macro_rules! subclass_aware_registrations {
                 let inner: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult = $inner;
                 inner(ctx, args)
             }
-            $r.register($cls, $name, $desc, $fname);
         )+
     };
 }
@@ -5798,6 +5807,161 @@ fn huc_using_proxy(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallR
 // Public registration entry point
 // ---------------------------------------------------------------------------
 
+// One `sa_*` body per triple. The registrations stay literal in
+// `register_one` below — see `subclass_aware_bodies`' note on the two source
+// scanners that read them.
+subclass_aware_bodies!(
+    (sa_connect, "connect", "()V", huc_connect),
+    (
+        sa_get_response_code,
+        "getResponseCode",
+        "()I",
+        huc_get_response_code
+    ),
+    (
+        sa_get_response_message,
+        "getResponseMessage",
+        "()Ljava/lang/String;",
+        huc_get_response_message
+    ),
+    (
+        sa_get_input_stream,
+        "getInputStream",
+        "()Ljava/io/InputStream;",
+        huc_get_input_stream
+    ),
+    (
+        sa_get_error_stream,
+        "getErrorStream",
+        "()Ljava/io/InputStream;",
+        huc_get_error_stream
+    ),
+    (
+        sa_get_output_stream,
+        "getOutputStream",
+        "()Ljava/io/OutputStream;",
+        huc_get_output_stream
+    ),
+    (
+        sa_get_header_field_named,
+        "getHeaderField",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        huc_get_header_field_named
+    ),
+    (
+        sa_get_header_field_indexed,
+        "getHeaderField",
+        "(I)Ljava/lang/String;",
+        huc_get_header_field_indexed
+    ),
+    (
+        sa_get_header_field_key,
+        "getHeaderFieldKey",
+        "(I)Ljava/lang/String;",
+        huc_get_header_field_key_indexed
+    ),
+    (
+        sa_get_header_fields,
+        "getHeaderFields",
+        "()Ljava/util/Map;",
+        huc_get_header_fields
+    ),
+    (
+        sa_get_content_length,
+        "getContentLength",
+        "()I",
+        huc_get_content_length
+    ),
+    (
+        sa_get_content_length_long,
+        "getContentLengthLong",
+        "()J",
+        huc_get_content_length_long
+    ),
+    (sa_disconnect, "disconnect", "()V", huc_disconnect),
+    (
+        sa_set_request_method,
+        "setRequestMethod",
+        "(Ljava/lang/String;)V",
+        huc_set_request_method
+    ),
+    (
+        sa_get_request_method,
+        "getRequestMethod",
+        "()Ljava/lang/String;",
+        huc_get_request_method
+    ),
+    (
+        sa_set_request_property,
+        "setRequestProperty",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        huc_set_request_property
+    ),
+    (
+        sa_add_request_property,
+        "addRequestProperty",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        huc_add_request_property
+    ),
+    (
+        sa_get_request_property,
+        "getRequestProperty",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        huc_get_request_property
+    ),
+    (sa_set_do_input, "setDoInput", "(Z)V", huc_set_do_input),
+    (sa_set_do_output, "setDoOutput", "(Z)V", huc_set_do_output),
+    (
+        sa_set_connect_timeout,
+        "setConnectTimeout",
+        "(I)V",
+        huc_set_connect_timeout
+    ),
+    (
+        sa_set_read_timeout,
+        "setReadTimeout",
+        "(I)V",
+        huc_set_read_timeout
+    ),
+    (
+        sa_set_fixed_length_i,
+        "setFixedLengthStreamingMode",
+        "(I)V",
+        huc_set_fixed_length_streaming_mode
+    ),
+    (
+        sa_set_fixed_length_j,
+        "setFixedLengthStreamingMode",
+        "(J)V",
+        huc_set_fixed_length_streaming_mode
+    ),
+    (
+        sa_set_chunked,
+        "setChunkedStreamingMode",
+        "(I)V",
+        huc_set_chunked_streaming_mode
+    ),
+    (
+        sa_set_instance_follow_redirects,
+        "setInstanceFollowRedirects",
+        "(Z)V",
+        huc_set_instance_follow_redirects
+    ),
+    (
+        sa_get_instance_follow_redirects,
+        "getInstanceFollowRedirects",
+        "()Z",
+        huc_get_instance_follow_redirects
+    ),
+    (sa_using_proxy, "usingProxy", "()Z", huc_using_proxy),
+    (
+        sa_get_request_properties,
+        "getRequestProperties",
+        "()Ljava/util/Map;",
+        huc_get_request_properties
+    ),
+);
+
 fn register_one(r: &mut NativeMethodRegistry, cls: &str) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -5811,8 +5975,8 @@ fn register_one(r: &mut NativeMethodRegistry, cls: &str) {
     r.register(cls, "<init>", "(Ljava/net/URL;)V", huc_init);
     r.register(cls, "<init>", "()V", huc_init);
     // Everything below runs for a carrier this VM minted and steps aside for a
-    // user subclass — see `subclass_runs_its_own_bytecode`. The wrapper is
-    // uniform on purpose: guarding only the five triples a probe happened to
+    // user subclass — see `subclass_runs_its_own_bytecode`. The guard is
+    // uniform on purpose: wrapping only the five triples a probe happened to
     // catch would leave the same defect in the other twenty-four.
     //
     // The streaming setters now carry the JDK's own refusals, in the JDK's
@@ -5821,160 +5985,129 @@ fn register_one(r: &mut NativeMethodRegistry, cls: &str) {
     // never runs URLConnection's field initializers, so those fields are 0
     // (not -1)". The premise was right and the conclusion was avoidable:
     // `huc_write_declared_field_defaults` writes the -1s.
-    subclass_aware_registrations!(
-        r,
+    r.register(cls, "connect", "()V", sa_connect);
+    r.register(cls, "getResponseCode", "()I", sa_get_response_code);
+    r.register(
         cls,
-        [
-            (sa_connect, "connect", "()V", huc_connect),
-            (
-                sa_get_response_code,
-                "getResponseCode",
-                "()I",
-                huc_get_response_code
-            ),
-            (
-                sa_get_response_message,
-                "getResponseMessage",
-                "()Ljava/lang/String;",
-                huc_get_response_message
-            ),
-            (
-                sa_get_input_stream,
-                "getInputStream",
-                "()Ljava/io/InputStream;",
-                huc_get_input_stream
-            ),
-            (
-                sa_get_error_stream,
-                "getErrorStream",
-                "()Ljava/io/InputStream;",
-                huc_get_error_stream
-            ),
-            (
-                sa_get_output_stream,
-                "getOutputStream",
-                "()Ljava/io/OutputStream;",
-                huc_get_output_stream
-            ),
-            (
-                sa_get_header_field_named,
-                "getHeaderField",
-                "(Ljava/lang/String;)Ljava/lang/String;",
-                huc_get_header_field_named
-            ),
-            (
-                sa_get_header_field_indexed,
-                "getHeaderField",
-                "(I)Ljava/lang/String;",
-                huc_get_header_field_indexed
-            ),
-            (
-                sa_get_header_field_key,
-                "getHeaderFieldKey",
-                "(I)Ljava/lang/String;",
-                huc_get_header_field_key_indexed
-            ),
-            (
-                sa_get_header_fields,
-                "getHeaderFields",
-                "()Ljava/util/Map;",
-                huc_get_header_fields
-            ),
-            (
-                sa_get_content_length,
-                "getContentLength",
-                "()I",
-                huc_get_content_length
-            ),
-            (
-                sa_get_content_length_long,
-                "getContentLengthLong",
-                "()J",
-                huc_get_content_length_long
-            ),
-            (sa_disconnect, "disconnect", "()V", huc_disconnect),
-            (
-                sa_set_request_method,
-                "setRequestMethod",
-                "(Ljava/lang/String;)V",
-                huc_set_request_method
-            ),
-            (
-                sa_get_request_method,
-                "getRequestMethod",
-                "()Ljava/lang/String;",
-                huc_get_request_method
-            ),
-            (
-                sa_set_request_property,
-                "setRequestProperty",
-                "(Ljava/lang/String;Ljava/lang/String;)V",
-                huc_set_request_property
-            ),
-            (
-                sa_add_request_property,
-                "addRequestProperty",
-                "(Ljava/lang/String;Ljava/lang/String;)V",
-                huc_add_request_property
-            ),
-            (
-                sa_get_request_property,
-                "getRequestProperty",
-                "(Ljava/lang/String;)Ljava/lang/String;",
-                huc_get_request_property
-            ),
-            (sa_set_do_input, "setDoInput", "(Z)V", huc_set_do_input),
-            (sa_set_do_output, "setDoOutput", "(Z)V", huc_set_do_output),
-            (
-                sa_set_connect_timeout,
-                "setConnectTimeout",
-                "(I)V",
-                huc_set_connect_timeout
-            ),
-            (
-                sa_set_read_timeout,
-                "setReadTimeout",
-                "(I)V",
-                huc_set_read_timeout
-            ),
-            (
-                sa_set_fixed_length_i,
-                "setFixedLengthStreamingMode",
-                "(I)V",
-                huc_set_fixed_length_streaming_mode
-            ),
-            (
-                sa_set_fixed_length_j,
-                "setFixedLengthStreamingMode",
-                "(J)V",
-                huc_set_fixed_length_streaming_mode
-            ),
-            (
-                sa_set_chunked,
-                "setChunkedStreamingMode",
-                "(I)V",
-                huc_set_chunked_streaming_mode
-            ),
-            (
-                sa_set_instance_follow_redirects,
-                "setInstanceFollowRedirects",
-                "(Z)V",
-                huc_set_instance_follow_redirects
-            ),
-            (
-                sa_get_instance_follow_redirects,
-                "getInstanceFollowRedirects",
-                "()Z",
-                huc_get_instance_follow_redirects
-            ),
-            (sa_using_proxy, "usingProxy", "()Z", huc_using_proxy),
-            (
-                sa_get_request_properties,
-                "getRequestProperties",
-                "()Ljava/util/Map;",
-                huc_get_request_properties
-            ),
-        ]
+        "getResponseMessage",
+        "()Ljava/lang/String;",
+        sa_get_response_message,
+    );
+    r.register(
+        cls,
+        "getInputStream",
+        "()Ljava/io/InputStream;",
+        sa_get_input_stream,
+    );
+    r.register(
+        cls,
+        "getErrorStream",
+        "()Ljava/io/InputStream;",
+        sa_get_error_stream,
+    );
+    r.register(
+        cls,
+        "getOutputStream",
+        "()Ljava/io/OutputStream;",
+        sa_get_output_stream,
+    );
+    r.register(
+        cls,
+        "getHeaderField",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        sa_get_header_field_named,
+    );
+    r.register(
+        cls,
+        "getHeaderField",
+        "(I)Ljava/lang/String;",
+        sa_get_header_field_indexed,
+    );
+    r.register(
+        cls,
+        "getHeaderFieldKey",
+        "(I)Ljava/lang/String;",
+        sa_get_header_field_key,
+    );
+    r.register(
+        cls,
+        "getHeaderFields",
+        "()Ljava/util/Map;",
+        sa_get_header_fields,
+    );
+    r.register(cls, "getContentLength", "()I", sa_get_content_length);
+    r.register(
+        cls,
+        "getContentLengthLong",
+        "()J",
+        sa_get_content_length_long,
+    );
+    r.register(cls, "disconnect", "()V", sa_disconnect);
+    r.register(
+        cls,
+        "setRequestMethod",
+        "(Ljava/lang/String;)V",
+        sa_set_request_method,
+    );
+    r.register(
+        cls,
+        "getRequestMethod",
+        "()Ljava/lang/String;",
+        sa_get_request_method,
+    );
+    r.register(
+        cls,
+        "setRequestProperty",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        sa_set_request_property,
+    );
+    r.register(
+        cls,
+        "addRequestProperty",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        sa_add_request_property,
+    );
+    r.register(
+        cls,
+        "getRequestProperty",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        sa_get_request_property,
+    );
+    r.register(cls, "setDoInput", "(Z)V", sa_set_do_input);
+    r.register(cls, "setDoOutput", "(Z)V", sa_set_do_output);
+    r.register(cls, "setConnectTimeout", "(I)V", sa_set_connect_timeout);
+    r.register(cls, "setReadTimeout", "(I)V", sa_set_read_timeout);
+    r.register(
+        cls,
+        "setFixedLengthStreamingMode",
+        "(I)V",
+        sa_set_fixed_length_i,
+    );
+    r.register(
+        cls,
+        "setFixedLengthStreamingMode",
+        "(J)V",
+        sa_set_fixed_length_j,
+    );
+    r.register(cls, "setChunkedStreamingMode", "(I)V", sa_set_chunked);
+    r.register(
+        cls,
+        "setInstanceFollowRedirects",
+        "(Z)V",
+        sa_set_instance_follow_redirects,
+    );
+    r.register(
+        cls,
+        "getInstanceFollowRedirects",
+        "()Z",
+        sa_get_instance_follow_redirects,
+    );
+    r.register(cls, "usingProxy", "()Z", sa_using_proxy);
+    r.register(
+        cls,
+        "getRequestProperties",
+        "()Ljava/util/Map;",
+        sa_get_request_properties,
     );
     r.set_category(__prev_cat);
 }
