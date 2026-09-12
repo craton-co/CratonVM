@@ -1603,8 +1603,8 @@ fn is_synthesized_locale_base(name: &str) -> bool {
 /// accessors return a plain `ResourceBundle` (no `checkcast`), and
 /// `DateFormatSymbols`/`DecimalFormatSymbols` consume them through the curated
 /// English/US map populated by `build_bundle`.
-fn needs_concrete_bundle_class(name: &str) -> bool {
-    name.ends_with(".TimeZoneNames") || name.ends_with(".LocaleNames")
+fn needs_concrete_bundle_class(name: &str, caller_is_app: bool) -> bool {
+    name.ends_with(".TimeZoneNames") || (name.ends_with(".LocaleNames") && !caller_is_app)
 }
 
 /// `.LocaleNames` was added 2026-09-11 (wave 6) and the paragraph above said
@@ -1638,6 +1638,31 @@ fn needs_concrete_bundle_class(name: &str) -> bool {
 /// `CurrencyNames` has the same shape and is deliberately NOT added: it
 /// measured `+38` armed on the same probe, so its curated path is doing work
 /// the class bundles would have to replace, and that is its own measurement.
+///
+/// # `LocaleNames` is routed for JDK-INTERNAL callers only, and that is
+/// MEASURED
+///
+/// The first cut routed it for every caller and cost one probe:
+///
+/// ```text
+///   CurrencyNameProbe row 18   HotSpot: THREW MissingResourceException
+///                                       "Can't find bundle for base name
+///                                        sun.util.resources.LocaleNames"
+///                              this VM: sun.util.resources.cldr.LocaleNames_en
+/// ```
+///
+/// Application code calling `ResourceBundle.getBundle` on that base name by
+/// hand gets a `MissingResourceException` on HotSpot, and answering it is a
+/// wrong answer even though the bundle is real and the cast would have
+/// worked. The `checkcast` that needs the real class lives in
+/// `LocaleData.getLocaleNames`, which is not application code -- so
+/// `caller_is_app` is exactly the discriminator, and it is already computed
+/// here for `is_jdk_internal_bundle`'s sake.
+///
+/// `TimeZoneNames` is NOT gated the same way: it was routed unconditionally
+/// in 2026-08 for Tomcat's `TestExpiresFilter` and nothing has measured the
+/// app-caller side of it. Narrowing someone else's fix on an argument rather
+/// than a measurement is how a working path breaks.
 fn concrete_bundle_chain(
     bundle_name: &str,
     chain: &[(String, String, String)],
@@ -2196,8 +2221,10 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // javac/launcher messages — and some apps ship resources — as compiled
     // bundle classes, e.g. `com.sun.tools.javac.resources.compiler`). Skip the
     // hand-synthesized locale-data families, which stay on their curated path.
-    if !is_synthesized_locale_base(&bundle_name) || needs_concrete_bundle_class(&bundle_name) {
-        let chain = if needs_concrete_bundle_class(&bundle_name) {
+    if !is_synthesized_locale_base(&bundle_name)
+        || needs_concrete_bundle_class(&bundle_name, caller_is_app)
+    {
+        let chain = if needs_concrete_bundle_class(&bundle_name, caller_is_app) {
             concrete_bundle_chain(&bundle_name, &chain)
         } else {
             chain.clone()
@@ -4421,13 +4448,32 @@ mod w6_concrete_bundle_chain_tests {
     /// not for.
     #[test]
     fn currency_names_is_not_routed_to_the_class_bundles() {
-        assert!(needs_concrete_bundle_class("sun.util.resources.TimeZoneNames"));
-        assert!(needs_concrete_bundle_class("sun.util.resources.LocaleNames"));
+        assert!(needs_concrete_bundle_class(
+            "sun.util.resources.TimeZoneNames",
+            false
+        ));
+        assert!(needs_concrete_bundle_class(
+            "sun.util.resources.LocaleNames",
+            false
+        ));
+        // An APPLICATION caller asking for `LocaleNames` by hand gets
+        // HotSpot's `MissingResourceException`, not our real bundle --
+        // measured on `CurrencyNameProbe` rows 18 and 20.
+        assert!(!needs_concrete_bundle_class(
+            "sun.util.resources.LocaleNames",
+            true
+        ));
+        // `TimeZoneNames` is unconditional, as it has been since 2026-08.
+        assert!(needs_concrete_bundle_class(
+            "sun.util.resources.TimeZoneNames",
+            true
+        ));
         // +38 armed on `L1LocaleProviderWorkload`: its curated path is doing
         // work the class bundles would have to replace, and that is its own
         // measurement rather than this one's corollary.
         assert!(!needs_concrete_bundle_class(
-            "sun.util.resources.CurrencyNames"
+            "sun.util.resources.CurrencyNames",
+            false
         ));
     }
 }
