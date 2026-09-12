@@ -1499,7 +1499,6 @@ pub fn write_class(
     let this_class = cp.class(name);
     let super_class = cp.class("java/lang/Object");
     let code_name = cp.utf8("Code");
-    let smt_name = cp.utf8("StackMapTable");
     let mut method_bytes = Vec::new();
     for m in &methods {
         let name_idx = cp.utf8(&m.name);
@@ -1518,6 +1517,9 @@ pub fn write_class(
         }
         let with_smt = version == ClassVersion::Java8 && !m.body.frames.is_empty();
         if with_smt {
+            // Interned only when a table is written: a pre-50 class must not
+            // even name the attribute.
+            let smt_name = cp.utf8("StackMapTable");
             let smt = stack_map_table(&mut cp, &m.body.frames);
             put_u16(&mut code_attr, 1);
             put_u16(&mut code_attr, smt_name);

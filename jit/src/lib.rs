@@ -87,7 +87,13 @@ pub mod bailout;
 // doors (method entry, the eager first-call compile, OSR), and only the first
 // ever asked the admission questions; the other two grew hand-copied subsets
 // of them. See `docs/feature-designs/jit-osr-entry-metadata.md` step 3.
+// Publication/retirement events for profilers and debuggers, and the three
+// sinks behind them (perf map, jitdump, GDB JIT interface).
+pub mod code_events;
 pub mod compile_gate;
+pub mod gdb_jit;
+pub mod jitdump;
+pub mod perf_map;
 pub mod deopt;
 pub mod escape_analysis;
 pub mod gpu_barrier;
@@ -1188,6 +1194,8 @@ impl Drop for ExecutableBuffer {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .deregister(self.ptr);
+        // Withdraw debugger symbols before the address can be reused.
+        crate::code_events::retire(self.ptr as usize, self.capacity);
         COMMITTED_JIT_CODE_BYTES.fetch_sub(self.capacity, std::sync::atomic::Ordering::Relaxed);
         // DIAG: `CRATONVM_DBG_JIT_UNMAP=1` names every code buffer as it is
         // unmapped. Paired with `CRATONVM_DBG=jitc` (which prints each
@@ -6537,6 +6545,11 @@ unsafe fn osr_trampoline(
                 sp_id_slot_off,
             )?;
             let fresh_arc = Arc::new(fresh);
+            // Profiler/debugger symbols; a racing loser is retired on drop.
+            crate::code_events::publish(fresh_arc.as_ptr() as usize, fresh_arc.pos(), || {
+                let label = format!("osr-trampoline->{target_addr:#x}");
+                crate::code_events::with_tier_suffix(&label, crate::code_events::CodeTier::Stub("osr-trampoline"))
+            });
             let mut guard = cache.lock();
             guard
                 .entry(cache_key)
@@ -18373,6 +18386,15 @@ invalidation before this body's publication"
                 format!("{}.{}{}", key.class_name, key.method_name, key.descriptor),
             );
         }
+        // Profiler/debugger symbols (perf map, jitdump, GDB); no-op unless enabled.
+        crate::code_events::publish(arc.entry_ptr() as usize, arc.code_len(), || {
+            let tier = if arc.used_ir_backend {
+                crate::code_events::CodeTier::C2
+            } else {
+                crate::code_events::CodeTier::C1
+            };
+            crate::code_events::method_name(&key.class_name, &key.method_name, &key.descriptor, tier)
+        });
         jit_entry_owners()
             .lock()
             .insert(arc.entry_ptr() as usize, Arc::downgrade(&arc));
@@ -18476,6 +18498,11 @@ invalidation before this body's publication"
                 ),
             );
         }
+        // Profiler/debugger symbols (perf map, jitdump, GDB); no-op unless enabled.
+        crate::code_events::publish(arc.entry_ptr() as usize, arc.code_len(), || {
+            let tier = crate::code_events::CodeTier::Osr(arc.osr_compiled_entry_pc);
+            crate::code_events::method_name(&key.class_name, &key.method_name, &key.descriptor, tier)
+        });
         jit_entry_owners()
             .lock()
             .insert(arc.entry_ptr() as usize, Arc::downgrade(&arc));

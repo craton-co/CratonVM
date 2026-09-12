@@ -2221,6 +2221,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "arm64-safepoints", on_key: Some("CRATONVM_JIT_ARM64_SAFEPOINTS"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
     E { group: Group::JIT, token: "ir-gc-point-maps", on_key: Some("CRATONVM_JIT_IR_GC_POINT_MAPS"), off_key: None, off_word: Some("0"), since: "2026-08-30" },
     E { group: Group::JIT, token: "zero-spid", on_key: Some("CRATONVM_JIT_ZERO_SPID"), off_key: None, off_word: Some("0"), since: "2026-08-30" },
+    // Profiler and debugger symbol sinks for JIT code, all opt-in: `perf-map`
+    // writes perf-<pid>.map, `jitdump` writes jit-<pid>.dump (Linux), `gdb` feeds
+    // the GDB JIT interface (Linux). See `jit/src/code_events.rs`.
+    E { group: Group::JIT, token: "perf-map", on_key: Some("CRATONVM_JIT_PERF_MAP"), off_key: None, off_word: None, since: "2026-09-12" },
+    E { group: Group::JIT, token: "jitdump", on_key: Some("CRATONVM_JIT_JITDUMP"), off_key: None, off_word: None, since: "2026-09-12" },
+    E { group: Group::JIT, token: "gdb", on_key: Some("CRATONVM_JIT_GDB"), off_key: None, off_word: None, since: "2026-09-12" },
     E { group: Group::GC, token: "card-metrics", on_key: Some("CRATONVM_GC_CARD_METRICS"), off_key: None, off_word: None, since: "2026-07-31" },
     // NOTE: `CRATONVM_DBG_MAPGEN` and `CRATONVM_DBG_VACATED_FRAMES` are declared
     // in the DBG group, which is where their names say they belong and which is

@@ -616,7 +616,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-454 tokens.
+457 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1066,6 +1066,9 @@ export inherited from a parent shell.
 | `arm64-safepoints` | `CRATONVM_JIT_ARM64_SAFEPOINTS` |
 | `ir-gc-point-maps` | `CRATONVM_JIT_IR_GC_POINT_MAPS` |
 | `zero-spid` | `CRATONVM_JIT_ZERO_SPID` |
+| `perf-map` | `CRATONVM_JIT_PERF_MAP` |
+| `jitdump` | `CRATONVM_JIT_JITDUMP` |
+| `gdb` | `CRATONVM_JIT_GDB` |
 | `int-value-direct` | `CRATONVM_JIT_INT_VALUE_DIRECT` |
 | `indy-lambda-fast` | `CRATONVM_JIT_INDY_LAMBDA_FAST` |
 | `hot-lookup-cache` | `CRATONVM_JIT_HOT_LOOKUP_CACHE` |

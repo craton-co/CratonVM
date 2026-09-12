@@ -730,9 +730,14 @@ fn fp_compare(em: &mut Em, r: &mut Rng) {
             em.a.if_int(cond, other);
             em.a.lconst(0x11);
             em.a.goto(join);
-            em.bind(other, &[]);
+            // A frame names the WHOLE operand stack: in the second round the
+            // first round's long is still underneath.
+            let below: &[VType] = if n == 1 { &[Long] } else { &[] };
+            em.bind(other, below);
             em.a.lconst(0x22);
-            em.bind(join, &[Long]);
+            let mut joined = below.to_vec();
+            joined.push(Long);
+            em.bind(join, &joined);
         }
         if n == 1 {
             em.lb(op::LXOR);
