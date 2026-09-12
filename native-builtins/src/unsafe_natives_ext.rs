@@ -50,11 +50,18 @@ pub(crate) fn native_unsafe_page_size(
 /// Derived from the host pointer width rather than hard-coded to 8, so it
 /// agrees with `jdk/internal/misc/Unsafe.addressSize0()` (unsafe_jdk25.rs) and
 /// stays correct if the VM is ever built for a 32-bit target.
+/// The value BOTH `addressSize()` and `Unsafe.ADDRESS_SIZE` answer with.
+///
+/// One constant because the two used to disagree by 8: the native below
+/// answered the host's pointer size and the `public static final int
+/// ADDRESS_SIZE` that the image's own bytecode reads was never assigned at all.
+const UNSAFE_ADDRESS_SIZE: i32 = std::mem::size_of::<usize>() as i32;
+
 pub(crate) fn native_unsafe_address_size(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Int(std::mem::size_of::<usize>() as i32)))
+    Ok(Some(Value::Int(UNSAFE_ADDRESS_SIZE)))
 }
 
 pub(crate) fn native_unsafe_ensure_class_initialized(
@@ -856,10 +863,38 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         native_noop,
         cratonvm_native_api::NativeKind::Bridge,
     );
+    // This SHADOWS the image's own class initialiser, so every static the real
+    // `<clinit>` assigns has to be assigned here or it stays at its default —
+    // and a static that is never assigned is invisible until something reads it
+    // through bytecode rather than through a native.
+    //
+    // `ADDRESS_SIZE` is exactly that. It is `public static final int` on all
+    // three images and `addressSize()` is a one-instruction
+    // `getstatic ADDRESS_SIZE` — so while the native below answered the
+    // question the field read **0 here and 8 on HotSpot**, measured 2026-09-12,
+    // and nothing could see it because every caller went through the native.
+    // Retiring `addressSize()` in lane 5's third wave made the field the only
+    // answer and turned the row red, which is how it surfaced; the row is out
+    // of that wave and the defect is fixed here, because the two are not the
+    // same thing.
+    //
+    // Seven other `getstatic ADDRESS_SIZE` sites in that class read it too —
+    // `getAddress`/`putAddress` branch on `ADDRESS_SIZE == 4` — so a zero there
+    // was one bytecode path away from picking the wrong width, and only
+    // accidentally right because 0 is not 4.
+    //
+    // `UnsafeConstants.PAGE_SIZE` needs no such line: it reads 4096 on both
+    // VMs, which is why `pageSize()` retires in the same wave that
+    // `addressSize()` could not.
     r.register(u2, "<clinit>", "()V", |ctx, _args| {
         let class_name = "jdk/internal/misc/Unsafe";
         let unsafe_obj = try_alloc_concurrent_synthetic(ctx, class_name, 0)?;
         ctx.set_static_field_by_name(class_name, "theUnsafe", Value::Object(Some(unsafe_obj)));
+        ctx.set_static_field_by_name(
+            class_name,
+            "ADDRESS_SIZE",
+            Value::Int(UNSAFE_ADDRESS_SIZE),
+        );
         Ok(None)
     });
     r.register(
