@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Retired 2026-09-10. Two RESIDUAL waves on 2026-09-11: §9a took four of §10's five items, §9b took 33 more rows, answered §10.1 by measurement and corrected two of §9a's own claims. Table count is now 98 + 67 + 33. What is left is §11. |
+| **Status** | Retired 2026-09-10. Two RESIDUAL waves on 2026-09-11 (§9a, §9b) and a DELETION wave on 2026-09-12 (§9c). Retired: 98 + 67 + 33. Deleted: 22 registrations no supported image declares. §10.1 is answered by measurement — 98 of the 99 ForkJoin keeps cannot be expressed in a retirement table at all. What is left is §11. |
 | **Was** | `docs/known-issues/jdk-only-lanes/lane-5-concurrent-thread-unsafe.md` |
 | **Table** | [`RETIRED_SHADOW_L5_TRIPLES`](../../../native-api/src/retired_shadow.rs) |
 | **Ownership authority** | [`lane-0-integration-and-gates.md`](../../known-issues/jdk-only-lanes/lane-0-integration-and-gates.md) |
@@ -1127,6 +1127,74 @@ the regression this gate exists for"*. Re-frozen to the measured values. It is
 the `STRICT_MIN_TOTAL_REGISTRATIONS` lesson from the other side, and lane 4
 replaced that constant with `STRICT_UNEXPLAINED_DROP_MAX` the same day for the
 same reason: an absolute number nothing enforces is not evidence.
+
+## 9c. The deletion wave: 22 registrations no supported image can name
+
+§11's second item, taken. These are not retirements — a retirement makes a
+native yield to the image's bytecode, and there is no bytecode here to yield to.
+They are lane 0's bucket F: registrations for methods that **no supported image
+declares**, so nothing on 17, 21 or 25 can dispatch them.
+
+```text
+  jdk/internal/misc/Unsafe   acquireFence()V, releaseFence()V
+                             addressSize0()I, isBigEndian0()Z, unalignedAccess0()Z
+                             weakCompareAndExchange{Int,Long}{,Acquire,Release}
+                             weakCompareAndExchangeReference{,Acquire,Release}
+                             weakCompareAndExchangeObject
+  sun/misc/Unsafe            acquireFence()V, releaseFence()V
+                             compareAndExchangeObject, weakCompareAndExchangeObject
+```
+
+19 triples, 22 registrations, six source sites.
+
+**Why each family is gone.** `acquireFence`/`releaseFence` are `VarHandle`
+access-mode names, not `Unsafe` methods: the JDK's fence surface is
+`loadFence`/`storeFence`/`fullFence` plus `loadLoadFence`/`storeStoreFence` on
+the internal spelling. `addressSize0`/`isBigEndian0`/`unalignedAccess0` were the
+private native primitives behind the public accessors in older JDKs; modern
+images answer those from constants and the `*0` methods are gone.
+`weakCompareAndExchange*` is a spelling the JDK renamed to `weakCompareAndSet*`
+— which returns `Z` rather than the witness value, is declared on all three
+images, and is registered (and now retired) separately.
+
+**One site registered a live row and a dead one from the same `name`.** The
+reference loop ended:
+
+```rust
+registry.register(u2, name, ref_desc, native_unsafe_cae_object);
+if name.ends_with("Object") {
+    registry.register(u, name, ref_desc, native_unsafe_cae_object);   // sun.misc
+}
+```
+
+`compareAndExchangeObject` IS declared on `jdk.internal.misc.Unsafe` for 17 and
+21 (25 renamed it to `...Reference`) and is declared on `sun.misc.Unsafe` on
+**none** of the three. So one iteration produced one registration worth keeping
+and one worth deleting. A per-NAME loop that registers on two classes cannot
+express a per-CLASS fact, and the fix is to stop registering on the second class
+rather than to filter inside the loop.
+
+**Three natives lost their last caller and went with the registrations**
+(`native_unsafe_acquire_fence`, `native_unsafe_release_fence`, and the three
+`*0` bodies), together with the unit tests that called them directly. A test of
+a body nothing dispatches measures the body, not the VM.
+
+### The census this rests on, and the one it does NOT
+
+Every row was checked against all three images with `javap -p`, the same
+discipline §9b.1 had to learn the hard way — and the pipeline was
+control-checked first: `javap -p` prints `private native long
+objectFieldOffset0(...)` on 21, so a name missing from the output is missing
+from the image rather than from the parser.
+
+**The kind-map baseline answers this question wrongly and was not used.** It
+reports 29 rows where the binary has 22, because it still carries rows for five
+registrations (`getReferencePlain`, `putReferencePlain`, `monitorEnter`,
+`monitorExit`, `defineAnonymousClass`) deleted from the source on 2026-08-29.
+`scripts/baselines/jdk-only-kind-map-25-linux.tsv` is hand-amended and nothing
+re-measures it, so it drifts in the direction of over-counting work that is
+already done. The 22 come from `--dump-native-registry` taken from the binary
+and intersected with the three images.
 
 ## 10. What the next wave should do, in order (as written 2026-09-10; see §9a for what happened)
 
