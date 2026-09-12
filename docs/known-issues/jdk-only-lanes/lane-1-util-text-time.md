@@ -24,13 +24,13 @@ preconditions and the landing protocol are in
 | HELD — `TreeMap`/`TreeSet` | 157 | state is `tm_array_table()`, a Rust side table; 9 probes worse armed |
 | HELD — `LinkedHashMap` + its four views + iterators | 102 | state is `lhm_overlay()`, a Rust side table; 11 probes worse |
 | PART RETIRED — `HashMap` + views + iterators + `$Node` | 98 | **wave 3**: 21 retired, 77 held. The nine rows that held it were a DIAL ARTEFACT; the twelve probes that hold the 77 are not — §3 |
-| HELD — `Hashtable` + views + `$Entry` | 79 | 4 probes worse |
+| HELD — `Hashtable` + views + `$Entry` | 79 | 4 probes worse. **Wave 6 bisected it: `+0` over 335 engagements on one probe and `+10` on another, and the ten rows are all views answering EMPTY** — §10 item 4 |
 | PART RETIRED — `java/util/jar/` | 45 | **wave 4**: everything but `JarFile`, which is the whole of the `+34` — §3 |
 | HELD — `Date` / `TimeZone` / `sun/util/calendar/` | 40 | 5 probes worse; bisected §10 item 6. **Wave 5 wrote a 2-row table for `ZoneInfoFile`, the one non-vacuous `+0`; unaccepted** |
-| HELD — `Locale` + `sun/util/locale/` + `sun/util/resources/` + `Currency` | 35 | 3 probes worse, one truncates 125 → 8; bisected §10 item 6. **Wave 5 located the blocker under the five vacuous rows and fixed half of it** — §10 item 6 |
+| PART RETIRED — `Locale` + `sun/util/locale/` + `sun/util/resources/` + `Currency` | 35 | 3 probes worse, one truncates 125 → 8; bisected §10 item 6. Wave 5 located the blocker under the five vacuous rows and fixed half of it. **Wave 6 gave the six `reached == 0` rows a workload: 2 retired, 2 candidates, 2 measured NO** — §10 item 6 |
 | HELD — the interface and abstract receivers | 28 | §6 — they are NOT dead, and no per-class trial was run |
 | HELD — `HashSet` / `LinkedHashSet` remainder | 13 | lane T holds `register_hashset_natives` (`SET_CLASSES` spans `java/util/` and `java/util/concurrent/`). **Wave 5 repaired its one measured row without retiring anything** — §10 item 7 |
-| PART RETIRED — `java/text/` | 12 | **wave 4**: `Normalizer` only. `BreakIterator` is the whole `+16`, `DateFormat` is vacuous, `ParseException` repairs nothing and its two moving rows are `Throwable`'s — §3 |
+| PART RETIRED — `java/text/` | 12 | **wave 4**: `Normalizer` only. **wave 6: `BreakIterator`, all 17, and the pin with them** — the `+16` was the provider chain and two natives on an abstract class, not the family. `DateFormat` is still vacuous; `ParseException` repairs nothing and its two moving rows are `Throwable`'s — §3, §10 item 5 |
 | HELD — `ResourceBundle` + `$Control` | 12 | **armed-clean over 51 probes, red on the trial binary** — §8 |
 | EXCLUDED — no dispatch any probe can produce | 9 | §5 |
 | | **959** | |
@@ -47,6 +47,11 @@ would invent a number neither took. What they retire, exactly:
                                                       java/text/Normalizer
   wave 5  RETIRED_SHADOW_L1_ZI_TRIPLES    2 triples   sun/util/calendar/ZoneInfoFile
                                                       -- ACCEPTED, see below
+  wave 6  RETIRED_SHADOW_L1_BI_TRIPLES   17 triples   java/text/BreakIterator,
+                                                      the whole family, with the
+                                                      BREAKITER pin removed
+  wave 6  RETIRED_SHADOW_L1_LP_TRIPLES    2 triples   sun/util/resources/LocaleData,
+                                                      JRELocaleProviderAdapter
 ```
 
 ### Wave 5 — the acceptance
@@ -915,6 +920,49 @@ Every remaining HELD family has a named blocker. In rough order of rows:
    unarmed and its views survive arming byte-identically
    (`L1EntrySetRouteProbe`'s `C.hashtable.*` rows are clean in all three
    columns). Its own question, unbisected.
+
+   **BISECTED 2026-09-11 (wave 6), and the answer is a SPLIT that one probe
+   would have shipped as a green.** Armed alone on the wave-6 control
+   binary, one class, one process:
+
+   ```text
+     probe                        DIFFS  DELTA  REACHED
+     HashtableVectorShadowSweep       0     +0      335   <- non-vacuous GREEN
+     L1EntrySetRouteProbe            10    +10      119   <- WORSE
+   ```
+
+   335 door engagements and not one divergence is exactly the shape §7 says
+   to trust more than a vacuous `+0`, and it is still wrong. The second
+   probe's ten lines name the blocker precisely, and it is the VIEWS and not
+   the table:
+
+   ```text
+     C.hashtable.entrySet.toArray        [3]java.lang.Object -> [0]java.lang.Object
+     C.hashtable.entrySet.intoArrayList  3 -> 0
+     C.hashtable.entrySet.intoHashSet    3 -> 0
+     C.hashtable.keySet.toArray          [3]java.lang.Object -> [0]java.lang.Object
+     C.hashtable.entrySet.toArrayString0 ArrayStoreException -> [3]java.lang.String
+   ```
+
+   Every row is a view that answers EMPTY when the natives step aside, which
+   is `AbstractCollection.toArray` sizing its array from a `size()` that read
+   zero. `Hashtable.keys()`/`elements()` are untouched by this, and that is
+   the tell: `deprecated_util.rs`'s `real_hashtable_enumerator` drives a REAL
+   `Hashtable$Enumerator` over the real `table` array and it works, because
+   an `Enumerator` walks the array and never asks for a count.
+
+   So the family divides into "walks the table" (working today, on real JDK
+   objects) and "asks the table how big it is" (empty armed). That is a
+   state-model gap of exactly the shape wave 5 found in `map_resize`, not a
+   node-graph rewrite like items 1 and 2 — and the same caution applies in
+   the other direction: **an armed arm that goes red is not a verdict
+   either.** A leaky dial can yield at `entrySet()` and not at `put`, and a
+   half-yielded map is empty for reasons the retirement would not reproduce.
+   Settling it needs a trial binary, which this wave did not spend.
+
+   The same run priced the three neighbours on that probe for the first
+   time: `HashMap` +24 (reached 1,499), `TreeMap` +18 (143),
+   `LinkedHashMap` +8 (152).
 5. **`java/util/jar/JarFile` and `java/text/BreakIterator`.** What is left
    of §7's two vacuous greens after wave 4 took the other six classes: each
    family's whole regression is ONE class.
@@ -960,17 +1008,97 @@ Every remaining HELD family has a named blocker. In rough order of rows:
    its surface onto `java/util/zip/ZipFile`; both classes are under
    `java/util/`, so the registrar is L1's and crosses no lane boundary.
 
+   **CORRECTED 2026-09-11 (wave 6): "dead in the shipping VM" is true, and
+   "dead" is not. THE WINNER IS ARM-DEPENDENT.** `vm_init` calls
+   `register_io_natives` in three arms and `register_p59_jar` explicitly in
+   two of them, AFTER it, so in the shipping binary and in the real-JDK arm
+   `p59` wins, which is what wave 5 replayed and measured. The third arm is
+   `#[cfg(feature = "synthetic-jdk")]` with `use_synthetic_jdk`, and it calls
+   `register_builtins` FIRST (which reaches `register_p59_jar` through
+   `register_synthetic_overrides` then `register_phase59_natives`) and
+   `register_io_natives` after. **In that arm the order is reversed and
+   `zip_real_jar`'s four constructors win.**
+
+   So deleting them on the strength of wave 5's measurement would have
+   changed the synthetic-JDK arm, which is the arm one of the three stub
+   ratchets is taken on. The lesson generalises past this pair: a
+   duplicate-registration census is taken in ONE arm, and which producer
+   wins is a property of that arm, not of the pair. Wave 6 checked before
+   deleting, and deleted nothing.
+
    The count-based ratchets in that file tolerate 1,201 shadowed rows, so this
    pair was invisible individually — the same shape as the `ZoneInfoFile`
    duplicate whose note in `native-builtins/src/lib.rs` ends "the later call
    always wins silently".
 
-   **`BreakIterator` (17) was item 6's blocker wearing a different mask, and
-   wave 5 implemented the fix.** See the item 6 entry below. One row of `apps/probes/L1JarTextSweep.java`
+   **`BreakIterator` (17): RETIRED WHOLE, 2026-09-11 (wave 6), and the pin
+   came out with it.** Wave 5 fixed the bundle read and could not claim the
+   family, because nothing had run the rest of the chain. Wave 6 ran it, and
+   the answer was not where the family's symptoms pointed.
+
+   `apps/probes/L1BreakIterRealProbe` is the instrument, and its design is
+   the reason this took one wave rather than three: its `P.*` rows reach
+   `BreakIteratorProviderImpl` DIRECTLY, which the BREAKITER pin never
+   covered, so the whole diagnosis was taken on the control binary before
+   anything changed. On that binary the chain already answered
+   `sun.text.RuleBasedBreakIterator` (and `DictionaryBasedBreakIterator` for
+   `th`), so wave 5's readers, the blob and the rule-data validation were all
+   fine — and every walk over that correct iterator answered `[0]`, while
+   `GraphemeBreakIterator`, which reads no bundle at all, threw
+   `NullPointerException: "this.boundaries" is null`.
+
+   **One cause, three symptoms, in two families.** Of the seventeen
+   registrations, exactly two name a method that is CONCRETE on
+   `java.text.BreakIterator` — `setText(String)` and `preceding(int)`;
+   `javap -p` says every other one is abstract. A dispatch door asks the
+   registry about the DECLARING class of the resolved method, so for the
+   fifteen abstract ones a real subclass resolves to its own body and the
+   native never sees it. For those two the declaring class IS the abstract
+   class, so the natives claimed every BreakIterator in the VM, and
+   `setText` wrote the text into slot 0 of an object whose slot 0 is
+   `charCategoryTable`.
+
+   The remedy is wave 5's `try_delegate_real_collection` shape: ask whether
+   the receiver is the FABRICATED carrier and, if not, run the real body.
+   The class is abstract, so no real instance can carry its exact name and
+   the discriminator is exact rather than a guess about object width.
+
+   ```text
+     control                     28 of 30 rows differ   (13 P.*, 15 F.*)
+     + setText / preceding       16 rows differ         (0 P.*, 16 F.*)
+     + pin removed, 17 retired    0 rows differ
+   ```
+
+   The pin is deleted in the same commit as the table: retire without
+   lifting and the pin still serves the four factories; lift without
+   retiring and the census still counts seventeen shadows over a family that
+   no longer uses one. What must NOT be retired is now a test —
+   `the_two_locale_resources_readers_are_not_retired_by_anything` — because
+   with the pin gone there is nothing behind
+   `getBreakIteratorInfo`/`getBreakIteratorResources`.
+
+   One row of `apps/probes/L1JarTextSweep.java`
    is already waiting for whoever does — `E.attributesFromJar` reads `null`
    where HotSpot reads the jar's per-entry manifest section, and it is
    `JarFile`'s, not `JarEntry`'s: the class declares no native for
    `getAttributes`, so nothing wave 4 could retire repairs it.
+
+   **FIXED 2026-09-11 (wave 6), and it did not need the state model.**
+   `JarEntry.getAttributes()` is `return attr;` in its entirety (`javap -c`
+   on the JDK 25 image), and the JDK never leaves that field to the caller:
+   `JarFile.getEntry` hands back a `JarFile$JarFileEntry` whose accessor
+   reads `jarfile.getManifest().getAttributes(name)`. This VM mints a plain
+   `JarEntry` and never wrote `attr`, so EVERY entry of EVERY jar answered
+   null. `p59_attach_entry_attributes` fills that one field at the three
+   sites that mint an entry, out of a per-(path, mtime) cache of the
+   manifest's sections, and the real accessor's own bytecode does the rest:
+   `L1JarTextSweep` goes 22 -> 20 diffs and the row reads `section-value`
+   like HotSpot.
+
+   Worth separating from the rest of this item: the state model is what a
+   RETIREMENT needs, and it is not what a WRONG ANSWER needs. Wave 4 could
+   not have repaired this row by retiring anything, and wave 6 did not have
+   to retire anything to repair it.
 
    **Neither `+34` nor `+16` is thirty-four or sixteen wrong answers.** Both
    are ONE throw and a truncated section, which is why the prefix numbers
@@ -1020,6 +1148,68 @@ Every remaining HELD family has a named blocker. In rough order of rows:
    §7's trap and say nothing at all. That is the measurement the trap
    predicted, and the next step on this family is a probe that reaches a
    provider lookup, not another sweep.
+
+   **WAVE 6 WROTE THAT PROBE, AND FIVE OF THE SIX NON-ANSWERS BECAME
+   ANSWERS.** `apps/probes/L1LocaleProviderWorkload` is 147 rows driving
+   every public API whose real-JDK implementation goes through these
+   classes: `Date`'s whole surface including the deprecated accessors, every
+   date/time pattern and symbol set in four locales, currency and locale and
+   time-zone display names, `Calendar.getDisplayName(s)` and the week rules,
+   java.time's localized formatting, and the adapter asked for its providers
+   directly. Armed one class per process against the wave-6 control binary
+   (base 8 diffs of 147):
+
+   ```text
+     java/util/Date                                     +0   reached=14
+     sun/util/locale/provider/CalendarDataUtility      +12   reached=108
+     sun/util/locale/provider/JRELocaleProviderAdapter   +0   reached=8
+     sun/util/locale/provider/LocaleResources          +12   reached=254
+     sun/util/resources/Bundles                          +0   reached=0
+     sun/util/resources/LocaleData                       +0   reached=21
+     sun/util/calendar/                                  +0   reached=411
+     java/util/TimeZone                                  +0   reached=196
+     java/util/Currency                                 +38   reached=75
+     java/util/Locale                                    +6   reached=16156
+   ```
+
+   Read the column that moved, not the one that did not. **The `+0`s are
+   the same as before and mean the opposite of what they meant before**,
+   because the engagement behind them went from zero to 14, 8, 21, 411 and
+   196. Two of those are retired in this wave
+   (`RETIRED_SHADOW_L1_LP_TRIPLES`, one registration each in the whole
+   tree); `Date` and the rest of `sun/util/calendar/` are candidates with no
+   trial binary yet.
+
+   And two of the five are now measured **NO** rather than unmeasured:
+   `LocaleResources` +12 on 254 engagements and `CalendarDataUtility` +12 on
+   108. The sentence above that called all five "one blocker" was reasoning
+   from an empty set, and it was half right -- which is the most expensive
+   kind of right, because the half that was wrong held two retirable rows
+   for two waves.
+
+   `sun/util/resources/Bundles` is the one row that stayed at `reached == 0`
+   under a workload built to reach it. That is worth its own line: it is not
+   a class this lane has failed to exercise, it is a class the exercise does
+   not reach.
+
+   The unarmed baseline of the new probe is itself a finding: **8 of 147
+   rows differ from HotSpot with nothing armed**, in four families, and
+   every one is a wrong ANSWER rather than a retirement question:
+
+   ```text
+     N.displayVariant   Valencian    -> THREW ClassCastException
+                        (java.util.ResourceBundle cannot be cast to
+                         sun.util.resources.OpenListResourceBundle)
+     N.displayScript    Latin        -> Latn
+     K.displayNamesStandalone.de  {Dienstag=3, ...} -> null
+     J.zoneDisplay      Central European Time -> Europe/Berlin
+   ```
+
+   The first is section 8's `ResourceBundle` blocker with a name and a
+   stack: `needs_concrete_bundle_class` routes only `.TimeZoneNames` to the
+   real class-based bundle, and its own comment says `getLocaleNames`
+   "shares the same latent pattern" but is left on the curated path because
+   "nothing in the failing test exercises their cast". Something does now.
    **WAVE 5 LOCATED THE PROVIDER BLOCKER AND IMPLEMENTED HALF OF IT.** The
    five `reached == 0` rows above are one thing, and it is not a provider
    *lookup* at all — it is a bundle *read*:
@@ -1235,6 +1425,41 @@ is worth pricing before the retirement rows.
   `ArrayStoreException` from real bytecode and cannot throw from a native that
   believes the collection is empty. One row separated "the view is empty" from
   "the walk is empty" after two revisions of not knowing.
+- **A native registered on an ABSTRACT class claims every subclass, and only
+  its CONCRETE methods can.** Seventeen registrations sat on
+  `java/text/BreakIterator`; fifteen name methods that are `abstract` there,
+  so a real `sun.text.RuleBasedBreakIterator` receiver resolves to its own
+  body and the native never sees it. The two that are concrete --
+  `setText(String)` and `preceding(int)` -- claimed every BreakIterator in the
+  VM, and one of them wrote the text into slot 0 of an object whose slot 0 is
+  `charCategoryTable`. Three separate symptoms, in two families, one cause.
+  Before writing a native on an abstract class, `javap -p` it and count which
+  of your methods are concrete: those are the ones with a blast radius.
+- **A probe that can only measure the thing after you change it cannot tell
+  you whether to change it.** `L1BreakIterRealProbe` reaches the provider
+  chain directly, which the pin never covered, so the whole diagnosis was
+  taken on the CONTROL binary: the chain already built the right class and
+  every walk over it answered `[0]`. A probe written through
+  `BreakIterator.getWordInstance` would have measured the pin and said the
+  family was fine.
+- **Which duplicate registration WINS is a property of the arm, not of the
+  pair.** `register_jar_natives`' four `JarFile` constructors lose to
+  `register_p59_jar` in the shipping and real-JDK arms and WIN in the
+  synthetic-JDK one, because that arm calls `register_builtins` before
+  `register_io_natives` and the other two call it after. A census replays one
+  arm. Deleting the loser on the strength of it changes a different arm's
+  behaviour, and the stub ratchet has a column for that arm.
+- **A non-vacuous green on one probe is one probe.** `java/util/Hashtable`
+  armed is `+0` over 335 door engagements on `HashtableVectorShadowSweep` and
+  `+10` on `L1EntrySetRouteProbe`. Engagement makes a green mean something; it
+  does not make it mean everything. Bisect on at least one probe that
+  exercises the family's VIEWS, because that is where the counts live.
+- **A `reached == 0` row is a request for a workload.** Six rows of this
+  lane's locale bisection said nothing for two waves. One purpose-built probe
+  turned five of them into answers -- two retirable, two measured blockers,
+  one still unreachable -- and the two that turned out to be blockers were
+  being described as the same thing as the two that turned out to be
+  retirable.
 
 ## 12. Done
 

@@ -1768,7 +1768,19 @@ use cratonvm_types::compat::CompatibilityMode;
 /// `2620 + 2` was NOT assumed — each arm was run again and this is its printed
 /// line. That is the treadmill the note above names: on a branch this busy the
 /// constant is re-measured per merge, never added up.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2622;
+/// **Re-frozen 2026-09-11 (lane 1 wave 6): 2622 -> 2641.** `+19`, and the
+/// account is nineteen rows in two tables: `RETIRED_SHADOW_L1_BI_TRIPLES`,
+/// all seventeen of `java/text/BreakIterator` (the family is retired whole
+/// because the class is ABSTRACT -- every instance the JDK hands back is a
+/// real subclass answering its own bytecode), and
+/// `RETIRED_SHADOW_L1_LP_TRIPLES`, one registration each on
+/// `sun/util/resources/LocaleData` and `JRELocaleProviderAdapter`. 17 + 2 =
+/// 19 on all three arms, which is the two tables' combined length and this
+/// ratchet reporting one number twice.
+///
+/// Read off the line this arm PRINTED, not derived from the arithmetic above
+/// -- the arithmetic is the corroboration, not the source.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2641;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2006,7 +2018,19 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2622;
 /// `2609 + 2` was NOT assumed — each arm was run again and this is its printed
 /// line. That is the treadmill the note above names: on a branch this busy the
 /// constant is re-measured per merge, never added up.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2611;
+/// **Re-frozen 2026-09-11 (lane 1 wave 6): 2611 -> 2630.** `+19`, and the
+/// account is nineteen rows in two tables: `RETIRED_SHADOW_L1_BI_TRIPLES`,
+/// all seventeen of `java/text/BreakIterator` (the family is retired whole
+/// because the class is ABSTRACT -- every instance the JDK hands back is a
+/// real subclass answering its own bytecode), and
+/// `RETIRED_SHADOW_L1_LP_TRIPLES`, one registration each on
+/// `sun/util/resources/LocaleData` and `JRELocaleProviderAdapter`. 17 + 2 =
+/// 19 on all three arms, which is the two tables' combined length and this
+/// ratchet reporting one number twice.
+///
+/// Read off the line this arm PRINTED, not derived from the arithmetic above
+/// -- the arithmetic is the corroboration, not the source.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2630;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2166,7 +2190,19 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2611;
 /// `2609 + 2` was NOT assumed — each arm was run again and this is its printed
 /// line. That is the treadmill the note above names: on a branch this busy the
 /// constant is re-measured per merge, never added up.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2611;
+/// **Re-frozen 2026-09-11 (lane 1 wave 6): 2611 -> 2630.** `+19`, and the
+/// account is nineteen rows in two tables: `RETIRED_SHADOW_L1_BI_TRIPLES`,
+/// all seventeen of `java/text/BreakIterator` (the family is retired whole
+/// because the class is ABSTRACT -- every instance the JDK hands back is a
+/// real subclass answering its own bytecode), and
+/// `RETIRED_SHADOW_L1_LP_TRIPLES`, one registration each on
+/// `sun/util/resources/LocaleData` and `JRELocaleProviderAdapter`. 17 + 2 =
+/// 19 on all three arms, which is the two tables' combined length and this
+/// ratchet reporting one number twice.
+///
+/// Read off the line this arm PRINTED, not derived from the arithmetic above
+/// -- the arithmetic is the corroboration, not the source.
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2630;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
