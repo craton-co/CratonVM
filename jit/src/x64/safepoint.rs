@@ -2140,8 +2140,7 @@ impl Compiler {
                 // where the map is actually built. The staged-argument state it
                 // refuses on has ALREADY been taken by this point, so it is
                 // passed in rather than re-read -- see `staged_args_unmapped`.
-                reg_oop_mask: self
-                    .live_oop_register_mask(staged_args_unmapped, call_oop_arg_regs),
+                reg_oop_mask: self.live_oop_register_mask(staged_args_unmapped, call_oop_arg_regs),
                 // The oracle a stale-word report needs to say "live". Taken
                 // through the shared accessor so the method-entry poll records
                 // its parameter mask rather than a `None` (see
@@ -2155,9 +2154,7 @@ impl Compiler {
                 // the value that already means "no claim". `frame_slot_offsets`
                 // (Stage 2 above) still names every window's locals; only this
                 // DIAGNOSTIC oracle abstains.
-                local_oop_mask: if self.local_oop_masks.is_empty()
-                    || self.local_oop_windows > 1
-                {
+                local_oop_mask: if self.local_oop_masks.is_empty() || self.local_oop_windows > 1 {
                     None
                 } else {
                     self.local_oop_mask_at_current_pc()

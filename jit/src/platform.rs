@@ -547,7 +547,11 @@ mod near_globals {
                 // than kept, so the next allocation re-enters at the ladder
                 // instead of proposing an address the check would refuse.
                 CURSOR.store(
-                    if in_reach(next, size, anchor) { next } else { 0 },
+                    if in_reach(next, size, anchor) {
+                        next
+                    } else {
+                        0
+                    },
                     Ordering::Relaxed,
                 );
                 IN_REACH.fetch_add(1, Ordering::Relaxed);
@@ -558,12 +562,7 @@ mod near_globals {
                 // The packing address is occupied by something else. Keeping
                 // it would spend one wasted `mmap`/`munmap` pair on every
                 // future allocation; the ladder re-seeds it on its next hit.
-                let _ = CURSOR.compare_exchange(
-                    cursor,
-                    0,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                );
+                let _ = CURSOR.compare_exchange(cursor, 0, Ordering::Relaxed, Ordering::Relaxed);
             }
         }
         // The whole ladder missed. Nothing in this address space is going to
@@ -1265,7 +1264,10 @@ mod near_globals_tests {
             !in_reach(anchor + WINDOW - 4096, 1 << 20, anchor),
             "base inside the window and the end outside it must be refused"
         );
-        assert!(!in_reach(anchor + WINDOW + 1, 4096, anchor), "past the window");
+        assert!(
+            !in_reach(anchor + WINDOW + 1, 4096, anchor),
+            "past the window"
+        );
     }
 
     /// Below the anchor as well as above it. `abs_diff` is what makes that

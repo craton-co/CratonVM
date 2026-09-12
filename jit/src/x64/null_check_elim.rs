@@ -655,7 +655,9 @@ mod receiver_elision_reach_tests {
              receiver is the value the immediately-preceding `aload` pushed — \
              see this test's doc comment for the two shapes where it is not."
         );
-        let bare = src.matches("self.emit_trusted_oop_receiver_check()").count();
+        let bare = src
+            .matches("self.emit_trusted_oop_receiver_check()")
+            .count();
         assert_eq!(
             bare, 4,
             "expected the two `putfield` and two `checkcast` arms to keep the \

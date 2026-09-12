@@ -608,7 +608,10 @@ pub enum Op {
     /// the interpreter re-runs the call and raises the NPE, or dispatches to
     /// the override that made the guard fail. `AtomicLong` and friends are not
     /// final, which is why the guard is not optional.
-    Unbox { op: UnboxOp, class_id: u32 },
+    Unbox {
+        op: UnboxOp,
+        class_id: u32,
+    },
 
     // ── Dead / removed ───────────────────────────────────────────────
     /// Placeholder for a removed node (inputs cleared, not referenced).
@@ -4624,8 +4627,7 @@ fn ir_string_intrinsics_enabled() -> bool {
 /// `BigDecimal` run.
 fn string_intrinsic_reporting() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE
-        .get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_STRING").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_STRING").is_some())
 }
 
 /// Builds an IR `Graph` from JVM bytecode by abstract-interpreting
@@ -5361,7 +5363,8 @@ impl IrBuilder {
             // negative, which makes the pair exactly the unsigned test the
             // single-pass region spells `CMP; JAE`.
             let zero = self.iconst(0);
-            let non_negative = self.add_data(Op::Cmp(CmpOp::Ge), IrType::Int, vec![index, zero], pc);
+            let non_negative =
+                self.add_data(Op::Cmp(CmpOp::Ge), IrType::Int, vec![index, zero], pc);
             self.graph.add(
                 Op::Guard { bci: pc },
                 IrType::Void,
@@ -5686,12 +5689,7 @@ impl IrBuilder {
         } else {
             vec![self.pop()]
         };
-        let node = self.add_data(
-            Op::ScalarIntrinsic(sop),
-            sop.result_type(),
-            inputs,
-            pc,
-        );
+        let node = self.add_data(Op::ScalarIntrinsic(sop), sop.result_type(), inputs, pc);
         self.push(node);
         note_scalar_intrinsic_lowered();
         true
@@ -6065,8 +6063,7 @@ impl IrBuilder {
             // constants now. See `ir_lower`'s `const_seeds` loop.
             MULTI_RETURN_SPLICES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             MULTI_RETURN_EDGES.fetch_add(ctrls.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            self.graph
-                .add(Op::Merge, IrType::Control, ctrls, Some(bci))
+            self.graph.add(Op::Merge, IrType::Control, ctrls, Some(bci))
         };
         self.ctrl = ctrl;
 
@@ -6074,9 +6071,7 @@ impl IrBuilder {
         if mems.iter().any(|&m| m != mems[0]) {
             let mut inputs = vec![ctrl];
             inputs.extend_from_slice(&mems);
-            self.mem = self
-                .graph
-                .add(Op::Phi, IrType::Memory, inputs, Some(bci));
+            self.mem = self.graph.add(Op::Phi, IrType::Memory, inputs, Some(bci));
         } else {
             self.mem = mems[0];
         }
@@ -6966,9 +6961,7 @@ impl IrBuilder {
                         let Some(decoded) = body_verified.instruction_at(p) else {
                             return ir_build_bail(line!(), base + p);
                         };
-                        if body_reachable.contains(&p)
-                            && matches!(body.get(p), Some(0xac..=0xb1))
-                        {
+                        if body_reachable.contains(&p) && matches!(body.get(p), Some(0xac..=0xb1)) {
                             reachable_returns += 1;
                         }
                         p = decoded.next_pc as usize;
@@ -8865,7 +8858,10 @@ impl IrBuilder {
                 0x58 | 0x5f | 0x5b | 0x5d | 0x5e => {
                     macro_rules! is_cat2 {
                         ($v:expr) => {
-                            matches!(self.graph.nodes[$v as usize].ty, IrType::Long | IrType::Double)
+                            matches!(
+                                self.graph.nodes[$v as usize].ty,
+                                IrType::Long | IrType::Double
+                            )
                         };
                     }
                     macro_rules! pop_value {
@@ -10535,11 +10531,7 @@ mod scalar_intrinsic_recognizer_tests {
     /// two sets.
     #[test]
     fn the_site_trap_decision_is_claimable_exactly_once_and_is_not_the_refusal_memo() {
-        let h = crate::ir_method_memo_hash(
-            "cratonvm/test/SiteTrapDecisionProbe",
-            "claimed",
-            "()V",
-        );
+        let h = crate::ir_method_memo_hash("cratonvm/test/SiteTrapDecisionProbe", "claimed", "()V");
         assert!(claim_site_trap_decision(h), "the first claim must succeed");
         assert!(
             !claim_site_trap_decision(h),
@@ -10577,9 +10569,7 @@ mod scalar_intrinsic_recognizer_tests {
             try_ir_unbox_intrinsic("java/lang/Long", "longValue", "()J", 0).is_none(),
             "class_id 0 is 'unresolved' and must never be admitted",
         );
-        assert!(
-            try_ir_unbox_intrinsic("java/lang/Integer", "intValue", "()I", 0).is_none(),
-        );
+        assert!(try_ir_unbox_intrinsic("java/lang/Integer", "intValue", "()I", 0).is_none(),);
     }
 
     /// Only the two triples, and only with their exact descriptors. A
@@ -10607,13 +10597,33 @@ mod scalar_intrinsic_recognizer_tests {
             // absent because the H2 census does not name them, and a family
             // added without a site to exercise it is one whose first real
             // receiver is a user's.
-            ("java/util/concurrent/atomic/AtomicLong", "compareAndSet", "(JJ)Z"),
-            ("java/util/concurrent/atomic/AtomicLong", "getAndIncrement", "()J"),
-            ("java/util/concurrent/atomic/AtomicLong", "addAndGet", "(J)J"),
+            (
+                "java/util/concurrent/atomic/AtomicLong",
+                "compareAndSet",
+                "(JJ)Z",
+            ),
+            (
+                "java/util/concurrent/atomic/AtomicLong",
+                "getAndIncrement",
+                "()J",
+            ),
+            (
+                "java/util/concurrent/atomic/AtomicLong",
+                "addAndGet",
+                "(J)J",
+            ),
             ("java/util/concurrent/atomic/AtomicInteger", "get", "()I"),
-            ("java/util/concurrent/atomic/AtomicInteger", "getAndAdd", "(I)I"),
+            (
+                "java/util/concurrent/atomic/AtomicInteger",
+                "getAndAdd",
+                "(I)I",
+            ),
             // Right owner and name, wrong descriptor.
-            ("java/util/concurrent/atomic/AtomicLong", "getAndAdd", "(I)I"),
+            (
+                "java/util/concurrent/atomic/AtomicLong",
+                "getAndAdd",
+                "(I)I",
+            ),
         ] {
             assert!(
                 try_ir_unbox_intrinsic(c, n, d, 7).is_none(),
@@ -10636,9 +10646,7 @@ mod scalar_intrinsic_recognizer_tests {
         match op {
             UnboxOp::LongValue => ("java/lang/Long", "longValue", "()J"),
             UnboxOp::IntValue => ("java/lang/Integer", "intValue", "()I"),
-            UnboxOp::AtomicLongGet => {
-                ("java/util/concurrent/atomic/AtomicLong", "get", "()J")
-            }
+            UnboxOp::AtomicLongGet => ("java/util/concurrent/atomic/AtomicLong", "get", "()J"),
             UnboxOp::AtomicIntIncrementAndGet => (
                 "java/util/concurrent/atomic/AtomicInteger",
                 "incrementAndGet",
@@ -10649,9 +10657,11 @@ mod scalar_intrinsic_recognizer_tests {
                 "decrementAndGet",
                 "()I",
             ),
-            UnboxOp::AtomicLongGetAndAdd => {
-                ("java/util/concurrent/atomic/AtomicLong", "getAndAdd", "(J)J")
-            }
+            UnboxOp::AtomicLongGetAndAdd => (
+                "java/util/concurrent/atomic/AtomicLong",
+                "getAndAdd",
+                "(J)J",
+            ),
         }
     }
 
@@ -10925,7 +10935,8 @@ pub fn ir_splice_multi_return_enabled() -> bool {
     *ON.get_or_init(|| {
         ir_splice_branch_enabled()
             && matches!(
-                cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPLICE_MULTI_RETURN").as_deref(),
+                cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPLICE_MULTI_RETURN")
+                    .as_deref(),
                 Ok("1") | Ok("true") | Ok("on") | Ok("yes")
             )
     })
@@ -12664,7 +12675,10 @@ mod tests {
         assert!(!ir_compatible(&scan));
         scan.static_field_ops.clear();
         scan.has_putstatic = true;
-        assert!(!ir_compatible(&scan), "putstatic has no IR lowering; refuse it up front");
+        assert!(
+            !ir_compatible(&scan),
+            "putstatic has no IR lowering; refuse it up front"
+        );
         scan.has_putstatic = false;
 
         // Object allocations stay the most conservative budget: a surviving
@@ -14475,14 +14489,28 @@ mod stack_shuffle_and_wide_tests {
     #[test]
     fn every_category1_and_category2_shuffle_form_builds() {
         // iload_0 iload_1 swap isub ireturn
-        assert!(builds(2, 2, &[0x1a, 0x1b, 0x5f, 0x64, 0xac, 0, 0], 5), "swap");
+        assert!(
+            builds(2, 2, &[0x1a, 0x1b, 0x5f, 0x64, 0xac, 0, 0], 5),
+            "swap"
+        );
         // iconst_1 iconst_2 pop2 iload_0 ireturn
-        assert!(builds(1, 1, &[0x04, 0x05, 0x58, 0x1a, 0xac, 0, 0], 5), "pop2 of two cat-1");
+        assert!(
+            builds(1, 1, &[0x04, 0x05, 0x58, 0x1a, 0xac, 0, 0], 5),
+            "pop2 of two cat-1"
+        );
         // lconst_1 pop2 iload_0 ireturn
-        assert!(builds(1, 1, &[0x0a, 0x58, 0x1a, 0xac, 0, 0], 4), "pop2 of one cat-2");
+        assert!(
+            builds(1, 1, &[0x0a, 0x58, 0x1a, 0xac, 0, 0], 4),
+            "pop2 of one cat-2"
+        );
         // iconst_1 iconst_2 iconst_3 dup_x2 pop pop pop ireturn
         assert!(
-            builds(0, 0, &[0x04, 0x05, 0x06, 0x5b, 0x57, 0x57, 0x57, 0xac, 0, 0], 8),
+            builds(
+                0,
+                0,
+                &[0x04, 0x05, 0x06, 0x5b, 0x57, 0x57, 0x57, 0xac, 0, 0],
+                8
+            ),
             "dup_x2 form 1"
         );
         // lconst_1 iconst_2 dup_x2 pop pop2 ireturn
@@ -14492,17 +14520,32 @@ mod stack_shuffle_and_wide_tests {
         );
         // iconst_1 iconst_2 iconst_3 dup2_x1 pop2 pop pop2 iconst_0 ireturn
         assert!(
-            builds(0, 0, &[0x04, 0x05, 0x06, 0x5d, 0x58, 0x57, 0x58, 0x03, 0xac, 0, 0], 9),
+            builds(
+                0,
+                0,
+                &[0x04, 0x05, 0x06, 0x5d, 0x58, 0x57, 0x58, 0x03, 0xac, 0, 0],
+                9
+            ),
             "dup2_x1 form 1"
         );
         // iconst_1 lconst_1 dup2_x1 pop2 pop pop2 iconst_0 ireturn
         assert!(
-            builds(0, 0, &[0x04, 0x0a, 0x5d, 0x58, 0x57, 0x58, 0x03, 0xac, 0, 0], 8),
+            builds(
+                0,
+                0,
+                &[0x04, 0x0a, 0x5d, 0x58, 0x57, 0x58, 0x03, 0xac, 0, 0],
+                8
+            ),
             "dup2_x1 form 2"
         );
         // lconst_0 lconst_1 dup2_x2 pop2 pop2 pop2 iconst_0 ireturn
         assert!(
-            builds(0, 0, &[0x09, 0x0a, 0x5e, 0x58, 0x58, 0x58, 0x03, 0xac, 0, 0], 8),
+            builds(
+                0,
+                0,
+                &[0x09, 0x0a, 0x5e, 0x58, 0x58, 0x58, 0x03, 0xac, 0, 0],
+                8
+            ),
             "dup2_x2 form 4"
         );
         // iconst_1 iconst_2 lconst_1 dup2_x2 pop2 pop2 pop pop iconst_0 ireturn
@@ -14522,15 +14565,30 @@ mod stack_shuffle_and_wide_tests {
     #[test]
     fn an_illegal_shuffle_shape_is_refused() {
         // iconst_1 lconst_1 swap ...
-        assert!(!builds(0, 0, &[0x04, 0x0a, 0x5f, 0x57, 0x57, 0x03, 0xac, 0, 0], 7));
+        assert!(!builds(
+            0,
+            0,
+            &[0x04, 0x0a, 0x5f, 0x57, 0x57, 0x03, 0xac, 0, 0],
+            7
+        ));
     }
 
     #[test]
     fn wide_loads_stores_and_iinc_build() {
         // wide iinc 0, +256 ; iload_0 ; ireturn
-        assert!(builds(1, 1, &[0xc4, 0x84, 0x00, 0x00, 0x01, 0x00, 0x1a, 0xac, 0, 0], 8));
+        assert!(builds(
+            1,
+            1,
+            &[0xc4, 0x84, 0x00, 0x00, 0x01, 0x00, 0x1a, 0xac, 0, 0],
+            8
+        ));
         // wide iload 0 ; wide istore 1 ; iload_1 ; ireturn
-        assert!(builds(1, 2, &[0xc4, 0x15, 0x00, 0x00, 0xc4, 0x36, 0x00, 0x01, 0x1b, 0xac, 0, 0], 10));
+        assert!(builds(
+            1,
+            2,
+            &[0xc4, 0x15, 0x00, 0x00, 0xc4, 0x36, 0x00, 0x01, 0x1b, 0xac, 0, 0],
+            10
+        ));
         // wide iload 7 with only one local: out of range, refused.
         assert!(!builds(1, 1, &[0xc4, 0x15, 0x00, 0x07, 0xac, 0, 0], 5));
     }

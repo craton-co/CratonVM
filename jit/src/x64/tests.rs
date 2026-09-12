@@ -18209,7 +18209,14 @@ fn review_cmov_minmax_declines_a_span_entered_by_another_branch() {
         0x00, 0x00,
     ];
     let compiled = review_compile!(code, 15, 3, 3, false).expect("short-circuit ternary compiles");
-    for (ok, a, b) in [(0i64, 1i64, 5i64), (0, 9, 5), (1, 1, 5), (1, 9, 5), (0, -7, 3), (1, -7, 3)] {
+    for (ok, a, b) in [
+        (0i64, 1i64, 5i64),
+        (0, 9, 5),
+        (1, 1, 5),
+        (1, 9, 5),
+        (0, -7, 3),
+        (1, -7, 3),
+    ] {
         let expected = if ok != 0 && a < b { a } else { b };
         // SAFETY: calling machine code compiled from the fixture above.
         let result = unsafe { compiled.try_call(&[ok, a, b]).expect("test JIT call") };
@@ -18252,11 +18259,16 @@ fn review_simd_int_sum_entered_past_its_bound_runs_zero_iterations() {
         unsafe {
             (array_ptr.add(ARRAY_LENGTH_OFFSET) as *mut i32).write_unaligned(len as i32); // Cast: test length
             for i in 0..len {
-                (array_ptr.add(ARRAY_DATA_OFFSET + 4 * i) as *mut i32).write_unaligned(i as i32 + 1); // Cast: test value
+                (array_ptr.add(ARRAY_DATA_OFFSET + 4 * i) as *mut i32)
+                    .write_unaligned(i as i32 + 1); // Cast: test value
             }
         }
         // SAFETY: the compiled method receives a correctly laid out int[].
-        unsafe { compiled.try_call(&[array_ptr as i64, n]).expect("test JIT call") } // Cast: pointer as JIT arg
+        unsafe {
+            compiled
+                .try_call(&[array_ptr as i64, n])
+                .expect("test JIT call")
+        } // Cast: pointer as JIT arg
     };
     assert_eq!(run(1, 1), 0, "i = 3 > n = 1 must run zero iterations");
     assert_eq!(run(2, 0), 0, "i = 3 > n = 0 must run zero iterations");
@@ -18268,9 +18280,16 @@ fn review_simd_int_sum_entered_past_its_bound_runs_zero_iterations() {
 /// neither the prologue nor any stub saves the scratch pool.
 #[test]
 fn review_scratch_xmm_pool_is_volatile_under_the_host_abi() {
-    let callee_saved: &[u8] = if cfg!(target_os = "windows") { &[6, 7, 8, 9, 10, 11, 12, 13, 14, 15] } else { &[] };
+    let callee_saved: &[u8] = if cfg!(target_os = "windows") {
+        &[6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    } else {
+        &[]
+    };
     for xmm in SCRATCH_XMMS {
-        assert!(!callee_saved.contains(&xmm), "scratch XMM{xmm} is callee-saved on this ABI");
+        assert!(
+            !callee_saved.contains(&xmm),
+            "scratch XMM{xmm} is callee-saved on this ABI"
+        );
     }
 }
 
@@ -18364,9 +18383,12 @@ fn review_simd_int_sum_into_a_long_does_not_wrap_at_32_bits() {
         }
         // SAFETY: the compiled method receives a correctly laid out int[].
         let result = unsafe {
-            compiled.try_call(&[array_ptr as i64, len as i64]).expect("test JIT call") // Cast: JIT args
+            compiled
+                .try_call(&[array_ptr as i64, len as i64])
+                .expect("test JIT call") // Cast: JIT args
         };
-        assert_eq!(result, value as i64 * len as i64, "len={len} value={value}"); // Cast: expected long sum
+        assert_eq!(result, value as i64 * len as i64, "len={len} value={value}");
+        // Cast: expected long sum
     }
 }
 
@@ -18388,7 +18410,10 @@ fn review_xmm_save_slots_tile_the_save_area() {
             // the lowest word the area above may own.
             assert_eq!(slots[0].1, span(base - 8, 8).0, "base={base}");
             for w in slots.windows(2) {
-                assert_eq!(w[1].1, w[0].0, "slots must be contiguous, base={base} n={n}");
+                assert_eq!(
+                    w[1].1, w[0].0,
+                    "slots must be contiguous, base={base} n={n}"
+                );
             }
             // Bottom of the last slot == top of the first word of the region below.
             let below = base + n as i32 * XMM_SAVE_SLOT_BYTES; // Cast: n <= 8

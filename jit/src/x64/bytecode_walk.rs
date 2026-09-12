@@ -1566,16 +1566,16 @@ impl Compiler {
             // INT: `push_from_rax` leaves the slot unmarked, which is what the
             // oop maps must see -- a length is never a reference.
             {
-                let len_replace = self
-                    .array_len_hoist_info
-                    .iter()
-                    .enumerate()
-                    .find_map(|(idx, h)| {
-                        h.sites
-                            .iter()
-                            .find(|&&(start, _)| start == pc)
-                            .map(|&(_, seq_end)| (seq_end, self.array_len_hoist_offsets[idx]))
-                    });
+                let len_replace =
+                    self.array_len_hoist_info
+                        .iter()
+                        .enumerate()
+                        .find_map(|(idx, h)| {
+                            h.sites
+                                .iter()
+                                .find(|&&(start, _)| start == pc)
+                                .map(|&(_, seq_end)| (seq_end, self.array_len_hoist_offsets[idx]))
+                        });
 
                 if let Some((seq_end, hoist_offset)) = len_replace {
                     self.emit_load_local(RAX, hoist_offset);
@@ -2500,11 +2500,7 @@ impl Compiler {
                             // to the inline sequence, which with the barrier
                             // armed is precisely the defect this gate exists to
                             // avoid. Failing closed is the only correct answer.
-                            crate::note_jit_bail_site_at(
-                                "aastore-zgc-barrier-no-helper",
-                                pc,
-                                0x53,
-                            );
+                            crate::note_jit_bail_site_at("aastore-zgc-barrier-no-helper", pc, 0x53);
                             return false;
                         }
                         AASTORE_ZGC_GATE_FALLBACKS
@@ -4220,7 +4216,15 @@ impl Compiler {
                     // the if_icmp, the fall-through iload, the goto,
                     // and the taken-side iload all at once; on hit
                     // we resume at the merge PC L2.
-                    if let Some(new_pc) = self.try_cmov_minmax_peephole(code, code_len, &branch_targets, pc, op, val1, val2) {
+                    if let Some(new_pc) = self.try_cmov_minmax_peephole(
+                        code,
+                        code_len,
+                        &branch_targets,
+                        pc,
+                        op,
+                        val1,
+                        val2,
+                    ) {
                         // Map the original if_icmp PC to the start of
                         // the CMOV sequence so downstream branch
                         // resolution keeps working.
@@ -4672,18 +4676,19 @@ impl Compiler {
                                     // the one failure this table can produce
                                     // that nothing downstream catches, so the
                                     // condition is written rather than assumed.
-                                    self.implicit_null_sites.extend(
-                                        orig_implicit_null.iter().map(|&(fault, recover)| {
-                                            let recover = if recover >= body_start
-                                                && recover < body_end
-                                            {
-                                                recover + shift_us
-                                            } else {
-                                                recover
-                                            };
-                                            (fault + shift_us, recover)
-                                        }),
-                                    );
+                                    self.implicit_null_sites
+                                        .extend(orig_implicit_null.iter().map(
+                                            |&(fault, recover)| {
+                                                let recover = if recover >= body_start
+                                                    && recover < body_end
+                                                {
+                                                    recover + shift_us
+                                                } else {
+                                                    recover
+                                                };
+                                                (fault + shift_us, recover)
+                                            },
+                                        ));
                                     // Deopt stub patches: (patch_offset, bci,
                                     // reason). bci and reason are the same
                                     // across copies (it's the same logical
@@ -5316,13 +5321,13 @@ impl Compiler {
                     self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                     self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: x86-64 immediate encoding
                     self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
-                    // `jit_getstatic` runs `<clinit>` on first touch — arbitrary
-                    // Java, so allocation and a collection. That is a safepoint
-                    // like any call: spill the register homes and publish a map
-                    // for THIS program point. Without the bracket a register-
-                    // homed reference local was unreported, and the sp-id slot
-                    // still named the previous safepoint's map, which could
-                    // claim complete coverage for a frame it no longer described.
+                                                                             // `jit_getstatic` runs `<clinit>` on first touch — arbitrary
+                                                                             // Java, so allocation and a collection. That is a safepoint
+                                                                             // like any call: spill the register homes and publish a map
+                                                                             // for THIS program point. Without the bracket a register-
+                                                                             // homed reference local was unreported, and the sp-id slot
+                                                                             // still named the previous safepoint's map, which could
+                                                                             // claim complete coverage for a frame it no longer described.
                     self.emit_pre_safepoint_spill();
                     self.emit_call_absolute(self.helpers.getstatic);
                     self.emit_oop_map_for_safepoint();
@@ -5417,7 +5422,7 @@ impl Compiler {
                     self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // class_id // Cast: x86-64 immediate encoding
                     self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // field_index // Cast: x86-64 immediate encoding
                     self.load_slot_to_reg(ARG_REGS[3], val_slot); // value
-                    // `<clinit>` on first touch, as for `getstatic`: a safepoint.
+                                                                  // `<clinit>` on first touch, as for `getstatic`: a safepoint.
                     self.emit_pre_safepoint_spill();
                     self.emit_call_absolute(helper_fn);
                     self.emit_oop_map_for_safepoint();
@@ -5570,8 +5575,7 @@ impl Compiler {
                         // Emitted BEFORE the receiver load because the
                         // fallback form clobbers R11 and RCX, exactly as
                         // `objects.rs`'s three call sites do.
-                        let mut layout_bail: Vec<usize> = if jit_sp_field_layout_guard_enabled()
-                        {
+                        let mut layout_bail: Vec<usize> = if jit_sp_field_layout_guard_enabled() {
                             self.emit_layout_epoch_guard().into_iter().collect()
                         } else {
                             Vec::new()
@@ -7580,9 +7584,7 @@ impl Compiler {
                                 // homes, and a bail site of
                                 // `spill-range-exhausted` said only that some
                                 // range somewhere did not fit.
-                                self.fail(
-                                    "singlepass-codegen/arraycopy-scratch-spill-exhausted",
-                                );
+                                self.fail("singlepass-codegen/arraycopy-scratch-spill-exhausted");
                                 return false;
                             }
                             let s_src = scratch_base;
@@ -7920,9 +7922,9 @@ impl Compiler {
                                 .invoke_info_idx
                                 .get(&pc)
                                 .map(|&i| self.invoke_info[i].1);
-                            match dispatch_info
-                                .map(|info| (info, self.reserve_spill_slots(5, SpillReason::HelperArgs)))
-                            {
+                            match dispatch_info.map(|info| {
+                                (info, self.reserve_spill_slots(5, SpillReason::HelperArgs))
+                            }) {
                                 Some((info, Some(args_base))) => {
                                     let skip_dispatch = self.emit_jmp_rel32_patch();
                                     for &patch in &bail_patches {
@@ -9182,8 +9184,7 @@ impl Compiler {
                             // the mirror of the defect this staging fixes. Truncating
                             // to the mark drops exactly what this site pushed; no
                             // safepoint can have run in between to take them.
-                            self.pending_staged_arg_oops
-                                .truncate(staged_self_args_mark);
+                            self.pending_staged_arg_oops.truncate(staged_self_args_mark);
 
                             // Skip the following xreturn — we already jumped
                             pc += 3; // invokestatic
@@ -9887,7 +9888,9 @@ impl Compiler {
                                     // ---- decline edge: the unchanged dispatch
                                     self.patch_rel32_to_here(declined);
                                     let nargs = if is_get { 3 } else { 4 };
-                                    let args_base = match self.reserve_spill_slots(nargs, SpillReason::HelperArgs) {
+                                    let args_base = match self
+                                        .reserve_spill_slots(nargs, SpillReason::HelperArgs)
+                                    {
                                         Some(b) => b,
                                         None => {
                                             self.fail(
@@ -10179,9 +10182,12 @@ impl Compiler {
                         // (`compareAndExchange`, which returns the witness, is
                         // NOT claimed here and keeps its native).
                         if !intrinsic_handled
-                            && callee_entry == crate::JitIntrinsic::AtomicIntCompareAndSet.as_entry()
+                            && callee_entry
+                                == crate::JitIntrinsic::AtomicIntCompareAndSet.as_entry()
                         {
-                            if let Some(layout) = crate::AtomicIntFieldLayout::new(0, guard_class_id) {
+                            if let Some(layout) =
+                                crate::AtomicIntFieldLayout::new(0, guard_class_id)
+                            {
                                 self.flush_scratch_registers();
                                 if crate::deopt_real_enabled() {
                                     self.snapshot_pre_intrinsic_call(
@@ -10415,9 +10421,12 @@ impl Compiler {
                         // (`compareAndExchange`, which returns the witness, is
                         // NOT claimed here and keeps its native).
                         if !intrinsic_handled
-                            && callee_entry == crate::JitIntrinsic::AtomicLongCompareAndSet.as_entry()
+                            && callee_entry
+                                == crate::JitIntrinsic::AtomicLongCompareAndSet.as_entry()
                         {
-                            if let Some(layout) = crate::AtomicLongFieldLayout::new(0, guard_class_id) {
+                            if let Some(layout) =
+                                crate::AtomicLongFieldLayout::new(0, guard_class_id)
+                            {
                                 self.flush_scratch_registers();
                                 if crate::deopt_real_enabled() {
                                     self.snapshot_pre_intrinsic_call(
@@ -10615,8 +10624,7 @@ impl Compiler {
                         // exception, a growth, or a coder inflation: the native
                         // does all three, unchanged.
                         if !intrinsic_handled
-                            && (callee_entry
-                                == crate::JitIntrinsic::StringBuilderLength.as_entry()
+                            && (callee_entry == crate::JitIntrinsic::StringBuilderLength.as_entry()
                                 || callee_entry
                                     == crate::JitIntrinsic::StringBuilderAppendChar.as_entry())
                         {
@@ -10636,8 +10644,11 @@ impl Compiler {
                                     self.flush_scratch_registers();
                                     // Operands, deepest first: receiver, then
                                     // (append only) the char.
-                                    let ch_slot =
-                                        if is_append { Some(self.pop_stack()) } else { None };
+                                    let ch_slot = if is_append {
+                                        Some(self.pop_stack())
+                                    } else {
+                                        None
+                                    };
                                     let recv_slot = self.pop_stack();
 
                                     let mut decline: Vec<usize> = Vec::new();
@@ -10731,9 +10742,7 @@ impl Compiler {
                                     {
                                         Some(base) => base,
                                         None => {
-                                            self.fail(
-                                                "singlepass-codegen/sb-args-spill-exhausted",
-                                            );
+                                            self.fail("singlepass-codegen/sb-args-spill-exhausted");
                                             return false;
                                         }
                                     };
@@ -10752,10 +10761,7 @@ impl Compiler {
                                     if ch_slot.is_some() {
                                         self.emit_store_local(top - 8, RCX);
                                     }
-                                    self.emit_load_local(
-                                        ARG_REGS[0],
-                                        self.heap_local_offset,
-                                    );
+                                    self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                                     self.emit_mov_imm64(ARG_REGS[1], info as *const _ as i64);
                                     self.emit_lea_frame_slot(ARG_REGS[2], top);
                                     self.emit_mov_imm32_sx(ARG_REGS[3], nargs as i32);
@@ -11815,11 +11821,8 @@ impl Compiler {
                                 // the next bytecode re-allocates spill slots
                                 // from the same base.
                                 let scratch_slots = if is_byte_form { 2 } else { 4 };
-                                if !self.spill_range_fits(self.next_spill_offset, scratch_slots)
-                                {
-                                    self.fail(
-                                        "singlepass-codegen/intrinsic-pin-spill-exhausted",
-                                    );
+                                if !self.spill_range_fits(self.next_spill_offset, scratch_slots) {
+                                    self.fail("singlepass-codegen/intrinsic-pin-spill-exhausted");
                                     return false;
                                 }
                                 let s_recv = self.next_spill_offset;
@@ -14583,7 +14586,8 @@ impl Compiler {
                     let recv_offset = match recv_slot {
                         StackSlot::Frame(offset) => offset,
                         StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg, ..) => {
-                            let Some(offset) = self.reserve_spill_slots(1, SpillReason::HelperArgs) else {
+                            let Some(offset) = self.reserve_spill_slots(1, SpillReason::HelperArgs)
+                            else {
                                 return false;
                             };
                             self.emit_store_local(offset, reg);

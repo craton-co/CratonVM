@@ -213,16 +213,16 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
     let mut has_athrow = false; // RBC.6 — method contains 0xbf
     let mut has_newarray = false; // Primitive array allocation (0xbc)
     let mut has_putstatic = false;
-                                  // RBC.6 local-handler-safety fix — every `*load`/`*store`/`iinc`
-                                  // instruction's (bytecode_pc, local_slot). Populated inline in the
-                                  // existing, already-correct per-opcode arms below (zero new pc-
-                                  // advancement logic — just recording a side effect), so it can never
-                                  // diverge from this scanner's own opcode-width decoding. Consumed by
-                                  // `local_handler_reads_unsafe_local` (jit/src/lib.rs) to conservatively
-                                  // verify every exception-table handler in a method only ever reads a
-                                  // local it (or something reachable before it in bytecode order,
-                                  // starting from the handler's own entry pc) has itself written — see
-                                  // that function's doc comment for why this check exists.
+    // RBC.6 local-handler-safety fix — every `*load`/`*store`/`iinc`
+    // instruction's (bytecode_pc, local_slot). Populated inline in the
+    // existing, already-correct per-opcode arms below (zero new pc-
+    // advancement logic — just recording a side effect), so it can never
+    // diverge from this scanner's own opcode-width decoding. Consumed by
+    // `local_handler_reads_unsafe_local` (jit/src/lib.rs) to conservatively
+    // verify every exception-table handler in a method only ever reads a
+    // local it (or something reachable before it in bytecode order,
+    // starting from the handler's own entry pc) has itself written — see
+    // that function's doc comment for why this check exists.
     let mut local_slot_ops: Vec<(usize, bool, u16)> = Vec::new(); // (pc, is_store, slot)
                                                                   // BUG-LQB-SCOPE (RELAXED, see docs/feature-designs/jit-local-exception-handlers.md
                                                                   // — documented alongside the RBC.6 relaxation it was found while

@@ -1232,15 +1232,12 @@ pub fn compile_with_param_slots(
     // hoist changes the emitted body of essentially every loop over an array
     // in the VM, so it needs one, and the bisect it serves must reach the
     // level the change is at (the emission, not the analysis).
-    let array_len_hoist_info = if cratonvm_types::flags::runtime_var_os(
-        "CRATONVM_DISABLE_ARRAYLEN_LICM",
-    )
-    .is_some()
-    {
-        Vec::new()
-    } else {
-        find_array_len_hoists(code, code_len, &loops)
-    };
+    let array_len_hoist_info =
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_ARRAYLEN_LICM").is_some() {
+            Vec::new()
+        } else {
+            find_array_len_hoists(code, code_len, &loops)
+        };
     // One filter, not the aaload hoist's two. There is no per-bci de-spec to
     // apply because this pre-header speculates on nothing: it throws the NPE
     // the body would have thrown rather than deopting, so there is no failed
@@ -2683,14 +2680,14 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
         if base != cm.code_bytes().as_ptr() as usize {
             crate::note_jit_bail_site_at("implicit-null-entry-not-base", 0, 0);
         } else {
-        for (fault_off, recover_off) in implicit_null_sites {
-            // A full table DECLINES. The site keeps its elided check, and the
-            // fault it would have caught then arrives as a crash instead of an
-            // NPE — so a decline is a real loss, not a graceful degradation,
-            // and that is why `implicit_null::counts` prints it rather than
-            // swallowing it.
-            let _ = crate::implicit_null::register(base + fault_off, base + recover_off);
-        }
+            for (fault_off, recover_off) in implicit_null_sites {
+                // A full table DECLINES. The site keeps its elided check, and the
+                // fault it would have caught then arrives as a crash instead of an
+                // NPE — so a decline is a real loss, not a graceful degradation,
+                // and that is why `implicit_null::counts` prints it rather than
+                // swallowing it.
+                let _ = crate::implicit_null::register(base + fault_off, base + recover_off);
+            }
         }
     }
 

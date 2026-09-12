@@ -4018,7 +4018,12 @@ mod tests {
             },
         ];
         let order = layout_blocks_rpo(&blocks, &[]).expect("a three-block chain must lay out");
-        let pos = |b: usize| order.iter().position(|&x| x == b).expect("every block placed");
+        let pos = |b: usize| {
+            order
+                .iter()
+                .position(|&x| x == b)
+                .expect("every block placed")
+        };
         assert_eq!(pos(0), 0, "the entry block stays at position 0");
         assert!(
             pos(2) < pos(1),
@@ -4067,14 +4072,24 @@ mod tests {
         let order = layout_blocks_rpo(&blocks, &[]).expect("a diamond must lay out");
         let mut seen = order.clone();
         seen.sort_unstable();
-        assert_eq!(seen, vec![0, 1, 2, 3], "order {order:?} is not a permutation");
+        assert_eq!(
+            seen,
+            vec![0, 1, 2, 3],
+            "order {order:?} is not a permutation"
+        );
         let pos = |b: usize| order.iter().position(|&x| x == b).unwrap();
-        assert!(pos(3) > pos(1) && pos(3) > pos(2), "the merge follows both arms");
+        assert!(
+            pos(3) > pos(1) && pos(3) > pos(2),
+            "the merge follows both arms"
+        );
     }
 
     /// An empty CFG is not an error, and must not be turned into one.
     #[test]
     fn rpo_layout_accepts_an_empty_block_list() {
-        assert_eq!(layout_blocks_rpo(&[], &[]).expect("empty is fine"), Vec::<usize>::new());
+        assert_eq!(
+            layout_blocks_rpo(&[], &[]).expect("empty is fine"),
+            Vec::<usize>::new()
+        );
     }
 }

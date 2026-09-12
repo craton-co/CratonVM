@@ -324,8 +324,12 @@ fn branch_target_pcs(code: &[u8], start: usize, end: usize) -> Vec<usize> {
             // goto_w
             0xc8 => {
                 if pc + 4 < code.len() {
-                    let off =
-                        i32::from_be_bytes([code[pc + 1], code[pc + 2], code[pc + 3], code[pc + 4]]);
+                    let off = i32::from_be_bytes([
+                        code[pc + 1],
+                        code[pc + 2],
+                        code[pc + 3],
+                        code[pc + 4],
+                    ]);
                     if let Some(t) = pc.checked_add_signed(off as isize) {
                         // Cast: address arithmetic
                         targets.push(t);
@@ -2945,29 +2949,29 @@ pub(super) fn local_mask_fail_closed_enabled() -> bool {
 pub(super) fn merge_marks_exact_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MERGE_MARKS_EXACT") {
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MERGE_MARKS_EXACT") {
             Ok(v) => !matches!(
                 v.trim().to_ascii_lowercase().as_str(),
                 "0" | "false" | "off" | "no"
             ),
             Err(_) => true,
-        }
-    })
+        },
+    )
 }
 
 pub(super) fn self_call_arg_maps_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_SELF_CALL_ARG_MAPS") {
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_SELF_CALL_ARG_MAPS") {
             Ok(v) => !matches!(
                 v.trim().to_ascii_lowercase().as_str(),
                 "0" | "false" | "off" | "no"
             ),
             Err(_) => true,
-        }
-    })
+        },
+    )
 }
 
 pub(super) fn spill_args_published_enabled() -> bool {

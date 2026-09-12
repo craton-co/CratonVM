@@ -1054,7 +1054,6 @@ fn header_offset_emission_site_inventory_matches_the_doc() {
     }
 }
 
-
 /// The array bounds check and its cold stub are ONE contract, split across two
 /// files, and neither half is correct alone.
 ///

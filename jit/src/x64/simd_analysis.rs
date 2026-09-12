@@ -1966,7 +1966,7 @@ pub mod vector_gate {
                 exit: NO_NODE,
                 safepoints: Vec::new(),
                 uses: UseLists::new(),
-            receiver_param: None,
+                receiver_param: None,
             }
         }
 
@@ -2023,6 +2023,7 @@ pub mod vector_gate {
                 form: LoopForm::PreTested,
                 modified_locals: 1u64 << 1,
                 heap_stable: true,
+                has_other_exit: false,
             }
         }
 

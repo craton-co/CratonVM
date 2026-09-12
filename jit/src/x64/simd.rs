@@ -37,18 +37,18 @@ impl Compiler {
         // 0x44, 0x89: MOV EAX, R11D;  SUB EAX, R10D; SHR EAX, 3
         self.buf.emit(&[0x44, 0x89, 0xD8]); // MOV EAX, R11D
         self.buf.emit(&[0x44, 0x29, 0xD0]); // SUB EAX, R10D
-        // Entered with i >= n the difference is zero or negative, and an
-        // unsigned SHR of a negative difference is ~2^29 chunks — every one
-        // of them past the array. Clamp to zero on the SIGNED flags of the
-        // SUB (JGE honours OF, so a wrapped `n - i` still reads as n < i),
-        // leaving the scalar loop's own `i < n` test to run zero iterations.
+                                            // Entered with i >= n the difference is zero or negative, and an
+                                            // unsigned SHR of a negative difference is ~2^29 chunks — every one
+                                            // of them past the array. Clamp to zero on the SIGNED flags of the
+                                            // SUB (JGE honours OF, so a wrapped `n - i` still reads as n < i),
+                                            // leaving the scalar loop's own `i < n` test to run zero iterations.
         self.buf.emit(&[0x7D, 0x02]); // JGE +2
         self.buf.emit(&[0x31, 0xC0]); // XOR EAX, EAX
-        // Neither the vector batches nor the scalar cleanup below poll for a
-        // safepoint, so bound the span exactly as the bulk-byte pre-headers
-        // do: past `MAX_BULK_BYTE_LOOP_SPAN` elements, skip the whole
-        // pre-header and let the original loop, which polls, do the work.
-        // Nothing Java-visible has changed yet at this point.
+                                      // Neither the vector batches nor the scalar cleanup below poll for a
+                                      // safepoint, so bound the span exactly as the bulk-byte pre-headers
+                                      // do: past `MAX_BULK_BYTE_LOOP_SPAN` elements, skip the whole
+                                      // pre-header and let the original loop, which polls, do the work.
+                                      // Nothing Java-visible has changed yet at this point.
         self.buf.emit_byte(0x3D); // CMP EAX, imm32
         self.buf.emit(&MAX_BULK_BYTE_LOOP_SPAN.to_le_bytes());
         let span_skip_patch = self.emit_jcc_rel32_patch(0x87); // JA .preheader_end
@@ -113,13 +113,13 @@ impl Compiler {
         // VEXTRACTI128 XMM1, YMM0, 1           VEX.256.66.0F3A.W0 39 /r ib
         self.emit_vex3(true, true, true, 0x03, false, 0, true, 1);
         self.buf.emit(&[0x39, 0xC1, 0x01]); // mod=11 reg=YMM0 rm=XMM1, imm8=1
-        // VPADDQ XMM0, XMM0, XMM1              VEX.128.66.0F.WIG D4 /r
+                                            // VPADDQ XMM0, XMM0, XMM1              VEX.128.66.0F.WIG D4 /r
         self.emit_vex2(true, 0, false, 1);
         self.buf.emit(&[0xD4, 0xC1]);
         // VPSHUFD XMM1, XMM0, 0x4E — high qword into the low lane
         self.emit_vex2(true, 0, false, 1);
         self.buf.emit(&[0x70, 0xC8, 0x4E]); // mod=11 reg=XMM1 rm=XMM0
-        // VPADDQ XMM0, XMM0, XMM1
+                                            // VPADDQ XMM0, XMM0, XMM1
         self.emit_vex2(true, 0, false, 1);
         self.buf.emit(&[0xD4, 0xC1]);
         // VMOVQ RAX, XMM0                      VEX.128.66.0F.W1 7E /r
@@ -169,9 +169,9 @@ impl Compiler {
         // Recompute: EAX = (R11D - R10D) >> 3 << 3; R10D += EAX
         self.buf.emit(&[0x44, 0x89, 0xD8]); // MOV EAX, R11D
         self.buf.emit(&[0x44, 0x29, 0xD0]); // SUB EAX, R10D
-        // The same signed clamp as the chunk count: for i > n, `(n - i) & ~7`
-        // is a NEGATIVE multiple of 8, which would restart the scalar tail
-        // below i and read a[i - 8k] — before the array.
+                                            // The same signed clamp as the chunk count: for i > n, `(n - i) & ~7`
+                                            // is a NEGATIVE multiple of 8, which would restart the scalar tail
+                                            // below i and read a[i - 8k] — before the array.
         self.buf.emit(&[0x7D, 0x02]); // JGE +2
         self.buf.emit(&[0x31, 0xC0]); // XOR EAX, EAX
         self.buf.emit(&[0x83, 0xE0, 0xF8]); // AND EAX, ~7 (round down to multiple of 8)
@@ -216,7 +216,7 @@ impl Compiler {
         let scalar_end = self.buf.pos();
         let end_rel = (scalar_end as i32) - (scalar_end_patch as i32 + 4); // Cast: x86-64 rel32 displacement
         self.buf.try_patch_i32(scalar_end_patch, end_rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
-        // .preheader_end: an over-long span falls through to the original loop.
+                                                                // .preheader_end: an over-long span falls through to the original loop.
         self.patch_rel32_to_here(span_skip_patch);
     }
 
@@ -575,10 +575,10 @@ impl Compiler {
         // `i*4 + chunk_count + H` and the first VMOVDQU faults.
         self.buf.emit(&[0x45, 0x89, 0xD8]); // MOV R8D, R11D
         self.buf.emit(&[0x45, 0x29, 0xD0]); // SUB R8D, R10D
-        // Signed clamp for an i >= n entry; see `emit_simd_int_array_sum`.
+                                            // Signed clamp for an i >= n entry; see `emit_simd_int_array_sum`.
         self.buf.emit(&[0x7D, 0x03]); // JGE +3
         self.buf.emit(&[0x45, 0x31, 0xC0]); // XOR R8D, R8D
-        // Poll-free span cap; see `emit_simd_int_array_sum`.
+                                            // Poll-free span cap; see `emit_simd_int_array_sum`.
         self.buf.emit(&[0x41, 0x81, 0xF8]); // CMP R8D, imm32
         self.buf.emit(&MAX_BULK_BYTE_LOOP_SPAN.to_le_bytes());
         let span_skip_patch = self.emit_jcc_rel32_patch(0x87); // JA .preheader_end
@@ -676,7 +676,7 @@ impl Compiler {
         // scalar remainder below dereferences.
         self.buf.emit(&[0x45, 0x89, 0xD8]); // MOV R8D, R11D
         self.buf.emit(&[0x45, 0x29, 0xD0]); // SUB R8D, R10D
-        // Signed clamp for i > n; see the recompute in `emit_simd_int_array_sum`.
+                                            // Signed clamp for i > n; see the recompute in `emit_simd_int_array_sum`.
         self.buf.emit(&[0x7D, 0x03]); // JGE +3
         self.buf.emit(&[0x45, 0x31, 0xC0]); // XOR R8D, R8D
         self.buf.emit(&[0x41, 0x83, 0xE0, 0xF8]); // AND R8D, ~7
@@ -750,7 +750,7 @@ impl Compiler {
         let scalar_end = self.buf.pos();
         let end_rel = (scalar_end as i32) - (scalar_end_patch as i32 + 4); // Cast: x86-64 rel32 displacement
         self.buf.try_patch_i32(scalar_end_patch, end_rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
-        // .preheader_end: an over-long span falls through to the original loop.
+                                                                // .preheader_end: an over-long span falls through to the original loop.
         self.patch_rel32_to_here(span_skip_patch);
     }
 

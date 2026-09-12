@@ -539,13 +539,13 @@ impl Compiler {
         self.buf.emit(&[0x0F, 0x83]);
         let patch_offset = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-        // PRECISE AIOOBE. Outside a protected range the cheap shared pad stays
-        // -- a frame is only useful where this method's own exception table can
-        // catch. Inside one, the pad returns the sentinel through the epilogue
-        // and the handler is entered from the INTERPRETER's frame, which is
-        // exactly the unpublished-frame case RBC.6 refuses the whole method
-        // for. Reason 11 publishes the AIOOBE and then materialises the frame,
-        // the same shape reason 10 uses for a locally-detected NPE.
+                                                  // PRECISE AIOOBE. Outside a protected range the cheap shared pad stays
+                                                  // -- a frame is only useful where this method's own exception table can
+                                                  // catch. Inside one, the pad returns the sentinel through the epilogue
+                                                  // and the handler is entered from the INTERPRETER's frame, which is
+                                                  // exactly the unpublished-frame case RBC.6 refuses the whole method
+                                                  // for. Reason 11 publishes the AIOOBE and then materialises the frame,
+                                                  // the same shape reason 10 uses for a locally-detected NPE.
         if self.precise_exception_frames && self.pc_is_protected(bc_pc) {
             let bci = self.orig_bci(bc_pc);
             if !self.exc_frame_box_ptr_by_bci.contains_key(&bci) {

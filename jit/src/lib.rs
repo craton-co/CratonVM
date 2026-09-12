@@ -92,9 +92,9 @@ pub mod deopt;
 pub mod escape_analysis;
 pub mod gpu_barrier;
 pub mod ir;
-pub mod ir_lower;
 pub mod ir_check_elim;
 pub mod ir_evidence;
+pub mod ir_lower;
 pub mod ir_optimize;
 pub mod ir_schedule;
 // The OSR entry-metadata contract, as executable checks — see
@@ -111,6 +111,7 @@ pub mod osr_exit;
 // The two OSR pc spaces, kept apart by the type system. `osr_contract` catches
 // the consequence (vectors that disagree); this catches the cause (an integer
 // in the wrong space).
+pub mod implicit_null;
 pub mod ir_verify;
 pub mod lambda_adapter;
 pub mod loop_analysis;
@@ -123,7 +124,6 @@ pub mod platform;
 pub mod profile;
 pub mod range_analysis;
 pub mod regalloc;
-pub mod implicit_null;
 pub mod runtime_lowering;
 pub mod scev;
 pub mod tiered;
@@ -2745,7 +2745,8 @@ impl FrameLayout {
             "rax", "rcx", "rdx", "rbx", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13",
             "r14", "r15",
         ];
-        if self.reg_spill_hi <= self.reg_spill_lo || off < self.reg_spill_lo
+        if self.reg_spill_hi <= self.reg_spill_lo
+            || off < self.reg_spill_lo
             || off >= self.reg_spill_hi
         {
             return None;
@@ -5651,8 +5652,7 @@ fn osr_trampoline_cache(
 ) -> &'static parking_lot::Mutex<FxHashMap<(usize, u64), Arc<ExecutableBuffer>>> {
     static CACHE: std::sync::OnceLock<
         parking_lot::Mutex<FxHashMap<(usize, u64), Arc<ExecutableBuffer>>>,
-    > =
-        std::sync::OnceLock::new();
+    > = std::sync::OnceLock::new();
     CACHE.get_or_init(|| parking_lot::Mutex::new(FxHashMap::default()))
 }
 
@@ -5727,10 +5727,10 @@ unsafe fn emit_osr_trampoline(
     // record. See each below.
     tramp.emit_byte(0x55); // push rbp
     tramp.emit(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
-    // Stack bang: probe every page the frame crosses before moving RSP. An OSR
-    // entry near the end of the stack otherwise skipped the guard page, and its
-    // first writes access-violated instead of raising StackOverflowError.
-    // MOV EAX, [RSP + disp32]  (8B 84 24 disp32); RAX is not an argument.
+                                     // Stack bang: probe every page the frame crosses before moving RSP. An OSR
+                                     // entry near the end of the stack otherwise skipped the guard page, and its
+                                     // first writes access-violated instead of raising StackOverflowError.
+                                     // MOV EAX, [RSP + disp32]  (8B 84 24 disp32); RAX is not an argument.
     let bang = crate::x64::jit_stack_bang_enabled();
     if bang {
         for disp in crate::x64::stack_bang_frame_probe_disps(frame_size)? {
@@ -7110,7 +7110,10 @@ fn append_ir_inline_site(
             // contributed no frame to a stack trace. Same string shape, built
             // from the same three fields, so the two tiers' chains are
             // indistinguishable to the consumer.
-            method_key: format!("{}.{}:{}", site.class_name, site.method_name, site.descriptor),
+            method_key: format!(
+                "{}.{}:{}",
+                site.class_name, site.method_name, site.descriptor
+            ),
             class_id: site.class_id,
         },
     );
@@ -7308,9 +7311,7 @@ fn append_ir_inline_site(
     // call.
     if ir_splice_refuse_unbindable_call_enabled()
         && site.invoke_targets.iter().any(|(pc, t)| {
-            !nested_pcs.contains(pc)
-                && !matches!(t.invoke_kind, 0 | 2)
-                && t.direct_entry.is_none()
+            !nested_pcs.contains(pc) && !matches!(t.invoke_kind, 0 | 2) && t.direct_entry.is_none()
         })
     {
         return false;
@@ -10547,8 +10548,8 @@ pub enum JitIntrinsic {
     // on one location, which is the same argument the `ATOMIC_INT` region
     // makes and the reason it says a side table would have made
     // intrinsification impossible.
-    LongLongValue,    // java/lang/Long.longValue()J       -> field 0, 8 bytes
-    IntegerIntValue,  // java/lang/Integer.intValue()I     -> field 0, 4 bytes
+    LongLongValue,   // java/lang/Long.longValue()J       -> field 0, 8 bytes
+    IntegerIntValue, // java/lang/Integer.intValue()I     -> field 0, 4 bytes
     // ===== INTRINSIC REGION END: BOX_UNBOX =====
 
     // ===== INTRINSIC REGION BEGIN: ARRAYCOPY =====
@@ -12476,7 +12477,6 @@ pub fn varhandle_write_direct_helper_sites() -> (u64, u64) {
     )
 }
 
-
 // ---------------------------------------------------------------------------
 // `VarHandle` compareAndSet thin direct-call bind.
 //
@@ -12669,9 +12669,18 @@ mod varhandle_cas_slot_tests {
     /// Primitives get their own slots, in `VARHANDLE_CAS_KINDS` order.
     #[test]
     fn primitive_values_get_their_own_slots() {
-        assert_eq!(varhandle_cas_helper_slot("compareAndSet", "(Ljava/lang/Object;II)Z"), Some(4));
-        assert_eq!(varhandle_cas_helper_slot("compareAndSet", "(Ljava/lang/Object;JJ)Z"), Some(5));
-        assert_eq!(varhandle_cas_helper_slot("compareAndSet", "(Ljava/lang/Object;ZZ)Z"), Some(0));
+        assert_eq!(
+            varhandle_cas_helper_slot("compareAndSet", "(Ljava/lang/Object;II)Z"),
+            Some(4)
+        );
+        assert_eq!(
+            varhandle_cas_helper_slot("compareAndSet", "(Ljava/lang/Object;JJ)Z"),
+            Some(5)
+        );
+        assert_eq!(
+            varhandle_cas_helper_slot("compareAndSet", "(Ljava/lang/Object;ZZ)Z"),
+            Some(0)
+        );
     }
 
     /// Everything this bind must NOT take, each for its own reason.
@@ -12687,11 +12696,20 @@ mod varhandle_cas_slot_tests {
             None,
         );
         // `expected` and `new` of different kinds is not a CAS shape.
-        assert_eq!(varhandle_cas_helper_slot("compareAndSet", "(Ljava/lang/Object;IJ)Z"), None);
+        assert_eq!(
+            varhandle_cas_helper_slot("compareAndSet", "(Ljava/lang/Object;IJ)Z"),
+            None
+        );
         // One operand only.
-        assert_eq!(varhandle_cas_helper_slot("compareAndSet", "(Ljava/lang/Object;I)Z"), None);
+        assert_eq!(
+            varhandle_cas_helper_slot("compareAndSet", "(Ljava/lang/Object;I)Z"),
+            None
+        );
         // Three operands.
-        assert_eq!(varhandle_cas_helper_slot("compareAndSet", "(Ljava/lang/Object;III)Z"), None);
+        assert_eq!(
+            varhandle_cas_helper_slot("compareAndSet", "(Ljava/lang/Object;III)Z"),
+            None
+        );
         // A non-boolean return is a different access mode.
         assert_eq!(
             varhandle_cas_helper_slot("compareAndSet", "(Ljava/lang/Object;II)I"),
@@ -12703,7 +12721,12 @@ mod varhandle_cas_slot_tests {
     /// the slot function is what refuses them.
     #[test]
     fn the_neighbouring_modes_are_not_bound() {
-        for mode in ["weakCompareAndSet", "weakCompareAndSetPlain", "compareAndExchange", "set"] {
+        for mode in [
+            "weakCompareAndSet",
+            "weakCompareAndSetPlain",
+            "compareAndExchange",
+            "set",
+        ] {
             assert_eq!(
                 varhandle_cas_helper_slot(mode, "(Ljava/lang/Object;II)Z"),
                 None,
@@ -13901,7 +13924,12 @@ pub(crate) fn box_unbox_intrinsic_shape(
                     layout.class_id, layout.value_compact_offset, layout.value_legacy_offset,
                 );
             }
-            Some((JitIntrinsic::LongLongValue.as_entry(), 0, b'J', layout.class_id))
+            Some((
+                JitIntrinsic::LongLongValue.as_entry(),
+                0,
+                b'J',
+                layout.class_id,
+            ))
         }
         ("java/lang/Integer", "intValue", "()I") => {
             let layout = AtomicIntFieldLayout::new(0, guard_class_id)?;
@@ -13915,7 +13943,12 @@ pub(crate) fn box_unbox_intrinsic_shape(
                     layout.class_id, layout.value_compact_offset, layout.value_legacy_offset,
                 );
             }
-            Some((JitIntrinsic::IntegerIntValue.as_entry(), 0, b'I', layout.class_id))
+            Some((
+                JitIntrinsic::IntegerIntValue.as_entry(),
+                0,
+                b'I',
+                layout.class_id,
+            ))
         }
         _ => None,
     }
@@ -13937,33 +13970,64 @@ mod atomic_accessor_intrinsic_tests {
     fn compare_and_set_is_claimed_for_both_widths_and_returns_z() {
         const CID: u32 = 12345;
         for (class, name, desc) in [
-            ("java/util/concurrent/atomic/AtomicLong", "compareAndSet", "(JJ)Z"),
-            ("java/util/concurrent/atomic/AtomicLong", "weakCompareAndSet", "(JJ)Z"),
+            (
+                "java/util/concurrent/atomic/AtomicLong",
+                "compareAndSet",
+                "(JJ)Z",
+            ),
+            (
+                "java/util/concurrent/atomic/AtomicLong",
+                "weakCompareAndSet",
+                "(JJ)Z",
+            ),
         ] {
             let (_, num_params, ret, guard) =
                 try_resolve_atomic_long_intrinsic(class, name, desc, CID)
                     .unwrap_or_else(|| panic!("{class}.{name}{desc} not claimed"));
             assert_eq!(num_params, 2, "{name}: receiver-excluded arity");
-            assert_eq!(ret, b'Z', "{name}: must be tagged boolean, not the field width");
+            assert_eq!(
+                ret, b'Z',
+                "{name}: must be tagged boolean, not the field width"
+            );
             assert_eq!(guard, CID);
         }
         for (class, name, desc) in [
-            ("java/util/concurrent/atomic/AtomicInteger", "compareAndSet", "(II)Z"),
-            ("java/util/concurrent/atomic/AtomicInteger", "weakCompareAndSet", "(II)Z"),
+            (
+                "java/util/concurrent/atomic/AtomicInteger",
+                "compareAndSet",
+                "(II)Z",
+            ),
+            (
+                "java/util/concurrent/atomic/AtomicInteger",
+                "weakCompareAndSet",
+                "(II)Z",
+            ),
         ] {
-            let (_, num_params, ret, guard) =
-                try_resolve_atomic_intrinsic(class, name, desc, CID)
-                    .unwrap_or_else(|| panic!("{class}.{name}{desc} not claimed"));
+            let (_, num_params, ret, guard) = try_resolve_atomic_intrinsic(class, name, desc, CID)
+                .unwrap_or_else(|| panic!("{class}.{name}{desc} not claimed"));
             assert_eq!(num_params, 2, "{name}: receiver-excluded arity");
-            assert_eq!(ret, b'Z', "{name}: must be tagged boolean, not the field width");
+            assert_eq!(
+                ret, b'Z',
+                "{name}: must be tagged boolean, not the field width"
+            );
             assert_eq!(guard, CID);
         }
         // The siblings must NOT have become `Z` along the way.
-        let (_, _, ret, _) =
-            try_resolve_atomic_long_intrinsic("java/util/concurrent/atomic/AtomicLong", "get", "()J", CID).unwrap();
+        let (_, _, ret, _) = try_resolve_atomic_long_intrinsic(
+            "java/util/concurrent/atomic/AtomicLong",
+            "get",
+            "()J",
+            CID,
+        )
+        .unwrap();
         assert_eq!(ret, b'J');
-        let (_, _, ret, _) =
-            try_resolve_atomic_intrinsic("java/util/concurrent/atomic/AtomicInteger", "get", "()I", CID).unwrap();
+        let (_, _, ret, _) = try_resolve_atomic_intrinsic(
+            "java/util/concurrent/atomic/AtomicInteger",
+            "get",
+            "()I",
+            CID,
+        )
+        .unwrap();
         assert_eq!(ret, b'I');
     }
 
@@ -13973,9 +14037,19 @@ mod atomic_accessor_intrinsic_tests {
     fn compare_and_exchange_is_not_claimed() {
         const CID: u32 = 12345;
         assert!(try_resolve_atomic_long_intrinsic(
-            "java/util/concurrent/atomic/AtomicLong", "compareAndExchange", "(JJ)J", CID).is_none());
+            "java/util/concurrent/atomic/AtomicLong",
+            "compareAndExchange",
+            "(JJ)J",
+            CID
+        )
+        .is_none());
         assert!(try_resolve_atomic_intrinsic(
-            "java/util/concurrent/atomic/AtomicInteger", "compareAndExchange", "(II)I", CID).is_none());
+            "java/util/concurrent/atomic/AtomicInteger",
+            "compareAndExchange",
+            "(II)I",
+            CID
+        )
+        .is_none());
     }
 
     /// The two CAS variants must not collide with each other or with the seven
@@ -13998,7 +14072,11 @@ mod atomic_accessor_intrinsic_tests {
         let mut v = all.to_vec();
         v.sort_unstable();
         v.dedup();
-        assert_eq!(v.len(), all.len(), "two atomic/box intrinsics share an `as_entry`");
+        assert_eq!(
+            v.len(),
+            all.len(),
+            "two atomic/box intrinsics share an `as_entry`"
+        );
     }
 
     // ===== INTRINSIC REGION BEGIN: BOX_UNBOX =====
@@ -14044,9 +14122,7 @@ mod atomic_accessor_intrinsic_tests {
             box_unbox_intrinsic_shape("java/lang/Long", "longValue", "()J", CID).is_some(),
             "the positive case must match, or every negative below is vacuous"
         );
-        assert!(
-            box_unbox_intrinsic_shape("java/lang/Integer", "intValue", "()I", CID).is_some()
-        );
+        assert!(box_unbox_intrinsic_shape("java/lang/Integer", "intValue", "()I", CID).is_some());
         for (c, n, d) in [
             // Right class, wrong method — `Long.hashCode` is also a field read
             // but returns a folded int, not the raw slot.
@@ -14077,9 +14153,7 @@ mod atomic_accessor_intrinsic_tests {
     #[test]
     fn box_unbox_declines_an_unresolved_class_id() {
         assert!(box_unbox_intrinsic_shape("java/lang/Long", "longValue", "()J", 0).is_none());
-        assert!(
-            box_unbox_intrinsic_shape("java/lang/Integer", "intValue", "()I", 0).is_none()
-        );
+        assert!(box_unbox_intrinsic_shape("java/lang/Integer", "intValue", "()I", 0).is_none());
     }
 
     /// The two widths must come from the two DIFFERENT layout helpers, because
@@ -18110,7 +18184,8 @@ fn narrow_array_value_fits(
         Op::And => {
             load_kind == MemKind::Char
                 && node.inputs.len() >= 2
-                && (const_of(node.inputs[1]) == Some(0xFFFF) || const_of(node.inputs[0]) == Some(0xFFFF))
+                && (const_of(node.inputs[1]) == Some(0xFFFF)
+                    || const_of(node.inputs[0]) == Some(0xFFFF))
         }
         _ => false,
     }
@@ -19327,7 +19402,6 @@ fn jfr_compile_door(door: compile_gate::CompileDoor) -> cratonvm_jfr::jit_decisi
     }
 }
 
-
 thread_local! {
     /// The furthest stage of the compile pipeline this thread has entered for
     /// the compile currently running.
@@ -19608,7 +19682,11 @@ struct DeferredNewRetry {
     /// have a retry" at the door the method itself walks through, and useless
     /// for the opposite direction: after holding a retry, something has to go
     /// looking for it once the class loads, and a hash names no method.
-    key: (std::sync::Arc<str>, std::sync::Arc<str>, std::sync::Arc<str>),
+    key: (
+        std::sync::Arc<str>,
+        std::sync::Arc<str>,
+        std::sync::Arc<str>,
+    ),
 }
 
 fn deferred_new_retries(
@@ -20214,7 +20292,6 @@ fn site_yields_to_thin_instance_helper(class: &str, name: &str, descriptor: &str
     }
 }
 
-
 /// `checkcast` sites that got the inline class-id compare, and the two reasons
 /// the rest did not.
 ///
@@ -20690,7 +20767,8 @@ pub fn note_inline_reserve(sum_words: u64, path_words: u64, spent_words: u64) {
 #[inline]
 pub fn note_spill_peak(words: u64, headroom: u64) {
     SPILL_CURSOR_COUNTS[SPILL_PEAK_WORDS].fetch_max(words, std::sync::atomic::Ordering::Relaxed);
-    SPILL_CURSOR_COUNTS[SPILL_MIN_HEADROOM].fetch_min(headroom, std::sync::atomic::Ordering::Relaxed);
+    SPILL_CURSOR_COUNTS[SPILL_MIN_HEADROOM]
+        .fetch_min(headroom, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Read the census. See [`SPILL_CURSOR_COUNTS`] for the columns.
@@ -25728,8 +25806,7 @@ fn try_compile_inner(
                         if let Some(uop) = cp_invoke_class_id_resolver
                             .and_then(|r| r(cp_idx))
                             .and_then(|cid| {
-                                ir::try_ir_unbox_intrinsic(&cn, &mn, &desc, cid)
-                                    .map(|op| (op, cid))
+                                ir::try_ir_unbox_intrinsic(&cn, &mn, &desc, cid).map(|op| (op, cid))
                             })
                         {
                             ir_unbox_intrinsic_sites.insert(pc, uop);
@@ -26442,8 +26519,9 @@ fn try_compile_inner(
                             std::collections::HashMap::new();
                         let resolved = cp_invokedynamic_descriptor_resolver
                             .map(|resolver| {
-                                scan.indy_ops.iter().all(|&(pc, cp_idx)| {
-                                    match resolver(cp_idx) {
+                                scan.indy_ops
+                                    .iter()
+                                    .all(|&(pc, cp_idx)| match resolver(cp_idx) {
                                         Some((descriptor, _bridge)) => {
                                             indy_sites.insert(
                                                 pc,
@@ -26455,8 +26533,7 @@ fn try_compile_inner(
                                             true
                                         }
                                         None => false,
-                                    }
-                                })
+                                    })
                             })
                             .unwrap_or(false);
                         // All or nothing: a partially resolved set would let
@@ -26488,9 +26565,8 @@ fn try_compile_inner(
                                 ir_scalar_intrinsic_sites.len(),
                             );
                         }
-                        builder.set_scalar_intrinsics(std::mem::take(
-                            &mut ir_scalar_intrinsic_sites,
-                        ));
+                        builder
+                            .set_scalar_intrinsics(std::mem::take(&mut ir_scalar_intrinsic_sites));
                     }
                     if all_emittable && !ir_unbox_intrinsic_sites.is_empty() {
                         if ir_stage_reporting() {
@@ -26502,9 +26578,7 @@ fn try_compile_inner(
                                 ir_unbox_intrinsic_sites.len(),
                             );
                         }
-                        builder.set_unbox_intrinsics(std::mem::take(
-                            &mut ir_unbox_intrinsic_sites,
-                        ));
+                        builder.set_unbox_intrinsics(std::mem::take(&mut ir_unbox_intrinsic_sites));
                     }
                     if all_emittable && !info_map.is_empty() {
                         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_CALL").is_some() {
@@ -26768,23 +26842,21 @@ fn try_compile_inner(
         // Empty without a profile, which is every run that has not
         // asked for one; `IrBuilder::prune_always_taken_branch` then
         // never fires and the graph is byte-identical.
-        let ir_pruned_branches: std::collections::HashSet<usize> =
-            if ir::ir_speculate_enabled() {
-                profile
-                    .map(|prof| {
-                        prof.branches
-                            .iter()
-                            .filter(|(_, c)| {
-                                c.not_taken == 0
-                                    && c.taken >= ir::MIN_OBSERVATIONS_TO_PRUNE
-                            })
-                            .map(|(&pc, _)| pc)
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            } else {
-                std::collections::HashSet::new()
-            };
+        let ir_pruned_branches: std::collections::HashSet<usize> = if ir::ir_speculate_enabled() {
+            profile
+                .map(|prof| {
+                    prof.branches
+                        .iter()
+                        .filter(|(_, c)| {
+                            c.not_taken == 0 && c.taken >= ir::MIN_OBSERVATIONS_TO_PRUNE
+                        })
+                        .map(|(&pc, _)| pc)
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            std::collections::HashSet::new()
+        };
         builder.set_pruned_branches(ir_pruned_branches);
         note_jit_pipeline_stage(JIT_STAGE_BUILD);
         let metrics_build = metrics.phase(metrics::Phase::Build);
@@ -26872,8 +26944,7 @@ fn try_compile_inner(
                 };
                 if value_body >= 0 && coder_body >= 0 {
                     for pc in sites {
-                        ir_compact_fields
-                            .insert((pc, true), (value_body as u32, true, b'['));
+                        ir_compact_fields.insert((pc, true), (value_body as u32, true, b'['));
                         ir_compact_fields
                             .insert((pc, false), (coder_body as u32, false, coder_tag));
                         STRING_ACCESS_COMPACT_ROWS
@@ -29579,7 +29650,12 @@ fn try_compile_inner(
                     && class_name == "java/nio/ByteBuffer"
                     && ((method_name == "put" && descriptor == "(IB)Ljava/nio/ByteBuffer;")
                         || (method_name == "get" && descriptor == "(I)B"))
-                    && !nio_byte_element_bind_refused(profile, pc, method_name == "put", "single-pass")
+                    && !nio_byte_element_bind_refused(
+                        profile,
+                        pc,
+                        method_name == "put",
+                        "single-pass",
+                    )
                 {
                     let is_put = method_name == "put";
                     let entry = direct_native_helper_for_impl(
@@ -42354,7 +42430,11 @@ mod devirt_intrinsic_yield_tests {
     #[test]
     fn a_private_target_never_yields_so_the_dispatch_rule_is_intact() {
         let layout = Some(STRING_INTRINSIC_NAME_PROBE);
-        for (name, desc) in [("isLatin1", "()Z"), ("coder", "()B"), ("checkIndex", "(II)V")] {
+        for (name, desc) in [
+            ("isLatin1", "()Z"),
+            ("coder", "()B"),
+            ("checkIndex", "(II)V"),
+        ] {
             assert!(
                 !site_yields_to_call_site_intrinsic("java/lang/String", name, desc, layout),
                 "String.{name}{desc} is not an intrinsic and must stay statically bound"
@@ -42658,9 +42738,15 @@ mod narrow_array_forwarding_tests {
         let c300 = konst(&mut g, 300);
         let c44 = konst(&mut g, 44);
         let c_neg = konst(&mut g, -1);
-        assert!(!narrow_array_value_fits(&g, c300, MemKind::Byte, Some(8)), "300 does not fit a byte");
+        assert!(
+            !narrow_array_value_fits(&g, c300, MemKind::Byte, Some(8)),
+            "300 does not fit a byte"
+        );
         assert!(narrow_array_value_fits(&g, c44, MemKind::Byte, Some(8)));
-        assert!(!narrow_array_value_fits(&g, c_neg, MemKind::Char, Some(5)), "char is unsigned");
+        assert!(
+            !narrow_array_value_fits(&g, c_neg, MemKind::Char, Some(5)),
+            "char is unsigned"
+        );
         assert!(narrow_array_value_fits(&g, c300, MemKind::Short, Some(9)));
         // Wide element kinds store the whole value.
         assert!(narrow_array_value_fits(&g, c300, MemKind::Int, Some(10)));
@@ -42688,6 +42774,9 @@ mod narrow_array_forwarding_tests {
         let one = konst(&mut g, 1);
         let two = konst(&mut g, 2);
         assert!(narrow_array_value_fits(&g, one, MemKind::Byte, Some(4)));
-        assert!(!narrow_array_value_fits(&g, two, MemKind::Byte, Some(4)), "boolean[] stores value & 1");
+        assert!(
+            !narrow_array_value_fits(&g, two, MemKind::Byte, Some(4)),
+            "boolean[] stores value & 1"
+        );
     }
 }

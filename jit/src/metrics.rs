@@ -3157,10 +3157,8 @@ pub fn note_ir_getfield_decline(reason: usize) {
 
 /// `(name, count)` for every refusal reason that fired.
 static IR_RECEIVER_SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static IR_RECV_NULL_ELIDED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static IR_RECV_NULL_EMITTED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static IR_RECV_NULL_ELIDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IR_RECV_NULL_EMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A block seeded with the receiver as non-null.
 pub fn note_ir_receiver_seed() {

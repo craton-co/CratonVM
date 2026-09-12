@@ -224,6 +224,10 @@ pub(crate) use inlining::inline_live_slot_clamps;
 /// Separate from the clamp above for the reason the counter itself is: one
 /// number cannot say which of the two guards a result should be credited to.
 pub(crate) use inlining::inline_locals_floor_bumps;
+/// The JVMS 4.9.1 bci bound, re-exported for `ir_lower`'s twin of
+/// `record_npe_trap_site`: the optimizing tier screens against the same bound
+/// and a second copy of it would be a second place to fix.
+pub(crate) use inlining::INLINE_FRAME_MAX_BCI;
 /// The PC -> inline-chain map, and the per-compile session that records it.
 ///
 /// NAMED rather than glob re-exported, unlike the ~15 `pub use foo::*;`
@@ -248,10 +252,6 @@ pub use inlining::{
     inline_miss_edge_poison_counts, npe_trap_lines_enabled, InlineFrameLevel, InlineFrameMap,
     InlineFrameRow, NpeTrapMap, NpeTrapSite,
 };
-/// The JVMS 4.9.1 bci bound, re-exported for `ir_lower`'s twin of
-/// `record_npe_trap_site`: the optimizing tier screens against the same bound
-/// and a second copy of it would be a second place to fix.
-pub(crate) use inlining::INLINE_FRAME_MAX_BCI;
 mod arith;
 mod arrays;
 mod deopt_stubs;
@@ -261,13 +261,13 @@ pub(crate) use objects::note_ungated_ref_store;
 // (`ir_lower`), deliberately: two tiers deciding independently what a
 // published plan means is how one of them ends up skipping a barrier the
 // other pays. `objects` is a private module, so the re-export is the seam.
-pub(crate) use objects::{ref_store_gates_of, ref_store_post_skip_mask_of};
-pub use objects::ref_store_site_counts;
-pub use objects::{inline_array_declines, inline_array_site_counts};
-pub(crate) use objects::note_gated_ref_store;
 pub use null_check_elim::receiver_null_check_counts;
 pub use null_check_elim::receiver_null_check_implicit_by_arm;
 pub use null_check_elim::receiver_null_check_implicit_count;
+pub(crate) use objects::note_gated_ref_store;
+pub use objects::ref_store_site_counts;
+pub use objects::{inline_array_declines, inline_array_site_counts};
+pub(crate) use objects::{ref_store_gates_of, ref_store_post_skip_mask_of};
 mod osr;
 mod simd;
 
@@ -287,8 +287,8 @@ thread_local! {
 mod emit;
 mod frames;
 mod operand_stack;
-pub use operand_stack::spill_slots_cap;
 pub(crate) use inlining::MAX_INLINE_MERGE_DEPTH;
+pub use operand_stack::spill_slots_cap;
 pub(crate) use operand_stack::SpillReason;
 pub mod safepoint;
 // ---------------------------------------------------------------------------
@@ -2162,7 +2162,11 @@ mod deopt_snapshot_tests {
         // `wide istore 70` at pc 8 clears local 70 (window 1, bit 6), which was
         // never set; assert it stays clear so the window rebasing is not just
         // setting everything.
-        assert_eq!(wmasks[code.len() + 12] & (1u64 << 6), 0, "local 70 is an int");
+        assert_eq!(
+            wmasks[code.len() + 12] & (1u64 << 6),
+            0,
+            "local 70 is an int"
+        );
         // And slot 0 in window 0 is untouched by any of it.
         assert_eq!(wmasks[4] & 1, 0, "local 0 is never stored here");
         assert!(wreached[4], "pc 4 is reachable");
@@ -2698,15 +2702,14 @@ impl Compiler {
                                                                                               // than `DIRECT_CALL_SERVICE_HEADROOM_SLOTS` arguments simply fails the
                                                                                               // reservation and falls back, exactly as an over-wide method does today.
         const DIRECT_CALL_SERVICE_HEADROOM_SLOTS: usize = 16;
-        let spill_slots = spill_slots_cap()
-            .map_or_else(
-                || max_stack.saturating_add(max_stack.min(DIRECT_CALL_SERVICE_HEADROOM_SLOTS)),
-                |cap| {
-                    max_stack
-                        .saturating_add(max_stack.min(DIRECT_CALL_SERVICE_HEADROOM_SLOTS))
-                        .min(cap)
-                },
-            );
+        let spill_slots = spill_slots_cap().map_or_else(
+            || max_stack.saturating_add(max_stack.min(DIRECT_CALL_SERVICE_HEADROOM_SLOTS)),
+            |cap| {
+                max_stack
+                    .saturating_add(max_stack.min(DIRECT_CALL_SERVICE_HEADROOM_SLOTS))
+                    .min(cap)
+            },
+        );
         let spill_size = (spill_slots.min(i32::MAX as usize / 8) as i32).saturating_mul(8); // Cast: address arithmetic
         let shadow_space = 32i32; // Windows x64 shadow space for helper calls
                                   // Reserved bytes ABOVE the shadow region for in-frame stack args to
@@ -2767,8 +2770,8 @@ impl Compiler {
         let num_reg_locals = local_assignments.iter().filter(|a| a.is_some()).count()
             + xmm_assignments.iter().filter(|a| a.is_some()).count();
         let callee_saved_size = alloc_used_regs.len() as i32 * 8; // Cast: x86-64 immediate encoding
-        // XMM save slots: 16 bytes each, the whole register (see
-        // `XMM_SAVE_SLOT_BYTES`).
+                                                                  // XMM save slots: 16 bytes each, the whole register (see
+                                                                  // `XMM_SAVE_SLOT_BYTES`).
         let xmm_saved_size = alloc_used_xmms.len() as i32 * XMM_SAVE_SLOT_BYTES; // Cast: x86-64 immediate encoding
 
         // Callee-saved registers are saved using MOV into frame slots (not PUSH)

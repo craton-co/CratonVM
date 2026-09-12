@@ -1325,7 +1325,6 @@ impl Compiler {
 
             // Standard method epilogue: restore callee-saved regs and return.
             self.emit_epilogue();
-
         }
 
         // Now the branch targets. A site with no recorded trap goes straight to
@@ -2159,16 +2158,16 @@ impl Compiler {
                     // is gpr[1]; see the spill loop above.
                     self.emit_load_local(RAX, base); // array
                     self.emit_load_local(RCX, base - 8); // index
-                    // Length is not live here either -- `emit_bounds_check`
-                    // folded its load into the compare -- so re-load it from the
-                    // header. RAX was just restored and the fast path
-                    // dereferenced this same word, so it cannot fault.
+                                                         // Length is not live here either -- `emit_bounds_check`
+                                                         // folded its load into the compare -- so re-load it from the
+                                                         // header. RAX was just restored and the fast path
+                                                         // dereferenced this same word, so it cannot fault.
                     const LEN_DISP: u8 =
                         crate::x64::disp::disp8_const(cratonvm_types::ARRAY_LENGTH_OFFSET as i64)
                             as u8;
                     self.buf.emit(&[0x44, 0x8B, 0x50, LEN_DISP]); // MOV R10D, [RAX+len]
-                    // jit_throw_aioobe(index, length, array_ptr, bytecode_pc) --
-                    // the same signature and order the shared pad uses.
+                                                                  // jit_throw_aioobe(index, length, array_ptr, bytecode_pc) --
+                                                                  // the same signature and order the shared pad uses.
                     #[cfg(target_os = "windows")]
                     {
                         self.buf.emit(&[0x49, 0x89, 0xC0]); // MOV R8, RAX
@@ -2197,10 +2196,10 @@ impl Compiler {
                     self.buf.emit_byte(0xB9); // MOV ECX, imm32
                     #[cfg(not(target_os = "windows"))]
                     self.buf.emit_byte(0xBF); // MOV EDI, imm32
-                    // The action travels with the bci for an ARRAY access; a
-                    // `putfield` records none and keeps `NONE`, which is what
-                    // this constant used to be for every site. See
-                    // `precise_npe_action_by_bci`.
+                                              // The action travels with the bci for an ARRAY access; a
+                                              // `putfield` records none and keeps `NONE`, which is what
+                                              // this constant used to be for every site. See
+                                              // `precise_npe_action_by_bci`.
                     let action = self
                         .precise_npe_action_by_bci
                         .get(&site_pc)
@@ -2254,7 +2253,7 @@ impl Compiler {
                 // interpreter frame, so without it the helper could only name
                 // the interpreted CALLER as the method that trapped.
                 let trap_reason_word = (reason as u64) | (u64::from(self.compile_id) << 32); // Cast: reason code is a small non-negative value
-                // vm_ptr is in the heap_local (frame slot) — load it first
+                                                                                             // vm_ptr is in the heap_local (frame slot) — load it first
                 #[cfg(target_os = "windows")]
                 {
                     // Windows x64: arg1=RCX, arg2=RDX, arg3=R8
@@ -2273,7 +2272,7 @@ impl Compiler {
                     self.rex_w();
                     self.buf.emit_byte(0xB8 + RDX as u8); // MOV r64, imm64 // Cast: x86-64 register encoding
                     self.buf.emit(&trap_reason_word.to_le_bytes()); // reason | compile id << 32
-                                                                   // MOV R8, bci (immediate)
+                                                                    // MOV R8, bci (immediate)
                     self.buf.emit(&[0x49, 0xB8 + (R8 as u8 - 8)]); // REX.WB + MOV r64, imm64 // Cast: x86-64 register encoding
                     self.buf.emit(&(bci as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
                 }
@@ -2291,7 +2290,7 @@ impl Compiler {
                     self.rex_w();
                     self.buf.emit_byte(0xB8 + RSI as u8); // Cast: x86-64 register encoding
                     self.buf.emit(&trap_reason_word.to_le_bytes()); // reason | compile id << 32
-                                                                   // MOV RDX, bci (immediate)
+                                                                    // MOV RDX, bci (immediate)
                     self.rex_w();
                     self.buf.emit_byte(0xB8 + RDX as u8); // Cast: x86-64 register encoding
                     self.buf.emit(&(bci as u64).to_le_bytes()); // Cast: x86-64 immediate encoding

@@ -79,7 +79,6 @@
 //! distinction that keeps a plumbing mistake from silently disabling the whole
 //! tier.
 
-
 /// One transform. Values are bit positions, not a count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transform {
@@ -284,8 +283,7 @@ pub fn note_blind_dispatch_in_splice() {
     STACK.with(|s| {
         if let Ok(mut v) = s.try_borrow_mut() {
             if let Some(rec) = v.last_mut() {
-                rec.blind_dispatches_in_splice =
-                    rec.blind_dispatches_in_splice.saturating_add(1);
+                rec.blind_dispatches_in_splice = rec.blind_dispatches_in_splice.saturating_add(1);
             }
         }
     });
@@ -489,10 +487,8 @@ pub fn accept(evidence: Option<CompileRecord>) -> bool {
 
 /// Bodies refused because their priced per-execution cost went UP, and the
 /// total nanoseconds-per-execution those refusals declined to publish.
-static REFUSED_COST_REGRESSION: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static REGRESSION_NS_REFUSED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static REFUSED_COST_REGRESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REGRESSION_NS_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `(bodies refused as a cost regression, ns/execution they would have added)`.
 ///
@@ -506,8 +502,7 @@ pub fn cost_regression_census() -> (u64, u64) {
     )
 }
 
-static REFUSED_BUT_SIMPLIFIED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static REFUSED_BUT_SIMPLIFIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REFUSED_AND_INERT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `(refused_but_the_optimizer_simplified, refused_and_the_optimizer_did_nothing)`.
@@ -656,7 +651,10 @@ mod tests {
         }
         let rec = take().expect("armed");
         assert!(rec.added_ns_per_execution() <= 0, "{rec:?}");
-        assert!(is_worth_publishing(rec), "a paid-for trade is still publishable");
+        assert!(
+            is_worth_publishing(rec),
+            "a paid-for trade is still publishable"
+        );
     }
 
     /// A blind dispatch in the method's OWN code is not this compile's doing --
@@ -882,8 +880,7 @@ pub fn take_last_verdict() -> Option<bool> {
 
 /// Supersedes abandoned because the optimizing body carried no evidence and a
 /// baseline body already existed.
-static SUPERSEDES_ABANDONED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static SUPERSEDES_ABANDONED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn note_supersede_abandoned() {
     SUPERSEDES_ABANDONED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

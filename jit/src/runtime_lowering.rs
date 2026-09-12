@@ -374,7 +374,8 @@ pub(crate) fn emit_inline_tlab_new_ir(
 
     // The layout snapshot, from the same source the helper reads. `None` means
     // this class allocates with uniform 16-byte cells.
-    let compact: Option<(usize, *const u32, u32)> = if cratonvm_types::compact_ref_fields_enabled() {
+    let compact: Option<(usize, *const u32, u32)> = if cratonvm_types::compact_ref_fields_enabled()
+    {
         cratonvm_types::class_layout(plan.class_id)
             .filter(|l| l.field_count() == plan.num_fields)
             .map(|l| {
@@ -445,20 +446,10 @@ pub(crate) fn emit_inline_tlab_new_ir(
     // `jit_post_tlab_init`, which writes the same value again idempotently.
     // Cast: a field count is bounded by the class file's own u16 limits.
     let shape = plan.num_fields as u32;
-    buf.emit(&[
-        0x41,
-        0xC7,
-        0x43,
-        cratonvm_types::NUM_SLOTS_OFFSET as u8,
-    ]);
+    buf.emit(&[0x41, 0xC7, 0x43, cratonvm_types::NUM_SLOTS_OFFSET as u8]);
     buf.emit(&shape.to_le_bytes());
     // mark_word at MARK_WORD_OFFSET — UNCONDITIONAL. See the doc comment.
-    buf.emit(&[
-        0x49,
-        0xC7,
-        0x43,
-        cratonvm_types::MARK_WORD_OFFSET as u8,
-    ]);
+    buf.emit(&[0x49, 0xC7, 0x43, cratonvm_types::MARK_WORD_OFFSET as u8]);
     buf.emit(&0i32.to_le_bytes());
     // The gc_flags byte, as a BYTE and AFTER the mark word that would erase it.
     // `gc_age` shares this byte and is 0 at allocation, so writing the whole

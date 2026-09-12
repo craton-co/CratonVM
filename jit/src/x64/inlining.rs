@@ -3119,8 +3119,8 @@ impl Compiler {
                             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                             self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: x86-64 immediate encoding
                             self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
-                            // `<clinit>` on first touch: a safepoint. See the
-                            // top-level 0xb2 arm.
+                                                                                     // `<clinit>` on first touch: a safepoint. See the
+                                                                                     // top-level 0xb2 arm.
                             self.emit_pre_safepoint_spill();
                             self.emit_call_absolute(self.helpers.getstatic);
                             self.emit_oop_map_for_safepoint();

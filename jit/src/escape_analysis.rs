@@ -6521,7 +6521,10 @@ mod phi_foreign_reference_tests {
 
         let result = analyze_escapes(&g);
         assert!(
-            result.scalar_replaceable.iter().all(|s| s.alloc_node != alloc),
+            result
+                .scalar_replaceable
+                .iter()
+                .all(|s| s.alloc_node != alloc),
             "a phi merging the allocation with the null literal must block scalar replacement"
         );
     }
@@ -6547,7 +6550,10 @@ mod phi_foreign_reference_tests {
 
         let result = analyze_escapes(&g);
         assert!(
-            result.scalar_replaceable.iter().all(|s| s.alloc_node != alloc),
+            result
+                .scalar_replaceable
+                .iter()
+                .all(|s| s.alloc_node != alloc),
             "a phi merging the allocation with a checkcast result must block scalar replacement"
         );
     }

@@ -639,10 +639,7 @@ impl Compiler {
         // oop map on it -- see `SP_ID_UNSET_BC_PC` for why the value is not
         // `0` here and is `0` in the IR backend. RAX is free: parameters are
         // already homed and no ABI argument is staged in the prologue.
-        if self.precise_maps
-            && self.sp_id_slot_off != 0
-            && crate::sp_id_slot_init_enabled()
-        {
+        if self.precise_maps && self.sp_id_slot_off != 0 && crate::sp_id_slot_init_enabled() {
             // Cast: the sentinel is `u32::MAX - 1`, which round-trips through
             // the sign-extended imm32 store and the collector's `as u32` read.
             self.emit_mov_imm32_sx(RAX, crate::x64::safepoint::SP_ID_UNSET_BC_PC as u32 as i32);

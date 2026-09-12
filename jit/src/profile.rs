@@ -197,7 +197,6 @@ pub fn is_receiver_profiling_enabled() -> bool {
     PROFILING_ENABLED.load(Ordering::Relaxed) || RECEIVER_PROFILING_ENABLED.load(Ordering::Relaxed)
 }
 
-
 // ---------------------------------------------------------------------------
 // Key type
 // ---------------------------------------------------------------------------

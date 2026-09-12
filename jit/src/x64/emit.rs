@@ -1219,7 +1219,10 @@ impl Compiler {
     /// registers (AL/CL/DL/BL); an extended register would need a REX prefix
     /// this encoding does not emit, so it is refused rather than mis-encoded.
     pub(super) fn emit_cmp_r8_mem8(&mut self, lhs: u8, base: u8, disp: i32) {
-        debug_assert!(lhs < 4, "emit_cmp_r8_mem8: r{lhs} is not a legacy byte register");
+        debug_assert!(
+            lhs < 4,
+            "emit_cmp_r8_mem8: r{lhs} is not a legacy byte register"
+        );
         if base >= 8 {
             self.buf.emit_byte(0x41); // REX.B
         }
@@ -1229,7 +1232,10 @@ impl Compiler {
 
     /// `TEST r8, imm8` for a legacy byte register.
     pub(super) fn emit_test_r8_imm8(&mut self, reg: u8, imm: u8) {
-        debug_assert!(reg < 4, "emit_test_r8_imm8: r{reg} is not a legacy byte register");
+        debug_assert!(
+            reg < 4,
+            "emit_test_r8_imm8: r{reg} is not a legacy byte register"
+        );
         self.buf.emit(&[0xF6, 0xC0 | (reg & 7), imm]);
     }
 

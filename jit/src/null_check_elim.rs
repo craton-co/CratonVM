@@ -293,7 +293,8 @@ fn switch_targets(code: &[u8], pc: usize, len: usize) -> Vec<usize> {
     }
     let end = len.min(code.len());
     let read = |at: usize| -> Option<i32> {
-        (at + 4 <= end).then(|| i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]))
+        (at + 4 <= end)
+            .then(|| i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]))
     };
     let mut push = |off: i32| {
         if let Some(t) = pc.checked_add_signed(off as isize).filter(|&t| t < len) {
@@ -741,13 +742,37 @@ pub fn analyze_with_receiver(
             let (ft_succ, tk_succ) = successors(code, pc);
 
             if let Some(s) = ft_succ {
-                meet_into(s, ft_out, &is_inst_start, &mut in_masks, &mut visited, &mut on_worklist, &mut worklist);
+                meet_into(
+                    s,
+                    ft_out,
+                    &is_inst_start,
+                    &mut in_masks,
+                    &mut visited,
+                    &mut on_worklist,
+                    &mut worklist,
+                );
             }
             if let Some(s) = tk_succ {
-                meet_into(s, tk_out, &is_inst_start, &mut in_masks, &mut visited, &mut on_worklist, &mut worklist);
+                meet_into(
+                    s,
+                    tk_out,
+                    &is_inst_start,
+                    &mut in_masks,
+                    &mut visited,
+                    &mut on_worklist,
+                    &mut worklist,
+                );
             }
             for s in switch_targets(code, pc, len) {
-                meet_into(s, ft_out, &is_inst_start, &mut in_masks, &mut visited, &mut on_worklist, &mut worklist);
+                meet_into(
+                    s,
+                    ft_out,
+                    &is_inst_start,
+                    &mut in_masks,
+                    &mut visited,
+                    &mut on_worklist,
+                    &mut worklist,
+                );
             }
         }
 
@@ -1035,7 +1060,10 @@ mod merge_point_tests {
         ];
         let info = analyze(&code, code.len());
         assert!(info.is_merge_point(9));
-        assert!(!info.is_nonnull(14, 2), "b was never dereferenced on the c == true path");
+        assert!(
+            !info.is_nonnull(14, 2),
+            "b was never dereferenced on the c == true path"
+        );
         assert!(!info.is_nonnull(15, 2));
         assert!(!info.is_nonnull(14, 1));
     }
@@ -1071,7 +1099,10 @@ mod merge_point_tests {
         let info = analyze(&code, code.len());
         assert!(info.is_merge_point(28));
         assert!(info.is_merge_point(33));
-        assert!(!info.is_nonnull(33, 1), "the switch case stored null into local 1");
+        assert!(
+            !info.is_nonnull(33, 1),
+            "the switch case stored null into local 1"
+        );
         assert!(!info.is_nonnull(34, 1));
     }
 
@@ -1097,8 +1128,14 @@ mod merge_point_tests {
             0xac, //            21: ireturn
         ];
         let info = analyze(&code, code.len());
-        assert!(info.is_merge_point(11), "a handler-only entry is a merge point");
-        assert!(!info.is_nonnull(14, 1), "the handler stored null into local 1");
+        assert!(
+            info.is_merge_point(11),
+            "a handler-only entry is a merge point"
+        );
+        assert!(
+            !info.is_nonnull(14, 1),
+            "the handler stored null into local 1"
+        );
         assert!(!info.is_nonnull(15, 1));
         // The fact still holds where only the normal path reaches.
         assert!(info.is_nonnull(5, 1));

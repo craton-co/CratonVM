@@ -11,8 +11,7 @@ use std::hash::{Hash, Hasher};
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 use super::ir::{
-    CmpOp, Graph, IrType, MemKind, Node, NodeId, Op, SafepointSlotKind, SafepointSnapshot,
-    NO_NODE,
+    CmpOp, Graph, IrType, MemKind, Node, NodeId, Op, SafepointSlotKind, SafepointSnapshot, NO_NODE,
 };
 
 // ── Public API ───────────────────────────────────────────────────────
@@ -1860,9 +1859,7 @@ fn loop_entry_memory(graph: &Graph, region: NodeId, entry_pred: NodeId) -> Optio
         .nodes
         .iter()
         .find(|node| {
-            node.op == Op::Phi
-                && node.ty == IrType::Memory
-                && node.inputs.first() == Some(&region)
+            node.op == Op::Phi && node.ty == IrType::Memory && node.inputs.first() == Some(&region)
         })
         // Phi inputs are `[region, v_for_pred0, v_for_pred1, …]`, aligned with
         // the region's own predecessor list.
@@ -2361,7 +2358,11 @@ fn licm(graph: &mut Graph) -> bool {
                     continue;
                 }
                 let base = inputs[2];
-                let addr = if inputs.len() >= 4 { inputs[3] } else { NO_NODE };
+                let addr = if inputs.len() >= 4 {
+                    inputs[3]
+                } else {
+                    NO_NODE
+                };
                 if !is_loop_invariant(graph, base, region, &body) {
                     if dbg {
                         eprintln!("[DBG_LICM] read-hoist load {load}: skip — base {base} variant");
@@ -3936,8 +3937,7 @@ fn analyze_counted_loop(
         }
         return Err(NotCounted::Shape);
     }
-    let cond = *graph
-        .nodes[if_node as usize]
+    let cond = *graph.nodes[if_node as usize]
         .inputs
         .get(1)
         .ok_or(NotCounted::Shape)?;
@@ -7706,7 +7706,6 @@ mod tests {
     }
 }
 
-
 // ── Per-copy deopt metadata ──────────────────────────────────────────
 //
 // These two tests are deliberately OPPOSED. The first asserts the loop
@@ -7873,9 +7872,9 @@ mod per_copy_frames_tests {
             after,
         );
         assert!(
-            g.nodes.iter().any(|n| {
-                matches!(n.op, Op::Region | Op::Merge) && n.inputs.len() == 2
-            }),
+            g.nodes
+                .iter()
+                .any(|n| { matches!(n.op, Op::Region | Op::Merge) && n.inputs.len() == 2 }),
             "the loop header is gone, so the loop was unrolled after all",
         );
     }
@@ -8203,7 +8202,10 @@ mod per_copy_frames_tests {
                     // The memory edge is default-ON, so the "neither" arm has
                     // to turn it OFF explicitly — leaving it unset would run
                     // both arms with it on and make the contrast vacuous.
-                    ("CRATONVM_JIT_IR_LICM_MEM_EDGE", Some(licm_first.unwrap_or("0"))),
+                    (
+                        "CRATONVM_JIT_IR_LICM_MEM_EDGE",
+                        Some(licm_first.unwrap_or("0")),
+                    ),
                 ],
                 || {
                     let mut builder = IrBuilder::new(2, 4);

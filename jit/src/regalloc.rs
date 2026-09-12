@@ -6857,7 +6857,13 @@ mod linear_scan_tests {
     #[test]
     fn a_reference_live_across_a_safepoint_gets_no_register_by_default() {
         let mut f = Fixture::new(12);
-        let across = f.value(Op::Load(crate::ir::MemKind::Ref), IrType::Ref, 0, 8, &[3, 8]);
+        let across = f.value(
+            Op::Load(crate::ir::MemKind::Ref),
+            IrType::Ref,
+            0,
+            8,
+            &[3, 8],
+        );
         let prim = f.value(Op::Add, IrType::Int, 0, 8, &[3, 8]);
         let (graph, live) = f.finish();
         let mut model = bare_model(gp(4));
@@ -6887,7 +6893,13 @@ mod linear_scan_tests {
     #[test]
     fn refs_may_cross_safepoints_lifts_that_refusal_and_only_that_one() {
         let mut f = Fixture::new(12);
-        let across = f.value(Op::Load(crate::ir::MemKind::Ref), IrType::Ref, 0, 8, &[3, 8]);
+        let across = f.value(
+            Op::Load(crate::ir::MemKind::Ref),
+            IrType::Ref,
+            0,
+            8,
+            &[3, 8],
+        );
         let pinned = f.home_bound(IrType::Ref, 0, 8, &[3, 8]);
         let (graph, live) = f.finish();
         let mut model = bare_model(gp(4));

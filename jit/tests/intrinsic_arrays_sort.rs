@@ -232,7 +232,9 @@ fn input_cases() -> Vec<Vec<i64>> {
         let mut x = seed;
         (0..n)
             .map(|_| {
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((x >> 33) as i64 % 2001) - 1000 // Cast: 31-bit value, fits
             })
             .collect()
