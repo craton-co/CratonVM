@@ -2240,7 +2240,47 @@ use cratonvm_types::compat::CompatibilityMode;
 /// above): the total not moving at all is the cleanest of the four readings
 /// -- every added SyntheticStub row is an existing Bridge relabelled, zero new
 /// registrations, exactly what a table landing on a fresh `dev` predicts.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3890;
+/// RE-FREEZE ON THE MERGE, 2026-09-12: a sibling lane re-froze this arm to
+/// 3890 while this wave was in flight, so the number below is that arm's
+/// value plus the SAME +81 -- re-measured on the merged tree, not added
+/// to it, in the three arms and against the same control worktree.
+/// # 3890 → 3971, 2026-09-12, L1 wave 7 (+81 on every arm, TOTAL
+/// registrations unchanged at 13961)
+///
+/// 79 triples re-tagged `Bridge` -> `SyntheticStub` by one retirement table
+/// (`RETIRED_SHADOW_L1_HT_TRIPLES`), and 81 REGISTRATIONS because two of them
+/// are registered twice — which is the distinction this file's own failure
+/// text spells out, and the reason 81 is not an arithmetic slip.
+///
+/// PAIRED, not subtracted: the control (`origin/dev` at `0ad29ab00`, its own
+/// worktree and its own target dir) was measured in the same three arms in the
+/// same sitting, and PASSED at the constants this line replaces.
+///
+/// ```text
+///   FIRST derivation, control 0ad29ab00
+///                       no-mgmt   mgmt   syn-jdk   total registrations
+///   control                3832   3859      3832   13593 / 13961 / 13628
+///   trial                  3913   3940      3913   13593 / 13961 / 13628
+///
+///   SECOND, on the LANDING tree after a sibling lane re-froze these arms
+///                       no-mgmt   mgmt   syn-jdk   total registrations
+///   control  f33bceb7d     3863   3890      3863   13586 / 13954 / 13621
+///   trial                  3944   3971      3944   13586 / 13954 / 13621
+/// ```
+///
+/// +81 in both sittings, on controls 31 rows apart, and the totals identical
+/// within each. The number below is the SECOND one, measured -- not the first
+/// one plus the sibling's delta.
+///
+/// The total not moving in any arm is the reading this file asks for: every
+/// added stub row is an existing `Bridge` relabelled, none is a new fake.
+///
+/// The same sitting measured the two WITHDRAWN versions of this wave on the
+/// same control, which is the arithmetic check on this constant: 189 triples
+/// (`LinkedHashMap`'s 102 and eight `HashMap` rows included) read
+/// 4011 / 4038 / 4011 = +179, and 87 triples read 3921 / 3948 / 3921 = +89.
+/// Two doubles in every one of the three counts.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3971;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2611,31 +2651,47 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3890;
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
 /// # 2948 → 3832, 2026-09-12 — see [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]'s
 /// account of this same merge; `+884` here too, total unchanged 13606 -> 13606.
-// 2026-09-12, lane 2 wave 3: +14 in every arm. The fourteen `java/math/BigInteger`
-// triples lane 2 held back joined `RETIRED_SHADOW_L2_TRIPLES`, and a table entry
-// re-tags the triple's `Bridge` to `SyntheticStub` in COMPATIBLE mode too --
-// `register` applies the retag before `register_inner`, and only `--jdk-only`
-// goes on to refuse it. So this count rising by exactly the number of rows added
-// is what an accepted wave looks like here; it is not a regression.
-//
-// TAKEN, not computed -- three times, because dev moved twice underneath this
-// branch and each merge conflicted on all three literals:
-//
-//   pre-merge tree            2915/2942/2915 -> measured 2929/2956/2929
-//   after 25 dev commits      dev 2948/2975/2948 -> measured 2962/2989/2962
-//   after 16 more (a +884
-//     wave from another lane) dev 3832/3859/3832 -> measured 3846/3873/3846
-//
-// Every conflict was resolved to DEV's literal and the gate re-run, never dev's
-// value plus 14: arithmetic over two baselines cannot see a row that moved in both
-// directions, which is the whole reason this lane re-measures on every merge. That
-// the measured delta came out +14 all three times -- across a wave that moved the
-// baselines by 884 -- is the CROSS-CHECK, not the derivation.
-//
-// The same +14 shows independently in the `--jdk-only-report`: 3036 refusals
-// against the control's 3022, and `java/math/BigInteger` going from 10 refused
-// triples to 24.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3863;
+/// RE-FREEZE ON THE MERGE, 2026-09-12: a sibling lane re-froze this arm to
+/// 3863 while this wave was in flight, so the number below is that arm's
+/// value plus the SAME +81 -- re-measured on the merged tree, not added
+/// to it, in the three arms and against the same control worktree.
+/// # 3863 → 3944, 2026-09-12, L1 wave 7 (+81 on every arm, TOTAL
+/// registrations unchanged at 13593)
+///
+/// 79 triples re-tagged `Bridge` -> `SyntheticStub` by one retirement table
+/// (`RETIRED_SHADOW_L1_HT_TRIPLES`), and 81 REGISTRATIONS because two of them
+/// are registered twice — which is the distinction this file's own failure
+/// text spells out, and the reason 81 is not an arithmetic slip.
+///
+/// PAIRED, not subtracted: the control (`origin/dev` at `0ad29ab00`, its own
+/// worktree and its own target dir) was measured in the same three arms in the
+/// same sitting, and PASSED at the constants this line replaces.
+///
+/// ```text
+///   FIRST derivation, control 0ad29ab00
+///                       no-mgmt   mgmt   syn-jdk   total registrations
+///   control                3832   3859      3832   13593 / 13961 / 13628
+///   trial                  3913   3940      3913   13593 / 13961 / 13628
+///
+///   SECOND, on the LANDING tree after a sibling lane re-froze these arms
+///                       no-mgmt   mgmt   syn-jdk   total registrations
+///   control  f33bceb7d     3863   3890      3863   13586 / 13954 / 13621
+///   trial                  3944   3971      3944   13586 / 13954 / 13621
+/// ```
+///
+/// +81 in both sittings, on controls 31 rows apart, and the totals identical
+/// within each. The number below is the SECOND one, measured -- not the first
+/// one plus the sibling's delta.
+///
+/// The total not moving in any arm is the reading this file asks for: every
+/// added stub row is an existing `Bridge` relabelled, none is a new fake.
+///
+/// The same sitting measured the two WITHDRAWN versions of this wave on the
+/// same control, which is the arithmetic check on this constant: 189 triples
+/// (`LinkedHashMap`'s 102 and eight `HashMap` rows included) read
+/// 4011 / 4038 / 4011 = +179, and 87 triples read 3921 / 3948 / 3921 = +89.
+/// Two doubles in every one of the three counts.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3944;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2875,7 +2931,47 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3863;
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
 /// # 2948 → 3832, 2026-09-12 — see [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]'s
 /// account of this same merge; `+884` here too, total unchanged 13641 -> 13641.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 3863;
+/// RE-FREEZE ON THE MERGE, 2026-09-12: a sibling lane re-froze this arm to
+/// 3863 while this wave was in flight, so the number below is that arm's
+/// value plus the SAME +81 -- re-measured on the merged tree, not added
+/// to it, in the three arms and against the same control worktree.
+/// # 3863 → 3944, 2026-09-12, L1 wave 7 (+81 on every arm, TOTAL
+/// registrations unchanged at 13628)
+///
+/// 79 triples re-tagged `Bridge` -> `SyntheticStub` by one retirement table
+/// (`RETIRED_SHADOW_L1_HT_TRIPLES`), and 81 REGISTRATIONS because two of them
+/// are registered twice — which is the distinction this file's own failure
+/// text spells out, and the reason 81 is not an arithmetic slip.
+///
+/// PAIRED, not subtracted: the control (`origin/dev` at `0ad29ab00`, its own
+/// worktree and its own target dir) was measured in the same three arms in the
+/// same sitting, and PASSED at the constants this line replaces.
+///
+/// ```text
+///   FIRST derivation, control 0ad29ab00
+///                       no-mgmt   mgmt   syn-jdk   total registrations
+///   control                3832   3859      3832   13593 / 13961 / 13628
+///   trial                  3913   3940      3913   13593 / 13961 / 13628
+///
+///   SECOND, on the LANDING tree after a sibling lane re-froze these arms
+///                       no-mgmt   mgmt   syn-jdk   total registrations
+///   control  f33bceb7d     3863   3890      3863   13586 / 13954 / 13621
+///   trial                  3944   3971      3944   13586 / 13954 / 13621
+/// ```
+///
+/// +81 in both sittings, on controls 31 rows apart, and the totals identical
+/// within each. The number below is the SECOND one, measured -- not the first
+/// one plus the sibling's delta.
+///
+/// The total not moving in any arm is the reading this file asks for: every
+/// added stub row is an existing `Bridge` relabelled, none is a new fake.
+///
+/// The same sitting measured the two WITHDRAWN versions of this wave on the
+/// same control, which is the arithmetic check on this constant: 189 triples
+/// (`LinkedHashMap`'s 102 and eight `HashMap` rows included) read
+/// 4011 / 4038 / 4011 = +179, and 87 triples read 3921 / 3948 / 3921 = +89.
+/// Two doubles in every one of the three counts.
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 3944;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///

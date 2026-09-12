@@ -26,10 +26,10 @@ preconditions and the landing protocol are in
 | disposition | rows | what decided it |
 |---|---:|---|
 | **RETIRED** — waves 1 and 2, `RETIRED_SHADOW_L1_TRIPLES` | **329** | §3 |
-| HELD — `TreeMap`/`TreeSet` | 157 | state is `tm_array_table()`, a Rust side table; 9 probes worse armed |
-| HELD — `LinkedHashMap` + its four views + iterators | 102 | state is `lhm_overlay()`, a Rust side table; 11 probes worse |
-| PART RETIRED — `HashMap` + views + iterators + `$Node` | 98 | **wave 3**: 21 retired, 77 held. The nine rows that held it were a DIAL ARTEFACT; the twelve probes that hold the 77 are not — §3 |
-| HELD — `Hashtable` + views + `$Entry` | 79 | 4 probes worse. **Wave 6 bisected it: `+0` over 335 engagements on one probe and `+10` on another, and the ten rows are all views answering EMPTY** — §10 item 4 |
+| HELD — `TreeMap`/`TreeSet` | 157 | state is `tm_array_table()` — **but the real `root` IS a real `TreeMap$Entry` tree and `size` is mirrored** (wave 7 measured it). 13 probes worse armed, one a crash. Its two view carriers are in NEITHER carrier list, which is why wave 7 fixed three families and not four — §10 item 1 |
+| HELD — `LinkedHashMap` + its four views + iterators | 102 | **wave 7: measured on TWO trial binaries and refused, and the reason is no longer the store.** Its `table`, `head`, `tail`, `size` and node classes match HotSpot. Retire the iterators and lane T's registrar mints a carrier real bytecode NPEs on; keep them and every mutation through a sequenced default is lost — §3, §10 item 2 |
+| PART RETIRED — `HashMap` + views + iterators + `$Node` | 98 | **wave 3**: 21 retired, 77 held. **Wave 7 took the eight `LinkedHashMap` inherits** (`RETIRED_SHADOW_L1_HM8_TRIPLES`) — not because it retired LinkedHashMap (it did not) but because the premise was false: those entries are in the real `table`. 69 held, on lane T's iterator carrier — §3, §10 item 3 |
+| **RETIRED** — `Hashtable` + views + `$Entry`, `RETIRED_SHADOW_L1_HT_TRIPLES` | **79** | **wave 7.** Wave 6's `+10` was right about WHERE (the views) and wrong about WHY: the table holds real `Hashtable$Entry` nodes and `count` is written. One decode fix and the arm is 0 — §3 |
 | PART RETIRED — `java/util/jar/` | 45 | **wave 4**: everything but `JarFile`, which is the whole of the `+34` — §3 |
 | HELD — `Date` / `TimeZone` / `sun/util/calendar/` | 40 | 5 probes worse; bisected §10 item 6. **Wave 5 wrote a 2-row table for `ZoneInfoFile`, the one non-vacuous `+0`; unaccepted** |
 | PART RETIRED — `Locale` + `sun/util/locale/` + `sun/util/resources/` + `Currency` | 35 | 3 probes worse, one truncates 125 → 8; bisected §10 item 6. Wave 5 located the blocker under the five vacuous rows and fixed half of it. **Wave 6 gave the six `reached == 0` rows a workload: 2 retired, 2 candidates, 2 measured NO** — §10 item 6 |
@@ -57,6 +57,207 @@ would invent a number neither took. What they retire, exactly:
                                                       BREAKITER pin removed
   wave 6  RETIRED_SHADOW_L1_LP_TRIPLES    2 triples   sun/util/resources/LocaleData,
                                                       JRELocaleProviderAdapter
+```
+
+### Wave 7 — the map families were never a state-model problem, and the one that still holds is held for a different reason
+
+**`Hashtable`'s 79 are retired, and the sentence three families were held on
+is false on this tree.** Section 1 said
+"state is a Rust side table, so retiring hands real bytecode an empty map" of
+`Hashtable`, `LinkedHashMap` and `TreeMap`. Their state is REAL. What was
+missing was a DECODE: one helper could not find the source map of a view the
+IMAGE'S OWN BYTECODE minted, and answered `size() == 0`.
+
+The instrument is `apps/probes/L1MapStateDiag`, run through
+`--add-opens java.base/java.util=ALL-UNNAMED` on the CONTROL binary,
+`--jdk-only`, UNARMED, against HotSpot 25.0.4+7. Seventy-five rows, one
+divergence:
+
+```text
+                          CratonVM (control, unarmed)        HotSpot
+  Hashtable.table         [Ljava.util.Hashtable$Entry;       SAME
+                          len=11 nonNull=3, real $Entry nodes
+  Hashtable.count         3                                  SAME
+  LinkedHashMap.table     [Ljava.util.HashMap$Node;          SAME
+                          nodes java.util.LinkedHashMap$Entry
+  LinkedHashMap.head/tail a=1 / c=3      .size 3             SAME
+  TreeMap.root            a java.util.TreeMap$Entry tree     SAME
+  HashMap.table           [Ljava.util.HashMap$Node;          SAME
+  LinkedHashMap.modCount  5                                  3      <- the one
+```
+
+Every one of those was taken before a line of this wave was written — §11's
+wave-6 rule applied again. Three separate earlier changes had each made part
+of it real (`H23-2`'s node-class move, `lhm_set`'s serialization mirror,
+`tm_publish_real_root`), and no one had re-read the hold they invalidated.
+
+#### What was actually broken, and it is one answer in one helper
+
+Armed one family per process on the control, `apps/probes/L1MapViewToArrayProbe`
+(168 rows, 0 diffs UNARMED on every family):
+
+```text
+                        rows differing armed     what differs
+  java/util/Hashtable            30              entrySet/keySet .toArray()
+  java/util/LinkedHashMap         8              entrySet().toArray()
+  java/util/HashMap              12              entrySet().toArray()
+  java/util/TreeMap              38              entrySet/keySet .toArray()
+```
+
+`size()`, `iterator()`, the for-each walk, `stream().count()`, `toString()`,
+`contains`, `equals`, `hashCode`, removal through a view and `setValue` through
+an entry were ALL already right with the family's natives declined. A family
+whose entries are missing cannot answer `size()` correctly, and these did.
+
+`toArray()` is the one caller that goes through `AbstractCollection.toArray`'s
+`new Object[size()]`, and that `size()` is asked from INSIDE a native, where
+`hs_backing_map` looks for the source map in a trailing slot only THIS crate's
+carriers have. On a view real `entrySet()` bytecode minted, that read is off
+the end of the object — and the VM had been saying so twice per call:
+
+```text
+  WARN zgc real: field index OOB index=1 num_slots=1 op="get"
+```
+
+Three changes in `native-collections/src/lib.rs`, none of which moves a store:
+`hs_backing_map` falls back to the enclosing-instance field BY NAME
+(`this$0`/`map`) for a `SET_VIEW_CARRIERS` receiver — the reading
+`values_view_class_source` has done for the VALUES carriers since G22-1;
+`hs_view_elements` decides keys-vs-entries from the CLASS, because the
+head-element reading answers "values" for an empty view and "values" for an
+entry set is an `ArrayStoreException` at the caller; and
+`collect_collection_elements` grows a branch for the same receiver ahead of the
+HashSet-shaped one that would hand back the source map's KEYS.
+
+```text
+  control  cratonvm-l1w7-base-20260912   armed: HT 30, LHM 8, HM 12 rows differ
+  + the decode fix (t3)                  armed: HT  0, LHM 0, HM  0
+```
+
+#### `LinkedHashMap` was measured and REFUSED, on three trial binaries
+
+The decode fix takes the LinkedHashMap ARM to zero, and the family still
+cannot be retired. Two trial binaries, and they fail in opposite directions:
+
+```text
+  trial A, all 102 retired
+    LinkedSequencedShadowSweep DIES at 74 of 104 rows
+      NullPointerException: Cannot read field "modCount"
+                            because "this.this$0" is null
+        at java/util/LinkedHashMap$LinkedHashIterator.nextNode
+    ItrCarrierCensus / CollectionsShadowSweep / DeadDoorProbe: same cause,
+    a java.util.LinkedHashSet's iterator.        5 probes worse
+
+  trial B, the 9 iterator triples and the 3 `iterator()` accessors withdrawn
+    no crash, and SIX probes worse — every row a MUTATION that stopped
+    writing through:
+      entrySet().iterator().remove()   removes nothing
+      entrySet().removeIf              writes nothing
+      Map.Entry.setValue               ConcurrentModificationException
+      pollFirstEntry / pollLastEntry   return the entry, remove nothing
+      reversed()                       insertion order, not reversed
+```
+
+```text
+  trial C, LinkedHashMap left alone and the eight rows it INHERITS from
+  `java/util/HashMap` retired instead (wave 3's refusal, re-tried)
+    LinkedSequencedShadowSweep, 16 rows, and they are wave 3's own sentence:
+      44 merge counts as an access    {b=22, c=33, a=2} -> {a=2}
+      45 replace counts as an access  {b=22, a=2, c=33} -> {a=2}
+      46 compute counts as an access  {b=22, c=33, a=2} -> {a=2}
+      12 replace keeps position       b=222 -> b=3
+```
+
+Trial C is the one that corrects this wave's own premise. The eight were taken
+on "the entries are in the real `table`, so real `HashMap` bytecode can read
+them" — true, and only half the question. `lhm_set`'s mirror is ONE-WAY:
+overlay writes reach the real fields, and a write made by REAL bytecode reaches
+the real fields and nothing tells the overlay. A retired inherited MUTATOR
+therefore puts the family in the one state neither store survives — half its
+writers on each side, its own natives still answering reads from the overlay.
+It is also why trial A did not show this: with the whole family retired there
+is no native left reading the overlay, and a one-way mirror costs nothing. **The
+mixed state is the broken one.**
+
+Trial B names the other blocker. `SequencedMap.pollFirstEntry` and its neighbours are
+DEFAULT methods whose body is `var it = entrySet().iterator(); it.next();
+it.remove();`, so retiring the map's surface routes them into real bytecode
+driving whatever `entrySet().iterator()` returns — and a VM-minted iterator's
+`remove()` writes to a model the real map no longer reads. Keep the iterators
+native and the mutations are lost; retire them and lane T's
+`register_hashset_natives` keeps minting a `LinkedKeyIterator` for a
+`LinkedHashSet` receiver that real bytecode dereferences through a null
+`this$0`.
+
+**So `LinkedHashMap` (102) and `HashMap`'s remaining 69 are one blocker, not
+two, and it is the HashSet-family iterator carrier lane T owns.** That is the
+wave's second finding and it is worth more than the row count: §10 items 2 and
+3 were two entries with two different stories, and they are one entry.
+
+#### The acceptance, both modes
+
+dev moved 41 commits during the wave, so the pair was rebuilt on the merged
+tree and pair 1 is reported as corroboration:
+
+```text
+  pair 1  control cratonvm-l1w7-base-20260912  dev bdb02d94e  sha 3abc5537abe8
+          trial   cratonvm-l1w7-t4-20260912    102+79+8       sha 4152ae4cc7f4
+  pair 2  control cratonvm-l1w7-base2-20260912 dev 0ad29ab00  sha 7e69b76b32f2
+          trial   cratonvm-l1w7-t8-20260912    79 retired     sha c24c64d59fd7
+  the two withdrawal rounds, same control:
+          cratonvm-l1w7-t5  (79+102+8)  5 worse, one crash
+          cratonvm-l1w7-t6  (79+90+8)   6 worse, no crash
+          cratonvm-l1w7-t7  (79+8)      1 worse  <- trial C
+          cratonvm-l1w7-t8  (79)        the pair-2 result below
+```
+
+```text
+  --jdk-only    161 probes measured   0 worse   0 better
+  DEFAULT       161 probes measured   0 worse   0 better
+
+  the nine probes the battery skips, run by hand with `--add-exports`:
+    L1BreakIterRealProbe, L1LocaleProviderWorkload, L5CasRace,
+    L5SubwordAtomics, L5UnsafeAccess          all base 0 / trial 0
+
+  regression-suite SUITE=all       136 / 136 on both binaries
+  regression-suite SUITE=core       95 /  95 on both binaries
+  jdk-only-strict-probes           FAIL on both
+```
+
+One probe moved in default mode and it is not evidence:
+`apps/probes/ConcurrentStressSweep` moves against ITSELF on this host. Four
+consecutive CONTROL-versus-control runs read 0, 4, 2 and 4 differing rows, and
+the rows are `chm.distinctKeys.size 19994/20000` and
+`chm.putIfAbsent.oneWinner 3 winner(s)` — a `ConcurrentHashMap` race that
+predates this wave. Reading it as a regression is exactly what §11's
+control-arm rule exists to stop, and the four runs are the arm.
+
+The strict corpus fails on the CONTROL too, and wave 6's account of it is
+re-taken rather than quoted: **every divergent line in both arms is a
+timestamped `WARN cas_diag: T19_H6_CAS_DIAG`**, 17 of them on the control and
+16 on the trial, in the same four sections (`ChmKeySetGrowth`,
+`ChmShadowSweep`, `JdkOnlyCensusLoadProbe`, `JdkOnlyPlatformProbe`). Zero
+substantive rows on either side. That arm cannot be green under contention
+whatever any lane does.
+
+
+#### The nine probes the shared battery cannot see
+
+`scripts/jdk-only-phase2-battery.sh` compiles every probe with a bare `javac`
+and prints `JAVAC-FAILED` for the ones that need `--add-exports`. Nine fail,
+and TWO OF THEM ARE WAVE 6'S OWN — `L1BreakIterRealProbe` and
+`L1LocaleProviderWorkload` both import `sun.util.locale.provider`. The tree
+that accepted wave 6 could not see wave 6's instruments, and neither could this
+one until they were run by hand:
+
+```text
+  --add-exports java.base/sun.util.locale.provider=ALL-UNNAMED
+    L1BreakIterRealProbe       base 0   trial 0
+    L1LocaleProviderWorkload   base 0   trial 0
+    L5CasRace / L5SubwordAtomics / L5UnsafeAccess   base 0   trial 0
+  still refused, for reasons that are not a flag: H2MapOpsProbe (org.h2),
+    JcaSunTlsVectors (sun.security.internal.spec), JdkInternalSweep
+    (jdk.internal.access), MinAssertRedefine (org.assertj)
 ```
 
 ### Wave 6 — the acceptance, and the first tree taken in BOTH modes
@@ -1082,31 +1283,74 @@ sits half-fixed is exactly what `owns_slot` exists to catch.
 
 Every remaining HELD family has a named blocker. In rough order of rows:
 
-1. **`TreeMap`/`TreeSet` (157).** `tm_get_slot`/`tm_set_slot` keep the whole map
-   in `tm_array_table()`, a Rust `HashMap` keyed by object; the real `root`,
-   `size` and `comparator` are never written and no `TreeMap$Entry` node graph
-   exists. The remedy is `Properties`' `replace_real_map` for a red-black tree:
-   build the real node graph, make it the authority, then retire. Retiring
-   first hands real bytecode an empty map.
-   **Wave 6 priced it on the views probe** (`L1EntrySetRouteProbe`, base 0
-   diffs, armed one class per process): `TreeMap` +18 with reached=143. The
-   engagement means the number is real; the number means the node graph is
-   still missing. Nothing here has changed except that the figure is now
-   taken on a probe that exercises the views rather than on the whole tree.
+1. **`TreeMap`/`TreeSet` (157).** `tm_get_slot`/`tm_set_slot` keep the whole
+   map in `tm_array_table()`, a Rust `HashMap` keyed by object.
 
-2. **`LinkedHashMap` + views (102).** `lhm_overlay()`, same shape, same
-   remedy — and now also a BLOCKER on someone else's table: wave 3 could not
-   retire eight `java/util/HashMap` methods because LinkedHashMap inherits
-   this VM's registration for them and its entries are in the overlay. Fixing
-   item 2 unblocks those eight for free.
-   **Wave 6: +8 with reached=152** on the same probe -- the smallest armed
-   delta of the four map families, and the one whose blocker is shared with
-   eight `java/util/HashMap` rows wave 3 could not retire. If a single
-   state-model rewrite is to be attempted next in this lane, this is the
-   cheapest per row unblocked.
+   **CORRECTED 2026-09-12 (wave 7), and the correction is half of it.** This
+   item used to end "no `TreeMap$Entry` node graph exists". There is one:
+   `tm_publish_real_root` builds a real red-black tree of real
+   `java.util.TreeMap$Entry` nodes into the receiver's real `root`, gated on
+   `modCount`, and `tm_set_slot` mirrors `size`. Reflected on the wave-7
+   control, unarmed, `TreeMap.root`, `.size` and `.comparator` all match
+   HotSpot 25.0.4+7 (`apps/probes/L1MapStateDiag`).
+
+   What is still true is the direction: that mirror is ONE-WAY, and its own
+   doc says so — *"nothing reads back through `root`"*. Retire the family and
+   real bytecode starts WRITING the node graph, which no `tm_array_table`
+   reader hears about. So the remedy is unchanged in shape and smaller in
+   size than the old text implies: make the real tree the authority, then
+   retire.
+
+   And there is a second, cheaper blocker that wave 7 measured and did not
+   fix. `java/util/TreeMap$KeySet` is in NEITHER carrier list —
+   `MAP_VIEW_CARRIERS` nor `SET_VIEW_CARRIERS` — it shares the `TreeSet`
+   native surface over `ts_state`, and `java/util/TreeMap$EntrySet` is in the
+   map list but `vc_route` declines it. So wave 7's decode fix, which took the
+   other three families to zero, leaves this one at:
+
+   ```text
+     java/util/TreeMap armed, apps/probes/L1MapViewToArrayProbe (168 rows)
+       control  38 rows differ        trial (decode fix)  38 rows differ
+   ```
+
+   That is the next TreeMap step and it is worth taking BEFORE the node-graph
+   rewrite: it is the same shape of fix as wave 7's, it is measurable on the
+   dial without a rebuild, and it tells you whether anything else is left.
+
+2. **`LinkedHashMap` + views (102). MEASURED AND REFUSED 2026-09-12, wave 7,
+   on three trial binaries — and the blocker is item 3's, not this item's.**
+
+   The reason this item gave — "`lhm_overlay()`, same shape, same remedy" —
+   was spent before it was written. `lhm_set` mirrors `head`, `tail`, `size`
+   and `table` into the real fields, `lhm_alloc_node` binds the real
+   `java/util/LinkedHashMap$Entry`, and on the wave-7 control every one of
+   those reads back identical to HotSpot 25.0.4+7. With wave 7's decode fix
+   the whole family reads correctly ARMED, 0 rows on a 168-row view probe.
+
+   What refuses it is the WRITE direction, and it takes two forms that cannot
+   both be satisfied while lane T's `register_hashset_natives` is native:
+
+   ```text
+     all 102 retired        LinkedSequencedShadowSweep DIES, 74 of 104 rows
+                            NPE: "this.this$0" is null in
+                            LinkedHashMap$LinkedHashIterator.nextNode -- a
+                            carrier THIS VM minted for a LinkedHashSet,
+                            driven by a real body
+     the 12 iterator rows   no crash, 6 probes worse: every mutation through
+     withdrawn (90)         a sequenced default is LOST, because
+                            SequencedMap.pollFirstEntry and friends are
+                            `entrySet().iterator(); next(); remove()` and a
+                            VM-minted iterator writes to a model the real map
+                            no longer reads
+   ```
+
+   So the remedy is not `replace_real_map`, and it is not this family's at
+   all: it is the `HashSet`-family iterator carrier item 3 has been waiting
+   for since wave 3. One blocker, two families, and this is the measurement
+   that says so.
 
 3. **`HashMap`'s views, iterators, `$Node` and its three view accessors
-   (77).** Wave 3 measured these and put them back; §3 has the two throws.
+   (77).** **Wave 7 re-tried the eight `LinkedHashMap` inherits on a trial binary and put them back**, and the correction is to the REASON rather than the verdict: the entries ARE in the real `table`, and what breaks is the WRITE direction -- `lhm_set` mirrors the overlay to the real fields and nothing mirrors back, so a retired inherited MUTATOR writes where the surviving natives never read. `LinkedSequencedShadowSweep` reproduced wave 3's own sentence, `{b=22, c=33, a=2}` -> `{a=2}`. **Item 2 is now the same blocker as this one**: the `HashSet`-family iterator carrier. The rest of this item is unchanged. Wave 3 measured these and put them back; §3 has the two throws.
 
    **CORRECTED 2026-09-11 (wave 5), and the correction matters for who does
    it.** This item used to say the iterators need "a Hashtable-family
@@ -1137,54 +1381,25 @@ Every remaining HELD family has a named blocker. In rough order of rows:
    Item 7 below was already blocked on that registrar; this item is too, and
    was not recorded as such. Until both carriers exist, any subset of the 77
    is a half-retirement.
-4. **`Hashtable` + views + `$Entry` (79).** Four probes worse armed, and
-   NOT the same answer as `HashMap` was: its fields already match HotSpot
-   unarmed and its views survive arming byte-identically
-   (`L1EntrySetRouteProbe`'s `C.hashtable.*` rows are clean in all three
-   columns). Its own question, unbisected.
+4. **`Hashtable` + views + `$Entry` (79). RETIRED 2026-09-12, wave 7.**
+   `RETIRED_SHADOW_L1_HT_TRIPLES`. Wave 6's bisection was right about WHERE
+   (the views, not the table) and wrong about WHY: it read the `+10` as "a
+   state-model gap of the shape wave 5 found in `map_resize`", and the state
+   was already real — `[Ljava.util.Hashtable$Entry;` with `count` written.
+   The ten rows were `toArray()` over a REAL view whose source map the natives
+   could not find, because they looked for it in a trailing slot only a
+   VM-minted carrier has. See §3.
 
-   **BISECTED 2026-09-11 (wave 6), and the answer is a SPLIT that one probe
-   would have shipped as a green.** Armed alone on the wave-6 control
-   binary, one class, one process:
+   The wave-6 caution that closed this item — *"an armed arm that goes red is
+   not a verdict either"* — is exactly what happened, in the direction it
+   warned about: the arm was red, the retirement is green, and the difference
+   is a native that a DIAL declines at the door but a RETIREMENT deletes, so
+   the `size()` a native asks ITSELF reaches real bytecode in one case and not
+   the other. Wave 3 had already written that sentence about `HashMap` (§3,
+   "the nine rows were a DIAL ARTEFACT"); this is its second sitting, and this
+   time the fix makes the two instruments agree rather than leaving the next
+   reader to know which one to trust.
 
-   ```text
-     probe                        DIFFS  DELTA  REACHED
-     HashtableVectorShadowSweep       0     +0      335   <- non-vacuous GREEN
-     L1EntrySetRouteProbe            10    +10      119   <- WORSE
-   ```
-
-   335 door engagements and not one divergence is exactly the shape §7 says
-   to trust more than a vacuous `+0`, and it is still wrong. The second
-   probe's ten lines name the blocker precisely, and it is the VIEWS and not
-   the table:
-
-   ```text
-     C.hashtable.entrySet.toArray        [3]java.lang.Object -> [0]java.lang.Object
-     C.hashtable.entrySet.intoArrayList  3 -> 0
-     C.hashtable.entrySet.intoHashSet    3 -> 0
-     C.hashtable.keySet.toArray          [3]java.lang.Object -> [0]java.lang.Object
-     C.hashtable.entrySet.toArrayString0 ArrayStoreException -> [3]java.lang.String
-   ```
-
-   Every row is a view that answers EMPTY when the natives step aside, which
-   is `AbstractCollection.toArray` sizing its array from a `size()` that read
-   zero. `Hashtable.keys()`/`elements()` are untouched by this, and that is
-   the tell: `deprecated_util.rs`'s `real_hashtable_enumerator` drives a REAL
-   `Hashtable$Enumerator` over the real `table` array and it works, because
-   an `Enumerator` walks the array and never asks for a count.
-
-   So the family divides into "walks the table" (working today, on real JDK
-   objects) and "asks the table how big it is" (empty armed). That is a
-   state-model gap of exactly the shape wave 5 found in `map_resize`, not a
-   node-graph rewrite like items 1 and 2 — and the same caution applies in
-   the other direction: **an armed arm that goes red is not a verdict
-   either.** A leaky dial can yield at `entrySet()` and not at `put`, and a
-   half-yielded map is empty for reasons the retirement would not reproduce.
-   Settling it needs a trial binary, which this wave did not spend.
-
-   The same run priced the three neighbours on that probe for the first
-   time: `HashMap` +24 (reached 1,499), `TreeMap` +18 (143),
-   `LinkedHashMap` +8 (152).
 5. **`java/util/jar/JarFile` and `java/text/BreakIterator`.** What is left
    of §7's two vacuous greens after wave 4 took the other six classes: each
    family's whole regression is ONE class.
@@ -1598,6 +1813,45 @@ is worth pricing before the retirement rows.
 
 ## 11. Standing warnings this lane confirmed
 
+**A "the state is a side table" hold is a claim about a tree, and this lane
+carried three of them past the day they stopped being true.** `Hashtable`,
+`LinkedHashMap` and `TreeMap` were all held on that sentence in §1, and on the
+wave-7 control every field the JDK's own bodies read — `table`, `count`,
+`head`, `tail`, `size`, `root`, and the node CLASSES in the bucket arrays —
+already matched HotSpot. Three separate changes (`H23-2`'s node-class move,
+`lhm_set`'s serialization mirror, `tm_publish_real_root`) had each closed part
+of it for a reason of its own, and no one re-read the hold. **Before pricing a
+state-model rewrite, reflect the receiver's real fields against HotSpot and
+compare; it is one probe and one `--add-opens`.**
+
+**A native that reads its own carrier's private slot must ask whether the
+receiver IS its carrier.** Wave 6 said this about a native on an ABSTRACT class
+(`java.text.BreakIterator`); wave 7 is the same sentence about a CONCRETE
+carrier the image also builds. `hs_backing_map` read a trailing slot only this
+crate's `HashMap$EntrySet` has; the image's own `entrySet()` mints the same
+class two fields narrower, and the read fell off the end. **The VM printed the
+answer twice per call for a month** — `WARN zgc real: field index OOB index=1
+num_slots=1` — and it read as noise because the bound above it made the read
+harmless. A guard that stops an out-of-range read still leaves the WRONG
+ANSWER behind it.
+
+**The dial and the retirement disagree in a knowable direction, and it is
+always the same one.** A dial declines a native AT THE DOOR, so a `size()` a
+native asks ITSELF still reaches the native. A retirement deletes the
+registration, so that same call reaches real bytecode. Every `+N` a dial arm
+reports on a family whose natives call each other is therefore an UPPER bound.
+This lane has now paid for that twice — wave 3's nine `HashMap` rows and wave
+6's ten `Hashtable` rows — and both times the trial binary was green.
+
+**The shared battery silently excludes nine probes, and two of them are this
+lane's own.** `scripts/jdk-only-phase2-battery.sh` compiles with a bare
+`javac`; `L1BreakIterRealProbe` and `L1LocaleProviderWorkload` import
+`sun.util.locale.provider` and are marked `JAVAC-FAILED`. Wave 6's acceptance
+tree could not see wave 6's own instruments. Run them with
+`--add-exports java.base/sun.util.locale.provider=ALL-UNNAMED` beside the
+battery until the battery learns the flag.
+
+
 - **A Rust side table is not the object.** §9's items 1 and 2 are the same
   defect `java/util/Properties` had, and the remedy is the same: make the real
   object the authority, THEN drop the native.
@@ -1724,28 +1978,57 @@ None of those is "9 probes move". Each names a function and a file.
   JarFile         narrowed. The state model is still the retirement blocker,
                   but the WRONG ANSWER it was carrying (`getAttributes` -> null
                   for every entry of every jar) needed no state model and is
-                  fixed. And "the other producer is dead" is true only in the
-                  arm it was measured in.
-  HashMap's 77    unchanged, and now with the Hashtable half MEASURED: +0 over
-                  335 engagements on one probe, +10 on another, and the ten
-                  rows are views whose size() reads zero.
+                  fixed.
+  HashMap's 77    unchanged, and now with the Hashtable half MEASURED.
 ```
 
-What wave 6 leaves for whoever takes this lane next, in the order this lane
+**Wave 7 retired the Hashtable half and refused the other two AFTER measuring
+them, which turned three separate holds into one blocker.**
+
+```text
+  Hashtable       RETIRED, all 79. The state was real; the views could not
+                  find it. One helper, read by name instead of by slot.
+  LinkedHashMap   REFUSED on three trial binaries, and NOT for the reason
+                  section 1 gave. Its blocker is HashMap's: the HashSet-family
+                  iterator carrier lane T's registrar keeps minting.
+  HashMap's 8     re-tried and put back. The entries ARE in the real table;
+                  the WRITE direction is what breaks.
+  TreeMap         still held, and now for a NAMED and SMALLER reason: its two
+                  view carriers are in neither carrier list, and its real
+                  `root` mirror is one-way.
+```
+
+What wave 7 leaves for whoever takes this lane next, in the order this lane
 would take them:
 
-1. **`LinkedHashMap` (102)** — +8 armed with engagement, the smallest of the
-   four map deltas, and it unblocks eight `java/util/HashMap` rows for free.
-2. **`Hashtable`'s views (79)** — the hypothesis is written and takeable in
-   one binary: the views answer EMPTY armed because `size()` reads a count
-   the natives keep elsewhere, which is `map_resize`'s shape and not
-   `TreeMap`'s. A trial binary settles whether the +10 is that or dial
-   leakage; nothing else will.
-3. **`Date` / `sun/util/calendar/` (40)** — now CANDIDATES rather than
-   non-answers (+0 with reached=14 and 411). One trial binary each.
-4. **`JarFile`'s `ZipFile` state** (32) and **`TreeMap`'s node graph** (157)
-   — the two genuine rewrites, in that order, because `JarFile` is 32 rows
-   behind one constructor and `TreeMap` is 157 behind a red-black tree.
-5. **`CurrencyNames`** — +38 armed on the wave-6 workload, and the only
-   locale family whose curated path is doing work the image's own bundles
-   would have to replace. Unpriced.
+1. **The `HashSet`-family iterator carrier.** It is now the single blocker for
+   `LinkedHashMap`'s 102 AND `HashMap`'s remaining 69 — 171 rows behind one
+   carrier — and wave 7 has the measurement that says so, on three trial
+   binaries. It is lane T's registrar (`register_hashset_natives`, whose
+   `SET_CLASSES` crosses into `java/util/concurrent/`), so this lane cannot
+   land it alone; what it can hand over is the trace. Nothing else in this
+   lane unblocks that many rows.
+2. **`TreeMap`'s two view carriers.** `TreeMap$KeySet` is in neither
+   `MAP_VIEW_CARRIERS` nor `SET_VIEW_CARRIERS` (it shares the `TreeSet`
+   surface over `ts_state`), and `TreeMap$EntrySet` is in the map list but
+   `vc_route` declines it. Wave 7's decode fix took three families to zero and
+   left `TreeMap` at 38 rows on the same probe. Same shape of fix, and the
+   dial prices it without a rebuild.
+3. **`TreeMap`'s node graph as the AUTHORITY (157).** `tm_publish_real_root`
+   already builds a real red-black tree into the real `root`; it is a one-way
+   mirror by design ("nothing reads back through `root`"). That is the bigger
+   half of item 2 and the only genuine state-model rewrite left in the map
+   families.
+4. **`Date` / `sun/util/calendar/` (40).** Still candidates on wave 6's
+   reading (+0 with reached=14 and 411) and still unspent: one trial binary
+   each. Wave 7 did not reach them.
+5. **`JarFile`'s `ZipFile` state (32)** and **`CurrencyNames`** — unchanged
+   from wave 6's list.
+
+And one repair worth a line of its own, because it is a wrong answer rather
+than a retirement: **`LinkedHashMap.modCount` counts 5 where HotSpot counts 3**
+for three `put`s, measured through `--add-opens` on the control (§3). Nothing
+in the tree reads the value; the keySet-view cache generation `lhm_set` bumps
+for does, and a double bump is a cache that invalidates twice as often rather
+than a wrong answer. It is the one row of `apps/probes/L1MapStateDiag` that
+does not match.

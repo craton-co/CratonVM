@@ -16793,6 +16793,78 @@ fn is_set_view_carrier(name: &str) -> bool {
     SET_VIEW_CARRIERS.contains(&name)
 }
 
+/// `true` iff this [`SET_VIEW_CARRIERS`] class holds `Map.Entry` elements
+/// rather than keys.
+///
+/// By NAME, and that is the point: the twin reading
+/// [`al_view_holds_entries_by_head`] classifies a carrier by its FIRST
+/// ELEMENT, which a view the image built has none of -- it answers "values"
+/// for an empty view, and "values" for an entry set is the wrong kind twice
+/// over (wrong elements, and an `ArrayStoreException` when the caller passes a
+/// `Map.Entry[]` template).
+/// The elements a set-shaped receiver over `backing` should answer with: the
+/// map's ENTRIES when the receiver is an entry-set carrier the IMAGE built,
+/// and its keys in every other case.
+///
+/// [`collect_view_snapshot_ordered`] already makes that distinction, and it
+/// makes it from a marker THIS CRATE writes on the backing
+/// ([`view_backing_kind`]). A carrier real `entrySet()` bytecode minted carries
+/// no marker and its "backing" -- resolved by name in [`hs_backing_map`] -- is
+/// the source map itself, so that reading answers KEYS for an entry set.
+///
+/// MEASURED 2026-09-12 on `cratonvm-l1w7-t1-20260912` with `java/util/Hashtable`
+/// armed: `entrySet().toArray(new Map.Entry[0])` threw
+/// `ArrayStoreException: java.lang.String`. The route is worth naming because
+/// it does not pass through this crate's own typed-array native at all --
+/// `Hashtable.entrySet()` hands back a `Collections$SynchronizedSet`, whose
+/// real `toArray(T[])` bytecode calls `c.toArray(a)` on the inner carrier,
+/// the dial declines the carrier's own registration, and
+/// `real_jdk_to_array_typed` (`vm/src/vm/vm_init.rs`) then drives the
+/// receiver's `iterator()` -- which is `native_hs_iterator`.
+///
+/// So the kind has to be right in the ITERATOR, not only in the array natives.
+fn hs_view_elements(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    backing: ObjectRef,
+) -> Result<Vec<Value>, MethodCallFailed> {
+    let foreign_entry_view = ctx
+        .class_name_arc_of_id(ctx.class_id_of_object(this))
+        .map(|n| set_view_carrier_holds_entries(&n))
+        .unwrap_or(false)
+        && view_backing_source(ctx, backing).is_none();
+    if !foreign_entry_view {
+        return collect_view_snapshot_ordered(ctx, backing);
+    }
+    // `backing` IS the source map here. Every `alloc_live_entry` inside
+    // `live_entries_for_pairs` is a GC point, so the map is pinned across both
+    // halves and re-read between them -- the same discipline
+    // `collect_view_snapshot_ordered`'s own entry-set arm follows.
+    let pin = ctx.pin_native_root(backing);
+    let pairs = match collect_entries_any(ctx, backing) {
+        Ok(p) => p,
+        Err(e) => {
+            ctx.unpin_native_roots(pin);
+            return Err(e);
+        }
+    };
+    let backing = ctx.read_native_pin(pin, backing);
+    let out = live_entries_for_pairs(ctx, pin, backing, &pairs);
+    ctx.unpin_native_roots(pin);
+    out
+}
+
+#[inline]
+fn set_view_carrier_holds_entries(name: &str) -> bool {
+    matches!(
+        name,
+        "java/util/HashMap$EntrySet"
+            | "java/util/LinkedHashMap$LinkedEntrySet"
+            | "java/util/Hashtable$EntrySet"
+            | "java/util/concurrent/ConcurrentHashMap$EntrySetView"
+    )
+}
+
 /// The class a `keySet()`/`entrySet()` view over `source` should be minted
 /// under, matching what the JDK's own accessor returns for that map family.
 ///
@@ -18518,13 +18590,52 @@ fn hs_backing_map(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef>
     // reading a cell that is not the object's and saying so ten times. The
     // shape is `has_byte_array_stream_layout`'s, one family over: ask the slot
     // count before probing the layout.
-    if slot >= ctx.object_num_fields(this) {
+    if slot < ctx.object_num_fields(this) {
+        if let Value::Object(Some(m)) = ctx.get_field(this, slot) {
+            return Some(m);
+        }
+    }
+    // THE CARRIER THE IMAGE BUILT ITSELF still has an enclosing map, and it is
+    // in the field the JDK's own constructor wrote: `this$0`.
+    //
+    // The bound above stops the out-of-range read; it does not answer the
+    // question. Every `native_hs_*` on one of these classes ends in "and if
+    // there is no backing map, the set is empty", so a view that real
+    // `HashMap.entrySet()` bytecode minted answered EMPTY through this one
+    // `None` -- `size()` 0, and `AbstractCollection.toArray` sizing its result
+    // from that 0 (`Arrays.copyOf(r, 0)`) even though the iterator behind it
+    // walks correctly.
+    //
+    // MEASURED 2026-09-12 on `cratonvm-l1w7-base-20260912`, `--jdk-only`, the
+    // dial armed one family per process so the view accessors yield to real
+    // bytecode and hand these natives a REAL carrier
+    // (`apps/probes/L1MapViewToArrayProbe`):
+    //
+    // ```text
+    //                       entrySet().toArray()   HotSpot   armed, before
+    //   HashMap                              [3]       [3]           [0]
+    //   LinkedHashMap                        [3]       [3]           [0]
+    //   Hashtable                            [3]       [3]           [0]
+    //   TreeMap                              [3]       [3]           [0]
+    // ```
+    //
+    // Everything else in those arms already matched HotSpot -- `size()`,
+    // `iterator()`, the for-each walk, `stream().count()`, `toString()` and the
+    // real heap fields (`table`, `count`, `head`/`tail`, `root`). This one
+    // answer is what stood between the four map families and a retirement, and
+    // it is not a state-model gap: the state was there and unreadable through a
+    // slot only OUR carrier has.
+    //
+    // Resolved BY NAME for the reason [`values_view_class_source`] gives on the
+    // values half: `LinkedHashMap$LinkedKeySet` declares `reversed` FIRST, so a
+    // hard-coded slot 0 reads a boolean as a reference. Restricted to the
+    // carrier classes so an ordinary `HashSet` -- whose `map` IS slot 0 and
+    // whose null there is a real answer -- keeps the `None` it has today.
+    let name = ctx.class_name_arc_of_id(ctx.class_id_of_object(this))?;
+    if !is_set_view_carrier(&name) {
         return None;
     }
-    match ctx.get_field(this, slot) {
-        Value::Object(Some(m)) => Some(m),
-        _ => None,
-    }
+    values_view_class_source(ctx, this)
 }
 
 /// Public helper: allocate a properly-initialised HashSet containing `elems`.
@@ -19251,7 +19362,7 @@ fn native_hs_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(m) => m,
         None => return Ok(Some(Value::Object(None))),
     };
-    let keys = collect_view_snapshot_ordered(ctx, backing)?;
+    let keys = hs_view_elements(ctx, this, backing)?;
     if let Some(arr) = target {
         let len = ctx.array_length(arr);
         if len >= keys.len() {
@@ -19285,7 +19396,7 @@ fn native_hs_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         }
         None => alloc_ref_array(ctx, len),
     });
-    let keys = collect_view_snapshot_ordered(ctx, backing)?;
+    let keys = hs_view_elements(ctx, this, backing)?;
     // `AbstractSet`/`AbstractCollection.toArray(T[])` stores through
     // `aastore` in its own loop, so a narrowing element is an
     // `ArrayStoreException` naming the VALUE -- `java.lang.Integer`, not
@@ -20305,7 +20416,7 @@ fn cow_set_snapshot_iterator(
     // `collect_collection_elements` does NOT read a map-backed Set and returns
     // an empty vector, which reads downstream as "the set is empty" rather than
     // as a failure.
-    let elems = collect_view_snapshot_ordered(ctx, backing)?;
+    let elems = hs_view_elements(ctx, this, backing)?;
     let (elem_pin_base, elem_handles) = pin_value_slice(ctx, &elems);
     let backing = alloc_ref_array(ctx, elems.len());
     let backing_pin = ctx.pin_native_root(backing);
@@ -20434,7 +20545,7 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // The pins are unchanged in kind and in order relative to `this_pin`, which
     // is still this frame's base and still releases all of them.
     let backing_pin = ctx.pin_native_root(backing);
-    let keys = collect_view_snapshot_ordered(ctx, backing)?;
+    let keys = hs_view_elements(ctx, this, backing)?;
     let (_, key_handles) = pin_value_slice(ctx, &keys);
     let len = keys.len();
     let keys_arr = alloc_ref_array(ctx, len);
@@ -20539,12 +20650,12 @@ fn native_hs_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(m) => m,
         None => return Ok(Some(Value::Object(None))),
     };
-    let len = collect_view_snapshot_ordered(ctx, backing)?.len();
+    let len = hs_view_elements(ctx, this, backing)?.len();
     let backing_pin = ctx.pin_native_root(backing);
     let arr = alloc_ref_array(ctx, len);
     let arr_pin = ctx.pin_native_root(arr);
     let backing = ctx.read_native_pin(backing_pin, backing);
-    let elems = collect_view_snapshot_ordered(ctx, backing)?;
+    let elems = hs_view_elements(ctx, this, backing)?;
     let arr = ctx.read_native_pin(arr_pin, arr);
     for (i, v) in elems.iter().enumerate().take(len) {
         ctx.set_array_element(arr, i, *v);
@@ -20601,11 +20712,11 @@ fn native_hs_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // collect once only to learn the length, allocate, then RE-collect from the
     // live (and now post-GC) backing and store each ref immediately, with no
     // allocation between the read and the store.
-    let len = collect_view_snapshot_ordered(ctx, backing)?.len();
+    let len = hs_view_elements(ctx, this, backing)?.len();
     // ...and root `backing` itself across that allocation: the re-collect below
     // reads through it, so a pre-move copy would walk freed memory.
     let (backing, arr) = rooted_across1(ctx, backing, |ctx| alloc_ref_array(ctx, len));
-    let keys = collect_view_snapshot_ordered(ctx, backing)?;
+    let keys = hs_view_elements(ctx, this, backing)?;
     for (i, k) in keys.iter().enumerate().take(len) {
         ctx.set_array_element(arr, i, *k);
     }
@@ -20625,7 +20736,7 @@ fn native_hs_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             return Ok(Some(Value::Object(Some(s))));
         }
     };
-    let keys = collect_view_snapshot_ordered(ctx, backing)?;
+    let keys = hs_view_elements(ctx, this, backing)?;
     let mut parts = Vec::with_capacity(keys.len());
     for k in &keys {
         parts.push(obj_to_display_units(ctx, k)?);
@@ -24286,7 +24397,7 @@ fn native_hs_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(m) => m,
         None => return Ok(None),
     };
-    let keys = collect_view_snapshot_ordered(ctx, backing)?;
+    let keys = hs_view_elements(ctx, this, backing)?;
     // GC-SAFETY: `accept` allocates → moving young GC relocates `action` and the
     // keys; pin both and re-read each from its handle before dispatch.
     let action_pin = ctx.pin_native_root(action);
@@ -30001,13 +30112,13 @@ fn native_hs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // backing map is pinned, then collect the live keys and store them without
     // another allocation.
     let backing_pin = ctx.pin_native_root(backing);
-    let len = collect_view_snapshot_ordered(ctx, backing)?.len();
+    let len = hs_view_elements(ctx, this, backing)?.len();
     let stream = try_alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS)?;
     let stream_pin = ctx.pin_native_root(stream);
     let arr = alloc_ref_array(ctx, len);
     let arr_pin = ctx.pin_native_root(arr);
     let backing = ctx.read_native_pin(backing_pin, backing);
-    let keys = collect_view_snapshot_ordered(ctx, backing)?;
+    let keys = hs_view_elements(ctx, this, backing)?;
     let arr = ctx.read_native_pin(arr_pin, arr);
     for (i, key) in keys.iter().enumerate().take(len) {
         ctx.set_array_element(arr, i, *key);
@@ -48691,6 +48802,54 @@ fn collect_collection_elements_pinned(
         if cls_name == KSV_CLASS {
             return Ok(ksv_collect(ctx, coll));
         }
+        // A [`SET_VIEW_CARRIERS`] object THE IMAGE'S OWN BYTECODE minted. This
+        // is the receiver shape that appears the moment a map family's view
+        // accessors stop being native -- the dial armed on that family, or the
+        // family retired -- and the layout probes below cannot see a thing in
+        // it, because the only field it has is `this$0`.
+        //
+        // MEASURED 2026-09-12, `--jdk-only`, one family armed per process on
+        // `cratonvm-l1w7-base-20260912` (`apps/probes/L1MapViewToArrayProbe`):
+        // `entrySet().toArray()` answered `[0]` for ALL FOUR map families where
+        // HotSpot answers `[3]`, while `size()`, `iterator()`, the for-each
+        // walk, `stream().count()` and `toString()` over the very same view
+        // were already right. The elements were never missing -- the map's
+        // `table` holds real `HashMap$Node`/`Hashtable$Entry` nodes and its
+        // `count`/`size` field is written -- so this is a decode gap, not the
+        // state-model gap the lane page recorded for these families.
+        //
+        // The KIND has to come from the class, not from the head element: a
+        // foreign carrier has no elements to look at, and
+        // [`al_view_holds_entries_by_head`] answers "values" for an empty view.
+        // Placed BEFORE the HashSet-shaped branch further down, which reaches
+        // the same receiver through [`hs_backing_map`] and would hand back the
+        // source map's KEYS for an entry set.
+        if is_set_view_carrier(&cls_name) && values_view_source(ctx, coll).is_none() {
+            if let Some(source) = values_view_class_source(ctx, coll) {
+                let source_pin = ctx.pin_native_root(source);
+                let pairs = match collect_entries_any(ctx, source) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        ctx.unpin_native_roots(source_pin);
+                        return Err(e);
+                    }
+                };
+                let out = if set_view_carrier_holds_entries(&cls_name) {
+                    let source = ctx.read_native_pin(source_pin, source);
+                    match live_entries_for_pairs(ctx, source_pin, source, &pairs) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            ctx.unpin_native_roots(source_pin);
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    pairs.into_iter().map(|(k, _)| k).collect()
+                };
+                ctx.unpin_native_roots(source_pin);
+                return Ok(out);
+            }
+        }
         if cls_name == "java/util/EnumSet" {
             if let Value::Object(Some(backing)) = ctx.get_field(coll, 0) {
                 return Ok(collect_collection_elements(ctx, backing)?);
@@ -49729,7 +49888,7 @@ fn native_hs_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         // For an entrySet-kind view these "keys" ARE the `Map.Entry` objects,
         // which is what the predicate is handed and what `native_hs_remove`
         // resolves back to a source-map key.
-        let elems = collect_view_snapshot_ordered(ctx, backing)?;
+        let elems = hs_view_elements(ctx, this, backing)?;
         let (_, handles) = pin_value_slice(ctx, &elems);
         let mut modified = false;
         for (i, elem) in elems.iter().enumerate() {

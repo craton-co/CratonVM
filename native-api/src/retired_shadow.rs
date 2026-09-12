@@ -8200,6 +8200,355 @@ static RETIRED_SHADOW_L1_LP_TRIPLES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Lane 1 wave 7, 2026-09-12: `java/util/Hashtable`, all 79, and what could
+/// not go before was not the state model.
+///
+/// # What the page said, and what the binary says
+///
+/// Section 1 held this family as "state is a Rust side table, so retiring
+/// hands real bytecode an empty map", and section 10 item 4 had it at `+10`
+/// armed with the ten rows all VIEWS answering EMPTY. Both readings are
+/// refuted by one run. On `cratonvm-l1w7-base-20260912`, `--jdk-only`,
+/// UNARMED, read through `--add-opens java.base/java.util=ALL-UNNAMED`
+/// (`apps/probes/L1MapStateDiag`, HotSpot 25.0.4+7 as the oracle):
+///
+/// ```text
+///   Hashtable.table    [Ljava.util.Hashtable$Entry;  len=11 nonNull=3
+///                      nodes java.util.Hashtable$Entry     SAME as HotSpot
+///   Hashtable.count    3                                   SAME
+///   Hashtable.modCount 3    threshold 8                    SAME
+/// ```
+///
+/// The state IS real -- `H23-2`'s node-class move landed it -- so the armed
+/// arm was measuring a DECODE, not a store. Every one of those ten rows was
+/// `toArray()` over a view the image's own bytecode minted, and
+/// `hs_backing_map` answered `None` for it: the source map is in `this$0`,
+/// and this VM's own carriers keep it in a trailing slot the real class does
+/// not have. `native-collections`' `hs_backing_map` and `hs_view_elements`
+/// now read it by name, and the arm moves with them:
+///
+/// ```text
+///   java/util/Hashtable armed, one class per process, whole probe tree
+///     control  cratonvm-l1w7-base-20260912   7 probes worse, 30 rows
+///     trial    cratonvm-l1w7-t3-20260912     0 probes worse
+///       L1MapViewToArrayProbe (168 rows)     30 -> 0
+///       L1EntrySetRouteProbe                 10 -> 0
+/// ```
+///
+/// # Why the family retires WHOLE
+///
+/// `Hashtable.entrySet()` hands back a `Collections$SynchronizedSet` around
+/// the inner carrier, so the accessor and the carrier are one unit: retire the
+/// accessor alone and a real inner view meets natives that cannot read it;
+/// retire the carrier alone and a VM-minted view meets real bytecode. The 79
+/// are `Hashtable` (22), its three view classes (56) and `$Entry` (1).
+///
+/// # `Properties` is not in the blast radius, and that is measured
+///
+/// `Properties extends Hashtable`, and JDK 9 moved its storage into
+/// `Properties.map`; it overrides the whole `Map` surface, so a dispatch door
+/// asking about the DECLARING class reaches `Properties` and never
+/// `Hashtable`. `PropertiesCloneProbe`, `SysPropsRealMapProbe` and the
+/// `F.props.*` rows of `apps/probes/L1MapViewToArrayProbe` read identically on
+/// the control and the trial.
+static RETIRED_SHADOW_L1_HT_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/util/Hashtable", "<init>", "()V"),
+    ("java/util/Hashtable", "<init>", "(I)V"),
+    ("java/util/Hashtable", "<init>", "(IF)V"),
+    ("java/util/Hashtable", "clear", "()V"),
+    ("java/util/Hashtable", "clone", "()Ljava/lang/Object;"),
+    (
+        "java/util/Hashtable",
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/Hashtable",
+        "containsValue",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/Hashtable",
+        "elements",
+        "()Ljava/util/Enumeration;",
+    ),
+    ("java/util/Hashtable", "entrySet", "()Ljava/util/Set;"),
+    (
+        "java/util/Hashtable",
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    ("java/util/Hashtable", "isEmpty", "()Z"),
+    ("java/util/Hashtable", "keySet", "()Ljava/util/Set;"),
+    ("java/util/Hashtable", "keys", "()Ljava/util/Enumeration;"),
+    (
+        "java/util/Hashtable",
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    ("java/util/Hashtable", "putAll", "(Ljava/util/Map;)V"),
+    (
+        "java/util/Hashtable",
+        "remove",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Hashtable",
+        "remove",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/Hashtable",
+        "replace",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Hashtable",
+        "replace",
+        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Z",
+    ),
+    ("java/util/Hashtable", "size", "()I"),
+    ("java/util/Hashtable", "toString", "()Ljava/lang/String;"),
+    ("java/util/Hashtable", "values", "()Ljava/util/Collection;"),
+    (
+        "java/util/Hashtable$Entry",
+        "setValue",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Hashtable$EntrySet",
+        "add",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/Hashtable$EntrySet",
+        "addAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    ("java/util/Hashtable$EntrySet", "clear", "()V"),
+    (
+        "java/util/Hashtable$EntrySet",
+        "contains",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/Hashtable$EntrySet",
+        "containsAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/Hashtable$EntrySet",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/Hashtable$EntrySet",
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+    ),
+    ("java/util/Hashtable$EntrySet", "hashCode", "()I"),
+    ("java/util/Hashtable$EntrySet", "isEmpty", "()Z"),
+    (
+        "java/util/Hashtable$EntrySet",
+        "iterator",
+        "()Ljava/util/Iterator;",
+    ),
+    (
+        "java/util/Hashtable$EntrySet",
+        "remove",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/Hashtable$EntrySet",
+        "removeAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/Hashtable$EntrySet",
+        "removeIf",
+        "(Ljava/util/function/Predicate;)Z",
+    ),
+    (
+        "java/util/Hashtable$EntrySet",
+        "retainAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    ("java/util/Hashtable$EntrySet", "size", "()I"),
+    (
+        "java/util/Hashtable$EntrySet",
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+    ),
+    (
+        "java/util/Hashtable$EntrySet",
+        "stream",
+        "()Ljava/util/stream/Stream;",
+    ),
+    (
+        "java/util/Hashtable$EntrySet",
+        "toArray",
+        "()[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Hashtable$EntrySet",
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Hashtable$EntrySet",
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Hashtable$EntrySet",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/util/Hashtable$KeySet", "add", "(Ljava/lang/Object;)Z"),
+    (
+        "java/util/Hashtable$KeySet",
+        "addAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    ("java/util/Hashtable$KeySet", "clear", "()V"),
+    (
+        "java/util/Hashtable$KeySet",
+        "contains",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/Hashtable$KeySet",
+        "containsAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/Hashtable$KeySet",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/Hashtable$KeySet",
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+    ),
+    ("java/util/Hashtable$KeySet", "hashCode", "()I"),
+    ("java/util/Hashtable$KeySet", "isEmpty", "()Z"),
+    (
+        "java/util/Hashtable$KeySet",
+        "iterator",
+        "()Ljava/util/Iterator;",
+    ),
+    (
+        "java/util/Hashtable$KeySet",
+        "remove",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/Hashtable$KeySet",
+        "removeAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/Hashtable$KeySet",
+        "removeIf",
+        "(Ljava/util/function/Predicate;)Z",
+    ),
+    (
+        "java/util/Hashtable$KeySet",
+        "retainAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    ("java/util/Hashtable$KeySet", "size", "()I"),
+    (
+        "java/util/Hashtable$KeySet",
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+    ),
+    (
+        "java/util/Hashtable$KeySet",
+        "stream",
+        "()Ljava/util/stream/Stream;",
+    ),
+    (
+        "java/util/Hashtable$KeySet",
+        "toArray",
+        "()[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Hashtable$KeySet",
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Hashtable$KeySet",
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Hashtable$KeySet",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/util/Hashtable$ValueCollection", "clear", "()V"),
+    (
+        "java/util/Hashtable$ValueCollection",
+        "contains",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/Hashtable$ValueCollection",
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+    ),
+    ("java/util/Hashtable$ValueCollection", "isEmpty", "()Z"),
+    (
+        "java/util/Hashtable$ValueCollection",
+        "iterator",
+        "()Ljava/util/Iterator;",
+    ),
+    (
+        "java/util/Hashtable$ValueCollection",
+        "remove",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/Hashtable$ValueCollection",
+        "removeIf",
+        "(Ljava/util/function/Predicate;)Z",
+    ),
+    ("java/util/Hashtable$ValueCollection", "size", "()I"),
+    (
+        "java/util/Hashtable$ValueCollection",
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+    ),
+    (
+        "java/util/Hashtable$ValueCollection",
+        "stream",
+        "()Ljava/util/stream/Stream;",
+    ),
+    (
+        "java/util/Hashtable$ValueCollection",
+        "toArray",
+        "()[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Hashtable$ValueCollection",
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Hashtable$ValueCollection",
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Hashtable$ValueCollection",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+];
+
 static RETIRED_SHADOW_L1_BI_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/text/BreakIterator", "current", "()I"),
     ("java/text/BreakIterator", "first", "()I"),
@@ -10512,6 +10861,17 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // counts seventeen shadows over a family that no longer uses them.
     RETIRED_SHADOW_L1_BI_TRIPLES,
     RETIRED_SHADOW_L1_LP_TRIPLES,
+    // 2026-09-12, L1 wave 7. `Hashtable` (79) and the eight `HashMap` rows
+    // `LinkedHashMap` was blocking. What made them takeable is a DECODE fix
+    // in `native-collections` -- `hs_backing_map` / `hs_view_elements`
+    // resolving a foreign view's source map through `this$0` -- and not a
+    // change of store: the store was already real in both families.
+    //
+    // `LinkedHashMap`'s own 102 were MEASURED AND REFUSED in the same wave, on
+    // two trial binaries, and so were the eight `java/util/HashMap` rows it
+    // inherits -- on a THIRD. See
+    // `wave_seven_refused_the_linked_hash_map_iterator_half`.
+    RETIRED_SHADOW_L1_HT_TRIPLES,
     // Lane 4 wave 2, added WITH the table rather than after a gate caught it --
     // which is the whole point of the loop this const now feeds.
     RETIRED_SHADOW_L4_FFM_TRIPLES,
@@ -11270,18 +11630,15 @@ mod tests {
                  acceptance measured that family."
             );
         }
+        // AMENDED 2026-09-12, L1 wave 7, and the two halves of this list now
+        // point opposite ways -- which is the finding, not an inconsistency.
+        // `Hashtable` IS retired (`RETIRED_SHADOW_L1_HT_TRIPLES`, its own
+        // trial binary). `LinkedHashMap` is NOT: wave 7 measured it on two
+        // trial binaries and refused it both ways round -- see
+        // `wave_seven_refused_the_linked_hash_map_iterator_half`. What the
+        // original assertion guarded is unchanged either way: neither family
+        // is on WAVE 3's table, because wave 3 did not measure them.
         for (c, m, d) in [
-            (
-                "java/util/LinkedHashMap",
-                "put",
-                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            ),
-            (
-                "java/util/LinkedHashMap$LinkedEntrySet",
-                "iterator",
-                "()Ljava/util/Iterator;",
-            ),
-            ("java/util/LinkedHashMap$LinkedKeySet", "size", "()I"),
             (
                 "java/util/Hashtable",
                 "put",
@@ -11294,11 +11651,157 @@ mod tests {
             ),
         ] {
             assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is no longer retired. Wave 7 retired the whole \
+                 `Hashtable` family on the strength of one decode fix \
+                 (`hs_backing_map` reading a foreign view's `this$0`); if this \
+                 row came back out, say which measurement took it out."
+            );
+        }
+        for (c, m, d) in [
+            (
+                "java/util/LinkedHashMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            (
+                "java/util/LinkedHashMap$LinkedEntrySet",
+                "iterator",
+                "()Ljava/util/Iterator;",
+            ),
+            ("java/util/LinkedHashMap$LinkedKeySet", "size", "()I"),
+        ] {
+            assert!(
                 !triple_is_retired_shadow(c, m, d),
-                "{c}.{m}{d} is retired, and wave 3 did not measure it. \
-                 `LinkedHashMap` keeps its entries in `lhm_overlay()` and \
-                 `Hashtable` was measured separately; both are §10's own \
-                 changes, not this table's."
+                "{c}.{m}{d} is retired, and the two waves that could have \
+                 done it did not: wave 3 never measured it, and wave 7 \
+                 measured it and refused."
+            );
+        }
+        for (c, m, d) in [
+            (
+                "java/util/LinkedHashMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            (
+                "java/util/Hashtable",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+        ] {
+            assert!(
+                !RETIRED_SHADOW_L1_HM_TRIPLES.contains(&(c, m, d)),
+                "{c}.{m}{d} was added to WAVE 3's table. Wave 3 is one family."
+            );
+        }
+    }
+
+    /// What wave 7 measured and then REFUSED: `java/util/LinkedHashMap`, and
+    /// the reason is wave 3's, one family over.
+    ///
+    /// The family's STATE is real (`RETIRED_SHADOW_L1_HT_TRIPLES` has the
+    /// reflection table; `lhm_set` mirrors `head`/`tail`/`size`/`table` and the
+    /// nodes are real `LinkedHashMap$Entry`), and with the decode fix this wave
+    /// landed, the whole view surface reads correctly with the family's natives
+    /// declined. Two trial binaries say it still cannot be retired, and they
+    /// disagree with each other in the way that names the blocker exactly:
+    ///
+    /// ```text
+    ///   trial A, all 102 retired
+    ///     LinkedSequencedShadowSweep  DIES at row 74 of 104
+    ///       NullPointerException: Cannot read field "modCount"
+    ///                             because "this.this$0" is null
+    ///         at LinkedHashMap$LinkedHashIterator.nextNode
+    ///     ItrCarrierCensus, CollectionsShadowSweep, DeadDoorProbe: same cause
+    ///     (a LinkedHashSet's iterator), 5 probes worse in all
+    ///
+    ///   trial B, the nine iterator triples and the three `iterator()`
+    ///   accessors withdrawn -- 90 retired
+    ///     no crash, and SIX probes worse instead of five, every row a
+    ///     MUTATION that stopped writing through:
+    ///       entrySet().iterator().remove()      removes nothing
+    ///       entrySet().removeIf                 writes nothing
+    ///       Map.Entry.setValue                  ConcurrentModificationException
+    ///       pollFirstEntry / pollLastEntry      return the entry, remove nothing
+    ///       reversed()                          insertion order, not reversed
+    /// ```
+    ///
+    /// Trial B is the informative one. `SequencedMap.pollFirstEntry` and its
+    /// neighbours are DEFAULT methods whose body is
+    /// `var it = entrySet().iterator(); it.next(); it.remove();` — so retiring
+    /// the map's own surface routes them into real bytecode that drives
+    /// whatever `entrySet().iterator()` hands back, and a VM-minted iterator's
+    /// `remove()` writes to a model the real map no longer reads. Keep the
+    /// iterators native and the mutations are lost; retire them and lane T's
+    /// `register_hashset_natives` keeps minting a `LinkedKeyIterator` for a
+    /// `java/util/LinkedHashSet` receiver that real bytecode then dereferences
+    /// through a null `this$0`.
+    ///
+    /// **So the family moves when the HashSet-family iterator carrier exists,
+    /// and not before** — §10 item 3's other half, and the same registrar that
+    /// holds `HashMap`'s remaining 69. It is one blocker for two families, and
+    /// this is the measurement that says so.
+    ///
+    /// # Trial C: the eight inherited `HashMap` rows are refused too, and this
+    /// # is the mechanism both refusals share
+    ///
+    /// Wave 3 refused those eight on "LinkedHashMap's entries live in
+    /// `lhm_overlay()`", and this wave read the real fields, found them
+    /// correct, and took them. The tree disagreed, in wave 3's own words:
+    ///
+    /// ```text
+    ///   LinkedSequencedShadowSweep, 79 + 8 retired, LinkedHashMap NOT retired
+    ///     44 merge counts as an access    {b=22, c=33, a=2} -> {a=2}
+    ///     45 replace counts as an access  {b=22, a=2, c=33} -> {a=2}
+    ///     46 compute counts as an access  {b=22, c=33, a=2} -> {a=2}
+    ///     12 replace keeps position       b=222 -> b=3
+    /// ```
+    ///
+    /// The mirror `lhm_set` keeps is ONE-WAY. Overlay writes reach the real
+    /// `table`/`head`/`tail`/`size`; a write made by REAL bytecode reaches the
+    /// real fields and nothing tells the overlay. So a retired INHERITED
+    /// MUTATOR (`merge`, `compute`, `computeIfPresent`, `replaceAll`,
+    /// `readObject`) puts the family in the one state neither store survives:
+    /// half its writers on each side, and its own natives still answering
+    /// reads from the overlay.
+    ///
+    /// That is why trial A — the whole family retired — did NOT show this: with
+    /// no native left reading the overlay, a one-way mirror costs nothing. The
+    /// mixed state is the broken one, which is the same lesson
+    /// `RETIRED_SHADOW_PHASE3_TRIPLES` records for CHM/`Properties` and the
+    /// reason a family is a unit.
+    #[test]
+    fn wave_seven_refused_the_linked_hash_map_iterator_half() {
+        for (c, m, d) in [
+            (
+                "java/util/LinkedHashMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            (
+                "java/util/LinkedHashMap",
+                "pollFirstEntry",
+                "()Ljava/util/Map$Entry;",
+            ),
+            (
+                "java/util/LinkedHashMap$LinkedEntrySet",
+                "iterator",
+                "()Ljava/util/Iterator;",
+            ),
+            (
+                "java/util/LinkedHashMap$LinkedKeyIterator",
+                "next",
+                "()Ljava/lang/Object;",
+            ),
+        ] {
+            assert!(
+                !triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is retired. Wave 7 measured this family on two \
+                 trial binaries and refused it BOTH ways round: the iterators \
+                 retired crash on a carrier lane T's registrar mints, and the \
+                 iterators kept lose every mutation the sequenced defaults \
+                 make through them. Say which trial binary took it out."
             );
         }
     }
@@ -11368,6 +11871,15 @@ mod tests {
                 "setValue",
                 "(Ljava/lang/Object;)Ljava/lang/Object;",
             ),
+            // 2026-09-12, L1 wave 7 TOOK THESE EIGHT AND PUT THEM BACK, on
+            // a trial binary. The row wave 3 wrote here is right and its
+            // REASON was half of it: the entries ARE in the real `table` (so
+            // real `HashMap` bytecode can read them), and the write direction
+            // is what breaks -- `lhm_set`'s mirror is one-way, so a retired
+            // inherited MUTATOR writes where the family's surviving natives
+            // never read. `LinkedSequencedShadowSweep` reproduces wave 3's own
+            // sentence, `{b=22, c=33, a=2}` -> `{a=2}`, on rows 44-46. See
+            // `wave_seven_refused_the_linked_hash_map_iterator_half`.
             // the eight LinkedHashMap inherits
             (
                 "java/util/HashMap",
@@ -11401,6 +11913,7 @@ mod tests {
                 "writeObject",
                 "(Ljava/io/ObjectOutputStream;)V",
             ),
+
         ] {
             assert!(
                 !triple_is_retired_shadow(c, m, d),
@@ -13163,11 +13676,19 @@ Ljava/nio/channels/FileChannel;"
             // real class does not declare, so no real body reads it. Armed
             // alone on `cratonvm-l1-base-20260910`, 44 probes: 0 worse, and
             // `NullArgMsgProbe` -2. See `RETIRED_SHADOW_L1_TRIPLES`.
-            (
-                "java/util/Hashtable",
-                "put",
-                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            ),
+            // 2026-09-12, L1 wave 7: `java/util/Hashtable` came OFF this
+            // list, all 79 triples, and so did `java/util/LinkedHashMap`'s
+            // 102. The `needs-VM-support` label was true when it was written
+            // and is not now. Both families' state is REAL -- measured
+            // unarmed through `--add-opens` against HotSpot 25.0.4+7:
+            // `Hashtable.table` is a `[Ljava.util.Hashtable$Entry;` of real
+            // `Hashtable$Entry` nodes with `count` written, and
+            // `LinkedHashMap`'s `table`/`head`/`tail`/`size` are the real
+            // fields. What was missing was a DECODE: `hs_backing_map`
+            // answered `None` for a view the image's own bytecode minted,
+            // because the source map is in `this$0` and this VM's carriers
+            // keep it in a trailing slot the real class does not have. See
+            // `RETIRED_SHADOW_L1_HT_TRIPLES`.
             ("java/util/LinkedHashSet", "add", "(Ljava/lang/Object;)Z"),
             // 2026-09-11, L1 wave 3: `java/util/HashMap` and its six view and
             // iterator classes came OFF this list, all 98 triples together.
@@ -13407,11 +13928,20 @@ Ljava/nio/channels/FileChannel;"
                 "Phase 3 is the CHM/Properties union; {c} is a different wave"
             );
         }
-        assert!(!triple_is_retired_shadow(
-            "java/util/Hashtable",
-            "get",
-            "(Ljava/lang/Object;)Ljava/lang/Object;"
-        ));
+        // AMENDED 2026-09-12, L1 wave 7. `java/util/Hashtable.get` IS retired
+        // now -- by `RETIRED_SHADOW_L1_HT_TRIPLES`, on its own trial binary --
+        // so the question this assertion asks has to be the one it meant:
+        // Hashtable must not ride in on PHASE 3's table, whose measurement was
+        // the CHM/`Properties` union and said nothing about it.
+        assert!(
+            !RETIRED_SHADOW_PHASE3_TRIPLES.contains(&(
+                "java/util/Hashtable",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;"
+            )),
+            "Hashtable rode in on the Phase 3 table. Wave 7 retired the family \
+             on its own measurement; this table's is the CHM/Properties union."
+        );
     }
 
     /// The L1 table obeys the two invariants every table here obeys.
@@ -13710,7 +14240,15 @@ Ljava/nio/channels/FileChannel;"
                 "(Ljava/lang/Object;)Ljava/lang/Object;",
             ),
             ("java/util/TreeSet", "add", "(Ljava/lang/Object;)Z"),
-            // 11 probes worse, one truncates. State is `lhm_overlay()`.
+            // STILL HELD, and 2026-09-12 (L1 wave 7) it is held for a
+            // different reason than the one written here. "State is
+            // `lhm_overlay()`" is false: `lhm_set` mirrors `head`, `tail`,
+            // `size` and `table` into the receiver's REAL fields and
+            // `lhm_alloc_node` binds the real `LinkedHashMap$Entry`, and on
+            // the wave-7 control every one of those fields matches HotSpot
+            // 25.0.4+7. The blocker is the ITERATOR half, measured on two
+            // trial binaries -- see
+            // `wave_seven_refused_the_linked_hash_map_iterator_half`.
             (
                 "java/util/LinkedHashMap",
                 "put",
@@ -13729,12 +14267,11 @@ Ljava/nio/channels/FileChannel;"
                 "iterator",
                 "()Ljava/util/Iterator;",
             ),
-            // 4 probes worse.
-            (
-                "java/util/Hashtable",
-                "put",
-                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            ),
+            // "4 probes worse" -- OFF this list 2026-09-12, L1 wave 7, with
+            // the LinkedHashMap row above. Seven probes and 30 rows moved on
+            // the wave-7 control, every one of them a `toArray()` over a view
+            // the image's own bytecode minted, and every one of them 0 on the
+            // trial. See `RETIRED_SHADOW_L1_HT_TRIPLES`.
             // 5 probes worse.
             ("java/util/Date", "getTime", "()J"),
             ("java/util/TimeZone", "getID", "()Ljava/lang/String;"),
