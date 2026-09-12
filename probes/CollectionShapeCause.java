@@ -89,12 +89,24 @@ public class CollectionShapeCause {
         filled("HashMap+4", n, HashMap::new, CollectionShapeCause::putFour);
         filled("LinkedHashMap+4", n, LinkedHashMap::new, CollectionShapeCause::putFour);
         filled("Hashtable+4", n, Hashtable::new, CollectionShapeCause::putFour);
+        // The EMPTY row alone cannot tell a deferred allocation from a deleted
+        // one, and `Properties` is the class where the difference is the whole
+        // question: its entries do NOT live in the bucket table its empty row
+        // used to retain, so if the empty row falls and this one does not rise
+        // to meet it, the array was never carrying anything.
+        filled("Properties+4", n, Properties::new, CollectionShapeCause::putFour);
         filled("TreeMap+4", n, TreeMap::new, CollectionShapeCause::putFour);
         filled("HashSet+4", n, HashSet::new, CollectionShapeCause::addFour);
         filled("LinkedHashSet+4", n, LinkedHashSet::new, CollectionShapeCause::addFour);
         filled("TreeSet+4", n, TreeSet::new, CollectionShapeCause::addFour);
         filled("ConcurrentHashMap+4", n, ConcurrentHashMap::new, CollectionShapeCause::putFour);
         filled("CopyOnWriteArrayList+4", n, CopyOnWriteArrayList::new,
+                CollectionShapeCause::addFour);
+        // Its EMPTY row is two tables up; this is the half that says whether a
+        // backing-object change moved the cost or removed it. A
+        // `CopyOnWriteArraySet` retains one `CopyOnWriteArrayList` on HotSpot,
+        // and retained a `LinkedHashMap` on this VM until 2026-09-12.
+        filled("CopyOnWriteArraySet+4", n, CopyOnWriteArraySet::new,
                 CollectionShapeCause::addFour);
         filled("ConcurrentLinkedQueue+4", n, ConcurrentLinkedQueue::new,
                 CollectionShapeCause::addFour);
@@ -106,6 +118,12 @@ public class CollectionShapeCause {
         fields("java.util.HashMap", new HashMap<>());
         fields("java.util.LinkedHashMap", new LinkedHashMap<>());
         fields("java.util.Hashtable", new Hashtable<>());
+        // `Properties` is the one class in this list whose real backing is NOT
+        // the fields it inherits: JDK 9+ keeps its entries in a side
+        // `ConcurrentHashMap map` and leaves every `Hashtable` field null, so
+        // a non-null `table` here is this VM's own allocation and nothing
+        // reads it through those fields.
+        fields("java.util.Properties", new Properties());
         fields("java.util.HashSet", new HashSet<>());
         fields("java.util.LinkedHashSet", new LinkedHashSet<>());
         fields("java.util.TreeMap", new TreeMap<>());

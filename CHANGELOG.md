@@ -7,6 +7,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 2026-09-12 `Properties` built a 144-byte bucket array that no `Properties` method reads
+
+`java.util.Properties` keeps its entries in three places, and the inherited
+`Hashtable.table` is not one of them: a String->String pair goes to a Rust
+side-table, anything else to the real `map` `ConcurrentHashMap`, and the bucket
+array holds nothing at all -- `map_carrier_class_for_receiver` had the
+measurement in a comment already, `occupied=0` with `size=2`. Both constructors
+allocated one anyway, via `map_init_eager`, because `Properties` is deliberately
+excluded from `CF_HASHTABLE_LAYOUT` and so fell through to the generic arm of
+`map_init_inner` and its `Object[16]`.
+
+```text
+  empty          224.0 -> 80.0     HotSpot 120.3    (1.86x -> 0.67x)
+  four entries  1128.0 -> 984.0    HotSpot 335.4    (3.36x -> 2.93x)
+```
+
+The empty row now sits below HotSpot, which allocates its `ConcurrentHashMap` in
+the constructor where this VM allocates it on demand. The four-entry row is new
+-- `probes/CollectionShapeCause.java` had no `Properties` row in its filled
+table -- and is the measurement that matters: it falls by the SAME 144 bytes as
+the empty row, so the array was carrying nothing rather than being moved. The
+2.93x that remains is `ConcurrentHashMap`'s number, not this class's: on both
+VMs the per-entry cost of a filled `Properties` is the per-entry cost of the CHM
+underneath it (792.0 vs 275.0, 2.88x), and narrowing that has its own record.
+
+The old comment at both call sites named the risk -- "leaving it null would make
+`map_state` report no buckets on a receiver whose native put path does not go
+through `map_resize`" -- and it does not apply here.
+`register_properties_sidetable` runs after `register_collections_natives` in
+both `vm_init` arms and overwrites every Map method on the class, none of which
+touches a bucket table; the one path that could reach them opens with
+`if initial_buckets.is_none() { map_resize(..) }` already; and
+`system_properties_object` has been handing out a bucket-less `Properties` --
+the one `java.home` is read from during bootstrap -- since it was written.
+HotSpot settles it rather than any of that: its own `new Properties()` leaves
+`table` null, `loadFactor` 0.0 and `threshold` 0, so the eager array was a
+divergence as well as a cost. The two VMs now agree field for field on a filled
+one, `map` a 4-entry CHM and `table` null.
+
+`probes/PropertiesBacking.java` is new and is what made the change safe: every
+method `javap -p java.util.Properties` lists bar four, against a HotSpot oracle,
+driven as a gate by `vm/tests/properties_backing.rs`. It caught a live defect
+older than this change. `native_properties_remove` opened with
+`read_java_text(..).unwrap_or_default()` and returned null on an empty result,
+before consulting the CHM -- so removing a non-String key did nothing and said
+nothing:
+
+```text
+  p.put(Integer.valueOf(3), "byIntKey");
+  p.remove(Integer.valueOf(3))  ->  null   (HotSpot: "byIntKey")
+  p.size()                      ->  3      (HotSpot: 2)
+```
+
+The entry survived its own removal and `size`/`keySet`/`containsKey` all went on
+reporting it, with no exception anywhere. The empty String took that same return
+and needed the opposite treatment -- `setProperty` puts it in BOTH stores where
+`put` puts it only in the CHM -- which the probe also caught, on the first cut of
+the fix.
+
+### 2026-09-12 `CopyOnWriteArraySet` was backed by a LinkedHashMap, and `removeIf` was the only method that said so
+
+`register_hashset_natives` mirrors the whole `java.util.HashSet` surface onto
+`CopyOnWriteArraySet`, on the stated premise that it is one of "HashSet's
+real-JDK subclasses that share the same `field 0 = backing map` layout". It is
+neither: it does not extend `HashSet`, and the ONE instance field the real class
+declares is `private final CopyOnWriteArrayList<E> al` — at exactly that slot 0.
+So `native_hs_init` stored a `LinkedHashMap` in a slot declared to hold a list.
+
+Nineteen methods, twenty registered triples, and `removeIf` in neither set — so
+its real body ran:
+
+```text
+  cowSet.removeIf(p)
+    -> NoSuchMethodError: java.util.LinkedHashMap.removeIf(java.util.function.Predicate)
+```
+
+Every other method looked correct because a native stood in front of it. Which
+ones are silent is a function of which triples the registrar happens to carry,
+which is why the guard below is the whole declared surface rather than the one
+method that broke.
+
+It cost the class its size as well. Retained heap against HotSpot on the same
+probe:
+
+```text
+  empty          112.0 -> 72.0     HotSpot 56.1     (2.00x -> 1.28x)
+  four entries   512.0 -> 120.0    HotSpot 88.3     (5.80x -> 1.36x)
+```
+
+The four-entry row is the larger half and had never been measured:
+`probes/CollectionShapeCause.java`'s filled table had no `CopyOnWriteArraySet`
+row, so a `LinkedHashMap` holding four entries — 488 bytes where HotSpot holds a
+six-element `Object[]` — was invisible. It has a row now.
+
+`cow_set_route` takes a real receiver to its own bytecode, method by method,
+from the top of each of the twenty natives — the placement `ksv_route` already
+uses, so the interface-level registrations (`java/util/Set.size()` and friends)
+are guarded by the same test as the exact-class ones. "Real" is a by-NAME
+question, not a mode flag: `is_real_cow_array_set` asks whether the receiver's
+class resolves `al`, so a fabricated stub keeps the map surface, where that
+surface IS the implementation. Delegation rather than a second implementation
+because the object underneath is already right — `CopyOnWriteArrayList` writes
+`lock` and `array` by name, runs the JDK's own constructor, and measures 48.0
+against HotSpot's 40.0. The one method that cannot go that way is `stream()`, a
+`Collection` default whose body builds a real `java.util.stream` pipeline; it
+takes the elements through the delegated `toArray()` and builds this VM's
+carrier, as every other `*_stream` native does.
+
+`probes/CowSetBacking.java` is the coverage that made the move safe — every
+method `javap -p` lists plus the four it inherits, asserting insertion ORDER
+throughout, because that is the observable separating a list-backed set from a
+hash-backed one. `vm/tests/cow_array_set_backing.rs` drives it as a gate and was
+mutation-checked: it FAILS on the pre-fix binary with exactly the
+`NoSuchMethodError` its message describes.
+
+Verified on both arms from the same commit: real-JDK `PASS CowSetBacking` and
+`PASS CollectionSlotFloor`, regression-suite 95/95, tier1 58/58;
+synthetic-JDK verdict-identical to an unchanged tree on both probes (the same 15
+and 14 outcomes, the same 127 `field index OOB`), which is the acceptance
+criterion rather than green.
+
 ### 2026-09-12 The synthetic slot floor was ONE number for TWO layouts, and six collection classes paid for it
 
 `synthetic_stub_fields` is read in two places that mean different things. It
