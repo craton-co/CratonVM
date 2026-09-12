@@ -1,7 +1,11 @@
 # The optimizing tier's loop body is mostly code it never runs
 
 **Status:** one default flipped, one wrong answer fixed, two switches left OFF
-because they measured as nothing. §7 adds the `sumWide` arm §6 left open.
+because they measured as nothing. §7 adds the `sumWide` arm §6 left open; §8
+answers why its four hoisted reads stayed four and gives the tier the
+redundant-load elimination it turned out not to have; §9 takes §6's other open
+item; §10 closes the rest of the list, two of them with reasons rather than
+work.
 **Shape:** `probes/FieldLoop.java` `sum` — `for (i…) a += this.fx;`
 **Predecessor:** `c2-the-phi-copy-staging-register-20260911.md`, whose §4 asked
 the question this answers.
@@ -317,11 +321,10 @@ the signal to stop and clean the host, not to report the number.
   lead on.
 * ~~`sumWide` is unmeasured.~~ **Measured — see §7.** It helps more there, not
   less, and the reason is not the one this bullet guessed.
-* **The speculation permission is narrow on purpose** (§3a): receiver, or
-  `definitely_non_null`, or already anchored at the header. A loop whose bound
-  is provably positive, or a base proven non-null by a dominating check, is
-  hoistable and is refused today. Widening it is an optimization; each widening
-  is a new claim about when the body must run.
+* ~~**The speculation permission is narrow on purpose**~~ (§3a). **Widened once
+  — see §9.** A loop whose bound is provably positive now hoists, because a
+  body that always runs makes the pre-header not speculation at all. "A base
+  proven non-null by a dominating check" is still refused, and still open.
 * **Nothing aligns a loop header**, and there is no nop/pad emitter in this
   backend at all. Worth less than it looked like before §5, for the same reason
   as the first bullet.
@@ -377,7 +380,261 @@ independent work and it disappears on its own.
 The four reads are hoisted, but they are still **four**: the pre-header holds
 four complete read sequences where one would do. GVN does not dedup them even
 once they share a control anchor and a memory state, which it should be able to
-after the memory edge moves. Once per call rather than once per iteration, so it
+after the memory edge moves. (**It should not — see §8.** Two reasons, and the
+sentence above names neither.) Once per call rather than once per iteration, so it
 is worth little on a 20,000-iteration loop and proportionally more the shorter
 the loop — and "identical loads in the same block do not GVN" is a fact about
 the pass worth knowing whatever it is worth here.
+
+---
+
+## 8. Why the four hoisted reads stayed four
+
+§7 ended on the one thing it could not explain: the memory-edge hoist moves
+all four of `sumWide`'s reads to the pre-header, and **they stay four**. The
+note guessed that GVN "does not dedup them even once they share a control
+anchor and a memory state, which it should be able to".
+
+It should not, and the reason took one grep.
+
+### Two reasons, and the second is the interesting one
+
+`gvn` skips the node entirely:
+
+```rust
+if node.op == Op::Dead || !node.op.is_pure() { continue; }
+```
+
+`Op::Load` is not in `Op::is_pure()`'s list and cannot be: a load's value
+depends on the heap, which its `(op, ty, inputs)` key does not describe. So
+there was no redundant-load elimination in the IR tier at all — not a weak one,
+none.
+
+Teaching `gvn` about loads would not have fixed it either, and this is the part
+worth keeping. The builder advances the memory token on every **read**:
+
+```rust
+// ir.rs, getfield
+self.mem = load;
+```
+
+That edge exists for a real reason — a later store to a possibly-aliasing cell
+must be ordered after this read — but it means four `getfield`s in a row form a
+CHAIN: `L1(mem=M)`, `L2(mem=L1)`, `L3(mem=L2)`, `L4(mem=L3)`. No two of them
+share a memory input, so input-equality rejects every pair. The four reads were
+never going to merge on identity, in the pre-header or anywhere else.
+
+### What landed
+
+`eliminate_redundant_loads` keys on everything EXCEPT the memory token, and
+then asks the question the token was hiding: is `B`'s memory state reachable
+backwards from `A`'s through nodes that cannot have written the cell `B` reads?
+Only `MemAccess::{FieldRead, ArrayRead, LengthRead}` may appear on that path —
+reads, which advance the token and write nothing. One store, one call, one
+allocation, one memory φ, and the walk stops.
+
+Four conditions, each with a test that fails if it is dropped:
+
+| | what it means | the test |
+|---|---|---|
+| same address | every input but the token is node-identical, and an `Op::Load`'s field index IS an input | `four_reads_..._become_one` |
+| same heap | the chain walk; `from == to` is the zero-length case | `a_write_between_two_reads_..._stops_the_merge` |
+| same place | `A`, `B` and every node between share a control anchor | `two_reads_on_opposite_arms_of_a_branch_are_not_merged` |
+| same program point | `frame_snapshot` is in the key, as it is in `gvn`'s | (shared with `gvn`) |
+
+The third is not a formality. Without it, `c != 0 ? o.v : o.v` merges two reads
+whose memory inputs are already equal, pulling a read and its null check onto a
+path that need not take it — the identical bug §3a records LICM having shipped.
+
+### The chain is repaired, not short-circuited
+
+`B` sits in the memory chain, so `replace_all_uses(B, A)` alone is wrong in the
+quiet direction. A store that named `B` as its token would be re-pointed at
+`A`, and lose its ordering against every read BETWEEN them — reads that are
+still there. The two kinds of edge are separated: a *token* user of `B` is
+spliced to `B`'s own incoming token, and only then do the remaining *value*
+users and the safepoint slots follow the value to `A`.
+
+`removing_a_read_splices_the_memory_chain_instead_of_shortcutting_it` is the
+test, and it is built so that the survivor and the correct token are different
+nodes — otherwise the wrong implementation passes it.
+
+### The emitted loop
+
+Same apparatus as §5 and §7. `sumWide`'s loop, header to back edge, in the
+2x2 against the memory-edge hoist:
+
+| | loop instructions | field reads inside | body bytes |
+|---|---:|---:|---:|
+| mem-edge ON, no CSE — today's default | 69 | 0 | 1869 |
+| mem-edge ON + CSE | 70 | 0 | **1224** |
+| mem-edge OFF, no CSE | **145** | **4** | 1890 |
+| mem-edge OFF + CSE | **91** | **1** | 1224 |
+
+Rows 1 and 3 are §7's numbers, reproduced by a different binary a day later,
+which is what says the apparatus is measuring the thing it claims to.
+
+### The clock
+
+Nine rounds, interleaved, medians, a same-config control whose spread is the
+floor. Checksums collapse to exactly three values across every run — one per
+probe shape — so no arm computed anything different.
+
+| | probe | ratio | floor | verdict |
+|---|---|---:|---:|---|
+| L1 | `sumWide`, mem-edge ON | 1.010x | 2.5% | UNMEASURABLE |
+| L2 | `sumWide`, mem-edge OFF | **0.627x** | 1.4% | **faster** |
+| L3 | `sum` (one read) | 1.013x | 3.3% | UNMEASURABLE |
+| L4 | tier A/B, `sumWide`, CSE ON + mem-edge OFF | **0.598x** | 2.4% | optimizing faster |
+
+**The predictions were registered before the binary existed**, and three of four
+held. L1, L3: nothing measurable, because with the memory edge on, the four
+reads are already out of the loop and collapsing them saves three read sequences
+ONCE PER CALL on a 20,000-iteration loop. L2: the large win, because with the
+memory edge off the reads are still IN the loop and the pass deletes three of
+four.
+
+The one that was wrong is worth keeping. The prediction said L2 would land "near
+the 0.445x that mem-edge ON reaches". It is 0.627x, and the disassembly had
+already said why before the clock ran: this pass collapses four reads to one but
+leaves that one INSIDE the loop (91 instructions), where the memory edge hoists
+it out entirely (69). The two overlap, and on this shape the memory edge is
+strictly the better of the pair.
+
+L4 is the independent result. §7 measured mem-edge OFF at 0.964x — no inversion
+on `sumWide`, but no win either. With load-CSE instead, the same configuration
+is **0.598x**. Two mechanisms with nothing in common — delete three reads, or
+move one — reach nearly the same place.
+
+### And it fires on nothing in CratonBench
+
+The census, on the seven-benchmark suite, with the switch on: **0**. Not a
+refusal — `CRATONVM_DBG_LOAD_CSE=1` prints a line per refused graph and there
+are none, and the same flag on `FieldLoop` prints `read 23 is redundant with
+21`, `25`, `27`, three compiles, matching the census of 9. The pass runs on
+those graphs and finds nothing: no method in `arith`, `fib`, `sieve`, `matrix`,
+`hashmap`, `stringregex` or `bintrees` reads one cell twice out of one heap
+state in one block.
+
+**So the switch stays OFF by default**, and that zero is the reason rather than
+the 1.010x. A pass that runs on every compile and fires on nothing in the
+measured workload has not earned a default, however good it looks on the probe
+written for it. It is there for the shape LICM cannot reach — a loop with a
+barrier in it, or straight-line redundancy — and when a workload with that
+shape turns up, the census is what will say so.
+
+---
+
+## 9. The other open item: a permission that refuses loops it does not have to
+
+§6's second bullet: the speculation permission §3a installed is *header-anchored,
+receiver, or `definitely_non_null`*, and "a loop with a provably positive bound
+... is hoistable and is refused today. Widening it is an optimization; each
+widening is a new claim about when the body must run."
+
+There is exactly one such claim this tree can already prove, and it was sitting
+in the unroller.
+
+### The claim
+
+A pre-header hoist is speculative for ONE reason: the pre-header runs when the
+body does not. If the body always runs, every fault the hoisted read can raise
+was going to be raised by the first iteration anyway, and the base needs no
+vouching at all. `analyze_counted_loop` — the unroller's own analysis — answers
+this for a single-back-edge loop, and two of its four answers mean yes:
+
+* `Ok(c)` with `c.trip >= 1`: a constant trip count that is not zero.
+* `Err(NotCounted::TripOverCap)`: **the interesting one.** The unroller returns
+  this only after simulating `UNROLL_MAX_TRIP + 1 = 9` iterations that all
+  continued. "Too big to unroll" is a stronger proof that the body runs than
+  the `Ok` arm's.
+
+The other two — a runtime bound, or a shape the analysis does not model — say
+nothing about whether the body runs, and are refused.
+
+Missing `TripOverCap` made the predicate answer `false` for every loop it was
+written for, because the full unroller is default-ON and takes constant-trip
+loops of 8 or fewer apart before LICM sees them. The population this permission
+actually serves is **the constant-trip loop too big to fully unroll**, and that
+population is reached only through the arm that looks like a refusal.
+
+### The probe
+
+`probes/CountedHoist.java`, written for this and for nothing else:
+`static int walk(N o) { int a = 0; for (int i = 0; i < 1000; i++) a += o.v;
+return a; }`. Static, so the base may be null and §3a's permission refuses it;
+constant-bounded, so the body runs. Its `walkVar(null, 0)` half is the safety
+check in the same file, so the two cannot drift.
+
+| | ratio | floor | verdict |
+|---|---:|---:|---|
+| L5 — flag A/B on the optimizing tier | **0.793x** | 3.6% | **faster** |
+| L6 — tier A/B with the flag on | **0.859x** | 1.2% | optimizing faster |
+
+20.7% on the shape it was written for, which turns §6's "widening it is an
+optimization" from a guess into a measurement. Checksum `60150000` on all 54
+runs, and `walkVar(null, 0)` returns 0 in every arm — as does
+`probes/ZeroTripHoist.java`, whose loop is bounded by a parameter and which this
+permission therefore still refuses.
+
+It stays **OFF by default** for the same reason §8's does: it is measured on the
+probe written for it and nowhere else. CratonBench's checksums are byte-identical
+with it on, so it is safe; safe is not the same as earning a default.
+
+`CRATONVM_JIT_IR_LICM_HOIST_COUNTED`. It is a widening of a permission rather
+than a fix to a wrong answer, which is the opposite direction from §3a's, so it
+gets a flag where that one deliberately did not.
+
+---
+
+## 10. What is left, and what is deliberately not being done
+
+§6's list, closed out. Two items were work; three were decisions, and saying so
+is the point — an open-items list that only ever grows is not a list, it is a
+backlog nobody reads.
+
+| §6 item | now |
+|---|---|
+| `sumWide` is unmeasured | **done**, §7 |
+| the four hoisted reads stay four | **done**, §8 |
+| the speculation permission is narrow | **done**, §9 |
+| the `getfield` cold arms are still inline | **not doing** — see below |
+| nothing aligns a loop header | **not doing** — see below |
+| the byte-span theory is dead | nothing to do; §2 reads as anatomy |
+
+### The two that are decisions
+
+**Outlining the `getfield` cold arms.** 61 of the loop's 412 bytes and one
+taken branch per iteration. This is the same trade `CRATONVM_JIT_IR_POLL_OUTLINE`
+made on a bigger block — 229 bytes and a taken branch — and it measured
+**0.999x**: a correctly predicted branch over cold bytes costs about nothing,
+because fetch follows the predicted target. Doing a smaller version of a
+measured-nothing change, at a higher cost in the lowering, is not a judgement
+call.
+
+**Aligning a loop header.** There is no nop/pad emitter in this backend, so this
+is new machinery before it is a measurement. §5's result is the reason to want
+one less: what moved this loop was deleting work, not moving bytes.
+
+### What is actually left
+
+* **The chain walk admits only reads.** One `Op::Store` between two reads of a
+  DIFFERENT cell stops the merge (§8's second test is exactly that shape). LICM
+  next door already has the alias oracle — `resolve_ref_points_to`,
+  `load_safe_past_clobber` — and letting the walk consult it for a provably
+  non-aliasing store is the obvious next increment. It is a widening of a
+  soundness argument, so it needs its own tests before its own measurement.
+* **The merge is within one block.** `A` and `B` must share a control anchor,
+  which costs every redundant read whose first copy is in a dominating block —
+  the pattern `if (c) { … o.f … } … o.f …`. Lifting it needs a dominance query
+  this pass does not have and `ir_schedule` does; wiring one in is a bigger
+  change than this was.
+* **Neither switch sets an `ir_evidence::Transform`.** A method whose only
+  improvement is a removed read does not count as "this tier did something the
+  baseline has no equivalent for", so the supersede gate will refuse to publish
+  it. That is the conservative direction and it is deliberate for now: adding a
+  `Transform` variant changes which bodies get published, and that is a
+  measurement of its own.
+* **The worst rows in `BENCHMARK.md` are not codegen.** String/Regex, HashMap
+  and Binary Trees are allocation- and GC-bound. Nothing in this document or
+  its predecessor touches them, and no amount of loop-body work will.

@@ -3196,7 +3196,7 @@ static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
 /// boundary-crossing registrars are carved out of the 992 rows under its prefix
 /// set. This table holds the rows that earned a retirement; every other row in
 /// that population is dispositioned in
-/// `docs/known-issues/jdk-only-lanes/lane-2-lang-values.md`.
+/// `docs/internal/jdk-only/lane-2-lang-values-RETIRED-20260911.md`.
 ///
 /// # `java/lang/Character` — three deprecated statics, and nothing to argue
 ///
@@ -3320,6 +3320,115 @@ static RETIRED_SHADOW_L2_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/lang/Character", "isJavaLetter", "(C)Z"),
     ("java/lang/Character", "isJavaLetterOrDigit", "(C)Z"),
     ("java/lang/Character", "isSpace", "(C)Z"),
+    ("java/lang/ExceptionInInitializerError", "<init>", "()V"),
+    (
+        "java/lang/ExceptionInInitializerError",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/ExceptionInInitializerError",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/IllegalThreadStateException", "<init>", "()V"),
+    (
+        "java/lang/IllegalThreadStateException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/NullPointerException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    ("java/lang/Object", "<init>", "()V"),
+    ("java/lang/Object", "equals", "(Ljava/lang/Object;)Z"),
+    ("java/lang/Object", "finalize", "()V"),
+    ("java/lang/Object", "toString", "()Ljava/lang/String;"),
+    ("java/lang/Object", "wait", "()V"),
+    ("java/lang/Object", "wait", "(J)V"),
+    ("java/lang/Package", "equals", "(Ljava/lang/Object;)Z"),
+    ("java/lang/Package", "getPackages", "()[Ljava/lang/Package;"),
+    ("java/lang/Package", "hashCode", "()I"),
+    ("java/lang/StringUTF16", "getChars", "([BII[CI)V"),
+    (
+        "java/lang/Throwable",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/UnsatisfiedLinkError", "<init>", "()V"),
+    (
+        "java/lang/UnsatisfiedLinkError",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    ("java/lang/VirtualMachineError", "<init>", "()V"),
+    (
+        "java/lang/VirtualMachineError",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/VirtualMachineError",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/VirtualMachineError",
+        "<init>",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getClassLoadingMXBean",
+        "()Ljava/lang/management/ClassLoadingMXBean;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getCompilationMXBean",
+        "()Ljava/lang/management/CompilationMXBean;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getGarbageCollectorMXBeans",
+        "()Ljava/util/List;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getMemoryMXBean",
+        "()Ljava/lang/management/MemoryMXBean;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getOperatingSystemMXBean",
+        "()Ljava/lang/management/OperatingSystemMXBean;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getPlatformMXBean",
+        "(Ljava/lang/Class;)Ljava/lang/management/PlatformManagedObject;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getPlatformMXBeans",
+        "(Ljava/lang/Class;)Ljava/util/List;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getRuntimeMXBean",
+        "()Ljava/lang/management/RuntimeMXBean;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getThreadMXBean",
+        "()Ljava/lang/management/ThreadMXBean;",
+    ),
+    ("java/lang/management/MemoryUsage", "<init>", "(JJJJ)V"),
+    ("java/lang/management/MemoryUsage", "getCommitted", "()J"),
+    ("java/lang/management/MemoryUsage", "getInit", "()J"),
+    ("java/lang/management/MemoryUsage", "getMax", "()J"),
+    ("java/lang/management/MemoryUsage", "getUsed", "()J"),
     ("java/math/BigInteger", "bitCount", "()I"),
     ("java/math/BigInteger", "bitLength", "()I"),
     ("java/math/BigInteger", "intValueExact", "()I"),
@@ -4953,6 +5062,178 @@ static RETIRED_SHADOW_L6_TRIPLES: &[(&str, &str, &str)] = &[
 /// rest of the package tree to one extra binary search each, which is the whole
 /// cost, and `the_held_collection_families_are_not_retired` is the test that
 /// says admitting them changes no answer.
+/// The 2026-09-11 lane-5 RESIDUAL wave: 67 `sun/misc/Unsafe` rows, and the
+/// reason they were held until now was a missing INSTRUMENT, not a blocker.
+///
+/// The retired lane page held all 82 `sun/misc/Unsafe` registrations with
+/// "precondition 1 fails by measurement" — 121 probes reported the dial VACUOUS
+/// on that scope and the 132 `--jdk-only` corpus reports reached 18 of the 82.
+/// Its own §9 said what that was worth: **until a workload exists, the count is
+/// not evidence of anything.** It is not evidence the rows are right, not
+/// evidence they are retirable, and not evidence they are dead.
+///
+/// `apps/probes/L5SunMiscUnsafe.java` is that workload, and with it the four
+/// preconditions read:
+///
+/// ```text
+///   1. the dial was asked              y/r = 76/76 on the workload
+///   2. whole probe tree no worse       134 measured: 0 toward, 1 away, and
+///                                      that row is y/r=0/0 VACUOUS with a
+///                                      line count that moved — not the dial
+///   3. the image target carries Code   outcome=bytecode-won on all 67, and
+///                                      `javap -p sun.misc.Unsafe` reports
+///                                      ZERO native methods on the class —
+///                                      all 99 carry Code and delegate to
+///                                      `theInternalUnsafe`
+///   4. a per-triple dispatch observed  67 distinct triples, one row each
+/// ```
+///
+/// **The wave was 48 rows for an afternoon.** The first workload reached 48 of
+/// them; widening it to the volatile twins, the long atomics and the bulk
+/// memory trio reached 19 more, and this page's own account had said that is
+/// what takes them — *a probe edit, not a build*. It cost one probe edit and
+/// two runs.
+///
+/// Precondition 2 was measured on the 36-row workload and is NOT re-run for
+/// the 19: the battery's question is whether arming this prefix disturbs the
+/// OTHER 133 probes, and widening one probe cannot change their answer. The
+/// row that did change is this probe's own, and it was re-measured directly —
+/// `d(base,armed) = 0` on 50 rows, so arming the prefix changes nothing about
+/// its output at all.
+///
+/// Precondition 3 is not read off a `javap` here: `outcome=bytecode-won` in the
+/// `--jdk-only-report` IS the image's bytecode having run and produced the
+/// answer. And the answer is the same one: the probe is **byte-identical armed
+/// and unarmed**, 36 rows, including the two lines that differ from HotSpot for
+/// an unrelated reason (see below). A retirement that changes no answer while
+/// refusing 48 natives is the definition of a shadow.
+///
+/// # What `sun.misc.Unsafe` actually is on JDK 25, measured
+///
+/// Fully functional. Every field accessor and its volatile twin, all three
+/// `compareAndSwap*`, `getAndAdd`/`getAndSet`, the static-field pair,
+/// `allocateMemory`/`setMemory`/`freeMemory`, `allocateInstance`,
+/// `getLoadAverage`, `park`/`unpark` and `throwException` answer on HotSpot 25
+/// and on CratonVM alike — only a terminal-deprecation WARNING is printed, on
+/// stderr, which the A/B harness drops. The class being deprecated for removal
+/// says nothing about whether it works today.
+///
+/// # The 34 rows NOT here, and why each is out
+///
+///   * **`ensureClassInitialized(Ljava/lang/Class;)V` and
+///     `shouldBeInitialized(Ljava/lang/Class;)Z` are ABSENT from the JDK 25
+///     image** — `javap -p sun.misc.Unsafe` declares neither, and the workload
+///     gets `NoSuchMethodException` for both on HotSpot. Nothing can dispatch
+///     them on a supported image, so they are bucket-F DELETIONS rather than
+///     retirements, the same verdict `AbstractExecutorService`'s four rows got.
+///     Left for a deletion commit with its own census: a retirement table entry
+///     would claim a dispatch nobody has observed, which is the rule this table
+///     is under.
+///   * **`getUnsafe()Lsun/misc/Unsafe;` is NOT absent, and the first version of
+///     this note said it was.** `javap -p sun.misc.Unsafe` prints
+///     `public static sun.misc.Unsafe getUnsafe();` on the 17, 21 AND 25
+///     images. The `NoSuchMethodException` that put it in the list above came
+///     from `getMethod`, and it is the JDK's core-reflection METHOD FILTER
+///     working: `jdk.internal.reflect.Reflection.methodFilterMap` hides this
+///     one method from the reflective surface, which is the door that stops a
+///     library from acquiring `Unsafe` reflectively.
+///
+///     So it is not a deletion candidate, and CratonVM's `getUnsafe` native is
+///     correct — it throws `SecurityException` for a caller off the boot path,
+///     measured against HotSpot. What diverges is that this VM implements no
+///     member filter AT ALL, so the method is reflectively visible here and
+///     invisible there. That is cross-cutting rather than lane 5's, and it has
+///     its own page:
+///     `docs/known-issues/jdk-only/core-reflection-has-no-member-filter-20260911.md`.
+///     It stays out of this table because the divergence is in the reflective
+///     surface, not in the native, and retiring the native would not move it.
+///
+///     **The lesson is worth more than the row: the image is not the authority
+///     on what reflection answers.** A census built from class files cannot see
+///     this defect, and a `javap` check would have prevented the wrong claim —
+///     which is what eventually caught it.
+///   * **the rest were not dispatched by this workload.** Precondition 4 is
+///     per-triple and this table honours that: a row with no observed dispatch
+///     stays out however obvious its sibling looks. The registered surface on
+///     this class is larger than the workload reaches, and closing the gap is
+///     more probe rows rather than a weaker rule.
+///
+/// # Why this is a separate table from `RETIRED_SHADOW_L5_TRIPLES`
+///
+/// Same reason the Phase 2 table gives for existing: these were adjudicated by
+/// a different instrument, on a different day, against a measurement the
+/// earlier wave explicitly did not have. Merging them would make the earlier
+/// table's account cover rows it never saw.
+static RETIRED_SHADOW_L5R_TRIPLES: &[(&str, &str, &str)] = &[
+    ("sun/misc/Unsafe", "addressSize", "()I"),
+    ("sun/misc/Unsafe", "allocateInstance", "(Ljava/lang/Class;)Ljava/lang/Object;"),
+    ("sun/misc/Unsafe", "allocateMemory", "(J)J"),
+    ("sun/misc/Unsafe", "arrayBaseOffset", "(Ljava/lang/Class;)I"),
+    ("sun/misc/Unsafe", "arrayIndexScale", "(Ljava/lang/Class;)I"),
+    ("sun/misc/Unsafe", "compareAndSwapInt", "(Ljava/lang/Object;JII)Z"),
+    ("sun/misc/Unsafe", "compareAndSwapLong", "(Ljava/lang/Object;JJJ)Z"),
+    ("sun/misc/Unsafe", "compareAndSwapObject", "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z"),
+    ("sun/misc/Unsafe", "copyMemory", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V"),
+    ("sun/misc/Unsafe", "freeMemory", "(J)V"),
+    ("sun/misc/Unsafe", "fullFence", "()V"),
+    ("sun/misc/Unsafe", "getAndAddInt", "(Ljava/lang/Object;JI)I"),
+    ("sun/misc/Unsafe", "getAndAddLong", "(Ljava/lang/Object;JJ)J"),
+    ("sun/misc/Unsafe", "getAndSetInt", "(Ljava/lang/Object;JI)I"),
+    ("sun/misc/Unsafe", "getAndSetLong", "(Ljava/lang/Object;JJ)J"),
+    ("sun/misc/Unsafe", "getAndSetObject", "(Ljava/lang/Object;JLjava/lang/Object;)Ljava/lang/Object;"),
+    ("sun/misc/Unsafe", "getBoolean", "(Ljava/lang/Object;J)Z"),
+    ("sun/misc/Unsafe", "getBooleanVolatile", "(Ljava/lang/Object;J)Z"),
+    ("sun/misc/Unsafe", "getByte", "(J)B"),
+    ("sun/misc/Unsafe", "getByte", "(Ljava/lang/Object;J)B"),
+    ("sun/misc/Unsafe", "getByteVolatile", "(Ljava/lang/Object;J)B"),
+    ("sun/misc/Unsafe", "getChar", "(Ljava/lang/Object;J)C"),
+    ("sun/misc/Unsafe", "getCharVolatile", "(Ljava/lang/Object;J)C"),
+    ("sun/misc/Unsafe", "getDouble", "(Ljava/lang/Object;J)D"),
+    ("sun/misc/Unsafe", "getDoubleVolatile", "(Ljava/lang/Object;J)D"),
+    ("sun/misc/Unsafe", "getFloat", "(Ljava/lang/Object;J)F"),
+    ("sun/misc/Unsafe", "getFloatVolatile", "(Ljava/lang/Object;J)F"),
+    ("sun/misc/Unsafe", "getInt", "(Ljava/lang/Object;J)I"),
+    ("sun/misc/Unsafe", "getIntVolatile", "(Ljava/lang/Object;J)I"),
+    ("sun/misc/Unsafe", "getLoadAverage", "([DI)I"),
+    ("sun/misc/Unsafe", "getLong", "(J)J"),
+    ("sun/misc/Unsafe", "getLong", "(Ljava/lang/Object;J)J"),
+    ("sun/misc/Unsafe", "getLongVolatile", "(Ljava/lang/Object;J)J"),
+    ("sun/misc/Unsafe", "getObject", "(Ljava/lang/Object;J)Ljava/lang/Object;"),
+    ("sun/misc/Unsafe", "getObjectVolatile", "(Ljava/lang/Object;J)Ljava/lang/Object;"),
+    ("sun/misc/Unsafe", "getShort", "(Ljava/lang/Object;J)S"),
+    ("sun/misc/Unsafe", "getShortVolatile", "(Ljava/lang/Object;J)S"),
+    ("sun/misc/Unsafe", "loadFence", "()V"),
+    ("sun/misc/Unsafe", "objectFieldOffset", "(Ljava/lang/reflect/Field;)J"),
+    ("sun/misc/Unsafe", "pageSize", "()I"),
+    ("sun/misc/Unsafe", "park", "(ZJ)V"),
+    ("sun/misc/Unsafe", "putBoolean", "(Ljava/lang/Object;JZ)V"),
+    ("sun/misc/Unsafe", "putBooleanVolatile", "(Ljava/lang/Object;JZ)V"),
+    ("sun/misc/Unsafe", "putByte", "(Ljava/lang/Object;JB)V"),
+    ("sun/misc/Unsafe", "putByteVolatile", "(Ljava/lang/Object;JB)V"),
+    ("sun/misc/Unsafe", "putChar", "(Ljava/lang/Object;JC)V"),
+    ("sun/misc/Unsafe", "putCharVolatile", "(Ljava/lang/Object;JC)V"),
+    ("sun/misc/Unsafe", "putDouble", "(Ljava/lang/Object;JD)V"),
+    ("sun/misc/Unsafe", "putDoubleVolatile", "(Ljava/lang/Object;JD)V"),
+    ("sun/misc/Unsafe", "putFloat", "(Ljava/lang/Object;JF)V"),
+    ("sun/misc/Unsafe", "putFloatVolatile", "(Ljava/lang/Object;JF)V"),
+    ("sun/misc/Unsafe", "putInt", "(Ljava/lang/Object;JI)V"),
+    ("sun/misc/Unsafe", "putIntVolatile", "(Ljava/lang/Object;JI)V"),
+    ("sun/misc/Unsafe", "putLong", "(JJ)V"),
+    ("sun/misc/Unsafe", "putLong", "(Ljava/lang/Object;JJ)V"),
+    ("sun/misc/Unsafe", "putLongVolatile", "(Ljava/lang/Object;JJ)V"),
+    ("sun/misc/Unsafe", "putObject", "(Ljava/lang/Object;JLjava/lang/Object;)V"),
+    ("sun/misc/Unsafe", "putObjectVolatile", "(Ljava/lang/Object;JLjava/lang/Object;)V"),
+    ("sun/misc/Unsafe", "putShort", "(Ljava/lang/Object;JS)V"),
+    ("sun/misc/Unsafe", "putShortVolatile", "(Ljava/lang/Object;JS)V"),
+    ("sun/misc/Unsafe", "reallocateMemory", "(JJ)J"),
+    ("sun/misc/Unsafe", "setMemory", "(Ljava/lang/Object;JJB)V"),
+    ("sun/misc/Unsafe", "staticFieldBase", "(Ljava/lang/reflect/Field;)Ljava/lang/Object;"),
+    ("sun/misc/Unsafe", "staticFieldOffset", "(Ljava/lang/reflect/Field;)J"),
+    ("sun/misc/Unsafe", "storeFence", "()V"),
+    ("sun/misc/Unsafe", "throwException", "(Ljava/lang/Throwable;)V"),
+    ("sun/misc/Unsafe", "unpark", "(Ljava/lang/Object;)V"),
+];
+
 pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor: &str) -> bool {
     if !RETIRED_SHADOW_PREFIXES
         .iter()
@@ -5056,6 +5337,11 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     RETIRED_SHADOW_L6_TRIPLES,
     RETIRED_SHADOW_L1_HM_TRIPLES,
     RETIRED_SHADOW_L1_JT_TRIPLES,
+    // Lane 5's residual wave, added here in the same 2026-09-11 merge. The
+    // note above is why this line exists at all: the loop below reads THIS
+    // list, so a table missing from it is a table the predicate does not
+    // consult.
+    RETIRED_SHADOW_L5R_TRIPLES,
     // 2026-09-11, L1 wave 5. Added HERE and nowhere else, which under the loop
     // above is the whole registration -- there is no chain arm to forget any
     // more. See `RETIRED_SHADOW_L1_ZI_TRIPLES` for why two rows and not forty,
@@ -5661,31 +5947,6 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn the_l2_table_is_disjoint_from_the_other_three() {
-        for key in RETIRED_SHADOW_L2_TRIPLES {
-            for (other, name) in [
-                (RETIRED_SHADOW_TRIPLES, "RETIRED_SHADOW_TRIPLES"),
-                (
-                    RETIRED_SHADOW_STATELESS_TRIPLES,
-                    "RETIRED_SHADOW_STATELESS_TRIPLES",
-                ),
-                (
-                    RETIRED_SHADOW_PHASE2_TRIPLES,
-                    "RETIRED_SHADOW_PHASE2_TRIPLES",
-                ),
-            ] {
-                assert!(
-                    other.binary_search(key).is_err(),
-                    "{key:?} is in both lane 2's table and {name}. Two tables \
-                     claiming one triple means two measurements claim it, and \
-                     only one of them can be the record."
-                );
-            }
-        }
-    }
-
     /// Lane 2 retires two families and nothing either side of them.
     ///
     /// The prefix list now admits the whole of `java/lang/` and `java/math/`,
@@ -5694,7 +5955,31 @@ mod tests {
     /// `the_held_collection_families_are_not_retired` does for `java/util/`.
     #[test]
     fn the_l2_table_holds_only_what_lane_2_measured() {
-        const RETIRED_CLASSES: &[&str] = &["java/lang/Character", "java/math/BigInteger"];
+        const RETIRED_CLASSES: &[&str] = &[
+            // wave 1, 2026-09-10
+            "java/lang/Character",
+            "java/math/BigInteger",
+            // wave 2, 2026-09-10 — the families a corpus screen called clean
+            // and nothing else had measured. Each is here because the IMAGE
+            // was asked two questions the corpus cannot: is the shadowed
+            // method reachable at all (an interface receiver, a private
+            // constructor or method, or a signature the image does not
+            // declare is not a shadow), and does the real body reach an
+            // ACC_NATIVE method this VM does not register. Ten rows failed the
+            // first question and are recorded in the lane page rather than
+            // retired; none failed the second.
+            "java/lang/ExceptionInInitializerError",
+            "java/lang/IllegalThreadStateException",
+            "java/lang/NullPointerException",
+            "java/lang/Object",
+            "java/lang/Package",
+            "java/lang/StringUTF16",
+            "java/lang/Throwable",
+            "java/lang/UnsatisfiedLinkError",
+            "java/lang/VirtualMachineError",
+            "java/lang/management/ManagementFactory",
+            "java/lang/management/MemoryUsage",
+        ];
         for (c, m, d) in RETIRED_SHADOW_L2_TRIPLES {
             assert!(
                 RETIRED_CLASSES.contains(c),
@@ -5777,6 +6062,62 @@ mod tests {
                 "{c}.{m}{d} takes a reference parameter. Until the JIT carries \
                  the helpful-NPE message into compiled code, such a row \
                  regresses the message it used to get from the native."
+            );
+        }
+
+        // The ten rows the image says are not shadows. Six are `<init>` on an
+        // INTERFACE, which declares no constructor at all; the rest are a
+        // private constructor, a private method, and two signatures the image
+        // does not declare. Retiring any of them trades a shadow for a
+        // `NoSuchMethodError` — the `Logger.log` eighth-overload shape — so
+        // they are held here as well as filtered by the funnel.
+        for (c, m, d) in [
+            ("java/lang/management/ClassLoadingMXBean", "<init>", "()V"),
+            ("java/lang/management/CompilationMXBean", "<init>", "()V"),
+            (
+                "java/lang/management/GarbageCollectorMXBean",
+                "<init>",
+                "()V",
+            ),
+            ("java/lang/management/MemoryMXBean", "<init>", "()V"),
+            (
+                "java/lang/management/PlatformLoggingMXBean",
+                "<init>",
+                "()V",
+            ),
+            ("java/lang/management/RuntimeMXBean", "<init>", "()V"),
+            ("java/lang/management/ManagementFactory", "<init>", "()V"),
+            (
+                "java/lang/management/ManagementFactory",
+                "loadNativeLib",
+                "()V",
+            ),
+            ("java/lang/management/MemoryUsage", "<init>", "()V"),
+        ] {
+            assert!(
+                !triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} was retired, and the image declares no such \
+                 dispatchable method. That is a NoSuchMethodError, not a \
+                 retirement."
+            );
+        }
+
+        // ...and the two that look identical to the funnel and are NOT the
+        // same thing. `Package.equals` resolves to `Object.equals` and
+        // `ExceptionInInitializerError.initCause` to `Throwable.initCause`,
+        // both concrete. A constructor is never inherited; an ordinary method
+        // is, so only the `<init>` rows above are phantoms.
+        for (c, m, d) in [
+            ("java/lang/Package", "equals", "(Ljava/lang/Object;)Z"),
+            (
+                "java/lang/ExceptionInInitializerError",
+                "initCause",
+                "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+            ),
+        ] {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is an inherited CONCRETE method, so it is a real                  bucket-B shadow and wave 2 retired it. If it is being held                  again, say which measurement changed."
             );
         }
 
@@ -6104,6 +6445,67 @@ mod tests {
                 "out of order or duplicated: {:?} then {:?}",
                 w[0],
                 w[1]
+            );
+        }
+    }
+
+    /// Lane 5's residual wave: sorted, unique, reachable, and one class.
+    ///
+    /// Disjointness is NOT asserted here — the N-way test above covers every
+    /// table in [`RETIRED_SHADOW_TABLES`], which is strictly more than the
+    /// hand-listed loop this test carried before the 2026-09-11 merge. What is
+    /// left is what that test cannot know: that this wave is one class, and
+    /// that every row reaches the predicate (i.e. `sun/misc/` is still a
+    /// prefix — a row under no prefix answers `false` and is invisible).
+    #[test]
+    fn the_l5r_table_is_sorted_unique_reachable_and_one_class() {
+        for w in RETIRED_SHADOW_L5R_TRIPLES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "out of order or duplicated: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
+        }
+        for &(c, m, d) in RETIRED_SHADOW_L5R_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "unreachable through the predicate: {c}.{m}{d} — is `sun/misc/` still in RETIRED_SHADOW_PREFIXES?"
+            );
+            assert_eq!(
+                c, "sun/misc/Unsafe",
+                "this wave is one class; {c} does not belong in it"
+            );
+        }
+    }
+
+    /// Three `sun/misc/Unsafe` triples stay OUT of that table, for two
+    /// different reasons, and the reasons are the point of this test.
+    ///
+    /// `ensureClassInitialized` and `shouldBeInitialized` are declared by NO
+    /// supported image — `javap -p sun.misc.Unsafe` finds neither on 17, 21 or
+    /// 25 — so nothing can dispatch them. They are deletions, and a retirement
+    /// entry would claim a dispatch nobody has observed.
+    ///
+    /// `getUnsafe` is here for a DIFFERENT reason and was very nearly recorded
+    /// under the first one. It IS declared, public, on all three images; the
+    /// `NoSuchMethodException` that first suggested absence was the JDK's
+    /// core-reflection METHOD FILTER hiding it. The native is correct
+    /// (`SecurityException` off the boot path, measured against HotSpot); what
+    /// diverges is that this VM implements no member filter at all, which is
+    /// cross-cutting and has its own page,
+    /// `docs/known-issues/jdk-only/core-reflection-has-no-member-filter-20260911.md`.
+    /// Retiring the native would not move that, so the row stays out.
+    #[test]
+    fn the_l5r_wave_excludes_three_triples_for_two_different_reasons() {
+        for (m, d) in [
+            ("getUnsafe", "()Lsun/misc/Unsafe;"),
+            ("ensureClassInitialized", "(Ljava/lang/Class;)V"),
+            ("shouldBeInitialized", "(Ljava/lang/Class;)Z"),
+        ] {
+            assert!(
+                !triple_is_retired_shadow("sun/misc/Unsafe", m, d),
+                "sun/misc/Unsafe.{m}{d} must stay out of the residual table — see this test's doc comment for which of the two reasons applies"
             );
         }
     }

@@ -38,6 +38,7 @@ pub fn optimize(graph: &mut Graph) {
         fold_constants(graph);
         algebraic_simplify(graph);
         gvn(graph);
+        eliminate_redundant_loads(graph);
         eliminate_dead_stores(graph);
         eliminate_dead_nodes(graph);
         if graph.live_count() == before {
@@ -89,6 +90,7 @@ pub fn optimize(graph: &mut Graph) {
             fold_constants(graph);
             algebraic_simplify(graph);
             gvn(graph);
+            eliminate_redundant_loads(graph);
             eliminate_dead_stores(graph);
             eliminate_dead_nodes(graph);
             if graph.live_count() == before {
@@ -119,6 +121,12 @@ fn run_licm_pass(graph: &mut Graph) {
     if licm_enabled() && licm(graph) {
         crate::ir_evidence::note(crate::ir_evidence::Transform::Licm);
         gvn(graph);
+        // The hoist lands every copy of an invariant read on ONE control anchor
+        // and ONE memory state, which is the zero-length case of the chain walk
+        // in `eliminate_redundant_loads`. Without this call the pre-header holds
+        // four complete read sequences where one would do — the shape §7 of
+        // `c2-the-loop-body-is-mostly-code-it-never-runs-20260911.md` filed.
+        eliminate_redundant_loads(graph);
         eliminate_dead_nodes(graph);
     }
 }
@@ -140,6 +148,67 @@ fn base_non_null_on_entry(graph: &Graph, base: NodeId) -> bool {
         Some(recv) => matches!(graph.nodes[base as usize].op, Op::Param(p) if p == recv),
         None => false,
     }
+}
+
+/// Does this loop's body execute at least once, every time the loop is
+/// reached?
+///
+/// The pre-header hoist is speculative for exactly one reason: the pre-header
+/// runs when the body does not. When the body always runs, that reason is gone
+/// and the hoist may take a base nothing else vouches for — every fault the
+/// hoisted read can raise, the first iteration was going to raise anyway.
+///
+/// One question answers it: does [`analyze_counted_loop`] prove this
+/// single-back-edge loop takes at least one trip? Two of its four answers say
+/// yes — a constant trip count of at least one, and `TripOverCap`, which the
+/// unroller returns only after simulating nine iterations that all continued.
+/// The second is the one that matters: the full unroller is default-ON and
+/// takes constant-trip loops of 8 or fewer apart before LICM sees them, so the
+/// population this permission actually serves is the constant-trip loop too
+/// big to fully unroll — real, but not the shape the tiering inversion was
+/// measured on
+/// (`probes/FieldLoop.java` counts to a `-D` property, so its bound is not
+/// constant and this answers `false` for it). A loop bounded by a parameter
+/// cannot be proven non-empty here at all; doing that needs the loop's entry
+/// test hoisted with the load, which is control-flow surgery and a different
+/// change.
+///
+/// `CRATONVM_JIT_IR_LICM_HOIST_COUNTED=1` turns it on. Default OFF: it widens
+/// a permission, and a widening that fires by default has to earn it on
+/// evidence the way the permission itself did not need to.
+fn loop_body_definitely_runs(graph: &Graph, region: NodeId, back_ctrls: &[NodeId]) -> bool {
+    if !licm_hoist_counted_enabled() {
+        return false;
+    }
+    // More than one back edge and `analyze_counted_loop`'s single-`If` model
+    // does not describe this loop; it would be answering about a different
+    // shape than the one being hoisted out of.
+    let [back] = back_ctrls else {
+        return false;
+    };
+    match analyze_counted_loop(graph, region, *back) {
+        Ok(c) => c.trip >= 1,
+        // `TripOverCap` is the interesting half, and missing it made this
+        // predicate answer `false` for every loop it was written for. The
+        // refusal is the UNROLLER's — `trip > UNROLL_MAX_TRIP`, which is 8 —
+        // and it is only reached after the simulation has already stepped the
+        // induction variable past the exit test nine times. "Too big to unroll"
+        // is therefore a proof that the body runs, and a stronger one than the
+        // `Ok` arm's.
+        Err(NotCounted::TripOverCap) => true,
+        // `RuntimeBound` is a counted loop whose bound is a runtime value, and
+        // `Shape` is a loop this analysis does not model. Neither says anything
+        // about whether the body runs.
+        Err(NotCounted::RuntimeBound(_)) | Err(NotCounted::Shape) => false,
+    }
+}
+
+/// `CRATONVM_JIT_IR_LICM_HOIST_COUNTED` — default OFF.
+fn licm_hoist_counted_enabled() -> bool {
+    matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_LICM_HOIST_COUNTED").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
 }
 
 /// A hoisted invariant load has its MEMORY edge moved to the loop-entry memory
@@ -929,6 +998,319 @@ fn gvn_hash(op: &Op, ty: IrType, frame_snapshot: Option<u32>, inputs: &[NodeId])
     hasher.finish()
 }
 
+// ── Redundant-load elimination ─────────────────────────────────
+//
+// Two reads of the same cell out of the same heap compute the same value, and
+// until 2026-09-11 nothing in this file said so.
+//
+// [`gvn`] cannot: it skips every node that is not `Op::is_pure()`, and no
+// memory op is pure. That is the right rule for `gvn` — a load's value depends
+// on the heap, which its `(op, ty, inputs)` key does not describe — but it
+// meant the IR tier had no redundant-load elimination at all.
+//
+// Making `gvn` load-aware would still not have fired, for a second reason that
+// is easy to miss: the builder advances the memory token on every READ
+// (`ir.rs`, `self.mem = load`, for the WAR ordering a later store needs). Four
+// `getfield`s in a row are therefore a CHAIN — `L1(mem=M)`, `L2(mem=L1)`,
+// `L3(mem=L2)`, `L4(mem=L3)` — and no two of them share a memory input, so
+// input-equality would reject every pair. `probes/FieldLoop.java` `sumWide` is
+// exactly this shape, and its loop body ran four complete field-read sequences
+// per iteration for one field that nothing writes
+// (`docs/internal/performance/c2-the-loop-body-is-mostly-code-it-never-runs-20260911.md`
+// §7).
+//
+// So this pass keys on everything EXCEPT the memory token, and then asks the
+// question the token was hiding: is `B`'s memory state reachable from `A`'s
+// through nodes that cannot have written the cell `B` reads? Only
+// `MemAccess::{FieldRead, ArrayRead, LengthRead}` — reads, which advance the
+// token and write nothing — may appear on that path. One store, one call, one
+// allocation, one memory φ stops the walk and the pair is left alone.
+//
+// SOUNDNESS, the four things that have to hold:
+//
+//   * **Same address.** Every input except the token is compared for
+//     node-identity, so the base, the field-index `Const` and (for an
+//     `ArrayLoad`) the index are literally the same nodes. The field identity
+//     of an `Op::Load` lives in an input (`Const(field_index)`), not in a side
+//     table, so input equality IS address equality.
+//   * **Same heap.** The chain walk above. `from == to` — the two loads
+//     already naming one memory state, which is what LICM's memory-edge hoist
+//     leaves behind — is the zero-length case and passes trivially.
+//   * **Same place.** `A` and `B` must share a control anchor, and so must
+//     every node on the chain between them. That makes the whole argument a
+//     within-block one and removes any need for a dominance query: `A` and `B`
+//     execute exactly when each other do. Dropping this would admit `if (c) x
+//     = o.f; else y = o.f;`, where neither load dominates the other and
+//     merging them speculates a read (and its null check) onto a path that
+//     need not take it — the same class of bug as the pre-header hoist fixed
+//     in §3a of the page above.
+//   * **Same program point.** `frame_snapshot` is part of the key, for the
+//     reason [`gvn`] states: two copies of an unrolled body are different
+//     program points, and merging across them gives one copy's code the
+//     other's deopt frame.
+//
+// AND THE CHAIN IS REPAIRED, NOT BROKEN. `B` sits in the memory chain, so
+// `replace_all_uses(B, A)` alone would be wrong in the quiet direction: a
+// store that named `B` as its token would be re-pointed at `A`, losing its
+// ordering against every read BETWEEN them — reads that are still there. The
+// two kinds of edge are separated: a *token* user of `B` is spliced to `B`'s
+// own incoming token (the chain closes over the hole, exactly as
+// `kill_store_splicing_memory_chain` does for a store), and only then do the
+// remaining *value* users, and the safepoint slots, follow the value to `A`.
+
+/// True when this op reads memory and writes none — the only thing allowed to
+/// sit between two loads this pass merges.
+///
+/// Reads the one table (`ir::Op::memory_shape`) rather than listing ops, so a
+/// new memory op is classified by the same authority `memory_token_slot` and
+/// `effect_of_node` read. An op with no shape at all (a φ, a `Return`, any pure
+/// node) answers `false`: it is not on a memory chain, and reaching one means
+/// the walk has left the territory this pass reasons about.
+fn is_pure_memory_read(op: &Op) -> bool {
+    matches!(
+        op.memory_shape().map(|s| s.access),
+        Some(crate::ir::MemAccess::FieldRead)
+            | Some(crate::ir::MemAccess::ArrayRead)
+            | Some(crate::ir::MemAccess::LengthRead)
+    )
+}
+
+/// How many links of memory chain the walk will follow before giving up.
+///
+/// A bound, not a tuning knob: the chain between two redundant reads is
+/// normally 0-4 links (the `sumWide` case is 1-3), and an unbounded walk on a
+/// graph whose chain has been left cyclic by a rewrite elsewhere would hang the
+/// compiler rather than miscompile. 64 is far past any real distance.
+const LOAD_CSE_CHAIN_BUDGET: usize = 64;
+
+/// Is memory state `to` reachable backwards from memory state `from` through
+/// nothing but pure reads anchored at `ctrl`?
+///
+/// `from == to` is the zero-length case and is `true`.
+fn memory_chain_reaches(graph: &Graph, from: NodeId, to: NodeId, ctrl: NodeId) -> bool {
+    let mut cur = from;
+    for _ in 0..LOAD_CSE_CHAIN_BUDGET {
+        if cur == to {
+            return true;
+        }
+        let Some(node) = graph.node_opt(cur) else {
+            return false;
+        };
+        if !is_pure_memory_read(&node.op) {
+            return false;
+        }
+        if node.input_opt(0) != Some(ctrl) {
+            return false;
+        }
+        let Some(slot) = crate::ir::memory_token_slot(node) else {
+            return false;
+        };
+        let Some(next) = node.input_opt(slot) else {
+            return false;
+        };
+        cur = next;
+    }
+    false
+}
+
+/// The GVN key of a memory read, with the memory token left out.
+///
+/// Hashes `(op, ty, frame_snapshot, inputs-except-the-token)`. The token slot
+/// is the one edge this pass reasons about separately; everything else is
+/// identity-compared by [`redundant_load_matches`] after the hash hit, exactly
+/// as `gvn` does.
+fn load_cse_hash(node: &Node, token_slot: usize) -> u64 {
+    let mut hasher = FxHasher::default();
+    node.op.hash(&mut hasher);
+    node.ty.hash(&mut hasher);
+    node.frame_snapshot.hash(&mut hasher);
+    for (i, input) in node.inputs.as_slice().iter().enumerate() {
+        if i == token_slot {
+            continue;
+        }
+        input.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Do these two reads address the same cell at the same program point? (The
+/// hash-collision check, and the real predicate.)
+fn redundant_load_matches(a: &Node, b: &Node, token_slot: usize) -> bool {
+    a.op == b.op
+        && a.ty == b.ty
+        && a.frame_snapshot == b.frame_snapshot
+        && a.inputs.len() == b.inputs.len()
+        && a.inputs
+            .as_slice()
+            .iter()
+            .zip(b.inputs.as_slice().iter())
+            .enumerate()
+            .all(|(i, (x, y))| i == token_slot || x == y)
+}
+
+/// Eliminate reads whose value a read already performed in the same block
+/// holds.
+///
+/// Returns `true` when it removed at least one. See the section comment above
+/// for the soundness argument; `CRATONVM_JIT_IR_LOAD_CSE` is the switch.
+fn eliminate_redundant_loads(graph: &mut Graph) -> bool {
+    if !load_cse_enabled() {
+        return false;
+    }
+    let dbg = std::env::var("CRATONVM_DBG_LOAD_CSE").is_ok();
+    // A memory op in a COMPACT layout carries no token, so it is not on the
+    // chain and the walk cannot see it. One such `Store` between two loads of
+    // the cell it writes would be a write this pass steps straight over. Today
+    // no such graph reaches here — the compact forms come from the EA bridge,
+    // and `apply_ea_to_ir` runs AFTER `optimize` — but "a pass that runs later
+    // does not build them yet" is a fact about pass order, not a property of
+    // this pass, and pass order is exactly the thing this file has been
+    // rearranging. So the whole graph is refused instead, which costs nothing
+    // in production and closes the argument.
+    if graph.nodes.iter().any(|n| {
+        n.op != Op::Dead
+            && n.op.memory_shape().is_some()
+            && crate::ir::memory_token_slot(n).is_none()
+    }) {
+        if dbg {
+            eprintln!(
+                "[DBG_LOAD_CSE] graph refused: it holds a memory op in a compact \
+                 layout, which carries no token this pass can follow"
+            );
+        }
+        return false;
+    }
+    // One bucket per address-key. Buckets hold every surviving read with that
+    // key, newest last, because the newest is the one whose memory state is
+    // closest to the candidate's and therefore the cheapest walk.
+    let mut buckets: FxHashMap<u64, Vec<NodeId>> = FxHashMap::default();
+    let mut removed = 0usize;
+    for id in 0..graph.nodes.len() {
+        let b = id as NodeId;
+        let (token_slot, b_mem, b_ctrl, key) = {
+            let node = &graph.nodes[id];
+            if node.op == Op::Dead || !is_pure_memory_read(&node.op) {
+                continue;
+            }
+            // Below the documented full arity the node is in a compact
+            // hand-built / EA-bridge layout and carries no memory token at
+            // all, so there is no heap state to compare and nothing this pass
+            // can say about it.
+            let Some(token_slot) = crate::ir::memory_token_slot(node) else {
+                continue;
+            };
+            let (Some(mem), Some(ctrl)) = (node.input_opt(token_slot), node.input_opt(0)) else {
+                continue;
+            };
+            (token_slot, mem, ctrl, load_cse_hash(node, token_slot))
+        };
+        let mut found = NO_NODE;
+        if let Some(bucket) = buckets.get(&key) {
+            for &a in bucket.iter().rev() {
+                let (Some(an), Some(bn)) = (graph.node_opt(a), graph.node_opt(b)) else {
+                    continue;
+                };
+                if !redundant_load_matches(an, bn, token_slot) {
+                    continue;
+                }
+                if an.input_opt(0) != Some(b_ctrl) {
+                    continue;
+                }
+                let Some(a_mem) = an.input_opt(token_slot) else {
+                    continue;
+                };
+                if memory_chain_reaches(graph, b_mem, a_mem, b_ctrl) {
+                    found = a;
+                    break;
+                }
+            }
+        }
+        if found == NO_NODE {
+            buckets.entry(key).or_default().push(b);
+            continue;
+        }
+        // Token users first: they want the chain, not the value. Splicing them
+        // to `b`'s own incoming token keeps every ordering `b` provided except
+        // `b`'s own read, which is about to stop existing.
+        for user in graph.users_of(b) {
+            let Some(node) = graph.node_opt(user) else {
+                continue;
+            };
+            let slots: Vec<usize> = node
+                .inputs
+                .as_slice()
+                .iter()
+                .enumerate()
+                .filter(|&(i, &x)| x == b && crate::ir::is_memory_token_slot(node, i))
+                .map(|(i, _)| i)
+                .collect();
+            for slot in slots {
+                graph.set_input(user, slot, b_mem);
+            }
+        }
+        // Everything still naming `b` is naming its VALUE, and that value is
+        // `found`'s. `replace_all_uses` carries the safepoint slots too, so a
+        // deopt frame that named the removed read follows it.
+        graph.replace_all_uses(b, found);
+        graph.kill(b);
+        removed += 1;
+        if dbg {
+            eprintln!("[DBG_LOAD_CSE] read {b} is redundant with {found}");
+        }
+    }
+    if removed > 0 {
+        IR_LOADS_CSE.fetch_add(removed as u64, std::sync::atomic::Ordering::Relaxed);
+        IR_LOADS_CSE_HERE.with(|c| c.set(c.get() + removed as u64));
+        if dbg {
+            eprintln!("[DBG_LOAD_CSE] removed {removed} redundant read(s)");
+        }
+    }
+    removed > 0
+}
+
+/// Reads this process removed as redundant, since it started.
+///
+/// Process-global and monotone, so a caller reads a DELTA around the compile it
+/// cares about. The closing identity: every read counted here had a surviving
+/// read with the same key, so `reads_after + this == reads_before`.
+static IR_LOADS_CSE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Total redundant reads eliminated by [`eliminate_redundant_loads`].
+pub fn ir_load_cse_census() -> u64 {
+    IR_LOADS_CSE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+thread_local! {
+    /// The same count, for THIS thread only.
+    ///
+    /// Both exist and neither is redundant. The process-global one answers
+    /// "what did this workload do", which is the question the `[c2-supersede]`
+    /// line is asked and the only one a cross-thread compile queue can answer.
+    /// It is also unreadable as a delta from a test: `cargo test` runs the
+    /// harness in parallel, `with_thread_overrides` is thread-local, so a
+    /// sibling test with the switch on inflates it by an amount that depends on
+    /// scheduling. That is not hypothetical — it is how
+    /// `the_census_counts_the_reads_this_pass_removed` first failed, reading 2
+    /// for its own 1.
+    ///
+    /// A test asserting "the pass removed exactly one read" has to read a
+    /// counter only its own thread can raise.
+    static IR_LOADS_CSE_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Redundant reads eliminated **on this thread**, since it started.
+pub fn ir_load_cse_census_here() -> u64 {
+    IR_LOADS_CSE_HERE.with(|c| c.get())
+}
+
+/// `CRATONVM_JIT_IR_LOAD_CSE` — default OFF while it is measured.
+fn load_cse_enabled() -> bool {
+    matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_LOAD_CSE").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
+}
+
 // ── SCEV-driven Loop-Invariant Code Motion (LICM) ────────────────────
 //
 // Hoists provably loop-invariant *pure* computations and *invariant loads*
@@ -1673,6 +2055,9 @@ fn licm(graph: &mut Graph) -> bool {
         // necessarily input slot 0, since a `Merge` header may carry the
         // back-edge at either slot.
         let preheader = entry_pred;
+        // One question about the LOOP, asked once, consumed by every load this
+        // header offers: may a hoist to this pre-header speculate at all?
+        let body_definitely_runs = loop_body_definitely_runs(graph, region, &back_ctrls);
         // ── Loop-invariant `Op::ArrayLength` ────────────────────────────────
         //
         // Run BEFORE the pre-header guard and the hard-barrier bail below, and
@@ -2032,9 +2417,11 @@ fn licm(graph: &mut Graph) -> bool {
                 // `FieldLoop.sum` has no disqualifying barrier at all, so it
                 // never went near it).
                 //
-                // `CRATONVM_JIT_IR_LICM_MEM_EDGE=1` turns it on. Default OFF:
-                // LICM is default-ON, so this changes where a load lands in
-                // every method that hoists one.
+                // `CRATONVM_JIT_IR_LICM_MEM_EDGE=0` turns it off. Default
+                // **ON** since 2026-09-11 — it landed off, and flipped in the
+                // same commit on the measurement (0.589x on `sum`, 0.472x on
+                // `sumWide`). It changes where a load lands in every method
+                // that hoists one, which is why it kept a kill switch.
                 //
                 // ── Speculation: the pre-header runs when the body does not ──
                 //
@@ -2065,7 +2452,15 @@ fn licm(graph: &mut Graph) -> bool {
                 //     non-null at the call site and SSA gives no other
                 //     definition — the fact `ir_check_elim` already seeds;
                 //   * `definitely_non_null` already answers for the base (a
-                //     fresh allocation, a materialized constant).
+                //     fresh allocation, a materialized constant);
+                //   * the BODY DEFINITELY RUNS — a constant-trip counted loop
+                //     with at least one trip. Then the pre-header is not
+                //     speculation at all: every fault the hoisted load can
+                //     raise, the first iteration was going to raise anyway.
+                //     This is the only one of the four that is a proof about
+                //     the LOOP rather than about the base, and it is narrow on
+                //     purpose — see [`loop_body_definitely_runs`] for what it
+                //     does and does not reach.
                 //
                 // This is a permission, not an analysis: anything else refuses,
                 // and a refusal costs an optimization rather than an answer. It
@@ -2074,7 +2469,8 @@ fn licm(graph: &mut Graph) -> bool {
                 // wrong, and it is default-ON.
                 let hoist_is_safe = inputs[0] == region
                     || base_non_null_on_entry(graph, base)
-                    || crate::ir_check_elim::definitely_non_null(&graph.nodes[base as usize].op);
+                    || crate::ir_check_elim::definitely_non_null(&graph.nodes[base as usize].op)
+                    || body_definitely_runs;
                 if !hoist_is_safe {
                     if dbg {
                         eprintln!(
@@ -2100,7 +2496,8 @@ fn licm(graph: &mut Graph) -> bool {
                         graph.nodes[load as usize].inputs[1] = new_mem;
                         if dbg {
                             eprintln!(
-                                "[DBG_LICM] load {load}: mem {} -> {new_mem} (the edge that                                  decides the block)",
+                                "[DBG_LICM] load {load}: mem {} -> {new_mem} (the edge that \
+                                 decides the block)",
                                 inputs[1]
                             );
                         }
@@ -3178,7 +3575,8 @@ fn publish_unroll_census(local: &[usize; 17]) {
                 + local[unroll_bucket::FRAME_UNCOPYABLE];
             total == local[unroll_bucket::HEADERS]
         },
-        "UnrollCensus does not close: {local:?} -- a `continue` in `unroll` has          no counter",
+        "UnrollCensus does not close: {local:?} -- a `continue` in `unroll` has \
+         no counter",
     );
     for (slot, v) in IR_UNROLL_CENSUS.iter().zip(local.iter()) {
         slot.fetch_add(*v as u64, std::sync::atomic::Ordering::Relaxed);
@@ -7878,6 +8276,452 @@ mod per_copy_frames_tests {
             g.nodes[here as usize].frame_snapshot,
             Some(0),
             "a refused call must leave the previous binding alone",
+        );
+    }
+}
+
+// ── Redundant-load elimination ─────────────────────────────────
+
+#[cfg(test)]
+mod load_cse_tests {
+    use super::*;
+    use crate::ir::IrBuilder;
+
+    /// Field 0 is `v`, field 1 is `w`. Both int.
+    fn field_info(pcs: &[(usize, usize)]) -> std::collections::HashMap<usize, (usize, u8)> {
+        pcs.iter().map(|&(pc, f)| (pc, (f, b'I'))).collect()
+    }
+
+    fn live_loads(g: &Graph) -> usize {
+        g.nodes
+            .iter()
+            .filter(|n| n.op != Op::Dead && matches!(n.op, Op::Load(_)))
+            .count()
+    }
+
+    /// Build with the real front end and run the whole pipeline, with
+    /// `CRATONVM_JIT_IR_LOAD_CSE` set to `on`.
+    fn optimized(
+        code: &[u8],
+        code_len: usize,
+        nargs: usize,
+        nlocals: usize,
+        info: &std::collections::HashMap<usize, (usize, u8)>,
+        on: bool,
+    ) -> Graph {
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_JIT_IR_LOAD_CSE", Some(if on { "1" } else { "0" }))],
+            || {
+                let mut builder = IrBuilder::new(nargs, nlocals);
+                builder.set_field_info(info.clone());
+                let mut g = builder.build(code, code_len).expect("IR build");
+                g.receiver_param = Some(0);
+                optimize(&mut g);
+                g
+            },
+        )
+    }
+
+    /// `int f() { return this.v + this.v + this.v + this.v; }`
+    ///
+    /// Four reads of one cell with nothing between them. The OFF arm is the
+    /// state of the tier until 2026-09-11 and is asserted, because "1 read"
+    /// means nothing without "4 reads" beside it: `gvn` skips them (a load is
+    /// not `Op::is_pure()`), and a load-aware `gvn` would ALSO have left four,
+    /// because the builder advances the memory token on every read and no two
+    /// of these share a memory input.
+    ///
+    /// This is `probes/FieldLoop.java` `sumWide`'s loop body with the loop
+    /// taken away — the shape whose four full read sequences per iteration
+    /// §7 of `c2-the-loop-body-is-mostly-code-it-never-runs-20260911.md`
+    /// measured at 145 instructions.
+    #[test]
+    fn four_reads_of_one_cell_with_nothing_between_them_become_one() {
+        #[rustfmt::skip]
+        let code = [
+            0x2Au8, 0xB4, 0x00, 0x07,       // aload_0; getfield v      pc 1
+            0x2A, 0xB4, 0x00, 0x07,         // aload_0; getfield v      pc 5
+            0x60,                           // iadd
+            0x2A, 0xB4, 0x00, 0x07,         // aload_0; getfield v      pc 10
+            0x60,                           // iadd
+            0x2A, 0xB4, 0x00, 0x07,         // aload_0; getfield v      pc 15
+            0x60,                           // iadd
+            0xAC,                           // ireturn
+        ];
+        let info = field_info(&[(1, 0), (5, 0), (10, 0), (15, 0)]);
+
+        let off = optimized(&code, code.len(), 1, 1, &info, false);
+        assert_eq!(
+            live_loads(&off),
+            4,
+            "without the switch the tier keeps every read; if this is not 4 \
+             the contrast below is measuring something else",
+        );
+
+        let on = optimized(&code, code.len(), 1, 1, &info, true);
+        assert_eq!(
+            live_loads(&on),
+            1,
+            "same cell, same heap, same block — three of the four reads are \
+             recomputing a value the first one already has",
+        );
+    }
+
+    /// A write between two reads of the same cell stops the merge.
+    ///
+    /// `int f() { int a = this.v; this.w = 1; return a + this.v; }` — and the
+    /// point is that the pass does not get to know `v` and `w` are different
+    /// cells. The chain walk admits only `MemAccess::{FieldRead, ArrayRead,
+    /// LengthRead}`; an `Op::Store` ends it whatever it writes. A version of
+    /// this pass that reasons about the store's address would keep one read
+    /// here, and would need an alias oracle to earn it.
+    #[test]
+    fn a_write_between_two_reads_of_the_same_cell_stops_the_merge() {
+        #[rustfmt::skip]
+        let code = [
+            0x2Au8, 0xB4, 0x00, 0x07,       // aload_0; getfield v      pc 1
+            0x3C,                           // istore_1                 a
+            0x2A, 0x04, 0xB5, 0x00, 0x08,   // aload_0; iconst_1; putfield w   pc 7
+            0x1B,                           // iload_1
+            0x2A, 0xB4, 0x00, 0x07,         // aload_0; getfield v      pc 12
+            0x60,                           // iadd
+            0xAC,                           // ireturn
+        ];
+        let info = field_info(&[(1, 0), (7, 1), (12, 0)]);
+
+        let on = optimized(&code, code.len(), 1, 2, &info, true);
+        assert_eq!(
+            live_loads(&on),
+            2,
+            "an `Op::Store` on the memory chain between them is a write this \
+             pass cannot see through, so both reads stand",
+        );
+    }
+
+    /// Two reads on OPPOSITE arms of a branch are not merged, even though they
+    /// name the same memory state.
+    ///
+    /// `int f(int c) { return c != 0 ? this.v : this.v; }`. Neither arm's read
+    /// is reached by the other, so their memory inputs are EQUAL — the chain
+    /// walk's zero-length case, which passes. The only thing refusing the merge
+    /// is the control-anchor check, and this test is what holds it in place:
+    /// merging them would pull a read (and its null check) onto a path that
+    /// need not take it, which is the bug §3a of
+    /// `c2-the-loop-body-is-mostly-code-it-never-runs-20260911.md` records
+    /// LICM having shipped for real.
+    #[test]
+    fn two_reads_on_opposite_arms_of_a_branch_are_not_merged() {
+        #[rustfmt::skip]
+        let code = [
+            0x1Bu8,                         // iload_1              c
+            0x99, 0x00, 0x0B,               // ifeq -> 12
+            0x2A, 0xB4, 0x00, 0x07,         // aload_0; getfield v  pc 5
+            0x3D,                           // istore_2
+            0xA7, 0x00, 0x08,               // goto -> 17
+            0x2A, 0xB4, 0x00, 0x07,         // aload_0; getfield v  pc 13
+            0x3D,                           // istore_2
+            0x1C,                           // iload_2
+            0xAC,                           // ireturn
+        ];
+        let info = field_info(&[(5, 0), (13, 0)]);
+
+        let on = optimized(&code, code.len(), 2, 3, &info, true);
+        assert_eq!(
+            live_loads(&on),
+            2,
+            "the two reads are on different control anchors; one does not \
+             happen when the other does, so neither may stand in for it",
+        );
+
+        // And the refusal has to be the CONTROL check doing it. If the two
+        // reads happened to disagree about memory as well, the chain walk
+        // would refuse them on its own and this test would pass with the
+        // control check deleted — which is the shape of a test that guards
+        // nothing.
+        let reads: Vec<NodeId> = on
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.op != Op::Dead && matches!(n.op, Op::Load(_)))
+            .map(|(i, _)| i as NodeId)
+            .collect();
+        let [x, y] = reads[..] else {
+            unreachable!("the count is asserted above")
+        };
+        assert_eq!(
+            on.nodes[x as usize].input_opt(1),
+            on.nodes[y as usize].input_opt(1),
+            "n{x} and n{y} must name the SAME memory state — nothing writes \
+             between the branch and either arm — so the chain walk passes \
+              them and only the control anchor separates them",
+        );
+        assert_ne!(
+            on.nodes[x as usize].input_opt(0),
+            on.nodes[y as usize].input_opt(0),
+            "n{x} and n{y} must sit on DIFFERENT control anchors; if a pass \
+             upstream merged the arms there is no branch here to test",
+        );
+    }
+
+    /// Removing a read REPAIRS the memory chain rather than short-circuiting
+    /// it.
+    ///
+    /// `int f() { int a = this.v; int b = this.w; int c = this.v; this.w = 1;
+    /// return a + b + c; }`. The third read is redundant with the first, and
+    /// the store's memory token names the third. The quiet wrong answer is to
+    /// let `replace_all_uses` carry that token to the SURVIVOR, which would
+    /// leave the store ordered after the first read but no longer after the
+    /// `w` read between them — free to be scheduled above a read it must
+    /// follow. The token is spliced to the removed node's own incoming token
+    /// instead, and that is what this asserts: the store's memory input is the
+    /// `w` read, not the `v` read.
+    #[test]
+    fn removing_a_read_splices_the_memory_chain_instead_of_shortcutting_it() {
+        #[rustfmt::skip]
+        let code = [
+            0x2Au8, 0xB4, 0x00, 0x07,       // aload_0; getfield v   pc 1
+            0x3C,                           // istore_1              a
+            0x2A, 0xB4, 0x00, 0x08,         // aload_0; getfield w   pc 6
+            0x3D,                           // istore_2              b
+            0x2A, 0xB4, 0x00, 0x07,         // aload_0; getfield v   pc 11
+            0x3E,                           // istore_3              c
+            0x2A, 0x04, 0xB5, 0x00, 0x08,   // aload_0; iconst_1; putfield w  pc 17
+            0x1B, 0x1C, 0x60, 0x1D, 0x60,   // a + b + c
+            0xAC,                           // ireturn
+        ];
+        let info = field_info(&[(1, 0), (6, 1), (11, 0), (17, 1)]);
+
+        let g = optimized(&code, code.len(), 1, 4, &info, true);
+        assert_eq!(
+            live_loads(&g),
+            2,
+            "the third read is redundant with the first; the `w` read between \
+             them is a different cell and stays",
+        );
+
+        // The one store, and the read its memory token names.
+        let store = g
+            .nodes
+            .iter()
+            .position(|n| matches!(n.op, Op::Store(_)))
+            .expect("the fixture writes `w` exactly once") as NodeId;
+        let token = g.nodes[store as usize]
+            .input_opt(1)
+            .expect("a full-form store carries a memory token");
+        let field_of = |load: NodeId| -> Option<i64> {
+            let n = g.node_opt(load)?;
+            if !matches!(n.op, Op::Load(_)) {
+                return None;
+            }
+            match g.node_opt(n.input_opt(3)?)?.op {
+                Op::Const(c) => Some(c),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            field_of(token),
+            Some(1),
+            "the store must stay ordered after the `w` read that sat between \
+             the removed read and its survivor — splicing to the survivor \
+             would drop exactly that edge",
+        );
+    }
+
+    /// The census counts what was removed, and counts nothing when the switch
+    /// is off.
+    ///
+    /// Asserted as a DELTA on the THREAD-LOCAL counter. The process-global
+    /// one is what the runtime prints, and it cannot carry this assertion:
+    /// `cargo test` runs in parallel and a sibling test with the switch on
+    /// raises it too, which is how the first version of this test read 2 for
+    /// its own 1.
+    ///
+    /// The off arm is asserted first and separately. A census that counts when
+    /// the switch is off would mean the flag is not the gate it claims to be,
+    /// and that failure looks nothing like the one the on arm catches.
+    #[test]
+    fn the_census_counts_the_reads_this_pass_removed() {
+        #[rustfmt::skip]
+        let code = [
+            0x2Au8, 0xB4, 0x00, 0x07,       // aload_0; getfield v      pc 1
+            0x2A, 0xB4, 0x00, 0x07,         // aload_0; getfield v      pc 5
+            0x60,                           // iadd
+            0xAC,                           // ireturn
+        ];
+        let info = field_info(&[(1, 0), (5, 0)]);
+
+        let before = ir_load_cse_census_here();
+        let _ = optimized(&code, code.len(), 1, 1, &info, false);
+        assert_eq!(
+            ir_load_cse_census_here() - before,
+            0,
+            "the switch is off, so the pass must not have run at all",
+        );
+        let _ = optimized(&code, code.len(), 1, 1, &info, true);
+        assert_eq!(
+            ir_load_cse_census_here() - before,
+            1,
+            "one of the two reads is redundant, and the census is the only \
+             thing that can tell 'the pass ran and removed it' from 'the \
+             front end never built two reads'",
+        );
+    }
+}
+
+#[cfg(test)]
+mod licm_counted_permission_tests {
+    use super::*;
+    use crate::ir::IrBuilder;
+
+    /// `static int walk(N o) { int a = 0; for (int i = 0; i < 1000; i++) a +=
+    /// o.v; return a; }`
+    ///
+    /// `o` is a STATIC method's parameter, so it may be null, and
+    /// `an_invariant_load_of_a_maybe_null_base_is_not_hoisted_out_of_a_maybe_
+    /// empty_loop` is the test that stops the read being hoisted over a loop
+    /// that might not run. Here the loop DOES run — the bound is a constant
+    /// 1000 — so the first iteration would have dereferenced `o` anyway and
+    /// the pre-header cannot invent a fault the body was not going to raise.
+    ///
+    /// The two arms differ only in the flag, and the OFF arm is asserted to
+    /// REFUSE: this is a widening, and a test that only shows the ON arm
+    /// hoisting cannot tell a widening from a hoist that was happening anyway.
+    ///
+    /// 1000 rather than 5 because the full unroller is default-ON and takes a
+    /// small constant-trip loop apart before LICM sees it. That is not this
+    /// test's concern — it calls `licm` directly — but it is the reason the
+    /// permission is narrow in production, and the fixture says so.
+    #[test]
+    fn a_maybe_null_base_hoists_out_of_a_loop_whose_trip_count_proves_it_runs() {
+        #[rustfmt::skip]
+        let code = [
+            0x03u8, 0x3D,               // iconst_0; istore_2       a = 0
+            0x03, 0x3E,                 // iconst_0; istore_3       i = 0
+            0x1D,                       // iload_3                  pc 4
+            0x11, 0x03, 0xE8,           // sipush 1000
+            0xA2, 0x00, 0x10,           // if_icmpge -> 24
+            0x1C, 0x2A, 0xB4, 0x00, 0x07, 0x60, 0x3D, // a += o.v   getfield pc 13
+            0x84, 0x03, 0x01,           // iinc 3, 1
+            0xA7, 0xFF, 0xEF,           // goto 4
+            0x1C, 0xAC,                 // iload_2; ireturn
+        ];
+        let mut info: std::collections::HashMap<usize, (usize, u8)> =
+            std::collections::HashMap::new();
+        info.insert(13, (0, b'I'));
+
+        let anchor_move = |on: bool| -> (NodeId, NodeId, NodeId) {
+            cratonvm_types::flags::with_thread_overrides(
+                &[(
+                    "CRATONVM_JIT_IR_LICM_HOIST_COUNTED",
+                    Some(if on { "1" } else { "0" }),
+                )],
+                || {
+                    let mut builder = IrBuilder::new(1, 4);
+                    builder.set_field_info(info.clone());
+                    let mut g = builder.build(&code, code.len()).expect("IR build");
+                    // No receiver: the base is a static parameter, which is the
+                    // whole point.
+                    g.receiver_param = None;
+                    for _ in 0..8 {
+                        let before = g.live_count();
+                        fold_constants(&mut g);
+                        algebraic_simplify(&mut g);
+                        gvn(&mut g);
+                        eliminate_dead_nodes(&mut g);
+                        if g.live_count() == before {
+                            break;
+                        }
+                    }
+                    // `licm` normalizes these itself, and the renumbering would
+                    // read as a hoist that never happened.
+                    collapse_trivial_merges(&mut g);
+                    let load = g
+                        .nodes
+                        .iter()
+                        .position(|n| matches!(n.op, Op::Load(_)))
+                        .expect("the fixture must contain the field read")
+                        as NodeId;
+                    let was = g.nodes[load as usize].inputs[0];
+                    licm(&mut g);
+                    (load, was, g.nodes[load as usize].inputs[0])
+                },
+            )
+        };
+
+        let (load, was, now) = anchor_move(false);
+        assert_eq!(
+            was, now,
+            "n{load}'s base may be null and the switch is off, so the hoist \
+             refuses — the state this widening starts from",
+        );
+
+        let (load, was, now) = anchor_move(true);
+        assert_ne!(
+            was, now,
+            "the loop counts to a constant 1000, so the body runs and the \
+             first iteration would have dereferenced the base anyway; n{load} \
+             may be hoisted",
+        );
+    }
+
+    /// And the loop that does NOT prove it runs is still refused with the
+    /// switch on.
+    ///
+    /// The same fixture with the bound read from a parameter instead of a
+    /// constant — `probes/ZeroTripHoist.java`'s shape, the one that threw a
+    /// `NullPointerException` for real. `analyze_counted_loop` needs a constant
+    /// bound, so it answers `NotCounted` here and the permission is not given.
+    /// Without this test the flag could be a blanket "hoist anything" and the
+    /// test above would not notice.
+    #[test]
+    fn a_loop_bounded_by_a_parameter_is_still_refused_with_the_switch_on() {
+        #[rustfmt::skip]
+        let code = [
+            0x03u8, 0x3D,               // iconst_0; istore_2       a = 0
+            0x03, 0x3E,                 // iconst_0; istore_3       i = 0
+            0x1D, 0x1B, 0xA2, 0x00, 0x10, // iload_3; iload_1; if_icmpge 22
+            0x1C, 0x2A, 0xB4, 0x00, 0x07, 0x60, 0x3D, // a += o.v  getfield pc 11
+            0x84, 0x03, 0x01,           // iinc 3, 1
+            0xA7, 0xFF, 0xF1,           // goto 4
+            0x1C, 0xAC,                 // iload_2; ireturn
+        ];
+        let mut info: std::collections::HashMap<usize, (usize, u8)> =
+            std::collections::HashMap::new();
+        info.insert(11, (0, b'I'));
+
+        let (load, was, now) = cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_JIT_IR_LICM_HOIST_COUNTED", Some("1"))],
+            || {
+                let mut builder = IrBuilder::new(2, 4);
+                builder.set_field_info(info.clone());
+                let mut g = builder.build(&code, 24).expect("IR build");
+                g.receiver_param = None;
+                for _ in 0..8 {
+                    let before = g.live_count();
+                    fold_constants(&mut g);
+                    algebraic_simplify(&mut g);
+                    gvn(&mut g);
+                    eliminate_dead_nodes(&mut g);
+                    if g.live_count() == before {
+                        break;
+                    }
+                }
+                collapse_trivial_merges(&mut g);
+                let load = g
+                    .nodes
+                    .iter()
+                    .position(|n| matches!(n.op, Op::Load(_)))
+                    .expect("the fixture must contain the field read")
+                    as NodeId;
+                let was = g.nodes[load as usize].inputs[0];
+                licm(&mut g);
+                (load, was, g.nodes[load as usize].inputs[0])
+            },
+        );
+        assert_eq!(
+            was, now,
+            "n{load}: the bound is a parameter, so nothing proves the body \
+             runs; `walk(null, 0)` must keep returning 0 rather than throwing",
         );
     }
 }
