@@ -131,9 +131,191 @@ pub enum TcpHandle {
     Closed,
 }
 
-pub(crate) fn tcp_registry() -> &'static RwLock<HashMap<i32, TcpHandle>> {
-    static REG: OnceLock<RwLock<HashMap<i32, TcpHandle>>> = OnceLock::new();
-    REG.get_or_init(|| RwLock::new(HashMap::new()))
+pub(crate) fn tcp_registry() -> &'static TimedRegistry<HashMap<i32, TcpHandle>> {
+    static REG: OnceLock<TimedRegistry<HashMap<i32, TcpHandle>>> = OnceLock::new();
+    REG.get_or_init(|| TimedRegistry::new(HashMap::new()))
+}
+
+/// `parking_lot::RwLock` with opt-in wait/hold timing per call site
+/// (`CRATONVM_DBG_SC_CLOSE_PHASES`).
+///
+/// Exists because the connected-close stall was traced to acquiring THIS lock
+/// — the main thread waiting to read it inside `sc_close`, the acceptor waiting
+/// to write it in `tcp_remove` — while the same syscalls with no VM and no
+/// global lock never stall. Every guard here is held only around a syscall, so
+/// the question is which one, at which call site, holds it for a Windows-tick
+/// length. Timing is off unless the flag is set, and a report is printed only
+/// AFTER the lock is released so it cannot lengthen the hold it measures.
+pub(crate) struct TimedRegistry<T> {
+    inner: RwLock<T>,
+}
+
+type RegistrySite = &'static std::panic::Location<'static>;
+
+impl<T> TimedRegistry<T> {
+    fn new(value: T) -> Self {
+        Self {
+            inner: RwLock::new(value),
+        }
+    }
+
+    #[track_caller]
+    pub(crate) fn read(&self) -> TimedReadGuard<'_, T> {
+        if !close_phases_enabled() {
+            return TimedReadGuard {
+                guard: std::mem::ManuallyDrop::new(self.inner.read()),
+                since: None,
+            };
+        }
+        let site = std::panic::Location::caller();
+        let t0 = std::time::Instant::now();
+        let guard = self.inner.read();
+        report_registry_wait("read", site, t0.elapsed());
+        TimedReadGuard {
+            guard: std::mem::ManuallyDrop::new(guard),
+            since: Some((std::time::Instant::now(), site)),
+        }
+    }
+
+    #[track_caller]
+    pub(crate) fn write(&self) -> TimedWriteGuard<'_, T> {
+        if !close_phases_enabled() {
+            return TimedWriteGuard {
+                guard: std::mem::ManuallyDrop::new(self.inner.write()),
+                since: None,
+            };
+        }
+        let site = std::panic::Location::caller();
+        let t0 = std::time::Instant::now();
+        let guard = self.inner.write();
+        report_registry_wait("write", site, t0.elapsed());
+        TimedWriteGuard {
+            guard: std::mem::ManuallyDrop::new(guard),
+            since: Some((std::time::Instant::now(), site)),
+        }
+    }
+}
+
+fn report_registry_wait(kind: &str, site: RegistrySite, waited: Duration) {
+    if waited > Duration::from_millis(2) {
+        eprintln!(
+            "[TCP_REGISTRY] WAITED {}us for {kind} at {}:{} thread={:?}",
+            waited.as_micros(),
+            site.file(),
+            site.line(),
+            std::thread::current().id()
+        );
+    }
+}
+
+fn report_registry_hold(kind: &str, site: RegistrySite, held: Duration) {
+    if held > Duration::from_millis(2) {
+        eprintln!(
+            "[TCP_REGISTRY] HELD {}us {kind} at {}:{} thread={:?}",
+            held.as_micros(),
+            site.file(),
+            site.line(),
+            std::thread::current().id()
+        );
+    }
+}
+
+pub(crate) struct TimedReadGuard<'a, T> {
+    guard: std::mem::ManuallyDrop<parking_lot::RwLockReadGuard<'a, T>>,
+    since: Option<(std::time::Instant, RegistrySite)>,
+}
+
+impl<T> std::ops::Deref for TimedReadGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T> Drop for TimedReadGuard<'_, T> {
+    fn drop(&mut self) {
+        let held = self.since.map(|(t, _)| t.elapsed());
+        // SAFETY: dropped exactly once, here, and never touched afterwards.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.guard) };
+        if let (Some(held), Some((_, site))) = (held, self.since) {
+            report_registry_hold("read", site, held);
+        }
+    }
+}
+
+pub(crate) struct TimedWriteGuard<'a, T> {
+    guard: std::mem::ManuallyDrop<parking_lot::RwLockWriteGuard<'a, T>>,
+    since: Option<(std::time::Instant, RegistrySite)>,
+}
+
+impl<T> std::ops::Deref for TimedWriteGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T> std::ops::DerefMut for TimedWriteGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.guard
+    }
+}
+
+impl<T> Drop for TimedWriteGuard<'_, T> {
+    fn drop(&mut self) {
+        let held = self.since.map(|(t, _)| t.elapsed());
+        // SAFETY: dropped exactly once, here, and never touched afterwards.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.guard) };
+        if let (Some(held), Some((_, site))) = (held, self.since) {
+            report_registry_hold("write", site, held);
+        }
+    }
+}
+
+/// Stream ids whose OS socket has been DUPLICATED (`try_clone`) for a selector.
+///
+/// Such a stream is the one case a plain close cannot end: on Windows the
+/// duplicate keeps the connection open, so `sc_close` must send the FIN itself
+/// with `shutdown(Write)`. Every other stream is closed exactly as HotSpot closes
+/// it — by closing the socket — which sends the same graceful FIN. See
+/// `sc_close_needs_fin`.
+fn tcp_duplicated() -> &'static parking_lot::Mutex<std::collections::HashSet<i32>> {
+    static SET: OnceLock<parking_lot::Mutex<std::collections::HashSet<i32>>> = OnceLock::new();
+    SET.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn mark_duplicated(id: i32, clone: Option<TcpStream>) -> Option<TcpHandleClone> {
+    if clone.is_some() {
+        tcp_duplicated().lock().insert(id);
+    }
+    clone.map(TcpHandleClone::Stream)
+}
+
+/// `CRATONVM_NET_CLOSE_SKIP_SHUTDOWN` (default ON). `=0` restores the
+/// unconditional `shutdown(Write)` on every connected close.
+fn close_skip_shutdown_enabled() -> bool {
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_NET_CLOSE_SKIP_SHUTDOWN")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
+
+/// Must this close send the FIN itself, or will closing the socket do it?
+///
+/// `stream` is a clone of the registry's `Arc`, so a count of 2 means nobody
+/// else holds it. More means another thread is inside a read or write on this
+/// stream, and the `shutdown` is part of how that thread is told the channel is
+/// closing (see `docs/internal/jdk-only/W2-2-blocked-reader-async-close-wakeup.md`):
+/// dropping our references would not close the socket under it.
+fn sc_close_needs_fin(id: i32, stream: &Arc<TcpStream>) -> bool {
+    !close_skip_shutdown_enabled()
+        || Arc::strong_count(stream) > 2
+        || tcp_duplicated().lock().contains(&id)
 }
 
 /// Try to clone a registered handle out of the tcp_registry. Returns
@@ -144,13 +326,13 @@ pub(crate) fn tcp_clone_for_selector(id: i32) -> Option<TcpHandleClone> {
     let regs = tcp_registry().read();
     match regs.get(&id) {
         Some(TcpHandle::Listener(l)) => l.try_clone().ok().map(TcpHandleClone::Listener),
-        Some(TcpHandle::Stream(s)) => s.try_clone().ok().map(TcpHandleClone::Stream),
-        Some(TcpHandle::Bound(s)) => s.try_clone().ok().map(TcpHandleClone::Stream),
+        Some(TcpHandle::Stream(s)) => mark_duplicated(id, s.try_clone().ok()),
+        Some(TcpHandle::Bound(s)) => mark_duplicated(id, s.try_clone().ok()),
         // A connect-in-progress socket is a live pollable fd: clone it as a
         // Stream so the selector polls it for write-readiness and surfaces
         // OP_CONNECT naturally once the OS completes (or refuses) the connect.
         Some(TcpHandle::Connecting(s)) | Some(TcpHandle::ConnectFailed(s, _)) => {
-            s.try_clone().ok().map(TcpHandleClone::Stream)
+            mark_duplicated(id, s.try_clone().ok())
         }
         // AF_UNIX listener: hand the selector the raw OS handle rather than a
         // duplicate. It is only ever *polled*, never owned, and `sc_close`
@@ -250,6 +432,7 @@ fn tcp_register(h: TcpHandle) -> i32 {
 
 fn tcp_remove(id: i32) {
     tcp_registry().write().remove(&id);
+    tcp_duplicated().lock().remove(&id);
     tcp_blocking_state().write().remove(&id);
     tcp_option_state()
         .write()
@@ -378,12 +561,12 @@ fn accept_close_aware(
                         l.set_nonblocking(true)?;
                         nonblocking_set = true;
                     }
-                    Some(l.accept())
+                    Some((l.accept(), cratonvm_native_api::net_wait::raw_sock(l)))
                 }
                 _ => None,
             }
         };
-        let Some(result) = attempt else {
+        let Some((result, raw)) = attempt else {
             return Err(std::io::Error::new(
                 ErrorKind::Interrupted,
                 "server channel closed",
@@ -395,7 +578,7 @@ fn accept_close_aware(
                 if !blocking {
                     return Ok(None);
                 }
-                std::thread::sleep(ACCEPT_CLOSE_POLL);
+                accept_park(raw, ACCEPT_CLOSE_POLL);
             }
             // Reissue on EINTR rather than reporting it. The Unix-domain
             // sibling below has carried this arm since it was written; this
@@ -425,9 +608,41 @@ fn accept_until_deadline(
                 if remaining.is_zero() {
                     return Ok(None);
                 }
-                std::thread::sleep(remaining.min(ACCEPT_CLOSE_POLL));
+                let bound = remaining.min(ACCEPT_CLOSE_POLL);
+                match tcp_listener_raw(id) {
+                    Some(raw) => accept_park(raw, bound),
+                    None => std::thread::sleep(bound),
+                }
             }
         }
+    }
+}
+
+/// Park an accept loop between two non-blocking attempts.
+///
+/// A kernel wait on the listener bounded by `bound`, so a connection that
+/// arrives mid-wait is taken at once instead of after the rest of a fixed
+/// sleep: measured server-side accept wait with the old 10 ms sleep was p90
+/// 15.9 ms, against HotSpot's 2.1 ms. The bound still gives the caller its
+/// close/interrupt re-check cadence.
+///
+/// `raw` was read under the registry lock and the lock was then dropped, so it
+/// is a wake-up HINT only: `cratonvm_native_api::net_wait` explains why a stale
+/// or recycled handle costs at most one spurious pass or one full bound. Under
+/// `CRATONVM_NET_EVENT_WAITS=0` this is the historical sleep.
+fn accept_park(raw: cratonvm_native_api::net_wait::RawSock, bound: Duration) {
+    if cratonvm_native_api::net_wait::event_waits_enabled() {
+        cratonvm_native_api::net_wait::wait_readable_raw(raw, bound.as_millis() as i32);
+    } else {
+        std::thread::sleep(bound);
+    }
+}
+
+/// The registry listener's raw handle, for [`accept_park`].
+fn tcp_listener_raw(id: i32) -> Option<cratonvm_native_api::net_wait::RawSock> {
+    match tcp_registry().read().get(&id) {
+        Some(TcpHandle::Listener(l)) => Some(cratonvm_native_api::net_wait::raw_sock(l)),
+        _ => None,
     }
 }
 
@@ -1946,9 +2161,142 @@ fn g_sc_configure_blocking_asc(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// `close()` -- guarded; `final` on `AbstractInterruptibleChannel`, which
 /// drives the subclass's own `implCloseChannel`/`implCloseSelectableChannel`.
 fn g_sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    match foreign_nio_delegate(ctx, args, "close", "()V") {
+    let started = close_phases_enabled().then(std::time::Instant::now);
+    let delegated = foreign_nio_delegate(ctx, args, "close", "()V");
+    if let Some(t) = started {
+        CLOSE_DELEGATE_US.with(|c| c.set(t.elapsed().as_micros() as u64));
+    }
+    match delegated {
         Some(r) => r,
         None => sc_close(ctx, args),
+    }
+}
+
+// ---- `CRATONVM_DBG_SC_CLOSE_PHASES`: where a slow SocketChannel.close() waits --
+//
+// Measured: ~6% of connected closes on Windows took one 12-25 ms stall, arriving
+// at ~15 ms intervals, with zero GC cycles and on a 32-core host (so not CPU
+// starvation), while `java.net.Socket.close()` and pure-Java code on the same
+// thread did not stall. The earlier inline `eprintln!` timing could not locate
+// it: two threads printing per close contended on stderr's own lock and moved
+// the stall into the measurement. This instrument keeps every sample in
+// atomics, prints one line per SLOW close only, and a summary every 1000.
+
+const CLOSE_PHASES: [&str; 12] = [
+    "delegate_check",
+    "read_reg_id",
+    "dbg_block",
+    "shutdown",
+    "deregister_fd",
+    "registry_remove",
+    "socket_drop",
+    "side_tables",
+    "deregister_channel",
+    "cf_clear",
+    "mark_closed",
+    "ssc_cache",
+];
+const PH_READ_REG_ID: usize = 1;
+const PH_DBG_BLOCK: usize = 2;
+const PH_SHUTDOWN: usize = 3;
+const PH_DEREGISTER_FD: usize = 4;
+const PH_REGISTRY_REMOVE: usize = 5;
+const PH_SOCKET_DROP: usize = 6;
+const PH_SIDE_TABLES: usize = 7;
+const PH_DEREGISTER_CHANNEL: usize = 8;
+const PH_CF_CLEAR: usize = 9;
+const PH_MARK_CLOSED: usize = 10;
+const PH_SSC_CACHE: usize = 11;
+
+thread_local! {
+    static CLOSE_DELEGATE_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+static CLOSE_PHASE_SAMPLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CLOSE_PHASE_SLOW_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CLOSE_PHASE_SLOW: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+static CLOSE_PHASE_MAX_US: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+
+fn close_phases_enabled() -> bool {
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_SC_CLOSE_PHASES")
+            .is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0")
+    })
+}
+
+struct ClosePhaseClock {
+    on: bool,
+    last: std::time::Instant,
+    us: [u64; 12],
+}
+
+impl ClosePhaseClock {
+    fn start() -> Self {
+        let on = close_phases_enabled();
+        let mut us = [0u64; 12];
+        if on {
+            us[0] = CLOSE_DELEGATE_US.with(|c| c.replace(0));
+        }
+        Self {
+            on,
+            last: std::time::Instant::now(),
+            us,
+        }
+    }
+
+    fn mark(&mut self, phase: usize) {
+        if self.on {
+            let now = std::time::Instant::now();
+            self.us[phase] += now.duration_since(self.last).as_micros() as u64;
+            self.last = now;
+        }
+    }
+
+    fn finish(self) {
+        if !self.on {
+            return;
+        }
+        let total: u64 = self.us.iter().sum();
+        for (i, &v) in self.us.iter().enumerate() {
+            if v > 2_000 {
+                CLOSE_PHASE_SLOW[i].fetch_add(1, Ordering::Relaxed);
+            }
+            CLOSE_PHASE_MAX_US[i].fetch_max(v, Ordering::Relaxed);
+        }
+        if total > 5_000 {
+            CLOSE_PHASE_SLOW_TOTAL.fetch_add(1, Ordering::Relaxed);
+            let parts: Vec<String> = self
+                .us
+                .iter()
+                .enumerate()
+                .filter(|(_, &v)| v >= 200)
+                .map(|(i, v)| format!("{}={v}us", CLOSE_PHASES[i]))
+                .collect();
+            eprintln!(
+                "[SC_CLOSE_PHASES] slow total={total}us thread={:?} {}",
+                std::thread::current().id(),
+                parts.join(" ")
+            );
+        }
+        let n = CLOSE_PHASE_SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 1000 == 0 {
+            let per: Vec<String> = (0..12)
+                .map(|i| {
+                    format!(
+                        "{}:{}/{}us",
+                        CLOSE_PHASES[i],
+                        CLOSE_PHASE_SLOW[i].load(Ordering::Relaxed),
+                        CLOSE_PHASE_MAX_US[i].load(Ordering::Relaxed)
+                    )
+                })
+                .collect();
+            eprintln!(
+                "[SC_CLOSE_PHASES] summary closes={n} slow_total={} slow>2ms/max per phase: {}",
+                CLOSE_PHASE_SLOW_TOTAL.load(Ordering::Relaxed),
+                per.join(" ")
+            );
+        }
     }
 }
 
@@ -2340,8 +2688,11 @@ fn sc_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let mut clock = ClosePhaseClock::start();
     if let Some(this) = obj_or_none(args, 0) {
-        if let Some(id) = read_reg_id(ctx, this) {
+        let reg_id = read_reg_id(ctx, this);
+        clock.mark(PH_READ_REG_ID);
+        if let Some(id) = reg_id {
             // Diagnostic (CRATONVM_DBG_SC_CLOSE=1, added 2026-07-16 during the
             // StompWebSocketIntegrationTests investigation): trace every
             // SocketChannel.close() with local/peer address + wall-clock time.
@@ -2388,6 +2739,7 @@ fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                     );
                 }
             }
+            clock.mark(PH_DBG_BLOCK);
             // Force the write-side FIN now. A selector this channel was
             // registered with holds a `try_clone()`d duplicate of the socket
             // (see `nio_selector::selector_register`); on Windows, closing only
@@ -2398,10 +2750,30 @@ fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             // aborting the read side is RST-prone on Windows and surfaces to the
             // client as WSAECONNABORTED instead of the graceful close Tomcat's
             // swallow-input path expects.
-            {
+            //
+            // MEASURED (`CRATONVM_DBG_SC_CLOSE_PHASES`, 2,000 connected closes,
+            // Windows 11): this `shutdown` used to run INSIDE a `tcp_registry`
+            // read lock, and it was the ONLY holder of that lock ever seen to
+            // hold it past 2 ms — 10 to 25 ms, on every one of the 39 closes the
+            // Java side saw as slow. Every other thread's connect, accept and
+            // close queued behind it (the acceptor was seen waiting 18-25 ms for
+            // the write lock). HotSpot sends no `shutdown` before closing a
+            // socket, and the same call outside the VM never stalled.
+            //
+            // So: take the `Arc` out and release the registry first, and send
+            // the FIN ourselves only when closing the socket would not (see
+            // `sc_close_needs_fin`). Otherwise the drop in `tcp_remove` below
+            // closes the socket, which sends the same graceful FIN.
+            let stream = {
                 let map = tcp_registry().read();
-                if let Some(TcpHandle::Stream(s)) = map.get(&id) {
-                    lingering_channel_close(id, s);
+                match map.get(&id) {
+                    Some(TcpHandle::Stream(s)) => Some(Arc::clone(s)),
+                    _ => None,
+                }
+            };
+            if let Some(s) = stream {
+                if sc_close_needs_fin(id, &s) {
+                    lingering_channel_close(id, &s);
                 }
             }
             // Drop the selector's cloned handle too, mirroring the JDK where
@@ -2409,29 +2781,51 @@ fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             // live duplicate of a logically-closed socket. Done after dropping
             // the tcp_registry lock above to keep the `selectors → tcp_registry`
             // lock order of the select path (no inversion).
+            clock.mark(PH_SHUTDOWN);
             crate::nio_selector::deregister_fd_everywhere(id);
-            tcp_remove(id);
+            clock.mark(PH_DEREGISTER_FD);
+            if clock.on {
+                // `tcp_remove`, split so the registry write-lock wait and the
+                // socket drop are measured apart.
+                let removed = tcp_registry().write().remove(&id);
+                clock.mark(PH_REGISTRY_REMOVE);
+                drop(removed);
+                clock.mark(PH_SOCKET_DROP);
+                tcp_duplicated().lock().remove(&id);
+                tcp_blocking_state().write().remove(&id);
+                tcp_option_state()
+                    .write()
+                    .retain(|(option_id, _), _| *option_id != id);
+                clock.mark(PH_SIDE_TABLES);
+            } else {
+                tcp_remove(id);
+            }
         }
         // A registration made before this channel had a socket is filed under a
         // placeholder pseudo-fd, which the fd-keyed sweep above cannot see; drop
         // it too, or `Selector.keys()` keeps reporting a closed channel.
         crate::nio_selector::deregister_channel_everywhere(ctx, this);
+        clock.mark(PH_DEREGISTER_CHANNEL);
         // Drop the synthetic state entirely: a later isOpen()/isConnected()
         // then reads the default Int(0) (== closed/not-connected), and the
         // side-table does not grow across many short-lived connections.
         cf_clear(ctx, this);
+        clock.mark(PH_CF_CLEAR);
         // ... and the JDK's OWN `closed` flag, which is what every reader that
         // does not go through `sc_is_open` consults — including any compiled
         // caller, because the JIT devirtualises `final` methods and
         // `AbstractInterruptibleChannel.isOpen()` is one. See
         // `mark_jdk_channel_closed`.
         mark_jdk_channel_closed(ctx, this);
+        clock.mark(PH_MARK_CLOSED);
         // Same for the `ServerSocketChannel.socket()` adaptor row. It holds two
         // GC roots, so leaving it behind would keep a closed listener and its
         // `java.net.ServerSocket` view alive for the life of the process.
         // A no-op for a plain SocketChannel, which never has a row.
         ssc_socket_cache_clear(ctx, this);
+        clock.mark(PH_SSC_CACHE);
     }
+    clock.finish();
     Ok(None)
 }
 
@@ -5370,7 +5764,12 @@ fn ssc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let listener = if bind_addr.ip().is_unspecified() {
         bind_wildcard_listener(ctx, this, bind_addr.port(), backlog)
     } else {
-        TcpListener::bind(bind_addr)
+        // Honours `backlog` with the JDK's `< 1 ? 50 : backlog`. This was
+        // `TcpListener::bind`, which listens at std's own 128 whatever Java
+        // asked for — measured 128 for a requested 50 AND for a requested
+        // 1024, where HotSpot queues 50 and 200. See
+        // `cratonvm_native_api::net_wait`.
+        cratonvm_native_api::net_wait::bind_tcp_listener(bind_addr, backlog)
     }
     .map_err(|e| map_err(&bind_addr.to_string(), e))?;
     ssc_finish_bind(ctx, this, listener, port as i32)
@@ -5408,7 +5807,10 @@ fn bind_wildcard_listener(
     backlog: i32,
 ) -> Result<TcpListener, std::io::Error> {
     if cf_get(ctx, this, F_FAMILY).as_int().unwrap_or(0) == FAMILY_INET {
-        return TcpListener::bind(SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port)));
+        return cratonvm_native_api::net_wait::bind_tcp_listener(
+            SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port)),
+            backlog,
+        );
     }
     cratonvm_native_api::fd_table::open_tcp_dual_stack_listener(port, backlog)
 }

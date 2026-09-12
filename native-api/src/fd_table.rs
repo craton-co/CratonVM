@@ -183,6 +183,23 @@ pub fn open_tcp_dual_stack_listener(
     port: u16,
     backlog: i32,
 ) -> Result<std::net::TcpListener, io::Error> {
+    let listener = open_tcp_dual_stack_unlistened(port)?;
+    // The JDK's `backlog < 1 ? 50 : backlog`. This used to substitute std's 128
+    // for a non-positive request, and `sun.nio.ch.Net.bind0` passed 0 — so a
+    // wildcard `ServerSocket` queued 128 whatever it asked for. See
+    // `crate::net_wait`. Under `CRATONVM_NET_JDK_BACKLOG=0` the old rule stands.
+    if crate::net_wait::jdk_backlog_enabled() {
+        crate::net_wait::listen_existing(&listener, backlog)?;
+    } else {
+        socket2::SockRef::from(&listener).listen(if backlog > 0 { backlog } else { 128 })?;
+    }
+    Ok(listener)
+}
+
+/// [`open_tcp_dual_stack_listener`] stopped short of `listen()`, for the
+/// `sun.nio.ch.Net` path, where the backlog only arrives with the later
+/// `Net.listen(fd, backlog)` call.
+pub fn open_tcp_dual_stack_unlistened(port: u16) -> Result<std::net::TcpListener, io::Error> {
     let socket = match socket2::Socket::new(
         socket2::Domain::IPV6,
         socket2::Type::STREAM,
@@ -194,7 +211,7 @@ pub fn open_tcp_dual_stack_listener(
         // No IPv6 stack. The v4 wildcard is the JDK's own fallback and this
         // call site's pre-dual-stack behaviour.
         Err(_) => {
-            return std::net::TcpListener::bind(std::net::SocketAddr::from((
+            return crate::net_wait::bind_tcp_unlistened_listener(std::net::SocketAddr::from((
                 std::net::Ipv4Addr::UNSPECIFIED,
                 port,
             )))
@@ -204,7 +221,6 @@ pub fn open_tcp_dual_stack_listener(
     socket.set_reuse_address(true)?;
     let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
     socket.bind(&addr.into())?;
-    socket.listen(if backlog > 0 { backlog } else { 128 })?;
     Ok(socket.into())
 }
 

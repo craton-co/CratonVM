@@ -960,13 +960,27 @@ fn net_accept_close_aware(
 ) -> std::io::Result<(TcpStream, SocketAddr)> {
     listener.set_nonblocking(true)?;
     loop {
-        match listener.accept() {
+        match accept_listening(listener) {
             Ok(pair) => return Ok(pair),
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 if !net_listener_still_registered(fd) {
                     return Err(net_accept_closed_err());
                 }
-                std::thread::sleep(NET_ACCEPT_CLOSE_POLL);
+                // Wait in the kernel for a pending connection, bounded by the
+                // same quantum so a close is still noticed on the next pass.
+                // The sleep this replaces was a latency floor, not just a
+                // liveness bound: a connection arriving just after the check
+                // waited out all of it. The handle is safe to poll here — this
+                // loop holds the listener's `Arc` and its mutex for its whole
+                // life, so it cannot be closed and recycled underneath us.
+                if cratonvm_native_api::net_wait::event_waits_enabled() {
+                    cratonvm_native_api::net_wait::wait_readable_raw(
+                        cratonvm_native_api::net_wait::raw_sock(listener),
+                        NET_ACCEPT_CLOSE_POLL.as_millis() as i32,
+                    );
+                } else {
+                    std::thread::sleep(NET_ACCEPT_CLOSE_POLL);
+                }
             }
             Err(e) => return Err(e),
         }
@@ -1260,7 +1274,20 @@ fn net_bind0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // for the Tribes auto-bind loop that breaks on.
     let target = crate::socket_channel::single_bind_addr(&addr_text, port.clamp(0, 65535) as u16)
         .map_err(|e| net_err(&bind_addr, e))?;
-    let listener = if target.ip().is_unspecified() && prefer_ipv6 {
+    // Bound but NOT yet listening. `NioSocketImpl.bind` calls
+    // `Net.listen(fd, backlog)` right after this, and that call is the only
+    // place the caller's backlog exists. `TcpListener::bind` listened here, at
+    // std's own 128, and `net_listen` was a no-op, so `new ServerSocket(0, 1024)`
+    // queued 128 connections where HotSpot queues 200 (the Windows cap) and a
+    // wider connect burst was REFUSED. `net_accept` listens at the JDK default
+    // if anything ever accepts without listening first.
+    let listener = if cratonvm_native_api::net_wait::jdk_backlog_enabled() {
+        if target.ip().is_unspecified() && prefer_ipv6 {
+            cratonvm_native_api::fd_table::open_tcp_dual_stack_unlistened(target.port())
+        } else {
+            cratonvm_native_api::net_wait::bind_tcp_unlistened_listener(target)
+        }
+    } else if target.ip().is_unspecified() && prefer_ipv6 {
         cratonvm_native_api::fd_table::open_tcp_dual_stack_listener(target.port(), 0)
     } else {
         TcpListener::bind(target)
@@ -1311,9 +1338,46 @@ fn net_bind0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 
 /// `listen(FileDescriptor fd, int backlog) -> void`
 ///
-/// No-op on Rust's `TcpListener` — backlog is locked in at bind time.
-fn net_listen(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+/// Listens the socket `bind0` left bound-but-not-listening, with the JDK's
+/// `backlog < 1 ? 50 : backlog`. This was a no-op, on the grounds that "backlog
+/// is locked in at bind time" — true of `TcpListener::bind`, which is exactly
+/// why `bind0` no longer uses it. Under `CRATONVM_NET_JDK_BACKLOG=0`, `bind0`
+/// listens as before and this stays a no-op.
+fn net_listen(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if !cratonvm_native_api::net_wait::jdk_backlog_enabled() {
+        return Ok(None);
+    }
+    let fd_obj = obj_arg(args, 0)?;
+    let backlog = int_arg(args, 1);
+    let fd = net_fd_from_descriptor(ctx, fd_obj)
+        .ok_or_else(|| ioex("listen: FileDescriptor has no fd id"))?;
+    let listener = {
+        let map = net_sockets().read();
+        match map.get(&fd) {
+            Some(NetSocketHandle::Listener(l)) => Arc::clone(l),
+            Some(_) => return Err(ioex("listen: fd is not bound")),
+            None => return Err(ioex("listen: unknown fd")),
+        }
+    };
+    let guard = listener.lock();
+    cratonvm_native_api::net_wait::listen_existing(&guard, backlog)
+        .map_err(|e| net_err("listen", e))?;
+    dbgnet!("listen fd={fd:#x} backlog={backlog}");
     Ok(None)
+}
+
+/// `accept()`, listening first if nothing did. `bind0` now leaves the socket
+/// unlistened for `Net.listen` to finish; the JDK always calls it, so this is a
+/// safety net for any other route to an accept, not a path. An accept on an
+/// unlistened socket fails `EINVAL`/`WSAEINVAL`, i.e. `InvalidInput`.
+fn accept_listening(listener: &TcpListener) -> std::io::Result<(TcpStream, SocketAddr)> {
+    match listener.accept() {
+        Err(e) if e.kind() == ErrorKind::InvalidInput => {
+            cratonvm_native_api::net_wait::listen_existing(listener, 0)?;
+            listener.accept()
+        }
+        other => other,
+    }
 }
 
 /// `accept(FileDescriptor fd, FileDescriptor newfd, InetSocketAddress[] isaa)
@@ -1374,7 +1438,7 @@ fn net_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             listener
                 .set_nonblocking(true)
                 .map_err(|e| net_err("accept", e))?;
-            match listener.accept() {
+            match accept_listening(&listener) {
                 Ok(pair) => Some(pair),
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
                     // A close that races the retry loop must surface as a
@@ -5035,15 +5099,22 @@ mod tests {
         drop(first);
     }
 
+    /// `Net.listen` used to be a no-op that answered `Ok` to anything, on the
+    /// grounds that `TcpListener::bind` had already listened — at std's 128,
+    /// whatever backlog the JDK passed. `bind0` now leaves the socket unlistened
+    /// and this native is where the backlog is applied, so a call that names no
+    /// socket must fail instead of silently succeeding. The backlog itself is
+    /// pinned against real sockets in `cratonvm_native_api::net_wait`'s
+    /// `deferred_listen_on_an_unlistened_listener_applies_the_backlog`.
     #[test]
-    fn t19_5_listen_no_op() {
-        // Rust's TcpListener has no explicit listen call; our registered
-        // listen() native just returns Ok(None). Exercise that path by
-        // calling the helper with a minimal MockNativeContext.
+    fn t19_5_listen_without_a_descriptor_is_an_error_not_a_silent_success() {
         let mut ctx = MockNativeContext::new();
         let r = net_listen(&mut ctx, &[]);
-        assert!(r.is_ok());
-        assert!(r.unwrap().is_none());
+        if cratonvm_native_api::net_wait::jdk_backlog_enabled() {
+            assert!(r.is_err(), "listen with no FileDescriptor answered {r:?}");
+        } else {
+            assert!(matches!(r, Ok(None)));
+        }
     }
 
     #[test]
