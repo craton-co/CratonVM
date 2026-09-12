@@ -1382,11 +1382,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // Pin across the list alloc below — a moving young GC there would
             // relocate the fresh array (native stale-local family).
             let arr_pin = ctx.pin_native_root(arr);
-            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3)?;
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
-            ctx.set_field(list, 0, Value::Int(0));
-            ctx.set_field(list, 1, Value::Object(Some(arr)));
-            ctx.set_field(list, 2, Value::Int(0));
+            // By NAME, not by raw slot. These three writes were
+            // `set_field(list, 0/1/2, ..)` against the REAL JDK layout
+            // (`AbstractList.modCount`, `ArrayList.elementData`,
+            // `ArrayList.size`) -- an absolute extent of 3 on a class this
+            // code does not own, which is what the T9C gate scores against the
+            // synthetic table's 2 and what that gate's own "rule when this
+            // fails" says to replace. Resolving by name is layout-independent:
+            // correct here, and in synthetic mode a write that finds no such
+            // field is dropped rather than landing on the wrong slot.
+            ctx.set_field_by_name(list, "modCount", Value::Int(0));
+            ctx.set_field_by_name(list, "elementData", Value::Object(Some(arr)));
+            ctx.set_field_by_name(list, "size", Value::Int(0));
             ctx.unpin_native_roots(arr_pin);
             Ok(Some(Value::Object(Some(list))))
         },
@@ -1464,11 +1473,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             ctx.set_array_element(arr, 0, Value::Object(Some(root_path)));
             // Real ArrayList field layout in real-JDK mode:
             //   [0]=AbstractList.modCount (int), [1]=elementData (Object[]), [2]=size (int).
-            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3)?;
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
-            ctx.set_field(list, 0, Value::Int(0));
-            ctx.set_field(list, 1, Value::Object(Some(arr)));
-            ctx.set_field(list, 2, Value::Int(1));
+            // By NAME, not by raw slot. These three writes were
+            // `set_field(list, 0/1/2, ..)` against the REAL JDK layout
+            // (`AbstractList.modCount`, `ArrayList.elementData`,
+            // `ArrayList.size`) -- an absolute extent of 3 on a class this
+            // code does not own, which is what the T9C gate scores against the
+            // synthetic table's 2 and what that gate's own "rule when this
+            // fails" says to replace. Resolving by name is layout-independent:
+            // correct here, and in synthetic mode a write that finds no such
+            // field is dropped rather than landing on the wrong slot.
+            ctx.set_field_by_name(list, "modCount", Value::Int(0));
+            ctx.set_field_by_name(list, "elementData", Value::Object(Some(arr)));
+            ctx.set_field_by_name(list, "size", Value::Int(1));
             ctx.unpin_native_roots(this_pin.map(|(h, _)| h).unwrap_or(root_path_pin));
             Ok(Some(Value::Object(Some(list))))
         },
@@ -2467,11 +2485,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             ctx.set_array_element(arr, 2, Value::Object(Some(jrt_p)));
             // Real ArrayList field layout in real-JDK mode:
             //   [0]=AbstractList.modCount (int), [1]=elementData (Object[]), [2]=size (int).
-            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3)?;
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
-            ctx.set_field(list, 0, Value::Int(0));
-            ctx.set_field(list, 1, Value::Object(Some(arr)));
-            ctx.set_field(list, 2, Value::Int(3));
+            // By NAME, not by raw slot. These three writes were
+            // `set_field(list, 0/1/2, ..)` against the REAL JDK layout
+            // (`AbstractList.modCount`, `ArrayList.elementData`,
+            // `ArrayList.size`) -- an absolute extent of 3 on a class this
+            // code does not own, which is what the T9C gate scores against the
+            // synthetic table's 2 and what that gate's own "rule when this
+            // fails" says to replace. Resolving by name is layout-independent:
+            // correct here, and in synthetic mode a write that finds no such
+            // field is dropped rather than landing on the wrong slot.
+            ctx.set_field_by_name(list, "modCount", Value::Int(0));
+            ctx.set_field_by_name(list, "elementData", Value::Object(Some(arr)));
+            ctx.set_field_by_name(list, "size", Value::Int(3));
             ctx.unpin_native_roots(file_pin);
             Ok(Some(Value::Object(Some(list))))
         },
@@ -2755,11 +2782,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // Pin across the list alloc below — a moving young GC there would
             // relocate the fresh array (native stale-local family).
             let arr_pin = ctx.pin_native_root(arr);
-            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3)?;
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
-            ctx.set_field(list, 0, Value::Int(0));
-            ctx.set_field(list, 1, Value::Object(Some(arr)));
-            ctx.set_field(list, 2, Value::Int(0));
+            // By NAME, not by raw slot. These three writes were
+            // `set_field(list, 0/1/2, ..)` against the REAL JDK layout
+            // (`AbstractList.modCount`, `ArrayList.elementData`,
+            // `ArrayList.size`) -- an absolute extent of 3 on a class this
+            // code does not own, which is what the T9C gate scores against the
+            // synthetic table's 2 and what that gate's own "rule when this
+            // fails" says to replace. Resolving by name is layout-independent:
+            // correct here, and in synthetic mode a write that finds no such
+            // field is dropped rather than landing on the wrong slot.
+            ctx.set_field_by_name(list, "modCount", Value::Int(0));
+            ctx.set_field_by_name(list, "elementData", Value::Object(Some(arr)));
+            ctx.set_field_by_name(list, "size", Value::Int(0));
             ctx.unpin_native_roots(arr_pin);
             Ok(Some(Value::Object(Some(list))))
         },

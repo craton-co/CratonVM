@@ -137,16 +137,18 @@ and they are two different things:
   `isAssignableFrom` and every JDK `checkcast` are satisfied — but a program
   that walks `getSuperclass()` to decide what it is holding would be misled.
 
-* **2 of them are the SAME defect this page decided, in a family the fix did not
-  reach**: `ValueLayout.JAVA_INT` and a struct layout still answer
-  `getClass().isInterface() == true`. The layout carriers are allocated with the
-  interface's own name (`java/lang/foreign/ValueLayout` and the ten
-  `ValueLayout$Of*` interfaces), the same shape `MemorySegment` had.
+* **2 of them were the SAME defect this page decided, in a family the fix did
+  not reach**: `ValueLayout.JAVA_INT` and a struct layout answered
+  `getClass().isInterface() == true`, the layout carriers being allocated with
+  the interface's own name. **CLOSED.** Both rows are false on 2026-09-11 and
+  `FfmSegmentSweep`'s remaining difference is exactly the 40 lines of the 20
+  class/superclass name pairs above -- the ones this page says are not
+  comparable. See §3.1.
 
-### What the layout half needs
+### 3.1 What the layout half needed, and what it got instead
 
-It is a bigger change than the segment half, which is why it is recorded rather
-than started:
+This is what the page asked for, kept verbatim because the route the fix took
+is not it:
 
 1. a `cratonvm/internal/foreign/LayoutImpl` carrier minted through
    `ensure_vm_internal_class`, as the segment carrier now is;
@@ -162,6 +164,33 @@ than started:
 
 The check is the two `isInterface` rows going false and `FfmSegmentSweep`'s
 other 23 staying exactly as they are.
+
+**Done, and NOT by minting a VM-internal carrier.** A layout is minted on its
+REAL JDK class -- `jdk/internal/foreign/layout/ValueLayouts$OfIntImpl` and its
+eight siblings, and the four group classes -- so item 1 is answered by there
+being no stand-in to name, item 2 by the real class already implementing the
+interfaces, and item 3 by the natives being registered on those impl classes.
+The stated check holds: both `isInterface` rows are false and the residual is
+the 20 name pairs, unchanged.
+
+**Why the difference matters to the next reader.** This page rejects the
+compatibility-stand-in shape for the SEGMENT carrier, and rightly: there is no
+JDK class it stands in for, and its slots are `ptr`/`size`/`arena` by design.
+The layout carriers are the other case -- there IS a JDK class, it declares
+`byteSize`, `byteAlignment`, `name`, `carrier` and `order`, and the honest move
+is to be that class and fill those fields. Lane 4 wave 2 then retires the
+registrations on them (`RETIRED_SHADOW_L4_FFM_TRIPLES`, 137 rows), which is
+only possible because the carrier is real. **The two halves of `java.lang.foreign`
+get opposite answers because they are opposite cases, not because the rule
+changed.**
+
+Filling those fields was itself a defect fix, found the same day: the mint wrote
+a bare `String` into a field the JDK declares `Optional<String>`, and never
+wrote `carrier` at all, so `ValueLayout.JAVA_INT.withName("k").equals(...)`
+threw `NullPointerException` in both modes. `docs/known-issues/jdk-only-lanes/lane-4-io-nio-foreign.md`
+§9.7 has the measurement. Its remaining half -- the COMPATIBLE-mode preseed in
+`make_prepared_value_layout`, which still writes three of the five -- is the one
+open item this page's §3 now leaves behind.
 
 ---
 

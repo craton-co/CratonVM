@@ -5924,6 +5924,7 @@ pub(crate) fn register_t27_natives(r: &mut NativeMethodRegistry) {
     register_https_url_connection(r);
     register_self_test(r);
     register_alpn_accessor(r);
+    register_client_socket_mode_accessors(r);
     // E31: must run after `register_p68_ssl` (lib.rs calls this function at
     // ~18540, that one at 18474) — but nothing else registers this triple in
     // either mode, so the ordering is a property to preserve rather than a
@@ -7176,6 +7177,146 @@ fn lookup_sock_alpn(ctx: &dyn NativeContext, sock: ObjectRef) -> Option<String> 
 /// moves.
 fn gc_stable_objref_key(ctx: &dyn NativeContext, o: ObjectRef) -> u64 {
     ctx.identity_hash_code(o) as u32 as u64
+}
+
+/// The client-socket half of the G25 fix.
+///
+/// `javax.net.ssl.SSLSocket` is abstract exactly like `SSLServerSocket`, and
+/// this VM allocates instances of it directly (`try_alloc_concurrent_synthetic`
+/// a few hundred lines above), so any method with no native and no concrete
+/// body raises `AbstractMethodError: ... has no Code attribute` rather than
+/// answering. G25 fixed the SERVER socket's three; the client socket kept
+/// them, and `L6TlsParamSweep` row 77 is the one that surfaced:
+///
+/// ```text
+///   HotSpot   connected=false clientMode=true need=false want=false createSessions=true …
+///   CratonVM  THREW java.lang.AbstractMethodError msg=method
+///             javax/net/ssl/SSLSocket.getEnableSessionCreation()Z has no Code attribute
+/// ```
+///
+/// One throw takes the whole row with it, so the four properties printed
+/// beside it were unobservable too.
+///
+/// The two validating setters come with it for the same reason they came with
+/// the server socket's: a setter that accepts an unsupported suite silently is
+/// a configuration error the caller never hears about, and the messages are
+/// transcribed from HotSpot rather than invented.
+fn register_client_socket_mode_accessors(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    let ss = "javax/net/ssl/SSLSocket";
+
+    // A client socket IS in client mode, and session creation is on: the
+    // mirror image of `SSS_MODE_DEFAULT`, whose first element is 0 because a
+    // SERVER socket is not.
+    r.register(ss, "getEnableSessionCreation", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let key = gc_stable_objref_key(ctx, this);
+        let state = sss_mode_states()
+            .lock()
+            .get(&key)
+            .copied()
+            .unwrap_or((1, 1));
+        Ok(Some(Value::Int(state.1)))
+    });
+    // A socket from `SSLSocketFactory.createSocket()` IS in client mode:
+    // measured `clientMode=true` on HotSpot where this VM answered false,
+    // because the only `getUseClientMode` registered was the SERVER socket's
+    // and its default is the opposite.
+    r.register(ss, "getUseClientMode", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let key = gc_stable_objref_key(ctx, this);
+        let state = sss_mode_states()
+            .lock()
+            .get(&key)
+            .copied()
+            .unwrap_or((1, 1));
+        Ok(Some(Value::Int(state.0)))
+    });
+    r.register(ss, "setUseClientMode", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let on = i32::from(args.get(1).and_then(|value| value.as_int()).unwrap_or(0) != 0);
+        let key = gc_stable_objref_key(ctx, this);
+        let mut table = sss_mode_states().lock();
+        let entry = table.entry(key).or_insert((1, 1));
+        entry.0 = on;
+        Ok(None)
+    });
+    r.register(ss, "setEnableSessionCreation", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let on = i32::from(args.get(1).and_then(|value| value.as_int()).unwrap_or(0) != 0);
+        let key = gc_stable_objref_key(ctx, this);
+        let mut table = sss_mode_states().lock();
+        let entry = table.entry(key).or_insert((1, 1));
+        entry.1 = on;
+        Ok(None)
+    });
+
+    r.register(
+        ss,
+        "setEnabledCipherSuites",
+        "([Ljava/lang/String;)V",
+        |ctx, args| {
+            // Null first, then membership: the order is observable, and
+            // `setEnabledCipherSuites(null)` reports "CipherSuites cannot be
+            // null" on HotSpot rather than complaining about a null suite.
+            let Some(Value::Object(Some(arr))) = args.get(1) else {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "CipherSuites cannot be null".into(),
+                }
+                .into());
+            };
+            for i in 0..ctx.array_length(*arr) {
+                let name = match ctx.get_array_element(*arr, i) {
+                    Value::Object(Some(s)) => ctx.read_string(s),
+                    _ => None,
+                };
+                let name = name.unwrap_or_default();
+                if !SUPPORTED_CIPHER_SUITE_NAMES.contains(&name.as_str()) {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: format!("Unsupported CipherSuite: {name}"),
+                    }
+                    .into());
+                }
+            }
+            Ok(None)
+        },
+    );
+    r.register(
+        ss,
+        "setEnabledProtocols",
+        "([Ljava/lang/String;)V",
+        |ctx, args| {
+            let Some(Value::Object(Some(arr))) = args.get(1) else {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "Protocols cannot be null".into(),
+                }
+                .into());
+            };
+            for i in 0..ctx.array_length(*arr) {
+                let name = match ctx.get_array_element(*arr, i) {
+                    Value::Object(Some(s)) => ctx.read_string(s),
+                    _ => None,
+                };
+                let name = name.unwrap_or_default();
+                // The protocol names this stack reports through
+                // `getSupportedProtocols`, plus the legacy spellings JSSE
+                // still names. Anything else is a caller's typo, and HotSpot
+                // says so rather than ignoring it.
+                const KNOWN: &[&str] = &[
+                    "TLSv1.3", "TLSv1.2", "TLSv1.1", "TLSv1", "SSLv3", "SSLv2Hello",
+                ];
+                if !KNOWN.contains(&name.as_str()) {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: format!("Unsupported protocol: {name}"),
+                    }
+                    .into());
+                }
+            }
+            Ok(None)
+        },
+    );
+    r.set_category(__prev_cat);
 }
 
 fn register_alpn_accessor(r: &mut NativeMethodRegistry) {
@@ -18186,14 +18327,34 @@ fn register_alpn_on_parameters(r: &mut NativeMethodRegistry) {
         "([Ljava/lang/String;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let mut list: Vec<String> = Vec::new();
-            if let Some(Value::Object(Some(arr))) = args.get(1) {
-                let len = ctx.array_length(*arr);
-                for i in 0..len {
-                    if let Value::Object(Some(s)) = ctx.get_array_element(*arr, i) {
-                        if let Some(t) = ctx.read_string(s) {
-                            list.push(t);
+            // `SSLParameters.setApplicationProtocols` VALIDATES, and the two
+            // checks are the ones an ALPN caller most needs: a null array and
+            // a null-or-empty element. MEASURED on HotSpot 25.0.4+7
+            // (`L6TlsParamSweep` rows 30, 31, 33) — this engine accepted all
+            // three, so `new String[]{"h2", null}` became an advertised
+            // protocol list with a hole in it and the failure surfaced at
+            // handshake time, on the wire, in another process.
+            let Some(Value::Object(Some(arr))) = args.get(1) else {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "protocols was null".into(),
+                }
+                .into());
+            };
+            let arr = *arr;
+            let len = ctx.array_length(arr);
+            let mut list: Vec<String> = Vec::with_capacity(len);
+            for i in 0..len {
+                let element = match ctx.get_array_element(arr, i) {
+                    Value::Object(Some(s)) => ctx.read_string(s),
+                    _ => None,
+                };
+                match element {
+                    Some(text) if !text.is_empty() => list.push(text),
+                    _ => {
+                        return Err(RuntimeError::IllegalArgumentException {
+                            message: "An element of protocols was null/empty".into(),
                         }
+                        .into())
                     }
                 }
             }
@@ -18214,7 +18375,13 @@ fn register_alpn_on_parameters(r: &mut NativeMethodRegistry) {
                 .lock()
                 .get(&engine_objref_key(ctx, this))
                 .cloned()
-                .unwrap_or_else(|| vec!["h2".into(), "http/1.1".into()]);
+                // A fresh `SSLParameters` advertises NOTHING: HotSpot's
+                // `getApplicationProtocols()` on one nobody has configured is
+                // a zero-length array, not this VM's invented `[h2,
+                // http/1.1]`. A caller that reads the list to decide whether
+                // ALPN was requested was told yes by every parameters object
+                // in the VM.
+                .unwrap_or_default();
             // GC NOTE: `create_string` allocates, so the array is rooted
             // across the loop — see `x509_manager::materialize_string_array`.
             let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);

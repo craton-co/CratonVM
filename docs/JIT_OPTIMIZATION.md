@@ -1355,6 +1355,8 @@ Generational; `cratonvm-jit` 2225 passed.
 | IR-tier fused compare reads its operands in place (register, frame slot or folded immediate) | **ON** | `CRATONVM_JIT_IR_CMP_IN_PLACE=0` |
 | IR-tier `x + k` / `x - k` as one `LEA` | **ON** | `CRATONVM_JIT_IR_ADD_LEA=0` |
 | IR-tier receiver-guard CSE (once per receiver per block) | **ON** | `CRATONVM_JIT_IR_RECEIVER_GUARD_CSE=0` |
+| IR-tier redundant-read elimination (same cell, same heap, same block) | off — large on the probe written for it (0.627x on `FieldLoop.sumWide` with the memory-edge hoist off) and fires on **nothing** in CratonBench; `c2-the-loop-body-is-mostly-code-it-never-runs-20260911.md` §8 | `CRATONVM_JIT_IR_LOAD_CSE=1` |
+| LICM may hoist a read of a maybe-null base out of a loop whose constant trip count proves the body runs | off — 0.793x on `probes/CountedHoist.java`, unmeasured elsewhere; §9 of the same page | `CRATONVM_JIT_IR_LICM_HOIST_COUNTED=1` |
 | IR-tier gated inline reference stores | **ON** where a collector publishes a plan | `CRATONVM_JIT_IR_GATED_REF_STORE=0` |
 | IR-tier inline TLAB bump for `Op::New` | off — the sequence has a defect `RJitMapTierDiff` reproduces 4/10; see `ir_inline_tlab_enabled` | `CRATONVM_JIT_IR_INLINE_TLAB=1` |
 | Thread pointer fetched from a TLS mirror (both tiers) | **ON** where the probe succeeds | `CRATONVM_JIT_TLS_THREAD_FETCH=0` |

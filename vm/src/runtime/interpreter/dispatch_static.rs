@@ -2003,12 +2003,43 @@ pub(super) fn resolve_string_field_layout(
     // `string_id` doubles as the ObjectHeader class id used to guard
     // `java/lang/CharSequence` accessor call sites (the receiver must be a
     // real String for the inline String-layout decode to be sound).
-    Some(cratonvm_jit::StringFieldLayout::new(
-        value_idx,
-        coder_idx,
-        hash_idx,
-        string_id.as_u32(),
-    ))
+    // The `java/lang/StringBuilder` half, resolved from the same read lock.
+    //
+    // `count` / `value` / `coder` are declared on `AbstractStringBuilder`, not
+    // on `StringBuilder`, so this asks for the field indices the way a field
+    // access does — through the hierarchy — rather than with
+    // `find_own_field`, which answers `None` for all three on the subclass.
+    //
+    // Absent for any reason (class not loaded yet, a synthetic image whose
+    // builder has no `coder`) leaves `builder` `None`, and every StringBuilder
+    // call site stays on ordinary native dispatch — which is where they all
+    // were before this existed.
+    // The descriptors are required, not just the names, and `value`'s is the
+    // load-bearing one: the inline `append(char)` body writes ONE BYTE per
+    // character, which is only the representation when the payload is a
+    // `byte[]` in LATIN1. A synthetic image lays `value` out as `[C` and has
+    // no `coder` at all — both make this `None`, and every StringBuilder site
+    // stays on ordinary native dispatch.
+    let builder = (|| {
+        let sb_id = cm.find_bootstrap_class_by_name("java/lang/StringBuilder")?;
+        let store = cm.class_store();
+        let field = |name: &str, descriptor: &str| {
+            crate::classloading::find_field_recursive_by_descriptor(
+                sb_id, name, descriptor, store,
+            )
+            .map(|(idx, _, _)| idx)
+        };
+        cratonvm_jit::StringBuilderFieldLayout::new(
+            field("count", "I")?,
+            field("value", "[B")?,
+            field("coder", "B")?,
+            sb_id.as_u32(),
+        )
+    })();
+    Some(
+        cratonvm_jit::StringFieldLayout::new(value_idx, coder_idx, hash_idx, string_id.as_u32())
+            .with_builder(builder),
+    )
 }
 
 /// Backward branch count threshold before triggering OSR compilation.

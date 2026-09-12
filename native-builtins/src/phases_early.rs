@@ -10527,6 +10527,61 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         );
     }
 
+    // ForkJoinPool.execute(ForkJoinTask) — the SAME side-table policy as
+    // `submit`/`externalSubmit` directly above, and it was missing.
+    //
+    // 2026-09-11, lane 5 residual §9.1. `execute` had no registration ANYWHERE
+    // and was not on `keep_real_forkjoinpool_bridge`'s allow-list, so
+    // `pool.execute(task)` ran the concrete JDK bytecode: the task went into a
+    // real `WorkQueue` and a real worker thread ran its body through the JDK's
+    // own `doExec()`, which never touches this side table. The caller's
+    // following `join()`/`get()` is a Bridge that reads the side table, saw
+    // `done == false`, and RAN THE BODY AGAIN — two threads, one task,
+    // overlapping. `apps/probes/L5FjDouble.java` scores it per shape and says
+    // which of the three double-execution shapes it is.
+    //
+    // The retired lane page read the symptom as the JDK's own WorkQueue being
+    // claimed twice and held 70 `ForkJoinPool`/`ForkJoinTask` rows behind it.
+    // It is not the JDK's: it is one half of this pool's surface on the
+    // side-table model and the other half on the real one, with no agreement
+    // about what "done" means.
+    //
+    // Why inline rather than teaching `join()` to wait for the real worker:
+    // that is the policy `submit` already states three lines up — letting the
+    // concrete submit bytecode enqueue into the real pool exposes
+    // WorkQueue/status machinery CratonVM only partially models, and Fork6Hard
+    // observes stale task/result objects there under GC stress. `execute` is
+    // the same call with the return value dropped, so it gets the same answer;
+    // a lane that moves `submit` off this model moves `execute` with it.
+    r.register(
+        "java/util/concurrent/ForkJoinPool",
+        "execute",
+        "(Ljava/util/concurrent/ForkJoinTask;)V",
+        |ctx, args| {
+            fjp_reject_submission(ctx, args, 1)?;
+            let task = match args.get(1).copied() {
+                Some(Value::Object(Some(r))) => r,
+                // `execute(null)` throws NullPointerException on a real pool,
+                // and `fjp_reject_submission` above is what raises it — by the
+                // time control is here the argument is a non-null task or the
+                // call has already failed. Returning void for anything else
+                // keeps this arm total without inventing a second policy.
+                _ => return Ok(None),
+            };
+            let (done, _) = fjp_state_get(task);
+            if !done {
+                let frame = fjp_pool_frame_enter(ctx, args);
+                let out = fjp_compute_for_submit(ctx, task);
+                fjp_pool_frame_leave(ctx, frame);
+                out?;
+            }
+            // void: `execute` hands nothing back, and a failure surfaces at the
+            // matching `join()`/`get()` exactly as `fjp_compute_for_submit`'s
+            // own doc comment describes for `submit`.
+            Ok(None)
+        },
+    );
+
     // ForkJoinPool.submit(Callable) / submit(Runnable) / submit(Runnable, T) —
     // same Bridge policy as submit(ForkJoinTask) above: these overloads were
     // previously left off the allow-list, so real JDK bytecode ran them

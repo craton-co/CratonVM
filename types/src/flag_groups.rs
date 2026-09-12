@@ -723,6 +723,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "linkage", on_key: Some("CRATONVM_DBG_LINKAGE"), off_key: None, off_word: None, since: "2026-08-01" },
     E { group: Group::DBG, token: "linkage-bt", on_key: Some("CRATONVM_DBG_LINKAGE_BT"), off_key: None, off_word: None, since: "2026-07-27" },
     E { group: Group::DBG, token: "linker", on_key: Some("CRATONVM_DBG_LINKER"), off_key: None, off_word: None, since: "2026-07-15" },
+    E { group: Group::DBG, token: "load-cse", on_key: Some("CRATONVM_DBG_LOAD_CSE"), off_key: None, off_word: None, since: "2026-09-11" },
     E { group: Group::DBG, token: "loadclass", on_key: Some("CRATONVM_DBG_LOADCLASS"), off_key: None, off_word: None, since: "2026-07-14" },
     E { group: Group::DBG, token: "loader-chain", on_key: Some("CRATONVM_DBG_LOADER_CHAIN"), off_key: None, off_word: None, since: "2026-07-30" },
     E { group: Group::DBG, token: "loader-trace", on_key: Some("CRATONVM_DBG_LOADER_TRACE"), off_key: None, off_word: None, since: "2026-07-22" },
@@ -1281,7 +1282,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "inline-putfield", on_key: None, off_key: Some("CRATONVM_NO_JIT_INLINE_PUTFIELD"), off_word: None, since: "2026-07-24" },
     E { group: Group::JIT, token: "inline-self-guard", on_key: Some("CRATONVM_JIT_INLINE_SELF_GUARD"), off_key: None, off_word: None, since: "2026-07-10" },
     E { group: Group::JIT, token: "inline-tlab-new", on_key: None, off_key: Some("CRATONVM_NO_JIT_INLINE_TLAB_NEW"), off_word: None, since: "2026-07-24" },
+    E { group: Group::JIT, token: "inline-tlab-newarray", on_key: None, off_key: Some("CRATONVM_NO_JIT_INLINE_TLAB_NEWARRAY"), off_word: None, since: "2026-09-11" },
     E { group: Group::JIT, token: "intrinsics", on_key: None, off_key: Some("CRATONVM_DISABLE_INTRINSICS"), off_word: None, since: "2026-05-22" },
+    E { group: Group::JIT, token: "sb-intrinsics", on_key: None, off_key: Some("CRATONVM_NO_JIT_SB_INTRINSICS"), off_word: None, since: "2026-09-11" },
+    E { group: Group::JIT, token: "staged-arg-slot", on_key: None, off_key: Some("CRATONVM_NO_JIT_STAGED_ARG_SLOT"), off_word: None, since: "2026-09-11" },
     E { group: Group::JIT, token: "ir-branchy", on_key: None, off_key: Some("CRATONVM_NO_IR_BRANCHY"), off_word: None, since: "2026-06-18" },
     E { group: Group::JIT, token: "ir-call", on_key: Some("CRATONVM_JIT_IR_CALL"), off_key: None, off_word: None, since: "2026-06-20" },
     E { group: Group::JIT, token: "ir-call-special", on_key: Some("CRATONVM_JIT_IR_CALL_SPECIAL"), off_key: None, off_word: None, since: "2026-06-21" },
@@ -1680,6 +1684,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-licm-mem-edge", on_key: Some("CRATONVM_JIT_IR_LICM_MEM_EDGE"), off_key: None, off_word: Some("0"), since: "2026-09-11" },
     E { group: Group::JIT, token: "ir-licm-before-unroll", on_key: Some("CRATONVM_JIT_IR_LICM_BEFORE_UNROLL"), off_key: None, off_word: None, since: "2026-09-11" },
     E { group: Group::JIT, token: "ir-poll-outline", on_key: Some("CRATONVM_JIT_IR_POLL_OUTLINE"), off_key: None, off_word: None, since: "2026-09-11" },
+    E { group: Group::JIT, token: "ir-load-cse", on_key: Some("CRATONVM_JIT_IR_LOAD_CSE"), off_key: None, off_word: None, since: "2026-09-11" },
+    E { group: Group::JIT, token: "ir-licm-hoist-counted", on_key: Some("CRATONVM_JIT_IR_LICM_HOIST_COUNTED"), off_key: None, off_word: None, since: "2026-09-11" },
     E { group: Group::JIT, token: "ir-per-copy-frames", on_key: Some("CRATONVM_JIT_IR_PER_COPY_FRAMES"), off_key: None, off_word: None, since: "2026-09-11" },
     E { group: Group::JIT, token: "ir-partial-unroll", on_key: Some("CRATONVM_JIT_IR_PARTIAL_UNROLL"), off_key: None, off_word: None, since: "2026-09-11" },
     E { group: Group::JIT, token: "ir-partial-unroll-factor", on_key: Some("CRATONVM_JIT_IR_PARTIAL_UNROLL_FACTOR"), off_key: None, off_word: None, since: "2026-09-11" },
@@ -2255,6 +2261,20 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "virtual-promote-handler-callee", on_key: Some("CRATONVM_JIT_VIRTUAL_PROMOTE_HANDLER_CALLEE"), off_key: None, off_word: None, since: "2026-09-11" },
     E { group: Group::JIT, token: "native-cf-postcomplete-skip", on_key: Some("CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "native-cf-postcomplete-direct", on_key: Some("CRATONVM_NATIVE_CF_POSTCOMPLETE_DIRECT"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // --- composition residuals, part two: 2026-09-11 -------------------------
+    // `composition-native-callback-and-the-promotion-question-20260902.md`.
+    // Item 1's mechanism and its engagement census; item 2's second census,
+    // the one that names why a NOMINATED site still refuses to promote.
+    E { group: Group::JIT, token: "native-callback-memo", on_key: Some("CRATONVM_NATIVE_CALLBACK_MEMO"), off_key: None, off_word: Some("0"), since: "2026-09-11" },
+    E { group: Group::DBG, token: "callback-memo", on_key: Some("CRATONVM_DBG_CALLBACK_MEMO"), off_key: None, off_word: None, since: "2026-09-11" },
+    E { group: Group::DBG, token: "promote-refuse", on_key: Some("CRATONVM_DBG_PROMOTE_REFUSE"), off_key: None, off_word: None, since: "2026-09-11" },
+    // The JIT per-call-site native cache used to refuse every
+    // capability-classified triple outright, which since 836631dcc (leaf-only
+    // -> every registered native) has meant refusing `jdk/internal/misc/Unsafe`
+    // -- 99 428 of the 100 805 general-resolver calls on the composition probe.
+    // The gate now runs on the dispatch side instead, where the funnel runs it;
+    // `=0` restores the refusal.
+    E { group: Group::JIT, token: "site-cache-capability", on_key: Some("CRATONVM_JIT_SITE_CACHE_CAPABILITY"), off_key: None, off_word: Some("0"), since: "2026-09-11" },
     // `CRATONVM_JIT_IR_COLD_ARG_STAGE` was declared here too, as a courtesy,
     // and dev declared it concurrently -- both rows merged with no conflict,
     // which is the append-anywhere hazard. Dev's row is kept; this note is the
@@ -2676,6 +2696,7 @@ pub const INVENTORY: &[E] = &[
     // so `CRATONVM_LOADER=enforce-native-shadow` could not reach it and no test
     // could arrange it.
     E { group: Group::LOADER, token: "enforce-native-shadow", on_key: Some("CRATONVM_ENFORCE_NATIVE_SHADOW"), off_key: None, off_word: None, since: "2026-08-06" },
+    E { group: Group::LOADER, token: "unretire-native-shadow", on_key: Some("CRATONVM_UNRETIRE_NATIVE_SHADOW"), off_key: None, off_word: None, since: "2026-09-11" },
     // Default ON. `-cf-delegating-yield` keeps the pure-delegation
     // `CompletableFuture` natives in front of the real JDK bytecode, so the
     // yield can be A/B'd on one binary. See

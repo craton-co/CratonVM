@@ -558,6 +558,17 @@ Both are structurally real, and neither is a point fix.
   `!has_registered_native`, `!receiver_is_java_util`,
   `cached.exception_table.is_empty()`.
 
+  **And in a SECOND copy, in `execute_invokevirtual_fast_door`** — which is the
+  door that actually serves the warm monomorphic hit, i.e. nearly every hit.
+  It spells the same `java/util/` test as the `class_is_java_util` bitmap
+  rather than as `starts_with("java/util/")`, so a grep over the tier-up paths
+  finds only the first one, and until 2026-09-11 it read neither of the
+  2026-09-02 nomination/promotion switches and still gated the COUNTER on the
+  prefix. `composition-native-callback-and-the-promotion-question-CLOSED-20260911.md`
+  item 2 is how that was found: the census this page's sibling relies on
+  reported 629 rows where the workload produces 46 268, because the dispatches
+  had migrated to a door nothing instrumented.
+
   **Do not "just count them".** That was built and measured
   (`CRATONVM_JIT=special-tierup`, reverted): counted invocations moved
   129 391 → 129 455, the compiled census 672 → 674, and wall-clock got *worse*.

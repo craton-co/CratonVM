@@ -2239,16 +2239,55 @@ pub(super) fn execute_invokevirtual_cached(
                             "nojit"
                         } else if has_registered_native() {
                             "registered_native"
-                        } else if receiver_is_java_util() {
-                            "receiver_is_java_util"
-                        } else if !crate::runtime::env_cache::jit_virtual_promote_handler_callee()
-                            && !cached.exception_table.is_empty()
-                        {
-                            "callee_exception_table"
                         } else if !crate::runtime::env_cache::jit_virtual_tierup() {
                             "virtual_tierup_off"
                         } else {
-                            "admitted"
+                            // MIRRORS THE `&&` CHAIN, INCLUDING THE TWO 2026-09-02
+                            // SWITCHES — which it did not until 2026-09-11, and
+                            // that is why item 2 of
+                            // `composition-native-callback-and-the-promotion-question-20260902.md`
+                            // could not read its own arm. This chain still
+                            // tested `receiver_is_java_util` and the exception
+                            // table in the ORDER and the SENSE they had before
+                            // nomination was separated from promotion, so with
+                            // `CRATONVM_JIT_VIRTUAL_NOMINATE_ALWAYS=1
+                            // CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL=1` it
+                            // reported `receiver_is_java_util` — a DECLINE — for
+                            // sites the chain had in fact admitted. An
+                            // instrument that reports the pre-switch verdict
+                            // when the switch is on cannot answer a question
+                            // about the switch.
+                            //
+                            // It now distinguishes the four states that matter:
+                            // barred outright, nominated-but-promotion-barred
+                            // (which is what the switch pair BUYS), and
+                            // admitted — and which HALF barred it, because the
+                            // two want opposite next steps: the exception table
+                            // is an unresumable-handler hazard, the prefix a
+                            // stale-receiver-entry one (cb563d707).
+                            // The bar is relaxable now: see
+                            // `env_cache::jit_virtual_promote_handler_callee`.
+                            let barred_handler =
+                                !crate::runtime::env_cache::jit_virtual_promote_handler_callee()
+                                    && !cached.exception_table.is_empty();
+                            let barred_prefix =
+                                !crate::runtime::env_cache::jit_virtual_promote_java_util()
+                                    && receiver_is_java_util();
+                            if crate::runtime::env_cache::jit_virtual_nominate_always() {
+                                if barred_handler {
+                                    "nominated_promotion_barred_exception_table"
+                                } else if barred_prefix {
+                                    "nominated_promotion_barred_java_util"
+                                } else {
+                                    "admitted"
+                                }
+                            } else if barred_handler {
+                                "callee_exception_table"
+                            } else if barred_prefix {
+                                "receiver_is_java_util"
+                            } else {
+                                "admitted"
+                            }
                         };
                         crate::runtime::interp_census::record_tierup_decline(
                             reason,
@@ -2313,7 +2352,8 @@ pub(super) fn execute_invokevirtual_cached(
                         // under `--nojit` and for a synchronized or
                         // native-shadowed callee, exactly as before.
                         //
-                        // With `jit_virtual_nominate_always` (default-ON) the
+                        // With `jit_virtual_nominate_always` (default-OFF; see
+                        // its own doc, and the 0.994x that is why) the
                         // chain no longer STOPS here: it enters the block with
                         // `promotion_barred` set, which suppresses the
                         // `jit_cache` probe and the inline upgrade but lets the
@@ -2342,9 +2382,39 @@ pub(super) fn execute_invokevirtual_cached(
                         // racing publication can only cause a redundant re-probe,
                         // never a missed one.
                         let jit_generation = cratonvm_jit::jit_cache_generation();
+                        // The SECOND census. `tierup-decline` above stops at
+                        // the `&&` chain; from here down is everything that
+                        // can still refuse a site the chain ADMITTED, and
+                        // until this existed nothing named any of it. See
+                        // `interp_census::promote_refuse_enabled`.
+                        let census = crate::runtime::interp_census::promote_refuse_enabled();
+                        let mut refusal: &'static str = "entered_compiled";
                         let compiled_opt = if promotion_barred
                             || cached.jit_probe_is_current(jit_generation)
                         {
+                            if census {
+                                refusal = if promotion_barred {
+                                    // Which HALF, because they want opposite
+                                    // next steps: the exception table is an
+                                    // unresumable-handler hazard, the prefix a
+                                    // stale-receiver-entry one (cb563d707).
+                                    if !cached.exception_table.is_empty() {
+                                        "barred_callee_exception_table"
+                                    } else {
+                                        "barred_receiver_is_java_util"
+                                    }
+                                } else {
+                                    // The T2.2 epoch guard: this entry already
+                                    // probed the jit cache at this generation
+                                    // and missed, so it does not probe again.
+                                    // A site that is compiled LATER but whose
+                                    // publication does not move
+                                    // `jit_cache_generation` would sit here
+                                    // forever, which is precisely the shape
+                                    // item 2 was looking for.
+                                    "jit_probe_epoch_guard"
+                                };
+                            }
                             None
                         } else {
                             let found = shared.jit.jit_cache.read().get(
@@ -2355,6 +2425,9 @@ pub(super) fn execute_invokevirtual_cached(
                             );
                             if found.is_none() {
                                 cached.record_jit_probe_miss(jit_generation);
+                                if census {
+                                    refusal = "jit_cache_miss";
+                                }
                             }
                             // See the interpreter's twin: released on the
                             // mutator, and regularly the last owner.
@@ -2370,6 +2443,16 @@ pub(super) fn execute_invokevirtual_cached(
                             let cnt = shared.jit.profile_store.increment_invocation(invoc_key);
                             let should_attempt = cnt >= threshold
                                 && (cnt == threshold || (cnt - threshold) % JIT_RETRY_STRIDE == 0);
+                            // Refine the row. "the jit cache had no body" and
+                            // "this method is not hot yet" are the same None
+                            // and want opposite next steps, and a barred site
+                            // keeps its own reason — the counter runs for it
+                            // by design (that is what nomination-without-
+                            // promotion IS), so reaching here does not mean
+                            // the promotion was available.
+                            if census && refusal == "jit_cache_miss" && cnt < threshold {
+                                refusal = "counter_below_threshold";
+                            }
                             if should_attempt {
                                 // wire-tiered-manager Step 7: off-thread tier-up is now
                                 // the default. Under `bg_compile` (default-ON) we ENQUEUE
@@ -2406,6 +2489,21 @@ pub(super) fn execute_invokevirtual_cached(
                             }
                             None
                         });
+                        if census && compiled_opt.is_some() {
+                            // The probe found a body, so whatever the earlier
+                            // arm recorded is superseded; what happens next is
+                            // `execute_jit_call_decoded`'s business and it
+                            // records its own rows.
+                            refusal = "entered_compiled";
+                        }
+                        if census {
+                            crate::runtime::interp_census::record_promote_refuse(
+                                refusal,
+                                &cached.class_name,
+                                &cached.method_name,
+                                &cached.method_descriptor,
+                            );
+                        }
                         if let Some(compiled) = compiled_opt {
                             // Engagement, not a clock: which population this
                             // direct compiled call belongs to. See
@@ -2627,10 +2725,16 @@ pub(super) fn execute_invokevirtual_cached(
                     // leaf_aware` since the leaf funnel landed; this one --
                     // the arm that serves every `invokevirtual` and
                     // `invokeinterface` on a registered native, which is the
-                    // largest single population the fast doors decline -- still
-                    // paid the full funnel for a body that cannot block. The
-                    // id is the one the cache already resolved, so the question
-                    // is one bounds-checked index.
+                    // largest single population the fast doors decline --
+                    // still paid the full funnel for a body that cannot block.
+                    // The id is the one the cache already resolved, so the
+                    // question is one bounds-checked index.
+                    //
+                    // And `facts` is the call site's descriptor, which is a
+                    // constant of this inline-cache entry: re-resolving it per
+                    // call cost a resolution-cache `RwLock` read, a hash probe,
+                    // three `Arc<str>` clone/drop pairs and two scans of the
+                    // string it returned, plus two heap `Vec`s.
                     if native_site_facts_usable(&facts, num_params_usize, true) {
                         site_stats::bump(site_stats::NATFACTS_VIRTUAL);
                         let mut buf = [Value::Uninitialized; MAX_CACHED_NATIVE_ARGS];
@@ -3100,9 +3204,9 @@ pub(super) fn execute_invokevirtual_cached(
                     .evict(caller_class_id, cp_index, is_special);
                 return Ok(CachedCallResult::CacheMiss);
             };
-            // See the matching arm in `execute_invokestatic_cached`: the
-            // call site's descriptor is a constant of this entry, so ask
-            // `facts` rather than re-resolving the constant pool per call.
+            // See the matching arm in `execute_invokestatic_cached`: the call
+            // site's descriptor is a constant of this entry, so ask `facts`
+            // rather than re-resolving the constant pool per call.
             let num_params = num_params as usize;
             if native_site_facts_usable(&facts, num_params, true) {
                 site_stats::bump(site_stats::NATFACTS_VIRTUAL);
@@ -4265,13 +4369,11 @@ pub(super) fn execute_invokevirtual_fast_door(
     use std::sync::atomic::Ordering;
     if crate::classloading::any_class_redefined() {
         crate::runtime::interpreter::invoke_fast::note_virtual_decline("a class was redefined");
-        return None;
+            return None;
     }
     if crate::runtime::env_cache::loader_aware_resolution() && adapt_isin_seen() {
-        crate::runtime::interpreter::invoke_fast::note_virtual_decline(
-            "loader-aware resolution and adapt-isin seen",
-        );
-        return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline("loader-aware resolution and adapt-isin seen");
+            return None;
     }
     let caller_class_id = thread.frames[frame_idx].class_id;
     let (receiver_class_id, cached, gate_generation) =
@@ -4419,7 +4521,9 @@ pub(super) fn execute_invokevirtual_fast_door(
         return None;
     }
     if cratonvm_jit_api::descriptor_facts_disabled() {
-        crate::runtime::interpreter::invoke_fast::note_virtual_decline("descriptor facts are disabled");
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline(
+            "descriptor facts are disabled",
+        );
         return None;
     }
     let facts = cached.descriptor_facts();
@@ -4428,7 +4532,7 @@ pub(super) fn execute_invokevirtual_fast_door(
         || facts.param_tag_len as usize != num_params
     {
         crate::runtime::interpreter::invoke_fast::note_virtual_decline(
-            "descriptor has more parameters than the inline tag array",
+            "descriptor facts do not fit the inline parameter budget",
         );
         return None;
     }
@@ -4470,100 +4574,188 @@ pub(super) fn execute_invokevirtual_fast_door(
     // questions it used to answer with a registry probe and a class-manager
     // read lock replaced by the `NativeCallSite` memo and the `java/util/`
     // bitmap, and the counter kept on the callee.
+    //
+    // THIS IS THE SECOND `java/util/` EXCLUSION, and until 2026-09-11 nothing
+    // was looking at it.
+    //
+    // `composition-native-callback-and-the-promotion-question-20260902.md`
+    // item 2 separated nomination from promotion for the prefix and built
+    // `CRATONVM_JIT_VIRTUAL_NOMINATE_ALWAYS` /
+    // `CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL` to price the two halves -- in
+    // `execute_invokevirtual_cached`. It then ran both switches on and found
+    // `CompletableFuture.getNow` STILL entered interpreted 40 000 times in
+    // 40 000 chains, and could not say whether "the promotion does not engage,
+    // or it engages and this site declines for a reason downstream of the
+    // prefix".
+    //
+    // It was neither. `getNow`'s site is served by THIS door -- the warm
+    // monomorphic `VirtualBytecode` hit is nearly every hit -- and this door
+    // carried its own copy of the prefix test, spelled as the
+    // `class_is_java_util` bitmap rather than as `starts_with("java/util/")`,
+    // which is why a grep over the tier-up paths finds only the other one.
+    // The switch pair could not reach it, so the arm that page ran was an arm
+    // on a path the workload does not take for that method. The door also
+    // still gated the COUNTER on the prefix, so the conflation that page's own
+    // change undid in one door survived intact in the other: `getNow` was
+    // never counted, never nominated, never compiled -- and no
+    // `tierup-decline` row named it, because it never reached the chain that
+    // census instruments.
+    //
+    // Both doors now read the same two switches, and the DEFAULT is
+    // bit-for-bit what it was: with both off, `promotion_barred` is
+    // `handler_bearing || java_util`, so the admission test reduces to the
+    // `exception_table.is_empty() && !has_native && !java_util` it replaces.
     let mut compiled_call: Option<cratonvm_jit::RetainedCode> = None;
     if gate_generation == 0
         && !crate::runtime::env_cache::disable_jit()
-        && (cached.exception_table.is_empty()
-            || crate::runtime::env_cache::jit_virtual_promote_handler_callee())
         && crate::runtime::env_cache::jit_virtual_tierup()
     {
-        let has_native = cached
-            .native_call_site()
-            .resolve(
-                &shared.natives.native_methods,
-                &cached.class_name,
-                &cached.method_name,
-                &cached.method_descriptor,
-            )
-            .is_some();
-        let java_util = match crate::classloading::class_is_java_util(receiver_class_id) {
-            Some(b) => b,
-            None => {
-                crate::runtime::interpreter::invoke_fast::note_virtual_decline(
-                    "the java.util bitmap has no answer for the receiver class",
-                );
-                return None;
-            }
-        };
-        if !has_native && !java_util {
-            let jit_generation = cratonvm_jit::jit_cache_generation();
-            let found = if cached.jit_probe_is_current(jit_generation) {
-                None
-            } else {
-                let found = shared.jit.jit_cache.read().get(
+        let handler_bearing =
+            !crate::runtime::env_cache::jit_virtual_promote_handler_callee()
+                && !cached.exception_table.is_empty();
+        let nominate_always = crate::runtime::env_cache::jit_virtual_nominate_always();
+        // Under the defaults a handler-bearing callee is barred outright and
+        // nothing below can change that, so neither the registry memo nor the
+        // bitmap is consulted for one -- which keeps this door's `return None`
+        // on an unanswerable bitmap exactly where it was.
+        if !handler_bearing || nominate_always {
+            let has_native = cached
+                .native_call_site()
+                .resolve(
+                    &shared.natives.native_methods,
                     &cached.class_name,
                     &cached.method_name,
                     &cached.method_descriptor,
-                    cached.declaring_class_id,
-                );
-                if found.is_none() {
-                    cached.record_jit_probe_miss(jit_generation);
-                }
-                found.map(cratonvm_jit::RetainedCode::new)
-            };
-            compiled_call = match found {
-                Some(c) => Some(c),
+                )
+                .is_some();
+            let java_util = match crate::classloading::class_is_java_util(receiver_class_id) {
+                Some(b) => b,
                 None => {
-                    const JIT_RETRY_STRIDE: u32 = 64;
-                    // The profile store is credited in batches of this size,
-                    // so the census still sees every call.
-                    const SYNC_EVERY: u32 = 16;
-                    let threshold = crate::runtime::env_cache::jit_invocation_threshold();
-                    let cnt = cached.interp_invocations.fetch_add(1, Ordering::Relaxed) + 1;
-                    if cnt % SYNC_EVERY == 0 {
-                        shared
-                            .jit
-                            .profile_store
-                            .add_invocations(cached.invoc_key(), SYNC_EVERY);
+                    crate::runtime::interpreter::invoke_fast::note_virtual_decline(
+                        "the java.util bitmap has no answer for the receiver class",
+                    );
+                    return None;
+                }
+            };
+            // The two PROMOTION hazards, exactly as `execute_invokevirtual_cached`
+            // names them. A handler-bearing callee entered by a direct compiled
+            // call has no interpreter boundary at which its own handler can be
+            // resumed; the prefix's own origin (cb563d707) is that this route
+            // "can publish a stale receiver-specific entry and then spin".
+            // Both are correctness hazards, which is why the switch that
+            // relaxes the second ships default-OFF even though the 30 %
+            // regression once cited for it does not reproduce.
+            let promotion_barred = handler_bearing
+                || (!crate::runtime::env_cache::jit_virtual_promote_java_util() && java_util);
+            let census = crate::runtime::interp_census::promote_refuse_enabled();
+            if census && (has_native || (promotion_barred && !nominate_always)) {
+                crate::runtime::interp_census::record_promote_refuse(
+                    if has_native {
+                        "door_registered_native"
+                    } else if handler_bearing {
+                        "door_callee_exception_table"
+                    } else {
+                        "door_receiver_is_java_util"
+                    },
+                    &cached.class_name,
+                    &cached.method_name,
+                    &cached.method_descriptor,
+                );
+            }
+            if !has_native && (nominate_always || !promotion_barred) {
+                let jit_generation = cratonvm_jit::jit_cache_generation();
+                let found = if promotion_barred || cached.jit_probe_is_current(jit_generation) {
+                    if census && promotion_barred {
+                        crate::runtime::interp_census::record_promote_refuse(
+                            if handler_bearing {
+                                "door_nominated_promotion_barred_exception_table"
+                            } else {
+                                "door_nominated_promotion_barred_java_util"
+                            },
+                            &cached.class_name,
+                            &cached.method_name,
+                            &cached.method_descriptor,
+                        );
                     }
-                    let should_attempt = cnt >= threshold
-                        && (cnt == threshold || (cnt - threshold) % JIT_RETRY_STRIDE == 0);
-                    let mut upgraded = None;
-                    if should_attempt {
-                        if crate::runtime::env_cache::bg_compile() {
-                            ensure_bg_compiler_started(shared);
-                            let tiered_key = crate::jit::tiered::MethodKey::new(
-                                cached.class_name.as_ref(),
-                                cached.method_name.as_ref(),
-                                cached.method_descriptor.as_ref(),
-                            );
-                            let _ = shared
+                    None
+                } else {
+                    let found = shared.jit.jit_cache.read().get(
+                        &cached.class_name,
+                        &cached.method_name,
+                        &cached.method_descriptor,
+                        cached.declaring_class_id,
+                    );
+                    if found.is_none() {
+                        cached.record_jit_probe_miss(jit_generation);
+                    }
+                    found.map(cratonvm_jit::RetainedCode::new)
+                };
+                compiled_call = match found {
+                    Some(c) => Some(c),
+                    None => {
+                        const JIT_RETRY_STRIDE: u32 = 64;
+                        // The profile store is credited in batches of this size,
+                        // so the census still sees every call.
+                        const SYNC_EVERY: u32 = 16;
+                        let threshold = crate::runtime::env_cache::jit_invocation_threshold();
+                        let cnt = cached.interp_invocations.fetch_add(1, Ordering::Relaxed) + 1;
+                        if cnt % SYNC_EVERY == 0 {
+                            shared
                                 .jit
-                                .tiered_manager
-                                .on_method_invocation_observed(&tiered_key, cnt as u64);
-                        } else {
-                            let gate = match thread.invoke_cache.get(caller_class_id, cp_index, false, site_pc as u32)
-                            {
-                                Some(CachedInvokeTarget::VirtualBytecode { gate, .. }) => {
-                                    gate.clone()
+                                .profile_store
+                                .add_invocations(cached.invoc_key(), SYNC_EVERY);
+                        }
+                        let should_attempt = cnt >= threshold
+                            && (cnt == threshold || (cnt - threshold) % JIT_RETRY_STRIDE == 0);
+                        if census && !promotion_barred && !should_attempt {
+                            crate::runtime::interp_census::record_promote_refuse(
+                                if cnt < threshold {
+                                    "door_counter_below_threshold"
+                                } else {
+                                    "door_jit_cache_miss"
+                                },
+                                &cached.class_name,
+                                &cached.method_name,
+                                &cached.method_descriptor,
+                            );
+                        }
+                        let mut upgraded = None;
+                        if should_attempt {
+                            if crate::runtime::env_cache::bg_compile() {
+                                ensure_bg_compiler_started(shared);
+                                let tiered_key = crate::jit::tiered::MethodKey::new(
+                                    cached.class_name.as_ref(),
+                                    cached.method_name.as_ref(),
+                                    cached.method_descriptor.as_ref(),
+                                );
+                                let _ = shared
+                                    .jit
+                                    .tiered_manager
+                                    .on_method_invocation_observed(&tiered_key, cnt as u64);
+                            } else if !promotion_barred {
+                                let gate = match thread.invoke_cache.get(caller_class_id, cp_index, false, site_pc as u32)
+                                {
+                                    Some(CachedInvokeTarget::VirtualBytecode { gate, .. }) => {
+                                        gate.clone()
+                                    }
+                                    _ => {
+                                        crate::runtime::interpreter::invoke_fast::note_virtual_decline(
+                                            "an inline tier-up attempt is due",
+                                        );
+                                        return None;
+                                    }
+                                };
+                                if let Some(CachedInvokeTarget::Jit { compiled, .. }) =
+                                    try_jit_upgrade_with_gate(shared, &cached, gate)
+                                {
+                                    upgraded = Some(compiled);
                                 }
-                                _ => {
-                                    crate::runtime::interpreter::invoke_fast::note_virtual_decline(
-                                        "an inline tier-up attempt is due",
-                                    );
-                                    return None;
-                                }
-                            };
-                            if let Some(CachedInvokeTarget::Jit { compiled, .. }) =
-                                try_jit_upgrade_with_gate(shared, &cached, gate)
-                            {
-                                upgraded = Some(compiled);
                             }
                         }
+                        upgraded
                     }
-                    upgraded
-                }
-            };
+                };
+            }
         }
     }
 

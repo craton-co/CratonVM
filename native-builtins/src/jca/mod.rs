@@ -52,6 +52,10 @@ pub mod key_agreement;
 pub mod kem;
 // WP6.6 — `javax.security.auth.x500.X500Principal` DER + RFC 4514 round-trip.
 pub mod x500;
+
+/// The DN grammar `x500.rs` renders and parses: RDNs, AVAs and the DER string
+/// type each attribute value carries.
+pub mod x500_name;
 // ASN.1 helper used by x500 (DER encode/decode primitives). No registrations
 // of its own — exists as a compile-time module for x500.rs to depend on.
 pub mod asn1;

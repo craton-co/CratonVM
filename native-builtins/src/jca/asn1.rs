@@ -634,7 +634,7 @@ pub fn decode_extensions(der: &[u8]) -> Result<Vec<Extension>, DerError> {
 /// }
 ///
 /// `subject_name_der` is the *complete* DER blob produced by
-/// `x500::encode_rdns_to_der` (i.e. an X.500 `Name` SEQUENCE).
+/// `x500_name::encode_der` (i.e. an X.500 `Name` SEQUENCE).
 /// `subject_pki_der` is the SPKI SEQUENCE.  `attributes_der` is the
 /// inner SEQUENCE OF Attribute *content*; we wrap it in `[0]` here.
 /// Pass an empty slice to emit `[0] {}` (BC does this for plain CSRs
