@@ -4827,6 +4827,7 @@ mod tests {
                     kind: crate::keystore::EntryKind::PrivateKey {
                         key_der: der.clone(),
                         chain: Vec::new(),
+                        protected: None,
                     },
                 },
             )]
