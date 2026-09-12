@@ -68,7 +68,20 @@ A table entry for any of those 98 does not make it yield in `--jdk-only`; it
 deletes the native in every mode, compatible included. `registry::tests::
 real_layout_bridge_keeps_are_not_retired_shadows` fails on exactly that.
 
-## 4. What a taker needs
+## 4. The nearest neighbour, and why it matters here
+
+`W3-4-forkjointask-status-flags-and-the-eager-default.md` is closed and is still
+worth reading first. It documents `CRATONVM_FJP_EAGER_FORK`, a lever that
+re-registers `fork()` on all three task classes so the body runs **at fork
+time** rather than at `join()`.
+
+That is the closest thing in the tree to a claim, and it is the obvious thing to
+reach for. It is not one: running earlier changes WHEN the single inline runner
+executes, and the double is two runners. But a taker should know the lever
+exists, that it is genuinely wired flag-to-consumer, and that W3-4's own §3
+condition (2) — the Spring/H2 A/B that would price it — has never been run.
+
+## 5. What a taker needs
 
 * read §3a of the lane page first — the double is a RACE, the count varies run
   to run, and one run of each configuration is not a measurement;
