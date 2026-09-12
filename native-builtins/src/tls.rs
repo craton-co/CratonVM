@@ -861,13 +861,29 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
     });
 
     // setUseClientMode(boolean mode) -> void
+    //
+    // `ENG_CLIENT_MODE` is a SYNTHETIC slot index and the engine this VM hands
+    // out is a real `sun.security.ssl.SSLEngineImpl`, where that index names
+    // one of the JDK's own fields — so the write landed somewhere else and the
+    // read answered something else. The role goes where the rest of the
+    // engine's state already is; `t27_tls` keeps the distinction between "what
+    // role was CONFIGURED" (what this getter must report) and "what role the
+    // handshake will take" (which still defaults to client). MEASURED,
+    // `L6TlsParamSweep` rows 66 and 89: a fresh engine said `true` where
+    // HotSpot says `false`.
+    //
+    // This registrar is the last writer on the `javax/net/ssl/SSLEngine`
+    // surface — see `registry_ordering_tests
+    // ::p68_ssl_is_the_last_writer_on_the_ssl_engine_surface` — so this pair
+    // is the live one and `phases_late::ssl_security`'s is not. Both were
+    // changed together anyway: a reordering must not resurrect the slot read.
     r.register(cls, "setUseClientMode", "(Z)V", |ctx, args| {
-        if let Some(Value::Object(Some(this))) = args.get(0) {
+        if let Some(Value::Object(Some(this))) = args.first() {
             let mode = match args.get(1) {
                 Some(Value::Int(v)) => *v,
                 _ => 1,
             };
-            ctx.set_field(*this, ENG_CLIENT_MODE, Value::Int(mode));
+            crate::t27_tls::set_engine_use_client_mode(ctx, *this, mode != 0);
         }
         Ok(None)
     });
@@ -875,7 +891,9 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
     // getUseClientMode() -> boolean
     r.register(cls, "getUseClientMode", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, ENG_CLIENT_MODE)))
+        Ok(Some(Value::Int(i32::from(
+            crate::t27_tls::engine_use_client_mode(ctx, this),
+        ))))
     });
 
     // getPeerHost() -> String
@@ -931,8 +949,34 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
         "([Ljava/lang/String;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let list = args.get(1).copied().unwrap_or(Value::Object(None));
-            ctx.set_field(this, ENG_ENABLED_CIPHERS, list);
+            // JSSE validates the names — `IllegalArgumentException` for
+            // anything that is not a cipher suite — and this registrar is the
+            // LAST writer on the `javax/net/ssl/SSLEngine` surface, so the
+            // validation `t27_tls` performs one class down never ran for a
+            // caller who reached the engine through its base class. A made-up
+            // name was stored and then silently widened by
+            // `cipher_provider_for`, which falls back to the full provider
+            // when nothing maps: the application ran unrestricted believing it
+            // had restricted. MEASURED, `L6TlsParamSweep` row 94.
+            let Some(Value::Object(Some(arr))) = args.get(1).copied() else {
+                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: "CipherSuites cannot be null".into(),
+                }
+                .into());
+            };
+            for i in 0..ctx.array_length(arr) {
+                let name = match ctx.get_array_element(arr, i) {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                if !crate::t27_tls::is_cipher_suite_name(&name) {
+                    return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                        message: format!("Unsupported CipherSuite: {name}"),
+                    }
+                    .into());
+                }
+            }
+            ctx.set_field(this, ENG_ENABLED_CIPHERS, Value::Object(Some(arr)));
             Ok(None)
         },
     );

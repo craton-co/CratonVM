@@ -4294,6 +4294,7 @@ fn native_wildfly_security_manager_get_property_privileged(
 /// `grep capability_gate:: native-builtins/src` is the complete list of gated
 /// sites here; `docs/security/capability-wiring.md` records which of the audit
 /// rows in `docs/security/native-capabilities.md` they close.
+pub mod buffer_session;
 pub mod capability_gate;
 pub mod case_map;
 /// One proleptic-Gregorian calendar for the crate. Four modules had their
@@ -7452,6 +7453,37 @@ fn system_properties_object(ctx: &mut dyn NativeContext) -> Result<ObjectRef, Me
             // real-JDK mode -- which is exactly what
             // `t9d_floor_exempt_classes_have_no_oversized_factories` refuses.
             let p = crate::try_alloc_concurrent_synthetic(ctx, "java/util/Properties", 0)?;
+            // JVMS §2.3's default for `defaults`, WRITTEN.
+            //
+            // This factory writes no slot, and `alloc_object` does not write
+            // the descriptor defaults either -- `Value::Object` carries a
+            // `NonNull` niche, so the all-zero cell `alloc_zeroed` leaves
+            // decodes as `Value::Int(0)` and NOT as `Value::Object(None)`.
+            // Every other `Properties` in the image gets `defaults` written by
+            // `native_props_init`; this singleton never runs a constructor, so
+            // it was the one receiver whose `defaults` was an `Int`.
+            //
+            // Measured on `probes/CollectionSlotFloor` before this line:
+            //
+            // ```text
+            //   descriptor-coercion census: total=31
+            //     primitive-into-reference[read=31]
+            //     class_id=132 index=8 descriptor=L hits=30
+            // ```
+            //
+            // -- `class_id=132` is `java/util/Properties` and index 8 is
+            // `defaults`. Thirty reads of a reference slot holding a primitive,
+            // each one DESTROYED by `coerce_field_value_for_slot`, on a probe
+            // that does nothing but read properties. It answers `null` after
+            // the coercion, which is the right value, so nothing observable was
+            // wrong -- and that is precisely why it has to be written rather
+            // than tolerated: the census exists to find the reads where the
+            // coerced answer is NOT the right one, and thirty benign rows at
+            // one locator is how a real one stays hidden.
+            //
+            // By name, so a fabricated stub (no `defaults` field) is a no-op
+            // rather than a write to whatever slot 8 means there.
+            ctx.set_field_by_name(p, "defaults", Value::Object(None));
             crate::properties_sidetable::mark_system_props(ctx, p);
             Ok(crate::lang_system::set_system_props_singleton(
                 ctx.vm_identity(),
@@ -20897,7 +20929,19 @@ pub fn register_essential_natives_with_shims(
             buf,
             "session",
             "()Ljdk/internal/foreign/MemorySessionImpl;",
-            |_ctx, _args| Ok(Some(cratonvm_types::Value::Object(None))),
+            |ctx, args| {
+                // Record which receiver class this shim actually answered for,
+                // so the JIT's thin `session()` helper can answer for the SAME
+                // classes without the ~160 ns generic native funnel — and for
+                // no others. See `crate::buffer_session` for why the eleven
+                // registered names are not the right population to read.
+                //
+                // The value is unchanged: a constant null, as before.
+                if let Some(cratonvm_types::Value::Object(Some(this))) = args.first() {
+                    crate::buffer_session::note_served(ctx.class_id_of_object(*this).as_u32());
+                }
+                Ok(Some(cratonvm_types::Value::Object(None)))
+            },
         );
         // KEEP: genuine no-op. `checkSession()` throws only when the buffer's
         // memory session has been closed; `session()` (registered immediately

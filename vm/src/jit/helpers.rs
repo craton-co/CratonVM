@@ -19887,6 +19887,95 @@ pub unsafe extern "C" fn jit_reachability_fence_direct(_vm_ptr: i64, referent: i
     let _ = std::hint::black_box(referent);
 }
 
+/// Synthetic call-site info for [`jit_buffer_session_direct`]'s decline edge.
+///
+/// `class_name` is the abstract base rather than a concrete buffer class, and
+/// that is safe because the decline path re-dispatches on the RECEIVER: the
+/// generic dispatcher resolves the same triple it would have resolved without
+/// the bind, for whatever class the receiver actually is.
+static BUFFER_SESSION_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "java/nio/Buffer",
+    method_name: "session",
+    descriptor: "()Ljdk/internal/foreign/MemorySessionImpl;",
+    num_jit_args: 1,
+    return_type: b'L',
+    invoke_kind: 0,
+    declaring_class_id: 0,
+};
+
+/// Thin direct-call target for JIT `java.nio.Buffer.session()` sites.
+///
+/// # What it replaces, and why that is exactly nothing
+///
+/// The registered shim's whole body is `Ok(Some(Value::Object(None)))` — a
+/// constant null — and `--dump-native-registry` prices it at ONE crossing per
+/// multi-byte heap accessor: 200 000 `session()` invocations for 200 000
+/// `HeapByteBuffer.getInt(int)` calls, alongside the 200 000
+/// `getIntUnaligned` crossings that do the actual read. Half the native
+/// crossings on the hot accessor path were for a constant.
+///
+/// # The receiver screen is the whole safety argument
+///
+/// `session()` is dispatched on the receiver's class, and the shim is
+/// registered for eleven named buffer classes that do **not** include
+/// `HeapByteBufferR` or `DirectByteBufferR`. For a receiver outside that set
+/// the REAL `java.nio.Buffer.session()` bytecode runs — `getfield segment;
+/// ifnull` — which returns the buffer's actual session when it has one. A
+/// helper that returned null unconditionally would therefore answer for
+/// receivers whose real method the registry never took over, and would silently
+/// skip scope validation on an FFM-derived buffer.
+///
+/// So it answers only for a class id `buffer_session::class_is_served` says the
+/// shim itself has already run for. For those receivers this returns
+/// byte-for-byte what the shim returned; for every other receiver it declines
+/// to the generic dispatcher and today's behaviour is unchanged, whatever it
+/// is. The population can only ever be *learned from the funnel*, never
+/// guessed from a class-name list — which is the mistake the list's own
+/// omissions would have caused.
+///
+/// # Safety
+/// Called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_buffer_session_direct(vm_ptr: i64, receiver: i64) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    if receiver == 0 {
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
+    let vm = &*(vm_ptr as *const SharedVm);
+    let raw = receiver as u64;
+    // Shape screen before any header read, as `dbb_direct_elem_addr` does:
+    // this is the only thing between a fabricated argument and the class-id
+    // probe below.
+    if (raw & 0x7) == 0 && raw < (1u64 << 48) {
+        if let Some((class_id, _identity)) = direct_receiver_facts(vm, raw as usize) {
+            // H12-1, as on every other shadow: the registered row is `bridge`,
+            // so under a policy latch that went strict after this site was
+            // compiled the real bytecode is authoritative and this helper must
+            // not answer. Placed after the receiver screen so the decline
+            // counter counts calls the fast path would otherwise have served.
+            if cratonvm_native_builtins::buffer_session::class_is_served(class_id)
+                && !jit_direct_helper_refused(vm)
+            {
+                cratonvm_jit::BUFFER_SESSION_SERVED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // `null`, which is what the shim returns and what every caller
+                // on this path (`ScopedMemoryAccess.get*Unaligned`) already
+                // accepts — it skips `checkValidStateRaw()` on a null session.
+                return 0;
+            }
+        }
+    }
+    cratonvm_jit::BUFFER_SESSION_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let args = [receiver];
+    jit_invoke_dispatch(
+        vm_ptr,
+        &BUFFER_SESSION_INFO as *const JitInvokeInfo as i64,
+        args.as_ptr() as i64,
+        1,
+    )
+}
+
 /// Synthetic call-site info for [`jit_thread_current_thread_direct`]'s
 /// cold arm (the first call on a thread whose mirror has not been built).
 static THREAD_CURRENT_THREAD_INFO: JitInvokeInfo = JitInvokeInfo {
@@ -27005,6 +27094,25 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         cratonvm_jit::set_nio_bytebuffer_byte_direct_fns(
             jit_dbb_put_byte_direct as *const () as usize,
             jit_dbb_get_byte_direct as *const () as usize,
+        );
+        // The predicate the OPTIMIZING door's bind is gated on. The JIT crate
+        // does not depend on `native-io`, so it cannot ask the served-class
+        // table directly; publishing the function pointer keeps the planner's
+        // "will the helper serve this receiver?" and the helper's own prologue
+        // reading the SAME table, which is the property that makes the bind
+        // gate meaningful rather than a guess.
+        cratonvm_jit::set_nio_byte_element_served_class_fn(
+            cratonvm_native_io::direct_buffer::elem_fastpath::class_is_served as *const () as usize,
+        );
+        // `Buffer.session()` and the served-class table its fast path is
+        // screened against — published as a pair, because the helper without
+        // the predicate would answer for every receiver, which is precisely
+        // the unsound version.
+        cratonvm_jit::set_buffer_session_direct_fn(
+            jit_buffer_session_direct as *const () as usize,
+        );
+        cratonvm_jit::set_buffer_session_served_class_fn(
+            cratonvm_native_builtins::buffer_session::class_is_served as *const () as usize,
         );
         cratonvm_jit::set_md_update_byte_direct_fn(jit_md_update_byte_direct as *const () as usize);
         cratonvm_jit::set_reachability_fence_direct_fn(

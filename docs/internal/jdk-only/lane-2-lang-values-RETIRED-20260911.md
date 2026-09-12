@@ -195,7 +195,7 @@ corpus, against a 40/40 baseline taken on the same binary.
 |---|---:|---|---|
 | `StringBuilder` + `AbstractStringBuilder` | 123 | **40/0** | the JIT intrinsic door, and cost |
 | `java/lang/System` | 23 | 38/2 `RJdkSecurity` `RJdkProxyIface` | the property store is the authority |
-| `java/lang/System$1` | 28 | 39/1 `RJdkProxyIface` | hidden-class `defineClass0` |
+| `java/lang/System$1` | 28 | ~~39/1 `RJdkProxyIface`~~ **136/0** | ~~hidden-class `defineClass0`~~ the retirement SCORE, not the VM |
 | `java/lang/foreign/` | 61 | 39/1 `RJdkForeign` | the FFM carrier is the VM's own shape |
 | `java/lang/ref/` | 35 | **40/0** | reference discovery — see the warning |
 | `java/lang/SecurityManager` | 13 | **40/0** | the exec/Panama security model |
@@ -203,7 +203,9 @@ corpus, against a 40/40 baseline taken on the same binary.
 | `java/lang/Runtime` + `Shutdown` | 11 | 39/1 `RJdkJni` | native library loading |
 | ~~`java/math/BigInteger`, held per-triple~~ **RETIRED 2026-09-12** | 14 | **41/0** | none — the rule's premise was false (§2) |
 
-**Four of those arms are corpus-clean and three are blocked anyway.** That is the
+**Four of those arms are corpus-clean and three are blocked anyway.** (Five as of
+2026-09-12: `System$1`'s arm is clean now too, and it is still blocked -- see
+below. The line below got stronger, not weaker.) That is the
 most important line on this page. `java/lang/ref/` is the campaign's own worked
 example: `retired_shadow.rs` records it passing the 36-vector screen in August
 and being rejected by the 102-vector ARM on `RClassUnloadSweep{,Gen}`, and this
@@ -244,6 +246,27 @@ lane's 40-vector screen reproduces the same false clean three weeks later.
   the resulting `MethodHandleProxies` class (`7 of 9 steps failed`). That error
   named no exception — it printed a raw heap pointer — so this wave also fixed
   the diagnostic in `vm/src/vm/vm_exec.rs`.
+
+  **The VM half is FIXED, 2026-09-12.** The diagnostic this wave added is what
+  made it findable: the error named `NoClassDefFoundError:
+  jdk/MHProxy1/RJdkProxyIface$Greeter` — the proxy's own name WITHOUT the hidden
+  suffix it is stored under. A hidden class could not refer to itself. Its
+  constant pool carries its class-FILE name and it is registered under
+  `"<that name>/0x<counter>"` in no loader's namespace, so `putstatic
+  <ITSELF>.interfaceType` in `<clinit>` and `invokestatic
+  <ITSELF>.ensureOriginalLookup` in `<init>` both resolved a name nothing could
+  find. Two doors, two different reasons, one predicate — see
+  `lane-2-system1-hidden-class-self-reference-FIXED-20260912.md`.
+
+  `RJdkProxyIface` armed goes from `7 of 9 steps failed` to 38/38, and the
+  ENFORCE arm over the whole `--jdk-only` corpus goes from 39/1 to **136/0**.
+
+  **It is still blocked, and the reason is now a different one.** A clean arm
+  means the corpus did not ask — this page's own §4 warning — and the enforcement
+  dial rejects a retirement but cannot promote one, so `armed == control` is
+  exactly what a promotion looks like whether or not it is safe. What these 28
+  rows now need is the two-binary score over the corpus, not another dial arm.
+  Nothing about them has been retired.
 
 ## 5. Nine rows are not shadows, and the distinction cost a correction
 

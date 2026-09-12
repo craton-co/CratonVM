@@ -5523,6 +5523,10 @@ impl<'a> Lowerer<'a> {
         // runs. `CRATONVM_JIT_IR_POLL_OUTLINE=1`; default OFF.
         if ir_poll_outline_enabled() {
             IR_POLLS_OUTLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            IR_POLLS_LOCAL.with(|c| {
+                let (o, i) = c.get();
+                c.set((o + 1, i));
+            });
             self.buf.emit(&[0x0F, 0x85]); // JNZ .slow (outlined, after the body)
             let slow_patch = self.buf.pos();
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
@@ -5536,6 +5540,10 @@ impl<'a> Lowerer<'a> {
             return;
         }
         IR_POLLS_INLINE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        IR_POLLS_LOCAL.with(|c| {
+            let (o, i) = c.get();
+            c.set((o, i + 1));
+        });
         self.buf.emit(&[0x0F, 0x84]); // JZ .clear
         let clear_patch = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
@@ -15471,6 +15479,34 @@ pub fn ir_poll_census() -> (u64, u64) {
     )
 }
 
+thread_local! {
+    /// Per-thread mirror of the two counters above, bumped at the same sites.
+    ///
+    /// The process-global pair is what the reporting wants; it is the wrong
+    /// instrument for a TEST, and the difference is a flake rather than a
+    /// theory. `CRATONVM_JIT_IR_POLL_OUTLINE` is set through
+    /// `with_thread_overrides`, so only the testing thread can outline a poll
+    /// -- but every other thread in a parallel `cargo test` is compiling
+    /// fixtures that emit INLINE polls into the same global counter. A delta
+    /// read around one compile therefore measures this thread's outlined polls
+    /// and the whole suite's inline ones.
+    ///
+    /// `an_outlined_safepoint_poll_stops_when_the_inline_one_does_and_not_otherwise`
+    /// already excused this on its first assertion ("the census is
+    /// PROCESS-global and the suite runs in parallel, so the INLINE count picks
+    /// up whatever else is compiling on another thread") and then asserted
+    /// `out_census.1 == 0` anyway -- which failed **two runs in three** on an
+    /// unmodified tree, measured 2026-09-12.
+    static IR_POLLS_LOCAL: std::cell::Cell<(u64, u64)> = const {
+        std::cell::Cell::new((0, 0))
+    };
+}
+
+/// This THREAD's `(outlined, inline)` poll counts. See [`IR_POLLS_LOCAL`].
+pub fn ir_poll_census_local() -> (u64, u64) {
+    IR_POLLS_LOCAL.with(std::cell::Cell::get)
+}
+
 fn ir_poll_outline_enabled() -> bool {
     matches!(
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_POLL_OUTLINE").as_deref(),
@@ -17130,10 +17166,47 @@ fn plan_register_residency(
         }
     }
     let (mut skip_const, mut skip_single_use) = (0usize, 0usize);
+    // What `ir_reserve_carried_enabled`'s pass will want, computed with ITS
+    // predicate so the two cannot disagree about who is a candidate. Its own
+    // `gp_reg_of[id].is_none()` filter is the one thing left out -- nothing is
+    // assigned yet, and the point here is to reserve room BEFORE that happens.
+    // See `ir_residency_crossblock_budget_enabled`.
+    let mut carried_w: Vec<u64> = (0..n)
+        .filter(|&id| live.carried.get(id).copied().unwrap_or(false))
+        .filter(|&id| plan.node_color.get(id).copied().flatten().is_some())
+        .filter(|&id| match graph.nodes.get(id) {
+            Some(node) => {
+                matches!(node.ty, IrType::Int | IrType::Long)
+                    && !matches!(node.op, Op::Const(_))
+                    && (ir_phi_residency_enabled() || !matches!(node.op, Op::Phi))
+            }
+            None => false,
+        })
+        .map(|id| live.weight.get(id).copied().unwrap_or(0))
+        .collect();
+    // Descending, because the carried pass serves its own candidates in that
+    // order (`cands.sort_unstable_by(|a, b| b.0.cmp(&a.0)...)`) and the register
+    // a crossblock value takes comes off the BOTTOM of that list.
+    carried_w.sort_unstable_by(|a, b| b.cmp(a));
+    let carried_demand = carried_w.len();
+    let (mut crossblock_taken, mut crossblock_over) = (0usize, 0usize);
     for id in 0..n {
         let Some(segs) = alloc.segments.get(id) else {
             continue;
         };
+        // A value the carry window cannot reach, and whether the budget still
+        // has room for it. `crossblock_candidate` is what it IS;
+        // `crossblock_admit` is what this method can still afford.
+        let crossblock_candidate = ir_residency_crossblock_enabled()
+            && use_count.get(id).copied().unwrap_or(0) == 1
+            && !single_use_is_in_the_carry_window(graph, schedule, id);
+        let crossblock_admit = crossblock_candidate
+            && (!ir_residency_crossblock_budget_enabled()
+                || live.weight.get(id).copied().unwrap_or(0)
+                    >= carried_displacement_price(&carried_w, crossblock_taken));
+        if crossblock_candidate && !crossblock_admit {
+            crossblock_over += 1;
+        }
         if ir_residency_pays_enabled() {
             match graph.nodes.get(id).map(|node| &node.op) {
                 Some(Op::Const(_)) => {
@@ -17164,12 +17237,17 @@ fn plan_register_residency(
                 // twice as often as the single publish. It reduces exactly to
                 // `use_count >= 2` when everything sits at depth 0, so a
                 // method with no loop is byte-identical.
+                // The single-use refusal, and the one population it must not
+                // refuse: a value the carry window cannot reach. See
+                // `ir_residency_crossblock_enabled` -- for those the
+                // alternative to a register is a home store AND a reload, not
+                // the free RAX hand-off the refusal assumes.
                 _ if !ir_residency_pays_here(
                     &live,
                     schedule,
                     id,
                     use_count.get(id).copied().unwrap_or(0),
-                ) =>
+                ) && !crossblock_admit =>
                 {
                     skip_single_use += 1;
                     continue;
@@ -17294,6 +17372,12 @@ fn plan_register_residency(
         }
         if is_gp {
             gp_reg_of[id] = Some(reg.num);
+            // Charged HERE rather than at the guard: everything between the two
+            // can still `continue`, and a budget spent on a value that never
+            // got a register would starve the carried pass for nothing.
+            if crossblock_candidate {
+                crossblock_taken += 1;
+            }
         } else {
             reg_of[id] = Some(reg.num);
         }
@@ -17572,7 +17656,8 @@ fn plan_register_residency(
             "[ir-ls] skipped: split_or_spilled={skip_split} \
              wrong_bank_or_type={skip_bank} no_home={skip_home} phi={skip_phi} \
              const={skip_const} single_use={skip_single_use} param_copies={param_copies} \
-             spilled={skip_spilled} no_alloc={skip_no_alloc} carried_reserved={carried_reserved}"
+             spilled={skip_spilled} no_alloc={skip_no_alloc} carried_reserved={carried_reserved}              | crossblock: price={} taken={crossblock_taken}              over={crossblock_over} carried_demand={carried_demand} carried_w={carried_w:?}",
+            carried_displacement_price(&carried_w, crossblock_taken)
         );
         eprintln!("[ir-ls] safepoints={}", graph.safepoints.len());
     }
@@ -19274,6 +19359,236 @@ fn ir_residency_pays_enabled() -> bool {
     }
 }
 
+/// Let a SINGLE-USE value be register-resident when the carry window cannot
+/// reach it -- **default OFF**, opt in with
+/// `CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK=1`.
+///
+/// `ir_residency_pays_here` reduces to `static_uses >= 2` in a default build
+/// (`ir_residency_loop_weight_enabled` is off), so a value read ONCE never gets
+/// a register. The reasoning behind that rule is sound where it applies: a
+/// single-use value costs one publish and saves one reload, which is a wash --
+/// **and `plan_carries` already serves those, for free, by handing the
+/// producer's RAX straight to the consumer.**
+///
+/// But `plan_carries` scans a window exactly one node wide:
+///
+/// ```text
+/// for w in 1..block.nodes.len() {
+///     let prod = block.nodes[w - 1];
+///     let cons = block.nodes[w];
+/// ```
+///
+/// so it reaches a single-use value only when its consumer is the very next
+/// node in the same block. For every other single-use value the trade is not a
+/// wash at all: the alternative to a register is a home STORE and a RELOAD, two
+/// memory operations, and the publish that replaces them is a register move.
+///
+/// `FibCall.fib` is the shape that names it. `n-1` and `n-2` are computed in
+/// the entry block and read at call sites blocks later, so neither can be
+/// carried and neither is resident:
+///
+/// ```asm
+/// lea eax,[rbx-1] ; mov [rbp-50h],rax    ; … stored in the entry block
+/// mov rdx,[rbp-50h]                      ; … and reloaded at the call
+/// ```
+///
+/// Four memory operations per call for two values a callee-saved register would
+/// have held across it, which is what the single-pass tier does and what
+/// `c2-fib-per-call-budget-20260912.md` counts as the largest term in that
+/// method's per-call budget.
+///
+/// This admits exactly the complement of the carry window, so the two
+/// mechanisms partition the single-use population instead of competing for it:
+/// `plan_carries` already declines a value residency took
+/// (`assigned_gpr(prod).is_some()`, `carry_skips[3]`).
+///
+/// **MEASURED** (2026-09-12, one binary, arms interleaved with a control arm;
+/// `c2-the-per-frame-contract-residency-20260912.md`):
+///
+/// ```text
+/// FieldLoop.sum  reps=3000 n=20000   A 99.0 | C 99.0 | B 91.5 ms
+///                floor 0.0%   effect -7.6%   ratio 0.924x   FASTER
+/// FibCall.fib    n=30                A 179.0 | C 177.0 | B 178.0 ms
+///                floor 1.1%   effect +0.0%   ratio 1.000x   UNMEASURABLE
+/// ```
+///
+/// The loop win is one value: `i + 1` is read exactly once, by the phi at the
+/// back edge, so it was stored to its home and reloaded on every iteration.
+/// The optimizing body SHRINKS there, 1052 -> 1039 bytes.
+///
+/// `fib` is the cost side. It admits four more values (`single_use` 13 -> 6,
+/// `resident` 2 -> 6) and grows the body 788 -> 883, because every register in
+/// [`ir_gp_file`] is callee-saved and `fib` has FOUR epilogues, each restoring
+/// the whole set -- twelve restores EMITTED against three removed reloads.
+///
+/// That static count is not the cost, and `probes/ManyExits.java` was written
+/// to prove it was: loop-free with SIX exits, the shape an epilogue-scaled cost
+/// would have to lose on. It is neutral twice (1.007x, 1.002x). **Exactly one
+/// epilogue executes per call**, so the file is saved once and restored once
+/// whatever the static exit count:
+///
+/// ```text
+///   dynamic cost = 2 memory ops per promoted register, PER CALL
+///                  (one save, one restore) -- NOT scaled by exit count
+///   static cost  = 1 + N_epilogues per register  (code size only)
+///   benefit      = reloads/stores removed, TIMES how often they execute
+/// ```
+///
+/// All three probes follow from that: `fib` and `ManyExits` each pay ~6 ops and
+/// recover ~6 (a wash, at four exits and at six alike), while `FieldLoop` pays
+/// ZERO -- its body already saves all five registers in both arms -- and
+/// recovers a load and a store on each of 20 000 iterations.
+///
+/// `static_uses >= 2` misses both sides: it counts static edges rather than
+/// executions, and it prices a register-to-register publish as costing what a
+/// memory reload costs.
+///
+/// **DEFAULT OFF, and the losing shape is now KNOWN.** `probes/RegPressure.java`
+/// oversubscribes the five-register file -- six loop-carried accumulators plus
+/// three cross-block single-use values -- and this flag is SLOWER there, three
+/// runs out of three, each above its own floor:
+///
+/// ```text
+///   mix       (6 accumulators)   floor 0.9%  +12.5%  ratio 1.125x  SLOWER
+///   mix       (confirmation)     floor 5.5%   +9.7%  ratio 1.097x  SLOWER
+///   mixNarrow (3 accumulators)   floor 2.3%   +5.4%  ratio 1.054x  SLOWER
+/// ```
+///
+/// The census names it: 25 more values admitted buys ONE more resident, while
+/// `split_or_spilled` goes 12 -> 28 and `carried_reserved` 5 -> 2. The model
+/// above prices the register as free to take; under pressure its real price is
+/// whatever the value that would otherwise have held it was worth, and on that
+/// probe that value is read every iteration.
+///
+/// [`ir_residency_crossblock_budget_enabled`] is that occupancy term, and it is
+/// **default ON**. With it, `mix` compiles byte-identically to this flag being
+/// off (3164) so its 12.5% is structurally gone, and `FieldLoop`'s win is kept
+/// (1039). It is still not enough to flip THIS flag on: `mixNarrow` remains
+/// 1.067x slower over a 0.0% floor, and it cannot be fixed by any rule of that
+/// shape -- it and `FieldLoop.sum` present identical carried weights, identical
+/// displacement price and identical candidate weights, and diverge anyway. Loop
+/// weight is not the discriminating variable; the allocator's own outcome under
+/// the added pressure is. See section 6d.
+///
+/// Correctness is not the objection -- section 6b: `jit-flag-soak` divergent=0,
+/// every `CratonBench` / `CratonBenchC2` checksum bit-identical.
+///
+/// **Measuring this flag on a new probe: check `CRATONVM_DBG=jit-disasm` prints
+/// a `full/ir` body at the A/B's settings, and that the two arms' `len=` DIFFER.**
+/// The OSR door is single-pass only (`osr ir-eligibility: ... INERT at this
+/// door`) while still running the IR pipeline, so a linear-scan census can differ
+/// between arms that execute byte-identical code. The first run of `RegPressure`
+/// read 1.000x over a 0.5% floor for exactly that reason.
+/// Leave the loop-carried reservation its registers before the crossblock arm
+/// spends them -- **default ON**, opt out with
+/// `CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK_BUDGET=0`.
+///
+/// [`ir_residency_crossblock_enabled`] admits single-use values in the MAIN
+/// residency loop. `ir_reserve_carried_enabled`'s pass runs after it, over
+/// `free = ir_gp_file() - taken`, so on a contended method the crossblock arm
+/// can spend the whole file before the values read on every iteration are ever
+/// considered. That is measured, on `probes/RegPressure.java`: 5 loop-carried
+/// values resident with the flag off, 2 with it on, and 5-12% SLOWER.
+///
+/// The budget is the cheapest form of the occupancy term that result asks for.
+/// Count what the carried pass will want -- the same predicate it uses -- and
+/// let the crossblock arm have only what is left over:
+///
+/// ```text
+/// budget = ir_gp_file().len() - |{ id : live.carried[id] && has home
+///                                      && Int|Long && !Const && (phi ok) }|
+/// ```
+///
+/// It is deliberately a COUNT and not a priority queue. The carried pass
+/// already orders its own candidates by loop-weighted use count; this only has
+/// to stop the main loop from emptying the file first, and a count does that
+/// without duplicating the ordering in two places that could disagree.
+/// What the NEXT register taken from the loop-carried reservation costs, in
+/// loop-weighted uses, once `taken` have already been taken.
+///
+/// `carried_w` is every carried candidate's `live.weight`, descending. The
+/// carried pass serves its list in that same order and stops when the file runs
+/// out, so the value a crossblock admission actually displaces is the weakest
+/// one that would still have been served -- `carried_w[file_len - 1]` -- and
+/// each further admission displaces the next one up. The bar therefore RISES as
+/// the file empties, which is what stops a run of cheap single-use values from
+/// evicting the whole carried set one register at a time.
+///
+/// Returns `u64::MAX` once the file is spent, refusing everything after that,
+/// and `0` when there are fewer carried candidates than registers -- nothing is
+/// displaced then, so nothing has to be outbid.
+///
+/// The caller compares with `>=`, not `>`, and that is MEASURED rather than
+/// chosen. On `probes/FieldLoop.java` the carried weights are
+/// `[20, 11, 10, 10, 10, 10]`, so the price is 10 -- and the induction variable
+/// the whole transform exists to serve weighs exactly 10 too. Under `>` all ten
+/// candidates are refused and the body reverts to its slow 1052 bytes. A tie
+/// means "these two values are read equally often", and at that point the
+/// crossblock value is the better holder: the carried pass's own candidates are
+/// phis and loop-carried values whose home word is written by
+/// `emit_phi_copies` at every incoming edge regardless, so their register saves
+/// reads only, while the crossblock value's register removes a store AND a
+/// reload. `probes/RegPressure.java` is unaffected by the tie-break -- its price
+/// is 21 against candidates weighing 10, which `>=` refuses just as `>` did.
+///
+/// This replaces a COUNT-based budget, which was built first and measured wrong:
+/// `ir_gp_file().len() - carried_demand` is zero for any loop with five or more
+/// carried candidates, which is most loops including `probes/FieldLoop.java` --
+/// so it removed the regression on `RegPressure` by removing the transform
+/// everywhere, reverting `FieldLoop.sum` to its slow 1052-byte body. A count
+/// cannot tell "displacing something worth less than me" from "displacing
+/// something worth more".
+fn carried_displacement_price(carried_w: &[u64], taken: usize) -> u64 {
+    let file_len = ir_gp_file().len();
+    if carried_w.len() < file_len {
+        return 0;
+    }
+    match file_len.checked_sub(1 + taken) {
+        Some(i) => carried_w.get(i).copied().unwrap_or(0),
+        None => u64::MAX,
+    }
+}
+
+fn ir_residency_crossblock_budget_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK_BUDGET") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
+fn ir_residency_crossblock_enabled() -> bool {
+    matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
+}
+
+/// Is `id`'s single use the node immediately after it in its own block -- the
+/// window [`Lowerer::plan_carries`] scans?
+///
+/// Mirrors that scan deliberately, including its "consumer is `nodes[w]`,
+/// producer is `nodes[w - 1]`" shape, so the two cannot drift into either
+/// double-serving a value or leaving one to neither. It does NOT re-check the
+/// carry's type and arm conditions: a value that clears this window but fails
+/// those is one the carry declines and residency would then have to serve, and
+/// answering `true` here would leave it with nothing. Erring toward `false`
+/// hands it to residency, which is the side that always has an answer.
+fn single_use_is_in_the_carry_window(graph: &Graph, schedule: &Schedule, id: usize) -> bool {
+    for block in &schedule.blocks {
+        let Some(w) = block.nodes.iter().position(|&n| n as usize == id) else {
+            continue;
+        };
+        let Some(&cons) = block.nodes.get(w + 1) else {
+            return false;
+        };
+        return graph
+            .nodes
+            .get(cons as usize)
+            .is_some_and(|cn| cn.inputs.iter().any(|&i| i != NO_NODE && i as usize == id));
+    }
+    false
+}
+
 /// A constant is read as an immediate rather than from its home word --
 /// **default ON**, opt out with `CRATONVM_JIT_IR_CONST_IMM=0`.
 fn ir_const_imm_enabled() -> bool {
@@ -19506,6 +19821,155 @@ mod tests {").next().unwrap_or(src);
             "patch sites must swallow the error and let `lower_inner`'s \
              `buf.overflowed()` bail fall back to single-pass, not panic \
              (use `.ok()`); offenders: {offenders:?}",
+        );
+    }
+
+    /// The flag must be read LIVE, not cached in a `OnceLock`.
+    ///
+    /// Same hazard `equal_depth_flag_is_read_live` pins: an A/B that runs both
+    /// arms in one process reports byte-identical code when a scheduling flag
+    /// is memoised, and the result looks like "the transform does nothing"
+    /// rather than "the flag was never re-read".
+    /// The displacement price rises as the file empties, and is zero when
+    /// nothing would be displaced.
+    ///
+    /// Both ends matter and both were wrong in an earlier draft. A price that
+    /// did NOT rise let a run of cheap single-use values evict the whole
+    /// carried set one register at a time; a price that was not zero for an
+    /// under-subscribed file made the transform inert on straight-line code,
+    /// where there is no carried value to outbid in the first place.
+    ///
+    /// The weights are `probes/FieldLoop.java`'s real ones, so this also pins
+    /// the case the `>=` tie-break exists for: price 10 against a candidate
+    /// weighing 10 must be admissible, or that probe's 7.6% goes away.
+    #[test]
+    fn the_displacement_price_rises_as_the_file_empties() {
+        let file = ir_gp_file().len();
+        assert!(
+            file >= 2,
+            "the rest of this test assumes a file worth sharing"
+        );
+
+        // Fewer carried candidates than registers: nothing is displaced.
+        assert_eq!(carried_displacement_price(&[99; 1], 0), 0);
+        assert_eq!(carried_displacement_price(&[], 0), 0);
+
+        // FieldLoop.sum's measured weights, descending.
+        let fieldloop = [20u64, 11, 10, 10, 10, 10];
+        assert!(
+            fieldloop.len() >= file,
+            "fixture must over-subscribe the file to displace anything"
+        );
+        let first = carried_displacement_price(&fieldloop, 0);
+        assert_eq!(
+            first,
+            fieldloop[file - 1],
+            "the first admission displaces the WEAKEST value still served"
+        );
+        assert!(
+            10 >= first,
+            "the induction variable weighs 10 and must be admissible at the              first price -- this is the `>=` tie-break §6d measured"
+        );
+
+        // Strictly rising, then refusing outright once the file is spent.
+        let mut prev = first;
+        for taken in 1..file {
+            let now = carried_displacement_price(&fieldloop, taken);
+            assert!(
+                now >= prev,
+                "price fell at taken={taken}: {prev} -> {now}; a falling price                  lets cheap values evict the carried set one register at a time"
+            );
+            prev = now;
+        }
+        assert_eq!(
+            carried_displacement_price(&fieldloop, file),
+            u64::MAX,
+            "once the file is spent nothing may be admitted at any weight"
+        );
+    }
+
+    #[test]
+    fn crossblock_flag_is_read_live() {
+        let read = |v: Option<&str>| {
+            cratonvm_types::flags::with_thread_overrides(
+                &[("CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK", v)],
+                ir_residency_crossblock_enabled,
+            )
+        };
+        assert!(read(Some("1")));
+        assert!(!read(Some("0")));
+        assert!(!read(None), "default is OFF");
+        assert!(read(Some("1")), "a second read must still see the override");
+    }
+
+    /// `single_use_is_in_the_carry_window` must answer for the window
+    /// [`Lowerer::plan_carries`] actually scans -- the node immediately after
+    /// the producer, in the producer's own block -- and not for "some later
+    /// node reads it".
+    ///
+    /// The fixture is `fib`'s shape reduced to its essential: a value computed
+    /// in the entry block whose only reader sits past a branch. That value is
+    /// the entire population the flag exists for, so a test that could not
+    /// produce one would not be testing anything. The assertion is therefore
+    /// two-sided: the cross-block value reads `false`, and the value whose
+    /// consumer IS adjacent reads `true`.
+    #[test]
+    fn the_carry_window_is_exactly_the_next_node_in_the_same_block() {
+        // int f(int a) { int t = a + a; if (a != 0) return t; return 1; }
+        //   0: iload_0  1: iload_0  2: iadd  3: istore_1
+        //   4: iload_0  5: ifeq 10  8: iload_1  9: ireturn
+        //  10: iconst_1 11: ireturn
+        let code = [
+            0x1a, 0x1a, 0x60, 0x3c, 0x1a, 0x99, 0x00, 0x05, 0x1b, 0xac, 0x04, 0xac,
+        ];
+        let mut graph = IrBuilder::new(1, 2).build(&code, 12).expect("IR build");
+        ir_optimize::optimize(&mut graph);
+        let schedule = ir_schedule::schedule(&graph);
+
+        // Recompute the window independently of the helper, so the two cannot
+        // agree by sharing a bug.
+        let adjacent_consumer = |id: usize| -> bool {
+            schedule.blocks.iter().any(|b| {
+                b.nodes
+                    .iter()
+                    .position(|&n| n as usize == id)
+                    .and_then(|w| b.nodes.get(w + 1))
+                    .is_some_and(|&c| {
+                        graph.nodes[c as usize]
+                            .inputs
+                            .iter()
+                            .any(|&i| i != NO_NODE && i as usize == id)
+                    })
+            })
+        };
+
+        let mut agreed = 0usize;
+        let mut outside_the_window = 0usize;
+        for id in 0..graph.nodes.len() {
+            if !schedule
+                .blocks
+                .iter()
+                .any(|b| b.nodes.contains(&(id as u32)))
+            {
+                continue;
+            }
+            let helper = single_use_is_in_the_carry_window(&graph, &schedule, id);
+            assert_eq!(
+                helper,
+                adjacent_consumer(id),
+                "node {id} ({:?}): helper and the independent recomputation disagree",
+                graph.nodes[id].op
+            );
+            agreed += 1;
+            if !helper {
+                outside_the_window += 1;
+            }
+        }
+
+        assert!(agreed > 0, "the fixture scheduled no nodes at all");
+        assert!(
+            outside_the_window > 0,
+            "this shape must contain at least one value the carry window cannot              reach -- otherwise the flag's target population is empty and the              test proves nothing"
         );
     }
 
@@ -19849,7 +20313,7 @@ mod tests {").next().unwrap_or(src);
         // when the switch does NOTHING — the inline poll is correct, so
         // "correct" is not evidence that the outlined one ran.
         let build = |outline: Option<&'static str>, flag: &'static u8| {
-            let before = ir_poll_census();
+            let before = ir_poll_census_local();
             let cm = cratonvm_types::flags::with_thread_overrides(
                 &[("CRATONVM_JIT_IR_POLL_OUTLINE", outline)],
                 || {
@@ -19862,7 +20326,7 @@ mod tests {").next().unwrap_or(src);
                     lower(&graph, &schedule, 1, 3, &helpers).expect("the loop must lower")
                 },
             );
-            let after = ir_poll_census();
+            let after = ir_poll_census_local();
             (cm, (after.0 - before.0, after.1 - before.1))
         };
         // SAFETY (all four calls): the lowered body takes one `int` and returns

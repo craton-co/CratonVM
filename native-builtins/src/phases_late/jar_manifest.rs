@@ -1963,28 +1963,49 @@ pub(crate) fn jar_entry_bytes_cached(
 pub(crate) fn jar_manifest_sections_cached(
     path: &str,
 ) -> Option<std::sync::Arc<std::collections::HashMap<String, Vec<(String, String)>>>> {
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, OnceLock};
     type Sections = std::collections::HashMap<String, Vec<(String, String)>>;
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Arc<Sections>>>> =
+    // LEVEL (lock-discipline ratchet): `Scratch` is L0, the bottom of the
+    // hierarchy -- a thread holding it may acquire NOTHING else, not even
+    // another `Scratch`. This cache meets that the same way `mtime_memo` above
+    // does, and the argument is the same one in the same order:
+    //
+    // * Its two critical sections are a `get(&str).cloned()` and an
+    //   `insert(String, Arc<_>)` on a plain `HashMap` of owned values. Neither
+    //   takes another lock.
+    // * `jar_manifest_sections_cached` takes no `NativeContext`, so it *cannot*
+    //   re-enter the VM while holding this -- which is the cycle this crate's
+    //   locks actually risk, since a native callback calling back into Java
+    //   takes the heap and the L10 class-manager lock.
+    // * The two calls it makes that DO take locks are both outside its critical
+    //   sections, and deliberately: `jar_path_mtime` (which takes the `Scratch`
+    //   mtime memo) runs before the first `lock()`, and `jar_entry_bytes_cached`
+    //   (which takes the two raw jar caches) runs between them. Two `Scratch`
+    //   locks nested would violate this level as surely as a higher one would,
+    //   so keep the mtime lookup where it is: it exists only to build the key.
+    static CACHE: OnceLock<OrderedPlMutex<std::collections::HashMap<String, Arc<Sections>>>> =
         OnceLock::new();
     if path.is_empty() {
         return None;
     }
     let mtime = jar_path_mtime(path);
     let key = format!("{path}\u{0}{mtime}");
-    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    if let Some(s) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
-        return Some(s.clone());
+    let cache = CACHE
+        .get_or_init(|| OrderedPlMutex::new(std::collections::HashMap::new(), LockLevel::Scratch));
+    // Bound to a `let` rather than read in the `if let` scrutinee: a scrutinee's
+    // temporary lives to the end of the whole `if let`, so the guard's release
+    // point would depend on a rule about temporaries rather than on anything
+    // visible here. The claim the level makes is worth making structurally.
+    let hit = cache.lock().get(&key).cloned();
+    if let Some(s) = hit {
+        return Some(s);
     }
     let sections: Sections = jar_entry_bytes_cached(path, "META-INF/MANIFEST.MF")
         .and_then(|bytes| p59_parse_manifest_bytes(&bytes).ok())
         .map(|parsed| parsed.entries.into_iter().collect())
         .unwrap_or_default();
     let sections = Arc::new(sections);
-    cache
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(key, sections.clone());
+    cache.lock().insert(key, sections.clone());
     Some(sections)
 }
 
@@ -2122,6 +2143,54 @@ mod w6_entry_attribute_tests {
     #[test]
     fn an_empty_path_is_not_a_jar() {
         assert!(jar_manifest_sections_cached("").is_none());
+    }
+
+    /// The sections cache's `LockLevel::Scratch` claim is actually EVALUATED,
+    /// and the miss path does not hold its guard across the read it needs.
+    ///
+    /// Modelled on `memo_lock_is_order_checked_and_not_re_entered_on_a_miss`
+    /// further down this file, because it is the same claim about the same
+    /// kind of lock and the sibling has already been bitten once by the shape
+    /// this asserts the absence of.
+    ///
+    /// * `enforcement_active()` is unconditionally true in DEBUG builds, which
+    ///   is what makes the three tests above live checks of the ordering claim
+    ///   rather than runs with the checker asleep. Asserting it here means a
+    ///   future change that makes debug enforcement conditional turns this
+    ///   module from silently vacuous into loudly red. `cfg`-gated because in
+    ///   RELEASE enforcement is off unless `CRATONVM_LOCK_ORDER_CHECK` is set
+    ///   and `cargo test --release` runs this test too.
+    /// * A MISS locks, drops, reads the manifest through
+    ///   `jar_entry_bytes_cached` — which takes two more locks — and then locks
+    ///   again to publish. `jar_path_mtime` takes the `Scratch` mtime memo
+    ///   before any of that. `Scratch` is the floor, so a thread holding it may
+    ///   take nothing else *including another `Scratch`*, and `parking_lot` is
+    ///   not reentrant: a guard left alive in an `if let` scrutinee is a HANG
+    ///   rather than a failure. Miss, hit, revalidate, hit — the whole cycle,
+    ///   under the checker.
+    #[test]
+    fn sections_lock_is_order_checked_and_not_held_across_the_read() {
+        #[cfg(debug_assertions)]
+        assert!(
+            cratonvm_types::lock_order::enforcement_active(),
+            "debug builds must enforce lock order, or this module's ordering \
+             claim is never checked by anything"
+        );
+
+        let jar = write_jar(
+            "lockorder",
+            Some("Manifest-Version: 1.0\r\n\r\nName: p/one.txt\r\nK: V\r\n\r\n"),
+        );
+        let path = jar.to_str().unwrap().to_string();
+        let miss = jar_manifest_sections_cached(&path).expect("miss");
+        let hit = jar_manifest_sections_cached(&path).expect("hit");
+        assert_eq!(miss.len(), hit.len());
+        assert!(miss.contains_key("p/one.txt"), "sections were {miss:?}");
+        // Re-probe the mtime (the memo lock again, still outside ours) and
+        // come back through the cache.
+        jar_cache_revalidate(&path);
+        let after = jar_manifest_sections_cached(&path).expect("post-revalidate");
+        assert_eq!(miss.len(), after.len());
     }
 }
 

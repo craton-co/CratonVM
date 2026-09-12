@@ -10728,6 +10728,119 @@ static RETIRED_SHADOW_L5S_TRIPLES: &[(&str, &str, &str)] = &[
     ("sun/misc/Unsafe", "putShort", "(JS)V"),
 ];
 
+/// Lane 5's THIRD residual wave, 2026-09-12 -- 25 triples, and the first of the
+/// three to be measured on more than one image.
+///
+/// # The 23 `jdk/internal/misc/Unsafe` rows: the off-heap surface
+///
+/// `RETIRED_SHADOW_L5S_TRIPLES` took that class's 20 delegating ATOMICS and
+/// said the rest "needs a dispatch each". This is that dispatch. The instrument
+/// is new -- `apps/probes/L5JdkInternalUnsafe.java` -- and it exists because
+/// L1's 472-row `UnsafeShadowSweep` reaches the off-heap surface through the
+/// `sun.misc` spelling nearly everywhere: of the 26 registered triples that are
+/// declared-with-code on 17, 21 and 25 and are outside the three permanently
+/// blocked families, its `off-heap` section dispatches SEVEN, four of them only
+/// on a throwing edge. Nineteen had never been dispatched by anything, which is
+/// precondition 4 failing for want of a caller rather than for a reason.
+///
+/// ```text
+///   dial armed on jdk/internal/misc/Unsafe   reached 1396  yielded 99
+///   per triple                               outcome = bytecode-won on all 28
+///                                            the armed run dispatched
+///   the workload                             d(base, armed) = 2 rows, and both
+///                                            are `invokeCleaner` -- see below
+///   vs HotSpot 25                            d(hs, base) = d(hs, strict) = 2,
+///                                            the same pre-existing row
+/// ```
+///
+/// These are admitted by the rule §4 used for the sixteen retired first: **a
+/// Java method that delegates to an `ACC_NATIVE` primitive at the same
+/// offset.** `javap -p` on all three images separates the two populations, and
+/// the separation is exact -- 68 of this class's methods are `ACC_NATIVE` on
+/// 21 and 25 (70 on 17) and can never be retired under contract §1.5; every row
+/// here is in the other group, `declared` with `has_code` on all three.
+///
+/// Two rows the dial passed are NOT here: `allocateMemory(J)J` and
+/// `reallocateMemory(JJ)J`. They were in this table until the two-binary arm
+/// ran, and what threw them out is recorded on
+/// `the_l5t_wave_refuses_the_two_allocator_rows_the_dial_passed`. The short
+/// version is that an armed dial yields one dispatch and leaves the native
+/// registered; a table entry removes it, and this VM's off-heap surface cannot
+/// resolve an address the JDK's own allocator path returned.
+///
+/// # `invokeCleaner` was dispatched, yielded, and is NOT in this table
+///
+/// It is the one row the armed arm made WORSE, and it is worth a sentence
+/// because the dial's own verdict says the opposite. `outcome = bytecode-won`,
+/// so precondition 4 passes; but `invokeCleaner` on a *direct* buffer goes from
+/// `ok=returned` to `EX:IllegalArgumentException` the moment the class is
+/// armed. The JDK's bytecode reaches the buffer's `Cleaner` through a field
+/// this VM's direct buffers do not carry, so yielding replaces a working call
+/// with a throw. Precondition 2 is not a formality that precondition 4 can
+/// overrule.
+///
+/// The same probe found the defect that observation sits on: this VM's
+/// `invokeCleaner` accepts a HEAP buffer and returns, where every supported
+/// image throws `IllegalArgumentException("buffer is non-direct")`. That is a
+/// native to fix, not a shadow to retire, and it is recorded in §9d of the
+/// lane page rather than fixed here.
+///
+/// # The two `sun/misc/Unsafe` rows: a version boundary, measured at last
+///
+/// `ensureClassInitialized` and `shouldBeInitialized` are declared `public`,
+/// with code, on 17 and 21, and REMOVED on 25. The second residual wave left
+/// them out with a precise blocker -- its workload runs on 25, where nothing
+/// can dispatch them, and precondition 4 is a dispatch observed by the citing
+/// instrument. It said they stay out "until someone measures them on a 17 or 21
+/// run". This is that run:
+///
+/// ```text
+///   CratonVM --java-home <jdk-21.0.12+8> --jdk-only, L5SunMiscUnsafe
+///   dial armed on sun/misc/Unsafe   reached 2   yielded 2   declined_no_bytecode 0
+///   per triple                      outcome = bytecode-won on both
+///   the workload                    d(base, armed) = 0 over 57 rows
+///   vs HotSpot 21                   d(hs, base) = d(hs, armed) = 1, and that
+///                                   row is `getUnsafe` -- the member-filter
+///                                   defect, which is not this wave's and is
+///                                   now confirmed on a second image
+///   image columns on the 21 run     declared, !acc_native, has_code on both
+/// ```
+///
+/// Note what yielding them lands on. The `sun.misc` bytecode delegates to
+/// `theInternalUnsafe.ensureClassInitialized(c)`, and the `jdk.internal`
+/// spelling of that method is one of the six rows
+/// [`RETIRED_SHADOW_L5S_TRIPLES`] names as permanently blocked -- so it is
+/// still a native here, and the delegation lands on it. The two spellings are
+/// not one decision, and retiring the outer one while the inner one stays is
+/// the §4 rule working exactly as written rather than an inconsistency.
+static RETIRED_SHADOW_L5T_TRIPLES: &[(&str, &str, &str)] = &[
+    ("jdk/internal/misc/Unsafe", "addressSize", "()I"),
+    ("jdk/internal/misc/Unsafe", "copyMemory", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V"),
+    ("jdk/internal/misc/Unsafe", "defineClass", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;"),
+    ("jdk/internal/misc/Unsafe", "freeMemory", "(J)V"),
+    ("jdk/internal/misc/Unsafe", "getAddress", "(J)J"),
+    ("jdk/internal/misc/Unsafe", "getByte", "(J)B"),
+    ("jdk/internal/misc/Unsafe", "getChar", "(J)C"),
+    ("jdk/internal/misc/Unsafe", "getDouble", "(J)D"),
+    ("jdk/internal/misc/Unsafe", "getFloat", "(J)F"),
+    ("jdk/internal/misc/Unsafe", "getInt", "(J)I"),
+    ("jdk/internal/misc/Unsafe", "getLong", "(J)J"),
+    ("jdk/internal/misc/Unsafe", "getShort", "(J)S"),
+    ("jdk/internal/misc/Unsafe", "loadLoadFence", "()V"),
+    ("jdk/internal/misc/Unsafe", "pageSize", "()I"),
+    ("jdk/internal/misc/Unsafe", "putAddress", "(JJ)V"),
+    ("jdk/internal/misc/Unsafe", "putByte", "(JB)V"),
+    ("jdk/internal/misc/Unsafe", "putChar", "(JC)V"),
+    ("jdk/internal/misc/Unsafe", "putDouble", "(JD)V"),
+    ("jdk/internal/misc/Unsafe", "putFloat", "(JF)V"),
+    ("jdk/internal/misc/Unsafe", "putInt", "(JI)V"),
+    ("jdk/internal/misc/Unsafe", "putLong", "(JJ)V"),
+    ("jdk/internal/misc/Unsafe", "putShort", "(JS)V"),
+    ("jdk/internal/misc/Unsafe", "setMemory", "(Ljava/lang/Object;JJB)V"),
+    ("sun/misc/Unsafe", "ensureClassInitialized", "(Ljava/lang/Class;)V"),
+    ("sun/misc/Unsafe", "shouldBeInitialized", "(Ljava/lang/Class;)Z"),
+];
+
 pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor: &str) -> bool {
     if !RETIRED_SHADOW_PREFIXES
         .iter()
@@ -10854,6 +10967,13 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // below reads THIS list, so a table that is not named here is a table
     // nothing consults and 33 rows that read as un-retired.
     RETIRED_SHADOW_L5S_TRIPLES,
+    // Lane 5's THIRD residual wave, 2026-09-12 -- the off-heap half of
+    // `jdk/internal/misc/Unsafe` plus the two `sun/misc/Unsafe` rows that
+    // needed a 21 run to be dispatchable at all. Same one-line registration as
+    // its two predecessors, and the same consequence for forgetting it: the
+    // predicate reads THIS list, so a table absent from it is 27 rows that
+    // read as un-retired everywhere except the sorted-and-unique test.
+    RETIRED_SHADOW_L5T_TRIPLES,
     // 2026-09-11, L1 wave 6: `java/text/BreakIterator`, all seventeen, with
     // the BREAKITER pin in `vm_exec.rs` removed in the same commit. Neither
     // half is correct alone -- retire without lifting the pin and the pin
@@ -12100,7 +12220,11 @@ mod tests {
         // The lane's three named blockers, each with a measurement behind it.
         // `StringBuilder` is the JIT intrinsic door (2026-08-28, N2);
         // `System.getProperty` is the property-store inversion; `System$1` is
-        // the hidden-class `defineClass0` failure found on 2026-09-10.
+        // ~~the hidden-class `defineClass0` failure found on 2026-09-10~~ FIXED
+        // 2026-09-12 (a hidden class could not refer to itself; the ENFORCE arm
+        // over the whole --jdk-only corpus is 136/0 now, was 39/1). It stays out
+        // of the table anyway: a clean dial arm is not a retirement score, and
+        // the dial cannot promote. These 28 rows need the two-binary score.
         for (c, m, d) in [
             ("java/lang/StringBuilder", "append", "(I)Ljava/lang/StringBuilder;"),
             ("java/lang/AbstractStringBuilder", "charAt", "(I)C"),
@@ -12485,6 +12609,90 @@ mod tests {
         }
     }
 
+    /// Sorted, duplicate-free, reachable, and two classes -- the same four
+    /// questions its L5S sibling asks, for the same reasons.
+    ///
+    /// The class assertion earns its place twice over in this wave: the table
+    /// spans `jdk/internal/misc/` and `sun/misc/`, which are separate entries in
+    /// `RETIRED_SHADOW_PREFIXES`, and a row written under a third class would
+    /// pass the sort check and then answer `false` at the prefix -- which reads
+    /// as "not retired" and is invisible in a workload.
+    #[test]
+    fn the_l5t_table_is_sorted_unique_reachable_and_two_classes() {
+        for w in RETIRED_SHADOW_L5T_TRIPLES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "out of order or duplicated: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
+        }
+        for &(c, m, d) in RETIRED_SHADOW_L5T_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "unreachable through the predicate: {c}.{m}{d} — are `jdk/internal/misc/` and `sun/misc/` both still in RETIRED_SHADOW_PREFIXES?"
+            );
+            assert!(
+                c == "jdk/internal/misc/Unsafe" || c == "sun/misc/Unsafe",
+                "this wave is two classes; {c} does not belong in it"
+            );
+        }
+    }
+
+    /// `invokeCleaner` yielded to bytecode and is still not retired.
+    ///
+    /// It is the counter-example to reading `outcome = bytecode-won` as a
+    /// verdict. The dial reached it, the bytecode won, and the *direct*-buffer
+    /// row went from `ok=returned` to `EX:IllegalArgumentException` in the same
+    /// run — the JDK's bytecode reaches the buffer's `Cleaner` through a field
+    /// this VM's direct buffers do not carry. Precondition 4 is about whether a
+    /// triple was measured; precondition 2 is about what the measurement said,
+    /// and only one of them can veto.
+    ///
+    /// A future wave that adds this row will fail here rather than in a corpus
+    /// arm three hours later.
+    #[test]
+    fn the_l5t_wave_refuses_invoke_cleaner_though_the_dial_yielded_it() {
+        assert!(
+            !triple_is_retired_shadow(
+                "jdk/internal/misc/Unsafe",
+                "invokeCleaner",
+                "(Ljava/nio/ByteBuffer;)V"
+            ),
+            "invokeCleaner is excluded by precondition 2, not by omission — see this test's doc comment"
+        );
+    }
+
+    /// The two allocator rows the TWO-BINARY arm threw out, asserted by name.
+    ///
+    /// Both passed the dial cleanly — `outcome = bytecode-won`, and the wave's
+    /// own probe was byte-identical with the class armed. Built into a binary
+    /// they take `ByteBuffer.allocateDirect(8)` from a `DirectByteBuffer` to
+    /// `IllegalArgumentException: Unsafe.setMemory: address 0x0 is not in any
+    /// live arena`, and with them retired every off-heap round trip in
+    /// `L5JdkInternalUnsafe` throws too.
+    ///
+    /// **That gap between the dial and the binary is the reason a retirement is
+    /// scored with two binaries.** An armed dial yields at the dispatch and
+    /// leaves the native registered for everything else; a table entry removes
+    /// it. `allocateMemory` is where the difference shows, because the address
+    /// it returns is an arena handle that the rest of this VM's off-heap
+    /// surface has to be able to resolve — the JDK's own
+    /// `allocateMemory` -> `allocateMemory0` path hands back something the
+    /// arena does not know.
+    ///
+    /// A future wave that adds either row will fail here rather than in a
+    /// corpus arm three hours later.
+    #[test]
+    fn the_l5t_wave_refuses_the_two_allocator_rows_the_dial_passed() {
+        for (m, d) in [("allocateMemory", "(J)J"), ("reallocateMemory", "(JJ)J")] {
+            assert!(
+                !triple_is_retired_shadow("jdk/internal/misc/Unsafe", m, d),
+                "jdk/internal/misc/Unsafe.{m}{d} is excluded by a two-binary measurement, not by omission — see this test's doc comment"
+            );
+        }
+    }
+
     /// The three families the second residual wave REFUSED, asserted by name.
     ///
     /// Each is excluded for a reason that does not expire with more probe rows,
@@ -12550,10 +12758,22 @@ mod tests {
     ///
     /// So they are not deletions: deleting them would take the registration
     /// away from two of the three supported images. They are a VERSION
-    /// BOUNDARY — live on 17 and 21, gone on 25 — and this lane's workload runs
-    /// on 25, where nothing can dispatch them. Precondition 4 is a dispatch
-    /// observed by the citing instrument, and on this image there can be none,
-    /// so they stay out until someone measures them on a 17 or 21 run.
+    /// BOUNDARY — live on 17 and 21, gone on 25 — and this lane's workload ran
+    /// on 25, where nothing could dispatch them. Precondition 4 is a dispatch
+    /// observed by the citing instrument, and on that image there could be
+    /// none, so they stayed out "until someone measures them on a 17 or 21
+    /// run".
+    ///
+    /// **2026-09-12: someone did, and they are now in
+    /// [`RETIRED_SHADOW_L5T_TRIPLES`].** CratonVM takes `--java-home` pointing
+    /// at a 21 image, the same `L5SunMiscUnsafe` class file runs there because
+    /// it reaches the class reflectively, and the dial armed on
+    /// `sun/misc/Unsafe` reports `reached 2, yielded 2` with
+    /// `outcome = bytecode-won` on both and a byte-identical transcript. So
+    /// this test now asserts the pair is IN a table and only `getUnsafe` stays
+    /// out — the original blocker was not "these rows are wrong", it was "this
+    /// instrument cannot see them", and the remedy was a different image rather
+    /// than a different row.
     ///
     /// The lesson is the same one `getUnsafe` taught and is worth more than the
     /// two rows: **"declared by no supported image" is a claim about THREE
@@ -12572,14 +12792,17 @@ mod tests {
     /// Retiring the native would not move that, so the row stays out.
     #[test]
     fn the_l5r_wave_excludes_three_triples_for_three_different_reasons() {
+        assert!(
+            !triple_is_retired_shadow("sun/misc/Unsafe", "getUnsafe", "()Lsun/misc/Unsafe;"),
+            "sun/misc/Unsafe.getUnsafe()Lsun/misc/Unsafe; must stay out: the native is correct and the divergence is the missing core-reflection member filter, which retiring it would not move"
+        );
         for (m, d) in [
-            ("getUnsafe", "()Lsun/misc/Unsafe;"),
             ("ensureClassInitialized", "(Ljava/lang/Class;)V"),
             ("shouldBeInitialized", "(Ljava/lang/Class;)Z"),
         ] {
             assert!(
-                !triple_is_retired_shadow("sun/misc/Unsafe", m, d),
-                "sun/misc/Unsafe.{m}{d} must stay out of the residual table — see this test's doc comment for which of the three reasons applies"
+                triple_is_retired_shadow("sun/misc/Unsafe", m, d),
+                "sun/misc/Unsafe.{m}{d} was retired on 2026-09-12 from a JDK 21 run — if this is deliberate, the doc comment above has to change with it"
             );
         }
     }

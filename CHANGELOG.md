@@ -72,6 +72,64 @@ and
 What survives the first is a different mechanism and gets its own page:
 [`docs/known-issues/gc/g1-pins-a-region-for-an-interior-array-cursor-20260912.md`](docs/known-issues/gc/g1-pins-a-region-for-an-interior-array-cursor-20260912.md).
 
+### 2026-09-12 `Properties` built a 144-byte bucket array that no `Properties` method reads
+
+`java.util.Properties` keeps its entries in three places, and the inherited
+`Hashtable.table` is not one of them: a String->String pair goes to a Rust
+side-table, anything else to the real `map` `ConcurrentHashMap`, and the bucket
+array holds nothing at all -- `map_carrier_class_for_receiver` had the
+measurement in a comment already, `occupied=0` with `size=2`. Both constructors
+allocated one anyway, via `map_init_eager`, because `Properties` is deliberately
+excluded from `CF_HASHTABLE_LAYOUT` and so fell through to the generic arm of
+`map_init_inner` and its `Object[16]`.
+
+```text
+  empty          224.0 -> 80.0     HotSpot 120.3    (1.86x -> 0.67x)
+  four entries  1128.0 -> 984.0    HotSpot 335.4    (3.36x -> 2.93x)
+```
+
+The empty row now sits below HotSpot, which allocates its `ConcurrentHashMap` in
+the constructor where this VM allocates it on demand. The four-entry row is new
+-- `probes/CollectionShapeCause.java` had no `Properties` row in its filled
+table -- and is the measurement that matters: it falls by the SAME 144 bytes as
+the empty row, so the array was carrying nothing rather than being moved. The
+2.93x that remains is `ConcurrentHashMap`'s number, not this class's: on both
+VMs the per-entry cost of a filled `Properties` is the per-entry cost of the CHM
+underneath it (792.0 vs 275.0, 2.88x), and narrowing that has its own record.
+
+The old comment at both call sites named the risk -- "leaving it null would make
+`map_state` report no buckets on a receiver whose native put path does not go
+through `map_resize`" -- and it does not apply here.
+`register_properties_sidetable` runs after `register_collections_natives` in
+both `vm_init` arms and overwrites every Map method on the class, none of which
+touches a bucket table; the one path that could reach them opens with
+`if initial_buckets.is_none() { map_resize(..) }` already; and
+`system_properties_object` has been handing out a bucket-less `Properties` --
+the one `java.home` is read from during bootstrap -- since it was written.
+HotSpot settles it rather than any of that: its own `new Properties()` leaves
+`table` null, `loadFactor` 0.0 and `threshold` 0, so the eager array was a
+divergence as well as a cost. The two VMs now agree field for field on a filled
+one, `map` a 4-entry CHM and `table` null.
+
+`probes/PropertiesBacking.java` is new and is what made the change safe: every
+method `javap -p java.util.Properties` lists bar four, against a HotSpot oracle,
+driven as a gate by `vm/tests/properties_backing.rs`. It caught a live defect
+older than this change. `native_properties_remove` opened with
+`read_java_text(..).unwrap_or_default()` and returned null on an empty result,
+before consulting the CHM -- so removing a non-String key did nothing and said
+nothing:
+
+```text
+  p.put(Integer.valueOf(3), "byIntKey");
+  p.remove(Integer.valueOf(3))  ->  null   (HotSpot: "byIntKey")
+  p.size()                      ->  3      (HotSpot: 2)
+```
+
+The entry survived its own removal and `size`/`keySet`/`containsKey` all went on
+reporting it, with no exception anywhere. The empty String took that same return
+and needed the opposite treatment -- `setProperty` puts it in BOTH stores where
+`put` puts it only in the CHM -- which the probe also caught, on the first cut of
+the fix.
 
 ### 2026-09-12 `CopyOnWriteArraySet` was backed by a LinkedHashMap, and `removeIf` was the only method that said so
 

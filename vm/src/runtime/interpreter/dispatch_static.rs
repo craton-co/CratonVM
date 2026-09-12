@@ -148,7 +148,13 @@ pub(super) fn execute_invokestatic(
         .class_manager
         .read()
         .get_class(current_class_id)
-        .filter(|c| c.name.as_ref() == method_class_name.as_ref())
+        .filter(|c| {
+            super::constants::is_self_class_reference(
+                &c.name,
+                c.is_hidden(),
+                method_class_name.as_ref(),
+            )
+        })
         .map(|_| current_class_id);
 
     // Sibling static owners in a user-defined loader need the same identity
