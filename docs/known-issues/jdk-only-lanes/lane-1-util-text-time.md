@@ -26,7 +26,7 @@ preconditions and the landing protocol are in
 | disposition | rows | what decided it |
 |---|---:|---|
 | **RETIRED** — waves 1 and 2, `RETIRED_SHADOW_L1_TRIPLES` | **329** | §3 |
-| HELD — `TreeMap`/`TreeSet` | 157 | state is `tm_array_table()` — **but the real `root` IS a real `TreeMap$Entry` tree and `size` is mirrored** (wave 7 measured it). 13 probes worse armed, one a crash. Its two view carriers are in NEITHER carrier list, which is why wave 7 fixed three families and not four — §10 item 1 |
+| **RETIRED** — `TreeMap`/`TreeSet` + views + iterators + `$Entry`, `RETIRED_SHADOW_L1_TM_TRIPLES` | **156** | **wave 8.** The hold said "state is `tm_array_table()`"; the real `root`, `size` and `comparator` had matched HotSpot since before wave 7 measured them. What was left was the DIRECTION — the mirror had no reader — and `tm_pairs_from_real_root` is that reader. Two binaries, 163 probes: 0 worse, 2 better — §3 |
 | HELD — `LinkedHashMap` + its four views + iterators | 102 | **wave 7: measured on TWO trial binaries and refused, and the reason is no longer the store.** Its `table`, `head`, `tail`, `size` and node classes match HotSpot. Retire the iterators and lane T's registrar mints a carrier real bytecode NPEs on; keep them and every mutation through a sequenced default is lost — §3, §10 item 2 |
 | PART RETIRED — `HashMap` + views + iterators + `$Node` | 98 | **wave 3**: 21 retired, 77 held. **Wave 7 took the eight `LinkedHashMap` inherits** (`RETIRED_SHADOW_L1_HM8_TRIPLES`) — not because it retired LinkedHashMap (it did not) but because the premise was false: those entries are in the real `table`. 69 held, on lane T's iterator carrier — §3, §10 item 3 |
 | **RETIRED** — `Hashtable` + views + `$Entry`, `RETIRED_SHADOW_L1_HT_TRIPLES` | **79** | **wave 7.** Wave 6's `+10` was right about WHERE (the views) and wrong about WHY: the table holds real `Hashtable$Entry` nodes and `count` is written. One decode fix and the arm is 0 — §3 |
@@ -1115,6 +1115,98 @@ grounds that the constants were lane 0's. That is no longer the convention on
 `dev` — lane 5 re-froze them itself on 2026-09-11 — so leaving the gate red
 would land a red test, and these are re-frozen.
 
+### Wave 8 — the TreeMap family, and a mirror that needed a reader
+
+Wave 7 left this lane three items and an order. Item 2 was `TreeMap`'s two view
+carriers, priced as "the same shape of fix as wave 7's, measurable on the dial
+without a rebuild". It was the same shape and it was not measurable on the
+dial, and finding out why is what turned items 2 and 3 into one wave that
+retired the family.
+
+**The 38 rows, and the three different reasons behind them.** Armed on
+`java/util/TreeMap` alone, `apps/probes/L1MapViewToArrayProbe` (168 rows, 0
+unarmed) differs on 38. They are not one defect:
+
+```text
+  java/util/TreeMap$Values     vc_route already handles it        0 rows
+  java/util/TreeMap$EntrySet   in MAP_VIEW_CARRIERS, but the      10 rows
+                               route's gate is CF_VALUES_VIEW,
+                               a FIVE-name list it is not on
+  java/util/TreeMap$KeySet     in NEITHER carrier list; shares    26 rows
+                               the TreeSet surface over
+                               `ts_array_table`
+  descendingKeySet / headMap   the source is a SUB-map             2 rows
+```
+
+The entry-set half is the sharpest of the three. `vc_route` has carried an
+entry-shaped arm since `RTreeRangeGc` — it names `TM_ENTRY_SET_CARRIER`
+explicitly and asks `view_carrier_holds_entries_by_class` — and that arm had
+never run once, because the route's front door is the values predicate and the
+one carrier the arm was written for is deliberately not in it. A dead branch
+with a comment explaining what it is for.
+
+**`TreeMap$KeySet` keeps its map in `m`, not `this$0`, and that cost a build.**
+The by-name fallback wave 7 wrote for `hs_backing_map` reads `this$0` then
+`map`. `TreeMap.KeySet` is a STATIC nested class — `javap -p` on
+jdk-17.0.20.1+1, 21.0.12+8 and 25.0.4+7 all give it exactly one field,
+`private final java.util.NavigableMap<E, ?> m` — so the first cut of the arm
+measured exactly as well as no arm at all: 28 of 38, all of them the keySet
+half. The sibling carriers ARE inner classes and DO have `this$0`, which is
+what made the wrong guess look reasonable.
+
+**The 16 the dial cannot clear are the dial's.** With both carriers decoded the
+armed reading goes 38 -> 16, and the residue is not a defect in the tree:
+
+```text
+  [TMVIEW] al_or_collection_elements fallback real_size=3 walked=0
+  [TMVIEW] collect_via_real_iterator recv=java/util/TreeMap$KeySet
+                                     itr=java/util/TreeMap$KeyIterator
+```
+
+`size()` answers 3 and the walk answers 0, because the walk drives
+`iterator()`, whose result this crate mints under
+`java/util/TreeMap$KeyIterator` — a class the SAME armed scope covers, so its
+own `hasNext` is declined and the real JDK body reads a `next` field this VM
+never wrote. A retirement deletes the registration instead of declining it, so
+the iterator is the image's own and the question does not arise. **On the
+retirement binary the same probe reads 0 rows.** This is the §11 rule about
+armed arms again, in its sharpest form yet: the dial could not have accepted
+this wave, and nothing but a second binary could.
+
+**The mirror needed a reader.** `tm_publish_real_root` builds a real
+`TreeMap$Entry` red-black tree into the receiver's real `root`, and its doc
+states the direction as a decision: *"nothing reads back through `root`"*. That
+holds while the natives are the only writers. Retire them and real bytecode
+maintains `root` while `tm_array_table` is empty, so every side-table reader
+answers zero for a map that has entries. `tm_pairs_from_real_root` is the read
+half — an iterative in-order walk of the real nodes, no allocation, no
+re-entry into Java.
+
+**And the store that rots.** The first retirement binary moved exactly ONE
+probe in a 163-probe tree, and it was not a missing store — it was a stale one:
+
+```text
+  apps/probes/StaleViewAddAllProbe, --jdk-only
+    TreeMap after growth size()        5   OK     <- the real field
+    TreeMap after growth for-each      5   OK     <- real bytecode
+    TreeMap after growth toArray       3   FAIL   <- the side table
+    TreeMap held view addAll after 6   3   FAIL
+```
+
+Something on the read path SEEDS `tm_array_table` once; with the writers
+retired nothing ever updates it, so every row that went through a native read a
+snapshot and every row that did not was right. So neither store is the
+authority by position now: `tm_collect_pairs` arbitrates with the receiver's
+own `size` field, which both stores write — `tm_set_slot` mirrors it by name,
+and real bytecode maintains it. Where they agree, which is every map this
+crate's natives manage, the side table answers exactly as it always did.
+
+**156 triples**, every `owns_slot && kind == "bridge"` row under the two
+prefixes that is bucket A or B **on all three supported images**, censused
+separately rather than assumed from JDK 25. Seven rows are refused by all three
+and stay out. The three iterator carriers are in the table WITH their
+producers, which is the condition a carrier retirement has to meet.
+
 ## 4. The finding this lane would most like the next lane to have: a retired PRODUCER makes a zero-invocation CONSUMER reachable
 
 Precondition 4 asks for `invocations > 0` per triple in your own instrument's
@@ -1283,39 +1375,22 @@ sits half-fixed is exactly what `owns_slot` exists to catch.
 
 Every remaining HELD family has a named blocker. In rough order of rows:
 
-1. **`TreeMap`/`TreeSet` (157).** `tm_get_slot`/`tm_set_slot` keep the whole
-   map in `tm_array_table()`, a Rust `HashMap` keyed by object.
+1. **`TreeMap`/`TreeSet` (157). DONE 2026-09-12, wave 8 — 156 retired.**
 
-   **CORRECTED 2026-09-12 (wave 7), and the correction is half of it.** This
-   item used to end "no `TreeMap$Entry` node graph exists". There is one:
-   `tm_publish_real_root` builds a real red-black tree of real
-   `java.util.TreeMap$Entry` nodes into the receiver's real `root`, gated on
-   `modCount`, and `tm_set_slot` mirrors `size`. Reflected on the wave-7
-   control, unarmed, `TreeMap.root`, `.size` and `.comparator` all match
-   HotSpot 25.0.4+7 (`apps/probes/L1MapStateDiag`).
+   Both halves of what this item asked for landed together, because they turned
+   out to be one thing. The view carriers (`TreeMap$KeySet` in neither carrier
+   list, `TreeMap$EntrySet` behind a gate its own arm was not on) could not be
+   scored on the dial at all: the armed reading stops at 16 of 38 rows on the
+   iterator carrier, which the same scope covers. And decoding those carriers
+   is useless without a reader for the real node graph, which is what the
+   "make the real tree the authority" half of this item was.
 
-   What is still true is the direction: that mirror is ONE-WAY, and its own
-   doc says so — *"nothing reads back through `root`"*. Retire the family and
-   real bytecode starts WRITING the node graph, which no `tm_array_table`
-   reader hears about. So the remedy is unchanged in shape and smaller in
-   size than the old text implies: make the real tree the authority, then
-   retire.
+   `tm_pairs_from_real_root` is that reader, `tm_collect_pairs` arbitrates
+   between the two stores with the receiver's own `size` field, and the family
+   is retired. See §3, wave 8.
 
-   And there is a second, cheaper blocker that wave 7 measured and did not
-   fix. `java/util/TreeMap$KeySet` is in NEITHER carrier list —
-   `MAP_VIEW_CARRIERS` nor `SET_VIEW_CARRIERS` — it shares the `TreeSet`
-   native surface over `ts_state`, and `java/util/TreeMap$EntrySet` is in the
-   map list but `vc_route` declines it. So wave 7's decode fix, which took the
-   other three families to zero, leaves this one at:
-
-   ```text
-     java/util/TreeMap armed, apps/probes/L1MapViewToArrayProbe (168 rows)
-       control  38 rows differ        trial (decode fix)  38 rows differ
-   ```
-
-   That is the next TreeMap step and it is worth taking BEFORE the node-graph
-   rewrite: it is the same shape of fix as wave 7's, it is measurable on the
-   dial without a rebuild, and it tells you whether anything else is left.
+   The 157 became 156 by census: `TreeMap.iterator()` is declared by no
+   supported image.
 
 2. **`LinkedHashMap` + views (102). MEASURED AND REFUSED 2026-09-12, wave 7,
    on three trial binaries — and the blocker is item 3's, not this item's.**
@@ -1946,6 +2021,36 @@ battery until the battery learns the flag.
   being described as the same thing as the two that turned out to be
   retirable.
 
+
+**A one-way mirror is a decision with an expiry date, and the expiry is the
+retirement.** `tm_publish_real_root` says "nothing reads back through `root`"
+and was right for as long as the natives were the only writers. Wave 8's read
+half is not a change of mind about that design; it is the same design surviving
+the removal of one of its two assumptions. Before retiring any family that
+keeps a mirrored store, ask which direction the mirror runs and who writes the
+other side after the natives are gone.
+
+**A stale store fails differently from a missing one, and only the mixed rows
+show it.** `StaleViewAddAllProbe` on the first wave-8 retirement binary:
+`size()` right, for-each right, `toArray` wrong, all on the same view in the
+same process. Every row that went through a native read a snapshot; every row
+that did not was correct. A family probe that happens to use only one of those
+two routes reads clean. This is why the acceptance battery is the whole tree
+and not the family's own probe.
+
+**A dead branch can carry a comment explaining what it is for.** `vc_route`'s
+entry-shaped arm names `TM_ENTRY_SET_CARRIER`, cites the bug it was written for
+and had never executed, because the function's front door is a predicate that
+excludes exactly that class. Grep found it; reading the function did not,
+because the arm reads as live code. When a route has a gate and a body that
+disagree about scope, the gate wins silently.
+
+**`javap -p` the carrier before reusing another family's by-name fallback.**
+`hs_backing_map` resolves `this$0` then `map`, which is right for five view
+classes and wrong for `TreeMap$KeySet`: it is a STATIC nested class whose only
+field is `m`. Reusing the helper cost a full build and measured exactly as well
+as doing nothing.
+
 ## 12. Done
 
 For this lane: every bucket-A/B row in the prefix set is retired, or classified
@@ -2001,29 +2106,31 @@ them, which turned three separate holds into one blocker.**
 What wave 7 leaves for whoever takes this lane next, in the order this lane
 would take them:
 
-1. **The `HashSet`-family iterator carrier.** It is now the single blocker for
-   `LinkedHashMap`'s 102 AND `HashMap`'s remaining 69 — 171 rows behind one
-   carrier — and wave 7 has the measurement that says so, on three trial
-   binaries. It is lane T's registrar (`register_hashset_natives`, whose
+1. **The `HashSet`-family iterator carrier.** Unchanged by wave 8 and still
+   the single biggest item: `LinkedHashMap`'s 102 AND `HashMap`'s remaining 69,
+   171 rows behind one carrier, with wave 7's three-binary measurement saying
+   so. It is lane T's registrar (`register_hashset_natives`, whose
    `SET_CLASSES` crosses into `java/util/concurrent/`), so this lane cannot
-   land it alone; what it can hand over is the trace. Nothing else in this
-   lane unblocks that many rows.
-2. **`TreeMap`'s two view carriers.** `TreeMap$KeySet` is in neither
-   `MAP_VIEW_CARRIERS` nor `SET_VIEW_CARRIERS` (it shares the `TreeSet`
-   surface over `ts_state`), and `TreeMap$EntrySet` is in the map list but
-   `vc_route` declines it. Wave 7's decode fix took three families to zero and
-   left `TreeMap` at 38 rows on the same probe. Same shape of fix, and the
-   dial prices it without a rebuild.
-3. **`TreeMap`'s node graph as the AUTHORITY (157).** `tm_publish_real_root`
-   already builds a real red-black tree into the real `root`; it is a one-way
-   mirror by design ("nothing reads back through `root`"). That is the bigger
-   half of item 2 and the only genuine state-model rewrite left in the map
-   families.
-4. **`Date` / `sun/util/calendar/` (40).** Still candidates on wave 6's
-   reading (+0 with reached=14 and 411) and still unspent: one trial binary
-   each. Wave 7 did not reach them.
-5. **`JarFile`'s `ZipFile` state (32)** and **`CurrencyNames`** — unchanged
+   land it alone; what it can hand over is the trace.
+
+   Wave 8 is the argument for taking it. `TreeMap`'s carriers looked like the
+   same class of blocker and were not — they were this lane's own, and once
+   decoded the family went in whole.
+
+2. **`Date` / `sun/util/calendar/` (40).** Still candidates on wave 6's reading
+   (+0 with reached=14 and 411) and still unspent: one trial binary each. Two
+   waves in a row have not reached them, which is now the main reason to.
+
+3. **`JarFile`'s `ZipFile` state (32)** and **`CurrencyNames`** — unchanged
    from wave 6's list.
+
+4. **The two sub-map rows wave 8 left.** `descendingKeySet()` and
+   `headMap(k).keySet()` hand back a `TreeMap$KeySet` whose `m` is a
+   `TreeMap$NavigableSubMap`, not a `TreeMap`, so `resync_ts_view` declines it
+   and `collect_collection_elements_pinned`'s new arm does too. They are 2 rows
+   of a 168-row probe under the DIAL and 0 rows on the retirement binary, which
+   is why they were left: the shipped tree does not have them. Anything that
+   makes a native decode a sub-map will.
 
 And one repair worth a line of its own, because it is a wrong answer rather
 than a retirement: **`LinkedHashMap.modCount` counts 5 where HotSpot counts 3**

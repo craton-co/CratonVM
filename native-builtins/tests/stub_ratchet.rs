@@ -2280,7 +2280,27 @@ use cratonvm_types::compat::CompatibilityMode;
 /// (`LinkedHashMap`'s 102 and eight `HashMap` rows included) read
 /// 4011 / 4038 / 4011 = +179, and 87 triples read 3921 / 3948 / 3921 = +89.
 /// Two doubles in every one of the three counts.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3971;
+///
+/// # 2026-09-12, L1 wave 8 — +156, and the by-file column names the file
+///
+/// `RETIRED_SHADOW_L1_TM_TRIPLES`, the whole `TreeMap`/`TreeSet` family. Paired
+/// control and trial in ONE sitting, three arms each, control
+/// `/data/wt-l1w8-ctl` at `f99c2e748` and trial the same tree with the wave on
+/// it:
+///
+/// ```text
+///                    control   trial   delta   total (both)
+///   no-management      3944    4100    +156      13586
+///   management         3971    4127    +156      13954
+///   synthetic-jdk      3944    4100    +156      13621
+/// ```
+///
+/// +156 is EXACTLY the table's row count, in all three arms, and the by-file
+/// column attributes every one of them to one file:
+/// `native-collections/src/lib.rs` goes 1082 -> 1238. A retirement re-tags a
+/// `Bridge` rather than adding a fake, and the total not moving in any arm is
+/// how this file says so.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 4127;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2691,7 +2711,27 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3971;
 /// (`LinkedHashMap`'s 102 and eight `HashMap` rows included) read
 /// 4011 / 4038 / 4011 = +179, and 87 triples read 3921 / 3948 / 3921 = +89.
 /// Two doubles in every one of the three counts.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3944;
+///
+/// # 2026-09-12, L1 wave 8 — +156, and the by-file column names the file
+///
+/// `RETIRED_SHADOW_L1_TM_TRIPLES`, the whole `TreeMap`/`TreeSet` family. Paired
+/// control and trial in ONE sitting, three arms each, control
+/// `/data/wt-l1w8-ctl` at `f99c2e748` and trial the same tree with the wave on
+/// it:
+///
+/// ```text
+///                    control   trial   delta   total (both)
+///   no-management      3944    4100    +156      13586
+///   management         3971    4127    +156      13954
+///   synthetic-jdk      3944    4100    +156      13621
+/// ```
+///
+/// +156 is EXACTLY the table's row count, in all three arms, and the by-file
+/// column attributes every one of them to one file:
+/// `native-collections/src/lib.rs` goes 1082 -> 1238. A retirement re-tags a
+/// `Bridge` rather than adding a fake, and the total not moving in any arm is
+/// how this file says so.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 4100;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2971,7 +3011,27 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3944;
 /// (`LinkedHashMap`'s 102 and eight `HashMap` rows included) read
 /// 4011 / 4038 / 4011 = +179, and 87 triples read 3921 / 3948 / 3921 = +89.
 /// Two doubles in every one of the three counts.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 3944;
+///
+/// # 2026-09-12, L1 wave 8 — +156, and the by-file column names the file
+///
+/// `RETIRED_SHADOW_L1_TM_TRIPLES`, the whole `TreeMap`/`TreeSet` family. Paired
+/// control and trial in ONE sitting, three arms each, control
+/// `/data/wt-l1w8-ctl` at `f99c2e748` and trial the same tree with the wave on
+/// it:
+///
+/// ```text
+///                    control   trial   delta   total (both)
+///   no-management      3944    4100    +156      13586
+///   management         3971    4127    +156      13954
+///   synthetic-jdk      3944    4100    +156      13621
+/// ```
+///
+/// +156 is EXACTLY the table's row count, in all three arms, and the by-file
+/// column attributes every one of them to one file:
+/// `native-collections/src/lib.rs` goes 1082 -> 1238. A retirement re-tags a
+/// `Bridge` rather than adding a fake, and the total not moving in any arm is
+/// how this file says so.
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 4100;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
