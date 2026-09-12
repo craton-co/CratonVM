@@ -1645,11 +1645,17 @@ struct Compiler {
     deopt_epoch_guard: *const crate::deopt::DeoptEpochGuard,
     /// deopt-osr Step 9 follow-up (c): this method's `"<class>.<method>:<desc>"`
     /// key, set by `compile_with_param_slots` from its `method_key` arg. Used to
-    /// consult the per-bci de-spec registry (`crate::deopt::despec_contains`) so a
-    /// loop-header speculation that has repeatedly deopted is NOT re-emitted on
-    /// recompile. Empty (`""`) on the legacy/test `compile()` wrapper and in
-    /// production (the registry is empty), so the consult is a no-op there.
+    /// consult the per-bci de-spec registry ([`Self::despec`]) so a
+    /// speculation that has repeatedly deopted is NOT re-emitted on recompile.
+    /// Empty (`""`) on the legacy/test `compile()` wrapper, where the consult is
+    /// a no-op.
     method_key: String,
+    /// The compiling VM's per-bci de-spec registry
+    /// (`crate::deopt::DespecRegistry`), set by `compile_with_param_slots` from
+    /// its `despec` arg. `None` (the legacy/test wrappers, no VM) consults
+    /// nothing. An `Arc` rather than a borrow because `Compiler` carries no
+    /// lifetime; cloning it once per compile is one refcount increment.
+    despec: Option<std::sync::Arc<crate::deopt::DespecRegistry>>,
     /// The common direct-recursive edge cannot allocate, call another method,
     /// or poll. See [`gc_inert_selfrec_candidate`].
     gc_inert_selfrec: bool,
@@ -3100,6 +3106,7 @@ impl Compiler {
             deopt_point_pcs: Vec::new(),
             deopt_epoch_guard: std::ptr::null(),
             method_key: String::new(),
+            despec: None,
             gc_inert_selfrec,
             deopt_regs_base,
             deopt_box_ptr_by_bci: FxHashMap::default(),

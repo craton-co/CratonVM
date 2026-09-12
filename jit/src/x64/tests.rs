@@ -1160,6 +1160,7 @@ fn self_recursive_second_call_map(method_key: &str) -> Option<crate::OopMapEntry
         0,
         Vec::new(),
         method_key,
+        None, // despec: no VM
         Vec::new(),
         None, // elidable_init_pcs: no constant pool, so nothing is proven empty
     )?;
@@ -6252,6 +6253,7 @@ fn trusted_oop_receiver_substitution_requires_live_bounds() {
             0b11, // param_oop_mask: both parameters are references
             vec![(2usize, 0u32, true)],
             "T.setRef:(Ljava/lang/Object;)V", // non-empty ⇒ trusted-oop eligible
+            None,                             // despec: no VM
             Vec::new(),
             None, // elidable_init_pcs: no constant pool, so nothing is proven empty
         )
@@ -9077,6 +9079,7 @@ fn instanceof_inline_fixture(
         0b1, // param_oop_mask: the parameter is a reference
         Vec::new(),
         "T.f:(Ljava/lang/Object;)I", // non-empty ⇒ trusted-oop eligible
+        None, // despec: no VM, so no despeculation verdicts
         Vec::new(),
         None, // elidable_init_pcs: no constant pool, so nothing is proven empty
     )
@@ -9270,6 +9273,7 @@ fn keyed_int_method(
         0, // param_oop_mask: int parameters only
         Vec::new(),
         method_key,
+        None, // despec: no VM, so no despeculation verdicts
         Vec::new(),
         None, // elidable_init_pcs: no constant pool, so nothing is proven empty
     )

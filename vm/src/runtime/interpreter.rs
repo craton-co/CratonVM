@@ -3431,8 +3431,9 @@ pub fn execute(
                         // method_key — bakes this method's identity into its
                         // deopt snapshots (resume sinks verify it before
                         // resuming a stashed frame). Also enables the per-bci
-                        // de-spec consult (inert in production).
+                        // de-spec consult against this VM's registry.
                         &format!("{class_name_arc}.{method_name_arc}:{descriptor_arc}"),
+                        Some(&shared.jit.despec_registry),
                         indy_info,
                         Some(elidable_init_pcs),
                     )?;

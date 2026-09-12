@@ -27658,41 +27658,18 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
             .unwrap_or(0),
     );
 
-    // §7/§10 — publish this VM's execution policy to the JIT BEFORE anything
-    // else here, and in particular before the first compilation.
+    // §7/§10 — the execution policy is NOT published to the JIT here.
     //
-    // Ordering is the whole point. `cratonvm_jit::set_jit_execution_policy`
-    // gates two compile-time mechanisms that would otherwise bake a native
-    // call into machine code with no policy check anywhere on the path: the
-    // thin direct-call helpers registered immediately below, and inline-cache
-    // publication of an unowned (native/builtin) entry pointer. A JIT decision
-    // is made once and then executes for the life of the artifact, so a
-    // callback bound before the policy arrives would keep running under a
-    // policy that forbids it. Setting it first makes that unrepresentable: no
-    // artifact of this VM is ever compiled under a policy other than the one
-    // it runs under.
-    //
-    // `process_vm()` is published by `Vm::new()` before any bytecode runs (see
-    // the `safepoint_flag_addr` note below, which relies on the same fact), and
-    // compilation only starts once the interpreter is executing bytecode — so
-    // by the time a real JIT compile can trigger this function, the policy is
-    // available. `None` (a unit test calling `build_helpers()` with no VM)
-    // leaves the JIT's latch untouched, which it already treats as
-    // `Compatible`; that is the pre-existing behaviour for such tests and the
-    // conservative direction is unavailable to us here anyway, since there is
-    // no VM to ask.
-    //
-    // The latch itself only ever moves toward strict, so this call can never
-    // relax a policy another VM in the same process already installed.
-    // The latch is still published, because `jit_entry_publishable` (the
-    // inline-cache publication refusal) has no VM handle and still reads it.
-    // That one is measured to never fire — every MIC/PIC publication takes its
-    // entry from `try_jit_compile_callee`, which has a live owner and returns
-    // early — so leaving it process-global refuses nothing in either VM.
-    // Everything the compile path decides is now threaded per-VM instead.
-    if let Some(shared) = vm_for_helpers {
-        cratonvm_jit::set_jit_execution_policy(shared.config.execution_policy());
-    }
+    // This spot used to call `cratonvm_jit::set_jit_execution_policy`, which
+    // latched a process-global `AtomicU8` with `fetch_max`: the first
+    // `--jdk-only` VM in a process made every later VM compile over-strict,
+    // and nothing could lower it. Every compile-time consumer of the policy
+    // now takes it as an argument from a site that holds this VM —
+    // `dispatch_policy(shared).is_jdk_only()` at the compile doors in
+    // `jit_bridge.rs`, and the `jit_entry_publishable` publication sites below
+    // — so the policy a compilation sees is always its own VM's, fixed for the
+    // VM's life. The latch and its setter were deleted on 2026-09-12; see
+    // `jit-compatibility-and-despec-state-per-vm-FIXED.md`.
 
     // `Integer.valueOf(I)` / `Integer.intValue()` thin direct-call helpers —
     // same no-ABI-change registration pattern as the savebase watch helpers

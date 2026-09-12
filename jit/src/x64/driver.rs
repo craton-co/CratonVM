@@ -268,6 +268,7 @@ pub fn compile(
         // empty for tests/AOT → legacy/helper field path.
         PENDING_COMPACT_FIELD_INFO.with(|c| std::mem::take(&mut *c.borrow_mut())),
         "",         // method_key: legacy/test wrapper disables the per-bci de-spec consult
+        None,       // despec: no VM, so no per-VM de-spec registry to consult
         Vec::new(), // indy_info: legacy/test wrapper passes no invokedynamic sites
         // elidable_init_pcs: no constant pool here, so nothing is PROVEN empty
         // and nothing may be elided. See the parameter's doc.
@@ -558,11 +559,17 @@ pub fn compile_with_param_slots(
     compact_field_info: Vec<(usize, u32, bool)>,
     // deopt-osr Step 9 follow-up (c) — this method's
     // `"<class>.<method>:<descriptor>"` key, used to consult the per-bci de-spec
-    // registry (`crate::deopt::despec_contains`) and suppress a loop-header
-    // speculative-BCE guard that has repeatedly deopted. `""` (the legacy/test
-    // `compile()` wrapper) disables the consult; the registry is empty in
-    // production, so a non-empty key is still byte-identical there.
+    // registry (`despec` below) and suppress a loop-header speculative-BCE
+    // guard that has repeatedly deopted. `""` (the legacy/test `compile()`
+    // wrapper) disables the consult; an empty registry leaves codegen
+    // byte-identical.
     method_key: &str,
+    // The compiling VM's per-bci de-spec registry
+    // (`crate::deopt::DespecRegistry`, owned by the VM's `JitRealm`). Per VM,
+    // not per process: one VM's despeculation verdicts must not strip
+    // speculations from another VM's compiles. `None` (no VM in scope: the
+    // legacy `compile()` wrapper and crate fixtures) consults nothing.
+    despec: Option<&std::sync::Arc<crate::deopt::DespecRegistry>>,
     // Resolved `invokedynamic` (0xba) call-site info — see the `indy_info`
     // field doc on the `Compiler` struct. Empty from the legacy `compile()`
     // test wrapper (which also passes no `indy_ops` to `jit_scan` callers, so
@@ -779,7 +786,7 @@ pub fn compile_with_param_slots(
         Some(x) => x.exception_ranges.clone(),
         None => exception_ranges,
     };
-    // The per-bci de-spec registry (`crate::deopt::despec_contains`) is keyed
+    // The per-bci de-spec registry (`crate::deopt::DespecRegistry`) is keyed
     // by INTERPRETER bci, but every loop header below is an output pc. Consult
     // it through the provenance map. Identity when unarmed.
     let despec_bci = |pc: usize| -> u32 {
@@ -1210,7 +1217,8 @@ pub fn compile_with_param_slots(
     let hoist_info: Vec<LoopHoist> = hoist_info
         .into_iter()
         .filter(|h| {
-            let despec = crate::deopt::despec_contains(method_key, despec_bci(h.loop_header));
+            let despec = despec
+                .is_some_and(|registry| registry.contains(method_key, despec_bci(h.loop_header)));
             if despec && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
                 eprintln!(
                     "[cratonvm-deopt] de-spec: dropping aaload LICM hoist at loop_header \
@@ -1867,6 +1875,7 @@ pub fn compile_with_param_slots(
     compiler.param_jvm_slots = param_jvm_slots.to_vec();
     compiler.param_slot_span = param_slot_span;
     compiler.method_key = method_key.to_string();
+    compiler.despec = despec.cloned();
     // Coordinate change, emitter half: the three sites that BAKE a bci as an
     // immediate into machine code consult this. It must be installed before
     // `compile_bytecode` runs — those stubs are emitted at the end of that
@@ -1885,14 +1894,16 @@ pub fn compile_with_param_slots(
     // so those accesses get their per-element checks back — a dropped guard
     // with the elisions left in place would be an UNGUARDED speculative elide
     // (silent out-of-bounds access on exactly the input that kept deopting).
-    // Inert in production / on the `compile()` wrapper: `despec_contains`
-    // returns `false` for an empty key or empty registry, so both sets are
-    // unchanged ⇒ byte-identical codegen.
+    // Inert on the `compile()` wrapper and with nothing de-spec'd:
+    // `DespecRegistry::contains` returns `false` for an empty key or empty
+    // registry, and `None` consults nothing, so both sets are unchanged ⇒
+    // byte-identical codegen.
     let mut bounds_safe_pcs = bounds_safe_pcs;
     let speculative_bce_guards: Vec<SpeculativeBCEGuard> = speculative_bce_guards
         .into_iter()
         .filter(|g| {
-            let despec = crate::deopt::despec_contains(method_key, despec_bci(g.loop_header));
+            let despec = despec
+                .is_some_and(|registry| registry.contains(method_key, despec_bci(g.loop_header)));
             if despec {
                 for covered_pc in &g.covered_pcs {
                     bounds_safe_pcs.remove(covered_pc);

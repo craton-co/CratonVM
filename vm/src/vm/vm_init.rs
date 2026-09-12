@@ -4493,6 +4493,7 @@ impl SharedVm {
                 // policy when the environment is unset.
                 tiered_manager: crate::jit::tiered::TieredCompilationManager::with_env_policy(),
                 deopt_log: parking_lot::Mutex::new(crate::jit::deopt::DeoptimizationLog::new()),
+                despec_registry: Arc::new(crate::jit::deopt::DespecRegistry::new()),
                 method_epochs: parking_lot::RwLock::new(FxHashMap::default()),
                 method_epoch_overflow: std::sync::atomic::AtomicU64::new(0),
                 // JIT slow-path allocation: per-class init recipe cache.
@@ -5938,24 +5939,23 @@ impl SharedVm {
     ///    `Vec<JdkOnlyViolation>`. A `Compatible` VM that asked for
     ///    `--jdk-only-report` would pay three uncontended locks for three
     ///    guaranteed-empty answers. The early return is free.
-    /// 2. **Honesty.** `cratonvm_jit`'s policy is a process global that
-    ///    latches monotonically toward strict (see
-    ///    `cratonvm_jit::set_jit_execution_policy`). Two VMs in one process can
-    ///    therefore make a `Compatible` VM compile under strict policy — never
-    ///    the reverse — and that VM's JIT would start filling these sinks with
-    ///    refusals it never asked for. Folding them into a report whose `mode`
-    ///    field says `"compatible"` would attribute another VM's policy
+    /// 2. **Honesty.** The sinks are process-wide, so rows a sibling `JdkOnly`
+    ///    VM recorded are visible from here. Folding them into a report whose
+    ///    `mode` field says `"compatible"` would attribute another VM's policy
     ///    decisions to this one. A `Compatible` VM has no JDK-only policy, so
-    ///    it reports no JDK-only violations, full stop.
+    ///    it reports no JDK-only violations, full stop. (Until 2026-09-12 the
+    ///    JIT's policy was itself a process-global latch that only moved toward
+    ///    strict, so a `Compatible` VM could even compile under strict policy
+    ///    and record refusals of its own. The policy is now a per-compilation
+    ///    argument taken from each VM's own config, and the latch is gone.)
     ///
     /// The residual imprecision runs the other way and cannot be fixed here:
     /// in a multi-VM process where at least one VM is `JdkOnly`, these three
     /// lists are **process-wide**, not this VM's. A `JdkOnly` VM's report may
-    /// therefore include rows produced while a sibling `Compatible` VM was
-    /// running. Making them per-VM is the wave-2 change named in
-    /// `cratonvm_jit`'s `JDK-ONLY-WAVE2` note (move the policy and the helper
-    /// addresses into a per-VM struct); until then this is over-reporting in
-    /// the strict direction, which is the safe direction for a diagnostic.
+    /// therefore include rows produced while a sibling `JdkOnly` VM was
+    /// running. The policy is per VM; the sinks are not yet. Until they are,
+    /// this over-reports in the strict direction, which is the safe direction
+    /// for a diagnostic.
     ///
     /// Each sink is append-only and bounded (4096 entries by default since
     /// 2026-08-20, `CRATONVM_NATIVE_SHADOW_SINK_CAP`) with an internal dedup, so
@@ -7971,7 +7971,8 @@ impl SharedVm {
             // The bci-aware policy: a method whose only failing speculation has
             // already been de-spec'd is recompiled, not blacklisted. See
             // `DeoptimizationLog::recommend_action_at_bci`.
-            let action = log.recommend_action_at_bci(method_key, reason, bci);
+            let action =
+                log.recommend_action_at_bci(method_key, reason, bci, &self.jit.despec_registry);
             log.record_deopt(method_key, event);
             action
         };

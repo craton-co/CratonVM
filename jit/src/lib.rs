@@ -11402,109 +11402,37 @@ pub use math_intrinsic_aliases::*;
 // the artifact. A callback bound under one policy must never execute under
 // another. Three properties give that:
 //
-//   * The policy is set once per VM at init (`VmConfig::execution_policy`,
-//     propagated by `build_helpers`) **before** the JIT compiles anything, so
-//     no artifact of that VM is ever compiled under a different policy than it
-//     runs under.
-//   * [`set_jit_execution_policy`] **latches monotonically toward strict**. It
-//     can only ever move `Compatible -> JdkOnly`, never back. So the worst a
-//     second VM in the same process can do is make a *Compatible* VM's later
-//     compilations over-strict (it loses the thin-helper fast paths and pays
-//     the dispatch helper instead). Over-strict costs throughput; it can never
-//     execute a callback the policy forbids. The reverse latch would be
-//     unsound, which is exactly why it does not exist.
+//   * The policy is the VM's own (`VmConfig::execution_policy`, read as
+//     `dispatch_policy(shared).is_jdk_only()`) and reaches the JIT as an
+//     **argument** — `jdk_only` on `try_compile_with_invokespecial_resolver`,
+//     and on `jit_entry_publishable` for inline-cache publication. It is fixed
+//     for the life of the VM, so no artifact of that VM is ever compiled under
+//     a different policy than it runs under.
 //   * Every refusal is a compile-time *omission*, never a runtime branch in
-//     emitted code, so an already-compiled Compatible artifact is untouched by
-//     a later strictening — it keeps running under the policy it was built for.
+//     emitted code, so an already-compiled Compatible artifact keeps running
+//     under the policy it was built for.
 //
 // # Cost in Compatible mode
 //
-// [`jit_is_jdk_only`] is one relaxed `u8` load with no allocation, no
-// formatting and no hashing. Every call to it is on a compile-time path
-// (`try_compile`'s bytecode scan) or on the cold inline-cache *miss* path
-// (`JitMICSlot::update`, which already takes two mutexes). Nothing is added to
-// any emitted instruction sequence, so compiled Compatible code is
-// byte-for-byte what it was.
+// Reading the policy is a `bool` argument test on a compile-time path
+// (`try_compile`'s bytecode scan) or on the cold inline-cache *miss* path.
+// Nothing is added to any emitted instruction sequence, so compiled Compatible
+// code is byte-for-byte what it was.
 //
-// # Process-global — and what is left of it
+// # No process global
 //
-// §2 of the design forbids process globals for this feature's state. Both
-// dispatch-affecting readers are gone:
-//
-//   * the `*_DIRECT_FN` helper addresses are registered **unconditionally**
-//     (2026-08-06) — they are process-invariant Rust `fn` pointers, so
-//     withholding them was never per-VM protection — and the bind decision is
-//     threaded per compilation as an argument instead;
-//   * [`jit_entry_publishable`] read this latch until 2026-08-10 and now takes
-//     the policy as an argument, from the VM call sites in
-//     `vm/src/jit/helpers.rs` that publish MIC/PIC entries.
-//
-// What still reads it is the legacy [`try_compile`] wrapper, for callers with
-// no VM in scope (this crate's tests, and any VM site not yet threading a
-// policy). No test latches it, so those read `Compatible`. Deleting the static
-// means giving that wrapper a policy parameter, which is a caller-side change.
-//
-// The monotone latch remains the only correct shape for whatever still reads
-// it: it can only move `Compatible -> JdkOnly`, so the worst a second VM can do
-// is make a `Compatible` VM over-strict — which costs throughput and can never
-// execute a callback the policy forbids.
+// §2 of the design forbids process globals for this feature's state, and
+// AGENTS.md forbids them for compatibility state generally. There was one: a
+// `JIT_COMPATIBILITY_MODE` `AtomicU8` that `build_helpers` latched with
+// `fetch_max`, so it only ever moved `Compatible -> JdkOnly`. A VM created in
+// `--jdk-only` mode made every LATER VM in the process over-strict. Its
+// dispatch-affecting readers were threaded per VM on 2026-08-06
+// (`*_DIRECT_FN` binds) and 2026-08-10 (`jit_entry_publishable`); the last
+// reader, the VM-less legacy [`try_compile`] wrapper, now passes `Compatible`
+// explicitly — what it always read, because no VM calls that wrapper — and the
+// static, its setter and its two readers were deleted on 2026-09-12. See
+// `jit-compatibility-and-despec-state-per-vm-FIXED.md`.
 // ===========================================================================
-
-/// Latched JIT-visible compatibility mode. `0` = never set (treated as
-/// `Compatible`), `1` = `Compatible`, `2` = `JdkOnly`. Only ever increases.
-static JIT_COMPATIBILITY_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-const JIT_MODE_COMPATIBLE: u8 = 1;
-const JIT_MODE_JDK_ONLY: u8 = 2;
-
-/// Publish the VM's execution policy to the JIT. Called once per VM from
-/// `vm/src/jit/helpers.rs::build_helpers`, **before** the first compilation.
-///
-/// JDK-ONLY-WAVE2 §2, CLOSED 2026-08-10 for everything that decides dispatch.
-/// This static is process-global where §2 wants per-VM state, and it used to
-/// gate two things: the `*_DIRECT_FN` binds (moved to a per-compilation
-/// argument, 2026-08-06) and `jit_entry_publishable`'s inline-cache refusal
-/// (moved to a per-publication argument, 2026-08-10). Neither reads it now.
-///
-/// It survives only as the fallback for [`try_compile`]'s legacy wrapper, which
-/// has no VM in scope. That is a caller-side gap, not a policy leak: the value
-/// it hands out there is `Compatible`, because nothing latches it in a build
-/// without a VM.
-///
-/// # Do not call this from a unit test in this crate
-///
-/// The latch is process-global and irreversible, and this crate's `mod tests`
-/// shares one test binary. A test that latched `JdkOnly` would change what the
-/// legacy `try_compile` wrapper compiles for every test that happened to run
-/// after it — an order-dependent failure. The policy transition is covered
-/// end-to-end by the `--jdk-only` launcher tests instead, which get a fresh
-/// process.
-pub fn set_jit_execution_policy(policy: cratonvm_types::compat::ExecutionPolicy) {
-    let requested = if policy.is_jdk_only() {
-        JIT_MODE_JDK_ONLY
-    } else {
-        JIT_MODE_COMPATIBLE
-    };
-    JIT_COMPATIBILITY_MODE.fetch_max(requested, std::sync::atomic::Ordering::Release);
-}
-
-/// The compatibility mode the JIT is compiling under.
-pub fn jit_compatibility_mode() -> cratonvm_types::compat::CompatibilityMode {
-    if jit_is_jdk_only() {
-        cratonvm_types::compat::CompatibilityMode::JdkOnly
-    } else {
-        cratonvm_types::compat::CompatibilityMode::Compatible
-    }
-}
-
-/// Whether strict JDK-only policy is in force for JIT compilation.
-///
-/// One relaxed byte load. Safe to call from a compile-time scan or a cold
-/// runtime miss path; deliberately never called from emitted code.
-#[inline]
-pub fn jit_is_jdk_only() -> bool {
-    JIT_COMPATIBILITY_MODE.load(std::sync::atomic::Ordering::Relaxed) == JIT_MODE_JDK_ONLY
-}
 
 /// Thin direct-call native binds refused because `JdkOnly` is in force.
 static JDK_ONLY_DIRECT_NATIVE_REFUSALS: std::sync::atomic::AtomicU64 =
@@ -11795,9 +11723,11 @@ fn direct_native_helper_for_impl(
 //     is counted. These are exactly the "JIT fast path that resolves natives on
 //     its own" the acceptance criterion is aimed at.
 //
-//  3. `vm/src/jit/helpers.rs::build_helpers` — must call
-//     [`set_jit_execution_policy`] with `config.execution_policy()` BEFORE the
-//     first compilation.
+//  3. `vm/src/jit/helpers.rs::build_helpers` — used to call a
+//     `set_jit_execution_policy` latch with `config.execution_policy()` BEFORE
+//     the first compilation. **CLOSED 2026-09-12:** the latch was a process
+//     global and is deleted; every compile door passes its own VM's policy as
+//     the `jdk_only` argument instead, so there is nothing to publish first.
 //
 //     This item used to continue: "and should skip the `set_*_direct_fn`
 //     registrations entirely under `JdkOnly` (belt and braces …)".
@@ -24238,13 +24168,16 @@ pub fn try_compile(
         // crate's own tests, which have no class manager to resolve a callee
         // body against. `None` keeps `IrBuilder` splicing nothing.
         None,
-        // No VM in scope here. The latch is what this wrapper's callers (this
-        // crate's tests, and any VM site not yet threading a policy) have
-        // always read, and no test latches it, so they keep reading
-        // `Compatible`.
-        jit_is_jdk_only(),
+        // jdk_only: `Compatible`. No VM is in scope, and no VM calls this
+        // wrapper — every VM compile door passes its own
+        // `dispatch_policy(shared).is_jdk_only()` to the full form. This
+        // wrapper used to read the process-global latch, which nothing set in
+        // a build without a VM, so it always answered `Compatible` here too.
+        false,
         // No registry in scope from this wrapper. `None` refuses, which is
         // what the blanket strict refusal did before §4.
+        None,
+        // No VM, so no per-VM de-spec registry: nothing is de-spec'd.
         None,
     )
 }
@@ -24428,6 +24361,11 @@ pub fn try_compile_with_invokespecial_resolver(
     // fail-closed direction — a compile with no way to ask cannot bake a
     // native in front of real bytes.
     intrinsic_resolver: Option<&dyn Fn(&str, &str, &str) -> bool>,
+    // The compiling VM's per-bci de-spec registry (`JitRealm::despec_registry`
+    // on the VM side). Was the process-global `deopt.rs` `DESPEC_SET` until
+    // 2026-09-12, which let one VM's despeculation verdicts strip speculations
+    // from every other VM's compiles. `None` (no VM in scope) consults nothing.
+    despec: Option<&std::sync::Arc<crate::deopt::DespecRegistry>>,
 ) -> Option<CompiledMethod> {
     // The admission gate. Four checks and two side effects, all of which used
     // to live inline here and NONE of which the other two backend doors (the
@@ -24544,6 +24482,7 @@ pub fn try_compile_with_invokespecial_resolver(
         &admission,
         jdk_only,
         intrinsic_resolver,
+        despec,
     );
 
     // ── The compiled-local-handler safety net ───────────────────────────
@@ -24599,6 +24538,7 @@ pub fn try_compile_with_invokespecial_resolver(
                 &admission,
                 jdk_only,
                 intrinsic_resolver,
+                despec,
             );
             backend_attempted |= retry_backend_attempted;
             if retried.is_some() && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
@@ -26032,6 +25972,9 @@ fn try_compile_inner(
     // fail-closed direction — a compile with no way to ask cannot bake a
     // native in front of real bytes.
     intrinsic_resolver: Option<&dyn Fn(&str, &str, &str) -> bool>,
+    // The compiling VM's per-bci de-spec registry — see the same parameter on
+    // `try_compile_with_invokespecial_resolver`. `None` consults nothing.
+    despec: Option<&std::sync::Arc<crate::deopt::DespecRegistry>>,
 ) -> Option<CompiledMethod> {
     // One compile, one verdict: the fall-through signal describes THIS call.
     reset_ir_fall_through_signal();
@@ -32012,13 +31955,15 @@ fn try_compile_inner(
                     // it gets its MIC like any other invoke.
                     let by_profile = !supported
                         || receiver_profile_rejects_guard(profile, pc, guard_class_id);
-                    let by_despec = crate::deopt::despec_contains(
-                        &format!(
-                            "{}.{}:{}",
-                            cached.class_name, cached.method_name, cached.method_descriptor
-                        ),
-                        pc as u32,
-                    );
+                    let by_despec = despec.is_some_and(|registry| {
+                        registry.contains(
+                            &format!(
+                                "{}.{}:{}",
+                                cached.class_name, cached.method_name, cached.method_descriptor
+                            ),
+                            pc as u32,
+                        )
+                    });
                     if by_profile {
                         crate::metrics::note_receiver_despec(
                             crate::metrics::RECEIVER_DESPEC_PROFILE_DECLINED,
@@ -32414,8 +32359,8 @@ fn try_compile_inner(
 
     // deopt-osr Step 9 follow-up (c): the per-bci de-spec key for this method
     // (same `"<class>.<method>:<descriptor>"` form the deopt log / method_epochs
-    // use). Lets the optimizing backend skip a loop-header speculative-BCE guard
-    // recorded in the de-spec registry. Empty registry in production ⇒ no effect.
+    // use). Lets the backend skip a loop-header speculative-BCE guard recorded
+    // in this VM's de-spec registry (`despec`). Nothing recorded ⇒ no effect.
     let despec_method_key = format!(
         "{}.{}:{}",
         cached.class_name, cached.method_name, cached.method_descriptor
@@ -32605,6 +32550,7 @@ fn try_compile_inner(
         param_oop_mask,
         compact_field_info,
         &despec_method_key,
+        despec,
         indy_info,
         elidable_init_pcs,
     )?;
@@ -34755,9 +34701,9 @@ mod tests {
     /// compilation in the process — whosever it was — got `0` back.
     ///
     /// This test could not have been written against that design. There was no
-    /// per-call policy to vary, and the module comment on
-    /// `set_jit_execution_policy` explicitly forbids latching from a unit test
-    /// in this crate precisely because it is irreversible and `mod tests`
+    /// per-call policy to vary, and the (since deleted) latch setter's doc
+    /// explicitly forbade latching from a unit test
+    /// in this crate precisely because it was irreversible and `mod tests`
     /// shares one binary. Now the policy is an argument, so the two cases are
     /// independent by construction and a test can simply ask for both.
     #[test]

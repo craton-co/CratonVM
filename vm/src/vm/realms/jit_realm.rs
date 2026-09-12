@@ -76,6 +76,18 @@ pub struct JitRealm {
     /// Deoptimization log — records deopt events and drives adaptive recompilation.
     pub deopt_log: parking_lot::Mutex<crate::jit::deopt::DeoptimizationLog>,
 
+    /// Per-bci de-speculation registry: the `(method_key, bci)` speculation
+    /// sites THIS VM has given up on. Written by the real-frame-deopt resume
+    /// sink (`deopt_resume.rs`), read by every compile this VM requests (passed
+    /// as `Some(&shared.jit.despec_registry)`) and by
+    /// `DeoptimizationLog::recommend_action_at_bci`.
+    ///
+    /// Was the process-global `DESPEC_SET` in `jit/src/deopt.rs` until
+    /// 2026-09-12, so an embedded or second VM inherited despeculation verdicts
+    /// it never earned. An `Arc` because the x64 `Compiler` holds it for the
+    /// duration of a compile, which may run on a background compile worker.
+    pub despec_registry: Arc<crate::jit::deopt::DespecRegistry>,
+
     /// deopt-osr Step 9 — per-method *live* compilation epoch (a monotonic
     /// invalidation generation), keyed by the same `"<class>.<method>:<descriptor>"`
     /// string the deopt log uses. `DeoptimizationController::deoptimize` advances
