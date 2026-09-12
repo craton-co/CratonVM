@@ -19365,11 +19365,35 @@ fn ir_residency_pays_enabled() -> bool {
 ///
 /// `static_uses >= 2` misses both sides: it counts static edges rather than
 /// executions, and it prices a register-to-register publish as costing what a
-/// memory reload costs. Default OFF because the register file is five deep and
-/// shared with `ir_reserve_carried_enabled`, and no probe here has real
-/// register pressure -- not because a losing shape is known. Correctness
-/// evidence in that page's section 6b: `jit-flag-soak` divergent=0, and every
-/// `CratonBench` / `CratonBenchC2` checksum bit-identical.
+/// memory reload costs.
+///
+/// **DEFAULT OFF, and the losing shape is now KNOWN.** `probes/RegPressure.java`
+/// oversubscribes the five-register file -- six loop-carried accumulators plus
+/// three cross-block single-use values -- and this flag is SLOWER there, three
+/// runs out of three, each above its own floor:
+///
+/// ```text
+///   mix       (6 accumulators)   floor 0.9%  +12.5%  ratio 1.125x  SLOWER
+///   mix       (confirmation)     floor 5.5%   +9.7%  ratio 1.097x  SLOWER
+///   mixNarrow (3 accumulators)   floor 2.3%   +5.4%  ratio 1.054x  SLOWER
+/// ```
+///
+/// The census names it: 25 more values admitted buys ONE more resident, while
+/// `split_or_spilled` goes 12 -> 28 and `carried_reserved` 5 -> 2. The model
+/// above prices the register as free to take; under pressure its real price is
+/// whatever the value that would otherwise have held it was worth, and on that
+/// probe that value is read every iteration. A successor rule needs an
+/// occupancy term, not just better prices on the two it has.
+///
+/// Correctness is not the objection -- section 6b: `jit-flag-soak` divergent=0,
+/// every `CratonBench` / `CratonBenchC2` checksum bit-identical.
+///
+/// **Measuring this flag on a new probe: check `CRATONVM_DBG=jit-disasm` prints
+/// a `full/ir` body at the A/B's settings, and that the two arms' `len=` DIFFER.**
+/// The OSR door is single-pass only (`osr ir-eligibility: ... INERT at this
+/// door`) while still running the IR pipeline, so a linear-scan census can differ
+/// between arms that execute byte-identical code. The first run of `RegPressure`
+/// read 1.000x over a 0.5% floor for exactly that reason.
 fn ir_residency_crossblock_enabled() -> bool {
     matches!(
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK").as_deref(),

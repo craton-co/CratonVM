@@ -11,12 +11,14 @@ fix it:
 
 This page takes that lane and reaches two results.
 
-* **`CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK` — a win.** Single-use values that
+* **`CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK` — a win where the register file has
+  slack, and a loss where it does not.** Single-use values that
   `plan_carries` provably cannot reach are refused a register by a rule that
   assumes the carry took them. Admitting exactly that complement is **7.6%
-  faster on `probes/FieldLoop.java` over a 0.0% floor**, with a *smaller*
-  optimizing body, and free (1.000x, inside a 1.1% floor) on `FibCall.fib`.
-  Default OFF pending broader shapes; §6a says what it needs.
+  faster on `probes/FieldLoop.java` over a 0.0% floor** with a *smaller*
+  optimizing body, and free on `FibCall.fib` and `ManyExits.pick`. But on
+  `probes/RegPressure.java`, which oversubscribes the five-register file, it is
+  **5.4% to 12.5% SLOWER** — §6c. **Default OFF, for that measured reason.**
 * **A retraction.** Admitting *constants* looked equally obvious, was built,
   compiled and passed 2 393 tests, and is **structurally incapable** of paying.
   §2 is why, and the reason was already written in the tree.
@@ -32,6 +34,11 @@ roughly free on straight-line code and pays in proportion to loop trip count.
 epilogue-scaled cost should make this flag lose, and it came out neutral twice.
 The error in the first model is the useful part, and it is recorded rather than
 quietly replaced.
+
+The model is still incomplete, and §6c says how. Its benefit term assumes the
+register is **free to take**; under pressure its real price is whatever the value
+that would otherwise have held it was worth. That is the term that makes
+`RegPressure` lose, and it is the one a successor rule has to add.
 
 Windows dev box under unrelated load from other worktrees; every timing is
 interleaved with a CONTROL arm and reports its own floor. Checksums identical on
@@ -333,19 +340,20 @@ side, and to stop treating a register move as costing what a load costs.
 `CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK` ships **default OFF**. One win and two
 neutrals across three deliberately different shapes — a counted loop, a
 self-recursive call, and a six-exit branch tree — is good evidence for the
-mechanism and for the absence of a losing shape, but the shapes are all small
-probes.
+mechanism. It is **not** evidence that no losing shape exists, and §6c found
+one: under register pressure the flag is 5.4–12.5% slower. Read §6c before
+reading the rest of this section as encouragement.
 
 What it still needs before the default flips:
 
 * ~~A differential correctness soak~~ and ~~`CratonBench` /
   `CratonBenchC2` checksum parity~~ — **both done, §6b.** No divergence, and
   every checksum on both benchmarks is bit-identical.
-* **A large real body.** Everything measured here is under 1 300 bytes. The
-  register file is five deep and shared with `ir_reserve_carried_enabled`'s
-  pass, which takes what the main loop leaves; on a method with genuine register
-  pressure the crossblock arm spends that file earlier, and none of these probes
-  can show what that costs.
+* ~~A large real body.~~ **Done, and it is the one that answers the
+  question — §6c.** `probes/RegPressure.java` oversubscribes the five-register
+  file, and the flag is **5.4% to 12.5% SLOWER** there, above the floor, three
+  runs out of three. The default stays OFF for that reason now, not for want of
+  evidence.
 ## 6b. The correctness evidence, and exactly how much it covers
 
 A default-off JIT flag is flipped on evidence that turning it on changes no
@@ -392,6 +400,96 @@ The first pair was noise on a shared box, and it was noise in the flattering
 direction. That is the failure mode the control arm is for, and a 2x that
 evaporates under interleaving is a reminder that single-run benchmark pairs on
 this host are not evidence of anything.
+## 6c. The pressure gate: closed, and the answer is NO
+
+§6a left one item: every probe above is under 1.3 KB with slack in the register
+file, and the flag's risk is specific — `ir_gp_file()` is five deep, and
+`ir_reserve_carried_enabled`'s pass runs **last**, over
+`free = ir_gp_file() - taken`. The crossblock arm spends that file earlier, so on
+a method whose live set already exceeds five it could take registers from values
+read every iteration and give them to values read once.
+
+`probes/RegPressure.java` is built for exactly that and nothing else: six
+loop-carried `long` accumulators against a five-register file, plus three
+cross-block single-use values (`p`, `q`, `r`) defined at the top of the body and
+each consumed in one arm of the branch below. `mixNarrow` is the same loop with
+three accumulators — tight, but not over-subscribed.
+
+**The worry is real, and the flag loses.** Both variants, both above their floors:
+
+```text
+mix        (6 accumulators)  A 215.0 | C 217.0 | B 243.0 ms
+                             floor 0.9%   effect +12.5%   ratio 1.125x   SLOWER
+mix        (confirmation)    A 207.0 | C 196.0 | B 221.0 ms
+                             floor 5.5%   effect  +9.7%   ratio 1.097x   SLOWER
+mixNarrow  (3 accumulators)  A 130.0 | C 127.0 | B 135.5 ms
+                             floor 2.3%   effect  +5.4%   ratio 1.054x   SLOWER
+```
+
+The census names the mechanism. On `mix` (`peak_live=35`, `splits=63`):
+
+| | `resident` | `single_use` | `split_or_spilled` | `carried_reserved` | body |
+|---|---:|---:|---:|---:|---:|
+| flag off | 5 | 57 | **12** | **5** | 3164 |
+| flag on | **6** | 32 | **28** | **2** | 3218 |
+
+Twenty-five more values admitted buys **one** more resident. What it actually
+does is more than double the values the scan splits or spills (12 → 28) and take
+three registers off the loop-carried reservation (5 → 2) — and `mix` then emits
+three more stores and six more loads than the arm that admitted nothing.
+
+This is the shape §5's cost model does not price, and the reason is that §5's
+benefit term assumes the register is **free to take**. Under pressure it is not:
+its real price is whatever the value that would otherwise have held it was worth,
+and on this probe that value is read every iteration. `static_uses >= 2` cannot
+see that either, so the successor rule §6 proposes needs a third term — an
+occupancy check — and not just better-priced first two.
+
+**`CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK` therefore stays default OFF, now for a
+measured reason rather than for want of evidence.** The mechanism is sound and
+the loop win in §3 is real, but it is not safe to hand out a shared five-register
+file on a rule that never asks whether anything else needed it.
+
+### The measurement error that nearly hid this, and how to not repeat it
+
+The first run of this probe reported **1.000x / UNMEASURABLE over a 0.5% floor**
+and would have closed this gate the wrong way.
+
+Both arms were executing **identical machine code**. At `probe.reps=400
+probe.n=20000`, `RegPressure.mix` is reached through the **OSR** door, and
+`CRATONVM_DBG=jitc` says what that door does with the optimizing pipeline:
+
+```text
+osr ir-eligibility: ACCEPTED for RegPressure.mix(I)J -- INERT at this door,
+                    which is single-pass only
+[ir] admission RegPressure.mix(I)J: admitted to the optimizing pipeline
+```
+
+The IR pipeline **runs** — which is why `CRATONVM_DBG_IR_LINEAR_SCAN=1` printed a
+census that differed between the arms, `resident` 5 → 6 and `carried_reserved`
+5 → 2, exactly the starvation this section is about. The published body is
+`osr/sp len=3354` in both arms regardless. **A differing linear-scan census is
+not evidence that differing code ran.**
+
+What fixes it is the invocation-count door: `c2_threshold` is 20 000
+*invocations*, so the probe must be run as many calls with a short loop
+(`reps=300000 n=40`) rather than few calls with a long one. Then
+`full/ir RegPressure.mix(I)J` is published, at 3164 vs 3218 bytes, and the
+regression appears immediately.
+
+Two checks worth making standard before trusting any `flag-ab.sh` verdict on a
+new probe, both cheap:
+
+* `CRATONVM_DBG=jit-disasm | grep full/ir` — **is there an optimizing body at
+  the settings the A/B uses?** `osr/sp` and `full/sp` are single-pass; a flag in
+  `ir_lower.rs` cannot move them.
+* **The two arms' `len=` must differ.** Identical bodies mean the A/B is
+  measuring the noise floor twice, and it will faithfully report
+  `UNMEASURABLE` — which reads exactly like "the flag is safe here".
+
+`FieldLoop`, `FibCall` and `ManyExits` were checked against both and are
+unaffected: each publishes a `full/ir` body at its measured settings, and each
+publishes a *different* one per arm.
 ## 7. What this says about the `fib` lane
 
 §4 is a negative result on `fib` and it belongs with the budget page's other
@@ -435,4 +533,12 @@ bash tools/tier-ab/flag-ab.sh -Exe $EXE -Cp probes/out -Class ManyExits -Flag CR
 # correctness, section 6b
 bash tools/jit-flag-soak.sh $EXE vm/tests/resources:cratonvm CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK=1
 $EXE -Xmx8g -XX:+UseG1GC -cp bench-classes CratonBench    # compare checksums
+
+# section 6c -- the pressure gate. NOTE the settings: many INVOCATIONS with a
+# short loop, so `mix` reaches the invocation-count door. With reps=400 n=20000
+# it arrives through OSR instead, which is single-pass only, and both arms then
+# execute byte-identical code while the linear-scan census still differs.
+javac -d probes/out probes/RegPressure.java
+CRATONVM_DBG=jit-disasm $EXE -cp probes/out -Dprobe.reps=300000 -Dprobe.n=40 RegPressure | grep full/ir
+bash tools/tier-ab/flag-ab.sh -Exe $EXE -Cp probes/out -Class RegPressure -Flag CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK -On 1 -Off 0 -D probe.reps=1200000 -D probe.n=40 -Rounds 15
 ```
