@@ -527,7 +527,9 @@ pub(super) fn resolved_private_invokevirtual_target(
     let self_match = {
         let cm = shared.classes.class_manager.read();
         cm.get_class(current_class_id)
-            .map(|c| &*c.name == method_class_name)
+            .map(|c| {
+                super::constants::is_self_class_reference(&c.name, c.is_hidden(), method_class_name)
+            })
             .unwrap_or(false)
     };
     let target_class_id = if self_match {

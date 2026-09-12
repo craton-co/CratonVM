@@ -5558,3 +5558,81 @@ fn multianewarray_arm_guards_the_component_bracket_subtraction() {
          `multianewarray_alloc`, not re-implement the component-class resolution"
     );
 }
+
+/// The hidden-class self-reference predicate, both directions.
+///
+/// A hidden class's constant pool names the class by its class-FILE name, which
+/// is never the name it is stored under, so `resolve_class_loader_aware` has to
+/// recognise `stored == "<referenced>/0x<hex>"` and answer with the referencing
+/// class itself. Getting this WRONG in the permissive direction resolves an
+/// unrelated reference to a hidden class, which is worse than the missing answer
+/// it replaces -- hence the negative rows, not just the positive one.
+#[test]
+fn hidden_self_reference_predicate_matches_only_the_mint_sites_shape() {
+    use constants::hidden_stored_name_is_self as is_self;
+
+    // The shape every mint site writes: `format!("{original}/0x{id:x}")`.
+    assert!(is_self(
+        "jdk/MHProxy1/RJdkProxyIface$Greeter/0x0",
+        "jdk/MHProxy1/RJdkProxyIface$Greeter"
+    ));
+    assert!(is_self("Foo/0xdeadbeef", "Foo"));
+    assert!(is_self("a/b/C/0xff", "a/b/C"));
+
+    // A LONGER name that merely starts with the referenced one. `A/0x1$Inner`
+    // is its own class; resolving a reference to `A` onto it would be a wrong
+    // answer, not a missing one.
+    assert!(!is_self("A/0x1$Inner", "A"));
+    assert!(!is_self("A/0x", "A"), "the counter is never empty");
+    assert!(!is_self("A/0xzz", "A"), "not hex");
+    assert!(!is_self("A/1", "A"), "no 0x");
+    assert!(
+        !is_self("AB/0x1", "A"),
+        "prefix of the NAME, not of a segment"
+    );
+
+    // An ordinary class referring to itself by its own name is not a hidden
+    // self-reference, and must fall through to the real resolution path.
+    assert!(!is_self("java/lang/String", "java/lang/String"));
+
+    // `Unsafe.defineAnonymousClass` mints `<HOST>/0x<id>`, so the stored name
+    // belongs to the HOST, not to the anonymous class's own class-file name.
+    // The predicate simply does not match, which is the correct outcome: that
+    // path has no self-reference to rescue.
+    assert!(!is_self("Host/0x7", "AnonymousBody"));
+}
+
+/// The self-reference predicate the two dispatch doors share.
+///
+/// `dispatch_static`'s `self_class_id` and `invoke`'s `self_match` both answer
+/// "the constant-pool owner is MY class" from the frame's own `ClassId`. Exact
+/// string equality is right for every ordinary class and cannot be right for a
+/// hidden one, so both halves are asserted here -- including that a non-hidden
+/// class is NOT given the mangled-name shortcut, which would let an ordinary
+/// class named `A/0x1` answer for a reference to `A`.
+#[test]
+fn self_class_reference_covers_the_hidden_name_and_nothing_more() {
+    use constants::is_self_class_reference as is_self;
+
+    // Ordinary self-call: literal equality, hidden flag irrelevant.
+    assert!(is_self("a/b/C", false, "a/b/C"));
+    assert!(is_self("a/b/C", true, "a/b/C"));
+
+    // Hidden self-call: the stored name is the class-file name plus the suffix.
+    assert!(is_self(
+        "jdk/MHProxy1/P$Greeter/0x0",
+        true,
+        "jdk/MHProxy1/P$Greeter"
+    ));
+
+    // The SAME stored name on a class that is not hidden gets no shortcut.
+    assert!(!is_self(
+        "jdk/MHProxy1/P$Greeter/0x0",
+        false,
+        "jdk/MHProxy1/P$Greeter"
+    ));
+
+    // Unrelated names stay unrelated in both modes.
+    assert!(!is_self("a/b/C", true, "a/b/D"));
+    assert!(!is_self("a/b/C", false, "a/b/D"));
+}
